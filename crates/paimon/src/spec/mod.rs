@@ -25,6 +25,12 @@ pub use binary_row::*;
 mod blob_descriptor;
 pub use blob_descriptor::BlobDescriptor;
 
+mod blob_consumer;
+pub use blob_consumer::BlobConsumer;
+
+mod video_frame_descriptor;
+pub use video_frame_descriptor::VideoFrameDescriptor;
+
 mod blob_view_struct;
 pub use blob_view_struct::BlobViewStruct;
 
@@ -50,11 +56,18 @@ pub(crate) use aggregation::{
 mod data_type_casts;
 pub(crate) use data_type_casts::supports_cast;
 
+pub(crate) mod map_shredding;
 mod schema;
 pub use schema::*;
 
 mod schema_change;
 pub use schema_change::*;
+
+mod read_type;
+pub use read_type::*;
+
+mod map_selected_keys;
+pub use map_selected_keys::*;
 
 mod variant_metadata;
 pub use variant_metadata::*;
@@ -103,6 +116,7 @@ pub use types::*;
 mod partition;
 pub use partition::Partition;
 mod partition_utils;
+pub use partition_utils::is_java_whitespace_only;
 pub(crate) use partition_utils::{
     bucket_path, bucket_path_under, data_file_path, escape_path_name, relative_bucket_path,
     unescape_path_name, PartitionComputer,

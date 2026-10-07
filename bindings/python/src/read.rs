@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex};
 use arrow::pyarrow::ToPyArrow;
 use arrow::record_batch::RecordBatch;
 use futures::TryStreamExt;
-use paimon::spec::{DataField, DataType, Predicate, RowType};
+use paimon::spec::{is_variant_extraction_row, DataField, DataType, Predicate, RowType};
 use paimon::table::{ArrowRecordBatchStream, DataSplit, IncrementalScanMode, RowRange, Table};
 use paimon_datafusion::runtime::runtime;
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
@@ -33,8 +33,10 @@ use tokio::sync::Notify;
 use crate::error::to_py_err;
 use crate::predicate::dict_to_table_predicate;
 
-const MAP_SELECTED_KEYS_PREFIX: &str = "__PAIMON_MAP_SELECTED_KEYS:";
-const MAP_SELECTED_KEYS_DELIMITER: char = ';';
+struct PyReadProjection<'a> {
+    columns: &'a Option<Vec<String>>,
+    read_type: &'a Option<Vec<DataField>>,
+}
 
 /// Time-travel selector option names, in the core's resolution priority order.
 const TIME_TRAVEL_SELECTORS: [&str; 6] = [
@@ -73,17 +75,16 @@ fn find_time_travel_selector(opts: &HashMap<String, String>) -> Option<(&str, &s
 /// Apply common scan/read config onto a core ReadBuilder.
 fn apply_read_config(
     builder: &mut paimon::table::ReadBuilder<'_>,
-    projection: &Option<Vec<String>>,
-    read_type: &Option<Vec<DataField>>,
+    projection: PyReadProjection<'_>,
     limit: Option<usize>,
     filter: &Option<Predicate>,
     case_sensitive: bool,
 ) -> PyResult<()> {
     builder.with_case_sensitive(case_sensitive);
-    if let Some(read_type) = read_type {
+    if let Some(read_type) = projection.read_type {
         builder.with_read_type(read_type.clone());
-    } else if let Some(projection) = projection {
-        let cols: Vec<&str> = projection.iter().map(String::as_str).collect();
+    } else if let Some(columns) = projection.columns {
+        let cols: Vec<&str> = columns.iter().map(String::as_str).collect();
         builder.with_projection(&cols).map_err(to_py_err)?;
     }
     if let Some(limit) = limit {
@@ -93,106 +94,6 @@ fn apply_read_config(
         builder.with_filter(filter.clone());
     }
     Ok(())
-}
-
-/// Resolve flat output paths to the authoritative nested read type used by the
-/// core reader. ROW children are pruned recursively. MAP values remain MAPs,
-/// but their requested string keys are carried in the temporary field
-/// description so shared-shredding Parquet files can prune physical columns.
-fn project_nested_read_type(
-    fields: &[DataField],
-    paths: &[Vec<String>],
-) -> PyResult<Vec<DataField>> {
-    if paths.iter().any(Vec::is_empty) {
-        return Err(PyValueError::new_err(
-            "nested projection paths must not be empty",
-        ));
-    }
-
-    let mut result = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    for path in paths {
-        let name = &path[0];
-        if !seen.insert(name.clone()) {
-            continue;
-        }
-        let field = fields
-            .iter()
-            .find(|field| field.name() == name)
-            .ok_or_else(|| {
-                PyValueError::new_err(format!(
-                    "nested projection field '{}' does not exist",
-                    path.join(".")
-                ))
-            })?;
-        let matching: Vec<&[String]> = paths
-            .iter()
-            .filter(|candidate| candidate.first() == Some(name))
-            .map(|candidate| candidate[1..].as_ref())
-            .collect();
-        result.push(project_nested_field(field, &matching, name)?);
-    }
-    Ok(result)
-}
-
-fn project_nested_field(
-    field: &DataField,
-    tails: &[&[String]],
-    full_name: &str,
-) -> PyResult<DataField> {
-    if tails.iter().any(|tail| tail.is_empty()) {
-        return Ok(field.clone());
-    }
-    match field.data_type() {
-        DataType::Row(row) => {
-            let child_paths: Vec<Vec<String>> = tails.iter().map(|tail| tail.to_vec()).collect();
-            let children = project_nested_read_type(row.fields(), &child_paths).map_err(|_| {
-                PyValueError::new_err(format!(
-                    "nested projection field '{}' does not exist",
-                    tails
-                        .first()
-                        .map(|tail| format!("{full_name}.{}", tail.join(".")))
-                        .unwrap_or_else(|| full_name.to_string())
-                ))
-            })?;
-            Ok(DataField::new(
-                field.id(),
-                field.name().to_string(),
-                DataType::Row(RowType::with_nullable(
-                    field.data_type().is_nullable(),
-                    children,
-                )),
-            )
-            .with_description(field.description().map(str::to_string)))
-        }
-        DataType::Map(_) if tails.iter().all(|tail| tail.len() == 1) => {
-            let mut keys = Vec::new();
-            for tail in tails {
-                let key = &tail[0];
-                if key.contains(MAP_SELECTED_KEYS_DELIMITER)
-                    || key.starts_with(MAP_SELECTED_KEYS_PREFIX)
-                {
-                    // Keep the complete MAP for keys which cannot be encoded
-                    // by the cross-language selected-key convention.
-                    return Ok(field.clone());
-                }
-                if !keys.contains(key) {
-                    keys.push(key.clone());
-                }
-            }
-            Ok(field.clone().with_description(Some(format!(
-                "{MAP_SELECTED_KEYS_PREFIX}{}",
-                keys.join(&MAP_SELECTED_KEYS_DELIMITER.to_string())
-            ))))
-        }
-        _ => Err(PyValueError::new_err(format!(
-            "nested projection field '{}' is not a ROW or MAP",
-            tails
-                .first()
-                .map(|tail| format!("{full_name}.{}", tail.join(".")))
-                .unwrap_or_else(|| full_name.to_string())
-        ))),
-    }
 }
 
 /// Extract a sequence of Python `Split` objects into core `DataSplit`s. Accepts
@@ -293,45 +194,48 @@ impl PyReadBuilder {
 
 #[pymethods]
 impl PyReadBuilder {
+    /// Project top-level columns by name.
     fn with_projection(mut slf: PyRefMut<'_, Self>, columns: Vec<String>) -> PyRefMut<'_, Self> {
         slf.projection = Some(columns);
         slf.read_type = None;
         slf
     }
 
-    /// Project top-level fields or nested ROW leaves by their exact name paths.
-    /// MAP paths keep the complete MAP so the caller can extract literal keys.
-    fn with_nested_projection(
-        mut slf: PyRefMut<'_, Self>,
-        paths: Vec<Vec<String>>,
-    ) -> PyResult<PyRefMut<'_, Self>> {
-        let schema = slf.table.schema();
-        let mut read_type = project_nested_read_type(schema.fields(), &paths)?;
-        let options = schema.options();
-        let has_default_aggregation = options.contains_key("fields.default-aggregate-function");
-        for projected in &mut read_type {
-            let selected_map = matches!(projected.data_type(), DataType::Map(_))
-                && projected
-                    .description()
-                    .is_some_and(|description| description.starts_with(MAP_SELECTED_KEYS_PREFIX));
-            let has_field_aggregation =
-                options.contains_key(&format!("fields.{}.aggregate-function", projected.name()));
-            if selected_map && (has_default_aggregation || has_field_aggregation) {
-                // Merge engines may need the complete MAP to calculate the
-                // projected key. Match PyPaimon's complete-MAP fallback.
-                *projected = schema
-                    .fields()
-                    .iter()
-                    .find(|field| field.name() == projected.name())
-                    .expect("nested projection came from this schema")
-                    .clone();
+    /// Set the complete Paimon ROW read type, including nested field metadata.
+    /// The JSON representation is the same as RowType in a Paimon schema.
+    fn with_read_type<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        read_type_json: &str,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        let read_type: RowType = serde_json::from_str(read_type_json)
+            .map_err(|e| PyValueError::new_err(format!("invalid Paimon read type: {e}")))?;
+        for field in read_type.fields() {
+            let source = slf
+                .table
+                .schema()
+                .fields()
+                .iter()
+                .find(|source| source.id() == field.id());
+            if let (Some(source), DataType::Row(row)) = (source, field.data_type()) {
+                if matches!(source.data_type(), DataType::Variant(_))
+                    && is_variant_extraction_row(row)
+                    && row
+                        .fields()
+                        .iter()
+                        .any(|child| !matches!(child.data_type(), DataType::Float(_)))
+                {
+                    return Err(PyValueError::new_err(
+                        "Variant extraction target type must be float32",
+                    ));
+                }
             }
         }
-        slf.read_type = Some(read_type);
+        slf.read_type = Some(read_type.fields().to_vec());
         slf.projection = None;
         Ok(slf)
     }
 
+    /// Limit the number of visible rows.
     fn with_limit(mut slf: PyRefMut<'_, Self>, limit: usize) -> PyRefMut<'_, Self> {
         slf.limit = Some(limit);
         slf
@@ -377,8 +281,7 @@ impl PyReadBuilder {
         mut slf: PyRefMut<'py, Self>,
         predicate: &Bound<'_, PyDict>,
     ) -> PyResult<PyRefMut<'py, Self>> {
-        let filter =
-            dict_to_table_predicate(predicate, slf.table.schema().fields(), slf.case_sensitive)?;
+        let filter = dict_to_table_predicate(predicate, slf.table.schema(), slf.case_sensitive)?;
         slf.filter = Some(filter);
         Ok(slf)
     }
@@ -551,8 +454,10 @@ impl PyTableScan {
         let mut builder = self.table.new_read_builder();
         apply_read_config(
             &mut builder,
-            &self.projection,
-            &self.read_type,
+            PyReadProjection {
+                columns: &self.projection,
+                read_type: &self.read_type,
+            },
             self.limit,
             &self.filter,
             self.case_sensitive,
@@ -608,7 +513,7 @@ impl PyTableScan {
         Ok(slf)
     }
 
-    /// Select one balanced worker shard for a distributed scan.
+    /// Select a Java file-name or bucket shard, or balanced shuffled chunks.
     fn with_shard(
         mut slf: PyRefMut<'_, Self>,
         index: usize,
@@ -665,8 +570,10 @@ impl PyTableRead {
             let mut builder = self.table.new_read_builder();
             apply_read_config(
                 &mut builder,
-                &self.projection,
-                &self.read_type,
+                PyReadProjection {
+                    columns: &self.projection,
+                    read_type: &self.read_type,
+                },
                 self.limit,
                 &self.filter,
                 self.case_sensitive,
@@ -909,102 +816,6 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-
-    use paimon::spec::{DataField, DataType, IntType, MapType, RowType, VarCharType};
-
-    #[test]
-    fn nested_projection_prunes_rows_and_marks_selected_map_keys() {
-        let fields = vec![
-            DataField::new(0, "id".to_string(), DataType::Int(IntType::new())),
-            DataField::new(
-                1,
-                "payload".to_string(),
-                DataType::Row(RowType::new(vec![
-                    DataField::new(2, "version".to_string(), DataType::Int(IntType::new())),
-                    DataField::new(
-                        3,
-                        "details".to_string(),
-                        DataType::Row(RowType::new(vec![
-                            DataField::new(
-                                4,
-                                "name".to_string(),
-                                DataType::VarChar(VarCharType::string_type()),
-                            ),
-                            DataField::new(5, "score".to_string(), DataType::Int(IntType::new())),
-                        ])),
-                    ),
-                ])),
-            ),
-            DataField::new(
-                6,
-                "attrs".to_string(),
-                DataType::Map(MapType::new(
-                    DataType::VarChar(VarCharType::string_type()),
-                    DataType::Int(IntType::new()),
-                )),
-            ),
-        ];
-
-        let projected = project_nested_read_type(
-            &fields,
-            &[
-                vec![
-                    "payload".to_string(),
-                    "details".to_string(),
-                    "score".to_string(),
-                ],
-                vec!["id".to_string()],
-                vec!["attrs".to_string(), "selected".to_string()],
-            ],
-        )
-        .unwrap();
-
-        assert_eq!(
-            projected.iter().map(DataField::name).collect::<Vec<_>>(),
-            vec!["payload", "id", "attrs"]
-        );
-        let DataType::Row(payload) = projected[0].data_type() else {
-            panic!("payload must remain a row");
-        };
-        assert_eq!(payload.fields().len(), 1);
-        assert_eq!(payload.fields()[0].name(), "details");
-        let DataType::Row(details) = payload.fields()[0].data_type() else {
-            panic!("details must remain a row");
-        };
-        assert_eq!(
-            details
-                .fields()
-                .iter()
-                .map(DataField::name)
-                .collect::<Vec<_>>(),
-            vec!["score"]
-        );
-        assert_eq!(projected[2].data_type(), fields[2].data_type());
-        assert_eq!(
-            projected[2].description(),
-            Some("__PAIMON_MAP_SELECTED_KEYS:selected")
-        );
-    }
-
-    #[test]
-    fn nested_projection_rejects_an_invalid_struct_path() {
-        let fields = vec![DataField::new(
-            1,
-            "payload".to_string(),
-            DataType::Row(RowType::new(vec![DataField::new(
-                2,
-                "version".to_string(),
-                DataType::Int(IntType::new()),
-            )])),
-        )];
-
-        let error = project_nested_read_type(
-            &fields,
-            &[vec!["payload".to_string(), "missing".to_string()]],
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("payload.missing"));
-    }
 
     #[test]
     fn record_batch_reader_close_interrupts_pending_next() {

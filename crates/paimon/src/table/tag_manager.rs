@@ -269,6 +269,33 @@ impl TagManager {
         self.file_io.delete_file(&path).await
     }
 
+    /// Rename a tag, preserving its snapshot pointer and the `tagCreateTime` /
+    /// `tagTimeRetained` metadata by moving the raw tag file. Errors if the
+    /// source tag is missing or the target name already exists.
+    ///
+    /// Uses copy-then-delete rather than a native rename: object stores and the
+    /// in-memory backend do not support rename.
+    pub async fn rename(&self, tag_name: &str, target_tag_name: &str) -> crate::Result<()> {
+        validate_tag_name(tag_name)?;
+        validate_tag_name(target_tag_name)?;
+        let src = self.tag_path(tag_name);
+        let dst = self.tag_path(target_tag_name);
+        if !self.file_io.new_input(&src)?.exists().await? {
+            return Err(crate::Error::DataInvalid {
+                message: format!("tag '{tag_name}' does not exist"),
+                source: None,
+            });
+        }
+        if self.file_io.new_input(&dst)?.exists().await? {
+            return Err(crate::Error::DataInvalid {
+                message: format!("tag '{target_tag_name}' already exists"),
+                source: None,
+            });
+        }
+        self.file_io.copy_file(&src, &dst).await?;
+        self.file_io.delete_file(&src).await
+    }
+
     /// List all tags as `(name, snapshot)` pairs sorted by name ascending.
     pub async fn list_all(&self) -> crate::Result<Vec<(String, Snapshot)>> {
         let names = self.list_all_names().await?;
@@ -423,6 +450,34 @@ mod tests {
                 .unwrap();
             assert_eq!(bytes.as_ref(), serde_json::to_vec(&snapshot).unwrap());
         }
+    }
+
+    #[tokio::test]
+    async fn test_rename_tag_preserves_metadata() {
+        let tm = TagManager::new(test_file_io(), "memory:/test_tag_rename".to_string());
+        let snapshot = test_snapshot(7);
+        tm.create_with_retention("v1", &snapshot, Some("1d"))
+            .await
+            .unwrap();
+        let (_, before_create, before_retained) =
+            tm.get_with_metadata("v1").await.unwrap().unwrap();
+        assert!(before_create.is_some());
+        assert!(before_retained.is_some());
+
+        tm.rename("v1", "release").await.unwrap();
+
+        // Source gone; target keeps the original snapshot and metadata verbatim.
+        assert!(tm.get("v1").await.unwrap().is_none());
+        let (snap, after_create, after_retained) =
+            tm.get_with_metadata("release").await.unwrap().unwrap();
+        assert_eq!(snap.id(), 7);
+        assert_eq!(after_create, before_create);
+        assert_eq!(after_retained, before_retained);
+
+        // A missing source or an existing target is rejected.
+        assert!(tm.rename("missing", "whatever").await.is_err());
+        tm.create("other", &test_snapshot(8)).await.unwrap();
+        assert!(tm.rename("release", "other").await.is_err());
     }
 
     #[tokio::test]

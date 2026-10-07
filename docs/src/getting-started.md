@@ -45,6 +45,7 @@ Available storage features:
 | `storage-s3`     | Amazon S3        |
 | `storage-oss`    | Alibaba Cloud OSS|
 | `storage-jindo`  | Alibaba Cloud OSS through JindoSDK |
+| `storage-oss-cpp` | Alibaba Cloud OSS through C++ SDK v2 (read-only) |
 | `storage-cos`    | Tencent Cloud COS |
 | `storage-azdls`  | Azure Data Lake Storage Gen2 |
 | `storage-obs`    | Huawei Cloud OBS |
@@ -123,6 +124,14 @@ cross-backend rename is rejected.
 with `with_provider` on the same builder. Without a provider, property-based
 storage configuration behaves as before.
 
+## Parquet Dictionary Encoding
+
+Dictionary encoding is enabled by default. Disable it for all columns with
+`parquet.enable.dictionary=false`, or override one column with
+`parquet.enable.dictionary#event_time=false` (Java-compatible syntax).
+Paths use dot-separated physical Parquet leaves, not logical MAP keys.
+These options affect new writes only.
+
 ## Parquet Page Pruning
 
 Parquet Page Index pruning is enabled by default. Set
@@ -185,9 +194,19 @@ When supported indexes are configured, each data file gets its own index.
 The complete serialized index is embedded in the manifest when its size
 is at most `file-index.in-manifest-threshold` (default `500 B`); larger indexes
 are stored beside the data file as a `.index` sidecar. Indexed write failures
-return an error and clean up newly created files on a best-effort basis.
-Use commit `abort` to clean up files after a successful `prepare_commit`
-when the prepared write will not be committed.
+return an error. Failed preparation discards outputs from that invocation before
+returning any messages. Files handed off by an earlier successful preparation
+remain available, including after a later preparation or Paimon Table commit
+exception. Explicit commit `abort` deletes newly written files only when the caller
+knows those messages are uncommitted and will never be submitted. Never call it
+when the Paimon Table commit outcome is unknown: publication can succeed even when
+its response fails.
+
+Format Tables follow Java's two-phase publication: validation failures discard
+staging only; append publication or partition-registration failures roll back new
+targets; overwrite failures retain replacement targets after old data is removed.
+Successfully registered append targets also survive a later abort. Cleanup attempts
+every file, and a cleanup failure does not replace the original commit error.
 
 `file-index.read.enabled` controls only reading, independently of index creation.
 Existing files are not backfilled. Index generation is not supported for
@@ -315,6 +334,12 @@ default. Set `fs.jindo.max.concurrent.reads` to a positive integer to tune this
 limit for the available network and JindoSDK connection capacity. JindoSDK state
 initialized before `fork` cannot be reused in the child; use `spawn` or initialize
 Jindo only after worker processes start.
+
+With `storage-oss-cpp`, set `fs.oss.impl=cpp` and
+`fs.oss.cpp.library.path` to the installed bridge library. This experimental
+backend supports stat, reads and listings, with 8 concurrent requests per
+operator by default. OpenDAL remains the default backend.
+See the [build instructions and options](https://github.com/apache/paimon-rust/tree/main/integrations/oss-cpp).
 
 Supported metastore types:
 

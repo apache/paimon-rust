@@ -842,20 +842,23 @@ fn decode_text_chunk(
                         message: format!("Invalid UTF-8 in CSV file: {e}"),
                         source: Some(Box::new(e)),
                     })?;
-                    let row = if line.trim().is_empty() {
+                    let mut row = if line.trim().is_empty() {
                         vec![None; schema.fields().len()]
                     } else {
                         parse_csv_line(line, options)?
                     };
-                    if row.len() != schema.fields().len() {
-                        return Err(Error::DataInvalid {
-                            message: format!(
-                                "CSV row has {} fields, expected {}",
-                                row.len(),
-                                schema.fields().len()
-                            ),
-                            source: None,
-                        });
+                    // Read permissively, matching Java `CsvParser` under the default
+                    // `csv.mode=permissive`: a row with fewer fields than the schema
+                    // pads the missing trailing columns with null, and a row with more
+                    // fields drops the extras. Failing the whole scan on a field-count
+                    // mismatch rejected files Java reads fine — e.g. reading a table
+                    // after ADD COLUMN (old files carry one fewer column), or any
+                    // externally produced CSV that omits an optional trailing column.
+                    let field_count = schema.fields().len();
+                    if row.len() < field_count {
+                        row.resize(field_count, None);
+                    } else if row.len() > field_count {
+                        row.truncate(field_count);
                     }
                     Ok(row)
                 })
@@ -1481,6 +1484,39 @@ mod tests {
                 Some(false), // "0"
                 None,        // null stays null
             ]
+        );
+    }
+
+    #[test]
+    fn csv_reads_ragged_rows_permissively() {
+        // A 3-column CSV format-table with a short row (missing the trailing
+        // column, e.g. an old file read after ADD COLUMN) and a long row (an
+        // extra trailing field). Java reads both under the default permissive
+        // mode; the reader must pad/truncate rather than fail the whole scan.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Utf8, true),
+            Field::new("b", DataType::Utf8, true),
+            Field::new("c", DataType::Utf8, true),
+        ]));
+        let options = TextOptions::new(TextKind::Csv, &std::collections::HashMap::new()).unwrap();
+        let lines: Vec<Vec<u8>> = vec![b"x,y".to_vec(), b"p,q,r".to_vec(), b"1,2,3,4".to_vec()];
+        let batches = decode_text_chunk(&lines, TextKind::Csv, &options, &schema).unwrap();
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 3);
+        let c = batches[0]
+            .column(2)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("utf8 column");
+        assert!(
+            c.is_null(0),
+            "short row must pad the trailing column with null"
+        );
+        assert_eq!(c.value(1), "r");
+        assert_eq!(
+            c.value(2),
+            "3",
+            "long row must drop the extra trailing field"
         );
     }
 }

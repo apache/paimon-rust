@@ -47,6 +47,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const BATCH_COMMIT_IDENTIFIER: i64 = i64::MAX;
 /// Java RollingFileWriter.CHECK_ROLLING_RECORD_CNT.
 const CHECK_ROLLING_RECORD_COUNT: usize = 1000;
+
+mod row_tracking;
+
 const DELETION_VECTORS_INDEX_TYPE: &str = "DELETION_VECTORS";
 
 type PartitionBucketKey = (Vec<u8>, i32);
@@ -259,7 +262,7 @@ impl TableCommit {
         mut commits: Vec<(i64, Vec<CommitMessage>)>,
     ) -> Result<usize> {
         CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
-        self.table.ensure_not_branch_reference_for_write()?;
+        super::write_builder::ensure_table_write_allowed(&self.table)?;
         commits.sort_by_key(|(id, _)| *id);
         for pair in commits.windows(2) {
             if pair[0].0 == pair[1].0 {
@@ -357,7 +360,7 @@ impl TableCommit {
         // A refusal here must not clean up: a retry with an identifier that
         // already committed names files a snapshot references.
         CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
-        self.table.ensure_not_branch_reference_for_write()?;
+        super::write_builder::ensure_table_write_allowed(&self.table)?;
         reject_compact_increment(&commit_messages)?;
         validate_fixed_bucket_commit_mode(&commit_messages, false)?;
         validate_bucket_ownership(&commit_messages)?;
@@ -370,6 +373,8 @@ impl TableCommit {
         let changelog_entries = self.messages_to_changelog_entries(&commit_messages);
         let new_index_entries = self.messages_to_index_entries(&commit_messages);
         let check_from_snapshot = Self::check_from_snapshot(&commit_messages)?;
+        // Never delete CommitMessage files on failure. A previous attempt may
+        // have published them even when the caller received an exception.
         self.try_commit(
             CommitEntriesPlan::Direct {
                 entries,
@@ -405,7 +410,7 @@ impl TableCommit {
     ) -> Result<()> {
         // A commit validates against the existing snapshot.
         CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
-        self.table.ensure_not_branch_reference_for_write()?;
+        super::write_builder::ensure_table_write_allowed(&self.table)?;
         reject_compact_increment(&commit_messages)?;
         validate_fixed_bucket_commit_mode(&commit_messages, false)?;
         validate_bucket_ownership(&commit_messages)?;
@@ -418,28 +423,18 @@ impl TableCommit {
         let changelog_entries = self.messages_to_changelog_entries(&commit_messages);
         let new_index_entries = self.messages_to_index_entries(&commit_messages);
         let check_from_snapshot = Self::check_from_snapshot(&commit_messages)?;
-        let result = self
-            .try_commit(
-                CommitEntriesPlan::Direct {
-                    entries,
-                    changelog_entries,
-                    new_index_entries,
-                    check_from_snapshot,
-                },
-                Some(expected_snapshot_id),
-                commit_identifier,
-                false,
-            )
-            .await;
-        if let Err(error) = result {
-            // Storage and REST errors can be indeterminate: the snapshot may
-            // already reference these files even though the response failed.
-            if matches!(&error, crate::Error::DataInvalid { .. }) {
-                let _ = self.abort(&commit_messages).await;
-            }
-            return Err(error);
-        }
-        Ok(())
+        self.try_commit(
+            CommitEntriesPlan::Direct {
+                entries,
+                changelog_entries,
+                new_index_entries,
+                check_from_snapshot,
+            },
+            Some(expected_snapshot_id),
+            commit_identifier,
+            false,
+        )
+        .await
     }
 
     /// Overwrite partitions with new data.
@@ -501,7 +496,7 @@ impl TableCommit {
     ) -> Result<()> {
         // A commit validates against the existing snapshot.
         CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
-        self.table.ensure_not_branch_reference_for_write()?;
+        super::write_builder::ensure_table_write_allowed(&self.table)?;
         reject_compact_increment(&commit_messages)?;
         validate_fixed_bucket_commit_mode(&commit_messages, true)?;
         validate_bucket_ownership(&commit_messages)?;
@@ -762,7 +757,7 @@ impl TableCommit {
         // A commit validates against the existing snapshot.
         CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
         self.ensure_not_format_table()?;
-        self.table.ensure_not_branch_reference_for_write()?;
+        super::write_builder::ensure_table_write_allowed(&self.table)?;
 
         if partitions.is_empty() {
             return Ok(());
@@ -810,7 +805,7 @@ impl TableCommit {
         partitions: Vec<HashMap<String, Option<Datum>>>,
         commit_identifier: i64,
     ) -> Result<()> {
-        self.table.ensure_not_branch_reference_for_write()?;
+        super::write_builder::ensure_table_write_allowed(&self.table)?;
 
         if partitions.is_empty() {
             return Err(crate::Error::DataInvalid {
@@ -844,7 +839,7 @@ impl TableCommit {
         // A commit validates against the existing snapshot.
         CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
         self.ensure_not_format_table()?;
-        self.table.ensure_not_branch_reference_for_write()?;
+        super::write_builder::ensure_table_write_allowed(&self.table)?;
 
         self.try_commit(
             CommitEntriesPlan::Overwrite {
@@ -879,11 +874,16 @@ impl TableCommit {
         Ok(())
     }
 
-    /// Abort a prepared commit by deleting newly written data, changelog and index files.
+    /// Delete new files for an explicitly abandoned, known-uncommitted write.
     ///
-    /// Deletion is best-effort and mirrors Python `FileStoreCommit.abort`: missing
-    /// files or storage errors are ignored so abort cleanup never masks the
-    /// original write failure.
+    /// Mirrors Java `FileStoreCommitImpl.abort`; removed inputs are preserved.
+    /// Call only when these messages will never be submitted. Never call after
+    /// a commit whose outcome is unknown: publication may have succeeded before
+    /// its response failed. File deletion is best-effort.
+    ///
+    /// Format Tables follow Java two-phase cleanup instead: discard staging,
+    /// roll back unregistered append targets and preserve overwrite replacements
+    /// or successfully registered append files.
     pub async fn abort(&self, commit_messages: &[CommitMessage]) -> Result<()> {
         if self.table.is_format_table() {
             return FormatTableCommit::new(&self.table)
@@ -892,7 +892,7 @@ impl TableCommit {
         }
         CoreOptions::new(self.table.schema().options())
             .ensure_type_paimon_served(&self.table.identifier().full_name())?;
-        self.table.ensure_not_branch_reference_for_write()?;
+        super::write_builder::ensure_table_write_allowed(&self.table)?;
 
         let table_path = self.table.location().trim_end_matches('/');
         let index_file_in_data_file_dir =
@@ -1172,7 +1172,12 @@ impl TableCommit {
         let base_snapshot_uuid = latest_snapshot.as_ref().and_then(Snapshot::uuid);
         let publication_error = match self
             .snapshot_commit
-            .commit(base_snapshot_uuid, &snapshot, &statistics)
+            .commit(
+                base_snapshot_uuid,
+                &snapshot,
+                self.table.branch(),
+                &statistics,
+            )
             .await
         {
             Ok(true) => return Ok(CommitAttemptResult::Success),
@@ -1208,10 +1213,16 @@ impl TableCommit {
                     .and_then(|s| s.next_row_id())
                     .or(Some(first_row_id_start));
             } else {
-                let (assigned, nrid) = self.assign_row_tracking_meta(
+                let mut entries = std::mem::take(&mut resolved.entries);
+                if CoreOptions::new(self.table.schema().options())
+                    .row_tracking_partition_group_on_commit()
+                {
+                    entries = row_tracking::group_by_partition(entries);
+                }
+                let (assigned, nrid) = row_tracking::assign_row_tracking(
                     new_snapshot_id,
                     first_row_id_start,
-                    std::mem::take(&mut resolved.entries),
+                    entries,
                 )?;
                 resolved.entries = assigned;
                 next_row_id = Some(nrid);
@@ -1363,7 +1374,7 @@ impl TableCommit {
         if let Some(env) = &self.table.rest_env {
             return env
                 .api()
-                .get_table(env.identifier())
+                .get_table(&env.identifier().with_branch(self.table.branch())?)
                 .await?
                 .schema_id
                 .ok_or_else(|| crate::Error::DataInvalid {
@@ -1371,14 +1382,20 @@ impl TableCommit {
                     source: None,
                 });
         }
-        // Tables constructed directly by callers need not have schema files.
-        Ok(self
-            .table
-            .schema_manager()
-            .latest()
-            .await?
-            .map(|schema| schema.id())
-            .unwrap_or(self.table.schema().id()))
+        let latest = self.table.schema_manager().latest().await?;
+        if let Some(schema) = latest {
+            return Ok(schema.id());
+        }
+        // A resolved schema may open a main table without on-disk metadata.
+        // Selecting a branch must never implicitly create it during publication.
+        if self.table.is_main_branch() {
+            Ok(self.table.schema().id())
+        } else {
+            Err(crate::Error::DataInvalid {
+                message: format!("Branch '{}' does not exist.", self.table.branch()),
+                source: None,
+            })
+        }
     }
 
     async fn inherited_statistics(
@@ -1998,6 +2015,7 @@ impl TableCommit {
         }
 
         match CoreOptions::new(self.table.schema().options()).global_index_column_update_action()? {
+            GlobalIndexColumnUpdateAction::Ignore => Ok(vec![]),
             GlobalIndexColumnUpdateAction::DropPartitionIndex => Ok(affected
                 .into_iter()
                 .map(|entry| IndexManifestEntry {
@@ -2379,7 +2397,6 @@ impl TableCommit {
         all_entries.extend(delta_entries.iter().cloned());
         let merged_entries = merge_active_entries(all_entries);
         self.check_total_bucket_conflicts(&merged_entries)?;
-        self.check_postpone_bucket_mixing(&merged_entries)?;
         self.check_fixed_bucket_ownership_conflicts(
             latest_snapshot,
             delta_entries,
@@ -2457,15 +2474,6 @@ impl TableCommit {
                 if *entry.kind() != FileKind::Add {
                     continue;
                 }
-                if entry.bucket() == POSTPONE_BUCKET && owned_partitions.contains(entry.partition())
-                {
-                    return Err(crate::Error::DataInvalid {
-                        message: format!(
-                            "Postpone fixed-bucket writer conflict: another commit wrote bucket=-2 files for the same partition after snapshot {check_from_snapshot}"
-                        ),
-                        source: None,
-                    });
-                }
                 if owned_buckets.contains(&(entry.partition(), entry.bucket())) {
                     return Err(crate::Error::DataInvalid {
                         message: format!(
@@ -2476,31 +2484,6 @@ impl TableCommit {
                     });
                 }
             }
-        }
-        Ok(())
-    }
-
-    fn check_postpone_bucket_mixing(&self, active_entries: &[ManifestEntry]) -> Result<()> {
-        if self.total_buckets != POSTPONE_BUCKET {
-            return Ok(());
-        }
-        let fixed_partitions = active_entries
-            .iter()
-            .filter(|entry| {
-                *entry.kind() == FileKind::Add && entry.bucket() >= 0 && entry.total_buckets() > 0
-            })
-            .map(|entry| entry.partition())
-            .collect::<HashSet<_>>();
-        if active_entries.iter().any(|entry| {
-            *entry.kind() == FileKind::Add
-                && entry.bucket() == POSTPONE_BUCKET
-                && fixed_partitions.contains(entry.partition())
-        }) {
-            return Err(crate::Error::DataInvalid {
-                message: "Cannot mix bucket=-2 files and fixed buckets in the same partition; use a complete overwrite to migrate the partition"
-                    .to_string(),
-                source: None,
-            });
         }
         Ok(())
     }
@@ -2683,7 +2666,10 @@ impl TableCommit {
 
         let mut existing_index: HashSet<(Vec<u8>, i32, i64, i64)> = HashSet::new();
         let mut existing_ranges: ExistingRowIdRanges = HashMap::new();
-        for base in base_entries {
+        for base in base_entries
+            .iter()
+            .filter(|entry| !is_dedicated_storage_file(entry.file()))
+        {
             if let Some(first_row_id) = base.file().first_row_id {
                 existing_index.insert((
                     base.partition().to_vec(),
@@ -2691,12 +2677,10 @@ impl TableCommit {
                     first_row_id,
                     base.file().row_count,
                 ));
-                if !is_dedicated_storage_file(base.file()) {
-                    existing_ranges
-                        .entry((base.partition().to_vec(), base.bucket()))
-                        .or_default()
-                        .push((first_row_id, first_row_id + base.file().row_count - 1));
-                }
+                existing_ranges
+                    .entry((base.partition().to_vec(), base.bucket()))
+                    .or_default()
+                    .push((first_row_id, first_row_id + base.file().row_count - 1));
             }
         }
 
@@ -2704,14 +2688,14 @@ impl TableCommit {
             let first_row_id = entry.file().first_row_id.unwrap();
             if is_dedicated_storage_file(entry.file()) {
                 if let Some((start, end)) = entry.file().row_id_range() {
-                    let overlaps_existing = existing_ranges
+                    let covered_by_existing = existing_ranges
                         .get(&(entry.partition().to_vec(), entry.bucket()))
                         .is_some_and(|ranges| {
                             ranges.iter().any(|&(base_start, base_end)| {
-                                ranges_overlap(start, end, base_start, base_end)
+                                base_start <= start && end <= base_end
                             })
                         });
-                    if overlaps_existing {
+                    if covered_by_existing {
                         continue;
                     }
                 }
@@ -2781,6 +2765,43 @@ impl TableCommit {
                 }
             }
         }
+        Self::check_dedicated_row_id_ranges(&entries, commit_entries)
+    }
+
+    /// Dedicated files can roll independently, but each must fit in one normal
+    /// file range. Adjacent ranges must not be merged: the DE reader joins one
+    /// normal group at a time, matching Java's RowRangeIndex with mergeAdjacent=false.
+    fn check_dedicated_row_id_ranges(
+        normal_entries: &[&ManifestEntry],
+        entries: &[ManifestEntry],
+    ) -> Result<()> {
+        for entry in entries
+            .iter()
+            .filter(|entry| is_dedicated_storage_file(entry.file()))
+        {
+            let Some((start, end)) = entry.file().row_id_range() else {
+                continue;
+            };
+            let covered = normal_entries.iter().any(|normal| {
+                normal.partition() == entry.partition()
+                    && normal.bucket() == entry.bucket()
+                    && normal
+                        .file()
+                        .row_id_range()
+                        .is_some_and(|(base_start, base_end)| {
+                            base_start <= start && end <= base_end
+                        })
+            });
+            if !covered {
+                return Err(crate::Error::DataInvalid {
+                    message: format!(
+                        "For Data Evolution table, dedicated file '{}' [{start}, {end}] is not covered by one data file range.",
+                        entry.file().file_name,
+                    ),
+                    source: None,
+                });
+            }
+        }
         Ok(())
     }
 
@@ -2832,9 +2853,8 @@ impl TableCommit {
             for entry in self
                 .read_delta_entries(partition_filter.as_ref(), &snapshot)
                 .await?
-                .into_iter()
-                .filter(|entry| *entry.kind() == FileKind::Add)
             {
+                // Java's DML checker treats deleted column ranges as writes too.
                 let Some((start, end)) = entry.file().row_id_range() else {
                     continue;
                 };
@@ -2864,10 +2884,7 @@ impl TableCommit {
         delta_entries: &[ManifestEntry],
     ) -> Result<Vec<RowIdWriteRange>> {
         let mut ranges = Vec::new();
-        for entry in delta_entries
-            .iter()
-            .filter(|entry| *entry.kind() == FileKind::Add)
-        {
+        for entry in delta_entries {
             let Some((start, end)) = entry.file().row_id_range() else {
                 continue;
             };
@@ -2934,96 +2951,6 @@ impl TableCommit {
             ids.extend(data_fields.iter().map(|field| field.id()));
         }
         Ok(ids)
-    }
-
-    /// Assign row tracking metadata: snapshot ID as sequence number, and
-    /// first_row_id for new APPEND files that don't already have one.
-    /// Normal files advance the main counter. Blob files (identified by file name)
-    /// use per-column counters starting from the same base, since each blob column
-    /// rolls independently.
-    fn assign_row_tracking_meta(
-        &self,
-        snapshot_id: i64,
-        first_row_id_start: i64,
-        entries: Vec<ManifestEntry>,
-    ) -> Result<(Vec<ManifestEntry>, i64)> {
-        let mut result = Vec::with_capacity(entries.len());
-        let mut start = first_row_id_start;
-        let mut blob_start_default = first_row_id_start;
-        let mut blob_starts: HashMap<String, i64> = HashMap::new();
-        let mut vector_store_start = first_row_id_start;
-
-        for entry in entries {
-            let mut entry = entry.with_sequence_number(snapshot_id, snapshot_id);
-            if entry.file().file_source.is_none() {
-                return Err(crate::Error::DataInvalid {
-                    message: format!(
-                        "file_source must be present for row-tracking table, file={}",
-                        entry.file().file_name
-                    ),
-                    source: None,
-                });
-            }
-            let contains_row_id =
-                entry.file().write_cols.as_ref().is_some_and(|cols| {
-                    cols.iter().any(|col| col == crate::spec::ROW_ID_FIELD_NAME)
-                });
-            if *entry.kind() == FileKind::Add
-                && entry.file().file_source == Some(0) // APPEND
-                && entry.file().first_row_id.is_none()
-                && !contains_row_id
-            {
-                if is_blob_data_file(entry.file()) {
-                    let blob_field_name = entry
-                        .file()
-                        .write_cols
-                        .as_ref()
-                        .and_then(|cols| cols.first())
-                        .cloned()
-                        .ok_or_else(|| crate::Error::DataInvalid {
-                            message: format!(
-                                "Blob file '{}' must have write_cols for row-tracking assignment.",
-                                entry.file().file_name
-                            ),
-                            source: None,
-                        })?;
-                    let blob_start = blob_starts
-                        .entry(blob_field_name)
-                        .or_insert(blob_start_default);
-                    if *blob_start >= start {
-                        return Err(crate::Error::DataInvalid {
-                            message: format!(
-                                "This is a bug, blobStart {} should be less than start {} when assigning a blob entry file.",
-                                *blob_start, start
-                            ),
-                            source: None,
-                        });
-                    }
-                    entry = entry.with_first_row_id(*blob_start);
-                    *blob_start += entry.file().row_count;
-                } else if is_vector_store_file(entry.file()) {
-                    if vector_store_start >= start {
-                        return Err(crate::Error::DataInvalid {
-                            message: format!(
-                                "This is a bug, vectorStoreStart {} should be less than start {} when assigning a vector-store entry file.",
-                                vector_store_start, start
-                            ),
-                            source: None,
-                        });
-                    }
-                    entry = entry.with_first_row_id(vector_store_start);
-                    vector_store_start += entry.file().row_count;
-                } else {
-                    entry = entry.with_first_row_id(start);
-                    blob_start_default = start;
-                    blob_starts.clear();
-                    start += entry.file().row_count;
-                }
-            }
-            result.push(entry);
-        }
-
-        Ok((result, start))
     }
 
     /// Validate that files with pre-assigned `first_row_id` (e.g. partial-column
@@ -3547,7 +3474,7 @@ fn ranges_overlap(left_start: i64, left_end: i64, right_start: i64, right_end: i
 }
 
 fn is_blob_data_file(file: &DataFileMeta) -> bool {
-    crate::table::dedicated_format_file_writer::is_blob_file_name(&file.file_name)
+    crate::table::dedicated_format_file_writer::is_blob_or_video_file_name(&file.file_name)
 }
 
 fn is_vector_store_file(file: &DataFileMeta) -> bool {
@@ -3686,10 +3613,12 @@ mod tests {
         use super::*;
         include!("table_commit/parity_tests.rs");
         include!("table_commit/recovery_tests.rs");
+        include!("table_commit/row_tracking_tests.rs");
+        include!("table_commit/abort_tests.rs");
     }
 
     #[tokio::test]
-    async fn abort_still_cleans_up_for_a_query_auth_table() {
+    async fn abort_is_allowed_for_a_query_auth_table() {
         let table = crate::table::query_auth_table();
         let commit = crate::table::WriteBuilder::new(&table).new_commit();
         commit.abort(&[]).await.unwrap();
@@ -4757,7 +4686,7 @@ mod tests {
         let snapshot = snap_manager.get_latest_snapshot().await.unwrap().unwrap();
         assert_eq!(snapshot.id(), 1);
         assert!(snapshot.index_manifest().is_none());
-        assert!(!file_io.exists(&index_path).await.unwrap());
+        assert!(file_io.exists(&index_path).await.unwrap());
     }
 
     #[tokio::test]

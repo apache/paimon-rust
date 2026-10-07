@@ -29,6 +29,8 @@ use base64::{engine::general_purpose, Engine as _};
 
 mod numeric;
 pub(crate) use numeric::VariantFloat32Projection;
+mod inference;
+pub(crate) use inference::VariantShreddingInferenceSession;
 
 const BASIC_TYPE_BITS: u8 = 2;
 const BASIC_TYPE_MASK: u8 = 0x3;
@@ -167,17 +169,21 @@ impl<'a> VariantRef<'a> {
     }
 
     pub fn get_path(&self, path: &str) -> Result<Option<VariantRef<'a>>> {
+        self.get_path_segments(&parse_path(path)?)
+    }
+
+    fn get_path_segments(&self, segments: &[PathSegment]) -> Result<Option<VariantRef<'a>>> {
         let mut current = *self;
-        for segment in parse_path(path)? {
+        for segment in segments {
             match (segment, current.kind()?) {
                 (PathSegment::Key(key), VariantKind::Object) => {
-                    let Some(next) = current.get_field_by_key(&key)? else {
+                    let Some(next) = current.get_field_by_key(key)? else {
                         return Ok(None);
                     };
                     current = next;
                 }
                 (PathSegment::Index(index), VariantKind::Array) => {
-                    let Some(next) = current.get_element_at_index(index)? else {
+                    let Some(next) = current.get_element_at_index(*index)? else {
                         return Ok(None);
                     };
                     current = next;
@@ -1228,12 +1234,12 @@ fn write_json(value: &[u8], metadata: &[u8], pos: usize, out: &mut String) -> Re
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum PathSegment {
+pub(crate) enum PathSegment {
     Key(String),
     Index(usize),
 }
 
-fn parse_path(path: &str) -> Result<Vec<PathSegment>> {
+pub(crate) fn parse_path(path: &str) -> Result<Vec<PathSegment>> {
     let bytes = path.as_bytes();
     if !bytes.starts_with(b"$") {
         return data_invalid(format!("Invalid Variant path: {path}"));
@@ -1293,6 +1299,19 @@ fn parse_path(path: &str) -> Result<Vec<PathSegment>> {
         }
     }
     Ok(segments)
+}
+
+/// Return the literal key selected by a one-segment object path.
+///
+/// Variant extraction read types carry SQL-style paths. The vectorized
+/// numeric projection can batch literal top-level keys, while nested paths
+/// continue through the general `variant_get` implementation.
+pub(crate) fn top_level_path_key(path: &str) -> Result<Option<String>> {
+    let segments = parse_path(path)?;
+    Ok(match segments.as_slice() {
+        [PathSegment::Key(key)] => Some(key.clone()),
+        _ => None,
+    })
 }
 
 #[derive(Clone)]
@@ -1973,8 +1992,7 @@ pub(crate) fn infer_variant_shredding_schema(
         simple_schema = merge_inferred_schema(simple_schema, schema_of_row)?;
     }
 
-    let min_cardinality =
-        ((variants.len() as f64) * config.min_field_cardinality_ratio).ceil() as u64;
+    let min_cardinality = ((variants.len() as f64) * config.min_field_cardinality_ratio).ceil();
     finalize_inferred_schema(simple_schema, min_cardinality, max_fields_remaining)
 }
 
@@ -2203,23 +2221,23 @@ fn merge_inferred_row_types(left: &RowType, right: &RowType) -> Result<RowType> 
     Ok(RowType::new(new_fields))
 }
 
-fn inferred_field_count(field: &DataField) -> Result<u64> {
+fn inferred_field_count(field: &DataField) -> Result<f64> {
     let Some(description) = field.description() else {
         return data_invalid("Variant inferred field is missing count");
     };
-    description.parse::<u64>().map_err(|e| Error::DataInvalid {
+    description.parse::<f64>().map_err(|e| Error::DataInvalid {
         message: format!("Invalid Variant inferred field count: {description}"),
         source: Some(Box::new(e)),
     })
 }
 
-fn inferred_count_field(id: i32, name: &str, data_type: DataType, count: u64) -> DataField {
+fn inferred_count_field(id: i32, name: &str, data_type: DataType, count: f64) -> DataField {
     DataField::new(id, name.to_string(), data_type).with_description(Some(count.to_string()))
 }
 
 fn finalize_inferred_schema(
     data_type: Option<DataType>,
-    min_cardinality: u64,
+    min_cardinality: f64,
     max_fields_remaining: &mut usize,
 ) -> Result<DataType> {
     if *max_fields_remaining == 0 {
@@ -2668,6 +2686,81 @@ pub(crate) fn rebuild_shredded(
     builder.result()
 }
 
+/// Resolve a path directly against a clipped shredded schema. Unrequested
+/// physical siblings and a pruned parent `value` are not needed to rebuild
+/// the selected subtree. Whole-value rebuilding remains strict.
+pub(crate) fn extract_shredded_path(
+    row: &ShreddedRow,
+    schema: &VariantSchema,
+    path: &str,
+) -> Result<Option<GenericVariant>> {
+    let metadata = binary_field(row, schema.top_level_metadata_idx)?;
+    if !shredded_row_has_value(row, schema) && schema.variant_idx.is_some() {
+        return data_invalid("Malformed shredded Variant: missing value");
+    }
+    extract_shredded_segments(row, schema, metadata, &parse_path(path)?)
+}
+
+fn extract_shredded_segments(
+    row: &ShreddedRow,
+    schema: &VariantSchema,
+    metadata: &[u8],
+    segments: &[PathSegment],
+) -> Result<Option<GenericVariant>> {
+    let Some((segment, remaining)) = segments.split_first() else {
+        if !shredded_row_has_value(row, schema) {
+            return Ok(None);
+        }
+        let mut builder = VariantBuilder::new();
+        rebuild_shredded_into(row, metadata, schema, &mut builder)?;
+        return builder.result().map(Some);
+    };
+    if let Some(typed) = schema.typed_idx.and_then(|index| row.field(index)) {
+        match (segment, typed) {
+            (PathSegment::Key(key), ShreddedValue::Row(object))
+                if schema.object_schema.is_some() =>
+            {
+                if let Some(index) = schema.object_field_index(key) {
+                    let Some(ShreddedValue::Row(child)) = object.field(index) else {
+                        return data_invalid("Malformed shredded Variant object field");
+                    };
+                    return extract_shredded_segments(
+                        child,
+                        &schema.object_schema.as_ref().unwrap()[index].schema,
+                        metadata,
+                        remaining,
+                    );
+                }
+            }
+            (PathSegment::Index(index), ShreddedValue::List(elements))
+                if schema.array_schema.is_some() =>
+            {
+                return match elements.get(*index) {
+                    Some(element) => extract_shredded_segments(
+                        element,
+                        schema.array_schema.as_ref().unwrap(),
+                        metadata,
+                        remaining,
+                    ),
+                    None => Ok(None),
+                };
+            }
+            _ => {}
+        }
+    }
+    match optional_binary_field(row, schema.variant_idx)? {
+        Some(value) => {
+            let variant = GenericVariant::from_parts(value.to_vec(), metadata.to_vec())?;
+            variant
+                .as_ref()?
+                .get_path_segments(segments)?
+                .map(|selected| selected.to_owned_variant())
+                .transpose()
+        }
+        None => Ok(None),
+    }
+}
+
 pub(crate) fn cast_variant_to_shredded_value(
     variant: VariantRef<'_>,
     data_type: &DataType,
@@ -2707,9 +2800,7 @@ fn cast_variant_to_extraction_value(
             .and_then(|value| i32::try_from(value).ok())
             .map(ShreddedValue::Int32),
         VariantScalarSchema::Int64 => cast_variant_to_i64(variant).map(ShreddedValue::Int64),
-        VariantScalarSchema::Float32 => {
-            cast_variant_to_f64(variant).map(|value| ShreddedValue::Float32(value as f32))
-        }
+        VariantScalarSchema::Float32 => cast_variant_to_f32(variant).map(ShreddedValue::Float32),
         VariantScalarSchema::Float64 => cast_variant_to_f64(variant).map(ShreddedValue::Float64),
         VariantScalarSchema::Decimal { precision, scale } => {
             cast_variant_to_decimal(variant, *precision, *scale).map(ShreddedValue::Decimal128)
@@ -2793,6 +2884,31 @@ fn cast_variant_to_f64(variant: VariantRef<'_>) -> Option<f64> {
             Some(decimal.unscaled as f64 / 10f64.powi(decimal.scale as i32))
         }
         VariantKind::String => variant.get_string().ok()?.parse::<f64>().ok(),
+        _ => None,
+    }
+}
+
+pub(crate) fn cast_variant_to_f32(variant: VariantRef<'_>) -> Option<f32> {
+    match variant.kind().ok()? {
+        VariantKind::Boolean => Some(if variant.get_boolean().ok()? {
+            1.0
+        } else {
+            0.0
+        }),
+        VariantKind::Long => Some(variant.get_long().ok()? as f32),
+        VariantKind::Float => variant.get_float().ok(),
+        VariantKind::Double => Some(variant.get_double().ok()? as f32),
+        VariantKind::Decimal => {
+            let decimal = variant.get_decimal().ok()?;
+            Some((decimal.unscaled as f64 / 10f64.powi(decimal.scale as i32)) as f32)
+        }
+        // Java Float.parseFloat removes only leading/trailing characters <= U+0020.
+        VariantKind::String => variant
+            .get_string()
+            .ok()?
+            .trim_matches(|c| c <= '\u{20}')
+            .parse::<f32>()
+            .ok(),
         _ => None,
     }
 }
@@ -3271,6 +3387,37 @@ mod tests {
     }
 
     #[test]
+    fn clipped_shredded_paths_do_not_rebuild_unrequested_parent_values() {
+        let full = simple_object_shredding_schema();
+        let mut clipped = full.clone();
+        clipped.variant_idx = None;
+        for (json, expected) in [
+            (r#"{"age":7,"city":"x","extra":true}"#, Some("7")),
+            ("42", None),
+            ("null", None),
+            ("[]", None),
+            ("{}", None),
+        ] {
+            let variant = GenericVariant::parse_json(json).unwrap();
+            let shredded = cast_shredded(&variant, &full).unwrap();
+            let actual = extract_shredded_path(&shredded, &clipped, "$.age").unwrap();
+            assert_eq!(
+                actual.map(|value| value.to_json().unwrap()).as_deref(),
+                expected,
+                "{json}"
+            );
+        }
+        let malformed = ShreddedRow::new(full.num_fields);
+        assert!(extract_shredded_path(&malformed, &full, "$.age").is_err());
+        let scalar = GenericVariant::parse_json("42").unwrap();
+        let row = cast_shredded(&scalar, &full).unwrap();
+        assert!(
+            rebuild_shredded(&row, &clipped).is_err(),
+            "whole values still require the pruned fallback"
+        );
+    }
+
+    #[test]
     fn variant_shredding_schema_matches_java_shape() {
         let configured = DataType::Row(RowType::new(vec![
             DataField::new(7, "age".to_string(), DataType::BigInt(BigIntType::new())),
@@ -3635,5 +3782,66 @@ mod tests {
             Some(2),
             "2.5 truncates to 2"
         );
+    }
+
+    #[test]
+    fn float32_projection_casts_supported_sources_without_reinterpreting_temporal_values() {
+        let variant = GenericVariant::parse_json(
+            r#"{"boolean":true,"integer":27,"decimal":1.25,"string":"3.5","invalid":"bad"}"#,
+        )
+        .unwrap();
+        for (path, expected) in [
+            ("$.boolean", Some(1.0)),
+            ("$.integer", Some(27.0)),
+            ("$.decimal", Some(1.25)),
+            ("$.string", Some(3.5)),
+            ("$.invalid", None),
+        ] {
+            assert_eq!(
+                cast_variant_to_f32(variant.get_path(path).unwrap().unwrap()),
+                expected
+            );
+        }
+
+        let mut date = VariantBuilder::new();
+        date.append_date(20_000);
+        assert_eq!(
+            cast_variant_to_f32(date.result().unwrap().as_ref().unwrap()),
+            None
+        );
+
+        let mut timestamp = VariantBuilder::new();
+        timestamp.append_timestamp(1_700_000_000_123_456);
+        assert_eq!(
+            cast_variant_to_f32(timestamp.result().unwrap().as_ref().unwrap()),
+            None
+        );
+    }
+
+    #[test]
+    fn float32_projection_uses_java_string_whitespace_rules() {
+        let variant = GenericVariant::parse_json(
+            r#"{"ascii":" \t1.5\n ","control":"\u00001.5\u001f","nbsp":"\u00a01.5\u00a0"}"#,
+        )
+        .unwrap();
+        let float_type = DataType::Float(crate::spec::FloatType::new());
+
+        for path in ["$.ascii", "$.control"] {
+            let value = variant.get_path(path).unwrap().unwrap();
+            assert_eq!(
+                cast_variant_to_shredded_value(value, &float_type, true).unwrap(),
+                Some(ShreddedValue::Float32(1.5))
+            );
+        }
+
+        let nbsp = variant.get_path("$.nbsp").unwrap().unwrap();
+        assert_eq!(
+            cast_variant_to_shredded_value(nbsp, &float_type, false).unwrap(),
+            None
+        );
+        assert!(matches!(
+            cast_variant_to_shredded_value(nbsp, &float_type, true),
+            Err(Error::DataInvalid { .. })
+        ));
     }
 }

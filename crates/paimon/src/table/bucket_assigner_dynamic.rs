@@ -31,7 +31,7 @@ use crate::table::bucket_assigner::{BatchAssignOutput, BucketAssigner, Partition
 use crate::table::data_file_path_factory::{DataFilePath, DataFilePathFactory};
 use crate::table::index_file_path::IndexFileLocation;
 use crate::table::partition_filter::PartitionFilter;
-use crate::table::{Snapshot, SnapshotManager, Table, TableScan};
+use crate::table::{Snapshot, Table, TableScan};
 use crate::Result;
 use arrow_array::RecordBatch;
 use rand::seq::SliceRandom;
@@ -276,6 +276,67 @@ impl PartitionIndex {
         }
     }
 
+    /// Merge buckets restored or modified by direct writers. The base snapshot
+    /// is shared, so an already-notified maintainer retains its newer state.
+    fn merge(&mut self, other: Self) -> Result<()> {
+        for (hash, bucket) in other.hash_to_bucket {
+            self.record_mapping(hash, bucket)?;
+        }
+        self.bucket_maintainers.extend(other.bucket_maintainers);
+        Ok(())
+    }
+
+    fn record_mapping(&mut self, hash: i32, bucket: i32) -> Result<()> {
+        if let Some(&previous) = self.hash_to_bucket.get(&hash) {
+            if previous != bucket {
+                return Err(crate::Error::DataInvalid {
+                    message: format!(
+                        "Precomputed hash {hash} belongs to bucket {previous}, not {bucket}"
+                    ),
+                    source: None,
+                });
+            }
+            return Ok(());
+        }
+        self.hash_to_bucket.insert(hash, bucket);
+        if self.all_buckets.insert(bucket) {
+            self.bucket_ids.push(bucket);
+            self.non_full_buckets.insert(bucket, 0);
+        }
+        if let Some(count) = self.non_full_buckets.get_mut(&bucket) {
+            *count += 1;
+            if *count >= self.target_bucket_row_number {
+                self.non_full_buckets.remove(&bucket);
+            }
+        }
+        Ok(())
+    }
+
+    fn notify_precomputed(&mut self, bucket: i32, hashes: &[i32]) -> Result<()> {
+        let notified: HashSet<i32> = hashes.iter().copied().collect();
+        // Validate the entire group before changing the assignment or maintainer.
+        for &hash in hashes {
+            if let Some(&previous) = self.hash_to_bucket.get(&hash) {
+                if previous != bucket {
+                    return Err(crate::Error::DataInvalid {
+                        message: format!(
+                            "Precomputed hash {hash} belongs to bucket {previous}, not {bucket}"
+                        ),
+                        source: None,
+                    });
+                }
+            }
+        }
+        for hash in notified {
+            self.record_mapping(hash, bucket)?;
+            self.bucket_maintainers
+                .entry(bucket)
+                .or_insert_with(|| DynamicBucketIndexMaintainer::new(vec![]))
+                .notify_new_record(hash);
+        }
+        Ok(())
+    }
+
     /// Load partition index from existing hash index files.
     ///
     /// Reads all HASH-type index entries for this partition and reconstructs
@@ -480,10 +541,14 @@ pub(crate) struct DynamicBucketAssigner {
     /// Schema fields for BinaryRow extraction.
     fields: Vec<DataField>,
     partition_indexes: HashMap<Vec<u8>, PartitionIndex>,
+    /// Direct writers restore only the supplied buckets. Assignment upgrades
+    /// these partial indexes to a full partition index on first use.
+    precomputed_indexes: HashMap<Vec<u8>, PartitionIndex>,
     target_bucket_row_number: i64,
     table: Table,
     max_buckets: i32,
     snapshot: Option<Snapshot>,
+    restore_snapshot_id: Option<i64>,
     /// Cached index manifest entries from the latest snapshot (loaded once).
     cached_index_entries: Option<Vec<IndexManifestEntry>>,
     /// Overwrite mode: skip loading existing index entries.
@@ -515,9 +580,11 @@ impl DynamicBucketAssigner {
             primary_key_indices,
             fields: table.schema().fields().to_vec(),
             partition_indexes: HashMap::new(),
+            precomputed_indexes: HashMap::new(),
             target_bucket_row_number: options.dynamic_bucket_target_row_num(),
             max_buckets: options.dynamic_bucket_max_buckets()?,
             snapshot: None,
+            restore_snapshot_id: None,
             cached_index_entries: None,
             is_overwrite,
             partition_computer,
@@ -530,6 +597,59 @@ impl DynamicBucketAssigner {
         self.is_overwrite = is_overwrite;
     }
 
+    /// Set by the builder before any index state is loaded.
+    pub fn set_restore_snapshot(&mut self, snapshot_id: i64) {
+        self.restore_snapshot_id = Some(snapshot_id);
+    }
+
+    /// Java's DynamicBucketIndexMaintainer sees keys after bucket assignment.
+    /// Keep that same full-file replacement lifecycle for precomputed groups.
+    pub async fn notify_precomputed_batch(
+        &mut self,
+        batch: &RecordBatch,
+        partition: &[u8],
+        bucket: i32,
+    ) -> Result<()> {
+        let hashes = batch_hash_codes(batch, &self.primary_key_indices, &self.fields)?;
+        if let Some(index) = self.partition_indexes.get_mut(partition) {
+            return index.notify_precomputed(bucket, &hashes);
+        }
+        let loaded = self
+            .precomputed_indexes
+            .get(partition)
+            .is_some_and(|index| index.bucket_maintainers.contains_key(&bucket));
+        if !loaded {
+            self.ensure_index_entries_loaded().await?;
+            let entries: Vec<_> = self
+                .cached_index_entries
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .filter(|entry| {
+                    entry.partition == partition
+                        && entry.bucket == bucket
+                        && entry.index_file.index_type == HASH_INDEX
+                })
+                .cloned()
+                .collect();
+            let mut restored = self.load_hash_indexes(partition, &entries).await?;
+            // Remember an empty bucket too, so subsequent batches do not restore
+            // it repeatedly. It remains unmodified until a key is notified.
+            restored
+                .bucket_maintainers
+                .entry(bucket)
+                .or_insert_with(|| DynamicBucketIndexMaintainer::new(vec![]));
+            self.precomputed_indexes
+                .entry(partition.to_vec())
+                .or_insert_with(|| PartitionIndex::empty(self.target_bucket_row_number))
+                .merge(restored)?;
+        }
+        self.precomputed_indexes
+            .get_mut(partition)
+            .unwrap()
+            .notify_precomputed(bucket, &hashes)
+    }
+
     /// Load all index manifest entries from the latest snapshot (cached).
     /// Overwrite mode skips loading — old index is irrelevant.
     async fn ensure_index_entries_loaded(&mut self) -> Result<()> {
@@ -540,11 +660,12 @@ impl DynamicBucketAssigner {
             self.cached_index_entries = Some(Vec::new());
             return Ok(());
         }
-        let snapshot_manager = SnapshotManager::new(
-            self.table.file_io().clone(),
-            self.table.location().to_string(),
-        );
-        let latest_snapshot = snapshot_manager.get_latest_snapshot().await?;
+        let snapshot_manager = self.table.snapshot_manager();
+        let latest_snapshot = match self.restore_snapshot_id {
+            Some(0) => None,
+            Some(id) => Some(snapshot_manager.get_snapshot(id).await?),
+            None => snapshot_manager.get_latest_snapshot().await?,
+        };
 
         let entries = if let Some(snapshot) = &latest_snapshot {
             if let Some(index_manifest_name) = snapshot.index_manifest() {
@@ -581,6 +702,15 @@ impl DynamicBucketAssigner {
 
         self.validate_data_buckets(partition_bytes, &partition_entries)
             .await?;
+        self.load_hash_indexes(partition_bytes, &partition_entries)
+            .await
+    }
+
+    async fn load_hash_indexes(
+        &self,
+        partition_bytes: &[u8],
+        partition_entries: &[IndexManifestEntry],
+    ) -> Result<PartitionIndex> {
         if !partition_entries.is_empty() {
             let partition_path = self.partition_path(partition_bytes)?;
             let options = CoreOptions::new(self.table.schema().options());
@@ -593,7 +723,7 @@ impl DynamicBucketAssigner {
             return PartitionIndex::load(
                 self.table.file_io(),
                 &layout,
-                &partition_entries,
+                partition_entries,
                 self.target_bucket_row_number,
             )
             .await;
@@ -609,6 +739,9 @@ impl DynamicBucketAssigner {
         partition: &[u8],
         indexes: &[IndexManifestEntry],
     ) -> Result<()> {
+        if self.is_overwrite {
+            return Ok(());
+        }
         let Some(snapshot) = &self.snapshot else {
             return Ok(());
         };
@@ -661,7 +794,10 @@ impl BucketAssigner for DynamicBucketAssigner {
             self.ensure_index_entries_loaded().await?;
         }
         for partition_bytes in unseen {
-            let index = self.load_partition_index(&partition_bytes).await?;
+            let mut index = self.load_partition_index(&partition_bytes).await?;
+            if let Some(notified) = self.precomputed_indexes.remove(&partition_bytes) {
+                index.merge(notified)?;
+            }
             self.partition_indexes.insert(partition_bytes, index);
         }
 
@@ -690,7 +826,12 @@ impl BucketAssigner for DynamicBucketAssigner {
             let mut result = HashMap::new();
             let table_path = self.table.location().trim_end_matches('/').to_string();
             let index_file_in_data_file_dir = self.index_file_in_data_file_dir;
-            let partition_keys: Vec<Vec<u8>> = self.partition_indexes.keys().cloned().collect();
+            let partition_keys: Vec<Vec<u8>> = self
+                .partition_indexes
+                .keys()
+                .chain(self.precomputed_indexes.keys())
+                .cloned()
+                .collect();
             let mut partition_paths = Vec::with_capacity(partition_keys.len());
             for partition_bytes in &partition_keys {
                 partition_paths.push(self.partition_path(partition_bytes)?);
@@ -704,7 +845,11 @@ impl BucketAssigner for DynamicBucketAssigner {
                     partition_path: &partition_path,
                     index_file_in_data_file_dir,
                 };
-                if let Some(partition_index) = self.partition_indexes.get_mut(&partition_bytes) {
+                if let Some(partition_index) = self
+                    .partition_indexes
+                    .get_mut(&partition_bytes)
+                    .or_else(|| self.precomputed_indexes.get_mut(&partition_bytes))
+                {
                     let bucket_files = partition_index
                         .prepare_commit(
                             file_io,

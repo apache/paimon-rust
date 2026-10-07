@@ -139,6 +139,40 @@ committer. Batch empty commits follow `snapshot.ignore-empty-commit` (default
 true). `truncate_table()` shares the batch commit guard; `truncate_partitions`
 accepts a nonempty list of partition specs as in Java.
 
+For fixed-bucket writes to a primary-key table with `bucket=-2`, use the
+specialized builder. Routing, merge functions, sequence initialization and
+failure cleanup all run in the core writer:
+
+```python
+import pyarrow as pa
+
+plan = pa.record_batch(
+    [pa.array(["2026-10-01", "2026-10-02"]), pa.array([3, 5], type=pa.int32())],
+    names=["dt", "total_buckets"],
+)
+builder = table.new_postpone_fixed_bucket_write_builder().with_bucket_plan(plan)
+writer = builder.new_write()
+try:
+    writer.write_arrow(batch)
+    messages = writer.prepare_commit()
+finally:
+    writer.close()
+builder.new_commit().commit(messages)
+```
+
+The plan contains partition columns in table order and an `int32` count.
+Every input partition must be present. Workers may share a plan, but all rows
+for a partition and bucket must have a single writer owner. Both duplicate
+owners in a commit and stale overlapping writers are rejected. Pending files
+(`bucket=-2`) can coexist with real buckets; they remain pending until assigned.
+
+Without an explicit plan, set `postpone.default-bucket-num` to a positive integer.
+The count is used exactly for new partitions, and append reuses existing layouts
+from the same snapshot used to initialize sequence numbers. Overwrite uses the
+configured default for replaced partitions. No staging, automatic rescaling or
+compaction is performed. Deletion-vector tables are rejected by this writer.
+A failed write cannot be prepared, and close deletes only unprepared output.
+
 Configure overwrite on the batch builder:
 
 ```python
@@ -163,8 +197,13 @@ mode. `CommitMessage.deserialize(body, version=14)` decodes it without a table
 or builder. Submit decoded messages to their originating table; commit identity
 and overwrite mode come from the configured committer. Messages returned directly
 by local writers retain their table and commit-user checks.
-Only v14 is supported. `abort(messages)` deletes newly written files and must
-only be used for messages known not to have committed. Compact increments remain
+Only v14 is supported. `abort(messages)` deletes newly written files for an
+explicitly abandoned write, matching Java. Call it only for messages known to be
+uncommitted that will never be submitted. A commit exception does not prove failure:
+publication may have succeeded before the response failed. Internal error paths
+preserve submitted files instead of calling `abort`. Preparation failures can clean
+outputs that have not been handed off to the caller.
+Compact increments remain
 unsupported by the Rust committer and are rejected.
 
 ### Tables resolved outside the Rust catalog

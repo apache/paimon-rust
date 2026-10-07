@@ -35,6 +35,48 @@ def _make_table_with_data(warehouse):
     return catalog.get_table("rdb.t")
 
 
+def _make_variant_table_with_data(warehouse):
+    ctx = SQLContext()
+    ctx.register_catalog("paimon", {"warehouse": warehouse})
+    ctx.sql("CREATE SCHEMA paimon.vdb")
+    ctx.sql("CREATE TABLE paimon.vdb.t (id INT, payload VARIANT)")
+    ctx.sql(
+        """
+        INSERT INTO paimon.vdb.t
+        SELECT 1, parse_json('{"age":27,"ratio":1.25}')
+        UNION ALL
+        SELECT 2, parse_json('{"age":"32","ratio":"invalid"}')
+        """
+    )
+    return PaimonCatalog({"warehouse": warehouse}).get_table("vdb.t")
+
+
+def _variant_read_type(table, columns, paths, fail_on_error=False):
+    fields = []
+    by_name = {field.name(): field for field in table.schema().fields()}
+    for name in columns:
+        field = by_name[name]
+        data_type = field.field_type()
+        if name == "payload":
+            data_type = {
+                "type": "ROW",
+                "fields": [
+                    {
+                        "id": index,
+                        "name": str(index),
+                        "type": "FLOAT",
+                        "description": (
+                            "__VARIANT_METADATA%s;%s;UTC"
+                            % (path, str(fail_on_error).lower())
+                        ),
+                    }
+                    for index, path in enumerate(paths)
+                ],
+            }
+        fields.append({"id": field.id(), "name": name, "type": data_type})
+    return json.dumps({"type": "ROW", "fields": fields})
+
+
 def test_read_builder_chain_exists():
     with tempfile.TemporaryDirectory() as warehouse:
         table = _make_table_with_data(warehouse)
@@ -57,6 +99,140 @@ def test_with_projection():
         table = _make_table_with_data(warehouse)
         plan = table.new_read_builder().with_projection(["id"]).new_scan().plan()
         assert plan is not None
+
+
+def test_with_read_type_plain_projection():
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_table_with_data(warehouse)
+        field = next(field for field in table.schema().fields() if field.name() == "id")
+        read_type = json.dumps({
+            "type": "ROW",
+            "fields": [{
+                "id": field.id(), "name": field.name(),
+                "type": field.field_type(),
+            }],
+        })
+        builder = table.new_read_builder().with_read_type(read_type)
+        plan = builder.new_scan().plan()
+        result = pa.Table.from_batches(builder.new_read().read(plan.splits()))
+        assert result.schema.names == ["id"]
+        assert sorted(result.column("id").to_pylist()) == [1, 2, 3]
+
+
+def test_with_read_type_extracts_variant_fields():
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_variant_table_with_data(warehouse)
+        builder = table.new_read_builder().with_read_type(_variant_read_type(
+            table, ["id", "payload"], ["$.ratio", "$.age", "$.missing"]))
+        plan = builder.new_scan().plan()
+        result = pa.Table.from_batches(builder.new_read().read(plan.splits())).sort_by("id")
+
+        assert result.schema.names == ["id", "payload"]
+        assert result.field("payload").type == pa.struct(
+            [
+                pa.field("0", pa.float32()),
+                pa.field("1", pa.float32()),
+                pa.field("2", pa.float32()),
+            ]
+        )
+        assert result.column("payload").combine_chunks().to_pylist() == [
+            {"0": 1.25, "1": 27.0, "2": None},
+            {"0": None, "1": 32.0, "2": None},
+        ]
+
+
+def test_with_read_type_variant_fields_honors_fail_on_error():
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_variant_table_with_data(warehouse)
+        builder = table.new_read_builder().with_read_type(_variant_read_type(
+            table, ["payload"], ["$.ratio"], fail_on_error=True))
+        plan = builder.new_scan().plan()
+        with pytest.raises(ValueError, match="Cannot cast Variant value to"):
+            builder.new_read().read(plan.splits())
+
+
+def test_with_read_type_variant_float_whitespace_matches_java():
+    with tempfile.TemporaryDirectory() as warehouse:
+        ctx = SQLContext()
+        ctx.register_catalog("paimon", {"warehouse": warehouse})
+        ctx.sql("CREATE SCHEMA paimon.vdb")
+        ctx.sql("CREATE TABLE paimon.vdb.t (id INT, payload VARIANT)")
+        ascii_value = json.dumps({"x": " 1.5 "})
+        nbsp_value = json.dumps({"x": "\u00a01.5\u00a0"}, ensure_ascii=False)
+        ctx.sql(
+            "INSERT INTO paimon.vdb.t "
+            "SELECT 1, parse_json('%s') UNION ALL "
+            "SELECT 2, parse_json('%s')" % (ascii_value, nbsp_value)
+        )
+        table = PaimonCatalog({"warehouse": warehouse}).get_table("vdb.t")
+
+        builder = table.new_read_builder().with_read_type(_variant_read_type(
+            table, ["id", "payload"], ["$.x"]))
+        plan = builder.new_scan().plan()
+        result = pa.Table.from_batches(
+            builder.new_read().read(plan.splits())
+        ).sort_by("id")
+        assert result.column("payload").combine_chunks().to_pylist() == [
+            {"0": 1.5}, {"0": None},
+        ]
+
+        strict = table.new_read_builder().with_read_type(_variant_read_type(
+            table, ["payload"], ["$.x"], fail_on_error=True))
+        with pytest.raises(ValueError, match="Cannot cast Variant value to"):
+            strict.new_read().read(strict.new_scan().plan().splits())
+
+
+def test_with_read_type_variant_fields_keeps_explicit_null():
+    with tempfile.TemporaryDirectory() as warehouse:
+        ctx = SQLContext()
+        ctx.register_catalog("paimon", {"warehouse": warehouse})
+        ctx.sql("CREATE SCHEMA paimon.vdb")
+        ctx.sql("CREATE TABLE paimon.vdb.t (id INT, payload VARIANT)")
+        ctx.sql("INSERT INTO paimon.vdb.t SELECT 1, parse_json('{\"x\":null}')")
+        table = PaimonCatalog({"warehouse": warehouse}).get_table("vdb.t")
+        builder = table.new_read_builder().with_read_type(_variant_read_type(
+            table, ["payload"], ["$.x"], fail_on_error=True))
+        plan = builder.new_scan().plan()
+        result = pa.Table.from_batches(builder.new_read().read(plan.splits()))
+        assert result.column("payload").combine_chunks().to_pylist() == [{"0": None}]
+
+
+def test_with_read_type_rejects_invalid_schema():
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_variant_table_with_data(warehouse)
+        with pytest.raises(ValueError, match="invalid Paimon read type"):
+            table.new_read_builder().with_read_type("not JSON")
+
+
+def test_with_read_type_rejects_unsupported_variant_target():
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_variant_table_with_data(warehouse)
+        read_type = json.loads(_variant_read_type(table, ["payload"], ["$.age"]))
+        read_type["fields"][0]["type"]["fields"][0]["type"] = "INT"
+        with pytest.raises(ValueError, match="must be float32"):
+            table.new_read_builder().with_read_type(json.dumps(read_type))
+
+
+def test_with_read_type_replaces_variant_extraction():
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_variant_table_with_data(warehouse)
+        builder = table.new_read_builder().with_read_type(_variant_read_type(
+            table, ["payload"], ["$.age"])).with_read_type(json.dumps({"type": "ROW", "fields": [{
+                "id": table.schema().fields()[0].id(), "name": "id", "type": "INT"}]}))
+        plan = builder.new_scan().plan()
+        result = pa.Table.from_batches(builder.new_read().read(plan.splits()))
+        assert result.schema.names == ["id"]
+        assert sorted(result.column("id").to_pylist()) == [1, 2]
+
+
+def test_with_projection_replaces_read_type():
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_variant_table_with_data(warehouse)
+        builder = table.new_read_builder().with_read_type(_variant_read_type(
+            table, ["payload"], ["$.age"])).with_projection(["id"])
+        plan = builder.new_scan().plan()
+        result = pa.Table.from_batches(builder.new_read().read(plan.splits()))
+        assert result.schema.names == ["id"]
 
 
 def test_with_limit():
@@ -141,8 +317,44 @@ def test_chunk_shuffle_takes_seed_and_chunk_size_before_optional_shard():
 
         with pytest.raises(ValueError, match="count must be positive"):
             builder.new_scan().with_shard(0, 0)
-        with pytest.raises(RuntimeError, match="requires chunk_shuffle"):
-            builder.new_scan().with_shard(0, 2).plan()
+
+
+@pytest.mark.parametrize("count", [1, 2, 5])
+def test_plain_worker_shards_read_each_row_once_before_limit(count):
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_table_with_data(warehouse)
+        builder = table.new_read_builder().with_projection(["id"])
+        snapshot_id = builder.new_scan().plan().snapshot_id()
+        seen = set()
+        for index in range(count):
+            scan = builder.new_scan()
+            assert scan.with_shard(index, count) is scan
+            plan = scan.plan()
+            assert plan.snapshot_id() == snapshot_id
+            rows = [
+                value
+                for split in plan.splits()
+                for value in pa.Table.from_batches(builder.new_read().read([split]))
+                .column("id").to_pylist()
+            ]
+            assert len(rows) == len(set(rows))
+            assert seen.isdisjoint(rows)
+            seen.update(rows)
+
+            limited = table.new_read_builder().with_projection(["id"]).with_limit(1)
+            limited_plan = limited.new_scan().with_shard(index, count).plan()
+            assert limited_plan.snapshot_id() == snapshot_id
+            limited_rows = [
+                value
+                for split in limited_plan.splits()
+                for value in pa.Table.from_batches(limited.new_read().read([split]))
+                .column("id").to_pylist()
+            ]
+            # with_limit is a split-planning hint; the reader can return a
+            # complete file. It must still retain this worker's owned rows.
+            assert bool(limited_rows) == bool(rows)
+            assert set(limited_rows).issubset(rows)
+        assert seen == {1, 2, 3}
 
 
 def test_chunk_shuffle_reads_split_local_ranges_across_files():
@@ -229,22 +441,60 @@ def test_row_id_filter_with_projection_and_data_predicate(data_evolution, case_s
         assert rows.to_pylist() == [{"name": "b", "_ROW_ID": 1}]
 
 
-@pytest.mark.parametrize("predicate_field", ["_row_id", "_ROW_ID"])
-def test_case_insensitive_filter_uses_real_lowercase_row_id_column(predicate_field):
+@pytest.mark.parametrize("user_field", ["_row_id", "_sequence_number"])
+@pytest.mark.parametrize("uppercase", [False, True])
+def test_case_insensitive_filter_uses_untracked_user_column(user_field, uppercase):
     with tempfile.TemporaryDirectory() as warehouse:
         ctx = SQLContext()
         ctx.register_catalog("paimon", {"warehouse": warehouse})
         ctx.sql("CREATE SCHEMA paimon.realrowid")
-        ctx.sql("CREATE TABLE paimon.realrowid.t (_row_id BIGINT, id INT)")
+        ctx.sql(f"CREATE TABLE paimon.realrowid.t ({user_field} BIGINT, id INT)")
         ctx.sql("INSERT INTO paimon.realrowid.t VALUES (11, 1), (22, 2)")
         table = PaimonCatalog({"warehouse": warehouse}).get_table("realrowid.t")
         builder = table.new_read_builder().with_case_sensitive(False)
-        builder.with_projection(["_row_id", "id"])
+        # Projection and predicate resolution must use the same available
+        # fields. Untracked append tables have no virtual tracking columns.
+        field = user_field.upper() if uppercase else user_field
+        builder.with_projection([field, "id"])
         builder.with_filter({
-            "method": "equal", "field": predicate_field, "literals": [22],
+            "method": "equal", "field": field, "literals": [22],
         })
         batches = builder.new_read().read(builder.new_scan().plan().splits())
-        assert pa.Table.from_batches(batches).to_pylist() == [{"_row_id": 22, "id": 2}]
+        assert pa.Table.from_batches(batches).to_pylist() == [{user_field: 22, "id": 2}]
+
+
+@pytest.mark.parametrize("user_field", ["_row_id", "_sequence_number"])
+@pytest.mark.parametrize("uppercase", [False, True])
+def test_case_insensitive_tracking_metadata_collision_is_ambiguous(user_field, uppercase):
+    with tempfile.TemporaryDirectory() as warehouse:
+        ctx = SQLContext()
+        ctx.register_catalog("paimon", {"warehouse": warehouse})
+        ctx.sql("CREATE SCHEMA paimon.trackingcollision")
+        ctx.sql(f"""CREATE TABLE paimon.trackingcollision.t ({user_field} BIGINT, id INT)
+            WITH ('row-tracking.enabled' = 'true')""")
+        table = PaimonCatalog({"warehouse": warehouse}).get_table("trackingcollision.t")
+        builder = table.new_read_builder().with_case_sensitive(False)
+        field = user_field.upper() if uppercase else user_field
+        with pytest.raises(ValueError, match="Ambiguous"):
+            builder.with_filter({"method": "equal", "field": field, "literals": [22]})
+        with pytest.raises(ValueError, match="Ambiguous"):
+            builder.with_projection([field]).new_read().read([])
+
+
+def test_primary_key_sequence_metadata_does_not_require_row_tracking():
+    with tempfile.TemporaryDirectory() as warehouse:
+        ctx = SQLContext()
+        ctx.register_catalog("paimon", {"warehouse": warehouse})
+        ctx.sql("CREATE SCHEMA paimon.pksequence")
+        ctx.sql("""CREATE TABLE paimon.pksequence.t (id INT, v INT, PRIMARY KEY (id))
+            WITH ('bucket' = '1', 'row-tracking.enabled' = 'false')""")
+        ctx.sql("INSERT INTO paimon.pksequence.t VALUES (1, 11), (2, 22)")
+        table = PaimonCatalog({"warehouse": warehouse}).get_table("pksequence.t")
+        builder = table.new_read_builder().with_case_sensitive(False)
+        builder.with_projection(["id", "_sequence_number"])
+        builder.with_filter({"method": "equal", "field": "_sequence_number", "literals": [1]})
+        result = pa.Table.from_batches(builder.new_read().read(builder.new_scan().plan().splits()))
+        assert result.to_pylist() == [{"id": 2, "_SEQUENCE_NUMBER": 1}]
 
 
 def test_row_tracking_append_row_ranges_keep_global_row_ids():

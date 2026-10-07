@@ -26,9 +26,6 @@ pub(super) fn validate_inline_blob_columns(
     batch: &RecordBatch,
     options: &HashMap<String, String>,
 ) -> Result<()> {
-    if !options.contains_key("blob-descriptor-field") && !options.contains_key("blob-view-field") {
-        return Ok(());
-    }
     let options = CoreOptions::new(options);
     for (option, fields) in [
         ("blob-descriptor-field", options.blob_descriptor_fields()),

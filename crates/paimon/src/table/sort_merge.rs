@@ -251,12 +251,39 @@ pub(crate) struct PartialUpdateMergeFunction {
     ignore_delete: bool,
     remove_record_on_delete: bool,
     sequence_group_partial_delete: HashSet<usize>,
+    sequence_group_enabled: bool,
     sequence_groups: Vec<RuntimeSequenceGroup>,
     grouped_fields: HashSet<usize>,
     aggregators: Option<Mutex<FieldAggregatorSlots>>,
 }
 
 type FieldAggregatorSlots = Vec<Option<Box<dyn FieldAggregator>>>;
+
+/// KV metadata belongs to the merged record, outside user-field aggregation.
+/// Java merge functions carry the latest effective sequence separately and
+/// normalize surviving records to INSERT, even when the last input retracts.
+fn merged_metadata_column(
+    field: &arrow_schema::Field,
+    row: &MergeRow,
+    deleted: bool,
+) -> Option<ArrayRef> {
+    match field.name().as_str() {
+        crate::spec::SEQUENCE_NUMBER_FIELD_NAME => {
+            Some(std::sync::Arc::new(Int64Array::from(vec![
+                row.sequence_number,
+            ])))
+        }
+        crate::spec::VALUE_KIND_FIELD_NAME => {
+            let kind = if deleted {
+                RowKind::Delete
+            } else {
+                RowKind::Insert
+            };
+            Some(std::sync::Arc::new(Int8Array::from(vec![kind as i8])))
+        }
+        _ => None,
+    }
+}
 
 #[derive(Debug, Clone)]
 struct RuntimeSequenceGroup {
@@ -333,6 +360,7 @@ impl PartialUpdateMergeFunction {
             remove_record_on_delete: PartialUpdateConfig::new(table_options)
                 .remove_record_on_delete(),
             sequence_group_partial_delete: HashSet::new(),
+            sequence_group_enabled: false,
             sequence_groups: Vec::new(),
             grouped_fields: HashSet::new(),
             aggregators: None,
@@ -349,6 +377,7 @@ impl PartialUpdateMergeFunction {
         let config = PartialUpdateConfig::new(table_options);
         config.validate_read_mode(true, table_name)?;
         let groups = config.validated_sequence_groups(table_fields, primary_keys)?;
+        let sequence_group_enabled = !groups.is_empty();
         let declared_group_sequences: HashSet<&str> = groups
             .iter()
             .flat_map(|group| group.sequence_fields.iter().map(String::as_str))
@@ -441,6 +470,7 @@ impl PartialUpdateMergeFunction {
             ignore_delete: CoreOptions::new(table_options).ignore_delete(),
             remove_record_on_delete: config.remove_record_on_delete(),
             sequence_group_partial_delete,
+            sequence_group_enabled,
             sequence_groups,
             grouped_fields,
             aggregators: aggregators
@@ -459,14 +489,26 @@ impl MergeFunction for PartialUpdateMergeFunction {
         source_output_col_indices: &[usize],
         output_schema: &SchemaRef,
     ) -> crate::Result<MergeResult> {
+        if let Some(result) = singleton_reducer_result(rows)? {
+            return Ok(result);
+        }
+        self.merge_unreduced(rows, batch_buffer, source_output_col_indices, output_schema)
+    }
+}
+
+impl PartialUpdateMergeFunction {
+    pub(super) fn merge_unreduced(
+        &self,
+        rows: &[MergeRow],
+        batch_buffer: &[BufferedBatch],
+        source_output_col_indices: &[usize],
+        output_schema: &SchemaRef,
+    ) -> crate::Result<MergeResult> {
         if rows.is_empty() {
             return Err(Error::UnexpectedError {
                 message: "merge called with empty rows".to_string(),
                 source: None,
             });
-        }
-        if let Some(result) = singleton_reducer_result(rows)? {
-            return Ok(result);
         }
 
         let mut ordered_row_indices: Vec<usize> = (0..rows.len()).collect();
@@ -494,6 +536,7 @@ impl MergeFunction for PartialUpdateMergeFunction {
         let mut saw_add = false;
         let mut current_delete_row = false;
         let mut last_retract_source = None;
+        let mut latest_row = None;
 
         for row_idx in ordered_row_indices {
             let row = &rows[row_idx];
@@ -502,6 +545,7 @@ impl MergeFunction for PartialUpdateMergeFunction {
                 if self.ignore_delete {
                     continue;
                 }
+                latest_row = Some(row);
                 if !saw_add && last_retract_source.is_none() {
                     // Java initializes the row from the first retract before
                     // applying sequence-group retractions. That row also
@@ -518,7 +562,7 @@ impl MergeFunction for PartialUpdateMergeFunction {
                 }
                 last_retract_source = Some((row.batch_idx, row.row_idx));
                 current_delete_row = false;
-                if !self.sequence_groups.is_empty() {
+                if self.sequence_group_enabled {
                     let mut full_delete = false;
                     for (group_idx, group) in self.sequence_groups.iter().enumerate() {
                         let sequence_is_empty = group.sequence_indices.iter().all(|&index| {
@@ -606,6 +650,7 @@ impl MergeFunction for PartialUpdateMergeFunction {
             }
             saw_add = true;
             current_delete_row = false;
+            latest_row = Some(row);
 
             for (output_col_idx, selected) in selected_by_col.iter_mut().enumerate() {
                 if self.grouped_fields.contains(&output_col_idx) {
@@ -700,6 +745,9 @@ impl MergeFunction for PartialUpdateMergeFunction {
             .iter()
             .enumerate()
             .map(|(output_col_idx, field)| {
+                if let Some(column) = merged_metadata_column(field, latest_row.unwrap(), !saw_add) {
+                    return Ok(column);
+                }
                 let column = match aggregators
                     .as_ref()
                     .and_then(|aggregators| aggregators.get(output_col_idx))
@@ -810,8 +858,8 @@ fn compare_sequence_group_rows(
 /// Reference: Java `org.apache.paimon.mergetree.compact.aggregate.AggregateMergeFunction`.
 #[derive(Debug)]
 pub(crate) struct AggregateMergeFunction {
-    /// One slot per output column.  `None` marks primary-key columns that are
-    /// copied through; `Some` holds the aggregator that owns the column.
+    /// One slot per output column. `None` marks keys or KV metadata;
+    /// `Some` holds the aggregator that owns a user value column.
     aggregators: Mutex<Vec<Option<Box<dyn FieldAggregator>>>>,
     remove_record_on_delete: bool,
 }
@@ -843,6 +891,12 @@ impl AggregateMergeFunction {
             .iter()
             .map(|field| -> crate::Result<Option<Box<dyn FieldAggregator>>> {
                 let name = field.name();
+                if matches!(
+                    field.id(),
+                    crate::spec::SEQUENCE_NUMBER_FIELD_ID | crate::spec::VALUE_KIND_FIELD_ID
+                ) {
+                    return Ok(None);
+                }
                 let agg_name: &str = if seq_set.contains(name) {
                     "last_value"
                 } else if pk_set.contains(name) {
@@ -927,15 +981,20 @@ impl AggregateMergeFunction {
             }
         }
 
-        // Use the last sorted row to source primary-key column values: every
-        // row in the group shares the same PK by construction, so any row
-        // works; picking the last one keeps the slice cheap to compute.
+        // Java getResult uses the last KV for keys and record metadata.
         let pk_source = rows.last().unwrap();
 
         let output_columns: Vec<ArrayRef> = aggregators
             .iter()
             .enumerate()
             .map(|(col_idx, slot)| -> crate::Result<ArrayRef> {
+                if let Some(column) = merged_metadata_column(
+                    output_schema.field(col_idx),
+                    pk_source,
+                    current_delete_row,
+                ) {
+                    return Ok(column);
+                }
                 if current_delete_row {
                     return Ok(batch_buffer[pk_source.batch_idx]
                         .column_for_output(col_idx, source_output_col_indices)

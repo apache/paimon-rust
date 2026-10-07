@@ -29,7 +29,7 @@ use crate::spec::{
     DataType, MergeEngine, RowKind, RowKindFilter, EMPTY_SERIALIZED_ROW, POSTPONE_BUCKET,
     VALUE_KIND_FIELD_NAME,
 };
-use crate::table::bucket_assigner::{BucketAssignerEnum, PartitionBucketKey};
+use crate::table::bucket_assigner::{BatchAssignOutput, BucketAssignerEnum, PartitionBucketKey};
 use crate::table::bucket_assigner_constant::ConstantBucketAssigner;
 use crate::table::bucket_assigner_cross::CrossPartitionAssigner;
 use crate::table::bucket_assigner_dynamic::DynamicBucketAssigner;
@@ -46,11 +46,14 @@ use crate::table::postpone_file_writer::{PostponeFileWriter, PostponeWriteConfig
 use crate::table::prepared_files::PreparedFiles;
 use crate::table::row_kind_generator::RowKindGenerator;
 use crate::table::write_batch_normalize::normalize_write_array;
-use crate::table::{Snapshot, SnapshotManager, Table, TableScan};
+use crate::table::{Snapshot, Table, TableScan};
 use crate::Result;
 use arrow_array::{ArrayRef, RecordBatch};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+
+#[path = "table_write_precomputed.rs"]
+mod precomputed;
 
 /// Enum to hold either an append-only writer, a key-value writer, or a postpone writer.
 enum FileWriter {
@@ -91,7 +94,7 @@ impl FileWriter {
         }
     }
 
-    async fn prepare_commit(mut self) -> Result<PreparedFiles> {
+    async fn prepare_commit(mut self) -> (Result<PreparedFiles>, Option<Self>) {
         let result = match &mut self {
             FileWriter::Append(w) => w.prepare_commit().await.map(PreparedFiles::data),
             FileWriter::AppendDedicated(w) => w.prepare_commit().await.map(PreparedFiles::data),
@@ -101,7 +104,12 @@ impl FileWriter {
         if result.is_err() {
             self.abort().await;
         }
-        result
+        // Java MergeTreeWriter keeps its sequence counter across checkpoints,
+        // including prepares whose messages have not been committed yet.
+        // Pending-bucket writers also retain first-retract validation.
+        let retain =
+            result.is_ok() && matches!(&self, FileWriter::KeyValue(_) | FileWriter::Postpone(_));
+        (result, retain.then_some(self))
     }
 
     async fn abort(&mut self) {
@@ -128,7 +136,10 @@ pub struct TableWrite {
     // Keep the Format Table state off ordinary Paimon write futures' stacks.
     format_writer: Option<Box<FormatTableWriter>>,
     table: Table,
+    branch_schema_checked: bool,
     write_schema: Arc<arrow_schema::Schema>,
+    write_fields: Vec<DataField>,
+    written: bool,
     partition_writers: HashMap<PartitionBucketKey, FileWriter>,
     partition_computer: PartitionComputer,
     partition_keys: Vec<String>,
@@ -152,6 +163,7 @@ pub struct TableWrite {
     changelog_file_compression: String,
     partition_seq_cache: HashMap<Vec<u8>, HashMap<i32, i64>>,
     sequence_snapshot: Option<Option<Snapshot>>,
+    restore_snapshot_id: Option<i64>,
     commit_user: String,
     /// Shared by this writer's postpone files, as in Java's per-writer writeId.
     postpone_write_id: i32,
@@ -165,6 +177,7 @@ pub struct TableWrite {
     blob_inline_fields: HashSet<String>,
     /// Whether the table has non-descriptor blob fields requiring a dedicated-format writer.
     has_blob_fields: bool,
+    blob_consumer: Option<Arc<dyn crate::spec::BlobConsumer>>,
     /// Dedicated vector-store file format, when configured.
     vector_file_format: Option<String>,
     /// Whether the table has VECTOR fields requiring dedicated vector files.
@@ -192,7 +205,10 @@ impl TableWrite {
         Ok(Self {
             format_writer: Some(Box::new(format_writer)),
             table: table.clone(),
+            branch_schema_checked: table.is_main_branch() || table.rest_env.is_some(),
             write_schema: build_target_arrow_schema(schema.fields())?,
+            write_fields: schema.fields().to_vec(),
+            written: false,
             partition_writers: HashMap::new(),
             partition_computer: PartitionComputer::new(
                 schema.partition_keys(),
@@ -221,6 +237,7 @@ impl TableWrite {
             changelog_file_compression: String::new(),
             partition_seq_cache: HashMap::new(),
             sequence_snapshot: None,
+            restore_snapshot_id: None,
             commit_user,
             postpone_write_id: 0,
             bucket_assigner: BucketAssignerEnum::Constant(ConstantBucketAssigner::new(
@@ -231,6 +248,7 @@ impl TableWrite {
             blob_view_fields: HashSet::new(),
             blob_inline_fields: HashSet::new(),
             has_blob_fields: false,
+            blob_consumer: None,
             vector_file_format: None,
             has_dedicated_vector_fields: false,
             row_kind_generator: None,
@@ -253,9 +271,15 @@ impl TableWrite {
             schema.primary_keys(),
             schema.options(),
         )?;
+        crate::spec::map_shredding::validate(schema.fields(), schema.options())?;
         let write_schema = build_target_arrow_schema(schema.fields())?;
         let core_options = CoreOptions::new(schema.options());
         let blob_descriptor_fields = core_options.blob_descriptor_fields();
+        if !core_options.video_frame_fields().is_empty() {
+            return Err(crate::Error::Unsupported {
+                message: "Writing packed video files is not supported yet".into(),
+            });
+        }
         let blob_view_fields = core_options.blob_view_fields();
         let blob_inline_fields = core_options.blob_inline_fields();
 
@@ -406,10 +430,19 @@ impl TableWrite {
             BucketAssignerEnum::CrossPartition(Box::new(CrossPartitionAssigner::new(
                 table.clone(),
                 partition_field_indices,
-                primary_key_indices.clone(),
+                schema
+                    .primary_keys()
+                    .iter()
+                    .map(|name| {
+                        fields
+                            .iter()
+                            .position(|field| field.name() == name)
+                            .unwrap()
+                    })
+                    .collect(),
                 target_bucket_row_number,
                 merge_engine,
-            )))
+            )?))
         } else if is_dynamic_bucket {
             BucketAssignerEnum::Dynamic(Box::new(DynamicBucketAssigner::new(
                 table.clone(),
@@ -442,7 +475,10 @@ impl TableWrite {
         let has_blob_fields = schema
             .fields()
             .iter()
-            .any(|f| f.data_type().is_blob_type() && !blob_inline_fields.contains(f.name()));
+            .any(|f| f.data_type().is_blob_file_field() && !blob_inline_fields.contains(f.name()));
+        if has_blob_fields {
+            core_options.blob_copy_buffer_size()?;
+        }
         let has_dedicated_vector_fields = vector_file_format.is_some()
             && schema
                 .fields()
@@ -460,7 +496,10 @@ impl TableWrite {
         Ok(Self {
             format_writer: None,
             table: table.clone(),
+            branch_schema_checked: table.is_main_branch() || table.rest_env.is_some(),
             write_schema,
+            write_fields: fields.to_vec(),
+            written: false,
             partition_writers: HashMap::new(),
             partition_computer,
             partition_keys,
@@ -484,6 +523,7 @@ impl TableWrite {
             changelog_file_compression,
             partition_seq_cache: HashMap::new(),
             sequence_snapshot: None,
+            restore_snapshot_id: None,
             commit_user,
             postpone_write_id: (uuid::Uuid::new_v4().as_u128() % i32::MAX as u128) as i32,
             bucket_assigner,
@@ -491,6 +531,7 @@ impl TableWrite {
             blob_view_fields,
             blob_inline_fields,
             has_blob_fields,
+            blob_consumer: None,
             vector_file_format,
             has_dedicated_vector_fields,
             row_kind_generator,
@@ -511,8 +552,7 @@ impl TableWrite {
         let latest_snapshot = match sequence_snapshot {
             Some(snapshot) => snapshot,
             None => {
-                let snapshot_manager =
-                    SnapshotManager::new(table.file_io().clone(), table.location().to_string());
+                let snapshot_manager = table.snapshot_manager();
                 snapshot_manager.get_latest_snapshot().await?
             }
         };
@@ -535,10 +575,7 @@ impl TableWrite {
     }
 
     pub(super) async fn pin_sequence_snapshot(&mut self) -> Result<i64> {
-        let snapshot_manager = SnapshotManager::new(
-            self.table.file_io().clone(),
-            self.table.location().to_string(),
-        );
+        let snapshot_manager = self.table.snapshot_manager();
         let snapshot = snapshot_manager.get_latest_snapshot().await?;
         let snapshot_id = snapshot.as_ref().map_or(0, Snapshot::id);
         self.sequence_snapshot = Some(snapshot);
@@ -585,6 +622,121 @@ impl TableWrite {
         self
     }
 
+    /// Select the top-level columns written by an append table, as Java
+    /// `BaseAppendFileStoreWrite.withWriteType` does. Input follows this order;
+    /// omitted columns are recorded in file metadata rather than filled with NULL.
+    /// Configure this before writing any nonempty batch.
+    pub fn with_write_type(&mut self, write_columns: Vec<String>) -> Result<&mut Self> {
+        self.ensure_active()?;
+        if self.written {
+            return Err(crate::Error::DataInvalid {
+                message: "with_write_type must be called before any data is written".into(),
+                source: None,
+            });
+        }
+        if self.format_writer.is_some() || !self.table.schema().primary_keys().is_empty() {
+            return Err(crate::Error::Unsupported {
+                message: "with_write_type requires a Paimon append table".into(),
+            });
+        }
+        if write_columns.is_empty() {
+            return Err(crate::Error::DataInvalid {
+                message: "write columns must not be empty".into(),
+                source: None,
+            });
+        }
+        let schema = self.table.schema();
+        let mut seen = HashSet::new();
+        let fields = write_columns
+            .iter()
+            .map(|name| {
+                if !seen.insert(name) {
+                    return Err(crate::Error::DataInvalid {
+                        message: format!("Duplicate write column '{name}'"),
+                        source: None,
+                    });
+                }
+                schema
+                    .fields()
+                    .iter()
+                    .find(|field| field.name() == name)
+                    .cloned()
+                    .ok_or_else(|| crate::Error::DataInvalid {
+                        message: format!("Column '{name}' is not in table schema"),
+                        source: None,
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let indices = |names: &[String]| {
+            names
+                .iter()
+                .map(|name| {
+                    fields
+                        .iter()
+                        .position(|field| field.name() == name)
+                        .ok_or_else(|| crate::Error::DataInvalid {
+                            message: format!("Write type must include routing column '{name}'"),
+                            source: None,
+                        })
+                })
+                .collect::<Result<Vec<_>>>()
+        };
+        let partition_indices = indices(&self.partition_keys)?;
+        let options = CoreOptions::new(schema.options());
+        let total_buckets = options.bucket();
+        let bucket_indices = if total_buckets > 1 {
+            indices(&schema.bucket_keys())?
+        } else {
+            Vec::new()
+        };
+        let assigner = if total_buckets <= 1 || bucket_indices.is_empty() {
+            BucketAssignerEnum::Constant(ConstantBucketAssigner::new(
+                partition_indices,
+                if total_buckets == POSTPONE_BUCKET {
+                    POSTPONE_BUCKET
+                } else {
+                    0
+                },
+            ))
+        } else {
+            BucketAssignerEnum::Fixed(FixedBucketAssigner::new(
+                partition_indices,
+                bucket_indices,
+                options.bucket_function_type()?,
+                total_buckets,
+            ))
+        };
+        let write_schema = build_target_arrow_schema(&fields)?;
+        self.bucket_assigner = assigner;
+        self.write_schema = write_schema;
+        self.write_fields = fields;
+        Ok(self)
+    }
+
+    /// Receive dedicated append BLOB payload descriptors. Configure before
+    /// writing, as in PyPaimon. Java's primary-key and inline BLOB writers do
+    /// not invoke this consumer. Automatic abort preserves consumer Blob files;
+    /// callers can explicitly discard prepared files with TableCommit::abort.
+    pub fn with_blob_consumer(
+        &mut self,
+        consumer: Option<Arc<dyn crate::spec::BlobConsumer>>,
+    ) -> Result<&mut Self> {
+        self.ensure_active()?;
+        if self.written {
+            return Err(crate::Error::DataInvalid {
+                message: "with_blob_consumer must be called before any write operation".into(),
+                source: None,
+            });
+        }
+        if self.format_writer.is_some() {
+            return Err(crate::Error::Unsupported {
+                message: "with_blob_consumer requires a Paimon table".into(),
+            });
+        }
+        self.blob_consumer = consumer;
+        Ok(self)
+    }
+
     /// Write an Arrow RecordBatch. Rows are routed to the correct partition and bucket.
     pub async fn write_arrow_batch(&mut self, batch: &RecordBatch) -> Result<()> {
         if let Some(writer) = self.format_writer.as_mut() {
@@ -594,6 +746,7 @@ impl TableWrite {
         let Some(batch) = self.normalize_write_batch(batch)? else {
             return Ok(());
         };
+        self.written = true;
 
         let grouped = match self.divide_by_partition_bucket(&batch).await {
             Ok(grouped) => grouped,
@@ -613,7 +766,12 @@ impl TableWrite {
         let batch = self.validate_write_batch_schema(batch)?;
         // Java filters row kinds before extracting Blob values. Ignored rows
         // need neither valid descriptor bytes nor physical files.
-        let batch = self.enrich_rowkind_batch(&batch)?;
+        let batch = self.generate_rowkind_batch(&batch)?;
+        let selection = self.rowkind_selection(&batch)?;
+        let batch = match &selection {
+            Some(rows) => take_rows(&batch, rows)?,
+            None => batch,
+        };
         if batch.num_rows() == 0 {
             return Ok(None);
         }
@@ -771,15 +929,13 @@ impl TableWrite {
             }
         }
 
-        let fields = self.table.schema().fields().to_vec();
+        let fields = self.write_fields.clone();
         let output = self.bucket_assigner.assign_batch(batch, &fields).await?;
-
+        if matches!(self.bucket_assigner, BucketAssignerEnum::CrossPartition(_)) {
+            return self.divide_cross_partition_batch(batch, output);
+        }
         let mut groups: HashMap<PartitionBucketKey, Vec<usize>> = HashMap::new();
-        let skip_set: HashSet<usize> = output.skips.into_iter().collect();
         for row_idx in 0..batch.num_rows() {
-            if skip_set.contains(&row_idx) {
-                continue;
-            }
             groups
                 .entry((
                     output.partition_bytes[row_idx].clone(),
@@ -788,52 +944,73 @@ impl TableWrite {
                 .or_default()
                 .push(row_idx);
         }
+        groups
+            .into_iter()
+            .map(|(key, rows)| Ok((key, take_rows(batch, &rows)?)))
+            .collect()
+    }
 
-        let mut result = Vec::with_capacity(groups.len());
-        let batch_has_value_kind = batch
-            .schema()
-            .column_with_name(VALUE_KIND_FIELD_NAME)
-            .is_some();
-        // Cross-partition writers must always include _VALUE_KIND to keep the
-        // Arrow schema stable across batches (some batches may have deletes,
-        // others may not — KeyValueFileWriter's concat_batches requires a
-        // consistent schema).
-        let needs_value_kind = batch_has_value_kind
-            || matches!(self.bucket_assigner, BucketAssignerEnum::CrossPartition(_))
-            || !output.deletes.is_empty();
-        for (key, row_indices) in groups {
-            let sub_batch = take_rows(batch, &row_indices)?;
-            let sub_batch = if matches!(self.bucket_assigner, BucketAssignerEnum::CrossPartition(_))
+    /// Preserve Java GlobalIndexAssigner's DELETE-before-input event order
+    /// within each bucket, including migrations back to an earlier partition.
+    fn divide_cross_partition_batch(
+        &self,
+        batch: &RecordBatch,
+        output: BatchAssignOutput,
+    ) -> Result<Vec<(PartitionBucketKey, RecordBatch)>> {
+        let mut groups: HashMap<PartitionBucketKey, (Vec<usize>, Vec<i8>)> = HashMap::new();
+        let skips: HashSet<usize> = output.skips.into_iter().collect();
+        let mut deletes = output.deletes.into_iter().peekable();
+        let kinds = batch.column_by_name(VALUE_KIND_FIELD_NAME).map(|column| {
+            column
+                .as_any()
+                .downcast_ref::<arrow_array::Int8Array>()
+                .unwrap()
+        });
+        for row_idx in 0..batch.num_rows() {
+            if skips.contains(&row_idx) {
+                continue;
+            }
+            if deletes
+                .peek()
+                .is_some_and(|(index, _, _)| *index == row_idx)
             {
-                self.with_partition_values(&sub_batch, &key.0)?
-            } else {
-                sub_batch
-            };
-            let sub_batch = if needs_value_kind && !batch_has_value_kind {
-                Self::add_value_kind_column(&sub_batch, 0)?
-            } else {
-                sub_batch
-            };
-            result.push((key, sub_batch));
-        }
-
-        if !output.deletes.is_empty() {
-            let mut delete_groups: HashMap<PartitionBucketKey, Vec<usize>> = HashMap::new();
-            for (row_idx, old_partition, old_bucket) in &output.deletes {
-                delete_groups
-                    .entry((old_partition.clone(), *old_bucket))
-                    .or_default()
-                    .push(*row_idx);
+                let (_, partition, bucket) = deletes.next().unwrap();
+                let (rows, kinds) = groups.entry((partition, bucket)).or_default();
+                rows.push(row_idx);
+                kinds.push(RowKind::Delete.to_value());
             }
-            for (key, row_indices) in delete_groups {
-                let sub_batch = take_rows(batch, &row_indices)?;
-                let sub_batch = self.with_partition_values(&sub_batch, &key.0)?;
-                let delete_batch = Self::add_value_kind_column(&sub_batch, 3)?;
-                result.push((key, delete_batch));
-            }
+            let key = (
+                output.partition_bytes[row_idx].clone(),
+                output.buckets[row_idx],
+            );
+            let (rows, row_kinds) = groups.entry(key).or_default();
+            rows.push(row_idx);
+            row_kinds.push(kinds.map_or(RowKind::Insert.to_value(), |kinds| kinds.value(row_idx)));
         }
-
-        Ok(result)
+        // Generated row kinds are replaced below; migration DELETEs must not
+        // append a second _VALUE_KIND column to a rowkind.field batch.
+        let data = if let Some((index, _)) = batch.schema().column_with_name(VALUE_KIND_FIELD_NAME)
+        {
+            batch
+                .project(
+                    &(0..batch.num_columns())
+                        .filter(|i| *i != index)
+                        .collect::<Vec<_>>(),
+                )
+                .map_err(|error| crate::Error::DataInvalid {
+                    message: format!("Failed to project cross-partition input: {error}"),
+                    source: Some(Box::new(error)),
+                })?
+        } else {
+            batch.clone()
+        };
+        groups
+            .into_iter()
+            .map(|(key, (rows, kinds))| {
+                let routed = self.with_partition_values(&take_rows(&data, &rows)?, &key.0)?;
+                Ok((key, Self::add_per_row_value_kind_column(&routed, kinds)?))
+            })
+            .collect()
     }
 
     /// Keep physical partition columns consistent with the routed partition.
@@ -867,33 +1044,9 @@ impl TableWrite {
         })
     }
 
-    /// Add a `_VALUE_KIND` column to a batch with the given value for all rows.
-    fn add_value_kind_column(batch: &RecordBatch, value_kind: i8) -> Result<RecordBatch> {
-        use arrow_array::Int8Array;
-        use arrow_schema::{DataType as ArrowDataType, Field as ArrowField};
-
-        let vk_array = Arc::new(Int8Array::from(vec![value_kind; batch.num_rows()]));
-        let vk_field = Arc::new(ArrowField::new(
-            crate::spec::VALUE_KIND_FIELD_NAME,
-            ArrowDataType::Int8,
-            false,
-        ));
-
-        let mut fields = batch.schema().fields().to_vec();
-        let mut columns: Vec<Arc<dyn arrow_array::Array>> = batch.columns().to_vec();
-        fields.push(vk_field);
-        columns.push(vk_array);
-
-        let schema = Arc::new(arrow_schema::Schema::new(fields));
-        RecordBatch::try_new(schema, columns).map_err(|e| crate::Error::DataInvalid {
-            message: format!("Failed to add _VALUE_KIND column: {e}"),
-            source: None,
-        })
-    }
-
-    fn enrich_rowkind_batch(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+    fn generate_rowkind_batch(&self, batch: &RecordBatch) -> Result<RecordBatch> {
         let Some(generator) = &self.row_kind_generator else {
-            return self.filter_rowkind_batch(batch);
+            return Ok(batch.clone());
         };
         if batch
             .schema()
@@ -910,18 +1063,17 @@ impl TableWrite {
         let kinds = (0..batch.num_rows())
             .map(|row| generator.generate(batch, row).map(|kind| kind.to_value()))
             .collect::<Result<Vec<_>>>()?;
-        let batch = Self::add_per_row_value_kind_column(batch, kinds)?;
-        self.filter_rowkind_batch(&batch)
+        Self::add_per_row_value_kind_column(batch, kinds)
     }
 
     /// Both generated row kinds and explicit caller-provided kinds use the
     /// same Java RowKindFilter before bucket assignment and changelog writing.
-    fn filter_rowkind_batch(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+    fn rowkind_selection(&self, batch: &RecordBatch) -> Result<Option<Vec<usize>>> {
         let Some(filter) = &self.row_kind_filter else {
-            return Ok(batch.clone());
+            return Ok(None);
         };
         let Some(column) = batch.column_by_name(VALUE_KIND_FIELD_NAME) else {
-            return Ok(batch.clone());
+            return Ok(None);
         };
         let kinds = column
             .as_any()
@@ -937,7 +1089,7 @@ impl TableWrite {
                 keep_rows.push(row);
             }
         }
-        take_rows(batch, &keep_rows)
+        Ok((keep_rows.len() != batch.num_rows()).then_some(keep_rows))
     }
 
     fn add_per_row_value_kind_column(
@@ -992,6 +1144,8 @@ impl TableWrite {
     ) -> Result<()> {
         self.ensure_active()?;
         let result = async {
+            self.ensure_branch_schema_exists().await?;
+
             let key = (partition_bytes, bucket);
             if !self.partition_writers.contains_key(&key) {
                 self.create_writer(key.0.clone(), key.1).await?;
@@ -1007,6 +1161,27 @@ impl TableWrite {
             self.fail_write().await;
         }
         result
+    }
+
+    /// Resolved filesystem handles must name an existing branch schema before
+    /// creating output. Main and REST tables retain their established metadata path.
+    async fn ensure_branch_schema_exists(&mut self) -> Result<()> {
+        if self.branch_schema_checked {
+            return Ok(());
+        }
+        let schema_path = self.table.schema_manager().schema_path(self.schema_id);
+        if !self.table.file_io().exists(&schema_path).await? {
+            return Err(crate::Error::DataInvalid {
+                message: format!(
+                    "Branch '{}' does not contain schema {}.",
+                    self.table.branch(),
+                    self.schema_id
+                ),
+                source: None,
+            });
+        }
+        self.branch_schema_checked = true;
+        Ok(())
     }
 
     /// Routing can update persistent bucket-index state before it fails, just
@@ -1026,10 +1201,19 @@ impl TableWrite {
         Ok(())
     }
 
-    /// Write multiple Arrow RecordBatches.
-    pub async fn write_arrow(&mut self, batches: &[RecordBatch]) -> Result<()> {
+    /// Write Arrow batches, optionally using a bucket assigned upstream, as
+    /// in Java TableWrite.write(row, bucket). Dynamic HASH indexes observe every
+    /// surviving key after RowKind filtering.
+    pub async fn write_arrow(
+        &mut self,
+        batches: &[RecordBatch],
+        bucket: Option<i32>,
+    ) -> Result<()> {
         for batch in batches {
-            self.write_arrow_batch(batch).await?;
+            match bucket {
+                Some(bucket) => self.write_precomputed_bucket(batch, bucket).await?,
+                None => self.write_arrow_batch(batch).await?,
+            }
         }
         Ok(())
     }
@@ -1046,17 +1230,12 @@ impl TableWrite {
         }
     }
 
-    /// Close all writers and collect CommitMessages for use with TableCommit.
-    /// Writers are cleared after this call, allowing the TableWrite to be reused.
+    /// Flush all writers and collect CommitMessages for use with TableCommit.
+    /// Append writers are closed; primary-key writers retain their sequence
+    /// counters after handing off the prepared files, as Java does.
     ///
-    /// The per-bucket primary-key sequence cache is invalidated here too: it
-    /// memoizes `max_sequence_number + 1` scanned from the latest snapshot, which
-    /// this commit advances. Keeping it would make the next reuse cycle re-seed
-    /// from the pre-commit value and assign sequence numbers that overlap the
-    /// just-written files, so the highest-sequence-wins merge would silently drop
-    /// the newer rows -- Java's `MergeTreeWriter` advances its counter across
-    /// commits. (`sequence_snapshot` is pinned only by the postpone path, which
-    /// forbids reuse, so it is left untouched.)
+    /// Invalidate the snapshot sequence cache used to seed previously unseen
+    /// buckets. Already-open key-value writers keep their own advancing counter.
     pub async fn prepare_commit(&mut self) -> Result<Vec<CommitMessage>> {
         if let Some(writer) = self.format_writer.as_mut() {
             return writer.prepare_commit().await;
@@ -1077,7 +1256,11 @@ impl TableWrite {
 
         let mut messages = Vec::new();
         let mut error = None;
-        for (partition_bytes, bucket, result) in results {
+        for (partition_bytes, bucket, (result, retained)) in results {
+            if let Some(writer) = retained {
+                self.partition_writers
+                    .insert((partition_bytes.clone(), bucket), writer);
+            }
             match result {
                 Ok(files) if !files.data_files.is_empty() || !files.changelog_files.is_empty() => {
                     let mut message = CommitMessage::new(partition_bytes, bucket, files.data_files);
@@ -1091,9 +1274,7 @@ impl TableWrite {
             }
         }
         if let Some(error) = error {
-            self.failed = true;
-            let commit = super::TableCommit::new(self.table.clone(), self.commit_user.clone());
-            let _ = commit.abort(&messages).await;
+            self.fail_prepare(&messages).await;
             return Err(error);
         }
 
@@ -1103,9 +1284,7 @@ impl TableWrite {
         {
             Ok(files) => files,
             Err(error) => {
-                self.failed = true;
-                let commit = super::TableCommit::new(self.table.clone(), self.commit_user.clone());
-                let _ = commit.abort(&messages).await;
+                self.fail_prepare(&messages).await;
                 return Err(error);
             }
         };
@@ -1124,6 +1303,29 @@ impl TableWrite {
             }
         }
         Ok(messages)
+    }
+
+    async fn fail_prepare(&mut self, messages: &[CommitMessage]) {
+        self.failed = true;
+        self.close().await;
+        // Only this failed invocation's outputs: no message has been returned
+        // or submitted. Earlier successful prepare calls belong to the caller.
+        let mut cleanup = messages.to_vec();
+        if self.primary_key_indices.is_empty() && self.blob_consumer.is_some() {
+            // A successful partition may already have exposed its dedicated
+            // Blob files to the consumer. Preserve Java's deletion policy in
+            // this table-wide cleanup too. Explicit TableCommit.abort remains
+            // available when the caller knows the files are no longer needed.
+            for message in &mut cleanup {
+                message
+                    .new_files
+                    .retain(|file| !file.file_name.ends_with(".blob"));
+            }
+        }
+        let commit = super::TableCommit::new(self.table.clone(), self.commit_user.clone());
+        if let Err(error) = commit.abort(&cleanup).await {
+            log::warn!("Failed to discard unreturned prepared files: {error}");
+        }
     }
 
     async fn create_writer(&mut self, partition_bytes: Vec<u8>, bucket: i32) -> Result<()> {
@@ -1176,10 +1378,12 @@ impl TableWrite {
                     self.vector_target_file_size,
                     self.vector_file_format.as_deref(),
                     &self.write_schema,
+                    &self.write_fields,
                     fields,
                     self.table.schema().options(),
                     &self.blob_inline_fields,
                 )?
+                .with_blob_consumer(self.blob_consumer.clone())?
                 .with_resources(self.resources.clone()),
             )))
         } else {
@@ -1195,13 +1399,32 @@ impl TableWrite {
                     self.file_compression_zstd_level,
                     self.write_buffer_size,
                     self.file_format.clone(),
-                    self.table.schema().fields().to_vec(),
+                    self.write_fields.clone(),
                     self.table.schema().options().clone(),
                     Some(0),
                     None,
-                    None,
+                    (!super::data_evolution_fields::can_omit_normal_write_cols(
+                        self.table.schema().fields(),
+                        &self
+                            .write_fields
+                            .iter()
+                            .map(|field| field.name().to_string())
+                            .collect::<Vec<_>>(),
+                        &CoreOptions::new(self.table.schema().options()),
+                    ))
+                    .then(|| {
+                        self.write_fields
+                            .iter()
+                            .map(|field| field.name().to_string())
+                            .collect()
+                    }),
                 )?
-                .with_file_index(self.file_index_options.clone())
+                .with_file_index(
+                    self.file_index_options
+                        .as_ref()
+                        .and_then(|options| options.project_to_fields(&self.write_fields))
+                        .map(Arc::new),
+                )
                 .with_target_file_row_num(self.target_file_row_num)
                 .with_resources(self.resources.clone()),
             ))
@@ -1218,12 +1441,17 @@ impl TableWrite {
             PostponeFileWriter::new(
                 self.table.file_io().clone(),
                 PostponeWriteConfig {
+                    table_name: self.table.identifier().full_name(),
+                    primary_keys: self.table.schema().primary_keys().to_vec(),
                     table_location: self.table.location().to_string(),
                     table_options: self.table.schema().options().clone(),
                     partition_path,
                     bucket,
                     schema_id: self.schema_id,
                     target_file_size: self.target_file_size,
+                    target_file_row_num: self.target_file_row_num,
+                    primary_key_indices: self.primary_key_indices.clone(),
+                    value_fields: self.table.schema().fields().to_vec(),
                     file_compression: self.file_compression.clone(),
                     file_compression_zstd_level: self.file_compression_zstd_level,
                     write_buffer_size: self.write_buffer_size,
@@ -1243,6 +1471,15 @@ impl TableWrite {
         bucket: i32,
         partition_bytes: &[u8],
     ) -> Result<FileWriter> {
+        if !self.is_overwrite && self.sequence_snapshot.is_none() {
+            if let Some(id) = self.restore_snapshot_id {
+                self.sequence_snapshot = Some(if id == 0 {
+                    None
+                } else {
+                    Some(self.table.snapshot_manager().get_snapshot(id).await?)
+                });
+            }
+        }
         // Lazily scan partition sequence numbers on first writer creation per partition.
         // Overwrite mode skips this — old data will be replaced, so seq starts at 0.
         if !self.is_overwrite && !self.partition_seq_cache.contains_key(partition_bytes) {
@@ -1322,6 +1559,95 @@ pub(in crate::table) mod tests {
 
     pub(in crate::table) fn test_file_io() -> FileIO {
         FileIOBuilder::new("memory").build().unwrap()
+    }
+
+    #[tokio::test]
+    async fn failed_partition_prepare_preserves_consumer_blob_files() {
+        use crate::io::FileRead;
+        use crate::spec::BlobDescriptor;
+        use arrow_array::{ArrayRef, LargeBinaryArray};
+        use std::sync::Mutex;
+
+        for has_consumer in [false, true] {
+            let io = test_file_io();
+            let schema = Schema::builder()
+                .column("pt", DataType::Int(IntType::new()))
+                .column("payload", DataType::Blob(BlobType::new()))
+                .partition_keys(["pt"])
+                .option("data-evolution.enabled", "true")
+                .option("row-tracking.enabled", "true")
+                .build()
+                .unwrap();
+            let table = Table::new(
+                io.clone(),
+                Identifier::new("db", "partitioned_blob"),
+                "memory:/partitioned-blob".into(),
+                TableSchema::new(0, &schema),
+                None,
+            );
+            let mut writer = TableWrite::new(&table, "consumer".into()).unwrap();
+            let descriptors = Arc::new(Mutex::new(Vec::new()));
+            if has_consumer {
+                let received = descriptors.clone();
+                writer
+                    .with_blob_consumer(Some(Arc::new(
+                        move |_: &str, descriptor: Option<&BlobDescriptor>| {
+                            received.lock().unwrap().push(descriptor.unwrap().clone());
+                            Ok(false)
+                        },
+                    )))
+                    .unwrap();
+            }
+            let batch = RecordBatch::try_from_iter([
+                ("pt", Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef),
+                (
+                    "payload",
+                    Arc::new(LargeBinaryArray::from(vec![
+                        Some(b"payload".as_slice()),
+                        Some(b"payload".as_slice()),
+                    ])) as ArrayRef,
+                ),
+            ])
+            .unwrap();
+            writer.write_arrow_batch(&batch).await.unwrap();
+            assert_eq!(writer.partition_writers.len(), 2);
+            let FileWriter::AppendDedicated(partition) =
+                writer.partition_writers.values_mut().next().unwrap()
+            else {
+                panic!("expected a dedicated Blob writer");
+            };
+            partition.inject_blob_close_failure();
+            assert!(writer
+                .prepare_commit()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("injected close failure"));
+            assert!(writer.prepare_commit().await.is_err());
+            writer.close().await;
+            let files = io.list_status_recursive(table.location()).await.unwrap();
+            if has_consumer {
+                assert_eq!(files.len(), 2);
+                assert!(files.iter().all(|file| file.path.ends_with(".blob")));
+                let descriptors = descriptors.lock().unwrap().clone();
+                assert_eq!(descriptors.len(), 2);
+                for descriptor in descriptors {
+                    let reader = io
+                        .new_input(descriptor.uri())
+                        .unwrap()
+                        .reader()
+                        .await
+                        .unwrap();
+                    let start = descriptor.offset() as u64;
+                    assert_eq!(
+                        reader.read(start..start + 7).await.unwrap().as_ref(),
+                        b"payload"
+                    );
+                }
+            } else {
+                assert!(files.is_empty());
+            }
+        }
     }
 
     fn test_schema() -> TableSchema {
@@ -4542,9 +4868,21 @@ pub(in crate::table) mod tests {
             "Postpone mode should preserve arrival order"
         );
 
-        // Empty key stats for postpone mode
-        assert_eq!(file.min_key, EMPTY_SERIALIZED_ROW.clone());
-        assert_eq!(file.max_key, EMPTY_SERIALIZED_ROW.clone());
+        // Java records the first and last keys without sorting postpone input.
+        assert_eq!(
+            BinaryRow::from_serialized_bytes(&file.min_key)
+                .unwrap()
+                .get_int(0)
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            BinaryRow::from_serialized_bytes(&file.max_key)
+                .unwrap()
+                .get_int(0)
+                .unwrap(),
+            2
+        );
     }
 
     // -----------------------------------------------------------------------

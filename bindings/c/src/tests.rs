@@ -1005,6 +1005,63 @@ fn test_table_from_schema_json_rejects_invalid_identifier() {
 // =========================================================================
 
 #[test]
+fn test_catalog_list_databases_and_tables() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let mut options = Options::new();
+    options.set("warehouse", temp_dir.path().to_string_lossy());
+    let catalog = FileSystemCatalog::new(options).unwrap();
+    crate::runtime().block_on(async {
+        catalog
+            .create_database("default", false, HashMap::new())
+            .await
+            .unwrap();
+        catalog
+            .create_database("analytics", false, HashMap::new())
+            .await
+            .unwrap();
+        for table in ["orders", "customers"] {
+            catalog
+                .create_table(&Identifier::new("default", table), simple_schema(), false)
+                .await
+                .unwrap();
+        }
+    });
+    unsafe {
+        let collect = |list: &paimon_string_list| -> Vec<String> {
+            (0..list.len)
+                .map(|i| {
+                    std::ffi::CStr::from_ptr(*list.items.add(i))
+                        .to_str()
+                        .unwrap()
+                        .to_string()
+                })
+                .collect()
+        };
+        let catalog = wrap_catalog(Arc::new(catalog));
+
+        let dbs = paimon_catalog_list_databases(catalog);
+        assert!(dbs.error.is_null());
+        let db_names = collect(&dbs.string_list);
+        assert!(db_names.contains(&"default".to_string()));
+        assert!(db_names.contains(&"analytics".to_string()));
+        paimon_string_list_free(dbs.string_list);
+
+        let db = CString::new("default").unwrap();
+        let tables = paimon_catalog_list_tables(catalog, db.as_ptr());
+        assert!(tables.error.is_null());
+        let mut table_names = collect(&tables.string_list);
+        table_names.sort();
+        assert_eq!(
+            table_names,
+            vec!["customers".to_string(), "orders".to_string()]
+        );
+        paimon_string_list_free(tables.string_list);
+
+        paimon_catalog_free(catalog);
+    }
+}
+
+#[test]
 fn test_catalog_tag_lifecycle() {
     let temp_dir = tempfile::tempdir().unwrap();
     let mut options = Options::new();
@@ -1165,6 +1222,94 @@ fn test_read_with_data() {
         vec![(1, "a".into()), (2, "b".into()), (3, "c".into())]
     );
     unsafe { unwrap_table(handle) };
+}
+
+#[test]
+fn test_read_builder_with_limit_prunes_plan_splits() {
+    // `with_limit` is a plan-time hint: planning stops retaining splits once the
+    // kept ones already cover the limit (mirrors core `apply_limit_pushdown`).
+    // Three separate commits give multiple splits with known row counts, so this
+    // asserts the FFI threads the hint through to planning across splits: a zero
+    // limit prunes every split, a small limit keeps a strict non-empty subset,
+    // and a generous limit leaves the plan untouched.
+    let path = "memory:/test_read_limit";
+    let file_io = memory_file_io();
+    setup_table_dirs(&file_io, path);
+    // Force a tiny split target so each committed file becomes its own split,
+    // giving multiple known-count splits instead of one bundled split.
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .column("name", DataType::VarChar(VarCharType::string_type()))
+        .option("source.split.target-size", "1")
+        .build()
+        .unwrap();
+    let table = Table::new(
+        file_io.clone(),
+        Identifier::new("default", "test"),
+        path.to_string(),
+        TableSchema::new(0, &schema),
+        None,
+    );
+    write_data_rust(&table, &[make_batch(vec![1, 2], vec!["a", "b"])]);
+    write_data_rust(&table, &[make_batch(vec![3, 4], vec!["c", "d"])]);
+    write_data_rust(&table, &[make_batch(vec![5, 6], vec!["e", "f"])]);
+    let handle = unsafe { wrap_table(table) };
+
+    unsafe fn plan_split_count(handle: *const paimon_table, limit: Option<usize>) -> usize {
+        let rb = paimon_table_new_read_builder(handle).read_builder;
+        if let Some(limit) = limit {
+            assert!(paimon_read_builder_with_limit(rb, limit).is_null());
+        }
+        let scan = paimon_read_builder_new_scan(rb).scan;
+        let plan_result = paimon_table_scan_plan(scan);
+        assert!(plan_result.error.is_null());
+        let count = paimon_plan_num_splits(plan_result.plan);
+        paimon_plan_free(plan_result.plan);
+        paimon_table_scan_free(scan);
+        paimon_read_builder_free(rb);
+        count
+    }
+
+    unsafe {
+        let baseline = plan_split_count(handle, None);
+        assert!(
+            baseline >= 2,
+            "three commits should plan multiple splits, got {baseline}"
+        );
+        assert_eq!(
+            plan_split_count(handle, Some(0)),
+            0,
+            "a zero limit must prune every split at plan time"
+        );
+        // A small positive limit is covered by the first retained split alone, so
+        // planning keeps a strict non-empty subset instead of every split. A limit
+        // that wrapped to a huge value (the negative-input bug) would instead keep
+        // the full baseline here.
+        let pruned = plan_split_count(handle, Some(1));
+        assert!(
+            pruned >= 1 && pruned < baseline,
+            "limit 1 should keep a strict non-empty subset of {baseline} splits, got {pruned}"
+        );
+        assert_eq!(
+            plan_split_count(handle, Some(1000)),
+            baseline,
+            "a limit above the row count must not prune any split"
+        );
+        // A limit above i64::MAX must not wrap negative in the accumulator's
+        // signed comparison and truncate the scan: SIZE_MAX and i64::MAX + 1
+        // keep every split, like any limit the row count cannot reach.
+        assert_eq!(
+            plan_split_count(handle, Some(usize::MAX)),
+            baseline,
+            "SIZE_MAX must not truncate the plan"
+        );
+        assert_eq!(
+            plan_split_count(handle, Some((i64::MAX as usize) + 1)),
+            baseline,
+            "i64::MAX + 1 must not truncate the plan"
+        );
+        unwrap_table(handle);
+    }
 }
 
 #[test]

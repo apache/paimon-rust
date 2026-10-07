@@ -19,13 +19,16 @@
 
 use std::borrow::Cow;
 use std::collections::HashSet;
+use std::ops::Range;
 use std::sync::Arc;
 
 use arrow_array::{ArrayRef, Int64Array, RecordBatch, UInt32Array};
 use arrow_schema::{DataType, Field, Schema};
 use arrow_select::{concat::concat_batches, take::take};
 use futures::TryStreamExt;
+use indexmap::IndexMap;
 
+use super::update_input::unique_column_index;
 use super::upsert_key_matcher::UpsertKeyMatcher;
 use super::write_batch_normalize::normalize_write_array;
 use crate::spec::{
@@ -74,7 +77,7 @@ fn partition_key(row: &BinaryRow, fields: &[DataField]) -> crate::Result<Vec<u8>
     Ok(builder.build().to_serialized_bytes())
 }
 
-/// Upsert full Arrow rows into a data-evolution table without primary keys.
+/// Upsert Arrow rows into a data-evolution table without primary keys.
 /// Internal executor for `TableUpdate::upsert_by_arrow_with_key`. Existing
 /// keys are updated by row ID; new keys are appended.
 #[must_use = "upsert must be used to call prepare_commit()"]
@@ -137,29 +140,142 @@ impl TableUpsert {
         })
     }
 
-    /// Add full rows. Column order may differ from the table schema; names and
-    /// Arrow layouts follow the same normalization as ordinary writes. Multiple
-    /// batches form one logical upsert input.
+    /// Add rows containing the keys and columns to write. Column order may
+    /// differ from the table schema; names and Arrow layouts follow the same
+    /// normalization as ordinary writes. Batches form one logical upsert input,
+    /// but may carry different non-key columns, preserving absent fields.
     pub(super) fn add_batch(&mut self, batch: RecordBatch) -> crate::Result<()> {
         let target = crate::arrow::build_target_arrow_schema(self.table.schema().fields())?;
-        if batch.num_columns() != target.fields().len() {
-            return Err(invalid("native upsert requires all table columns"));
+        let input_schema = batch.schema();
+        for field in input_schema.fields() {
+            unique_column_index(&input_schema, field.name())?;
+            target.field_with_name(field.name()).map_err(|_| {
+                invalid(format!(
+                    "upsert column '{}' is not in table schema",
+                    field.name()
+                ))
+            })?;
+        }
+        for key in &self.keys {
+            unique_column_index(&input_schema, key)?;
         }
         let mut columns = Vec::with_capacity(target.fields().len());
+        let mut fields = Vec::new();
         for field in target.fields() {
-            let column = batch
-                .column_by_name(field.name())
-                .ok_or_else(|| invalid(format!("missing upsert column '{}'", field.name())))?;
+            let Some(column) = batch.column_by_name(field.name()) else {
+                continue;
+            };
             columns.push(
                 normalize_write_array(column, field.data_type()).map_err(|error| {
                     invalid(format!("Invalid upsert column '{}': {error}", field.name()))
                 })?,
             );
+            fields.push(field.clone());
         }
-        let ordered = RecordBatch::try_new(target, columns)
+        let ordered = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
             .map_err(|error| invalid(format!("cannot order upsert columns: {error}")))?;
         self.source.push(ordered);
         Ok(())
+    }
+
+    /// Concatenate only match keys. Padding payload columns with NULL would
+    /// lose the distinction between an absent field and an explicit NULL.
+    fn key_rows(&self) -> crate::Result<RecordBatch> {
+        let batches = self
+            .source
+            .iter()
+            .map(|batch| {
+                let columns = batch
+                    .schema()
+                    .fields()
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, field)| self.keys.contains(field.name()))
+                    .map(|(index, _)| index)
+                    .collect::<Vec<_>>();
+                batch
+                    .project(&columns)
+                    .map_err(|error| invalid(error.to_string()))
+            })
+            .collect::<crate::Result<Vec<_>>>()?;
+        let first = batches
+            .first()
+            .ok_or_else(|| invalid("Input data is empty"))?;
+        concat_batches(&first.schema(), &batches)
+            .map_err(|error| invalid(format!("cannot concatenate upsert keys: {error}")))
+    }
+
+    /// Matcher indices are sorted by their original input position, with one
+    /// repeated index per matching target row. The range retains alignment
+    /// with the matcher's parallel row-ID vector across source batch boundaries.
+    fn selected_batches(
+        &self,
+        indices: &[usize],
+    ) -> crate::Result<Vec<(RecordBatch, Range<usize>)>> {
+        let mut groups = Vec::new();
+        let (mut offset, mut selected) = (0, 0);
+        for source in &self.source {
+            let end = offset + source.num_rows();
+            let count = indices[selected..].partition_point(|index| *index < end);
+            if count > 0 {
+                let range = selected..selected + count;
+                let rows = indices[range.clone()]
+                    .iter()
+                    .map(|index| index - offset)
+                    .collect::<Vec<_>>();
+                groups.push((selected_rows(source, &rows)?, range));
+                selected += count;
+            }
+            offset = end;
+        }
+        Ok(groups)
+    }
+
+    fn serialized_partitions(&self, batch: &RecordBatch) -> crate::Result<Vec<Vec<u8>>> {
+        let schema = self.table.schema();
+        let indices = schema
+            .partition_keys()
+            .iter()
+            .map(|name| unique_column_index(&batch.schema(), name))
+            .collect::<crate::Result<Vec<_>>>()?;
+        let fields = batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| {
+                schema
+                    .fields()
+                    .iter()
+                    .find(|table_field| table_field.name() == field.name())
+                    .unwrap()
+                    .clone()
+            })
+            .collect::<Vec<_>>();
+        batch_to_serialized_bytes(batch, &indices, &fields)
+    }
+
+    /// Java append writers use one write type for a partition's input. Like
+    /// PyPaimon named-row upserts, validate only surviving unmatched rows;
+    /// different partitions may append different field sets.
+    fn append_groups(&self, indices: &[usize]) -> crate::Result<Vec<Vec<RecordBatch>>> {
+        let mut groups: IndexMap<Vec<u8>, Vec<RecordBatch>> = IndexMap::new();
+        for (batch, _) in self.selected_batches(indices)? {
+            let mut by_partition: IndexMap<Vec<u8>, Vec<usize>> = IndexMap::new();
+            for (row, partition) in self.serialized_partitions(&batch)?.into_iter().enumerate() {
+                by_partition.entry(partition).or_default().push(row);
+            }
+            for (partition, rows) in by_partition {
+                let group = groups.entry(partition).or_default();
+                if group
+                    .first()
+                    .is_some_and(|first| first.schema() != batch.schema())
+                {
+                    return Err(invalid("upsert_by_key requires appended rows in the same partition to have the same field set"));
+                }
+                group.push(selected_rows(&batch, &rows)?);
+            }
+        }
+        Ok(groups.into_values().collect())
     }
 
     /// Match only the source partitions, as PyPaimon does. Filter planned splits
@@ -173,19 +289,7 @@ impl TableUpsert {
         if schema.partition_keys().is_empty() {
             return Ok(Cow::Borrowed(plan.splits()));
         }
-        let indices = schema
-            .partition_keys()
-            .iter()
-            .map(|name| {
-                source
-                    .schema()
-                    .index_of(name)
-                    .map_err(|error| invalid(error.to_string()))
-            })
-            .collect::<crate::Result<Vec<_>>>()?;
-        let partitions: HashSet<_> = batch_to_serialized_bytes(source, &indices, schema.fields())?
-            .into_iter()
-            .collect();
+        let partitions: HashSet<_> = self.serialized_partitions(source)?.into_iter().collect();
         let fields = schema.partition_fields();
         let mut splits = Vec::new();
         for split in plan.splits() {
@@ -201,11 +305,7 @@ impl TableUpsert {
     #[must_use = "commit messages must be passed to TableCommit"]
     pub(super) async fn prepare_commit(self) -> crate::Result<Vec<CommitMessage>> {
         CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
-        let Some(first) = self.source.first() else {
-            return Err(invalid("Input data is empty"));
-        };
-        let source = concat_batches(&first.schema(), &self.source)
-            .map_err(|error| invalid(format!("cannot concatenate upsert input: {error}")))?;
+        let source = self.key_rows()?;
         if source.num_rows() == 0 {
             return Err(invalid("Input data is empty"));
         }
@@ -224,51 +324,60 @@ impl TableUpsert {
         }
         let (matched_indices, row_ids, new_indices) = matcher.finish();
 
+        // Validate append field sets before staging any updates or new files.
+        let append_groups = self.append_groups(&new_indices)?;
+        let matched_batches = self.selected_batches(&matched_indices)?;
+
         let mut messages = Vec::new();
         let result: crate::Result<()> = async {
             if !matched_indices.is_empty() {
-                let selected = selected_rows(&source, &matched_indices)?;
-                let mut fields = selected.schema().fields().to_vec();
-                fields.push(Arc::new(Field::new(ROW_ID, DataType::Int64, false)));
-                let mut columns: Vec<ArrayRef> = selected.columns().to_vec();
-                columns.push(Arc::new(Int64Array::from(row_ids)));
-                let matched = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
-                    .map_err(|error| {
-                        invalid(format!("cannot build matched upsert rows: {error}"))
-                    })?;
-                let mut update =
-                    super::DataEvolutionWriter::for_row_id(&self.table, self.update_columns)?;
+                let mut update = super::DataEvolutionWriter::for_row_id(
+                    &self.table,
+                    self.update_columns.clone(),
+                )?;
                 if let Some(snapshot_id) = plan.snapshot_id() {
                     update.pin_read_snapshot(snapshot_id);
                 }
-                update.add_matched_batch(matched)?;
+                for (selected, range) in matched_batches {
+                    let mut fields = selected.schema().fields().to_vec();
+                    fields.push(Arc::new(Field::new(ROW_ID, DataType::Int64, false)));
+                    let mut columns: Vec<ArrayRef> = selected.columns().to_vec();
+                    columns.push(Arc::new(Int64Array::from(row_ids[range].to_vec())));
+                    let matched = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+                        .map_err(|error| {
+                            invalid(format!("cannot build matched upsert rows: {error}"))
+                        })?;
+                    update.add_matched_batch(matched)?;
+                }
                 messages.extend(update.prepare_commit().await?);
             }
-            if !new_indices.is_empty() {
-                let new_rows = selected_rows(&source, &new_indices)?;
+            for group in append_groups {
                 let mut append = self
                     .table
                     .new_write_builder()
                     .with_commit_user(self.commit_user.clone())?
                     .new_write()?;
-                if let Err(error) = append.write_arrow_batch(&new_rows).await {
-                    append.close().await;
-                    return Err(error);
+                append.with_write_type(
+                    group[0]
+                        .schema()
+                        .fields()
+                        .iter()
+                        .map(|field| field.name().to_string())
+                        .collect(),
+                )?;
+                for batch in group {
+                    if let Err(error) = append.write_arrow_batch(&batch).await {
+                        append.close().await;
+                        return Err(error);
+                    }
                 }
                 messages.extend(append.prepare_commit().await?);
             }
             Ok(())
         }
         .await;
-        if result.is_err() && !messages.is_empty() {
-            if let Ok(builder) = self
-                .table
-                .new_write_builder()
-                .with_commit_user(self.commit_user)
-            {
-                let _ = builder.new_commit().abort(&messages).await;
-            }
-        }
+        // Preserve earlier prepared groups on failure. Never delete files
+        // based on CommitMessage; a failed response does not prove ownership.
         result.map(|()| messages)
     }
 }

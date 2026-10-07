@@ -26,7 +26,7 @@ use crate::table::Table;
 use crate::Result;
 use arrow_array::RecordBatch;
 use futures::TryStreamExt;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 
 /// Result of assigning a bucket for a key in cross-partition mode.
 enum AssignResult {
@@ -51,19 +51,23 @@ enum AssignResult {
 struct GlobalPartitionIndex {
     /// pk_bytes -> (partition_bytes, bucket)
     key_to_location: HashMap<Vec<u8>, (Vec<u8>, i32)>,
-    /// partition -> { bucket -> row_count } (only non-full buckets)
-    partition_non_full_buckets: HashMap<Vec<u8>, HashMap<i32, i64>>,
-    /// partition -> all known bucket ids
-    partition_all_buckets: HashMap<Vec<u8>, HashSet<i32>>,
-    /// partition -> next bucket id to allocate (avoids linear scan)
-    partition_next_bucket_id: HashMap<Vec<u8>, i32>,
-    /// (partition, bucket) -> total row count
-    bucket_row_counts: HashMap<(Vec<u8>, i32), i64>,
+    /// Java BucketAssigner uses a TreeMap: reuse the first non-full bucket,
+    /// then allocate the smallest unused non-negative ID.
+    partition_bucket_counts: HashMap<Vec<u8>, BTreeMap<i32, i64>>,
     target_bucket_row_number: i64,
     merge_engine: MergeEngine,
 }
 
 impl GlobalPartitionIndex {
+    fn empty(target_bucket_row_number: i64, merge_engine: MergeEngine) -> Self {
+        Self {
+            key_to_location: HashMap::new(),
+            partition_bucket_counts: HashMap::new(),
+            target_bucket_row_number,
+            merge_engine,
+        }
+    }
+
     /// Build the global partition index by scanning all data files from the latest snapshot.
     ///
     /// Uses TableRead to get deduplicated PK rows per split, so DELETE records
@@ -78,7 +82,7 @@ impl GlobalPartitionIndex {
         crate::spec::CoreOptions::new(table.schema().options()).ensure_read_authorized()?;
 
         let mut key_to_location: HashMap<Vec<u8>, (Vec<u8>, i32)> = HashMap::new();
-        let mut bucket_row_counts: HashMap<(Vec<u8>, i32), i64> = HashMap::new();
+        let mut partition_bucket_counts: HashMap<Vec<u8>, BTreeMap<i32, i64>> = HashMap::new();
 
         let fields = table.schema().fields();
         let pk_field_names: Vec<&str> = primary_key_indices
@@ -101,55 +105,33 @@ impl GlobalPartitionIndex {
             let partition_bytes = split.partition().to_serialized_bytes();
             let bucket = split.bucket();
 
-            let batches: Vec<RecordBatch> = read
-                .to_arrow(std::slice::from_ref(split))?
-                .try_collect()
-                .await?;
-
-            let pb_key = (partition_bytes.clone(), bucket);
-            for batch in &batches {
+            let mut batches = read.to_arrow(std::slice::from_ref(split))?;
+            while let Some(batch) = batches.try_next().await? {
                 let pk_bytes_vec =
-                    batch_to_serialized_bytes(batch, &projected_pk_indices, &pk_fields)?;
-                let count = pk_bytes_vec.len() as i64;
+                    batch_to_serialized_bytes(&batch, &projected_pk_indices, &pk_fields)?;
                 for pk_bytes in pk_bytes_vec {
-                    key_to_location.insert(pk_bytes, (partition_bytes.clone(), bucket));
+                    if key_to_location
+                        .insert(pk_bytes, (partition_bytes.clone(), bucket))
+                        .is_some()
+                    {
+                        return Err(crate::Error::DataInvalid {
+                            message: "Duplicate primary key found while bootstrapping the cross-partition index".into(),
+                            source: None,
+                        });
+                    }
+                    *partition_bucket_counts
+                        .entry(partition_bytes.clone())
+                        .or_default()
+                        .entry(bucket)
+                        .or_default() += 1;
                 }
-                *bucket_row_counts.entry(pb_key.clone()).or_insert(0) += count;
             }
         }
 
-        let mut partition_all_buckets: HashMap<Vec<u8>, HashSet<i32>> = HashMap::new();
-        let mut partition_non_full_buckets: HashMap<Vec<u8>, HashMap<i32, i64>> = HashMap::new();
-        for ((partition, bucket), count) in &bucket_row_counts {
-            partition_all_buckets
-                .entry(partition.clone())
-                .or_default()
-                .insert(*bucket);
-            if *count < target_bucket_row_number {
-                partition_non_full_buckets
-                    .entry(partition.clone())
-                    .or_default()
-                    .insert(*bucket, *count);
-            }
-        }
-
-        let partition_next_bucket_id: HashMap<Vec<u8>, i32> = partition_all_buckets
-            .iter()
-            .map(|(p, buckets)| {
-                let next = buckets.iter().copied().max().map_or(0, |m| m + 1);
-                (p.clone(), next)
-            })
-            .collect();
-
-        Ok(Self {
-            key_to_location,
-            partition_non_full_buckets,
-            partition_all_buckets,
-            partition_next_bucket_id,
-            bucket_row_counts,
-            target_bucket_row_number,
-            merge_engine,
-        })
+        let mut index = Self::empty(target_bucket_row_number, merge_engine);
+        index.key_to_location = key_to_location;
+        index.partition_bucket_counts = partition_bucket_counts;
+        Ok(index)
     }
 
     /// Assign a bucket for the given primary key targeting `new_partition`.
@@ -171,19 +153,14 @@ impl GlobalPartitionIndex {
                     let old_partition = existing_partition.clone();
                     let old_bucket = *existing_bucket;
 
-                    // Decrement row count for old bucket
-                    let old_key = (old_partition.clone(), old_bucket);
-                    let old_count = self.bucket_row_counts.get(&old_key).copied().unwrap_or(0);
-                    let new_count = (old_count - 1).max(0);
-                    self.bucket_row_counts.insert(old_key, new_count);
-                    if new_count < self.target_bucket_row_number {
-                        self.partition_non_full_buckets
-                            .entry(old_partition.clone())
-                            .or_default()
-                            .insert(old_bucket, new_count);
-                    }
-
-                    let new_bucket = self.assign_bucket_in_partition(new_partition);
+                    let old_count = self
+                        .partition_bucket_counts
+                        .entry(old_partition.clone())
+                        .or_default()
+                        .entry(old_bucket)
+                        .or_default();
+                    *old_count -= 1;
+                    let new_bucket = self.assign_bucket_in_partition(new_partition)?;
                     self.key_to_location
                         .insert(pk_bytes.to_vec(), (new_partition.to_vec(), new_bucket));
 
@@ -202,60 +179,34 @@ impl GlobalPartitionIndex {
             }
         }
 
-        let bucket = self.assign_bucket_in_partition(new_partition);
+        let bucket = self.assign_bucket_in_partition(new_partition)?;
         self.key_to_location
             .insert(pk_bytes.to_vec(), (new_partition.to_vec(), bucket));
         Ok(AssignResult::SamePartition { bucket })
     }
 
-    fn assign_bucket_in_partition(&mut self, partition: &[u8]) -> i32 {
-        let non_full = self
-            .partition_non_full_buckets
+    fn assign_bucket_in_partition(&mut self, partition: &[u8]) -> Result<i32> {
+        let buckets = self
+            .partition_bucket_counts
             .entry(partition.to_vec())
             .or_default();
-
-        let mut full_buckets = Vec::new();
-        let mut assigned_bucket = None;
-        for (&bucket, count) in non_full.iter_mut() {
+        for (&bucket, count) in buckets.iter_mut() {
             if *count < self.target_bucket_row_number {
                 *count += 1;
-                assigned_bucket = Some(bucket);
-                break;
-            } else {
-                full_buckets.push(bucket);
+                return Ok(bucket);
             }
         }
-        for b in full_buckets {
-            non_full.remove(&b);
+        let mut next = 0;
+        while buckets.contains_key(&next) {
+            next = next
+                .checked_add(1)
+                .ok_or_else(|| crate::Error::DataInvalid {
+                    message: "No bucket IDs available for cross-partition writes".into(),
+                    source: None,
+                })?;
         }
-
-        let bucket = if let Some(b) = assigned_bucket {
-            b
-        } else {
-            let all = self
-                .partition_all_buckets
-                .entry(partition.to_vec())
-                .or_default();
-            let next_id = self
-                .partition_next_bucket_id
-                .entry(partition.to_vec())
-                .or_insert(0);
-            let new_bucket = *next_id;
-            *next_id += 1;
-            all.insert(new_bucket);
-            self.partition_non_full_buckets
-                .entry(partition.to_vec())
-                .or_default()
-                .insert(new_bucket, 1);
-            new_bucket
-        };
-
-        *self
-            .bucket_row_counts
-            .entry((partition.to_vec(), bucket))
-            .or_insert(0) += 1;
-
-        bucket
+        buckets.insert(next, 1);
+        Ok(next)
     }
 }
 
@@ -280,15 +231,41 @@ impl CrossPartitionAssigner {
         primary_key_indices: Vec<usize>,
         target_bucket_row_number: i64,
         merge_engine: MergeEngine,
-    ) -> Self {
-        Self {
+    ) -> Result<Self> {
+        if !crate::spec::CoreOptions::new(table.schema().options())
+            .sequence_fields()
+            .is_empty()
+        {
+            return Err(crate::Error::DataInvalid {
+                message: "Cannot define 'sequence.field' for cross-partition update tables".into(),
+                source: None,
+            });
+        }
+        if table.schema().options().contains_key("bucket-key") {
+            return Err(crate::Error::DataInvalid {
+                message: "Cannot define 'bucket-key' for dynamic bucket tables".into(),
+                source: None,
+            });
+        }
+        if table
+            .schema()
+            .options()
+            .contains_key("cross-partition-upsert.index-ttl")
+        {
+            return Err(crate::Error::Unsupported {
+                message:
+                    "Cross-partition writes do not support 'cross-partition-upsert.index-ttl' yet"
+                        .into(),
+            });
+        }
+        Ok(Self {
             table,
             partition_field_indices,
             primary_key_indices,
             global_partition_index: None,
             target_bucket_row_number,
             merge_engine,
-        }
+        })
     }
 }
 
@@ -357,5 +334,52 @@ impl BucketAssigner for CrossPartitionAssigner {
         _file_io: &FileIO,
     ) -> Result<HashMap<PartitionBucketKey, Vec<IndexFileMeta>>> {
         Ok(HashMap::new())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bucket_assignment_reuses_lowest_nonfull_bucket_then_first_unused_id() {
+        let mut index = GlobalPartitionIndex::empty(2, MergeEngine::Deduplicate);
+        index
+            .partition_bucket_counts
+            .insert(vec![1], [(0, 2), (2, 1), (4, 1)].into());
+        assert_eq!(index.assign_bucket_in_partition(&[1]).unwrap(), 2);
+        assert_eq!(index.assign_bucket_in_partition(&[1]).unwrap(), 4);
+        assert_eq!(index.assign_bucket_in_partition(&[1]).unwrap(), 1);
+        assert_eq!(index.assign_bucket_in_partition(&[1]).unwrap(), 1);
+        assert_eq!(index.assign_bucket_in_partition(&[1]).unwrap(), 3);
+    }
+
+    #[test]
+    fn migration_releases_old_bucket_capacity_without_forgetting_other_keys() {
+        let mut index = GlobalPartitionIndex::empty(1, MergeEngine::Deduplicate);
+        assert!(matches!(
+            index.assign(&[1], &[1]).unwrap(),
+            AssignResult::SamePartition { bucket: 0 }
+        ));
+        assert!(matches!(
+            index.assign(&[2], &[1]).unwrap(),
+            AssignResult::SamePartition { bucket: 1 }
+        ));
+        assert!(matches!(
+            index.assign(&[1], &[2]).unwrap(),
+            AssignResult::CrossPartition {
+                old_bucket: 0,
+                new_bucket: 0,
+                ..
+            }
+        ));
+        assert!(matches!(
+            index.assign(&[3], &[1]).unwrap(),
+            AssignResult::SamePartition { bucket: 0 }
+        ));
+        assert!(matches!(
+            index.assign(&[2], &[1]).unwrap(),
+            AssignResult::SamePartition { bucket: 1 }
+        ));
     }
 }

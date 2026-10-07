@@ -255,16 +255,20 @@ def test_resolved_rest_response_keeps_snapshot_and_token_refresh(
             if '$branch_' in object_name else 'main'
         )
         assert table.branch() == expected_branch
-        if '$branch_' in object_name:
-            with pytest.raises(NotImplementedError, match='Writing to Paimon branch'):
-                table.new_batch_write_builder().new_write()
+        builder = table.new_batch_write_builder()
+        builder.new_write().close()
+        builder.new_commit().close()
         assert len(token_requests) == (0 if external else 1)
         assert all(path.endswith('/token') for path in requests)
         assert _read(table) == (1, [{'id': 1, 'name': 'a'}])
         assert all(path.endswith(('/token', '/snapshot')) for path in requests)
-        encoded_name = object_name.replace('$', '%24')
-        assert any(path.endswith(
-            f'/databases/db/tables/{encoded_name}/snapshot') for path in requests)
+        # Java switchToBranch uses the base identifier for main, including an
+        # explicitly supplied $branch_main alias.
+        encoded_name = 't' if expected_branch == 'main' else object_name.replace('$', '%24')
+        snapshot_paths = [path for path in requests if path.endswith('/snapshot')]
+        assert snapshot_paths
+        assert all(path.endswith(
+            f'/databases/db/tables/{encoded_name}/snapshot') for path in snapshot_paths)
         assert len(token_requests) == (0 if external else 2)
     finally:
         server.shutdown()

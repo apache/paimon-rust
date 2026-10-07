@@ -347,7 +347,8 @@ fn build_projection_rewrite(
                         "UTC".to_string(),
                     )
                 }),
-            );
+            )
+            .map_err(to_datafusion_error)?;
             read_type.push(
                 DataField::new(
                     field.id(),
@@ -541,6 +542,11 @@ fn parse_variant_get(expr: &Expr) -> DFResult<VariantGetParse> {
     let Some(type_name) = func.args.get(2).and_then(string_literal) else {
         return Ok(VariantGetParse::FullVariant(column.clone()));
     };
+    // Java's Variant field metadata uses ';' as a delimiter. Keep the full
+    // column so the original expression can handle paths containing it.
+    if path.contains(';') {
+        return Ok(VariantGetParse::FullVariant(column.clone()));
+    }
     let Some(data_type) = paimon_type_for_variant_get(&type_name)? else {
         return Ok(VariantGetParse::FullVariant(column.clone()));
     };

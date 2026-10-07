@@ -44,6 +44,235 @@ async fn evolution_table() -> Table {
     table
 }
 
+async fn inline_blob_table(option: &str) -> Table {
+    let path = "memory:/inline_blob_update";
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .column("payload", DataType::Blob(paimon::spec::BlobType::new()))
+        .column("value", DataType::Int(IntType::new()))
+        .option("row-tracking.enabled", "true")
+        .option("data-evolution.enabled", "true")
+        .option("deletion-vectors.enabled", "true")
+        .option(option, "payload")
+        .build()
+        .unwrap();
+    let (io, table) = memory_table(path, TableSchema::new(0, &schema));
+    setup_dirs(&io, path).await;
+    persist_table_schema(&io, path, table.schema()).await;
+    table
+}
+
+fn inline_reference(option: &str, id: i64) -> Vec<u8> {
+    if option == "blob-view-field" {
+        paimon::spec::BlobViewStruct::new(
+            paimon::catalog::Identifier::new("missing", "upstream"),
+            5,
+            id,
+        )
+        .serialize()
+        .unwrap()
+    } else {
+        // These files do not exist: staging a partial update must preserve
+        // references without resolving or copying external payloads.
+        paimon::spec::BlobDescriptor::new(format!("memory:/missing/{id}"), 0, 10).serialize()
+    }
+}
+
+fn inline_batch(table: &Table, ids: Vec<i32>, values: &[Option<Vec<u8>>]) -> RecordBatch {
+    RecordBatch::try_new(
+        paimon::arrow::build_target_arrow_schema(table.schema().fields()).unwrap(),
+        vec![
+            Arc::new(Int32Array::from(ids.clone())),
+            Arc::new(arrow_array::LargeBinaryArray::from_iter(
+                values.iter().map(|value| value.as_deref()),
+            )),
+            Arc::new(Int32Array::from(
+                ids.iter().map(|id| id * 10).collect::<Vec<_>>(),
+            )),
+        ],
+    )
+    .unwrap()
+}
+
+async fn inline_rows(table: &Table) -> Vec<(i32, Option<Vec<u8>>, i32)> {
+    use arrow_array::Array;
+    let read_table = table.copy_with_options(HashMap::from([
+        ("blob-as-descriptor".into(), "true".into()),
+        ("blob-view.resolve.enabled".into(), "false".into()),
+    ]));
+    let builder = read_table.new_read_builder();
+    let plan = builder.new_scan().plan().await.unwrap();
+    let batches: Vec<RecordBatch> = builder
+        .new_read()
+        .unwrap()
+        .to_arrow(plan.splits())
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    let mut rows = Vec::new();
+    for batch in batches {
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let payloads = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow_array::LargeBinaryArray>()
+            .unwrap();
+        let values = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        for row in 0..batch.num_rows() {
+            rows.push((
+                ids.value(row),
+                payloads.is_valid(row).then(|| payloads.value(row).to_vec()),
+                values.value(row),
+            ));
+        }
+    }
+    rows.sort_by_key(|row| row.0);
+    rows
+}
+
+#[tokio::test]
+async fn inline_blob_row_id_updates_keep_unmatched_references_and_nulls() {
+    for option in [
+        "blob-descriptor-field",
+        "blob.stored-descriptor-fields",
+        "blob-view-field",
+    ] {
+        for incremental in [false, true] {
+            let table = inline_blob_table(option).await;
+            let before = vec![
+                Some(inline_reference(option, 0)),
+                None,
+                Some(inline_reference(option, 2)),
+                Some(inline_reference(option, 3)),
+            ];
+            write_batch(&table, &inline_batch(&table, vec![0, 1, 2, 3], &before)).await;
+            let changed = Some(inline_reference(option, 20));
+            let input = RecordBatch::try_from_iter(vec![
+                (
+                    "_ROW_ID",
+                    Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef,
+                ),
+                (
+                    "payload",
+                    Arc::new(arrow_array::LargeBinaryArray::from_iter([
+                        None,
+                        changed.as_deref(),
+                    ])) as ArrayRef,
+                ),
+            ])
+            .unwrap();
+            let update = table.new_write_builder().new_update().unwrap();
+            let messages = if incremental {
+                let mut writer = update.new_update_by_row_id().await.unwrap();
+                writer
+                    .update_columns(vec![input], vec!["payload".into()])
+                    .await
+                    .unwrap()
+            } else {
+                update
+                    .update_by_arrow_with_row_id(vec![input])
+                    .await
+                    .unwrap()
+            };
+            assert!(!messages.is_empty());
+            for file in messages.iter().flat_map(|message| &message.new_files) {
+                assert!(file.file_name.ends_with(".parquet"));
+                assert_eq!(file.write_cols, Some(vec!["payload".into()]));
+                assert_eq!(file.first_row_id, Some(0));
+                assert_eq!(file.row_count, 4);
+            }
+            commit(&table, messages).await;
+            assert_eq!(
+                inline_rows(&table).await,
+                vec![
+                    (0, before[0].clone(), 0),
+                    (1, None, 10),
+                    (2, changed, 20),
+                    (3, before[3].clone(), 30),
+                ]
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn inline_blob_upsert_and_delete_preserve_reference_layout() {
+    for option in [
+        "blob-descriptor-field",
+        "blob.stored-descriptor-fields",
+        "blob-view-field",
+    ] {
+        let table = inline_blob_table(option).await;
+        let old = inline_reference(option, 0);
+        write_batch(
+            &table,
+            &inline_batch(&table, vec![0, 1], &[Some(old.clone()), None]),
+        )
+        .await;
+        let new = inline_reference(option, 20);
+        let source = inline_batch(&table, vec![0, 2], &[Some(new.clone()), None]);
+        let update = table.new_write_builder().new_update().unwrap();
+        let messages = update
+            .upsert_by_arrow_with_key(vec![source], vec!["id".into()])
+            .await
+            .unwrap();
+        assert!(messages
+            .iter()
+            .flat_map(|message| &message.new_files)
+            .all(|file| file.file_name.ends_with(".parquet")));
+        commit(&table, messages).await;
+        assert_eq!(
+            inline_rows(&table).await,
+            vec![(0, Some(new), 0), (1, None, 10), (2, None, 20)]
+        );
+        let update = table.new_write_builder().new_update().unwrap();
+        let messages = update.delete_by_row_id(vec![0, 0]).await.unwrap();
+        commit(&table, messages).await;
+        assert_eq!(
+            inline_rows(&table).await,
+            vec![(1, None, 10), (2, None, 20)]
+        );
+    }
+}
+
+#[tokio::test]
+async fn inline_blob_failed_update_does_not_stage_files() {
+    let table = inline_blob_table("blob-view-field").await;
+    write_batch(&table, &inline_batch(&table, vec![0, 1], &[None, None])).await;
+    let before = parquet_files(&table).await;
+    let update = table.new_write_builder().new_update().unwrap();
+    let input = RecordBatch::try_from_iter(vec![
+        (
+            "_ROW_ID",
+            Arc::new(Int64Array::from(vec![0, 0])) as ArrayRef,
+        ),
+        (
+            "payload",
+            Arc::new(arrow_array::LargeBinaryArray::from(vec![
+                Some(b"a".as_slice()),
+                Some(b"b".as_slice()),
+            ])) as ArrayRef,
+        ),
+    ])
+    .unwrap();
+    let error = update
+        .update_by_arrow_with_row_id(vec![input])
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("duplicate UPDATE operations"));
+    assert_eq!(parquet_files(&table).await, before);
+    assert_eq!(inline_rows(&table).await, vec![(0, None, 0), (1, None, 10)]);
+}
+
 fn batch(columns: &[(&str, Vec<i32>)]) -> RecordBatch {
     RecordBatch::try_from_iter(columns.iter().map(|(name, values)| {
         (
@@ -52,6 +281,223 @@ fn batch(columns: &[(&str, Vec<i32>)]) -> RecordBatch {
         )
     }))
     .unwrap()
+}
+
+#[tokio::test]
+async fn inline_blob_alias_rejects_malformed_writes_and_updates() {
+    let table = inline_blob_table("blob.stored-descriptor-fields").await;
+    let invalid = b"not a descriptor".to_vec();
+    let mut write = table.new_write_builder().new_write().unwrap();
+    let error = write
+        .write_arrow_batch(&inline_batch(&table, vec![0], &[Some(invalid.clone())]))
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("serialized BlobDescriptor"),
+        "{error}"
+    );
+    assert!(parquet_files(&table).await.is_empty());
+    write_batch(&table, &inline_batch(&table, vec![0], &[None])).await;
+    let before = parquet_files(&table).await;
+    let input = RecordBatch::try_from_iter(vec![
+        ("_ROW_ID", Arc::new(Int64Array::from(vec![0])) as ArrayRef),
+        (
+            "payload",
+            Arc::new(arrow_array::LargeBinaryArray::from(vec![Some(
+                invalid.as_slice(),
+            )])) as ArrayRef,
+        ),
+    ])
+    .unwrap();
+    let error = table
+        .new_write_builder()
+        .new_update()
+        .unwrap()
+        .update_by_arrow_with_row_id(vec![input])
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("serialized BlobDescriptor"),
+        "{error}"
+    );
+    assert_eq!(parquet_files(&table).await, before);
+    assert_eq!(inline_rows(&table).await, vec![(0, None, 0)]);
+}
+
+#[tokio::test]
+async fn normal_column_update_metadata_matches_java_blob_layout() {
+    for option in [
+        "blob-field",
+        "blob-descriptor-field",
+        "blob.stored-descriptor-fields",
+        "blob-view-field",
+    ] {
+        for optimize in [false, true] {
+            let table = inline_blob_table(option)
+                .await
+                .copy_with_options(HashMap::from([
+                    (
+                        "data-evolution.write-cols-optimization.enabled".into(),
+                        optimize.to_string(),
+                    ),
+                    ("metadata.stats-mode".into(), "full".into()),
+                ]));
+            persist_table_schema(table.file_io(), table.location(), table.schema()).await;
+            let reference = if option == "blob-field" {
+                b"raw payload".to_vec()
+            } else {
+                inline_reference(option, 0)
+            };
+            write_batch(&table, &inline_batch(&table, vec![0], &[Some(reference)])).await;
+            let original = inline_rows(&table).await[0].1.clone();
+            let messages = table
+                .new_write_builder()
+                .new_update()
+                .unwrap()
+                .update_by_arrow_with_row_id(vec![matched(
+                    vec![0],
+                    &[("id", vec![1]), ("value", vec![100])],
+                )])
+                .await
+                .unwrap();
+            let file = &messages[0].new_files[0];
+            let expected = if optimize && option == "blob-field" {
+                None
+            } else {
+                Some(vec!["id".to_string(), "value".to_string()])
+            };
+            assert_eq!(file.write_cols, expected);
+            assert_eq!(file.first_row_id, Some(0));
+            commit(&table, messages).await;
+            assert_eq!(inline_rows(&table).await, vec![(1, original, 100)]);
+        }
+    }
+}
+
+#[tokio::test]
+async fn inline_blob_history_restores_layout_after_drop_and_add() {
+    for option in [
+        "blob-descriptor-field",
+        "blob.stored-descriptor-fields",
+        "blob-view-field",
+    ] {
+        let table = inline_blob_table(option).await;
+        let reference = inline_reference(option, 0);
+        write_batch(
+            &table,
+            &inline_batch(&table, vec![0, 1], &[Some(reference.clone()), None]),
+        )
+        .await;
+        let update = table.new_write_builder().new_update().unwrap();
+        commit(
+            &table,
+            update
+                .update_by_arrow_with_row_id(vec![matched(vec![0], &[("value", vec![100])])])
+                .await
+                .unwrap(),
+        )
+        .await;
+        let expected = inline_rows(&table).await;
+        let schema = table
+            .schema()
+            .apply_changes(vec![
+                paimon::spec::SchemaChange::drop_column("payload".into()),
+                paimon::spec::SchemaChange::AddColumn {
+                    field_names: vec!["reference".into()],
+                    data_type: DataType::Blob(paimon::spec::BlobType::new()),
+                    comment: Some("__BLOB_DESCRIPTOR_FIELD".into()),
+                    column_move: None,
+                },
+            ])
+            .unwrap();
+        persist_table_schema(table.file_io(), table.location(), &schema).await;
+        let current = table.copy_with_resolved_schema(schema, "main").unwrap();
+        let historical = current
+            .copy_with_time_travel_strict(HashMap::from([
+                ("scan.snapshot-id".into(), "2".into()),
+                ("read.batch-size".into(), "1".into()),
+            ]))
+            .await
+            .unwrap();
+        assert_eq!(
+            historical.schema().options().get(option).unwrap(),
+            "payload"
+        );
+        assert_eq!(inline_rows(&historical).await, expected);
+        if option == "blob.stored-descriptor-fields" {
+            let snapshot = table
+                .snapshot_manager()
+                .get_latest_snapshot()
+                .await
+                .unwrap()
+                .unwrap();
+            table
+                .tag_manager()
+                .create("before_drop", &snapshot)
+                .await
+                .unwrap();
+            let branches =
+                paimon::table::BranchManager::new(table.file_io().clone(), table.location().into());
+            branches
+                .create_branch_from_tag("dev", "before_drop")
+                .await
+                .unwrap();
+            persist_table_schema(
+                table.file_io(),
+                &branches.branch_path("dev"),
+                current.schema(),
+            )
+            .await;
+            let overridden = table
+                .copy_with_options(HashMap::from([("blob-descriptor-field".into(), "".into())]));
+            let branch = overridden.copy_with_branch("dev").await.unwrap();
+            let history = branch
+                .copy_with_time_travel_strict(HashMap::from([(
+                    "scan.snapshot-id".into(),
+                    "2".into(),
+                )]))
+                .await
+                .unwrap();
+            assert_eq!(inline_rows(&history).await, expected);
+            let resolved = overridden
+                .copy_with_resolved_schema(current.schema().clone(), "main")
+                .unwrap();
+            let history = resolved
+                .copy_with_time_travel_strict(HashMap::from([(
+                    "scan.snapshot-id".into(),
+                    "2".into(),
+                )]))
+                .await
+                .unwrap();
+            assert_eq!(inline_rows(&history).await, expected);
+        }
+        // An explicit alias override keeps the canonical/fallback group from
+        // being restored, including across successive copies.
+        let overridden = current
+            .copy_with_options(HashMap::from([(
+                "blob.stored-descriptor-fields".into(),
+                "".into(),
+            )]))
+            .copy_with_time_travel_strict(HashMap::from([("scan.snapshot-id".into(), "2".into())]))
+            .await
+            .unwrap();
+        assert_eq!(
+            overridden
+                .schema()
+                .options()
+                .get("blob-descriptor-field")
+                .unwrap(),
+            "reference"
+        );
+        assert_eq!(
+            overridden
+                .schema()
+                .options()
+                .get("blob.stored-descriptor-fields")
+                .unwrap(),
+            ""
+        );
+    }
 }
 
 fn matched(row_ids: Vec<i64>, columns: &[(&str, Vec<i32>)]) -> RecordBatch {
@@ -208,7 +654,7 @@ async fn grouped_updates_allow_disjoint_columns_on_the_same_file() {
 }
 
 #[tokio::test]
-async fn overlapping_groups_abort_previously_prepared_columns() {
+async fn overlapping_groups_preserve_previously_prepared_columns() {
     let table = evolution_table().await;
     seed(&table).await;
     let before = parquet_files(&table).await;
@@ -235,7 +681,9 @@ async fn overlapping_groups_abort_previously_prepared_columns() {
             .contains("overlapping first_row_ids by column"),
         "{error}"
     );
-    assert_eq!(parquet_files(&table).await, before);
+    let after = parquet_files(&table).await;
+    assert!(after.len() > before.len());
+    assert!(before.iter().all(|path| after.contains(path)));
     assert_eq!(
         read_rows(&table).await,
         vec![vec![1, 10, 100], vec![2, 20, 200], vec![3, 30, 300]]
@@ -304,6 +752,500 @@ async fn grouped_updates_on_an_empty_table_preserve_empty_input_semantics() {
         .unwrap_err();
     assert!(error.to_string().contains("No files with row tracking"));
     assert!(parquet_files(&table).await.is_empty());
+}
+
+#[tokio::test]
+async fn partial_upsert_updates_matches_and_appends_only_input_columns() {
+    use arrow_array::Array;
+    let table = evolution_table().await;
+    write_batch(
+        &table,
+        &batch(&[
+            ("id", vec![1, 1, 2]),
+            ("value", vec![10, 11, 20]),
+            ("score", vec![100, 101, 200]),
+        ]),
+    )
+    .await;
+    let builder = table.new_write_builder();
+    let mut update = builder.new_update().unwrap();
+    update.with_update_type(vec!["value".into()]).unwrap();
+    let messages = update
+        .upsert_by_arrow_with_key(
+            vec![batch(&[("value", vec![12, 30, 13]), ("id", vec![1, 3, 1])])],
+            vec!["id".into()],
+        )
+        .await
+        .unwrap();
+    for file in messages.iter().flat_map(|message| &message.new_files) {
+        assert!(file
+            .write_cols
+            .as_ref()
+            .unwrap()
+            .iter()
+            .all(|column| column != "score"));
+    }
+    builder.new_commit().commit(messages).await.unwrap();
+    let reader = table.new_read_builder();
+    let plan = reader.new_scan().plan().await.unwrap();
+    let batches: Vec<RecordBatch> = reader
+        .new_read()
+        .unwrap()
+        .to_arrow(plan.splits())
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    let mut rows = Vec::new();
+    for batch in batches {
+        let columns = batch
+            .columns()
+            .iter()
+            .map(|array| array.as_any().downcast_ref::<Int32Array>().unwrap())
+            .collect::<Vec<_>>();
+        for row in 0..batch.num_rows() {
+            rows.push(
+                columns
+                    .iter()
+                    .map(|column| column.is_valid(row).then(|| column.value(row)))
+                    .collect::<Vec<_>>(),
+            );
+        }
+    }
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some(1), Some(13), Some(100)],
+            vec![Some(1), Some(13), Some(101)],
+            vec![Some(2), Some(20), Some(200)],
+            vec![Some(3), Some(30), None],
+        ]
+    );
+}
+
+#[tokio::test]
+async fn heterogeneous_upsert_deduplicates_before_matched_column_validation() {
+    let table = evolution_table().await;
+    seed(&table).await;
+    let mut update = table.new_write_builder().new_update().unwrap();
+    update.with_update_type(vec!["value".into()]).unwrap();
+    let messages = update
+        .upsert_by_arrow_with_key(
+            vec![
+                // Missing update columns on a superseded source row are irrelevant.
+                batch(&[("id", vec![1]), ("score", vec![999])]),
+                // New rows need not contain the matched-row update projection.
+                batch(&[("id", vec![4]), ("score", vec![400])]),
+                batch(&[("id", vec![1]), ("value", vec![111])]),
+            ],
+            vec!["id".into()],
+        )
+        .await
+        .unwrap();
+    let appended = messages
+        .iter()
+        .flat_map(|message| &message.new_files)
+        .filter(|file| {
+            file.write_cols
+                .as_ref()
+                .is_some_and(|cols| cols.contains(&"id".into()))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(appended.len(), 1);
+    assert_eq!(
+        appended[0].write_cols,
+        Some(vec!["id".into(), "score".into()])
+    );
+    commit(&table, messages).await;
+    let reader = table.new_read_builder();
+    let plan = reader.new_scan().plan().await.unwrap();
+    let batches: Vec<RecordBatch> = reader
+        .new_read()
+        .unwrap()
+        .to_arrow(plan.splits())
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    let mut rows = Vec::new();
+    for batch in batches {
+        use arrow_array::Array;
+        let cols = batch
+            .columns()
+            .iter()
+            .map(|array| array.as_any().downcast_ref::<Int32Array>().unwrap())
+            .collect::<Vec<_>>();
+        for row in 0..batch.num_rows() {
+            rows.push(
+                cols.iter()
+                    .map(|col| col.is_valid(row).then(|| col.value(row)))
+                    .collect::<Vec<_>>(),
+            );
+        }
+    }
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some(1), Some(111), Some(100)],
+            vec![Some(2), Some(20), Some(200)],
+            vec![Some(3), Some(30), Some(300)],
+            vec![Some(4), None, Some(400)],
+        ]
+    );
+}
+
+#[tokio::test]
+async fn partial_upsert_requires_update_columns_only_for_matches() {
+    let table = evolution_table().await;
+    seed(&table).await;
+    let mut update = table.new_write_builder().new_update().unwrap();
+    update.with_update_type(vec!["score".into()]).unwrap();
+    let before = parquet_files(&table).await;
+    let error = update
+        .upsert_by_arrow_with_key(
+            vec![batch(&[("id", vec![1]), ("value", vec![99])])],
+            vec!["id".into()],
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("score"));
+    assert_eq!(parquet_files(&table).await, before);
+    // The update selection does not restrict the columns of unmatched rows.
+    let messages = update
+        .upsert_by_arrow_with_key(
+            vec![batch(&[("id", vec![4]), ("value", vec![40])])],
+            vec!["id".into()],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        messages[0].new_files[0].write_cols,
+        Some(vec!["id".into(), "value".into()])
+    );
+    commit(&table, messages).await;
+}
+
+#[tokio::test]
+async fn heterogeneous_upsert_keeps_append_shapes_separate_by_partition() {
+    let path = "memory:/upsert_partition_shapes";
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .column("value", DataType::Int(IntType::new()))
+        .column("score", DataType::Int(IntType::new()))
+        .column("region", DataType::Int(IntType::new()))
+        .partition_keys(["region"])
+        .option("row-tracking.enabled", "true")
+        .option("data-evolution.enabled", "true")
+        .build()
+        .unwrap();
+    let (io, table) = memory_table(path, TableSchema::new(0, &schema));
+    setup_dirs(&io, path).await;
+    persist_table_schema(&io, path, table.schema()).await;
+    write_batch(
+        &table,
+        &batch(&[
+            ("id", vec![1, 1]),
+            ("value", vec![10, 20]),
+            ("score", vec![100, 200]),
+            ("region", vec![1, 2]),
+        ]),
+    )
+    .await;
+    let mut update = table.new_write_builder().new_update().unwrap();
+    update.with_update_type(vec!["value".into()]).unwrap();
+    let messages = update
+        .upsert_by_arrow_with_key(
+            vec![
+                batch(&[
+                    ("region", vec![1, 1]),
+                    ("value", vec![111, 40]),
+                    ("id", vec![1, 4]),
+                ]),
+                batch(&[("id", vec![4]), ("score", vec![400]), ("region", vec![2])]),
+                batch(&[
+                    ("id", vec![1]),
+                    ("value", vec![222]),
+                    ("score", vec![999]),
+                    ("region", vec![2]),
+                ]),
+                batch(&[("id", vec![4]), ("value", vec![41]), ("region", vec![1])]),
+            ],
+            vec!["id".into()],
+        )
+        .await
+        .unwrap();
+    let shapes = messages
+        .iter()
+        .flat_map(|message| &message.new_files)
+        .filter_map(|file| file.write_cols.as_ref())
+        .filter(|columns| columns.contains(&"id".into()))
+        .cloned()
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(
+        shapes,
+        std::collections::HashSet::from([
+            vec!["id".into(), "value".into(), "region".into()],
+            vec!["id".into(), "score".into(), "region".into()],
+        ])
+    );
+    commit(&table, messages).await;
+    let reader = table.new_read_builder();
+    let plan = reader.new_scan().plan().await.unwrap();
+    let batches: Vec<RecordBatch> = reader
+        .new_read()
+        .unwrap()
+        .to_arrow(plan.splits())
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    let mut rows = Vec::new();
+    for batch in batches {
+        use arrow_array::Array;
+        let cols = batch
+            .columns()
+            .iter()
+            .map(|array| array.as_any().downcast_ref::<Int32Array>().unwrap())
+            .collect::<Vec<_>>();
+        for row in 0..batch.num_rows() {
+            rows.push(
+                cols.iter()
+                    .map(|col| col.is_valid(row).then(|| col.value(row)))
+                    .collect::<Vec<_>>(),
+            );
+        }
+    }
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some(1), Some(111), Some(100), Some(1)],
+            vec![Some(1), Some(222), Some(200), Some(2)],
+            vec![Some(4), None, Some(400), Some(2)],
+            vec![Some(4), Some(41), None, Some(1)],
+        ]
+    );
+}
+
+#[tokio::test]
+async fn heterogeneous_upsert_validates_only_surviving_shapes_before_staging() {
+    let table = evolution_table().await;
+    seed(&table).await;
+    let mut update = table.new_write_builder().new_update().unwrap();
+    update.with_update_type(vec!["value".into()]).unwrap();
+    let before = parquet_files(&table).await;
+    for batches in [
+        // The winning matched row must supply the requested update columns.
+        vec![
+            batch(&[("id", vec![1]), ("value", vec![111])]),
+            batch(&[("id", vec![2]), ("score", vec![222])]),
+        ],
+        // Appended rows in one partition cannot silently acquire NULL padding.
+        vec![
+            batch(&[("id", vec![4]), ("value", vec![40])]),
+            batch(&[("id", vec![5]), ("score", vec![500])]),
+        ],
+    ] {
+        assert!(update
+            .upsert_by_arrow_with_key(batches, vec!["id".into()])
+            .await
+            .is_err());
+        assert_eq!(parquet_files(&table).await, before);
+    }
+    let messages = update
+        .upsert_by_arrow_with_key(
+            vec![
+                batch(&[("id", vec![4]), ("value", vec![40])]),
+                batch(&[("id", vec![4]), ("score", vec![400])]),
+            ],
+            vec!["id".into()],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        messages[0].new_files[0].write_cols,
+        Some(vec!["id".into(), "score".into()])
+    );
+    commit(&table, messages).await;
+}
+
+#[tokio::test]
+async fn partial_upsert_rejects_ambiguous_unknown_and_inconsistent_input() {
+    let table = evolution_table().await;
+    seed(&table).await;
+    let before = parquet_files(&table).await;
+    let mut update = table.new_write_builder().new_update().unwrap();
+    update.with_update_type(vec!["value".into()]).unwrap();
+    for batches in [
+        vec![batch(&[
+            ("id", vec![1]),
+            ("id", vec![2]),
+            ("value", vec![99]),
+        ])],
+        vec![batch(&[("id", vec![1]), ("missing", vec![99])])],
+        vec![batch(&[("value", vec![99])])],
+        vec![
+            batch(&[("id", vec![1]), ("value", vec![99])]),
+            batch(&[("id", vec![1]), ("score", vec![99])]),
+        ],
+    ] {
+        assert!(update
+            .upsert_by_arrow_with_key(batches, vec!["id".into()])
+            .await
+            .is_err());
+        assert_eq!(parquet_files(&table).await, before);
+    }
+    let messages = update
+        .upsert_by_arrow_with_key(
+            vec![
+                batch(&[("value", vec![41]), ("id", vec![1])]),
+                batch(&[("id", vec![1]), ("value", vec![42])]),
+            ],
+            vec!["id".into()],
+        )
+        .await
+        .unwrap();
+    commit(&table, messages).await;
+    assert_eq!(
+        read_rows(&table).await,
+        vec![vec![1, 42, 100], vec![2, 20, 200], vec![3, 30, 300]]
+    );
+}
+
+#[tokio::test]
+async fn floating_upsert_keys_preserve_fractions_nulls_and_duplicate_targets() {
+    use arrow_array::{Array, Float32Array, Float64Array};
+    use paimon::spec::{DoubleType, FloatType};
+    for wide in [false, true] {
+        let schema = Schema::builder()
+            .column(
+                "key",
+                if wide {
+                    DataType::Double(DoubleType::new())
+                } else {
+                    DataType::Float(FloatType::new())
+                },
+            )
+            .column("value", DataType::Int(IntType::new()))
+            .column("keep", DataType::Int(IntType::new()))
+            .option("row-tracking.enabled", "true")
+            .option("data-evolution.enabled", "true")
+            .build()
+            .unwrap();
+        let (io, table) = memory_table("memory:/floating_upsert", TableSchema::new(0, &schema));
+        setup_dirs(&io, table.location()).await;
+        persist_table_schema(&io, table.location(), table.schema()).await;
+        let keys = |values: Vec<Option<f64>>| -> ArrayRef {
+            if wide {
+                Arc::new(Float64Array::from(values))
+            } else {
+                Arc::new(Float32Array::from(
+                    values
+                        .into_iter()
+                        .map(|value| value.map(|v| v as f32))
+                        .collect::<Vec<_>>(),
+                ))
+            }
+        };
+        let original = RecordBatch::try_from_iter([
+            ("key", keys(vec![Some(-1.25), Some(-1.25), None, Some(1.5)])),
+            (
+                "value",
+                Arc::new(Int32Array::from(vec![10, 11, 20, 30])) as ArrayRef,
+            ),
+            (
+                "keep",
+                Arc::new(Int32Array::from(vec![1, 2, 3, 4])) as ArrayRef,
+            ),
+        ])
+        .unwrap();
+        write_batch(&table, &original).await;
+        let input = RecordBatch::try_from_iter([
+            (
+                "key",
+                keys(vec![None, Some(-1.25), Some(2.75), Some(-1.25)]),
+            ),
+            (
+                "value",
+                Arc::new(Int32Array::from(vec![21, 12, 40, 13])) as ArrayRef,
+            ),
+        ])
+        .unwrap();
+        let mut update = table.new_write_builder().new_update().unwrap();
+        update.with_update_type(vec!["value".into()]).unwrap();
+        commit(
+            &table,
+            update
+                .upsert_by_arrow_with_key(vec![input], vec!["key".into()])
+                .await
+                .unwrap(),
+        )
+        .await;
+        let reader = table.new_read_builder();
+        let plan = reader.new_scan().plan().await.unwrap();
+        let batches: Vec<RecordBatch> = reader
+            .new_read()
+            .unwrap()
+            .to_arrow(plan.splits())
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let mut actual = Vec::new();
+        for batch in batches {
+            let value = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let keep = batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            for row in 0..batch.num_rows() {
+                let key = if batch.column(0).is_null(row) {
+                    None
+                } else if wide {
+                    Some(
+                        batch
+                            .column(0)
+                            .as_any()
+                            .downcast_ref::<Float64Array>()
+                            .unwrap()
+                            .value(row),
+                    )
+                } else {
+                    Some(f64::from(
+                        batch
+                            .column(0)
+                            .as_any()
+                            .downcast_ref::<Float32Array>()
+                            .unwrap()
+                            .value(row),
+                    ))
+                };
+                actual.push((
+                    key,
+                    value.value(row),
+                    keep.is_valid(row).then(|| keep.value(row)),
+                ));
+            }
+        }
+        actual.sort_by_key(|row| row.1);
+        assert_eq!(
+            actual,
+            vec![
+                (Some(-1.25), 13, Some(1)),
+                (Some(-1.25), 13, Some(2)),
+                (None, 21, Some(3)),
+                (Some(1.5), 30, Some(4)),
+                (Some(2.75), 40, None),
+            ]
+        );
+    }
 }
 
 #[tokio::test]
@@ -504,7 +1446,61 @@ async fn row_id_factory_shares_snapshot_and_selects_columns_per_call() {
 }
 
 #[tokio::test]
-async fn grouped_input_failure_aborts_files_and_preserves_the_cause() {
+async fn row_id_abort_preserves_prepared_and_published_updates() {
+    for published in [false, true] {
+        let table = evolution_table().await;
+        seed(&table).await;
+        let builder = table.new_write_builder();
+        let update = builder.new_update().unwrap();
+        let mut updater = update.new_update_by_row_id().await.unwrap();
+        let messages = updater
+            .update_columns(
+                vec![matched(vec![0], &[("value", vec![11])])],
+                vec!["value".into()],
+            )
+            .await
+            .unwrap();
+        let prepared_files = parquet_files(&table).await;
+        let snapshot_id = table
+            .snapshot_manager()
+            .get_latest_snapshot()
+            .await
+            .unwrap()
+            .unwrap()
+            .id();
+        if published {
+            builder.new_commit().commit(messages.clone()).await.unwrap();
+        }
+        updater.abort().await.unwrap();
+        updater.abort().await.unwrap();
+        assert!(updater.commit_messages().is_empty());
+        assert_eq!(parquet_files(&table).await, prepared_files);
+        if !published {
+            assert_eq!(
+                table
+                    .snapshot_manager()
+                    .get_latest_snapshot()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .id(),
+                snapshot_id
+            );
+            assert_eq!(
+                read_rows(&table).await,
+                vec![vec![1, 10, 100], vec![2, 20, 200], vec![3, 30, 300]]
+            );
+            builder.new_commit().commit(messages).await.unwrap();
+        }
+        assert_eq!(
+            read_rows(&table).await,
+            vec![vec![1, 11, 100], vec![2, 20, 200], vec![3, 30, 300]]
+        );
+    }
+}
+
+#[tokio::test]
+async fn grouped_input_failure_preserves_files_and_the_cause() {
     let table = evolution_table().await;
     seed(&table).await;
     let before = parquet_files(&table).await;
@@ -520,7 +1516,9 @@ async fn grouped_input_failure_aborts_files_and_preserves_the_cause() {
         .await
         .unwrap_err();
     assert!(error.to_string().contains("input generator failed"));
-    assert_eq!(parquet_files(&table).await, before);
+    let after = parquet_files(&table).await;
+    assert!(after.len() > before.len());
+    assert!(before.iter().all(|path| after.contains(path)));
     assert_eq!(
         read_rows(&table).await,
         vec![vec![1, 10, 100], vec![2, 20, 200], vec![3, 30, 300]]
@@ -700,7 +1698,7 @@ async fn predicate_array_assignments_span_file_groups() {
 }
 
 #[tokio::test]
-async fn predicate_callback_failure_aborts_earlier_group_files() {
+async fn predicate_callback_failure_preserves_earlier_group_files() {
     use paimon::table::UpdateAssignment;
     use std::sync::atomic::{AtomicUsize, Ordering};
     let table = evolution_table().await;
@@ -736,7 +1734,9 @@ async fn predicate_callback_failure_aborts_earlier_group_files() {
         .unwrap_err();
     assert!(error.to_string().contains("second callback failed"));
     assert_eq!(calls.load(Ordering::SeqCst), 2);
-    assert_eq!(parquet_files(&table).await, before);
+    let after = parquet_files(&table).await;
+    assert!(after.len() > before.len());
+    assert!(before.iter().all(|path| after.contains(path)));
 }
 
 #[tokio::test]
@@ -1015,7 +2015,6 @@ async fn row_id_nested_overlap_uses_leaf_identity_across_calls() {
     .unwrap();
     let child = matched(vec![1], &[("profile.a", vec![22])]);
     let update = table.new_write_builder().new_update().unwrap();
-    let original_files = parquet_files(&table).await;
     for reverse in [false, true] {
         let mut updater = update.new_update_by_row_id().await.unwrap();
         let calls = if reverse {
@@ -1037,7 +2036,7 @@ async fn row_id_nested_overlap_uses_leaf_identity_across_calls() {
         assert_eq!(updater.commit_messages().len(), messages);
         assert_eq!(parquet_files(&table).await, staged_files);
         updater.abort().await.unwrap();
-        assert_eq!(parquet_files(&table).await, original_files);
+        assert_eq!(parquet_files(&table).await, staged_files);
     }
     // Disjoint sibling leaves of the same file group remain valid.
     let mut updater = update.new_update_by_row_id().await.unwrap();

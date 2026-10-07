@@ -148,7 +148,9 @@ impl DataEvolutionWriter {
             });
         }
         let partition_keys = schema.partition_keys();
-        let blob_descriptor_fields = core_options.blob_descriptor_fields();
+        // Java CoreOptions.updatableBlobFields() includes descriptor and view
+        // fields, both of which store their references in normal data files.
+        let updatable_blob_fields = core_options.blob_inline_fields();
         for col in &update_columns {
             let top_level = DataEvolutionPartialWriter::top_level_write_name(col, schema.fields());
             if !allow_partition_columns && partition_keys.iter().any(|key| key == top_level) {
@@ -157,11 +159,13 @@ impl DataEvolutionWriter {
                 });
             }
             if let Some(field) = schema.fields().iter().find(|f| f.name() == top_level) {
-                if field.data_type().is_blob_type() && !blob_descriptor_fields.contains(top_level) {
+                if field.data_type().is_blob_file_field()
+                    && !updatable_blob_fields.contains(top_level)
+                {
                     return Err(crate::Error::Unsupported {
                         message: format!(
                             "Cannot update raw-data BLOB column '{col}' in MERGE INTO. \
-                             Only BLOB columns listed in 'blob-descriptor-field' can be updated"
+                             Only inline BLOB columns listed in 'blob-descriptor-field' or 'blob-view-field' can be updated"
                         ),
                     });
                 }
@@ -322,10 +326,10 @@ impl DataEvolutionWriter {
         // Rewriting an inline Blob column must preserve references for rows
         // without an update. Resolving them would replace descriptors with
         // payload bytes and unnecessarily require the external files to exist.
-        let read_table = index.read_table.copy_with_options(HashMap::from([(
-            "blob-as-descriptor".to_string(),
-            "true".to_string(),
-        )]));
+        let read_table = index.read_table.copy_with_options(HashMap::from([
+            ("blob-as-descriptor".to_string(), "true".to_string()),
+            ("blob-view.resolve.enabled".to_string(), "false".to_string()),
+        ]));
         let file_index = &index.files;
         if file_index.is_empty() {
             return Err(crate::Error::DataInvalid {
@@ -655,6 +659,8 @@ impl DataEvolutionDeleteWriter {
                 Ok(Some(message)) => messages.push(message),
                 Ok(None) => {}
                 Err(error) => {
+                    // Earlier outputs are private to this preparation; nothing
+                    // has been returned to a caller or submitted for commit.
                     let _ = self
                         .table
                         .new_write_builder()
@@ -1347,6 +1353,7 @@ struct PartialWriteSet {
     file_format: String,
     write_fields: Vec<DataField>,
     write_columns: Vec<String>,
+    omit_write_cols: bool,
     column_indices: Vec<usize>,
     schema: Arc<arrow_schema::Schema>,
     file_index_options: Option<Arc<FileIndexOptions>>,
@@ -1471,6 +1478,11 @@ impl DataEvolutionPartialWriter {
                 target_file_size: core_options.target_file_size(),
                 file_format: core_options.file_format().to_string(),
                 write_fields: normal_fields,
+                omit_write_cols: super::data_evolution_fields::can_omit_normal_write_cols(
+                    fields,
+                    &normal_columns,
+                    core_options,
+                ),
                 write_columns: normal_columns,
                 column_indices: normal_indices,
                 schema,
@@ -1487,6 +1499,7 @@ impl DataEvolutionPartialWriter {
                 file_format: format!("vector.{vector_file_format}"),
                 write_fields: vector_fields,
                 write_columns: vector_columns,
+                omit_write_cols: false,
                 column_indices: vector_indices,
                 schema,
                 file_index_options: None,
@@ -1556,9 +1569,18 @@ impl DataEvolutionPartialWriter {
                     self.format_options.clone(),
                     Some(0), // file_source: APPEND
                     Some(first_row_id),
-                    Some(write_set.write_columns.clone()),
+                    (!write_set.omit_write_cols).then(|| write_set.write_columns.clone()),
                 )?
                 .with_file_index(write_set.file_index_options.clone());
+                let writer = if self
+                    .write_sets
+                    .iter()
+                    .any(|set| set.kind == PartialFileKind::Vector)
+                {
+                    writer.without_row_sidecar()
+                } else {
+                    writer
+                };
                 self.writers.insert(key.clone(), writer);
             }
 

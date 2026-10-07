@@ -24,8 +24,12 @@ pub(crate) mod bin_pack;
 mod bitmap_global_index_format;
 mod bitmap_global_index_reader;
 mod bitmap_global_index_writer;
+#[cfg(test)]
+mod blob_consumer_tests;
 mod blob_resolver;
 mod branch_manager;
+#[cfg(test)]
+mod branch_write_tests;
 mod bucket_assigner;
 mod bucket_assigner_constant;
 mod bucket_assigner_cross;
@@ -65,6 +69,8 @@ mod format_write_builder;
 #[cfg(feature = "fulltext")]
 mod full_text_index_adapter;
 #[cfg(feature = "fulltext")]
+mod full_text_index_build_builder;
+#[cfg(feature = "fulltext")]
 mod full_text_search_builder;
 pub(crate) mod global_index_build_common;
 mod global_index_drop_builder;
@@ -82,6 +88,8 @@ mod managed_blob_reference;
 #[cfg(test)]
 mod managed_blob_table_tests;
 mod managed_blob_writer;
+#[cfg(test)]
+mod map_shredding_write_tests;
 pub(crate) mod merge_tree_split_generator;
 #[cfg(test)]
 mod mosaic_table_write_tests;
@@ -111,14 +119,17 @@ mod postpone_file_writer;
 mod postpone_fixed_bucket_router;
 mod postpone_fixed_bucket_write;
 mod postpone_fixed_bucket_write_builder;
+mod postpone_retract;
 mod prepared_files;
 mod query_auth;
 mod read_builder;
+mod read_limit;
 pub mod referenced_files;
 pub(crate) mod rest_env;
 pub(crate) mod row_id_predicate;
 mod row_kind_generator;
 mod row_position_selection;
+mod row_sidecar;
 mod scan_trace;
 pub(crate) mod schema_manager;
 pub(crate) mod snapshot_commit;
@@ -168,6 +179,8 @@ pub use format_partition::{
 };
 pub use format_partition_stats::FormatTablePartitionStatsCollector;
 pub use format_partition_truncate::FormatTableTruncator;
+#[cfg(feature = "fulltext")]
+pub use full_text_index_build_builder::FullTextIndexBuildBuilder;
 #[cfg(feature = "fulltext")]
 pub use full_text_search_builder::FullTextSearchBuilder;
 use futures::stream::BoxStream;
@@ -224,7 +237,7 @@ use crate::spec::{
     SCAN_TIMESTAMP_MILLIS_OPTION, SCAN_TIMESTAMP_OPTION, SCAN_VERSION_OPTION,
     SCAN_WATERMARK_OPTION,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Table represents a table in the catalog.
 #[derive(Debug, Clone)]
@@ -247,6 +260,8 @@ pub struct Table {
     /// options, so scans don't have to resolve the same selector again.
     /// Cleared when [`Table::copy_with_options`] changes the selector.
     travel_snapshot: Option<Snapshot>,
+    /// Explicit options remain overrides across later time-travel copies.
+    applied_dynamic_option_keys: HashSet<String>,
 }
 
 impl Table {
@@ -272,6 +287,7 @@ impl Table {
             rest_env,
             time_traveled: false,
             travel_snapshot: None,
+            applied_dynamic_option_keys: HashSet::new(),
         }
     }
 
@@ -281,7 +297,8 @@ impl Table {
     /// invariants are validated — primary-key/partition columns must exist and
     /// field names/ids must be unique — so a malformed external schema is
     /// rejected here instead of panicking or reading the wrong column later. The
-    /// branch only selects the branch-scoped managers used by subsequent reads.
+    /// branch selects the metadata managers for subsequent reads and writes.
+    /// Filesystem writes require the supplied schema to exist in that branch.
     pub fn from_resolved_schema(
         file_io: FileIO,
         identifier: Identifier,
@@ -313,6 +330,7 @@ impl Table {
             rest_env: None,
             time_traveled: false,
             travel_snapshot: None,
+            applied_dynamic_option_keys: HashSet::new(),
         })
     }
 
@@ -519,6 +537,14 @@ impl Table {
         BatchVectorSearchBuilder::new(self)
     }
 
+    /// Create a builder for `full-text` global index files.
+    ///
+    /// Reference: [NativeFullTextGlobalIndexWriter](https://github.com/apache/paimon/blob/master/paimon-full-text/src/main/java/org/apache/paimon/fulltext/index/NativeFullTextGlobalIndexWriter.java)
+    #[cfg(feature = "fulltext")]
+    pub fn new_full_text_index_build_builder(&self) -> FullTextIndexBuildBuilder<'_> {
+        FullTextIndexBuildBuilder::new(self)
+    }
+
     pub fn new_lumina_index_build_builder(&self) -> LuminaIndexBuildBuilder<'_> {
         LuminaIndexBuildBuilder::new(self)
     }
@@ -560,6 +586,8 @@ impl Table {
     /// [`Table::copy_with_time_travel`] when the options may select a
     /// historical snapshot whose schema should be used for reading.
     pub fn copy_with_options(&self, extra: HashMap<String, String>) -> Self {
+        let mut applied_dynamic_option_keys = self.applied_dynamic_option_keys.clone();
+        applied_dynamic_option_keys.extend(extra.keys().cloned());
         // Changing the time-travel selector invalidates the resolved snapshot
         // (a time-travelled schema then has no matching snapshot anymore, and
         // scans of such a copy fail until `copy_with_time_travel` re-resolves
@@ -583,6 +611,7 @@ impl Table {
             query_auth_session: self.query_auth_session,
             rest_env: self.rest_env.clone(),
             time_traveled: self.time_traveled,
+            applied_dynamic_option_keys,
             travel_snapshot: if selector_changed {
                 None
             } else {
@@ -617,6 +646,7 @@ impl Table {
             travel_snapshot: None,
             // Not the schema the catalog loaded, so not a handle it authorizes.
             query_auth_session: None,
+            applied_dynamic_option_keys: HashSet::new(),
             ..self.clone()
         })
     }
@@ -630,11 +660,9 @@ impl Table {
     pub(crate) async fn copy_with_resolved_snapshot(&self, snapshot: &Snapshot) -> Result<Self> {
         let mut table = self.copy_with_pinned_snapshot(snapshot);
         if snapshot.schema_id() != self.schema.id() {
-            table.schema = self
-                .schema_manager
-                .schema(snapshot.schema_id())
-                .await?
-                .copy_with_replaced_options(table.schema.options().clone());
+            let schema = self.schema_manager.schema(snapshot.schema_id()).await?;
+            let options = table.historical_field_options(&schema);
+            table.schema = schema.copy_with_replaced_options(options);
         }
         Ok(table)
     }
@@ -678,7 +706,8 @@ impl Table {
     /// (`scan.version` / `scan.timestamp-millis` / `scan.timestamp` / `scan.watermark` /
     /// `scan.snapshot-id` / `scan.tag-name`) that resolves to a snapshot, the
     /// table's fields and keys come from that snapshot's schema while the
-    /// options stay the merged ones (Java `TableSchema.copy(newOptions)`).
+    /// runtime options stay merged. Column declarations follow the historical
+    /// schema unless explicitly overridden, as in Java.
     /// Like Java, resolution failures fall back silently to the current
     /// schema (the `if let Ok` below swallows them); an invalid selector
     /// still fails later at scan planning.
@@ -779,13 +808,44 @@ impl Table {
         if let Some(snapshot) = snapshot {
             if snapshot.schema_id() != table.schema.id() {
                 let snapshot_schema = table.schema_manager.schema(snapshot.schema_id()).await?;
-                table.schema =
-                    snapshot_schema.copy_with_replaced_options(table.schema.options().clone());
+                let options = table.historical_field_options(&snapshot_schema);
+                table.schema = snapshot_schema.copy_with_replaced_options(options);
                 table.time_traveled = true;
             }
             table.travel_snapshot = Some(snapshot);
         }
         Ok(table)
+    }
+
+    fn historical_field_options(&self, historical_schema: &TableSchema) -> HashMap<String, String> {
+        use crate::spec::{
+            BLOB_DESCRIPTOR_FIELD_FALLBACK, BLOB_DESCRIPTOR_FIELD_OPTION, BLOB_FIELD_OPTION,
+            BLOB_VIEW_FIELD_OPTION,
+        };
+        let mut options = self.schema.options().clone();
+        // Canonical and fallback keys form one override group in Java
+        // AbstractFileStoreTable.excludeCurrentSchemaFieldOptions.
+        for keys in [
+            &["vector-field"][..],
+            &[BLOB_FIELD_OPTION][..],
+            &[BLOB_DESCRIPTOR_FIELD_OPTION, BLOB_DESCRIPTOR_FIELD_FALLBACK][..],
+            &[BLOB_VIEW_FIELD_OPTION][..],
+        ] {
+            if keys
+                .iter()
+                .any(|key| self.applied_dynamic_option_keys.contains(*key))
+            {
+                continue;
+            }
+            for key in keys {
+                if let Some(value) = historical_schema.options().get(*key) {
+                    options.insert((*key).to_string(), value.clone());
+                } else {
+                    options.remove(*key);
+                }
+            }
+        }
+        options
     }
 
     pub async fn copy_with_branch(&self, branch_name: &str) -> Result<Self> {
@@ -802,6 +862,30 @@ impl Table {
             validate_branch_name(branch_name)?;
             branch_name.to_string()
         };
+        if let Some(env) = &self.rest_env {
+            // Catalog branches may have no schema directory in the data store.
+            // Load their schema, identity and FileIO through the same catalog.
+            let identifier = env.identifier().with_branch(&branch)?;
+            let mut table = env.get_table(&identifier).await?;
+            if table.location() != self.location()
+                || table
+                    .rest_env
+                    .as_ref()
+                    .is_none_or(|branch_env| branch_env.uuid() != env.uuid())
+            {
+                return Err(crate::Error::DataInvalid {
+                    message: format!(
+                        "Branch '{branch}' no longer belongs to the loaded table '{}'; reload the table before switching branches",
+                        self.identifier.full_name()
+                    ),
+                    source: None,
+                });
+            }
+            let mut options = table.schema.options().clone();
+            options.insert("branch".to_string(), branch);
+            table.schema = table.schema.copy_with_replaced_options(options);
+            return Ok(table);
+        }
         let schema_manager = if branch == DEFAULT_MAIN_BRANCH {
             SchemaManager::new(self.file_io.clone(), self.location.clone())
         } else {
@@ -828,6 +912,7 @@ impl Table {
             rest_env: self.rest_env.clone(),
             time_traveled: false,
             travel_snapshot: None,
+            applied_dynamic_option_keys: HashSet::new(),
         })
     }
 

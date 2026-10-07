@@ -165,6 +165,18 @@ impl Identifier {
             .unwrap_or_else(|| DEFAULT_MAIN_BRANCH.to_string()))
     }
 
+    /// Java's Identifier(database, tableName, branch) for branch-scoped metadata.
+    pub(crate) fn with_branch(&self, branch: &str) -> Result<Self> {
+        validate_branch_name(branch)?;
+        let table = self.parsed_object_name()?.table;
+        let object = if branch == DEFAULT_MAIN_BRANCH {
+            table
+        } else {
+            format!("{table}$branch_{branch}")
+        };
+        Ok(Self::new(self.database(), object))
+    }
+
     pub fn system_table_name(&self) -> Result<Option<String>> {
         Ok(self.parsed_object_name()?.system_table)
     }

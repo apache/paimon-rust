@@ -58,11 +58,21 @@ impl VariantFieldMetadata {
     }
 }
 
-pub fn build_variant_metadata(path: &str, fail_on_error: bool, time_zone_id: &str) -> String {
-    let metadata = VariantFieldMetadata::new(path, fail_on_error, time_zone_id);
-    let json = serde_json::to_string(&metadata)
-        .expect("Variant metadata serialization should not fail for string and bool fields");
-    format!("{VARIANT_METADATA_KEY}{json}")
+pub fn build_variant_metadata(
+    path: &str,
+    fail_on_error: bool,
+    time_zone_id: &str,
+) -> Result<String> {
+    if path.contains(VARIANT_METADATA_DELIMITER) {
+        return Err(Error::ConfigInvalid {
+            message: format!(
+                "Variant extraction path must not contain '{VARIANT_METADATA_DELIMITER}': {path}"
+            ),
+        });
+    }
+    Ok(format!(
+        "{VARIANT_METADATA_KEY}{path}{VARIANT_METADATA_DELIMITER}{fail_on_error}{VARIANT_METADATA_DELIMITER}{time_zone_id}"
+    ))
 }
 
 pub fn parse_variant_metadata(description: &str) -> Result<VariantFieldMetadata> {
@@ -82,10 +92,10 @@ pub fn parse_variant_metadata(description: &str) -> Result<VariantFieldMetadata>
         return Ok(metadata);
     }
 
-    parse_legacy_variant_metadata(raw)
+    parse_java_variant_metadata(raw)
 }
 
-fn parse_legacy_variant_metadata(raw: &str) -> Result<VariantFieldMetadata> {
+fn parse_java_variant_metadata(raw: &str) -> Result<VariantFieldMetadata> {
     let mut parts = raw.split(VARIANT_METADATA_DELIMITER);
     let path = parts.next().unwrap_or_default();
     let fail_on_error = parts.next().ok_or_else(|| Error::DataInvalid {
@@ -147,27 +157,33 @@ pub fn is_variant_extraction_row(row_type: &RowType) -> bool {
 pub fn variant_extraction_row(
     nullable: bool,
     extractions: impl IntoIterator<Item = (DataType, String, bool, String)>,
-) -> RowType {
+) -> Result<RowType> {
     let fields = extractions
         .into_iter()
         .enumerate()
         .map(|(idx, (data_type, path, fail_on_error, time_zone_id))| {
-            DataField::new(idx as i32, idx.to_string(), data_type).with_description(Some(
-                build_variant_metadata(&path, fail_on_error, &time_zone_id),
-            ))
+            Ok(
+                DataField::new(idx as i32, idx.to_string(), data_type).with_description(Some(
+                    build_variant_metadata(&path, fail_on_error, &time_zone_id)?,
+                )),
+            )
         })
-        .collect();
-    RowType::with_nullable(nullable, fields)
+        .collect::<Result<Vec<_>>>()?;
+    Ok(RowType::with_nullable(nullable, fields))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::spec::{DataType, IntType, VarCharType};
+    use crate::spec::{DataType, FloatType, IntType, VarCharType};
+
+    // Serialized by Java RowType.serializeJson with VariantMetadataUtils descriptions.
+    const JAVA_READ_TYPE_JSON: &str = r#"{"type":"ROW","fields":[{"id":7,"name":"payload","type":{"type":"ROW","fields":[{"id":0,"name":"0","type":"FLOAT","description":"__VARIANT_METADATA$.x;false;Asia/Shanghai"},{"id":1,"name":"1","type":"FLOAT","description":"__VARIANT_METADATA$.y;true;UTC"}]}}]}"#;
 
     #[test]
     fn parses_variant_metadata_description() {
-        let description = build_variant_metadata("$.a", false, "UTC");
+        let description = build_variant_metadata("$.a", false, "UTC").unwrap();
+        assert_eq!(description, "__VARIANT_METADATA$.a;false;UTC");
         let metadata = parse_variant_metadata(&description).unwrap();
         assert_eq!(metadata.path(), "$.a");
         assert!(!metadata.fail_on_error());
@@ -175,21 +191,77 @@ mod tests {
     }
 
     #[test]
-    fn parses_variant_metadata_description_with_delimiters() {
-        let description = build_variant_metadata("$.a;b", true, "UTC;8");
-        let metadata = parse_variant_metadata(&description).unwrap();
+    fn parses_previous_json_variant_metadata_description() {
+        let description =
+            r#"__VARIANT_METADATA{"path":"$.a;b","failOnError":true,"timeZoneId":"UTC"}"#;
+        let metadata = parse_variant_metadata(description).unwrap();
         assert_eq!(metadata.path(), "$.a;b");
         assert!(metadata.fail_on_error());
-        assert_eq!(metadata.time_zone_id(), "UTC;8");
+        assert_eq!(metadata.time_zone_id(), "UTC");
     }
 
     #[test]
-    fn parses_legacy_variant_metadata_description() {
+    fn rejects_path_with_java_delimiter() {
+        assert!(build_variant_metadata("$.a;b", true, "UTC")
+            .unwrap_err()
+            .to_string()
+            .contains("must not contain ';'"));
+    }
+
+    #[test]
+    fn parses_java_variant_metadata_description() {
         let description = format!("{VARIANT_METADATA_KEY}$.a;false;UTC");
         let metadata = parse_variant_metadata(&description).unwrap();
         assert_eq!(metadata.path(), "$.a");
         assert!(!metadata.fail_on_error());
         assert_eq!(metadata.time_zone_id(), "UTC");
+    }
+
+    #[test]
+    fn java_read_type_json_round_trips_through_rust() {
+        let java_row: RowType = serde_json::from_str(JAVA_READ_TYPE_JSON).unwrap();
+        let DataType::Row(variant_row) = java_row.fields()[0].data_type() else {
+            panic!("expected Variant extraction row");
+        };
+        let metadata = variant_row
+            .fields()
+            .iter()
+            .map(|field| parse_variant_metadata(field.description().unwrap()).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            metadata[0],
+            VariantFieldMetadata::new("$.x", false, "Asia/Shanghai")
+        );
+        assert_eq!(metadata[1], VariantFieldMetadata::new("$.y", true, "UTC"));
+
+        let rust_row = RowType::new(vec![DataField::new(
+            7,
+            "payload".to_string(),
+            DataType::Row(
+                variant_extraction_row(
+                    true,
+                    [
+                        (
+                            DataType::Float(FloatType::new()),
+                            "$.x".to_string(),
+                            false,
+                            "Asia/Shanghai".to_string(),
+                        ),
+                        (
+                            DataType::Float(FloatType::new()),
+                            "$.y".to_string(),
+                            true,
+                            "UTC".to_string(),
+                        ),
+                    ],
+                )
+                .unwrap(),
+            ),
+        )]);
+        assert_eq!(
+            serde_json::to_value(rust_row).unwrap(),
+            serde_json::from_str::<serde_json::Value>(JAVA_READ_TYPE_JSON).unwrap()
+        );
     }
 
     #[test]
@@ -210,7 +282,8 @@ mod tests {
                     "UTC".to_string(),
                 ),
             ],
-        );
+        )
+        .unwrap();
         assert!(is_variant_extraction_row(&row));
         assert!(is_variant_extraction_row_type(&DataType::Row(row)));
     }

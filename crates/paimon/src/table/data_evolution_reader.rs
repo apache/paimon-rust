@@ -22,6 +22,7 @@ use super::data_file_reader::{
     append_null_row_id_column, attach_row_id, expand_selected_row_ids,
     file_index_selection_to_local_ranges, insert_column_at, DataFileReadTiming, DataFileReader,
 };
+use super::read_limit::take_limited_batch;
 use crate::arrow::format::blob::DEFAULT_BLOB_READ_PARALLELISM;
 use crate::arrow::format::FilePredicates;
 use crate::arrow::format::MosaicPrefetchOptions;
@@ -34,7 +35,7 @@ use crate::spec::{
     BlobDescriptor, BlobViewStruct, CoreOptions, DataField, DataFileMeta, DataType, Predicate,
     ROW_ID_FIELD_NAME,
 };
-use crate::table::dedicated_format_file_writer::is_blob_file_name;
+use crate::table::dedicated_format_file_writer::is_blob_or_video_file_name;
 use crate::table::schema_manager::SchemaManager;
 use crate::table::source::any_range_overlaps_file;
 use crate::table::stats_filter::group_by_overlapping_row_id;
@@ -139,15 +140,6 @@ pub(crate) struct DataEvolutionReader {
     table_options: Arc<HashMap<String, String>>,
     mosaic_prefetch: MosaicPrefetchOptions,
     read_timing: Option<Arc<DataFileReadTiming>>,
-}
-
-fn take_limited_batch(batch: RecordBatch, remaining: &mut Option<usize>) -> RecordBatch {
-    let Some(left) = remaining else {
-        return batch;
-    };
-    let taken = batch.num_rows().min(*left);
-    *left -= taken;
-    batch.slice(0, taken)
 }
 
 impl DataEvolutionReader {
@@ -280,7 +272,7 @@ impl DataEvolutionReader {
                 split
                     .data_files()
                     .iter()
-                    .any(|file| is_blob_file_name(&file.file_name))
+                    .any(|file| is_blob_or_video_file_name(&file.file_name))
             })
             // A legacy raw file without first_row_id cannot be addressed by
             // the preselection's global row ranges. Keep its existing read
@@ -451,7 +443,8 @@ impl DataEvolutionReader {
             // LIMIT reads resolve views only after the surviving batch has
             // been selected. Eagerly scanning every split here can fail on a
             // reference beyond the quota and load unrelated upstream blobs.
-            let mut blob_view_lookup = if self.limit.is_some() && resolve_blob_views {
+            let mut blob_view_lookup = if resolve_blob_views && (self.limit.is_some() || splits.iter().any(|split|
+                split.data_files().iter().any(|file| file.extra_files.iter().any(|name| name.ends_with(".row"))))) {
                 Some(BlobViewLookup::default())
             } else {
                 self.preload_blob_view_lookup(&splits, filter_before_blob_resolution)
@@ -533,7 +526,8 @@ impl DataEvolutionReader {
                             .await?;
 
                             let has_row_id = file_meta.first_row_id.is_some();
-                            let mut effective_row_ranges = if has_row_id { row_ranges.clone() } else { None };
+                            let requested_row_ranges = if has_row_id { row_ranges.clone() } else { None };
+                            let mut effective_row_ranges = requested_row_ranges.clone();
                             if read_raw_file_index {
                                 // Independent files can apply a physical row selection
                                 // before decoding. Column-merge groups cannot: an older
@@ -615,12 +609,13 @@ impl DataEvolutionReader {
                                         .data_evolution_nested_field_enabled()
                                         || file_schema_nested_enabled,
                                 )
-                                .read_single_file_stream(
+                                .read_single_file_stream_with_requested_ranges(
                                 &split,
                                 file_meta,
                                 data_fields,
                                 deletion_vector,
                                 effective_row_ranges,
+                                requested_row_ranges,
                             )?;
                             while remaining != Some(0) {
                                 let Some(batch) = stream.next().await else { break };
@@ -703,6 +698,7 @@ impl DataEvolutionReader {
                             &split,
                             &prepared_group,
                             effective_row_ranges,
+                            row_ranges.clone(),
                             expected_output_rows,
                             anchor_deletion_vector,
                         )?;
@@ -772,7 +768,13 @@ impl DataEvolutionReader {
     /// trailing.
     fn project_output(&self, filtered: RecordBatch) -> crate::Result<RecordBatch> {
         let final_width = self.output_schema.fields().len();
-        if filtered.num_columns() == final_width {
+        if filtered.num_columns() == final_width
+            && !filtered
+                .schema()
+                .fields()
+                .iter()
+                .any(|field| super::row_sidecar::is_blob_data(field))
+        {
             return Ok(filtered);
         }
         let columns = filtered.columns()[..final_width].to_vec();
@@ -811,14 +813,12 @@ impl DataEvolutionReader {
             return self.project_output(batch);
         }
 
-        if self.limit.is_some() {
-            if let (Some(lookup), Some(rest_env)) =
-                (blob_view_lookup.as_mut(), self.blob_view_rest_env.clone())
-            {
-                lookup
-                    .load_missing(rest_env, &batch, &self.blob_view_fields)
-                    .await?;
-            }
+        if let (Some(lookup), Some(rest_env)) =
+            (blob_view_lookup.as_mut(), self.blob_view_rest_env.clone())
+        {
+            lookup
+                .load_missing(rest_env, &batch, &self.blob_view_fields)
+                .await?;
         }
         batch = self.resolve_blob_view_columns(batch, blob_view_lookup.as_ref())?;
         let mut batch = if !self.blob_as_descriptor && !descriptor_fields.is_empty() {
@@ -896,7 +896,12 @@ impl DataEvolutionReader {
                 Vec::new()
             },
             true,
-            HashSet::new(),
+            // View structs are physically inline even during the unresolved
+            // prescan. They must come from normal Parquet column providers.
+            self.blob_view_fields
+                .union(&self.blob_descriptor_fields)
+                .cloned()
+                .collect(),
             HashSet::new(),
             false,
             None,
@@ -945,6 +950,7 @@ impl DataEvolutionReader {
         split: &DataSplit,
         prepared_group: &PreparedMergeGroup,
         row_ranges: Option<Vec<RowRange>>,
+        requested_row_ranges: Option<Vec<RowRange>>,
         expected_output_rows: usize,
         anchor_deletion_vector: Option<DeletionVectorContext>,
     ) -> crate::Result<ArrowRecordBatchStream> {
@@ -964,7 +970,8 @@ impl DataEvolutionReader {
         // whose values would be transformed by resolution.
         let read_type = self.wide_file_read_type.clone();
         let table_fields = self.table_fields.clone();
-        let blob_descriptor_fields = self.blob_descriptor_fields.clone();
+        let mut blob_inline_fields = self.blob_descriptor_fields.clone();
+        blob_inline_fields.extend(self.blob_view_fields.iter().cloned());
         let blob_as_descriptor = self.blob_as_descriptor;
         let blob_parallelism = self.blob_parallelism;
         let batch_size = self.effective_batch_size();
@@ -994,7 +1001,7 @@ impl DataEvolutionReader {
                 &file_infos,
                 &read_type,
                 &table_fields,
-                &blob_descriptor_fields,
+                &blob_inline_fields,
                 row_ranges.is_some(),
                 nested_enabled,
             )?;
@@ -1059,6 +1066,7 @@ impl DataEvolutionReader {
                             &split,
                             source,
                             row_ranges.clone(),
+                            requested_row_ranges.clone(),
                             file_io.clone(),
                             schema_manager.clone(),
                             table_schema_id,
@@ -1167,6 +1175,15 @@ impl DataEvolutionReader {
                         .unwrap_or_else(|| {
                             arrow_array::new_null_array(target_field.data_type(), rows_to_emit)
                         });
+                    let array = if let Some((source_idx, field_offset)) = provider {
+                        crate::arrow::nested_evolution::evolve_field(
+                            &array,
+                            &source_plan.sources[*source_idx].read_fields()[*field_offset],
+                            &read_type[idx],
+                        )?
+                    } else {
+                        array
+                    };
                     columns.push(array);
                 }
 
@@ -1177,8 +1194,15 @@ impl DataEvolutionReader {
                 }
 
                 emitted_rows += rows_to_emit;
+                let blob_data_fields = source_plan.column_plan.iter().enumerate().filter_map(|(idx, provider)| {
+                    let (source_idx, field_offset) = provider.as_ref()?;
+                    let (batch, _) = source_cursors[*source_idx].as_ref()?;
+                    super::row_sidecar::is_blob_data(batch.schema().field(*field_offset))
+                        .then(|| target_schema.field(idx).name().clone())
+                }).collect();
+                let merged_schema = super::row_sidecar::mark_blob_data(&target_schema, &blob_data_fields);
                 let merged =
-                    RecordBatch::try_new(target_schema.clone(), columns).map_err(|e| {
+                    RecordBatch::try_new(merged_schema, columns).map_err(|e| {
                         Error::UnexpectedError {
                             message: format!("Failed to build merged RecordBatch: {e}"),
                             source: Some(Box::new(e)),
@@ -1256,7 +1280,8 @@ where
     let mut descriptor_columns = Vec::new();
 
     for (idx, field) in schema.fields().iter().enumerate() {
-        if blob_descriptor_fields.contains(field.name()) {
+        if blob_descriptor_fields.contains(field.name()) && !super::row_sidecar::is_blob_data(field)
+        {
             if let Some(bin_col) = batch
                 .column(idx)
                 .as_any()
@@ -1310,7 +1335,7 @@ fn predicate_references_any_field(
         Predicate::Leaf { column, index, .. } => {
             // Never a BLOB column; resolving its placeholder index would force
             // every BLOB to be resolved before filtering.
-            if crate::spec::is_row_id_column(column) {
+            if crate::spec::is_row_tracking_column(column) {
                 return false;
             }
             field_names.contains(column)
@@ -1332,7 +1357,7 @@ fn collect_blob_view_structs(
     view_structs: &mut HashSet<BlobViewStruct>,
 ) -> crate::Result<()> {
     for (idx, field) in batch.schema().fields().iter().enumerate() {
-        if !blob_view_fields.contains(field.name()) {
+        if !blob_view_fields.contains(field.name()) || super::row_sidecar::is_blob_data(field) {
             continue;
         }
         let col = large_binary_column(batch, idx, field.name())?;
@@ -1366,7 +1391,7 @@ fn replace_blob_view_columns(
     let mut changed = false;
 
     for (idx, field) in schema.fields().iter().enumerate() {
-        if !blob_view_fields.contains(field.name()) {
+        if !blob_view_fields.contains(field.name()) || super::row_sidecar::is_blob_data(field) {
             columns.push(batch.column(idx).clone());
             continue;
         }
@@ -1612,6 +1637,7 @@ fn open_source_stream(
     split: &DataSplit,
     source: &FieldSource,
     row_ranges: Option<Vec<RowRange>>,
+    requested_row_ranges: Option<Vec<RowRange>>,
     file_io: FileIO,
     schema_manager: SchemaManager,
     table_schema_id: i64,
@@ -1702,12 +1728,13 @@ fn open_source_stream(
             file, data_fields, ..
         } => {
             let deletion_vector = shifted_deletion_vector_for_file(file, anchor_deletion_vector)?;
-            file_reader.read_single_file_stream(
+            file_reader.read_single_file_stream_with_requested_ranges(
                 split,
                 file.as_ref().clone(),
                 data_fields.clone(),
                 deletion_vector,
                 row_ranges,
+                requested_row_ranges,
             )
         }
         FieldSource::BlobBunch { bunch, .. } => {
@@ -2133,7 +2160,8 @@ impl PreparedMergeGroup {
         let data_files: Vec<&DataFileMeta> = files
             .iter()
             .filter(|file| {
-                !is_blob_file_name(&file.file_name) && !is_vector_store_file_name(&file.file_name)
+                !is_blob_or_video_file_name(&file.file_name)
+                    && !is_vector_store_file_name(&file.file_name)
             })
             .collect();
         if data_files.is_empty() {
@@ -2321,7 +2349,7 @@ fn build_source_plan_with_row_id_pushdown(
 
     for (file_idx, file) in prepared_group.files.iter().enumerate() {
         let info = &file_infos[file_idx];
-        if is_blob_file_name(&file.file_name) {
+        if is_blob_or_video_file_name(&file.file_name) {
             let field_id = resolve_blob_field_id(file, info)?;
             let expected_row_count = expected_blob_row_count.ok_or_else(|| Error::DataInvalid {
                 message: format!(
@@ -2426,6 +2454,13 @@ fn build_source_plan_with_row_id_pushdown(
                 data_fields: info.data_fields.clone(),
                 read_fields: Vec::new(),
             });
+            // Java rowTypeWithRowTracking adds this metadata provider even
+            // when write_cols omits the physical sequence column. The newest
+            // normal file supplies the group version, independently of the
+            // requested data columns.
+            normal_providers
+                .entry(crate::spec::SEQUENCE_NUMBER_FIELD_ID)
+                .or_insert(source_idx);
             for &field_id in &info.field_ids {
                 // first normal file that carries the id wins (preserve existing semantics)
                 normal_providers.entry(field_id).or_insert(source_idx);
@@ -2493,7 +2528,13 @@ fn build_source_plan_with_row_id_pushdown(
                 }
             }
         }
-        let source_idx = if field.data_type().is_blob_file_field()
+        let source_field = table_fields
+            .iter()
+            .find(|source| source.id() == field.id())
+            .filter(|_| crate::spec::is_map_selected_keys_field(field))
+            .filter(|source| source.data_type().is_blob_file_field())
+            .unwrap_or(field);
+        let source_idx = if source_field.data_type().is_blob_file_field()
             && !blob_descriptor_fields.contains(field.name())
         {
             blob_source_indices.get(&field.id()).copied()
@@ -2510,7 +2551,7 @@ fn build_source_plan_with_row_id_pushdown(
         };
 
         if let Some(source_idx) = source_idx {
-            let field_offset = sources[source_idx].add_read_field(field.clone());
+            let field_offset = sources[source_idx].add_read_field(source_field.clone());
             column_plan.push(Some((source_idx, field_offset)));
             nested_plan.push(None);
         } else if !field.data_type().is_nullable() {
@@ -2667,7 +2708,7 @@ impl BlobBunch {
             self.logical_ranges.is_none(),
             "Cannot add files to a finalized blob bunch"
         );
-        if !is_blob_file_name(&file.file_name) {
+        if !is_blob_or_video_file_name(&file.file_name) {
             return Err(Error::DataInvalid {
                 message: "Only blob file can be added to a blob bunch.".to_string(),
                 source: None,
@@ -3044,7 +3085,7 @@ fn normalize_merge_group(files: Vec<DataFileMeta>) -> crate::Result<Vec<DataFile
     let mut blob_files = Vec::new();
 
     for file in files {
-        if is_blob_file_name(&file.file_name) {
+        if is_blob_or_video_file_name(&file.file_name) {
             blob_files.push(file);
         } else if is_vector_store_file_name(&file.file_name) {
             vector_files.push(file);
@@ -3987,7 +4028,7 @@ mod tests {
             .files
             .iter()
             .map(|file| {
-                if is_blob_file_name(&file.file_name) {
+                if is_blob_or_video_file_name(&file.file_name) {
                     resolved_info(vec![2])
                 } else {
                     resolved_info(vec![1])
@@ -4132,6 +4173,37 @@ mod tests {
         assert!(
             matches!(err, Error::DataInvalid { message, .. } if message.contains("exceeds the expected"))
         );
+    }
+
+    #[test]
+    fn selected_map_blob_uses_the_blob_provider_and_original_map_type() {
+        let map = DataField::new(
+            2,
+            "payload".into(),
+            DataType::Map(crate::spec::MapType::new(
+                DataType::VarChar(crate::spec::VarCharType::string_type()),
+                DataType::Blob(BlobType::new()),
+            )),
+        );
+        let selected = crate::spec::map_selected_keys_field(&map, &["key".into()]).unwrap();
+        let files = vec![
+            data_file("others.parquet", 0, 3, 1, Some(vec!["id"])),
+            data_file("payload.blob", 0, 3, 1, Some(vec!["payload"])),
+        ];
+        let group = PreparedMergeGroup::new(&files).unwrap();
+        let plan = build_source_plan_with_row_id_pushdown(
+            &group,
+            &[resolved_info(vec![1]), resolved_info(vec![2])],
+            &[selected],
+            std::slice::from_ref(&map),
+            &HashSet::new(),
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(plan.column_plan, vec![Some((1, 0))]);
+        assert!(matches!(plan.sources[1], FieldSource::BlobBunch { .. }));
+        assert_eq!(plan.sources[1].read_fields(), &[map]);
     }
 
     #[test]

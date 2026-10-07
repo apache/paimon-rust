@@ -27,14 +27,14 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
-use crate::context::complete_jindo_options;
+use crate::context::complete_storage_options;
 use crate::error::to_py_err;
 use crate::partition::PyPartitionStat;
 use crate::read::PyReadBuilder;
 use crate::schema::PyTableSchema;
 use crate::snapshot::PySnapshot;
 use crate::tag::PyTag;
-use crate::write::{PyBatchWriteBuilder, PyStreamWriteBuilder};
+use crate::write::{PyBatchWriteBuilder, PyPostponeFixedBucketWriteBuilder, PyStreamWriteBuilder};
 
 #[pyclass(name = "Table", module = "pypaimon_rust.datafusion")]
 pub struct PyTable {
@@ -67,7 +67,7 @@ impl PyTable {
     ) -> PyResult<Self> {
         let schema: TableSchema = serde_json::from_str(schema_json)
             .map_err(|err| PyValueError::new_err(format!("Invalid table schema JSON: {err}")))?;
-        let properties = complete_jindo_options(
+        let properties = complete_storage_options(
             options
                 .map(crate::read::extract_options)
                 .transpose()?
@@ -103,7 +103,7 @@ impl PyTable {
                 PyValueError::new_err(format!("Invalid REST table response JSON: {err}"))
             })?;
         let identifier = Identifier::new(database, table);
-        let rest_options = complete_jindo_options(rest_options);
+        let rest_options = complete_storage_options(rest_options);
         let table = py
             .detach(|| {
                 runtime().block_on(paimon::table::Table::from_rest_response(
@@ -173,6 +173,12 @@ impl PyTable {
 
     fn new_batch_write_builder(&self) -> PyBatchWriteBuilder {
         PyBatchWriteBuilder::new(Arc::clone(&self.inner))
+    }
+
+    fn new_postpone_fixed_bucket_write_builder(
+        &self,
+    ) -> PyResult<PyPostponeFixedBucketWriteBuilder> {
+        PyPostponeFixedBucketWriteBuilder::new(Arc::clone(&self.inner))
     }
 
     fn new_stream_write_builder(&self) -> PyStreamWriteBuilder {

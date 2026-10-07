@@ -45,7 +45,9 @@
 //! must not reference any vortex-specific types.
 
 use crate::arrow::format::FilePredicates;
-use crate::spec::{is_row_id_column, DataField, DataType, Datum, Predicate, PredicateOperator};
+use crate::spec::{
+    is_row_tracking_column, DataField, DataType, Datum, Predicate, PredicateOperator,
+};
 use crate::Error;
 use arrow_array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Datum as ArrowDatum, Decimal128Array,
@@ -168,10 +170,10 @@ fn evaluate_predicate_mask(
         } => {
             // Resolve the batch column by NAME, but pick that name carefully: a
             // real column may be renamed in the file, so its batch name comes
-            // from `file_fields[index]`; `_ROW_ID` is absent from `file_fields`
+            // from `file_fields[index]`; row-tracking metadata is absent from the logical `file_fields`
             // and only its own name is meaningful. Java's `PredicateRemapper`
             // rebinds by name too.
-            let file_field = if is_row_id_column(column) {
+            let file_field = if is_row_tracking_column(column) {
                 None
             } else {
                 match file_fields.get(*index) {
@@ -196,9 +198,14 @@ fn evaluate_predicate_mask(
                     // Backstop for residuals applied to a predicate-free reader
                     // (PK merge output, vector search); readers that own their
                     // predicates reject earlier.
-                    return Err(crate::table::row_id_predicate::unsupported_row_id_filter(
-                        "this read",
-                    ));
+                    if crate::spec::is_row_id_column(field_name) {
+                        return Err(crate::table::row_id_predicate::unsupported_row_id_filter(
+                            "this read",
+                        ));
+                    }
+                    return Err(Error::Unsupported {
+                        message: format!("filtering on '{field_name}' requires this read to supply the row-tracking column"),
+                    });
                 }
                 // A real column missing here is a reader bug: it did not widen
                 // its scan to the predicate columns.
@@ -265,8 +272,12 @@ pub(crate) fn widen_scan_fields(
             collect_predicate_leaf_refs(predicate, &mut refs);
         }
         for (name, index) in refs {
+            if name == crate::spec::SEQUENCE_NUMBER_FIELD_NAME {
+                push_unique_scan_field(&mut fields, &crate::spec::sequence_number_data_field());
+                continue;
+            }
             // Not read from the file, so there is nothing to widen with.
-            if is_row_id_column(name) {
+            if is_row_tracking_column(name) {
                 continue;
             }
             if let Some(field) = fp.file_fields.get(index) {
@@ -281,7 +292,7 @@ pub(crate) fn widen_scan_fields(
 /// Collect every leaf as `(column name, leaf index)`.
 ///
 /// Callers that resolve a leaf positionally must check the name first — see
-/// [`crate::spec::is_row_id_column`].
+/// [`crate::spec::is_row_tracking_column`].
 pub(crate) fn collect_predicate_leaf_refs<'a>(
     predicate: &'a Predicate,
     refs: &mut Vec<(&'a str, usize)>,
@@ -358,7 +369,7 @@ pub(crate) fn evaluate_exact_leaf_predicate(
     if matches!(array.data_type(), arrow_schema::DataType::Decimal128(_, _))
         && !matches!(op, PredicateOperator::IsNull | PredicateOperator::IsNotNull)
     {
-        return evaluate_decimal_leaf(array, op, literals);
+        return evaluate_decimal_leaf(array, op, literals).map(sanitize_filter_mask);
     }
     match op {
         PredicateOperator::IsNull => Ok(boolean_mask_from_predicate(array.len(), |row_index| {
@@ -994,16 +1005,42 @@ fn set_membership_hash_mask(
         let array = array
             .as_any()
             .downcast_ref::<arrow_array::PrimitiveArray<T>>()?;
-        let set = literals
+        let mut set = literals
             .iter()
-            .map(|literal| integer_literal(literal).and_then(|v| T::Native::try_from(v).ok()))
-            .collect::<Option<HashSet<_>>>()?;
-        Some(
-            array
-                .iter()
-                .map(|value| Some(value.is_some_and(|v| set.contains(&v) == keep)))
-                .collect(),
-        )
+            .map(|literal| {
+                integer_literal(literal)
+                    .and_then(|v| T::Native::try_from(v).ok())
+                    .and_then(arrow_buffer::ArrowNativeType::to_i64)
+            })
+            .collect::<Option<Vec<i64>>>()?;
+        set.sort_unstable();
+        set.dedup();
+        let (min, max) = (*set.first()?, *set.last()?);
+        let values = array.values();
+        // Small literal spans use a bitmap; otherwise binary search. Both avoid per-call hashing.
+        let span = max.checked_sub(min).and_then(|d| usize::try_from(d).ok());
+        let member: Box<dyn Fn(i64) -> bool> = match span {
+            Some(span) if span < (1 << 16) => {
+                let mut bits = vec![0u64; span / 64 + 1];
+                for v in &set {
+                    let i = (v - min) as usize;
+                    bits[i / 64] |= 1 << (i % 64);
+                }
+                Box::new(move |v: i64| {
+                    v >= min && v <= max && {
+                        let i = (v - min) as usize;
+                        bits[i / 64] & (1 << (i % 64)) != 0
+                    }
+                })
+            }
+            _ => Box::new(move |v: i64| set.binary_search(&v).is_ok()),
+        };
+        let mask = arrow_buffer::BooleanBuffer::collect_bool(array.len(), |row| {
+            array.is_valid(row)
+                && arrow_buffer::ArrowNativeType::to_i64(values[row])
+                    .is_some_and(|v| member(v) == keep)
+        });
+        Some(BooleanArray::new(mask, None))
     }
 
     match array.data_type() {
@@ -1763,6 +1800,60 @@ mod tests {
     }
 
     #[test]
+    fn test_in_integer_bitmap_and_search_paths() {
+        use crate::spec::BigIntType;
+        let array: ArrayRef = Arc::new(arrow_array::Int64Array::from(vec![
+            Some(-5i64),
+            None,
+            Some(0),
+            Some(83),
+            Some(84),
+            Some(1 << 40),
+        ]));
+        let data_type = DataType::BigInt(BigIntType::new());
+        let near = vec![
+            Datum::Long(0),
+            Datum::Long(83),
+            Datum::Long(-5),
+            Datum::Long(83),
+        ];
+        let far = vec![Datum::Long(-5), Datum::Long(1 << 40)];
+        for (literals, expected) in [
+            (&near, vec![true, false, true, true, false, false]),
+            (&far, vec![true, false, false, false, false, true]),
+        ] {
+            let mask = evaluate_set_membership_predicate(
+                &array,
+                &data_type,
+                PredicateOperator::In,
+                literals,
+            )
+            .unwrap();
+            assert_eq!(mask.null_count(), 0);
+            assert_eq!(
+                mask.iter().map(Option::unwrap).collect::<Vec<_>>(),
+                expected
+            );
+            let mask = evaluate_set_membership_predicate(
+                &array,
+                &data_type,
+                PredicateOperator::NotIn,
+                literals,
+            )
+            .unwrap();
+            let not_expected = expected
+                .iter()
+                .enumerate()
+                .map(|(row, hit)| row != 1 && !hit)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                mask.iter().map(Option::unwrap).collect::<Vec<_>>(),
+                not_expected
+            );
+        }
+    }
+
+    #[test]
     fn test_blob_literal_uses_large_binary_scalar() {
         let scalar = literal_scalar_for_arrow_filter(
             &Datum::Bytes(b"blob".to_vec()),
@@ -2446,5 +2537,63 @@ mod tests {
         let out =
             filter_record_batch_by_predicates(batch, &fp, std::slice::from_ref(&col)).unwrap();
         assert_eq!(out.num_rows(), 2, "d > 1.05 == d >= 1.1 -> {{1.1, 1.2}}");
+    }
+
+    #[test]
+    fn test_nullable_decimal_composes() {
+        // A NULL decimal fails its leaf, so AND and OR combine masks without NULLs.
+        use crate::spec::DecimalType;
+        let decimal = || DataType::Decimal(DecimalType::with_nullable(true, 10, 2).unwrap());
+        let col = DataField::new(0, "d".to_string(), decimal());
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "d",
+            ArrowDataType::Decimal128(10, 2),
+            true,
+        )]));
+        // 1.00, NULL, 2.00 (unscaled at scale 2)
+        let arr = arrow_array::Decimal128Array::from(vec![Some(100), None, Some(200)])
+            .with_precision_and_scale(10, 2)
+            .unwrap();
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(arr)]).unwrap();
+        let cmp = |op, unscaled| {
+            let literal = Datum::Decimal {
+                unscaled,
+                precision: 10,
+                scale: 2,
+            };
+            leaf(0, decimal(), op, vec![literal])
+        };
+        for (pred, expected) in [
+            // d > 0.50 AND d < 1.50 -> [1.00]
+            (
+                Predicate::And(vec![
+                    cmp(PredicateOperator::Gt, 50),
+                    cmp(PredicateOperator::Lt, 150),
+                ]),
+                vec![100i128],
+            ),
+            // d < 1.50 OR d > 1.50 -> [1.00, 2.00]
+            (
+                Predicate::Or(vec![
+                    cmp(PredicateOperator::Lt, 150),
+                    cmp(PredicateOperator::Gt, 150),
+                ]),
+                vec![100, 200],
+            ),
+        ] {
+            let fp = file_predicates(vec![pred], vec![col.clone()]);
+            let out =
+                filter_record_batch_by_predicates(batch.clone(), &fp, std::slice::from_ref(&col))
+                    .unwrap();
+            let values: Vec<i128> = out
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow_array::Decimal128Array>()
+                .unwrap()
+                .iter()
+                .flatten()
+                .collect();
+            assert_eq!(values, expected);
+        }
     }
 }

@@ -276,6 +276,46 @@ pub(crate) struct FormatFileCommit {
     pub partition: HashMap<String, String>,
     pub record_count: i64,
     pub file_size: i64,
+    // Java TwoPhaseCommitMessage keeps this on the message so a later abort
+    // instance makes the same decision. Cloned Rust messages share the flag.
+    preserve_published_target_on_abort: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl FormatFileCommit {
+    pub(crate) fn new(
+        staged_path: String,
+        target_path: String,
+        partition: HashMap<String, String>,
+        record_count: i64,
+        file_size: i64,
+    ) -> Self {
+        Self {
+            staged_path,
+            target_path,
+            partition,
+            record_count,
+            file_size,
+            // Until publication starts the target is not owned by this write.
+            preserve_published_target_on_abort: std::sync::Arc::new(
+                std::sync::atomic::AtomicBool::new(true),
+            ),
+        }
+    }
+
+    pub(crate) fn preserve_published_target_on_abort(&self) {
+        self.preserve_published_target_on_abort
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn allow_published_target_cleanup(&self) {
+        self.preserve_published_target_on_abort
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn should_preserve_published_target_on_abort(&self) -> bool {
+        self.preserve_published_target_on_abort
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 #[cfg(test)]

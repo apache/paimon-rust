@@ -305,8 +305,12 @@ async fn test_partition_literals() {
     }
 }
 
-/// A blank string for a string partition column is written to the default partition, so ADD and
-/// DROP refuse it rather than address the NULL partition, as Java does.
+/// A value that folds to the default partition for a string column is written to the default
+/// partition, so ADD and DROP refuse it rather than address the NULL partition, as Java does.
+/// This covers Rust-blank strings and the control characters U+001C-U+001F, which Java's
+/// `Character.isWhitespace` folds but Rust `str::trim` keeps: the mutating guard must classify
+/// with the same Java-whitespace predicate the formatter folds by, or `DROP PARTITION
+/// (label = '<U+001C>')` would silently delete the default partition's registration and files.
 #[cfg(not(windows))]
 #[tokio::test]
 async fn test_partition_ddl_refuses_blank_string_values() {
@@ -326,6 +330,12 @@ async fn test_partition_ddl_refuses_blank_string_values() {
         "DROP IF EXISTS PARTITION (label = '   ')",
         "ADD PARTITION (label = '')",
         "ADD IF NOT EXISTS PARTITION (label = ' ')",
+        // Control characters that are Java whitespace but not Rust `str::trim`
+        // whitespace: a `trim().is_empty()` guard would let these address the
+        // default partition and (for DROP) destroy it.
+        "DROP PARTITION (label = '\u{001C}')",
+        "DROP IF EXISTS PARTITION (label = '\u{001F}')",
+        "ADD PARTITION (label = '\u{001E}')",
     ] {
         common::assert_sql_error(
             &context,

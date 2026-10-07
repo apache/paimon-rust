@@ -43,8 +43,8 @@ fn invalid(message: impl Into<String>) -> crate::Error {
 /// [`TableCommit`](super::TableCommit).
 ///
 /// Row-ID updates infer columns from the input unless configured with
-/// [`with_update_type`](Self::with_update_type). Key-based upserts currently
-/// require complete Arrow rows and match keys within each partition.
+/// [`with_update_type`](Self::with_update_type). Key-based upserts accept a
+/// column subset including the keys and match keys within each partition.
 #[derive(Clone)]
 pub struct TableUpdate {
     table: Table,
@@ -125,7 +125,7 @@ impl TableUpdate {
 
     /// Create a row-ID updater sharing one snapshot across per-call columns.
     pub async fn new_update_by_row_id(&self) -> crate::Result<TableUpdateByRowId> {
-        TableUpdateByRowId::new(&self.table, self.commit_user.clone()).await
+        TableUpdateByRowId::new(&self.table).await
     }
 
     /// Update existing rows from chunks of one Arrow table containing `_ROW_ID`.
@@ -172,11 +172,8 @@ impl TableUpdate {
                 .map_or_else(Vec::new, |writer| writer.commit_messages().to_vec()))
         }
         .await;
-        if result.is_err() {
-            if let Some(writer) = &mut writer {
-                let _ = writer.abort().await;
-            }
-        }
+        // Preserve earlier prepared groups on failure. Never delete files
+        // based on CommitMessage.
         result
     }
 
@@ -189,20 +186,18 @@ impl TableUpdate {
         assignments: Vec<(String, super::UpdateAssignment)>,
         read_columns: Vec<String>,
     ) -> crate::Result<Vec<CommitMessage>> {
-        super::table_update_predicate::update(
-            &self.table,
-            &self.commit_user,
-            predicate,
-            assignments,
-            read_columns,
-        )
-        .await
+        super::table_update_predicate::update(&self.table, predicate, assignments, read_columns)
+            .await
     }
 
-    /// Upsert complete Arrow rows by composite key through the core upsert
+    /// Upsert Arrow rows by composite key through the core upsert
     /// writer. Keys match within each partition, including when partition
     /// columns are omitted from `upsert_keys`. Existing keys update every
-    /// matching row ID; new keys append.
+    /// matching row ID; new keys append all input columns. Omitted columns on
+    /// matched rows retain their values; on new rows they are absent from the file.
+    /// Input batches may have different non-key columns. After last-write-wins
+    /// deduplication, matched rows must supply their update columns and appended
+    /// rows in each partition must share a field set.
     pub async fn upsert_by_arrow_with_key(
         &self,
         batches: Vec<RecordBatch>,

@@ -344,6 +344,40 @@ func (pb *PredicateBuilder) NotIn(column string, values ...any) (*Predicate, err
 	return pb.buildInPredicate(ffiPredicateIsNotIn, column, values)
 }
 
+// StartsWith creates a predicate matching rows where the string column starts
+// with prefix.
+func (pb *PredicateBuilder) StartsWith(column string, prefix string) (*Predicate, error) {
+	return pb.buildLeafPredicate(ffiPredicateStartsWith, column, StringDatum(prefix))
+}
+
+// EndsWith creates a predicate matching rows where the string column ends with
+// suffix.
+func (pb *PredicateBuilder) EndsWith(column string, suffix string) (*Predicate, error) {
+	return pb.buildLeafPredicate(ffiPredicateEndsWith, column, StringDatum(suffix))
+}
+
+// Contains creates a predicate matching rows where the string column contains
+// substr.
+func (pb *PredicateBuilder) Contains(column string, substr string) (*Predicate, error) {
+	return pb.buildLeafPredicate(ffiPredicateContains, column, StringDatum(substr))
+}
+
+// Like creates a SQL LIKE predicate: column LIKE pattern, using the default
+// escape character.
+func (pb *PredicateBuilder) Like(column string, pattern string) (*Predicate, error) {
+	return pb.buildLikePredicate(ffiPredicateLike, column, StringDatum(pattern))
+}
+
+// Between creates an inclusive range predicate: low <= column <= high.
+func (pb *PredicateBuilder) Between(column string, low, high any) (*Predicate, error) {
+	return pb.buildBetweenPredicate(ffiPredicateBetween, column, low, high)
+}
+
+// NotBetween creates a predicate: column < low OR column > high.
+func (pb *PredicateBuilder) NotBetween(column string, low, high any) (*Predicate, error) {
+	return pb.buildBetweenPredicate(ffiPredicateNotBetween, column, low, high)
+}
+
 // buildLeafPredicate is a helper for comparison predicates that take (table, column, datum).
 func (pb *PredicateBuilder) buildLeafPredicate(
 	ffiVar *FFI[func(*paimonTable, *byte, paimonDatumC, bool) (*paimonPredicate, error)],
@@ -411,6 +445,60 @@ func (pb *PredicateBuilder) buildInPredicate(
 	runtime.KeepAlive(cCol)
 	runtime.KeepAlive(datums)
 	runtime.KeepAlive(values)
+	if err != nil {
+		return nil, err
+	}
+	t.lib.acquire()
+	return &Predicate{ctx: t.ctx, lib: t.lib, inner: inner}, nil
+}
+
+// buildLikePredicate is a helper for LIKE predicates that take
+// (table, column, pattern, escape, case_sensitive). escape 0 selects the
+// default escape character.
+func (pb *PredicateBuilder) buildLikePredicate(
+	ffiVar *FFI[func(*paimonTable, *byte, paimonDatumC, int8, bool) (*paimonPredicate, error)],
+	column string, pattern Datum,
+) (*Predicate, error) {
+	t := pb.table
+	if t.inner == nil {
+		return nil, ErrClosed
+	}
+	cCol := append([]byte(column), 0)
+	inner, err := ffiVar.symbol(t.ctx)(t.inner, &cCol[0], pattern.inner, 0, pb.caseSensitive)
+	runtime.KeepAlive(cCol)
+	runtime.KeepAlive(pattern)
+	if err != nil {
+		return nil, err
+	}
+	t.lib.acquire()
+	return &Predicate{ctx: t.ctx, lib: t.lib, inner: inner}, nil
+}
+
+// buildBetweenPredicate is a helper for BETWEEN / NOT BETWEEN predicates that
+// take (table, column, low, high, case_sensitive).
+func (pb *PredicateBuilder) buildBetweenPredicate(
+	ffiVar *FFI[func(*paimonTable, *byte, paimonDatumC, paimonDatumC, bool) (*paimonPredicate, error)],
+	column string, low, high any,
+) (*Predicate, error) {
+	t := pb.table
+	if t.inner == nil {
+		return nil, ErrClosed
+	}
+	lowDatum, err := toDatum(low)
+	if err != nil {
+		return nil, err
+	}
+	highDatum, err := toDatum(high)
+	if err != nil {
+		return nil, err
+	}
+	cCol := append([]byte(column), 0)
+	inner, err := ffiVar.symbol(t.ctx)(
+		t.inner, &cCol[0], lowDatum.inner, highDatum.inner, pb.caseSensitive,
+	)
+	runtime.KeepAlive(cCol)
+	runtime.KeepAlive(lowDatum)
+	runtime.KeepAlive(highDatum)
 	if err != nil {
 		return nil, err
 	}
@@ -496,6 +584,9 @@ var ffiPredicateLessThan = newPredicateLeafFFI("paimon_predicate_less_than_with_
 var ffiPredicateLessOrEqual = newPredicateLeafFFI("paimon_predicate_less_or_equal_with_case_sensitive")
 var ffiPredicateGreaterThan = newPredicateLeafFFI("paimon_predicate_greater_than_with_case_sensitive")
 var ffiPredicateGreaterOrEqual = newPredicateLeafFFI("paimon_predicate_greater_or_equal_with_case_sensitive")
+var ffiPredicateStartsWith = newPredicateLeafFFI("paimon_predicate_starts_with_with_case_sensitive")
+var ffiPredicateEndsWith = newPredicateLeafFFI("paimon_predicate_ends_with_with_case_sensitive")
+var ffiPredicateContains = newPredicateLeafFFI("paimon_predicate_contains_with_case_sensitive")
 
 // newPredicateLeafFFI wraps the (table, column, datum, case_sensitive) form.
 func newPredicateLeafFFI(
@@ -518,6 +609,41 @@ func newPredicateLeafFFI(
 				unsafe.Pointer(&table),
 				unsafe.Pointer(&column),
 				unsafe.Pointer(&datum),
+				unsafe.Pointer(&flag),
+			)
+			if result.error != nil {
+				return nil, parseError(ctx, result.error)
+			}
+			return result.predicate, nil
+		}
+	})
+}
+
+var ffiPredicateLike = newPredicateLikeFFI("paimon_predicate_like_with_case_sensitive")
+
+// newPredicateLikeFFI wraps the (table, column, pattern, escape, case_sensitive)
+// form. escape is a C char; 0 selects the default escape character.
+func newPredicateLikeFFI(
+	sym string,
+) *FFI[func(*paimonTable, *byte, paimonDatumC, int8, bool) (*paimonPredicate, error)] {
+	return newFFI(ffiOpts{
+		sym:   contextKey(sym),
+		rType: &typeResultPredicate,
+		aTypes: []*ffi.Type{
+			&ffi.TypePointer, &ffi.TypePointer, &typePaimonDatum, &ffi.TypeSint8, &ffi.TypeUint8,
+		},
+	}, func(ctx context.Context, ffiCall ffiCall) func(*paimonTable, *byte, paimonDatumC, int8, bool) (*paimonPredicate, error) {
+		return func(
+			table *paimonTable, column *byte, pattern paimonDatumC, escape int8, caseSensitive bool,
+		) (*paimonPredicate, error) {
+			flag := boolByte(caseSensitive)
+			var result resultPredicate
+			ffiCall(
+				unsafe.Pointer(&result),
+				unsafe.Pointer(&table),
+				unsafe.Pointer(&column),
+				unsafe.Pointer(&pattern),
+				unsafe.Pointer(&escape),
 				unsafe.Pointer(&flag),
 			)
 			if result.error != nil {
@@ -583,6 +709,42 @@ func newPredicateInFFI(
 				unsafe.Pointer(&column),
 				unsafe.Pointer(&datums),
 				unsafe.Pointer(&datumsLen),
+				unsafe.Pointer(&flag),
+			)
+			if result.error != nil {
+				return nil, parseError(ctx, result.error)
+			}
+			return result.predicate, nil
+		}
+	})
+}
+
+var ffiPredicateBetween = newPredicateBetweenFFI("paimon_predicate_between_with_case_sensitive")
+var ffiPredicateNotBetween = newPredicateBetweenFFI("paimon_predicate_not_between_with_case_sensitive")
+
+// newPredicateBetweenFFI wraps the (table, column, low, high, case_sensitive)
+// form shared by BETWEEN and NOT BETWEEN.
+func newPredicateBetweenFFI(
+	sym string,
+) *FFI[func(*paimonTable, *byte, paimonDatumC, paimonDatumC, bool) (*paimonPredicate, error)] {
+	return newFFI(ffiOpts{
+		sym:   contextKey(sym),
+		rType: &typeResultPredicate,
+		aTypes: []*ffi.Type{
+			&ffi.TypePointer, &ffi.TypePointer, &typePaimonDatum, &typePaimonDatum, &ffi.TypeUint8,
+		},
+	}, func(ctx context.Context, ffiCall ffiCall) func(*paimonTable, *byte, paimonDatumC, paimonDatumC, bool) (*paimonPredicate, error) {
+		return func(
+			table *paimonTable, column *byte, low paimonDatumC, high paimonDatumC, caseSensitive bool,
+		) (*paimonPredicate, error) {
+			flag := boolByte(caseSensitive)
+			var result resultPredicate
+			ffiCall(
+				unsafe.Pointer(&result),
+				unsafe.Pointer(&table),
+				unsafe.Pointer(&column),
+				unsafe.Pointer(&low),
+				unsafe.Pointer(&high),
 				unsafe.Pointer(&flag),
 			)
 			if result.error != nil {

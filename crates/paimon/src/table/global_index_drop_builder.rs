@@ -21,7 +21,7 @@ use super::global_index_types::{
     SUPPORTED_GLOBAL_INDEX_TYPES_FOR_DROP,
 };
 use crate::spec::{FileKind, IndexFileMeta, IndexManifest};
-use crate::table::{CommitMessage, SnapshotManager, Table, TableCommit};
+use crate::table::{CommitMessage, Table, TableCommit};
 use crate::{Error, Result};
 use std::collections::HashMap;
 
@@ -91,10 +91,9 @@ impl<'a> GlobalIndexDropBuilder<'a> {
             .map(|field| field.id())
             .collect::<Vec<_>>();
 
-        let snapshot_manager = SnapshotManager::new(
-            self.table.file_io().clone(),
-            self.table.location().to_string(),
-        );
+        // The table's manager resolves a REST-managed table's latest snapshot
+        // through the catalog, like reads and commit validation do.
+        let snapshot_manager = self.table.snapshot_manager();
         let Some(snapshot) = snapshot_manager.get_latest_snapshot().await? else {
             return Ok(0);
         };
@@ -346,8 +345,10 @@ mod tests {
     }
 
     async fn latest_index_entries(table: &Table) -> Vec<IndexManifestEntry> {
-        let snapshot_manager =
-            SnapshotManager::new(table.file_io().clone(), table.location().to_string());
+        let snapshot_manager = crate::table::SnapshotManager::new(
+            table.file_io().clone(),
+            table.location().to_string(),
+        );
         let snapshot = snapshot_manager
             .get_latest_snapshot()
             .await
@@ -407,6 +408,51 @@ mod tests {
                 "dv.index".to_string(),
                 "fulltext-id.index".to_string(),
                 "hash.index".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_drop_full_text_global_index_only_removes_target_entries() {
+        let table = test_table("memory:/test_drop_full_text_global_index");
+        setup_dirs(&table).await;
+
+        let mut message = CommitMessage::new(
+            BinaryRow::new(0).to_serialized_bytes(),
+            0,
+            vec![data_file("data-0.parquet")],
+        );
+        message.new_index_files = vec![
+            global_index_file("full-text", "full-text-name-0.index", 1, 0, 9),
+            global_index_file("full-text", "full-text-name-1.index", 1, 10, 19),
+            global_index_file("full-text", "full-text-id.index", 0, 0, 9),
+            global_index_file(BTREE_GLOBAL_INDEX_TYPE, "btree-name.index", 1, 0, 9),
+        ];
+        TableCommit::new(table.clone(), "test-user".to_string())
+            .commit(vec![message])
+            .await
+            .unwrap();
+
+        let dropped = table
+            .new_global_index_drop_builder()
+            .with_index_column("name")
+            .with_index_type("Full-Text")
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(dropped, 2);
+
+        let mut remaining = latest_index_entries(&table)
+            .await
+            .into_iter()
+            .map(|entry| entry.index_file.file_name)
+            .collect::<Vec<_>>();
+        remaining.sort();
+        assert_eq!(
+            remaining,
+            vec![
+                "btree-name.index".to_string(),
+                "full-text-id.index".to_string(),
             ]
         );
     }
@@ -535,7 +581,7 @@ mod tests {
         let err = table
             .new_global_index_drop_builder()
             .with_index_column("id")
-            .with_index_type("full-text")
+            .with_index_type("hash")
             .execute()
             .await
             .expect_err("unsupported type must error");

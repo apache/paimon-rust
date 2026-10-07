@@ -185,15 +185,25 @@ def test_invalid_batch_bridge_commit_user_preserves_identity(tmp_path, user):
     assert _rows(table) == [1]
 
 
-def test_abort_serialized_messages_deletes_files(tmp_path):
-    table = _table(tmp_path)
-    builder = table.new_batch_write_builder()
-    messages = _roundtrip(_prepare(builder, [1], [10]))
+@pytest.mark.parametrize('stream', [False, True])
+@pytest.mark.parametrize('primary_key', [False, True])
+@pytest.mark.parametrize('serialized', [False, True])
+def test_explicit_abort_deletes_known_uncommitted_files(tmp_path, stream, primary_key, serialized):
+    table = _table(tmp_path, primary_key=primary_key, options={'bucket': '1'} if primary_key else None)
+    builder = table.new_stream_write_builder() if stream else table.new_batch_write_builder()
+    messages = _prepare(builder, [1], [10], 7 if stream else None)
+    if serialized:
+        messages = _roundtrip(messages)
     files = list(tmp_path.rglob("data-*.parquet"))
     assert files
-    builder.new_commit().abort(messages)
+    assert table.latest_snapshot() is None
+    commit = builder.new_commit()
+    # These messages have never been submitted and will not be committed.
+    commit.abort(messages)
+    commit.abort(messages)
     assert not any(file.exists() for file in files)
     assert table.latest_snapshot() is None
+    assert _rows(table) == []
 
 
 def test_batch_writer_and_commit_are_one_shot(tmp_path):

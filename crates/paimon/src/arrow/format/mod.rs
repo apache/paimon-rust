@@ -18,6 +18,7 @@
 mod avro;
 mod avro_write;
 pub(crate) mod blob;
+mod delta_varint;
 mod metadata_cache;
 mod mosaic;
 mod mosaic_write;
@@ -26,6 +27,8 @@ pub(crate) mod parquet;
 mod row;
 mod shredding;
 pub(crate) mod text;
+mod variant_projection;
+pub(crate) mod video;
 #[cfg(feature = "vortex")]
 mod vortex;
 
@@ -395,6 +398,8 @@ pub(crate) fn create_format_reader_with_budget(
             blob::BlobFormatReader::new(path.to_string(), blob_as_descriptor)
                 .with_blob_parallelism(blob_parallelism),
         )
+    } else if lower.ends_with(".video") {
+        Box::new(video::VideoFormatReader::new(path.to_string()))
     } else if lower.ends_with(".orc") {
         Box::new(orc::OrcFormatReader)
     } else if let Some((kind, compression)) = text::TextKind::from_path(path) {
@@ -442,6 +447,7 @@ fn supported_read_formats() -> Vec<&'static str> {
     vec![
         ".parquet",
         ".blob",
+        ".video",
         ".orc",
         ".csv",
         ".json",
@@ -470,111 +476,186 @@ fn supported_write_formats() -> Vec<&'static str> {
     ]
 }
 
-/// Create a format writer that streams directly to storage.
+/// Reusable factory for one rolling writer, mirroring Java FormatWriterFactory.
+/// Output and compression belong to each file; schema/options belong to the factory.
+#[async_trait]
+pub(crate) trait FormatWriterFactory: Send + Sync {
+    async fn create_writer(
+        &self,
+        output: &OutputFile,
+        compression: &str,
+    ) -> crate::Result<Box<dyn FormatFileWriter>>;
+
+    /// Some plan factories need the previous close callback before the next file.
+    fn needs_completed_file_stats(&self) -> bool {
+        false
+    }
+}
+
+/// Build a factory once per rolling writer. Statistics describe logical value
+/// fields independently of a shredding plan's physical schema (notably for PK files).
+pub(crate) fn create_format_writer_factory(
+    file_format: &str,
+    schema: SchemaRef,
+    zstd_level: i32,
+    file_io: Option<FileIO>,
+    write_fields: Option<&[DataField]>,
+    format_options: Option<&HashMap<String, String>>,
+    stats_fields: Option<&[DataField]>,
+) -> crate::Result<Arc<dyn FormatWriterFactory>> {
+    let file_format = file_format.rsplit('.').next().unwrap_or_default();
+    if file_format.eq_ignore_ascii_case("parquet") {
+        let raw = Arc::new(parquet::ParquetWriterFactory::new(
+            schema,
+            write_fields.map(<[_]>::to_vec),
+            zstd_level,
+            format_options.cloned().unwrap_or_default(),
+            stats_fields.map(<[_]>::to_vec),
+        ));
+        return shredding::wrap_writer_factory(raw, write_fields, format_options);
+    }
+    // Direct format writers can bypass table-schema validation. Never silently
+    // drop a requested MAP layout when selecting an unsupported format.
+    if let (Some(fields), Some(options)) = (write_fields, format_options) {
+        if !crate::arrow::shredding::map::detect_map_shredding_fields(fields, options)?.is_empty() {
+            crate::spec::map_shredding::validate_format("file.format", file_format)?;
+        }
+    }
+    if file_format.eq_ignore_ascii_case("blob") {
+        return Ok(Arc::new(blob::BlobWriterFactory::new(
+            file_io,
+            write_fields.and_then(|fields| fields.first()),
+            format_options,
+        )?));
+    }
+    Ok(Arc::new(PlainFormatWriterFactory {
+        schema,
+        zstd_level,
+        write_fields: write_fields.map(<[_]>::to_vec),
+        format_options: format_options.cloned(),
+    }))
+}
+
+/// Convenience entry point for writing a single physical file.
 pub(crate) async fn create_format_writer(
     output: &OutputFile,
     schema: SchemaRef,
     compression: &str,
     zstd_level: i32,
-    file_io: Option<crate::io::FileIO>,
+    file_io: Option<FileIO>,
     write_fields: Option<&[DataField]>,
     format_options: Option<&HashMap<String, String>>,
 ) -> crate::Result<Box<dyn FormatFileWriter>> {
-    let path = output.location();
-    let lower = path.to_ascii_lowercase();
-    if lower.ends_with(".parquet") {
-        let writer_factory = Box::new(parquet::ParquetPhysicalWriterFactory::new(
-            output,
-            compression,
-            zstd_level,
-            format_options.cloned().unwrap_or_default(),
-        ));
-        shredding::ShreddingFormatWriter::create(
-            writer_factory,
-            schema,
-            write_fields,
-            format_options,
-            compression,
-        )
-        .await
-    } else if lower.ends_with(".blob") {
-        Ok(Box::new(
-            blob::BlobFormatWriter::new(output, file_io).await?,
-        ))
-    } else if lower.ends_with(".orc") {
-        if !matches!(
-            compression.to_ascii_lowercase().as_str(),
-            "" | "none" | "uncompressed"
-        ) {
-            return Err(Error::Unsupported {
+    let file_format = output.location().rsplit('.').next().unwrap_or_default();
+    create_format_writer_factory(
+        file_format,
+        schema,
+        zstd_level,
+        file_io,
+        write_fields,
+        format_options,
+        None,
+    )?
+    .create_writer(output, compression)
+    .await
+}
+
+struct PlainFormatWriterFactory {
+    schema: SchemaRef,
+    zstd_level: i32,
+    write_fields: Option<Vec<DataField>>,
+    format_options: Option<HashMap<String, String>>,
+}
+
+#[async_trait]
+impl FormatWriterFactory for PlainFormatWriterFactory {
+    async fn create_writer(
+        &self,
+        output: &OutputFile,
+        compression: &str,
+    ) -> crate::Result<Box<dyn FormatFileWriter>> {
+        let schema = self.schema.clone();
+        let zstd_level = self.zstd_level;
+        let write_fields = self.write_fields.as_deref();
+        let format_options = self.format_options.as_ref();
+        let path = output.location();
+        let lower = path.to_ascii_lowercase();
+        if lower.ends_with(".orc") {
+            if !matches!(
+                compression.to_ascii_lowercase().as_str(),
+                "" | "none" | "uncompressed"
+            ) {
+                return Err(Error::Unsupported {
+                    message: format!(
+                        "ORC compression '{compression}' is not supported by the current writer"
+                    ),
+                });
+            }
+            Ok(Box::new(orc::OrcFormatWriter::new(output, schema).await?))
+        } else if let Some((kind, path_compression)) = text::TextKind::from_path(path) {
+            let compression = text::TextCompression::from_name(compression)?;
+            if compression != path_compression {
+                return Err(Error::ConfigInvalid {
+                    message: format!(
+                        "Text file compression {:?} does not match file suffix of {path}",
+                        compression
+                    ),
+                });
+            }
+            Ok(Box::new(
+                text::TextFormatWriter::new(output, schema, kind, compression, format_options)
+                    .await?,
+            ))
+        } else if lower.ends_with(".avro") {
+            let fields = match write_fields {
+                Some(fields) => fields.to_vec(),
+                None => row::row_type_from_arrow_schema(&schema)?,
+            };
+            Ok(Box::new(
+                avro_write::AvroFormatWriter::new(
+                    output,
+                    schema,
+                    fields,
+                    compression,
+                    zstd_level,
+                    format_options,
+                )
+                .await?,
+            ))
+        } else if lower.ends_with(".row") {
+            let row_type = match write_fields {
+                Some(fields) => fields.to_vec(),
+                None => row::row_type_from_arrow_schema(&schema)?,
+            };
+            Ok(Box::new(
+                row::RowFormatWriter::new(output, schema, row_type, zstd_level).await?,
+            ))
+        } else if lower.ends_with(".mosaic") {
+            Ok(Box::new(
+                mosaic_write::MosaicFormatWriter::new(
+                    output,
+                    schema,
+                    compression,
+                    zstd_level,
+                    write_fields,
+                    format_options,
+                )
+                .await?,
+            ))
+        } else {
+            #[cfg(feature = "vortex")]
+            if lower.ends_with(".vortex") {
+                return Ok(Box::new(
+                    vortex::VortexFormatWriter::new(output, schema).await?,
+                ));
+            }
+            Err(Error::Unsupported {
                 message: format!(
-                    "ORC compression '{compression}' is not supported by the current writer"
+                    "unsupported write format: expected {}, got: {path}",
+                    supported_write_formats().join(", ")
                 ),
-            });
+            })
         }
-        Ok(Box::new(orc::OrcFormatWriter::new(output, schema).await?))
-    } else if let Some((kind, path_compression)) = text::TextKind::from_path(path) {
-        let compression = text::TextCompression::from_name(compression)?;
-        if compression != path_compression {
-            return Err(Error::ConfigInvalid {
-                message: format!(
-                    "Text file compression {:?} does not match file suffix of {path}",
-                    compression
-                ),
-            });
-        }
-        Ok(Box::new(
-            text::TextFormatWriter::new(output, schema, kind, compression, format_options).await?,
-        ))
-    } else if lower.ends_with(".avro") {
-        let fields = match write_fields {
-            Some(fields) => fields.to_vec(),
-            None => row::row_type_from_arrow_schema(&schema)?,
-        };
-        Ok(Box::new(
-            avro_write::AvroFormatWriter::new(
-                output,
-                schema,
-                fields,
-                compression,
-                zstd_level,
-                format_options,
-            )
-            .await?,
-        ))
-    } else if lower.ends_with(".row") {
-        let row_type = match write_fields {
-            Some(fields) => fields.to_vec(),
-            None => row::row_type_from_arrow_schema(&schema)?,
-        };
-        Ok(Box::new(
-            row::RowFormatWriter::new(output, schema, row_type, zstd_level).await?,
-        ))
-    } else if lower.ends_with(".mosaic") {
-        Ok(Box::new(
-            mosaic_write::MosaicFormatWriter::new(
-                output,
-                schema,
-                compression,
-                zstd_level,
-                write_fields,
-                format_options,
-            )
-            .await?,
-        ))
-    } else {
-        #[cfg(feature = "vortex")]
-        if lower.ends_with(".vortex") {
-            return Ok(Box::new(
-                vortex::VortexFormatWriter::new(output, schema).await?,
-            ));
-        }
-        Err(Error::Unsupported {
-            message: format!(
-                "unsupported write format: expected {}, got: {path}",
-                supported_write_formats().join(", ")
-            ),
-        })
     }
 }
 
@@ -659,6 +740,75 @@ mod tests {
             .unwrap();
             assert_eq!(configured.read_fields.as_slice(), expected, "{path}");
         }
+    }
+
+    #[tokio::test]
+    async fn direct_writer_rejects_unsupported_map_shredding_before_creating_file() {
+        use crate::spec::{MapType, VarCharType};
+        let fields = vec![DataField::new(
+            0,
+            "tags".into(),
+            DataType::Map(MapType::new(
+                DataType::VarChar(VarCharType::string_type())
+                    .copy_with_nullable(false)
+                    .unwrap(),
+                DataType::Int(IntType::new()),
+            )),
+        )];
+        let schema = crate::arrow::build_target_arrow_schema(&fields).unwrap();
+        // The actual output format must be checked even when table options
+        // name Parquet (or the caller does not go through TableWrite).
+        let options = HashMap::from([
+            ("file.format".into(), "parquet".into()),
+            (
+                "fields.tags.map.storage-layout".into(),
+                "shared-shredding".into(),
+            ),
+        ]);
+        let io = FileIOBuilder::new("memory").build().unwrap();
+        for format in ["orc", "ORC", "avro", "row"] {
+            let path = format!("memory:/unsupported-map/data.{format}");
+            let output = io.new_output(&path).unwrap();
+            let error = create_format_writer(
+                &output,
+                schema.clone(),
+                "none",
+                0,
+                None,
+                Some(&fields),
+                Some(&options),
+            )
+            .await
+            .err()
+            .expect("unsupported MAP layout must fail before writing");
+            assert!(
+                error.to_string().contains("only supports parquet"),
+                "{error}"
+            );
+            assert!(!io.exists(&path).await.unwrap());
+        }
+        // A default layout still reaches the existing ORC type validation;
+        // it must not be rejected as an unsupported shredding configuration.
+        let options = HashMap::from([("fields.tags.map.storage-layout".into(), "default".into())]);
+        let output = io.new_output("memory:/ordinary-map/data.orc").unwrap();
+        let error = create_format_writer(
+            &output,
+            schema,
+            "none",
+            0,
+            None,
+            Some(&fields),
+            Some(&options),
+        )
+        .await
+        .err()
+        .expect("ORC's existing writer does not support MAP columns");
+        assert!(
+            error
+                .to_string()
+                .contains("ORC writer does not support column"),
+            "{error}"
+        );
     }
 
     #[tokio::test]

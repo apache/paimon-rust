@@ -30,9 +30,10 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
-use opendal::raw::{normalize_path, normalize_root};
+use opendal::raw::{new_std_io_error, normalize_path, normalize_root};
 use opendal::Operator;
 use sha2::{Digest, Sha256};
+use tokio::io::AsyncWriteExt;
 use tokio_util::compat::FuturesAsyncWriteCompatExt;
 use url::Url;
 
@@ -399,15 +400,23 @@ impl FileIO {
                 provider: provider.clone(),
                 origin_only: self.origin_only,
             }),
-            FileIOBackend::Storage(_) => {
+            FileIOBackend::Storage(storage) => {
                 let (op, relative_path) = self.create_routed_static(path)?;
                 let namespace = self.cache_namespace_for_path(path)?;
                 let cache_path =
                     cache_object_path(&namespace, op.origin_operator(), &relative_path);
+                #[cfg(feature = "storage-fs")]
+                let local_fs = matches!(storage.as_ref(), Storage::LocalFs { .. });
+                #[cfg(not(feature = "storage-fs"))]
+                let local_fs = {
+                    let _ = storage;
+                    false
+                };
                 Ok(FileSource::Static {
                     op,
                     relative_path,
                     cache_path,
+                    local_fs,
                 })
             }
         }
@@ -1163,6 +1172,12 @@ impl FileRead for InputFileReader {
 pub trait FileWrite: Send + Unpin + 'static {
     async fn write(&mut self, bs: Bytes) -> crate::Result<()>;
 
+    /// Drain stream-level buffering without closing or publishing the file.
+    /// Writers whose `write` already drains their stream need no extra work.
+    async fn flush(&mut self) -> crate::Result<()> {
+        Ok(())
+    }
+
     async fn close(&mut self) -> crate::Result<()>;
 }
 
@@ -1184,10 +1199,119 @@ struct CacheInvalidatingWriter {
     path: String,
 }
 
+/// OpenDAL's local position writer retains its last write until close. Use a
+/// flushable stream for the built-in local filesystem only; custom operators
+/// and providers must continue to execute their own storage implementations.
+struct LocalFileWriter(tokio::io::BufWriter<tokio::fs::File>);
+
+impl LocalFileWriter {
+    async fn new(op: &Operator, relative_path: &str) -> crate::Result<Self> {
+        let relative_path = normalize_path(relative_path);
+        let relative = std::path::Path::new(relative_path.trim_end_matches('/'));
+        if relative
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            return Err(opendal::Error::new(
+                opendal::ErrorKind::NotFound,
+                "path escapes the configured root via `..`",
+            )
+            .into());
+        }
+        let path = std::path::Path::new(&op.info().root()).join(relative);
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(new_std_io_error)?;
+        }
+        let file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(path)
+            .await
+            .map_err(new_std_io_error)?;
+        Ok(Self(tokio::io::BufWriter::with_capacity(
+            8 * 1024 * 1024,
+            file,
+        )))
+    }
+}
+
+#[async_trait::async_trait]
+impl FileWrite for LocalFileWriter {
+    async fn write(&mut self, bytes: Bytes) -> crate::Result<()> {
+        self.0.write_all(&bytes).await.map_err(new_std_io_error)?;
+        Ok(())
+    }
+
+    async fn flush(&mut self) -> crate::Result<()> {
+        self.0.flush().await.map_err(new_std_io_error)?;
+        Ok(())
+    }
+
+    async fn close(&mut self) -> crate::Result<()> {
+        self.flush().await?;
+        self.0
+            .get_ref()
+            .sync_all()
+            .await
+            .map_err(new_std_io_error)?;
+        Ok(())
+    }
+}
+
+/// Buffer outside OpenDAL's write generator so flush can drain the pending
+/// stream without closing it. Backend multipart uploads still publish on close.
+struct FlushableFileWriter {
+    delegate: opendal::Writer,
+    pending: Vec<Bytes>,
+    pending_bytes: usize,
+}
+
+#[async_trait::async_trait]
+impl FileWrite for FlushableFileWriter {
+    async fn write(&mut self, bytes: Bytes) -> crate::Result<()> {
+        // OpenDAL's non-contiguous buffer does not skip empty segments. Keep
+        // empty collection indexes out so the backend can always advance.
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        self.pending_bytes += bytes.len();
+        self.pending.push(bytes);
+        if self.pending_bytes >= 8 * 1024 * 1024 {
+            self.flush().await?;
+        }
+        Ok(())
+    }
+
+    async fn flush(&mut self) -> crate::Result<()> {
+        if !self.pending.is_empty() {
+            self.pending_bytes = 0;
+            self.delegate
+                .write(std::mem::take(&mut self.pending))
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn close(&mut self) -> crate::Result<()> {
+        self.flush().await?;
+        self.delegate.close().await?;
+        Ok(())
+    }
+}
+
 #[async_trait::async_trait]
 impl FileWrite for CacheInvalidatingWriter {
     async fn write(&mut self, bs: Bytes) -> crate::Result<()> {
         self.delegate.write(bs).await
+    }
+
+    async fn flush(&mut self) -> crate::Result<()> {
+        self.delegate.flush().await?;
+        self.cache.invalidate_path(&self.path).await;
+        Ok(())
     }
 
     async fn close(&mut self) -> crate::Result<()> {
@@ -1268,6 +1392,7 @@ enum FileSource {
         op: RoutedOperator,
         relative_path: String,
         cache_path: String,
+        local_fs: bool,
     },
     Provider {
         provider: Arc<dyn FileIOProvider>,
@@ -1293,6 +1418,7 @@ impl FileSource {
                 op,
                 relative_path,
                 cache_path,
+                ..
             } => Ok((op.clone(), relative_path.clone(), Some(cache_path.clone()))),
         }
     }
@@ -1440,14 +1566,41 @@ impl OutputFile {
                 .chunk(8 * 1024 * 1024)
                 .await?,
         );
+        Ok(self.with_cache_invalidation(writer, cache_path))
+    }
+
+    /// A stream-level flush is needed by BlobConsumer. Keep the ordinary
+    /// bulk output path unchanged; do not install OpenDAL's fixed-size chunk
+    /// queue here because it cannot drain a partial chunk before close.
+    pub(crate) async fn flushable_writer(&self) -> crate::Result<Box<dyn FileWrite>> {
+        let (op, relative_path, cache_path) = self.source.resolve(&self.path).await?;
+        let op = op.operator(OpClass::Write);
+        let writer: Box<dyn FileWrite> =
+            if matches!(self.source, FileSource::Static { local_fs: true, .. }) {
+                Box::new(LocalFileWriter::new(op, &relative_path).await?)
+            } else {
+                Box::new(FlushableFileWriter {
+                    delegate: op.writer(&relative_path).await?,
+                    pending: Vec::new(),
+                    pending_bytes: 0,
+                })
+            };
+        Ok(self.with_cache_invalidation(writer, cache_path))
+    }
+
+    fn with_cache_invalidation(
+        &self,
+        writer: Box<dyn FileWrite>,
+        cache_path: Option<String>,
+    ) -> Box<dyn FileWrite> {
         let (Some(cache), Some(cache_path)) = (&self.cache, cache_path) else {
-            return Ok(writer);
+            return writer;
         };
-        Ok(Box::new(CacheInvalidatingWriter {
+        Box::new(CacheInvalidatingWriter {
             delegate: writer,
             cache: cache.clone(),
             path: cache_path,
-        }))
+        })
     }
 
     /// Get an async streaming writer for format-level writes (e.g. parquet).
@@ -1500,7 +1653,7 @@ mod file_action_test {
         async fn create(&self, _path: &str) -> crate::Result<(Operator, String)> {
             let service: Servicer = Arc::new(CountingListService {
                 pulls: Arc::clone(&self.pulls),
-                fail_with_fork_error: false,
+                fork_error: None,
             });
             Ok((
                 Operator::from_parts(OperationContext::default(), service),
@@ -1512,7 +1665,7 @@ mod file_action_test {
     #[derive(Debug)]
     struct CountingListService {
         pulls: Arc<AtomicUsize>,
-        fail_with_fork_error: bool,
+        fork_error: Option<&'static str>,
     }
 
     impl Service for CountingListService {
@@ -1550,8 +1703,8 @@ mod file_action_test {
             _path: &str,
             _args: OpStat,
         ) -> opendal::Result<RpStat> {
-            if self.fail_with_fork_error {
-                return Err(fork_test_error());
+            if let Some(message) = self.fork_error {
+                return Err(fork_test_error(message));
             }
             Err(unsupported_test_operation())
         }
@@ -1587,7 +1740,7 @@ mod file_action_test {
             Ok(CountingLister {
                 pulls: Arc::clone(&self.pulls),
                 next: 0,
-                fail_with_fork_error: self.fail_with_fork_error,
+                fork_error: self.fork_error,
             })
         }
 
@@ -1629,21 +1782,21 @@ mod file_action_test {
         )
     }
 
-    fn fork_test_error() -> opendal::Error {
-        opendal::Error::new(opendal::ErrorKind::Unsupported, JINDO_FORK_ERROR)
+    fn fork_test_error(message: &'static str) -> opendal::Error {
+        opendal::Error::new(opendal::ErrorKind::Unsupported, message)
     }
 
     struct CountingLister {
         pulls: Arc<AtomicUsize>,
         next: usize,
-        fail_with_fork_error: bool,
+        fork_error: Option<&'static str>,
     }
 
     impl oio::List for CountingLister {
         async fn next(&mut self) -> opendal::Result<Option<oio::Entry>> {
             self.pulls.fetch_add(1, AtomicOrdering::SeqCst);
-            if self.fail_with_fork_error {
-                return Err(fork_test_error());
+            if let Some(message) = self.fork_error {
+                return Err(fork_test_error(message));
             }
             if self.next == 0 {
                 self.next += 1;
@@ -1789,13 +1942,6 @@ mod file_action_test {
 
     #[tokio::test]
     async fn file_status_reads_preserve_fork_safety_error() {
-        let pulls = Arc::new(AtomicUsize::new(0));
-        let service: Servicer = Arc::new(CountingListService {
-            pulls,
-            fail_with_fork_error: true,
-        });
-        let operator = Operator::from_parts(OperationContext::default(), service);
-
         #[derive(Debug)]
         struct FixedProvider(Operator);
 
@@ -1809,26 +1955,36 @@ mod file_action_test {
             }
         }
 
-        let file_io = setup_memory_file_io().with_provider(Arc::new(FixedProvider(operator)));
-        let error = file_io
-            .get_status("counting:/objects/file")
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(error, Error::ProcessForkUnsupported { .. }),
-            "{error:?}"
-        );
+        for message in [
+            crate::error::JINDO_FORK_ERROR,
+            crate::error::OSS_CPP_FORK_ERROR,
+        ] {
+            let service: Servicer = Arc::new(CountingListService {
+                pulls: Arc::new(AtomicUsize::new(0)),
+                fork_error: Some(message),
+            });
+            let operator = Operator::from_parts(OperationContext::default(), service);
+            let file_io = setup_memory_file_io().with_provider(Arc::new(FixedProvider(operator)));
+            let error = file_io
+                .get_status("counting:/objects/file")
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, Error::ProcessForkUnsupported { .. }),
+                "{error:?}"
+            );
 
-        let error = file_io.list_status("counting:/objects/").await.unwrap_err();
-        assert!(matches!(error, Error::ProcessForkUnsupported { .. }));
+            let error = file_io.list_status("counting:/objects/").await.unwrap_err();
+            assert!(matches!(error, Error::ProcessForkUnsupported { .. }));
 
-        let snapshots =
-            crate::table::SnapshotManager::new(file_io, "counting:/objects/table".to_string());
-        let error = snapshots.get_latest_snapshot_id().await.unwrap_err();
-        assert!(
-            matches!(error, Error::ProcessForkUnsupported { .. }),
-            "{error:?}"
-        );
+            let snapshots =
+                crate::table::SnapshotManager::new(file_io, "counting:/objects/table".to_string());
+            let error = snapshots.get_latest_snapshot_id().await.unwrap_err();
+            assert!(
+                matches!(error, Error::ProcessForkUnsupported { .. }),
+                "{error:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -2150,6 +2306,42 @@ mod input_output_test {
 
     fn setup_fs_file_io() -> FileIO {
         FileIOBuilder::new("file").build().unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_flushable_local_output_drains_before_close_and_invalidates_cache() {
+        for cached in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let io = if cached {
+                setup_cached_fs_file_io(&directory.path().join("cache"))
+            } else {
+                setup_fs_file_io()
+            };
+            let path = directory
+                .path()
+                .join("output.blob")
+                .to_string_lossy()
+                .into_owned();
+            std::fs::write(&path, b"stale payload").unwrap();
+            let input = io.new_input(&path).unwrap();
+            assert_eq!(input.read().await.unwrap().as_ref(), b"stale payload");
+            let mut writer = io
+                .new_output(&path)
+                .unwrap()
+                .flushable_writer()
+                .await
+                .unwrap();
+            writer.write(Bytes::new()).await.unwrap();
+            writer.write(Bytes::from_static(b"first")).await.unwrap();
+            writer.flush().await.unwrap();
+            assert_eq!(input.read().await.unwrap().as_ref(), b"first");
+            writer.write(Bytes::new()).await.unwrap();
+            writer.write(Bytes::from_static(b"second")).await.unwrap();
+            writer.flush().await.unwrap();
+            assert_eq!(input.read().await.unwrap().as_ref(), b"firstsecond");
+            writer.close().await.unwrap();
+            assert_eq!(input.read().await.unwrap().as_ref(), b"firstsecond");
+        }
     }
 
     fn setup_cached_fs_file_io(cache_directory: &std::path::Path) -> FileIO {

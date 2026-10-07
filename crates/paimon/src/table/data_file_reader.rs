@@ -330,6 +330,7 @@ impl DataFileReader {
                         )
                     });
                     split_file_offset += file_meta.row_count;
+                    let sidecar_ranges = split_ranges.clone();
                     let selected_ranges = match file_index_result {
                         FileIndexResult::Remain => split_ranges,
                         FileIndexResult::Skip => Some(Vec::new()),
@@ -360,6 +361,7 @@ impl DataFileReader {
                         data_fields,
                         None,
                         row_selection,
+                        sidecar_ranges,
                     )?;
                     while let Some(batch) = stream.next().await {
                         yield batch?;
@@ -437,6 +439,27 @@ impl DataFileReader {
         dv: Option<Arc<DeletionVector>>,
         row_ranges: Option<Vec<RowRange>>,
     ) -> crate::Result<ArrowRecordBatchStream> {
+        self.read_single_file_stream_with_requested_ranges(
+            split,
+            file_meta,
+            data_fields,
+            dv,
+            row_ranges.clone(),
+            row_ranges,
+        )
+    }
+
+    /// Physical selection may be narrowed by file indexes or a LIMIT, while
+    /// Java selects the ROW sidecar from the caller's original row ranges.
+    pub(super) fn read_single_file_stream_with_requested_ranges(
+        &self,
+        split: &DataSplit,
+        file_meta: DataFileMeta,
+        data_fields: Option<Vec<DataField>>,
+        dv: Option<Arc<DeletionVector>>,
+        row_ranges: Option<Vec<RowRange>>,
+        requested_ranges: Option<Vec<RowRange>>,
+    ) -> crate::Result<ArrowRecordBatchStream> {
         let local_ranges = row_ranges.as_ref().map(|ranges| {
             to_local_row_ranges(
                 ranges,
@@ -446,12 +469,20 @@ impl DataFileReader {
         });
         let row_selection =
             merge_row_selection(file_meta.row_count, dv.as_deref(), local_ranges.as_deref());
+        let sidecar_ranges = requested_ranges.as_ref().map(|ranges| {
+            to_local_row_ranges(
+                ranges,
+                file_meta.first_row_id.unwrap_or(0),
+                file_meta.row_count,
+            )
+        });
         self.read_single_file_stream_with_selection(
             split,
             file_meta,
             data_fields,
             None,
             row_selection,
+            sidecar_ranges,
         )
     }
 
@@ -482,6 +513,7 @@ impl DataFileReader {
             data_fields,
             Some(data_schema_fields),
             row_selection,
+            local_ranges,
         )
     }
 
@@ -492,6 +524,7 @@ impl DataFileReader {
         data_fields: Option<Vec<DataField>>,
         data_schema_fields: Option<Vec<DataField>>,
         row_selection: Option<Vec<RowRange>>,
+        sidecar_ranges: Option<Vec<RowRange>>,
     ) -> crate::Result<ArrowRecordBatchStream> {
         if row_selection.as_ref().is_some_and(Vec::is_empty) {
             return Ok(futures::stream::empty().boxed());
@@ -504,27 +537,46 @@ impl DataFileReader {
         let projects_row_id = read_type
             .iter()
             .any(|field| field.name() == ROW_ID_FIELD_NAME);
-        let row_id_residual = projects_row_id
+        let row_tracking_enabled =
+            crate::spec::CoreOptions::new(&self.table_options).row_tracking_enabled();
+        let mut refs = Vec::new();
+        for predicate in &predicates {
+            crate::arrow::residual::collect_predicate_leaf_refs(predicate, &mut refs);
+        }
+        let metadata_residual = (projects_row_id
             && predicates
                 .iter()
-                .any(|predicate| !matches!(predicate, Predicate::AlwaysTrue));
-        if row_id_residual {
+                .any(|predicate| !matches!(predicate, Predicate::AlwaysTrue)))
+            || (row_tracking_enabled
+                && refs
+                    .iter()
+                    .any(|(name, _)| *name == crate::spec::SEQUENCE_NUMBER_FIELD_NAME));
+        if metadata_residual {
             // Decoder-side filtering can drop rows before positional `_ROW_ID`
             // attachment. Read predicate-only columns without pushing the filter
             // down, attach the original ids, then evaluate the exact predicate.
-            let mut refs = Vec::new();
-            for predicate in &predicates {
-                crate::arrow::residual::collect_predicate_leaf_refs(predicate, &mut refs);
-            }
             for (name, index) in refs {
-                if name != ROW_ID_FIELD_NAME {
+                if name == crate::spec::SEQUENCE_NUMBER_FIELD_NAME {
+                    crate::arrow::residual::push_unique_scan_field(
+                        &mut read_type,
+                        &crate::spec::sequence_number_data_field(),
+                    );
+                } else if name == ROW_ID_FIELD_NAME {
+                    crate::arrow::residual::push_unique_scan_field(
+                        &mut read_type,
+                        &crate::spec::row_id_data_field(),
+                    );
+                } else {
                     if let Some(field) = table_fields.get(index) {
                         crate::arrow::residual::push_unique_scan_field(&mut read_type, field);
                     }
                 }
             }
         }
-        let residual_predicates = row_id_residual.then(|| crate::arrow::format::FilePredicates {
+        let projects_row_id = read_type
+            .iter()
+            .any(|field| field.name() == ROW_ID_FIELD_NAME);
+        let residual_predicates = metadata_residual.then(|| crate::arrow::format::FilePredicates {
             predicates: predicates.clone(),
             row_filter_factory: None,
             file_fields: table_fields.clone(),
@@ -534,7 +586,7 @@ impl DataFileReader {
         // post-filter until expression adaptation is proven for that path.
         // Positional `_ROW_ID` materialization must see the unfiltered row
         // stream, so the engine hook stays disabled for this projection.
-        let row_filter_factory = (data_fields.is_none() && !projects_row_id)
+        let row_filter_factory = (data_fields.is_none() && !projects_row_id && !metadata_residual)
             .then(|| self.row_filter_factory.clone())
             .flatten();
         let file_io = self.file_io.clone();
@@ -555,16 +607,18 @@ impl DataFileReader {
             data_schema_fields.as_deref(),
         )?;
         // What the reader is asked for.
-        let projected_read_fields: Vec<DataField> =
-            if data_fields.is_some() || file_meta.write_cols.is_some() {
-                read_data_fields(&data_schema_fields, &read_type, self.nested_field_enabled)?
-            } else {
-                read_type
-                    .iter()
-                    .filter(|field| field.name() != ROW_ID_FIELD_NAME)
-                    .cloned()
-                    .collect()
-            };
+        let projected_read_fields: Vec<DataField> = if data_fields.is_some()
+            || file_meta.write_cols.is_some()
+            || read_type.iter().any(contains_selected_map)
+        {
+            read_data_fields(&data_schema_fields, &read_type, self.nested_field_enabled)?
+        } else {
+            read_type
+                .iter()
+                .filter(|field| field.name() != ROW_ID_FIELD_NAME)
+                .cloned()
+                .collect()
+        };
         let path_to_read = split.data_file_path(&file_meta);
         let configured_reader = create_format_reader_with_budget(
             &path_to_read,
@@ -578,23 +632,8 @@ impl DataFileReader {
             blob_parallelism,
             mosaic_prefetch,
         )?;
-        let format_read_fields = configured_reader.read_fields;
-        let format_reader = configured_reader.reader;
-        // The decoded batch is described by `format_read_fields`, so map
-        // `read_type` onto *that* list: its entries carry the types the columns
-        // actually come back as, which is what reconciling them needs.
-        let (index_mapping, source_fields) =
-            if data_fields.is_some() || file_meta.write_cols.is_some() {
-                (
-                    create_index_mapping(&read_type, &format_read_fields),
-                    Some(format_read_fields.clone()),
-                )
-            } else {
-                (None, None)
-            };
-
         // Remap predicates from table-level to file-level indices.
-        let file_predicates = if row_id_residual {
+        let file_predicates = if metadata_residual {
             None
         } else {
             let remapped = crate::arrow::filtering::remap_predicates_to_file(
@@ -615,7 +654,40 @@ impl DataFileReader {
 
         Ok(try_stream! {
             let schema_open_start = read_timing.as_ref().map(|_| Instant::now());
-            let input_file = file_io.new_input(&path_to_read)?;
+            let options = crate::spec::CoreOptions::new(&table_options);
+            let sidecar_ranges = super::row_sidecar::supports_read_type(
+                &read_type, blob_as_descriptor || options.blob_as_descriptor(),
+            ).then_some(sidecar_ranges.as_deref()).flatten();
+            let (read_path, read_size) = super::row_sidecar::read_target(
+                &file_io, &file_meta, split.bucket_path(), sidecar_ranges, &options,
+            ).await?;
+            let configured_reader = if read_path == path_to_read {
+                configured_reader
+            } else {
+                create_format_reader_with_budget(
+                    &read_path, blob_as_descriptor,
+                    FormatReadFields { data_schema: &data_schema_fields, projected: &projected_read_fields },
+                    &table_options, None, blob_parallelism, mosaic_prefetch,
+                )?
+            };
+            let format_read_fields = configured_reader.read_fields;
+            let format_reader = configured_reader.reader;
+            // The decoded batch is described by `format_read_fields`, so map
+            // `read_type` onto *that* list: its entries carry the types the columns
+            // actually come back as, which is what reconciling them needs.
+            let (index_mapping, source_fields) = if data_fields.is_some()
+                || file_meta.write_cols.is_some()
+                || read_type.iter().any(contains_selected_map)
+            {
+                (
+                    create_index_mapping(&read_type, &format_read_fields),
+                    Some(format_read_fields.clone()),
+                )
+            } else {
+                (None, None)
+            };
+
+            let input_file = file_io.new_input(&read_path)?;
             let open_start = read_timing.as_ref().map(|_| Instant::now());
             let file_reader = input_file.reader().await?;
             if let (Some(timing), Some(start)) = (read_timing.as_ref(), open_start) {
@@ -628,7 +700,14 @@ impl DataFileReader {
                 }),
                 None => Box::new(file_reader),
             };
-            let is_parquet = path_to_read.to_ascii_lowercase().ends_with(".parquet");
+            let is_parquet = read_path.to_ascii_lowercase().ends_with(".parquet");
+            let target_schema = if read_path != path_to_read && read_path.ends_with(".row") {
+                let names = read_type.iter().filter(|field| matches!(field.data_type(), DataType::Blob(_)))
+                    .map(|field| field.name().to_string()).collect();
+                super::row_sidecar::mark_blob_data(&target_schema, &names)
+            } else {
+                target_schema
+            };
             let selected_row_ids = selected_row_ids_for_read(
                 projects_row_id,
                 file_meta.first_row_id,
@@ -639,7 +718,7 @@ impl DataFileReader {
 
             let mut batch_stream = format_reader.read_batch_stream(
                 file_reader,
-                file_meta.file_size as u64,
+                read_size,
                 &format_read_fields,
                 file_predicates.as_ref(),
                 batch_size,
@@ -718,6 +797,18 @@ impl DataFileReader {
                             .ok()
                             .map(|col_idx| batch.column(col_idx))
                     });
+
+                    if row_tracking_enabled
+                        && read_type[i].id() == crate::spec::SEQUENCE_NUMBER_FIELD_ID
+                        && target_field.name() == crate::spec::SEQUENCE_NUMBER_FIELD_NAME
+                    {
+                        columns.push(row_tracking_sequence_column(
+                            source_col,
+                            file_meta.max_sequence_number,
+                            num_rows,
+                        )?);
+                        continue;
+                    }
 
                     match (source_col, source_field) {
                         (Some(col), Some(source_field)) => {
@@ -850,16 +941,18 @@ impl DataFileReader {
         let data_schema_fields =
             data_schema_fields_for_file(&file_fields, file_meta.write_cols.as_deref(), None)?;
         // What the reader is asked for.
-        let projected_read_fields: Vec<DataField> =
-            if data_fields.is_some() || file_meta.write_cols.is_some() {
-                read_data_fields(&data_schema_fields, &read_type, self.nested_field_enabled)?
-            } else {
-                read_type
-                    .iter()
-                    .filter(|field| field.name() != ROW_ID_FIELD_NAME)
-                    .cloned()
-                    .collect()
-            };
+        let projected_read_fields: Vec<DataField> = if data_fields.is_some()
+            || file_meta.write_cols.is_some()
+            || read_type.iter().any(contains_selected_map)
+        {
+            read_data_fields(&data_schema_fields, &read_type, self.nested_field_enabled)?
+        } else {
+            read_type
+                .iter()
+                .filter(|field| field.name() != ROW_ID_FIELD_NAME)
+                .cloned()
+                .collect()
+        };
         let path_to_read = split.data_file_path(&file_meta);
         let configured_reader = create_format_reader_with_budget(
             &path_to_read,
@@ -878,15 +971,17 @@ impl DataFileReader {
         // The decoded batch is described by `format_read_fields`, so map
         // `read_type` onto *that* list: its entries carry the types the columns
         // actually come back as, which is what reconciling them needs.
-        let (index_mapping, source_fields) =
-            if data_fields.is_some() || file_meta.write_cols.is_some() {
-                (
-                    create_index_mapping(&read_type, &format_read_fields),
-                    Some(format_read_fields.clone()),
-                )
-            } else {
-                (None, None)
-            };
+        let (index_mapping, source_fields) = if data_fields.is_some()
+            || file_meta.write_cols.is_some()
+            || read_type.iter().any(contains_selected_map)
+        {
+            (
+                create_index_mapping(&read_type, &format_read_fields),
+                Some(format_read_fields.clone()),
+            )
+        } else {
+            (None, None)
+        };
 
         // Remap predicates from table-level to file-level indices.
         let file_predicates = {
@@ -955,19 +1050,16 @@ fn reconcile_column(
     source_field: &DataField,
     target_field: &DataField,
 ) -> crate::Result<Arc<dyn Array>> {
-    crate::arrow::nested_evolution::evolve_column(
-        col,
-        source_field.data_type(),
-        target_field.data_type(),
-    )
-    .map_err(|e| Error::UnexpectedError {
-        message: format!(
-            "Failed to reconcile column '{}' read as {:?} with read type {:?}",
-            target_field.name(),
-            col.data_type(),
-            target_field.data_type()
-        ),
-        source: Some(Box::new(e)),
+    crate::arrow::nested_evolution::evolve_field(col, source_field, target_field).map_err(|e| {
+        Error::UnexpectedError {
+            message: format!(
+                "Failed to reconcile column '{}' read as {:?} with read type {:?}",
+                target_field.name(),
+                col.data_type(),
+                target_field.data_type()
+            ),
+            source: Some(Box::new(e)),
+        }
     })
 }
 
@@ -1041,6 +1133,36 @@ fn project_file_batch(
     })
 }
 
+fn contains_selected_map(field: &DataField) -> bool {
+    crate::spec::is_map_selected_keys_field(field)
+        || matches!(field.data_type(), DataType::Row(row) if row.fields().iter().any(contains_selected_map))
+}
+
+fn row_tracking_sequence_column(
+    physical: Option<&Arc<dyn Array>>,
+    max_sequence_number: i64,
+    num_rows: usize,
+) -> crate::Result<Arc<dyn Array>> {
+    let physical = physical
+        .map(|array| {
+            array
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| Error::DataInvalid {
+                    message: "Row-tracking sequence column must be BIGINT".into(),
+                    source: None,
+                })
+        })
+        .transpose()?;
+    Ok(Arc::new(Int64Array::from_iter_values((0..num_rows).map(
+        |index| {
+            physical
+                .filter(|array| !array.is_null(index))
+                .map_or(max_sequence_number, |array| array.value(index))
+        },
+    ))))
+}
+
 fn read_data_fields(
     all_data_fields: &[DataField],
     expected_fields: &[DataField],
@@ -1057,8 +1179,22 @@ fn read_data_fields(
                 data_field.data_type(),
                 nested_field_enabled,
             )? {
-                read_fields.push(data_field_with_type(data_field, pruned_type));
+                let mut field = data_field_with_type(data_field, pruned_type);
+                if crate::spec::is_map_selected_keys_field(expected) {
+                    field = field.with_description(expected.description().map(str::to_string));
+                }
+                read_fields.push(field);
             }
+        }
+    }
+    for expected in expected_fields {
+        if expected.id() == crate::spec::SEQUENCE_NUMBER_FIELD_ID
+            && expected.name() == crate::spec::SEQUENCE_NUMBER_FIELD_NAME
+            && !read_fields.iter().any(|field| field.id() == expected.id())
+        {
+            // Row tracking stores this physical system column outside the
+            // logical table schema, including alongside selected MAP keys.
+            read_fields.push(expected.clone());
         }
     }
     Ok(read_fields)
@@ -1077,22 +1213,8 @@ fn prune_data_type(
             let DataType::Row(data_row) = data_type else {
                 return Ok(Some(data_type.clone()));
             };
-            let mut fields = Vec::new();
-            for read_field in read_row.fields() {
-                if let Some(data_field) = data_row
-                    .fields()
-                    .iter()
-                    .find(|field| field.id() == read_field.id())
-                {
-                    if let Some(pruned_type) = prune_data_type(
-                        read_field.data_type(),
-                        data_field.data_type(),
-                        nested_field_enabled,
-                    )? {
-                        fields.push(data_field_with_type(data_field, pruned_type));
-                    }
-                }
-            }
+            let mut fields =
+                read_data_fields(data_row.fields(), read_row.fields(), nested_field_enabled)?;
             if fields.is_empty() {
                 if !nested_field_enabled {
                     return Ok(None);
@@ -1428,7 +1550,8 @@ pub(super) fn insert_column_at(
     if insert_index >= batch.num_columns() {
         columns.push(column);
     }
-    RecordBatch::try_new(output_schema.clone(), columns).map_err(|e| Error::UnexpectedError {
+    let schema = super::row_sidecar::propagate_blob_data(output_schema, &batch);
+    RecordBatch::try_new(schema, columns).map_err(|e| Error::UnexpectedError {
         message: format!("Failed to insert column into RecordBatch: {e}"),
         source: Some(Box::new(e)),
     })
@@ -1516,6 +1639,52 @@ mod row_tests {
     }
 
     #[test]
+    fn row_tracking_sequence_fills_only_missing_values_from_file_metadata() {
+        let physical: Arc<dyn Array> = Arc::new(Int64Array::from(vec![Some(3), None, Some(5)]));
+        let filled = row_tracking_sequence_column(Some(&physical), 9, 3).unwrap();
+        assert_eq!(
+            filled.as_any().downcast_ref::<Int64Array>().unwrap(),
+            &Int64Array::from(vec![3, 9, 5]),
+        );
+        let absent = row_tracking_sequence_column(None, 9, 3).unwrap();
+        assert_eq!(
+            absent.as_any().downcast_ref::<Int64Array>().unwrap(),
+            &Int64Array::from(vec![9, 9, 9]),
+        );
+    }
+
+    #[test]
+    fn selected_map_read_preserves_physical_sequence_number() {
+        let map = field(
+            1,
+            "attrs",
+            DataType::Map(crate::spec::MapType::new(
+                DataType::VarChar(VarCharType::string_type()),
+                DataType::Int(IntType::new()),
+            )),
+        );
+        let selected = crate::spec::map_selected_keys_field(&map, &["key".into()]).unwrap();
+        let sequence = field(
+            crate::spec::SEQUENCE_NUMBER_FIELD_ID,
+            crate::spec::SEQUENCE_NUMBER_FIELD_NAME,
+            DataType::BigInt(BigIntType::with_nullable(false)),
+        );
+        let read = read_data_fields(
+            std::slice::from_ref(&map),
+            &[selected, sequence.clone()],
+            false,
+        )
+        .unwrap();
+        assert_eq!(read.len(), 2);
+        assert_eq!(read[0].data_type(), map.data_type());
+        assert_eq!(
+            read[0].description(),
+            Some("__PAIMON_MAP_SELECTED_KEYS:key")
+        );
+        assert_eq!(read[1], sequence);
+    }
+
+    #[test]
     fn read_data_fields_preserves_variant_extraction_row_type() {
         let configured = DataType::Row(RowType::new(vec![field(
             0,
@@ -1524,15 +1693,18 @@ mod row_tests {
         )]));
         let physical_type = variant_shredding_type(&configured).unwrap();
         let data_field = field(1, "v", physical_type);
-        let extraction_type = DataType::Row(variant_extraction_row(
-            true,
-            vec![(
-                DataType::Int(IntType::new()),
-                "$.age".to_string(),
+        let extraction_type = DataType::Row(
+            variant_extraction_row(
                 true,
-                "UTC".to_string(),
-            )],
-        ));
+                vec![(
+                    DataType::Int(IntType::new()),
+                    "$.age".to_string(),
+                    true,
+                    "UTC".to_string(),
+                )],
+            )
+            .unwrap(),
+        );
         let expected_field = field(1, "v", extraction_type.clone());
 
         let read_fields = read_data_fields(&[data_field], &[expected_field], false).unwrap();

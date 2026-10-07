@@ -85,6 +85,8 @@ const DEFAULT_METADATA_STATS_KEEP_FIRST_N_COLUMNS: i32 = -1;
 const FIELDS_PREFIX: &str = "fields";
 const STATS_MODE_SUFFIX: &str = "stats-mode";
 const ROW_TRACKING_ENABLED_OPTION: &str = "row-tracking.enabled";
+const ROW_TRACKING_PARTITION_GROUP_ON_COMMIT_OPTION: &str =
+    "row-tracking.partition-group-on-commit";
 const CLUSTERING_INCREMENTAL_OPTION: &str = "clustering.incremental";
 pub(crate) const TABLE_TYPE_OPTION: &str = "type";
 
@@ -178,7 +180,9 @@ const DEFAULT_BTREE_INDEX_HIGH_PRIORITY_POOL_RATIO: f64 = 0.1;
 const BLOB_AS_DESCRIPTOR_OPTION: &str = "blob-as-descriptor";
 pub(crate) const BLOB_FIELD_OPTION: &str = "blob-field";
 pub(crate) const BLOB_DESCRIPTOR_FIELD_OPTION: &str = "blob-descriptor-field";
+pub(crate) const BLOB_DESCRIPTOR_FIELD_FALLBACK: &str = "blob.stored-descriptor-fields";
 pub(crate) const BLOB_VIEW_FIELD_OPTION: &str = "blob-view-field";
+pub(crate) const VIDEO_FRAME_FIELD_OPTION: &str = "video-frame-field";
 pub const BLOB_VIEW_RESOLVE_ENABLED_OPTION: &str = "blob-view.resolve.enabled";
 const PK_VECTOR_INDEX_COLUMNS_OPTION: &str = "pk-vector.index.columns";
 const PK_FULL_TEXT_INDEX_COLUMNS_OPTION: &str = "pk-full-text.index.columns";
@@ -218,6 +222,9 @@ pub enum ChangelogProducer {
 pub enum GlobalIndexColumnUpdateAction {
     ThrowError,
     DropPartitionIndex,
+    /// Preserve existing indexes. As in Java, the caller must refresh affected
+    /// index ranges separately before relying on their updated values.
+    Ignore,
 }
 
 /// Search mode for global index queries.
@@ -766,6 +773,52 @@ impl<'a> CoreOptions<'a> {
             .unwrap_or(false)
     }
 
+    /// Whether normal Data Evolution files also write an aligned ROW sidecar.
+    pub fn data_evolution_row_sidecar_enabled(&self) -> crate::Result<bool> {
+        match self.options.get("data-evolution.row-sidecar.enabled") {
+            None => Ok(false),
+            Some(value) if value.eq_ignore_ascii_case("true") => Ok(true),
+            Some(value) if value.eq_ignore_ascii_case("false") => Ok(false),
+            Some(value) => Err(crate::Error::ConfigInvalid {
+                message: format!(
+                    "data-evolution.row-sidecar.enabled must be true or false, got {value}"
+                ),
+            }),
+        }
+    }
+
+    /// Largest sparse selection served by a ROW sidecar. Java defaults to 4096.
+    pub fn data_evolution_row_sidecar_max_selected_rows(&self) -> crate::Result<i64> {
+        let option = "data-evolution.row-sidecar.max-selected-rows";
+        let rows = self.parse_i64_option(option)?.unwrap_or(4096);
+        if rows <= 0 {
+            return Err(crate::Error::ConfigInvalid {
+                message: format!("{option} must be positive, got {rows}"),
+            });
+        }
+        Ok(rows)
+    }
+
+    /// Largest fraction of a file served by a ROW sidecar. Java defaults to 0.05.
+    pub fn data_evolution_row_sidecar_max_selection_ratio(&self) -> crate::Result<f64> {
+        let option = "data-evolution.row-sidecar.max-selection-ratio";
+        let ratio = match self.options.get(option) {
+            Some(raw) => raw
+                .trim()
+                .parse::<f64>()
+                .map_err(|_| crate::Error::ConfigInvalid {
+                    message: format!("Invalid {option}: {raw}"),
+                })?,
+            None => 0.05,
+        };
+        if !(ratio > 0.0 && ratio <= 1.0) {
+            return Err(crate::Error::ConfigInvalid {
+                message: format!("{option} must be in (0, 1], got {ratio}"),
+            });
+        }
+        Ok(ratio)
+    }
+
     pub fn data_evolution_write_cols_optimization_enabled(&self) -> bool {
         self.options
             .get("data-evolution.write-cols-optimization.enabled")
@@ -1130,6 +1183,7 @@ impl<'a> CoreOptions<'a> {
         {
             "THROW_ERROR" => Ok(GlobalIndexColumnUpdateAction::ThrowError),
             "DROP_PARTITION_INDEX" => Ok(GlobalIndexColumnUpdateAction::DropPartitionIndex),
+            "IGNORE" => Ok(GlobalIndexColumnUpdateAction::Ignore),
             other => Err(crate::Error::ConfigInvalid {
                 message: format!("Unsupported global-index.column-update-action: {other}"),
             }),
@@ -1353,6 +1407,15 @@ impl<'a> CoreOptions<'a> {
             .unwrap_or(false)
     }
 
+    /// Group new file metadata by partition before assigning row IDs. Defaults
+    /// to true, matching Java, so each partition receives contiguous row IDs.
+    pub fn row_tracking_partition_group_on_commit(&self) -> bool {
+        self.options
+            .get(ROW_TRACKING_PARTITION_GROUP_ON_COMMIT_OPTION)
+            .map(|v| v.eq_ignore_ascii_case("true"))
+            .unwrap_or(true)
+    }
+
     /// Whether incremental clustering is enabled. Default is false.
     pub fn clustering_incremental_enabled(&self) -> bool {
         self.options
@@ -1417,6 +1480,18 @@ impl<'a> CoreOptions<'a> {
     /// Java leaves `target-file-size` without a default and documents 128 MB for
     /// primary-key tables and 256 MB for append tables; this returns the append
     /// value for both.
+    /// Java's exact default for postpone partitions without an existing layout.
+    /// Unlike inferred counts this is not capped or rounded to a power of two.
+    pub fn postpone_default_bucket_num(&self) -> crate::Result<Option<i32>> {
+        self.options.get("postpone.default-bucket-num").map(|raw| {
+            raw.parse::<i32>().ok().filter(|count| *count > 0).ok_or_else(|| {
+                crate::Error::ConfigInvalid {
+                    message: format!("postpone.default-bucket-num must be a positive 32-bit integer, got '{raw}'"),
+                }
+            })
+        }).transpose()
+    }
+
     pub fn target_file_size(&self) -> i64 {
         self.options
             .get("target-file-size")
@@ -1459,6 +1534,22 @@ impl<'a> CoreOptions<'a> {
             .get("blob.target-file-size")
             .and_then(|v| parse_memory_size(v))
             .unwrap_or_else(|| self.target_file_size())
+    }
+
+    /// Java's BlobFormatWriter copies through a positive, int-sized buffer.
+    pub fn blob_copy_buffer_size(&self) -> crate::Result<usize> {
+        let raw = self.options.get("blob.copy-buffer-size");
+        let bytes = raw
+            .map(|value| parse_memory_size(value))
+            .unwrap_or(Some(4 * 1024))
+            .filter(|size| (1..=i64::from(i32::MAX)).contains(size))
+            .ok_or_else(|| crate::Error::ConfigInvalid {
+                message: format!(
+                    "blob.copy-buffer-size must be between 1 and {} bytes, got {raw:?}",
+                    i32::MAX
+                ),
+            })?;
+        Ok(bytes as usize)
     }
 
     /// Dedicated vector-store file format, if configured.
@@ -1755,13 +1846,25 @@ impl<'a> CoreOptions<'a> {
         let mut fields = self.parse_csv_set(BLOB_FIELD_OPTION);
         fields.extend(self.blob_descriptor_fields());
         fields.extend(self.blob_view_fields());
+        fields.extend(self.video_frame_fields());
         fields
+    }
+
+    /// Scalar BLOB columns stored as logical frame runs in packed `.video` files.
+    pub fn video_frame_fields(&self) -> HashSet<String> {
+        self.parse_csv_set(VIDEO_FRAME_FIELD_OPTION)
     }
 
     /// Comma-separated BLOB field names stored as serialized BlobDescriptor
     /// bytes inline in normal data files (no .blob files for these fields).
     pub fn blob_descriptor_fields(&self) -> HashSet<String> {
-        self.parse_csv_set(BLOB_DESCRIPTOR_FIELD_OPTION)
+        // Java ConfigOption.withFallbackKeys: presence of the canonical key,
+        // including an empty value, takes precedence over the fallback key.
+        Self::parse_csv_value(
+            self.options
+                .get(BLOB_DESCRIPTOR_FIELD_OPTION)
+                .or_else(|| self.options.get(BLOB_DESCRIPTOR_FIELD_FALLBACK)),
+        )
     }
 
     /// Comma-separated BLOB field names stored as serialized BlobViewStruct
@@ -1789,8 +1892,11 @@ impl<'a> CoreOptions<'a> {
     }
 
     fn parse_csv_set(&self, option_name: &'static str) -> HashSet<String> {
-        self.options
-            .get(option_name)
+        Self::parse_csv_value(self.options.get(option_name))
+    }
+
+    fn parse_csv_value(value: Option<&String>) -> HashSet<String> {
+        value
             .map(|s| {
                 s.split(',')
                     .map(str::trim)
@@ -3577,6 +3683,34 @@ mod tests {
             "false".to_string(),
         )]);
         assert!(!CoreOptions::new(&disabled).blob_view_resolve_enabled());
+    }
+
+    #[test]
+    fn blob_descriptor_fallback_obeys_canonical_presence() {
+        for (canonical, expected) in [
+            (None, vec!["a", "b"]),
+            (Some("current"), vec!["current"]),
+            (Some(""), vec![]),
+            (Some(" , "), vec![]),
+        ] {
+            let mut options = HashMap::from([
+                ("blob.stored-descriptor-fields".into(), " a, b,a, ".into()),
+                ("blob-view-field".into(), "view".into()),
+            ]);
+            if let Some(value) = canonical {
+                options.insert("blob-descriptor-field".into(), value.into());
+            }
+            let core = CoreOptions::new(&options);
+            let descriptors = expected
+                .into_iter()
+                .map(String::from)
+                .collect::<HashSet<_>>();
+            assert_eq!(core.blob_descriptor_fields(), descriptors);
+            let mut inline = descriptors;
+            inline.insert("view".into());
+            assert_eq!(core.blob_inline_fields(), inline);
+            assert_eq!(core.blob_fields(), inline);
+        }
     }
 
     #[test]

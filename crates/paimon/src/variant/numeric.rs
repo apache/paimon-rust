@@ -21,6 +21,9 @@ pub(crate) struct VariantFloat32Projection {
     fields: HashMap<usize, ProjectedField>,
     output_width: usize,
     last_layout: Option<ObjectLayoutProjection>,
+    // Offsets of non-monotonic objects in ascending order and each offset's rank; reused while valid.
+    order: Vec<usize>,
+    rank: Vec<usize>,
 }
 
 struct ObjectLayoutProjection {
@@ -33,6 +36,12 @@ struct ObjectLayoutProjection {
 struct ProjectedField {
     name: String,
     outputs: Vec<usize>,
+}
+
+#[derive(Clone, Copy)]
+enum Float32ProjectionMode<'a> {
+    Numeric,
+    Cast { fail_on_error: &'a [bool] },
 }
 
 impl VariantFloat32Projection {
@@ -62,6 +71,8 @@ impl VariantFloat32Projection {
             fields: projected,
             output_width: fields.len(),
             last_layout: None,
+            order: Vec::new(),
+            rank: Vec::new(),
         })
     }
 
@@ -75,6 +86,43 @@ impl VariantFloat32Projection {
         if output.len() != self.output_width {
             return data_invalid("Invalid Variant numeric output width");
         }
+        self.extract_float32_impl(
+            value,
+            metadata,
+            offsets,
+            output,
+            Float32ProjectionMode::Numeric,
+        )
+    }
+
+    pub(crate) fn extract_float32_cast(
+        &mut self,
+        value: &[u8],
+        metadata: &[u8],
+        fail_on_error: &[bool],
+        offsets: &mut Vec<usize>,
+        output: &mut [Option<f32>],
+    ) -> Result<()> {
+        if output.len() != self.output_width || fail_on_error.len() != self.output_width {
+            return data_invalid("Invalid Variant float32 projection width");
+        }
+        self.extract_float32_impl(
+            value,
+            metadata,
+            offsets,
+            output,
+            Float32ProjectionMode::Cast { fail_on_error },
+        )
+    }
+
+    fn extract_float32_impl(
+        &mut self,
+        value: &[u8],
+        metadata: &[u8],
+        offsets: &mut Vec<usize>,
+        output: &mut [Option<f32>],
+        mode: Float32ProjectionMode<'_>,
+    ) -> Result<()> {
         output.fill(None);
         if value_kind(value, 0)? != VariantKind::Object {
             validate_payload(value, metadata)?;
@@ -98,33 +146,33 @@ impl VariantFloat32Projection {
 
         let monotonic =
             offsets.first() == Some(&0) && offsets.windows(2).all(|pair| pair[0] < pair[1]);
-        let sorted_offsets = if monotonic {
-            None
-        } else {
-            let mut sorted = offsets.clone();
-            sorted.sort_unstable();
-            if sorted.first() != Some(&0)
-                || sorted.last() != Some(&data_size)
-                || sorted.windows(2).any(|pair| pair[0] == pair[1])
-            {
+        if !monotonic && !self.order_fits(offsets, data_size) {
+            self.order.clear();
+            self.order.extend(0..offsets.len());
+            self.order.sort_unstable_by_key(|index| offsets[*index]);
+            if !self.order_fits(offsets, data_size) {
                 return data_invalid("Malformed Variant object offsets");
             }
-            Some(sorted)
-        };
+            self.rank.clear();
+            self.rank.resize(offsets.len(), 0);
+            for (position, index) in self.order.iter().enumerate() {
+                self.rank[*index] = position;
+            }
+        }
 
         self.prepare_layout(value, metadata, &layout)?;
-        for (index, id) in &self.last_layout.as_ref().unwrap().selected {
+        let selected = &self.last_layout.as_ref().unwrap().selected;
+        for (index, id) in selected {
             let projected = self.fields.get(id).unwrap();
             let start = offsets[*index];
-            let end = match &sorted_offsets {
-                None => offsets[*index + 1],
-                Some(sorted) => {
-                    let next = sorted.partition_point(|offset| *offset <= start);
-                    *sorted.get(next).ok_or_else(|| Error::DataInvalid {
-                        message: "Malformed Variant object offsets".to_string(),
-                        source: None,
-                    })?
-                }
+            let end = if monotonic {
+                offsets[*index + 1]
+            } else {
+                let next = self.rank[*index] + 1;
+                offsets[*self.order.get(next).ok_or_else(|| Error::DataInvalid {
+                    message: "Malformed Variant object offsets".to_string(),
+                    source: None,
+                })?]
             };
             let child_pos =
                 layout
@@ -139,12 +187,43 @@ impl VariantFloat32Projection {
                 return data_invalid("Malformed Variant child size");
             }
             let child = VariantRef::new_at(value, metadata, child_pos)?;
-            let numeric = numeric_to_float32(child, &projected.name)?;
+            let numeric = match mode {
+                Float32ProjectionMode::Numeric => numeric_to_float32(child, &projected.name)?,
+                Float32ProjectionMode::Cast { fail_on_error } => {
+                    if child.is_null()? {
+                        continue;
+                    }
+                    let numeric = cast_variant_to_f32(child);
+                    if numeric.is_none()
+                        && projected
+                            .outputs
+                            .iter()
+                            .any(|output_index| fail_on_error[*output_index])
+                    {
+                        return data_invalid(format!(
+                            "Cannot cast Variant value to {:?}",
+                            DataType::Float(FloatType::new())
+                        ));
+                    }
+                    numeric
+                }
+            };
             for output_index in &projected.outputs {
                 output[*output_index] = numeric;
             }
         }
         Ok(())
+    }
+
+    /// True if the cached order lists `offsets` strictly ascending from 0 to `data_size`.
+    fn order_fits(&self, offsets: &[usize], data_size: usize) -> bool {
+        self.order.len() == offsets.len()
+            && self.order.first().map(|index| offsets[*index]) == Some(0)
+            && self.order.last().map(|index| offsets[*index]) == Some(data_size)
+            && self
+                .order
+                .windows(2)
+                .all(|pair| offsets[pair[0]] < offsets[pair[1]])
     }
 
     fn prepare_layout(
@@ -242,5 +321,47 @@ mod tests {
             .extract_float32(&value, variant.metadata(), &mut offsets, &mut output)
             .unwrap();
         assert_eq!(output, vec![Some(2.0), Some(1.0), Some(2.0)]);
+    }
+
+    #[test]
+    fn cached_offset_order_still_rejects_malformed_rows() {
+        let variant = GenericVariant::parse_json(r#"{"a":1,"b":2}"#).unwrap();
+        let mut value = variant.value().to_vec();
+        let layout = object_layout(&value, 0).unwrap();
+        let first = read_unsigned(&value, layout.offset_start, layout.offset_size).unwrap();
+        let second = read_unsigned(
+            &value,
+            layout.offset_start + layout.offset_size,
+            layout.offset_size,
+        )
+        .unwrap();
+        write_le_at(&mut value, layout.offset_start, second, layout.offset_size);
+        write_le_at(
+            &mut value,
+            layout.offset_start + layout.offset_size,
+            first,
+            layout.offset_size,
+        );
+        let fields = vec!["a".to_string(), "b".to_string()];
+        let mut projection = VariantFloat32Projection::new(variant.metadata(), &fields).unwrap();
+        let mut offsets = Vec::new();
+        let mut output = vec![None; fields.len()];
+        for _ in 0..2 {
+            projection
+                .extract_float32(&value, variant.metadata(), &mut offsets, &mut output)
+                .unwrap();
+            assert_eq!(output, vec![Some(2.0), Some(1.0)]);
+        }
+        let mut duplicate = value.clone();
+        write_le_at(&mut duplicate, layout.offset_start, 0, layout.offset_size);
+        write_le_at(
+            &mut duplicate,
+            layout.offset_start + layout.offset_size,
+            0,
+            layout.offset_size,
+        );
+        assert!(projection
+            .extract_float32(&duplicate, variant.metadata(), &mut offsets, &mut output)
+            .is_err());
     }
 }

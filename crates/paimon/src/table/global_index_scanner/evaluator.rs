@@ -285,9 +285,13 @@ impl GlobalIndexScanner {
                         )
                         .await?;
 
-                    // Evaluate non-leaf children recursively
-                    for child in non_leaf_children {
-                        if let Some(child_result) = self.evaluate(child).await? {
+                    // Evaluate non-leaf children concurrently in predicate order.
+                    let stream = futures::stream::iter(0..non_leaf_children.len())
+                        .map(|index| self.evaluate(non_leaf_children[index]))
+                        .buffered(self.global_index_thread_num);
+                    futures::pin_mut!(stream);
+                    while let Some(result) = stream.try_next().await? {
+                        if let Some(child_result) = result {
                             row_ranges = Some(match row_ranges {
                                 None => child_result.row_ranges,
                                 Some(existing) => {

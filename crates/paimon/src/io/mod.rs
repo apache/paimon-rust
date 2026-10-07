@@ -81,6 +81,11 @@ mod storage_jindo;
 #[cfg(feature = "storage-jindo")]
 use storage_jindo::*;
 
+#[cfg(feature = "storage-oss-cpp")]
+mod storage_oss_cpp;
+#[cfg(feature = "storage-oss-cpp")]
+use storage_oss_cpp::*;
+
 #[cfg(feature = "storage-s3")]
 mod storage_s3;
 #[cfg(feature = "storage-s3")]
