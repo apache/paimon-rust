@@ -25,6 +25,10 @@ use reqwest::header::CONTENT_ENCODING;
 use std::ops::Range;
 use std::sync::{Arc, LazyLock};
 
+mod custom;
+pub(crate) use custom::ReusingBlobRefStreamProvider;
+pub use custom::{UriInputStream, UriReader, UriReaderFactory};
+
 pub(crate) enum UriInput {
     File(InputFile),
     Http(HttpReader),

@@ -108,6 +108,21 @@ print(f"\nRead: {batches_tt[0].num_rows} rows")
 print(batches_tt[0])
 ```
 
+### Custom Blob URI sources
+
+Before the first Arrow write, call
+`writer.with_blob_uri_reader_factory(factory)` to copy referenced Blob payloads
+from custom sources. The factory provides `create(uri)`, returning a reader with
+`new_input_stream(uri)`. Streams provide bounded `read(size)`, `close()`, and
+optionally `seek(offset)`; an empty read means EOF. Return the same reader object
+when sources share reader identity so consecutive reference windows can reuse an
+open stream. Pass `None` to restore the default URI reader before writing.
+
+Rust handles descriptor ranges, successful short reads, stream reuse, reopening
+and closure for scalar, array and map Blob writes, including managed primary-key
+Blob packs. Exceptions raised by Python source callbacks are propagated to the
+caller. The Python layer does not copy payloads or cache source streams.
+
 ### Native commit from serialized messages
 
 The Python binding follows Java's batch/stream builder structure. Use

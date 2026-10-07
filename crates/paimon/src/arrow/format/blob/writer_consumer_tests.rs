@@ -63,6 +63,8 @@ fn writer(kind: BlobFieldKind, output: &Arc<Mutex<OutputState>>) -> BlobFormatWr
         path: "memory:/payload.blob".into(),
         field_name: "payload".into(),
         consumer: None,
+        uri_reader_factory: None,
+        reference_streams: ReusingBlobRefStreamProvider::default(),
         copy_buffer_size: 4 * 1024,
         bytes_written: 0,
         lengths: Vec::new(),

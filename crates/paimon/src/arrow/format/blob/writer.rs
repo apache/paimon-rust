@@ -23,7 +23,8 @@ use super::{
     BLOB_MAP_MAGIC_NUMBER, BLOB_MAP_VERSION,
 };
 use crate::arrow::format::{FormatFileWriter, FormatWriteResult, FormatWriterFactory};
-use crate::io::{FileIO, FileRead, FileWrite, OutputFile};
+use crate::io::uri_reader::ReusingBlobRefStreamProvider;
+use crate::io::{FileIO, FileRead, FileWrite, OutputFile, UriInputStream, UriReaderFactory};
 use crate::spec::{BlobConsumer, BlobDescriptor, CoreOptions, DataField, DataType};
 use crate::{Error, Result};
 use arrow_array::{
@@ -45,10 +46,15 @@ const SOURCE_READ_SIZE: u64 = 8 * 1024 * 1024;
 #[path = "writer_consumer_tests.rs"]
 mod consumer_tests;
 
+#[cfg(test)]
+#[path = "writer_uri_reader_tests.rs"]
+mod uri_reader_tests;
+
 pub(crate) struct BlobWriterFactory {
     file_io: Option<FileIO>,
     field: Option<DataField>,
     consumer: Option<Arc<dyn BlobConsumer>>,
+    uri_reader_factory: Option<Arc<dyn UriReaderFactory>>,
     copy_buffer_size: usize,
 }
 
@@ -63,6 +69,7 @@ impl BlobWriterFactory {
             file_io,
             field: field.cloned(),
             consumer: None,
+            uri_reader_factory: None,
             copy_buffer_size: CoreOptions::new(options.unwrap_or(&defaults))
                 .blob_copy_buffer_size()?,
         })
@@ -70,6 +77,11 @@ impl BlobWriterFactory {
 
     pub(crate) fn with_consumer(mut self, consumer: Arc<dyn BlobConsumer>) -> Self {
         self.consumer = Some(consumer);
+        self
+    }
+
+    pub(crate) fn with_uri_reader_factory(mut self, factory: Arc<dyn UriReaderFactory>) -> Self {
+        self.uri_reader_factory = Some(factory);
         self
     }
 }
@@ -94,6 +106,7 @@ impl FormatWriterFactory for BlobWriterFactory {
                 self.field.as_ref(),
             )?
             .with_copy_buffer_size(self.copy_buffer_size)
+            .with_uri_reader_factory(self.uri_reader_factory.clone())
             .with_consumer(self.consumer.clone()),
         ))
     }
@@ -106,6 +119,8 @@ pub(crate) struct BlobFormatWriter {
     path: String,
     field_name: String,
     consumer: Option<Arc<dyn BlobConsumer>>,
+    uri_reader_factory: Option<Arc<dyn UriReaderFactory>>,
+    reference_streams: ReusingBlobRefStreamProvider,
     copy_buffer_size: usize,
     bytes_written: u64,
     lengths: Vec<i64>,
@@ -147,6 +162,8 @@ impl BlobFormatWriter {
             path: output.location().to_string(),
             field_name: field.map_or_else(String::new, |field| field.name().to_string()),
             consumer: None,
+            uri_reader_factory: None,
+            reference_streams: ReusingBlobRefStreamProvider::default(),
             copy_buffer_size: 4 * 1024,
             bytes_written: 0,
             lengths: Vec::new(),
@@ -156,6 +173,14 @@ impl BlobFormatWriter {
     pub(crate) fn with_copy_buffer_size(mut self, size: usize) -> Self {
         debug_assert!(size > 0);
         self.copy_buffer_size = size;
+        self
+    }
+
+    pub(crate) fn with_uri_reader_factory(
+        mut self,
+        factory: Option<Arc<dyn UriReaderFactory>>,
+    ) -> Self {
+        self.uri_reader_factory = factory;
         self
     }
 
@@ -249,6 +274,11 @@ impl BlobFormatWriter {
         }
         let descriptor = BlobDescriptor::deserialize(value)?;
         let range = descriptor.range_spec()?;
+        if let Some(factory) = self.uri_reader_factory.clone() {
+            return self
+                .copy_custom_reference(factory.as_ref(), &descriptor, hasher)
+                .await;
+        }
         let file_io = self.file_io.as_ref().ok_or_else(|| {
             invalid("BlobFormatWriter received a BlobDescriptor but has no FileIO to resolve it")
         })?;
@@ -279,6 +309,94 @@ impl BlobFormatWriter {
         self.copy_payload(reader.as_ref(), offset..end, hasher, descriptor.uri())
             .await?;
         Ok(length_i64)
+    }
+
+    async fn copy_custom_reference(
+        &mut self,
+        factory: &dyn UriReaderFactory,
+        descriptor: &BlobDescriptor,
+        hasher: &mut Hasher,
+    ) -> Result<i64> {
+        let range = descriptor.range_spec()?;
+        let reader = factory.create(descriptor.uri())?;
+        let length = match range.length() {
+            Some(length) => {
+                let mut sources = std::mem::take(&mut self.reference_streams);
+                let result = async {
+                    sources
+                        .prepare(reader, descriptor.uri(), range.offset())
+                        .await?;
+                    let result = self
+                        .copy_uri_stream(sources.stream(), Some(length), hasher)
+                        .await;
+                    match result {
+                        Ok(length) => {
+                            sources.advance(length);
+                            Ok(length)
+                        }
+                        Err(error) => {
+                            let _ = sources.close().await;
+                            Err(error)
+                        }
+                    }
+                }
+                .await;
+                self.reference_streams = sources;
+                result?
+            }
+            None => {
+                // Unknown-length references read to EOF on their own stream;
+                // do not consume or replace the cached bounded source.
+                let mut stream = reader.new_input_stream(descriptor.uri()).await?;
+                let result = async {
+                    if range.offset() != 0 {
+                        stream.seek(range.offset()).await?;
+                    }
+                    self.copy_uri_stream(stream.as_mut(), None, hasher).await
+                }
+                .await;
+                let close = stream.close().await;
+                let length = result?;
+                close?;
+                length
+            }
+        };
+        i64::try_from(length).map_err(|_| invalid("BLOB payload exceeds i64"))
+    }
+
+    async fn copy_uri_stream(
+        &mut self,
+        stream: &mut dyn UriInputStream,
+        length: Option<u64>,
+        hasher: &mut Hasher,
+    ) -> Result<u64> {
+        let mut copied = 0_u64;
+        loop {
+            let requested = length.map_or(self.copy_buffer_size, |length| {
+                (length - copied).min(self.copy_buffer_size as u64) as usize
+            });
+            if requested == 0 {
+                return Ok(copied);
+            }
+            let bytes = stream.read(requested).await?;
+            if bytes.len() > requested {
+                return Err(invalid("URI stream returned more bytes than requested"));
+            }
+            if bytes.is_empty() {
+                if length.is_some_and(|length| length != copied) {
+                    return Err(invalid(format!(
+                        "Unexpected EOF copying BLOB payload: expected {} bytes, received {copied}",
+                        length.unwrap()
+                    )));
+                }
+                return Ok(copied);
+            }
+            copied = copied
+                .checked_add(bytes.len() as u64)
+                .filter(|length| *length <= i64::MAX as u64)
+                .ok_or_else(|| invalid("BLOB payload exceeds i64"))?;
+            self.write_bytes(bytes, hasher).await?;
+        }
     }
 
     async fn copy_payload(
@@ -455,17 +573,27 @@ impl FormatFileWriter for BlobFormatWriter {
         self.writer.flush().await
     }
     async fn close(mut self: Box<Self>) -> Result<FormatWriteResult> {
-        let index = encode_delta_varints_write(&self.lengths);
-        let length =
-            i32::try_from(index.len()).map_err(|_| invalid("BLOB file index exceeds i32"))?;
-        self.writer.write(index.into()).await?;
-        self.writer
-            .write(Bytes::copy_from_slice(&length.to_le_bytes()))
-            .await?;
-        self.writer
-            .write(Bytes::from_static(&[BLOB_FORMAT_VERSION]))
-            .await?;
-        self.writer.close().await?;
+        let footer = async {
+            let index = encode_delta_varints_write(&self.lengths);
+            let length =
+                i32::try_from(index.len()).map_err(|_| invalid("BLOB file index exceeds i32"))?;
+            self.writer.write(index.into()).await?;
+            self.writer
+                .write(Bytes::copy_from_slice(&length.to_le_bytes()))
+                .await?;
+            self.writer
+                .write(Bytes::from_static(&[BLOB_FORMAT_VERSION]))
+                .await?;
+            Ok::<_, Error>(length)
+        }
+        .await;
+        // Close both source and destination even if the footer or one close
+        // fails, keeping the first failure primary, like Java's finally blocks.
+        let source_close = self.reference_streams.close().await;
+        let output_close = self.writer.close().await;
+        let length = footer?;
+        source_close?;
+        output_close?;
         Ok(FormatWriteResult::new(
             self.bytes_written + length as u64 + 5,
         ))

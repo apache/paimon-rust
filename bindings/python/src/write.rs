@@ -31,6 +31,7 @@ use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyString};
 
+use crate::blob_uri_reader::{callback_error, to_callback_error, PythonUriReaderFactory};
 use crate::error::to_py_err;
 use crate::predicate::{dict_to_table_predicate, py_to_datum};
 
@@ -84,7 +85,6 @@ impl WriteContext {
             ))),
             table_location: self.table.location().to_string(),
             commit_user: self.commit_user.clone(),
-            blob_consumer: None,
         })
     }
 }
@@ -315,6 +315,21 @@ enum WriteTarget {
 }
 
 impl WriteTarget {
+    fn with_blob_uri_reader_factory(
+        &mut self,
+        factory: Option<Arc<dyn paimon::io::UriReaderFactory>>,
+    ) -> paimon::Result<()> {
+        match self {
+            Self::Table(writer) => {
+                writer.with_blob_uri_reader_factory(factory)?;
+            }
+            Self::PostponeFixed(writer) => {
+                writer.with_blob_uri_reader_factory(factory)?;
+            }
+        }
+        Ok(())
+    }
+
     fn with_blob_consumer(
         &mut self,
         consumer: Option<Arc<dyn BlobConsumer>>,
@@ -459,7 +474,6 @@ impl PyPostponeFixedBucketWriteBuilder {
                 ))),
                 table_location: context.table.location().to_string(),
                 commit_user: context.commit_user.clone(),
-                blob_consumer: None,
             },
             prepared: false,
         })
@@ -474,14 +488,12 @@ struct WriteState {
     inner: Option<WriteTarget>,
     table_location: String,
     commit_user: String,
-    blob_consumer: Option<Arc<PythonBlobConsumer>>,
 }
 
 /// Descriptor serialization and exception transport only; record boundaries,
 /// callback timing and requested flushes belong to Rust core.
 struct PythonBlobConsumer {
     callback: Py<PyAny>,
-    error: Mutex<Option<PyErr>>,
 }
 
 impl BlobConsumer for PythonBlobConsumer {
@@ -500,13 +512,7 @@ impl BlobConsumer for PythonBlobConsumer {
                     .is_truthy()
             })
         });
-        result.map_err(|error| {
-            *self.error.lock().unwrap() = Some(error);
-            paimon::Error::DataInvalid {
-                message: "BLOB consumer failed".into(),
-                source: None,
-            }
-        })
+        result.map_err(callback_error)
     }
 }
 
@@ -711,16 +717,31 @@ impl UpdateContext {
 }
 
 impl WriteState {
+    fn with_blob_uri_reader_factory(
+        &mut self,
+        factory: Option<Py<PyAny>>,
+        py: Python<'_>,
+    ) -> PyResult<()> {
+        let factory = factory
+            .map(|factory| {
+                PythonUriReaderFactory::new(factory, py)
+                    .map(|factory| Arc::new(factory) as Arc<dyn paimon::io::UriReaderFactory>)
+            })
+            .transpose()?;
+        self.inner
+            .as_mut()
+            .ok_or_else(|| PyRuntimeError::new_err("TableWrite is closed"))?
+            .with_blob_uri_reader_factory(factory)
+            .map_err(to_py_err)
+    }
+
     fn with_blob_consumer(&mut self, callback: Option<Py<PyAny>>, py: Python<'_>) -> PyResult<()> {
         let consumer = callback
             .map(|callback| {
                 if !callback.bind(py).is_callable() {
                     return Err(PyTypeError::new_err("blob_consumer must be callable"));
                 }
-                Ok(Arc::new(PythonBlobConsumer {
-                    callback,
-                    error: Mutex::new(None),
-                }))
+                Ok(Arc::new(PythonBlobConsumer { callback }))
             })
             .transpose()?;
         self.inner
@@ -732,17 +753,11 @@ impl WriteState {
                     .map(|consumer| consumer as Arc<dyn BlobConsumer>),
             )
             .map_err(to_py_err)?;
-        self.blob_consumer = consumer;
         Ok(())
     }
 
     fn write_result(&self, result: paimon::Result<()>) -> PyResult<()> {
-        if let Some(consumer) = &self.blob_consumer {
-            if let Some(error) = consumer.error.lock().unwrap().take() {
-                return Err(error);
-            }
-        }
-        result.map_err(to_py_err)
+        result.map_err(to_callback_error)
     }
 
     fn with_write_type(&mut self, columns: Vec<String>) -> PyResult<()> {
@@ -775,7 +790,7 @@ impl WriteState {
             .ok_or_else(|| PyRuntimeError::new_err("TableWrite is closed"))?;
         let messages = py
             .detach(|| runtime().block_on(inner.prepare_commit()))
-            .map_err(to_py_err)?;
+            .map_err(to_callback_error)?;
         Ok(wrap_messages(
             messages,
             &self.table_location,
@@ -982,6 +997,16 @@ impl PyBatchTableUpdate {
 
 #[pymethods]
 impl PyBatchTableWrite {
+    #[pyo3(signature = (factory))]
+    fn with_blob_uri_reader_factory(
+        mut slf: PyRefMut<'_, Self>,
+        factory: Option<Py<PyAny>>,
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        let py = slf.py();
+        slf.state.with_blob_uri_reader_factory(factory, py)?;
+        Ok(slf)
+    }
+
     #[pyo3(signature = (callback))]
     fn with_blob_consumer(
         mut slf: PyRefMut<'_, Self>,
@@ -1038,6 +1063,16 @@ pub struct PyStreamTableWrite {
 
 #[pymethods]
 impl PyStreamTableWrite {
+    #[pyo3(signature = (factory))]
+    fn with_blob_uri_reader_factory(
+        mut slf: PyRefMut<'_, Self>,
+        factory: Option<Py<PyAny>>,
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        let py = slf.py();
+        slf.state.with_blob_uri_reader_factory(factory, py)?;
+        Ok(slf)
+    }
+
     #[pyo3(signature = (callback))]
     fn with_blob_consumer(
         mut slf: PyRefMut<'_, Self>,

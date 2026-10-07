@@ -27,6 +27,8 @@ mod bitmap_global_index_writer;
 #[cfg(test)]
 mod blob_consumer_tests;
 mod blob_resolver;
+#[cfg(test)]
+mod blob_uri_reader_tests;
 mod branch_manager;
 #[cfg(test)]
 mod branch_write_tests;

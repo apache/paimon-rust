@@ -5383,6 +5383,8 @@ version = "0.4.0"
 dependencies = [
  "arrow",
  "arrow-row",
+ "async-trait",
+ "bytes",
  "chrono",
  "datafusion",
  "datafusion-ffi",

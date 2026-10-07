@@ -178,6 +178,7 @@ pub struct TableWrite {
     /// Whether the table has non-descriptor blob fields requiring a dedicated-format writer.
     has_blob_fields: bool,
     blob_consumer: Option<Arc<dyn crate::spec::BlobConsumer>>,
+    blob_uri_reader_factory: Option<Arc<dyn crate::io::UriReaderFactory>>,
     /// Dedicated vector-store file format, when configured.
     vector_file_format: Option<String>,
     /// Whether the table has VECTOR fields requiring dedicated vector files.
@@ -249,6 +250,7 @@ impl TableWrite {
             blob_inline_fields: HashSet::new(),
             has_blob_fields: false,
             blob_consumer: None,
+            blob_uri_reader_factory: None,
             vector_file_format: None,
             has_dedicated_vector_fields: false,
             row_kind_generator: None,
@@ -532,6 +534,7 @@ impl TableWrite {
             blob_inline_fields,
             has_blob_fields,
             blob_consumer: None,
+            blob_uri_reader_factory: None,
             vector_file_format,
             has_dedicated_vector_fields,
             row_kind_generator,
@@ -737,6 +740,30 @@ impl TableWrite {
         Ok(self)
     }
 
+    /// Select URI readers for referenced Blob payloads before writing any data.
+    /// Source selection, bounded copies, stream reuse and cleanup are handled
+    /// by core, as with Java UriReaderFactory and BlobRef.
+    pub fn with_blob_uri_reader_factory(
+        &mut self,
+        factory: Option<Arc<dyn crate::io::UriReaderFactory>>,
+    ) -> Result<&mut Self> {
+        self.ensure_active()?;
+        if self.written {
+            return Err(crate::Error::DataInvalid {
+                message: "with_blob_uri_reader_factory must be called before any write operation"
+                    .into(),
+                source: None,
+            });
+        }
+        if self.format_writer.is_some() {
+            return Err(crate::Error::Unsupported {
+                message: "with_blob_uri_reader_factory requires a Paimon table".into(),
+            });
+        }
+        self.blob_uri_reader_factory = factory;
+        Ok(self)
+    }
+
     /// Write an Arrow RecordBatch. Rows are routed to the correct partition and bucket.
     pub async fn write_arrow_batch(&mut self, batch: &RecordBatch) -> Result<()> {
         if let Some(writer) = self.format_writer.as_mut() {
@@ -790,6 +817,11 @@ impl TableWrite {
         bucket: i32,
         batch: RecordBatch,
     ) -> Result<()> {
+        self.ensure_active()?;
+        if batch.num_rows() == 0 {
+            return Ok(());
+        }
+        self.written = true;
         self.write_bucket(partition, bucket, batch).await
     }
 
@@ -1383,7 +1415,10 @@ impl TableWrite {
                     self.table.schema().options(),
                     &self.blob_inline_fields,
                 )?
-                .with_blob_consumer(self.blob_consumer.clone())?
+                .with_blob_writer_options(
+                    self.blob_consumer.clone(),
+                    self.blob_uri_reader_factory.clone(),
+                )?
                 .with_resources(self.resources.clone()),
             )))
         } else {
@@ -1460,6 +1495,7 @@ impl TableWrite {
                     file_index_options: self.file_index_options.clone(),
                 },
             )?
+            .with_blob_uri_reader_factory(self.blob_uri_reader_factory.clone())
             .with_resources(self.resources.clone()),
         ))
     }
@@ -1530,6 +1566,7 @@ impl TableWrite {
                 },
                 next_seq,
             )?
+            .with_blob_uri_reader_factory(self.blob_uri_reader_factory.clone())
             .with_resources(self.resources.clone()),
         ))
     }
