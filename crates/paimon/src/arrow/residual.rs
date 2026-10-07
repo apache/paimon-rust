@@ -1005,16 +1005,42 @@ fn set_membership_hash_mask(
         let array = array
             .as_any()
             .downcast_ref::<arrow_array::PrimitiveArray<T>>()?;
-        let set = literals
+        let mut set = literals
             .iter()
-            .map(|literal| integer_literal(literal).and_then(|v| T::Native::try_from(v).ok()))
-            .collect::<Option<HashSet<_>>>()?;
-        Some(
-            array
-                .iter()
-                .map(|value| Some(value.is_some_and(|v| set.contains(&v) == keep)))
-                .collect(),
-        )
+            .map(|literal| {
+                integer_literal(literal)
+                    .and_then(|v| T::Native::try_from(v).ok())
+                    .and_then(arrow_buffer::ArrowNativeType::to_i64)
+            })
+            .collect::<Option<Vec<i64>>>()?;
+        set.sort_unstable();
+        set.dedup();
+        let (min, max) = (*set.first()?, *set.last()?);
+        let values = array.values();
+        // Small literal spans use a bitmap; otherwise binary search. Both avoid per-call hashing.
+        let span = max.checked_sub(min).and_then(|d| usize::try_from(d).ok());
+        let member: Box<dyn Fn(i64) -> bool> = match span {
+            Some(span) if span < (1 << 16) => {
+                let mut bits = vec![0u64; span / 64 + 1];
+                for v in &set {
+                    let i = (v - min) as usize;
+                    bits[i / 64] |= 1 << (i % 64);
+                }
+                Box::new(move |v: i64| {
+                    v >= min && v <= max && {
+                        let i = (v - min) as usize;
+                        bits[i / 64] & (1 << (i % 64)) != 0
+                    }
+                })
+            }
+            _ => Box::new(move |v: i64| set.binary_search(&v).is_ok()),
+        };
+        let mask = arrow_buffer::BooleanBuffer::collect_bool(array.len(), |row| {
+            array.is_valid(row)
+                && arrow_buffer::ArrowNativeType::to_i64(values[row])
+                    .is_some_and(|v| member(v) == keep)
+        });
+        Some(BooleanArray::new(mask, None))
     }
 
     match array.data_type() {
@@ -1771,6 +1797,60 @@ mod tests {
             mask.iter().collect::<Vec<_>>(),
             vec![Some(true), Some(false), Some(false), Some(true)]
         );
+    }
+
+    #[test]
+    fn test_in_integer_bitmap_and_search_paths() {
+        use crate::spec::BigIntType;
+        let array: ArrayRef = Arc::new(arrow_array::Int64Array::from(vec![
+            Some(-5i64),
+            None,
+            Some(0),
+            Some(83),
+            Some(84),
+            Some(1 << 40),
+        ]));
+        let data_type = DataType::BigInt(BigIntType::new());
+        let near = vec![
+            Datum::Long(0),
+            Datum::Long(83),
+            Datum::Long(-5),
+            Datum::Long(83),
+        ];
+        let far = vec![Datum::Long(-5), Datum::Long(1 << 40)];
+        for (literals, expected) in [
+            (&near, vec![true, false, true, true, false, false]),
+            (&far, vec![true, false, false, false, false, true]),
+        ] {
+            let mask = evaluate_set_membership_predicate(
+                &array,
+                &data_type,
+                PredicateOperator::In,
+                literals,
+            )
+            .unwrap();
+            assert_eq!(mask.null_count(), 0);
+            assert_eq!(
+                mask.iter().map(Option::unwrap).collect::<Vec<_>>(),
+                expected
+            );
+            let mask = evaluate_set_membership_predicate(
+                &array,
+                &data_type,
+                PredicateOperator::NotIn,
+                literals,
+            )
+            .unwrap();
+            let not_expected = expected
+                .iter()
+                .enumerate()
+                .map(|(row, hit)| row != 1 && !hit)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                mask.iter().map(Option::unwrap).collect::<Vec<_>>(),
+                not_expected
+            );
+        }
     }
 
     #[test]
