@@ -656,6 +656,63 @@ fn cast_record_batch_to_schema(
     })
 }
 
+/// Options for per-row-group readers; they keep the main reader's Variant metadata schema.
+fn rebuilt_reader_options(variant_schema: &Option<arrow_schema::SchemaRef>) -> ArrowReaderOptions {
+    match variant_schema {
+        Some(schema) => ArrowReaderOptions::new().with_schema(Arc::clone(schema)),
+        None => ArrowReaderOptions::new(),
+    }
+}
+
+/// File schema with `metadata: Dictionary(Int32, Binary)` for plain Variant columns read for extraction.
+fn dictionary_variant_metadata_schema(
+    schema: &arrow_schema::SchemaRef,
+    read_fields: &[DataField],
+) -> Option<arrow_schema::SchemaRef> {
+    let mut changed = false;
+    let fields = schema
+        .fields()
+        .iter()
+        .map(|field| {
+            let extraction = read_fields.iter().any(|read| {
+                read.name() == field.name()
+                    && crate::spec::is_variant_extraction_row_type(read.data_type())
+            });
+            match field.data_type() {
+                arrow_schema::DataType::Struct(children)
+                    if extraction && crate::arrow::is_variant_arrow_fields(children) =>
+                {
+                    changed = true;
+                    let mut children = children
+                        .iter()
+                        .map(|child| child.as_ref().clone())
+                        .collect::<Vec<_>>();
+                    children[1] =
+                        children[1]
+                            .clone()
+                            .with_data_type(arrow_schema::DataType::Dictionary(
+                                Box::new(arrow_schema::DataType::Int32),
+                                Box::new(arrow_schema::DataType::Binary),
+                            ));
+                    Arc::new(
+                        field
+                            .as_ref()
+                            .clone()
+                            .with_data_type(arrow_schema::DataType::Struct(children.into())),
+                    )
+                }
+                _ => Arc::clone(field),
+            }
+        })
+        .collect::<Vec<_>>();
+    changed.then(|| {
+        Arc::new(arrow_schema::Schema::new_with_metadata(
+            fields,
+            schema.metadata().clone(),
+        ))
+    })
+}
+
 #[async_trait]
 impl FormatFileReader for ParquetFormatReader {
     async fn read_batch_stream(
@@ -689,9 +746,24 @@ impl FormatFileReader for ParquetFormatReader {
                 arrow_options = arrow_options.with_offset_index_policy(PageIndexPolicy::Optional);
             }
         }
-        let mut batch_stream_builder =
-            ParquetRecordBatchStreamBuilder::new_with_options(arrow_file_reader, arrow_options)
-                .await?;
+        let mut batch_stream_builder = ParquetRecordBatchStreamBuilder::new_with_options(
+            arrow_file_reader,
+            arrow_options.clone(),
+        )
+        .await?;
+        // Variant columns read only for extraction keep their metadata dictionary-encoded.
+        let variant_schema =
+            dictionary_variant_metadata_schema(batch_stream_builder.schema(), read_fields);
+        if let Some(schema) = variant_schema.clone() {
+            let reader_metadata = ArrowReaderMetadata::try_new(
+                Arc::clone(batch_stream_builder.metadata()),
+                arrow_options.with_schema(schema),
+            )?;
+            let reader = ArrowFileReader::new(file_size, Arc::clone(&shared_reader))
+                .with_metadata_cache_enabled(self.metadata_cache_enabled);
+            batch_stream_builder =
+                ParquetRecordBatchStreamBuilder::new_with_metadata(reader, reader_metadata);
+        }
 
         let parquet_schema = batch_stream_builder.parquet_schema().clone();
 
@@ -906,7 +978,7 @@ impl FormatFileReader for ParquetFormatReader {
             let row_group_count = selected_row_groups.len();
             let reader_metadata = ArrowReaderMetadata::try_new(
                 batch_stream_builder.metadata().clone(),
-                ArrowReaderOptions::new(),
+                rebuilt_reader_options(&variant_schema),
             )?;
             let read_budget = Arc::clone(read_budget.expect("checked above"));
             let (row_group_tx, mut row_group_rx) = mpsc::channel(row_group_parallelism);
@@ -1004,7 +1076,7 @@ impl FormatFileReader for ParquetFormatReader {
             let selected = selected_row_groups.expect("resource-aware reads need a selection plan");
             let metadata = ArrowReaderMetadata::try_new(
                 batch_stream_builder.metadata().clone(),
-                ArrowReaderOptions::new(),
+                rebuilt_reader_options(&variant_schema),
             )?;
             let residual = (!all_enforced).then(|| FilePredicates {
                 predicates: preds.to_vec(),
@@ -7405,5 +7477,88 @@ mod tests {
             panic!("expected DataInvalid, got {err:?}");
         };
         assert!(message.contains("file.compression"), "message: {message}");
+    }
+
+    #[tokio::test]
+    async fn variant_extraction_reads_metadata_as_dictionary() {
+        let rows = [r#"{"x":1,"y":2.5}"#, r#"{"y":-1,"x":4}"#, r#"{"x":6}"#];
+        let variants = rows
+            .iter()
+            .map(|json| GenericVariant::parse_json(json).unwrap())
+            .collect::<Vec<_>>();
+        let ArrowDataType::Struct(variant_fields) = variant_arrow_type() else {
+            unreachable!()
+        };
+        let column = StructArray::new(
+            variant_fields.clone(),
+            vec![
+                Arc::new(BinaryArray::from_iter_values(
+                    variants.iter().map(|v| v.value()),
+                )),
+                Arc::new(BinaryArray::from_iter_values(
+                    variants.iter().map(|v| v.metadata()),
+                )),
+            ],
+            None,
+        );
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "v",
+            ArrowDataType::Struct(variant_fields),
+            true,
+        )]));
+        let batch =
+            RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(column.clone())]).unwrap();
+        let mut buf = Vec::new();
+        let mut writer = AsyncArrowWriter::try_new(&mut buf, schema, None).unwrap();
+        writer.write(&batch).await.unwrap();
+        writer.close().await.unwrap();
+
+        let float = || DataType::Float(crate::spec::FloatType::new());
+        let row_type = crate::spec::variant_extraction_row(
+            true,
+            vec![
+                (float(), "$.x".to_string(), false, "UTC".to_string()),
+                (float(), "$.y".to_string(), false, "UTC".to_string()),
+            ],
+        )
+        .unwrap();
+        let fields = vec![DataField::new(
+            0,
+            "v".to_string(),
+            DataType::Row(row_type.clone()),
+        )];
+        let data = Bytes::from(buf);
+        let batches = ParquetFormatReader::default()
+            .read_batch_stream(
+                Box::new(TrackingFileRead::new(data.clone())),
+                data.len() as u64,
+                &fields,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let read = batches[0]
+            .column_by_name("v")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        assert!(matches!(
+            read.column(1).data_type(),
+            ArrowDataType::Dictionary(key, value)
+                if key.as_ref() == &ArrowDataType::Int32 && value.as_ref() == &ArrowDataType::Binary
+        ));
+        let expected =
+            crate::arrow::shredding::variant::assemble_variant_extraction_array(&column, &row_type)
+                .unwrap();
+        let actual =
+            crate::arrow::shredding::variant::assemble_variant_extraction_array(read, &row_type)
+                .unwrap();
+        assert_eq!(actual.as_ref(), expected.as_ref());
     }
 }

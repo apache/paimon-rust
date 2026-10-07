@@ -904,6 +904,8 @@ pub(crate) fn assemble_variant_extraction_array(
     if let Some(projected) = assemble_plain_variant_projection(input, fields, &metadata)? {
         return Ok(projected);
     }
+    let materialized = materialize_variant_metadata(input)?;
+    let input = &materialized;
 
     let shredded_type = if is_shredded_variant_array(input) {
         let DataType::Row(row) = arrow_to_paimon_type(input.data_type(), true)? else {
@@ -1174,7 +1176,45 @@ fn is_plain_variant_array(array: &dyn Array) -> bool {
     let ArrowDataType::Struct(fields) = array.data_type() else {
         return false;
     };
-    is_variant_arrow_fields(fields)
+    is_variant_arrow_fields(fields) || has_dictionary_variant_metadata(fields)
+}
+
+/// Plain Variant whose metadata child the Parquet reader kept dictionary-encoded.
+fn has_dictionary_variant_metadata(fields: &Fields) -> bool {
+    fields.len() == 2
+        && fields[0].name() == "value"
+        && fields[0].data_type() == &ArrowDataType::Binary
+        && fields[1].name() == "metadata"
+        && matches!(fields[1].data_type(), ArrowDataType::Dictionary(key, value)
+            if key.as_ref() == &ArrowDataType::Int32 && value.as_ref() == &ArrowDataType::Binary)
+}
+
+/// Turns dictionary-encoded Variant metadata back into Binary for the generic row path.
+fn materialize_variant_metadata(input: &StructArray) -> Result<StructArray> {
+    if !has_dictionary_variant_metadata(input.fields()) {
+        return Ok(input.clone());
+    }
+    let metadata = arrow_cast::cast(input.column(1), &ArrowDataType::Binary).map_err(|e| {
+        Error::DataInvalid {
+            message: format!("Failed to decode dictionary Variant metadata: {e}"),
+            source: Some(Box::new(e)),
+        }
+    })?;
+    let mut fields = input
+        .fields()
+        .iter()
+        .map(|f| f.as_ref().clone())
+        .collect::<Vec<_>>();
+    fields[1] = fields[1].clone().with_data_type(ArrowDataType::Binary);
+    StructArray::try_new(
+        fields.into(),
+        vec![input.column(0).clone(), metadata],
+        input.nulls().cloned(),
+    )
+    .map_err(|e| Error::DataInvalid {
+        message: format!("Failed to rebuild Variant struct: {e}"),
+        source: Some(Box::new(e)),
+    })
 }
 
 fn shredded_rows_to_struct_array(
