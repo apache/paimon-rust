@@ -172,9 +172,8 @@ impl<'a> TableRead<'a> {
         })
     }
 
-    /// Pass the read limit to paths that can enforce it. Data-evolution reads
-    /// apply it before BLOB resolution; other Paimon reads still use the
-    /// builder limit only as a scan hint.
+    /// Pass the limit to Data Evolution and primary-key readers. These paths
+    /// apply it after merging/filtering and before output BLOB resolution.
     pub(crate) fn with_limit(self, limit: Option<usize>) -> Self {
         match self.0 {
             TableReadKind::Paimon(mut read) => {
@@ -514,6 +513,9 @@ impl<'a> PaimonTableRead<'a> {
             .iter()
             .cloned()
             .partition(DataSplit::is_streaming);
+        if self.limit.is_some() && !streaming.is_empty() && !materialized.is_empty() {
+            return self.limited_mixed_row_kind_stream(materialized, streaming);
+        }
         let mut streams = Vec::with_capacity(2);
         if !materialized.is_empty() {
             streams.push(prepend_insert_row_kind_stream(
@@ -532,6 +534,47 @@ impl<'a> PaimonTableRead<'a> {
             }
         }
         Ok(Box::pin(stream::select_all(streams)))
+    }
+
+    /// Open each kind of split only after the preceding group consumed its
+    /// quota. Truncating two independently limited streams afterward could
+    /// fetch BLOB payloads from a group whose rows will never be returned.
+    fn limited_mixed_row_kind_stream(
+        &self,
+        materialized: Vec<DataSplit>,
+        streaming: Vec<DataSplit>,
+    ) -> crate::Result<ArrowRecordBatchStream> {
+        let table = self.table.clone();
+        let read_type = self.read_type.clone();
+        let data_predicates = self.data_predicates.clone();
+        let row_filter_factory = self.row_filter_factory.clone();
+        let parquet_read_budget = self.parquet_read_budget()?;
+        let resources = self.resources.clone();
+        let data_file_read_timing = self.data_file_read_timing.clone();
+        let blob_parallelism = self.blob_parallelism;
+        let limit = self.limit;
+        Ok(Box::pin(async_stream::try_stream! {
+            let mut remaining = limit;
+            for group in [materialized, streaming] {
+                if remaining == Some(0) { break; }
+                let read = PaimonTableRead {
+                    table: &table,
+                    read_type: read_type.clone(),
+                    data_predicates: data_predicates.clone(),
+                    row_filter_factory: row_filter_factory.clone(),
+                    parquet_read_budget: Some(parquet_read_budget.clone()),
+                    resources: resources.clone(),
+                    data_file_read_timing: data_file_read_timing.clone(),
+                    blob_parallelism,
+                    limit: remaining,
+                };
+                let mut stream = read.to_arrow_with_row_kind(&group)?;
+                while remaining != Some(0) {
+                    let Some(batch) = stream.next().await else { break };
+                    yield super::read_limit::take_limited_batch(batch?, &mut remaining);
+                }
+            }
+        }))
     }
 
     fn audit_raw_stream(
@@ -554,6 +597,8 @@ impl<'a> PaimonTableRead<'a> {
         has_value_kind: bool,
         include_sequence: bool,
     ) -> crate::Result<ArrowRecordBatchStream> {
+        use super::managed_blob_reader::{resolve_primary_key_blob_stream, ManagedBlobReadPlan};
+
         let core_options = self.table.schema().core_options();
         let user_read_type = self.read_type.clone();
         let audit_schema = audit_schema_for_read_type(&user_read_type, include_sequence)?;
@@ -577,14 +622,34 @@ impl<'a> PaimonTableRead<'a> {
             ));
         }
 
+        let primary_key = !self.table.schema().primary_keys().is_empty();
+        let blob_plan = primary_key
+            .then(|| {
+                ManagedBlobReadPlan::new(
+                    &read_type,
+                    &self.data_predicates,
+                    self.table.schema().fields(),
+                    &core_options,
+                )
+            })
+            .flatten();
+        let scan_type = blob_plan
+            .as_ref()
+            .map_or_else(|| read_type.clone(), |plan| plan.scan_fields().to_vec());
+        let predicates = if blob_plan.is_some() {
+            Vec::new()
+        } else {
+            self.data_predicates.clone()
+        };
         let reader = DataFileReader::new(
             self.table.file_io.clone(),
             self.table.schema_manager().clone(),
             self.table.schema().id(),
             self.table.schema.fields().to_vec(),
-            read_type,
-            self.data_predicates.clone(),
+            scan_type,
+            predicates,
         )
+        .with_blob_as_descriptor(primary_key)
         .with_file_index_read_enabled(core_options.file_index_read_enabled())
         .with_batch_size(Some(core_options.read_batch_size()?))
         .with_blob_parallelism(self.blob_parallelism)
@@ -592,6 +657,26 @@ impl<'a> PaimonTableRead<'a> {
         .with_table_options(self.table.schema().options().clone())
         .with_mosaic_prefetch(configured_mosaic_prefetch(self.table)?);
         let raw_stream = reader.read(data_splits)?;
+        let raw_stream = if let Some(plan) = blob_plan {
+            plan.finish(
+                raw_stream,
+                &core_options,
+                self.table.file_io.clone(),
+                self.blob_parallelism,
+                self.limit,
+            )
+        } else if primary_key {
+            resolve_primary_key_blob_stream(
+                raw_stream,
+                &read_type,
+                &core_options,
+                self.table.file_io.clone(),
+                self.blob_parallelism,
+                self.limit,
+            )
+        } else {
+            raw_stream
+        };
 
         Ok(Box::pin(async_stream::try_stream! {
             futures::pin_mut!(raw_stream);
@@ -1003,6 +1088,7 @@ impl<'a> PaimonTableRead<'a> {
                 core_options,
                 self.table.file_io.clone(),
                 self.blob_parallelism,
+                self.limit,
             ));
         }
 
@@ -1013,6 +1099,7 @@ impl<'a> PaimonTableRead<'a> {
             core_options,
             self.table.file_io.clone(),
             self.blob_parallelism,
+            self.limit,
         ))
     }
 
