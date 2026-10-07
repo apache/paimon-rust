@@ -281,8 +281,7 @@ impl PyReadBuilder {
         mut slf: PyRefMut<'py, Self>,
         predicate: &Bound<'_, PyDict>,
     ) -> PyResult<PyRefMut<'py, Self>> {
-        let filter =
-            dict_to_table_predicate(predicate, slf.table.schema().fields(), slf.case_sensitive)?;
+        let filter = dict_to_table_predicate(predicate, slf.table.schema(), slf.case_sensitive)?;
         slf.filter = Some(filter);
         Ok(slf)
     }

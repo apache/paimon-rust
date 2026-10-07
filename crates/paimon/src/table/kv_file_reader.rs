@@ -506,7 +506,10 @@ impl KeyValueFileReader {
         let user_fields = crate::arrow::residual::widen_scan_fields(
             &user_fields,
             residual_file_predicates.as_ref(),
-        );
+        )
+        .into_iter()
+        .filter(|field| !matches!(field.id(), SEQUENCE_NUMBER_FIELD_ID | VALUE_KIND_FIELD_ID))
+        .collect();
         let user_fields = widen_partial_update_sequence_group_fields(
             self.config.merge_engine,
             &self.config.table_options,
@@ -529,6 +532,13 @@ impl KeyValueFileReader {
         // Indices within internal_schema (offset 2 for _SEQ and _VK).
         let seq_index = 0;
         let value_kind_index = 1;
+        let mut predicate_refs = Vec::new();
+        for predicate in &self.config.predicates {
+            crate::arrow::residual::collect_predicate_leaf_refs(predicate, &mut predicate_refs);
+        }
+        let needs_sequence = predicate_refs
+            .iter()
+            .any(|(name, _)| *name == SEQUENCE_NUMBER_FIELD_NAME);
         let key_indices: Vec<usize> = self
             .config
             .primary_keys
@@ -547,6 +557,7 @@ impl KeyValueFileReader {
             .filter(|(index, field)| {
                 !key_names.contains(field.name())
                     && (*index >= 2
+                        || (needs_sequence && field.id() == SEQUENCE_NUMBER_FIELD_ID)
                         || self
                             .config
                             .read_type
@@ -1221,9 +1232,9 @@ mod tests {
             vec![Datum::Long(102)],
         );
         let mut read_builder = table.new_read_builder();
-        read_builder
-            .with_projection(&["id", "value", crate::spec::ROW_ID_FIELD_NAME])
-            .unwrap();
+        // Untracked PK tables do not advertise ROW_ID. A hand-built predicate
+        // must still be rejected rather than binding its placeholder index.
+        read_builder.with_projection(&["id", "value"]).unwrap();
         read_builder.with_filter(row_id);
         let plan = read_builder.new_scan().plan().await.unwrap();
         let err = read_builder

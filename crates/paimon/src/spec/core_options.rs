@@ -773,13 +773,6 @@ impl<'a> CoreOptions<'a> {
             .unwrap_or(false)
     }
 
-    /// Whether a missing optional read target may fall back to the primary file.
-    pub fn scan_ignore_lost_file(&self) -> bool {
-        self.options
-            .get("scan.ignore-lost-files")
-            .is_some_and(|value| value.eq_ignore_ascii_case("true"))
-    }
-
     /// Whether normal Data Evolution files also write an aligned ROW sidecar.
     pub fn data_evolution_row_sidecar_enabled(&self) -> crate::Result<bool> {
         match self.options.get("data-evolution.row-sidecar.enabled") {

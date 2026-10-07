@@ -99,6 +99,26 @@ impl TableSchema {
         &self.fields
     }
 
+    /// Logical fields followed by the metadata available to table reads.
+    /// Row tracking provides ROW_ID and SEQUENCE_NUMBER; primary-key files
+    /// provide SEQUENCE_NUMBER independently of row tracking. Keeping this
+    /// schema shared makes projection and predicate name resolution agree.
+    pub fn fields_with_read_metadata(&self) -> Vec<DataField> {
+        let mut fields = self.fields.clone();
+        let row_tracking = CoreOptions::new(&self.options).row_tracking_enabled();
+        if row_tracking && !fields.iter().any(|field| field.name() == ROW_ID_FIELD_NAME) {
+            fields.push(row_id_data_field());
+        }
+        if (row_tracking || !self.primary_keys.is_empty())
+            && !fields
+                .iter()
+                .any(|field| field.name() == SEQUENCE_NUMBER_FIELD_NAME)
+        {
+            fields.push(sequence_number_data_field());
+        }
+        fields
+    }
+
     pub fn highest_field_id(&self) -> i32 {
         self.highest_field_id
     }
@@ -1147,17 +1167,26 @@ pub(crate) fn row_id_data_field() -> DataField {
     )
 }
 
-/// `_ROW_ID` is synthesized by the reader and is not a table column, so
-/// `PredicateBuilder` cannot resolve it and callers hand-build the leaf with a
-/// placeholder index. Every index-based resolution must recognize it by name
-/// instead, or it binds the predicate to whatever field sits at that index.
-///
-/// The other reserved names are excluded on purpose. `_SEQUENCE_NUMBER` and
-/// `_VALUE_KIND` are physical columns of a KV file and do have a position; none
-/// of them is ever referenced by a predicate. Widening this to every reserved
-/// name would instead break a schema that predates their rejection.
+/// `_ROW_ID` conditions alone can be converted to positional row ranges.
 pub(crate) fn is_row_id_column(name: &str) -> bool {
     name == ROW_ID_FIELD_NAME
+}
+
+/// Java's row-tracking version column. A missing or NULL physical value is
+/// supplied from the data file's max sequence number.
+pub(crate) fn sequence_number_data_field() -> DataField {
+    DataField::new(
+        SEQUENCE_NUMBER_FIELD_ID,
+        SEQUENCE_NUMBER_FIELD_NAME.to_string(),
+        DataType::BigInt(crate::spec::BigIntType::with_nullable(false)),
+    )
+}
+
+/// Row-tracking metadata has no index in the logical table schema. Resolve
+/// predicates by reserved name instead of interpreting a placeholder index as
+/// a user column. `_VALUE_KIND` remains a physical KV column.
+pub(crate) fn is_row_tracking_column(name: &str) -> bool {
+    is_row_id_column(name) || name == SEQUENCE_NUMBER_FIELD_NAME
 }
 
 /// Must match Java Paimon's `SpecialFields.ROW_KIND` (Integer.MAX_VALUE - 4).

@@ -405,22 +405,60 @@ def test_row_id_filter_with_projection_and_data_predicate(data_evolution, case_s
         assert rows.to_pylist() == [{"name": "b", "_ROW_ID": 1}]
 
 
-@pytest.mark.parametrize("predicate_field", ["_row_id", "_ROW_ID"])
-def test_case_insensitive_filter_uses_real_lowercase_row_id_column(predicate_field):
+@pytest.mark.parametrize("user_field", ["_row_id", "_sequence_number"])
+@pytest.mark.parametrize("uppercase", [False, True])
+def test_case_insensitive_filter_uses_untracked_user_column(user_field, uppercase):
     with tempfile.TemporaryDirectory() as warehouse:
         ctx = SQLContext()
         ctx.register_catalog("paimon", {"warehouse": warehouse})
         ctx.sql("CREATE SCHEMA paimon.realrowid")
-        ctx.sql("CREATE TABLE paimon.realrowid.t (_row_id BIGINT, id INT)")
+        ctx.sql(f"CREATE TABLE paimon.realrowid.t ({user_field} BIGINT, id INT)")
         ctx.sql("INSERT INTO paimon.realrowid.t VALUES (11, 1), (22, 2)")
         table = PaimonCatalog({"warehouse": warehouse}).get_table("realrowid.t")
         builder = table.new_read_builder().with_case_sensitive(False)
-        builder.with_projection(["_row_id", "id"])
+        # Projection and predicate resolution must use the same available
+        # fields. Untracked append tables have no virtual tracking columns.
+        field = user_field.upper() if uppercase else user_field
+        builder.with_projection([field, "id"])
         builder.with_filter({
-            "method": "equal", "field": predicate_field, "literals": [22],
+            "method": "equal", "field": field, "literals": [22],
         })
         batches = builder.new_read().read(builder.new_scan().plan().splits())
-        assert pa.Table.from_batches(batches).to_pylist() == [{"_row_id": 22, "id": 2}]
+        assert pa.Table.from_batches(batches).to_pylist() == [{user_field: 22, "id": 2}]
+
+
+@pytest.mark.parametrize("user_field", ["_row_id", "_sequence_number"])
+@pytest.mark.parametrize("uppercase", [False, True])
+def test_case_insensitive_tracking_metadata_collision_is_ambiguous(user_field, uppercase):
+    with tempfile.TemporaryDirectory() as warehouse:
+        ctx = SQLContext()
+        ctx.register_catalog("paimon", {"warehouse": warehouse})
+        ctx.sql("CREATE SCHEMA paimon.trackingcollision")
+        ctx.sql(f"""CREATE TABLE paimon.trackingcollision.t ({user_field} BIGINT, id INT)
+            WITH ('row-tracking.enabled' = 'true')""")
+        table = PaimonCatalog({"warehouse": warehouse}).get_table("trackingcollision.t")
+        builder = table.new_read_builder().with_case_sensitive(False)
+        field = user_field.upper() if uppercase else user_field
+        with pytest.raises(ValueError, match="Ambiguous"):
+            builder.with_filter({"method": "equal", "field": field, "literals": [22]})
+        with pytest.raises(ValueError, match="Ambiguous"):
+            builder.with_projection([field]).new_read().read([])
+
+
+def test_primary_key_sequence_metadata_does_not_require_row_tracking():
+    with tempfile.TemporaryDirectory() as warehouse:
+        ctx = SQLContext()
+        ctx.register_catalog("paimon", {"warehouse": warehouse})
+        ctx.sql("CREATE SCHEMA paimon.pksequence")
+        ctx.sql("""CREATE TABLE paimon.pksequence.t (id INT, v INT, PRIMARY KEY (id))
+            WITH ('bucket' = '1', 'row-tracking.enabled' = 'false')""")
+        ctx.sql("INSERT INTO paimon.pksequence.t VALUES (1, 11), (2, 22)")
+        table = PaimonCatalog({"warehouse": warehouse}).get_table("pksequence.t")
+        builder = table.new_read_builder().with_case_sensitive(False)
+        builder.with_projection(["id", "_sequence_number"])
+        builder.with_filter({"method": "equal", "field": "_sequence_number", "literals": [1]})
+        result = pa.Table.from_batches(builder.new_read().read(builder.new_scan().plan().splits()))
+        assert result.to_pylist() == [{"id": 2, "_SEQUENCE_NUMBER": 1}]
 
 
 def test_row_tracking_append_row_ranges_keep_global_row_ids():

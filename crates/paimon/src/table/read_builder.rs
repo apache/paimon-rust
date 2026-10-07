@@ -389,7 +389,7 @@ impl<'a> PaimonReadBuilder<'a> {
         let projection_names: Vec<String> = columns.iter().map(|c| (*c).to_string()).collect();
         validate_projection_possible(
             self.table.identifier().full_name(),
-            self.table.schema.fields(),
+            &self.table.schema.fields_with_read_metadata(),
             &projection_names,
         )?;
         self.projection_names = Some(projection_names);
@@ -606,7 +606,7 @@ impl<'a> PaimonReadBuilder<'a> {
     ) -> Result<Vec<DataField>> {
         resolve_projected_fields(
             self.table.identifier().full_name(),
-            self.table.schema.fields(),
+            &self.table.schema.fields_with_read_metadata(),
             projection_names,
             self.case_sensitive,
         )
@@ -632,9 +632,6 @@ pub(super) fn validate_projection_possible(
         .map(|f| f.name().to_ascii_lowercase())
         .collect();
     for name in projection_names {
-        if name == crate::spec::ROW_ID_FIELD_NAME {
-            continue;
-        }
         if !folded_names.contains(&name.to_ascii_lowercase()) {
             return Err(Error::ColumnNotExist {
                 full_name: full_name.clone(),
@@ -693,11 +690,6 @@ pub(super) fn resolve_projected_fields(
             });
         }
 
-        if name == crate::spec::ROW_ID_FIELD_NAME {
-            resolved.push(crate::spec::row_id_data_field());
-            continue;
-        }
-
         let field = if case_sensitive {
             sensitive_index.get(name.as_str()).copied()
         } else {
@@ -726,7 +718,10 @@ pub(super) fn resolve_projected_fields(
 pub(super) fn projected_read_field_ids_from_fields(fields: &[DataField]) -> HashSet<i32> {
     fields
         .iter()
-        .filter(|field| !is_system_projection_field(field.id()))
+        .filter(|field| {
+            field.id() == crate::spec::SEQUENCE_NUMBER_FIELD_ID
+                || !is_system_projection_field(field.id())
+        })
         .map(|field| field.id())
         .collect::<HashSet<_>>()
 }
@@ -748,9 +743,14 @@ fn projected_read_field_ids_with_predicates(
         crate::arrow::residual::collect_predicate_leaf_refs(predicate, &mut refs);
     }
     for (name, index) in refs {
+        if name == crate::spec::SEQUENCE_NUMBER_FIELD_NAME {
+            // The version provider need not write any projected user column.
+            field_ids.insert(crate::spec::SEQUENCE_NUMBER_FIELD_ID);
+            continue;
+        }
         // Not in `table_fields`, and excluded from this set anyway — files never
         // list it in `write_cols`.
-        if crate::spec::is_row_id_column(name) {
+        if crate::spec::is_row_tracking_column(name) {
             continue;
         }
         let Some(field) = table_fields.get(index) else {
@@ -1650,6 +1650,66 @@ mod tests {
             super::resolve_projected_fields("db.t".to_string(), &fields, &["COL".into()], false)
                 .unwrap_err();
         assert!(matches!(err, crate::Error::ConfigInvalid { .. }));
+    }
+
+    #[test]
+    fn test_metadata_projection_case_insensitive_collision_is_ambiguous() {
+        for (user, metadata) in [
+            ("_sequence_number", "_SEQUENCE_NUMBER"),
+            ("_row_id", "_ROW_ID"),
+        ] {
+            let untracked = TableSchema::new(
+                0,
+                &Schema::builder()
+                    .column(user, DataType::Int(IntType::new()))
+                    .build()
+                    .unwrap(),
+            );
+            let tracked = untracked.copy_with_options(HashMap::from([(
+                "row-tracking.enabled".into(),
+                "true".into(),
+            )]));
+            let fields = tracked.fields_with_read_metadata();
+            let metadata_fields = fields
+                .iter()
+                .filter(|field| field.id() != 0)
+                .cloned()
+                .collect::<Vec<_>>();
+            for name in [user, metadata] {
+                let err =
+                    super::resolve_projected_fields("db.t".into(), &fields, &[name.into()], false)
+                        .unwrap_err();
+                assert!(
+                    matches!(err, crate::Error::ConfigInvalid { message } if message.contains("Ambiguous"))
+                );
+                let resolved = super::resolve_projected_fields(
+                    "db.t".into(),
+                    &metadata_fields,
+                    &[name.into()],
+                    false,
+                )
+                .unwrap();
+                assert_eq!(resolved[0].name(), metadata);
+                let resolved = super::resolve_projected_fields(
+                    "db.t".into(),
+                    &untracked.fields_with_read_metadata(),
+                    &[name.into()],
+                    false,
+                )
+                .unwrap();
+                assert_eq!(resolved[0].name(), user);
+                assert_eq!(resolved[0].id(), 0);
+            }
+            let fields = super::resolve_projected_fields(
+                "db.t".into(),
+                &fields,
+                &[user.into(), metadata.into()],
+                true,
+            )
+            .unwrap();
+            assert_eq!(fields[0].id(), 0);
+            assert_ne!(fields[1].id(), 0);
+        }
     }
 
     #[test]

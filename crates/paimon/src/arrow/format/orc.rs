@@ -17,7 +17,9 @@
 
 use super::{FilePredicates, FormatFileReader, FormatFileWriter, FormatWriteResult};
 use crate::io::{FileRead, FileWrite, OutputFile};
-use crate::spec::{is_row_id_column, DataField, DataType, Datum, Predicate, PredicateOperator};
+use crate::spec::{
+    is_row_tracking_column, DataField, DataType, Datum, Predicate, PredicateOperator,
+};
 use crate::table::{ArrowRecordBatchStream, RowRange};
 use crate::Error;
 use arrow_array::RecordBatch;
@@ -547,7 +549,7 @@ fn build_orc_leaf_predicate(
         return None;
     };
     // Not in the file, and its index would push the wrong column down.
-    if is_row_id_column(column) {
+    if is_row_tracking_column(column) {
         return None;
     }
     let file_field = file_fields.get(*index)?;

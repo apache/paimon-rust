@@ -45,7 +45,9 @@
 //! must not reference any vortex-specific types.
 
 use crate::arrow::format::FilePredicates;
-use crate::spec::{is_row_id_column, DataField, DataType, Datum, Predicate, PredicateOperator};
+use crate::spec::{
+    is_row_tracking_column, DataField, DataType, Datum, Predicate, PredicateOperator,
+};
 use crate::Error;
 use arrow_array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Datum as ArrowDatum, Decimal128Array,
@@ -168,10 +170,10 @@ fn evaluate_predicate_mask(
         } => {
             // Resolve the batch column by NAME, but pick that name carefully: a
             // real column may be renamed in the file, so its batch name comes
-            // from `file_fields[index]`; `_ROW_ID` is absent from `file_fields`
+            // from `file_fields[index]`; row-tracking metadata is absent from the logical `file_fields`
             // and only its own name is meaningful. Java's `PredicateRemapper`
             // rebinds by name too.
-            let file_field = if is_row_id_column(column) {
+            let file_field = if is_row_tracking_column(column) {
                 None
             } else {
                 match file_fields.get(*index) {
@@ -196,9 +198,14 @@ fn evaluate_predicate_mask(
                     // Backstop for residuals applied to a predicate-free reader
                     // (PK merge output, vector search); readers that own their
                     // predicates reject earlier.
-                    return Err(crate::table::row_id_predicate::unsupported_row_id_filter(
-                        "this read",
-                    ));
+                    if crate::spec::is_row_id_column(field_name) {
+                        return Err(crate::table::row_id_predicate::unsupported_row_id_filter(
+                            "this read",
+                        ));
+                    }
+                    return Err(Error::Unsupported {
+                        message: format!("filtering on '{field_name}' requires this read to supply the row-tracking column"),
+                    });
                 }
                 // A real column missing here is a reader bug: it did not widen
                 // its scan to the predicate columns.
@@ -265,8 +272,12 @@ pub(crate) fn widen_scan_fields(
             collect_predicate_leaf_refs(predicate, &mut refs);
         }
         for (name, index) in refs {
+            if name == crate::spec::SEQUENCE_NUMBER_FIELD_NAME {
+                push_unique_scan_field(&mut fields, &crate::spec::sequence_number_data_field());
+                continue;
+            }
             // Not read from the file, so there is nothing to widen with.
-            if is_row_id_column(name) {
+            if is_row_tracking_column(name) {
                 continue;
             }
             if let Some(field) = fp.file_fields.get(index) {
@@ -281,7 +292,7 @@ pub(crate) fn widen_scan_fields(
 /// Collect every leaf as `(column name, leaf index)`.
 ///
 /// Callers that resolve a leaf positionally must check the name first — see
-/// [`crate::spec::is_row_id_column`].
+/// [`crate::spec::is_row_tracking_column`].
 pub(crate) fn collect_predicate_leaf_refs<'a>(
     predicate: &'a Predicate,
     refs: &mut Vec<(&'a str, usize)>,
