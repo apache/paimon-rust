@@ -90,7 +90,8 @@ impl StreamTableScan {
         self
     }
 
-    /// Distribute files or buckets using Java's shard rules.
+    /// Distribute initial primary-key state by bucket so all key versions
+    /// merge together. Follow-up physical events use Java's shard rules.
     pub fn with_shard(&mut self, index: usize, count: usize) -> Result<&mut Self> {
         self.scan = self.scan.clone().with_shard(index, count)?;
         Ok(self)

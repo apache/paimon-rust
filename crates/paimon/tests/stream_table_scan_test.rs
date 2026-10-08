@@ -134,6 +134,111 @@ async fn stream_scan_owns_table_and_read_configuration() {
 }
 
 #[tokio::test]
+async fn initial_shards_merge_all_key_versions_and_follow_up_shards_keep_events() {
+    for (engine, dv, bucket, producer, expected) in [
+        ("first-row", false, "1", "none", 10),
+        ("first-row", false, "-2", "none", 10),
+        ("deduplicate", true, "1", "none", 13),
+        ("deduplicate", true, "-2", "none", 13),
+        ("deduplicate", true, "1", "input", 13),
+    ] {
+        for count in [2, 3] {
+            let table = table(
+                &format!("memory:/stream-shards-{engine}-{producer}-{bucket}-{count}"),
+                producer,
+            )
+            .await
+            .copy_with_options(HashMap::from([
+                ("merge-engine".into(), engine.into()),
+                ("deletion-vectors.enabled".into(), dv.to_string()),
+                ("bucket".into(), bucket.into()),
+            ]));
+            for version in 0..4 {
+                let builder = table.new_write_builder();
+                let mut writer = builder.new_write().unwrap();
+                writer
+                    .write_arrow_batch(&make_batch(vec![1], vec![10 + version]))
+                    .await
+                    .unwrap();
+                let mut messages = writer.prepare_commit().await.unwrap();
+                // Deterministic names distribute consecutive versions to
+                // different file-name shards, independent of writer UUIDs.
+                for message in &mut messages {
+                    let bucket_path = format!(
+                        "{}/{}",
+                        table.location(),
+                        paimon::spec::bucket_dir_name(message.bucket)
+                    );
+                    for (prefix, files) in [
+                        ("data", &mut message.new_files),
+                        ("changelog", &mut message.new_changelog_files),
+                    ] {
+                        for (index, file) in files.iter_mut().enumerate() {
+                            let old_path = file.data_file_path(&bucket_path);
+                            let bytes = table
+                                .file_io()
+                                .new_input(&old_path)
+                                .unwrap()
+                                .read()
+                                .await
+                                .unwrap();
+                            file.file_name = format!("{prefix}-{version}-{index}.parquet");
+                            table
+                                .file_io()
+                                .new_output(&file.data_file_path(&bucket_path))
+                                .unwrap()
+                                .write(bytes)
+                                .await
+                                .unwrap();
+                        }
+                    }
+                }
+                builder.new_commit().commit(messages).await.unwrap();
+            }
+            let full = table
+                .new_stream_scan()
+                .unwrap()
+                .plan()
+                .await
+                .unwrap()
+                .unwrap();
+            let expected_rows = values(&table, full).await;
+            assert_eq!(expected_rows, vec![(1, expected)]);
+            let mut initial_union = Vec::new();
+            let mut event_union = Vec::new();
+            for index in 0..count {
+                let mut scan = table.new_stream_scan().unwrap();
+                scan.with_shard(index, count).unwrap();
+                let initial = scan.plan().await.unwrap().unwrap();
+                assert_eq!(initial.snapshot_id(), Some(4));
+                initial_union.extend(values(&table, initial).await);
+                scan.restore(Some(1)).unwrap();
+                let mut events = Vec::new();
+                while let Some(plan) = scan.plan().await.unwrap() {
+                    assert!(plan.splits().iter().all(|split| split.is_streaming()));
+                    events.extend(values(&table, plan).await);
+                }
+                if count == 2 {
+                    assert!(!events.is_empty(), "physical events should use both shards");
+                }
+                assert_eq!(scan.checkpoint(), Some(5));
+                event_union.extend(events);
+            }
+            initial_union.sort_unstable();
+            assert_eq!(
+                initial_union, expected_rows,
+                "{engine}, {producer}, bucket={bucket}, count={count}"
+            );
+            event_union.sort_unstable();
+            assert_eq!(
+                event_union,
+                (10..14).map(|value| (1, value)).collect::<Vec<_>>()
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn delta_follow_up_skips_overwrite_and_compact_commits() {
     let table = table("memory:/stream-delta-selection", "none").await;
     for id in 1..=4 {

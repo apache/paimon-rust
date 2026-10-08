@@ -27,9 +27,10 @@ use paimon::table::{
     ArrowRecordBatchStream, DataSplit, IncrementalScanMode, RowRange, StreamTableScan, Table,
 };
 use paimon_datafusion::runtime::runtime;
-use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
+use pyo3::exceptions::{PyBaseException, PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
+use pyo3::{PyTraverseError, PyVisit};
 use tokio::sync::Notify;
 
 use crate::error::to_py_err;
@@ -332,7 +333,7 @@ impl PyReadBuilder {
                 .read_builder()?
                 .new_stream_scan()
                 .map_err(to_py_err)?,
-            callback_error: Arc::new(Mutex::new(None)),
+            bucket_filter: Arc::new(Mutex::new(PyBucketFilterState::default())),
         })
     }
 
@@ -487,11 +488,35 @@ impl PyTableScan {
 #[pyclass(name = "StreamTableScan", module = "pypaimon_rust.datafusion")]
 pub struct PyStreamTableScan {
     scan: StreamTableScan,
-    callback_error: Arc<Mutex<Option<PyErr>>>,
+    bucket_filter: Arc<Mutex<PyBucketFilterState>>,
+}
+
+// The wrapper and core closure share one Python reference per object, so GC
+// can traverse every retained reference exactly once through the wrapper.
+#[derive(Default)]
+struct PyBucketFilterState {
+    filter: Option<Py<PyAny>>,
+    error: Option<Py<PyBaseException>>,
 }
 
 #[pymethods]
 impl PyStreamTableScan {
+    fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
+        let state = self.bucket_filter.lock().unwrap();
+        visit.call(&state.filter)?;
+        visit.call(&state.error)
+    }
+
+    fn __clear__(&mut self) {
+        let references = {
+            let mut state = self.bucket_filter.lock().unwrap();
+            (state.filter.take(), state.error.take())
+        };
+        // Drop Python references outside the lock: destructors may re-enter
+        // Python. The core closure sees an empty filter and retains no cycle.
+        drop(references);
+    }
+
     #[pyo3(signature = (filter = None))]
     fn with_bucket_filter(
         mut slf: PyRefMut<'_, Self>,
@@ -503,22 +528,35 @@ impl PyStreamTableScan {
         {
             return Err(PyTypeError::new_err("bucket filter must be callable"));
         }
-        let error_slot = Arc::clone(&slf.callback_error);
+        let previous_filter =
+            std::mem::replace(&mut slf.bucket_filter.lock().unwrap().filter, filter);
+        drop(previous_filter);
+        let state = Arc::clone(&slf.bucket_filter);
         slf.scan.with_bucket_filter(move |bucket| {
-            let Some(filter) = &filter else {
-                return Ok(true);
-            };
             Python::attach(|py| {
+                // Release the lock before invoking Python: callbacks may run
+                // GC, which traverses this same state.
+                let filter = state
+                    .lock()
+                    .unwrap()
+                    .filter
+                    .as_ref()
+                    .map(|filter| filter.clone_ref(py));
+                let Some(filter) = filter else {
+                    return Ok(true);
+                };
                 filter
                     .call1(py, (bucket,))
                     .and_then(|result| result.is_truthy(py))
-            })
-            .map_err(|error| {
-                *error_slot.lock().unwrap() = Some(error);
-                paimon::Error::UnexpectedError {
-                    message: "Python bucket filter failed".into(),
-                    source: None,
-                }
+                    .map_err(|error| {
+                        let error = error.into_value(py);
+                        let previous_error = state.lock().unwrap().error.replace(error);
+                        drop(previous_error);
+                        paimon::Error::UnexpectedError {
+                            message: "Python bucket filter failed".into(),
+                            source: None,
+                        }
+                    })
             })
         });
         Ok(slf)
@@ -564,13 +602,12 @@ impl PyStreamTableScan {
     }
 
     fn plan(&mut self, py: Python<'_>) -> PyResult<Option<PyPlan>> {
-        py.detach(|| {
-            let plan = runtime().block_on(self.scan.plan());
-            if let Some(error) = self.callback_error.lock().unwrap().take() {
-                return Err(error);
-            }
-            plan.map(|plan| plan.map(PyPlan::from)).map_err(to_py_err)
-        })
+        let plan = py.detach(|| runtime().block_on(self.scan.plan()));
+        let error = self.bucket_filter.lock().unwrap().error.take();
+        if let Some(error) = error {
+            return Err(PyErr::from_value(error.into_bound(py).into_any()));
+        }
+        plan.map(|plan| plan.map(PyPlan::from)).map_err(to_py_err)
     }
 }
 

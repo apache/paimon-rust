@@ -1967,11 +1967,15 @@ impl<'a> PaimonTableScan<'a> {
         };
         let options = self.table.schema().core_options();
         let has_primary_keys = !self.table.schema().primary_keys().is_empty();
-        // Match SplitGenerator.alwaysRawConvertible, independent of whether a
-        // particular split is raw-convertible or the scan includes level zero.
+        let initial_state = self.snapshot_mode() == Some(SnapshotScanMode::All);
+        // Initial stream state merges overlapping key versions, including
+        // L0 files. Keep each bucket intact until that merge has completed.
+        // Follow-up physical events and ordinary raw scans retain Java's
+        // SplitGenerator.alwaysRawConvertible file-name distribution.
         let by_file_name = if has_primary_keys {
-            options.deletion_vectors_enabled()
-                || options.merge_engine()? == crate::spec::MergeEngine::FirstRow
+            !initial_state
+                && (options.deletion_vectors_enabled()
+                    || options.merge_engine()? == crate::spec::MergeEngine::FirstRow)
         } else {
             !options.data_evolution_enabled()
         };
@@ -1988,7 +1992,11 @@ impl<'a> PaimonTableScan<'a> {
                 // also handles Integer.MIN_VALUE without overflow.
                 ((i128::from(hash) % count as i128).unsigned_abs() as usize) == index
             } else {
-                i128::from(entry.bucket()) % count as i128 == index as i128
+                let bucket = i128::from(entry.bucket());
+                // Initial state includes postpone buckets. Assign them to
+                // one worker as well, rather than dropping a negative remainder.
+                let bucket = if initial_state { bucket.abs() } else { bucket };
+                bucket % count as i128 == index as i128
             }
         });
         Ok(())

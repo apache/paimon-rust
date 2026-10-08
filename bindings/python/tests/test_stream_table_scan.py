@@ -17,6 +17,9 @@
 
 """Stateful core streaming through the Python wrapper."""
 
+import gc
+import weakref
+
 import pyarrow as pa
 import pytest
 
@@ -95,6 +98,50 @@ def test_bucket_callback_replacement_clearing_and_shard(table, follow_up):
         shard.restore(2 if follow_up else None)
         union.extend(_rows(builder, shard.plan()))
     assert sorted(union) == [(i, 200 + i) for i in range(32)]
+
+
+@pytest.mark.parametrize('bound_method', [False, True])
+def test_bucket_callback_owner_cycle_is_collected(table, bound_method):
+    class Owner:
+        def __init__(self):
+            self.scan = table.new_stream_scan()
+            self.scan.with_bucket_filter(self.select if bound_method else self)
+
+        def select(self, bucket):
+            return True
+
+        def __call__(self, bucket):
+            return self.select(bucket)
+
+    owner = Owner()
+    reference = weakref.ref(owner)
+    # A live owner must keep the callback and its scan usable during GC.
+    gc.collect()
+    assert owner.scan.plan().snapshot_id() == 2
+    del owner
+    gc.collect()
+    assert reference() is None
+
+
+@pytest.mark.parametrize('clear', [False, True])
+def test_bucket_callback_owner_is_released_on_replacement(table, clear):
+    class Owner:
+        def select(self, bucket):
+            gc.collect()
+            return True
+
+    owner = Owner()
+    reference = weakref.ref(owner)
+    scan = table.new_stream_scan().with_bucket_filter(owner.select)
+    del owner
+    gc.collect()
+    assert reference() is not None
+    assert scan.plan().snapshot_id() == 2
+    scan.with_bucket_filter(None if clear else lambda bucket: True)
+    gc.collect()
+    assert reference() is None
+    scan.restore(None)
+    assert scan.plan().snapshot_id() == 2
 
 
 @pytest.mark.parametrize('follow_up', [False, True])
