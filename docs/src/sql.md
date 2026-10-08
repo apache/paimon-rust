@@ -1602,6 +1602,23 @@ When the following conditions are met, `COUNT(*)` retrieves exact row counts dir
 - No LIMIT clause
 - Filter predicates only involve partition columns (Exact level)
 
+### Query Authorization
+
+Row filters cannot reference a resolving BLOB view: the stored reference's
+nullness can differ from its upstream value. Other BLOB payloads and output-only
+BLOB views are resolved after row authorization.
+
+When a table in a REST catalog has `'query-auth.enabled' = 'true'`, planning a
+query asks the catalog what the current user may read, and the row filters it
+returns (see `create_policy`) are applied to the result:
+
+- Rows are filtered on their stored values.
+- A user the catalog also masks columns for is refused.
+- Statistics are not used under a row filter, which also turns off `LIMIT`
+  pushdown, so such queries read the data.
+- Time travel, branches, system tables, incremental and audit-log reads, and
+  search are refused on such tables.
+
 ## Python Multimodal Helper Functions
 
 When you use `pypaimon_rust.datafusion.SQLContext`, the Python binding registers a small set of scalar helper functions for BLOB-backed media and vector workflows. These helpers are Python-binding built-ins; they are not registered by the Rust `paimon_datafusion::SQLContext`.
