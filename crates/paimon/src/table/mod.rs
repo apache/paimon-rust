@@ -141,6 +141,7 @@ mod sorted_global_index_build_builder;
 mod sorted_global_index_options;
 mod source;
 mod stats_filter;
+mod stream_table_scan;
 pub(crate) mod table_commit;
 mod table_merge_input;
 mod table_merge_into;
@@ -222,6 +223,7 @@ pub use sorted_global_index_build_builder::{
 pub use source::{
     merge_row_ranges, DataSplit, DataSplitBuilder, DeletionFile, PartitionBucket, Plan, RowRange,
 };
+pub use stream_table_scan::StreamTableScan;
 pub use table_commit::TableCommit;
 pub use table_merge_into::{
     MergeAssignment, MergeCondition, MergeSource, WhenMatched, WhenNotMatched,
@@ -522,6 +524,11 @@ impl Table {
     /// Reference: [pypaimon FileStoreTable.new_read_builder](https://github.com/apache/paimon/blob/release-1.3/paimon-python/pypaimon/table/file_store_table.py).
     pub fn new_read_builder(&self) -> ReadBuilder<'_> {
         ReadBuilder::new(self)
+    }
+
+    /// Create a stateful streaming scan. Configure filters through a read builder.
+    pub fn new_stream_scan(&self) -> Result<StreamTableScan> {
+        self.new_read_builder().new_stream_scan()
     }
 
     /// Create a full-text search builder.

@@ -175,6 +175,10 @@ impl PyTable {
         PyBatchWriteBuilder::new(Arc::clone(&self.inner))
     }
 
+    fn new_stream_scan(&self) -> PyResult<crate::read::PyStreamTableScan> {
+        PyReadBuilder::new(Arc::clone(&self.inner)).new_stream_scan()
+    }
+
     fn new_postpone_fixed_bucket_write_builder(
         &self,
     ) -> PyResult<PyPostponeFixedBucketWriteBuilder> {

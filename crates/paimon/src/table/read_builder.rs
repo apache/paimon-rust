@@ -298,6 +298,11 @@ impl<'a> ReadBuilder<'a> {
         }
     }
 
+    /// Create a stateful streaming scan using the configured filter and read type.
+    pub fn new_stream_scan(&self) -> Result<super::StreamTableScan> {
+        super::StreamTableScan::new(self.new_scan())
+    }
+
     /// Create a batch incremental scan over snapshot id range
     /// `(start_exclusive, end_inclusive]`.
     ///
