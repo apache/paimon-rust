@@ -630,6 +630,69 @@ async fn test_dropped_global_index_files_are_deleted() {
     assert_files_match_references(&table).await;
 }
 
+#[cfg(feature = "fulltext")]
+#[tokio::test]
+async fn test_dropped_full_text_index_files_are_deleted() {
+    let table = test_table(
+        "memory:/expire_full_text_index",
+        &[
+            ("row-tracking.enabled", "true"),
+            ("data-evolution.enabled", "true"),
+            ("global-index.enabled", "true"),
+            ("global-index.row-count-per-shard", "1"),
+        ],
+        false,
+    );
+    setup_dirs(&table).await;
+    for (id, text) in [(1, "paimon lake"), (2, "rust engine")] {
+        let messages = write(&table, &[id], text).await;
+        TableCommit::new(table.clone(), "test-user".to_string())
+            .commit(messages)
+            .await
+            .unwrap();
+    }
+    let build = || async {
+        table
+            .new_full_text_index_build_builder()
+            .with_index_column("dt")
+            .execute()
+            .await
+            .unwrap()
+    };
+    // One file per shard.
+    assert_eq!(build().await, 2);
+    let dropped = file_names_under(&table, "index").await;
+    assert_eq!(dropped.len(), 2);
+    assert!(dropped
+        .iter()
+        .all(|name| name.starts_with("full-text-global-index-")));
+    table
+        .new_global_index_drop_builder()
+        .with_index_column("dt")
+        .with_index_type("full-text")
+        .execute()
+        .await
+        .unwrap();
+    // The rebuilt index stays referenced.
+    assert_eq!(build().await, 2);
+    append(&table, &[3]).await;
+
+    expire_keeping(&table, 1).await;
+    let remaining = file_names_under(&table, "index").await;
+    assert_eq!(remaining.len(), 2);
+    assert!(remaining.is_disjoint(&dropped));
+    assert_files_match_references(&table).await;
+    let hits = table
+        .new_full_text_search_builder()
+        .with_text_column("dt")
+        .with_query_text("paimon")
+        .with_limit(10)
+        .execute()
+        .await
+        .unwrap();
+    assert_eq!(hits, vec![crate::table::RowRange::new(0, 0)]);
+}
+
 #[tokio::test]
 async fn test_missing_end_snapshot_keeps_manifests() {
     let table = test_table("memory:/expire_missing_end", &[], false);
@@ -1321,4 +1384,190 @@ async fn test_unreadable_external_changelog_manifest_changes_nothing() {
     assert_eq!(snapshot_ids(&table).await, vec![1, 2, 3]);
     assert_eq!(physical_data_files(&table).await, data_before);
     assert_eq!(file_names_under(&table, "manifest").await, manifests_before);
+}
+
+/// A REST-managed copy of `seed` whose catalog reports `main` as main's latest
+/// snapshot and `branches` as each branch's; a `None` branch answers HTTP 500.
+/// Returns the table, the server handle and the request paths it served.
+async fn rest_table(
+    seed: &Table,
+    main: Snapshot,
+    branches: HashMap<String, Option<Snapshot>>,
+) -> (
+    Table,
+    tokio::task::JoinHandle<()>,
+    Arc<std::sync::Mutex<Vec<String>>>,
+) {
+    use crate::api::rest_api::RESTApi;
+    use crate::common::Options;
+    use axum::{
+        body::Bytes,
+        http::{StatusCode, Uri},
+        Json, Router,
+    };
+
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let handler_requests = requests.clone();
+    let app = Router::new().fallback(move |uri: Uri, _body: Bytes| {
+        let requests = handler_requests.clone();
+        let main = main.clone();
+        let branches = branches.clone();
+        async move {
+            let path = uri.path().to_string();
+            requests.lock().unwrap().push(path.clone());
+            if !path.ends_with("/snapshot") {
+                return (StatusCode::OK, Json(serde_json::json!({"schemaId": 0})));
+            }
+            let decoded = path.replace("%24", "$");
+            let snapshot = match branches
+                .iter()
+                .find(|(branch, _)| decoded.contains(&format!("$branch_{branch}/")))
+            {
+                Some((_, Some(snapshot))) => snapshot.clone(),
+                Some((_, None)) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({"message": "catalog unavailable", "code": 500})),
+                    )
+                }
+                None => main,
+            };
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"snapshot": {"snapshot": snapshot, "recordCount": 1}})),
+            )
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut options = Options::new();
+    options.set("uri", format!("http://{}", listener.local_addr().unwrap()));
+    options.set("prefix", "test");
+    options.set("token.provider", "bear");
+    options.set("token", "test-token");
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let api = Arc::new(RESTApi::new(options.clone(), false).await.unwrap());
+    let identifier = Identifier::new("default", "expire_table");
+    let file_io_cache = crate::io::FileIOCacheContext::from_props(options.to_map()).unwrap();
+    let env = crate::table::RESTEnv::new(
+        identifier.clone(),
+        "uuid".into(),
+        api,
+        options,
+        false,
+        None,
+        file_io_cache,
+    );
+    let table = Table::new(
+        seed.file_io().clone(),
+        identifier,
+        seed.location().to_string(),
+        seed.schema().clone(),
+        Some(env),
+    );
+    (table, server, requests)
+}
+
+/// A read view of `table`'s branch, resolving its snapshot like a branch table.
+fn rest_branch_view(table: &Table, branch: &str) -> Table {
+    let mut view = table.clone();
+    view.branch = branch.to_string();
+    view.branch_reference = true;
+    view
+}
+
+#[tokio::test]
+async fn test_catalog_only_branch_snapshot_is_protected() {
+    let seed = test_table("memory:/expire_rest_branch", &[], false);
+    setup_dirs(&seed).await;
+    write_schema_file(&seed).await;
+    append(&seed, &[1]).await; // snapshot 1
+    overwrite(&seed, &[2]).await; // snapshot 2
+    let sm = seed.snapshot_manager();
+    let snapshot_1 = sm.get_snapshot(1).await.unwrap();
+    let snapshot_2 = sm.get_snapshot(2).await.unwrap();
+    // Branch b1 exists (it has a schema) but its snapshot lives only in the
+    // catalog: no snapshot JSON and no tags on storage.
+    seed.file_io()
+        .new_output(&format!(
+            "{}/branch/branch-b1/schema/schema-0",
+            seed.location()
+        ))
+        .unwrap()
+        .write(bytes::Bytes::from(
+            serde_json::to_vec(seed.schema()).unwrap(),
+        ))
+        .await
+        .unwrap();
+    let (table, server, requests) = rest_table(
+        &seed,
+        snapshot_2,
+        HashMap::from([("b1".to_string(), Some(snapshot_1.clone()))]),
+    )
+    .await;
+    let branch = rest_branch_view(&table, "b1");
+    assert_eq!(read_ids(&table).await, vec![2]);
+    assert_eq!(
+        read_ids(&branch).await,
+        vec![1],
+        "the branch reads through the catalog"
+    );
+
+    assert_eq!(expire_keeping(&table, 1).await, 1);
+    let manifests = file_names_under(&table, "manifest").await;
+    assert!(
+        manifests.contains(snapshot_1.base_manifest_list())
+            && manifests.contains(snapshot_1.delta_manifest_list()),
+        "the branch's manifest lists must survive"
+    );
+    assert_eq!(
+        read_ids(&branch).await,
+        vec![1],
+        "the branch still reads after expiration"
+    );
+    assert!(
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|path| path.replace("%24", "$").contains("$branch_b1/")),
+        "expiration must ask the catalog for the branch's snapshot"
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn test_failed_branch_catalog_lookup_changes_nothing() {
+    let seed = test_table("memory:/expire_rest_branch_unavailable", &[], false);
+    setup_dirs(&seed).await;
+    write_schema_file(&seed).await;
+    append(&seed, &[1]).await;
+    overwrite(&seed, &[2]).await;
+    let snapshot_2 = seed.snapshot_manager().get_snapshot(2).await.unwrap();
+    seed.file_io()
+        .new_output(&format!(
+            "{}/branch/branch-b1/schema/schema-0",
+            seed.location()
+        ))
+        .unwrap()
+        .write(bytes::Bytes::from(
+            serde_json::to_vec(seed.schema()).unwrap(),
+        ))
+        .await
+        .unwrap();
+    let (table, server, _) =
+        rest_table(&seed, snapshot_2, HashMap::from([("b1".to_string(), None)])).await;
+    let data_before = physical_data_files(&table).await;
+    let manifests_before = file_names_under(&table, "manifest").await;
+
+    let result = table
+        .new_expire_snapshots()
+        .with_retain_min(1)
+        .with_older_than_millis(i64::MAX)
+        .execute()
+        .await;
+    assert!(result.is_err(), "{result:?}");
+    assert_eq!(snapshot_ids(&table).await, vec![1, 2]);
+    assert_eq!(physical_data_files(&table).await, data_before);
+    assert_eq!(file_names_under(&table, "manifest").await, manifests_before);
+    server.abort();
 }

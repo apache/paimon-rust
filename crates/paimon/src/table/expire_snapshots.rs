@@ -357,6 +357,10 @@ impl<'a> ExpireSnapshots<'a> {
             for id in snapshot_manager.list_all_ids().await? {
                 snapshots.extend(snapshot_manager.try_get_snapshot(id).await?);
             }
+            // A REST-managed branch may read a snapshot that only the catalog
+            // knows, with no snapshot file on storage. A failed lookup aborts
+            // the run before anything is deleted.
+            snapshots.extend(snapshot_manager.get_latest_snapshot().await?);
             snapshots.extend(
                 self.table
                     .tag_manager()
