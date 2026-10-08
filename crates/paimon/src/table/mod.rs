@@ -136,6 +136,7 @@ mod scan_trace;
 pub(crate) mod schema_manager;
 pub(crate) mod snapshot_commit;
 mod snapshot_manager;
+mod snapshot_reader;
 mod sort_merge;
 mod sorted_global_index_build_builder;
 mod sorted_global_index_options;
@@ -216,6 +217,7 @@ pub use scan_trace::ScanTrace;
 pub use schema_manager::SchemaManager;
 pub use snapshot_commit::{RESTSnapshotCommit, RenamingSnapshotCommit, SnapshotCommit};
 pub use snapshot_manager::SnapshotManager;
+pub use snapshot_reader::{ScanMode, SnapshotReader};
 pub use sorted_global_index_build_builder::{
     BTreeGlobalIndexBuildBuilder, SortedGlobalIndexBuildBuilder,
 };
@@ -522,6 +524,12 @@ impl Table {
     /// Reference: [pypaimon FileStoreTable.new_read_builder](https://github.com/apache/paimon/blob/release-1.3/paimon-python/pypaimon/table/file_store_table.py).
     pub fn new_read_builder(&self) -> ReadBuilder<'_> {
         ReadBuilder::new(self)
+    }
+
+    /// Create Java's per-snapshot ALL/DELTA/CHANGELOG reader.
+    /// Use a read builder's `new_snapshot_reader` to configure filters and read type.
+    pub fn new_snapshot_reader(&self) -> SnapshotReader<'_> {
+        self.new_read_builder().new_snapshot_reader()
     }
 
     /// Create a full-text search builder.

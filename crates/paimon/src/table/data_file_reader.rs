@@ -1188,16 +1188,29 @@ fn read_data_fields(
         }
     }
     for expected in expected_fields {
-        if expected.id() == crate::spec::SEQUENCE_NUMBER_FIELD_ID
-            && expected.name() == crate::spec::SEQUENCE_NUMBER_FIELD_NAME
+        if is_physical_system_field(expected)
             && !read_fields.iter().any(|field| field.id() == expected.id())
         {
-            // Row tracking stores this physical system column outside the
-            // logical table schema, including alongside selected MAP keys.
+            // Row tracking and KV files store these columns outside the logical
+            // table schema. Keep them during MAP pruning/schema evolution too;
+            // an audit reader must receive the stored _VALUE_KIND.
             read_fields.push(expected.clone());
         }
     }
     Ok(read_fields)
+}
+
+fn is_physical_system_field(field: &DataField) -> bool {
+    matches!(
+        (field.id(), field.name()),
+        (
+            crate::spec::SEQUENCE_NUMBER_FIELD_ID,
+            crate::spec::SEQUENCE_NUMBER_FIELD_NAME
+        ) | (
+            crate::spec::VALUE_KIND_FIELD_ID,
+            crate::spec::VALUE_KIND_FIELD_NAME
+        )
+    )
 }
 
 fn prune_data_type(
@@ -1682,6 +1695,31 @@ mod row_tests {
             Some("__PAIMON_MAP_SELECTED_KEYS:key")
         );
         assert_eq!(read[1], sequence);
+    }
+
+    #[test]
+    fn schema_pruning_keeps_value_kind_but_does_not_bind_an_alias() {
+        let value_kind = field(
+            crate::spec::VALUE_KIND_FIELD_ID,
+            crate::spec::VALUE_KIND_FIELD_NAME,
+            DataType::TinyInt(crate::spec::TinyIntType::with_nullable(false)),
+        );
+        let read = read_data_fields(&[], std::slice::from_ref(&value_kind), false).unwrap();
+        assert_eq!(read, vec![value_kind]);
+        for alias in [
+            field(
+                10,
+                crate::spec::VALUE_KIND_FIELD_NAME,
+                DataType::Int(IntType::new()),
+            ),
+            field(
+                crate::spec::VALUE_KIND_FIELD_ID,
+                "kind",
+                DataType::Int(IntType::new()),
+            ),
+        ] {
+            assert!(read_data_fields(&[], &[alias], false).unwrap().is_empty());
+        }
     }
 
     #[test]

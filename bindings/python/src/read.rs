@@ -23,7 +23,9 @@ use arrow::pyarrow::ToPyArrow;
 use arrow::record_batch::RecordBatch;
 use futures::TryStreamExt;
 use paimon::spec::{is_variant_extraction_row, DataField, DataType, Predicate, RowType};
-use paimon::table::{ArrowRecordBatchStream, DataSplit, IncrementalScanMode, RowRange, Table};
+use paimon::table::{
+    ArrowRecordBatchStream, DataSplit, IncrementalScanMode, RowRange, ScanMode, Table,
+};
 use paimon_datafusion::runtime::runtime;
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
@@ -322,6 +324,17 @@ impl PyReadBuilder {
         }
     }
 
+    /// Create Java's per-snapshot ALL/DELTA/CHANGELOG reader.
+    pub(crate) fn new_snapshot_reader(&self) -> PySnapshotReader {
+        PySnapshotReader {
+            scan: self.new_scan(),
+            snapshot_id: None,
+            mode: ScanMode::All,
+            bucket_filter: None,
+            only_real_buckets: false,
+        }
+    }
+
     /// Plan physical changes in (start_snapshot_id, end_snapshot_id] as one
     /// ordinary split plan. Mode is `delta` by default; `changelog` reads
     /// changelog manifest files and `auto` follows the table's producer.
@@ -466,6 +479,126 @@ impl PyTableScan {
             builder.with_row_ranges(row_ranges.clone());
         }
         Ok(builder)
+    }
+}
+
+/// Owns only Python configuration; manifest and split semantics belong to core.
+#[pyclass(name = "SnapshotReader", module = "pypaimon_rust.datafusion")]
+pub struct PySnapshotReader {
+    scan: PyTableScan,
+    snapshot_id: Option<i64>,
+    mode: ScanMode,
+    bucket_filter: Option<Py<PyAny>>,
+    only_real_buckets: bool,
+}
+
+#[pymethods]
+impl PySnapshotReader {
+    fn only_read_real_buckets(mut slf: PyRefMut<'_, Self>) -> PyRefMut<'_, Self> {
+        slf.only_real_buckets = true;
+        slf
+    }
+
+    fn with_snapshot(
+        mut slf: PyRefMut<'_, Self>,
+        snapshot_id: i64,
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        slf.scan
+            .read_builder()?
+            .new_snapshot_reader()
+            .with_snapshot(snapshot_id)
+            .map_err(to_py_err)?;
+        slf.snapshot_id = Some(snapshot_id);
+        Ok(slf)
+    }
+
+    fn with_mode<'py>(mut slf: PyRefMut<'py, Self>, mode: &str) -> PyResult<PyRefMut<'py, Self>> {
+        slf.mode = match mode.to_ascii_lowercase().as_str() {
+            "all" => ScanMode::All,
+            "delta" => ScanMode::Delta,
+            "changelog" => ScanMode::Changelog,
+            _ => {
+                return Err(PyValueError::new_err(
+                    "snapshot mode must be all, delta or changelog",
+                ))
+            }
+        };
+        Ok(slf)
+    }
+
+    #[pyo3(signature = (filter = None))]
+    fn with_bucket_filter(
+        mut slf: PyRefMut<'_, Self>,
+        filter: Option<Py<PyAny>>,
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        if filter
+            .as_ref()
+            .is_some_and(|filter| !filter.bind(slf.py()).is_callable())
+        {
+            return Err(PyTypeError::new_err("bucket filter must be callable"));
+        }
+        slf.bucket_filter = filter;
+        Ok(slf)
+    }
+
+    fn with_shard(
+        mut slf: PyRefMut<'_, Self>,
+        index: usize,
+        count: usize,
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        slf.scan
+            .read_builder()?
+            .new_snapshot_reader()
+            .with_shard(index, count)
+            .map_err(to_py_err)?;
+        slf.scan.shard = Some((index, count));
+        Ok(slf)
+    }
+
+    fn read(&self, py: Python<'_>) -> PyResult<PyPlan> {
+        let filter = self
+            .bucket_filter
+            .as_ref()
+            .map(|filter| filter.clone_ref(py));
+        let callback_error = Arc::new(Mutex::new(None));
+        py.detach(|| {
+            let mut reader = self
+                .scan
+                .read_builder()?
+                .new_snapshot_reader()
+                .with_mode(self.mode);
+            if self.only_real_buckets {
+                reader = reader.only_read_real_buckets();
+            }
+            if let Some(id) = self.snapshot_id {
+                reader = reader.with_snapshot(id).map_err(to_py_err)?;
+            }
+            if let Some((index, count)) = self.scan.shard {
+                reader = reader.with_shard(index, count).map_err(to_py_err)?;
+            }
+            if let Some(filter) = filter {
+                let error_slot = Arc::clone(&callback_error);
+                reader = reader.with_bucket_filter(move |bucket| {
+                    Python::attach(|py| {
+                        filter
+                            .call1(py, (bucket,))
+                            .and_then(|result| result.extract::<bool>(py))
+                    })
+                    .map_err(|error| {
+                        *error_slot.lock().unwrap() = Some(error);
+                        paimon::Error::UnexpectedError {
+                            message: "Python bucket filter failed".into(),
+                            source: None,
+                        }
+                    })
+                });
+            }
+            let plan = runtime().block_on(reader.read());
+            if let Some(error) = callback_error.lock().unwrap().take() {
+                return Err(error);
+            }
+            plan.map(PyPlan::from).map_err(to_py_err)
+        })
     }
 }
 

@@ -298,6 +298,11 @@ impl<'a> ReadBuilder<'a> {
         }
     }
 
+    /// Create a per-snapshot reader retaining this builder's read configuration.
+    pub fn new_snapshot_reader(&self) -> super::SnapshotReader<'a> {
+        super::SnapshotReader::new(self.new_scan())
+    }
+
     /// Create a batch incremental scan over snapshot id range
     /// `(start_exclusive, end_inclusive]`.
     ///

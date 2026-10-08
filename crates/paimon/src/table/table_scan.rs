@@ -1098,6 +1098,64 @@ enum TableScanKind<'a> {
 }
 
 impl<'a> TableScan<'a> {
+    pub(super) fn only_read_snapshot_real_buckets(mut self) -> Self {
+        if let TableScanKind::Paimon(scan) = &mut self.0 {
+            scan.split_selection
+                .get_or_insert_with(Default::default)
+                .only_real_buckets = true;
+        }
+        self
+    }
+
+    pub(super) fn with_snapshot_bucket_filter(
+        mut self,
+        filter: super::snapshot_reader::BucketFilter,
+    ) -> Self {
+        if let TableScanKind::Paimon(scan) = &mut self.0 {
+            let selection = scan.split_selection.get_or_insert_with(Default::default);
+            selection.bucket_filter = Some(filter);
+        }
+        self
+    }
+
+    /// The lower-level SnapshotReader pins snapshots itself instead of applying
+    /// batch startup options. ALL retains L0 but keeps batch merge/DV semantics.
+    pub(super) async fn read_snapshot(
+        &self,
+        snapshot_id: Option<i64>,
+        mode: super::ScanMode,
+    ) -> crate::Result<Plan> {
+        let TableScanKind::Paimon(scan) = &self.0 else {
+            return Err(crate::Error::Unsupported {
+                message: "SnapshotReader requires a Paimon table".into(),
+            });
+        };
+        scan.validate_read_options()?;
+        let manager = scan.table.snapshot_manager();
+        let snapshot = match snapshot_id {
+            Some(id) => Some(manager.get_snapshot(id).await?),
+            None => manager.get_latest_snapshot().await?,
+        };
+        let Some(snapshot) = snapshot else {
+            return Ok(Plan::new(Vec::new()));
+        };
+        // SnapshotReader itself does not hide unassigned buckets. Stream/batch
+        // starting scanners opt in to onlyReadRealBuckets according to Java.
+        let mut scan = scan.clone();
+        scan.scan_all_files = true;
+        scan.split_selection
+            .get_or_insert_with(Default::default)
+            .snapshot_mode = Some(mode);
+        match mode {
+            super::ScanMode::All => {
+                let fields = scan.projected_read_field_ids()?;
+                scan.plan_snapshot(snapshot, fields.as_ref(), None).await
+            }
+            super::ScanMode::Delta => scan.plan_snapshot_delta(&snapshot).await,
+            super::ScanMode::Changelog => scan.plan_snapshot_changelog(&snapshot, None).await,
+        }
+    }
+
     pub(crate) fn new(
         table: &'a Table,
         partition_filter: Option<PartitionFilter>,
@@ -1191,6 +1249,9 @@ impl<'a> TableScan<'a> {
                 scan.split_selection = Some(Box::new(ScanSplitSelection {
                     mode: Some(ScanSplitMode::ChunkShuffle(config)),
                     shard: scan.shard(),
+                    bucket_filter: scan.bucket_filter().cloned(),
+                    only_real_buckets: scan.only_real_buckets(),
+                    snapshot_mode: scan.snapshot_mode(),
                 }));
                 Ok(Self(TableScanKind::Paimon(scan)))
             }
@@ -1230,6 +1291,9 @@ impl<'a> TableScan<'a> {
                         scan.split_selection = Some(Box::new(ScanSplitSelection {
                             mode: None,
                             shard: Some((index, count)),
+                            bucket_filter: None,
+                            only_real_buckets: false,
+                            snapshot_mode: None,
                         }));
                     }
                 }
@@ -1288,6 +1352,9 @@ impl<'a> TableScan<'a> {
                 scan.split_selection = Some(Box::new(ScanSplitSelection {
                     mode: Some(ScanSplitMode::RowPosition(selection)),
                     shard: None,
+                    bucket_filter: scan.bucket_filter().cloned(),
+                    only_real_buckets: scan.only_real_buckets(),
+                    snapshot_mode: scan.snapshot_mode(),
                 }));
                 Ok(Self(TableScanKind::Paimon(scan)))
             }
@@ -1409,10 +1476,13 @@ enum ScanSplitMode {
     ChunkShuffle(ChunkShuffle),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 struct ScanSplitSelection {
     mode: Option<ScanSplitMode>,
     shard: Option<(usize, usize)>,
+    bucket_filter: Option<super::snapshot_reader::BucketFilter>,
+    only_real_buckets: bool,
+    snapshot_mode: Option<super::ScanMode>,
 }
 
 #[derive(Debug, Clone)]
@@ -1441,6 +1511,24 @@ struct PaimonTableScan<'a> {
 }
 
 impl<'a> PaimonTableScan<'a> {
+    fn snapshot_mode(&self) -> Option<super::ScanMode> {
+        self.split_selection
+            .as_deref()
+            .and_then(|selection| selection.snapshot_mode)
+    }
+
+    fn only_real_buckets(&self) -> bool {
+        self.split_selection
+            .as_deref()
+            .is_some_and(|selection| selection.only_real_buckets)
+    }
+
+    fn bucket_filter(&self) -> Option<&super::snapshot_reader::BucketFilter> {
+        self.split_selection
+            .as_deref()
+            .and_then(|selection| selection.bucket_filter.as_ref())
+    }
+
     fn row_position_selection(&self) -> Option<RowPositionSelection> {
         match self
             .split_selection
@@ -1788,6 +1876,7 @@ impl<'a> PaimonTableScan<'a> {
     /// cannot be selected from packed splits: one split can contain files owned
     /// by several workers. Keep chunk-shuffle input complete until shuffling.
     fn retain_shard_entries(&self, entries: &mut Vec<ManifestEntry>) -> crate::Result<()> {
+        self.retain_bucket_entries(entries)?;
         let Some((index, count)) = self.shard().filter(|_| self.chunk_shuffle().is_none()) else {
             return Ok(());
         };
@@ -1817,6 +1906,29 @@ impl<'a> PaimonTableScan<'a> {
                 i128::from(entry.bucket()) % count as i128 == index as i128
             }
         });
+        Ok(())
+    }
+
+    fn retain_bucket_entries(&self, entries: &mut Vec<ManifestEntry>) -> crate::Result<()> {
+        let filter = self.bucket_filter();
+        let only_real = self.only_real_buckets();
+        if filter.is_none() && !only_real {
+            return Ok(());
+        }
+        let mut selected = Vec::with_capacity(entries.len());
+        for entry in std::mem::take(entries) {
+            if only_real && entry.bucket() < 0 {
+                continue;
+            }
+            if filter
+                .map(|filter| filter.test(entry.bucket()))
+                .transpose()?
+                .unwrap_or(true)
+            {
+                selected.push(entry);
+            }
+        }
+        *entries = selected;
         Ok(())
     }
 
@@ -2116,7 +2228,8 @@ impl<'a> PaimonTableScan<'a> {
 
     fn requires_key_merge(&self) -> bool {
         let options = self.table.schema().core_options();
-        self.is_streaming()
+        self.snapshot_mode() == Some(super::ScanMode::All)
+            || self.is_streaming()
             || match options.merge_engine() {
                 Ok(crate::spec::MergeEngine::FirstRow) => !self.skip_level_zero(),
                 _ => {

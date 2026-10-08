@@ -175,6 +175,10 @@ impl PyTable {
         PyBatchWriteBuilder::new(Arc::clone(&self.inner))
     }
 
+    fn new_snapshot_reader(&self) -> crate::read::PySnapshotReader {
+        PyReadBuilder::new(Arc::clone(&self.inner)).new_snapshot_reader()
+    }
+
     fn new_postpone_fixed_bucket_write_builder(
         &self,
     ) -> PyResult<PyPostponeFixedBucketWriteBuilder> {
