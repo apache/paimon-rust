@@ -2580,11 +2580,16 @@ mod tests {
     #[tokio::test]
     async fn test_a_restricted_read_refuses_a_variant_extraction_that_can_fail() {
         use crate::spec::{
-            variant_extraction_row, DataField, DataType, IntType, Schema, TableSchema, VariantType,
+            variant_extraction_row, ArrayType, DataField, DataType, IntType, MapType, Schema,
+            TableSchema, VarCharType, VariantType,
         };
+        let variant = || DataType::Variant(VariantType::new());
+        let key = || DataType::VarChar(VarCharType::string_type());
         let schema = Schema::builder()
             .column("id", DataType::Int(IntType::new()))
-            .column("payload", DataType::Variant(VariantType::new()))
+            .column("payload", variant())
+            .column("items", DataType::Array(ArrayType::new(variant())))
+            .column("tags", DataType::Map(MapType::new(key(), variant())))
             .option("query-auth.enabled", "true")
             .build()
             .unwrap();
@@ -2592,9 +2597,9 @@ mod tests {
             schema: TableSchema::new(0, &schema),
             ..crate::table::rest_query_auth_table().await
         };
-        // `variant_get(payload, '$.x', 'INT')` pushed into the read, strict or not.
-        let read = |fail_on_error| {
-            let extraction = variant_extraction_row(
+        // `variant_get(..., '$.x', 'INT')` pushed into the read, strict or not.
+        let extraction = |fail_on_error| {
+            let row = variant_extraction_row(
                 true,
                 [(
                     DataType::Int(IntType::new()),
@@ -2604,16 +2609,33 @@ mod tests {
                 )],
             )
             .unwrap();
-            let payload = DataField::new(1, "payload".to_string(), DataType::Row(extraction));
-            TableRead::new(&table, vec![payload], Vec::new())
+            DataType::Row(row)
         };
+        let read = |field: DataField| TableRead::new(&table, vec![field], Vec::new());
         let split = split_with_grant(Some(grant_for(&table, true)));
-        assert!(
-            matches!(read(true).to_arrow(std::slice::from_ref(&split)), Err(crate::Error::Unsupported { ref message })
-                if message.contains("Variant extraction")),
-            "a strict cast would run on the rows the rules drop"
-        );
-        assert!(read(false).to_arrow(&[split]).is_ok());
+        // Nested evolution evaluates one inside a collection too.
+        for field in [
+            DataField::new(1, "payload".to_string(), extraction(true)),
+            DataField::new(
+                2,
+                "items".to_string(),
+                DataType::Array(ArrayType::new(extraction(true))),
+            ),
+            DataField::new(
+                3,
+                "tags".to_string(),
+                DataType::Map(MapType::new(key(), extraction(true))),
+            ),
+        ] {
+            let name = field.name().to_string();
+            assert!(
+                matches!(read(field).to_arrow(std::slice::from_ref(&split)), Err(crate::Error::Unsupported { ref message })
+                    if message.contains("Variant extraction")),
+                "a strict cast in '{name}' would run on the rows the rules drop"
+            );
+        }
+        let lenient = DataField::new(1, "payload".to_string(), extraction(false));
+        assert!(read(lenient).to_arrow(&[split]).is_ok());
     }
 
     #[tokio::test]

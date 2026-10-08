@@ -244,6 +244,10 @@ pub(crate) fn reject_throwing_extractions(
                 })
             }
             DataType::Row(row) => row.fields().iter().any(|field| throws(field.data_type())),
+            // Nested evolution reaches through collections too.
+            DataType::Array(array) => throws(array.element_type()),
+            DataType::Multiset(multiset) => throws(multiset.element_type()),
+            DataType::Map(map) => throws(map.key_type()) || throws(map.value_type()),
             _ => false,
         }
     }
