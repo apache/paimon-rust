@@ -48,6 +48,7 @@ pub struct MergeCondition {
 pub enum MergeAssignment {
     SourceColumn(String),
     TargetColumn(String),
+    /// Evaluate once across all selected rows of this clause, in target scan order.
     Value(UpdateAssignment),
 }
 
@@ -152,13 +153,31 @@ async fn select_clause(
     Ok((gather(&batch, &selected)?, gather(&batch, &remaining)?))
 }
 
+fn column_assignment(
+    batches: &[RecordBatch],
+    prefix: &str,
+    name: &str,
+) -> crate::Result<UpdateAssignment> {
+    Ok(UpdateAssignment::Array(
+        batches
+            .iter()
+            .map(|batch| {
+                batch
+                    .column_by_name(&format!("{prefix}.{name}"))
+                    .cloned()
+                    .ok_or_else(|| invalid(format!("Missing MERGE {prefix} column {name}")))
+            })
+            .collect::<crate::Result<_>>()?,
+    ))
+}
+
 fn assigned(
-    batch: &RecordBatch,
+    batches: &[RecordBatch],
     assignments: &[(String, MergeAssignment)],
     columns: &[String],
     schema: SchemaRef,
     insert: bool,
-) -> crate::Result<RecordBatch> {
+) -> crate::Result<Vec<RecordBatch>> {
     let mut values = Vec::new();
     for name in columns {
         let value = assignments
@@ -167,35 +186,17 @@ fn assigned(
             .map(|(_, value)| value);
         let assignment = match value {
             Some(MergeAssignment::Value(value)) => value.clone(),
-            Some(MergeAssignment::SourceColumn(column))
-            | Some(MergeAssignment::TargetColumn(column)) => {
-                let prefix = if matches!(value, Some(MergeAssignment::SourceColumn(_))) {
-                    "s"
-                } else {
-                    "t"
-                };
-                let column = batch
-                    .column_by_name(&format!("{prefix}.{column}"))
-                    .ok_or_else(|| invalid(format!("Missing MERGE {prefix} column {column}")))?;
-                UpdateAssignment::Array(vec![column.clone()])
-            }
+            Some(MergeAssignment::SourceColumn(column)) => column_assignment(batches, "s", column)?,
+            Some(MergeAssignment::TargetColumn(column)) => column_assignment(batches, "t", column)?,
             None if insert => UpdateAssignment::Scalar(arrow_array::new_null_array(
                 schema.field_with_name(name).unwrap().data_type(),
                 1,
             )),
-            None => UpdateAssignment::Array(vec![batch
-                .column_by_name(&format!("t.{name}"))
-                .ok_or_else(|| invalid(format!("Missing target column {name}")))?
-                .clone()]),
+            None => column_assignment(batches, "t", name)?,
         };
         values.push((name.clone(), assignment));
     }
-    let batches =
-        super::update_assignment::assigned_batches(std::slice::from_ref(batch), values, schema)?;
-    let first = batches
-        .first()
-        .ok_or_else(|| invalid("MERGE assignment produced no rows"))?;
-    concat_batches(&first.schema(), &batches).map_err(|error| invalid(error.to_string()))
+    super::update_assignment::assigned_batches(batches, values, schema)
 }
 
 pub(super) async fn merge_into(
@@ -484,6 +485,7 @@ pub(super) async fn merge_into(
     let mut pending = joined;
     for clause in matched {
         let mut remaining = Vec::new();
+        let mut clause_rows = Vec::new();
         for batch in pending {
             let (selected, rest) = select_clause(batch, &clause.condition).await?;
             if rest.num_rows() > 0 {
@@ -501,14 +503,20 @@ pub(super) async fn merge_into(
                     .unwrap();
                 deletes.extend(ids.values().iter().copied());
             } else if !update_columns.is_empty() {
-                updates.push(assigned(
-                    &selected,
-                    &clause.assignments,
-                    &update_columns,
-                    schema.clone(),
-                    false,
-                )?);
+                clause_rows.push(selected);
             }
+        }
+        // Array/function assignments cover the complete clause selection, not
+        // each physical target batch. Shared assignment cursors consume chunks
+        // across these batches while preserving row IDs and scan order.
+        if !clause_rows.is_empty() {
+            updates.extend(assigned(
+                &clause_rows,
+                &clause.assignments,
+                &update_columns,
+                schema.clone(),
+                false,
+            )?);
         }
         pending = remaining;
     }
@@ -532,18 +540,19 @@ pub(super) async fn merge_into(
             let (selected, rest) = select_clause(pending, &clause.condition).await?;
             pending = rest;
             if selected.num_rows() > 0 {
-                let batch = assigned(
-                    &selected,
+                for batch in assigned(
+                    std::slice::from_ref(&selected),
                     &clause.assignments,
                     &columns,
                     schema.clone(),
                     true,
-                )?;
-                inserts.push(
-                    batch
-                        .project(&(1..batch.num_columns()).collect::<Vec<_>>())
-                        .map_err(|error| invalid(error.to_string()))?,
-                );
+                )? {
+                    inserts.push(
+                        batch
+                            .project(&(1..batch.num_columns()).collect::<Vec<_>>())
+                            .map_err(|error| invalid(error.to_string()))?,
+                    );
+                }
             }
         }
     }

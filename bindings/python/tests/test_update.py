@@ -439,7 +439,9 @@ def test_prepared_merge_conditions_chunks_and_lazy_literals(tmp_path, stream):
     context.sql("""CREATE TABLE paimon.prepared_merge.t (id INT, value INT) WITH (
         'row-tracking.enabled' = 'true', 'data-evolution.enabled' = 'true',
         'deletion-vectors.enabled' = 'true')""")
-    context.sql('INSERT INTO paimon.prepared_merge.t (id, value) VALUES (1, 10), (2, 20)')
+    # Separate commits force the clause to consume values across target files.
+    context.sql('INSERT INTO paimon.prepared_merge.t (id, value) VALUES (1, 10)')
+    context.sql('INSERT INTO paimon.prepared_merge.t (id, value) VALUES (2, 20)')
     table = PaimonCatalog({'warehouse': str(tmp_path)}).get_table('prepared_merge.t')
     builder = (table.new_stream_write_builder().with_commit_user('prepared-merge')
                if stream else table.new_batch_write_builder())

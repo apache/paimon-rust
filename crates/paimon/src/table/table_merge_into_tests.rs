@@ -342,3 +342,136 @@ async fn core_merge_rejects_inconsistent_source_schemas_before_staging() {
     assert!(error.to_string().contains("must share a schema"));
     assert_eq!(rows(&table).await, vec![(Some(1), Some(10))]);
 }
+
+#[tokio::test]
+async fn core_merge_consumes_assignments_across_all_selected_files() {
+    for chunked in [false, true] {
+        let table = table();
+        for id in 1..=3 {
+            seed(&table, &batch(vec![Some(id)], vec![Some(id * 10)])).await;
+        }
+        let values: Vec<ArrayRef> = if chunked {
+            vec![
+                Arc::new(Int32Array::from(vec![100])),
+                Arc::new(Int32Array::from(vec![200])),
+            ]
+        } else {
+            vec![Arc::new(Int32Array::from(vec![100, 200]))]
+        };
+        let condition = MergeCondition {
+            target_columns: Vec::new(),
+            source_columns: vec!["id".into()],
+            evaluate: Arc::new(|batch| {
+                Box::pin(async move {
+                    let ids = batch
+                        .column_by_name("s.id")
+                        .unwrap()
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .unwrap();
+                    Ok(BooleanArray::from(
+                        ids.iter().map(|id| id.map(|id| id < 3)).collect::<Vec<_>>(),
+                    ))
+                })
+            }),
+        };
+        let messages = table
+            .new_write_builder()
+            .new_update()
+            .unwrap()
+            .merge_into(
+                MergeSource::Batches(vec![batch(
+                    vec![Some(1), Some(2), Some(3)],
+                    vec![Some(11), Some(22), Some(33)],
+                )]),
+                vec![("id".into(), "id".into())],
+                vec![
+                    WhenMatched {
+                        condition: Some(condition),
+                        delete: false,
+                        assignments: vec![
+                            ("id".into(), MergeAssignment::TargetColumn("id".into())),
+                            (
+                                "value".into(),
+                                MergeAssignment::Value(UpdateAssignment::Array(values)),
+                            ),
+                        ],
+                    },
+                    update(None),
+                ],
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        TableCommit::new(table.clone(), "merge".into())
+            .commit(messages)
+            .await
+            .unwrap();
+        assert_eq!(
+            rows(&table).await,
+            vec![
+                (Some(1), Some(100)),
+                (Some(2), Some(200)),
+                (Some(3), Some(33))
+            ]
+        );
+    }
+}
+
+#[tokio::test]
+async fn core_merge_evaluates_functions_once_for_the_complete_clause() {
+    let table = table();
+    for id in 1..=2 {
+        seed(&table, &batch(vec![Some(id)], vec![Some(id * 10)])).await;
+    }
+    let calls = Arc::new(AtomicUsize::new(0));
+    let evaluated = calls.clone();
+    let values = UpdateAssignment::Function(Arc::new(move |batches| {
+        evaluated.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
+        Ok(batches
+            .iter()
+            .map(|batch| {
+                let ids = batch
+                    .column_by_name("s.id")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap();
+                Arc::new(Int32Array::from(
+                    ids.iter()
+                        .map(|id| id.map(|id| id * 100))
+                        .collect::<Vec<_>>(),
+                )) as ArrayRef
+            })
+            .collect())
+    }));
+    let messages = table
+        .new_write_builder()
+        .new_update()
+        .unwrap()
+        .merge_into(
+            MergeSource::Batches(vec![batch(
+                vec![Some(1), Some(2)],
+                vec![Some(11), Some(22)],
+            )]),
+            vec![("id".into(), "id".into())],
+            vec![WhenMatched {
+                condition: None,
+                delete: false,
+                assignments: vec![("value".into(), MergeAssignment::Value(values))],
+            }],
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    TableCommit::new(table.clone(), "merge".into())
+        .commit(messages)
+        .await
+        .unwrap();
+    assert_eq!(
+        rows(&table).await,
+        vec![(Some(1), Some(100)), (Some(2), Some(200))]
+    );
+}
