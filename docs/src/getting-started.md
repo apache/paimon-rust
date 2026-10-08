@@ -405,7 +405,7 @@ apply when `fs.oss.impl=jindo`.
 |--------|---------|-------------|
 | `io-cache.enabled` | `false` | Master switch. A value set in the catalog options wins over the token, so clients can turn routing off. |
 | `io-cache.origin.endpoint` | `fs.oss.endpoint` | OSS endpoint for requests that do not use a target. |
-| `io-cache.policy` | none | Operations that may use a target: `read`, `meta` (file status and existence checks), `write`, or `none`. |
+| `io-cache.policy` | none | Operations that may use a target: `read`, `meta` (file status), `exists` (existence checks), `write`, or `none`. |
 | `io-cache.whitelist` | all types | File types that may use a target: `meta`, `global-index`, `bucket-index`, `data`, `file-index`, or `*`. |
 | `io-cache.targets` | none | Comma-separated target names matching `[a-z][a-z0-9-]*`. |
 | `io-cache.target.<name>.endpoint` | none | Target endpoint, such as `http://host:port`; `https` when the scheme is omitted. |
@@ -416,8 +416,9 @@ apply when `fs.oss.impl=jindo`.
 `io-cache.target.<name>.region` is accepted but ignored, because OpenDAL signs
 OSS requests without a region.
 
-Only reads, file status and existence checks, and with `write` in the policy also
-writes, of files that Paimon writes once under a unique name can use a target:
+Only reads, file status lookups, existence checks (with `exists` in the policy)
+and writes (with `write` in the policy) of files that Paimon writes once under a
+unique name can use a target:
 manifests, statistics, indexes, and data files. A data file is
 recognized by the name Paimon writers give it: the `data-` or `changelog-`
 prefix, or `data-file.prefix` or `changelog-file.prefix` when these are in the
