@@ -199,8 +199,16 @@ class Table:
     @staticmethod
     def from_rest_response(
         response_json: str, *, database: str, table: str, rest_options: Dict[str, str],
+        initial_data_token: Optional[Tuple[Dict[str, str], int]] = None,
     ) -> "Table":
-        """Reuse matching REST metadata and merged catalog options."""
+        """Reuse REST metadata and optionally an already fetched table data token."""
+        ...
+    @staticmethod
+    def from_rest_response_with_token(
+        response_json: str, *, database: str, table: str, rest_options: Dict[str, str],
+        data_token: Dict[str, str], expires_at_millis: int,
+    ) -> "Table":
+        """Reuse REST metadata and a matching table token; Rust refreshes it on expiry."""
         ...
 
     def copy_with_resolved_schema(self, schema_json: str, *, branch: Optional[str] = None) -> "Table":
