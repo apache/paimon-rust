@@ -1412,6 +1412,25 @@ To drop a composite BTree definition, pass the same ordered `index_column`
 list used to build it, such as `'category,item_number'`. Scalar indexes and
 definitions with a different column order remain available.
 
+Set `dry_run => true` to return the number of matching index files without
+committing changes to the table:
+
+```sql
+CALL sys.drop_global_index(
+  table => 'paimon.my_db.my_table',
+  index_column => 'id',
+  index_type => 'btree',
+  dry_run => true
+);
+```
+
+The `result` column contains `Would drop N global index file(s)`, including
+when `N` is zero. `dry_run` defaults to `false`; an explicit `false` or an
+omitted argument performs the drop and returns `OK`. Other values are rejected.
+The preview uses the latest snapshot at the time of the call; concurrent changes
+can affect the number of files matched by a later drop. Reads retain the usual
+local-cache behavior. Partition filtering is not supported by this procedure.
+
 ### create_lumina_index
 
 Build and commit a Lumina global vector index for a table column:

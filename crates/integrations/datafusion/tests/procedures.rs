@@ -19,12 +19,14 @@ mod common;
 
 use common::{
     assert_sql_error, collect_id_name, create_sql_context, create_test_env, exec, row_count,
-    setup_sql_context,
+    setup_sql_context, string_value,
 };
 use datafusion::arrow::array::{Array, Int64Array, StringArray};
 use paimon::catalog::Identifier;
 use paimon::table::BranchManager;
 use paimon::Catalog;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 async fn setup_table_with_snapshots() -> (tempfile::TempDir, paimon_datafusion::SQLContext) {
     let (tmp, sql_context) = setup_sql_context().await;
@@ -1007,6 +1009,143 @@ async fn test_create_full_text_global_index_rejects_non_string_column() {
         "Full-text index requires a character string column",
     )
     .await;
+}
+
+fn table_files(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    let mut files = BTreeMap::new();
+    for entry in std::fs::read_dir(root).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            files.extend(table_files(&path));
+        } else {
+            let content = std::fs::read(&path).unwrap();
+            files.insert(path, content);
+        }
+    }
+    files
+}
+
+#[tokio::test]
+async fn test_drop_global_index_dry_run_then_drop() {
+    for (table_name, dry_run, drop_arg) in [
+        ("dry_run_false", "true", ", dry_run => false"),
+        ("dry_run_default", "' TrUe '", ""),
+    ] {
+        let (tmp, sql_context) = setup_btree_global_index_table(table_name).await;
+        exec(
+            &sql_context,
+            &format!(
+                "INSERT INTO paimon.test_db.{table_name} (id, name) VALUES (1, 'alice'), (2, 'bob')"
+            ),
+        )
+        .await;
+        exec(
+            &sql_context,
+            &format!(
+                "CALL sys.create_global_index(table => 'test_db.{table_name}', index_column => 'id')"
+            ),
+        )
+        .await;
+        let index_sql = format!("SELECT * FROM paimon.test_db.`{table_name}$table_indexes`");
+        let matched = row_count(&sql_context, &index_sql).await;
+        assert!(matched > 0);
+        let before = table_files(tmp.path());
+
+        let result = sql_context
+            .sql(&format!(
+                "CALL sys.drop_global_index(table => 'test_db.{table_name}', index_column => 'id', dry_run => {dry_run})"
+            ))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(
+            string_value(result[0].column_by_name("result").unwrap().as_ref(), 0),
+            format!("Would drop {matched} global index file(s)")
+        );
+        assert_eq!(row_count(&sql_context, &index_sql).await, matched);
+        assert_eq!(table_files(tmp.path()), before);
+
+        let result = sql_context
+            .sql(&format!(
+                "CALL sys.drop_global_index(table => 'test_db.{table_name}', index_column => 'id'{drop_arg})"
+            ))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(
+            string_value(result[0].column_by_name("result").unwrap().as_ref(), 0),
+            "OK"
+        );
+        assert_eq!(row_count(&sql_context, &index_sql).await, 0);
+        assert_ne!(table_files(tmp.path()), before);
+    }
+}
+
+#[tokio::test]
+async fn test_drop_global_index_dry_run_without_match() {
+    let (tmp, sql_context) = setup_btree_global_index_table("dry_run_empty").await;
+    for insert_data in [false, true] {
+        if insert_data {
+            exec(
+                &sql_context,
+                "INSERT INTO paimon.test_db.dry_run_empty (id, name) VALUES (1, 'alice')",
+            )
+            .await;
+        }
+        let before = table_files(tmp.path());
+        let result = sql_context
+            .sql("CALL sys.drop_global_index(table => 'test_db.dry_run_empty', index_column => 'id', dry_run => true)")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(
+            string_value(result[0].column(0).as_ref(), 0),
+            "Would drop 0 global index file(s)"
+        );
+        assert_eq!(table_files(tmp.path()), before);
+    }
+}
+
+#[tokio::test]
+async fn test_drop_global_index_dry_run_rejects_invalid_args() {
+    let (tmp, sql_context) = setup_btree_global_index_table("dry_run_invalid").await;
+    exec(
+        &sql_context,
+        "INSERT INTO paimon.test_db.dry_run_invalid (id, name) VALUES (1, 'alice')",
+    )
+    .await;
+    exec(
+        &sql_context,
+        "CALL sys.create_global_index(table => 'test_db.dry_run_invalid', index_column => 'id')",
+    )
+    .await;
+    let before = table_files(tmp.path());
+    for (args, expected_error) in [
+        ("dry_run => 'maybe'", "Invalid dry_run"),
+        ("dry_run => 1", "Invalid dry_run"),
+        ("dry_run => ''", "Invalid dry_run"),
+        ("dry_run => NULL", "Unsupported argument value"),
+        (
+            "dry_run => true, partitions => 'pt=p1'",
+            "drop_global_index partitions are not supported yet",
+        ),
+    ] {
+        assert_sql_error(
+            &sql_context,
+            &format!(
+                "CALL sys.drop_global_index(table => 'test_db.dry_run_invalid', index_column => 'id', {args})"
+            ),
+            expected_error,
+        )
+        .await;
+        assert_eq!(table_files(tmp.path()), before);
+    }
 }
 
 #[tokio::test]
