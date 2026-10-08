@@ -552,6 +552,11 @@ impl DataSplit {
     pub fn snapshot_id(&self) -> i64 {
         self.snapshot_id
     }
+
+    pub(crate) fn with_snapshot_id(mut self, snapshot_id: i64) -> Self {
+        self.snapshot_id = snapshot_id;
+        self
+    }
     pub fn partition(&self) -> &BinaryRow {
         &self.partition
     }

@@ -78,6 +78,7 @@ impl<'a> FormatTableScan<'a> {
     }
 
     fn ensure_query_auth_allowed(&self) -> crate::Result<()> {
+        CoreOptions::new(self.table.schema().options()).validate_scan_options()?;
         CoreOptions::new(self.table.schema().options()).ensure_read_authorized()
     }
 

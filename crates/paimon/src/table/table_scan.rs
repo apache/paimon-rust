@@ -213,6 +213,7 @@ enum IncrementalSplitMode {
 enum ManifestListSource<'a> {
     Snapshot(&'a Snapshot),
     AppendDeltas(&'a [Snapshot]),
+    IncrementalList(&'a str),
 }
 
 /// Reads all manifest entries for a snapshot (base + delta manifest lists, then each manifest file).
@@ -244,12 +245,16 @@ async fn read_all_manifest_entries(
     manifest_parallelism: usize,
     trace: Option<&mut ScanTrace>,
 ) -> crate::Result<Vec<ManifestEntry>> {
-    let incremental = matches!(&source, ManifestListSource::AppendDeltas(_));
+    let incremental = !matches!(&source, ManifestListSource::Snapshot(_));
     let (mut manifest_files, delta) = match source {
         ManifestListSource::Snapshot(snapshot) => futures::try_join!(
             read_manifest_list(file_io, table_path, snapshot.base_manifest_list()),
             read_manifest_list(file_io, table_path, snapshot.delta_manifest_list()),
         )?,
+        ManifestListSource::IncrementalList(name) => (
+            Vec::new(),
+            read_manifest_list(file_io, table_path, name).await?,
+        ),
         ManifestListSource::AppendDeltas(snapshots) => {
             let names = snapshots
                 .iter()
@@ -1319,13 +1324,17 @@ impl<'a> TableScan<'a> {
         }
     }
 
-    pub(crate) async fn plan_snapshot_deltas(
+    pub(crate) async fn plan_snapshot_deltas_with_trace(
         &self,
         snapshots: &[Snapshot],
         end_snapshot: &Snapshot,
+        trace: Option<&mut ScanTrace>,
     ) -> crate::Result<Plan> {
         match &self.0 {
-            TableScanKind::Paimon(scan) => scan.plan_snapshot_deltas(snapshots, end_snapshot).await,
+            TableScanKind::Paimon(scan) => {
+                scan.plan_snapshot_deltas(snapshots, end_snapshot, trace)
+                    .await
+            }
             TableScanKind::Format(_) => Err(crate::Error::Unsupported {
                 message: "Format tables do not support incremental delta scan".to_string(),
             }),
@@ -1355,9 +1364,13 @@ impl<'a> TableScan<'a> {
     }
 
     /// Plan data splits from a snapshot's changelog manifest list only.
-    pub(crate) async fn plan_snapshot_changelog(&self, snapshot: &Snapshot) -> crate::Result<Plan> {
+    pub(crate) async fn plan_snapshot_changelog_with_trace(
+        &self,
+        snapshot: &Snapshot,
+        trace: Option<&mut ScanTrace>,
+    ) -> crate::Result<Plan> {
         match &self.0 {
-            TableScanKind::Paimon(scan) => scan.plan_snapshot_changelog(snapshot).await,
+            TableScanKind::Paimon(scan) => scan.plan_snapshot_changelog(snapshot, trace).await,
             TableScanKind::Format(_) => Err(crate::Error::Unsupported {
                 message: "Format tables do not support incremental changelog scan".to_string(),
             }),
@@ -1543,6 +1556,16 @@ impl<'a> PaimonTableScan<'a> {
             .filter(|grant| !grant.is_unrestricted())
             .map(|grant| self.restricted_by(grant));
         let scan = restricted.as_ref().unwrap_or(self);
+        if let Some((start, end)) = scan
+            .table
+            .schema()
+            .core_options()
+            .incremental_timestamp_window()?
+        {
+            let plan = scan.plan_timestamp_window(start, end, None).await?;
+            scan.check_planned_files(&plan, grant.is_some()).await?;
+            return Ok(plan.planned(grant));
+        }
         let data_evolution_read_field_ids = scan.projected_read_field_ids()?;
         let plan = match super::time_travel::resolve_snapshot(scan.table).await? {
             Some(snapshot) => {
@@ -1567,6 +1590,20 @@ impl<'a> PaimonTableScan<'a> {
             limit: scan.limit,
             ..Default::default()
         };
+        if let Some((start, end)) = scan
+            .table
+            .schema()
+            .core_options()
+            .incremental_timestamp_window()?
+        {
+            let plan = scan
+                .plan_timestamp_window(start, end, Some(&mut trace))
+                .await?;
+            trace.snapshot_id = plan.snapshot_id();
+            trace.planned_data_file_bytes = plan.planned_data_file_bytes();
+            scan.check_planned_files(&plan, grant.is_some()).await?;
+            return Ok((plan.planned(grant), trace));
+        }
         let data_evolution_read_field_ids = scan.projected_read_field_ids()?;
         let plan = match super::time_travel::resolve_snapshot(scan.table).await? {
             Some(snapshot) => {
@@ -1644,6 +1681,32 @@ impl<'a> PaimonTableScan<'a> {
         }
     }
 
+    async fn plan_timestamp_window(
+        &self,
+        start: i64,
+        end: i64,
+        trace: Option<&mut ScanTrace>,
+    ) -> crate::Result<Plan> {
+        let Some((start, end)) = super::incremental_scan::timestamp_snapshot_range(
+            &self.table.snapshot_manager(),
+            start,
+            end,
+        )
+        .await?
+        else {
+            return Ok(Plan::new(Vec::new()));
+        };
+        super::IncrementalScan::new(
+            self.table,
+            TableScan(TableScanKind::Paimon(self.clone())),
+            super::IncrementalScanMode::Auto,
+            start,
+            end,
+        )
+        .plan_combined_with_trace(trace)
+        .await
+    }
+
     /// The grant predates the manifest read, so the table can have been
     /// re-created in between. Also refuses stats the schema no longer covers.
     async fn check_planned_files(&self, plan: &Plan, query_auth: bool) -> crate::Result<()> {
@@ -1670,6 +1733,7 @@ impl<'a> PaimonTableScan<'a> {
         let core_options = CoreOptions::new(self.table.schema().options());
         // Unconditional: unrelated to query-auth.
         core_options.ensure_type_paimon_served(&self.table.identifier().full_name())?;
+        core_options.validate_scan_options()?;
         core_options.validate_data_file_path_directory()?;
 
         // File paths and stats, not table columns: the endpoint cannot rule on them.
@@ -2095,6 +2159,7 @@ impl<'a> PaimonTableScan<'a> {
             snapshot,
             snapshot.delta_manifest_list(),
             data_evolution_read_field_ids.as_ref(),
+            None,
         )
         .await
     }
@@ -2105,6 +2170,7 @@ impl<'a> PaimonTableScan<'a> {
         &self,
         snapshots: &[Snapshot],
         end_snapshot: &Snapshot,
+        trace: Option<&mut ScanTrace>,
     ) -> crate::Result<Plan> {
         self.validate_read_options()?;
         let data_evolution_read_field_ids = self.projected_read_field_ids()?;
@@ -2114,7 +2180,7 @@ impl<'a> PaimonTableScan<'a> {
             end_snapshot,
             ManifestListSource::AppendDeltas(snapshots),
             data_evolution_read_field_ids.as_ref(),
-            None,
+            trace,
         )
         .await
     }
@@ -2124,7 +2190,11 @@ impl<'a> PaimonTableScan<'a> {
     /// Reuses the same split-building path as a full snapshot plan, but only
     /// reads the changelog manifest list and keeps ADD entries. Snapshots
     /// without a changelog list yield an empty plan.
-    pub(crate) async fn plan_snapshot_changelog(&self, snapshot: &Snapshot) -> crate::Result<Plan> {
+    pub(crate) async fn plan_snapshot_changelog(
+        &self,
+        snapshot: &Snapshot,
+        trace: Option<&mut ScanTrace>,
+    ) -> crate::Result<Plan> {
         self.validate_read_options()?;
         let Some(list_name) = snapshot.changelog_manifest_list() else {
             return Ok(Plan::new(Vec::new()).with_snapshot_id(snapshot.id()));
@@ -2136,6 +2206,7 @@ impl<'a> PaimonTableScan<'a> {
             snapshot,
             list_name,
             data_evolution_read_field_ids.as_ref(),
+            trace,
         )
         .await
     }
@@ -2145,54 +2216,13 @@ impl<'a> PaimonTableScan<'a> {
         snapshot: &Snapshot,
         manifest_list_name: &str,
         data_evolution_read_field_ids: Option<&HashSet<i32>>,
+        trace: Option<&mut ScanTrace>,
     ) -> crate::Result<Plan> {
-        if matches!(self.limit, Some(0)) {
-            return Ok(Plan::new(Vec::new()).with_snapshot_id(snapshot.id()));
-        }
-        let core_options = CoreOptions::new(self.table.schema().options());
-        let data_evolution_enabled = core_options.data_evolution_enabled();
-        let global_index_settings =
-            self.global_index_scan_settings(&core_options, data_evolution_enabled)?;
-        let index_entries = self
-            .read_index_manifest_entries(
-                snapshot,
-                global_index_settings.is_some(),
-                core_options.deletion_vectors_enabled() && !self.is_streaming(),
-            )
-            .await?;
-        let manifest_row_ranges = self
-            .manifest_row_ranges(snapshot, index_entries.as_deref(), global_index_settings)
-            .await?;
-        if manifest_row_ranges.as_ref().is_some_and(Vec::is_empty) {
-            return Ok(Plan::new(Vec::new()).with_snapshot_id(snapshot.id()));
-        }
-        // Positional scans count all candidate row IDs. Pruning a preceding
-        // manifest or file here would renumber the surviving rows; intersect
-        // explicit/global-index ranges after assigning positions instead.
-        let row_range_index = if data_evolution_enabled && self.row_position_selection().is_none() {
-            manifest_row_ranges.clone().map(RowRangeIndex::create)
-        } else {
-            None
-        };
-        let entries = self
-            .plan_manifest_list_entries(manifest_list_name, row_range_index.as_ref())
-            .await?;
-        let effective_row_ranges = self
-            .effective_row_ranges(
-                snapshot,
-                &entries,
-                index_entries.as_deref(),
-                global_index_settings,
-                manifest_row_ranges,
-            )
-            .await?;
-        self.plan_snapshot_from_entries(
-            snapshot.clone(),
-            entries,
+        self.plan_snapshot_from_lists(
+            snapshot,
+            ManifestListSource::IncrementalList(manifest_list_name),
             data_evolution_read_field_ids,
-            index_entries,
-            effective_row_ranges,
-            None,
+            trace,
         )
         .await
     }
@@ -2287,132 +2317,6 @@ impl<'a> PaimonTableScan<'a> {
             });
         }
         Ok(())
-    }
-
-    /// Read entries from a single manifest list (delta or changelog) with
-    /// partition / bucket filter pushdown matching the full scan path.
-    async fn plan_manifest_list_entries(
-        &self,
-        manifest_list_name: &str,
-        row_range_index: Option<&RowRangeIndex>,
-    ) -> crate::Result<Vec<ManifestEntry>> {
-        let file_io = self.table.file_io();
-        let table_path = self.table.location();
-        let core_options = CoreOptions::new(self.table.schema().options());
-        let has_primary_keys = !self.table.schema().primary_keys().is_empty();
-        let partition_fields = self.table.schema().partition_fields();
-
-        let mut manifest_metas =
-            read_manifest_list(file_io, table_path, manifest_list_name).await?;
-
-        if let Some(pf) = self.partition_filter.as_ref() {
-            manifest_metas.retain(|meta| pf.matches_manifest(meta, &partition_fields));
-        }
-        if let Some(index) = row_range_index {
-            retain_manifest_row_ranges(&mut manifest_metas, index);
-        }
-
-        let bucket_key_fields: Vec<DataField> = if self.bucket_predicate.is_none() {
-            Vec::new()
-        } else {
-            let bucket_keys = core_options.bucket_key().unwrap_or_else(|| {
-                if has_primary_keys {
-                    self.table.schema().trimmed_primary_keys()
-                } else {
-                    Vec::new()
-                }
-            });
-            bucket_keys
-                .iter()
-                .filter_map(|key| {
-                    self.table
-                        .schema()
-                        .fields()
-                        .iter()
-                        .find(|f| f.name() == key)
-                        .cloned()
-                })
-                .collect::<Vec<_>>()
-        };
-        let bucket_function_type = core_options.bucket_function_type()?;
-
-        retain_manifest_buckets(
-            &mut manifest_metas,
-            has_primary_keys && !self.scan_all_files,
-            self.bucket_predicate.as_ref(),
-            &bucket_key_fields,
-            bucket_function_type,
-        );
-
-        let base_path = format!("{}/{}", table_path.trim_end_matches('/'), MANIFEST_DIR);
-        let shared_cache = SharedSchemaCache::new();
-        let partition_filter = self.partition_filter.as_ref();
-        let bucket_predicate = self.bucket_predicate.as_ref();
-        let scan_all_files = self.scan_all_files;
-
-        let mut entries = Vec::new();
-        for meta in manifest_metas {
-            let path = format!("{base_path}/{}", meta.file_name());
-            // This path validates incremental/changelog manifests before its
-            // existing post-read row-range pruning, so do not hide DELETEs at
-            // the block layer.
-            let bytes = read_manifest_bytes_with_sidecar(
-                file_io,
-                &path,
-                &meta,
-                core_options.manifest_sidecar_enabled(),
-                ManifestSidecarPruning {
-                    row_range_index: None,
-                    partition_filter,
-                    partition_arity: partition_fields.len(),
-                    bucket_predicate,
-                    bucket_key_fields: &bucket_key_fields,
-                    bucket_function_type,
-                },
-            )
-            .await?;
-            let mut bucket_cache: HashMap<i32, Option<HashSet<i32>>> = HashMap::new();
-            let manifest_entries = crate::spec::avro::from_manifest_bytes_filtered_shared(
-                &bytes,
-                &shared_cache,
-                &mut |_kind, partition_bytes, bucket, total_buckets| {
-                    if has_primary_keys && !scan_all_files && bucket < 0 {
-                        return false;
-                    }
-                    if let Some(pred) = bucket_predicate {
-                        let targets = bucket_cache.entry(total_buckets).or_insert_with(|| {
-                            compute_target_buckets(
-                                pred,
-                                &bucket_key_fields,
-                                bucket_function_type,
-                                total_buckets,
-                            )
-                        });
-                        if let Some(targets) = targets {
-                            if !targets.contains(&bucket) {
-                                return false;
-                            }
-                        }
-                    }
-                    if let Some(pf) = partition_filter {
-                        match pf.matches_entry(partition_bytes) {
-                            Ok(false) => return false,
-                            Ok(true) => {}
-                            Err(_) => {}
-                        }
-                    }
-                    true
-                },
-            )?;
-            entries.extend(manifest_entries);
-        }
-        validate_incremental_entries(&entries)?;
-        let entries = if let Some(index) = row_range_index {
-            retain_manifest_entry_row_ranges(entries, index)
-        } else {
-            entries
-        };
-        Ok(entries)
     }
 
     async fn plan_snapshot(
@@ -6927,7 +6831,7 @@ mod tests {
         assert_eq!(delta.snapshot_id(), Some(1));
         let changelog = builder
             .new_scan()
-            .plan_snapshot_changelog(&snapshot)
+            .plan_snapshot_changelog_with_trace(&snapshot, None)
             .await
             .unwrap();
         assert!(changelog.splits().is_empty());

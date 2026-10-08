@@ -72,7 +72,7 @@ pub struct WhenNotMatched {
 /// Materialized input, a Paimon source table, or the target joined on its row ID.
 pub enum MergeSource {
     Batches(Vec<RecordBatch>),
-    /// Read a Paimon table at one independently pinned source snapshot.
+    /// Read a Paimon table at an independently selected snapshot or timestamp window.
     Table(Arc<Table>),
     SelfTable,
 }

@@ -268,8 +268,8 @@ class BatchTableUpdate:
     ) -> List[CommitMessage]:
         """Prepare MERGE against one target snapshot. None selects self-merge on _ROW_ID.
 
-        A Table source reads its selected full snapshot in core, independently
-        of the target. Arrow input preserves batches and source row order.
+        A Table source reads its selected snapshot or numeric timestamp window
+        in core, independently of the target. Arrow input preserves batches and source row order.
 
         Clauses carry assignments as (column, source/target/literal, value)
         tuples, a delete flag, and optional SQL condition metadata.
@@ -310,8 +310,8 @@ class StreamTableUpdate:
     ) -> List[CommitMessage]:
         """Prepare MERGE against one target snapshot. None selects self-merge on _ROW_ID.
 
-        A Table source reads its selected full snapshot in core, independently
-        of the target. Arrow input preserves batches and source row order.
+        A Table source reads its selected snapshot or numeric timestamp window
+        in core, independently of the target. Arrow input preserves batches and source row order.
 
         Clauses carry assignments as (column, source/target/literal, value)
         tuples, a delete flag, and optional SQL condition metadata.

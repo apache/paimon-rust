@@ -15,8 +15,42 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::{DataSplit, Plan, SnapshotManager, Table, TableScan};
+use super::{DataSplit, Plan, ScanTrace, SnapshotManager, Table, TableScan};
 use crate::spec::{CommitKind, CoreOptions};
+
+/// Java IncrementalDeltaStartingScanner.betweenTimestamps. Resolve both bounds
+/// once; readers consume the resulting plan and never reselect a source window.
+pub(super) async fn timestamp_snapshot_range(
+    manager: &SnapshotManager,
+    start: i64,
+    end: i64,
+) -> crate::Result<Option<(i64, i64)>> {
+    let Some(earliest_id) = manager.earliest_snapshot_id().await? else {
+        return Ok(None);
+    };
+    let earliest = manager.get_snapshot(earliest_id).await?;
+    let Some(latest) = manager.get_latest_snapshot().await? else {
+        return Ok(None);
+    };
+    if end < start {
+        return Err(crate::Error::DataInvalid {
+            message: format!("Ending timestamp {end} should be >= starting timestamp {start}"),
+            source: None,
+        });
+    }
+    if start == end || start > latest.time_millis() as i64 || end < earliest.time_millis() as i64 {
+        return Ok(None);
+    }
+    let start_id = manager
+        .earlier_or_equal_time_millis(start)
+        .await?
+        .map_or(earliest.id() - 1, |snapshot| snapshot.id());
+    let end_id = manager
+        .earlier_or_equal_time_millis(end)
+        .await?
+        .map_or(latest.id(), |snapshot| snapshot.id());
+    Ok(Some((start_id, end_id)))
+}
 
 /// Batch incremental scan mode.
 ///
@@ -273,6 +307,20 @@ impl<'a> IncrementalScan<'a> {
     }
 
     pub async fn plan(&self) -> crate::Result<IncrementalPlan> {
+        let mode = self.resolve_mode();
+        self.validate_per_snapshot_plan(mode).await?;
+        if self.start_exclusive == self.end_inclusive {
+            return Ok(IncrementalPlan::new(mode, Vec::new()));
+        }
+        match mode {
+            IncrementalScanMode::Delta => self.plan_delta(mode).await,
+            IncrementalScanMode::Changelog => self.plan_changelog(mode, None).await,
+            IncrementalScanMode::Auto => unreachable!("Auto must resolve before planning"),
+            IncrementalScanMode::Diff => self.plan_diff(mode).await,
+        }
+    }
+
+    async fn validate_per_snapshot_plan(&self, mode: IncrementalScanMode) -> crate::Result<()> {
         crate::spec::CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
         if self.scan.has_row_position_selection()
             || self.scan.has_chunk_shuffle()
@@ -283,17 +331,7 @@ impl<'a> IncrementalScan<'a> {
                     .into(),
             });
         }
-        let mode = self.resolve_mode();
-        self.validate_snapshot_range(mode).await?;
-        if self.start_exclusive == self.end_inclusive {
-            return Ok(IncrementalPlan::new(mode, Vec::new()));
-        }
-        match mode {
-            IncrementalScanMode::Delta => self.plan_delta(mode).await,
-            IncrementalScanMode::Changelog => self.plan_changelog(mode).await,
-            IncrementalScanMode::Auto => unreachable!("Auto must resolve before planning"),
-            IncrementalScanMode::Diff => self.plan_diff(mode).await,
-        }
+        self.validate_snapshot_range(mode).await
     }
 
     /// Plan a Delta or Changelog range as one ordinary [`Plan`].
@@ -305,14 +343,22 @@ impl<'a> IncrementalScan<'a> {
     /// represented by an ordinary split list because each unit contains a
     /// before/after pair.
     pub async fn plan_combined(&self) -> crate::Result<Plan> {
+        self.plan_combined_with_trace(None).await
+    }
+
+    pub(crate) async fn plan_combined_with_trace(
+        &self,
+        trace: Option<&mut ScanTrace>,
+    ) -> crate::Result<Plan> {
         match self.resolve_mode() {
-            IncrementalScanMode::Delta => self.plan_combined_delta().await,
+            IncrementalScanMode::Delta => self.plan_combined_delta_with_trace(trace).await,
             IncrementalScanMode::Changelog => {
-                let incremental = self.plan().await?;
+                self.validate_per_snapshot_plan(IncrementalScanMode::Changelog).await?;
+                let incremental = self.plan_changelog(IncrementalScanMode::Changelog, trace).await?;
                 let mut splits = Vec::with_capacity(incremental.splits().len());
                 for split in incremental.splits() {
                     match split {
-                        IncrementalSplit::Data(split) => splits.push(split.clone()),
+                        IncrementalSplit::Data(split) => splits.push(split.clone().with_snapshot_id(self.end_inclusive)),
                         IncrementalSplit::DiffPair { .. } => {
                             return Err(crate::Error::UnexpectedError {
                                 message: "DiffPair appeared in a Changelog incremental plan"
@@ -341,6 +387,13 @@ impl<'a> IncrementalScan<'a> {
     /// must exist and supplies snapshot metadata. Snapshot deletion vectors and
     /// automatic global-index pruning do not apply to these historical events.
     pub async fn plan_combined_delta(&self) -> crate::Result<Plan> {
+        self.plan_combined_delta_with_trace(None).await
+    }
+
+    async fn plan_combined_delta_with_trace(
+        &self,
+        trace: Option<&mut ScanTrace>,
+    ) -> crate::Result<Plan> {
         CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
         let mode = self.resolve_mode();
         if mode != IncrementalScanMode::Delta {
@@ -366,7 +419,7 @@ impl<'a> IncrementalScan<'a> {
             snapshots.push(end_snapshot.clone());
         }
         self.scan
-            .plan_snapshot_deltas(&snapshots, &end_snapshot)
+            .plan_snapshot_deltas_with_trace(&snapshots, &end_snapshot, trace)
             .await
     }
 
@@ -435,7 +488,11 @@ impl<'a> IncrementalScan<'a> {
         IncrementalPlan::try_new(mode, splits)
     }
 
-    async fn plan_changelog(&self, mode: IncrementalScanMode) -> crate::Result<IncrementalPlan> {
+    async fn plan_changelog(
+        &self,
+        mode: IncrementalScanMode,
+        mut trace: Option<&mut ScanTrace>,
+    ) -> crate::Result<IncrementalPlan> {
         let mut splits = Vec::new();
         for snapshot_id in (self.start_exclusive + 1)..=self.end_inclusive {
             let snapshot = self.snapshot_manager.get_snapshot(snapshot_id).await?;
@@ -447,7 +504,17 @@ impl<'a> IncrementalScan<'a> {
             if snapshot.changelog_manifest_list().is_none() {
                 continue;
             }
-            let plan = self.scan.plan_snapshot_changelog(&snapshot).await?;
+            let mut snapshot_trace = ScanTrace::default();
+            let plan = self
+                .scan
+                .plan_snapshot_changelog_with_trace(
+                    &snapshot,
+                    trace.as_ref().map(|_| &mut snapshot_trace),
+                )
+                .await?;
+            if let Some(trace) = trace.as_deref_mut() {
+                trace.accumulate(&snapshot_trace);
+            }
             splits.extend(plan.splits().iter().cloned().map(IncrementalSplit::Data));
         }
         IncrementalPlan::try_new(mode, splits)
