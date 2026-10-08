@@ -48,7 +48,7 @@ use crate::table::row_kind_generator::RowKindGenerator;
 use crate::table::write_batch_normalize::normalize_write_array;
 use crate::table::{Snapshot, Table, TableScan};
 use crate::Result;
-use arrow_array::{ArrayRef, Int8Array, RecordBatch};
+use arrow_array::{Array, ArrayRef, Int8Array, RecordBatch};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -875,10 +875,10 @@ impl TableWrite {
         let actual_field_count = actual_schema.fields().len();
         // Primary-key data writers consume `_VALUE_KIND` independently of whether
         // separate changelog files are enabled. Row-kind generation and
-        // cross-partition routing add the column themselves, so callers must not.
-        let allows_value_kind = !self.primary_key_indices.is_empty()
-            && self.row_kind_generator.is_none()
-            && !matches!(self.bucket_assigner, BucketAssignerEnum::CrossPartition(_));
+        // cross-partition routing replaces the column after preserving input
+        // kinds and emitting migration DELETEs. A configured generator owns it.
+        let allows_value_kind =
+            !self.primary_key_indices.is_empty() && self.row_kind_generator.is_none();
         let includes_value_kind = allows_value_kind && actual_field_count == table_field_count + 1;
 
         if actual_field_count != table_field_count && !includes_value_kind {
@@ -1060,7 +1060,13 @@ impl TableWrite {
             );
             let (rows, row_kinds) = groups.entry(key).or_default();
             rows.push(row_idx);
-            row_kinds.push(kinds.map_or(RowKind::Insert.to_value(), |kinds| kinds.value(row_idx)));
+            row_kinds.push(kinds.map_or(RowKind::Insert.to_value(), |kinds| {
+                if kinds.is_null(row_idx) {
+                    RowKind::Insert.to_value()
+                } else {
+                    kinds.value(row_idx)
+                }
+            }));
         }
         // Generated row kinds are replaced below; migration DELETEs must not
         // append a second _VALUE_KIND column to a rowkind.field batch.
@@ -1121,6 +1127,17 @@ impl TableWrite {
 
     fn generate_rowkind_batch(&self, batch: &RecordBatch) -> Result<RecordBatch> {
         let Some(generator) = &self.row_kind_generator else {
+            // Every PK batch sent to a buffered writer uses the same schema.
+            // Mixing default INSERT batches with explicit kinds must neither
+            // discard DELETEs nor concatenate columns by the wrong position.
+            if !self.primary_key_indices.is_empty()
+                && batch.column_by_name(VALUE_KIND_FIELD_NAME).is_none()
+            {
+                return Self::add_per_row_value_kind_column(
+                    batch,
+                    vec![RowKind::Insert.to_value(); batch.num_rows()],
+                );
+            }
             return Ok(batch.clone());
         };
         if batch
@@ -4397,6 +4414,77 @@ pub(in crate::table) mod tests {
     }
 
     #[tokio::test]
+    async fn test_pk_writer_mixes_default_and_explicit_row_kinds() {
+        for producer in ["none", "input"] {
+            for row_first in [false, true] {
+                let file_io = test_file_io();
+                let table_path = format!("memory:/mixed-kinds-{producer}-{row_first}");
+                setup_dirs(&file_io, &table_path).await;
+                let table = Table::new(
+                    file_io,
+                    Identifier::new("default", "mixed_kinds"),
+                    table_path,
+                    pk_changelog_schema(&[("changelog-producer", producer)]),
+                    None,
+                );
+                let mut writer = TableWrite::new(&table, "test-user".to_owned()).unwrap();
+                let first = if row_first {
+                    make_batch_with_value_kind(vec![1], vec![10], vec![0])
+                } else {
+                    make_batch(vec![1], vec![10])
+                };
+                let second = if row_first {
+                    make_batch(vec![1], vec![20])
+                } else {
+                    make_batch_with_value_kind(vec![1], vec![20], vec![3])
+                };
+                writer.write_arrow_batch(&first).await.unwrap();
+                writer.write_arrow_batch(&second).await.unwrap();
+                let messages = writer.prepare_commit().await.unwrap();
+                TableCommit::new(table.clone(), "test-user".to_owned())
+                    .commit(messages)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    read_id_value_rows(&table).await,
+                    if row_first { vec![(1, 20)] } else { vec![] }
+                );
+                if producer == "input" {
+                    let builder = table.new_read_builder();
+                    let plan = builder
+                        .new_incremental_scan(super::super::IncrementalScanMode::Changelog, 0, 1)
+                        .plan_combined()
+                        .await
+                        .unwrap();
+                    let batches: Vec<RecordBatch> = futures::TryStreamExt::try_collect(
+                        builder
+                            .new_read()
+                            .unwrap()
+                            .to_arrow_with_row_kind(plan.splits())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                    let kinds: Vec<String> = batches
+                        .iter()
+                        .flat_map(|batch| {
+                            batch
+                                .column(0)
+                                .as_any()
+                                .downcast_ref::<StringArray>()
+                                .unwrap()
+                                .iter()
+                                .map(|kind| kind.unwrap().to_owned())
+                                .collect::<Vec<_>>()
+                        })
+                        .collect();
+                    assert_eq!(kinds, vec!["+I", if row_first { "+I" } else { "-D" }]);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn test_default_changelog_producer_accepts_value_kind() {
         let file_io = test_file_io();
         let table_path = "memory:/test_default_changelog_value_kind";
@@ -5387,8 +5475,10 @@ pub(in crate::table) mod tests {
     }
 
     #[tokio::test]
-    async fn test_input_changelog_cross_partition_write_rejects_caller_value_kind() {
+    async fn test_input_changelog_cross_partition_write_preserves_caller_value_kind() {
         let file_io = test_file_io();
+        let table_path = "memory:/test_cross_partition_input_kinds";
+        setup_dirs(&file_io, table_path).await;
         let schema = Schema::builder()
             .column("pt", DataType::VarChar(VarCharType::string_type()))
             .column("id", DataType::Int(IntType::new()))
@@ -5400,32 +5490,92 @@ pub(in crate::table) mod tests {
             .unwrap();
         let table = Table::new(
             file_io,
-            Identifier::new("default", "test_cross_partition_schema_validation"),
-            "memory:/test_cross_partition_schema_validation".to_string(),
+            Identifier::new("default", "test_cross_partition_input_kinds"),
+            table_path.to_string(),
             TableSchema::new(0, &schema),
             None,
         );
         let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
 
-        let error = table_write
-            .write_arrow_batch(&make_partitioned_batch_with_value_kind(
-                vec!["a"],
-                vec![1],
-                vec![10],
-                vec![0],
-            ))
+        let batch = make_partitioned_batch_with_value_kind(
+            vec!["a", "b", "b", "b"],
+            vec![1, 1, 1, 1],
+            vec![10, 20, 30, 40],
+            vec![0, 2, 1, 3],
+        );
+        let mut fields = batch.schema().fields().to_vec();
+        fields[3] = Arc::new(ArrowField::new(
+            VALUE_KIND_FIELD_NAME,
+            ArrowDataType::Int8,
+            true,
+        ));
+        let mut columns = batch.columns().to_vec();
+        // The null slot deliberately carries a DELETE byte in its underlying
+        // buffer. Cross-partition routing must use INSERT for the logical null.
+        columns[3] = Arc::new(Int8Array::new(
+            vec![3, 2, 1, 3].into(),
+            Some(arrow_buffer::NullBuffer::from(vec![
+                false, true, true, true,
+            ])),
+        ));
+        let batch = RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), columns).unwrap();
+        table_write.write_arrow_batch(&batch).await.unwrap();
+        let messages = table_write.prepare_commit().await.unwrap();
+        TableCommit::new(table.clone(), "test-user".to_string())
+            .commit(messages)
             .await
-            .unwrap_err();
+            .unwrap();
 
-        assert_data_invalid_contains(
-            error,
-            &[
-                "field count",
-                "expected 3",
-                "actual 4",
-                "<no field>",
-                VALUE_KIND_FIELD_NAME,
-            ],
+        let builder = table.new_read_builder();
+        let plan = builder
+            .new_incremental_scan(super::super::IncrementalScanMode::Changelog, 0, 1)
+            .plan_combined()
+            .await
+            .unwrap();
+        let batches: Vec<RecordBatch> = futures::TryStreamExt::try_collect(
+            builder
+                .new_read()
+                .unwrap()
+                .to_arrow_with_row_kind(plan.splits())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        let mut events = Vec::new();
+        for batch in batches {
+            let kinds = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let partitions = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let values = batch
+                .column(3)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            events.extend((0..batch.num_rows()).map(|i| {
+                (
+                    kinds.value(i).to_owned(),
+                    partitions.value(i).to_owned(),
+                    values.value(i),
+                )
+            }));
+        }
+        events.sort_unstable();
+        assert_eq!(
+            events,
+            vec![
+                ("+I".to_owned(), "a".to_owned(), 10),
+                ("+U".to_owned(), "b".to_owned(), 20),
+                ("-D".to_owned(), "a".to_owned(), 20),
+                ("-D".to_owned(), "b".to_owned(), 40),
+                ("-U".to_owned(), "b".to_owned(), 30),
+            ]
         );
     }
 
