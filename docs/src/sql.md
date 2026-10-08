@@ -1140,7 +1140,9 @@ together with their snapshots (`changelog.num-retained.*` and
 
 As in Java, every commit also expires snapshots with the table options
 afterwards. Set `write-only` to `true` to skip this, for example when a separate
-job runs `expire_snapshots`. Automatic expiration is also skipped while
+job runs `expire_snapshots`; a value other than `true` or `false` also skips it,
+with a warning. A recovery commit of several checkpoints
+(`filter_and_commit`) expires once, after the whole batch. Automatic expiration is also skipped while
 changelogs are configured to outlive snapshots (`changelog.num-retained.*` or
 `changelog.time-retained` above the `snapshot.*` settings), because
 paimon-rust cannot keep changelogs past their snapshots yet. A failed automatic

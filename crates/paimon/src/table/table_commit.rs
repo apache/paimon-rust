@@ -288,8 +288,15 @@ impl TableCommit {
             self.check_recovery_files(messages).await?;
         }
         let count = pending.len();
+        // Like Java `commitMultiple`, maintain once after the whole batch: an
+        // expiration between groups could remove the snapshot a later group's
+        // conflict check starts from.
         for (id, messages) in pending {
-            self.filter_and_commit_with_identifier(messages, id).await?;
+            self.commit_with_identifier_impl(messages, id, true, false)
+                .await?;
+        }
+        if count > 0 {
+            self.maintain().await;
         }
         Ok(count)
     }
@@ -327,7 +334,7 @@ impl TableCommit {
                 .append(&commit_messages)
                 .await;
         }
-        self.commit_with_identifier_impl(commit_messages, commit_identifier, false)
+        self.commit_with_identifier_impl(commit_messages, commit_identifier, false, true)
             .await
     }
 
@@ -341,7 +348,7 @@ impl TableCommit {
         commit_messages: Vec<CommitMessage>,
         commit_identifier: i64,
     ) -> Result<()> {
-        self.commit_with_identifier_impl(commit_messages, commit_identifier, true)
+        self.commit_with_identifier_impl(commit_messages, commit_identifier, true, true)
             .await
     }
 
@@ -350,6 +357,7 @@ impl TableCommit {
         commit_messages: Vec<CommitMessage>,
         commit_identifier: i64,
         filter_committed: bool,
+        run_maintenance: bool,
     ) -> Result<()> {
         if self.table.is_format_table() {
             return Err(crate::Error::Unsupported {
@@ -368,7 +376,9 @@ impl TableCommit {
         if commit_messages.is_empty() && self.ignore_empty_commit {
             // Nothing to publish, but like Java (`expireForEmptyCommit`) a
             // successful commit still runs maintenance.
-            self.maintain().await;
+            if run_maintenance {
+                self.maintain().await;
+            }
             return Ok(());
         }
 
@@ -390,7 +400,9 @@ impl TableCommit {
             filter_committed,
         )
         .await?;
-        self.maintain().await;
+        if run_maintenance {
+            self.maintain().await;
+        }
         Ok(())
     }
 
@@ -976,8 +988,14 @@ impl TableCommit {
     /// `expire_snapshots` call retries it.
     async fn maintain(&self) {
         let core_options = CoreOptions::new(self.table.schema().options());
-        if core_options.write_only() {
-            return;
+        match core_options.write_only() {
+            Ok(false) => {}
+            Ok(true) => return,
+            // A malformed switch must not enable deletion by accident.
+            Err(error) => {
+                log::warn!("Skip expiring snapshots after commit: {error}");
+                return;
+            }
         }
         match core_options.changelog_lifecycle_decoupled() {
             Ok(false) => {}

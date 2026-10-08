@@ -1478,13 +1478,24 @@ impl<'a> CoreOptions<'a> {
     }
 
     /// Whether writers skip compaction and snapshot expiration (`write-only`,
-    /// fallback `write.compaction-skip`, default false).
-    pub fn write_only(&self) -> bool {
-        self.options
-            .get(WRITE_ONLY_OPTION)
-            .or_else(|| self.options.get(WRITE_COMPACTION_SKIP_OPTION))
-            .map(|v| v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
+    /// fallback `write.compaction-skip`, default false). Like Java's typed
+    /// boolean, only `true` and `false` (any case) are accepted.
+    pub fn write_only(&self) -> crate::Result<bool> {
+        let (key, value) = match self.options.get(WRITE_ONLY_OPTION) {
+            Some(value) => (WRITE_ONLY_OPTION, value),
+            None => match self.options.get(WRITE_COMPACTION_SKIP_OPTION) {
+                Some(value) => (WRITE_COMPACTION_SKIP_OPTION, value),
+                None => return Ok(false),
+            },
+        };
+        match value.trim() {
+            v if v.eq_ignore_ascii_case("true") => Ok(true),
+            v if v.eq_ignore_ascii_case("false") => Ok(false),
+            _ => Err(crate::Error::DataInvalid {
+                message: format!("Invalid boolean for {key}: '{value}'"),
+                source: None,
+            }),
+        }
     }
 
     fn positive_i32_option(&self, option_name: &'static str, default: i32) -> crate::Result<i32> {
@@ -2278,7 +2289,7 @@ mod tests {
         assert!(!CoreOptions::new(&options)
             .changelog_lifecycle_decoupled()
             .unwrap());
-        assert!(!CoreOptions::new(&options).write_only());
+        assert!(!CoreOptions::new(&options).write_only().unwrap());
 
         for pairs in [
             [
@@ -2308,9 +2319,16 @@ mod tests {
             .unwrap());
 
         let options = core(&[("write-only", "true")]);
-        assert!(CoreOptions::new(&options).write_only());
+        assert!(CoreOptions::new(&options).write_only().unwrap());
         let options = core(&[("write.compaction-skip", "true")]);
-        assert!(CoreOptions::new(&options).write_only());
+        assert!(CoreOptions::new(&options).write_only().unwrap());
+        // `write-only` wins over its fallback, and typos are errors.
+        let options = core(&[("write-only", "FALSE"), ("write.compaction-skip", "true")]);
+        assert!(!CoreOptions::new(&options).write_only().unwrap());
+        for key in ["write-only", "write.compaction-skip"] {
+            let options = core(&[(key, "tru")]);
+            assert!(CoreOptions::new(&options).write_only().is_err(), "{key}");
+        }
     }
 
     #[test]

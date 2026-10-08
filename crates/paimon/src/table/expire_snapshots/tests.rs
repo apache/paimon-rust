@@ -1839,3 +1839,196 @@ async fn test_commit_expiration_with_data_directory() {
     assert_eq!(snapshot_ids(&table).await, vec![2]);
     assert_eq!(read_ids(&table).await, vec![2]);
 }
+
+#[tokio::test]
+async fn test_empty_commit_keeps_catalog_only_branch() {
+    let seed = test_table(
+        "memory:/expire_after_commit_rest_branch",
+        &[
+            ("snapshot.num-retained.min", "1"),
+            ("snapshot.num-retained.max", "1"),
+            ("write-only", "true"),
+        ],
+        false,
+    );
+    setup_dirs(&seed).await;
+    write_schema_file(&seed).await;
+    append(&seed, &[1]).await;
+    overwrite(&seed, &[2]).await;
+    let sm = seed.snapshot_manager();
+    let snapshot_1 = sm.get_snapshot(1).await.unwrap();
+    let snapshot_2 = sm.get_snapshot(2).await.unwrap();
+    seed.file_io()
+        .new_output(&format!(
+            "{}/branch/branch-b1/schema/schema-0",
+            seed.location()
+        ))
+        .unwrap()
+        .write(bytes::Bytes::from(
+            serde_json::to_vec(seed.schema()).unwrap(),
+        ))
+        .await
+        .unwrap();
+    let (table, server, _) = rest_table(
+        &seed,
+        snapshot_2,
+        HashMap::from([("b1".to_string(), Some(snapshot_1))]),
+    )
+    .await;
+    // Maintenance switched on for the REST table.
+    let table = table.copy_with_options(HashMap::from([(
+        "write-only".to_string(),
+        "false".to_string(),
+    )]));
+    let branch = rest_branch_view(&table, "b1");
+    assert_eq!(read_ids(&branch).await, vec![1]);
+
+    TableCommit::new(table.clone(), "u".to_string())
+        .commit(Vec::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        snapshot_ids(&table).await,
+        vec![2],
+        "maintenance expired snapshot 1"
+    );
+    assert_eq!(
+        read_ids(&branch).await,
+        vec![1],
+        "the branch still reads after maintenance"
+    );
+    server.abort();
+}
+
+fn id_value_batch(ids: &[i32], values: &[i32]) -> RecordBatch {
+    RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", ArrowDataType::Int32, true),
+            ArrowField::new("value", ArrowDataType::Int32, true),
+        ])),
+        vec![
+            Arc::new(Int32Array::from(ids.to_vec())) as ArrayRef,
+            Arc::new(Int32Array::from(values.to_vec())) as ArrayRef,
+        ],
+    )
+    .unwrap()
+}
+
+async fn read_id_values(table: &Table) -> Vec<(i32, i32)> {
+    let read_builder = table.new_read_builder();
+    let plan = read_builder.new_scan().plan().await.unwrap();
+    let batches = read_builder
+        .new_read()
+        .unwrap()
+        .to_arrow(plan.splits())
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    let mut rows = Vec::new();
+    for batch in &batches {
+        let ids = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let values = batch
+            .column_by_name("value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        rows.extend((0..batch.num_rows()).map(|i| (ids.value(i), values.value(i))));
+    }
+    rows.sort_unstable();
+    rows
+}
+
+#[tokio::test]
+async fn test_recovery_batch_runs_maintenance_after_all_groups() {
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .column("value", DataType::Int(IntType::new()))
+        .option("row-tracking.enabled", "true")
+        .option("data-evolution.enabled", "true")
+        .option("snapshot.num-retained.min", "1")
+        .option("snapshot.num-retained.max", "1")
+        .build()
+        .unwrap();
+    let table = table_with_schema("memory:/expire_recovery_batch", schema);
+    setup_dirs(&table).await;
+    // Seeded by another user, so the recovered identifiers are not filtered.
+    let mut seed = TableWrite::new(&table, "seed".to_string()).unwrap();
+    seed.write_arrow_batch(&id_value_batch(&[1], &[10]))
+        .await
+        .unwrap();
+    TableCommit::new(table.clone(), "seed".to_string())
+        .commit(seed.prepare_commit().await.unwrap())
+        .await
+        .unwrap(); // snapshot 1
+    let mut append_write = TableWrite::new(&table, "u".to_string()).unwrap();
+    append_write
+        .write_arrow_batch(&id_value_batch(&[2], &[20]))
+        .await
+        .unwrap();
+    let append_messages = append_write.prepare_commit().await.unwrap();
+    let update_messages = table
+        .new_write_builder()
+        .new_update()
+        .unwrap()
+        .update_by_arrow_with_row_id(vec![RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("_ROW_ID", ArrowDataType::Int64, false),
+                ArrowField::new("value", ArrowDataType::Int32, true),
+            ])),
+            vec![
+                Arc::new(arrow_array::Int64Array::from(vec![0])) as ArrayRef,
+                Arc::new(Int32Array::from(vec![100])) as ArrayRef,
+            ],
+        )
+        .unwrap()])
+        .await
+        .unwrap();
+    assert!(update_messages
+        .iter()
+        .any(|message| message.check_from_snapshot == Some(1)));
+
+    let recovered = TableCommit::new(table.clone(), "u".to_string())
+        .filter_and_commit(vec![(10, append_messages), (11, update_messages)])
+        .await;
+    assert!(recovered.is_ok(), "{recovered:?}");
+    assert_eq!(read_id_values(&table).await, vec![(1, 100), (2, 20)]);
+    assert_eq!(
+        snapshot_ids(&table).await.len(),
+        1,
+        "history expires after the batch"
+    );
+}
+
+#[tokio::test]
+async fn test_malformed_no_expiration_switch_skips_maintenance() {
+    for key in ["write-only", "write.compaction-skip"] {
+        let table = test_table(
+            &format!("memory:/expire_malformed_{key}"),
+            &[
+                ("snapshot.num-retained.min", "1"),
+                ("snapshot.num-retained.max", "1"),
+                (key, "true"),
+            ],
+            false,
+        );
+        setup_dirs(&table).await;
+        for id in 1..=3 {
+            append(&table, &[id]).await;
+        }
+        assert_eq!(snapshot_ids(&table).await, vec![1, 2, 3]);
+        // A typo must not switch on a destructive default.
+        let table = table.copy_with_options(HashMap::from([(key.to_string(), "tru".to_string())]));
+        TableCommit::new(table.clone(), "u".to_string())
+            .commit(Vec::new())
+            .await
+            .unwrap();
+        assert_eq!(snapshot_ids(&table).await, vec![1, 2, 3], "{key}=tru");
+    }
+}
