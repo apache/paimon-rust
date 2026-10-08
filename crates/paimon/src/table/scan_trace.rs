@@ -59,40 +59,6 @@ pub struct ScanTrace {
 }
 
 impl ScanTrace {
-    /// Add counters from another independently planned changelog snapshot.
-    pub(crate) fn accumulate(&mut self, other: &Self) {
-        self.base_manifest_files += other.base_manifest_files;
-        self.delta_manifest_files += other.delta_manifest_files;
-        self.manifest_files_before_partition_pruning +=
-            other.manifest_files_before_partition_pruning;
-        self.manifest_files_after_partition_pruning += other.manifest_files_after_partition_pruning;
-        self.manifest_files_pruned_by_row_ranges += other.manifest_files_pruned_by_row_ranges;
-        self.manifest_entries_read += other.manifest_entries_read;
-        self.manifest_entries_pruned_by_bucket += other.manifest_entries_pruned_by_bucket;
-        self.manifest_entries_pruned_by_partition += other.manifest_entries_pruned_by_partition;
-        self.manifest_entries_after_entry_pruning += other.manifest_entries_after_entry_pruning;
-        self.manifest_entries_pruned_by_level += other.manifest_entries_pruned_by_level;
-        self.manifest_entries_pruned_by_row_ranges += other.manifest_entries_pruned_by_row_ranges;
-        self.manifest_entries_pruned_by_data_stats += other.manifest_entries_pruned_by_data_stats;
-        self.manifest_entries_after_manifest_filters +=
-            other.manifest_entries_after_manifest_filters;
-        self.manifest_entries_after_merge += other.manifest_entries_after_merge;
-        self.manifest_entries_pruned_by_cross_schema_stats +=
-            other.manifest_entries_pruned_by_cross_schema_stats;
-        self.manifest_entries_after_cross_schema_stats +=
-            other.manifest_entries_after_cross_schema_stats;
-        self.data_evolution_groups_before_stats += other.data_evolution_groups_before_stats;
-        self.data_evolution_groups_pruned_by_stats += other.data_evolution_groups_pruned_by_stats;
-        self.data_evolution_groups_pruned_by_row_ranges +=
-            other.data_evolution_groups_pruned_by_row_ranges;
-        self.split_candidates_built += other.split_candidates_built;
-        self.splits_before_limit += other.splits_before_limit;
-        self.splits_after_limit += other.splits_after_limit;
-        self.final_splits += other.final_splits;
-        self.final_files += other.final_files;
-        self.limit_early_stopped |= other.limit_early_stopped;
-    }
-
     pub(crate) fn record_manifest_lists(&mut self, base_count: usize, delta_count: usize) {
         self.base_manifest_files = base_count;
         self.delta_manifest_files = delta_count;

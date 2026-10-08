@@ -1547,6 +1547,40 @@ def test_incremental_changelog_and_auto_plan_physical_changelog_files():
         assert empty.splits() == []
 
 
+@pytest.mark.parametrize("mode", ["changelog", "auto"])
+def test_batch_incremental_changelog_packing_sharding_and_limits(mode):
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_input_changelog_table(warehouse)
+        builder = table.new_read_builder().with_include_row_kind(True)
+        full = builder.new_incremental_scan(0, 2, mode).plan()
+        # Java packs changelogs over the whole range, rather than once per
+        # snapshot. The two commits in this bucket fit into one split.
+        assert len(full.splits()) == 1
+        assert len(_native_split_file_names(full.splits())) == 2
+        names, rows = [], []
+        for index in range(3):
+            scan = builder.new_incremental_scan(0, 2, mode).with_shard(index, 3)
+            plan = scan.plan()
+            assert plan.snapshot_id() == 2
+            assert all(split.is_streaming() for split in plan.splits())
+            names.extend(_native_split_file_names(plan.splits()))
+            batches = builder.new_read().read(plan.splits())
+            if batches:
+                rows.extend(pa.Table.from_batches(batches).to_pylist())
+            for boundary in (0, 2):
+                empty = builder.new_incremental_scan(boundary, boundary, mode).with_shard(index, 3).plan()
+                assert empty.snapshot_id() == boundary
+                assert empty.splits() == []
+        assert sorted(names) == sorted(_native_split_file_names(full.splits()))
+        assert sorted((row['rowkind'], row['id'], row['value']) for row in rows) == [
+            ('+I', 1, 'a'), ('+I', 2, 'b'), ('+I', 3, 'c')]
+        limited = (table.new_read_builder().with_limit(1).with_include_row_kind(True))
+        plan = limited.new_incremental_scan(0, 2, mode).with_shard(0, 3).plan()
+        result = pa.Table.from_batches(limited.new_read().read(plan.splits())).to_pylist()
+        assert len(result) == 1
+        assert result[0] in rows
+
+
 def test_incremental_changelog_keeps_filter_projection_and_validates_mode():
     with tempfile.TemporaryDirectory() as warehouse:
         table = _make_input_changelog_table(warehouse)

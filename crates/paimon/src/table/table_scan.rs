@@ -197,7 +197,7 @@ async fn read_manifest_bytes_with_sidecar(
 fn validate_incremental_entries(entries: &[ManifestEntry]) -> crate::Result<()> {
     if entries.iter().any(|entry| *entry.kind() != FileKind::Add) {
         return Err(crate::Error::DataInvalid {
-            message: "Incremental delta manifests must contain only ADD entries".into(),
+            message: "Incremental manifests must contain only ADD entries".into(),
             source: None,
         });
     }
@@ -212,7 +212,7 @@ enum IncrementalSplitMode {
 
 enum ManifestListSource<'a> {
     Snapshot(&'a Snapshot),
-    AppendDeltas(&'a [Snapshot]),
+    IncrementalLists(Vec<String>),
     IncrementalList(&'a str),
 }
 
@@ -255,11 +255,7 @@ async fn read_all_manifest_entries(
             Vec::new(),
             read_manifest_list(file_io, table_path, name).await?,
         ),
-        ManifestListSource::AppendDeltas(snapshots) => {
-            let names = snapshots
-                .iter()
-                .map(|snapshot| snapshot.delta_manifest_list().to_string())
-                .collect::<Vec<_>>();
+        ManifestListSource::IncrementalLists(names) => {
             let delta = futures::stream::iter(names)
                 .map(|name| async move { read_manifest_list(file_io, table_path, &name).await })
                 .buffered(manifest_parallelism)
@@ -1450,19 +1446,19 @@ impl<'a> TableScan<'a> {
         }
     }
 
-    pub(crate) async fn plan_snapshot_deltas_with_trace(
+    pub(crate) async fn plan_incremental_lists_with_trace(
         &self,
-        snapshots: &[Snapshot],
         end_snapshot: &Snapshot,
+        manifest_lists: Vec<String>,
         trace: Option<&mut ScanTrace>,
     ) -> crate::Result<Plan> {
         match &self.0 {
             TableScanKind::Paimon(scan) => {
-                scan.plan_snapshot_deltas(snapshots, end_snapshot, trace)
+                scan.plan_incremental_lists(end_snapshot, manifest_lists, trace)
                     .await
             }
             TableScanKind::Format(_) => Err(crate::Error::Unsupported {
-                message: "Format tables do not support incremental delta scan".to_string(),
+                message: "Format tables do not support incremental batch scans".to_string(),
             }),
         }
     }
@@ -2374,12 +2370,13 @@ impl<'a> PaimonTableScan<'a> {
         .await
     }
 
-    /// Plan all selected APPEND deltas together. Entries are merged before
-    /// splitting so versions of a primary key cannot escape into separate plans.
-    async fn plan_snapshot_deltas(
+    /// Pack all selected delta or changelog files as one batch, as Java's
+    /// IncrementalDeltaStartingScanner does. Every physical event is retained;
+    /// sharding, split costs and LIMIT apply to the complete selected range.
+    async fn plan_incremental_lists(
         &self,
-        snapshots: &[Snapshot],
         end_snapshot: &Snapshot,
+        manifest_lists: Vec<String>,
         trace: Option<&mut ScanTrace>,
     ) -> crate::Result<Plan> {
         self.validate_read_options()?;
@@ -2388,7 +2385,7 @@ impl<'a> PaimonTableScan<'a> {
         scan.incremental_split_mode = Some(IncrementalSplitMode::Batch);
         scan.plan_snapshot_from_lists(
             end_snapshot,
-            ManifestListSource::AppendDeltas(snapshots),
+            ManifestListSource::IncrementalLists(manifest_lists),
             data_evolution_read_field_ids.as_ref(),
             trace,
         )
