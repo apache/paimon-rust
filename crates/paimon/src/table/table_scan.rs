@@ -1097,8 +1097,32 @@ enum TableScanKind<'a> {
     Format(FormatTableScan<'a>),
 }
 
+/// File set to plan from one selected snapshot. Streaming progress is managed
+/// separately by StreamTableScan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SnapshotScanMode {
+    All,
+    Delta,
+    Changelog,
+}
+
+#[derive(Clone)]
+struct BucketFilter(std::sync::Arc<dyn Fn(i32) -> crate::Result<bool> + Send + Sync>);
+
+impl std::fmt::Debug for BucketFilter {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("BucketFilter")
+    }
+}
+
+impl BucketFilter {
+    fn test(&self, bucket: i32) -> crate::Result<bool> {
+        (self.0)(bucket)
+    }
+}
+
 impl<'a> TableScan<'a> {
-    pub(super) fn into_owned_snapshot_scan(self) -> crate::Result<TableScan<'static>> {
+    pub(super) fn into_owned_paimon_scan(self) -> crate::Result<TableScan<'static>> {
         let TableScanKind::Paimon(scan) = self.0 else {
             return Err(crate::Error::Unsupported {
                 message: "StreamTableScan requires a Paimon table".into(),
@@ -1153,65 +1177,38 @@ impl<'a> TableScan<'a> {
 
     pub(super) fn with_snapshot_bucket_filter(
         mut self,
-        filter: super::snapshot_reader::BucketFilter,
+        filter: impl Fn(i32) -> crate::Result<bool> + Send + Sync + 'static,
     ) -> Self {
         if let TableScanKind::Paimon(scan) = &mut self.0 {
             let selection = scan.split_selection.get_or_insert_with(Default::default);
-            selection.bucket_filter = Some(filter);
+            selection.bucket_filter = Some(BucketFilter(std::sync::Arc::new(filter)));
         }
         self
-    }
-
-    /// The lower-level SnapshotReader pins snapshots itself instead of applying
-    /// batch startup options. ALL retains L0 but keeps batch merge/DV semantics.
-    #[cfg(test)]
-    pub(super) async fn read_snapshot(
-        &self,
-        snapshot_id: Option<i64>,
-        mode: super::snapshot_reader::ScanMode,
-    ) -> crate::Result<Plan> {
-        let TableScanKind::Paimon(scan) = &self.0 else {
-            return Err(crate::Error::Unsupported {
-                message: "SnapshotReader requires a Paimon table".into(),
-            });
-        };
-        scan.validate_read_options()?;
-        let manager = scan.table.snapshot_manager();
-        let snapshot = match snapshot_id {
-            Some(id) => Some(manager.get_snapshot(id).await?),
-            None => manager.get_latest_snapshot().await?,
-        };
-        let Some(snapshot) = snapshot else {
-            return Ok(Plan::new(Vec::new()));
-        };
-        self.plan_selected_snapshot(snapshot, mode).await
     }
 
     pub(super) async fn plan_selected_snapshot(
         &self,
         snapshot: crate::spec::Snapshot,
-        mode: super::snapshot_reader::ScanMode,
+        mode: SnapshotScanMode,
     ) -> crate::Result<Plan> {
         self.validate_snapshot_read()?;
         let TableScanKind::Paimon(scan) = &self.0 else {
             unreachable!("snapshot scans only contain Paimon tables")
         };
-        // SnapshotReader itself does not hide unassigned buckets. Stream/batch
-        // starting scanners opt in to onlyReadRealBuckets according to Java.
+        // Snapshot planning preserves the selected file set. Scan policies
+        // explicitly decide whether unassigned buckets should be hidden.
         let mut scan = scan.clone();
         scan.scan_all_files = true;
         scan.split_selection
             .get_or_insert_with(Default::default)
             .snapshot_mode = Some(mode);
         match mode {
-            super::snapshot_reader::ScanMode::All => {
+            SnapshotScanMode::All => {
                 let fields = scan.projected_read_field_ids()?;
                 scan.plan_snapshot(snapshot, fields.as_ref(), None).await
             }
-            super::snapshot_reader::ScanMode::Delta => scan.plan_snapshot_delta(&snapshot).await,
-            super::snapshot_reader::ScanMode::Changelog => {
-                scan.plan_snapshot_changelog(&snapshot, None).await
-            }
+            SnapshotScanMode::Delta => scan.plan_snapshot_delta(&snapshot).await,
+            SnapshotScanMode::Changelog => scan.plan_snapshot_changelog(&snapshot, None).await,
         }
     }
 
@@ -1542,9 +1539,9 @@ enum ScanSplitMode {
 struct ScanSplitSelection {
     mode: Option<ScanSplitMode>,
     shard: Option<(usize, usize)>,
-    bucket_filter: Option<super::snapshot_reader::BucketFilter>,
+    bucket_filter: Option<BucketFilter>,
     only_real_buckets: bool,
-    snapshot_mode: Option<super::snapshot_reader::ScanMode>,
+    snapshot_mode: Option<SnapshotScanMode>,
     snapshot_levels: Option<std::ops::RangeInclusive<i32>>,
 }
 
@@ -1599,7 +1596,7 @@ impl<'a> PaimonTableScan<'a> {
             .and_then(|selection| selection.snapshot_levels.as_ref())
     }
 
-    fn snapshot_mode(&self) -> Option<super::snapshot_reader::ScanMode> {
+    fn snapshot_mode(&self) -> Option<SnapshotScanMode> {
         self.split_selection
             .as_deref()
             .and_then(|selection| selection.snapshot_mode)
@@ -1611,7 +1608,7 @@ impl<'a> PaimonTableScan<'a> {
             .is_some_and(|selection| selection.only_real_buckets)
     }
 
-    fn bucket_filter(&self) -> Option<&super::snapshot_reader::BucketFilter> {
+    fn bucket_filter(&self) -> Option<&BucketFilter> {
         self.split_selection
             .as_deref()
             .and_then(|selection| selection.bucket_filter.as_ref())
@@ -2320,7 +2317,7 @@ impl<'a> PaimonTableScan<'a> {
 
     fn requires_key_merge(&self) -> bool {
         let options = self.table.schema().core_options();
-        self.snapshot_mode() == Some(super::snapshot_reader::ScanMode::All)
+        self.snapshot_mode() == Some(SnapshotScanMode::All)
             || self.is_streaming()
             || match options.merge_engine() {
                 Ok(crate::spec::MergeEngine::FirstRow) => !self.skip_level_zero(),
@@ -7108,3 +7105,7 @@ mod tests {
         assert_eq!(empty.snapshot_id(), Some(1));
     }
 }
+
+#[cfg(test)]
+#[path = "snapshot_scan_tests.rs"]
+mod snapshot_tests;

@@ -15,11 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Stateful streaming planning, following Java `DataTableStreamScan`.
+//! Stateful snapshot selection and progress for continuous table reads.
 
-use super::snapshot_reader::{ScanMode, SnapshotReader};
+use super::table_scan::SnapshotScanMode;
 use super::{Plan, TableScan};
-use crate::spec::{ChangelogProducer, CommitKind, CoreOptions};
+use crate::spec::{ChangelogProducer, CommitKind, CoreOptions, Snapshot};
 use crate::{Error, Result};
 
 /// Continuous table scan. `checkpoint` is the next snapshot to consume.
@@ -31,30 +31,30 @@ use crate::{Error, Result};
 /// Progress is persisted only by an explicit `notify_checkpoint_complete`.
 #[derive(Debug)]
 pub struct StreamTableScan {
-    reader: SnapshotReader<'static>,
+    scan: TableScan<'static>,
     next_snapshot_id: Option<i64>,
     watermark: Option<i64>,
     consumer_id: Option<String>,
-    follow_up_mode: ScanMode,
+    follow_up_mode: SnapshotScanMode,
     consumer_restored: bool,
     missing_snapshot_polls: usize,
 }
 
 impl StreamTableScan {
     pub(super) fn new(scan: TableScan<'_>) -> Result<Self> {
-        let mut reader = SnapshotReader::new(scan.into_owned_snapshot_scan()?);
-        let options = CoreOptions::new(reader.table().schema().options());
+        let mut scan = scan.into_owned_paimon_scan()?;
+        let options = CoreOptions::new(scan.snapshot_table().schema().options());
         let producer = options.try_changelog_producer()?;
         let follow_up_mode = if producer == ChangelogProducer::None {
-            ScanMode::Delta
+            SnapshotScanMode::Delta
         } else {
-            ScanMode::Changelog
+            SnapshotScanMode::Changelog
         };
         if options.bucket() == -2 && producer != ChangelogProducer::None {
-            reader = reader.only_read_real_buckets();
+            scan = scan.only_read_snapshot_real_buckets();
         }
-        let consumer_id = reader
-            .table()
+        let consumer_id = scan
+            .snapshot_table()
             .schema()
             .options()
             .get("consumer-id")
@@ -63,7 +63,7 @@ impl StreamTableScan {
             super::ConsumerManager::validate_consumer_id(id)?;
         }
         Ok(Self {
-            reader,
+            scan,
             next_snapshot_id: None,
             watermark: None,
             consumer_id,
@@ -86,13 +86,13 @@ impl StreamTableScan {
         &mut self,
         filter: impl Fn(i32) -> Result<bool> + Send + Sync + 'static,
     ) -> &mut Self {
-        self.reader = self.reader.clone().with_bucket_filter(filter);
+        self.scan = self.scan.clone().with_snapshot_bucket_filter(filter);
         self
     }
 
     /// Distribute files or buckets using Java's shard rules.
     pub fn with_shard(&mut self, index: usize, count: usize) -> Result<&mut Self> {
-        self.reader = self.reader.clone().with_shard(index, count)?;
+        self.scan = self.scan.clone().with_shard(index, count)?;
         Ok(self)
     }
 
@@ -120,12 +120,12 @@ impl StreamTableScan {
 
     pub async fn plan(&mut self) -> Result<Option<Plan>> {
         // Validate even when the table is empty or no follow-up is available.
-        self.reader.validate()?;
+        self.scan.validate_snapshot_read()?;
         if self.next_snapshot_id.is_none() && !self.consumer_restored {
             if let Some(consumer_id) = &self.consumer_id {
                 let next = self
-                    .reader
-                    .table()
+                    .scan
+                    .snapshot_table()
                     .consumer_manager()
                     .get(consumer_id)
                     .await?;
@@ -135,14 +135,14 @@ impl StreamTableScan {
             }
             self.consumer_restored = true;
         }
-        let manager = self.reader.table().snapshot_manager();
+        let manager = self.scan.snapshot_table().snapshot_manager();
         if self.next_snapshot_id.is_none() {
             let Some(snapshot) = manager.get_latest_snapshot().await? else {
                 return Ok(None);
             };
             let next = snapshot.id() + 1;
             let watermark = snapshot.watermark();
-            let plan = self.reader.read_initial(snapshot).await?;
+            let plan = self.plan_initial_snapshot(snapshot).await?;
             self.next_snapshot_id = Some(next);
             self.watermark = watermark;
             return Ok(Some(plan));
@@ -175,9 +175,9 @@ impl StreamTableScan {
             };
             self.missing_snapshot_polls = 0;
             let should_scan = match mode {
-                ScanMode::Delta => snapshot.commit_kind() == &CommitKind::APPEND,
-                ScanMode::Changelog => snapshot.changelog_manifest_list().is_some(),
-                ScanMode::All => unreachable!("follow-up mode"),
+                SnapshotScanMode::Delta => snapshot.commit_kind() == &CommitKind::APPEND,
+                SnapshotScanMode::Changelog => snapshot.changelog_manifest_list().is_some(),
+                SnapshotScanMode::All => unreachable!("follow-up mode"),
             };
             if !should_scan {
                 self.next_snapshot_id = Some(id + 1);
@@ -185,7 +185,7 @@ impl StreamTableScan {
             }
             let watermark = snapshot.watermark();
             // Keep the failing snapshot retryable if planning or a callback fails.
-            let plan = self.reader.read_selected(snapshot, mode).await?;
+            let plan = self.scan.plan_selected_snapshot(snapshot, mode).await?;
             self.next_snapshot_id = Some(id + 1);
             self.watermark = watermark;
             if !plan.splits().is_empty() {
@@ -194,11 +194,54 @@ impl StreamTableScan {
         }
     }
 
+    async fn plan_initial_snapshot(&self, snapshot: Snapshot) -> Result<Plan> {
+        let options = self.scan.snapshot_table().schema().options();
+        let mut scan = self.scan.clone();
+        let parse = |key, default| -> Result<i32> {
+            options
+                .get(key)
+                .map(|value| {
+                    value.parse().map_err(|error| crate::Error::DataInvalid {
+                        message: format!("invalid {key}: {value}"),
+                        source: Some(Box::new(error)),
+                    })
+                })
+                .unwrap_or(Ok(default))
+        };
+        match self
+            .scan
+            .snapshot_table()
+            .schema()
+            .core_options()
+            .try_changelog_producer()?
+        {
+            ChangelogProducer::Lookup => scan = scan.with_snapshot_levels(1..=i32::MAX),
+            ChangelogProducer::FullCompaction => {
+                // Java numLevels defaults to incrementSafely(compactionTrigger).
+                let levels = if options.contains_key("num-levels") {
+                    parse("num-levels", 0)?
+                } else {
+                    parse("num-sorted-run.compaction-trigger", 5)?.saturating_add(1)
+                };
+                let last = levels
+                    .checked_sub(1)
+                    .ok_or_else(|| crate::Error::DataInvalid {
+                        message: "num-levels is out of range".into(),
+                        source: None,
+                    })?;
+                scan = scan.with_snapshot_levels(last..=last);
+            }
+            ChangelogProducer::None | ChangelogProducer::Input => {}
+        }
+        scan.plan_selected_snapshot(snapshot, SnapshotScanMode::All)
+            .await
+    }
+
     /// Acknowledge a checkpoint after the caller has processed its plan.
     pub async fn notify_checkpoint_complete(&self, next_snapshot: Option<i64>) -> Result<()> {
         if let (Some(consumer_id), Some(next)) = (&self.consumer_id, next_snapshot) {
-            self.reader
-                .table()
+            self.scan
+                .snapshot_table()
                 .consumer_manager()
                 .reset(consumer_id, next)
                 .await?;

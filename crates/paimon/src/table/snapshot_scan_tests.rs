@@ -18,13 +18,14 @@
 #[path = "../../tests/common/mod.rs"]
 mod common;
 
+use super::SnapshotScanMode;
 use arrow_array::{Int32Array, RecordBatch};
 use common::incremental_helpers::{
     make_batch, make_batch_with_kinds, memory_table, persist_table_schema, setup_dirs, write_batch,
 };
 use futures::TryStreamExt;
 use paimon::spec::{DataType, IntType, Schema, TableSchema};
-use paimon::table::{IncrementalScanMode, Plan, ScanMode, Table};
+use paimon::table::{IncrementalScanMode, Plan, Table, TableScan};
 use std::collections::HashMap;
 
 async fn table(name: &str, engine: &str, producer: &str, buckets: i32) -> Table {
@@ -54,11 +55,30 @@ async fn table(name: &str, engine: &str, producer: &str, buckets: i32) -> Table 
     if engine == "aggregation" {
         schema = schema.option("fields.value.aggregate-function", "sum");
     }
-    let path = format!("memory:/snapshot_reader/{name}");
+    let path = format!("memory:/snapshot_scan/{name}");
     let (io, table) = memory_table(&path, TableSchema::new(0, &schema.build().unwrap()));
     setup_dirs(&io, &path).await;
     persist_table_schema(&io, &path, table.schema()).await;
     table
+}
+
+// Snapshot loading is test fixture setup; the production planner receives an
+// already selected Snapshot from the batch/stream scanning policy.
+async fn snapshot_plan(
+    scan: TableScan<'_>,
+    snapshot_id: Option<i64>,
+    mode: SnapshotScanMode,
+) -> paimon::Result<Plan> {
+    scan.validate_snapshot_read()?;
+    let manager = scan.snapshot_table().snapshot_manager();
+    let snapshot = match snapshot_id {
+        Some(id) => Some(manager.get_snapshot(id).await?),
+        None => manager.get_latest_snapshot().await?,
+    };
+    match snapshot {
+        Some(snapshot) => scan.plan_selected_snapshot(snapshot, mode).await,
+        None => Ok(Plan::new(Vec::new())),
+    }
 }
 
 async fn rows(table: &Table, plan: &Plan) -> Vec<(i32, i32)> {
@@ -103,13 +123,13 @@ async fn all_pins_snapshot_and_keeps_batch_merge_semantics_including_level_zero(
         write_batch(&table, &make_batch(vec![1, 2], vec![10, 20])).await;
         write_batch(&table, &make_batch(vec![1, 3], vec![11, 30])).await;
         write_batch(&table, &make_batch(vec![4], vec![40])).await;
-        let plan = table
-            .new_snapshot_reader()
-            .with_snapshot(2)
-            .unwrap()
-            .read()
-            .await
-            .unwrap();
+        let plan = snapshot_plan(
+            table.new_read_builder().new_scan(),
+            Some(2),
+            SnapshotScanMode::All,
+        )
+        .await
+        .unwrap();
         assert_eq!(plan.snapshot_id(), Some(2));
         assert!(!plan.splits().is_empty());
         assert!(plan.splits().iter().all(|split| !split.is_streaming()));
@@ -120,7 +140,13 @@ async fn all_pins_snapshot_and_keeps_batch_merge_semantics_including_level_zero(
             _ => vec![(1, 11), (2, 20), (3, 30)],
         };
         assert_eq!(rows(&table, &plan).await, expected, "{engine}");
-        let current = table.new_snapshot_reader().read().await.unwrap();
+        let current = snapshot_plan(
+            table.new_read_builder().new_scan(),
+            None,
+            SnapshotScanMode::All,
+        )
+        .await
+        .unwrap();
         assert_eq!(current.snapshot_id(), Some(3));
         assert!(rows(&table, &current).await.contains(&(4, 40)));
     }
@@ -135,13 +161,13 @@ async fn explicit_snapshot_overrides_startup_options_without_mutating_table() {
         ("scan.snapshot-id".into(), "1".into()),
         ("scan.mode".into(), "from-snapshot".into()),
     ]));
-    let pinned = selected
-        .new_snapshot_reader()
-        .with_snapshot(2)
-        .unwrap()
-        .read()
-        .await
-        .unwrap();
+    let pinned = snapshot_plan(
+        selected.new_read_builder().new_scan(),
+        Some(2),
+        SnapshotScanMode::All,
+    )
+    .await
+    .unwrap();
     assert_eq!(rows(&selected, &pinned).await, vec![(1, 10), (2, 20)]);
     let batch = selected.new_read_builder().new_scan().plan().await.unwrap();
     assert_eq!(batch.snapshot_id(), Some(1));
@@ -179,11 +205,8 @@ async fn changelog_reads_overwrite_while_batch_range_still_skips_it() {
         .await
         .unwrap();
     write_batch(&table, &make_batch(vec![3], vec![30])).await;
-    let reader = table.new_snapshot_reader().with_snapshot(2).unwrap();
-    let events = reader
-        .clone()
-        .with_mode(ScanMode::Changelog)
-        .read()
+    let scan = table.new_read_builder().new_scan();
+    let events = snapshot_plan(scan.clone(), Some(2), SnapshotScanMode::Changelog)
         .await
         .unwrap();
     assert_eq!(events.snapshot_id(), Some(2));
@@ -202,7 +225,9 @@ async fn changelog_reads_overwrite_while_batch_range_still_skips_it() {
         .unwrap();
     assert!(range.splits().is_empty());
     assert_eq!(range.snapshot_id(), Some(2));
-    let full = reader.with_mode(ScanMode::All).read().await.unwrap();
+    let full = snapshot_plan(scan, Some(2), SnapshotScanMode::All)
+        .await
+        .unwrap();
     assert_eq!(rows(&table, &full).await, vec![(2, 20)]);
 }
 
@@ -214,14 +239,13 @@ async fn changelog_keeps_all_row_kinds_and_arrival_order() {
         &make_batch_with_kinds(vec![1, 1, 1, 1], vec![10, 10, 11, 11], vec![0, 1, 2, 3]),
     )
     .await;
-    let plan = table
-        .new_snapshot_reader()
-        .with_snapshot(1)
-        .unwrap()
-        .with_mode(ScanMode::Changelog)
-        .read()
-        .await
-        .unwrap();
+    let plan = snapshot_plan(
+        table.new_read_builder().new_scan(),
+        Some(1),
+        SnapshotScanMode::Changelog,
+    )
+    .await
+    .unwrap();
     let builder = table.new_read_builder();
     let batches: Vec<RecordBatch> = builder
         .new_read()
@@ -250,11 +274,12 @@ async fn changelog_keeps_all_row_kinds_and_arrival_order() {
 async fn bucket_filter_precedes_packing_and_limit_for_every_mode() {
     let table = table("buckets", "deduplicate", "input", 4).await;
     write_batch(&table, &make_batch((0..32).collect(), (100..132).collect())).await;
-    for mode in [ScanMode::All, ScanMode::Delta, ScanMode::Changelog] {
-        let all = table
-            .new_snapshot_reader()
-            .with_mode(mode)
-            .read()
+    for mode in [
+        SnapshotScanMode::All,
+        SnapshotScanMode::Delta,
+        SnapshotScanMode::Changelog,
+    ] {
+        let all = snapshot_plan(table.new_read_builder().new_scan(), None, mode)
             .await
             .unwrap();
         let selected_bucket = all.splits().last().unwrap().bucket();
@@ -275,13 +300,15 @@ async fn bucket_filter_precedes_packing_and_limit_for_every_mode() {
         assert!(!expected_ids.is_empty());
         let mut builder = table.new_read_builder();
         builder.with_limit(1);
-        let selected = builder
-            .new_snapshot_reader()
-            .with_mode(mode)
-            .with_bucket_filter(move |bucket| Ok(bucket == selected_bucket))
-            .read()
-            .await
-            .unwrap();
+        let selected = snapshot_plan(
+            builder
+                .new_scan()
+                .with_snapshot_bucket_filter(move |bucket| Ok(bucket == selected_bucket)),
+            None,
+            mode,
+        )
+        .await
+        .unwrap();
         assert_eq!(selected.snapshot_id(), Some(1));
         assert!(!selected.splits().is_empty());
         assert!(selected
@@ -292,13 +319,16 @@ async fn bucket_filter_precedes_packing_and_limit_for_every_mode() {
             .await
             .iter()
             .all(|(id, _)| expected_ids.contains(id)));
-        let empty = table
-            .new_snapshot_reader()
-            .with_mode(mode)
-            .with_bucket_filter(|_| Ok(false))
-            .read()
-            .await
-            .unwrap();
+        let empty = snapshot_plan(
+            table
+                .new_read_builder()
+                .new_scan()
+                .with_snapshot_bucket_filter(|_| Ok(false)),
+            None,
+            mode,
+        )
+        .await
+        .unwrap();
         assert_eq!(empty.snapshot_id(), Some(1));
         assert!(empty.splits().is_empty());
     }
@@ -308,24 +338,31 @@ async fn bucket_filter_precedes_packing_and_limit_for_every_mode() {
 async fn filter_errors_fail_instead_of_publishing_a_partial_plan() {
     let table = table("callback", "deduplicate", "input", 4).await;
     write_batch(&table, &make_batch((0..32).collect(), (100..132).collect())).await;
-    for mode in [ScanMode::All, ScanMode::Delta, ScanMode::Changelog] {
+    for mode in [
+        SnapshotScanMode::All,
+        SnapshotScanMode::Delta,
+        SnapshotScanMode::Changelog,
+    ] {
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counter = calls.clone();
-        let error = table
-            .new_snapshot_reader()
-            .with_mode(mode)
-            .with_bucket_filter(move |_| {
-                if counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
-                    return Ok(true);
-                }
-                Err(paimon::Error::DataInvalid {
-                    message: "bucket selection failed".into(),
-                    source: None,
-                })
-            })
-            .read()
-            .await
-            .unwrap_err();
+        let error = snapshot_plan(
+            table
+                .new_read_builder()
+                .new_scan()
+                .with_snapshot_bucket_filter(move |_| {
+                    if counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                        return Ok(true);
+                    }
+                    Err(paimon::Error::DataInvalid {
+                        message: "bucket selection failed".into(),
+                        source: None,
+                    })
+                }),
+            None,
+            mode,
+        )
+        .await
+        .unwrap_err();
         assert!(error.to_string().contains("bucket selection failed"));
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
@@ -338,16 +375,19 @@ async fn replacing_bucket_filter_and_composing_shard_preserves_versions() {
     write_batch(&table, &make_batch((0..32).collect(), (200..232).collect())).await;
     let mut union = Vec::new();
     for index in 0..2 {
-        let plan = table
-            .new_snapshot_reader()
-            .with_bucket_filter(|_| Ok(false))
-            .with_bucket_filter(|bucket| Ok(bucket >= 0))
-            .with_shard(index, 2)
-            .unwrap()
-            .with_mode(ScanMode::All)
-            .read()
-            .await
-            .unwrap();
+        let plan = snapshot_plan(
+            table
+                .new_read_builder()
+                .new_scan()
+                .with_snapshot_bucket_filter(|_| Ok(false))
+                .with_snapshot_bucket_filter(|bucket| Ok(bucket >= 0))
+                .with_shard(index, 2)
+                .unwrap(),
+            None,
+            SnapshotScanMode::All,
+        )
+        .await
+        .unwrap();
         assert!(plan
             .splits()
             .iter()
@@ -370,13 +410,8 @@ async fn read_configuration_and_empty_snapshot_metadata_survive_modes() {
                 .greater_than("id", paimon::spec::Datum::Int(1))
                 .unwrap(),
         );
-        for mode in [ScanMode::All, ScanMode::Delta] {
-            let plan = builder
-                .new_snapshot_reader()
-                .with_mode(mode)
-                .read()
-                .await
-                .unwrap();
+        for mode in [SnapshotScanMode::All, SnapshotScanMode::Delta] {
+            let plan = snapshot_plan(builder.new_scan(), None, mode).await.unwrap();
             let batches: Vec<RecordBatch> = builder
                 .new_read()
                 .unwrap()
@@ -397,10 +432,7 @@ async fn read_configuration_and_empty_snapshot_metadata_survive_modes() {
                 20
             );
         }
-        let empty = builder
-            .new_snapshot_reader()
-            .with_mode(ScanMode::Changelog)
-            .read()
+        let empty = snapshot_plan(builder.new_scan(), None, SnapshotScanMode::Changelog)
             .await
             .unwrap();
         assert!(empty.splits().is_empty());
@@ -413,20 +445,22 @@ async fn absent_and_missing_snapshots_are_distinct_even_with_zero_limit() {
     let table = table("missing", "append", "none", 1).await;
     let mut builder = table.new_read_builder();
     builder.with_limit(0);
-    for mode in [ScanMode::All, ScanMode::Delta, ScanMode::Changelog] {
-        let reader = builder.new_snapshot_reader().with_mode(mode);
-        let empty = reader.read().await.unwrap();
+    for mode in [
+        SnapshotScanMode::All,
+        SnapshotScanMode::Delta,
+        SnapshotScanMode::Changelog,
+    ] {
+        let scan = builder.new_scan();
+        let empty = snapshot_plan(scan.clone(), None, mode).await.unwrap();
         assert!(empty.splits().is_empty());
         assert_eq!(empty.snapshot_id(), None);
         assert!(matches!(
-            reader.with_snapshot(1).unwrap().read().await,
+            snapshot_plan(scan, Some(1), mode).await,
             Err(paimon::Error::SnapshotNotExist { snapshot_id: 1 })
         ));
     }
-    assert!(builder.new_snapshot_reader().with_snapshot(0).is_err());
-    assert!(builder.new_snapshot_reader().with_snapshot(-1).is_err());
-    assert!(builder.new_snapshot_reader().with_shard(0, 0).is_err());
-    assert!(builder.new_snapshot_reader().with_shard(2, 2).is_err());
+    assert!(builder.new_scan().with_shard(0, 0).is_err());
+    assert!(builder.new_scan().with_shard(2, 2).is_err());
 }
 
 #[tokio::test]
@@ -440,7 +474,13 @@ async fn all_dv_level_zero_versions_merge_before_value_predicates() {
             ]));
         write_batch(&table, &make_batch(vec![1, 2], vec![10, 20])).await;
         write_batch(&table, &make_batch(vec![1, 3], vec![11, 30])).await;
-        let plan = table.new_snapshot_reader().read().await.unwrap();
+        let plan = snapshot_plan(
+            table.new_read_builder().new_scan(),
+            None,
+            SnapshotScanMode::All,
+        )
+        .await
+        .unwrap();
         assert_eq!(rows(&table, &plan).await, vec![(1, 11), (2, 20), (3, 30)]);
         let mut builder = table.new_read_builder();
         builder.with_filter(
@@ -448,7 +488,9 @@ async fn all_dv_level_zero_versions_merge_before_value_predicates() {
                 .equal("value", paimon::spec::Datum::Int(10))
                 .unwrap(),
         );
-        let plan = builder.new_snapshot_reader().read().await.unwrap();
+        let plan = snapshot_plan(builder.new_scan(), None, SnapshotScanMode::All)
+            .await
+            .unwrap();
         let batches: Vec<RecordBatch> = builder
             .new_read()
             .unwrap()
@@ -462,27 +504,24 @@ async fn all_dv_level_zero_versions_merge_before_value_predicates() {
 }
 
 #[tokio::test]
-async fn snapshot_reader_never_bypasses_query_authorization() {
+async fn snapshot_planning_never_bypasses_query_authorization() {
     let table = table("auth", "append", "none", 1)
         .await
         .copy_with_options(HashMap::from([(
             "query-auth.enabled".into(),
             "true".into(),
         )]));
-    for mode in [ScanMode::All, ScanMode::Delta, ScanMode::Changelog] {
-        for reader in [
-            table.new_snapshot_reader().with_mode(mode),
-            table
-                .new_snapshot_reader()
-                .with_mode(mode)
-                .with_snapshot(1)
-                .unwrap(),
-        ] {
-            let error = reader
-                .with_bucket_filter(|_| Ok(false))
-                .read()
-                .await
-                .unwrap_err();
+    for mode in [
+        SnapshotScanMode::All,
+        SnapshotScanMode::Delta,
+        SnapshotScanMode::Changelog,
+    ] {
+        for snapshot_id in [None, Some(1)] {
+            let scan = table
+                .new_read_builder()
+                .new_scan()
+                .with_snapshot_bucket_filter(|_| Ok(false));
+            let error = snapshot_plan(scan, snapshot_id, mode).await.unwrap_err();
             assert!(error.to_string().contains("query-auth.enabled"));
             assert!(matches!(error, paimon::Error::Unsupported { .. }));
         }
@@ -494,28 +533,32 @@ async fn postpone_pending_visibility_is_an_explicit_reader_selection() {
     for producer in ["none", "input"] {
         let table = table(&format!("pending_{producer}"), "deduplicate", producer, -2).await;
         write_batch(&table, &make_batch(vec![1], vec![10])).await;
-        for mode in [ScanMode::All, ScanMode::Delta, ScanMode::Changelog] {
-            let plan = table
-                .new_snapshot_reader()
-                .with_mode(mode)
-                .read()
+        for mode in [
+            SnapshotScanMode::All,
+            SnapshotScanMode::Delta,
+            SnapshotScanMode::Changelog,
+        ] {
+            let plan = snapshot_plan(table.new_read_builder().new_scan(), None, mode)
                 .await
                 .unwrap();
-            let expected = if mode == ScanMode::Changelog {
+            let expected = if mode == SnapshotScanMode::Changelog {
                 vec![]
             } else {
                 vec![(1, 10)]
             };
             assert_eq!(rows(&table, &plan).await, expected, "{producer} {mode:?}");
             assert!(plan.splits().iter().all(|split| split.bucket() == -2));
-            let plan = table
-                .new_snapshot_reader()
-                .with_mode(mode)
-                .with_bucket_filter(|_| panic!("unassigned bucket reached callback"))
-                .only_read_real_buckets()
-                .read()
-                .await
-                .unwrap();
+            let plan = snapshot_plan(
+                table
+                    .new_read_builder()
+                    .new_scan()
+                    .with_snapshot_bucket_filter(|_| panic!("unassigned bucket reached callback"))
+                    .only_read_snapshot_real_buckets(),
+                None,
+                mode,
+            )
+            .await
+            .unwrap();
             assert!(plan.splits().is_empty());
             assert_eq!(plan.snapshot_id(), Some(1));
         }
