@@ -48,7 +48,8 @@ pub struct MergeCondition {
 pub enum MergeAssignment {
     SourceColumn(String),
     TargetColumn(String),
-    /// Evaluate once across all selected rows of this clause, in target scan order.
+    /// Evaluate once across all selected rows of this clause.
+    /// Matched rows follow target scan order; inserts follow source input order.
     Value(UpdateAssignment),
 }
 
