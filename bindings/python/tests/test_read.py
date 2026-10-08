@@ -1315,11 +1315,11 @@ def test_explicit_scan_mode_without_selector_raises():
             table.new_read_builder({"scan.mode": "from-snapshot"})
 
 
-def test_unimplemented_scan_mode_raises_not_implemented():
+def test_incremental_scan_mode_requires_timestamp_window():
     with tempfile.TemporaryDirectory() as warehouse:
         _make_two_snapshot_table(warehouse)
         table = PaimonCatalog({"warehouse": warehouse}).get_table("tdb.t")
-        with pytest.raises(NotImplementedError):
+        with pytest.raises(ValueError, match="incremental-between-timestamp"):
             table.new_read_builder({"scan.mode": "incremental"})
 
 
@@ -1730,3 +1730,28 @@ def test_incremental_row_positions_use_combined_delta_batch():
         builder.with_row_ranges([(1, 3)]).with_limit(2)
         plan = builder.new_incremental_scan(0, 2).with_row_position_slice(2, 5).plan()
         assert pa.Table.from_batches(builder.new_read().read(plan.splits())).column("id").to_pylist() == [2, 3]
+
+
+@pytest.mark.parametrize("window,snapshot,expected", [
+    ("0,100", 1, [dict(id=1, name="a")]),
+    ("100,200", 2, [dict(id=2, name="b"), dict(id=3, name="c")]),
+    ("100,150", 1, []),
+    ("100,100", None, []),
+])
+@pytest.mark.parametrize("mode", ["default", "incremental"])
+def test_numeric_timestamp_window_options_use_core_scan(tmp_path, window, snapshot, expected, mode):
+    from pathlib import Path
+
+    _make_two_snapshot_table(str(tmp_path))
+    table = PaimonCatalog({"warehouse": str(tmp_path)}).get_table("tdb.t")
+    for identifier, timestamp in [(1, 100), (2, 200)]:
+        path = Path(table.location()) / "snapshot" / ("snapshot-%s" % identifier)
+        data = json.loads(path.read_text())
+        data["timeMillis"] = timestamp
+        path.write_text(json.dumps(data))
+    builder = table.new_read_builder({"scan.mode": mode, "incremental-between-timestamp": window})
+    plan = builder.new_scan().plan()
+    assert plan.snapshot_id() == snapshot
+    batches = list(builder.new_read().read(plan.splits()))
+    actual = [row for batch in batches for row in batch.to_pylist()]
+    assert sorted(actual, key=lambda row: row["id"]) == expected

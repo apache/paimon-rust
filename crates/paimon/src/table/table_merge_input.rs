@@ -108,7 +108,16 @@ impl MergeInput {
             .iter()
             .map(|field| field.name().as_str())
             .collect::<Vec<_>>();
-        let snapshot = super::time_travel::resolve_snapshot(table).await?;
+        let incremental = table
+            .schema()
+            .core_options()
+            .incremental_timestamp_window()?
+            .is_some();
+        let snapshot = if incremental {
+            None
+        } else {
+            super::time_travel::resolve_snapshot(table).await?
+        };
         // Pin the source independently, keeping branch/time-travel resolution
         // and the caller's resolved schema. Include L0 as Python plan_for_write.
         let table = snapshot.as_ref().map_or_else(
@@ -121,7 +130,7 @@ impl MergeInput {
         );
         let mut builder = table.new_read_builder();
         builder.with_projection(&names)?;
-        let plan = if snapshot.is_some() {
+        let plan = if incremental || snapshot.is_some() {
             builder.new_scan().with_scan_all_files().plan().await?
         } else {
             // Run the normal reader's policy checks even with no snapshot, but

@@ -129,6 +129,13 @@ logical rows through the ordinary reader, including primary-key merge engines.
 The source does not require data evolution or row tracking. Arrow batches keep
 their chunk boundaries; matching gathers only the contributing source chunks.
 
+Numeric `incremental-between-timestamp` options select `(start, end]` in core,
+including for table-source MERGE. AUTO reads APPEND deltas without a changelog
+producer and physical changelogs otherwise; OVERWRITE snapshots are skipped.
+Equal bounds return an empty plan. Window plans and all their splits identify
+the ending snapshot, including when no selected files remain. The existing
+`new_scan()` honors these options; no new Python API is required.
+
 ### Custom Blob URI sources
 
 Before the first Arrow write, call

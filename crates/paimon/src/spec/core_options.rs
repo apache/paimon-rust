@@ -527,11 +527,11 @@ impl<'a> CoreOptions<'a> {
     /// that selector is present (the batch-read semantics are identical to
     /// leaving the mode at `default`); an explicit mode without its selector
     /// is malformed input (`Error::DataInvalid`), mirroring Java's
-    /// `SchemaValidation`. All other non-default modes are unimplemented.
+    /// `SchemaValidation`. Incremental timestamp windows reuse the batch
+    /// Delta/Changelog scanner; snapshot/tag ranges remain unimplemented here.
     pub fn validate_scan_options(&self) -> crate::Result<()> {
         for key in [
             INCREMENTAL_BETWEEN_OPTION,
-            INCREMENTAL_BETWEEN_TIMESTAMP_OPTION,
             INCREMENTAL_BETWEEN_SCAN_MODE_OPTION,
         ] {
             if self.options.contains_key(key) {
@@ -540,9 +540,47 @@ impl<'a> CoreOptions<'a> {
                 });
             }
         }
+        let incremental = self.incremental_timestamp_window()?.is_some();
+        if incremental {
+            self.try_changelog_producer()?;
+            if self.is_format_table() {
+                return Err(crate::Error::Unsupported {
+                    message: "Incremental timestamp scans require a Paimon table".into(),
+                });
+            }
+            let selectors = self.configured_time_travel_selectors();
+            if !selectors.is_empty()
+                || self.options.contains_key("scan.file-creation-time-millis")
+                || self.options.contains_key("scan.creation-time-millis")
+            {
+                return Err(crate::Error::DataInvalid {
+                    message: "incremental-between-timestamp cannot be used with point-in-time scan options".into(),
+                    source: None,
+                });
+            }
+        }
         if let Some(mode) = self.options.get(SCAN_MODE_OPTION) {
+            if incremental
+                && !mode.eq_ignore_ascii_case("default")
+                && !mode.eq_ignore_ascii_case("incremental")
+            {
+                return Err(crate::Error::DataInvalid {
+                    message: format!(
+                        "incremental-between-timestamp cannot be used with scan.mode={mode}"
+                    ),
+                    source: None,
+                });
+            }
             let selector_keys: &[&str] = if mode.eq_ignore_ascii_case("default") {
                 return Ok(());
+            } else if mode.eq_ignore_ascii_case("incremental") {
+                if incremental {
+                    return Ok(());
+                }
+                return Err(crate::Error::DataInvalid {
+                    message: "scan.mode=incremental requires incremental-between-timestamp".into(),
+                    source: None,
+                });
             } else if mode.eq_ignore_ascii_case("from-snapshot") {
                 &[
                     SCAN_SNAPSHOT_ID_OPTION,
@@ -573,6 +611,22 @@ impl<'a> CoreOptions<'a> {
             }
         }
         Ok(())
+    }
+
+    /// The numeric timestamp window supported by PyPaimon. Snapshot resolution
+    /// and ordering checks belong to the batch scanner, as in Java.
+    pub(crate) fn incremental_timestamp_window(&self) -> crate::Result<Option<(i64, i64)>> {
+        let Some(raw) = self.options.get(INCREMENTAL_BETWEEN_TIMESTAMP_OPTION) else {
+            return Ok(None);
+        };
+        let parse = || {
+            let (start, end) = raw.split_once(',')?;
+            Some((start.parse::<i64>().ok()?, end.parse::<i64>().ok()?))
+        };
+        parse().map(Some).ok_or_else(|| crate::Error::DataInvalid {
+            message: format!("incremental-between-timestamp requires start(exclusive),end(inclusive) in milliseconds, got: {raw}"),
+            source: None,
+        })
     }
 
     pub fn deletion_vectors_enabled(&self) -> bool {
@@ -1286,7 +1340,7 @@ impl<'a> CoreOptions<'a> {
     pub fn ensure_engine_can_serve(&self, full_name: &str) -> crate::Result<()> {
         self.ensure_query_auth_absent()?;
         self.validate_scan_options()?;
-        if self.has_time_travel_selector() {
+        if self.has_time_travel_selector() || self.incremental_timestamp_window()?.is_some() {
             return Err(crate::Error::Unsupported {
                 message: format!(
                     "time travel is not supported for engine-served table '{full_name}'"
@@ -3715,17 +3769,102 @@ mod tests {
 
     #[test]
     fn test_validate_scan_options_rejects_unsupported() {
-        for key in [
-            "incremental-between",
-            "incremental-between-timestamp",
-            "incremental-between-scan-mode",
-        ] {
+        for key in ["incremental-between", "incremental-between-scan-mode"] {
             let options = HashMap::from([(key.to_string(), "x".to_string())]);
             let err = CoreOptions::new(&options)
                 .validate_scan_options()
                 .unwrap_err();
             assert!(matches!(err, crate::Error::Unsupported { message } if message.contains(key)));
         }
+    }
+
+    #[test]
+    fn test_numeric_incremental_timestamp_options_match_java_long_rules() {
+        for value in [
+            "0,100",
+            "100,100",
+            "200,100",
+            "+0,+100",
+            "-100,100",
+            "-9223372036854775808,9223372036854775807",
+        ] {
+            for mode in [None, Some("default"), Some("incremental")] {
+                let mut options =
+                    HashMap::from([("incremental-between-timestamp".into(), value.into())]);
+                if let Some(mode) = mode {
+                    options.insert("scan.mode".into(), mode.into());
+                }
+                assert!(
+                    CoreOptions::new(&options).validate_scan_options().is_ok(),
+                    "{options:?}"
+                );
+            }
+        }
+        for value in [
+            "100",
+            "one,200",
+            "100,200,300",
+            "100, 200",
+            "1_00,200",
+            "0,9223372036854775808",
+            "-9223372036854775809,100",
+        ] {
+            let options = HashMap::from([("incremental-between-timestamp".into(), value.into())]);
+            assert!(
+                matches!(
+                    CoreOptions::new(&options).validate_scan_options(),
+                    Err(crate::Error::DataInvalid { .. })
+                ),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_incremental_timestamp_options_reject_conflicting_and_unservable_routes() {
+        for selector in [
+            "scan.snapshot-id",
+            "scan.tag-name",
+            "scan.version",
+            "scan.watermark",
+            "scan.timestamp",
+            "scan.timestamp-millis",
+            "scan.file-creation-time-millis",
+            "scan.creation-time-millis",
+        ] {
+            let options = HashMap::from([
+                ("incremental-between-timestamp".into(), "0,100".into()),
+                (selector.into(), "1".into()),
+            ]);
+            assert!(
+                matches!(
+                    CoreOptions::new(&options).validate_scan_options(),
+                    Err(crate::Error::DataInvalid { .. })
+                ),
+                "{selector}"
+            );
+        }
+        let options = HashMap::from([("scan.mode".into(), "incremental".into())]);
+        assert!(matches!(
+            CoreOptions::new(&options).validate_scan_options(),
+            Err(crate::Error::DataInvalid { .. })
+        ));
+        let options = HashMap::from([("incremental-between-timestamp".into(), "0,100".into())]);
+        assert!(matches!(
+            CoreOptions::new(&options).ensure_engine_can_serve("db.t"),
+            Err(crate::Error::Unsupported { .. })
+        ));
+        let mut format_options = options.clone();
+        format_options.insert("type".into(), "format-table".into());
+        assert!(matches!(
+            CoreOptions::new(&format_options).validate_scan_options(),
+            Err(crate::Error::Unsupported { .. })
+        ));
+        let mut producer_options = options;
+        producer_options.insert("changelog-producer".into(), "invalid".into());
+        assert!(CoreOptions::new(&producer_options)
+            .validate_scan_options()
+            .is_err());
     }
 
     #[test]
@@ -3738,7 +3877,7 @@ mod tests {
         let ok = HashMap::from([("scan.mode".to_string(), "default".to_string())]);
         assert!(CoreOptions::new(&ok).validate_scan_options().is_ok());
         // unimplemented modes Unsupported
-        for mode in ["compacted-full", "incremental", "latest", "latest-full"] {
+        for mode in ["compacted-full", "latest", "latest-full"] {
             let bad = HashMap::from([("scan.mode".to_string(), mode.to_string())]);
             let err = CoreOptions::new(&bad).validate_scan_options().unwrap_err();
             assert!(
