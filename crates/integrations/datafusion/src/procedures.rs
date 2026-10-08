@@ -176,8 +176,8 @@ fn declared_parameters(proc_name: &str) -> Option<&'static [&'static str]> {
         "create_tag_from_timestamp" => &["table", "tag", "timestamp"],
         "rename_branch" => &["table", "from_branch", "to_branch"],
         "create_global_index" => &["table", "index_column", "index_type", "options"],
-        // `partitions`/`dry_run` are declared but not yet implemented; they still reach
-        // their own "not supported yet" error rather than being reported as unknown.
+        // `partitions` is declared but not yet implemented; it still reaches its
+        // own "not supported yet" error rather than being reported as unknown.
         "drop_global_index" => &[
             "table",
             "index_column",
@@ -810,16 +810,22 @@ async fn proc_drop_global_index(
             "drop_global_index partitions are not supported yet".to_string(),
         ));
     }
-    if args.contains_key("dry_run") {
-        return Err(DataFusionError::NotImplemented(
-            "drop_global_index dry_run is not supported yet".to_string(),
-        ));
-    }
+    let dry_run = bool_arg(args, "dry_run")?;
 
     let mut builder = table.new_global_index_drop_builder();
     builder.with_index_column(index_column);
     builder.with_index_type(index_type);
-    builder.execute().await.map_err(to_datafusion_error)?;
+    builder.with_dry_run(dry_run);
+    let dropped = builder.execute().await.map_err(to_datafusion_error)?;
+    if dry_run {
+        return utf8_result(
+            ctx,
+            &[("result", false)],
+            vec![vec![Some(format!(
+                "Would drop {dropped} global index file(s)"
+            ))]],
+        );
+    }
     ok_result(ctx)
 }
 
