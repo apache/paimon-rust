@@ -271,6 +271,8 @@ impl RESTEnv {
         .await
     }
 
+    // Keep the REST construction inputs explicit, including the optional initial token.
+    #[allow(clippy::too_many_arguments)]
     async fn build_table_with_token(
         identifier: &Identifier,
         response: crate::api::GetTableResponse,
@@ -456,6 +458,8 @@ impl RESTEnv {
         .await
     }
 
+    // Match the existing FileIO builder while passing through the optional initial token.
+    #[allow(clippy::too_many_arguments)]
     async fn build_file_io_with_token(
         identifier: &Identifier,
         path: &str,
