@@ -2302,6 +2302,91 @@ pub(in crate::table) mod tests {
     }
 
     #[tokio::test]
+    async fn test_parquet_block_size_bounds_row_groups_of_one_large_batch() {
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+        for primary_key in [false, true] {
+            let file_io = test_file_io();
+            let table_path = format!("memory:/test_parquet_block_size_{primary_key}");
+            setup_dirs(&file_io, &table_path).await;
+            let mut schema = Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("value", DataType::Int(IntType::new()))
+                .option("file.format", "parquet")
+                .option("file.compression", "none")
+                .option("parquet.enable.dictionary", "false")
+                .option("file.block-size", "16 kb")
+                // Shadowed by file.block-size as in Java, so this malformed value is never parsed.
+                .option("parquet.block.size", "128mb");
+            if primary_key {
+                schema = schema.primary_key(["id"]).option("bucket", "1");
+            }
+            let table = Table::new(
+                file_io.clone(),
+                Identifier::new("default", "test_table"),
+                table_path.clone(),
+                TableSchema::new(0, &schema.build().unwrap()),
+                None,
+            );
+            let ids = (0..65_536).collect::<Vec<i32>>();
+            let values = ids.iter().map(|id| id.wrapping_mul(7919)).collect();
+            let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+            table_write
+                .write_arrow_batch(&make_batch(ids, values))
+                .await
+                .unwrap();
+            let messages = table_write.prepare_commit().await.unwrap();
+            for message in &messages {
+                for file in &message.new_files {
+                    let path = format!(
+                        "{table_path}/{}/{}",
+                        bucket_dir_name(message.bucket),
+                        file.file_name
+                    );
+                    let bytes = file_io.new_input(&path).unwrap().read().await.unwrap();
+                    let metadata = ParquetRecordBatchReaderBuilder::try_new(bytes)
+                        .unwrap()
+                        .metadata()
+                        .clone();
+                    assert!(metadata.num_row_groups() > 1, "{path}");
+                    for row_group in metadata.row_groups() {
+                        assert!(row_group.compressed_size() <= 2 * 16 * 1024, "{path}");
+                    }
+                }
+            }
+            TableCommit::new(table.clone(), "test-user".to_string())
+                .commit(messages)
+                .await
+                .unwrap();
+            let read_builder = table.new_read_builder();
+            let plan = read_builder.new_scan().plan().await.unwrap();
+            let batches: Vec<RecordBatch> = futures::TryStreamExt::try_collect(
+                read_builder
+                    .new_read()
+                    .unwrap()
+                    .to_arrow(plan.splits())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+            let mut read_ids = batches
+                .iter()
+                .flat_map(|batch| {
+                    let ids = batch
+                        .column_by_name("id")
+                        .unwrap()
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .unwrap();
+                    ids.values().to_vec()
+                })
+                .collect::<Vec<_>>();
+            read_ids.sort_unstable();
+            assert_eq!(read_ids, (0..65_536).collect::<Vec<i32>>());
+        }
+    }
+
+    #[tokio::test]
     async fn test_append_write_populates_value_stats() {
         let file_io = test_file_io();
         let table_path = "memory:/test_table_write_value_stats";

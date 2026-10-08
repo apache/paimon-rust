@@ -288,6 +288,7 @@ pub(crate) struct ParquetFormatWriter {
     write_fields: Option<Vec<DataField>>,
     stats_modes: Option<Vec<MetadataStatsMode>>,
     stats_dense_store: bool,
+    max_row_group_bytes: Option<usize>,
 }
 
 pub(crate) struct ParquetWriterFactory {
@@ -370,6 +371,7 @@ impl ParquetFormatWriter {
         let core_options = CoreOptions::new(format_options);
         let page_index_enabled = core_options.parquet_write_page_index_enabled()?;
         let props = parquet_writer_properties(codec, page_index_enabled, format_options)?;
+        let max_row_group_bytes = props.max_row_group_bytes();
         let async_write = output.async_writer().await?;
         let input_schema = schema;
         let schema = timestamp_millis_schema(&input_schema);
@@ -384,7 +386,18 @@ impl ParquetFormatWriter {
             write_fields: write_fields.map(|fields| fields.to_vec()),
             stats_modes,
             stats_dense_store: core_options.metadata_stats_dense_store(),
+            max_row_group_bytes,
         })
+    }
+
+    async fn write_physical(&mut self, batch: &RecordBatch) -> crate::Result<()> {
+        self.inner
+            .write(batch)
+            .await
+            .map_err(|e| crate::Error::DataInvalid {
+                message: format!("Failed to write parquet batch: {e}"),
+                source: None,
+            })
     }
 }
 
@@ -485,7 +498,11 @@ fn parquet_sizing_properties(
                 })
         })
         .transpose()?;
-    if let Some(bytes) = file_block_size.or(positive(BLOCK_SIZE)?) {
+    let block_size = match file_block_size {
+        Some(bytes) => Some(bytes),
+        None => positive(BLOCK_SIZE)?,
+    };
+    if let Some(bytes) = block_size {
         props = props.set_max_row_group_bytes(Some(bytes));
     }
     if let Some(bytes) = positive(PAGE_SIZE)? {
@@ -583,13 +600,21 @@ impl FormatFileWriter for ParquetFormatWriter {
             physical_batch = cast_record_batch_to_schema(batch, &self.schema)?;
             &physical_batch
         };
-        self.inner
-            .write(batch)
-            .await
-            .map_err(|e| crate::Error::DataInvalid {
-                message: format!("Failed to write parquet batch: {e}"),
-                source: None,
-            })
+        // parquet-rs splits by bytes only once a row group holds rows, so bound each write
+        // by the batch's in-memory row size, which is not smaller than its encoded size.
+        let rows = batch.num_rows();
+        let step = self.max_row_group_bytes.map_or(rows, |limit| {
+            let row_bytes = batch.get_array_memory_size().div_ceil(rows.max(1)).max(1);
+            (limit / row_bytes).max(1)
+        });
+        if step >= rows {
+            return self.write_physical(batch).await;
+        }
+        for offset in (0..rows).step_by(step) {
+            self.write_physical(&batch.slice(offset, step.min(rows - offset)))
+                .await?;
+        }
+        Ok(())
     }
 
     fn num_bytes(&self) -> usize {
@@ -4224,6 +4249,7 @@ mod tests {
                 write_fields: None,
                 stats_modes: None,
                 stats_dense_store: false,
+                max_row_group_bytes: None,
             }),
             Some(&resources),
         );
@@ -4413,6 +4439,7 @@ mod tests {
         assert_eq!(props.write_batch_size(), 500);
 
         options.insert("file.block-size".to_owned(), "2 mb".to_owned());
+        options.insert("parquet.block.size".to_owned(), "128mb".to_owned());
         options.insert(
             "parquet.page.size.row.check.min".to_owned(),
             "100".to_owned(),
