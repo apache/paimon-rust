@@ -969,6 +969,7 @@ impl FormatFileReader for ParquetFormatReader {
             &scan_fields,
             map_read_plan.as_deref(),
             preds,
+            &null_shredded_residuals(batch_stream_builder.metadata()),
         );
         batch_stream_builder = batch_stream_builder.with_projection(mask.clone());
 
@@ -1322,17 +1323,43 @@ impl FormatFileReader for ParquetFormatReader {
     }
 }
 
+/// Shredded object-field residuals (`typed_value.<key>.value`) that every row group's
+/// statistics prove null; Variant extraction can leave them unread.
+fn null_shredded_residuals(metadata: &ParquetMetaData) -> std::collections::HashSet<Vec<String>> {
+    let schema = metadata.file_metadata().schema_descr();
+    (0..schema.num_columns())
+        .filter(|&leaf| {
+            let column = schema.column(leaf);
+            let parts = column.path().parts();
+            parts.len() >= 3
+                && parts[parts.len() - 1] == "value"
+                && parts[parts.len() - 3] == "typed_value"
+                && metadata.num_row_groups() > 0
+                && metadata.row_groups().iter().all(|row_group| {
+                    let chunk = row_group.column(leaf);
+                    chunk
+                        .statistics()
+                        .and_then(|statistics| statistics.null_count_opt())
+                        .is_some_and(|nulls| i64::try_from(nulls).ok() == Some(chunk.num_values()))
+                })
+        })
+        .map(|leaf| schema.column(leaf).path().parts().to_vec())
+        .collect()
+}
+
 fn read_type_projection_mask(
     parquet_schema: &parquet::schema::types::SchemaDescriptor,
     read_fields: &[DataField],
     map_plan: Option<&MapShreddingReadPlan>,
     predicates: &[Predicate],
+    null_residuals: &std::collections::HashSet<Vec<String>>,
 ) -> ProjectionMask {
     fn requested_paths(
         field: &DataField,
         physical: &parquet::schema::types::Type,
         path: &mut Vec<String>,
         output: &mut std::collections::HashSet<Vec<String>>,
+        null_residuals: &std::collections::HashSet<Vec<String>>,
     ) {
         if crate::spec::is_map_selected_keys_field(field) {
             // Selected-key ROW children name logical MAP keys, not physical
@@ -1351,7 +1378,8 @@ fn read_type_projection_mask(
                             let mut full = path.clone();
                             full.extend(parts);
                             full
-                        }),
+                        })
+                        .filter(|full| !null_residuals.contains(full)),
                 );
                 return;
             }
@@ -1363,7 +1391,7 @@ fn read_type_projection_mask(
                         .find(|child| child.name() == field.name())
                     {
                         path.push(child.name().to_string());
-                        requested_paths(field, child, path, output);
+                        requested_paths(field, child, path, output, null_residuals);
                         path.pop();
                     }
                 }
@@ -1401,7 +1429,7 @@ fn read_type_projection_mask(
                 path.pop();
             }
         } else {
-            requested_paths(field, root, &mut path, &mut selected);
+            requested_paths(field, root, &mut path, &mut selected, null_residuals);
         }
     }
     let leaves = (0..parquet_schema.num_columns())
@@ -3301,7 +3329,8 @@ mod tests {
                 DataType::Row(RowType::new(vec![nested])),
             ),
         ];
-        let mask = super::read_type_projection_mask(&descriptor, &fields, None, &[]);
+        let mask =
+            super::read_type_projection_mask(&descriptor, &fields, None, &[], &Default::default());
         for index in 0..4 {
             assert!(mask.leaf_included(index), "Missing MAP leaf {index}");
         }
@@ -3333,12 +3362,24 @@ mod tests {
         let selected =
             crate::spec::project_read_type(&fields, &[vec!["profile".into(), "score".into()]])
                 .unwrap();
-        let mask = super::read_type_projection_mask(&descriptor, &selected, None, &[]);
+        let mask = super::read_type_projection_mask(
+            &descriptor,
+            &selected,
+            None,
+            &[],
+            &Default::default(),
+        );
         assert!(mask.leaf_included(0));
         assert!(!mask.leaf_included(1));
         assert!(!mask.leaf_included(2));
         let predicate = PredicateBuilder::new(&fields).is_null("profile").unwrap();
-        let widened = super::read_type_projection_mask(&descriptor, &selected, None, &[predicate]);
+        let widened = super::read_type_projection_mask(
+            &descriptor,
+            &selected,
+            None,
+            &[predicate],
+            &Default::default(),
+        );
         assert!(widened.leaf_included(0));
         assert!(widened.leaf_included(1));
         assert!(!widened.leaf_included(2));
@@ -7867,6 +7908,115 @@ mod tests {
             ArrowDataType::Dictionary(key, value)
                 if key.as_ref() == &ArrowDataType::Int32 && value.as_ref() == &ArrowDataType::Binary
         ));
+        let expected =
+            crate::arrow::shredding::variant::assemble_variant_extraction_array(&column, &row_type)
+                .unwrap();
+        let actual =
+            crate::arrow::shredding::variant::assemble_variant_extraction_array(read, &row_type)
+                .unwrap();
+        assert_eq!(actual.as_ref(), expected.as_ref());
+    }
+
+    #[tokio::test]
+    async fn shredded_variant_extraction_skips_null_residuals() {
+        let fields = vec![DataField::new(
+            0,
+            "v".to_string(),
+            DataType::Variant(VariantType::new()),
+        )];
+        let options = HashMap::from([(
+            "variant.shreddingSchema".to_string(),
+            r#"{"type":"ROW","fields":[{"name":"v","type":{"type":"ROW","fields":[{"name":"x","type":"DOUBLE"},{"name":"y","type":"BIGINT"}]}}]}"#.to_string(),
+        )]);
+        let variants = [r#"{"x":1.5e0,"y":2,"z":"rest"}"#, r#"{"x":4e0,"y":"text"}"#]
+            .iter()
+            .map(|json| GenericVariant::parse_json(json).unwrap())
+            .collect::<Vec<_>>();
+        let ArrowDataType::Struct(variant_fields) = variant_arrow_type() else {
+            unreachable!()
+        };
+        let column = StructArray::new(
+            variant_fields,
+            vec![
+                Arc::new(BinaryArray::from_iter_values(
+                    variants.iter().map(|v| v.value()),
+                )),
+                Arc::new(BinaryArray::from_iter_values(
+                    variants.iter().map(|v| v.metadata()),
+                )),
+            ],
+            None,
+        );
+        let schema = build_target_arrow_schema(&fields).unwrap();
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(column.clone())]).unwrap();
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let path = format!("memory:/null_residuals_{}.parquet", uuid::Uuid::new_v4());
+        let mut writer = create_format_writer(
+            &file_io.new_output(&path).unwrap(),
+            schema,
+            "zstd",
+            1,
+            None,
+            Some(&fields),
+            Some(&options),
+        )
+        .await
+        .unwrap();
+        writer.write(&batch).await.unwrap();
+        writer.close().await.unwrap();
+        let data = file_io.new_input(&path).unwrap().read().await.unwrap();
+
+        let double = || DataType::Double(crate::spec::DoubleType::new());
+        let row_type = crate::spec::variant_extraction_row(
+            true,
+            ["$.x", "$.y"]
+                .iter()
+                .map(|path| (double(), path.to_string(), false, "UTC".to_string()))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let read_fields = vec![DataField::new(
+            0,
+            "v".to_string(),
+            DataType::Row(row_type.clone()),
+        )];
+        let batches = ParquetFormatReader::default()
+            .read_batch_stream(
+                Box::new(TrackingFileRead::new(data.clone())),
+                data.len() as u64,
+                &read_fields,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let read = batches[0]
+            .column_by_name("v")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let typed = read
+            .column_by_name("typed_value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let group = |key: &str| {
+            typed
+                .column_by_name(key)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .unwrap()
+                .clone()
+        };
+        assert!(group("x").column_by_name("value").is_none());
+        assert!(group("y").column_by_name("value").is_some());
         let expected =
             crate::arrow::shredding::variant::assemble_variant_extraction_array(&column, &row_type)
                 .unwrap();
