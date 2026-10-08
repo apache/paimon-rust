@@ -26,8 +26,8 @@ use crate::resource::ResourceContext;
 use crate::spec::PartitionComputer;
 use crate::spec::{
     first_row_supports_changelog_producer, BinaryRow, ChangelogProducer, CoreOptions, DataField,
-    DataType, MergeEngine, RowKind, RowKindFilter, EMPTY_SERIALIZED_ROW, POSTPONE_BUCKET,
-    VALUE_KIND_FIELD_NAME,
+    DataType, MergeEngine, PartialUpdateConfig, RowKind, RowKindFilter, EMPTY_SERIALIZED_ROW,
+    POSTPONE_BUCKET, VALUE_KIND_FIELD_NAME,
 };
 use crate::table::bucket_assigner::{BatchAssignOutput, BucketAssignerEnum, PartitionBucketKey};
 use crate::table::bucket_assigner_constant::ConstantBucketAssigner;
@@ -48,7 +48,7 @@ use crate::table::row_kind_generator::RowKindGenerator;
 use crate::table::write_batch_normalize::normalize_write_array;
 use crate::table::{Snapshot, Table, TableScan};
 use crate::Result;
-use arrow_array::{ArrayRef, RecordBatch};
+use arrow_array::{ArrayRef, Int8Array, RecordBatch};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -808,6 +808,49 @@ impl TableWrite {
                 self.table.schema().options(),
             )?;
         }
+        let config = PartialUpdateConfig::new(self.table.schema().options());
+        let batch = if !self.primary_key_indices.is_empty()
+            && config.is_enabled()
+            && config.remove_record_on_delete()
+        {
+            let batch = if batch
+                .schema()
+                .column_with_name(VALUE_KIND_FIELD_NAME)
+                .is_none()
+            {
+                Self::add_per_row_value_kind_column(
+                    &batch,
+                    vec![RowKind::Insert.to_value(); batch.num_rows()],
+                )?
+            } else {
+                batch
+            };
+            let schema = batch.schema();
+            let kind_index = schema.index_of(VALUE_KIND_FIELD_NAME).unwrap();
+            let mut columns = batch.columns().to_vec();
+            // Input changelogs require non-null kinds; NULL means Insert.
+            if columns[kind_index].null_count() > 0 {
+                let kinds = columns[kind_index]
+                    .as_any()
+                    .downcast_ref::<Int8Array>()
+                    .unwrap();
+                columns[kind_index] = Arc::new(Int8Array::from_iter_values(
+                    kinds
+                        .iter()
+                        .map(|kind| kind.unwrap_or(RowKind::Insert.to_value())),
+                ));
+            }
+            let mut schema = arrow_schema::SchemaBuilder::from(schema.as_ref());
+            Arc::make_mut(schema.field_mut(kind_index)).set_nullable(false);
+            RecordBatch::try_new(Arc::new(schema.finish()), columns).map_err(|error| {
+                crate::Error::DataInvalid {
+                    message: format!("Failed to normalize _VALUE_KIND: {error}"),
+                    source: Some(Box::new(error)),
+                }
+            })?
+        } else {
+            batch
+        };
         Ok(Some(batch))
     }
 
@@ -2274,6 +2317,132 @@ pub(in crate::table) mod tests {
     }
 
     #[tokio::test]
+    async fn test_partial_update_remove_record_on_delete_with_rowkind_field() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_partial_update_delete_rowkind_field";
+        setup_dirs(&file_io, table_path).await;
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("value", DataType::Int(IntType::new()))
+            .column("op", DataType::VarChar(VarCharType::string_type()))
+            .primary_key(["id"])
+            .option("bucket", "1")
+            .option("merge-engine", "partial-update")
+            .option("partial-update.remove-record-on-delete", "true")
+            .option("rowkind.field", "op")
+            .build()
+            .unwrap();
+        let table = Table::new(
+            file_io,
+            Identifier::new("default", "test_partial_update_delete_rowkind_field"),
+            table_path.to_string(),
+            TableSchema::new(0, &schema),
+            None,
+        );
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("id", ArrowDataType::Int32, false),
+                ArrowField::new("value", ArrowDataType::Int32, false),
+                ArrowField::new("op", ArrowDataType::Utf8, false),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 1])),
+                Arc::new(Int32Array::from(vec![10, 10])),
+                Arc::new(StringArray::from(vec!["+I", "-D"])),
+            ],
+        )
+        .unwrap();
+        let mut writer = TableWrite::new(&table, "test-user".to_string()).unwrap();
+        writer.write_arrow_batch(&batch).await.unwrap();
+        let messages = writer.prepare_commit().await.unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].new_files.len(), 1);
+        assert_eq!(messages[0].new_files[0].delete_row_count, Some(1));
+        TableCommit::new(table.clone(), "test-user".to_string())
+            .commit(messages)
+            .await
+            .unwrap();
+        assert!(read_id_value_rows(&table).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_partial_update_input_changelog_normalizes_null_kinds() {
+        for kinds_first in [false, true] {
+            let file_io = test_file_io();
+            let table_path = format!("memory:/test_partial_update_null_changelog_{kinds_first}");
+            setup_dirs(&file_io, &table_path).await;
+            let table = Table::new(
+                file_io.clone(),
+                Identifier::new("default", "test_partial_update_null_changelog"),
+                table_path.clone(),
+                pk_changelog_schema(&[
+                    ("merge-engine", "partial-update"),
+                    ("partial-update.remove-record-on-delete", "true"),
+                    ("changelog-producer", "input"),
+                ]),
+                None,
+            );
+            let ordinary = make_batch(vec![1, 3, 4], vec![10, 30, 40]);
+            let explicit_kinds = RecordBatch::try_new(
+                Arc::new(ArrowSchema::new(vec![
+                    ArrowField::new("id", ArrowDataType::Int32, false),
+                    ArrowField::new("value", ArrowDataType::Int32, false),
+                    ArrowField::new(VALUE_KIND_FIELD_NAME, ArrowDataType::Int8, true),
+                ])),
+                vec![
+                    Arc::new(Int32Array::from(vec![2, 3, 4])),
+                    Arc::new(Int32Array::from(vec![20, 31, 42])),
+                    Arc::new(Int8Array::from(vec![None, Some(3), Some(2)])),
+                ],
+            )
+            .unwrap();
+            let batches = if kinds_first {
+                [&explicit_kinds, &ordinary]
+            } else {
+                [&ordinary, &explicit_kinds]
+            };
+            let mut writer = TableWrite::new(&table, "test-user".to_string()).unwrap();
+            for batch in batches {
+                writer.write_arrow_batch(batch).await.unwrap();
+            }
+            let messages = writer.prepare_commit().await.unwrap();
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0].new_changelog_files.len(), 1);
+            let changelog = &messages[0].new_changelog_files[0];
+            let changelog_path = format!(
+                "{table_path}/{}/{}",
+                bucket_dir_name(messages[0].bucket),
+                changelog.file_name
+            );
+            let changelog_size = changelog.file_size;
+            TableCommit::new(table.clone(), "test-user".to_string())
+                .commit(messages)
+                .await
+                .unwrap();
+
+            let expected = if kinds_first {
+                vec![(1, 10), (2, 20), (3, 30), (4, 40)]
+            } else {
+                vec![(1, 10), (2, 20), (4, 42)]
+            };
+            assert_eq!(read_id_value_rows(&table).await, expected, "{table_path}");
+            let changelog =
+                read_physical_key_value_batches(&file_io, &changelog_path, changelog_size).await;
+            assert!(changelog
+                .iter()
+                .all(|batch| batch.column(1).null_count() == 0));
+            assert_eq!(collect_i32(&changelog, 2), vec![1, 2, 3, 3, 4, 4]);
+            let (expected_kinds, expected_values) = if kinds_first {
+                (vec![0, 0, 3, 0, 2, 0], vec![10, 20, 31, 30, 42, 40])
+            } else {
+                (vec![0, 0, 0, 3, 0, 2], vec![10, 20, 30, 31, 40, 42])
+            };
+            assert_eq!(collect_i8(&changelog, 1), expected_kinds, "{table_path}");
+            assert_eq!(collect_i32(&changelog, 3), expected_values, "{table_path}");
+        }
+    }
+
+    #[tokio::test]
     async fn test_write_and_commit() {
         let file_io = test_file_io();
         let table_path = "memory:/test_table_write";
@@ -3002,6 +3171,31 @@ pub(in crate::table) mod tests {
 
         assert_eq!(collect_i32(&batches, 0), vec![1, 2, 3]);
         assert_eq!(collect_i32(&batches, 1), vec![10, 20, 30]);
+    }
+
+    #[tokio::test]
+    async fn test_append_row_format_ignores_partial_update_options() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_append_row_partial_update_options";
+        setup_dirs(&file_io, table_path).await;
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("value", DataType::Int(IntType::new()))
+            .option("merge-engine", "partial-update")
+            .option("partial-update.remove-record-on-delete", "true")
+            .option("file.format", "row")
+            .build()
+            .unwrap();
+        let table = Table::new(
+            file_io,
+            Identifier::new("default", "test_append_row_partial_update_options"),
+            table_path.to_string(),
+            TableSchema::new(0, &schema),
+            None,
+        );
+
+        commit_one_batch(&table, vec![1], vec![10]).await;
+        assert_eq!(read_id_value_rows(&table).await, vec![(1, 10)]);
     }
 
     #[tokio::test]
