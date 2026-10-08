@@ -248,6 +248,24 @@ async fn test_query_auth_explain_shows_the_restriction_but_not_the_files() {
     assert!(!plan.contains("files="), "{plan}");
 }
 
+/// Pruning can leave no split to carry the grant; the counts and trace still precede the rules.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_query_auth_explain_hides_the_trace_when_pruning_leaves_no_split() {
+    let (_tmp, _server, context) = restricted_people(None).await;
+
+    let plan = datafusion::arrow::util::pretty::pretty_format_batches(
+        &query(
+            &context,
+            &format!("EXPLAIN SELECT id FROM {TABLE} WHERE id > 100"),
+        )
+        .await,
+    )
+    .unwrap()
+    .to_string();
+    assert!(!plan.contains("files="), "{plan}");
+    assert!(!plan.contains("trace="), "{plan}");
+}
+
 /// Rows `(1, {"x":"bad"})` and `(2, {"x":7})`, served under the rule `id > 1`.
 async fn restricted_variants() -> (tempfile::TempDir, RESTServer, SQLContext) {
     let schema = |options: &[(&str, &str)]| {

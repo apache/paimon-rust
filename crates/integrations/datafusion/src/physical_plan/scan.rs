@@ -1249,6 +1249,9 @@ impl DisplayAs for PaimonTableScan {
             // Split and file counts describe the data before the server's rules.
             write!(f, ", query-auth=restricted")?;
         }
+        // A plan pruned to nothing has no split left to carry the grant.
+        let hidden =
+            restricted || CoreOptions::new(self.table.schema().options()).query_auth_enabled();
 
         let total_splits: usize = self.planned_partitions.iter().map(|p| p.len()).sum();
         let total_files: usize = self
@@ -1257,7 +1260,7 @@ impl DisplayAs for PaimonTableScan {
             .flat_map(|p| p.iter())
             .map(|s| s.data_files().len())
             .sum();
-        if !restricted {
+        if !hidden {
             write!(
                 f,
                 ", partitions={}, splits={total_splits}, files={total_files}",
@@ -1277,7 +1280,7 @@ impl DisplayAs for PaimonTableScan {
         if let Some(limit) = self.limit {
             write!(f, ", limit={limit}")?;
         }
-        if let Some(trace) = self.scan_trace.as_ref().filter(|_| !restricted) {
+        if let Some(trace) = self.scan_trace.as_ref().filter(|_| !hidden) {
             write!(f, ", trace={trace}")?;
         }
         if let Some(ref pushed_variants) = self.pushed_variants {
