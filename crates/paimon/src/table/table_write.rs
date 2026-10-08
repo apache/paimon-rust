@@ -2301,6 +2301,213 @@ pub(in crate::table) mod tests {
         assert_eq!(snapshot.total_record_count(), Some(3));
     }
 
+    fn sizing_table(
+        file_io: &FileIO,
+        table_path: &str,
+        primary_key: bool,
+        options: &[(&str, &str)],
+    ) -> Table {
+        let mut schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("name", DataType::VarChar(VarCharType::string_type()))
+            .option("file.format", "parquet")
+            .option("file.compression", "none")
+            .option("parquet.enable.dictionary", "false");
+        for (key, value) in options {
+            schema = schema.option(*key, *value);
+        }
+        if primary_key {
+            schema = schema.primary_key(["id"]).option("bucket", "1");
+        }
+        Table::new(
+            file_io.clone(),
+            Identifier::new("default", "test_table"),
+            table_path.to_string(),
+            TableSchema::new(0, &schema.build().unwrap()),
+            None,
+        )
+    }
+
+    fn sizing_batch(names: Vec<String>) -> RecordBatch {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", ArrowDataType::Int32, false),
+            ArrowField::new("name", ArrowDataType::Utf8, false),
+        ]));
+        let ids = (0..names.len() as i32).collect::<Vec<_>>();
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(ids)),
+                Arc::new(StringArray::from(names)),
+            ],
+        )
+        .unwrap()
+    }
+
+    /// Writes one batch, returns the footers (with page indexes) of the new files, then
+    /// commits and checks that every row reads back.
+    async fn write_sizing_batch(
+        file_io: &FileIO,
+        table: &Table,
+        batch: &RecordBatch,
+    ) -> Vec<(String, parquet::file::metadata::ParquetMetaData)> {
+        use parquet::arrow::arrow_reader::{ArrowReaderOptions, ParquetRecordBatchReaderBuilder};
+        use parquet::file::metadata::PageIndexPolicy;
+
+        let mut table_write = TableWrite::new(table, "test-user".to_string()).unwrap();
+        table_write.write_arrow_batch(batch).await.unwrap();
+        let messages = table_write.prepare_commit().await.unwrap();
+        let mut footers = Vec::new();
+        for message in &messages {
+            for file in &message.new_files {
+                let path = format!(
+                    "{}/{}/{}",
+                    table.location(),
+                    bucket_dir_name(message.bucket),
+                    file.file_name
+                );
+                let bytes = file_io.new_input(&path).unwrap().read().await.unwrap();
+                let metadata = ParquetRecordBatchReaderBuilder::try_new_with_options(
+                    bytes,
+                    ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Required),
+                )
+                .unwrap()
+                .metadata()
+                .as_ref()
+                .clone();
+                footers.push((path, metadata));
+            }
+        }
+        TableCommit::new(table.clone(), "test-user".to_string())
+            .commit(messages)
+            .await
+            .unwrap();
+        let read_builder = table.new_read_builder();
+        let plan = read_builder.new_scan().plan().await.unwrap();
+        let batches: Vec<RecordBatch> = futures::TryStreamExt::try_collect(
+            read_builder
+                .new_read()
+                .unwrap()
+                .to_arrow(plan.splits())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        let mut read_ids = batches
+            .iter()
+            .flat_map(|batch| {
+                let ids = batch
+                    .column_by_name("id")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap();
+                ids.values().to_vec()
+            })
+            .collect::<Vec<_>>();
+        read_ids.sort_unstable();
+        assert_eq!(read_ids, (0..batch.num_rows() as i32).collect::<Vec<_>>());
+        footers
+    }
+
+    #[tokio::test]
+    async fn test_parquet_block_size_bounds_row_groups_of_one_large_batch() {
+        for primary_key in [false, true] {
+            let file_io = test_file_io();
+            let table_path = format!("memory:/test_parquet_block_size_{primary_key}");
+            setup_dirs(&file_io, &table_path).await;
+            // parquet.block.size is shadowed by file.block-size as in Java, so it is never parsed.
+            let table = sizing_table(
+                &file_io,
+                &table_path,
+                primary_key,
+                &[
+                    ("file.block-size", "16 kb"),
+                    ("parquet.block.size", "128mb"),
+                ],
+            );
+            let names = (0..65_536).map(|id| format!("{:08}", id * 7919)).collect();
+            for (path, metadata) in write_sizing_batch(&file_io, &table, &sizing_batch(names)).await
+            {
+                assert!(metadata.num_row_groups() > 1, "{path}");
+                for row_group in metadata.row_groups() {
+                    assert!(row_group.compressed_size() <= 2 * 16 * 1024, "{path}");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_parquet_block_size_bounds_row_groups_of_skewed_rows() {
+        const LIMIT: i64 = 1024 * 1024;
+        for primary_key in [false, true] {
+            let file_io = test_file_io();
+            let table_path = format!("memory:/test_parquet_block_size_skewed_{primary_key}");
+            setup_dirs(&file_io, &table_path).await;
+            let table = sizing_table(
+                &file_io,
+                &table_path,
+                primary_key,
+                &[("file.block-size", "1 mb")],
+            );
+            // The first rows hold nearly all bytes, so the batch average says little about them.
+            let names = (0..65_536)
+                .map(|id| {
+                    if id < 1_000 {
+                        "x".repeat(8 * 1024)
+                    } else {
+                        "y".to_string()
+                    }
+                })
+                .collect();
+            for (path, metadata) in write_sizing_batch(&file_io, &table, &sizing_batch(names)).await
+            {
+                assert!(metadata.num_row_groups() > 1, "{path}");
+                for row_group in metadata.row_groups() {
+                    assert!(
+                        row_group.compressed_size() <= LIMIT * 3 / 2,
+                        "{path}: {}",
+                        row_group.compressed_size()
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_parquet_row_check_interval_keeps_default_page_row_limit() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_parquet_row_check_interval";
+        setup_dirs(&file_io, table_path).await;
+        let table = sizing_table(
+            &file_io,
+            table_path,
+            false,
+            &[("parquet.page.size.row.check.min", "65536")],
+        );
+        let names = (0..131_072).map(|id| (id % 10).to_string()).collect();
+        let default_limit = parquet::file::properties::DEFAULT_DATA_PAGE_ROW_COUNT_LIMIT as i64;
+        for (path, metadata) in write_sizing_batch(&file_io, &table, &sizing_batch(names)).await {
+            let offsets = metadata.offset_index().expect("page index");
+            for (row_group, columns) in metadata.row_groups().iter().zip(offsets) {
+                for column in columns {
+                    let firsts = column
+                        .page_locations()
+                        .iter()
+                        .map(|page| page.first_row_index)
+                        .chain(std::iter::once(row_group.num_rows()))
+                        .collect::<Vec<_>>();
+                    assert!(
+                        firsts
+                            .windows(2)
+                            .all(|pair| pair[1] - pair[0] <= default_limit),
+                        "{path}: {firsts:?}"
+                    );
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn test_append_write_populates_value_stats() {
         let file_io = test_file_io();
