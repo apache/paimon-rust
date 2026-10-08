@@ -263,10 +263,13 @@ class BatchTableWrite:
 
 class BatchTableUpdate:
     def merge_into(
-        self, source: Optional[pyarrow.Table], *, on: Sequence[Tuple[str, str]],
+        self, source: Optional[Union[pyarrow.Table, Table]], *, on: Sequence[Tuple[str, str]],
         when_matched: Sequence[Dict[str, Any]], when_not_matched: Sequence[Dict[str, Any]]
     ) -> List[CommitMessage]:
-        """Prepare MERGE against one snapshot. None selects self-merge on _ROW_ID.
+        """Prepare MERGE against one target snapshot. None selects self-merge on _ROW_ID.
+
+        A Table source reads its selected full snapshot in core, independently
+        of the target. Arrow input preserves batches and source row order.
 
         Clauses carry assignments as (column, source/target/literal, value)
         tuples, a delete flag, and optional SQL condition metadata.
@@ -301,11 +304,14 @@ class TableUpdateByRowId:
 
 class StreamTableUpdate:
     def merge_into(
-        self, source: Optional[pyarrow.Table], *, on: Sequence[Tuple[str, str]],
+        self, source: Optional[Union[pyarrow.Table, Table]], *, on: Sequence[Tuple[str, str]],
         when_matched: Sequence[Dict[str, Any]], when_not_matched: Sequence[Dict[str, Any]],
         commit_identifier: int
     ) -> List[CommitMessage]:
-        """Prepare MERGE against one snapshot. None selects self-merge on _ROW_ID.
+        """Prepare MERGE against one target snapshot. None selects self-merge on _ROW_ID.
+
+        A Table source reads its selected full snapshot in core, independently
+        of the target. Arrow input preserves batches and source row order.
 
         Clauses carry assignments as (column, source/target/literal, value)
         tuples, a delete flag, and optional SQL condition metadata.

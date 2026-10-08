@@ -28,6 +28,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 fn table() -> Table {
+    table_at("merge")
+}
+
+fn table_at(name: &str) -> Table {
     let schema = Schema::builder()
         .column("id", DataType::Int(IntType::new()))
         .column("value", DataType::Int(IntType::new()))
@@ -38,8 +42,8 @@ fn table() -> Table {
         .unwrap();
     Table::new(
         FileIOBuilder::new("memory").build().unwrap(),
-        Identifier::new("db", "t"),
-        "memory:/merge".into(),
+        Identifier::new("db", name),
+        format!("memory:/{name}"),
         TableSchema::new(0, &schema),
         None,
     )
@@ -472,6 +476,221 @@ async fn core_merge_evaluates_functions_once_for_the_complete_clause() {
         .unwrap();
     assert_eq!(
         rows(&table).await,
+        vec![(Some(1), Some(100)), (Some(2), Some(200))]
+    );
+}
+
+#[tokio::test]
+async fn core_merge_reads_table_source_at_the_selected_snapshot() {
+    let target = table();
+    let source = table_at("source");
+    seed(&target, &batch(vec![Some(1)], vec![Some(10)])).await;
+    seed(&source, &batch(vec![Some(1)], vec![Some(11)])).await;
+    seed(&source, &batch(vec![Some(2)], vec![Some(22)])).await;
+    let historical = source.copy_with_options(std::collections::HashMap::from([(
+        "scan.snapshot-id".into(),
+        "1".into(),
+    )]));
+    let messages = target
+        .new_write_builder()
+        .new_update()
+        .unwrap()
+        .merge_into(
+            MergeSource::Table(Arc::new(historical)),
+            vec![("id".into(), "id".into())],
+            vec![update(None)],
+            vec![WhenNotMatched {
+                condition: None,
+                assignments: vec![
+                    ("id".into(), MergeAssignment::SourceColumn("id".into())),
+                    (
+                        "value".into(),
+                        MergeAssignment::SourceColumn("value".into()),
+                    ),
+                ],
+            }],
+        )
+        .await
+        .unwrap();
+    TableCommit::new(target.clone(), "merge".into())
+        .commit(messages)
+        .await
+        .unwrap();
+    assert_eq!(rows(&target).await, vec![(Some(1), Some(11))]);
+    assert_eq!(
+        rows(&source).await,
+        vec![(Some(1), Some(11)), (Some(2), Some(22))]
+    );
+}
+
+#[tokio::test]
+async fn core_merge_empty_table_source_keeps_no_match_assignments_lazy() {
+    let target = table();
+    seed(&target, &batch(vec![Some(1)], vec![Some(10)])).await;
+    let source = table_at("empty_source");
+    let called = Arc::new(AtomicUsize::new(0));
+    let evaluated = called.clone();
+    let value = UpdateAssignment::DeferredScalar(Arc::new(move || {
+        evaluated.fetch_add(1, Ordering::Relaxed);
+        Err(crate::Error::DataInvalid {
+            message: "Must remain lazy".into(),
+            source: None,
+        })
+    }));
+    let messages = target
+        .new_write_builder()
+        .new_update()
+        .unwrap()
+        .merge_into(
+            MergeSource::Table(Arc::new(source)),
+            vec![("id".into(), "id".into())],
+            vec![WhenMatched {
+                condition: None,
+                delete: false,
+                assignments: vec![("value".into(), MergeAssignment::Value(value))],
+            }],
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    assert!(messages.is_empty());
+    assert_eq!(called.load(Ordering::Relaxed), 0);
+    assert_eq!(rows(&target).await, vec![(Some(1), Some(10))]);
+}
+
+#[tokio::test]
+async fn core_merge_empty_table_source_obeys_reader_authorization() {
+    let target = table();
+    seed(&target, &batch(vec![Some(1)], vec![Some(10)])).await;
+    let source = table_at("empty_source").copy_with_options(std::collections::HashMap::from([(
+        "query-auth.enabled".into(),
+        "true".into(),
+    )]));
+    let error = target
+        .new_write_builder()
+        .new_update()
+        .unwrap()
+        .merge_into(
+            MergeSource::Table(Arc::new(source)),
+            vec![("id".into(), "id".into())],
+            vec![update(None)],
+            Vec::new(),
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("query-auth.enabled"));
+    assert_eq!(rows(&target).await, vec![(Some(1), Some(10))]);
+}
+
+#[tokio::test]
+async fn core_merge_checks_source_duplicates_across_batches() {
+    let target = table();
+    seed(&target, &batch(vec![Some(1)], vec![Some(10)])).await;
+    let source = vec![
+        batch(vec![Some(1)], vec![Some(11)]),
+        batch(vec![Some(1)], vec![Some(12)]),
+    ];
+    let error = target
+        .new_write_builder()
+        .new_update()
+        .unwrap()
+        .merge_into(
+            MergeSource::Batches(source),
+            vec![("id".into(), "id".into())],
+            vec![update(None)],
+            Vec::new(),
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("multiple source rows"));
+    assert_eq!(rows(&target).await, vec![(Some(1), Some(10))]);
+}
+
+#[tokio::test]
+async fn core_merge_does_not_reread_a_source_advanced_by_a_condition() {
+    let target = table();
+    let source = Arc::new(table_at("source_advanced"));
+    seed(&target, &batch(vec![Some(1)], vec![Some(10)])).await;
+    seed(&source, &batch(vec![Some(1)], vec![Some(11)])).await;
+    let advancing = source.clone();
+    let condition = MergeCondition {
+        target_columns: Vec::new(),
+        source_columns: Vec::new(),
+        evaluate: Arc::new(move |input| {
+            let source = advancing.clone();
+            Box::pin(async move {
+                seed(&source, &batch(vec![Some(2)], vec![Some(22)])).await;
+                Ok(BooleanArray::from(vec![true; input.num_rows()]))
+            })
+        }),
+    };
+    let messages = target
+        .new_write_builder()
+        .new_update()
+        .unwrap()
+        .merge_into(
+            MergeSource::Table(source.clone()),
+            vec![("id".into(), "id".into())],
+            vec![update(Some(condition))],
+            vec![WhenNotMatched {
+                condition: None,
+                assignments: vec![
+                    ("id".into(), MergeAssignment::SourceColumn("id".into())),
+                    (
+                        "value".into(),
+                        MergeAssignment::SourceColumn("value".into()),
+                    ),
+                ],
+            }],
+        )
+        .await
+        .unwrap();
+    TableCommit::new(target.clone(), "merge".into())
+        .commit(messages)
+        .await
+        .unwrap();
+    assert_eq!(rows(&target).await, vec![(Some(1), Some(11))]);
+    assert_eq!(
+        rows(&source).await,
+        vec![(Some(1), Some(11)), (Some(2), Some(22))]
+    );
+}
+
+#[tokio::test]
+async fn core_merge_insert_arrays_cover_selected_rows_across_source_batches() {
+    let target = table();
+    let messages = target
+        .new_write_builder()
+        .new_update()
+        .unwrap()
+        .merge_into(
+            MergeSource::Batches(vec![
+                batch(vec![Some(1)], vec![Some(11)]),
+                batch(vec![Some(2)], vec![Some(22)]),
+            ]),
+            vec![("id".into(), "id".into())],
+            Vec::new(),
+            vec![WhenNotMatched {
+                condition: None,
+                assignments: vec![
+                    ("id".into(), MergeAssignment::SourceColumn("id".into())),
+                    (
+                        "value".into(),
+                        MergeAssignment::Value(UpdateAssignment::Array(vec![Arc::new(
+                            Int32Array::from(vec![100, 200]),
+                        )])),
+                    ),
+                ],
+            }],
+        )
+        .await
+        .unwrap();
+    TableCommit::new(target.clone(), "merge".into())
+        .commit(messages)
+        .await
+        .unwrap();
+    assert_eq!(
+        rows(&target).await,
         vec![(Some(1), Some(100)), (Some(2), Some(200))]
     );
 }

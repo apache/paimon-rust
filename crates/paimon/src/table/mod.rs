@@ -142,6 +142,7 @@ mod sorted_global_index_options;
 mod source;
 mod stats_filter;
 pub(crate) mod table_commit;
+mod table_merge_input;
 mod table_merge_into;
 #[cfg(test)]
 mod table_merge_into_tests;

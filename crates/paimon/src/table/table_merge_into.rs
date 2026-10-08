@@ -20,10 +20,11 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use super::table_merge_input::MergeInput;
 use arrow_array::{Array, BooleanArray, Int64Array, RecordBatch, UInt64Array};
 use arrow_row::{RowConverter, SortField};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use arrow_select::{concat::concat_batches, take::take};
+use arrow_select::take::take;
 use futures::{future::BoxFuture, TryStreamExt};
 
 use super::data_evolution_writer::RowIdFileIndex;
@@ -68,9 +69,11 @@ pub struct WhenNotMatched {
     pub assignments: Vec<(String, MergeAssignment)>,
 }
 
-/// Already materialized input, or the target itself joined on its row ID.
+/// Materialized input, a Paimon source table, or the target joined on its row ID.
 pub enum MergeSource {
     Batches(Vec<RecordBatch>),
+    /// Read a Paimon table at one independently pinned source snapshot.
+    Table(Arc<Table>),
     SelfTable,
 }
 
@@ -307,32 +310,49 @@ pub(super) async fn merge_into(
     };
     let index = RowIdFileIndex::from_splits(scan_table.clone(), plan.splits())?;
     let source = match source {
-        MergeSource::Batches(batches) => {
-            let first = batches
-                .first()
-                .ok_or_else(|| invalid("MERGE source needs an Arrow schema"))?;
-            if batches.iter().any(|batch| batch.schema() != first.schema()) {
-                return Err(invalid("MERGE source batches must share a schema"));
-            }
-            let names = first
-                .schema()
-                .fields()
+        MergeSource::Batches(batches) => Some(MergeInput::new(batches)?),
+        MergeSource::Table(source) => {
+            let mut columns = on
                 .iter()
-                .map(|field| field.name().clone())
+                .map(|(_, source)| source.clone())
                 .collect::<HashSet<_>>();
-            if names.len() != first.num_columns() {
-                return Err(invalid("MERGE source has duplicate column names"));
+            for (assignments, condition) in matched
+                .iter()
+                .map(|clause| (&clause.assignments, &clause.condition))
+                .chain(
+                    not_matched
+                        .iter()
+                        .map(|clause| (&clause.assignments, &clause.condition)),
+                )
+            {
+                for (_, assignment) in assignments {
+                    if let MergeAssignment::SourceColumn(name) = assignment {
+                        columns.insert(name.clone());
+                    }
+                    if matches!(
+                        assignment,
+                        MergeAssignment::Value(UpdateAssignment::Function(_))
+                    ) {
+                        columns.extend(
+                            source
+                                .schema()
+                                .fields()
+                                .iter()
+                                .map(|field| field.name().to_string()),
+                        );
+                    }
+                }
+                if let Some(condition) = condition {
+                    columns.extend(condition.source_columns.clone());
+                }
             }
-            Some(
-                concat_batches(&first.schema(), &batches)
-                    .map_err(|error| invalid(error.to_string()))?,
-            )
+            Some(MergeInput::read(&source, &columns).await?)
         }
         MergeSource::SelfTable => None,
     };
     let source_schema = source
         .as_ref()
-        .map_or_else(|| schema.clone(), RecordBatch::schema);
+        .map_or_else(|| schema.clone(), |source| source.schema.clone());
     for (assignments, condition, insert) in matched
         .iter()
         .map(|clause| (&clause.assignments, &clause.condition, false))
@@ -390,14 +410,16 @@ pub(super) async fn merge_into(
     }
     let mut converter = None;
     let mut source_keys = HashMap::<Vec<u8>, Vec<usize>>::new();
-    let mut seen_source = vec![false; source.as_ref().map_or(0, RecordBatch::num_rows)];
+    let mut seen_source = vec![false; source.as_ref().map_or(0, |source| source.row_count)];
     if let Some(source) = &source {
-        let keys = on
+        let fields = on
             .iter()
             .map(|(target, source_name)| {
-                let source_column = source
-                    .column_by_name(source_name)
-                    .ok_or_else(|| invalid(format!("Missing source ON key {source_name}")))?;
+                let source_type = source
+                    .schema
+                    .field_with_name(source_name)
+                    .map_err(|error| invalid(error.to_string()))?
+                    .data_type();
                 let target_type = if target == ROW_ID {
                     &DataType::Int64
                 } else {
@@ -406,31 +428,33 @@ pub(super) async fn merge_into(
                         .map_err(|error| invalid(error.to_string()))?
                         .data_type()
                 };
-                if source_column.data_type() != target_type
+                if source_type != target_type
                     || !super::upsert_key_matcher::supported_key_type(target_type)
                 {
                     return Err(invalid(
                         "MERGE ON key types must match and support row encoding",
                     ));
                 }
-                Ok(source_column.clone())
+                Ok(SortField::new(source_type.clone()))
             })
-            .collect::<crate::Result<Vec<_>>>()?;
-        let key_converter = RowConverter::new(
-            keys.iter()
-                .map(|column| SortField::new(column.data_type().clone()))
-                .collect(),
-        )
-        .map_err(|error| invalid(error.to_string()))?;
-        let rows = key_converter
-            .convert_columns(&keys)
-            .map_err(|error| invalid(error.to_string()))?;
-        for row in 0..source.num_rows() {
-            if keys.iter().all(|column| !column.is_null(row)) {
-                source_keys
-                    .entry(rows.row(row).as_ref().to_vec())
-                    .or_default()
-                    .push(row);
+            .collect::<crate::Result<_>>()?;
+        let key_converter =
+            RowConverter::new(fields).map_err(|error| invalid(error.to_string()))?;
+        for (chunk, batch) in source.batches.iter().enumerate() {
+            let keys = on
+                .iter()
+                .map(|(_, name)| batch.column_by_name(name).unwrap().clone())
+                .collect::<Vec<_>>();
+            let rows = key_converter
+                .convert_columns(&keys)
+                .map_err(|error| invalid(error.to_string()))?;
+            for row in 0..batch.num_rows() {
+                if keys.iter().all(|column| !column.is_null(row)) {
+                    source_keys
+                        .entry(rows.row(row).as_ref().to_vec())
+                        .or_default()
+                        .push(source.row_offset(chunk) + row);
+                }
             }
         }
         converter = Some(key_converter);
@@ -474,7 +498,7 @@ pub(super) async fn merge_into(
             if !target_rows.is_empty() {
                 joined.push(aliases(
                     Some(&gather(&target, &target_rows)?),
-                    &gather(source, &source_rows)?,
+                    &source.gather(&source_rows)?,
                 )?);
             }
         } else if target.num_rows() > 0 {
@@ -523,26 +547,36 @@ pub(super) async fn merge_into(
     }
     let mut inserts = Vec::new();
     if let Some(source) = source {
-        let unmatched = seen_source
-            .iter()
-            .enumerate()
-            .filter_map(|(row, seen)| (!seen).then_some(row))
-            .collect::<Vec<_>>();
-        let mut pending = aliases(None, &gather(&source, &unmatched)?)?;
+        let mut pending = Vec::new();
+        for (chunk, batch) in source.batches.iter().enumerate() {
+            let offset = source.row_offset(chunk);
+            let unmatched = (0..batch.num_rows())
+                .filter(|row| !seen_source[offset + row])
+                .collect::<Vec<_>>();
+            if !unmatched.is_empty() {
+                pending.push(aliases(None, &gather(batch, &unmatched)?)?);
+            }
+        }
         let columns = schema
             .fields()
             .iter()
             .map(|field| field.name().clone())
             .collect::<Vec<_>>();
         for clause in not_matched {
-            if pending.num_rows() == 0 {
-                break;
+            let mut remaining = Vec::new();
+            let mut clause_rows = Vec::new();
+            for batch in pending {
+                let (selected, rest) = select_clause(batch, &clause.condition).await?;
+                if rest.num_rows() > 0 {
+                    remaining.push(rest);
+                }
+                if selected.num_rows() > 0 {
+                    clause_rows.push(selected);
+                }
             }
-            let (selected, rest) = select_clause(pending, &clause.condition).await?;
-            pending = rest;
-            if selected.num_rows() > 0 {
+            if !clause_rows.is_empty() {
                 for batch in assigned(
-                    std::slice::from_ref(&selected),
+                    &clause_rows,
                     &clause.assignments,
                     &columns,
                     schema.clone(),
@@ -555,6 +589,7 @@ pub(super) async fn merge_into(
                     );
                 }
             }
+            pending = remaining;
         }
     }
     // Materialize/validate every action before staging. Once prepared, messages

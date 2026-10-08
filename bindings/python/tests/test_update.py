@@ -466,3 +466,45 @@ def test_prepared_merge_conditions_chunks_and_lazy_literals(tmp_path, stream):
     commit = builder.new_commit()
     commit.commit(42, messages) if stream else commit.commit(messages)
     assert rows() == [dict(id=1, value=100), dict(id=2, value=200)]
+
+
+@pytest.mark.parametrize('stream', [False, True])
+@pytest.mark.parametrize('historical', [False, True])
+def test_prepared_merge_accepts_native_table_sources(tmp_path, stream, historical):
+    import json
+    from pathlib import Path
+
+    context = SQLContext()
+    context.register_catalog('paimon', {'warehouse': str(tmp_path)})
+    context.sql('CREATE SCHEMA paimon.table_merge')
+    context.sql("""CREATE TABLE paimon.table_merge.target (id INT, value INT) WITH (
+        'row-tracking.enabled' = 'true', 'data-evolution.enabled' = 'true')""")
+    # An ordinary append source needs neither row tracking nor data evolution.
+    context.sql('CREATE TABLE paimon.table_merge.source (source_id INT, amount INT, flag INT)')
+    context.sql('INSERT INTO paimon.table_merge.target (id, value) VALUES (1, 10), (2, 20)')
+    for values in ['(1, 11, 1)', '(3, 33, 1)', '(2, 22, 1)']:
+        context.sql('INSERT INTO paimon.table_merge.source (source_id, amount, flag) VALUES ' + values)
+    catalog = PaimonCatalog({'warehouse': str(tmp_path)})
+    target, source = catalog.get_table('table_merge.target'), catalog.get_table('table_merge.source')
+    if historical:
+        schema = json.loads((Path(source.location()) / 'schema' / 'schema-0').read_text())
+        schema['options']['scan.snapshot-id'] = '2'
+        source = source.copy_with_resolved_schema(json.dumps(schema))
+    source_snapshot = source.latest_snapshot().id()
+    target_snapshot = target.latest_snapshot().id()
+    builder = (target.new_stream_write_builder().with_commit_user('source-merge')
+               if stream else target.new_batch_write_builder())
+    kwargs = dict(commit_identifier=42) if stream else {}
+    condition = dict(sql='"s.flag" = 1')
+    messages = builder.new_update().merge_into(
+        source, on=[('id', 'source_id')], when_matched=[
+            dict(delete=False, condition=condition, assignments=[('value', 'source', 'amount')])],
+        when_not_matched=[dict(condition=condition, assignments=[
+            ('id', 'source', 'source_id'), ('value', 'source', 'amount')])], **kwargs)
+    assert target.latest_snapshot().id() == target_snapshot
+    assert source.latest_snapshot().id() == source_snapshot
+    commit = builder.new_commit()
+    commit.commit(42, messages) if stream else commit.commit(messages)
+    actual = pa.Table.from_batches(context.sql(
+        'SELECT id, value FROM paimon.table_merge.target ORDER BY id')).to_pylist()
+    assert actual == [dict(id=1, value=11), dict(id=2, value=20 if historical else 22), dict(id=3, value=33)]
