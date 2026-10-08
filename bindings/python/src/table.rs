@@ -18,7 +18,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use paimon::catalog::Identifier;
+use paimon::catalog::{Identifier, RESTToken};
 use paimon::io::FileIO;
 use paimon::spec::TableSchema;
 use paimon::Options;
@@ -90,13 +90,14 @@ impl PyTable {
     /// Reuse the matching REST table response and merged catalog options.
     /// Skips config/get-table requests, preserving REST snapshots and token refresh.
     #[staticmethod]
-    #[pyo3(signature = (response_json, *, database, table, rest_options))]
+    #[pyo3(signature = (response_json, *, database, table, rest_options, initial_data_token=None))]
     fn from_rest_response(
         py: Python<'_>,
         response_json: &str,
         database: &str,
         table: &str,
         rest_options: HashMap<String, String>,
+        initial_data_token: Option<(HashMap<String, String>, i64)>,
     ) -> PyResult<Self> {
         let response: paimon::api::GetTableResponse =
             serde_json::from_str(response_json).map_err(|err| {
@@ -104,16 +105,42 @@ impl PyTable {
             })?;
         let identifier = Identifier::new(database, table);
         let rest_options = complete_storage_options(rest_options);
+        let initial_token =
+            initial_data_token.map(|(token, expires_at)| RESTToken::new(token, expires_at));
         let table = py
             .detach(|| {
-                runtime().block_on(paimon::table::Table::from_rest_response(
+                runtime().block_on(paimon::table::Table::from_rest_response_with_token(
                     identifier,
                     response,
                     Options::from_map(rest_options),
+                    initial_token,
                 ))
             })
             .map_err(to_py_err)?;
         Ok(Self::new(Arc::new(table)))
+    }
+
+    /// Reuse an already obtained table token during REST table construction.
+    /// Rust keeps its normal refresh path when the token expires.
+    #[staticmethod]
+    #[pyo3(signature = (response_json, *, database, table, rest_options, data_token, expires_at_millis))]
+    fn from_rest_response_with_token(
+        py: Python<'_>,
+        response_json: &str,
+        database: &str,
+        table: &str,
+        rest_options: HashMap<String, String>,
+        data_token: HashMap<String, String>,
+        expires_at_millis: i64,
+    ) -> PyResult<Self> {
+        Self::from_rest_response(
+            py,
+            response_json,
+            database,
+            table,
+            rest_options,
+            Some((data_token, expires_at_millis)),
+        )
     }
 
     /// Replace the complete schema while retaining FileIO, REST credentials and branch.

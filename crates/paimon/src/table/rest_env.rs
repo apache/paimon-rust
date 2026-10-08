@@ -20,7 +20,7 @@
 use crate::api::rest_api::RESTApi;
 use crate::api::rest_error::RestError;
 use crate::api::GetTableResponse;
-use crate::catalog::{Identifier, RESTTokenFileIO};
+use crate::catalog::{Identifier, RESTToken, RESTTokenFileIO};
 use crate::common::{CatalogOptions, Options};
 use crate::error::Error;
 use crate::io::cache::{create_local_cache_with_namespace, LocalCache};
@@ -39,6 +39,17 @@ impl Table {
         response: crate::api::GetTableResponse,
         rest_options: Options,
     ) -> Result<Self> {
+        Self::from_rest_response_with_token(identifier, response, rest_options, None).await
+    }
+
+    /// As `from_rest_response`, but reuse a matching table data token already
+    /// fetched by the caller. Rust will refresh it from REST after expiry.
+    pub async fn from_rest_response_with_token(
+        identifier: Identifier,
+        response: crate::api::GetTableResponse,
+        rest_options: Options,
+        initial_token: Option<RESTToken>,
+    ) -> Result<Self> {
         identifier.validate()?;
         // Reject a stale or misrouted response before initializing auth or local-cache resources.
         response_identifier(&identifier, &response)?;
@@ -55,7 +66,7 @@ impl Table {
             .unwrap_or(false);
         let local_cache = create_local_cache_with_namespace(&rest_options, api.options())?;
         let file_io_cache = FileIOCacheContext::from_props(api.options().to_map())?;
-        RESTEnv::build_table(
+        RESTEnv::build_table_with_token(
             &identifier,
             response,
             api,
@@ -63,6 +74,7 @@ impl Table {
             data_token_enabled,
             local_cache,
             file_io_cache,
+            initial_token,
         )
         .await
     }
@@ -246,6 +258,29 @@ impl RESTEnv {
         local_cache: Option<Arc<LocalCache>>,
         file_io_cache: FileIOCacheContext,
     ) -> Result<Table> {
+        Self::build_table_with_token(
+            identifier,
+            response,
+            api,
+            options,
+            data_token_enabled,
+            local_cache,
+            file_io_cache,
+            None,
+        )
+        .await
+    }
+
+    async fn build_table_with_token(
+        identifier: &Identifier,
+        response: crate::api::GetTableResponse,
+        api: Arc<RESTApi>,
+        options: Options,
+        data_token_enabled: bool,
+        local_cache: Option<Arc<LocalCache>>,
+        file_io_cache: FileIOCacheContext,
+        initial_token: Option<RESTToken>,
+    ) -> Result<Table> {
         let identifier = response_identifier(identifier, &response)?;
         let schema = response.schema.ok_or_else(|| Error::DataInvalid {
             message: format!("Table {} response missing schema", identifier.full_name()),
@@ -303,7 +338,7 @@ impl RESTEnv {
             source: None,
         })?;
 
-        let file_io = Self::build_file_io(
+        let file_io = Self::build_file_io_with_token(
             &identifier,
             &table_path,
             api.clone(),
@@ -311,6 +346,7 @@ impl RESTEnv {
             data_token_enabled && !is_external,
             local_cache.clone(),
             file_io_cache.clone(),
+            initial_token,
         )
         .await?;
 
@@ -407,17 +443,42 @@ impl RESTEnv {
         local_cache: Option<Arc<LocalCache>>,
         file_io_cache: FileIOCacheContext,
     ) -> Result<FileIO> {
+        Self::build_file_io_with_token(
+            identifier,
+            path,
+            api,
+            options,
+            use_data_token,
+            local_cache,
+            file_io_cache,
+            None,
+        )
+        .await
+    }
+
+    async fn build_file_io_with_token(
+        identifier: &Identifier,
+        path: &str,
+        api: Arc<RESTApi>,
+        options: &Options,
+        use_data_token: bool,
+        local_cache: Option<Arc<LocalCache>>,
+        file_io_cache: FileIOCacheContext,
+        initial_token: Option<RESTToken>,
+    ) -> Result<FileIO> {
         if use_data_token {
-            return Arc::new(RESTTokenFileIO::new(
+            let mut token_file_io = RESTTokenFileIO::new(
                 identifier.clone(),
                 path.to_string(),
                 options.clone(),
                 api,
                 local_cache,
                 file_io_cache,
-            ))
-            .build_file_io()
-            .await;
+            );
+            if let Some(token) = initial_token {
+                token_file_io = token_file_io.with_initial_token(token);
+            }
+            return Arc::new(token_file_io).build_file_io().await;
         }
 
         let mut builder = FileIO::from_path(path)?.with_props(options.to_map());
