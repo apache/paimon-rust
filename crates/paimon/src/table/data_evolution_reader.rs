@@ -1454,6 +1454,23 @@ struct BlobViewLookup {
     descriptors: HashMap<BlobViewStruct, Option<BlobDescriptor>>,
 }
 
+/// Resolve view references only after the caller has selected authorized rows.
+pub(crate) fn resolve_blob_view_stream(
+    stream: ArrowRecordBatchStream,
+    fields: HashSet<String>,
+    rest_env: RESTEnv,
+) -> ArrowRecordBatchStream {
+    Box::pin(async_stream::try_stream! {
+        let mut stream = stream;
+        let mut lookup = BlobViewLookup::default();
+        while let Some(batch) = stream.next().await {
+            let batch = batch?;
+            lookup.load_missing(rest_env.clone(), &batch, &fields).await?;
+            yield replace_blob_view_columns(batch, &fields, &lookup)?;
+        }
+    })
+}
+
 impl BlobViewLookup {
     async fn load_missing(
         &mut self,

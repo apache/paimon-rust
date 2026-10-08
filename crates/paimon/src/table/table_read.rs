@@ -1083,6 +1083,21 @@ impl<'a> PaimonTableRead<'a> {
         super::query_auth::reject_throwing_extractions(&self.read_type)?;
         let index_of = |field: &DataField| schema_fields.iter().position(|s| s.id() == field.id());
         let needed = rules.filter_columns();
+        let core_options = self.table.schema.core_options();
+        let view_fields = core_options.blob_view_fields();
+        if core_options.blob_view_resolve_enabled() && self.table.rest_env().is_some() {
+            if let Some(field) = needed
+                .iter()
+                .map(|i| &schema_fields[*i])
+                .find(|f| view_fields.contains(f.name()))
+            {
+                return Err(unsupported(&format!(
+                    "the server's row filter reads resolving BLOB view '{}'; its stored \
+                     nullness can differ from the resolved value",
+                    field.name(),
+                )));
+            }
+        }
         // A partly projected column would feed the filter a partial value (Java
         // `validateReadType`).
         for field in &self.read_type {
@@ -1106,13 +1121,33 @@ impl<'a> PaimonTableRead<'a> {
                 physical.push(field.clone());
             }
         }
+        let predicates = crate::arrow::format::FilePredicates {
+            predicates: self.data_predicates.clone(),
+            row_filter_factory: None,
+            file_fields: schema_fields.clone(),
+        };
+        physical = crate::arrow::residual::widen_scan_fields(&physical, Some(&predicates));
         let mut inner = self.clone();
         inner.read_type = physical.clone();
         inner.limit = None;
-        let stream = inner.read_splits(data_splits, &self.table.schema.core_options())?;
+        let has_blobs = physical.iter().any(|f| f.data_type().is_blob_file_field());
+        let unresolved_table;
+        if has_blobs {
+            // Keep payload predicates above authorization too: they can open
+            // a descriptor belonging to a row the server excludes.
+            inner.data_predicates.clear();
+            unresolved_table = self
+                .table
+                .copy_with_options(std::collections::HashMap::from([
+                    ("blob-as-descriptor".to_string(), "true".to_string()),
+                    ("blob-view.resolve.enabled".to_string(), "false".to_string()),
+                ]));
+            inner.table = &unresolved_table;
+        }
+        let stream = inner.read_splits(data_splits, &inner.table.schema.core_options())?;
 
         let filters = rules.filters.clone();
-        let projection: Vec<usize> = (0..self.read_type.len()).collect();
+        let batch_fields = physical.clone();
         let stream = stream.map(move |batch| {
             let batch = batch?;
             let names_match = batch.num_columns() == physical.len()
@@ -1127,17 +1162,139 @@ impl<'a> PaimonTableRead<'a> {
                     "the read returned columns the rules cannot address",
                 ));
             }
-            let batch = filter_batch(&batch, &filters, &schema_fields, &physical)?;
-            batch
-                .project(&projection)
-                .map_err(|e| crate::Error::DataInvalid {
-                    message: format!("failed to project the authorized batch: {e}"),
-                    source: Some(Box::new(e)),
-                })
+            filter_batch(&batch, &filters, &schema_fields, &physical)
         });
+        let stream: ArrowRecordBatchStream = Box::pin(stream);
+        if has_blobs {
+            return self.finish_authorized_blobs(stream, &batch_fields, &core_options);
+        }
+        let stream = project_authorized_stream(stream, self.read_type.len());
         Ok(match self.limit {
             None => Box::pin(stream),
             Some(limit) => limit_rows(Box::pin(stream), limit),
+        })
+    }
+
+    fn finish_authorized_blobs(
+        &self,
+        stream: ArrowRecordBatchStream,
+        batch_fields: &[DataField],
+        core_options: &CoreOptions<'_>,
+    ) -> crate::Result<ArrowRecordBatchStream> {
+        use super::managed_blob_reader::{resolve_primary_key_blob_stream, ManagedBlobReadPlan};
+
+        let view_fields = core_options.blob_view_fields();
+        let resolve_views = core_options.blob_view_resolve_enabled()
+            && self.table.rest_env().is_some()
+            && batch_fields.iter().any(|f| view_fields.contains(f.name()));
+        let predicate_views: std::collections::HashSet<_> =
+            super::query_auth::leaf_names(&self.data_predicates)
+                .intersection(&view_fields)
+                .cloned()
+                .collect();
+        let resolve_predicate_views =
+            resolve_views && core_options.blob_as_descriptor() && !predicate_views.is_empty();
+        let mut output_views = view_fields.clone();
+        if resolve_predicate_views {
+            output_views.retain(|field| !predicate_views.contains(field));
+        }
+        // Descriptor mode still translates view references to upstream
+        // descriptors. Query predicates must see those logical values.
+        let stream = match self.table.rest_env().filter(|_| resolve_predicate_views) {
+            Some(env) => super::data_evolution_reader::resolve_blob_view_stream(
+                stream,
+                predicate_views,
+                env.clone(),
+            ),
+            None => stream,
+        };
+        let mut payload_options = self.table.schema().options().clone();
+        if resolve_views {
+            let mut descriptors = core_options.blob_descriptor_fields();
+            descriptors.extend(view_fields.iter().cloned());
+            let mut descriptors: Vec<_> = descriptors.into_iter().collect();
+            descriptors.sort_unstable();
+            payload_options.insert("blob-descriptor-field".to_string(), descriptors.join(","));
+        }
+        let payload_options = CoreOptions::new(&payload_options);
+        let blob_plan = ManagedBlobReadPlan::new(
+            &self.read_type,
+            &self.data_predicates,
+            self.table.schema().fields(),
+            &payload_options,
+        );
+        let stream = match &blob_plan {
+            Some(plan) => {
+                // The payload filter owns its widened schema. Drop authorization
+                // columns before it resolves columns by position.
+                let fields = plan.scan_fields().to_vec();
+                Box::pin(stream.map(move |batch| {
+                    let batch = batch?;
+                    let indices = fields
+                        .iter()
+                        .map(|f| batch.schema().index_of(f.name()))
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|e| crate::Error::DataInvalid {
+                            message: format!("authorized BLOB filter is missing a column: {e}"),
+                            source: None,
+                        })?;
+                    batch
+                        .project(&indices)
+                        .map_err(|e| crate::Error::DataInvalid {
+                            message: format!("failed to project the authorized batch: {e}"),
+                            source: Some(Box::new(e)),
+                        })
+                })) as ArrowRecordBatchStream
+            }
+            None => {
+                let predicates = crate::arrow::format::FilePredicates {
+                    predicates: self.data_predicates.clone(),
+                    row_filter_factory: None,
+                    file_fields: self.table.schema().fields().to_vec(),
+                };
+                let fields = batch_fields.to_vec();
+                let stream = stream.map(move |batch| {
+                    crate::arrow::residual::filter_record_batch_by_predicates(
+                        batch?,
+                        &predicates,
+                        &fields,
+                    )
+                });
+                let stream = project_authorized_stream(Box::pin(stream), self.read_type.len());
+                match self.limit {
+                    Some(limit) => limit_rows(stream, limit),
+                    None => stream,
+                }
+            }
+        };
+        let stream = match self
+            .table
+            .rest_env()
+            .filter(|_| resolve_views && !output_views.is_empty())
+        {
+            Some(env) => super::data_evolution_reader::resolve_blob_view_stream(
+                stream,
+                output_views,
+                env.clone(),
+            ),
+            None => stream,
+        };
+        Ok(match blob_plan {
+            Some(plan) => plan.finish(
+                stream,
+                &payload_options,
+                self.table.file_io.clone(),
+                self.blob_parallelism,
+                self.limit,
+            ),
+            None => resolve_primary_key_blob_stream(
+                stream,
+                &self.read_type,
+                &payload_options,
+                self.table.file_io.clone(),
+                self.blob_parallelism,
+                None,
+            ),
         })
     }
 
@@ -1349,6 +1506,7 @@ impl<'a> PaimonTableRead<'a> {
             self.read_type().to_vec(),
             self.data_predicates.clone(),
         )
+        .with_blob_as_descriptor(core_options.blob_as_descriptor())
         .with_file_index_read_enabled(core_options.file_index_read_enabled())
         .with_batch_size(Some(core_options.read_batch_size()?))
         .with_blob_parallelism(self.blob_parallelism)
@@ -1366,6 +1524,21 @@ impl<'a> PaimonTableRead<'a> {
         }
         Ok(reader)
     }
+}
+
+fn project_authorized_stream(
+    stream: ArrowRecordBatchStream,
+    columns: usize,
+) -> ArrowRecordBatchStream {
+    let projection: Vec<usize> = (0..columns).collect();
+    Box::pin(stream.map(move |batch| {
+        batch?
+            .project(&projection)
+            .map_err(|e| crate::Error::DataInvalid {
+                message: format!("failed to project the authorized batch: {e}"),
+                source: Some(Box::new(e)),
+            })
+    }))
 }
 
 /// Stops once `limit` rows are out, without polling for more.

@@ -1604,6 +1604,10 @@ When the following conditions are met, `COUNT(*)` retrieves exact row counts dir
 
 ### Query Authorization
 
+Row filters cannot reference a resolving BLOB view: the stored reference's
+nullness can differ from its upstream value. Other BLOB payloads and output-only
+BLOB views are resolved after row authorization.
+
 When a table in a REST catalog has `'query-auth.enabled' = 'true'`, planning a
 query asks the catalog what the current user may read, and the row filters it
 returns (see `create_policy`) are applied to the result:

@@ -1119,6 +1119,119 @@ async fn test_blob_view_limit_only_resolves_selected_references() {
             (3, "Repeated again".to_string(), Some(b"bob".to_vec())),
         ]
     );
+
+    // The same selection must protect view lookups under server authorization,
+    // including the multi-provider read after the partial-column updates.
+    server.add_table_with_schema(
+        "default",
+        "blob_view_target",
+        blob_schema(&[
+            ("blob-view-field", "picture"),
+            ("query-auth.enabled", "true"),
+        ]),
+        view.location(),
+    );
+    server.set_auth_response(
+        "default",
+        "blob_view_target",
+        rules(&[int_leaf(0, "id", "LESS_THAN", 4)], &[]),
+    );
+    let authorized = rest_catalog.get_table(&view_id).await.unwrap();
+    assert_eq!(
+        collect_blob_rows(&read_all(&authorized.new_read_builder()).await.unwrap()),
+        vec![
+            (1, "Updated".to_string(), Some(b"alice".to_vec())),
+            (2, "Repeated".to_string(), None),
+            (3, "Repeated again".to_string(), Some(b"bob".to_vec())),
+        ]
+    );
+    let plan = authorized
+        .new_read_builder()
+        .new_scan()
+        .plan()
+        .await
+        .unwrap();
+    let mut filtered = authorized.new_read_builder();
+    filtered.with_projection(&["id"]).unwrap().with_filter(
+        PredicateBuilder::new(authorized.schema().fields())
+            .equal("picture", Datum::Bytes(b"alice".to_vec()))
+            .unwrap(),
+    );
+    let rows: Vec<RecordBatch> = filtered
+        .new_read()
+        .unwrap()
+        .to_arrow(plan.splits())
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(ids(&rows), vec![1]);
+
+    // Descriptor reads still translate a view reference before user predicates.
+    let descriptors = authorized.copy_with_options(HashMap::from([(
+        "blob-as-descriptor".to_string(),
+        "true".to_string(),
+    )]));
+    let batches = read_all(&descriptors.new_read_builder()).await.unwrap();
+    let descriptor = collect_blob_rows(&batches)
+        .into_iter()
+        .find(|row| row.0 == 1)
+        .unwrap()
+        .2
+        .unwrap();
+    paimon::spec::BlobDescriptor::deserialize(&descriptor).unwrap();
+    let plan = descriptors
+        .new_read_builder()
+        .new_scan()
+        .plan()
+        .await
+        .unwrap();
+    let mut filtered = descriptors.new_read_builder();
+    filtered.with_projection(&["id"]).unwrap().with_filter(
+        PredicateBuilder::new(descriptors.schema().fields())
+            .equal("picture", Datum::Bytes(descriptor.clone()))
+            .unwrap(),
+    );
+    let rows: Vec<RecordBatch> = filtered
+        .new_read()
+        .unwrap()
+        .to_arrow(plan.splits())
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(ids(&rows), vec![1]);
+
+    let mut filtered = descriptors.new_read_builder();
+    filtered.with_filter(
+        PredicateBuilder::new(descriptors.schema().fields())
+            .equal("picture", Datum::Bytes(descriptor))
+            .unwrap(),
+    );
+    assert_eq!(ids(&read_all(&filtered).await.unwrap()), vec![1]);
+
+    // A view reference and its upstream BLOB can disagree on nullness.
+    // Until rules can resolve that dependency safely, reject instead of
+    // authorizing rows by the reference bytes.
+    for function in ["IS_NULL", "IS_NOT_NULL"] {
+        server.set_auth_response(
+            "default",
+            "blob_view_target",
+            rules(
+                &[serde_json::json!({
+                    "kind": "LEAF",
+                    "transform": {"name": "FIELD_REF", "fieldRef": {
+                        "index": 2, "name": "picture", "type": "BLOB",
+                    }},
+                    "function": function, "literals": [],
+                })],
+                &[],
+            ),
+        );
+        assert!(matches!(read_all(&authorized.new_read_builder()).await,
+            Err(paimon::Error::Unsupported { message })
+                if message.contains("row filter reads resolving BLOB view")));
+    }
 }
 
 #[cfg(not(windows))]
@@ -2801,6 +2914,115 @@ async fn test_query_auth_unrestricted_user_can_read() {
         3,
         "every written row must come back"
     );
+}
+
+/// Authorization must select rows before output or predicate BLOB payloads open.
+#[cfg(not(windows))]
+#[tokio::test]
+async fn test_query_auth_filters_before_resolving_blob_payloads() {
+    let source = tempfile::tempdir().unwrap();
+    let good_uri = format!("file://{}/allowed.blob", source.path().display());
+    std::fs::write(source.path().join("allowed.blob"), b"good").unwrap();
+    let good = paimon::spec::BlobDescriptor::new(good_uri, 0, 4).serialize();
+    let missing = paimon::spec::BlobDescriptor::new(
+        format!("file://{}/denied.blob", source.path().display()),
+        0,
+        4,
+    )
+    .serialize();
+    for primary_key in [true, false] {
+        let batch = RecordBatch::try_from_iter([
+            (
+                "id",
+                Arc::new(Int32Array::from(vec![1, 2, 3])) as arrow_array::ArrayRef,
+            ),
+            (
+                "payload",
+                Arc::new(LargeBinaryArray::from(vec![
+                    None,
+                    Some(missing.as_slice()),
+                    Some(good.as_slice()),
+                ])) as arrow_array::ArrayRef,
+            ),
+        ])
+        .unwrap();
+        let g = written(
+            "auth_blob_order",
+            |options| {
+                let mut builder = Schema::builder()
+                    .column("id", DataType::Int(IntType::with_nullable(false)))
+                    .column("payload", DataType::Blob(BlobType::new()))
+                    .option("blob-descriptor-field", "payload");
+                if primary_key {
+                    builder = builder.primary_key(["id"]).option("bucket", "1");
+                } else {
+                    builder = builder
+                        .option("data-evolution.enabled", "true")
+                        .option("row-tracking.enabled", "true");
+                }
+                for (key, value) in options {
+                    builder = builder.option(*key, *value);
+                }
+                builder.build().unwrap()
+            },
+            vec![batch],
+        )
+        .await;
+        g.ctx.server.set_auth_response(
+            "default",
+            "auth_blob_order",
+            rules(&[int_leaf(0, "id", "NOT_EQUAL", 2)], &[]),
+        );
+
+        let mut id_only = g.table.new_read_builder();
+        id_only.with_projection(&["id"]).unwrap();
+        assert_eq!(ids(&read_all(&id_only).await.unwrap()), vec![1, 3]);
+
+        let full = read_all(&g.table.new_read_builder()).await.unwrap();
+        assert_eq!(ids(&full), vec![1, 3]);
+        for batch in &full {
+            let id = column::<Int32Array>(batch, "id");
+            let payload = column::<LargeBinaryArray>(batch, "payload");
+            for row in 0..batch.num_rows() {
+                if id.value(row) == 1 {
+                    assert!(payload.is_null(row));
+                } else {
+                    assert_eq!(payload.value(row), b"good");
+                }
+            }
+        }
+
+        let mut limited = g.table.new_read_builder();
+        limited.with_limit(1);
+        assert_eq!(
+            read_all(&limited)
+                .await
+                .unwrap()
+                .iter()
+                .map(RecordBatch::num_rows)
+                .sum::<usize>(),
+            1
+        );
+
+        // Even when the payload is not returned, its predicate must run after auth.
+        // Plan the complete column scope, then read the narrower result.
+        let plan = g.table.new_read_builder().new_scan().plan().await.unwrap();
+        let mut filtered = g.table.new_read_builder();
+        filtered.with_projection(&["id"]).unwrap().with_filter(
+            PredicateBuilder::new(g.table.schema().fields())
+                .equal("payload", Datum::Bytes(b"good".to_vec()))
+                .unwrap(),
+        );
+        let result: Vec<RecordBatch> = filtered
+            .new_read()
+            .unwrap()
+            .to_arrow(plan.splits())
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(ids(&result), vec![3]);
+    }
 }
 
 fn schema_of(columns: &[&str], options: &[(&str, &str)]) -> Schema {
