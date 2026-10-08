@@ -512,16 +512,80 @@ fn parquet_sizing_properties(
         props = props.set_dictionary_page_size_limit(bytes);
     }
     // parquet-rs checks page limits between write batches, so the batch bounds the check interval.
-    let mut write_batch_size = positive(PAGE_SIZE_ROW_CHECK_MIN)?;
-    if let Some(rows) = positive(PAGE_ROW_COUNT_LIMIT)? {
+    let row_check = positive(PAGE_SIZE_ROW_CHECK_MIN)?;
+    let page_rows = positive(PAGE_ROW_COUNT_LIMIT)?;
+    if let Some(rows) = page_rows {
         props = props.set_data_page_row_count_limit(rows);
-        let batch = write_batch_size.unwrap_or(parquet::file::properties::DEFAULT_WRITE_BATCH_SIZE);
-        write_batch_size = Some(batch.min(rows));
     }
-    if let Some(rows) = write_batch_size {
-        props = props.set_write_batch_size(rows);
+    if row_check.is_some() || page_rows.is_some() {
+        let limit =
+            page_rows.unwrap_or(parquet::file::properties::DEFAULT_DATA_PAGE_ROW_COUNT_LIMIT);
+        let batch = row_check.unwrap_or(parquet::file::properties::DEFAULT_WRITE_BATCH_SIZE);
+        props = props.set_write_batch_size(batch.min(limit));
     }
     Ok(props)
+}
+
+/// Bytes the rows of a (possibly sliced) batch occupy; unlike `get_array_memory_size`, list
+/// values and dictionaries outside the slice are not counted.
+fn batch_slice_bytes(batch: &RecordBatch) -> usize {
+    batch
+        .columns()
+        .iter()
+        .map(|column| array_slice_bytes(column.as_ref()))
+        .sum()
+}
+
+fn array_slice_bytes(array: &dyn arrow_array::Array) -> usize {
+    use arrow_array::cast::AsArray;
+    use arrow_array::{Array, ArrayRef};
+    use arrow_schema::DataType as ArrowDataType;
+    let nulls = array.nulls().map_or(0, |nulls| nulls.len().div_ceil(8));
+    let list_bytes = |values: &ArrayRef, start: usize, end: usize, offset_width: usize| {
+        offset_width * (array.len() + 1)
+            + nulls
+            + array_slice_bytes(values.slice(start, end - start).as_ref())
+    };
+    match array.data_type() {
+        ArrowDataType::List(_) => {
+            let list = array.as_list::<i32>();
+            let offsets = list.value_offsets();
+            let (start, end) = (offsets[0] as usize, offsets[list.len()] as usize);
+            list_bytes(list.values(), start, end, 4)
+        }
+        ArrowDataType::LargeList(_) => {
+            let list = array.as_list::<i64>();
+            let offsets = list.value_offsets();
+            let (start, end) = (offsets[0] as usize, offsets[list.len()] as usize);
+            list_bytes(list.values(), start, end, 8)
+        }
+        ArrowDataType::Map(_, _) => {
+            let map = array.as_map();
+            let offsets = map.value_offsets();
+            let (start, end) = (offsets[0] as usize, offsets[map.len()] as usize);
+            let entries: ArrayRef = Arc::new(map.entries().clone());
+            list_bytes(&entries, start, end, 4)
+        }
+        ArrowDataType::Struct(_) => {
+            nulls
+                + array
+                    .as_struct()
+                    .columns()
+                    .iter()
+                    .map(|column| array_slice_bytes(column.as_ref()))
+                    .sum::<usize>()
+        }
+        ArrowDataType::Dictionary(_, _) => {
+            let dictionary = array.as_any_dictionary();
+            let values = dictionary.values();
+            let value_bytes = array_slice_bytes(values.as_ref());
+            array_slice_bytes(dictionary.keys()) + value_bytes * array.len() / values.len().max(1)
+        }
+        _ => array
+            .to_data()
+            .get_slice_memory_size()
+            .unwrap_or_else(|_| array.get_array_memory_size()),
+    }
 }
 
 /// Every `file.compression` value a parquet write accepts.
@@ -600,19 +664,27 @@ impl FormatFileWriter for ParquetFormatWriter {
             physical_batch = cast_record_batch_to_schema(batch, &self.schema)?;
             &physical_batch
         };
-        // parquet-rs splits by bytes only once a row group holds rows, so bound each write
-        // by the batch's in-memory row size, which is not smaller than its encoded size.
-        let rows = batch.num_rows();
-        let step = self.max_row_group_bytes.map_or(rows, |limit| {
-            let row_bytes = batch.get_array_memory_size().div_ceil(rows.max(1)).max(1);
-            (limit / row_bytes).max(1)
-        });
-        if step >= rows {
+        let Some(limit) = self.max_row_group_bytes else {
             return self.write_physical(batch).await;
-        }
-        for offset in (0..rows).step_by(step) {
-            self.write_physical(&batch.slice(offset, step.min(rows - offset)))
-                .await?;
+        };
+        // parquet-rs splits by bytes only once a row group holds rows, so write slices of at
+        // most a quarter of the limit, measured on their own rows, and close the group here.
+        let target = (limit / 4).max(1);
+        let rows = batch.num_rows();
+        let guess = (target / batch_slice_bytes(batch).div_ceil(rows.max(1)).max(1)).max(1);
+        let mut offset = 0;
+        while offset < rows {
+            let mut len = guess.min(rows - offset);
+            let mut slice = batch.slice(offset, len);
+            while len > 1 && batch_slice_bytes(&slice) > target {
+                len /= 2;
+                slice = batch.slice(offset, len);
+            }
+            self.write_physical(&slice).await?;
+            offset += len;
+            if self.inner.in_progress_size() >= limit {
+                self.flush().await?;
+            }
         }
         Ok(())
     }
@@ -4447,6 +4519,21 @@ mod tests {
         let props = parquet_writer_properties(Compression::UNCOMPRESSED, true, &options).unwrap();
         assert_eq!(props.max_row_group_bytes(), Some(2 * 1024 * 1024));
         assert_eq!(props.write_batch_size(), 100);
+
+        // Without an explicit page row limit, the default one still bounds the check interval.
+        let options = HashMap::from([(
+            "parquet.page.size.row.check.min".to_owned(),
+            "65536".to_owned(),
+        )]);
+        let props = parquet_writer_properties(Compression::UNCOMPRESSED, true, &options).unwrap();
+        assert_eq!(
+            props.data_page_row_count_limit(),
+            parquet::file::properties::DEFAULT_DATA_PAGE_ROW_COUNT_LIMIT
+        );
+        assert_eq!(
+            props.write_batch_size(),
+            parquet::file::properties::DEFAULT_DATA_PAGE_ROW_COUNT_LIMIT
+        );
     }
 
     #[tokio::test]

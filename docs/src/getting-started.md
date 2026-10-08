@@ -142,8 +142,11 @@ The Parquet writer accepts Java's sizing keys as plain integers:
 defaults: no row group byte limit with at most 1,048,576 rows, 1 MiB data and
 dictionary pages, and 20,000 rows per page. parquet-rs checks page limits between
 write batches of `parquet.page.size.row.check.min` rows (1,024 by default, and
-never more than the page row limit), so a page can exceed its row limit by up to
-one batch. These options affect new writes only.
+never more than the effective page row limit), so a page can exceed its row limit
+by up to one batch. With a row group byte limit, the writer passes rows in slices
+of at most a quarter of the limit and closes the row group once its encoded size
+reaches the limit, so large or skewed batches stay close to it. These options
+affect new writes only.
 
 ## Parquet Page Pruning
 
