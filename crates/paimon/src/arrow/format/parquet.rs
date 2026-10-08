@@ -664,7 +664,18 @@ fn rebuilt_reader_options(variant_schema: &Option<arrow_schema::SchemaRef>) -> A
     }
 }
 
-/// File schema with `metadata: Dictionary(Int32, Binary)` for plain Variant columns read for extraction.
+/// Index of the Binary `metadata` child of a plain or shredded Variant struct.
+fn variant_metadata_child(children: &arrow_schema::Fields) -> Option<usize> {
+    let shredded = children.iter().any(|child| child.name() == "typed_value");
+    if !shredded && !crate::arrow::is_variant_arrow_fields(children) {
+        return None;
+    }
+    children.iter().position(|child| {
+        child.name() == "metadata" && child.data_type() == &arrow_schema::DataType::Binary
+    })
+}
+
+/// File schema with `metadata: Dictionary(Int32, Binary)` for Variant columns read for extraction.
 fn dictionary_variant_metadata_schema(
     schema: &arrow_schema::SchemaRef,
     read_fields: &[DataField],
@@ -679,21 +690,21 @@ fn dictionary_variant_metadata_schema(
                     && crate::spec::is_variant_extraction_row_type(read.data_type())
             });
             match field.data_type() {
-                arrow_schema::DataType::Struct(children)
-                    if extraction && crate::arrow::is_variant_arrow_fields(children) =>
-                {
+                arrow_schema::DataType::Struct(children) if extraction => {
+                    let Some(metadata) = variant_metadata_child(children) else {
+                        return Arc::clone(field);
+                    };
                     changed = true;
                     let mut children = children
                         .iter()
                         .map(|child| child.as_ref().clone())
                         .collect::<Vec<_>>();
-                    children[1] =
-                        children[1]
-                            .clone()
-                            .with_data_type(arrow_schema::DataType::Dictionary(
-                                Box::new(arrow_schema::DataType::Int32),
-                                Box::new(arrow_schema::DataType::Binary),
-                            ));
+                    children[metadata] = children[metadata].clone().with_data_type(
+                        arrow_schema::DataType::Dictionary(
+                            Box::new(arrow_schema::DataType::Int32),
+                            Box::new(arrow_schema::DataType::Binary),
+                        ),
+                    );
                     Arc::new(
                         field
                             .as_ref()
@@ -7560,5 +7571,115 @@ mod tests {
             crate::arrow::shredding::variant::assemble_variant_extraction_array(read, &row_type)
                 .unwrap();
         assert_eq!(actual.as_ref(), expected.as_ref());
+    }
+
+    #[tokio::test]
+    async fn shredded_variant_extraction_reads_metadata_as_dictionary() {
+        let fields = vec![DataField::new(
+            0,
+            "v".to_string(),
+            DataType::Variant(VariantType::new()),
+        )];
+        let options = HashMap::from([(
+            "variant.shreddingSchema".to_string(),
+            r#"{"type":"ROW","fields":[{"name":"v","type":{"type":"ROW","fields":[{"name":"x","type":"DOUBLE"},{"name":"y","type":"BIGINT"}]}}]}"#.to_string(),
+        )]);
+        let rows = [
+            r#"{"x":1.5e0,"y":2,"z":"rest"}"#,
+            r#"{"y":-1,"x":4e0}"#,
+            r#"{"x":"text","y":6}"#,
+        ];
+        let variants = rows
+            .iter()
+            .map(|json| GenericVariant::parse_json(json).unwrap())
+            .collect::<Vec<_>>();
+        let ArrowDataType::Struct(variant_fields) = variant_arrow_type() else {
+            unreachable!()
+        };
+        let column = StructArray::new(
+            variant_fields,
+            vec![
+                Arc::new(BinaryArray::from_iter_values(
+                    variants.iter().map(|v| v.value()),
+                )),
+                Arc::new(BinaryArray::from_iter_values(
+                    variants.iter().map(|v| v.metadata()),
+                )),
+            ],
+            None,
+        );
+        let schema = build_target_arrow_schema(&fields).unwrap();
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(column.clone())]).unwrap();
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let path = format!(
+            "memory:/shredded_dictionary_{}.parquet",
+            uuid::Uuid::new_v4()
+        );
+        let mut writer = create_format_writer(
+            &file_io.new_output(&path).unwrap(),
+            schema,
+            "zstd",
+            1,
+            None,
+            Some(&fields),
+            Some(&options),
+        )
+        .await
+        .unwrap();
+        writer.write(&batch).await.unwrap();
+        writer.close().await.unwrap();
+        let data = file_io.new_input(&path).unwrap().read().await.unwrap();
+
+        let float = || DataType::Float(crate::spec::FloatType::new());
+        for paths in [vec!["$.y", "$.x"], vec!["$.y"]] {
+            let row_type = crate::spec::variant_extraction_row(
+                true,
+                paths
+                    .iter()
+                    .map(|path| (float(), path.to_string(), false, "UTC".to_string()))
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+            let read_fields = vec![DataField::new(
+                0,
+                "v".to_string(),
+                DataType::Row(row_type.clone()),
+            )];
+            let batches = ParquetFormatReader::default()
+                .read_batch_stream(
+                    Box::new(TrackingFileRead::new(data.clone())),
+                    data.len() as u64,
+                    &read_fields,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            let read = batches[0]
+                .column_by_name("v")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .unwrap();
+            assert!(read.column_by_name("typed_value").is_some());
+            assert!(matches!(
+                read.column_by_name("metadata").unwrap().data_type(),
+                ArrowDataType::Dictionary(key, value)
+                    if key.as_ref() == &ArrowDataType::Int32 && value.as_ref() == &ArrowDataType::Binary
+            ));
+            let expected = crate::arrow::shredding::variant::assemble_variant_extraction_array(
+                &column, &row_type,
+            )
+            .unwrap();
+            let actual = crate::arrow::shredding::variant::assemble_variant_extraction_array(
+                read, &row_type,
+            )
+            .unwrap();
+            assert_eq!(actual.as_ref(), expected.as_ref());
+        }
     }
 }
