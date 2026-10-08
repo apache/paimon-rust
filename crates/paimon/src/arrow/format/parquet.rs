@@ -445,7 +445,66 @@ fn parquet_writer_properties(
             );
         }
     }
-    Ok(props.build())
+    Ok(parquet_sizing_properties(props, options)?.build())
+}
+
+/// Java's parquet writer sizing keys; `file.block-size` overrides `parquet.block.size` as in
+/// Java's `ParquetFileFormat`.
+fn parquet_sizing_properties(
+    mut props: parquet::file::properties::WriterPropertiesBuilder,
+    options: &HashMap<String, String>,
+) -> crate::Result<parquet::file::properties::WriterPropertiesBuilder> {
+    const BLOCK_SIZE: &str = "parquet.block.size";
+    const PAGE_SIZE: &str = "parquet.page.size";
+    const DICTIONARY_PAGE_SIZE: &str = "parquet.dictionary.page.size";
+    const PAGE_ROW_COUNT_LIMIT: &str = "parquet.page.row.count.limit";
+    const PAGE_SIZE_ROW_CHECK_MIN: &str = "parquet.page.size.row.check.min";
+    let positive = |key: &str| -> crate::Result<Option<usize>> {
+        options
+            .get(key)
+            .map(|value| {
+                value
+                    .trim()
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|parsed| *parsed > 0)
+                    .ok_or_else(|| crate::Error::ConfigInvalid {
+                        message: format!("Option '{key}' must be a positive integer, got: {value}"),
+                    })
+            })
+            .transpose()
+    };
+    let file_block_size = CoreOptions::new(options)
+        .file_block_size()?
+        .map(|bytes| {
+            usize::try_from(bytes)
+                .ok()
+                .filter(|bytes| *bytes > 0)
+                .ok_or_else(|| crate::Error::ConfigInvalid {
+                    message: format!("Option 'file.block-size' must be positive, got: {bytes}"),
+                })
+        })
+        .transpose()?;
+    if let Some(bytes) = file_block_size.or(positive(BLOCK_SIZE)?) {
+        props = props.set_max_row_group_bytes(Some(bytes));
+    }
+    if let Some(bytes) = positive(PAGE_SIZE)? {
+        props = props.set_data_page_size_limit(bytes);
+    }
+    if let Some(bytes) = positive(DICTIONARY_PAGE_SIZE)? {
+        props = props.set_dictionary_page_size_limit(bytes);
+    }
+    // parquet-rs checks page limits between write batches, so the batch bounds the check interval.
+    let mut write_batch_size = positive(PAGE_SIZE_ROW_CHECK_MIN)?;
+    if let Some(rows) = positive(PAGE_ROW_COUNT_LIMIT)? {
+        props = props.set_data_page_row_count_limit(rows);
+        let batch = write_batch_size.unwrap_or(parquet::file::properties::DEFAULT_WRITE_BATCH_SIZE);
+        write_batch_size = Some(batch.min(rows));
+    }
+    if let Some(rows) = write_batch_size {
+        props = props.set_write_batch_size(rows);
+    }
+    Ok(props)
 }
 
 /// Every `file.compression` value a parquet write accepts.
@@ -4326,6 +4385,136 @@ mod tests {
             assert!(matches!(result, Err(crate::Error::ConfigInvalid { .. })));
             assert!(!file_io.exists(path).await.unwrap());
         }
+    }
+
+    #[test]
+    fn test_parquet_writer_sizing_options() {
+        let defaults =
+            parquet_writer_properties(Compression::UNCOMPRESSED, true, &HashMap::new()).unwrap();
+        assert_eq!(defaults.max_row_group_bytes(), None);
+        assert_eq!(
+            defaults.write_batch_size(),
+            parquet::file::properties::DEFAULT_WRITE_BATCH_SIZE
+        );
+        let mut options = HashMap::from([
+            ("parquet.block.size".to_owned(), "1048576".to_owned()),
+            ("parquet.page.size".to_owned(), "65536".to_owned()),
+            (
+                "parquet.dictionary.page.size".to_owned(),
+                "32768".to_owned(),
+            ),
+            ("parquet.page.row.count.limit".to_owned(), "500".to_owned()),
+        ]);
+        let props = parquet_writer_properties(Compression::UNCOMPRESSED, true, &options).unwrap();
+        assert_eq!(props.max_row_group_bytes(), Some(1_048_576));
+        assert_eq!(props.data_page_size_limit(), 65_536);
+        assert_eq!(props.dictionary_page_size_limit(), 32_768);
+        assert_eq!(props.data_page_row_count_limit(), 500);
+        assert_eq!(props.write_batch_size(), 500);
+
+        options.insert("file.block-size".to_owned(), "2 mb".to_owned());
+        options.insert(
+            "parquet.page.size.row.check.min".to_owned(),
+            "100".to_owned(),
+        );
+        let props = parquet_writer_properties(Compression::UNCOMPRESSED, true, &options).unwrap();
+        assert_eq!(props.max_row_group_bytes(), Some(2 * 1024 * 1024));
+        assert_eq!(props.write_batch_size(), 100);
+    }
+
+    #[tokio::test]
+    async fn test_parquet_writer_invalid_sizing_options_create_no_file() {
+        for (key, value) in [
+            ("parquet.block.size", "0"),
+            ("parquet.block.size", "128mb"),
+            ("parquet.page.size", "-1"),
+            ("parquet.dictionary.page.size", "x"),
+            ("parquet.page.row.count.limit", "0"),
+            ("parquet.page.size.row.check.min", ""),
+            ("file.block-size", "0 b"),
+            ("file.block-size", "invalid"),
+        ] {
+            let file_io = FileIOBuilder::new("memory").build().unwrap();
+            let path = "memory:/invalid_sizing.parquet";
+            let options = HashMap::from([(key.to_owned(), value.to_owned())]);
+            let result = ParquetFormatWriter::new(
+                &file_io.new_output(path).unwrap(),
+                writer_arrow_schema(),
+                "zstd",
+                1,
+                None,
+                &options,
+            )
+            .await;
+            assert!(
+                matches!(result, Err(crate::Error::ConfigInvalid { .. })),
+                "{key}={value}"
+            );
+            assert!(!file_io.exists(path).await.unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_parquet_writer_sizing_options_shape_the_file() {
+        use parquet::arrow::arrow_reader::{ArrowReaderOptions, ParquetRecordBatchReaderBuilder};
+
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let path = "memory:/sizing_options.parquet";
+        let options = HashMap::from([
+            ("parquet.enable.dictionary".to_owned(), "false".to_owned()),
+            ("parquet.block.size".to_owned(), "16384".to_owned()),
+            ("parquet.page.row.count.limit".to_owned(), "100".to_owned()),
+        ]);
+        let schema = writer_arrow_schema();
+        let mut writer = ParquetFormatWriter::new(
+            &file_io.new_output(path).unwrap(),
+            schema.clone(),
+            "none",
+            1,
+            None,
+            &options,
+        )
+        .await
+        .unwrap();
+        for chunk in 0..40 {
+            let ids = (chunk * 100..(chunk + 1) * 100).collect::<Vec<i32>>();
+            let values = ids.iter().map(|id| id.wrapping_mul(7919)).collect();
+            writer
+                .write(&writer_test_batch(&schema, ids, values))
+                .await
+                .unwrap();
+        }
+        Box::new(writer).close().await.unwrap();
+
+        let bytes = file_io.new_input(path).unwrap().read().await.unwrap();
+        let reader = ParquetRecordBatchReaderBuilder::try_new_with_options(
+            bytes,
+            ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Required),
+        )
+        .unwrap();
+        let metadata = reader.metadata().clone();
+        assert!(metadata.num_row_groups() > 1);
+        let offsets = metadata.offset_index().expect("page index");
+        for (row_group, columns) in metadata.row_groups().iter().zip(offsets) {
+            assert!(row_group.compressed_size() <= 2 * 16384);
+            for column in columns {
+                let firsts = column
+                    .page_locations()
+                    .iter()
+                    .map(|page| page.first_row_index)
+                    .chain(std::iter::once(row_group.num_rows()))
+                    .collect::<Vec<_>>();
+                // parquet-rs checks the limit between write batches, so a split batch can add one batch.
+                assert!(firsts.windows(2).all(|pair| pair[1] - pair[0] < 200));
+                assert!(firsts.len() > (row_group.num_rows() / 100) as usize);
+            }
+        }
+        let rows = reader
+            .build()
+            .unwrap()
+            .map(|batch| batch.unwrap().num_rows())
+            .sum::<usize>();
+        assert_eq!(rows, 4000);
     }
 
     #[tokio::test]

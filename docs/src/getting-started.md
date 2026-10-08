@@ -132,6 +132,19 @@ Dictionary encoding is enabled by default. Disable it for all columns with
 Paths use dot-separated physical Parquet leaves, not logical MAP keys.
 These options affect new writes only.
 
+## Parquet Row Groups and Pages
+
+The Parquet writer accepts Java's sizing keys as plain integers:
+`parquet.block.size` (row group bytes), `parquet.page.size`,
+`parquet.dictionary.page.size`, `parquet.page.row.count.limit` and
+`parquet.page.size.row.check.min`. As in Java, `file.block-size` (for example
+`32 mb`) overrides `parquet.block.size`. Unset keys keep the parquet-rs
+defaults: no row group byte limit with at most 1,048,576 rows, 1 MiB data and
+dictionary pages, and 20,000 rows per page. parquet-rs checks page limits between
+write batches of `parquet.page.size.row.check.min` rows (1,024 by default, and
+never more than the page row limit), so a page can exceed its row limit by up to
+one batch. These options affect new writes only.
+
 ## Parquet Page Pruning
 
 Parquet Page Index pruning is enabled by default. Set
