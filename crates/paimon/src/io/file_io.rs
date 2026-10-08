@@ -317,7 +317,7 @@ impl FileIO {
         }
     }
 
-    /// A view of this FileIO that sends every request to origin, for copies and Format Tables.
+    /// A view of this FileIO that sends every request to origin, as copies require.
     pub(crate) fn origin_only(&self) -> Self {
         let mut file_io = self.clone();
         file_io.origin_only = true;

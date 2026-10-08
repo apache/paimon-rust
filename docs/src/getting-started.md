@@ -428,9 +428,10 @@ rewritten in place (such as `LATEST`, tags and temporary files), sequentially
 numbered metadata (`snapshot-N`, `schema-N`, `changelog/changelog-N`), unknown
 file names. A target is used like any
 other endpoint: requests to it use the same retry settings, and its errors are
-returned rather than retried on origin. Format Tables never use a target,
-because their files may be replaced under the same name. Setting
-`dlf.oss-endpoint` on the client turns routing off.
+returned rather than retried on origin. Format Tables follow the same rules;
+their files may be replaced in place, so the catalog that vends the token
+decides per table whether they use a target. Setting `dlf.oss-endpoint` on the
+client turns routing off.
 
 ### Manage Databases
 
