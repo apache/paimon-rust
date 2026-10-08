@@ -209,20 +209,6 @@ async fn collections_use_java_blob_files_and_preserve_null_empty_and_sliced_valu
     }
 }
 
-#[tokio::test]
-async fn raw_blob_collection_updates_are_rejected_like_java() {
-    let table = collection_table(&[]).await;
-    for column in ["items", "attrs"] {
-        assert!(
-            table
-                .new_write_builder()
-                .new_data_evolution_writer(vec![column.into()])
-                .is_err(),
-            "raw Blob collection {column} must not be updated"
-        );
-    }
-}
-
 #[test]
 fn video_configuration_matches_java_and_does_not_fall_through_to_blob_writes() {
     fn schema(

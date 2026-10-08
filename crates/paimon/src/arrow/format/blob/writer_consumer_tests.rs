@@ -57,6 +57,7 @@ impl FileWrite for RecordingOutput {
 
 fn writer(kind: BlobFieldKind, output: &Arc<Mutex<OutputState>>) -> BlobFormatWriter {
     BlobFormatWriter {
+        update_rows: None,
         writer: Box::new(RecordingOutput(output.clone())),
         file_io: None,
         kind,
@@ -149,13 +150,66 @@ async fn scalar_consumer_runs_after_record_and_null_does_not_flush() {
 }
 
 #[tokio::test]
+async fn sparse_delta_uses_java_tags_and_only_exposes_updated_values() {
+    let output = Arc::new(Mutex::new(OutputState::default()));
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut writer = writer(BlobFieldKind::Scalar, &output)
+        .with_consumer(Some(consumer(&events, &output)))
+        .with_update_rows(Some(BlobUpdateRows {
+            updated: vec![1, 3].into(),
+            next_position: Arc::new(AtomicUsize::new(0)),
+        }));
+    let batch = RecordBatch::try_from_iter([(
+        "payload",
+        Arc::new(LargeBinaryArray::from(vec![
+            Some(b"not copied".as_slice()),
+            None,
+            Some(b"also not copied"),
+            Some(b"new"),
+        ])) as ArrayRef,
+    )])
+    .unwrap();
+    writer.write(&batch).await.unwrap();
+    assert_eq!(writer.lengths, [-2, -1, -2, 19]);
+    check_payloads(
+        &output.lock().unwrap(),
+        &events.lock().unwrap(),
+        &[None, Some(b"new")],
+    );
+}
+
+#[tokio::test]
+async fn sparse_cursor_survives_physical_writer_recreation() {
+    let rows = BlobUpdateRows {
+        updated: vec![2].into(),
+        next_position: Arc::new(AtomicUsize::new(0)),
+    };
+    let output = Arc::new(Mutex::new(OutputState::default()));
+    let mut first = writer(BlobFieldKind::Scalar, &output).with_update_rows(Some(rows.clone()));
+    let batch = RecordBatch::try_from_iter([(
+        "payload",
+        Arc::new(LargeBinaryArray::from(vec![
+            None,
+            None,
+            Some(b"new".as_slice()),
+        ])) as ArrayRef,
+    )])
+    .unwrap();
+    first.write(&batch.slice(0, 2)).await.unwrap();
+    assert_eq!(first.lengths, [-2, -2]);
+    let mut second = writer(BlobFieldKind::Scalar, &output).with_update_rows(Some(rows));
+    second.write(&batch.slice(2, 1)).await.unwrap();
+    assert_eq!(second.lengths, [19]);
+}
+
+#[tokio::test]
 async fn collection_consumer_skips_null_elements_and_flushes_after_trailer() {
     for keys in [
         None,
         Some(vec![
-            b"key-a".to_vec(),
-            b"key-null".to_vec(),
-            b"key-b".to_vec(),
+            Some(b"key-a".to_vec()),
+            Some(b"key-null".to_vec()),
+            Some(b"key-b".to_vec()),
         ]),
     ] {
         let output = Arc::new(Mutex::new(OutputState::default()));
