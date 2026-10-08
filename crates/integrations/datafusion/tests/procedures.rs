@@ -21,6 +21,7 @@ use common::{
     assert_sql_error, collect_id_name, create_sql_context, create_test_env, exec, row_count,
     setup_sql_context,
 };
+use datafusion::arrow::array::{Array, Int64Array, StringArray};
 use paimon::catalog::Identifier;
 use paimon::table::BranchManager;
 use paimon::Catalog;
@@ -89,6 +90,172 @@ async fn test_create_tag_with_snapshot_id() {
     )
     .await;
     assert_eq!(count, 1);
+}
+
+#[tokio::test]
+async fn test_create_tag_retention() {
+    let (tmp, sql_context) = setup_table_with_snapshots().await;
+    let table_dir = tmp.path().join("test_db.db/t1");
+
+    for (name, args, snapshot_id, expected_retention) in [
+        (
+            "retained_explicit",
+            ", snapshot_id => 1, time_retained => '1d'",
+            1,
+            Some("PT24H"),
+        ),
+        (
+            "retained_latest",
+            ", time_retained => '1d'",
+            3,
+            Some("PT24H"),
+        ),
+        ("plain_explicit", ", snapshot_id => 1", 1, None),
+        ("plain_latest", "", 3, None),
+    ] {
+        let batches = sql_context
+            .sql(&format!(
+                "CALL sys.create_tag(table => 'paimon.test_db.t1', tag => '{name}'{args})"
+            ))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 1);
+        let result = batches[0]
+            .column_by_name("result")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(result.value(0), "OK");
+
+        let bytes = std::fs::read(table_dir.join("tag").join(format!("tag-{name}"))).unwrap();
+        let tag: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(tag["id"], snapshot_id);
+        if expected_retention.is_some() {
+            assert_eq!(
+                tag["tagTimeRetained"].as_number().unwrap().to_string(),
+                "86400.000000000"
+            );
+            assert_eq!(tag["tagCreateTime"].as_array().unwrap().len(), 7);
+        } else {
+            assert!(tag.get("tagTimeRetained").is_none());
+            assert!(tag.get("tagCreateTime").is_none());
+            let snapshot = std::fs::read(
+                table_dir
+                    .join("snapshot")
+                    .join(format!("snapshot-{snapshot_id}")),
+            )
+            .unwrap();
+            assert_eq!(bytes, snapshot);
+        }
+
+        let batches = sql_context
+            .sql(&format!(
+                "SELECT snapshot_id, create_time, time_retained \
+                 FROM paimon.test_db.`t1$tags` WHERE tag_name = '{name}'"
+            ))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 1);
+        let ids = batches[0]
+            .column_by_name("snapshot_id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(ids.value(0), snapshot_id);
+        let created = batches[0].column_by_name("create_time").unwrap();
+        assert_eq!(created.is_null(0), expected_retention.is_none());
+        let retained = batches[0]
+            .column_by_name("time_retained")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let actual = (!retained.is_null(0)).then(|| retained.value(0));
+        assert_eq!(actual, expected_retention);
+    }
+}
+
+#[tokio::test]
+async fn test_create_tag_with_invalid_retention_does_not_write() {
+    let (tmp, sql_context) = setup_table_with_snapshots().await;
+    let tag_path = tmp.path().join("test_db.db/t1/tag/tag-invalid");
+
+    for retention in [
+        "",
+        "invalid",
+        "-1d",
+        "106751991167301d",
+        "9223372036854775807h",
+        "9223372036854775808ns",
+    ] {
+        assert_sql_error(
+            &sql_context,
+            &format!(
+                "CALL sys.create_tag(table => 'test_db.t1', tag => 'invalid', \
+                 snapshot_id => 1, time_retained => '{retention}')"
+            ),
+            "Invalid tag retention",
+        )
+        .await;
+        assert!(!tag_path.exists(), "{retention:?}");
+    }
+    assert_eq!(
+        row_count(&sql_context, "SELECT * FROM paimon.test_db.`t1$tags`").await,
+        0
+    );
+}
+
+#[tokio::test]
+async fn test_create_tag_with_retention_preserves_existing_tag() {
+    let (tmp, sql_context) = setup_table_with_snapshots().await;
+    exec(
+        &sql_context,
+        "CALL sys.create_tag(table => 'test_db.t1', tag => 'retained', \
+         snapshot_id => 1, time_retained => '1d')",
+    )
+    .await;
+    let tag_path = tmp.path().join("test_db.db/t1/tag/tag-retained");
+    let original = std::fs::read(&tag_path).unwrap();
+
+    for retention in ["2d", "invalid"] {
+        assert_sql_error(
+            &sql_context,
+            &format!(
+                "CALL sys.create_tag(table => 'test_db.t1', tag => 'retained', \
+                 snapshot_id => 3, time_retained => '{retention}')"
+            ),
+            "Tag 'retained' already exists",
+        )
+        .await;
+        assert_eq!(std::fs::read(&tag_path).unwrap(), original);
+    }
+}
+
+#[tokio::test]
+async fn test_create_tag_rejects_unknown_retention_argument() {
+    let (tmp, sql_context) = setup_table_with_snapshots().await;
+    assert_sql_error(
+        &sql_context,
+        "CALL sys.create_tag(table => 'test_db.t1', tag => 'invalid', \
+         snapshot_id => 1, time_retain => '1d')",
+        "Argument time_retain is unknown",
+    )
+    .await;
+    assert!(!tmp.path().join("test_db.db/t1/tag/tag-invalid").exists());
+    assert_eq!(
+        row_count(&sql_context, "SELECT * FROM paimon.test_db.`t1$tags`").await,
+        0
+    );
 }
 
 #[tokio::test]
