@@ -27,7 +27,7 @@ use std::sync::Arc;
 /// select snapshots by commit kind. The caller's starting/follow-up scanner
 /// decides which snapshot to consume (Java `FollowUpScanner`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum ScanMode {
+pub(super) enum ScanMode {
     /// Full live file set, with batch split packing, including level zero.
     #[default]
     All,
@@ -61,9 +61,11 @@ impl BucketFilter {
 /// This lower-level reader currently refuses query-auth tables, like the
 /// existing incremental planner; it cannot bypass authorization.
 #[derive(Debug, Clone)]
-pub struct SnapshotReader<'a> {
+pub(super) struct SnapshotReader<'a> {
     scan: TableScan<'a>,
+    #[cfg(test)]
     snapshot_id: Option<i64>,
+    #[cfg(test)]
     mode: ScanMode,
 }
 
@@ -71,12 +73,73 @@ impl<'a> SnapshotReader<'a> {
     pub(crate) fn new(scan: TableScan<'a>) -> Self {
         Self {
             scan,
+            #[cfg(test)]
             snapshot_id: None,
+            #[cfg(test)]
             mode: ScanMode::All,
         }
     }
 
+    pub(super) async fn read_initial(&self, snapshot: crate::spec::Snapshot) -> Result<Plan> {
+        use crate::spec::ChangelogProducer;
+        let options = self.table().schema().options();
+        let mut scan = self.scan.clone();
+        let parse = |key, default| -> Result<i32> {
+            options
+                .get(key)
+                .map(|value| {
+                    value.parse().map_err(|error| crate::Error::DataInvalid {
+                        message: format!("invalid {key}: {value}"),
+                        source: Some(Box::new(error)),
+                    })
+                })
+                .unwrap_or(Ok(default))
+        };
+        match self
+            .table()
+            .schema()
+            .core_options()
+            .try_changelog_producer()?
+        {
+            ChangelogProducer::Lookup => scan = scan.with_snapshot_levels(1..=i32::MAX),
+            ChangelogProducer::FullCompaction => {
+                // Java numLevels defaults to incrementSafely(compactionTrigger).
+                let levels = if options.contains_key("num-levels") {
+                    parse("num-levels", 0)?
+                } else {
+                    parse("num-sorted-run.compaction-trigger", 5)?.saturating_add(1)
+                };
+                let last = levels
+                    .checked_sub(1)
+                    .ok_or_else(|| crate::Error::DataInvalid {
+                        message: "num-levels is out of range".into(),
+                        source: None,
+                    })?;
+                scan = scan.with_snapshot_levels(last..=last);
+            }
+            ChangelogProducer::None | ChangelogProducer::Input => {}
+        }
+        scan.plan_selected_snapshot(snapshot, ScanMode::All).await
+    }
+
+    pub(super) fn table(&self) -> &super::Table {
+        self.scan.snapshot_table()
+    }
+
+    pub(super) fn validate(&self) -> Result<()> {
+        self.scan.validate_snapshot_read()
+    }
+
+    pub(super) async fn read_selected(
+        &self,
+        snapshot: crate::spec::Snapshot,
+        mode: ScanMode,
+    ) -> Result<Plan> {
+        self.scan.plan_selected_snapshot(snapshot, mode).await
+    }
+
     /// Pin the snapshot instead of resolving the latest one at read time.
+    #[cfg(test)]
     pub fn with_snapshot(mut self, snapshot_id: i64) -> Result<Self> {
         if snapshot_id < 1 {
             return Err(crate::Error::DataInvalid {
@@ -88,6 +151,7 @@ impl<'a> SnapshotReader<'a> {
         Ok(self)
     }
 
+    #[cfg(test)]
     pub fn with_mode(mut self, mode: ScanMode) -> Self {
         self.mode = mode;
         self
@@ -119,7 +183,12 @@ impl<'a> SnapshotReader<'a> {
     }
 
     /// Read the configured manifest lists and build ordinary table splits.
+    #[cfg(test)]
     pub async fn read(&self) -> Result<Plan> {
         self.scan.read_snapshot(self.snapshot_id, self.mode).await
     }
 }
+
+#[cfg(test)]
+#[path = "snapshot_reader_tests.rs"]
+mod tests;

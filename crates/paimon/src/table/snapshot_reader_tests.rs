@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#[path = "../../tests/common/mod.rs"]
 mod common;
 
 use arrow_array::{Int32Array, RecordBatch};

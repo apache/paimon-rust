@@ -298,9 +298,15 @@ impl<'a> ReadBuilder<'a> {
         }
     }
 
+    #[cfg(test)]
     /// Create a per-snapshot reader retaining this builder's read configuration.
-    pub fn new_snapshot_reader(&self) -> super::SnapshotReader<'a> {
-        super::SnapshotReader::new(self.new_scan())
+    pub(super) fn new_snapshot_reader(&self) -> super::snapshot_reader::SnapshotReader<'a> {
+        super::snapshot_reader::SnapshotReader::new(self.new_scan())
+    }
+
+    /// Create a stateful streaming scan using the configured filter and read type.
+    pub fn new_stream_scan(&self) -> Result<super::StreamTableScan> {
+        super::StreamTableScan::new(self.new_scan())
     }
 
     /// Create a batch incremental scan over snapshot id range

@@ -142,6 +142,7 @@ mod sorted_global_index_build_builder;
 mod sorted_global_index_options;
 mod source;
 mod stats_filter;
+mod stream_table_scan;
 pub(crate) mod table_commit;
 mod table_merge_input;
 mod table_merge_into;
@@ -217,13 +218,15 @@ pub use scan_trace::ScanTrace;
 pub use schema_manager::SchemaManager;
 pub use snapshot_commit::{RESTSnapshotCommit, RenamingSnapshotCommit, SnapshotCommit};
 pub use snapshot_manager::SnapshotManager;
-pub use snapshot_reader::{ScanMode, SnapshotReader};
+#[cfg(test)]
+use snapshot_reader::{ScanMode, SnapshotReader};
 pub use sorted_global_index_build_builder::{
     BTreeGlobalIndexBuildBuilder, SortedGlobalIndexBuildBuilder,
 };
 pub use source::{
     merge_row_ranges, DataSplit, DataSplitBuilder, DeletionFile, PartitionBucket, Plan, RowRange,
 };
+pub use stream_table_scan::StreamTableScan;
 pub use table_commit::TableCommit;
 pub use table_merge_into::{
     MergeAssignment, MergeCondition, MergeSource, WhenMatched, WhenNotMatched,
@@ -526,10 +529,14 @@ impl Table {
         ReadBuilder::new(self)
     }
 
-    /// Create Java's per-snapshot ALL/DELTA/CHANGELOG reader.
-    /// Use a read builder's `new_snapshot_reader` to configure filters and read type.
-    pub fn new_snapshot_reader(&self) -> SnapshotReader<'_> {
+    #[cfg(test)]
+    fn new_snapshot_reader(&self) -> SnapshotReader<'_> {
         self.new_read_builder().new_snapshot_reader()
+    }
+
+    /// Create a stateful streaming scan. Configure filters through a read builder.
+    pub fn new_stream_scan(&self) -> Result<StreamTableScan> {
+        self.new_read_builder().new_stream_scan()
     }
 
     /// Create a full-text search builder.
