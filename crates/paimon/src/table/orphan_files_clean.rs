@@ -247,6 +247,15 @@ impl<'a> RemoveOrphanFiles<'a> {
                 });
             }
         }
+        // A REST-managed table or branch may read a snapshot that only the
+        // catalog knows, with no snapshot file on storage. It is live by
+        // definition (`file: None`), and a failed lookup aborts the run.
+        if let Some(snapshot) = snapshot_manager.get_latest_snapshot().await? {
+            owners.push(Owner {
+                file: None,
+                snapshot,
+            });
+        }
         let tag_manager = if branch == MAIN_BRANCH {
             self.table.tag_manager()
         } else {
@@ -327,6 +336,20 @@ impl Clean {
         self.file_io.list_status(dir).await
     }
 
+    /// [`Self::list`] for a directory that may hold candidates: a directory
+    /// that cannot be listed (for example an unused `specific-fs` external
+    /// root) is skipped, like Java `tryBestListingDirs`, since skipping only
+    /// leaves garbage behind. Owner metadata is never read this way.
+    async fn list_candidates(&self, dir: &str) -> Vec<FileStatus> {
+        match self.list(dir).await {
+            Ok(statuses) => statuses,
+            Err(error) => {
+                log::warn!("Skip listing {dir} for orphan files: {error}");
+                Vec::new()
+            }
+        }
+    }
+
     /// Old non-snapshot files in the snapshot and changelog directories, such
     /// as temporary files of interrupted commits. Java `cleanBranchSnapshotDir`.
     ///
@@ -339,7 +362,7 @@ impl Clean {
             ("snapshot", SNAPSHOT_PREFIX),
             ("changelog", CHANGELOG_PREFIX),
         ] {
-            for status in self.list(&format!("{branch_root}/{dir}")).await? {
+            for status in self.list_candidates(&format!("{branch_root}/{dir}")).await {
                 let name = file_name(&status.path);
                 if !status.is_dir
                     && !is_numbered(name, prefix)
@@ -370,7 +393,7 @@ impl Clean {
         );
         let mut statuses = Vec::new();
         for dir in dirs {
-            statuses.extend(self.list(&dir).await?);
+            statuses.extend(self.list_candidates(&dir).await);
         }
         // Writers place external files under the same relative bucket path,
         // and with `entropy-inject` add hash directories below each bucket, so
@@ -386,7 +409,10 @@ impl Clean {
                 self.data_directory.as_deref(),
             );
             for bucket in self.bucket_dirs(&root, partition_depth).await? {
-                statuses.extend(self.file_io.list_status_recursive(&bucket).await?);
+                match self.file_io.list_status_recursive(&bucket).await {
+                    Ok(files) => statuses.extend(files),
+                    Err(error) => log::warn!("Skip listing {bucket} for orphan files: {error}"),
+                }
             }
         }
 
@@ -409,7 +435,7 @@ impl Clean {
         for _ in 0..partition_depth {
             let mut next = Vec::new();
             for dir in &level {
-                for status in self.list(dir).await? {
+                for status in self.list_candidates(dir).await {
                     if status.is_dir && file_name(&status.path).contains('=') {
                         next.push(status.path.trim_end_matches('/').to_string());
                     }
@@ -419,7 +445,7 @@ impl Clean {
         }
         let mut buckets = Vec::new();
         for dir in &level {
-            for status in self.list(dir).await? {
+            for status in self.list_candidates(dir).await {
                 if status.is_dir && file_name(&status.path).starts_with(BUCKET_PREFIX) {
                     buckets.push(status.path.trim_end_matches('/').to_string());
                 }

@@ -468,6 +468,60 @@ async fn test_referenced_global_index_files_are_kept() {
     assert_eq!(all_files(dir.path()), referenced);
 }
 
+#[cfg(feature = "fulltext")]
+#[tokio::test]
+async fn test_referenced_full_text_index_files_are_kept() {
+    let dir = tempfile::tempdir().unwrap();
+    let schema = base_schema()
+        .option("row-tracking.enabled", "true")
+        .option("data-evolution.enabled", "true")
+        .option("global-index.enabled", "true")
+        .option("global-index.row-count-per-shard", "1")
+        .build()
+        .unwrap();
+    let table = setup_with(&dir, schema).await;
+    commit(&table, &[1], "paimon lake", false).await;
+    commit(&table, &[2], "rust engine", false).await;
+    let build = || async {
+        table
+            .new_full_text_index_build_builder()
+            .with_index_column("dt")
+            .execute()
+            .await
+            .unwrap()
+    };
+    assert_eq!(build().await, 2);
+    // The dropped index stays referenced by the snapshots before the drop.
+    table
+        .new_global_index_drop_builder()
+        .with_index_column("dt")
+        .with_index_type("full-text")
+        .execute()
+        .await
+        .unwrap();
+    assert_eq!(build().await, 2);
+    let referenced = all_files(dir.path());
+    let index_files = referenced
+        .iter()
+        .filter(|path| path.starts_with("index/full-text-global-index-"))
+        .count();
+    assert_eq!(index_files, 4, "{referenced:?}");
+    let orphan = plant(&dir, "index/full-text-global-index-orphan.index");
+
+    let result = clean_later(&table, false).await;
+    assert_eq!(relative(&dir, &result), BTreeSet::from([orphan]));
+    assert_eq!(all_files(dir.path()), referenced);
+    let hits = table
+        .new_full_text_search_builder()
+        .with_text_column("dt")
+        .with_query_text("paimon")
+        .with_limit(10)
+        .execute()
+        .await
+        .unwrap();
+    assert_eq!(hits, vec![crate::table::RowRange::new(0, 0)]);
+}
+
 #[tokio::test]
 async fn test_external_paths_are_scanned_and_referenced_files_kept() {
     let dir = tempfile::tempdir().unwrap();
@@ -786,4 +840,216 @@ async fn test_absolute_data_directory_is_scanned() {
     assert!(!orphan.exists());
     assert!(live[0].exists());
     assert_eq!(read_ids(&table).await, vec![1]);
+}
+
+/// A REST-managed copy of `seed` whose catalog reports `main` as main's latest
+/// snapshot and `branches` as each branch's; a `None` branch answers HTTP 500.
+async fn rest_table(
+    seed: &Table,
+    main: crate::spec::Snapshot,
+    branches: HashMap<String, Option<crate::spec::Snapshot>>,
+) -> (Table, tokio::task::JoinHandle<()>) {
+    use crate::api::rest_api::RESTApi;
+    use crate::common::Options;
+    use axum::{
+        body::Bytes,
+        http::{StatusCode, Uri},
+        Json, Router,
+    };
+
+    let app = Router::new().fallback(move |uri: Uri, _body: Bytes| {
+        let main = main.clone();
+        let branches = branches.clone();
+        async move {
+            let path = uri.path().replace("%24", "$");
+            if !path.ends_with("/snapshot") {
+                return (StatusCode::OK, Json(serde_json::json!({"schemaId": 0})));
+            }
+            let snapshot = match branches
+                .iter()
+                .find(|(branch, _)| path.contains(&format!("$branch_{branch}/")))
+            {
+                Some((_, Some(snapshot))) => snapshot.clone(),
+                Some((_, None)) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({"message": "catalog unavailable", "code": 500})),
+                    )
+                }
+                None => main,
+            };
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"snapshot": {"snapshot": snapshot, "recordCount": 1}})),
+            )
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut options = Options::new();
+    options.set("uri", format!("http://{}", listener.local_addr().unwrap()));
+    options.set("prefix", "test");
+    options.set("token.provider", "bear");
+    options.set("token", "test-token");
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let api = Arc::new(RESTApi::new(options.clone(), false).await.unwrap());
+    let identifier = Identifier::new("default", "orphan_table");
+    let file_io_cache = crate::io::FileIOCacheContext::from_props(options.to_map()).unwrap();
+    let env = crate::table::RESTEnv::new(
+        identifier.clone(),
+        "uuid".into(),
+        api,
+        options,
+        false,
+        None,
+        file_io_cache,
+    );
+    let table = Table::new(
+        seed.file_io().clone(),
+        identifier,
+        seed.location().to_string(),
+        seed.schema().clone(),
+        Some(env),
+    );
+    (table, server)
+}
+
+#[tokio::test]
+async fn test_catalog_only_snapshots_are_owners() {
+    let dir = tempfile::tempdir().unwrap();
+    let seed = setup(&dir, false).await;
+    commit(&seed, &[1], "a", false).await; // snapshot 1
+    commit(&seed, &[2], "a", true).await; // snapshot 2
+    let sm = seed.snapshot_manager();
+    let snapshot_1 = sm.get_snapshot(1).await.unwrap();
+    let snapshot_2 = sm.get_snapshot(2).await.unwrap();
+    // Branch b1 reads snapshot 1 only through the catalog; neither main's
+    // snapshot-1 nor any branch snapshot file exists on storage.
+    std::fs::create_dir_all(dir.path().join("branch/branch-b1/schema")).unwrap();
+    std::fs::copy(
+        dir.path().join("schema/schema-0"),
+        dir.path().join("branch/branch-b1/schema/schema-0"),
+    )
+    .unwrap();
+    std::fs::remove_file(dir.path().join("snapshot/snapshot-1")).unwrap();
+    let (table, server) = rest_table(
+        &seed,
+        snapshot_2,
+        HashMap::from([("b1".to_string(), Some(snapshot_1.clone()))]),
+    )
+    .await;
+    let mut branch = table.clone();
+    branch.branch = "b1".to_string();
+    branch.branch_reference = true;
+    assert_eq!(read_ids(&table).await, vec![2]);
+    assert_eq!(read_ids(&branch).await, vec![1]);
+    let orphan = plant(&dir, &format!("{}/data-orphan.parquet", bucket_dir(&dir)));
+
+    let dry = clean_later(&table, true).await;
+    assert_eq!(
+        relative(&dir, &dry),
+        BTreeSet::from([orphan.clone()]),
+        "the branch's live manifests are not orphans"
+    );
+    let result = clean_later(&table, false).await;
+    assert_eq!(relative(&dir, &result), BTreeSet::from([orphan]));
+    assert!(dir
+        .path()
+        .join("manifest")
+        .join(snapshot_1.base_manifest_list())
+        .exists());
+    assert_eq!(read_ids(&branch).await, vec![1]);
+    server.abort();
+}
+
+/// Resolves `file:` paths on the local file system and rejects every other
+/// scheme, like a FileIO built without that storage backend.
+#[derive(Debug)]
+struct LocalOnlyProvider(crate::io::FileIO);
+
+#[async_trait::async_trait]
+impl crate::io::FileIOProvider for LocalOnlyProvider {
+    async fn create(&self, path: &str) -> crate::Result<(opendal::Operator, String)> {
+        if path.starts_with("file:") {
+            self.0.create_static(path)
+        } else {
+            Err(Error::ConfigInvalid {
+                message: format!("unsupported storage scheme for {path}"),
+            })
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_unused_specific_fs_root_is_skipped() {
+    let dir = tempfile::tempdir().unwrap();
+    let external = tempfile::tempdir().unwrap();
+    let roots = format!(
+        "s3://unused-bucket/external,file://{}",
+        external.path().display()
+    );
+    let schema = base_schema()
+        .option("data-file.external-paths", roots.as_str())
+        .option("data-file.external-paths.strategy", "specific-fs")
+        .option("data-file.external-paths.specific-fs", "file")
+        .build()
+        .unwrap();
+    let local = FileIOBuilder::new("file").build().unwrap();
+    let file_io = FileIOBuilder::new("file")
+        .with_provider(Arc::new(LocalOnlyProvider(local)))
+        .build()
+        .unwrap();
+    let table = setup_table(
+        &dir,
+        Table::new(
+            file_io,
+            Identifier::new("default", "orphan_table"),
+            format!("file://{}", dir.path().display()),
+            TableSchema::new(0, &schema),
+            None,
+        ),
+    )
+    .await;
+    commit(&table, &[7], "a", false).await;
+    let live = walk_files(external.path());
+    assert_eq!(live.len(), 1, "{live:?}");
+    let orphan = live[0].parent().unwrap().join("data-orphan.parquet");
+    std::fs::write(&orphan, b"orphan").unwrap();
+
+    let result = table
+        .new_remove_orphan_files()
+        .with_current_time_millis(current_time_millis() + 2 * DAY_MS)
+        .execute()
+        .await
+        .unwrap();
+    assert_eq!(result.deleted_file_count, 1, "{:?}", result.deleted_files);
+    assert!(!orphan.exists());
+    assert!(live[0].exists());
+    assert_eq!(read_ids(&table).await, vec![7]);
+}
+
+#[tokio::test]
+async fn test_failed_branch_catalog_lookup_deletes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let seed = setup(&dir, false).await;
+    commit(&seed, &[1], "a", false).await;
+    let snapshot_1 = seed.snapshot_manager().get_snapshot(1).await.unwrap();
+    std::fs::create_dir_all(dir.path().join("branch/branch-b1/schema")).unwrap();
+    std::fs::copy(
+        dir.path().join("schema/schema-0"),
+        dir.path().join("branch/branch-b1/schema/schema-0"),
+    )
+    .unwrap();
+    let (table, server) =
+        rest_table(&seed, snapshot_1, HashMap::from([("b1".to_string(), None)])).await;
+    plant(&dir, &format!("{}/data-orphan.parquet", bucket_dir(&dir)));
+    let before = all_files(dir.path());
+
+    let result = table
+        .new_remove_orphan_files()
+        .with_current_time_millis(current_time_millis() + 2 * DAY_MS)
+        .execute()
+        .await;
+    assert!(result.is_err(), "{result:?}");
+    assert_eq!(all_files(dir.path()), before);
+    server.abort();
 }

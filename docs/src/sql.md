@@ -1170,8 +1170,10 @@ rejected, since nothing references its live files. Candidates are files in the
 root, including the hash directories of the `entropy-inject` strategy), and
 non-snapshot files in snapshot and changelog directories. Files are matched by name against
 everything the snapshots, tags and changelogs of every branch reference. The
-cleanup aborts without deleting anything when a branch has no schema, or when
-a live snapshot references a missing metadata file. Managed BLOB files
+cleanup aborts without deleting anything when a branch has no schema, when a
+catalog snapshot cannot be loaded, or when a live snapshot references a
+missing metadata file. A candidate directory that cannot be listed, such as an
+unused root of the `specific-fs` external-path strategy, is skipped. Managed BLOB files
 (`*.managed.blob`) are never removed, and empty directories are left in place.
 `table => 'db.*'` (every table of a database) is not supported yet.
 
