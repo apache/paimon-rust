@@ -54,10 +54,10 @@ static DATA_FILE_SUFFIX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&format!(r"^{UUID}-[0-9]+\..+$")).expect("valid data file pattern")
 });
 // Other types are routed only under the names Paimon writes; Format Table files may be replaced
-// in place.
+// in place. TableCommit names changelog manifests manifest-{uuid}-changelog-{count}.
 static META_FILE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&format!(
-        r"^(?:(?:manifest|manifest-list|index-manifest|stat)-{UUID}-[0-9]+|manifest-{UUID}-[0-9]+\.avro\.sidecar)$"
+        r"^(?:(?:manifest-list|index-manifest|stat)-{UUID}-[0-9]+|manifest-{UUID}(?:-changelog)?-[0-9]+(?:\.avro\.sidecar)?)$"
     ))
     .expect("valid metadata file pattern")
 });
@@ -754,6 +754,8 @@ mod tests {
             "manifest/manifest-old",
             "manifest/manifest-old.avro.sidecar",
             "manifest/manifest-list-{uuid}-1.avro.sidecar",
+            "manifest/manifest-list-{uuid}-changelog-1",
+            "manifest/manifest-{uuid}-changelog",
             "statistics/stat-old",
             "index/index-old",
             "index/my-global-index.index",
@@ -771,6 +773,10 @@ mod tests {
         );
         let sidecar = "manifest/manifest-{uuid}-0.avro.sidecar";
         assert_type(sidecar, Some(FileType::Meta), &[]);
+        let changelog = "manifest/manifest-{uuid}-changelog-0";
+        assert_type(changelog, Some(FileType::Meta), &[]);
+        let changelog_sidecar = "manifest/manifest-{uuid}-changelog-0.avro.sidecar";
+        assert_type(changelog_sidecar, Some(FileType::Meta), &[]);
         assert_type("statistics/stat-{uuid}-0", Some(FileType::Meta), &[]);
         assert_type(
             "dt=1/bucket-0/data-{uuid}-0.parquet",
