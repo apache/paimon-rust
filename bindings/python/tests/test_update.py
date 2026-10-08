@@ -429,3 +429,40 @@ def test_update_can_transfer_and_be_collected_on_another_thread(tmp_path, kind, 
         finally:
             if enabled:
                 gc.enable()
+
+
+@pytest.mark.parametrize('stream', [False, True])
+def test_prepared_merge_conditions_chunks_and_lazy_literals(tmp_path, stream):
+    context = SQLContext()
+    context.register_catalog('paimon', {'warehouse': str(tmp_path)})
+    context.sql('CREATE SCHEMA paimon.prepared_merge')
+    context.sql("""CREATE TABLE paimon.prepared_merge.t (id INT, value INT) WITH (
+        'row-tracking.enabled' = 'true', 'data-evolution.enabled' = 'true',
+        'deletion-vectors.enabled' = 'true')""")
+    # Separate commits force the clause to consume values across target files.
+    context.sql('INSERT INTO paimon.prepared_merge.t (id, value) VALUES (1, 10)')
+    context.sql('INSERT INTO paimon.prepared_merge.t (id, value) VALUES (2, 20)')
+    table = PaimonCatalog({'warehouse': str(tmp_path)}).get_table('prepared_merge.t')
+    builder = (table.new_stream_write_builder().with_commit_user('prepared-merge')
+               if stream else table.new_batch_write_builder())
+    source = pa.table({'id': [1, 2], 'value': [11, 22]}, schema=pa.schema([
+        ('id', pa.int32()), ('value', pa.int32())]))
+    update = builder.new_update()
+    kwargs = dict(commit_identifier=42) if stream else {}
+    false_clause = dict(delete=False, condition=dict(sql='"s.value" < 0'),
+                        assignments=[('value', 'literal', 'invalid int')])
+    assert update.merge_into(source, on=[('id', 'id')], when_matched=[false_clause],
+                             when_not_matched=[], **kwargs) == []
+    messages = update.merge_into(source, on=[('id', 'id')], when_matched=[
+        dict(delete=False, condition=dict(sql='"s.value" IN (SELECT v FROM (VALUES (11), (22)) AS m(v))'),
+             assignments=[('value', 'literal', pa.chunked_array([[100], [200]]))])],
+        when_not_matched=[], **kwargs)
+    # Preparation leaves the visible snapshot unchanged.
+
+    def rows():
+        return pa.Table.from_batches(context.sql(
+            'SELECT id, value FROM paimon.prepared_merge.t ORDER BY id')).to_pylist()
+    assert rows() == [dict(id=1, value=10), dict(id=2, value=20)]
+    commit = builder.new_commit()
+    commit.commit(42, messages) if stream else commit.commit(messages)
+    assert rows() == [dict(id=1, value=100), dict(id=2, value=200)]

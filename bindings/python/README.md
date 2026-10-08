@@ -108,6 +108,21 @@ print(f"\nRead: {batches_tt[0].num_rows} rows")
 print(batches_tt[0])
 ```
 
+### Prepared MERGE operations
+
+Batch and stream update objects expose `merge_into` to prepare data-evolution
+updates, deletion vectors and inserts without publishing a snapshot. Rust core
+owns matching, ordered action selection and file staging. SQL conditions are
+compiled by the Rust DataFusion adapter. PyPaimon's existing `WhenMatched` and
+`WhenNotMatched` APIs normalize into these core clauses; no Python join runs on
+the native path.
+
+Source NULL keys do not match target NULL keys. Multiple source matches are
+rejected before action conditions, except for a sole unconditional DELETE.
+Self-merge uses the target's pinned row IDs. A later action failure retains files already prepared by earlier actions, even
+when the operation cannot return their messages. Returned messages may only be
+explicitly aborted by a caller that knows publication has been abandoned.
+
 ### Custom Blob URI sources
 
 Before the first Arrow write, call

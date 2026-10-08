@@ -218,6 +218,26 @@ impl TableUpdate {
         writer.prepare_commit().await
     }
 
+    /// Prepare MERGE actions against one target snapshot. Clauses run in order,
+    /// SQL NULL keys do not match, and ambiguous source matches are rejected.
+    pub async fn merge_into(
+        &self,
+        source: super::MergeSource,
+        on: Vec<(String, String)>,
+        when_matched: Vec<super::WhenMatched>,
+        when_not_matched: Vec<super::WhenNotMatched>,
+    ) -> crate::Result<Vec<CommitMessage>> {
+        super::table_merge_into::merge_into(
+            &self.table,
+            &self.commit_user,
+            source,
+            on,
+            when_matched,
+            when_not_matched,
+        )
+        .await
+    }
+
     /// Delete rows by row ID using deletion vectors.
     pub async fn delete_by_row_id(&self, row_ids: Vec<i64>) -> crate::Result<Vec<CommitMessage>> {
         if row_ids.is_empty() {

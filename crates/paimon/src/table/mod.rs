@@ -142,6 +142,9 @@ mod sorted_global_index_options;
 mod source;
 mod stats_filter;
 pub(crate) mod table_commit;
+mod table_merge_into;
+#[cfg(test)]
+mod table_merge_into_tests;
 mod table_read;
 mod table_scan;
 mod table_update;
@@ -219,6 +222,9 @@ pub use source::{
     merge_row_ranges, DataSplit, DataSplitBuilder, DeletionFile, PartitionBucket, Plan, RowRange,
 };
 pub use table_commit::TableCommit;
+pub use table_merge_into::{
+    MergeAssignment, MergeCondition, MergeSource, WhenMatched, WhenNotMatched,
+};
 pub use table_read::{AuditLogRead, TableRead};
 pub use table_scan::{AuditLogScan, TableScan};
 pub use table_update::TableUpdate;
