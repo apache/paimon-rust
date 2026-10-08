@@ -868,7 +868,7 @@ fn assemble_array_to_logical(
             if is_variant_extraction_row(row_type)
                 && (is_variant_storage_array(array)
                     || is_plain_variant_array(array)
-                    || is_dictionary_shredded_variant_array(array)) =>
+                    || is_dictionary_variant_storage_array(array)) =>
         {
             Ok(Some(assemble_variant_extraction_array(array, row_type)?))
         }
@@ -1348,12 +1348,24 @@ fn is_dictionary_metadata(field: &ArrowField) -> bool {
             if key.as_ref() == &ArrowDataType::Int32 && value.as_ref() == &ArrowDataType::Binary)
 }
 
-/// Shredded Variant whose metadata child the Parquet reader kept dictionary-encoded.
-fn is_dictionary_shredded_variant_array(array: &dyn Array) -> bool {
+/// Variant storage, shredded or clipped to `metadata` and `value`, whose metadata the Parquet
+/// reader kept dictionary-encoded; recognized by child names, not by order.
+fn is_dictionary_variant_storage_array(array: &dyn Array) -> bool {
     let ArrowDataType::Struct(fields) = array.data_type() else {
         return false;
     };
-    is_shredded_variant_array(array) && fields.iter().any(|field| is_dictionary_metadata(field))
+    let named = |name: &str| fields.iter().find(|field| field.name() == name);
+    fields.iter().all(|field| {
+        [
+            VARIANT_METADATA_FIELD_NAME,
+            VARIANT_VALUE_FIELD_NAME,
+            VARIANT_TYPED_VALUE_FIELD_NAME,
+        ]
+        .contains(&field.name().as_str())
+    }) && named(VARIANT_METADATA_FIELD_NAME).is_some_and(|field| is_dictionary_metadata(field))
+        && (named(VARIANT_VALUE_FIELD_NAME)
+            .is_some_and(|field| field.data_type() == &ArrowDataType::Binary)
+            || named(VARIANT_TYPED_VALUE_FIELD_NAME).is_some())
 }
 
 /// Turns dictionary-encoded Variant metadata back into Binary for the generic row path.
@@ -2524,6 +2536,60 @@ mod tests {
         let dictionary = with_dictionary_metadata(&input);
         let actual = assemble_variant_extraction_array(&dictionary, &row_type).unwrap();
         assert_eq!(actual.as_ref(), expected.as_ref());
+    }
+
+    #[test]
+    fn dictionary_storage_without_typed_value_is_assembled() {
+        let input = shredded_for_test(
+            &[
+                Some(r#"{"age":27,"rest":"A"}"#),
+                None,
+                Some(r#"{"age":32,"rest":"B"}"#),
+            ],
+            r#"[{"name":"age","type":"INT"}]"#,
+        );
+        // A residual-only extraction reads the shredded root clipped to metadata and value.
+        let keep =
+            |name: &str| name == VARIANT_METADATA_FIELD_NAME || name == VARIANT_VALUE_FIELD_NAME;
+        let (fields, columns, nulls) = input.clone().into_parts();
+        let (fields, columns): (Vec<_>, Vec<_>) = fields
+            .iter()
+            .zip(columns)
+            .filter(|(field, _)| keep(field.name()))
+            .map(|(field, column)| (field.as_ref().clone(), column))
+            .unzip();
+        let clipped = StructArray::try_new(fields.into(), columns, nulls).unwrap();
+        let dictionary = with_dictionary_metadata(&clipped);
+        assert!(is_dictionary_variant_storage_array(&dictionary));
+        let (row_type, metadata) =
+            extraction_for_test(&[(DataType::VarChar(VarCharType::string_type()), "$.rest")]);
+        let read_fields = vec![DataField::new(
+            1,
+            "v".to_string(),
+            DataType::Row(row_type.clone()),
+        )];
+        let batch = RecordBatch::try_new(
+            Arc::new(arrow_schema::Schema::new(vec![ArrowField::new(
+                "v",
+                dictionary.data_type().clone(),
+                true,
+            )])),
+            vec![Arc::new(dictionary)],
+        )
+        .unwrap();
+        let assembled = assemble_shredded_variant_batch(batch, &read_fields).unwrap();
+        let expected =
+            assemble_row_wise_variant_extraction(&clipped, row_type.fields(), &metadata).unwrap();
+        assert_eq!(assembled.column(0).as_ref(), expected.as_ref());
+        let rest = expected.as_any().downcast_ref::<StructArray>().unwrap();
+        let rest = rest
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(rest.value(0), "A");
+        assert!(rest.is_null(1));
+        assert_eq!(rest.value(2), "B");
     }
 
     #[test]
