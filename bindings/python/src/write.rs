@@ -592,11 +592,18 @@ impl UpdateContext {
         when_not_matched: &Bound<'_, PyAny>,
     ) -> PyResult<Vec<PyCommitMessage>> {
         let source = match source {
-            Some(source) => paimon::table::MergeSource::Batches(arrow_table_batches(source)?),
+            Some(source) => match source.extract::<PyRef<crate::table::PyTable>>() {
+                Ok(table) => paimon::table::MergeSource::Table(table.inner.clone()),
+                Err(_) => paimon::table::MergeSource::Batches(arrow_table_batches(source)?),
+            },
             None => paimon::table::MergeSource::SelfTable,
         };
         let source_schema = match &source {
             paimon::table::MergeSource::Batches(batches) => batches[0].schema(),
+            paimon::table::MergeSource::Table(table) => {
+                paimon::arrow::build_target_arrow_schema(table.schema().fields())
+                    .map_err(to_py_err)?
+            }
             paimon::table::MergeSource::SelfTable => {
                 let schema = paimon::arrow::build_target_arrow_schema(self.table.schema().fields())
                     .map_err(to_py_err)?;

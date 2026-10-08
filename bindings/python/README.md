@@ -123,6 +123,12 @@ Self-merge uses the target's pinned row IDs. A later action failure retains file
 when the operation cannot return their messages. Returned messages may only be
 explicitly aborted by a caller that knows publication has been abandoned.
 
+The source may also be a native `Table`. Core resolves its branch and snapshot
+selectors once, projects the source keys and referenced columns, and reads the
+logical rows through the ordinary reader, including primary-key merge engines.
+The source does not require data evolution or row tracking. Arrow batches keep
+their chunk boundaries; matching gathers only the contributing source chunks.
+
 ### Custom Blob URI sources
 
 Before the first Arrow write, call
