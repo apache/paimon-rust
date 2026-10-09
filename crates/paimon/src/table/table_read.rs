@@ -1192,36 +1192,29 @@ impl<'a> PaimonTableRead<'a> {
                 .intersection(&view_fields)
                 .cloned()
                 .collect();
-        let resolve_predicate_views =
-            resolve_views && core_options.blob_as_descriptor() && !predicate_views.is_empty();
+        let resolve_predicate_views = resolve_views && !predicate_views.is_empty();
         let mut output_views = view_fields.clone();
         if resolve_predicate_views {
             output_views.retain(|field| !predicate_views.contains(field));
         }
-        // Descriptor mode still translates view references to upstream
-        // descriptors. Query predicates must see those logical values.
+        // User predicates see resolved descriptors or payloads, after authorization.
         let stream = match self.table.rest_env().filter(|_| resolve_predicate_views) {
             Some(env) => super::data_evolution_reader::resolve_blob_view_stream(
                 stream,
                 predicate_views,
                 env.clone(),
+                core_options.blob_as_descriptor(),
+                self.blob_parallelism,
             ),
             None => stream,
         };
-        let mut payload_options = self.table.schema().options().clone();
-        if resolve_views {
-            let mut descriptors = core_options.blob_descriptor_fields();
-            descriptors.extend(view_fields.iter().cloned());
-            let mut descriptors: Vec<_> = descriptors.into_iter().collect();
-            descriptors.sort_unstable();
-            payload_options.insert("blob-descriptor-field".to_string(), descriptors.join(","));
-        }
-        let payload_options = CoreOptions::new(&payload_options);
+        // Resolving views owns their upstream FileIO, including REST tokens.
+        // The ordinary Blob plan must not decode those payloads a second time.
         let blob_plan = ManagedBlobReadPlan::new(
             &self.read_type,
             &self.data_predicates,
             self.table.schema().fields(),
-            &payload_options,
+            core_options,
         );
         let stream = match &blob_plan {
             Some(plan) => {
@@ -1276,13 +1269,15 @@ impl<'a> PaimonTableRead<'a> {
                 stream,
                 output_views,
                 env.clone(),
+                core_options.blob_as_descriptor(),
+                self.blob_parallelism,
             ),
             None => stream,
         };
         Ok(match blob_plan {
             Some(plan) => plan.finish(
                 stream,
-                &payload_options,
+                core_options,
                 self.table.file_io.clone(),
                 self.blob_parallelism,
                 self.limit,
@@ -1290,7 +1285,7 @@ impl<'a> PaimonTableRead<'a> {
             None => resolve_primary_key_blob_stream(
                 stream,
                 &self.read_type,
-                &payload_options,
+                core_options,
                 self.table.file_io.clone(),
                 self.blob_parallelism,
                 None,

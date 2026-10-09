@@ -204,6 +204,31 @@ impl RESTEnv {
         &self.uuid
     }
 
+    /// Attach Java's outermost table identity to dependency requests. The
+    /// dependency client is separate so ordinary requests retain their headers.
+    pub(crate) async fn for_dependency_reads(&self) -> Result<Self> {
+        let key = format!("{}{}", RESTApi::HEADER_PREFIX, RESTApi::READ_VIA_HEADER);
+        let mut options = self.api.options().clone();
+        if options.get(&key).is_some() {
+            return Ok(self.clone());
+        }
+        let identifier =
+            serde_json::to_string(&self.identifier).map_err(|error| Error::DataInvalid {
+                message: "Cannot serialize dependency read identifier".to_string(),
+                source: Some(Box::new(error)),
+            })?;
+        options.set(
+            key,
+            crate::api::rest_util::RESTUtil::encode_string(&identifier),
+        );
+        let api = Arc::new(RESTApi::new(options.clone(), false).await?);
+        Ok(Self {
+            api,
+            options,
+            ..self.clone()
+        })
+    }
+
     /// Load a table through the same REST catalog environment.
     pub async fn get_table(&self, identifier: &Identifier) -> Result<Table> {
         Self::load_table(
@@ -602,6 +627,67 @@ mod tests {
     use super::*;
     use crate::common::CatalogOptions;
     use crate::io::cache::create_local_cache;
+
+    #[tokio::test]
+    async fn dependency_reads_preserve_the_outermost_identifier_and_catalog_options() {
+        let table = crate::table::rest_query_auth_table().await;
+        let mut env = table.rest_env().unwrap().clone();
+        env.identifier = Identifier::new("db 空格", "root$branch_dev");
+        let mut options = env.api.options().clone();
+        options.set("prefix", "configured-prefix");
+        options.set("header.X-Custom", "kept");
+        env.api = Arc::new(RESTApi::new(options, false).await.unwrap());
+        // The API has the merged server configuration, while env.options can
+        // still be the original catalog options.
+        let dependency = env.for_dependency_reads().await.unwrap();
+        let key = "header.X-Paimon-Read-Via";
+        assert!(env.api.options().get(key).is_none());
+        assert!(!Arc::ptr_eq(&env.api, &dependency.api));
+        assert_eq!(
+            dependency.api.options().get("prefix").unwrap(),
+            "configured-prefix"
+        );
+        assert_eq!(
+            dependency.api.options().get("header.X-Custom").unwrap(),
+            "kept"
+        );
+        let decoded =
+            crate::api::RESTUtil::decode_string(dependency.api.options().get(key).unwrap());
+        assert_eq!(
+            decoded,
+            r#"{"database":"db 空格","object":"root$branch_dev"}"#
+        );
+        let mut nested = dependency.clone();
+        nested.identifier = Identifier::new("other", "middle");
+        let nested = nested.for_dependency_reads().await.unwrap();
+        assert!(Arc::ptr_eq(&dependency.api, &nested.api));
+        assert_eq!(
+            nested.api.options().get(key),
+            dependency.api.options().get(key)
+        );
+    }
+
+    #[tokio::test]
+    async fn dependency_reads_preserve_an_explicit_read_via() {
+        let table = crate::table::rest_query_auth_table().await;
+        let mut env = table.rest_env().unwrap().clone();
+        let mut options = env.api.options().clone();
+        options.set(
+            "header.X-Paimon-Read-Via",
+            "an-already-encoded-outermost-table",
+        );
+        env.api = Arc::new(RESTApi::new(options, false).await.unwrap());
+        let dependency = env.for_dependency_reads().await.unwrap();
+        assert!(Arc::ptr_eq(&env.api, &dependency.api));
+        assert_eq!(
+            dependency
+                .api
+                .options()
+                .get("header.X-Paimon-Read-Via")
+                .unwrap(),
+            "an-already-encoded-outermost-table"
+        );
+    }
 
     #[tokio::test]
     async fn test_rest_env_clones_catalog_local_cache() {

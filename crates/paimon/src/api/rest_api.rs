@@ -104,6 +104,7 @@ pub struct RESTApi {
 
 impl RESTApi {
     // Constants for query parameters and headers
+    pub const READ_VIA_HEADER: &'static str = "X-Paimon-Read-Via";
     pub const HEADER_PREFIX: &'static str = "header.";
     pub const MAX_RESULTS: &'static str = "maxResults";
     pub const PAGE_TOKEN: &'static str = "pageToken";
