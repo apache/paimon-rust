@@ -877,6 +877,21 @@ pub struct PyTableUpdateByRowId {
 
 #[pymethods]
 impl PyTableUpdateByRowId {
+    fn _with_blob_uri_reader_factory(
+        &mut self,
+        py: Python<'_>,
+        factory: Option<Py<PyAny>>,
+    ) -> PyResult<()> {
+        let factory = factory
+            .map(|factory| {
+                PythonUriReaderFactory::new(factory, py)
+                    .map(|factory| Arc::new(factory) as Arc<dyn paimon::io::UriReaderFactory>)
+            })
+            .transpose()?;
+        self.inner.with_blob_uri_reader_factory(factory);
+        Ok(())
+    }
+
     fn update_columns(
         &mut self,
         py: Python<'_>,
@@ -886,7 +901,7 @@ impl PyTableUpdateByRowId {
         let batches = arrow_table_batches(data)?;
         let messages = py
             .detach(|| runtime().block_on(self.inner.update_columns(batches, column_names)))
-            .map_err(to_py_err)?;
+            .map_err(to_callback_error)?;
         Ok(wrap_messages(
             messages,
             &self.table_location,

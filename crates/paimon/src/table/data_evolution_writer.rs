@@ -36,10 +36,10 @@ use crate::table::commit_message::CommitMessage;
 use crate::table::data_file_index_writer::FileIndexOptions;
 use crate::table::data_file_writer::DataFileWriter;
 use crate::table::index_file_path::IndexFileLocation;
-use crate::table::source::data_evolution_anchor_file;
+use crate::table::source::{data_evolution_anchor_file, is_data_evolution_normal_file};
 use crate::table::stats_filter::group_by_overlapping_row_id;
 use crate::table::Table;
-use crate::table::{DataSplit, DataSplitBuilder};
+use crate::table::{DataSplit, DataSplitBuilder, RowRange};
 use crate::Result;
 use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, StructArray};
 use arrow_buffer::NullBuffer;
@@ -53,6 +53,9 @@ use roaring::RoaringBitmap;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use uuid::Uuid;
+
+#[path = "data_evolution_blob.rs"]
+mod blob_updates;
 
 const DELETION_VECTORS_INDEX_TYPE: &str = "DELETION_VECTORS";
 const DELETION_VECTORS_INDEX_VERSION_V1: u8 = 1;
@@ -81,6 +84,7 @@ pub struct DataEvolutionWriter {
     matched_batches: Vec<RecordBatch>,
     matched_batch_groups: Vec<usize>,
     next_group_id: usize,
+    blob_uri_reader_factory: Option<Arc<dyn crate::io::UriReaderFactory>>,
 }
 
 impl DataEvolutionWriter {
@@ -148,9 +152,7 @@ impl DataEvolutionWriter {
             });
         }
         let partition_keys = schema.partition_keys();
-        // Java CoreOptions.updatableBlobFields() includes descriptor and view
-        // fields, both of which store their references in normal data files.
-        let updatable_blob_fields = core_options.blob_inline_fields();
+        let video_fields = core_options.video_frame_fields();
         for col in &update_columns {
             let top_level = DataEvolutionPartialWriter::top_level_write_name(col, schema.fields());
             if !allow_partition_columns && partition_keys.iter().any(|key| key == top_level) {
@@ -158,17 +160,10 @@ impl DataEvolutionWriter {
                     message: format!("Cannot update partition column '{col}' in MERGE INTO"),
                 });
             }
-            if let Some(field) = schema.fields().iter().find(|f| f.name() == top_level) {
-                if field.data_type().is_blob_file_field()
-                    && !updatable_blob_fields.contains(top_level)
-                {
-                    return Err(crate::Error::Unsupported {
-                        message: format!(
-                            "Cannot update raw-data BLOB column '{col}' in MERGE INTO. \
-                             Only inline BLOB columns listed in 'blob-descriptor-field' or 'blob-view-field' can be updated"
-                        ),
-                    });
-                }
+            if video_fields.contains(top_level) {
+                return Err(crate::Error::Unsupported {
+                    message: format!("Updating packed VIDEO column '{col}' is not supported"),
+                });
             }
         }
 
@@ -180,7 +175,15 @@ impl DataEvolutionWriter {
             matched_batches: Vec::new(),
             matched_batch_groups: Vec::new(),
             next_group_id: 1,
+            blob_uri_reader_factory: None,
         })
+    }
+
+    pub(super) fn with_blob_uri_reader_factory(
+        &mut self,
+        factory: Option<Arc<dyn crate::io::UriReaderFactory>>,
+    ) {
+        self.blob_uri_reader_factory = factory;
     }
 
     fn validate_partition_values(
@@ -351,6 +354,14 @@ impl DataEvolutionWriter {
 
         // 3. For each affected file: read original columns, apply updates, write partial files
         let mut writer = DataEvolutionPartialWriter::new(&self.table, self.update_columns.clone())?;
+        writer.blob_uri_reader_factory = self.blob_uri_reader_factory.clone();
+        let inline = CoreOptions::new(self.table.schema().options()).blob_inline_fields();
+        let normal_fields = self
+            .write_fields
+            .iter()
+            .filter(|field| !blob_updates::is_dedicated_blob(field, &inline))
+            .cloned()
+            .collect::<Vec<_>>();
 
         let result = async {
             for (&file_pos, matched_rows) in &file_matches {
@@ -358,22 +369,63 @@ impl DataEvolutionWriter {
                 let first_row_id = file_range.first_row_id;
                 let row_count = file_range.row_count as usize;
 
+                let mut sorted_matches: Vec<(usize, usize, usize)> = matched_rows
+                    .iter()
+                    .map(|m| (m.offset, m.batch_idx, m.row_idx))
+                    .collect();
+                sorted_matches.sort_by_key(|(offset, _, _)| *offset);
+                if sorted_matches.windows(2).any(|rows| rows[0].0 == rows[1].0) {
+                    return Err(crate::Error::DataInvalid {
+                        message: "Multiple updates target the same row ID".to_string(),
+                        source: None,
+                    });
+                }
+                let blobs = blob_updates::file_updates(
+                    &self.table,
+                    &self.write_fields,
+                    &self.matched_batches,
+                    &sorted_matches,
+                    file_range,
+                )
+                .await?;
+                if normal_fields.is_empty() {
+                    for blob in blobs {
+                        writer
+                            .write_blob_batch(
+                                file_range,
+                                &blob.field,
+                                blob.batch,
+                                blob.updated_rows,
+                            )
+                            .await?;
+                    }
+                    continue;
+                }
+
                 // Read original columns from the entire file group (base + partial-column files).
-                let col_refs: Vec<&str> = self.write_fields.iter().map(DataField::name).collect();
+                let mut col_refs: Vec<&str> = normal_fields.iter().map(DataField::name).collect();
+                // Anchor row counts even when all ordinary SET columns were
+                // added after the original files were written.
+                col_refs.push("_ROW_ID");
                 let mut rb = read_table.new_read_builder();
                 rb.with_projection(&col_refs)?;
+                rb.with_row_ranges(vec![RowRange::new(
+                    file_range.first_row_id,
+                    file_range.last_row_id,
+                )]);
                 let read = rb.new_read()?;
 
                 // Base + partial-column files share row-id ranges, so physical
                 // row counts overcount the group's logical rows.
+                let read_files = blob_updates::normal_read_files(&file_range.files);
                 let split = DataSplitBuilder::new()
                     .with_snapshot(file_range.snapshot_id)
                     .with_partition(BinaryRow::from_serialized_bytes(&file_range.partition)?)
                     .with_bucket(file_range.bucket)
                     .with_bucket_path(file_range.bucket_path.clone())
                     .with_total_buckets(file_range.total_buckets)
-                    .with_data_files(file_range.files.clone())
-                    .with_raw_convertible(file_range.files.len() == 1)
+                    .with_raw_convertible(read_files.len() == 1)
+                    .with_data_files(read_files)
                     .build()?;
 
                 let stream = read.to_arrow(&[split])?;
@@ -405,19 +457,7 @@ impl DataEvolutionWriter {
 
                 // Keep one physical ROW column per top-level field, even when the
                 // update names identify several nested leaves of that ROW.
-                let mut sorted_matches: Vec<(usize, usize, usize)> = matched_rows
-                    .iter()
-                    .map(|m| (m.offset, m.batch_idx, m.row_idx))
-                    .collect();
-                sorted_matches.sort_by_key(|(offset, _, _)| *offset);
-                if sorted_matches.windows(2).any(|rows| rows[0].0 == rows[1].0) {
-                    return Err(crate::Error::DataInvalid {
-                        message: "Multiple updates target the same row ID".to_string(),
-                        source: None,
-                    });
-                }
-                let new_columns = self
-                    .write_fields
+                let new_columns = normal_fields
                     .iter()
                     .enumerate()
                     .map(|(index, field)| {
@@ -431,7 +471,7 @@ impl DataEvolutionWriter {
                         )
                     })
                     .collect::<Result<Vec<_>>>()?;
-                let write_schema = crate::arrow::build_target_arrow_schema(&self.write_fields)?;
+                let write_schema = crate::arrow::build_target_arrow_schema(&normal_fields)?;
                 let updated_batch =
                     RecordBatch::try_new(write_schema, new_columns).map_err(|e| {
                         crate::Error::DataInvalid {
@@ -449,6 +489,11 @@ impl DataEvolutionWriter {
                         updated_batch,
                     )
                     .await?;
+                for blob in blobs {
+                    writer
+                        .write_blob_batch(file_range, &blob.field, blob.batch, blob.updated_rows)
+                        .await?;
+                }
             }
 
             // 4. Collect commit messages (caller is responsible for committing)
@@ -585,7 +630,7 @@ impl DataEvolutionDeleteWriter {
                 .cloned()
                 .collect::<Vec<_>>();
 
-            for group in group_by_overlapping_row_id(files) {
+            for group in group_by_normal_row_id(files) {
                 let anchor = data_evolution_anchor_file(&group)?;
                 let first_row_id =
                     anchor
@@ -1232,18 +1277,23 @@ impl RowIdFileIndex {
                 .cloned()
                 .collect();
 
-            let groups = group_by_overlapping_row_id(all_files);
+            let groups = group_by_normal_row_id(all_files);
             for group in groups {
                 // Compute the overall row_id range for this group.
                 // The base file has the widest range; partial-column files share it.
-                let first_row_id = group.iter().filter_map(|f| f.first_row_id).min().unwrap();
+                let normal = group
+                    .iter()
+                    .filter(|file| is_data_evolution_normal_file(file))
+                    .collect::<Vec<_>>();
+                let first_row_id = normal.iter().filter_map(|f| f.first_row_id).min().unwrap();
                 let last_row_id = group
                     .iter()
+                    .filter(|file| is_data_evolution_normal_file(file))
                     .filter_map(|f| f.row_id_range().map(|(_, end)| end))
                     .max()
                     .unwrap();
                 // The actual row count is the max among the group (base file's count).
-                let row_count = group.iter().map(|f| f.row_count).max().unwrap();
+                let row_count = normal.iter().map(|f| f.row_count).max().unwrap();
 
                 file_index.push(FileRowRange {
                     first_row_id,
@@ -1284,6 +1334,38 @@ impl RowIdFileIndex {
     }
 }
 
+/// Dedicated column files can cross normal-file boundaries. They provide
+/// values, but must not merge anchors or introduce otherwise absent row IDs.
+fn group_by_normal_row_id(files: Vec<DataFileMeta>) -> Vec<Vec<DataFileMeta>> {
+    let (normal, dedicated): (Vec<_>, Vec<_>) =
+        files.into_iter().partition(is_data_evolution_normal_file);
+    group_by_overlapping_row_id(normal)
+        .into_iter()
+        .map(|mut group| {
+            let first = group
+                .iter()
+                .filter_map(|file| file.first_row_id)
+                .min()
+                .unwrap();
+            let last = group
+                .iter()
+                .filter_map(|file| file.row_id_range().map(|(_, last)| last))
+                .max()
+                .unwrap();
+            group.extend(
+                dedicated
+                    .iter()
+                    .filter(|file| {
+                        file.row_id_range()
+                            .is_some_and(|(from, to)| from <= last && to >= first)
+                    })
+                    .cloned(),
+            );
+            group
+        })
+        .collect()
+}
+
 struct FileRowRange {
     first_row_id: i64,
     last_row_id: i64,
@@ -1304,7 +1386,7 @@ struct MatchedRow {
 }
 
 // ---------------------------------------------------------------------------
-// DataEvolutionPartialWriter — writes partial-column parquet files for data evolution
+// DataEvolutionPartialWriter — writes partial-column data evolution files
 // ---------------------------------------------------------------------------
 
 /// Key: (partition_bytes, bucket, first_row_id)
@@ -1324,6 +1406,8 @@ type PartialCommitGroup = (Option<i64>, Vec<DataFileMeta>);
 /// `file_source = APPEND (0)`, caller-supplied `first_row_id`, and `write_cols`.
 /// VECTOR columns use dedicated `*.vector.<format>` files when `vector.file.format`
 /// is configured.
+/// Raw BLOB, ARRAY<BLOB> and MAP<X, BLOB> columns use dedicated `*.blob`
+/// files with Java's placeholder tags for unchanged rows.
 pub(crate) struct DataEvolutionPartialWriter {
     file_io: FileIO,
     table_location: String,
@@ -1338,12 +1422,14 @@ pub(crate) struct DataEvolutionPartialWriter {
     /// Writers keyed by (partition_bytes, bucket, first_row_id, file kind).
     writers: HashMap<WriterKey, DataFileWriter>,
     check_from_snapshots: HashMap<WriterBaseKey, i64>,
+    blob_uri_reader_factory: Option<Arc<dyn crate::io::UriReaderFactory>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum PartialFileKind {
     Normal,
     Vector,
+    Blob(i32),
 }
 
 #[derive(Clone)]
@@ -1354,7 +1440,6 @@ struct PartialWriteSet {
     write_fields: Vec<DataField>,
     write_columns: Vec<String>,
     omit_write_cols: bool,
-    column_indices: Vec<usize>,
     schema: Arc<arrow_schema::Schema>,
     file_index_options: Option<Arc<FileIndexOptions>>,
 }
@@ -1383,10 +1468,16 @@ impl DataEvolutionPartialWriter {
                 .as_ref()
                 .and_then(|options| options.project_to_fields(&write_set.write_fields))
                 .map(Arc::new);
-            if write_set.kind == PartialFileKind::Vector && write_set.file_index_options.is_some() {
+            if write_set.kind != PartialFileKind::Normal && write_set.file_index_options.is_some() {
+                let kind = if write_set.kind == PartialFileKind::Vector {
+                    "VECTOR"
+                } else {
+                    "BLOB"
+                };
                 return Err(crate::Error::Unsupported {
-                    message: "FileIndex generation does not support dedicated VECTOR partial files"
-                        .to_string(),
+                    message: format!(
+                        "FileIndex generation does not support dedicated {kind} partial files"
+                    ),
                 });
             }
         }
@@ -1410,6 +1501,7 @@ impl DataEvolutionPartialWriter {
             write_sets,
             writers: HashMap::new(),
             check_from_snapshots: HashMap::new(),
+            blob_uri_reader_factory: None,
         })
     }
 
@@ -1437,17 +1529,19 @@ impl DataEvolutionPartialWriter {
         )?;
         let projected = super::data_evolution_fields::project_by_paths(fields, write_columns)?;
         let mut normal_fields = Vec::new();
-        let mut normal_indices = Vec::new();
         let mut vector_fields = Vec::new();
-        let mut vector_indices = Vec::new();
+        let inline = core_options.blob_inline_fields();
+        let mut blob_fields = Vec::new();
 
-        for (idx, field) in projected.into_iter().enumerate() {
-            if vector_file_format.is_some() && matches!(field.data_type(), DataType::Vector(_)) {
+        for field in projected {
+            if blob_updates::is_dedicated_blob(&field, &inline) {
+                blob_fields.push(field);
+            } else if vector_file_format.is_some()
+                && matches!(field.data_type(), DataType::Vector(_))
+            {
                 vector_fields.push(field);
-                vector_indices.push(idx);
             } else {
                 normal_fields.push(field);
-                normal_indices.push(idx);
             }
         }
 
@@ -1484,7 +1578,6 @@ impl DataEvolutionPartialWriter {
                     core_options,
                 ),
                 write_columns: normal_columns,
-                column_indices: normal_indices,
                 schema,
                 file_index_options: None,
             });
@@ -1500,12 +1593,24 @@ impl DataEvolutionPartialWriter {
                 write_fields: vector_fields,
                 write_columns: vector_columns,
                 omit_write_cols: false,
-                column_indices: vector_indices,
                 schema,
                 file_index_options: None,
             });
         }
 
+        for field in blob_fields {
+            let schema = crate::arrow::build_target_arrow_schema(std::slice::from_ref(&field))?;
+            write_sets.push(PartialWriteSet {
+                kind: PartialFileKind::Blob(field.id()),
+                target_file_size: core_options.blob_target_file_size(),
+                file_format: "blob".to_string(),
+                write_columns: vec![field.name().to_string()],
+                write_fields: vec![field],
+                omit_write_cols: false,
+                schema,
+                file_index_options: None,
+            });
+        }
         Ok(write_sets)
     }
 
@@ -1547,6 +1652,9 @@ impl DataEvolutionPartialWriter {
         };
 
         for write_set in self.write_sets.clone() {
+            if matches!(write_set.kind, PartialFileKind::Blob(_)) {
+                continue;
+            }
             let key = (
                 partition_bytes.clone(),
                 bucket,
@@ -1554,33 +1662,8 @@ impl DataEvolutionPartialWriter {
                 write_set.kind,
             );
             if !self.writers.contains_key(&key) {
-                let writer = DataFileWriter::new(
-                    self.file_io.clone(),
-                    self.table_location.clone(),
-                    partition_path.clone(),
-                    bucket,
-                    self.schema_id,
-                    write_set.target_file_size,
-                    self.file_compression.clone(),
-                    self.file_compression_zstd_level,
-                    self.write_buffer_size,
-                    write_set.file_format.clone(),
-                    write_set.write_fields.clone(),
-                    self.format_options.clone(),
-                    Some(0), // file_source: APPEND
-                    Some(first_row_id),
-                    (!write_set.omit_write_cols).then(|| write_set.write_columns.clone()),
-                )?
-                .with_file_index(write_set.file_index_options.clone());
-                let writer = if self
-                    .write_sets
-                    .iter()
-                    .any(|set| set.kind == PartialFileKind::Vector)
-                {
-                    writer.without_row_sidecar()
-                } else {
-                    writer
-                };
+                let writer =
+                    self.new_file_writer(&write_set, partition_path.clone(), bucket, first_row_id)?;
                 self.writers.insert(key.clone(), writer);
             }
 
@@ -1592,12 +1675,104 @@ impl DataEvolutionPartialWriter {
         Ok(())
     }
 
+    async fn write_blob_batch(
+        &mut self,
+        file: &FileRowRange,
+        field: &DataField,
+        batch: RecordBatch,
+        updated_rows: Option<Vec<usize>>,
+    ) -> Result<()> {
+        let write_set = self
+            .write_sets
+            .iter()
+            .find(|set| set.kind == PartialFileKind::Blob(field.id()))
+            .expect("dedicated Blob field has a physical write set")
+            .clone();
+        let base_key = (file.partition.clone(), file.bucket, file.first_row_id);
+        self.check_from_snapshots
+            .entry(base_key)
+            .or_insert(file.snapshot_id);
+        let key = (
+            file.partition.clone(),
+            file.bucket,
+            file.first_row_id,
+            write_set.kind,
+        );
+        if !self.writers.contains_key(&key) {
+            let partition_path = if self.partition_keys.is_empty() {
+                String::new()
+            } else {
+                self.partition_computer
+                    .generate_partition_path(&BinaryRow::from_serialized_bytes(&file.partition)?)?
+            };
+            let mut writer =
+                self.new_file_writer(&write_set, partition_path, file.bucket, file.first_row_id)?;
+            if let Some(rows) = updated_rows {
+                writer.set_blob_update_rows(rows, self.blob_uri_reader_factory.clone())?;
+            } else if self.blob_uri_reader_factory.is_some() {
+                writer.set_blob_writer_options(None, self.blob_uri_reader_factory.clone())?;
+            }
+            self.writers.insert(key.clone(), writer);
+        }
+        let writer = self.writers.get_mut(&key).unwrap();
+        // Dedicated Blob writers check payload bytes after each record.
+        for row in 0..batch.num_rows() {
+            writer.write(&batch.slice(row, 1)).await?;
+        }
+        Ok(())
+    }
+
+    fn new_file_writer(
+        &self,
+        write_set: &PartialWriteSet,
+        partition_path: String,
+        bucket: i32,
+        first_row_id: i64,
+    ) -> Result<DataFileWriter> {
+        let writer = DataFileWriter::new(
+            self.file_io.clone(),
+            self.table_location.clone(),
+            partition_path,
+            bucket,
+            self.schema_id,
+            write_set.target_file_size,
+            self.file_compression.clone(),
+            self.file_compression_zstd_level,
+            self.write_buffer_size,
+            write_set.file_format.clone(),
+            write_set.write_fields.clone(),
+            self.format_options.clone(),
+            Some(0),
+            Some(first_row_id),
+            (!write_set.omit_write_cols).then(|| write_set.write_columns.clone()),
+        )?
+        .with_file_index(write_set.file_index_options.clone());
+        Ok(
+            if self
+                .write_sets
+                .iter()
+                .any(|set| set.kind == PartialFileKind::Vector)
+            {
+                writer.without_row_sidecar()
+            } else {
+                writer
+            },
+        )
+    }
+
     fn project_batch(batch: &RecordBatch, write_set: &PartialWriteSet) -> Result<RecordBatch> {
         let columns: Vec<ArrayRef> = write_set
-            .column_indices
+            .write_fields
             .iter()
-            .map(|&idx| batch.column(idx).clone())
-            .collect();
+            .map(|field| {
+                batch.column_by_name(field.name()).cloned().ok_or_else(|| {
+                    crate::Error::DataInvalid {
+                        message: format!("Missing data-evolution write column '{}'", field.name()),
+                        source: None,
+                    }
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
         RecordBatch::try_new(write_set.schema.clone(), columns).map_err(|e| {
             crate::Error::DataInvalid {
                 message: format!(
@@ -1626,7 +1801,10 @@ impl DataEvolutionPartialWriter {
 
         // Group files by (partition, bucket) since multiple first_row_ids may share the same partition/bucket
         let mut grouped: HashMap<(Vec<u8>, i32), PartialCommitGroup> = HashMap::new();
-        for ((partition_bytes, bucket, first_row_id, _kind), files) in results {
+        for ((partition_bytes, bucket, first_row_id, kind), mut files) in results {
+            if matches!(kind, PartialFileKind::Blob(_)) {
+                blob_updates::assign_delta_metadata(first_row_id, &mut files);
+            }
             let base_key = (partition_bytes.clone(), bucket, first_row_id);
             let check_from_snapshot = check_from_snapshots.get(&base_key).copied();
             let entry = grouped
@@ -2719,6 +2897,25 @@ mod tests {
         assert_eq!(first_row_id, 0);
         assert_eq!(last_row_id, 99);
         assert_eq!(row_count, 100);
+    }
+
+    #[test]
+    fn dedicated_ranges_attach_to_normal_anchors_without_bridging_gaps() {
+        let groups = group_by_normal_row_id(vec![
+            make_test_file_meta("first.parquet", 2, Some(0), 1, None),
+            make_test_file_meta("second.parquet", 2, Some(4), 1, None),
+            make_test_file_meta("payload.blob", 8, Some(0), 1, Some(vec!["payload".into()])),
+            make_test_file_meta("other.blob", 1, Some(10), 1, Some(vec!["payload".into()])),
+        ]);
+        assert_eq!(groups.len(), 2);
+        for (group, expected) in groups.iter().zip([(0, 1), (4, 5)]) {
+            assert_eq!(group.len(), 2);
+            assert_eq!(
+                data_evolution_anchor_file(group).unwrap().row_id_range(),
+                Some(expected)
+            );
+            assert_eq!(group[1].file_name, "payload.blob");
+        }
     }
 
     #[tokio::test]
