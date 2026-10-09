@@ -86,9 +86,6 @@ impl Rules {
                         "the server masks '{column}', which is not a column"
                     ))
                 })?;
-            if fields[target].data_type().is_blob_file_field() {
-                return Err(unsupported("BLOB column masks are not supported yet"));
-            }
             let transform = Transform::from_rest_json(json, fields).map_err(|e| {
                 unsupported(&format!(
                     "cannot parse the server's mask on '{column}': {e}"
@@ -812,31 +809,6 @@ mod tests {
         // One bad entry spoils the list.
         let good = leaf("EQUAL", "id", "[1]");
         assert!(refusal(parse(&[&good, ""], &[], &fields)).contains("empty row filter"));
-    }
-
-    #[test]
-    fn test_blob_masks_are_not_supported_yet() {
-        use crate::spec::{ArrayType, BlobType, MapType};
-
-        let blob = DataType::Blob(BlobType::new());
-        for data_type in [
-            blob.clone(),
-            DataType::Array(ArrayType::new(blob.clone())),
-            DataType::Map(MapType::new(string(), blob)),
-        ] {
-            let fields = vec![field(0, "payload", data_type.clone())];
-            for mask in [
-                NULL.to_string(),
-                field_ref("payload"),
-                cast("payload", &data_type.to_string()),
-            ] {
-                let message = refusal(parse(&[], &[("payload", &mask)], &fields));
-                assert!(
-                    message.contains("BLOB column masks are not supported yet"),
-                    "{message}"
-                );
-            }
-        }
     }
 
     #[test]

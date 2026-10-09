@@ -1225,6 +1225,40 @@ async fn test_blob_view_limit_only_resolves_selected_references() {
     );
     assert_eq!(ids(&read_all(&filtered).await.unwrap()), vec![1]);
 
+    // Masked views resolve once when their values are read.
+    for (mask, expected) in [
+        (serde_json::json!({"name": "NULL"}), vec![None, None, None]),
+        (
+            field_ref_mask(2, "picture", "BLOB"),
+            vec![Some(first_payload.clone()), None, Some(b"bob".to_vec())],
+        ),
+    ] {
+        server.set_auth_response(
+            "default",
+            "blob_view_target",
+            rules(&[int_leaf(0, "id", "LESS_THAN", 4)], &[("picture", mask)]),
+        );
+        let rows = collect_blob_rows(&read_all(&authorized.new_read_builder()).await.unwrap());
+        assert_eq!(
+            rows.into_iter().map(|row| row.2).collect::<Vec<_>>(),
+            expected
+        );
+        let mut filtered = authorized.new_read_builder();
+        filtered.with_projection(&["id"]).unwrap().with_filter(
+            PredicateBuilder::new(authorized.schema().fields())
+                .equal("picture", Datum::Bytes(first_payload.clone()))
+                .unwrap(),
+        );
+        assert_eq!(
+            ids(&read_all(&filtered).await.unwrap()),
+            if expected[0].is_some() {
+                vec![1]
+            } else {
+                vec![]
+            },
+        );
+    }
+
     // A view reference and its upstream BLOB can disagree on nullness.
     // Until rules can resolve that dependency safely, reject instead of
     // authorizing rows by the reference bytes.
@@ -3045,33 +3079,502 @@ async fn test_query_auth_filters_before_resolving_blob_payloads() {
             .await
             .unwrap();
         assert_eq!(ids(&result), vec![3]);
+
+        // BLOB masks still return logical payloads.
+        g.set_rules(
+            &[int_leaf(0, "id", "NOT_EQUAL", 2)],
+            &[("payload", field_ref_mask(1, "payload", "BLOB"))],
+        );
+        let batches = read_all(&g.table.new_read_builder()).await.unwrap();
+        assert_eq!(ids(&batches), vec![1, 3]);
+        assert_eq!(
+            batches
+                .iter()
+                .flat_map(|batch| column::<LargeBinaryArray>(batch, "payload").iter())
+                .flatten()
+                .collect::<Vec<_>>(),
+            vec![b"good".as_slice()],
+        );
+        assert_eq!(ids(&read_all(&filtered).await.unwrap()), vec![3]);
+
+        // A NULL mask must not open the missing payload.
+        g.set_rules(
+            &[int_leaf(0, "id", "GREATER_THAN", 1)],
+            &[("payload", serde_json::json!({"name": "NULL"}))],
+        );
+        let batches = read_all(&g.table.new_read_builder()).await.unwrap();
+        assert_eq!(ids(&batches), vec![2, 3]);
+        for batch in &batches {
+            assert_eq!(
+                column::<LargeBinaryArray>(batch, "payload").null_count(),
+                batch.num_rows(),
+            );
+        }
+        assert!(read_all(&filtered)
+            .await
+            .unwrap()
+            .iter()
+            .all(|b| b.num_rows() == 0));
+        let mut nulls = g.table.new_read_builder();
+        nulls.with_projection(&["id"]).unwrap().with_filter(
+            PredicateBuilder::new(g.table.schema().fields())
+                .is_null("payload")
+                .unwrap(),
+        );
+        assert_eq!(ids(&read_all(&nulls).await.unwrap()), vec![2, 3]);
+        nulls.with_limit(1);
+        assert_eq!(ids(&read_all(&nulls).await.unwrap()), vec![2]);
     }
 }
 
 #[cfg(not(windows))]
 #[tokio::test]
-async fn test_query_auth_refuses_blob_masks() {
+async fn test_blob_masks_preserve_filter_and_limit_selection() {
+    let (_source, good, missing) = blob_payloads();
     for primary_key in [true, false] {
-        let g = blob_mask_rows(primary_key, vec![None]).await;
-        for mask in [
-            serde_json::json!({"name": "NULL"}),
-            field_ref_mask(1, "payload", "BLOB"),
-            serde_json::json!({"name": "CAST", "fieldRef": {
-                "index": 1, "name": "payload", "type": "BLOB",
-            }, "type": "BLOB"}),
+        let g = blob_mask_rows(primary_key, vec![None, Some(&missing), Some(&good)]).await;
+        for masked in [false, true] {
+            let masks = if masked {
+                vec![
+                    ("payload", field_ref_mask(1, "payload", "BLOB")),
+                    ("label", upper(2, "label")),
+                ]
+            } else {
+                vec![]
+            };
+            g.set_rules(&[int_leaf(0, "id", "GREATER_THAN", 0)], &masks);
+            for batch_size in [1, 3] {
+                let table = g.table.copy_with_options(HashMap::from([(
+                    "read.batch-size".to_string(),
+                    batch_size.to_string(),
+                )]));
+                let predicates = PredicateBuilder::new(table.schema().fields());
+                for (case, predicate, limit, expected) in [
+                    (
+                        "ordinary filter",
+                        Some(predicates.equal("id", Datum::Int(3)).unwrap()),
+                        None,
+                        vec![3],
+                    ),
+                    (
+                        "scalar mask filter",
+                        Some(
+                            predicates
+                                .equal(
+                                    "label",
+                                    Datum::String(if masked { "ROW3" } else { "row3" }.to_string()),
+                                )
+                                .unwrap(),
+                        ),
+                        None,
+                        vec![3],
+                    ),
+                    ("limit", None, Some(1), vec![1]),
+                    (
+                        "remaining predicate",
+                        Some(paimon::spec::Predicate::and(vec![
+                            predicates.not_equal("id", Datum::Int(2)).unwrap(),
+                            predicates
+                                .equal("payload", Datum::Bytes(b"good".to_vec()))
+                                .unwrap(),
+                        ])),
+                        Some(1),
+                        vec![3],
+                    ),
+                    (
+                        "or predicate",
+                        Some(paimon::spec::Predicate::or(vec![
+                            predicates.equal("id", Datum::Int(3)).unwrap(),
+                            predicates.is_null("payload").unwrap(),
+                        ])),
+                        Some(1),
+                        vec![1],
+                    ),
+                    ("zero limit", None, Some(0), vec![]),
+                ] {
+                    let mut read = table.new_read_builder();
+                    if let Some(predicate) = predicate {
+                        read.with_filter(predicate);
+                    }
+                    if let Some(limit) = limit {
+                        read.with_limit(limit);
+                    }
+                    let label =
+                        format!("pk={primary_key}, mask={masked}, batch={batch_size}, {case}");
+                    let batches = read_all(&read)
+                        .await
+                        .unwrap_or_else(|error| panic!("{label}: {error}"));
+                    assert_eq!(ids(&batches), expected, "{label}");
+                    for batch in &batches {
+                        let id = column::<Int32Array>(batch, "id");
+                        let payload = column::<LargeBinaryArray>(batch, "payload");
+                        for row in 0..batch.num_rows() {
+                            if id.value(row) == 1 {
+                                assert!(payload.is_null(row), "{label}");
+                            } else {
+                                assert_eq!(payload.value(row), b"good", "{label}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn test_blob_masks_keep_predicates_and_projection_lazy() {
+    let (_source, good, missing) = blob_payloads();
+    let field = serde_json::json!({"index": 1, "name": "payload", "type": "BLOB"});
+    for primary_key in [true, false] {
+        let g = blob_mask_rows(primary_key, vec![Some(&missing), None, Some(&good)]).await;
+        for (name, mask) in [
+            ("unmasked", None),
+            (
+                "field-ref",
+                Some(serde_json::json!({"name": "FIELD_REF", "fieldRef": field})),
+            ),
+            (
+                "cast",
+                Some(serde_json::json!({"name": "CAST", "fieldRef": field, "type": "BLOB"})),
+            ),
         ] {
-            g.set_rules(&[], &[("payload", mask)]);
-            for projection in [vec!["payload"], vec!["id"], vec![]] {
-                let mut read = g.table.new_read_builder();
-                read.with_projection(&projection).unwrap();
-                let error = read.new_scan().plan().await.unwrap_err();
-                assert!(
-                    matches!(error, paimon::Error::Unsupported { ref message }
-                    if message.contains("BLOB column masks are not supported yet")),
-                    "{error:?}"
+            let masks: Vec<_> = mask.into_iter().map(|mask| ("payload", mask)).collect();
+            g.set_rules(&[int_leaf(0, "id", "GREATER_THAN", 0)], &masks);
+            for batch_size in [1, 3] {
+                let table = g.table.copy_with_options(HashMap::from([(
+                    "read.batch-size".to_string(),
+                    batch_size.to_string(),
+                )]));
+                let predicates = PredicateBuilder::new(table.schema().fields());
+                let first = predicates.equal("id", Datum::Int(1)).unwrap();
+                let payload = predicates
+                    .equal("payload", Datum::Bytes(b"good".to_vec()))
+                    .unwrap();
+                for (case, predicate, expected) in [
+                    (
+                        "or",
+                        paimon::spec::Predicate::or(vec![first.clone(), payload.clone()]),
+                        vec![1, 3],
+                    ),
+                    (
+                        "is-not-null",
+                        predicates.is_not_null("payload").unwrap(),
+                        vec![1, 3],
+                    ),
+                    ("is-null", predicates.is_null("payload").unwrap(), vec![2]),
+                    (
+                        "nested-or",
+                        paimon::spec::Predicate::or(vec![
+                            paimon::spec::Predicate::and(vec![
+                                first.clone(),
+                                predicates.is_not_null("payload").unwrap(),
+                            ]),
+                            payload.clone(),
+                        ]),
+                        vec![1, 3],
+                    ),
+                ] {
+                    for limit in [None, Some(1)] {
+                        let mut read = table.new_read_builder();
+                        read.with_projection(&["id"])
+                            .unwrap()
+                            .with_filter(predicate.clone());
+                        if let Some(limit) = limit {
+                            read.with_limit(limit);
+                        }
+                        let label = format!(
+                            "pk={primary_key}, {name}, batch={batch_size}, {case}, limit={limit:?}"
+                        );
+                        let batches = read_all(&read)
+                            .await
+                            .unwrap_or_else(|error| panic!("{label}: {error}"));
+                        assert_eq!(
+                            ids(&batches),
+                            expected[..limit.unwrap_or(expected.len())],
+                            "{label}"
+                        );
+                    }
+                }
+                for (projection, predicate) in [(vec!["payload"], first), (vec!["id"], payload)] {
+                    let mut read = table.new_read_builder();
+                    read.with_projection(&projection)
+                        .unwrap()
+                        .with_filter(predicate);
+                    let error = read_all(&read).await.unwrap_err().to_string();
+                    assert!(error.contains("missing.blob"), "{error}");
+                }
+                let mut read = table.new_read_builder();
+                read.with_projection(&["payload"])
+                    .unwrap()
+                    .with_filter(predicates.equal("id", Datum::Int(3)).unwrap());
+                let batches = read_all(&read).await.unwrap();
+                assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+                let batch = batches.iter().find(|batch| batch.num_rows() > 0).unwrap();
+                assert_eq!(
+                    column::<LargeBinaryArray>(batch, "payload").value(0),
+                    b"good"
                 );
             }
         }
+    }
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn test_blob_mask_alias_keeps_the_source_reference_format() {
+    let (_source, good, missing) = blob_payloads();
+    for primary_key in [true, false] {
+        let batch = RecordBatch::try_from_iter([
+            (
+                "id",
+                Arc::new(Int32Array::from(vec![1, 2, 3])) as arrow_array::ArrayRef,
+            ),
+            (
+                "payload",
+                Arc::new(LargeBinaryArray::from(vec![
+                    Some(missing.as_slice()),
+                    None,
+                    Some(good.as_slice()),
+                ])) as arrow_array::ArrayRef,
+            ),
+            (
+                "alias",
+                Arc::new(LargeBinaryArray::from(vec![None::<&[u8]>; 3])) as arrow_array::ArrayRef,
+            ),
+        ])
+        .unwrap();
+        let g = written(
+            "auth_blob_alias",
+            |options| {
+                let mut schema = Schema::builder()
+                    .column("id", DataType::Int(IntType::with_nullable(false)))
+                    .column("payload", DataType::Blob(BlobType::new()))
+                    .column("alias", DataType::Blob(BlobType::new()))
+                    .option("blob-descriptor-field", "payload")
+                    .option("blob-view-field", "alias");
+                if primary_key {
+                    schema = schema.primary_key(["id"]).option("bucket", "1");
+                } else {
+                    schema = schema
+                        .option("data-evolution.enabled", "true")
+                        .option("row-tracking.enabled", "true");
+                }
+                for (key, value) in options {
+                    schema = schema.option(*key, *value);
+                }
+                schema.build().unwrap()
+            },
+            vec![batch],
+        )
+        .await;
+        let field = serde_json::json!({"index": 1, "name": "payload", "type": "BLOB"});
+        for mask in [
+            serde_json::json!({"name": "FIELD_REF", "fieldRef": field}),
+            serde_json::json!({"name": "CAST", "fieldRef": field, "type": "BLOB"}),
+        ] {
+            g.set_rules(&[int_leaf(0, "id", "GREATER_THAN", 0)], &[("alias", mask)]);
+            let predicates = PredicateBuilder::new(g.table.schema().fields());
+            for (predicate, expected) in [
+                (
+                    paimon::spec::Predicate::or(vec![
+                        predicates.equal("id", Datum::Int(1)).unwrap(),
+                        predicates
+                            .equal("alias", Datum::Bytes(b"good".to_vec()))
+                            .unwrap(),
+                    ]),
+                    vec![1, 3],
+                ),
+                (predicates.is_not_null("alias").unwrap(), vec![1, 3]),
+                (predicates.is_null("alias").unwrap(), vec![2]),
+            ] {
+                let mut read = g.table.new_read_builder();
+                read.with_projection(&["id"])
+                    .unwrap()
+                    .with_filter(predicate);
+                assert_eq!(ids(&read_all(&read).await.unwrap()), expected);
+            }
+            let mut read = g.table.new_read_builder();
+            read.with_projection(&["alias"])
+                .unwrap()
+                .with_filter(predicates.equal("id", Datum::Int(3)).unwrap());
+            let batches = read_all(&read).await.unwrap();
+            let batch = batches.iter().find(|batch| batch.num_rows() > 0).unwrap();
+            assert_eq!(column::<LargeBinaryArray>(batch, "alias").value(0), b"good");
+            read.with_filter(predicates.equal("id", Datum::Int(1)).unwrap());
+            let error = read_all(&read).await.unwrap_err().to_string();
+            assert!(error.contains("missing.blob"), "{error}");
+        }
+    }
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn test_blob_view_mask_alias_resolves_the_source_view() {
+    let tmp = tempfile::tempdir().unwrap();
+    let warehouse = format!("file://{}", tmp.path().display());
+    let mut fs_options = Options::new();
+    fs_options.set(CatalogOptions::WAREHOUSE, &warehouse);
+    let fs_catalog = FileSystemCatalog::new(fs_options).unwrap();
+    fs_catalog
+        .create_database("default", true, HashMap::new())
+        .await
+        .unwrap();
+
+    let source_id = Identifier::new("default", "alias_view_source");
+    let source_schema = blob_schema(&[]);
+    fs_catalog
+        .create_table(&source_id, source_schema.clone(), false)
+        .await
+        .unwrap();
+    let source = fs_catalog.get_table(&source_id).await.unwrap();
+    write_batch(
+        &source,
+        blob_batch(
+            vec![1, 2],
+            vec!["Alice", "Bob"],
+            vec![b"alice".to_vec(), b"bob".to_vec()],
+        ),
+        "source-writer",
+    )
+    .await;
+    let picture_field_id = source
+        .schema()
+        .fields()
+        .iter()
+        .find(|field| field.name() == "picture")
+        .unwrap()
+        .id();
+    let view_ref = |row_id| {
+        BlobViewStruct::new(source_id.clone(), picture_field_id, row_id)
+            .serialize()
+            .unwrap()
+    };
+
+    // Only `picture` is a view; the mask makes `alias` one by copying it.
+    let view_id = Identifier::new("default", "alias_view_target");
+    let view_schema = |options: &[(&str, &str)]| {
+        let mut builder = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("picture", DataType::Blob(BlobType::new()))
+            .column("alias", DataType::Blob(BlobType::new()))
+            .option("data-evolution.enabled", "true")
+            .option("row-tracking.enabled", "true")
+            .option("blob-view-field", "picture");
+        for (key, value) in options {
+            builder = builder.option(*key, *value);
+        }
+        builder.build().unwrap()
+    };
+    fs_catalog
+        .create_table(&view_id, view_schema(&[]), false)
+        .await
+        .unwrap();
+    let view = fs_catalog.get_table(&view_id).await.unwrap();
+    let (first, second) = (view_ref(0), view_ref(1));
+    let batch = RecordBatch::try_from_iter([
+        (
+            "id",
+            Arc::new(Int32Array::from(vec![1, 2, 3])) as arrow_array::ArrayRef,
+        ),
+        (
+            "picture",
+            Arc::new(LargeBinaryArray::from(vec![
+                Some(first.as_slice()),
+                None,
+                Some(second.as_slice()),
+            ])) as arrow_array::ArrayRef,
+        ),
+        (
+            "alias",
+            Arc::new(LargeBinaryArray::from(vec![None::<&[u8]>; 3])) as arrow_array::ArrayRef,
+        ),
+    ])
+    .unwrap();
+    write_batch(&view, batch, "view-writer").await;
+
+    let mut defaults = HashMap::new();
+    defaults.insert("prefix".to_string(), "mock-test".to_string());
+    let server = start_mock_server(
+        "test_warehouse".to_string(),
+        warehouse.clone(),
+        ConfigResponse::new(defaults),
+        vec!["default".to_string()],
+    )
+    .await;
+    server.add_table_with_schema(
+        "default",
+        "alias_view_source",
+        source_schema,
+        source.location(),
+    );
+    server.add_table_with_schema(
+        "default",
+        "alias_view_target",
+        view_schema(&[("query-auth.enabled", "true")]),
+        view.location(),
+    );
+    let read_via = paimon::api::RESTUtil::encode_string(&serde_json::to_string(&view_id).unwrap());
+    server.require_table_read_via("default", "alias_view_source", read_via);
+    server.set_auth_response(
+        "default",
+        "alias_view_target",
+        rules(&[], &[("alias", field_ref_mask(1, "picture", "BLOB"))]),
+    );
+    let mut rest_options = Options::new();
+    rest_options.set("uri", server.url().unwrap());
+    rest_options.set("warehouse", "test_warehouse");
+    rest_options.set("token.provider", "bear");
+    rest_options.set("token", "test_token");
+    let rest_catalog = RESTCatalog::new(rest_options, true).await.unwrap();
+    let table = rest_catalog.get_table(&view_id).await.unwrap();
+
+    let payloads = |batches: &[RecordBatch], name: &str| {
+        let mut rows: Vec<(i32, Option<Vec<u8>>)> = batches
+            .iter()
+            .flat_map(|b| {
+                let ids = column::<Int32Array>(b, "id").values().to_vec();
+                let values = column::<LargeBinaryArray>(b, name).iter();
+                ids.into_iter().zip(values.map(|v| v.map(|v| v.to_vec())))
+            })
+            .collect();
+        rows.sort();
+        rows
+    };
+    let expected = vec![
+        (1, Some(b"alice".to_vec())),
+        (2, None),
+        (3, Some(b"bob".to_vec())),
+    ];
+    // The alias resolves to the source view's payload, alone or beside it.
+    for projection in [vec!["id", "alias"], vec!["id", "picture", "alias"]] {
+        let mut read = table.new_read_builder();
+        read.with_projection(&projection).unwrap();
+        let batches = read_all(&read).await.unwrap();
+        assert_eq!(payloads(&batches, "alias"), expected);
+        if projection.contains(&"picture") {
+            assert_eq!(payloads(&batches, "picture"), expected);
+        }
+    }
+
+    // Predicates on the alias match the resolved payload, not the reference.
+    let predicates = PredicateBuilder::new(table.schema().fields());
+    for (predicate, expected) in [
+        (
+            predicates
+                .equal("alias", Datum::Bytes(b"bob".to_vec()))
+                .unwrap(),
+            vec![3],
+        ),
+        (predicates.is_null("alias").unwrap(), vec![2]),
+        (predicates.is_not_null("alias").unwrap(), vec![1, 3]),
+    ] {
+        let mut read = table.new_read_builder();
+        read.with_projection(&["id"])
+            .unwrap()
+            .with_filter(predicate);
+        assert_eq!(ids(&read_all(&read).await.unwrap()), expected);
     }
 }
 
@@ -4621,6 +5124,26 @@ async fn test_query_auth_masks_the_merged_primary_key_row() {
         score_rows(&read_all(&g.table.new_read_builder()).await.unwrap()),
         vec![(1, "ALICIA".to_string(), 80), (3, "CAROL".to_string(), 90)]
     );
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn test_query_auth_refuses_a_restricted_primary_key_audit_log_read() {
+    let g = scores().await;
+    g.set_rules(
+        &[int_leaf(2, "score", "GREATER_THAN", 30)],
+        &[("name", upper(1, "name"))],
+    );
+    // An audit scan is refused at planning, but ordinary splits still carry
+    // the grant to a directly built audit read.
+    let builder = g.table.new_read_builder();
+    let plan = builder.new_scan().plan().await.unwrap();
+    let audit = paimon::table::AuditLogRead::new(builder.new_read().unwrap()).unwrap();
+    // It builds its primary-key readers itself, so it must not return raw rows.
+    let Err(err) = audit.to_arrow(plan.splits()) else {
+        panic!("a restricted primary-key audit read must be refused")
+    };
+    assert_refused(err);
 }
 
 #[tokio::test]

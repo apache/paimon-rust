@@ -1191,6 +1191,7 @@ impl<'a> PaimonTableRead<'a> {
             row_filter_factory: None,
             file_fields: schema_fields.clone(),
         };
+        let blob_options = has_blobs.then(|| self.masked_blob_options(&masks));
         let stream = stream.map(move |batch| {
             let batch = batch?;
             let names_match = batch.num_columns() == physical.len()
@@ -1208,6 +1209,7 @@ impl<'a> PaimonTableRead<'a> {
             let batch = filter_batch(&batch, &filters, &schema_fields, &physical)?;
             // Safe ordinary conjuncts avoid masking rows the caller excludes.
             let batch = filter_record_batch_by_predicates(batch, &predicates, &physical)?;
+            // BLOB masks copy references; consumers resolve payloads lazily.
             let batch = mask_batch(&batch, &masks, &schema_fields, &physical)?;
             if has_blobs {
                 Ok(batch)
@@ -1216,8 +1218,8 @@ impl<'a> PaimonTableRead<'a> {
             }
         });
         let stream: ArrowRecordBatchStream = Box::pin(stream);
-        if has_blobs {
-            return self.finish_authorized_blobs(stream, &batch_fields, &pending, &core_options);
+        if let Some(options) = blob_options {
+            return self.finish_authorized_blobs(stream, &batch_fields, &pending, options);
         }
         let stream = project_authorized_stream(stream, self.read_type.len());
         Ok(match self.limit {
@@ -1226,15 +1228,66 @@ impl<'a> PaimonTableRead<'a> {
         })
     }
 
+    /// Copy the source's BLOB representation along with its references.
+    fn masked_blob_options(
+        &self,
+        masks: &[super::query_auth::ColumnMask],
+    ) -> std::collections::HashMap<String, String> {
+        use crate::spec::Transform;
+
+        let fields = self.table.schema().fields();
+        let copies: Vec<_> = masks
+            .iter()
+            .filter_map(|mask| {
+                let source = match &mask.transform {
+                    Transform::FieldRef(index) | Transform::Cast(index, _) => &fields[*index],
+                    _ => return None,
+                };
+                let target = &fields[mask.column];
+                (source.data_type().is_blob_file_field()
+                    && target.data_type().is_blob_file_field()
+                    && source.name() != target.name())
+                .then(|| (source.name(), target.name()))
+            })
+            .collect();
+        let mut options = self.table.schema().options().clone();
+        if copies.is_empty() {
+            return options;
+        }
+        let core_options = self.table.schema().core_options();
+        for (key, original) in [
+            (
+                "blob-descriptor-field",
+                core_options.blob_descriptor_fields(),
+            ),
+            ("blob-view-field", core_options.blob_view_fields()),
+            ("video-frame-field", core_options.video_frame_fields()),
+        ] {
+            let mut selected = original.clone();
+            for &(source, target) in &copies {
+                if original.contains(source) {
+                    selected.insert(target.to_string());
+                } else {
+                    selected.remove(target);
+                }
+            }
+            let mut selected: Vec<_> = selected.into_iter().collect();
+            selected.sort_unstable();
+            options.insert(key.to_string(), selected.join(","));
+        }
+        options
+    }
+
     fn finish_authorized_blobs(
         &self,
         stream: ArrowRecordBatchStream,
         batch_fields: &[DataField],
         predicates: &[Predicate],
-        core_options: &CoreOptions<'_>,
+        payload_options: std::collections::HashMap<String, String>,
     ) -> crate::Result<ArrowRecordBatchStream> {
         use super::managed_blob_reader::{resolve_primary_key_blob_stream, ManagedBlobReadPlan};
 
+        let core_options = &CoreOptions::new(&payload_options);
         let view_fields = core_options.blob_view_fields();
         let resolve_views = core_options.blob_view_resolve_enabled()
             && self.table.rest_env().is_some()

@@ -1650,7 +1650,8 @@ query asks the catalog what the current user may read, and the row filters and
 column masks it returns (see `create_policy`) are applied to the result:
 
 - Rows are filtered on their stored values; masked columns return masked values.
-- BLOB column masks are not yet supported.
+- BLOB masks keep payload reads lazy. A NULL mask does not read the original
+  BLOB payload.
 - Query filters on masked columns, including partition keys, match masked values.
 - Statistics are not used under a row filter or a mask, and a row filter turns
   off `LIMIT` pushdown, so such queries read the data.
