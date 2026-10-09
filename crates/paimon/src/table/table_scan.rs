@@ -2178,21 +2178,23 @@ impl<'a> PaimonTableScan<'a> {
         }
     }
 
-    fn pk_sorted_index_needed(&self) -> bool {
+    fn pk_sorted_index_definitions(
+        &self,
+    ) -> crate::Result<Vec<super::pk_sorted_index_scan::Definition>> {
         let schema = self.table.schema();
         let options = schema.core_options();
-        !schema.primary_keys().is_empty()
-            && !self.is_streaming()
-            && !self.scan_all_files
-            && !self.row_range_optimization_disabled
-            && self.incremental_split_mode.is_none()
-            && self.snapshot_mode().is_none()
-            && !options.query_auth_enabled()
-            && options.global_index_enabled()
-            && !self.data_predicates.is_empty()
-            && ["pk-btree.index.columns", "pk-bitmap.index.columns"]
-                .iter()
-                .any(|key| schema.options().contains_key(*key))
+        if schema.primary_keys().is_empty()
+            || self.is_streaming()
+            || self.scan_all_files
+            || self.row_range_optimization_disabled
+            || self.snapshot_mode().is_some()
+            || options.query_auth_enabled()
+            || !options.global_index_enabled()
+            || self.data_predicates.is_empty()
+        {
+            return Ok(Vec::new());
+        }
+        super::pk_sorted_index_scan::definitions(schema.fields(), schema.options())
     }
 
     async fn read_index_manifest_entries(
@@ -2504,6 +2506,7 @@ impl<'a> PaimonTableScan<'a> {
                 None,
                 before_index_entries,
                 None,
+                &[],
                 None,
             )
             .await?;
@@ -2514,6 +2517,7 @@ impl<'a> PaimonTableScan<'a> {
                 None,
                 after_index_entries,
                 None,
+                &[],
                 None,
             )
             .await?;
@@ -2575,11 +2579,11 @@ impl<'a> PaimonTableScan<'a> {
         let data_evolution_enabled = core_options.data_evolution_enabled();
         let global_index_settings =
             self.global_index_scan_settings(&core_options, data_evolution_enabled)?;
-        let pk_sorted_index_needed = self.pk_sorted_index_needed();
+        let pk_sorted_index_definitions = self.pk_sorted_index_definitions()?;
         let index_entries = self
             .read_index_manifest_entries(
                 snapshot,
-                global_index_settings.is_some() || pk_sorted_index_needed,
+                global_index_settings.is_some() || !pk_sorted_index_definitions.is_empty(),
                 core_options.deletion_vectors_enabled() && !self.is_streaming(),
             )
             .await?;
@@ -2622,11 +2626,13 @@ impl<'a> PaimonTableScan<'a> {
             data_evolution_read_field_ids,
             index_entries,
             effective_row_ranges,
+            &pk_sorted_index_definitions,
             trace,
         )
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn plan_snapshot_from_entries(
         &self,
         snapshot: Snapshot,
@@ -2634,6 +2640,7 @@ impl<'a> PaimonTableScan<'a> {
         data_evolution_read_field_ids: Option<&HashSet<i32>>,
         index_entries: Option<Vec<IndexManifestEntry>>,
         effective_row_ranges: Option<Vec<RowRange>>,
+        pk_sorted_index_definitions: &[super::pk_sorted_index_scan::Definition],
         mut trace: Option<&mut ScanTrace>,
     ) -> crate::Result<Plan> {
         let table_path = self.table.location();
@@ -3052,16 +3059,12 @@ impl<'a> PaimonTableScan<'a> {
         } else {
             splits
         };
-        let splits = if self.pk_sorted_index_needed() {
-            let definitions = super::pk_sorted_index_scan::definitions(
-                self.table.schema().fields(),
-                self.table.schema().options(),
-            )?;
+        let splits = if !pk_sorted_index_definitions.is_empty() {
             super::pk_sorted_index_scan::refine(
                 &self.table,
                 splits,
                 index_entries.as_deref().unwrap_or_default(),
-                &definitions,
+                pk_sorted_index_definitions,
                 &self.data_predicates,
             )
             .await?
@@ -3540,6 +3543,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    &[],
                     None,
                 )
                 .await
@@ -5008,6 +5012,7 @@ mod tests {
                             None,
                             None,
                             None,
+                            &[],
                             None,
                         )
                         .await
@@ -5085,6 +5090,7 @@ mod tests {
                                 None,
                                 None,
                                 None,
+                                &[],
                                 None,
                             )
                             .await
@@ -5181,6 +5187,7 @@ mod tests {
                         None,
                         None,
                         None,
+                        &[],
                         None,
                     )
                     .await
@@ -6628,6 +6635,64 @@ mod tests {
             .await
             .unwrap();
         assert!(entries.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_pk_index_scan_uses_resolved_definitions_instead_of_option_presence() {
+        let table = pk_stats_gate_table("memory:/pk_index_definition_gate");
+        setup_scan_trace_dirs(&table).await;
+        TableCommit::new(table.clone(), "definition-gate".into())
+            .commit(vec![CommitMessage::new(
+                BinaryRow::new(0).to_serialized_bytes(),
+                0,
+                vec![pk_stats_file("data.parquet", (1, 2), (10, 20))],
+            )])
+            .await
+            .unwrap();
+        let snapshot = table
+            .snapshot_manager()
+            .get_latest_snapshot()
+            .await
+            .unwrap()
+            .unwrap();
+        let mut json = serde_json::to_value(&snapshot).unwrap();
+        json["indexManifest"] = serde_json::json!("missing-index-manifest");
+        let snapshot: Snapshot = serde_json::from_value(json).unwrap();
+        let predicate = PredicateBuilder::new(table.schema().fields())
+            .equal("value", Datum::Int(10))
+            .unwrap();
+        for (key, columns, enabled, uses_index) in [
+            ("pk-btree.index.columns", "", true, false),
+            ("pk-btree.index.columns", "unknown", true, false),
+            ("pk-bitmap.index.columns", "unknown", true, false),
+            ("pk-btree.index.columns", "value", false, false),
+            ("pk-btree.index.columns", "value", true, true),
+            ("pk-bitmap.index.columns", "value", true, true),
+        ] {
+            let configured = table.copy_with_options(HashMap::from([
+                (key.into(), columns.into()),
+                ("global-index.enabled".into(), enabled.to_string()),
+            ]));
+            let scan =
+                PaimonTableScan::new(&configured, None, vec![predicate.clone()], None, None, None);
+            let plan = scan.plan_snapshot(snapshot.clone(), None, None).await;
+            if uses_index {
+                assert!(plan
+                    .unwrap_err()
+                    .to_string()
+                    .contains("missing-index-manifest"));
+            } else {
+                let plan = plan.unwrap();
+                assert_eq!(plan.snapshot_id(), Some(snapshot.id()));
+                let files: Vec<_> = plan
+                    .splits()
+                    .iter()
+                    .flat_map(|split| split.data_files())
+                    .map(|file| file.file_name.as_str())
+                    .collect();
+                assert_eq!(files, vec!["data.parquet"]);
+            }
+        }
     }
 
     // ======================== Bucket predicate filtering ========================
