@@ -818,8 +818,6 @@ impl DataEvolutionDeleteWriter {
             index_manifest_name
         );
         let index_entries = IndexManifest::read(self.table.file_io(), &manifest_path).await?;
-        let mut floating_paths =
-            super::floating_partition_path::FloatingPartitionPathResolver::new(&self.table)?;
         let mut bitmaps = IndexMap::new();
         let mut deleted_index_files = Vec::new();
 
@@ -839,7 +837,6 @@ impl DataEvolutionDeleteWriter {
                 &entry.index_file.file_name,
                 entry.index_file.external_path.as_deref(),
             );
-            let index_path = floating_paths.index_path(&entry, &index_path).await?;
             for (data_file_name, meta) in ranges {
                 let deletion_file = crate::DeletionFile::new(
                     index_path.clone(),

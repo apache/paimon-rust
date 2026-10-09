@@ -712,10 +712,6 @@ impl DynamicBucketAssigner {
         partition_entries: &[IndexManifestEntry],
     ) -> Result<PartitionIndex> {
         if !partition_entries.is_empty() {
-            let mut partition_entries = partition_entries.to_vec();
-            super::floating_partition_path::FloatingPartitionPathResolver::new(&self.table)?
-                .resolve_index_paths(&mut partition_entries)
-                .await?;
             let partition_path = self.partition_path(partition_bytes)?;
             let options = CoreOptions::new(self.table.schema().options());
             let layout = HashIndexLayout {
@@ -727,7 +723,7 @@ impl DynamicBucketAssigner {
             return PartitionIndex::load(
                 self.table.file_io(),
                 &layout,
-                &partition_entries,
+                partition_entries,
                 self.target_bucket_row_number,
             )
             .await;

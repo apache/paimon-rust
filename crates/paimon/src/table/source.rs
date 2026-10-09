@@ -23,7 +23,6 @@ use crate::spec::{BinaryRow, DataFileMeta, DataFileMetaRowLayout};
 use crate::table::query_auth::QueryAuthGrant;
 use crate::table::stats_filter::group_by_overlapping_row_id;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::sync::Arc;
 
 fn is_vector_store_file_name(file_name: &str) -> bool {
@@ -496,11 +495,6 @@ pub struct DataSplit {
     bucket_path: Arc<str>,
     total_buckets: i32,
     data_files: Arc<[DataFileMeta]>,
-    /// Original manifest identities for files whose read location was resolved
-    /// from a different Java partition spelling. Used only by local rewrites;
-    /// Java split serialization carries read locations and cannot convey this.
-    #[serde(skip)]
-    original_data_files: Option<Arc<HashMap<String, DataFileMeta>>>,
     /// Deletion file for each data file, same order as `data_files`.
     /// `None` at index `i` means no deletion file for `data_files[i]` (matches Java getDeletionFiles() / List<DeletionFile> with null elements).
     data_deletion_files: Option<Arc<[Option<DeletionFile>]>>,
@@ -574,12 +568,6 @@ impl DataSplit {
 
     pub fn data_files(&self) -> &[DataFileMeta] {
         &self.data_files
-    }
-
-    pub(crate) fn original_data_file(&self, name: &str) -> Option<&DataFileMeta> {
-        self.original_data_files
-            .as_ref()
-            .and_then(|files| files.get(name))
     }
 
     /// Deletion files for each data file (same order as `data_files`); `None` = no deletion file for that data file.
@@ -1252,7 +1240,6 @@ pub struct DataSplitBuilder {
     bucket_path: Option<String>,
     total_buckets: i32,
     data_files: Option<Vec<DataFileMeta>>,
-    original_data_files: Option<Arc<HashMap<String, DataFileMeta>>>,
     /// Same length as data_files; `None` at index i = no deletion file for data_files[i].
     data_deletion_files: Option<Vec<Option<DeletionFile>>>,
     row_ranges: Option<Vec<RowRange>>,
@@ -1269,7 +1256,6 @@ impl DataSplitBuilder {
             bucket_path: None,
             total_buckets: -1,
             data_files: None,
-            original_data_files: None,
             data_deletion_files: None,
             row_ranges: None,
             // Splits with no merge semantics (append tables, single-file
@@ -1302,14 +1288,6 @@ impl DataSplitBuilder {
     }
     pub fn with_data_files(mut self, data_files: Vec<DataFileMeta>) -> Self {
         self.data_files = Some(data_files);
-        self
-    }
-
-    pub(crate) fn with_original_data_files(
-        mut self,
-        files: Option<Arc<HashMap<String, DataFileMeta>>>,
-    ) -> Self {
-        self.original_data_files = files;
         self
     }
 
@@ -1391,7 +1369,6 @@ impl DataSplitBuilder {
             bucket_path: bucket_path.into(),
             total_buckets: self.total_buckets,
             data_files: data_files.into(),
-            original_data_files: self.original_data_files,
             data_deletion_files: self.data_deletion_files.map(Into::into),
             row_ranges: self.row_ranges.map(Into::into),
             raw_convertible: self.raw_convertible,
@@ -1938,40 +1915,6 @@ mod tests {
         let expected = include_bytes!("goldens/datasplit_v9.bin");
         let split = sample_v9_split();
         assert_eq!(split.serialize().unwrap().as_slice(), &expected[..]);
-    }
-
-    #[test]
-    fn resolved_read_location_preserves_manifest_identity_through_clone_and_selection() {
-        let base = sample_split(None);
-        let mut original = base.data_files()[0].clone();
-        original.external_path = None;
-        let mut physical = original.clone();
-        physical.external_path = Some("memory:/old-java-partition/my_file".into());
-        let split = DataSplitBuilder::new()
-            .with_snapshot(base.snapshot_id())
-            .with_partition(base.partition().clone())
-            .with_bucket(base.bucket())
-            .with_bucket_path(base.bucket_path().into())
-            .with_data_files(vec![physical.clone()])
-            .with_original_data_files(Some(Arc::new(HashMap::from([(
-                original.file_name.clone(),
-                original.clone(),
-            )]))))
-            .build()
-            .unwrap();
-        let selected = split
-            .clone()
-            .with_selected_row_ranges(vec![RowRange::new(0, 0)]);
-        assert_eq!(selected.data_files(), &[physical]);
-        assert_eq!(
-            selected.original_data_file(&original.file_name),
-            Some(&original)
-        );
-        // Java bytes contain the reader's location only. The local rewrite
-        // bookkeeping does not add a field to the Java split protocol.
-        let restored = DataSplit::deserialize(&split.serialize().unwrap()).unwrap();
-        assert_eq!(restored.data_files(), split.data_files());
-        assert!(restored.original_data_file(&original.file_name).is_none());
     }
 
     /// The fixture split behind the Java-generated `goldens/datasplit_v*.bin`. The two
