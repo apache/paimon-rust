@@ -18,6 +18,8 @@
 //! Plans global-index vector searches against one snapshot and resolves scalar pre-filters.
 
 use crate::spec::{CoreOptions, IndexManifest, IndexManifestEntry, Predicate, ROW_ID_FIELD_NAME};
+use crate::table::bucket_filter::split_partition_and_data_predicates;
+use crate::table::partition_filter::PartitionFilter;
 use crate::table::vector_scan::Scan;
 use crate::table::Table;
 use crate::vindex::vector_search_timing_enabled;
@@ -281,6 +283,24 @@ impl Scan for DeVectorScan {
             }
             None => Vec::new(),
         };
+        if let Some(filter) = &self.filter {
+            let (partition, _) = split_partition_and_data_predicates(
+                filter.clone(),
+                plan.table.schema().fields(),
+                plan.table.schema().partition_keys(),
+            );
+            if let Some(partition) = partition {
+                let fields = plan.table.schema().partition_fields();
+                let partition = PartitionFilter::from_predicate(partition, &fields);
+                let mut entries = Vec::with_capacity(plan.index_entries.len());
+                for entry in plan.index_entries {
+                    if partition.matches_entry(&entry.partition)? {
+                        entries.push(entry);
+                    }
+                }
+                plan.index_entries = entries;
+            }
+        }
         if let Some(timing) = &mut plan.timing {
             timing.manifest = manifest_start.map_or(Duration::ZERO, |start| start.elapsed());
         }

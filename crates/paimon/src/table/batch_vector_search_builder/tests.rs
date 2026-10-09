@@ -155,3 +155,86 @@ fn batch_resolve_materialize_read_type_default_rejects_reserved_user_column() {
         "batch default projection must reject reserved user column, got: {err:?}"
     );
 }
+
+#[tokio::test]
+async fn repeated_filters_are_conjoined_for_single_and_batch_searches() {
+    use crate::spec::{Datum, PredicateBuilder};
+    let table = de_vector_table().await;
+    let predicates = PredicateBuilder::new(table.schema().fields());
+    let lower = predicates.greater_than("id", Datum::Int(1)).unwrap();
+    let upper = predicates.less_than("id", Datum::Int(3)).unwrap();
+    let single = table
+        .new_vector_search_builder()
+        .with_vector_column("embedding")
+        .with_query_vector(vec![1.0, 0.0])
+        .with_limit(3)
+        .with_filter(lower.clone())
+        .with_filter(upper.clone())
+        .execute()
+        .await
+        .unwrap();
+    assert_eq!(single.row_ids().unwrap().row_ids, vec![1]);
+    let batch = table
+        .new_batch_vector_search_builder()
+        .with_vector_column("embedding")
+        .with_query_vectors(vec![vec![1.0, 0.0], vec![0.0, 1.0]])
+        .with_limit(3)
+        .with_filter(lower)
+        .with_filter(upper)
+        .execute()
+        .await
+        .unwrap();
+    assert_eq!(batch.len(), 2);
+    assert!(batch
+        .iter()
+        .all(|result| result.row_ids().unwrap().row_ids == vec![1]));
+}
+
+#[tokio::test]
+async fn repeated_options_keep_earlier_overrides() {
+    let table = de_vector_table().await.copy_with_options(HashMap::from([(
+        "fields.embedding.ivf.refine-factor".to_string(),
+        "invalid".to_string(),
+    )]));
+    let override_options = HashMap::from([("refine_factor".to_string(), "1".to_string())]);
+    let later = HashMap::from([("nprobe".to_string(), "1".to_string())]);
+    let result = table
+        .new_vector_search_builder()
+        .with_vector_column("embedding")
+        .with_query_vector(vec![0.0, 1.0])
+        .with_limit(1)
+        .with_options(override_options.clone())
+        .with_options(later.clone())
+        .execute()
+        .await
+        .unwrap();
+    assert_eq!(result.row_ids().unwrap().row_ids, vec![1]);
+    let results = table
+        .new_batch_vector_search_builder()
+        .with_vector_column("embedding")
+        .with_query_vectors(vec![vec![0.0, 1.0]])
+        .with_limit(1)
+        .with_options(override_options)
+        .with_options(later)
+        .execute()
+        .await
+        .unwrap();
+    assert_eq!(results[0].row_ids().unwrap().row_ids, vec![1]);
+}
+
+#[test]
+fn explicit_partition_filters_reject_data_fields() {
+    use crate::spec::{Datum, PredicateBuilder};
+    let table = vector_test_table();
+    let filter = PredicateBuilder::new(table.schema().fields())
+        .equal("id", Datum::Int(1))
+        .unwrap();
+    assert!(table
+        .new_vector_search_builder()
+        .with_partition_filter(filter.clone())
+        .is_err());
+    assert!(table
+        .new_batch_vector_search_builder()
+        .with_partition_filter(filter)
+        .is_err());
+}

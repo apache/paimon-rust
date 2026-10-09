@@ -278,7 +278,7 @@ async fn execute_vindex_searches<S: SeekRead + 'static, G: Send + 'static>(
     vector_searches: Vec<VectorSearch>,
     source: S,
     file_name: String,
-    index_parallelism: usize,
+    context: VectorIndexSearchContext,
     guard: G,
 ) -> crate::Result<Vec<Option<HashMap<u64, f32>>>> {
     let panic_context = if vector_searches.len() > 1 {
@@ -288,9 +288,17 @@ async fn execute_vindex_searches<S: SeekRead + 'static, G: Send + 'static>(
     };
     execute_global_index_with_guard(panic_context, guard, move || {
         let mut reader = VindexVectorGlobalIndexReader::new(io_meta, options)
-            .with_batch_index_parallelism(index_parallelism);
+            .with_batch_index_parallelism(context.parallelism);
         reader
-            .visit_batch_vector_search(&vector_searches, |_| Ok(source))
+            .visit_batch_vector_search_validated(
+                &vector_searches,
+                |_| Ok(source),
+                |metadata| {
+                    context
+                        .metrics
+                        .check(RawVectorMetric::from_vindex(metadata.metric))
+                },
+            )
             .map_err(|e| crate::Error::DataInvalid {
                 message: format!("Failed to read vindex index file '{}': {}", file_name, e),
                 source: Some(Box::new(e)),
@@ -307,6 +315,45 @@ struct VectorSearchEvaluation<'a> {
     table_options: &'a HashMap<String, String>,
     schema_fields: &'a [DataField],
     next_row_id: Option<i64>,
+}
+
+#[derive(Clone)]
+struct VectorMetricCheck {
+    persisted: Arc<std::sync::Mutex<Option<RawVectorMetric>>>,
+    requested: Option<RawVectorMetric>,
+}
+
+impl VectorMetricCheck {
+    fn check(&self, metric: RawVectorMetric) -> crate::Result<()> {
+        if self.requested.is_some_and(|requested| requested != metric) {
+            return Err(crate::Error::ConfigInvalid {
+                message: format!(
+                    "Query vector metric {:?} does not match index metric {metric:?}",
+                    self.requested
+                ),
+            });
+        }
+        let mut persisted =
+            self.persisted
+                .lock()
+                .map_err(|error| crate::Error::UnexpectedError {
+                    message: format!("Vector metric validation lock poisoned: {error}"),
+                    source: None,
+                })?;
+        if persisted.is_some_and(|previous| previous != metric) {
+            return Err(crate::Error::DataInvalid {
+                message: "Cannot merge vector indexes with different metrics".to_string(),
+                source: None,
+            });
+        }
+        *persisted = Some(metric);
+        Ok(())
+    }
+}
+
+struct VectorIndexSearchContext {
+    parallelism: usize,
+    metrics: VectorMetricCheck,
 }
 
 #[derive(Default)]
@@ -454,6 +501,10 @@ async fn evaluate_batch_vector_search(
             .map(|entry| (entry, None))
             .collect::<Vec<_>>()
     };
+    let metric_check = VectorMetricCheck {
+        persisted: Arc::new(std::sync::Mutex::new(None)),
+        requested: configured_raw_vector_metric_override(&search_options, field_name)?,
+    };
     let mut permit_wait = Duration::ZERO;
     let mut file_reader_open = Duration::ZERO;
     let mut index_search = Duration::ZERO;
@@ -516,6 +567,7 @@ async fn evaluate_batch_vector_search(
                 let mut options = evaluation.table_options.clone();
                 options.extend(search_options.clone());
                 let input = evaluation.file_io.new_input(&path);
+                let metric_check = metric_check.clone();
                 async move {
                     if let Some(local_filter) = shared_local_filter {
                         let local_filter = Arc::new(local_filter);
@@ -575,6 +627,8 @@ async fn evaluate_batch_vector_search(
                             if let Some(start) = read_start {
                                 full_file_read = Some((start.elapsed(), data.len()));
                             }
+                            let metric = LuminaIndexMeta::deserialize(&io_meta.metadata)?.metric()?;
+                            metric_check.check(RawVectorMetric::from_lumina(metric))?;
                             execute_global_index_with_guard(
                                 "Lumina global-index batch search task failed",
                                 permit,
@@ -618,7 +672,7 @@ async fn evaluate_batch_vector_search(
                                         vector_searches,
                                         source,
                                         file_name.clone(),
-                                        batch_index_parallelism,
+                                        VectorIndexSearchContext { parallelism: batch_index_parallelism, metrics: metric_check },
                                         permit,
                                     )
                                     .await?;
@@ -651,7 +705,7 @@ async fn evaluate_batch_vector_search(
                                         vector_searches,
                                         Cursor::new(data),
                                         file_name.clone(),
-                                        batch_index_parallelism,
+                                        VectorIndexSearchContext { parallelism: batch_index_parallelism, metrics: metric_check },
                                         permit,
                                     )
                                     .await?
@@ -727,7 +781,7 @@ async fn evaluate_batch_vector_search(
             evaluation,
             index_entries,
             field_id,
-            field_name,
+            &metric_check,
             vector_searches,
             merged,
             index_search_limit,
@@ -766,12 +820,14 @@ async fn evaluate_batch_vector_search(
                 evaluation.file_io,
                 table_path,
                 evaluation.table_options,
+                &vector_searches[0].options,
                 index_entries,
                 field_id,
                 field_name,
             )
             .await?;
             let metric_resolve = metric_start.map_or(Duration::ZERO, |start| start.elapsed());
+            metric_check.check(metric)?;
             let (raw_results, raw_timing) =
                 read_raw_batch_vector_search(table, vector_searches, &raw_ranges, metric).await?;
             if let Some(raw_timing) = raw_timing {
@@ -965,7 +1021,7 @@ async fn maybe_rerank_indexed_batch_results(
     evaluation: VectorSearchEvaluation<'_>,
     index_entries: &[IndexManifestEntry],
     field_id: i32,
-    field_name: &str,
+    metric_check: &VectorMetricCheck,
     vector_searches: &[VectorSearch],
     results: Vec<ScoredRowIds>,
     index_search_limit: usize,
@@ -1003,15 +1059,18 @@ async fn maybe_rerank_indexed_batch_results(
     let unique_candidates = union_candidates.len();
     let raw_ranges = sorted_row_ids_to_row_ranges(union_candidates.iter())?;
     let metric_start = timing_enabled.then(Instant::now);
+    let field_name = &vector_searches[0].field_name;
     let metric = resolve_raw_vector_metric(
         evaluation.file_io,
         evaluation.table_path.trim_end_matches('/'),
         evaluation.table_options,
+        &vector_searches[0].options,
         index_entries,
         field_id,
         field_name,
     )
     .await?;
+    metric_check.check(metric)?;
     let metric_resolve = metric_start.map_or(Duration::ZERO, |start| start.elapsed());
 
     let (results, raw_timing) =
@@ -1241,6 +1300,7 @@ async fn resolve_raw_vector_metric(
     file_io: &FileIO,
     table_path: &str,
     table_options: &HashMap<String, String>,
+    search_options: &HashMap<String, String>,
     index_entries: &[IndexManifestEntry],
     field_id: i32,
     field_name: &str,
@@ -1320,13 +1380,19 @@ async fn resolve_raw_vector_metric(
         }
     }
 
-    configured_raw_vector_metric(table_options, field_name)
+    if let Some(metric) = configured_raw_vector_metric_override(search_options, field_name)? {
+        return Ok(metric);
+    }
+    Ok(
+        configured_raw_vector_metric_override(table_options, field_name)?
+            .unwrap_or(RawVectorMetric::L2),
+    )
 }
 
-fn configured_raw_vector_metric(
+fn configured_raw_vector_metric_override(
     options: &HashMap<String, String>,
     field_name: &str,
-) -> crate::Result<RawVectorMetric> {
+) -> crate::Result<Option<RawVectorMetric>> {
     let direct_keys = [
         format!("fields.{field_name}.distance.metric"),
         format!("fields.{field_name}.metric"),
@@ -1337,7 +1403,7 @@ fn configured_raw_vector_metric(
     ];
     for key in direct_keys {
         if let Some(value) = options.get(&key) {
-            return RawVectorMetric::parse(value);
+            return RawVectorMetric::parse(value).map(Some);
         }
     }
 
@@ -1352,13 +1418,13 @@ fn configured_raw_vector_metric(
         };
         if let Some(existing) = inferred {
             if existing != metric {
-                return Ok(RawVectorMetric::L2);
+                return Ok(None);
             }
         } else {
             inferred = Some(metric);
         }
     }
-    Ok(inferred.unwrap_or(RawVectorMetric::L2))
+    Ok(inferred)
 }
 
 #[derive(Default)]

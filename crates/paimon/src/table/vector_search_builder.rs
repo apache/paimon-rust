@@ -20,6 +20,7 @@
 use crate::spec::{CoreOptions, Predicate};
 use crate::table::vector_read::{BatchVectorRead, VectorRead};
 use crate::table::vector_scan::{PlanContext, VectorScan};
+use crate::table::vector_search_common::{add_filter, validate_partition_filter};
 use crate::table::Table;
 use crate::vector_search::SearchResult;
 use std::collections::HashMap;
@@ -61,7 +62,7 @@ impl<'a> VectorSearchBuilder<'a> {
     }
 
     pub fn with_options(&mut self, options: HashMap<String, String>) -> &mut Self {
-        self.options = options;
+        self.options.extend(options);
         self
     }
 
@@ -79,8 +80,14 @@ impl<'a> VectorSearchBuilder<'a> {
     /// the surviving files, so results stay exact. Sub-file row-range narrowing is
     /// not performed; a surviving file is re-read in full for the residual.
     pub fn with_filter(&mut self, filter: Predicate) -> &mut Self {
-        self.filter = Some(filter);
+        add_filter(&mut self.filter, filter);
         self
+    }
+
+    /// Add a partition-only predicate expressed against the table schema.
+    pub fn with_partition_filter(&mut self, filter: Predicate) -> crate::Result<&mut Self> {
+        validate_partition_filter(self.table, &filter)?;
+        Ok(self.with_filter(filter))
     }
 
     /// Create a query-independent scan. Only the vector column must be configured.

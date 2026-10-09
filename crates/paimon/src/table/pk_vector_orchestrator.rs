@@ -289,7 +289,8 @@ pub(crate) fn build_indexed_splits(
             .with_bucket(source.bucket())
             .with_bucket_path(source.bucket_path().to_string())
             .with_total_buckets(source.total_buckets())
-            .with_data_files(vec![file_meta]);
+            .with_data_files(vec![file_meta])
+            .with_raw_convertible(false);
         if let Some(df) = deletion_file {
             builder = builder.with_data_deletion_files(vec![Some(df)]);
         }
