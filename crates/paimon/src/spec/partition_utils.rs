@@ -390,6 +390,8 @@ fn format_partition_value(
         DataType::SmallInt(_) => row.get_short(pos)?.to_string(),
         DataType::Int(_) => row.get_int(pos)?.to_string(),
         DataType::BigInt(_) => row.get_long(pos)?.to_string(),
+        DataType::Float(_) => format_java_float(row.get_float(pos)?),
+        DataType::Double(_) => format_java_float(row.get_double(pos)?),
 
         DataType::Char(_) | DataType::VarChar(_) => {
             let s = row.get_string(pos)?;
@@ -463,12 +465,7 @@ fn format_partition_value(
             }
         }
 
-        // Float/Double: Rust f32/f64 Display differs from Java Float/Double.toString()
-        // on edge-case values. This could silently produce wrong partition paths.
-        // Since float partition keys are extremely rare, reject them explicitly.
-        DataType::Float(_)
-        | DataType::Double(_)
-        | DataType::Binary(_)
+        DataType::Binary(_)
         | DataType::VarBinary(_)
         | DataType::Variant(_)
         | DataType::Blob(_)
@@ -484,6 +481,90 @@ fn format_partition_value(
     };
 
     Ok(value)
+}
+
+/// Java's shortest-decimal string contract (JDK 19+), including its notation
+/// thresholds and closest choice among one- and two-digit decimals. Rust's
+/// shortest Display chooses different digits at ties; Ryū uses ties-to-even.
+fn format_java_float<T: ryu::Float + std::fmt::LowerExp + Copy + Into<f64>>(value: T) -> String {
+    let number = value.into();
+    if number.is_nan() {
+        return "NaN".into();
+    }
+    if number.is_infinite() {
+        return if number.is_sign_negative() {
+            "-Infinity"
+        } else {
+            "Infinity"
+        }
+        .into();
+    }
+    if number == 0.0 {
+        return if number.is_sign_negative() {
+            "-0.0"
+        } else {
+            "0.0"
+        }
+        .into();
+    }
+
+    let mut buffer = ryu::Buffer::new();
+    let (mut negative, mut digits, mut exponent) = decimal_parts(buffer.format_finite(value));
+    if digits.len() == 1 {
+        // Padding the shortest digit with zero would miss the closer two-digit
+        // form of small subnormals, e.g. Double.MIN_VALUE -> 4.9E-324.
+        (negative, digits, exponent) = decimal_parts(&format!("{value:.1e}"));
+    }
+    let mut result = if negative {
+        "-".to_string()
+    } else {
+        String::new()
+    };
+    if (-3..7).contains(&exponent) {
+        let point = exponent + 1;
+        if point <= 0 {
+            result.push_str("0.");
+            result.push_str(&"0".repeat((-point) as usize));
+            result.push_str(&digits);
+        } else if point as usize >= digits.len() {
+            result.push_str(&digits);
+            result.push_str(&"0".repeat(point as usize - digits.len()));
+            result.push_str(".0");
+        } else {
+            result.push_str(&digits[..point as usize]);
+            result.push('.');
+            result.push_str(&digits[point as usize..]);
+        }
+    } else {
+        result.push_str(&digits[..1]);
+        result.push('.');
+        result.push_str(if digits.len() > 1 { &digits[1..] } else { "0" });
+        result.push('E');
+        result.push_str(&exponent.to_string());
+    }
+    result
+}
+
+fn decimal_parts(text: &str) -> (bool, String, i32) {
+    let (mantissa, exponent) = text
+        .split_once('e')
+        .map_or((text, 0), |(mantissa, exponent)| {
+            (mantissa, exponent.parse::<i32>().expect("decimal exponent"))
+        });
+    let negative = mantissa.starts_with('-');
+    let mantissa = mantissa.trim_start_matches('-');
+    let point = mantissa.find('.').unwrap_or(mantissa.len()) as i32;
+    let digits = mantissa.replace('.', "");
+    let first = digits
+        .bytes()
+        .position(|byte| byte != b'0')
+        .expect("nonzero decimal");
+    let exponent = exponent + point - first as i32 - 1;
+    let mut digits = digits[first..].to_string();
+    while digits.len() > 1 && digits.ends_with('0') {
+        digits.pop();
+    }
+    (negative, digits, exponent)
 }
 
 /// Decode as Java's UTF-8 decoder does for `BinaryString.toString()`.
@@ -1514,20 +1595,57 @@ mod tests {
             |b| b.write_int(0, 0),
             true,
         );
-        // Float
-        assert_single_partition_err(
-            "f",
-            DataType::Float(FloatType::new()),
-            |b| b.write_int(0, 0),
-            true,
-        );
-        // Double
-        assert_single_partition_err(
-            "d",
-            DataType::Double(DoubleType::new()),
-            |b| b.write_int(0, 0),
-            true,
-        );
+    }
+
+    #[test]
+    fn test_floating_partition_names_match_java() {
+        // Float.toString / Double.toString on JDK 21. Include decimal / exponent
+        // boundaries and shortest-decimal ties where Rust Display differs.
+        for legacy in [false, true] {
+            for (value, expected) in [
+                (1.5_f32, "1.5"),
+                (42.0, "42.0"),
+                (0.001, "0.001"),
+                (0.0001, "1.0E-4"),
+                (1e7, "1.0E7"),
+                (f32::from_bits(3388994202), "-2096723.2"),
+                (f32::from_bits(1208999304), "147318.12"),
+                (f32::MIN_POSITIVE, "1.1754944E-38"),
+                (f32::from_bits(1), "1.4E-45"),
+                (f32::MAX, "3.4028235E38"),
+            ] {
+                assert_single_partition(
+                    "f",
+                    DataType::Float(FloatType::new()),
+                    |b| b.write_int(0, value.to_bits() as i32),
+                    &format!("f={expected}/"),
+                    legacy,
+                );
+            }
+            for (value, expected) in [
+                (2.25_f64, "2.25"),
+                (-42.0, "-42.0"),
+                (0.001, "0.001"),
+                (0.0001, "1.0E-4"),
+                (1e7, "1.0E7"),
+                (1e23, "1.0E23"),
+                (
+                    f64::from_bits(14053136104817660578),
+                    "-8.011083811354442E14",
+                ),
+                (f64::MIN_POSITIVE, "2.2250738585072014E-308"),
+                (f64::from_bits(1), "4.9E-324"),
+                (f64::MAX, "1.7976931348623157E308"),
+            ] {
+                assert_single_partition(
+                    "d",
+                    DataType::Double(DoubleType::new()),
+                    |b| b.write_long(0, value.to_bits() as i64),
+                    &format!("d={expected}/"),
+                    legacy,
+                );
+            }
+        }
     }
 
     #[test]

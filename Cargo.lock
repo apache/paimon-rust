@@ -4708,6 +4708,7 @@ dependencies = [
  "regex",
  "reqwest 0.12.28",
  "roaring",
+ "ryu",
  "serde",
  "serde_bytes",
  "serde_json",
