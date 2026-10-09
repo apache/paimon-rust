@@ -195,6 +195,9 @@ impl GlobalIndexScanner {
                         .map(|field| field.id())
                         .collect(),
                     indexed_coverage,
+                    // Tuple bounds can leave suffix constraints for data reads.
+                    // Search pre-filters exclude these definitions entirely.
+                    fully_evaluated: false,
                 },
             }));
         }

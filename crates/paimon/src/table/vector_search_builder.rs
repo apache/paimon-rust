@@ -70,15 +70,13 @@ impl<'a> VectorSearchBuilder<'a> {
     ///
     /// On the primary-key vector path this remains a residual allow-list over
     /// physical positions, mirroring Java `PrimaryKeyVectorRead`. On the
-    /// data-evolution/global-index path the predicate is evaluated through a
-    /// snapshot-pinned table read (which can use scalar global indexes such as
-    /// BTree), producing global row IDs that are localized for each vector-index
-    /// shard and passed to the vector backend as an include filter.
-    ///
-    /// The whole predicate is both pushed into the scan — where it prunes whole
-    /// data files by their column stats — and applied per row as a residual over
-    /// the surviving files, so results stay exact. Sub-file row-range narrowing is
-    /// not performed; a surviving file is re-read in full for the residual.
+    /// data-evolution/global-index path an exact scalar-index lookup supplies
+    /// the vector backend's row-ID include filter. Candidate-only answers are
+    /// refined against snapshot-pinned data when
+    /// `global-index.filter.refine-from-data=true`; otherwise those candidates
+    /// are excluded. If no scalar index can evaluate the predicate, indexed
+    /// ranges are scored from raw data even in FAST mode. Raw searches always
+    /// apply the row predicate before Top-K, matching Java.
     pub fn with_filter(&mut self, filter: Predicate) -> &mut Self {
         add_filter(&mut self.filter, filter);
         self

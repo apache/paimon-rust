@@ -120,3 +120,8 @@ def test_invalid_query_is_reported_before_planning(table, query):
         builder.new_vector_search_read()
     with pytest.raises(Exception, match='Query vectors'):
         table.new_batch_vector_search_builder().with_vector_column('embedding').with_limit(1).with_query_vectors([]).execute_batch_local()
+
+
+def test_single_vector_keyword_matches_stub(table):
+    builder = _single(table).with_query_vector(vector=[1, 0]).with_limit(1)
+    assert builder.execute_local().row_ids() == _single(table).with_limit(1).execute_local().row_ids()

@@ -114,8 +114,8 @@ impl PyVectorSearchBuilder {
         slf.config.limit = Some(limit);
         slf
     }
-    fn with_query_vector(mut slf: PyRefMut<'_, Self>, vectors: Vec<f32>) -> PyRefMut<'_, Self> {
-        slf.query = Some(vectors);
+    fn with_query_vector(mut slf: PyRefMut<'_, Self>, vector: Vec<f32>) -> PyRefMut<'_, Self> {
+        slf.query = Some(vector);
         slf
     }
     fn with_option(mut slf: PyRefMut<'_, Self>, key: String, value: String) -> PyRefMut<'_, Self> {

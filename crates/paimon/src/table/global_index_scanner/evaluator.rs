@@ -59,6 +59,9 @@ pub(super) struct GlobalIndexScanResult {
     pub(super) row_ranges: Vec<RowRange>,
     pub(super) evaluated_field_ids: HashSet<i32>,
     pub(super) indexed_coverage: Vec<RowRange>,
+    /// False when an AND conjunct was declined or only some constraints were
+    /// selected for a field. Contributing field IDs alone cannot prove exactness.
+    pub(super) fully_evaluated: bool,
 }
 
 pub(super) async fn try_fold_bounded<T, Fut, Acc, Fold>(
@@ -149,10 +152,13 @@ impl GlobalIndexScanner {
                     self.evaluate_leaf(&selected_entries, &predicates)
                         .await
                         .map(|result| {
-                            result.map(|(row_ranges, indexed_coverage)| GlobalIndexScanResult {
-                                row_ranges,
-                                evaluated_field_ids: HashSet::from([field_id]),
-                                indexed_coverage,
+                            result.map(|(row_ranges, indexed_coverage, fully_evaluated)| {
+                                GlobalIndexScanResult {
+                                    row_ranges,
+                                    evaluated_field_ids: HashSet::from([field_id]),
+                                    indexed_coverage,
+                                    fully_evaluated,
+                                }
                             })
                         })
                 }
@@ -161,6 +167,7 @@ impl GlobalIndexScanner {
                     let mut row_ranges: Option<Vec<RowRange>> = None;
                     let mut indexed_coverage: Option<Vec<RowRange>> = None;
                     let mut evaluated_field_ids = HashSet::new();
+                    let mut fully_evaluated = true;
                     loop {
                         let remaining_predicate = Predicate::And(children.clone());
                         let Some(composite) = self.evaluate_composite(&remaining_predicate).await?
@@ -168,6 +175,7 @@ impl GlobalIndexScanner {
                             break;
                         };
                         let result = composite.result;
+                        fully_evaluated &= result.fully_evaluated;
                         row_ranges = Some(match row_ranges {
                             None => result.row_ranges,
                             Some(existing) => {
@@ -250,40 +258,48 @@ impl GlobalIndexScanner {
                                     }
                                 }
                             }
+                            let fully_evaluated = selected_predicates.len() == predicates.len();
                             leaf_futures.push(async move {
                                 let result = self
                                     .evaluate_leaf(&selected_entries, &selected_predicates)
                                     .await?;
-                                Ok((field_id, result))
+                                Ok((field_id, result, fully_evaluated))
                             });
                         }
                     }
                     let leaf_group_count = leaf_futures.len();
-                    let (mut row_ranges, mut indexed_coverage, mut evaluated_field_ids) =
-                        try_fold_bounded(
-                            leaf_futures,
-                            leaf_group_count.max(1),
-                            (row_ranges, indexed_coverage, evaluated_field_ids),
-                            |(row_ranges, indexed_coverage, evaluated_field_ids),
-                             (field_id, result)| {
-                                if let Some((ranges, coverage)) = result {
-                                    *row_ranges = Some(match row_ranges.take() {
-                                        None => ranges,
-                                        Some(existing) => {
-                                            intersect_sorted_ranges(&existing, &ranges)
-                                        }
-                                    });
-                                    *indexed_coverage = Some(match indexed_coverage.take() {
-                                        None => coverage,
-                                        Some(existing) => {
-                                            intersect_sorted_ranges(&existing, &coverage)
-                                        }
-                                    });
-                                    evaluated_field_ids.insert(field_id);
-                                }
-                            },
-                        )
-                        .await?;
+                    let (
+                        mut row_ranges,
+                        mut indexed_coverage,
+                        mut evaluated_field_ids,
+                        mut fully_evaluated,
+                    ) = try_fold_bounded(
+                        leaf_futures,
+                        leaf_group_count.max(1),
+                        (
+                            row_ranges,
+                            indexed_coverage,
+                            evaluated_field_ids,
+                            fully_evaluated,
+                        ),
+                        |(row_ranges, indexed_coverage, evaluated_field_ids, fully_evaluated),
+                         (field_id, result, group_fully_evaluated)| {
+                            *fully_evaluated &= group_fully_evaluated && result.is_some();
+                            if let Some((ranges, coverage, leaf_fully_evaluated)) = result {
+                                *fully_evaluated &= leaf_fully_evaluated;
+                                *row_ranges = Some(match row_ranges.take() {
+                                    None => ranges,
+                                    Some(existing) => intersect_sorted_ranges(&existing, &ranges),
+                                });
+                                *indexed_coverage = Some(match indexed_coverage.take() {
+                                    None => coverage,
+                                    Some(existing) => intersect_sorted_ranges(&existing, &coverage),
+                                });
+                                evaluated_field_ids.insert(field_id);
+                            }
+                        },
+                    )
+                    .await?;
 
                     // Evaluate non-leaf children concurrently in predicate order.
                     let stream = futures::stream::iter(0..non_leaf_children.len())
@@ -292,6 +308,7 @@ impl GlobalIndexScanner {
                     futures::pin_mut!(stream);
                     while let Some(result) = stream.try_next().await? {
                         if let Some(child_result) = result {
+                            fully_evaluated &= child_result.fully_evaluated;
                             row_ranges = Some(match row_ranges {
                                 None => child_result.row_ranges,
                                 Some(existing) => {
@@ -306,6 +323,8 @@ impl GlobalIndexScanner {
                                     &child_result.indexed_coverage,
                                 ),
                             });
+                        } else {
+                            fully_evaluated = false;
                         }
                     }
 
@@ -313,10 +332,12 @@ impl GlobalIndexScanner {
                         row_ranges,
                         evaluated_field_ids,
                         indexed_coverage: indexed_coverage.unwrap_or_default(),
+                        fully_evaluated,
                     }))
                 }
                 Predicate::Or(children) => {
                     let mut all_ranges: Vec<RowRange> = Vec::new();
+                    let mut fully_evaluated = true;
                     let mut evaluated_field_ids = HashSet::new();
                     let mut indexed_coverage: Option<Vec<RowRange>> = None;
                     let stream = futures::stream::iter(0..children.len())
@@ -326,6 +347,7 @@ impl GlobalIndexScanner {
                     while let Some(result) = stream.try_next().await? {
                         match result {
                             Some(child_result) => {
+                                fully_evaluated &= child_result.fully_evaluated;
                                 all_ranges.extend(child_result.row_ranges);
                                 evaluated_field_ids.extend(child_result.evaluated_field_ids);
                                 indexed_coverage = Some(match indexed_coverage {
@@ -348,6 +370,7 @@ impl GlobalIndexScanner {
                         row_ranges,
                         evaluated_field_ids,
                         indexed_coverage: indexed_coverage.unwrap_or_default(),
+                        fully_evaluated,
                     }))
                 }
                 _ => Ok(None),
@@ -362,7 +385,7 @@ impl GlobalIndexScanner {
         &self,
         entries: &[&GlobalIndexEntry],
         predicates: &[(PredicateOperator, &[Datum], &DataType)],
-    ) -> Result<Option<(Vec<RowRange>, Vec<RowRange>)>> {
+    ) -> Result<Option<(Vec<RowRange>, Vec<RowRange>, bool)>> {
         let Some(normalized_predicates) = predicates
             .iter()
             .map(|(op, literals, data_type)| {
@@ -415,7 +438,7 @@ impl GlobalIndexScanner {
             )
         };
         if between.as_ref().is_some_and(|range| range.is_empty()) {
-            return Ok(Some((Vec::new(), coverage())));
+            return Ok(Some((Vec::new(), coverage(), true)));
         }
 
         let effective_predicates = if between.is_some() {
@@ -569,6 +592,7 @@ impl GlobalIndexScanner {
 
         let mut query_plans = Vec::with_capacity(entries.len());
         let mut all_matching_ranges = Vec::new();
+        let mut fully_evaluated = true;
         for (entry_idx, entry) in entries.iter().enumerate() {
             if (between.is_none() || between_all_matches[entry_idx])
                 && predicate_all_matches
@@ -632,6 +656,7 @@ impl GlobalIndexScanner {
             if file_cannot_match {
                 continue;
             }
+            fully_evaluated &= !file_has_unsupported_match;
             if !file_evaluated {
                 if file_has_unsupported_match {
                     return Ok(None);
@@ -722,6 +747,7 @@ impl GlobalIndexScanner {
         Ok(Some((
             crate::table::merge_row_ranges(all_ranges),
             coverage(),
+            fully_evaluated,
         )))
     }
 

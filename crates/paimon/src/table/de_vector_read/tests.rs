@@ -61,6 +61,7 @@ fn eval_context<'a>(
         table_options: options,
         schema_fields: fields,
         next_row_id,
+        filter: None,
     }
 }
 
@@ -1554,6 +1555,7 @@ async fn filtered_rerank_rejects_metric_from_a_skipped_shard() {
         table_options: table.schema().options(),
         schema_fields: table.schema().fields(),
         next_row_id: snapshot.next_row_id(),
+        filter: None,
     };
     let error = evaluate_vector_search(evaluation, &entries, &query)
         .await

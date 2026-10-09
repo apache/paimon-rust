@@ -86,7 +86,7 @@ async fn reader_reuses_queries_without_leaking_plan_filters() {
     let filter = id_gt_filter(&table, 1);
     let empty_filter = id_gt_filter(&table, 99);
     // One reader executes filtered, empty, and unfiltered plans. The plan owns
-    // the allow-list; neither it nor the empty result can alter later queries.
+    // the predicate; neither it nor the empty result can alter later queries.
     for (filter, expected) in [
         (Some(&filter), [vec![2, 1], vec![1, 2]]),
         (Some(&empty_filter), [vec![], vec![]]),
@@ -361,4 +361,120 @@ async fn de_scalar_filter_applies_to_unindexed_raw_fallback() {
         .unwrap();
 
     assert_eq!(result.row_ids().unwrap().row_ids, vec![3]);
+}
+
+#[tokio::test]
+async fn unevaluable_scalar_filter_routes_covered_ranges_to_raw_in_every_mode() {
+    let table = de_vector_table().await;
+    for mode in ["fast", "full", "detail"] {
+        let table = table.copy_with_options(HashMap::from([(
+            "vector-index.search-mode".to_string(),
+            mode.to_string(),
+        )]));
+        let filter = id_gt_filter(&table, 0);
+        let mut plan = DeVectorScan::new(&table, Some(&filter), None, None)
+            .plan()
+            .await
+            .unwrap();
+        // Keep the committed IVF shards but remove the scalar index from this
+        // plan. A data-derived ANN allow-list can lose hits with nprobe=1.
+        plan.index_entries
+            .retain(|entry| entry.index_file.index_type == "ivf-flat");
+        let read = DeVectorRead::new(
+            "embedding",
+            &[&[1.0, 0.0], &[0.0, 1.0]],
+            3,
+            &HashMap::from([("ivf.nprobe".to_string(), "1".to_string())]),
+        )
+        .unwrap();
+        let results = read.read(plan).await.unwrap();
+        for result in results {
+            let mut ids = result.row_ids().unwrap().row_ids.clone();
+            ids.sort_unstable();
+            assert_eq!(ids, vec![0, 1, 2], "{mode}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn exact_and_partial_scalar_indexes_obey_refinement_switch() {
+    let table = de_vector_table().await;
+    let predicate = crate::spec::PredicateBuilder::new(table.schema().fields());
+    let exact = id_gt_filter(&table, 1);
+    let partial = Predicate::and(vec![
+        exact.clone(),
+        predicate.is_not_null("embedding").unwrap(),
+    ]);
+    let contradiction = Predicate::and(vec![exact.clone(), Predicate::negate(exact.clone())]);
+    for mode in ["fast", "full", "detail"] {
+        for refine in [false, true] {
+            let table = table.copy_with_options(HashMap::from([
+                ("vector-index.search-mode".to_string(), mode.to_string()),
+                (
+                    "global-index.filter.refine-from-data".to_string(),
+                    refine.to_string(),
+                ),
+            ]));
+            for (filter, expected) in [
+                (&exact, 2),
+                (&partial, if refine { 2 } else { 0 }),
+                (&contradiction, 0),
+            ] {
+                let results = table
+                    .new_batch_vector_search_builder()
+                    .with_vector_column("embedding")
+                    .with_query_vectors(vec![vec![1.0, 0.0], vec![0.0, 1.0]])
+                    .with_limit(3)
+                    .with_options(HashMap::from([("ivf.nprobe".to_string(), "2".to_string())]))
+                    .with_filter(filter.clone())
+                    .execute()
+                    .await
+                    .unwrap();
+                assert_eq!(results.len(), 2);
+                for result in results {
+                    assert_eq!(
+                        result.row_ids().unwrap().len(),
+                        expected,
+                        "{mode}, refine={refine}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn scalar_filter_ignores_composite_index_definitions() {
+    let table = de_vector_table().await.copy_with_options(HashMap::from([
+        ("vector-index.search-mode".to_string(), "fast".to_string()),
+        (
+            "global-index.filter.refine-from-data".to_string(),
+            "false".to_string(),
+        ),
+    ]));
+    let filter = id_gt_filter(&table, 0);
+    let mut plan = DeVectorScan::new(&table, Some(&filter), None, None)
+        .plan()
+        .await
+        .unwrap();
+    let embedding_id =
+        crate::table::find_field_id_by_name(table.schema().fields(), "embedding").unwrap();
+    for entry in &mut plan.index_entries {
+        if entry.index_file.index_type == "btree" {
+            // A multi-field definition cannot supply Java's per-column scalar
+            // coverage, regardless of whether its leading field is indexed.
+            entry
+                .index_file
+                .global_index_meta
+                .as_mut()
+                .unwrap()
+                .extra_field_ids = Some(vec![embedding_id]);
+        }
+    }
+    let results = DeVectorRead::new("embedding", &[&[1.0, 0.0]], 3, &HashMap::new())
+        .unwrap()
+        .read(plan)
+        .await
+        .unwrap();
+    assert_eq!(results[0].row_ids().unwrap().len(), 3);
 }
