@@ -24,6 +24,7 @@ use arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField};
 use arrow::pyarrow::{FromPyArrow, ToPyArrow};
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion::catalog::CatalogProvider;
+use datafusion::execution::context::SQLOptions;
 use datafusion::execution::memory_pool::{FairSpillPool, GreedyMemoryPool, MemoryPool};
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::logical_expr::{Signature, TypeSignature, Volatility};
@@ -81,6 +82,20 @@ fn pyarrow_compatible_batch(batch: &RecordBatch) -> arrow::error::Result<RecordB
     let options = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
 
     RecordBatch::try_new_with_options(schema, columns, &options)
+}
+
+fn batches_to_pyarrow(py: Python<'_>, batches: &[RecordBatch]) -> PyResult<Vec<Py<PyAny>>> {
+    batches
+        .iter()
+        .map(|batch| {
+            let batch = pyarrow_compatible_batch(batch).map_err(|err| {
+                PyValueError::new_err(format!(
+                    "Failed to convert query result for PyArrow compatibility: {err}"
+                ))
+            })?;
+            Ok(batch.to_pyarrow(py)?.unbind())
+        })
+        .collect()
 }
 
 const OSS_IMPL: &str = "fs.oss.impl";
@@ -336,6 +351,39 @@ impl PaimonCatalog {
                 .map_err(to_py_err)
         })?;
         Ok(PyTable::new(Arc::new(table)))
+    }
+}
+
+#[pyclass(name = "SQLOptions", module = "pypaimon_rust.datafusion")]
+pub struct PySQLOptions {
+    inner: SQLOptions,
+}
+
+#[pymethods]
+impl PySQLOptions {
+    #[new]
+    fn new() -> Self {
+        Self {
+            inner: SQLOptions::new(),
+        }
+    }
+
+    #[pyo3(signature = (allow = true))]
+    fn with_allow_ddl(mut slf: PyRefMut<'_, Self>, allow: bool) -> PyRefMut<'_, Self> {
+        slf.inner = slf.inner.with_allow_ddl(allow);
+        slf
+    }
+
+    #[pyo3(signature = (allow = true))]
+    fn with_allow_dml(mut slf: PyRefMut<'_, Self>, allow: bool) -> PyRefMut<'_, Self> {
+        slf.inner = slf.inner.with_allow_dml(allow);
+        slf
+    }
+
+    #[pyo3(signature = (allow = true))]
+    fn with_allow_statements(mut slf: PyRefMut<'_, Self>, allow: bool) -> PyRefMut<'_, Self> {
+        slf.inner = slf.inner.with_allow_statements(allow);
+        slf
     }
 }
 
@@ -649,17 +697,28 @@ impl PySQLContext {
                 df.collect().await.map_err(df_to_py_err)
             })
         })?;
-        batches
-            .iter()
-            .map(|batch| {
-                let batch = pyarrow_compatible_batch(batch).map_err(|err| {
-                    PyValueError::new_err(format!(
-                        "Failed to convert query result for PyArrow compatibility: {err}"
-                    ))
-                })?;
-                Ok(batch.to_pyarrow(py)?.unbind())
+        batches_to_pyarrow(py, &batches)
+    }
+
+    fn sql_with_options(
+        &self,
+        py: Python<'_>,
+        sql: String,
+        options: PyRef<'_, PySQLOptions>,
+    ) -> PyResult<Vec<Py<PyAny>>> {
+        let rt = runtime();
+        let options = options.inner;
+        let batches = py.detach(|| {
+            rt.block_on(async {
+                let df = self
+                    .inner
+                    .sql_with_options(&sql, options)
+                    .await
+                    .map_err(df_to_py_err)?;
+                df.collect().await.map_err(df_to_py_err)
             })
-            .collect()
+        })?;
+        batches_to_pyarrow(py, &batches)
     }
 }
 
@@ -677,6 +736,7 @@ pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> 
     this.add_class::<crate::schema::PyTableSchema>()?;
     this.add_class::<crate::schema::PyDataField>()?;
     this.add_class::<PyPythonScalarUDFObject>()?;
+    this.add_class::<PySQLOptions>()?;
     this.add_class::<PySQLContext>()?;
     this.add_class::<crate::write::PyBatchWriteBuilder>()?;
     this.add_class::<crate::write::PyPostponeFixedBucketWriteBuilder>()?;
