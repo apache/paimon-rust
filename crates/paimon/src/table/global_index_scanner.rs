@@ -32,6 +32,7 @@ mod row_ranges;
 
 pub(crate) use deletion_vectors::deleted_row_ranges_for_data_evolution_dvs;
 use entry::{validate_fm_file_sets, GlobalIndexEntry, GlobalIndexEntryMeta, GlobalIndexFileKind};
+pub(super) use row_ranges::intersect_sorted_ranges;
 use row_ranges::unindexed_ranges_for_indexed_coverage;
 pub(crate) use row_ranges::{
     search_limit_with_deleted_rows, unindexed_ranges_for_global_index_entries, RowRangeIndex,
@@ -168,7 +169,7 @@ impl GlobalIndexScanner {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn create_with_fm_options(
+    pub(super) fn create_with_fm_options(
         file_io: &FileIO,
         table_path: &str,
         global_index_thread_num: usize,
@@ -363,6 +364,18 @@ impl GlobalIndexScanner {
                 .entry(path)
                 .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
         )
+    }
+
+    /// Matching positions without data-evolution's unindexed row-id extension.
+    /// Source-backed PK indexes cover a validated immutable source group.
+    pub(super) async fn matching_ranges(
+        &self,
+        predicate: &Predicate,
+    ) -> Result<Option<Vec<RowRange>>> {
+        Ok(self
+            .evaluate(predicate)
+            .await?
+            .map(|result| result.row_ranges))
     }
 }
 

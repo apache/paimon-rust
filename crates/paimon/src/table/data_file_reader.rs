@@ -486,34 +486,30 @@ impl DataFileReader {
         )
     }
 
-    /// Read one file with the complete physical data schema supplied by a
-    /// caller such as the KV reader. The format chooses whether it needs the
-    /// full schema or only the projected fields.
-    pub(super) fn read_single_file_stream_with_schema(
+    /// Read one file with the complete physical data schema and optional
+    /// file-local row positions, independent of stable row IDs. The format
+    /// chooses whether it needs the full schema or only the projected fields.
+    pub(super) fn read_single_file_stream_with_schema_and_local_ranges(
         &self,
         split: &DataSplit,
         file_meta: DataFileMeta,
         data_fields: Option<Vec<DataField>>,
         data_schema_fields: Vec<DataField>,
         dv: Option<Arc<DeletionVector>>,
-        row_ranges: Option<Vec<RowRange>>,
+        local_row_ranges: Option<Vec<RowRange>>,
     ) -> crate::Result<ArrowRecordBatchStream> {
-        let local_ranges = row_ranges.as_ref().map(|ranges| {
-            to_local_row_ranges(
-                ranges,
-                file_meta.first_row_id.unwrap_or(0),
-                file_meta.row_count,
-            )
-        });
-        let row_selection =
-            merge_row_selection(file_meta.row_count, dv.as_deref(), local_ranges.as_deref());
+        let row_selection = merge_row_selection(
+            file_meta.row_count,
+            dv.as_deref(),
+            local_row_ranges.as_deref(),
+        );
         self.read_single_file_stream_with_selection(
             split,
             file_meta,
             data_fields,
             Some(data_schema_fields),
             row_selection,
-            local_ranges,
+            local_row_ranges,
         )
     }
 

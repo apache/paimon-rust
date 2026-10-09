@@ -108,6 +108,7 @@ mod pk_full_text_read;
 mod pk_full_text_scan;
 mod pk_search_position;
 mod pk_search_ranker;
+mod pk_sorted_index_scan;
 mod pk_vector_bucket_split;
 mod pk_vector_data_file_reader;
 mod pk_vector_indexed_split_read;

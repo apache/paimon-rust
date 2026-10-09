@@ -717,7 +717,7 @@ impl KeyValueFileReader {
                                 // Only the PK-only predicate projection may run before
                                 // sort-merge. A value index can match an old version of
                                 // a key, so it must not prune merge inputs here.
-                                let row_ranges = if file_index_read_enabled {
+                                let local_row_ranges = if file_index_read_enabled {
                                     match evaluate_file_index(
                                         &run_file_io,
                                         split.bucket_path(),
@@ -750,13 +750,13 @@ impl KeyValueFileReader {
                                     )),
                                     None => None,
                                 };
-                                let mut file_stream = reader.read_single_file_stream_with_schema(
+                                let mut file_stream = reader.read_single_file_stream_with_schema_and_local_ranges(
                                     split.as_ref(),
                                     file_meta,
                                     data_fields,
                                     data_schema_fields,
                                     deletion_vector,
-                                    row_ranges,
+                                    local_row_ranges,
                                 )?;
                                 while let Some(batch) = file_stream.next().await {
                                     yield batch?;
