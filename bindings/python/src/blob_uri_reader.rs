@@ -80,6 +80,18 @@ pub(crate) struct PythonUriReaderFactory {
     readers: Mutex<HashMap<usize, Weak<PythonUriReader>>>,
 }
 
+pub(crate) fn optional_uri_reader_factory(
+    factory: Option<Py<PyAny>>,
+    py: Python<'_>,
+) -> PyResult<Option<Arc<dyn UriReaderFactory>>> {
+    factory
+        .map(|factory| {
+            PythonUriReaderFactory::new(factory, py)
+                .map(|factory| Arc::new(factory) as Arc<dyn UriReaderFactory>)
+        })
+        .transpose()
+}
+
 impl PythonUriReaderFactory {
     pub(crate) fn new(factory: Py<PyAny>, py: Python<'_>) -> PyResult<Self> {
         if !factory.bind(py).getattr("create")?.is_callable() {
@@ -95,6 +107,20 @@ impl PythonUriReaderFactory {
 }
 
 impl UriReaderFactory for PythonUriReaderFactory {
+    fn supports_uri(&self, uri: &str) -> paimon::Result<bool> {
+        tokio::task::block_in_place(|| {
+            Python::attach(|py| {
+                let factory = self.factory.bind(py);
+                if factory.hasattr("_supports_uri")? {
+                    factory.call_method1("_supports_uri", (uri,))?.extract()
+                } else {
+                    Ok(true)
+                }
+            })
+        })
+        .map_err(callback_error)
+    }
+
     fn create(&self, uri: &str) -> paimon::Result<Arc<dyn UriReader>> {
         tokio::task::block_in_place(|| {
             Python::attach(|py| {

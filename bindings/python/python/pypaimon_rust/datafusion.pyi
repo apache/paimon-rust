@@ -287,6 +287,7 @@ class BatchTableWrite:
         ...
 
 class BatchTableUpdate:
+    def _with_blob_uri_reader_factory(self, factory: Optional[Any]) -> None: ...
     def merge_into(
         self, source: Optional[Union[pyarrow.Table, Table]], *, on: Sequence[Tuple[str, str]],
         when_matched: Sequence[Dict[str, Any]], when_not_matched: Sequence[Dict[str, Any]]
@@ -329,6 +330,7 @@ class TableUpdateByRowId:
     def _abort(self) -> None: ...
 
 class StreamTableUpdate:
+    def _with_blob_uri_reader_factory(self, factory: Optional[Any]) -> None: ...
     def merge_into(
         self, source: Optional[Union[pyarrow.Table, Table]], *, on: Sequence[Tuple[str, str]],
         when_matched: Sequence[Dict[str, Any]], when_not_matched: Sequence[Dict[str, Any]],

@@ -24,6 +24,13 @@ use std::sync::Arc;
 /// Select a URI reader, corresponding to Java's UriReaderFactory.create.
 /// Return the same Arc when references share the same reader identity.
 pub trait UriReaderFactory: Send + Sync {
+    /// Limit an application reader to the references it owns. Other URIs use
+    /// the table's native FileIO/HTTP reader. Existing factories own all URIs.
+    /// Errors are propagated; they never select a different reader.
+    fn supports_uri(&self, _uri: &str) -> Result<bool> {
+        Ok(true)
+    }
+
     fn create(&self, uri: &str) -> Result<Arc<dyn UriReader>>;
 }
 

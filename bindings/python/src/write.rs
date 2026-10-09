@@ -31,7 +31,7 @@ use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyString};
 
-use crate::blob_uri_reader::{callback_error, to_callback_error, PythonUriReaderFactory};
+use crate::blob_uri_reader::{callback_error, optional_uri_reader_factory, to_callback_error};
 use crate::error::to_py_err;
 use crate::predicate::{dict_to_table_predicate, py_to_datum};
 
@@ -568,6 +568,16 @@ struct UpdateContext {
 }
 
 impl UpdateContext {
+    fn with_blob_uri_reader_factory(
+        &mut self,
+        factory: Option<Py<PyAny>>,
+        py: Python<'_>,
+    ) -> PyResult<()> {
+        self.inner
+            .with_blob_uri_reader_factory(optional_uri_reader_factory(factory, py)?);
+        Ok(())
+    }
+
     fn new(context: &WriteContext) -> PyResult<Self> {
         Ok(Self {
             inner: context
@@ -631,7 +641,7 @@ impl UpdateContext {
             return Err(error);
         }
         Ok(wrap_messages(
-            result.map_err(to_py_err)?,
+            result.map_err(to_callback_error)?,
             &self.table_location,
             &self.commit_user,
         ))
@@ -665,7 +675,7 @@ impl UpdateContext {
             return Err(error);
         }
         Ok(wrap_messages(
-            result.map_err(to_py_err)?,
+            result.map_err(to_callback_error)?,
             &self.table_location,
             &self.commit_user,
         ))
@@ -679,7 +689,7 @@ impl UpdateContext {
         let batches = arrow_table_batches(table)?;
         let messages = py
             .detach(|| runtime().block_on(self.inner.update_by_arrow_with_row_id(batches)))
-            .map_err(to_py_err)?;
+            .map_err(to_callback_error)?;
         Ok(wrap_messages(
             messages,
             &self.table_location,
@@ -720,7 +730,7 @@ impl UpdateContext {
             return Err(error);
         }
         Ok(wrap_messages(
-            result.map_err(to_py_err)?,
+            result.map_err(to_callback_error)?,
             &self.table_location,
             &self.commit_user,
         ))
@@ -746,7 +756,7 @@ impl UpdateContext {
         let batches = arrow_upsert_batches(input)?;
         let messages = py
             .detach(|| runtime().block_on(self.inner.upsert_by_arrow_with_key(batches, keys)))
-            .map_err(to_py_err)?;
+            .map_err(to_callback_error)?;
         Ok(wrap_messages(
             messages,
             &self.table_location,
@@ -776,12 +786,7 @@ impl WriteState {
         factory: Option<Py<PyAny>>,
         py: Python<'_>,
     ) -> PyResult<()> {
-        let factory = factory
-            .map(|factory| {
-                PythonUriReaderFactory::new(factory, py)
-                    .map(|factory| Arc::new(factory) as Arc<dyn paimon::io::UriReaderFactory>)
-            })
-            .transpose()?;
+        let factory = optional_uri_reader_factory(factory, py)?;
         self.inner
             .as_mut()
             .ok_or_else(|| PyRuntimeError::new_err("TableWrite is closed"))?
@@ -882,12 +887,7 @@ impl PyTableUpdateByRowId {
         py: Python<'_>,
         factory: Option<Py<PyAny>>,
     ) -> PyResult<()> {
-        let factory = factory
-            .map(|factory| {
-                PythonUriReaderFactory::new(factory, py)
-                    .map(|factory| Arc::new(factory) as Arc<dyn paimon::io::UriReaderFactory>)
-            })
-            .transpose()?;
+        let factory = optional_uri_reader_factory(factory, py)?;
         self.inner.with_blob_uri_reader_factory(factory);
         Ok(())
     }
@@ -931,6 +931,14 @@ pub struct PyStreamTableUpdate {
 
 #[pymethods]
 impl PyStreamTableUpdate {
+    fn _with_blob_uri_reader_factory(
+        &mut self,
+        py: Python<'_>,
+        factory: Option<Py<PyAny>>,
+    ) -> PyResult<()> {
+        self.context.with_blob_uri_reader_factory(factory, py)
+    }
+
     #[pyo3(signature = (source, *, on, when_matched, when_not_matched, commit_identifier))]
     fn merge_into(
         &self,
@@ -1018,6 +1026,14 @@ impl PyStreamTableUpdate {
 
 #[pymethods]
 impl PyBatchTableUpdate {
+    fn _with_blob_uri_reader_factory(
+        &mut self,
+        py: Python<'_>,
+        factory: Option<Py<PyAny>>,
+    ) -> PyResult<()> {
+        self.context.with_blob_uri_reader_factory(factory, py)
+    }
+
     #[pyo3(signature = (source, *, on, when_matched, when_not_matched))]
     fn merge_into(
         &self,

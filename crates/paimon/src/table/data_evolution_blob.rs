@@ -223,7 +223,7 @@ pub(super) fn delta_batch(
 fn update_arrow_type(field: &DataField, batches: &[RecordBatch]) -> Result<arrow_schema::DataType> {
     use arrow_schema::DataType;
     let target = crate::arrow::paimon_type_to_arrow(field.data_type())?;
-    let DataType::Map(entries, _) = &target else {
+    let DataType::Map(_, _) = &target else {
         return Ok(target);
     };
     let list_input = batches
@@ -238,16 +238,8 @@ fn update_arrow_type(field: &DataField, batches: &[RecordBatch]) -> Result<arrow
     if !list_input {
         return Ok(target);
     }
-    let DataType::Struct(fields) = entries.data_type() else {
-        unreachable!("Arrow map entries are structs");
-    };
-    let fields = vec![
-        Arc::new(fields[0].as_ref().clone().with_nullable(true)),
-        fields[1].clone(),
-    ];
-    Ok(DataType::List(Arc::new(arrow_schema::Field::new(
-        "item",
-        DataType::Struct(fields.into()),
-        false,
-    ))))
+    Ok(
+        super::super::write_batch_normalize::blob_map_row_type(&target)
+            .expect("logical Blob maps have key/value entries"),
+    )
 }

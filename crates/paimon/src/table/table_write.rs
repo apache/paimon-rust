@@ -45,7 +45,7 @@ use crate::table::partition_filter::PartitionFilter;
 use crate::table::postpone_file_writer::{PostponeFileWriter, PostponeWriteConfig};
 use crate::table::prepared_files::PreparedFiles;
 use crate::table::row_kind_generator::RowKindGenerator;
-use crate::table::write_batch_normalize::normalize_write_array;
+use crate::table::write_batch_normalize::{normalize_blob_write_field, normalize_write_array};
 use crate::table::{Snapshot, Table, TableScan};
 use crate::Result;
 use arrow_array::{Array, ArrayRef, Int8Array, RecordBatch};
@@ -938,10 +938,22 @@ impl TableWrite {
             }
         }
 
+        let blob_maps: HashSet<_> = self.table.schema().fields().iter()
+            .filter(|field| self.primary_key_indices.is_empty()
+                && matches!(field.data_type(), DataType::Map(map) if map.value_type().is_blob_type())
+                && !self.blob_inline_fields.contains(field.name()))
+            .map(|field| field.name()).collect();
         let mut normalized_columns: Vec<ArrayRef> = Vec::with_capacity(actual_field_count);
+        let mut normalized_fields = Vec::with_capacity(actual_field_count);
         for (index, expected_field) in expected_schema.fields().iter().enumerate() {
             let actual_field = actual_schema.field(index);
-            let column = normalize_write_array(batch.column(index), expected_field.data_type())
+            let normalized = if blob_maps.contains(expected_field.name().as_str()) {
+                normalize_blob_write_field(batch.column(index), expected_field)
+            } else {
+                normalize_write_array(batch.column(index), expected_field.data_type())
+                    .map(|column| (expected_field.as_ref().clone(), column))
+            };
+            let (field, column) = normalized
                 .map_err(|error| crate::Error::DataInvalid {
                     message: format!(
                         "write batch schema data type mismatch for field '{}' at index {index}: expected {:?}, actual {:?}: {error}",
@@ -951,6 +963,7 @@ impl TableWrite {
                     ),
                     source: Some(Box::new(error)),
                 })?;
+            normalized_fields.push(Arc::new(field));
             normalized_columns.push(column);
         }
         if includes_value_kind {
@@ -966,18 +979,13 @@ impl TableWrite {
                 });
             }
             normalized_columns.push(batch.column(table_field_count).clone());
+            normalized_fields.push(actual_schema.fields()[table_field_count].clone());
         }
 
-        let schema = if includes_value_kind {
-            let mut fields = expected_schema.fields().iter().cloned().collect::<Vec<_>>();
-            fields.push(actual_schema.fields()[table_field_count].clone());
-            Arc::new(arrow_schema::Schema::new_with_metadata(
-                fields,
-                expected_schema.metadata().clone(),
-            ))
-        } else {
-            expected_schema.clone()
-        };
+        let schema = Arc::new(arrow_schema::Schema::new_with_metadata(
+            normalized_fields,
+            expected_schema.metadata().clone(),
+        ));
         RecordBatch::try_new(schema, normalized_columns).map_err(|error| {
             crate::Error::DataInvalid {
                 message: format!("Failed to normalize write batch schema: {error}"),
