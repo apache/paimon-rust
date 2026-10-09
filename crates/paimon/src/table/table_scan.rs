@@ -2178,6 +2178,23 @@ impl<'a> PaimonTableScan<'a> {
         }
     }
 
+    fn pk_sorted_index_needed(&self) -> bool {
+        let schema = self.table.schema();
+        let options = schema.core_options();
+        !schema.primary_keys().is_empty()
+            && !self.is_streaming()
+            && !self.scan_all_files
+            && !self.row_range_optimization_disabled
+            && self.incremental_split_mode.is_none()
+            && self.snapshot_mode().is_none()
+            && !options.query_auth_enabled()
+            && options.global_index_enabled()
+            && !self.data_predicates.is_empty()
+            && ["pk-btree.index.columns", "pk-bitmap.index.columns"]
+                .iter()
+                .any(|key| schema.options().contains_key(*key))
+    }
+
     async fn read_index_manifest_entries(
         &self,
         snapshot: &Snapshot,
@@ -2558,10 +2575,11 @@ impl<'a> PaimonTableScan<'a> {
         let data_evolution_enabled = core_options.data_evolution_enabled();
         let global_index_settings =
             self.global_index_scan_settings(&core_options, data_evolution_enabled)?;
+        let pk_sorted_index_needed = self.pk_sorted_index_needed();
         let index_entries = self
             .read_index_manifest_entries(
                 snapshot,
-                global_index_settings.is_some(),
+                global_index_settings.is_some() || pk_sorted_index_needed,
                 core_options.deletion_vectors_enabled() && !self.is_streaming(),
             )
             .await?;
@@ -3031,6 +3049,22 @@ impl<'a> PaimonTableScan<'a> {
         };
         let splits = if let Some(config) = self.chunk_shuffle() {
             chunk_shuffle_splits(&self.table, splits, config, self.shard()).await?
+        } else {
+            splits
+        };
+        let splits = if self.pk_sorted_index_needed() {
+            let definitions = super::pk_sorted_index_scan::definitions(
+                self.table.schema().fields(),
+                self.table.schema().options(),
+            )?;
+            super::pk_sorted_index_scan::refine(
+                &self.table,
+                splits,
+                index_entries.as_deref().unwrap_or_default(),
+                &definitions,
+                &self.data_predicates,
+            )
+            .await?
         } else {
             splits
         };

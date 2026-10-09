@@ -47,8 +47,9 @@ pub(crate) fn data_evolution_anchor_file(files: &[DataFileMeta]) -> crate::Resul
 // ======================= RowRange ===============================
 
 /// An inclusive row range `[from, to]` in the coordinate system of the read
-/// path: stable row IDs for row-tracked tables, or physical positions for raw
-/// tables without row tracking.
+/// path: stable row IDs for row-tracked append/Data Evolution tables,
+/// split-local positions for ordinary append tables, or file-local physical
+/// positions for primary-key IndexedSplits.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RowRange {
     from: i64,
@@ -498,9 +499,10 @@ pub struct DataSplit {
     /// Deletion file for each data file, same order as `data_files`.
     /// `None` at index `i` means no deletion file for `data_files[i]` (matches Java getDeletionFiles() / List<DeletionFile> with null elements).
     data_deletion_files: Option<Arc<[Option<DeletionFile>]>>,
-    /// IndexedSplit-compatible ranges. Row-tracked tables interpret these as
-    /// stable row IDs; raw tables without row tracking interpret them as
-    /// split-local physical positions over `data_files` in list order.
+    /// IndexedSplit-compatible ranges. Append/Data Evolution reads use stable
+    /// row IDs when tracked, otherwise split-local positions over `data_files`.
+    /// Primary-key IndexedSplits use file-local physical positions, independent
+    /// of row tracking.
     row_ranges: Option<Arc<[RowRange]>>,
     /// Whether the split can be read raw, without the merge reader: its
     /// physical rows are exactly its logical rows (modulo deletion files).
@@ -585,6 +587,21 @@ impl DataSplit {
     pub(crate) fn with_selected_row_ranges(mut self, ranges: Vec<RowRange>) -> Self {
         self.row_ranges = Some(ranges.into());
         self
+    }
+
+    /// Java PrimaryKeySortedIndexResult preserves each non-raw split whole,
+    /// and turns raw splits into single-file merge-reader inputs. Its ranges
+    /// address physical positions, including when the file tracks row IDs.
+    pub(crate) fn for_pk_index_file(&self, file_index: usize) -> Self {
+        let mut split = self.clone();
+        split.data_files = vec![self.data_files[file_index].clone()].into();
+        split.data_deletion_files = self
+            .data_deletion_files
+            .as_ref()
+            .map(|files| vec![files[file_index].clone()].into());
+        split.row_ranges = None;
+        split.raw_convertible = false;
+        split
     }
 
     /// Whether this split can be read raw (no sort-merge needed); see the

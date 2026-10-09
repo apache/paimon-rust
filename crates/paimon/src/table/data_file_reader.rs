@@ -498,13 +498,9 @@ impl DataFileReader {
         dv: Option<Arc<DeletionVector>>,
         row_ranges: Option<Vec<RowRange>>,
     ) -> crate::Result<ArrowRecordBatchStream> {
-        let local_ranges = row_ranges.as_ref().map(|ranges| {
-            to_local_row_ranges(
-                ranges,
-                file_meta.first_row_id.unwrap_or(0),
-                file_meta.row_count,
-            )
-        });
+        // KV IndexedSplit ranges are physical file positions (Java
+        // KeyValueDataFileRecordReader), independent of stable row IDs.
+        let local_ranges = row_ranges;
         let row_selection =
             merge_row_selection(file_meta.row_count, dv.as_deref(), local_ranges.as_deref());
         self.read_single_file_stream_with_selection(
