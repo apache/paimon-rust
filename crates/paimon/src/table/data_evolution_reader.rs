@@ -820,15 +820,21 @@ impl DataEvolutionReader {
                 .load_missing(rest_env, &batch, &self.blob_view_fields)
                 .await?;
         }
-        batch = self.resolve_blob_view_columns(batch, blob_view_lookup.as_ref())?;
+        batch = self
+            .resolve_blob_view_columns(batch, blob_view_lookup.as_ref())
+            .await?;
         let mut batch = if !self.blob_as_descriptor && !descriptor_fields.is_empty() {
-            resolve_descriptor_columns(
-                batch,
-                descriptor_fields,
-                &self.file_io,
-                &self.blob_read_limiter,
-            )
-            .await?
+            // View payloads were resolved with their upstream table's FileIO.
+            let fields = if blob_view_lookup.is_some() {
+                descriptor_fields
+                    .difference(&self.blob_view_fields)
+                    .cloned()
+                    .collect()
+            } else {
+                descriptor_fields.clone()
+            };
+            resolve_descriptor_columns(batch, &fields, &self.file_io, &self.blob_read_limiter)
+                .await?
         } else {
             batch
         };
@@ -928,7 +934,7 @@ impl DataEvolutionReader {
         fields
     }
 
-    fn resolve_blob_view_columns(
+    async fn resolve_blob_view_columns(
         &self,
         batch: RecordBatch,
         lookup: Option<&BlobViewLookup>,
@@ -937,7 +943,14 @@ impl DataEvolutionReader {
             return Ok(batch);
         };
 
-        replace_blob_view_columns(batch, &self.blob_view_fields, lookup)
+        replace_blob_view_columns(
+            batch,
+            &self.blob_view_fields,
+            lookup,
+            self.blob_as_descriptor,
+            &self.blob_read_limiter,
+        )
+        .await
     }
 
     /// Merge multiple logical sources column-wise for data evolution.
@@ -1381,10 +1394,12 @@ fn collect_blob_view_structs(
     Ok(())
 }
 
-fn replace_blob_view_columns(
+async fn replace_blob_view_columns(
     batch: RecordBatch,
     blob_view_fields: &HashSet<String>,
     lookup: &BlobViewLookup,
+    blob_as_descriptor: bool,
+    limiter: &BlobReadLimiter,
 ) -> crate::Result<RecordBatch> {
     let schema = batch.schema();
     let mut columns: Vec<Arc<dyn arrow_array::Array>> = Vec::with_capacity(batch.num_columns());
@@ -1397,10 +1412,11 @@ fn replace_blob_view_columns(
         }
 
         let col = large_binary_column(&batch, idx, field.name())?;
-        let mut builder = arrow_array::builder::LargeBinaryBuilder::new();
-        for row in 0..col.len() {
+        let mut values = vec![None; col.len()];
+        let mut by_table: HashMap<crate::catalog::Identifier, Vec<(usize, Vec<u8>)>> =
+            HashMap::new();
+        for (row, slot) in values.iter_mut().enumerate() {
             if col.is_null(row) {
-                builder.append_null();
                 continue;
             }
 
@@ -1416,11 +1432,35 @@ fn replace_blob_view_columns(
             }
             let view_struct = BlobViewStruct::deserialize(value)?;
             match lookup.descriptor(&view_struct)? {
-                None => builder.append_null(),
-                Some(descriptor) => builder.append_value(descriptor.serialize()),
+                None => {}
+                Some(descriptor) if blob_as_descriptor => *slot = Some(descriptor.serialize()),
+                Some(descriptor) => by_table
+                    .entry(view_struct.identifier().clone())
+                    .or_default()
+                    .push((row, descriptor.serialize())),
             }
         }
-        columns.push(Arc::new(builder.finish()));
+        for (identifier, entries) in by_table {
+            let file_io = lookup
+                .file_ios
+                .get(&identifier)
+                .ok_or_else(|| Error::DataInvalid {
+                    message: format!("Missing upstream FileIO for {}", identifier.full_name()),
+                    source: None,
+                })?;
+            let descriptors =
+                LargeBinaryArray::from_iter_values(entries.iter().map(|(_, value)| value));
+            let payloads = super::blob_resolver::resolve_descriptor_column(
+                &descriptors,
+                file_io,
+                limiter.clone(),
+            )
+            .await?;
+            for ((row, _), value) in entries.into_iter().zip(payloads.iter()) {
+                values[row] = value.map(<[u8]>::to_vec);
+            }
+        }
+        columns.push(Arc::new(LargeBinaryArray::from_iter(values)));
         changed = true;
     }
 
@@ -1452,6 +1492,8 @@ fn large_binary_column<'a>(
 #[derive(Debug, Default)]
 struct BlobViewLookup {
     descriptors: HashMap<BlobViewStruct, Option<BlobDescriptor>>,
+    file_ios: HashMap<crate::catalog::Identifier, FileIO>,
+    rest_env: Option<RESTEnv>,
 }
 
 /// Resolve view references only after the caller has selected authorized rows.
@@ -1459,14 +1501,17 @@ pub(crate) fn resolve_blob_view_stream(
     stream: ArrowRecordBatchStream,
     fields: HashSet<String>,
     rest_env: RESTEnv,
+    blob_as_descriptor: bool,
+    blob_parallelism: usize,
 ) -> ArrowRecordBatchStream {
     Box::pin(async_stream::try_stream! {
+        let limiter = BlobReadLimiter::with_parallelism(blob_parallelism);
         let mut stream = stream;
         let mut lookup = BlobViewLookup::default();
         while let Some(batch) = stream.next().await {
             let batch = batch?;
             lookup.load_missing(rest_env.clone(), &batch, &fields).await?;
-            yield replace_blob_view_columns(batch, &fields, &lookup)?;
+            yield replace_blob_view_columns(batch, &fields, &lookup, blob_as_descriptor, &limiter).await?;
         }
     })
 }
@@ -1482,8 +1527,11 @@ impl BlobViewLookup {
         collect_blob_view_structs(batch, blob_view_fields, &mut view_structs)?;
         view_structs.retain(|view| !self.descriptors.contains_key(view));
         if !view_structs.is_empty() {
-            let loaded = Self::load(rest_env, view_structs).await?;
+            let loaded =
+                Self::load(self.rest_env.clone().unwrap_or(rest_env), view_structs).await?;
             self.descriptors.extend(loaded.descriptors);
+            self.file_ios.extend(loaded.file_ios);
+            self.rest_env = loaded.rest_env;
         }
         Ok(())
     }
@@ -1493,101 +1541,106 @@ impl BlobViewLookup {
             return Ok(Self::default());
         }
 
-        let mut by_table_and_field: HashMap<
-            (crate::catalog::Identifier, i32),
-            Vec<BlobViewStruct>,
-        > = HashMap::new();
+        let rest_env = rest_env.for_dependency_reads().await?;
+        let mut by_table: HashMap<crate::catalog::Identifier, Vec<BlobViewStruct>> = HashMap::new();
         for view_struct in view_structs {
-            by_table_and_field
-                .entry((view_struct.identifier().clone(), view_struct.field_id()))
+            by_table
+                .entry(view_struct.identifier().clone())
                 .or_default()
                 .push(view_struct);
         }
 
-        let mut lookup = Self::default();
-        for ((identifier, field_id), refs) in by_table_and_field {
+        let mut lookup = Self {
+            rest_env: Some(rest_env.clone()),
+            ..Self::default()
+        };
+        for (identifier, refs) in by_table {
             let table = rest_env.get_table(&identifier).await?;
-            let field = table
+            lookup
+                .file_ios
+                .insert(identifier.clone(), table.file_io().clone());
+            let field_ids: HashSet<_> = refs.iter().map(BlobViewStruct::field_id).collect();
+            // Java groups fields and row ranges by table. One projected scan
+            // keeps all referenced fields on the same upstream snapshot.
+            let fields: Vec<_> = table
                 .schema()
                 .fields()
                 .iter()
-                .find(|field| field.id() == field_id)
+                .filter(|field| field_ids.contains(&field.id()))
                 .cloned()
-                .ok_or_else(|| Error::DataInvalid {
-                    message: format!(
-                        "Cannot find blob field id {field_id} in upstream table {}",
-                        identifier.full_name()
-                    ),
-                    source: None,
-                })?;
-            if !field.data_type().is_blob_type() {
-                return Err(Error::DataInvalid {
-                    message: format!(
-                        "Field id {field_id} in upstream table {} is not a BLOB field",
-                        identifier.full_name()
-                    ),
-                    source: None,
-                });
+                .collect();
+            for id in &field_ids {
+                if !fields.iter().any(|field| field.id() == *id) {
+                    return Err(Error::DataInvalid {
+                        message: format!(
+                            "Cannot find blob field id {id} in upstream table {}",
+                            identifier.full_name()
+                        ),
+                        source: None,
+                    });
+                }
+            }
+            for field in &fields {
+                if !field.data_type().is_blob_type() {
+                    return Err(Error::DataInvalid {
+                        message: format!(
+                            "Field id {} in upstream table {} is not a BLOB field",
+                            field.id(),
+                            identifier.full_name()
+                        ),
+                        source: None,
+                    });
+                }
             }
 
-            let mut options = HashMap::new();
-            options.insert("blob-as-descriptor".to_string(), "true".to_string());
-            let table = table.copy_with_options(options);
-            let row_ranges = row_ranges_for_blob_view_refs(&refs);
+            let table = table.copy_with_options(HashMap::from([(
+                "blob-as-descriptor".to_string(),
+                "true".to_string(),
+            )]));
+            let mut read_fields = fields.clone();
+            read_fields.push(crate::spec::row_id_data_field());
             let mut read_builder = table.new_read_builder();
-            read_builder.with_read_type(vec![field.clone(), crate::spec::row_id_data_field()]);
-            read_builder.with_row_ranges(row_ranges);
+            read_builder.with_read_type(read_fields);
+            read_builder.with_row_ranges(row_ranges_for_blob_view_refs(&refs));
             let plan = read_builder.new_scan().plan().await?;
-            let read = read_builder.new_read()?;
-            let mut stream = read.to_arrow(plan.splits())?;
+            let mut stream = read_builder.new_read()?.to_arrow(plan.splits())?;
 
             while let Some(batch) = stream.next().await {
                 let batch = batch?;
-                let blob_col = batch
-                    .column(0)
-                    .as_any()
-                    .downcast_ref::<LargeBinaryArray>()
-                    .ok_or_else(|| Error::DataInvalid {
-                        message: format!(
-                            "Upstream blob field '{}' did not read as LargeBinaryArray",
-                            field.name()
-                        ),
-                        source: None,
-                    })?;
                 let row_id_col = batch
-                    .column(1)
+                    .column(fields.len())
                     .as_any()
                     .downcast_ref::<Int64Array>()
                     .ok_or_else(|| Error::DataInvalid {
                         message: "Upstream _ROW_ID did not read as Int64Array".to_string(),
                         source: None,
                     })?;
-
-                for row in 0..batch.num_rows() {
-                    if row_id_col.is_null(row) {
-                        continue;
+                for (index, field) in fields.iter().enumerate() {
+                    let blob_col = large_binary_column(&batch, index, field.name())?;
+                    for row in 0..batch.num_rows() {
+                        if row_id_col.is_null(row) {
+                            continue;
+                        }
+                        let view_struct = BlobViewStruct::new(
+                            identifier.clone(),
+                            field.id(),
+                            row_id_col.value(row),
+                        );
+                        let descriptor = if blob_col.is_null(row) {
+                            None
+                        } else {
+                            let value = blob_col.value(row);
+                            if !BlobDescriptor::is_blob_descriptor(value) {
+                                return Err(Error::DataInvalid {
+                                    message: format!("BlobViewStruct {} field_id={} row_id={} resolved to non-BlobDescriptor bytes",
+                                                     identifier.full_name(), field.id(), row_id_col.value(row)),
+                                    source: None,
+                                });
+                            }
+                            Some(BlobDescriptor::deserialize(value)?)
+                        };
+                        lookup.descriptors.insert(view_struct, descriptor);
                     }
-                    let view_struct =
-                        BlobViewStruct::new(identifier.clone(), field_id, row_id_col.value(row));
-                    if blob_col.is_null(row) {
-                        lookup.descriptors.insert(view_struct, None);
-                        continue;
-                    }
-                    let value = blob_col.value(row);
-                    if !BlobDescriptor::is_blob_descriptor(value) {
-                        return Err(Error::DataInvalid {
-                            message: format!(
-                                "BlobViewStruct {} field_id={} row_id={} resolved to non-BlobDescriptor bytes",
-                                identifier.full_name(),
-                                field_id,
-                                row_id_col.value(row)
-                            ),
-                            source: None,
-                        });
-                    }
-                    lookup
-                        .descriptors
-                        .insert(view_struct, Some(BlobDescriptor::deserialize(value)?));
                 }
             }
 
@@ -3190,6 +3243,107 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn blob_view_payloads_use_each_upstream_file_io_even_for_the_same_uri() {
+        let uri = "memory:/referenced-payload";
+        let first_io = FileIO::from_path(uri).unwrap().build().unwrap();
+        let second_io = FileIO::from_path(uri).unwrap().build().unwrap();
+        first_io
+            .new_output(uri)
+            .unwrap()
+            .write(Bytes::from_static(b"first"))
+            .await
+            .unwrap();
+        second_io
+            .new_output(uri)
+            .unwrap()
+            .write(Bytes::from_static(b"other"))
+            .await
+            .unwrap();
+        let first = BlobViewStruct::new(Identifier::new("db", "first"), 1, 0);
+        let second = BlobViewStruct::new(Identifier::new("db", "second"), 1, 0);
+        let null = BlobViewStruct::new(first.identifier().clone(), 1, 1);
+        let descriptor = BlobDescriptor::new(uri.to_string(), 0, 5);
+        let mut lookup = BlobViewLookup::default();
+        lookup
+            .descriptors
+            .insert(first.clone(), Some(descriptor.clone()));
+        lookup
+            .descriptors
+            .insert(second.clone(), Some(descriptor.clone()));
+        lookup.descriptors.insert(null.clone(), None);
+        lookup.file_ios.insert(first.identifier().clone(), first_io);
+        lookup
+            .file_ios
+            .insert(second.identifier().clone(), second_io);
+        let refs = [
+            Some(first.serialize().unwrap()),
+            None,
+            Some(second.serialize().unwrap()),
+            Some(first.serialize().unwrap()),
+            Some(null.serialize().unwrap()),
+        ];
+        let batch = RecordBatch::try_from_iter([(
+            "payload",
+            Arc::new(LargeBinaryArray::from_iter(refs)) as arrow_array::ArrayRef,
+        )])
+        .unwrap();
+        let fields = HashSet::from(["payload".to_string()]);
+        let result = replace_blob_view_columns(
+            batch.clone(),
+            &fields,
+            &lookup,
+            false,
+            &BlobReadLimiter::new(),
+        )
+        .await
+        .unwrap();
+        let values = large_binary_column(&result, 0, "payload")
+            .unwrap()
+            .iter()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            values,
+            vec![
+                Some(b"first".as_slice()),
+                None,
+                Some(b"other".as_slice()),
+                Some(b"first".as_slice()),
+                None
+            ]
+        );
+        // Descriptor output must not open payload files.
+        lookup.file_ios.clear();
+        let result = replace_blob_view_columns(
+            batch.clone(),
+            &fields,
+            &lookup,
+            true,
+            &BlobReadLimiter::new(),
+        )
+        .await
+        .unwrap();
+        let expected = descriptor.serialize();
+        assert_eq!(
+            large_binary_column(&result, 0, "payload")
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![
+                Some(expected.as_slice()),
+                None,
+                Some(expected.as_slice()),
+                Some(expected.as_slice()),
+                None
+            ]
+        );
+        let error =
+            replace_blob_view_columns(batch, &fields, &lookup, false, &BlobReadLimiter::new())
+                .await
+                .unwrap_err();
+        assert!(error.to_string().contains("Missing upstream FileIO"));
+    }
 
     mod blob_test_utils {
         include!(concat!(env!("CARGO_MANIFEST_DIR"), "/blob_test_utils.rs"));

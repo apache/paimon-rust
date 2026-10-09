@@ -22,7 +22,7 @@
 
 use axum::{
     extract::{Extension, Json, Path, Query},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{get, post},
     serve, Router,
@@ -70,6 +70,7 @@ struct MockState {
     list_page_size: Option<usize>,
     no_permission_databases: HashSet<String>,
     no_permission_tables: HashSet<String>,
+    table_read_via: HashMap<String, String>,
     create_partitions_calls: Vec<(String, String, CreatePartitionsRequest)>,
     drop_partitions_calls: Vec<(String, String, DropPartitionsRequest)>,
     create_partitions_error_status: Option<StatusCode>,
@@ -817,12 +818,31 @@ impl RESTServer {
 
     /// Handle GET /databases/:db/tables/:table - get a specific table.
     pub async fn get_table(
+        headers: HeaderMap,
         Path((db, table)): Path<(String, String)>,
         Extension(state): Extension<Arc<RESTServer>>,
     ) -> impl IntoResponse {
         let mut s = state.inner.lock().unwrap();
 
         let key = format!("{db}.{table}");
+        if let Some(expected) = s.table_read_via.get(&key) {
+            if headers
+                .get("X-Paimon-Read-Via")
+                .and_then(|value| value.to_str().ok())
+                != Some(expected)
+            {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(ErrorResponse::new(
+                        Some("table".to_string()),
+                        Some(table.clone()),
+                        Some("Dependency requires Read-Via".to_string()),
+                        Some(403),
+                    )),
+                )
+                    .into_response();
+            }
+        }
         if s.no_permission_tables.contains(&key) {
             let err = ErrorResponse::new(
                 Some("table".to_string()),
@@ -1870,6 +1890,15 @@ impl RESTServer {
             .lock()
             .unwrap()
             .create_partitions_statistics_error_status = status;
+    }
+
+    /// Require the dependency identity on get-table requests for this table.
+    pub fn require_table_read_via(&self, database: &str, table: &str, read_via: String) {
+        self.inner
+            .lock()
+            .unwrap()
+            .table_read_via
+            .insert(format!("{database}.{table}"), read_via);
     }
 
     /// Make the list-partitions endpoint return the given status.

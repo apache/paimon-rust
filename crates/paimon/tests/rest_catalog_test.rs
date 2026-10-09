@@ -905,6 +905,19 @@ async fn test_blob_view_limit_only_resolves_selected_references() {
         .await
         .unwrap();
 
+    // This is payload, not another reference to decode. Both the ordinary
+    // and authorized view pipelines below must return these bytes unchanged.
+    let first_payload =
+        paimon::spec::BlobDescriptor::new("memory:/not-an-upstream-payload".to_string(), 0, 4)
+            .serialize();
+    let payload_path = tmp.path().join("descriptor-payload");
+    std::fs::write(&payload_path, &first_payload).unwrap();
+    let first_input = paimon::spec::BlobDescriptor::new(
+        format!("file://{}", payload_path.display()),
+        0,
+        first_payload.len() as i64,
+    )
+    .serialize();
     let source_id = Identifier::new("default", "blob_source");
     let source_schema = blob_schema(&[]);
     fs_catalog
@@ -917,7 +930,7 @@ async fn test_blob_view_limit_only_resolves_selected_references() {
         blob_batch(
             vec![1, 2],
             vec!["Alice", "Bob"],
-            vec![b"alice".to_vec(), b"bob".to_vec()],
+            vec![first_input, b"bob".to_vec()],
         ),
         "source-writer",
     )
@@ -983,6 +996,8 @@ async fn test_blob_view_limit_only_resolves_selected_references() {
         .await
         .expect("create rest catalog");
 
+    let read_via = paimon::api::RESTUtil::encode_string(&serde_json::to_string(&view_id).unwrap());
+    server.require_table_read_via("default", "blob_source", read_via);
     let rest_view = rest_catalog.get_table(&view_id).await.unwrap();
     let predicate = PredicateBuilder::new(rest_view.schema().fields())
         .equal("id", Datum::Int(1))
@@ -1114,7 +1129,7 @@ async fn test_blob_view_limit_only_resolves_selected_references() {
     assert_eq!(
         collect_blob_rows(&batches),
         vec![
-            (1, "Updated".to_string(), Some(b"alice".to_vec())),
+            (1, "Updated".to_string(), Some(first_payload.clone())),
             (2, "Repeated".to_string(), None),
             (3, "Repeated again".to_string(), Some(b"bob".to_vec())),
         ]
@@ -1140,7 +1155,7 @@ async fn test_blob_view_limit_only_resolves_selected_references() {
     assert_eq!(
         collect_blob_rows(&read_all(&authorized.new_read_builder()).await.unwrap()),
         vec![
-            (1, "Updated".to_string(), Some(b"alice".to_vec())),
+            (1, "Updated".to_string(), Some(first_payload.clone())),
             (2, "Repeated".to_string(), None),
             (3, "Repeated again".to_string(), Some(b"bob".to_vec())),
         ]
@@ -1154,7 +1169,7 @@ async fn test_blob_view_limit_only_resolves_selected_references() {
     let mut filtered = authorized.new_read_builder();
     filtered.with_projection(&["id"]).unwrap().with_filter(
         PredicateBuilder::new(authorized.schema().fields())
-            .equal("picture", Datum::Bytes(b"alice".to_vec()))
+            .equal("picture", Datum::Bytes(first_payload.clone()))
             .unwrap(),
     );
     let rows: Vec<RecordBatch> = filtered
