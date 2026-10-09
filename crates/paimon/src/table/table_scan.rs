@@ -1272,6 +1272,7 @@ impl<'a> TableScan<'a> {
     /// `seed` must render as a decimal integer. Accepting any `ToString` seed
     /// keeps ordinary Rust integer calls ergonomic while allowing language
     /// bindings to preserve arbitrary-precision integer seeds.
+    /// Only predicates on unmasked partition keys are supported.
     pub fn with_chunk_shuffle(self, seed: impl ToString, chunk_size: u64) -> crate::Result<Self> {
         let config = ChunkShuffle::from_decimal_seed(&seed.to_string(), chunk_size)?;
         match self.0 {
@@ -1293,7 +1294,13 @@ impl<'a> TableScan<'a> {
                                 .to_string(),
                     });
                 }
-                if !scan.data_predicates.is_empty() {
+                if !scan.data_predicates.is_empty()
+                    && !super::read_builder::is_exact_filter_pushdown_for_schema(
+                        scan.table.schema().fields(),
+                        scan.table.schema().partition_keys(),
+                        &Predicate::and(scan.data_predicates.clone()),
+                    )
+                {
                     return Err(crate::Error::Unsupported {
                         message: "chunk_shuffle only supports partition predicates".to_string(),
                     });
@@ -1970,7 +1977,6 @@ impl<'a> PaimonTableScan<'a> {
             .table
             .authorize_read(query_auth, self.query_auth_select())
             .await?;
-        // Explicit partition selectors cannot be reapplied after masking.
         if let Some(grant) = &grant {
             let fields = self.table.schema().fields();
             let masked: Vec<&str> = grant
@@ -1979,6 +1985,16 @@ impl<'a> PaimonTableScan<'a> {
                 .iter()
                 .map(|m| fields[m.column].name())
                 .collect();
+            if self.chunk_shuffle().is_some()
+                && super::query_auth::leaf_names(&self.data_predicates)
+                    .iter()
+                    .any(|name| masked.contains(&name.as_str()))
+            {
+                return Err(super::query_auth::unsupported(
+                    "chunk_shuffle only supports unmasked partition predicates",
+                ));
+            }
+            // Explicit partition selectors cannot be reapplied after masking.
             if let Some(key) = self
                 .partition_filter_columns()
                 .into_iter()

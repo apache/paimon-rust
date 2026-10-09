@@ -4074,6 +4074,131 @@ async fn test_query_auth_does_not_prune_buckets_on_a_masked_bucket_key() {
 
 #[cfg(not(windows))]
 #[tokio::test]
+async fn test_query_auth_chunk_shuffle_with_partition_filters() {
+    for evolution in [false, true] {
+        let schema = |options: &[(&str, &str)]| {
+            let mut builder = Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("name", DataType::VarChar(VarCharType::new(255).unwrap()))
+                .partition_keys(["name"]);
+            if evolution {
+                builder = builder
+                    .option("data-evolution.enabled", "true")
+                    .option("row-tracking.enabled", "true");
+            }
+            for (key, value) in options {
+                builder = builder.option(*key, *value);
+            }
+            builder.build().unwrap()
+        };
+        let g = written(
+            "partition_shuffle",
+            schema,
+            vec![people_batch(&[
+                (1, "eng"),
+                (2, "eng"),
+                (3, "ops"),
+                (4, "eng"),
+                (5, "ops"),
+                (6, "eng"),
+            ])],
+        )
+        .await;
+        let predicates = PredicateBuilder::new(g.table.schema().fields());
+        let partition = predicates
+            .equal("name", Datum::String("eng".into()))
+            .unwrap();
+        for (filters, masks, expected) in [
+            (vec![], vec![], vec![1, 2, 4, 6]),
+            (
+                vec![],
+                vec![("id", field_ref_mask(0, "id", "INT"))],
+                vec![1, 2, 4, 6],
+            ),
+            (
+                vec![int_leaf(0, "id", "GREATER_THAN", 1)],
+                vec![],
+                vec![2, 4, 6],
+            ),
+        ] {
+            g.set_rules(&filters, &masks);
+            let mut read = g.table.new_read_builder();
+            read.with_projection(&["id"])
+                .unwrap()
+                .with_filter(partition.clone());
+            let scan = read
+                .new_scan()
+                .with_chunk_shuffle(7, 2)
+                .expect("partition-only filters must allow chunk shuffle");
+            for traced in [false, true] {
+                let plan = if traced {
+                    scan.plan_with_trace().await.unwrap().0
+                } else {
+                    scan.plan().await.unwrap()
+                };
+                assert_eq!(plan.splits().len(), 2);
+                assert!(plan
+                    .splits()
+                    .iter()
+                    .all(|split| split.partition().get_string(0).unwrap() == "eng"));
+                let batches: Vec<RecordBatch> = read
+                    .new_read()
+                    .unwrap()
+                    .to_arrow(plan.splits())
+                    .unwrap()
+                    .try_collect()
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    ids(&batches),
+                    expected,
+                    "evolution={evolution}, traced={traced}"
+                );
+            }
+        }
+
+        let data = predicates.greater_than("id", Datum::Int(2)).unwrap();
+        for filter in [
+            data.clone(),
+            Predicate::and(vec![partition.clone(), data.clone()]),
+            Predicate::or(vec![partition.clone(), data]),
+        ] {
+            let mut read = g.table.new_read_builder();
+            read.with_filter(filter);
+            let error = read.new_scan().with_chunk_shuffle(7, 2).unwrap_err();
+            assert!(
+                matches!(error, paimon::Error::Unsupported { ref message }
+                if message.contains("only supports partition predicates")),
+                "{error:?}"
+            );
+        }
+
+        g.set_rules(&[], &[("name", upper(1, "name"))]);
+        let mut read = g.table.new_read_builder();
+        read.with_filter(
+            predicates
+                .equal("name", Datum::String("ENG".into()))
+                .unwrap(),
+        );
+        let scan = read.new_scan().with_chunk_shuffle(7, 2).unwrap();
+        for traced in [false, true] {
+            let result = if traced {
+                scan.plan_with_trace().await.map(|(plan, _)| plan)
+            } else {
+                scan.plan().await
+            };
+            let error = result.unwrap_err();
+            assert!(
+                matches!(error, paimon::Error::Unsupported { ref message }
+                if message.contains("unmasked partition predicates")),
+                "{error:?}"
+            );
+        }
+    }
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
 async fn test_query_auth_filters_masked_partition_values() {
     for data_evolution in [false, true] {
         let schema = |options: &[(&str, &str)]| {

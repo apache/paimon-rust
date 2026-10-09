@@ -46,7 +46,7 @@ struct NormalizedFilter {
 /// Exact filters are fully enforced by paimon-core scan planning using only
 /// partition-owned semantics, without requiring residual filtering above the
 /// scan.
-fn is_exact_filter_pushdown_for_schema(
+pub(super) fn is_exact_filter_pushdown_for_schema(
     fields: &[DataField],
     partition_keys: &[String],
     filter: &Predicate,
