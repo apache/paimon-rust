@@ -109,6 +109,8 @@ roaring = "0.11"
 datasketches = "0.2"
 num-bigint = "0.4"
 num-traits = "0.2"
+# Already in the Arrow dependency tree; shortest decimals use ties-to-even.
+ryu = "1"
 crc32fast = "1"
 zstd = "0.13"
 snap = "1"

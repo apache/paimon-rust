@@ -3170,23 +3170,18 @@ impl TableCommit {
 
     /// Generate per-partition statistics from commit entries.
     ///
-    /// Reference: [pypaimon FileStoreCommit._generate_partition_statistics](https://github.com/apache/paimon/blob/master/paimon-python/pypaimon/write/file_store_commit.py)
+    /// Java PartitionEntry.toPartitionStatistics uses the same computer as paths.
     fn generate_partition_statistics(
         &self,
         entries: &[ManifestEntry],
     ) -> Result<Vec<PartitionStatistics>> {
-        let partition_fields = self.table.schema().partition_fields();
-        let data_types: Vec<_> = partition_fields
-            .iter()
-            .map(|f| f.data_type().clone())
-            .collect();
-        let partition_keys: Vec<_> = self
-            .table
-            .schema()
-            .partition_keys()
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let options = self.table.schema().core_options();
+        let computer = PartitionComputer::new(
+            self.table.schema().partition_keys(),
+            self.table.schema().fields(),
+            options.partition_default_name(),
+            options.legacy_partition_name(),
+        )?;
 
         let mut stats_map: HashMap<Vec<u8>, PartitionStatistics> = HashMap::new();
 
@@ -3201,20 +3196,27 @@ impl TableCommit {
                 .map(|t| t.timestamp_millis())
                 .unwrap_or_else(|| current_time_millis() as i64);
 
-            let stats = stats_map.entry(partition_bytes.clone()).or_insert_with(|| {
-                // Parse partition spec from BinaryRow
-                let spec = self
-                    .parse_partition_spec(&partition_bytes, &partition_keys, &data_types)
-                    .unwrap_or_default();
-                PartitionStatistics {
-                    spec,
-                    record_count: 0,
-                    file_size_in_bytes: 0,
-                    file_count: 0,
-                    last_file_creation_time: 0,
-                    total_buckets: entry.total_buckets(),
+            let stats = match stats_map.entry(partition_bytes) {
+                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::hash_map::Entry::Vacant(vacant) => {
+                    let spec = if self.table.schema().partition_keys().is_empty() {
+                        HashMap::new()
+                    } else {
+                        computer
+                            .generate_part_values(&BinaryRow::from_serialized_bytes(vacant.key())?)?
+                            .into_iter()
+                            .collect()
+                    };
+                    vacant.insert(PartitionStatistics {
+                        spec,
+                        record_count: 0,
+                        file_size_in_bytes: 0,
+                        file_count: 0,
+                        last_file_creation_time: 0,
+                        total_buckets: entry.total_buckets(),
+                    })
                 }
-            });
+            };
 
             stats.record_count += sign * file.row_count;
             stats.file_size_in_bytes += sign * file.file_size;
@@ -3225,28 +3227,6 @@ impl TableCommit {
         }
 
         Ok(stats_map.into_values().collect())
-    }
-
-    /// Parse partition BinaryRow bytes into a HashMap<String, String>.
-    fn parse_partition_spec(
-        &self,
-        partition_bytes: &[u8],
-        partition_keys: &[String],
-        data_types: &[crate::spec::DataType],
-    ) -> Result<HashMap<String, String>> {
-        let mut spec = HashMap::new();
-        if partition_bytes.is_empty() || partition_keys.is_empty() {
-            return Ok(spec);
-        }
-        let row = BinaryRow::from_serialized_bytes(partition_bytes)?;
-        for (i, key) in partition_keys.iter().enumerate() {
-            let value = match extract_datum(&row, i, &data_types[i])? {
-                Some(datum) => datum.to_string(),
-                None => self.partition_default_name.clone(),
-            };
-            spec.insert(key.clone(), value);
-        }
-        Ok(spec)
     }
 
     /// Check conflicts from the earliest writer snapshot, validating row-id baselines.
@@ -3971,6 +3951,94 @@ mod tests {
     fn setup_partitioned_commit(file_io: &FileIO, table_path: &str) -> TableCommit {
         let table = test_partitioned_table(file_io, table_path);
         TableCommit::new(table, "test-user".to_string())
+    }
+
+    #[test]
+    fn partition_statistics_use_java_partition_values() {
+        use crate::spec::{DateType, DecimalType, Schema, VarBinaryType, VarCharType};
+
+        for legacy in [false, true] {
+            let schema = Schema::builder()
+                .column("text", DataType::VarChar(VarCharType::string_type()))
+                .column("day", DataType::Date(DateType::new()))
+                .column("amount", DataType::Decimal(DecimalType::new(8, 2).unwrap()))
+                .partition_keys(["text", "day", "amount"])
+                .option("partition.legacy-name", legacy.to_string())
+                .build()
+                .unwrap();
+            let table = Table::new(
+                test_file_io(),
+                Identifier::new("default", "stats"),
+                "memory:/partition-stat-values".into(),
+                TableSchema::new(0, &schema),
+                None,
+            );
+            let commit = TableCommit::new(table, "user".into());
+            let mut row = BinaryRowBuilder::new(3);
+            row.write_string(0, "a/b");
+            row.write_int(1, 1);
+            row.write_long(2, 1234);
+            let entries = vec![ManifestEntry::new(
+                FileKind::Add,
+                row.build().to_serialized_bytes(),
+                0,
+                1,
+                test_data_file("data.parquet", 5),
+                2,
+            )];
+            let stats = commit.generate_partition_statistics(&entries).unwrap();
+            assert_eq!(
+                stats[0].spec,
+                HashMap::from([
+                    ("text".into(), "a/b".into()),
+                    ("day".into(), if legacy { "1" } else { "1970-01-02" }.into()),
+                    ("amount".into(), "12.34".into()),
+                ])
+            );
+            assert_eq!(stats[0].record_count, 5);
+        }
+
+        let schema = Schema::builder()
+            .column(
+                "bytes",
+                DataType::VarBinary(VarBinaryType::new(20).unwrap()),
+            )
+            .partition_keys(["bytes"])
+            .option("partition.legacy-name", "false")
+            .build()
+            .unwrap();
+        let table = Table::new(
+            test_file_io(),
+            Identifier::new("default", "binary"),
+            "memory:/binary-partition-stats".into(),
+            TableSchema::new(0, &schema),
+            None,
+        );
+        let commit = TableCommit::new(table, "user".into());
+        for (value, expected) in [
+            (Some(b"a/b".as_slice()), "a/b"),
+            (Some(b" \t".as_slice()), "__DEFAULT_PARTITION__"),
+            (None, "__DEFAULT_PARTITION__"),
+        ] {
+            let mut row = BinaryRowBuilder::new(1);
+            if let Some(value) = value {
+                row.write_binary(0, value);
+            } else {
+                row.set_null_at(0);
+            }
+            let entries = vec![ManifestEntry::new(
+                FileKind::Add,
+                row.build().to_serialized_bytes(),
+                0,
+                1,
+                test_data_file("data.parquet", 5),
+                2,
+            )];
+            assert_eq!(
+                commit.generate_partition_statistics(&entries).unwrap()[0].spec["bytes"],
+                expected
+            );
+        }
     }
 
     fn partition_filter_for(commit: &TableCommit, partitions: Vec<Vec<u8>>) -> PartitionFilter {

@@ -2614,7 +2614,7 @@ impl<'a> PaimonTableScan<'a> {
         snapshot: Snapshot,
         mut entries: Vec<ManifestEntry>,
         data_evolution_read_field_ids: Option<&HashSet<i32>>,
-        index_entries: Option<Vec<IndexManifestEntry>>,
+        mut index_entries: Option<Vec<IndexManifestEntry>>,
         effective_row_ranges: Option<Vec<RowRange>>,
         mut trace: Option<&mut ScanTrace>,
     ) -> crate::Result<Plan> {
@@ -2755,6 +2755,11 @@ impl<'a> PaimonTableScan<'a> {
 
         // The index manifest was read before data manifests so global-index row
         // ranges can prune manifest I/O. Reuse it here for deletion vectors.
+        let mut floating_paths =
+            super::floating_partition_path::FloatingPartitionPathResolver::new(&self.table)?;
+        if let Some(entries) = index_entries.as_mut() {
+            floating_paths.resolve_index_paths(entries).await?;
+        }
         let deletion_files_map = index_entries.as_deref().map(build_deletion_files_map);
         let index_file_in_data_file_dir = self
             .table
@@ -2774,7 +2779,7 @@ impl<'a> PaimonTableScan<'a> {
             _ => None,
         };
 
-        'groups: for ((partition, bucket), (total_buckets, data_files)) in groups {
+        'groups: for ((partition, bucket), (total_buckets, mut data_files)) in groups {
             let partition_row = BinaryRow::from_serialized_bytes(&partition)?;
             let bucket_path = bucket_path(
                 &self.table.data_file_location(),
@@ -2782,6 +2787,9 @@ impl<'a> PaimonTableScan<'a> {
                 &partition_row,
                 bucket,
             )?;
+            let original_data_files = floating_paths
+                .resolve_data_file_paths(&partition_row, bucket, &bucket_path, &mut data_files)
+                .await?;
             // Deletion vectors are index files, so they resolve against this bucket's
             // directory, now that it is known.
             let dv_location = IndexFileLocation::BucketLocal {
@@ -2993,6 +3001,7 @@ impl<'a> PaimonTableScan<'a> {
                     .with_bucket_path(bucket_path.clone())
                     .with_total_buckets(total_buckets)
                     .with_data_files(file_group)
+                    .with_original_data_files(original_data_files.clone())
                     .with_raw_convertible(raw_convertible)
                     .with_streaming(self.is_streaming());
                 if let Some(files) = data_deletion_files {

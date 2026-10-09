@@ -69,6 +69,7 @@ pub struct CopyOnWriteMergeWriter {
     table: Table,
     update_columns: Vec<String>,
     file_index: Vec<FileInfo>,
+    original_files: HashMap<usize, DataFileMeta>,
     affected_files: HashMap<usize, Vec<RowOperation>>,
     update_batches: Vec<RecordBatch>,
 }
@@ -150,6 +151,7 @@ impl CopyOnWriteMergeWriter {
         let plan = scan.plan().await?;
 
         let mut file_index = Vec::new();
+        let mut original_files = HashMap::new();
         for split in plan.splits() {
             let partition_bytes = split.partition().to_serialized_bytes();
             let bucket = split.bucket();
@@ -158,6 +160,9 @@ impl CopyOnWriteMergeWriter {
             let total_buckets = split.total_buckets();
 
             for file_meta in split.data_files() {
+                if let Some(original) = split.original_data_file(&file_meta.file_name) {
+                    original_files.insert(file_index.len(), original.clone());
+                }
                 file_index.push(FileInfo {
                     partition: partition_bytes.clone(),
                     bucket,
@@ -173,6 +178,7 @@ impl CopyOnWriteMergeWriter {
             table: table.clone(),
             update_columns,
             file_index,
+            original_files,
             affected_files: HashMap::new(),
             update_batches: Vec::new(),
         })
@@ -247,6 +253,7 @@ impl CopyOnWriteMergeWriter {
         let update_columns = &self.update_columns;
         let update_batches = &self.update_batches;
         let file_index = &self.file_index;
+        let original_files = &self.original_files;
         let table = &self.table;
         let partition_keys = &partition_keys;
         let partition_computer = &partition_computer;
@@ -301,7 +308,10 @@ impl CopyOnWriteMergeWriter {
                     partition_computer.generate_partition_path(&row)?
                 };
 
-                let deleted_file = file_info.file_meta.clone();
+                let deleted_file = original_files
+                    .get(&file_idx)
+                    .unwrap_or(&file_info.file_meta)
+                    .clone();
 
                 let new_files = if rewritten.num_rows() > 0 {
                     let mut writer = DataFileWriter::new(

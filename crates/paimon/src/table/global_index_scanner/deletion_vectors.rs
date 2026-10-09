@@ -72,6 +72,8 @@ pub(crate) async fn deleted_row_ranges_for_data_evolution_dvs(
     let mut ranges = Vec::new();
     let table_path = table.location().trim_end_matches('/');
     let index_file_in_data_file_dir = table.schema().core_options().index_file_in_data_file_dir();
+    let mut floating_paths =
+        crate::table::floating_partition_path::FloatingPartitionPathResolver::new(table)?;
     for entry in index_entries {
         if entry.kind != FileKind::Add || entry.index_file.index_type != DELETION_VECTORS_INDEX_TYPE
         {
@@ -117,6 +119,7 @@ pub(crate) async fn deleted_row_ranges_for_data_evolution_dvs(
                 &entry.index_file.file_name,
                 entry.index_file.external_path.as_deref(),
             );
+            let index_path = floating_paths.index_path(entry, &index_path).await?;
             let deletion_file = DeletionFile::new(
                 index_path,
                 meta.offset as i64,
