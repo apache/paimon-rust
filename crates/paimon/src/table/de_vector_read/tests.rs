@@ -1567,3 +1567,75 @@ async fn filtered_rerank_rejects_metric_from_a_skipped_shard() {
         "{error}"
     );
 }
+
+#[test]
+fn scalar_unindexed_coverage_intersects_all_predicate_fields() {
+    let io = FileIOBuilder::new("memory").build().unwrap();
+    let options = HashMap::new();
+    let fields = vec![make_field(1, "id"), make_field(2, "other")];
+    let evaluation = eval_context(&io, &options, &fields, Some(20));
+    let mut id = make_lumina_entry("id.btree", "btree", FileKind::Add, 1);
+    let mut other = make_lumina_entry("other.btree", "btree", FileKind::Add, 2);
+    other
+        .index_file
+        .global_index_meta
+        .as_mut()
+        .unwrap()
+        .row_range_end = 4;
+    let mut composite = id.clone();
+    let meta = composite.index_file.global_index_meta.as_mut().unwrap();
+    meta.row_range_end = 19;
+    meta.extra_field_ids = Some(vec![2]);
+    let builder = crate::spec::PredicateBuilder::new(&fields);
+    let predicates = vec![
+        builder.equal("id", crate::spec::Datum::Int(7)).unwrap(),
+        builder.equal("other", crate::spec::Datum::Int(7)).unwrap(),
+    ];
+    for filter in [
+        Predicate::and(predicates.clone()),
+        Predicate::or(predicates),
+    ] {
+        let entries = vec![id.clone(), other.clone(), composite.clone()];
+        assert_eq!(
+            scalar_unindexed_ranges(
+                evaluation,
+                &entries,
+                &filter,
+                GlobalIndexSearchMode::Full,
+                &[]
+            ),
+            vec![RowRange::new(5, 19)]
+        );
+        assert_eq!(
+            scalar_unindexed_ranges(
+                evaluation,
+                &entries,
+                &filter,
+                GlobalIndexSearchMode::Detail,
+                &[RowRange::new(0, 9), RowRange::new(15, 17)]
+            ),
+            vec![RowRange::new(5, 9), RowRange::new(15, 17)]
+        );
+        assert!(scalar_unindexed_ranges(
+            evaluation,
+            &entries,
+            &filter,
+            GlobalIndexSearchMode::Fast,
+            &[]
+        )
+        .is_empty());
+        // An index from another family cannot fill scalar coverage.
+        id.index_file.index_type = "full-text".to_string();
+        assert_eq!(
+            scalar_unindexed_ranges(
+                evaluation,
+                &[id.clone(), other.clone()],
+                &filter,
+                GlobalIndexSearchMode::Full,
+                &[]
+            ),
+            vec![RowRange::new(0, 19)]
+        );
+        id.index_file.index_type = "btree".to_string();
+    }
+}

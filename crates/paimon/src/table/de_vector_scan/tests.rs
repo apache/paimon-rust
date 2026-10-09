@@ -478,3 +478,95 @@ async fn scalar_filter_ignores_composite_index_definitions() {
         .unwrap();
     assert_eq!(results[0].row_ids().unwrap().len(), 3);
 }
+
+#[tokio::test]
+async fn scalar_coverage_gaps_follow_scalar_and_vector_modes() {
+    for vector_covers_tail in [false, true] {
+        let table = de_vector_table().await;
+        let element = Arc::new(ArrowField::new("element", ArrowDataType::Float32, true));
+        let mut vectors = ListBuilder::new(Float32Builder::new()).with_field(element.clone());
+        vectors.values().append_slice(&[3.0, 3.0]);
+        vectors.append(true);
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("id", ArrowDataType::Int32, false),
+                ArrowField::new("embedding", ArrowDataType::List(element), true),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![4])) as ArrayRef,
+                Arc::new(vectors.finish()) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let mut writer = TableWrite::new(&table, "coverage-test".to_string()).unwrap();
+        writer.write_arrow_batch(&batch).await.unwrap();
+        TableCommit::new(table.clone(), "coverage-test".to_string())
+            .commit(writer.prepare_commit().await.unwrap())
+            .await
+            .unwrap();
+        if vector_covers_tail {
+            table
+                .new_vindex_index_build_builder(crate::vindex::IVF_FLAT_IDENTIFIER)
+                .with_index_column("embedding")
+                .with_options(HashMap::from([(
+                    "ivf-flat.nlist".to_string(),
+                    "1".to_string(),
+                )]))
+                .execute()
+                .await
+                .unwrap();
+        }
+        let filter = id_gt_filter(&table, 3);
+        for scalar_mode in ["fast", "full", "detail"] {
+            for vector_mode in ["fast", "full", "detail"] {
+                for builder_options in [false, true] {
+                    let modes = HashMap::from([
+                        (
+                            "vector-index.search-mode".to_string(),
+                            vector_mode.to_string(),
+                        ),
+                        (
+                            "scalar-index.search-mode".to_string(),
+                            scalar_mode.to_string(),
+                        ),
+                    ]);
+                    let mut table_options = if builder_options {
+                        HashMap::from([
+                            ("vector-index.search-mode".to_string(), "fast".to_string()),
+                            ("scalar-index.search-mode".to_string(), "fast".to_string()),
+                        ])
+                    } else {
+                        modes.clone()
+                    };
+                    table_options.insert(
+                        "global-index.filter.refine-from-data".to_string(),
+                        "false".to_string(),
+                    );
+                    let table = table.copy_with_options(table_options);
+                    let mut builder = table.new_batch_vector_search_builder();
+                    builder
+                        .with_vector_column("embedding")
+                        .with_query_vectors(vec![vec![0.0, 0.0], vec![1.0, 0.0]])
+                        .with_limit(10)
+                        .with_filter(filter.clone());
+                    if builder_options {
+                        builder.with_options(modes);
+                    }
+                    let expected = if (vector_covers_tail && scalar_mode != "fast")
+                        || (!vector_covers_tail && vector_mode != "fast")
+                    {
+                        vec![3]
+                    } else {
+                        vec![]
+                    };
+                    let results = builder.execute().await.unwrap();
+                    assert_eq!(results.len(), 2);
+                    for result in results {
+                        assert_eq!(result.row_ids().unwrap().row_ids, expected,
+                            "scalar={scalar_mode}, vector={vector_mode}, vector_covers_tail={vector_covers_tail}, builder_options={builder_options}");
+                    }
+                }
+            }
+        }
+    }
+}

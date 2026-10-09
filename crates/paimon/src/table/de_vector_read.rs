@@ -29,6 +29,7 @@ use crate::table::global_index_scanner::{
     deleted_row_ranges_for_data_evolution_dvs, search_limit_with_deleted_rows,
     unindexed_ranges_for_global_index_entries, GlobalIndexScanner, RowRangeIndex,
 };
+use crate::table::global_index_types::normalize_queryable_global_index_type;
 use crate::table::index_file_path::IndexFileLocation;
 use crate::table::pk_vector_position_read::SEARCH_SCORE_COLUMN;
 use crate::table::row_id_predicate::intersect_sorted_ranges;
@@ -471,7 +472,6 @@ async fn evaluate_batch_vector_search(
 
     let table_path = evaluation.table_path.trim_end_matches('/');
     let core_options = CoreOptions::new(evaluation.table_options);
-    let search_mode = core_options.vector_index_search_mode()?;
     let field_name = &vector_searches[0].field_name;
     if vector_searches
         .iter()
@@ -494,6 +494,12 @@ async fn evaluate_batch_vector_search(
             source: None,
         });
     }
+
+    // Java's scan overlays query options for the vector/scalar search modes.
+    let mut effective_options = evaluation.table_options.clone();
+    effective_options.extend(search_options.clone());
+    let effective_core = CoreOptions::new(&effective_options);
+    let search_mode = effective_core.vector_index_search_mode()?;
 
     let field_id = match find_field_id_by_name(evaluation.schema_fields, field_name) {
         Some(id) => id,
@@ -544,6 +550,10 @@ async fn evaluate_batch_vector_search(
         }
         None => Some(filter.clone()),
     });
+    let scalar_search_mode = scalar_filter
+        .as_ref()
+        .map(|_| effective_core.scalar_index_search_mode())
+        .transpose()?;
     if let Some(filter) = scalar_filter
         .as_ref()
         .filter(|_| !vector_entries.is_empty())
@@ -914,9 +924,14 @@ async fn evaluate_batch_vector_search(
         refine = refine_start.map_or(Duration::ZERO, |start| start.elapsed());
     }
 
-    if route_indexed_to_raw || search_mode != GlobalIndexSearchMode::Fast {
+    if route_indexed_to_raw
+        || search_mode != GlobalIndexSearchMode::Fast
+        || scalar_search_mode.is_some_and(|mode| mode != GlobalIndexSearchMode::Fast)
+    {
         let raw_fallback_start = timing_enabled.then(Instant::now);
-        let detail_ranges = if search_mode == GlobalIndexSearchMode::Detail {
+        let detail_ranges = if search_mode == GlobalIndexSearchMode::Detail
+            || scalar_search_mode == Some(GlobalIndexSearchMode::Detail)
+        {
             let table = evaluation.table.ok_or_else(|| crate::Error::DataInvalid {
                 message: "Vector raw search in detail mode requires table context".to_string(),
                 source: None,
@@ -934,10 +949,25 @@ async fn evaluate_batch_vector_search(
             &detail_ranges,
             is_vector_global_index_file,
         );
+        if let (Some(filter), Some(scalar_mode)) = (&scalar_filter, scalar_search_mode) {
+            let mut scalar_ranges = scalar_unindexed_ranges(
+                evaluation,
+                index_entries,
+                filter,
+                scalar_mode,
+                &detail_ranges,
+            );
+            // Scalar FULL/DETAIL also recover gaps inside vector coverage. In
+            // vector FAST they must not expand beyond the indexed corpus.
+            if search_mode == GlobalIndexSearchMode::Fast {
+                scalar_ranges = intersect_sorted_ranges(&scalar_ranges, &vector_ranges);
+            }
+            raw_ranges.extend(scalar_ranges);
+        }
         if route_indexed_to_raw {
             raw_ranges.extend(vector_ranges);
-            raw_ranges = merge_row_ranges(raw_ranges);
         }
+        raw_ranges = merge_row_ranges(raw_ranges);
         if !raw_ranges.is_empty() {
             let table = evaluation.table.ok_or_else(|| crate::Error::DataInvalid {
                 message: "Vector raw search requires table context".to_string(),
@@ -1032,6 +1062,40 @@ async fn evaluate_batch_vector_search(
         );
     }
     Ok(results)
+}
+
+/// Predicate coverage requires every referenced field to be covered by a
+/// single-field scalar index. Reuse the table scanner's coverage accounting.
+fn scalar_unindexed_ranges(
+    evaluation: VectorSearchEvaluation<'_>,
+    entries: &[IndexManifestEntry],
+    filter: &Predicate,
+    search_mode: GlobalIndexSearchMode,
+    data_ranges: &[RowRange],
+) -> Vec<RowRange> {
+    if !evaluation.next_row_id.is_some_and(|next| next > 0) {
+        return Vec::new();
+    }
+    let mut leaf_refs = Vec::new();
+    crate::arrow::residual::collect_predicate_leaf_refs(filter, &mut leaf_refs);
+    let field_ids = leaf_refs
+        .into_iter()
+        .filter_map(|(column, _)| find_field_id_by_name(evaluation.schema_fields, column))
+        .collect();
+    unindexed_ranges_for_global_index_entries(
+        entries,
+        &field_ids,
+        search_mode,
+        evaluation.next_row_id,
+        data_ranges,
+        |file| {
+            normalize_queryable_global_index_type(&file.index_type).is_some()
+                && file
+                    .global_index_meta
+                    .as_ref()
+                    .is_some_and(|meta| meta.extra_field_ids.as_ref().is_none_or(Vec::is_empty))
+        },
+    )
 }
 
 fn is_vector_global_index_file(index_file: &IndexFileMeta) -> bool {
