@@ -811,6 +811,22 @@ struct BlobSource {
 
 struct BlobSourceFactory(Arc<BlobSource>);
 
+struct SelectiveBlobSourceFactory(Arc<BlobSource>);
+
+impl paimon::io::UriReaderFactory for SelectiveBlobSourceFactory {
+    fn supports_uri(&self, uri: &str) -> paimon::Result<bool> {
+        Ok(uri.starts_with("custom://"))
+    }
+
+    fn create(&self, uri: &str) -> paimon::Result<Arc<dyn paimon::io::UriReader>> {
+        assert_eq!(
+            uri, "custom://update",
+            "shadowed source must never be opened"
+        );
+        Ok(self.0.clone())
+    }
+}
+
 impl paimon::io::UriReaderFactory for BlobSourceFactory {
     fn create(&self, uri: &str) -> paimon::Result<Arc<dyn paimon::io::UriReader>> {
         assert_eq!(uri, "custom://update");
@@ -887,4 +903,260 @@ async fn row_id_blob_reader_factory_streams_unknown_lengths_and_closes_sources()
     let rows = rows(&table).await;
     assert_eq!(rows[1].1, Some(b"streamed value".to_vec()));
     assert_eq!(rows[4].1, Some(b"streamed value".to_vec()));
+}
+
+fn source_reader() -> Arc<BlobSource> {
+    Arc::new(BlobSource {
+        opened: AtomicUsize::new(0),
+        closed: Arc::new(AtomicUsize::new(0)),
+    })
+}
+
+fn upsert_rows(ids: Vec<i32>, payloads: Vec<Option<&[u8]>>, values: Vec<i32>) -> RecordBatch {
+    RecordBatch::try_from_iter([
+        ("id", Arc::new(Int32Array::from(ids)) as ArrayRef),
+        (
+            "payload",
+            Arc::new(LargeBinaryArray::from(payloads)) as ArrayRef,
+        ),
+        ("value", Arc::new(Int32Array::from(values)) as ArrayRef),
+    ])
+    .unwrap()
+}
+
+#[tokio::test]
+async fn table_update_passes_reader_factory_to_new_row_id_updaters() {
+    let table = table(&[]).await;
+    seed(&table).await;
+    let reader = source_reader();
+    let builder = table.new_write_builder();
+    let mut update = builder.new_update().unwrap();
+    update.with_blob_uri_reader_factory(Some(Arc::new(BlobSourceFactory(reader.clone()))));
+    let descriptor = BlobDescriptor::new("custom://update".into(), 0, -1).serialize();
+    let messages = update
+        .update_by_arrow_with_row_id(vec![matched(vec![1], vec![Some(&descriptor)])])
+        .await
+        .unwrap();
+    assert_eq!(reader.opened.load(Ordering::Relaxed), 1);
+    assert_eq!(reader.closed.load(Ordering::Relaxed), 1);
+    builder.new_commit().commit(messages).await.unwrap();
+    assert_eq!(
+        rows(&table).await[1],
+        (1, Some(b"streamed value".to_vec()), 11)
+    );
+}
+
+#[tokio::test]
+async fn predicate_updates_share_configured_reader_across_scalar_and_array_groups() {
+    use paimon::spec::{Datum, PredicateBuilder};
+    use paimon::table::UpdateAssignment;
+    for array_assignment in [false, true] {
+        let table = table(&[("target-file-row-num", "2")]).await;
+        seed_chunks(&table, 2).await;
+        let before = rows(&table).await;
+        let reader = source_reader();
+        let builder = table.new_write_builder();
+        let mut update = builder.new_update().unwrap();
+        update.with_blob_uri_reader_factory(Some(Arc::new(BlobSourceFactory(reader.clone()))));
+        let reference = BlobDescriptor::new("custom://update".into(), 0, -1).serialize();
+        let values: ArrayRef = Arc::new(LargeBinaryArray::from(vec![
+            Some(reference.as_slice());
+            if array_assignment {
+                2
+            } else {
+                1
+            }
+        ]));
+        let assignment = if array_assignment {
+            UpdateAssignment::Array(vec![values])
+        } else {
+            UpdateAssignment::Scalar(values)
+        };
+        let predicate = PredicateBuilder::new(table.schema().fields())
+            .greater_or_equal("id", Datum::Int(3))
+            .unwrap();
+        let messages = update
+            .update_by_predicate(
+                Some(predicate),
+                vec![("payload".into(), assignment)],
+                vec![],
+            )
+            .await
+            .unwrap();
+        assert_eq!(reader.opened.load(Ordering::Relaxed), 2);
+        assert_eq!(reader.closed.load(Ordering::Relaxed), 2);
+        builder.new_commit().commit(messages).await.unwrap();
+        let actual = rows(&table).await;
+        assert_eq!(actual[..3], before[..3]);
+        assert_eq!(actual[3], (3, Some(b"streamed value".to_vec()), 13));
+        assert_eq!(actual[4], (4, Some(b"streamed value".to_vec()), 14));
+    }
+}
+
+#[tokio::test]
+async fn upsert_uses_one_reader_configuration_for_matches_appends_and_native_references() {
+    let table = table(&[]).await;
+    seed(&table).await;
+    table
+        .file_io()
+        .new_output("memory:/native-source")
+        .unwrap()
+        .write(bytes::Bytes::from_static(b"prefixNATIVEtail"))
+        .await
+        .unwrap();
+    let native = BlobDescriptor::new("memory:/native-source".into(), 6, 6).serialize();
+    let custom = BlobDescriptor::new("custom://update".into(), 0, -1).serialize();
+    let shadow = BlobDescriptor::new("custom://shadowed".into(), 0, -1).serialize();
+    let reader = source_reader();
+    let builder = table.new_write_builder();
+    let mut update = builder.new_update().unwrap();
+    update.with_update_type(vec!["payload".into()]).unwrap();
+    update.with_blob_uri_reader_factory(Some(Arc::new(SelectiveBlobSourceFactory(reader.clone()))));
+    let messages = update
+        .upsert_by_arrow_with_key(
+            vec![
+                upsert_rows(
+                    vec![1, 8],
+                    vec![Some(&shadow), Some(&shadow)],
+                    vec![111, 888],
+                ),
+                upsert_rows(
+                    vec![1, 8, 9],
+                    vec![Some(&custom), Some(&custom), Some(&native)],
+                    vec![112, 88, 99],
+                ),
+            ],
+            vec!["id".into()],
+        )
+        .await
+        .unwrap();
+    assert_eq!(reader.opened.load(Ordering::Relaxed), 2);
+    assert_eq!(reader.closed.load(Ordering::Relaxed), 2);
+    builder.new_commit().commit(messages).await.unwrap();
+    let result = rows(&table).await;
+    assert_eq!(result[1], (1, Some(b"streamed value".to_vec()), 11));
+    assert_eq!(result[5], (8, Some(b"streamed value".to_vec()), 88));
+    assert_eq!(result[6], (9, Some(b"NATIVE".to_vec()), 99));
+}
+
+#[tokio::test]
+async fn selective_reader_preserves_native_io_for_ordinary_append_references() {
+    let table = table(&[]).await;
+    table
+        .file_io()
+        .new_output("memory:/native-source")
+        .unwrap()
+        .write(bytes::Bytes::from_static(b"prefixNATIVEtail"))
+        .await
+        .unwrap();
+    let native = BlobDescriptor::new("memory:/native-source".into(), 6, 6).serialize();
+    let custom = BlobDescriptor::new("custom://update".into(), 0, -1).serialize();
+    let reader = source_reader();
+    let builder = table.new_write_builder();
+    let mut writer = builder.new_write().unwrap();
+    writer
+        .with_blob_uri_reader_factory(Some(Arc::new(SelectiveBlobSourceFactory(reader.clone()))))
+        .unwrap();
+    writer
+        .write_arrow_batch(&upsert_rows(
+            vec![0, 1],
+            vec![Some(&native), Some(&custom)],
+            vec![10, 11],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(reader.opened.load(Ordering::Relaxed), 1);
+    assert_eq!(reader.closed.load(Ordering::Relaxed), 1);
+    let messages = writer.prepare_commit().await.unwrap();
+    builder.new_commit().commit(messages).await.unwrap();
+    assert_eq!(
+        rows(&table).await,
+        vec![
+            (0, Some(b"NATIVE".to_vec()), 10),
+            (1, Some(b"streamed value".to_vec()), 11)
+        ]
+    );
+}
+
+#[tokio::test]
+async fn merge_uses_configured_readers_for_matched_and_inserted_blobs() {
+    use paimon::table::{MergeAssignment, MergeSource, WhenMatched, WhenNotMatched};
+    let table = table(&[]).await;
+    seed(&table).await;
+    let reader = source_reader();
+    let descriptor = BlobDescriptor::new("custom://update".into(), 0, -1).serialize();
+    let builder = table.new_write_builder();
+    let mut update = builder.new_update().unwrap();
+    update.with_blob_uri_reader_factory(Some(Arc::new(BlobSourceFactory(reader.clone()))));
+    let messages = update
+        .merge_into(
+            MergeSource::Batches(vec![upsert_rows(
+                vec![1, 8],
+                vec![Some(&descriptor), Some(&descriptor)],
+                vec![111, 88],
+            )]),
+            vec![("id".into(), "id".into())],
+            vec![WhenMatched {
+                condition: None,
+                delete: false,
+                assignments: vec![(
+                    "payload".into(),
+                    MergeAssignment::SourceColumn("payload".into()),
+                )],
+            }],
+            vec![WhenNotMatched {
+                condition: None,
+                assignments: ["id", "payload", "value"]
+                    .into_iter()
+                    .map(|name| (name.into(), MergeAssignment::SourceColumn(name.into())))
+                    .collect(),
+            }],
+        )
+        .await
+        .unwrap();
+    assert_eq!(reader.opened.load(Ordering::Relaxed), 2);
+    assert_eq!(reader.closed.load(Ordering::Relaxed), 2);
+    builder.new_commit().commit(messages).await.unwrap();
+    let result = rows(&table).await;
+    assert_eq!(result[1], (1, Some(b"streamed value".to_vec()), 11));
+    assert_eq!(result[5], (8, Some(b"streamed value".to_vec()), 88));
+}
+
+struct FailedReaderSelection;
+
+impl paimon::io::UriReaderFactory for FailedReaderSelection {
+    fn supports_uri(&self, _uri: &str) -> paimon::Result<bool> {
+        Err(paimon::Error::DataInvalid {
+            message: "reader selection failed".into(),
+            source: None,
+        })
+    }
+
+    fn create(&self, _uri: &str) -> paimon::Result<Arc<dyn paimon::io::UriReader>> {
+        panic!("Selection failures must not open another reader")
+    }
+}
+
+#[tokio::test]
+async fn reader_selection_error_does_not_fall_back_to_readable_native_reference() {
+    let table = table(&[]).await;
+    table
+        .file_io()
+        .new_output("memory:/native-source")
+        .unwrap()
+        .write(bytes::Bytes::from_static(b"NATIVE"))
+        .await
+        .unwrap();
+    let descriptor = BlobDescriptor::new("memory:/native-source".into(), 0, 6).serialize();
+    let mut writer = table.new_write_builder().new_write().unwrap();
+    writer
+        .with_blob_uri_reader_factory(Some(Arc::new(FailedReaderSelection)))
+        .unwrap();
+    let error = writer
+        .write_arrow_batch(&upsert_rows(vec![0], vec![Some(&descriptor)], vec![10]))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("reader selection failed"));
+    writer.close().await;
+    assert!(physical_files(&table).await.is_empty());
 }

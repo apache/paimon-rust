@@ -50,6 +50,7 @@ pub struct TableUpdate {
     table: Table,
     commit_user: String,
     update_cols: Option<Vec<String>>,
+    blob_uri_reader_factory: Option<std::sync::Arc<dyn crate::io::UriReaderFactory>>,
 }
 
 impl TableUpdate {
@@ -58,7 +59,18 @@ impl TableUpdate {
             table: table.clone(),
             commit_user,
             update_cols: None,
+            blob_uri_reader_factory: None,
         }
+    }
+
+    /// Configure readers for Blob input references. The same factory supplies
+    /// matched updates and appended rows in upsert and MERGE operations.
+    pub fn with_blob_uri_reader_factory(
+        &mut self,
+        factory: Option<std::sync::Arc<dyn crate::io::UriReaderFactory>>,
+    ) -> &mut Self {
+        self.blob_uri_reader_factory = factory;
+        self
     }
 
     /// Select columns to update when a key or row ID matches. Duplicate names
@@ -125,7 +137,9 @@ impl TableUpdate {
 
     /// Create a row-ID updater sharing one snapshot across per-call columns.
     pub async fn new_update_by_row_id(&self) -> crate::Result<TableUpdateByRowId> {
-        TableUpdateByRowId::new(&self.table).await
+        let mut writer = TableUpdateByRowId::new(&self.table).await?;
+        writer.with_blob_uri_reader_factory(self.blob_uri_reader_factory.clone());
+        Ok(writer)
     }
 
     /// Update existing rows from chunks of one Arrow table containing `_ROW_ID`.
@@ -186,8 +200,14 @@ impl TableUpdate {
         assignments: Vec<(String, super::UpdateAssignment)>,
         read_columns: Vec<String>,
     ) -> crate::Result<Vec<CommitMessage>> {
-        super::table_update_predicate::update(&self.table, predicate, assignments, read_columns)
-            .await
+        super::table_update_predicate::update(
+            &self.table,
+            predicate,
+            assignments,
+            read_columns,
+            self.blob_uri_reader_factory.clone(),
+        )
+        .await
     }
 
     /// Upsert Arrow rows by composite key through the core upsert
@@ -212,6 +232,7 @@ impl TableUpdate {
                 .filter(|columns| !columns.is_empty())
                 .unwrap_or_else(|| self.all_fields()),
         )?;
+        writer.with_blob_uri_reader_factory(self.blob_uri_reader_factory.clone());
         for batch in batches {
             writer.add_batch(batch)?;
         }
@@ -234,6 +255,7 @@ impl TableUpdate {
             on,
             when_matched,
             when_not_matched,
+            self.blob_uri_reader_factory.clone(),
         )
         .await
     }

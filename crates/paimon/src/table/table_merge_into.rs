@@ -210,6 +210,7 @@ pub(super) async fn merge_into(
     on: Vec<(String, String)>,
     matched: Vec<WhenMatched>,
     not_matched: Vec<WhenNotMatched>,
+    blob_uri_reader_factory: Option<Arc<dyn crate::io::UriReaderFactory>>,
 ) -> crate::Result<Vec<CommitMessage>> {
     if on.is_empty() || matched.is_empty() && not_matched.is_empty() {
         return Err(invalid("MERGE requires ON keys and at least one action"));
@@ -597,6 +598,7 @@ pub(super) async fn merge_into(
     let mut messages = Vec::new();
     if !updates.is_empty() {
         let mut updater = TableUpdateByRowId::with_index(table, index)?;
+        updater.with_blob_uri_reader_factory(blob_uri_reader_factory.clone());
         messages.extend(updater.update_columns(updates, update_columns).await?);
     }
     if !deletes.is_empty() {
@@ -609,6 +611,7 @@ pub(super) async fn merge_into(
             .new_write_builder()
             .with_commit_user(commit_user.to_string())?
             .new_write()?;
+        writer.with_blob_uri_reader_factory(blob_uri_reader_factory.clone())?;
         let result = async {
             for batch in inserts {
                 writer.write_arrow_batch(&batch).await?;

@@ -303,7 +303,11 @@ impl BlobFormatWriter {
         }
         let descriptor = BlobDescriptor::deserialize(value)?;
         let range = descriptor.range_spec()?;
-        if let Some(factory) = self.uri_reader_factory.clone() {
+        let factory = match &self.uri_reader_factory {
+            Some(factory) if factory.supports_uri(descriptor.uri())? => Some(factory.clone()),
+            _ => None,
+        };
+        if let Some(factory) = factory {
             return self
                 .copy_custom_reference(factory.as_ref(), &descriptor, hasher)
                 .await;
