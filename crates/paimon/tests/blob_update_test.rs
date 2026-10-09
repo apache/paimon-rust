@@ -947,6 +947,53 @@ async fn table_update_passes_reader_factory_to_new_row_id_updaters() {
 }
 
 #[tokio::test]
+async fn predicate_updates_share_configured_reader_across_scalar_and_array_groups() {
+    use paimon::spec::{Datum, PredicateBuilder};
+    use paimon::table::UpdateAssignment;
+    for array_assignment in [false, true] {
+        let table = table(&[("target-file-row-num", "2")]).await;
+        seed_chunks(&table, 2).await;
+        let before = rows(&table).await;
+        let reader = source_reader();
+        let builder = table.new_write_builder();
+        let mut update = builder.new_update().unwrap();
+        update.with_blob_uri_reader_factory(Some(Arc::new(BlobSourceFactory(reader.clone()))));
+        let reference = BlobDescriptor::new("custom://update".into(), 0, -1).serialize();
+        let values: ArrayRef = Arc::new(LargeBinaryArray::from(vec![
+            Some(reference.as_slice());
+            if array_assignment {
+                2
+            } else {
+                1
+            }
+        ]));
+        let assignment = if array_assignment {
+            UpdateAssignment::Array(vec![values])
+        } else {
+            UpdateAssignment::Scalar(values)
+        };
+        let predicate = PredicateBuilder::new(table.schema().fields())
+            .greater_or_equal("id", Datum::Int(3))
+            .unwrap();
+        let messages = update
+            .update_by_predicate(
+                Some(predicate),
+                vec![("payload".into(), assignment)],
+                vec![],
+            )
+            .await
+            .unwrap();
+        assert_eq!(reader.opened.load(Ordering::Relaxed), 2);
+        assert_eq!(reader.closed.load(Ordering::Relaxed), 2);
+        builder.new_commit().commit(messages).await.unwrap();
+        let actual = rows(&table).await;
+        assert_eq!(actual[..3], before[..3]);
+        assert_eq!(actual[3], (3, Some(b"streamed value".to_vec()), 13));
+        assert_eq!(actual[4], (4, Some(b"streamed value".to_vec()), 14));
+    }
+}
+
+#[tokio::test]
 async fn upsert_uses_one_reader_configuration_for_matches_appends_and_native_references() {
     let table = table(&[]).await;
     seed(&table).await;

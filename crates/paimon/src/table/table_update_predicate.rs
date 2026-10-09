@@ -18,6 +18,7 @@
 //! Predicate matching and assignment orchestration for TableUpdate.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use futures::TryStreamExt;
@@ -104,6 +105,7 @@ pub(super) async fn update(
     predicate: Option<Predicate>,
     assignments: Vec<(String, UpdateAssignment)>,
     read_columns: Vec<String>,
+    blob_uri_reader_factory: Option<Arc<dyn crate::io::UriReaderFactory>>,
 ) -> crate::Result<Vec<CommitMessage>> {
     let combine_all = validate(table, &assignments, &read_columns)?;
     let Some(snapshot) = super::time_travel::resolve_snapshot(table).await? else {
@@ -135,6 +137,7 @@ pub(super) async fn update(
     let index = RowIdFileIndex::from_splits(scan_table.clone(), plan.splits())?;
     let groups = ordered_file_groups(plan.splits())?;
     let mut updater = TableUpdateByRowId::with_index(table, index)?;
+    updater.with_blob_uri_reader_factory(blob_uri_reader_factory);
     let reader = read_builder.new_read()?;
     let schema = crate::arrow::build_target_arrow_schema(table.schema().fields())?;
     let columns: Vec<_> = assignments.iter().map(|(name, _)| name.clone()).collect();

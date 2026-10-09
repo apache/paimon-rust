@@ -176,6 +176,8 @@ def test_scoped_blob_factory_keeps_native_file_references(tmp_path, stream):
     (False, 'merge'), (True, 'merge'), (False, 'row_id'), (True, 'row_id'),
     (False, 'grouped_row_id'), (False, 'incremental'), (True, 'incremental'),
     (False, 'upsert'), (True, 'upsert'),
+    (False, 'predicate_scalar'), (True, 'predicate_scalar'),
+    (False, 'predicate_array'), (True, 'predicate_array'),
 ])
 @pytest.mark.parametrize('failure_stage', ['select', 'create'])
 def test_update_factory_errors_keep_identity_and_existing_data(tmp_path, stream, operation, failure_stage):
@@ -224,8 +226,49 @@ def test_update_factory_errors_keep_identity_and_existing_data(tmp_path, stream,
             update.update_by_arrow_batches_with_row_id([data], **extra)
         elif operation == 'incremental':
             update.new_update_by_row_id(**extra).update_columns(data, ['payload'])
+        elif operation.startswith('predicate_'):
+            value = (reference if operation == 'predicate_scalar'
+                     else pa.array([reference], type=pa.large_binary()))
+            update.update_by_predicate(None, {'payload': value}, **extra)
         else:
             update.with_update_type(['payload']).upsert_by_arrow_with_key(source, ['id'], **extra)
     assert caught.value is error
     assert calls == (['select'] if failure_stage == 'select' else ['select', 'create'])
     assert _read(context) == {'id': [0], 'payload': [b'old']}
+
+
+@pytest.mark.parametrize('stream', [False, True])
+@pytest.mark.parametrize('assignment', ['scalar', 'array', 'callable'])
+def test_predicate_updates_share_blob_factory_across_matched_file_groups(tmp_path, stream, assignment):
+    context, table = _update_table(tmp_path)
+    for ids, values in [([0, 1], [b'old-0', b'old-1']), ([2], [b'old-2'])]:
+        builder = table.new_batch_write_builder()
+        seed = builder.new_write()
+        try:
+            seed.write_arrow(_batch(ids, values))
+            builder.new_commit().commit(seed.prepare_commit())
+        finally:
+            seed.close()
+    factory = ReaderFactory()
+    builder = table.new_stream_write_builder() if stream else table.new_batch_write_builder()
+    update = builder.new_update()
+    update._with_blob_uri_reader_factory(factory)
+    reference = descriptor(2, -1)
+    read_columns = None
+    if assignment == 'scalar':
+        value = reference
+    elif assignment == 'array':
+        value = pa.array([reference, reference], type=pa.large_binary())
+    else:
+        def value(rows):
+            assert rows.column_names == ['id', '_ROW_ID']
+            return pa.array([reference] * rows.num_rows, type=pa.large_binary())
+        read_columns = ['id']
+    extra = {'commit_identifier': 7} if stream else {}
+    messages = update.update_by_predicate(
+        {'method': 'greaterOrEqual', 'field': 'id', 'literals': [1]},
+        {'payload': value}, read_columns=read_columns, **extra)
+    assert factory.opens == factory.closes == 2
+    commit = builder.new_commit()
+    commit.commit(7, messages) if stream else commit.commit(messages)
+    assert _read(context) == {'id': [0, 1, 2], 'payload': [b'old-0', b'23456789', b'23456789']}

@@ -200,8 +200,14 @@ impl TableUpdate {
         assignments: Vec<(String, super::UpdateAssignment)>,
         read_columns: Vec<String>,
     ) -> crate::Result<Vec<CommitMessage>> {
-        super::table_update_predicate::update(&self.table, predicate, assignments, read_columns)
-            .await
+        super::table_update_predicate::update(
+            &self.table,
+            predicate,
+            assignments,
+            read_columns,
+            self.blob_uri_reader_factory.clone(),
+        )
+        .await
     }
 
     /// Upsert Arrow rows by composite key through the core upsert
