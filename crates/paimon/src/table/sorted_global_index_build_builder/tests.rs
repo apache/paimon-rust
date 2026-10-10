@@ -720,7 +720,7 @@ async fn assert_btree_build_version(version: u32) {
         .unwrap();
 
     let shard_count = table
-        .new_btree_global_index_build_builder()
+        .new_global_index_build_builder()
         .with_index_column("name")
         .execute()
         .await
@@ -932,7 +932,7 @@ async fn column_group_btree_table(rows: i32, version: u32) -> Table {
         .any(|file| file.write_cols.as_deref() == Some(&["payload".into()])));
     for column in ["id", "name"] {
         table
-            .new_btree_global_index_build_builder()
+            .new_global_index_build_builder()
             .with_index_column(column)
             .execute()
             .await
@@ -1081,7 +1081,7 @@ async fn test_execute_writes_and_queries_fm_index() {
 
     assert_eq!(
         table
-            .new_sorted_global_index_build_builder()
+            .new_global_index_build_builder()
             .with_index_column("name")
             .with_index_type(FM_GLOBAL_INDEX_TYPE)
             .execute()
@@ -1192,7 +1192,7 @@ async fn test_failed_fm_build_removes_partial_index_file() {
     options.insert("fm-index.partition-row-count".to_string(), "1".to_string());
     options.insert("fm-index.compression".to_string(), "none".to_string());
     let error = table
-        .new_sorted_global_index_build_builder()
+        .new_global_index_build_builder()
         .with_index_column("name")
         .with_index_type(FM_GLOBAL_INDEX_TYPE)
         .with_options(options)
@@ -1244,7 +1244,7 @@ async fn test_global_index_prunes_during_manifest_read() {
         }
 
         table
-            .new_btree_global_index_build_builder()
+            .new_global_index_build_builder()
             .with_index_column("name")
             .execute()
             .await
@@ -1297,7 +1297,7 @@ async fn test_scalar_full_search_includes_unindexed_rows() {
         .await
         .unwrap();
     table
-        .new_btree_global_index_build_builder()
+        .new_global_index_build_builder()
         .with_index_column("name")
         .execute()
         .await
@@ -1365,7 +1365,7 @@ async fn test_empty_global_index_ranges_skip_legacy_manifests() {
             .await
             .unwrap();
         table
-            .new_btree_global_index_build_builder()
+            .new_global_index_build_builder()
             .with_index_column("name")
             .execute()
             .await
@@ -1441,7 +1441,7 @@ async fn test_detail_mode_defers_manifest_pruning_for_unindexed_ranges() {
         .await
         .unwrap();
     table
-        .new_btree_global_index_build_builder()
+        .new_global_index_build_builder()
         .with_index_column("name")
         .execute()
         .await
@@ -1504,7 +1504,7 @@ async fn test_execute_writes_bitmap_index_manifest_and_java_file() {
         .unwrap();
 
     let shard_count = table
-        .new_btree_global_index_build_builder()
+        .new_global_index_build_builder()
         .with_index_column("name")
         .with_index_type(BITMAP_GLOBAL_INDEX_TYPE)
         .execute()
@@ -1606,7 +1606,7 @@ async fn test_execute_multivalue_index_and_array_queries_end_to_end() {
         .unwrap();
 
     let shard_count = table
-        .new_btree_global_index_build_builder()
+        .new_global_index_build_builder()
         .with_index_column("items")
         .with_index_type(MULTIVALUE_GLOBAL_INDEX_TYPE)
         .execute()
@@ -1778,7 +1778,7 @@ async fn test_bitmap_floating_candidates_preserve_residual_results() {
 
     for column in ["f", "d"] {
         let shard_count = table
-            .new_btree_global_index_build_builder()
+            .new_global_index_build_builder()
             .with_index_column(column)
             .with_index_type(BITMAP_GLOBAL_INDEX_TYPE)
             .execute()
@@ -1931,7 +1931,7 @@ async fn bitmap_second_build_without_new_data_is_noop() {
         .unwrap();
 
     let first_built = table
-        .new_btree_global_index_build_builder()
+        .new_global_index_build_builder()
         .with_index_column("name")
         .with_index_type(BITMAP_GLOBAL_INDEX_TYPE)
         .execute()
@@ -1946,7 +1946,7 @@ async fn bitmap_second_build_without_new_data_is_noop() {
     assert!(!files_after_first.is_empty());
 
     let built = table
-        .new_btree_global_index_build_builder()
+        .new_global_index_build_builder()
         .with_index_column("name")
         .with_index_type(BITMAP_GLOBAL_INDEX_TYPE)
         .execute()
@@ -1992,7 +1992,7 @@ async fn bitmap_build_after_btree_on_same_field_still_indexes() {
         .unwrap();
 
     let btree_built = table
-        .new_btree_global_index_build_builder()
+        .new_global_index_build_builder()
         .with_index_column("name")
         .execute()
         .await
@@ -2000,7 +2000,7 @@ async fn bitmap_build_after_btree_on_same_field_still_indexes() {
     assert!(btree_built > 0);
 
     let bitmap_built = table
-        .new_btree_global_index_build_builder()
+        .new_global_index_build_builder()
         .with_index_column("name")
         .with_index_type(BITMAP_GLOBAL_INDEX_TYPE)
         .execute()
@@ -2050,7 +2050,7 @@ async fn bitmap_incremental_build_indexes_only_new_rows() {
         .unwrap();
 
     let first_built = table
-        .new_btree_global_index_build_builder()
+        .new_global_index_build_builder()
         .with_index_column("name")
         .with_index_type(BITMAP_GLOBAL_INDEX_TYPE)
         .execute()
@@ -2076,7 +2076,7 @@ async fn bitmap_incremental_build_indexes_only_new_rows() {
         .unwrap();
 
     let second_built = table
-        .new_btree_global_index_build_builder()
+        .new_global_index_build_builder()
         .with_index_column("name")
         .with_index_type(BITMAP_GLOBAL_INDEX_TYPE)
         .execute()
@@ -2215,7 +2215,7 @@ async fn second_build_without_new_data_is_noop() {
         .unwrap();
 
     let first_built = table
-        .new_btree_global_index_build_builder()
+        .new_global_index_build_builder()
         .with_index_column("name")
         .execute()
         .await
@@ -2226,7 +2226,7 @@ async fn second_build_without_new_data_is_noop() {
     assert!(!files_after_first.is_empty());
 
     let built = table
-        .new_btree_global_index_build_builder()
+        .new_global_index_build_builder()
         .with_index_column("name")
         .execute()
         .await
@@ -2269,7 +2269,7 @@ async fn incremental_build_indexes_only_new_rows() {
         .unwrap();
 
     let first_built = table
-        .new_btree_global_index_build_builder()
+        .new_global_index_build_builder()
         .with_index_column("name")
         .execute()
         .await
@@ -2296,7 +2296,7 @@ async fn incremental_build_indexes_only_new_rows() {
         .unwrap();
 
     let second_built = table
-        .new_btree_global_index_build_builder()
+        .new_global_index_build_builder()
         .with_index_column("name")
         .execute()
         .await
@@ -2356,7 +2356,7 @@ async fn first_build_indexes_full_coverage() {
         .unwrap();
 
     let built = table
-        .new_btree_global_index_build_builder()
+        .new_global_index_build_builder()
         .with_index_column("name")
         .execute()
         .await
@@ -2401,7 +2401,7 @@ async fn incremental_build_splits_gap_across_records_per_range_grid() {
         .unwrap();
 
     let first_built = table
-        .new_btree_global_index_build_builder()
+        .new_global_index_build_builder()
         .with_index_column("name")
         .execute()
         .await
@@ -2457,7 +2457,7 @@ async fn incremental_build_splits_gap_across_records_per_range_grid() {
     );
 
     let second_built = table
-        .new_btree_global_index_build_builder()
+        .new_global_index_build_builder()
         .with_index_column("name")
         .execute()
         .await
@@ -2578,7 +2578,7 @@ async fn incremental_build_splits_gap_around_mid_coverage_indexed_hole() {
     // Build: gap = coverage minus the hole = [0, hole_start-1] and
     // [hole_end+1, last_row]; two shards since the grid does not split here.
     let built = table
-        .new_btree_global_index_build_builder()
+        .new_global_index_build_builder()
         .with_index_column("name")
         .execute()
         .await
@@ -2673,7 +2673,7 @@ async fn test_composite_btree_build_query_coverage_and_drop() {
             .unwrap();
         assert_eq!(
             table
-                .new_btree_global_index_build_builder()
+                .new_global_index_build_builder()
                 .with_index_columns(&["name", "id"])
                 .execute()
                 .await
@@ -2682,7 +2682,7 @@ async fn test_composite_btree_build_query_coverage_and_drop() {
         );
         assert_eq!(
             table
-                .new_btree_global_index_build_builder()
+                .new_global_index_build_builder()
                 .with_index_column(" name , id ")
                 .execute()
                 .await
@@ -2800,7 +2800,7 @@ async fn test_composite_btree_build_query_coverage_and_drop() {
         assert_eq!(scan_ids(&table, point).await, vec![1, 1]);
         assert_eq!(
             table
-                .new_btree_global_index_build_builder()
+                .new_global_index_build_builder()
                 .with_index_columns(&["name", "id"])
                 .execute()
                 .await
@@ -2810,7 +2810,7 @@ async fn test_composite_btree_build_query_coverage_and_drop() {
         // Independent scalar and reversed tuple definitions coexist.
         assert!(
             table
-                .new_btree_global_index_build_builder()
+                .new_global_index_build_builder()
                 .with_index_column("name")
                 .execute()
                 .await
@@ -2819,7 +2819,7 @@ async fn test_composite_btree_build_query_coverage_and_drop() {
         );
         assert!(
             table
-                .new_btree_global_index_build_builder()
+                .new_global_index_build_builder()
                 .with_index_columns(&["id", "name"])
                 .execute()
                 .await
@@ -2872,7 +2872,7 @@ async fn test_composite_btree_column_validation() {
     let table = test_table(table_options("10"));
     for columns in ["", "name,", "name,name", "name,missing"] {
         assert!(table
-            .new_btree_global_index_build_builder()
+            .new_global_index_build_builder()
             .with_index_column(columns)
             .execute()
             .await
@@ -2887,7 +2887,7 @@ async fn test_composite_btree_column_validation() {
     for index_type in ["bitmap", "multivalue", "fm"] {
         assert!(matches!(
             table
-                .new_btree_global_index_build_builder()
+                .new_global_index_build_builder()
                 .with_index_columns(&["name", "id"])
                 .with_index_type(index_type)
                 .execute()
@@ -2920,7 +2920,7 @@ async fn test_composite_btree_all_null_tuple_and_residual_filter() {
         .await
         .unwrap();
     table
-        .new_btree_global_index_build_builder()
+        .new_global_index_build_builder()
         .with_index_columns(&["name", "id"])
         .execute()
         .await
@@ -3059,7 +3059,7 @@ async fn test_composite_btree_literal_precision_preserves_scan_results() {
     }
     for columns in [["d", "id"], ["ts", "id"]] {
         table
-            .new_btree_global_index_build_builder()
+            .new_global_index_build_builder()
             .with_index_columns(&columns)
             .execute()
             .await
@@ -3099,7 +3099,7 @@ async fn test_composite_btree_literal_precision_preserves_scan_results() {
     for index_type in ["btree", "bitmap"] {
         for column in ["d", "ts"] {
             table
-                .new_btree_global_index_build_builder()
+                .new_global_index_build_builder()
                 .with_index_column(column)
                 .with_index_type(index_type)
                 .execute()
@@ -3162,14 +3162,14 @@ async fn test_composite_btree_intersects_independent_indexes() {
         .await
         .unwrap();
     table
-        .new_btree_global_index_build_builder()
+        .new_global_index_build_builder()
         .with_index_type("bitmap")
         .with_index_column("flag")
         .execute()
         .await
         .unwrap();
     table
-        .new_btree_global_index_build_builder()
+        .new_global_index_build_builder()
         .with_index_columns(&["name", "id"])
         .execute()
         .await
@@ -3204,7 +3204,7 @@ async fn test_composite_btree_intersects_independent_indexes() {
             .await
             .unwrap();
         table
-            .new_btree_global_index_build_builder()
+            .new_global_index_build_builder()
             .with_index_columns(&["flag", "id"])
             .execute()
             .await
@@ -3250,12 +3250,12 @@ async fn test_composite_btree_combines_different_index_coverage() {
             .await
             .unwrap();
         table
-            .new_btree_global_index_build_builder()
+            .new_global_index_build_builder()
             .with_index_columns(&["name", "id"])
             .execute()
             .await
             .unwrap();
-        let mut independent = table.new_btree_global_index_build_builder();
+        let mut independent = table.new_global_index_build_builder();
         if independent_type == "bitmap" {
             independent
                 .with_index_type("bitmap")
@@ -3404,7 +3404,7 @@ async fn test_composite_btree_preserves_exact_column_names() {
         .unwrap();
     assert_eq!(
         table
-            .new_btree_global_index_build_builder()
+            .new_global_index_build_builder()
             .with_index_columns(&["a,b", " c "])
             .execute()
             .await
@@ -3413,7 +3413,7 @@ async fn test_composite_btree_preserves_exact_column_names() {
     );
     assert_eq!(
         table
-            .new_btree_global_index_build_builder()
+            .new_global_index_build_builder()
             .with_index_column("a,b")
             .execute()
             .await
@@ -3422,7 +3422,7 @@ async fn test_composite_btree_preserves_exact_column_names() {
     );
     assert_eq!(
         table
-            .new_btree_global_index_build_builder()
+            .new_global_index_build_builder()
             .with_index_column(" c ")
             .execute()
             .await
@@ -3472,7 +3472,7 @@ async fn test_composite_btree_preserves_exact_column_names() {
         1
     );
     assert!(table
-        .new_btree_global_index_build_builder()
+        .new_global_index_build_builder()
         .with_index_columns(&[])
         .execute()
         .await

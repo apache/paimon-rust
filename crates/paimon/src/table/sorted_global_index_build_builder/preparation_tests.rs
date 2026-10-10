@@ -144,7 +144,7 @@ async fn staged_indexes_reject_target_column_changes_and_preserve_files() {
                 vec![None; 2],
             )
             .await;
-            let mut builder = table.new_sorted_global_index_build_builder();
+            let mut builder = table.new_global_index_build_builder();
             builder.with_index_column("name").with_index_type(kind);
             let mut messages = builder.build().await.unwrap();
             let file = messages[0].new_index_files[0].clone();
@@ -202,7 +202,7 @@ async fn staged_indexes_reject_deleted_partial_columns_and_removed_source_ranges
             let updates = update_name(&table, "changed").await;
             let commit = TableCommit::new(table.clone(), "update".into());
             commit.commit(updates.clone()).await.unwrap();
-            let mut builder = table.new_sorted_global_index_build_builder();
+            let mut builder = table.new_global_index_build_builder();
             builder.with_index_column("name").with_index_type(kind);
             let messages = builder.build().await.unwrap();
             if remove_all {
@@ -242,7 +242,7 @@ async fn staged_index_survives_append_and_unrelated_column_update() {
         vec![None; 2],
     )
     .await;
-    let mut builder = table.new_sorted_global_index_build_builder();
+    let mut builder = table.new_global_index_build_builder();
     builder.with_index_column("name");
     let messages = builder.build().await.unwrap();
     assert_eq!(
@@ -297,7 +297,7 @@ async fn equivalent_empty_partition_encodings_share_source_checks() {
         for changed in [false, true] {
             let table = table(false, false);
             append(&table, vec![1], vec![Some("a")], vec![None]).await;
-            let mut builder = table.new_sorted_global_index_build_builder();
+            let mut builder = table.new_global_index_build_builder();
             builder.with_index_column("name");
             let mut messages = builder.build().await.unwrap();
             for message in &mut messages {
@@ -343,7 +343,7 @@ async fn prepared_files_are_invisible_until_explicit_commit() {
             .await
             .unwrap()
             .unwrap();
-        let mut builder = table.new_sorted_global_index_build_builder();
+        let mut builder = table.new_global_index_build_builder();
         builder.with_index_column("name").with_index_type(kind);
         let messages = builder.build().await.unwrap();
         assert_eq!(messages.len(), 2);
@@ -410,7 +410,7 @@ async fn caller_can_abort_prepared_files_without_changing_snapshot() {
     for kind in ["btree", "bitmap"] {
         let table = table(false, true);
         append(&table, vec![1, 2], vec![Some("a"), None], vec![None; 2]).await;
-        let mut builder = table.new_sorted_global_index_build_builder();
+        let mut builder = table.new_global_index_build_builder();
         builder.with_index_column("name").with_index_type(kind);
         let messages = builder.build().await.unwrap();
         let path = messages[0].new_index_files[0]
@@ -474,7 +474,7 @@ async fn partition_builds_only_cover_selected_partitions_and_new_rows() {
         .await;
         let predicates = PredicateBuilder::new(table.schema().fields());
         let selected = predicates.equal("pt", Datum::Int(1)).unwrap();
-        let mut builder = table.new_sorted_global_index_build_builder();
+        let mut builder = table.new_global_index_build_builder();
         builder
             .with_index_column("id")
             .with_index_type(kind)
@@ -503,7 +503,7 @@ async fn partition_builds_only_cover_selected_partitions_and_new_rows() {
         assert_eq!(builder.execute().await.unwrap(), 1);
         assert!(builder.build().await.unwrap().is_empty());
 
-        let mut all = table.new_sorted_global_index_build_builder();
+        let mut all = table.new_global_index_build_builder();
         all.with_index_column("id").with_index_type(kind);
         let remaining = all.build().await.unwrap();
         assert_eq!(
@@ -526,7 +526,7 @@ async fn partition_builds_only_cover_selected_partitions_and_new_rows() {
 #[tokio::test]
 async fn empty_and_disjoint_partition_builds_publish_nothing() {
     let table = table(true, false);
-    let mut builder = table.new_sorted_global_index_build_builder();
+    let mut builder = table.new_global_index_build_builder();
     builder.with_index_column("id");
     assert!(builder.build().await.unwrap().is_empty());
     assert_eq!(builder.execute().await.unwrap(), 0);
@@ -562,7 +562,7 @@ async fn empty_and_disjoint_partition_builds_publish_nothing() {
         .is_null("pt")
         .unwrap();
     assert!(unpartitioned
-        .new_sorted_global_index_build_builder()
+        .new_global_index_build_builder()
         .with_partition_filter(filter)
         .is_err());
 }

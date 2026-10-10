@@ -594,7 +594,8 @@ async fn vindex_second_build_without_new_data_is_noop() {
     assert!(!names_before.is_empty());
 
     let built = table
-        .new_vindex_index_build_builder(IVF_FLAT_IDENTIFIER)
+        .new_global_index_build_builder()
+        .with_index_type(IVF_FLAT_IDENTIFIER)
         .with_index_column("embedding")
         .execute()
         .await
@@ -634,7 +635,8 @@ async fn vindex_incremental_build_indexes_only_new_rows() {
     )
     .await;
     let first_built = table
-        .new_vindex_index_build_builder(IVF_FLAT_IDENTIFIER)
+        .new_global_index_build_builder()
+        .with_index_type(IVF_FLAT_IDENTIFIER)
         .with_index_column("embedding")
         .with_options(HashMap::from([(
             "ivf-flat.train.sample-ratio".to_string(),
@@ -667,7 +669,8 @@ async fn vindex_incremental_build_indexes_only_new_rows() {
 
     // End-to-end: build #2 must SUCCEED and index the appended rows.
     let second_built = table
-        .new_vindex_index_build_builder(IVF_FLAT_IDENTIFIER)
+        .new_global_index_build_builder()
+        .with_index_type(IVF_FLAT_IDENTIFIER)
         .with_index_column("embedding")
         .with_options(HashMap::from([(
             "vindex.build.granule.enabled".to_string(),
@@ -747,7 +750,8 @@ async fn vindex_small_training_sample_preserves_tail_cluster_recall() {
     .await;
     assert_eq!(
         table
-            .new_vindex_index_build_builder(crate::vindex::IVF_SQ_IDENTIFIER)
+            .new_global_index_build_builder()
+            .with_index_type(crate::vindex::IVF_SQ_IDENTIFIER)
             .with_index_column("embedding")
             .execute()
             .await
@@ -823,7 +827,8 @@ async fn vindex_granule_training_sees_file_periodic_cluster() {
 
     assert_eq!(
         table
-            .new_vindex_index_build_builder(crate::vindex::IVF_SQ_IDENTIFIER)
+            .new_global_index_build_builder()
+            .with_index_type(crate::vindex::IVF_SQ_IDENTIFIER)
             .with_index_column("embedding")
             .execute()
             .await
@@ -967,7 +972,8 @@ async fn vindex_granule_training_sees_one_oversized_row_group() {
         assert_eq!(physical_granules.len(), 1);
         assert_eq!(physical_granules[0].row_count, LARGE_ROWS as i64);
 
-        let mut builder = table.new_vindex_index_build_builder(crate::vindex::IVF_SQ_IDENTIFIER);
+        let mut builder =
+            super::VindexIndexBuildBuilder::new(&table, crate::vindex::IVF_SQ_IDENTIFIER);
         builder
             .with_index_column("embedding")
             .with_options(HashMap::from([(
@@ -996,7 +1002,20 @@ async fn vindex_granule_training_sees_one_oversized_row_group() {
             assert!(plan.rest.is_empty(), "snapshot {}", snapshot.id());
             assert_eq!(plan.first, vec![RowRange::new(0, total_rows as i64 - 1)]);
         }
-        assert_eq!(builder.execute().await.unwrap(), 1);
+        assert_eq!(
+            table
+                .new_global_index_build_builder()
+                .with_index_column("embedding")
+                .with_index_type(crate::vindex::IVF_SQ_IDENTIFIER)
+                .with_options(HashMap::from([(
+                    "vindex.build.granule.enabled".to_string(),
+                    granule_enabled.to_string()
+                )]))
+                .execute()
+                .await
+                .unwrap(),
+            1
+        );
         let result = table
             .new_vector_search_builder()
             .with_vector_column("embedding")
@@ -1033,7 +1052,8 @@ async fn vindex_build_cleans_written_shards_when_later_shard_fails() {
     .await;
 
     let error = table
-        .new_vindex_index_build_builder(IVF_FLAT_IDENTIFIER)
+        .new_global_index_build_builder()
+        .with_index_type(IVF_FLAT_IDENTIFIER)
         .with_index_column("embedding")
         .execute()
         .await
@@ -1099,7 +1119,8 @@ async fn vindex_build_coexists_with_different_index_type_on_same_field() {
     // A native-build failure over the tiny synthetic dataset is tolerated;
     // only the overlap error is forbidden.
     let result = table
-        .new_vindex_index_build_builder(IVF_FLAT_IDENTIFIER)
+        .new_global_index_build_builder()
+        .with_index_type(IVF_FLAT_IDENTIFIER)
         .with_index_column("embedding")
         .execute()
         .await;

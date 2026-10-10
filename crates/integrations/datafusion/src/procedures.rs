@@ -64,21 +64,18 @@ use paimon::api::{
     PermissionColumns, PermissionResource, PolicyType, ResourceType, RowFilter,
 };
 use paimon::catalog::{Catalog, Identifier, RESTCatalog};
-use paimon::lumina::LUMINA_IDENTIFIER;
+use paimon::lumina::{is_lumina_index_type, LUMINA_IDENTIFIER};
 use paimon::spec::Snapshot;
 use paimon::table::{
-    normalize_global_index_type_for_drop, BranchManager, SnapshotManager, Table, TagManager,
+    normalize_global_index_type, BranchManager, SnapshotManager, Table, TagManager,
     SUPPORTED_GLOBAL_INDEX_TYPES_FOR_DROP,
 };
-use paimon::vindex::is_vindex_index_type;
 
 use crate::error::to_datafusion_error;
 
 /// Default `index_type` for the global index procedures when the argument is
 /// omitted, matching Java's `CreateGlobalIndexProcedure`.
 const DEFAULT_GLOBAL_INDEX_TYPE: &str = "btree";
-/// Java `NativeFullTextGlobalIndexerFactory.IDENTIFIER`.
-const FULL_TEXT_GLOBAL_INDEX_TYPE: &str = "full-text";
 
 /// Resolve a snapshot by id: try live snapshot file first, then fall back to tag metadata.
 async fn resolve_snapshot_by_id(
@@ -716,13 +713,18 @@ async fn proc_create_lumina_index(
 ) -> DFResult<DataFrame> {
     let table = get_table(catalog, catalog_name, args).await?;
     let index_column = require_arg(args, "index_column")?;
-    let mut builder = table.new_lumina_index_build_builder();
+    let mut builder = table.new_global_index_build_builder();
     builder.with_index_column(index_column);
     let index_type = normalize_index_type(
         args.get("index_type")
             .map(String::as_str)
             .unwrap_or(LUMINA_IDENTIFIER),
     );
+    if !is_lumina_index_type(&index_type) {
+        return Err(DataFusionError::NotImplemented(format!(
+            "Unsupported Lumina index type: {index_type}"
+        )));
+    }
     builder.with_index_type(&index_type);
     if let Some(options) = args.get("options") {
         builder.with_options(parse_key_value_options(options)?);
@@ -743,45 +745,14 @@ async fn proc_create_global_index(
         .get("index_type")
         .map(String::as_str)
         .unwrap_or(DEFAULT_GLOBAL_INDEX_TYPE);
-    let index_type = normalize_index_type(index_type_arg);
-    let index_type = index_type.as_str();
-    if is_scalar_global_index_type(index_type) {
-        let mut builder = table.new_sorted_global_index_build_builder();
-        builder.with_index_column(index_column);
-        builder.with_index_type(index_type);
-        if let Some(options) = args.get("options") {
-            builder.with_options(parse_key_value_options(options)?);
-        }
-        builder.execute().await.map_err(to_datafusion_error)?;
-    } else if is_vindex_index_type(index_type) {
-        let mut builder = table.new_vindex_index_build_builder(index_type);
-        builder.with_index_column(index_column);
-        if let Some(options) = args.get("options") {
-            builder.with_options(parse_key_value_options(options)?);
-        }
-        builder.execute().await.map_err(to_datafusion_error)?;
-    } else if index_type == FULL_TEXT_GLOBAL_INDEX_TYPE {
-        #[cfg(feature = "fulltext")]
-        {
-            let mut builder = table.new_full_text_index_build_builder();
-            builder.with_index_column(index_column);
-            if let Some(options) = args.get("options") {
-                builder.with_options(parse_key_value_options(options)?);
-            }
-            builder.execute().await.map_err(to_datafusion_error)?;
-        }
-        #[cfg(not(feature = "fulltext"))]
-        return Err(DataFusionError::NotImplemented(
-            "create_global_index with index_type => 'full-text' requires the 'fulltext' feature"
-                .to_string(),
-        ));
-    } else {
-        // Echo the raw argument, not the normalized one, so a typo stays visible.
-        return Err(DataFusionError::NotImplemented(format!(
-            "create_global_index only supports index_type => 'btree', 'bitmap', 'multivalue', 'fm', 'full-text', \
-             or vindex types ('ivf-flat', 'ivf-pq', 'ivf-sq', 'ivf-rq', 'diskann'), got '{index_type_arg}'"
-        )));
+    let mut builder = table.new_global_index_build_builder();
+    builder
+        .with_index_column(index_column)
+        .with_index_type(index_type_arg);
+    if let Some(options) = args.get("options") {
+        builder.with_options(parse_key_value_options(options)?);
     }
+    builder.execute().await.map_err(to_datafusion_error)?;
     ok_result(ctx)
 }
 
@@ -799,7 +770,7 @@ async fn proc_drop_global_index(
         .unwrap_or(DEFAULT_GLOBAL_INDEX_TYPE);
     let index_type = normalize_index_type(index_type_arg);
     let index_type = index_type.as_str();
-    if normalize_global_index_type_for_drop(index_type).is_none() {
+    if normalize_global_index_type(index_type).is_none() {
         // Echo the raw argument, not the normalized one, so a typo stays visible.
         return Err(DataFusionError::NotImplemented(format!(
             "unsupported global index type '{index_type_arg}'; supported: {SUPPORTED_GLOBAL_INDEX_TYPES_FOR_DROP}"
@@ -829,17 +800,10 @@ async fn proc_drop_global_index(
     ok_result(ctx)
 }
 
-/// Precondition: `index_type` is already canonical (see `normalize_index_type`).
-fn is_scalar_global_index_type(index_type: &str) -> bool {
-    matches!(index_type, "btree" | "bitmap" | "multivalue" | "fm")
-}
-
 /// Canonicalize a procedure's `index_type` argument: trim, then lowercase.
 /// Mirrors `indexType.toLowerCase(Locale.ROOT).trim()` in Java's Flink and Spark
 /// `CreateGlobalIndexProcedure` / `DropGlobalIndexProcedure`. Normalizing at this
-/// boundary keeps the core builders' exact matching intact -- they are the analog
-/// of Java's `GlobalIndexer`, which likewise receives an already-canonical value
-/// and persists it into index metadata.
+/// boundary and the core builder both accept procedure-style identifiers.
 fn normalize_index_type(index_type: &str) -> String {
     index_type.trim().to_ascii_lowercase()
 }
@@ -1440,18 +1404,6 @@ mod tests {
         // is normalized but not rewritten -- the caller still rejects it.
         assert_eq!(normalize_index_type("ivf-flat"), "ivf-flat");
         assert_eq!(normalize_index_type(" Full-Text "), "full-text");
-    }
-
-    #[test]
-    fn test_scalar_global_index_type_predicate() {
-        assert!(is_scalar_global_index_type("btree"));
-        assert!(is_scalar_global_index_type("bitmap"));
-        assert!(is_scalar_global_index_type("multivalue"));
-        assert!(is_scalar_global_index_type("fm"));
-        assert!(!is_scalar_global_index_type("ivf-flat"));
-        assert!(!is_scalar_global_index_type("lumina"));
-        // The predicate requires a canonical input; callers normalize first.
-        assert!(!is_scalar_global_index_type("BTREE"));
     }
 
     #[test]

@@ -39,7 +39,6 @@ use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 use tokio_util::io::SyncIoBridge;
 
-const INDEX_DIR: &str = "index";
 const VECTOR_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 
 pub(super) struct BuiltIndexFile {
@@ -426,23 +425,16 @@ impl<'a> VindexIndexBuildBuilder<'a> {
         index_meta: Vec<u8>,
         row_count: i64,
     ) -> Result<IndexFileMeta> {
-        self.table
-            .file_io()
-            .mkdirs(&format!(
-                "{}/{INDEX_DIR}/",
-                self.table.location().trim_end_matches('/')
-            ))
-            .await?;
         let file_name = format!(
             "vector-{}-global-index-{}.index",
             self.index_type,
             uuid::Uuid::new_v4()
         );
-        let index_path = format!(
-            "{}/{INDEX_DIR}/{}",
-            self.table.location().trim_end_matches('/'),
-            file_name
-        );
+        let (index_path, external_path) =
+            crate::table::global_index_build_common::prepare_index_file_path(
+                self.table, &file_name,
+            )
+            .await?;
         let write_result = async {
             let async_writer = self
                 .table
@@ -484,13 +476,15 @@ impl<'a> VindexIndexBuildBuilder<'a> {
             )?,
             row_count,
             deletion_vectors_ranges: None,
-            external_path: None,
+            external_path,
             global_index_meta: Some(GlobalIndexMeta {
                 row_range_start: shard.row_range_start,
                 row_range_end: shard.row_range_end,
                 index_field_id,
                 extra_field_ids: None,
-                source_meta: None,
+                source_meta: Some(
+                    crate::spec::DataEvolutionIndexSourceMeta::new(shard.snapshot_id)?.serialize(),
+                ),
                 index_meta: Some(index_meta),
             }),
         })

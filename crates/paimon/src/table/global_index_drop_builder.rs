@@ -17,8 +17,7 @@
 
 use super::global_index_build_common::IndexColumns;
 use super::global_index_types::{
-    normalize_global_index_type_for_drop, BTREE_GLOBAL_INDEX_TYPE,
-    SUPPORTED_GLOBAL_INDEX_TYPES_FOR_DROP,
+    normalize_global_index_type, BTREE_GLOBAL_INDEX_TYPE, SUPPORTED_GLOBAL_INDEX_TYPES_FOR_DROP,
 };
 use crate::spec::{FileKind, IndexFileMeta, IndexManifest};
 use crate::table::{CommitMessage, Table, TableCommit};
@@ -73,13 +72,11 @@ impl<'a> GlobalIndexDropBuilder<'a> {
         self.table.ensure_not_branch_reference_for_write()?;
 
         let index_type =
-            normalize_global_index_type_for_drop(&self.index_type).ok_or_else(|| {
-                Error::Unsupported {
-                    message: format!(
-                        "unsupported global index type '{}'; supported: {}",
-                        self.index_type, SUPPORTED_GLOBAL_INDEX_TYPES_FOR_DROP
-                    ),
-                }
+            normalize_global_index_type(&self.index_type).ok_or_else(|| Error::Unsupported {
+                message: format!(
+                    "unsupported global index type '{}'; supported: {}",
+                    self.index_type, SUPPORTED_GLOBAL_INDEX_TYPES_FOR_DROP
+                ),
             })?;
         let index_column = self
             .index_column
@@ -121,9 +118,7 @@ impl<'a> GlobalIndexDropBuilder<'a> {
             if entry.kind != FileKind::Add {
                 continue;
             }
-            if normalize_global_index_type_for_drop(&entry.index_file.index_type)
-                != Some(index_type)
-            {
+            if normalize_global_index_type(&entry.index_file.index_type) != Some(index_type) {
                 continue;
             }
             let Some(global_meta) = entry.index_file.global_index_meta.as_ref() else {
@@ -218,7 +213,7 @@ mod tests {
         }
         refused(
             table
-                .new_btree_global_index_build_builder()
+                .new_global_index_build_builder()
                 .execute()
                 .await
                 .unwrap_err(),
@@ -226,7 +221,8 @@ mod tests {
         );
         refused(
             table
-                .new_vindex_index_build_builder("vector")
+                .new_global_index_build_builder()
+                .with_index_type("vector")
                 .execute()
                 .await
                 .unwrap_err(),
@@ -234,7 +230,8 @@ mod tests {
         );
         refused(
             table
-                .new_lumina_index_build_builder()
+                .new_global_index_build_builder()
+                .with_index_type("lumina")
                 .execute()
                 .await
                 .unwrap_err(),

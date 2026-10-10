@@ -544,7 +544,7 @@ async fn test_create_global_index_rejects_unsupported_index_types() {
                     index_type => '{index_type}'\
                 )"
             ),
-            "only supports index_type => 'btree', 'bitmap', 'multivalue', 'fm', 'full-text', or vindex types",
+            "Unsupported global index type",
         )
         .await;
     }
@@ -675,7 +675,7 @@ async fn test_global_index_procedures_echo_raw_unsupported_type() {
     assert_sql_error(
         &sql_context,
         "CALL sys.create_global_index(table => 'test_db.btree_echo', index_column => 'id', index_type => 'Ivf-Hnsw-Flat')",
-        "got 'Ivf-Hnsw-Flat'",
+        "Unsupported global index type: 'Ivf-Hnsw-Flat'",
     )
     .await;
     assert_sql_error(

@@ -20,14 +20,14 @@ use std::time::Duration;
 
 const VECTOR_INDEX_BUILD_TIMING_ENV: &str = "PAIMON_LOG_VECTOR_INDEX_BUILD_TIMING";
 
-pub(super) fn vector_index_build_timing_enabled() -> bool {
+pub(in crate::table) fn vector_index_build_timing_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
         std::env::var_os(VECTOR_INDEX_BUILD_TIMING_ENV).is_some_and(|value| value == "1")
     })
 }
 
-pub(super) struct VectorIndexBuildTiming {
+pub(in crate::table) struct VectorIndexBuildTiming {
     pub(super) total_without_commit: Duration,
     pub(super) source_batch_wait: Duration,
     pub(super) oss_read: Duration,
@@ -59,7 +59,7 @@ pub(super) struct VectorIndexBuildTiming {
 }
 
 impl VectorIndexBuildTiming {
-    pub(super) fn log(self, index_type: &str, commit: Duration) {
+    pub(in crate::table) fn log(self, index_type: &str, commit: Duration) {
         let total = self.total_without_commit.saturating_add(commit);
         let accounted = self
             .source_batch_wait

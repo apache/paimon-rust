@@ -235,3 +235,26 @@ pub(crate) async fn validate_existing_index_overlap(
     }
     Ok(())
 }
+
+/// Resolve and create the table's global index directory, including external placement.
+pub(crate) async fn prepare_index_file_path(
+    table: &Table,
+    file_name: &str,
+) -> Result<(String, Option<String>)> {
+    let external_path = super::external_path::new_index_external_path(
+        table.schema().options(),
+        false,
+        "",
+        file_name,
+    )?;
+    let path = external_path.clone().unwrap_or_else(|| {
+        format!(
+            "{}/index/{file_name}",
+            table.location().trim_end_matches('/')
+        )
+    });
+    if let Some((directory, _)) = path.rsplit_once('/') {
+        table.file_io().mkdirs(&format!("{directory}/")).await?;
+    }
+    Ok((path, external_path))
+}

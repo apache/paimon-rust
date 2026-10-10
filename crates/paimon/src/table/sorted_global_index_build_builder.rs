@@ -63,17 +63,13 @@ fn make_index_key_codec(index_type: &str, data_type: &DataType) -> (KeyComparato
     }
 }
 
-pub struct SortedGlobalIndexBuildBuilder<'a> {
+pub(super) struct SortedGlobalIndexBuildBuilder<'a> {
     table: &'a Table,
     index_column: Option<IndexColumns>,
     index_type: String,
     options: HashMap<String, String>,
     partition_filter: Option<Predicate>,
 }
-
-/// Backward-compatible name retained for callers that used the original
-/// BTree-only builder API before it also supported bitmap and multivalue.
-pub type BTreeGlobalIndexBuildBuilder<'a> = SortedGlobalIndexBuildBuilder<'a>;
 
 impl<'a> SortedGlobalIndexBuildBuilder<'a> {
     pub(crate) fn new(table: &'a Table) -> Self {
@@ -84,11 +80,6 @@ impl<'a> SortedGlobalIndexBuildBuilder<'a> {
             options: HashMap::new(),
             partition_filter: None,
         }
-    }
-
-    pub fn with_index_column(&mut self, column: &str) -> &mut Self {
-        self.index_column = Some(IndexColumns::Column(column.to_string()));
-        self
     }
 
     /// Select BTree columns in physical tuple-key order.
@@ -120,32 +111,6 @@ impl<'a> SortedGlobalIndexBuildBuilder<'a> {
         Ok(self)
     }
 
-    /// Build index files without publishing a snapshot, like Java's index builders.
-    /// The caller owns the returned messages and decides whether to commit or abort.
-    /// A build with no snapshot or uncovered rows returns an empty list.
-    pub async fn build(&self) -> Result<Vec<CommitMessage>> {
-        self.prepare().await.map(|(_, messages)| messages)
-    }
-
-    /// Build and commit, rejecting a concurrent change to the planned snapshot.
-    pub async fn execute(&self) -> Result<usize> {
-        let (snapshot_id, messages) = self.prepare().await?;
-        if messages.is_empty() {
-            return Ok(0);
-        }
-        let count = messages
-            .iter()
-            .map(|message| message.new_index_files.len())
-            .sum();
-        self.new_commit()
-            .commit_if_latest_snapshot(
-                messages,
-                snapshot_id.expect("nonempty build has a snapshot"),
-            )
-            .await?;
-        Ok(count)
-    }
-
     fn new_commit(&self) -> TableCommit {
         TableCommit::new(
             self.table.clone(),
@@ -157,7 +122,7 @@ impl<'a> SortedGlobalIndexBuildBuilder<'a> {
         )
     }
 
-    async fn prepare(&self) -> Result<(Option<i64>, Vec<CommitMessage>)> {
+    pub(super) async fn prepare(&self) -> Result<(Option<i64>, Vec<CommitMessage>)> {
         // Building the index scans the table's rows.
         CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
 

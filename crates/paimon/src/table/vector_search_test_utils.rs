@@ -187,14 +187,15 @@ pub(super) async fn de_vector_table() -> Table {
         .unwrap();
 
     let built = table
-        .new_vindex_index_build_builder(IVF_FLAT_IDENTIFIER)
+        .new_global_index_build_builder()
+        .with_index_type(IVF_FLAT_IDENTIFIER)
         .with_index_column("embedding")
         .execute()
         .await
         .unwrap();
     assert!(built > 0, "DE fixture must build a global vector index");
     let built = table
-        .new_sorted_global_index_build_builder()
+        .new_global_index_build_builder()
         .with_index_column("id")
         .with_index_type("btree")
         .execute()

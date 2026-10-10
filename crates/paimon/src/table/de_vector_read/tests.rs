@@ -1516,7 +1516,8 @@ async fn filtered_rerank_rejects_metric_from_a_skipped_shard() {
         .await
         .unwrap();
     let count = table
-        .new_vindex_index_build_builder(IVF_FLAT_IDENTIFIER)
+        .new_global_index_build_builder()
+        .with_index_type(IVF_FLAT_IDENTIFIER)
         .with_index_column("embedding")
         .with_options(HashMap::from([(
             "ivf-flat.distance.metric".to_string(),
