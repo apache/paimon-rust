@@ -198,6 +198,10 @@ impl PyTable {
         }
     }
 
+    fn new_full_text_search_builder(&self) -> crate::full_text_search::PyFullTextSearchBuilder {
+        crate::full_text_search::PyFullTextSearchBuilder::new(Arc::clone(&self.inner))
+    }
+
     fn new_vector_search_builder(&self) -> crate::vector_search::PyVectorSearchBuilder {
         crate::vector_search::PyVectorSearchBuilder::new(Arc::clone(&self.inner))
     }

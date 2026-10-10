@@ -727,6 +727,11 @@ pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> 
     this.add_class::<PaimonCatalog>()?;
     this.add_class::<crate::table::PyTable>()?;
     this.add_class::<crate::index_build::PyGlobalIndexBuildBuilder>()?;
+    this.add_class::<crate::full_text_search::PyFullTextSearchBuilder>()?;
+    this.add_class::<crate::full_text_search::PyFullTextScan>()?;
+    this.add_class::<crate::full_text_search::PyFullTextScanPlan>()?;
+    this.add_class::<crate::full_text_search::PyFullTextRead>()?;
+    this.add_class::<crate::full_text_search::PyFullTextSearchResult>()?;
     this.add_class::<crate::vector_search::PyVectorSearchBuilder>()?;
     this.add_class::<crate::vector_search::PyBatchVectorSearchBuilder>()?;
     this.add_class::<crate::vector_search::PyVectorScan>()?;
