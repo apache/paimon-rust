@@ -486,6 +486,12 @@ impl TableWrite {
                 .fields()
                 .iter()
                 .any(|f| matches!(f.data_type(), DataType::Vector(_)));
+        if let Some(format) = vector_file_format
+            .as_deref()
+            .filter(|_| has_dedicated_vector_fields)
+        {
+            crate::arrow::format::validate_write_format(format)?;
+        }
 
         let file_index_options = FileIndexOptions::parse(schema.options(), schema.fields())?;
         if file_index_options.is_some() && has_dedicated_vector_fields {
@@ -3505,6 +3511,23 @@ pub(in crate::table) mod tests {
             "parquet",
         )
         .await;
+    }
+
+    #[test]
+    fn test_unsupported_vector_format_fails_before_accepting_data() {
+        let file_io = FileIO::from_path("memory:/").unwrap().build().unwrap();
+        let table = Table::new(
+            file_io,
+            Identifier::new("default", "unsupported_vector_format"),
+            "memory:/unsupported_vector_format".to_string(),
+            test_vector_table_schema("lance"),
+            None,
+        );
+        let error = TableWrite::new(&table, "test-user".to_string())
+            .err()
+            .unwrap();
+        assert!(matches!(error, crate::Error::Unsupported { .. }));
+        assert!(error.to_string().contains("lance"));
     }
 
     #[cfg(feature = "vortex")]

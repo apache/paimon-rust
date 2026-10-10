@@ -1824,17 +1824,9 @@ fn open_source_stream(
         FieldSource::VectorBunch {
             bunch, data_fields, ..
         } => {
-            let anchor = crate::table::source::data_evolution_anchor_file(split.data_files())?;
-            let first_row_id = anchor.first_row_id.ok_or_else(|| Error::DataInvalid {
-                message: format!(
-                    "Data-evolution anchor file '{}' is missing first_row_id",
-                    anchor.file_name
-                ),
-                source: None,
-            })?;
             let selected_ranges = selected_absolute_row_ranges_for_file(
-                first_row_id,
-                anchor.row_count,
+                bunch.expected_first_row_id,
+                bunch.expected_row_count,
                 row_ranges.as_deref(),
                 anchor_deletion_vector.map(|context| context.deletion_vector.as_ref()),
             )?;
@@ -2469,6 +2461,7 @@ fn build_source_plan_with_row_id_pushdown(
                 let source_idx = sources.len();
                 sources.push(FieldSource::VectorBunch {
                     bunch: VectorBunch::new(
+                        prepared_group.first_row_id,
                         prepared_group.logical_row_count,
                         file.schema_id,
                         format_suffix,
@@ -3015,6 +3008,7 @@ struct VectorBunch {
     schema_id: i64,
     format_suffix: String,
     normalized_write_cols: Vec<String>,
+    expected_first_row_id: i64,
     expected_row_count: i64,
     latest_first_row_id: i64,
     expected_next_first_row_id: i64,
@@ -3025,6 +3019,7 @@ struct VectorBunch {
 
 impl VectorBunch {
     fn new(
+        expected_first_row_id: i64,
         expected_row_count: i64,
         schema_id: i64,
         format_suffix: String,
@@ -3035,6 +3030,7 @@ impl VectorBunch {
             schema_id,
             format_suffix,
             normalized_write_cols,
+            expected_first_row_id,
             expected_row_count,
             latest_first_row_id: -1,
             expected_next_first_row_id: -1,
@@ -3959,7 +3955,7 @@ mod tests {
 
     #[test]
     fn test_vector_bunch_aggregates_contiguous_segments() {
-        let mut bunch = VectorBunch::new(30, 0, "parquet".to_string(), vec!["emb".to_string()]);
+        let mut bunch = VectorBunch::new(0, 30, 0, "parquet".to_string(), vec!["emb".to_string()]);
         bunch
             .add(
                 data_file("v1.vector.parquet", 0, 10, 1, Some(vec!["emb"])),
@@ -3992,7 +3988,7 @@ mod tests {
 
     #[test]
     fn test_vector_bunch_rejects_gap() {
-        let mut bunch = VectorBunch::new(30, 0, "parquet".to_string(), vec!["emb".to_string()]);
+        let mut bunch = VectorBunch::new(0, 30, 0, "parquet".to_string(), vec!["emb".to_string()]);
         bunch
             .add(
                 data_file("v1.vector.parquet", 0, 10, 1, Some(vec!["emb"])),
@@ -4013,7 +4009,7 @@ mod tests {
 
     #[test]
     fn test_vector_bunch_ignores_same_first_row_id_lower_seq() {
-        let mut bunch = VectorBunch::new(30, 0, "parquet".to_string(), vec!["emb".to_string()]);
+        let mut bunch = VectorBunch::new(0, 30, 0, "parquet".to_string(), vec!["emb".to_string()]);
         bunch
             .add(
                 data_file("v-high.vector.parquet", 0, 10, 3, Some(vec!["emb"])),
@@ -4034,7 +4030,7 @@ mod tests {
 
     #[test]
     fn test_vector_bunch_rejects_same_first_row_id_higher_seq() {
-        let mut bunch = VectorBunch::new(30, 0, "parquet".to_string(), vec!["emb".to_string()]);
+        let mut bunch = VectorBunch::new(0, 30, 0, "parquet".to_string(), vec!["emb".to_string()]);
         bunch
             .add(
                 data_file("v-low.vector.parquet", 0, 10, 2, Some(vec!["emb"])),
@@ -4052,7 +4048,7 @@ mod tests {
 
     #[test]
     fn test_vector_bunch_ignores_overlapping_lower_seq() {
-        let mut bunch = VectorBunch::new(30, 0, "parquet".to_string(), vec!["emb".to_string()]);
+        let mut bunch = VectorBunch::new(0, 30, 0, "parquet".to_string(), vec!["emb".to_string()]);
         bunch
             .add(
                 data_file("v1.vector.parquet", 0, 10, 3, Some(vec!["emb"])),
@@ -4072,7 +4068,7 @@ mod tests {
 
     #[test]
     fn test_selected_vector_bunch_rejects_partial_higher_sequence_overlap() {
-        let mut bunch = VectorBunch::new(30, 0, "parquet".to_string(), vec!["emb".to_string()])
+        let mut bunch = VectorBunch::new(0, 30, 0, "parquet".to_string(), vec!["emb".to_string()])
             .with_row_id_pushdown(true);
         bunch
             .add(
@@ -4097,7 +4093,7 @@ mod tests {
 
     #[test]
     fn test_vector_bunch_rejects_row_count_overflow() {
-        let mut bunch = VectorBunch::new(15, 0, "parquet".to_string(), vec!["emb".to_string()]);
+        let mut bunch = VectorBunch::new(0, 15, 0, "parquet".to_string(), vec!["emb".to_string()]);
         bunch
             .add(
                 data_file("v1.vector.parquet", 0, 10, 1, Some(vec!["emb"])),
@@ -4116,7 +4112,7 @@ mod tests {
     #[test]
     fn test_vector_bunch_rejects_key_identity_mismatch() {
         // schema_id mismatch
-        let mut bunch = VectorBunch::new(30, 0, "parquet".to_string(), vec!["emb".to_string()]);
+        let mut bunch = VectorBunch::new(0, 30, 0, "parquet".to_string(), vec!["emb".to_string()]);
         bunch
             .add(
                 data_file("v1.vector.parquet", 0, 10, 1, Some(vec!["emb"])),
@@ -4129,7 +4125,7 @@ mod tests {
         assert!(matches!(err, Error::DataInvalid { .. }));
 
         // format_suffix mismatch
-        let mut bunch2 = VectorBunch::new(30, 0, "parquet".to_string(), vec!["emb".to_string()]);
+        let mut bunch2 = VectorBunch::new(0, 30, 0, "parquet".to_string(), vec!["emb".to_string()]);
         bunch2
             .add(
                 data_file("v1.vector.parquet", 0, 10, 1, Some(vec!["emb"])),
@@ -4145,7 +4141,7 @@ mod tests {
         assert!(matches!(err2, Error::DataInvalid { .. }));
 
         // normalized_write_cols mismatch
-        let mut bunch3 = VectorBunch::new(30, 0, "parquet".to_string(), vec!["emb".to_string()]);
+        let mut bunch3 = VectorBunch::new(0, 30, 0, "parquet".to_string(), vec!["emb".to_string()]);
         bunch3
             .add(
                 data_file("v1.vector.parquet", 0, 10, 1, Some(vec!["emb"])),
@@ -4163,7 +4159,7 @@ mod tests {
 
     #[test]
     fn test_vector_bunch_rejects_non_vector_file() {
-        let mut bunch = VectorBunch::new(30, 0, "parquet".to_string(), vec!["emb".to_string()]);
+        let mut bunch = VectorBunch::new(0, 30, 0, "parquet".to_string(), vec!["emb".to_string()]);
         let err = bunch
             .add(
                 data_file("v1.parquet", 0, 10, 1, Some(vec!["emb"])),
@@ -6090,6 +6086,81 @@ mod tests {
             "embedding",
             2,
             &[Some(vec![1.0, 2.0]), None, Some(vec![3.0, 4.0])],
+        );
+    }
+
+    #[tokio::test]
+    async fn test_filtered_vector_read_keeps_each_merge_group_range() {
+        let tempdir = tempdir().unwrap();
+        let bucket_dir = tempdir.path().join("bucket-0");
+        fs::create_dir_all(&bucket_dir).unwrap();
+        let mut files = Vec::new();
+        for (index, first_row_id) in [100, 200].into_iter().enumerate() {
+            let ids = vec![index as i32 * 2 + 1, index as i32 * 2 + 2];
+            let normal_name = format!("data-{index}.parquet");
+            let vector_name = format!("data-{index}.vector.parquet");
+            let normal_path = bucket_dir.join(&normal_name);
+            let vector_path = bucket_dir.join(&vector_name);
+            write_int_parquet_file(&normal_path, vec![("id", ids)], None);
+            let vector = vec![index as f32 + 1.0, index as f32 + 2.0];
+            write_fixed_size_list_parquet(
+                &vector_path,
+                "embedding",
+                2,
+                &[Some(vector.clone()), Some(vector)],
+            );
+            for (name, path, columns) in [
+                (normal_name, normal_path, vec!["id"]),
+                (vector_name, vector_path, vec!["embedding"]),
+            ] {
+                files.push(data_file_meta_with_path(
+                    &name,
+                    first_row_id,
+                    2,
+                    1,
+                    path.metadata().unwrap().len() as i64,
+                    Some(columns),
+                ));
+            }
+        }
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("embedding", vector_float_type(2))
+            .option("data-evolution.enabled", "true")
+            .option("row-tracking.enabled", "true")
+            .build()
+            .unwrap();
+        let table = Table::new(
+            FileIOBuilder::new("file").build().unwrap(),
+            Identifier::new("default", "vector_groups"),
+            local_file_path(tempdir.path()),
+            TableSchema::new(0, &schema),
+            None,
+        );
+        // A Python plan can bundle multiple independent file groups in one
+        // split. Each group's vectors must use its own normal-file anchor.
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(local_file_path(&bucket_dir))
+            .with_total_buckets(1)
+            .with_data_files(files)
+            .with_row_ranges(vec![RowRange::new(100, 100), RowRange::new(201, 201)])
+            .build()
+            .unwrap();
+        let batches = TableRead::new(&table, table.schema().fields().to_vec(), Vec::new())
+            .to_arrow(&[split])
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(collect_int_values(&batches, "id"), vec![1, 4]);
+        assert_fixed_size_list(
+            &batches,
+            "embedding",
+            2,
+            &[Some(vec![1.0, 2.0]), Some(vec![2.0, 3.0])],
         );
     }
 
