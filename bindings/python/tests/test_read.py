@@ -1046,14 +1046,39 @@ def test_filter_out_of_range_raises():
                 {"method": "equal", "field": "small", "literals": [9999]})
 
 
-def test_filter_wrong_literal_count_raises():
+@pytest.mark.parametrize("literals", [[], [1, 2]])
+def test_filter_wrong_literal_count_raises(literals):
     with tempfile.TemporaryDirectory() as warehouse:
         table = _make_table_with_data(warehouse)
         b = table.new_read_builder()
         with pytest.raises(ValueError):
-            b.with_filter({"method": "equal", "field": "id", "literals": [1, 2]})
-        with pytest.raises(ValueError):
-            b.with_filter({"method": "in", "field": "id", "literals": []})
+            b.with_filter({"method": "equal", "field": "id", "literals": literals})
+
+
+@pytest.mark.parametrize("method, literals, expected_ids", [
+    ("in", [], []),
+    ("notIn", [], [2, 3]),
+    ("in", [None], []),
+    ("notIn", [None], []),
+    ("in", [None, 10], [2]),
+    ("notIn", [None, 10], []),
+    ("in", [10], [2]),
+    ("notIn", [10], [3]),
+])
+def test_filter_set_predicates_follow_java_null_semantics(method, literals, expected_ids):
+    with tempfile.TemporaryDirectory() as warehouse:
+        ctx = SQLContext()
+        ctx.register_catalog("paimon", {"warehouse": warehouse})
+        ctx.sql("CREATE SCHEMA paimon.setdb")
+        ctx.sql("CREATE TABLE paimon.setdb.t (id INT, value INT)")
+        ctx.sql("INSERT INTO paimon.setdb.t VALUES (1, NULL), (2, 10), (3, 20)")
+        table = PaimonCatalog({"warehouse": warehouse}).get_table("setdb.t")
+        builder = table.new_read_builder().with_filter({
+            "method": method, "field": "value", "literals": literals,
+        }).with_projection(["id"])
+        batches = builder.new_read().read(builder.new_scan().plan().splits())
+        actual_ids = sorted(value for batch in batches for value in batch.column(0).to_pylist())
+        assert actual_ids == expected_ids
 
 
 def test_filter_compound_with_unsupported_child_fails():

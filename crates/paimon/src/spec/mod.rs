@@ -83,6 +83,8 @@ pub use index_file_meta::*;
 
 mod pk_index_source;
 pub use pk_index_source::*;
+mod data_evolution_index_source;
+pub use data_evolution_index_source::*;
 
 mod index_manifest;
 pub use index_manifest::{IndexManifest, IndexManifestEntry};
