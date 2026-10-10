@@ -74,6 +74,7 @@ mod full_text_index_adapter;
 mod full_text_index_build_builder;
 #[cfg(feature = "fulltext")]
 mod full_text_search_builder;
+mod global_index_build_builder;
 pub(crate) mod global_index_build_common;
 mod global_index_drop_builder;
 pub(crate) mod global_index_scanner;
@@ -188,21 +189,17 @@ pub use format_partition::{
 pub use format_partition_stats::FormatTablePartitionStatsCollector;
 pub use format_partition_truncate::FormatTableTruncator;
 #[cfg(feature = "fulltext")]
-pub use full_text_index_build_builder::FullTextIndexBuildBuilder;
-#[cfg(feature = "fulltext")]
 pub use full_text_search_builder::FullTextSearchBuilder;
 use futures::stream::BoxStream;
+pub use global_index_build_builder::GlobalIndexBuildBuilder;
 pub use global_index_drop_builder::GlobalIndexDropBuilder;
-pub use global_index_types::{
-    normalize_global_index_type_for_drop, SUPPORTED_GLOBAL_INDEX_TYPES_FOR_DROP,
-};
+pub use global_index_types::{normalize_global_index_type, SUPPORTED_GLOBAL_INDEX_TYPES_FOR_DROP};
 pub use hybrid_search_builder::{
     HybridSearchBuilder, HybridSearchRanker, HybridSearchRoute, HybridSearchRouteKind,
 };
 pub use incremental_scan::{
     IncrementalPlan, IncrementalScan, IncrementalScanMode, IncrementalSplit,
 };
-pub use lumina_index_build_builder::LuminaIndexBuildBuilder;
 pub use object_table::{ObjectEntry, ObjectTable};
 pub use partition_row_count::PartitionRowCount;
 pub use partition_stat::PartitionStat;
@@ -218,9 +215,6 @@ pub use scan_trace::ScanTrace;
 pub use schema_manager::SchemaManager;
 pub use snapshot_commit::{RESTSnapshotCommit, RenamingSnapshotCommit, SnapshotCommit};
 pub use snapshot_manager::SnapshotManager;
-pub use sorted_global_index_build_builder::{
-    BTreeGlobalIndexBuildBuilder, SortedGlobalIndexBuildBuilder,
-};
 pub use source::{
     merge_row_ranges, DataSplit, DataSplitBuilder, DeletionFile, PartitionBucket, Plan, RowRange,
 };
@@ -239,7 +233,6 @@ pub use update_assignment::UpdateAssignment;
 pub use vector_read::{BatchVectorRead, VectorRead};
 pub use vector_scan::{VectorScan, VectorScanPlan};
 pub use vector_search_builder::VectorSearchBuilder;
-pub use vindex_index_build_builder::VindexIndexBuildBuilder;
 pub use write_builder::WriteBuilder;
 
 use crate::catalog::{validate_branch_name, Identifier, DEFAULT_MAIN_BRANCH};
@@ -555,32 +548,13 @@ impl Table {
         BatchVectorSearchBuilder::new(self)
     }
 
-    /// Create a builder for `full-text` global index files.
-    ///
-    /// Reference: [NativeFullTextGlobalIndexWriter](https://github.com/apache/paimon/blob/master/paimon-full-text/src/main/java/org/apache/paimon/fulltext/index/NativeFullTextGlobalIndexWriter.java)
-    #[cfg(feature = "fulltext")]
-    pub fn new_full_text_index_build_builder(&self) -> FullTextIndexBuildBuilder<'_> {
-        FullTextIndexBuildBuilder::new(self)
-    }
-
-    pub fn new_lumina_index_build_builder(&self) -> LuminaIndexBuildBuilder<'_> {
-        LuminaIndexBuildBuilder::new(self)
-    }
-
-    pub fn new_sorted_global_index_build_builder(&self) -> SortedGlobalIndexBuildBuilder<'_> {
-        SortedGlobalIndexBuildBuilder::new(self)
-    }
-
-    pub fn new_btree_global_index_build_builder(&self) -> BTreeGlobalIndexBuildBuilder<'_> {
-        self.new_sorted_global_index_build_builder()
+    /// Build global index files selected by index type, without publishing them.
+    pub fn new_global_index_build_builder(&self) -> GlobalIndexBuildBuilder<'_> {
+        GlobalIndexBuildBuilder::new(self)
     }
 
     pub fn new_global_index_drop_builder(&self) -> GlobalIndexDropBuilder<'_> {
         GlobalIndexDropBuilder::new(self)
-    }
-
-    pub fn new_vindex_index_build_builder(&self, index_type: &str) -> VindexIndexBuildBuilder<'_> {
-        VindexIndexBuildBuilder::new(self, index_type)
     }
 
     /// Create a write builder for write/commit.

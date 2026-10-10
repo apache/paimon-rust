@@ -7360,7 +7360,7 @@ mod tests {
             .await
             .unwrap();
         table
-            .new_btree_global_index_build_builder()
+            .new_global_index_build_builder()
             .with_index_column("id")
             .execute()
             .await

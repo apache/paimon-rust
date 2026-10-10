@@ -393,7 +393,8 @@ async fn test_execute_rejects_primary_key_table() {
     );
 
     let err = table
-        .new_lumina_index_build_builder()
+        .new_global_index_build_builder()
+        .with_index_type("lumina")
         .with_index_column("embedding")
         .execute()
         .await
@@ -411,7 +412,8 @@ async fn test_execute_rejects_deletion_vectors_table() {
     let table = test_table(options);
 
     let err = table
-        .new_lumina_index_build_builder()
+        .new_global_index_build_builder()
+        .with_index_type("lumina")
         .with_index_column("embedding")
         .execute()
         .await
@@ -867,7 +869,8 @@ async fn test_execute_writes_lumina_index_manifest() {
         .unwrap();
 
     let shard_count = table
-        .new_lumina_index_build_builder()
+        .new_global_index_build_builder()
+        .with_index_type("lumina")
         .with_index_column("embedding")
         .execute()
         .await
@@ -1059,7 +1062,8 @@ async fn lumina_second_build_without_new_data_is_noop() {
     assert!(!names_before.is_empty());
 
     let built = table
-        .new_lumina_index_build_builder()
+        .new_global_index_build_builder()
+        .with_index_type("lumina")
         .with_index_column("embedding")
         .execute()
         .await
@@ -1167,7 +1171,8 @@ async fn lumina_incremental_build_indexes_only_new_rows() {
     // error. Without the native Lumina library the gap build surfaces a
     // library-load error instead; with it present it succeeds.
     let result = table
-        .new_lumina_index_build_builder()
+        .new_global_index_build_builder()
+        .with_index_type("lumina")
         .with_index_column("embedding")
         .execute()
         .await;

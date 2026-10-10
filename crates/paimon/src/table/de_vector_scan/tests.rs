@@ -506,7 +506,8 @@ async fn scalar_coverage_gaps_follow_scalar_and_vector_modes() {
             .unwrap();
         if vector_covers_tail {
             table
-                .new_vindex_index_build_builder(crate::vindex::IVF_FLAT_IDENTIFIER)
+                .new_global_index_build_builder()
+                .with_index_type(crate::vindex::IVF_FLAT_IDENTIFIER)
                 .with_index_column("embedding")
                 .with_options(HashMap::from([(
                     "ivf-flat.nlist".to_string(),

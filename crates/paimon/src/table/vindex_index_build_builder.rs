@@ -18,26 +18,25 @@
 mod extraction;
 mod pipeline;
 mod planning;
-mod timing;
+pub(super) mod timing;
 mod validation;
 mod writer;
 
 use planning::plan_vindex_shards;
-use timing::vector_index_build_timing_enabled;
 use validation::{checked_i32, find_index_field, validate_table_options, validate_vector_field};
 
-use crate::spec::CoreOptions;
-use crate::table::{CommitMessage, RowRange, SnapshotManager, Table, TableCommit};
+use crate::spec::{CoreOptions, Predicate};
+use crate::table::{CommitMessage, RowRange, Table, TableCommit};
 use crate::vindex::{is_vindex_index_type, VindexVectorIndexOptions};
 use crate::{Error, Result};
 use std::collections::HashMap;
-use std::time::Instant;
 
-pub struct VindexIndexBuildBuilder<'a> {
+pub(super) struct VindexIndexBuildBuilder<'a> {
     table: &'a Table,
     index_column: Option<String>,
     index_type: String,
     options: HashMap<String, String>,
+    pub(super) partition_filter: Option<Predicate>,
 }
 
 impl<'a> VindexIndexBuildBuilder<'a> {
@@ -47,6 +46,7 @@ impl<'a> VindexIndexBuildBuilder<'a> {
             index_column: None,
             index_type: index_type.to_string(),
             options: HashMap::new(),
+            partition_filter: None,
         }
     }
 
@@ -60,7 +60,13 @@ impl<'a> VindexIndexBuildBuilder<'a> {
         self
     }
 
-    pub async fn execute(&self) -> Result<usize> {
+    pub(super) async fn prepare(
+        &self,
+    ) -> Result<(
+        Option<i64>,
+        Vec<CommitMessage>,
+        Vec<timing::VectorIndexBuildTiming>,
+    )> {
         // Building the index scans the table's rows.
         CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
 
@@ -81,15 +87,20 @@ impl<'a> VindexIndexBuildBuilder<'a> {
                 source: None,
             })?;
 
-        let core_options = CoreOptions::new(self.table.schema().options());
+        let mut merged_options = self.table.schema().options().clone();
+        merged_options.extend(self.options.clone());
+        let core_options = CoreOptions::new(&merged_options);
         validate_table_options(self.table, &core_options)?;
         let rows_per_shard = core_options.global_index_row_count_per_shard()?;
 
         let index_field = find_index_field(self.table, index_column)?;
         validate_vector_field(index_field)?;
+        // The builder consumes shard sizing; it is not a native writer option.
+        let mut writer_options = self.options.clone();
+        writer_options.remove("global-index.row-count-per-shard");
         let vindex_options = VindexVectorIndexOptions::new(
             self.table.schema().options(),
-            &self.options,
+            &writer_options,
             &self.index_type,
             index_field,
         )?;
@@ -103,21 +114,16 @@ impl<'a> VindexIndexBuildBuilder<'a> {
                 source: Some(Box::new(e)),
             })?;
 
-        let snapshot_manager = SnapshotManager::new(
-            self.table.file_io().clone(),
-            self.table.location().to_string(),
-        );
-        let snapshot = snapshot_manager
-            .get_latest_snapshot()
-            .await?
-            .ok_or_else(|| Error::DataInvalid {
-                message: "Cannot build vindex index without a snapshot".to_string(),
-                source: None,
-            })?;
+        let snapshot_manager = self.table.snapshot_manager();
+        let Some(snapshot) = snapshot_manager.get_latest_snapshot().await? else {
+            return Ok((None, vec![], vec![]));
+        };
 
-        let manifest_entries = self
-            .table
-            .new_read_builder()
+        let mut read_builder = self.table.new_read_builder();
+        if let Some(filter) = &self.partition_filter {
+            read_builder.with_filter(filter.clone());
+        }
+        let manifest_entries = read_builder
             .new_scan()
             .with_scan_all_files()
             .plan_manifest_entries(&snapshot)
@@ -141,7 +147,7 @@ impl<'a> VindexIndexBuildBuilder<'a> {
             &indexed,
         )?;
         if shards.is_empty() {
-            return Ok(0);
+            return Ok((Some(snapshot.id()), vec![], vec![]));
         }
 
         crate::table::global_index_build_common::validate_existing_index_overlap(
@@ -196,18 +202,7 @@ impl<'a> VindexIndexBuildBuilder<'a> {
             }
         }
 
-        let commit_start = vector_index_build_timing_enabled().then(Instant::now);
-        commit
-            .commit_if_latest_snapshot(messages, snapshot.id())
-            .await?;
-        if let Some(commit_start) = commit_start {
-            let commit = commit_start.elapsed();
-            for timing in timings {
-                timing.log(&self.index_type, commit);
-            }
-        }
-
-        Ok(shard_count)
+        Ok((Some(snapshot.id()), messages, timings))
     }
 }
 

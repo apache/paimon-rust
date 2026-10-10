@@ -62,7 +62,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     ]);
     let started = Instant::now();
     let built_shards = table
-        .new_vindex_index_build_builder("ivf-pq")
+        .new_global_index_build_builder()
+        .with_index_type("ivf-pq")
         .with_index_column(&column)
         .with_options(options.clone())
         .execute()

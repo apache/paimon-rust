@@ -726,7 +726,7 @@ pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> 
     let this = PyModule::new(py, "datafusion")?;
     this.add_class::<PaimonCatalog>()?;
     this.add_class::<crate::table::PyTable>()?;
-    this.add_class::<crate::index_build::PySortedGlobalIndexBuildBuilder>()?;
+    this.add_class::<crate::index_build::PyGlobalIndexBuildBuilder>()?;
     this.add_class::<crate::vector_search::PyVectorSearchBuilder>()?;
     this.add_class::<crate::vector_search::PyBatchVectorSearchBuilder>()?;
     this.add_class::<crate::vector_search::PyVectorScan>()?;

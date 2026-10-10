@@ -28,8 +28,6 @@ use crate::table::{CommitMessage, TableCommit};
 use crate::{Error, Result};
 use std::path::PathBuf;
 
-const INDEX_DIR: &str = "index";
-
 impl LuminaIndexBuildBuilder<'_> {
     pub(super) async fn build_index_file(
         &self,
@@ -61,18 +59,11 @@ impl LuminaIndexBuildBuilder<'_> {
         builder.dump(&temp_path_str)?;
 
         let file_name = format!("lumina-global-index-{}.index", uuid::Uuid::new_v4());
-        self.table
-            .file_io()
-            .mkdirs(&format!(
-                "{}/{INDEX_DIR}/",
-                self.table.location().trim_end_matches('/')
-            ))
+        let (index_path, external_path) =
+            crate::table::global_index_build_common::prepare_index_file_path(
+                self.table, &file_name,
+            )
             .await?;
-        let index_path = format!(
-            "{}/{INDEX_DIR}/{}",
-            self.table.location().trim_end_matches('/'),
-            file_name
-        );
         let write_result: Result<i64> = async {
             copy_local_file_to_output(&temp_path, self.table.file_io().new_output(&index_path)?)
                 .await?;
@@ -97,13 +88,15 @@ impl LuminaIndexBuildBuilder<'_> {
             file_size,
             row_count,
             deletion_vectors_ranges: None,
-            external_path: None,
+            external_path,
             global_index_meta: Some(GlobalIndexMeta {
                 row_range_start: shard.row_range_start,
                 row_range_end: shard.row_range_end,
                 index_field_id,
                 extra_field_ids: None,
-                source_meta: None,
+                source_meta: Some(
+                    crate::spec::DataEvolutionIndexSourceMeta::new(shard.snapshot_id)?.serialize(),
+                ),
                 index_meta: Some(index_meta),
             }),
         })

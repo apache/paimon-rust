@@ -15,13 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Parameter and commit-message wrappers for the core sorted-index builder.
+//! Parameter and commit-message wrappers for the core global-index builder.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use paimon::spec::Predicate;
-use paimon::table::{SortedGlobalIndexBuildBuilder, Table};
+use paimon::table::{GlobalIndexBuildBuilder, Table};
 use paimon_datafusion::runtime::runtime;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -30,33 +30,41 @@ use crate::error::to_py_err;
 use crate::predicate::dict_to_table_predicate;
 use crate::write::PyCommitMessage;
 
-#[pyclass(
-    name = "SortedGlobalIndexBuildBuilder",
-    module = "pypaimon_rust.datafusion"
-)]
-pub struct PySortedGlobalIndexBuildBuilder {
+enum PyIndexColumns {
+    Column(String),
+    Columns(Vec<String>),
+}
+
+#[pyclass(name = "GlobalIndexBuildBuilder", module = "pypaimon_rust.datafusion")]
+pub struct PyGlobalIndexBuildBuilder {
     table: Arc<Table>,
-    column: Option<String>,
+    columns: Option<PyIndexColumns>,
     index_type: String,
     options: HashMap<String, String>,
     partition_filters: Vec<Predicate>,
 }
 
-impl PySortedGlobalIndexBuildBuilder {
+impl PyGlobalIndexBuildBuilder {
     pub(crate) fn new(table: Arc<Table>) -> Self {
         Self {
             table,
-            column: None,
+            columns: None,
             index_type: "btree".into(),
             options: HashMap::new(),
             partition_filters: vec![],
         }
     }
 
-    fn builder(&self) -> paimon::Result<SortedGlobalIndexBuildBuilder<'_>> {
-        let mut builder = self.table.new_sorted_global_index_build_builder();
-        if let Some(column) = &self.column {
-            builder.with_index_column(column);
+    fn builder(&self) -> paimon::Result<GlobalIndexBuildBuilder<'_>> {
+        let mut builder = self.table.new_global_index_build_builder();
+        match &self.columns {
+            Some(PyIndexColumns::Column(column)) => {
+                builder.with_index_column(column);
+            }
+            Some(PyIndexColumns::Columns(columns)) => {
+                builder.with_index_columns(&columns.iter().map(String::as_str).collect::<Vec<_>>());
+            }
+            None => {}
         }
         builder
             .with_index_type(&self.index_type)
@@ -69,9 +77,19 @@ impl PySortedGlobalIndexBuildBuilder {
 }
 
 #[pymethods]
-impl PySortedGlobalIndexBuildBuilder {
+impl PyGlobalIndexBuildBuilder {
+    #[staticmethod]
+    fn supports_index_type(index_type: &str) -> bool {
+        GlobalIndexBuildBuilder::supports_index_type(index_type)
+    }
+
+    fn with_index_columns(mut slf: PyRefMut<'_, Self>, columns: Vec<String>) -> PyRefMut<'_, Self> {
+        slf.columns = Some(PyIndexColumns::Columns(columns));
+        slf
+    }
+
     fn with_index_column(mut slf: PyRefMut<'_, Self>, column: String) -> PyRefMut<'_, Self> {
-        slf.column = Some(column);
+        slf.columns = Some(PyIndexColumns::Column(column));
         slf
     }
 
