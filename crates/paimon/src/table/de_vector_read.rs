@@ -24,11 +24,12 @@ use crate::spec::{
     row_id_data_field, CoreOptions, DataField, DataType, FileKind, GlobalIndexSearchMode,
     IndexFileMeta, IndexManifestEntry, Predicate, ROW_ID_FIELD_NAME,
 };
-use crate::table::de_vector_scan::{matching_row_ids_for_filter, DeVectorScanPlan};
+use crate::table::de_vector_scan::DeVectorScanPlan;
 use crate::table::global_index_scanner::{
     deleted_row_ranges_for_data_evolution_dvs, search_limit_with_deleted_rows,
     unindexed_ranges_for_global_index_entries, GlobalIndexScanner, RowRangeIndex,
 };
+use crate::table::global_index_search_filter::matching_row_ids_for_filter;
 use crate::table::global_index_types::normalize_queryable_global_index_type;
 use crate::table::index_file_path::IndexFileLocation;
 use crate::table::pk_vector_position_read::SEARCH_SCORE_COLUMN;

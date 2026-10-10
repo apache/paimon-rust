@@ -2129,6 +2129,40 @@ The function searches across all Tantivy full-text index files for the target co
 
 Build the index files with `CALL sys.create_global_index(..., index_type => 'full-text')` (see [create_global_index](#create_global_index)), or with Java Paimon; both write the same format.
 
+### Rust full-text builder
+
+The core builder accepts the structured full-text query DSL used by Java and
+PyPaimon. Scalar and partition predicates are applied before the final Top-K.
+
+```rust,ignore
+let predicate = PredicateBuilder::new(table.schema().fields())
+    .equal("category", Datum::String("news".into()))?;
+let mut builder = table.new_full_text_search_builder();
+builder
+    .with_query("content", r#"{"match":{"query":"paimon"}}"#)
+    .with_filter(predicate)
+    .with_limit(10);
+let plan = builder.new_scan()?.scan().await?;
+let result = builder.new_read()?.read(plan).await?;
+```
+
+`FullTextScanPlan` owns a pinned snapshot and can outlive its scan. Readers
+for the same table, branch, column and filter can reuse the plan with different
+queries or limits. Pinning preserves the query's bound schema, including
+schema-only column renames. `execute_scored()` performs both stages directly.
+
+For Data Evolution, full-text and scalar `fast`, `full`, and `detail` modes
+follow Java's coverage rules. Inexact scalar candidates are read back only
+when `global-index.filter.refine-from-data=true`. Composite scalar indexes
+are excluded from search pre-filters, as in Java. Filtering preserves the
+unfiltered corpus for BM25 scores; Boolean and boosted queries collect leaf
+candidates before applying the final limit. Index shard searches use
+`global-index.thread-num` workers.
+
+The existing `with_text_column()` / `with_query_text()` API continues to
+accept plain text for the SQL table function. Full-text row filters require
+Data Evolution; primary-key materialized reads use `execute_read()`.
+
 
 ## Time Travel
 

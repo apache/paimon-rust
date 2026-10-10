@@ -27,6 +27,7 @@ use crate::vector_search::SearchResult;
 use arrow_array::builder::{Float32Builder, ListBuilder};
 use arrow_array::{ArrayRef, Float32Array, Int32Array, RecordBatch};
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+use futures::TryStreamExt;
 use roaring::RoaringTreemap;
 use std::collections::HashMap;
 use std::sync::Arc;

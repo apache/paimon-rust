@@ -17,14 +17,13 @@
 
 //! Plans global-index vector searches against one snapshot and resolves scalar pre-filters.
 
-use crate::spec::{CoreOptions, IndexManifest, IndexManifestEntry, Predicate, ROW_ID_FIELD_NAME};
+use crate::spec::{CoreOptions, IndexManifest, IndexManifestEntry, Predicate};
 use crate::table::bucket_filter::split_partition_and_data_predicates;
+use crate::table::global_index_search_filter::matching_row_ids_for_filter;
 use crate::table::partition_filter::PartitionFilter;
 use crate::table::vector_scan::Scan;
-use crate::table::{RowRange, Table};
+use crate::table::Table;
 use crate::vindex::vector_search_timing_enabled;
-use arrow_array::{Array, Int64Array};
-use futures::TryStreamExt;
 use roaring::RoaringTreemap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -52,65 +51,6 @@ impl PreparedVectorSearchFilter {
 fn same_vector_search_table(left: &Table, right: &Table) -> bool {
     left.location().trim_end_matches('/') == right.location().trim_end_matches('/')
         && left.branch() == right.branch()
-}
-
-pub(super) async fn matching_row_ids_for_filter(
-    table: &Table,
-    filter: &Predicate,
-    ranges: Option<Vec<RowRange>>,
-) -> crate::Result<RoaringTreemap> {
-    let mut read_builder = table.new_read_builder();
-    read_builder
-        .with_projection(&[ROW_ID_FIELD_NAME])?
-        .with_filter(filter.clone());
-    if let Some(ranges) = ranges {
-        read_builder.with_row_ranges(ranges);
-    }
-    let plan = read_builder.new_scan().plan().await?;
-    let read = read_builder.new_read()?;
-    let mut stream = read.to_arrow(plan.splits())?;
-    let mut row_ids = RoaringTreemap::new();
-    while let Some(batch) = stream.try_next().await? {
-        let index =
-            batch
-                .schema()
-                .index_of(ROW_ID_FIELD_NAME)
-                .map_err(|_| crate::Error::DataInvalid {
-                    message: format!(
-                        "scalar vector pre-filter read is missing {ROW_ID_FIELD_NAME}"
-                    ),
-                    source: None,
-                })?;
-        let values = batch
-            .column(index)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .ok_or_else(|| crate::Error::DataInvalid {
-                message: format!(
-                    "scalar vector pre-filter {ROW_ID_FIELD_NAME} column is not Int64"
-                ),
-                source: None,
-            })?;
-        for row in 0..values.len() {
-            if values.is_null(row) {
-                return Err(crate::Error::DataInvalid {
-                    message: format!(
-                        "scalar vector pre-filter produced a null {ROW_ID_FIELD_NAME}"
-                    ),
-                    source: None,
-                });
-            }
-            let row_id = values.value(row);
-            let row_id = u64::try_from(row_id).map_err(|_| crate::Error::DataInvalid {
-                message: format!(
-                    "scalar vector pre-filter produced a negative {ROW_ID_FIELD_NAME}: {row_id}"
-                ),
-                source: None,
-            })?;
-            row_ids.insert(row_id);
-        }
-    }
-    Ok(row_ids)
 }
 
 impl Table {

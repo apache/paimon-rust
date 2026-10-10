@@ -78,6 +78,7 @@ mod global_index_build_builder;
 pub(crate) mod global_index_build_common;
 mod global_index_drop_builder;
 pub(crate) mod global_index_scanner;
+mod global_index_search_filter;
 mod global_index_types;
 mod hybrid_search_builder;
 mod incremental_scan;
@@ -189,7 +190,9 @@ pub use format_partition::{
 pub use format_partition_stats::FormatTablePartitionStatsCollector;
 pub use format_partition_truncate::FormatTableTruncator;
 #[cfg(feature = "fulltext")]
-pub use full_text_search_builder::FullTextSearchBuilder;
+pub use full_text_search_builder::{
+    FullTextRead, FullTextScan, FullTextScanPlan, FullTextSearchBuilder,
+};
 use futures::stream::BoxStream;
 pub use global_index_build_builder::GlobalIndexBuildBuilder;
 pub use global_index_drop_builder::GlobalIndexDropBuilder;
