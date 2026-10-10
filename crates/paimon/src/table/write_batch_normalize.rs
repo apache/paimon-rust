@@ -25,8 +25,8 @@
 
 use crate::{Error, Result};
 use arrow_array::{
-    Array, ArrayRef, BinaryArray, Decimal128Array, FixedSizeBinaryArray, ListArray, MapArray,
-    StringArray, StructArray,
+    Array, ArrayRef, BinaryArray, Decimal128Array, FixedSizeBinaryArray, FixedSizeListArray,
+    ListArray, MapArray, StringArray, StructArray,
 };
 use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::{DataType, Field};
@@ -218,7 +218,10 @@ fn normalize_visible_array(
     if array.data_type() == expected
         && !matches!(
             expected,
-            DataType::List(_) | DataType::Struct(_) | DataType::Map(_, _)
+            DataType::List(_)
+                | DataType::FixedSizeList(_, _)
+                | DataType::Struct(_)
+                | DataType::Map(_, _)
         )
     {
         return Ok(array.clone());
@@ -242,6 +245,26 @@ fn normalize_visible_array(
             let values = normalize_write_array(&values, expected_child.data_type())?;
             let normalized = ListArray::try_new(expected_child.clone(), offsets, values, nulls)
                 .map_err(normalization_error)?;
+            Ok(Arc::new(normalized))
+        }
+        (
+            DataType::FixedSizeList(_, actual_size),
+            DataType::FixedSizeList(expected_child, expected_size),
+        ) if actual_size == expected_size => {
+            let list = array.as_any().downcast_ref::<FixedSizeListArray>().unwrap();
+            // VECTOR elements are positional, just like ARRAY elements. Reuse
+            // the values of sliced inputs and let Arrow validate NOT NULL
+            // elements against the combined vector/containing ROW validity.
+            let nulls = NullBuffer::union(list.nulls(), parent_nulls);
+            let values = normalize_write_array(list.values(), expected_child.data_type())?;
+            let normalized = FixedSizeListArray::try_new_with_length(
+                expected_child.clone(),
+                *expected_size,
+                values,
+                nulls,
+                list.len(),
+            )
+            .map_err(normalization_error)?;
             Ok(Arc::new(normalized))
         }
         (DataType::Struct(actual_fields), DataType::Struct(expected_fields))
@@ -392,9 +415,112 @@ fn normalization_error(error: arrow_schema::ArrowError) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{Int32Array, LargeBinaryArray, StringArray};
+    use arrow_array::{FixedSizeListArray, Int32Array, LargeBinaryArray, StringArray};
     use arrow_buffer::{OffsetBuffer, ScalarBuffer};
     use arrow_schema::Field;
+
+    #[test]
+    fn vector_child_aliases_preserve_sliced_values_and_nulls() {
+        for name in ["item", "", "element"] {
+            let input = FixedSizeListArray::new(
+                Arc::new(Field::new(name, DataType::Int32, true)),
+                2,
+                Arc::new(Int32Array::from(vec![
+                    Some(0),
+                    Some(1),
+                    Some(2),
+                    Some(3),
+                    None,
+                    None,
+                    Some(6),
+                    Some(7),
+                ])),
+                Some(NullBuffer::from(vec![true, true, false, true])),
+            )
+            .slice(1, 3);
+            let input: ArrayRef = Arc::new(input);
+            let expected =
+                DataType::FixedSizeList(Arc::new(Field::new("element", DataType::Int32, true)), 2);
+            let output = normalize_write_array(&input, &expected).unwrap();
+            output.to_data().validate_full().unwrap();
+            assert_eq!(output.data_type(), &expected);
+            assert_eq!(output.len(), 3);
+            assert_eq!(output.nulls(), input.nulls());
+            let source = input.as_any().downcast_ref::<FixedSizeListArray>().unwrap();
+            let result = output
+                .as_any()
+                .downcast_ref::<FixedSizeListArray>()
+                .unwrap();
+            assert!(Arc::ptr_eq(result.values(), source.values()));
+            assert_eq!(
+                result.value(0).to_data(),
+                Int32Array::from(vec![2, 3]).to_data()
+            );
+            assert_eq!(
+                result.value(2).to_data(),
+                Int32Array::from(vec![6, 7]).to_data()
+            );
+        }
+    }
+
+    #[test]
+    fn vector_normalization_rejects_dimensions_and_element_type_changes() {
+        let input: ArrayRef = Arc::new(FixedSizeListArray::new(
+            Arc::new(Field::new("item", DataType::Int32, true)),
+            2,
+            Arc::new(Int32Array::from(vec![1, 2])),
+            None,
+        ));
+        for expected in [
+            DataType::FixedSizeList(Arc::new(Field::new("element", DataType::Int32, true)), 1),
+            DataType::FixedSizeList(Arc::new(Field::new("element", DataType::Int64, true)), 2),
+            DataType::List(Arc::new(Field::new("element", DataType::Int32, true))),
+        ] {
+            assert!(normalize_write_array(&input, &expected).is_err());
+        }
+    }
+
+    #[test]
+    fn vector_element_nullability_only_checks_visible_parents() {
+        let expected =
+            DataType::FixedSizeList(Arc::new(Field::new("element", DataType::Int32, false)), 2);
+        let make_input = |nulls| {
+            Arc::new(FixedSizeListArray::new(
+                Arc::new(Field::new("item", DataType::Int32, true)),
+                2,
+                Arc::new(Int32Array::from(vec![None, None, Some(3), Some(4)])),
+                nulls,
+            )) as ArrayRef
+        };
+        let hidden = make_input(Some(NullBuffer::from(vec![false, true])));
+        let output = normalize_write_array(&hidden, &expected).unwrap();
+        assert!(output.is_null(0));
+        assert!(!output.is_null(1));
+        assert!(normalize_write_array(&make_input(None), &expected).is_err());
+
+        let row: ArrayRef = Arc::new(StructArray::new(
+            vec![Field::new("embedding", hidden.data_type().clone(), true)].into(),
+            vec![make_input(None)],
+            Some(NullBuffer::from(vec![false, true])),
+        ));
+        let row_type =
+            DataType::Struct(vec![Field::new("embedding", expected.clone(), true)].into());
+        let output = normalize_write_array(&row, &row_type).unwrap();
+        let result = output.as_any().downcast_ref::<StructArray>().unwrap();
+        assert!(result.column(0).is_null(0));
+        assert!(!result.column(0).is_null(1));
+
+        // FFI inputs can claim NOT NULL elements while carrying visible NULLs.
+        let invalid = unsafe {
+            make_input(None)
+                .to_data()
+                .into_builder()
+                .data_type(expected.clone())
+                .build_unchecked()
+        };
+        let invalid = arrow_array::make_array(invalid);
+        assert!(normalize_write_array(&invalid, &expected).is_err());
+    }
 
     fn blob_map_field(nullable_value: bool) -> Field {
         Field::new(
