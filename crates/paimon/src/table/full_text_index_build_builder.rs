@@ -34,7 +34,7 @@ use crate::table::global_index_build_common::{
     copy_local_file_to_output, indexed_row_ranges, validate_existing_index_overlap,
 };
 use crate::table::global_index_types::FULL_TEXT_GLOBAL_INDEX_TYPE;
-use crate::table::{CommitMessage, DataSplitBuilder, RowRange, Table, TableCommit};
+use crate::table::{CommitMessage, DataSplitBuilder, RowRange, Table};
 use crate::{Error, Result};
 use arrow_array::cast::AsArray;
 use arrow_array::{Array, Int64Array, LargeStringArray, RecordBatch, StringArray, StringViewArray};
@@ -98,8 +98,9 @@ impl<'a> FullTextIndexBuildBuilder<'a> {
         // procedure options.
         let mut merged_options = self.table.schema().options().clone();
         merged_options.extend(self.options.clone());
-        let rows_per_shard =
-            CoreOptions::new(&merged_options).global_index_row_count_per_shard()?;
+        let core_options = CoreOptions::new(&merged_options);
+        let rows_per_shard = core_options.global_index_row_count_per_shard()?;
+        let parallelism = core_options.global_index_build_parallelism()?;
 
         let index_field = find_index_field(self.table, index_column)?;
         validate_text_field(index_field)?;
@@ -161,43 +162,34 @@ impl<'a> FullTextIndexBuildBuilder<'a> {
         )
         .await?;
 
-        let commit = TableCommit::new(
-            self.table.clone(),
-            format!(
-                "global-index-{}-create-{}",
-                FULL_TEXT_GLOBAL_INDEX_TYPE,
-                uuid::Uuid::new_v4()
-            ),
-        );
-        let mut messages: Vec<CommitMessage> = Vec::with_capacity(shards.len());
-        for shard in shards {
-            let build_result = self
-                .build_shard(
-                    &shard,
-                    index_column,
-                    &native_options,
-                    index_field.id(),
-                    &index_meta,
-                )
-                .await;
-            let index_file = match build_result {
-                Ok(index_file) => index_file,
-                Err(error) => {
-                    let _ = commit.abort(&messages).await;
-                    return Err(error);
+        let prepared = super::global_index_build_common::preparation::prepare_shards(
+            self.table,
+            shards,
+            parallelism,
+            |shard| {
+                let native_options = &native_options;
+                let index_meta = &index_meta;
+                async move {
+                    let file = self
+                        .build_shard(
+                            &shard,
+                            index_column,
+                            native_options,
+                            index_field.id(),
+                            index_meta,
+                        )
+                        .await?;
+                    // Java skips a shard whose writer saw no rows.
+                    Ok(file.map(|file| {
+                        let mut message = CommitMessage::new(shard.partition_bytes, 0, vec![]);
+                        message.new_index_files = vec![file];
+                        (message, ())
+                    }))
                 }
-            };
-            // Java skips a shard whose writer saw no rows.
-            let Some(index_file) = index_file else {
-                continue;
-            };
-            let mut message = CommitMessage::new(shard.partition_bytes.clone(), 0, vec![]);
-            message.new_index_files = vec![index_file];
-            messages.push(message);
-        }
-        if messages.is_empty() {
-            return Ok((Some(snapshot.id()), vec![]));
-        }
+            },
+        )
+        .await?;
+        let messages = prepared.into_iter().map(|(message, ())| message).collect();
 
         Ok((Some(snapshot.id()), messages))
     }

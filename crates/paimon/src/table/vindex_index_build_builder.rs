@@ -26,7 +26,7 @@ use planning::plan_vindex_shards;
 use validation::{checked_i32, find_index_field, validate_table_options, validate_vector_field};
 
 use crate::spec::{CoreOptions, Predicate};
-use crate::table::{CommitMessage, RowRange, Table, TableCommit};
+use crate::table::{CommitMessage, RowRange, Table};
 use crate::vindex::{is_vindex_index_type, VindexVectorIndexOptions};
 use crate::{Error, Result};
 use std::collections::HashMap;
@@ -92,21 +92,7 @@ impl<'a> VindexIndexBuildBuilder<'a> {
         let core_options = CoreOptions::new(&merged_options);
         validate_table_options(self.table, &core_options)?;
         let rows_per_shard = core_options.global_index_row_count_per_shard()?;
-        if let Some(value) = merged_options.get("global-index.build.parallelism") {
-            let parallelism = value
-                .trim()
-                .parse::<usize>()
-                .map_err(|_| Error::ConfigInvalid {
-                    message: "Option 'global-index.build.parallelism' must be greater than 0."
-                        .into(),
-                })?;
-            if parallelism == 0 {
-                return Err(Error::ConfigInvalid {
-                    message: "Option 'global-index.build.parallelism' must be greater than 0."
-                        .into(),
-                });
-            }
-        }
+        let parallelism = core_options.global_index_build_parallelism()?;
 
         let index_field = find_index_field(self.table, index_column)?;
         validate_vector_field(index_field)?;
@@ -175,42 +161,38 @@ impl<'a> VindexIndexBuildBuilder<'a> {
         )
         .await?;
 
-        let commit = TableCommit::new(
-            self.table.clone(),
-            format!(
-                "global-index-{}-create-{}",
-                self.index_type,
-                uuid::Uuid::new_v4()
-            ),
-        );
-        let shard_count = shards.len();
-        let mut messages = Vec::with_capacity(shard_count);
-        let mut timings = Vec::with_capacity(shard_count);
-        for shard in shards {
-            let built = match self
-                .build_index_file(
-                    &shard,
-                    index_column,
-                    dimension,
-                    index_field.id(),
-                    &vindex_options,
-                    index_meta.clone(),
-                )
-                .await
-            {
-                Ok(index_file) => index_file,
-                Err(error) => {
-                    // Earlier outputs are private to this preparation; nothing
-                    // has been returned to a caller or submitted for commit.
-                    let _ = commit.abort(&messages).await;
-                    return Err(error);
+        let prepared = super::global_index_build_common::preparation::prepare_shards(
+            self.table,
+            shards,
+            parallelism,
+            |shard| {
+                let vindex_options = &vindex_options;
+                let index_meta = index_meta.clone();
+                async move {
+                    let built = self
+                        .build_index_file(
+                            &shard,
+                            index_column,
+                            dimension,
+                            index_field.id(),
+                            vindex_options,
+                            index_meta,
+                        )
+                        .await?;
+                    Ok(built.map(|built| {
+                        let mut message = CommitMessage::new(shard.partition_bytes, 0, vec![]);
+                        message.new_index_files = vec![built.meta];
+                        (message, built.timing)
+                    }))
                 }
-            };
-            let Some(built) = built else { continue };
-            let mut message = CommitMessage::new(shard.partition_bytes.clone(), 0, vec![]);
-            message.new_index_files = vec![built.meta];
+            },
+        )
+        .await?;
+        let mut messages = Vec::with_capacity(prepared.len());
+        let mut timings = Vec::with_capacity(prepared.len());
+        for (message, timing) in prepared {
             messages.push(message);
-            if let Some(timing) = built.timing {
+            if let Some(timing) = timing {
                 timings.push(timing);
             }
         }

@@ -33,6 +33,7 @@ use bytes::Bytes;
 use std::path::Path;
 use tokio::io::AsyncReadExt;
 
+pub(crate) mod preparation;
 pub(crate) mod vector;
 
 const COPY_BUFFER_SIZE: usize = 1024 * 1024;
