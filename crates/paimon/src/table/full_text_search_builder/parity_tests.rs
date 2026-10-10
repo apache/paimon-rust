@@ -101,6 +101,32 @@ async fn index(table: &Table, kind: &str, column: &str) {
         .unwrap();
 }
 
+async fn append_labels(table: &Table, start: i32, labels: &[Option<&str>]) {
+    let schema = Arc::new(ArrowSchema::new(vec![
+        Field::new("id", ArrowType::Int32, true),
+        Field::new("text", ArrowType::Utf8, true),
+        Field::new("label", ArrowType::Utf8, true),
+        Field::new("pt", ArrowType::Int32, true),
+    ]));
+    let columns: Vec<ArrayRef> = vec![
+        Arc::new(Int32Array::from_iter_values(
+            start..start + labels.len() as i32,
+        )),
+        Arc::new(StringArray::from(vec!["paimon"; labels.len()])),
+        Arc::new(StringArray::from(labels.to_vec())),
+        Arc::new(Int32Array::from(vec![0; labels.len()])),
+    ];
+    let mut write = TableWrite::new(table, "data".into()).unwrap();
+    write
+        .write_arrow_batch(&RecordBatch::try_new(schema, columns).unwrap())
+        .await
+        .unwrap();
+    TableCommit::new(table.clone(), "data".into())
+        .commit(write.prepare_commit().await.unwrap())
+        .await
+        .unwrap();
+}
+
 fn query(table: &Table) -> FullTextSearchBuilder<'_> {
     let mut builder = table.new_full_text_search_builder();
     builder
@@ -176,6 +202,95 @@ async fn scalar_modes_and_refinement_follow_java_before_top_k() {
     let mut search = query(&table);
     search.with_limit(1).with_filter(high);
     assert_eq!(ids(search.execute_scored().await.unwrap()), vec![5]);
+}
+
+#[tokio::test]
+async fn empty_string_filters_preserve_java_search_refinement() {
+    for kind in ["btree", "bitmap"] {
+        let table = new_table(false);
+        append_labels(
+            &table,
+            0,
+            &[
+                Some(""),
+                None,
+                Some("keep"),
+                Some("drop"),
+                Some(""),
+                Some("keep"),
+                Some("drop"),
+                None,
+            ],
+        )
+        .await;
+        index(&table, "full-text", "text").await;
+        index(&table, kind, "label").await;
+        let pb = PredicateBuilder::new(table.schema().fields());
+        let filters = [
+            (
+                "like-empty",
+                pb.like("label", Datum::String("".into()), None).unwrap(),
+            ),
+            (
+                "like-percent",
+                pb.like("label", Datum::String("%".into()), None).unwrap(),
+            ),
+            (
+                "like-double-percent",
+                pb.like("label", Datum::String("%%".into()), None).unwrap(),
+            ),
+            (
+                "contains",
+                pb.contains("label", Datum::String("".into())).unwrap(),
+            ),
+            (
+                "ends-with",
+                pb.ends_with("label", Datum::String("".into())).unwrap(),
+            ),
+            (
+                "starts-with",
+                pb.starts_with("label", Datum::String("".into())).unwrap(),
+            ),
+        ];
+        for partial in [false, true] {
+            if partial {
+                append_labels(&table, 8, &[Some(""), None, Some("keep"), Some("drop")]).await;
+            }
+            for refine in [false, true] {
+                let table = table.copy_with_options(HashMap::from([(
+                    "global-index.filter.refine-from-data".into(),
+                    refine.to_string(),
+                )]));
+                for (name, filter) in &filters {
+                    let mut expected = if refine || *name == "starts-with" {
+                        if *name == "like-empty" {
+                            vec![0, 4]
+                        } else {
+                            vec![0, 2, 3, 4, 5, 6]
+                        }
+                    } else {
+                        vec![]
+                    };
+                    if partial {
+                        expected.extend(if *name == "like-empty" {
+                            vec![8]
+                        } else {
+                            vec![8, 10, 11]
+                        });
+                    }
+                    assert_eq!(
+                        ids(query(&table)
+                            .with_filter(filter.clone())
+                            .execute_scored()
+                            .await
+                            .unwrap()),
+                        expected,
+                        "index={kind}, filter={name}, refine={refine}, partial={partial}",
+                    );
+                }
+            }
+        }
+    }
 }
 
 async fn user_ids(table: &Table, result: SearchResult) -> Vec<i32> {

@@ -906,13 +906,29 @@ mod tests {
     }
 
     #[test]
-    fn string_op_empty_pattern_folds_to_is_not_null() {
+    fn string_op_empty_pattern_preserves_java_operator() {
         Python::attach(|py| {
             let fields = test_fields();
-            for method in ["startsWith", "endsWith", "contains"] {
+            for (method, op) in [
+                ("startsWith", PredicateOperator::StartsWith),
+                ("endsWith", PredicateOperator::EndsWith),
+                ("contains", PredicateOperator::Contains),
+            ] {
                 let dict = str_leaf_dict(py, method, "name", &[""]);
                 let pred = dict_to_predicate(&dict, &fields, true).unwrap();
-                expect_leaf_op(&pred, PredicateOperator::IsNotNull);
+                expect_leaf_op(&pred, op);
+            }
+        });
+    }
+
+    #[test]
+    fn like_empty_and_all_wildcard_patterns_stay_like() {
+        Python::attach(|py| {
+            let fields = test_fields();
+            for pattern in ["", "%", "%%", "%%%"] {
+                let dict = str_leaf_dict(py, "like", "name", &[pattern]);
+                let pred = dict_to_predicate(&dict, &fields, true).unwrap();
+                expect_leaf_op(&pred, PredicateOperator::Like);
             }
         });
     }
