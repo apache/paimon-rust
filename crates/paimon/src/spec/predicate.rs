@@ -1436,19 +1436,18 @@ impl PredicateBuilder {
 
     // -- string operators --
 
-    /// `field LIKE 'pat%'` shape. Empty pattern → `IsNotNull(field)` (every
-    /// non-null string starts with the empty string). Non-string `pattern`
-    /// → [`Error::ConfigInvalid`].
+    /// `field LIKE 'pat%'` shape. Retains an empty pattern as a string leaf,
+    /// matching Java. Non-string `pattern` → [`Error::ConfigInvalid`].
     pub fn starts_with(&self, field: &str, pattern: Datum) -> Result<Predicate> {
         self.string_leaf(field, PredicateOperator::StartsWith, pattern)
     }
 
-    /// `field LIKE '%pat'` shape. Empty pattern → `IsNotNull(field)`.
+    /// `field LIKE '%pat'` shape, including an empty pattern.
     pub fn ends_with(&self, field: &str, pattern: Datum) -> Result<Predicate> {
         self.string_leaf(field, PredicateOperator::EndsWith, pattern)
     }
 
-    /// `field LIKE '%pat%'` shape. Empty pattern → `IsNotNull(field)`.
+    /// `field LIKE '%pat%'` shape, including an empty pattern.
     pub fn contains(&self, field: &str, pattern: Datum) -> Result<Predicate> {
         self.string_leaf(field, PredicateOperator::Contains, pattern)
     }
@@ -1477,14 +1476,13 @@ impl PredicateBuilder {
     /// `%mid%` / no-wildcard patterns into [`PredicateOperator::StartsWith`] /
     /// [`PredicateOperator::EndsWith`] / [`PredicateOperator::Contains`] /
     /// [`PredicateOperator::Eq`]; falls back to a [`PredicateOperator::Like`]
-    /// leaf for anything more complex (`_`, multi-segment `%`, escaped
-    /// wildcards). The `Like` evaluator follows arrow_string `like` kernel
-    /// semantics for the residual cases.
+    /// leaf for empty or all-wildcard patterns and anything more complex
+    /// (`_`, multi-segment `%`, escaped wildcards). The `Like` evaluator follows
+    /// arrow_string `like` kernel semantics for the residual cases.
     ///
     /// `escape == None` defaults to `\`. Any other ESCAPE character is
     /// rejected with [`Error::ConfigInvalid`] (the DataFusion translator turns
-    /// that into a fall-open). Empty pattern → [`PredicateOperator::Eq`] of the
-    /// empty string (SQL semantics: only the empty string matches).
+    /// that into a fall-open).
     pub fn like(&self, field: &str, pattern: Datum, escape: Option<char>) -> Result<Predicate> {
         let pattern_str = match &pattern {
             Datum::String(s) => s.clone(),
@@ -1504,7 +1502,7 @@ impl PredicateBuilder {
         }
 
         match optimize_like_pattern(&pattern_str) {
-            LikeShape::EmptyOrLiteral(s) => self.equal(field, Datum::String(s)),
+            LikeShape::Literal(s) => self.equal(field, Datum::String(s)),
             LikeShape::StartsWith(prefix) => self.starts_with(field, Datum::String(prefix)),
             LikeShape::EndsWith(suffix) => self.ends_with(field, Datum::String(suffix)),
             LikeShape::Contains(mid) => self.contains(field, Datum::String(mid)),
@@ -1539,17 +1537,11 @@ impl PredicateBuilder {
         matches!(datum_cmp(low, high), Some(Ordering::Greater))
     }
 
-    /// Shared body for the three string operators: empty-string short-circuit
-    /// and literal-type guard ([`leaf`] still cross-checks against the column
-    /// type, so non-string columns are rejected there).
+    /// Shared literal-type guard for the three string operators. Preserve
+    /// empty string leaves: search refinement depends on the original operator,
+    /// even when row evaluation is equivalent to `IsNotNull`.
     fn string_leaf(&self, field: &str, op: PredicateOperator, pattern: Datum) -> Result<Predicate> {
         match &pattern {
-            // Every non-null string starts with / ends with / contains the
-            // empty string, and a NULL value matches none of them — i.e. the
-            // empty pattern is exactly `IsNotNull`. Folding to `AlwaysTrue`
-            // would wrongly retain NULL rows (and drop the field reference,
-            // keeping the predicate out of the data-pruning path).
-            Datum::String(s) if s.is_empty() => return self.is_not_null(field),
             Datum::String(_) => {}
             other => {
                 return Err(Error::ConfigInvalid {
@@ -1944,10 +1936,8 @@ fn eval_leaf(op: PredicateOperator, datum: Option<&Datum>, literals: &[Datum]) -
 /// literal substrings extracted from the pattern (with escape sequences
 /// already decoded).
 enum LikeShape {
-    /// Empty pattern, or a pattern that contains no wildcards / escapes —
-    /// equivalent to `Eq <literal>` (where the literal is the unescaped
-    /// pattern, possibly empty).
-    EmptyOrLiteral(String),
+    /// Nonempty pattern with no wildcards or escapes, equivalent to `Eq`.
+    Literal(String),
     /// `prefix%` (exactly one trailing `%`, no other wildcards or escapes).
     StartsWith(String),
     /// `%suffix`.
@@ -1965,14 +1955,14 @@ enum LikeShape {
 /// [`LikeShape::Residual`] (the simple shape rules don't account for escaped
 /// wildcards).
 fn optimize_like_pattern(pattern: &str) -> LikeShape {
-    if pattern.contains('\\') || pattern.contains('_') {
+    if pattern.is_empty() || pattern.contains('\\') || pattern.contains('_') {
         return LikeShape::Residual;
     }
     let bytes = pattern.as_bytes();
     let percent_count = bytes.iter().filter(|b| **b == b'%').count();
     match percent_count {
-        0 => LikeShape::EmptyOrLiteral(pattern.to_string()),
-        1 => {
+        0 => LikeShape::Literal(pattern.to_string()),
+        1 if pattern.len() > 1 => {
             if let Some(prefix) = pattern.strip_suffix('%') {
                 LikeShape::StartsWith(prefix.to_string())
             } else if let Some(suffix) = pattern.strip_prefix('%') {
@@ -1981,10 +1971,7 @@ fn optimize_like_pattern(pattern: &str) -> LikeShape {
                 LikeShape::Residual
             }
         }
-        2 if pattern.starts_with('%') && pattern.ends_with('%') => {
-            // `%%` reduces to `Contains('')`, which itself short-circuits to
-            // `IsNotNull` at the StartsWith/EndsWith/Contains builder boundary
-            // — so no special-casing here.
+        2 if pattern.len() > 2 && pattern.starts_with('%') && pattern.ends_with('%') => {
             LikeShape::Contains(pattern[1..pattern.len() - 1].to_string())
         }
         _ => LikeShape::Residual,
@@ -3273,22 +3260,28 @@ mod tests {
     }
 
     #[test]
-    fn test_builder_string_ops_empty_pattern_is_not_null() {
+    fn test_builder_string_ops_preserve_empty_pattern() {
         let pb = PredicateBuilder::new(&test_fields());
-        // An empty pattern matches every non-null string and no NULL, so it is
-        // exactly `IsNotNull` (not `AlwaysTrue`, which would retain NULL rows).
-        for build in [
-            pb.starts_with("name", Datum::String(String::new())),
-            pb.ends_with("name", Datum::String(String::new())),
-            pb.contains("name", Datum::String(String::new())),
+        for (build, op) in [
+            (
+                pb.starts_with("name", Datum::String(String::new())),
+                PredicateOperator::StartsWith,
+            ),
+            (
+                pb.ends_with("name", Datum::String(String::new())),
+                PredicateOperator::EndsWith,
+            ),
+            (
+                pb.contains("name", Datum::String(String::new())),
+                PredicateOperator::Contains,
+            ),
         ] {
-            assert!(matches!(
-                build.unwrap(),
-                Predicate::Leaf {
-                    op: PredicateOperator::IsNotNull,
-                    ..
-                }
-            ));
+            assert_leaf(&build.unwrap(), op, "");
+            let literals = [Datum::String(String::new())];
+            for value in ["", "paimon"] {
+                assert!(eval_leaf(op, Some(&Datum::String(value.into())), &literals));
+            }
+            assert!(!eval_leaf(op, None, &literals));
         }
     }
 
@@ -3369,12 +3362,6 @@ mod tests {
             PredicateOperator::Eq,
             "foo",
         );
-        // Empty pattern → Eq("") (only empty string matches).
-        assert_leaf(
-            &pb.like("name", Datum::String(String::new()), None).unwrap(),
-            PredicateOperator::Eq,
-            "",
-        );
         // prefix% → StartsWith.
         assert_leaf(
             &pb.like("name", Datum::String("foo%".to_string()), None)
@@ -3422,6 +3409,32 @@ mod tests {
             PredicateOperator::Like,
             r"foo\%",
         );
+    }
+
+    #[test]
+    fn test_like_empty_and_all_wildcard_patterns_preserve_java_leaves() {
+        let pb = PredicateBuilder::new(&test_fields());
+        for pattern in ["", "%", "%%", "%%%"] {
+            let predicate = pb
+                .like("name", Datum::String(pattern.into()), None)
+                .unwrap();
+            assert_leaf(&predicate, PredicateOperator::Like, pattern);
+            let literals = [Datum::String(pattern.into())];
+            assert!(eval_leaf(
+                PredicateOperator::Like,
+                Some(&Datum::String(String::new())),
+                &literals
+            ));
+            assert_eq!(
+                eval_leaf(
+                    PredicateOperator::Like,
+                    Some(&Datum::String("paimon".into())),
+                    &literals
+                ),
+                !pattern.is_empty()
+            );
+            assert!(!eval_leaf(PredicateOperator::Like, None, &literals));
+        }
     }
 
     #[test]
