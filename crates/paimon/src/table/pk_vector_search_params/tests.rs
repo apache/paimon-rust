@@ -39,3 +39,37 @@ fn vindex_array_dimension_accepts_diskann_search_options() {
         Some(8)
     );
 }
+
+#[test]
+fn raw_query_dimensions_remain_supported_with_java_build_option_mapping() {
+    let field = DataField::new(
+        1,
+        "embedding".into(),
+        DataType::Array(ArrayType::new(DataType::Float(FloatType::new()))),
+    );
+    for index_type in ["ivf-flat", "ivf-pq", "diskann"] {
+        let table = HashMap::from([("dimension".into(), "8".into())]);
+        assert_eq!(
+            pk_vector_query_dimension(&table, &HashMap::new(), index_type, &field).unwrap(),
+            Some(8)
+        );
+        let query = HashMap::from([("dimension".into(), "2".into())]);
+        assert_eq!(
+            pk_vector_query_dimension(&table, &query, index_type, &field).unwrap(),
+            Some(2)
+        );
+        let table = HashMap::from([
+            ("dimension".into(), "8".into()),
+            (format!("{index_type}.index.dimension"), "16".into()),
+            ("fields.embedding.index.dimension".into(), "32".into()),
+        ]);
+        assert_eq!(
+            pk_vector_query_dimension(&table, &HashMap::new(), index_type, &field).unwrap(),
+            Some(32)
+        );
+        assert_eq!(
+            pk_vector_query_dimension(&table, &query, index_type, &field).unwrap(),
+            Some(2)
+        );
+    }
+}
