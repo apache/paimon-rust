@@ -1259,6 +1259,28 @@ async fn test_blob_view_limit_only_resolves_selected_references() {
         );
     }
 
+    // As without authorization, a predicate on the resolved view under LIMIT
+    // must stop before the invalid fourth reference the server still admits.
+    server.set_auth_response(
+        "default",
+        "blob_view_target",
+        rules(&[int_leaf(0, "id", "LESS_THAN", 5)], &[]),
+    );
+    let mut limited = authorized.new_read_builder();
+    limited.with_limit(2);
+    limited.with_filter(
+        PredicateBuilder::new(authorized.schema().fields())
+            .is_not_null("picture")
+            .unwrap(),
+    );
+    assert_eq!(
+        collect_blob_rows(&read_all(&limited).await.unwrap()),
+        vec![
+            (1, "Updated".to_string(), Some(first_payload.clone())),
+            (3, "Repeated again".to_string(), Some(b"bob".to_vec())),
+        ]
+    );
+
     // A view reference and its upstream BLOB can disagree on nullness.
     // Until rules can resolve that dependency safely, reject instead of
     // authorizing rows by the reference bytes.
