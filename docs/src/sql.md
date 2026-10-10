@@ -1256,6 +1256,13 @@ Invalid options are rejected before any data is read. NULL values are counted
 in a shard's row count but are not indexed. A later call indexes only rows
 that no `full-text` index on the column covers yet.
 
+Full-text and vindex builds honor `global-index.build.parallelism` from table
+or build options. The default is `1`; higher values bound the number of shards
+built concurrently. Each shard owns its writer and may also use native worker
+threads. Prepared commit messages retain shard plan order. On a build failure,
+all started shards finish before private outputs are cleaned. Files in messages
+already returned to a caller are retained, including after a failed commit.
+
 The current global-index builders require a row-tracking data-evolution table
 with global indexes enabled. They do not support primary-key tables or tables
 with deletion vectors enabled:

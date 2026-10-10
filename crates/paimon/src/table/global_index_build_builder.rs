@@ -98,6 +98,8 @@ impl<'a> GlobalIndexBuildBuilder<'a> {
         self
     }
 
+    /// Overrides table options for this build. Full-text and vindex builds use
+    /// `global-index.build.parallelism` to bound concurrent shards (default: 1).
     pub fn with_options(&mut self, options: HashMap<String, String>) -> &mut Self {
         self.options = options;
         self
@@ -346,3 +348,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "global_index_build_builder/parallel_tests.rs"]
+mod parallel_tests;

@@ -31,6 +31,7 @@ const GLOBAL_INDEX_SEARCH_MODE_OPTION: &str = "global-index.search-mode";
 const SCALAR_INDEX_SEARCH_MODE_OPTION: &str = "scalar-index.search-mode";
 const VECTOR_INDEX_SEARCH_MODE_OPTION: &str = "vector-index.search-mode";
 const FULL_TEXT_INDEX_SEARCH_MODE_OPTION: &str = "full-text-index.search-mode";
+const GLOBAL_INDEX_BUILD_PARALLELISM_OPTION: &str = "global-index.build.parallelism";
 const GLOBAL_INDEX_ROW_COUNT_PER_SHARD_OPTION: &str = "global-index.row-count-per-shard";
 const GLOBAL_INDEX_THREAD_NUM_OPTION: &str = "global-index.thread-num";
 const GLOBAL_INDEX_VINDEX_READ_THREAD_NUM_OPTION: &str = "global-index.vindex.read-thread-num";
@@ -1055,6 +1056,19 @@ impl<'a> CoreOptions<'a> {
             });
         }
         Ok(value)
+    }
+
+    /// Number of generic global-index shards prepared concurrently by a local
+    /// build, matching PyPaimon's option and default. Each shard may also use
+    /// native worker threads; the default remains one.
+    pub fn global_index_build_parallelism(&self) -> crate::Result<usize> {
+        match self.options.get(GLOBAL_INDEX_BUILD_PARALLELISM_OPTION) {
+            None => Ok(1),
+            Some(raw) => raw.trim().parse::<usize>().ok().filter(|value| *value > 0)
+                .ok_or_else(|| crate::Error::ConfigInvalid {
+                    message: format!("Option '{GLOBAL_INDEX_BUILD_PARALLELISM_OPTION}' must be greater than 0, got: {raw}"),
+                }),
+        }
     }
 
     /// Maximum number of concurrent global-index search tasks, mirroring Java
@@ -2531,6 +2545,35 @@ mod tests {
                 .expect_err("invalid rows-per-shard should fail");
             assert!(matches!(err, crate::Error::DataInvalid { message, .. }
                     if message.contains(GLOBAL_INDEX_ROW_COUNT_PER_SHARD_OPTION)));
+        }
+    }
+
+    #[test]
+    fn test_global_index_build_parallelism() {
+        assert_eq!(
+            CoreOptions::new(&HashMap::new())
+                .global_index_build_parallelism()
+                .unwrap(),
+            1
+        );
+        for (raw, expected) in [("1", 1), (" 3 ", 3), ("+2", 2), ("1000000", 1000000)] {
+            let options =
+                HashMap::from([(GLOBAL_INDEX_BUILD_PARALLELISM_OPTION.into(), raw.into())]);
+            assert_eq!(
+                CoreOptions::new(&options)
+                    .global_index_build_parallelism()
+                    .unwrap(),
+                expected
+            );
+        }
+        for raw in ["0", "-1", "invalid", "18446744073709551616"] {
+            let options =
+                HashMap::from([(GLOBAL_INDEX_BUILD_PARALLELISM_OPTION.into(), raw.into())]);
+            assert!(CoreOptions::new(&options)
+                .global_index_build_parallelism()
+                .unwrap_err()
+                .to_string()
+                .contains("parallelism"));
         }
     }
 
