@@ -362,10 +362,9 @@ async fn snapshot_pinning_preserves_schema_only_renames() {
     use crate::common::Options;
     use crate::spec::SchemaChange;
 
-    let directory = tempfile::TempDir::new().unwrap();
     let catalog = FileSystemCatalog::new(Options::from_map(HashMap::from([(
         "warehouse".into(),
-        directory.path().to_str().unwrap().into(),
+        format!("memory:/text-schema-rename-{}", uuid::Uuid::new_v4()),
     )])))
     .unwrap();
     catalog
