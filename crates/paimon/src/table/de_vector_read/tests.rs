@@ -61,6 +61,7 @@ fn eval_context<'a>(
         table_options: options,
         schema_fields: fields,
         next_row_id,
+        filter: None,
     }
 }
 
@@ -432,16 +433,16 @@ fn test_configured_raw_vector_metric_precedence_and_conflict_default() {
     );
     options.insert("metric".to_string(), "cosine".to_string());
     assert_eq!(
-        configured_raw_vector_metric(&options, "embedding").unwrap(),
-        RawVectorMetric::InnerProduct
+        configured_raw_vector_metric_override(&options, "embedding").unwrap(),
+        Some(RawVectorMetric::InnerProduct)
     );
 
     options.clear();
     options.insert("foo.metric".to_string(), "cosine".to_string());
     options.insert("bar.distance.metric".to_string(), "l2".to_string());
     assert_eq!(
-        configured_raw_vector_metric(&options, "embedding").unwrap(),
-        RawVectorMetric::L2
+        configured_raw_vector_metric_override(&options, "embedding").unwrap(),
+        None
     );
 }
 
@@ -464,6 +465,7 @@ async fn test_resolve_raw_vector_metric_uses_vindex_manifest_metadata() {
     let metric = resolve_raw_vector_metric(
         &file_io,
         "memory:///test_table",
+        &HashMap::new(),
         &HashMap::new(),
         &[entry],
         2,
@@ -502,6 +504,7 @@ async fn test_resolve_raw_vector_metric_falls_back_to_vindex_header() {
         let metric = resolve_raw_vector_metric(
             &file_io,
             "memory:///test_table",
+            &HashMap::new(),
             &HashMap::new(),
             &[entry],
             2,
@@ -1389,4 +1392,250 @@ async fn de_result_read_applies_scalar_filter_before_top_k() {
     }
 
     assert_eq!(ids, vec![3, 2]);
+}
+
+#[tokio::test]
+async fn raw_query_metric_options_precede_table_options() {
+    let file_io = FileIOBuilder::new("memory").build().unwrap();
+    let table_options = HashMap::from([(
+        "fields.embedding.distance.metric".to_string(),
+        "invalid".to_string(),
+    )]);
+    let options = HashMap::from([("ivf-flat.metric".to_string(), "cosine".to_string())]);
+    let metric = resolve_raw_vector_metric(
+        &file_io,
+        "memory:/table",
+        &table_options,
+        &options,
+        &[],
+        2,
+        "embedding",
+    )
+    .await
+    .unwrap();
+    assert_eq!(metric, RawVectorMetric::Cosine);
+    let table_options = HashMap::from([("metric".to_string(), "inner_product".to_string())]);
+    let conflicting = HashMap::from([
+        ("a.metric".to_string(), "cosine".to_string()),
+        ("b.metric".to_string(), "l2".to_string()),
+    ]);
+    let metric = resolve_raw_vector_metric(
+        &file_io,
+        "memory:/table",
+        &table_options,
+        &conflicting,
+        &[],
+        2,
+        "embedding",
+    )
+    .await
+    .unwrap();
+    assert_eq!(metric, RawVectorMetric::InnerProduct);
+}
+
+#[tokio::test]
+async fn indexed_search_rejects_mixed_metrics_and_conflicting_query_metric() {
+    let file_io = FileIOBuilder::new("memory").build().unwrap();
+    let mut entries = Vec::new();
+    for (ordinal, metric) in ["l2", "cosine"].into_iter().enumerate() {
+        let bytes = build_vindex_segment_bytes(metric);
+        let name = format!("metric-{ordinal}.idx");
+        let mut entry = make_lumina_entry(&name, IVF_FLAT_IDENTIFIER, FileKind::Add, 2);
+        entry.index_file.file_size = bytes.len() as i64;
+        let meta = entry.index_file.global_index_meta.as_mut().unwrap();
+        meta.row_range_start = ordinal as i64 * 3;
+        meta.row_range_end = meta.row_range_start + 2;
+        file_io
+            .new_output(&format!("memory:///test_table/index/{name}"))
+            .unwrap()
+            .write(bytes::Bytes::from(bytes))
+            .await
+            .unwrap();
+        entries.push(entry);
+    }
+    let fields = vec![make_field(2, "embedding")];
+    let options = HashMap::new();
+    let query = VectorSearch::new(vec![1.0, 0.0], 10, "embedding".to_string()).unwrap();
+    let error = evaluate_batch_vector_search(
+        eval_context(&file_io, &options, &fields, None),
+        &entries,
+        &[query.clone(), query.clone()],
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("Cannot merge vector indexes with different metrics"),
+        "{error}"
+    );
+    let query = query.with_options(HashMap::from([(
+        "metric".to_string(),
+        "cosine".to_string(),
+    )]));
+    let error = evaluate_vector_search(
+        eval_context(&file_io, &options, &fields, None),
+        &entries[..1],
+        &query,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("does not match index metric"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn filtered_rerank_rejects_metric_from_a_skipped_shard() {
+    use crate::spec::IndexManifest;
+    use crate::table::{TableCommit, TableWrite};
+    use arrow_array::builder::ListBuilder;
+    let table = de_vector_table().await;
+    let element = Arc::new(ArrowField::new("item", ArrowDataType::Float32, false));
+    let mut vectors = ListBuilder::new(Float32Builder::new()).with_field(element.clone());
+    for values in [[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]] {
+        vectors.values().append_slice(&values);
+        vectors.append(true);
+    }
+    let batch = RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", ArrowDataType::Int32, false),
+            ArrowField::new("embedding", ArrowDataType::List(element), true),
+        ])),
+        vec![
+            Arc::new(Int32Array::from(vec![4, 5, 6])),
+            Arc::new(vectors.finish()),
+        ],
+    )
+    .unwrap();
+    let mut writer = TableWrite::new(&table, "metric-user".to_string()).unwrap();
+    writer.write_arrow_batch(&batch).await.unwrap();
+    TableCommit::new(table.clone(), "metric-user".to_string())
+        .commit(writer.prepare_commit().await.unwrap())
+        .await
+        .unwrap();
+    let count = table
+        .new_vindex_index_build_builder(IVF_FLAT_IDENTIFIER)
+        .with_index_column("embedding")
+        .with_options(HashMap::from([(
+            "ivf-flat.distance.metric".to_string(),
+            "cosine".to_string(),
+        )]))
+        .execute()
+        .await
+        .unwrap();
+    assert!(count > 0);
+    let manager = table.snapshot_manager();
+    let snapshot = manager.get_latest_snapshot().await.unwrap().unwrap();
+    let mut entries = IndexManifest::read(
+        table.file_io(),
+        &manager.manifest_path(snapshot.index_manifest().unwrap()),
+    )
+    .await
+    .unwrap();
+    entries.sort_by_key(|entry| {
+        entry
+            .index_file
+            .global_index_meta
+            .as_ref()
+            .map(|meta| meta.row_range_start)
+    });
+    let query = VectorSearch::new(vec![1.0, 0.0], 2, "embedding".to_string())
+        .unwrap()
+        .with_options(HashMap::from([(
+            "refine_factor".to_string(),
+            "2".to_string(),
+        )]))
+        .with_include_row_ids((3..6).collect());
+    let evaluation = VectorSearchEvaluation {
+        table: Some(&table),
+        file_io: table.file_io(),
+        table_path: table.location(),
+        table_options: table.schema().options(),
+        schema_fields: table.schema().fields(),
+        next_row_id: snapshot.next_row_id(),
+        filter: None,
+    };
+    let error = evaluate_vector_search(evaluation, &entries, &query)
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("Cannot merge vector indexes with different metrics"),
+        "{error}"
+    );
+}
+
+#[test]
+fn scalar_unindexed_coverage_intersects_all_predicate_fields() {
+    let io = FileIOBuilder::new("memory").build().unwrap();
+    let options = HashMap::new();
+    let fields = vec![make_field(1, "id"), make_field(2, "other")];
+    let evaluation = eval_context(&io, &options, &fields, Some(20));
+    let mut id = make_lumina_entry("id.btree", "btree", FileKind::Add, 1);
+    let mut other = make_lumina_entry("other.btree", "btree", FileKind::Add, 2);
+    other
+        .index_file
+        .global_index_meta
+        .as_mut()
+        .unwrap()
+        .row_range_end = 4;
+    let mut composite = id.clone();
+    let meta = composite.index_file.global_index_meta.as_mut().unwrap();
+    meta.row_range_end = 19;
+    meta.extra_field_ids = Some(vec![2]);
+    let builder = crate::spec::PredicateBuilder::new(&fields);
+    let predicates = vec![
+        builder.equal("id", crate::spec::Datum::Int(7)).unwrap(),
+        builder.equal("other", crate::spec::Datum::Int(7)).unwrap(),
+    ];
+    for filter in [
+        Predicate::and(predicates.clone()),
+        Predicate::or(predicates),
+    ] {
+        let entries = vec![id.clone(), other.clone(), composite.clone()];
+        assert_eq!(
+            scalar_unindexed_ranges(
+                evaluation,
+                &entries,
+                &filter,
+                GlobalIndexSearchMode::Full,
+                &[]
+            ),
+            vec![RowRange::new(5, 19)]
+        );
+        assert_eq!(
+            scalar_unindexed_ranges(
+                evaluation,
+                &entries,
+                &filter,
+                GlobalIndexSearchMode::Detail,
+                &[RowRange::new(0, 9), RowRange::new(15, 17)]
+            ),
+            vec![RowRange::new(5, 9), RowRange::new(15, 17)]
+        );
+        assert!(scalar_unindexed_ranges(
+            evaluation,
+            &entries,
+            &filter,
+            GlobalIndexSearchMode::Fast,
+            &[]
+        )
+        .is_empty());
+        // An index from another family cannot fill scalar coverage.
+        id.index_file.index_type = "full-text".to_string();
+        assert_eq!(
+            scalar_unindexed_ranges(
+                evaluation,
+                &[id.clone(), other.clone()],
+                &filter,
+                GlobalIndexSearchMode::Full,
+                &[]
+            ),
+            vec![RowRange::new(0, 19)]
+        );
+        id.index_file.index_type = "btree".to_string();
+    }
 }

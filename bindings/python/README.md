@@ -56,6 +56,30 @@ ctx.sql("DROP TEMPORARY TABLE paimon.default.my_temp")
 
 For the full SQL reference, see the [SQL Integration docs](https://paimon.apache.org/docs/master/sql/).
 
+### Native Vector Search
+
+A table with an existing vector column can search through the Rust core without
+materializing user rows in Python:
+
+```python
+search = (table.new_vector_search_builder()
+          .with_vector_column("embedding")
+          .with_query_vector([1.0, 0.0])
+          .with_limit(10))
+plan = search.new_vector_search_scan().scan()
+result = search.new_vector_search_read().read_plan(plan)
+batches = result.new_read_builder().with_projection(["id"]).read()
+```
+
+The plan pins one snapshot and can be reused with different queries. Scalar and
+partition filters are applied before ranking. Batch builders return one result
+per input query, in input order, including empty results.
+
+Data Evolution results expose scored global row IDs through `row_ids()`. PK
+results expose physical positions and Java-compatible scored split bytes;
+`new_read_builder()` reads both result types from their source snapshot and
+returns projected columns plus `__paimon_search_score` in relevance order.
+
 ### Native Read / Write
 
 Beyond SQL, you can use the lower-level read and write APIs directly from Python.

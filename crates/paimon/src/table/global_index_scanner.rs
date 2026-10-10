@@ -366,6 +366,48 @@ impl GlobalIndexScanner {
         )
     }
 
+    /// Scalar candidates and Java's exactness contract for searches which rank
+    /// rows before applying the row predicate.
+    pub(super) async fn matching_ranges_with_exactness(
+        &self,
+        predicate: &Predicate,
+    ) -> Result<Option<(Vec<RowRange>, bool)>> {
+        let Some(result) = self.evaluate(predicate).await? else {
+            return Ok(None);
+        };
+        let exact = result.fully_evaluated
+            && self.is_exact_predicate(predicate, &result.evaluated_field_ids);
+        Ok(Some((result.row_ranges, exact)))
+    }
+
+    fn is_exact_predicate(
+        &self,
+        predicate: &Predicate,
+        evaluated_fields: &std::collections::HashSet<i32>,
+    ) -> bool {
+        use crate::spec::PredicateOperator;
+        match predicate {
+            Predicate::Leaf { column, op, .. } => {
+                predicates::is_sorted_global_index_supported_op(*op)
+                    && !matches!(
+                        op,
+                        PredicateOperator::Contains
+                            | PredicateOperator::EndsWith
+                            | PredicateOperator::Like
+                    )
+                    && crate::table::find_field_id_by_name(&self.schema_fields, column)
+                        .is_some_and(|id| evaluated_fields.contains(&id))
+            }
+            Predicate::And(children) | Predicate::Or(children) => children
+                .iter()
+                .all(|child| self.is_exact_predicate(child, evaluated_fields)),
+            // The index evaluator declines NOT; its child's contributing
+            // field IDs cannot prove that this conjunct was evaluated.
+            Predicate::Not(_) | Predicate::AlwaysFalse => false,
+            Predicate::AlwaysTrue => true,
+        }
+    }
+
     /// Matching positions without data-evolution's unindexed row-id extension.
     /// Source-backed PK indexes cover a validated immutable source group.
     pub(super) async fn matching_ranges(

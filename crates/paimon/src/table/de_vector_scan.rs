@@ -18,8 +18,10 @@
 //! Plans global-index vector searches against one snapshot and resolves scalar pre-filters.
 
 use crate::spec::{CoreOptions, IndexManifest, IndexManifestEntry, Predicate, ROW_ID_FIELD_NAME};
+use crate::table::bucket_filter::split_partition_and_data_predicates;
+use crate::table::partition_filter::PartitionFilter;
 use crate::table::vector_scan::Scan;
-use crate::table::Table;
+use crate::table::{RowRange, Table};
 use crate::vindex::vector_search_timing_enabled;
 use arrow_array::{Array, Int64Array};
 use futures::TryStreamExt;
@@ -52,14 +54,18 @@ fn same_vector_search_table(left: &Table, right: &Table) -> bool {
         && left.branch() == right.branch()
 }
 
-async fn matching_row_ids_for_filter(
+pub(super) async fn matching_row_ids_for_filter(
     table: &Table,
     filter: &Predicate,
+    ranges: Option<Vec<RowRange>>,
 ) -> crate::Result<RoaringTreemap> {
     let mut read_builder = table.new_read_builder();
     read_builder
         .with_projection(&[ROW_ID_FIELD_NAME])?
         .with_filter(filter.clone());
+    if let Some(ranges) = ranges {
+        read_builder.with_row_ranges(ranges);
+    }
     let plan = read_builder.new_scan().plan().await?;
     let read = read_builder.new_read()?;
     let mut stream = read.to_arrow(plan.splits())?;
@@ -122,7 +128,7 @@ impl Table {
             });
         };
         let table = self.copy_with_resolved_snapshot(&snapshot).await?;
-        let include_row_ids = matching_row_ids_for_filter(&table, &filter).await?;
+        let include_row_ids = matching_row_ids_for_filter(&table, &filter, None).await?;
         Ok(PreparedVectorSearchFilter {
             table,
             include_row_ids: Arc::new(include_row_ids),
@@ -160,6 +166,7 @@ pub(super) struct DeVectorScanPlan {
     pub(super) table: Table,
     pub(super) index_entries: Vec<IndexManifestEntry>,
     pub(super) include_row_ids: Option<Arc<RoaringTreemap>>,
+    pub(super) filter: Option<Predicate>,
     pub(super) timing: Option<DeVectorScanTiming>,
     pub(super) next_row_id: Option<i64>,
     pub(super) skip_search: bool,
@@ -172,6 +179,7 @@ impl DeVectorScanPlan {
             skip_search: true,
             index_entries: Vec::new(),
             include_row_ids: None,
+            filter: None,
             next_row_id: None,
             timing,
         }
@@ -254,14 +262,11 @@ impl Scan for DeVectorScan {
         };
         plan.next_row_id = snapshot.next_row_id();
 
+        plan.filter = self.filter.clone();
         plan.include_row_ids = if let Some(prepared) = self.prepared_filter.as_ref() {
             Some(Arc::clone(prepared.include_row_ids()))
         } else if let Some(include_row_ids) = self.include_row_ids.as_ref() {
             Some(Arc::clone(include_row_ids))
-        } else if let Some(filter) = self.filter.as_ref() {
-            Some(Arc::new(
-                matching_row_ids_for_filter(&plan.table, filter).await?,
-            ))
         } else {
             None
         };
@@ -281,6 +286,24 @@ impl Scan for DeVectorScan {
             }
             None => Vec::new(),
         };
+        if let Some(filter) = &self.filter {
+            let (partition, _) = split_partition_and_data_predicates(
+                filter.clone(),
+                plan.table.schema().fields(),
+                plan.table.schema().partition_keys(),
+            );
+            if let Some(partition) = partition {
+                let fields = plan.table.schema().partition_fields();
+                let partition = PartitionFilter::from_predicate(partition, &fields);
+                let mut entries = Vec::with_capacity(plan.index_entries.len());
+                for entry in plan.index_entries {
+                    if partition.matches_entry(&entry.partition)? {
+                        entries.push(entry);
+                    }
+                }
+                plan.index_entries = entries;
+            }
+        }
         if let Some(timing) = &mut plan.timing {
             timing.manifest = manifest_start.map_or(Duration::ZERO, |start| start.elapsed());
         }

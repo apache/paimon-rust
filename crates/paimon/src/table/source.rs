@@ -943,7 +943,27 @@ impl DataSplit {
     /// `IndexedSplit` (type 3) wrapping the DataSplit body plus the ranges. Byte-compatible with
     /// `compatibility/split-v1-data` / `split-v1-indexed`.
     pub fn serialize_split_v1(&self) -> crate::Result<Vec<u8>> {
+        self.serialize_split_v1_with_scores(None)
+    }
+
+    /// Serialize aligned vector scores using Java's IndexedSplit wire format.
+    /// Scores belong to the selection, in ascending expanded-range order.
+    pub fn serialize_split_v1_with_scores(&self, scores: Option<&[f32]>) -> crate::Result<Vec<u8>> {
         self.ensure_serializable_without_grant()?;
+        if let Some(scores) = scores {
+            let count = self.row_ranges.as_ref().and_then(|ranges| {
+                ranges.iter().try_fold(0usize, |count, range| {
+                    let len = range.to().checked_sub(range.from())?.checked_add(1)?;
+                    count.checked_add(usize::try_from(len).ok()?)
+                })
+            });
+            if count != Some(scores.len()) || scores.len() > i32::MAX as usize {
+                return Err(crate::Error::DataInvalid {
+                    message: "IndexedSplit scores must align with selected row ranges".to_string(),
+                    source: None,
+                });
+            }
+        }
         let mut out = Vec::new();
         out.extend_from_slice(&SPLIT_SER_MAGIC.to_be_bytes());
         out.extend_from_slice(&SPLIT_SER_VERSION.to_be_bytes());
@@ -963,7 +983,16 @@ impl DataSplit {
                     out.extend_from_slice(&r.from().to_be_bytes());
                     out.extend_from_slice(&r.to().to_be_bytes());
                 }
-                out.push(0); // scores = null (vector scores are not modeled on the Rust split)
+                match scores {
+                    None => out.push(0),
+                    Some(scores) => {
+                        out.push(1);
+                        out.extend_from_slice(&(scores.len() as i32).to_be_bytes());
+                        for score in scores {
+                            out.extend_from_slice(&score.to_be_bytes());
+                        }
+                    }
+                }
             }
         }
         Ok(out)
@@ -2397,6 +2426,34 @@ mod tests {
         assert_eq!(split.row_count(), 7);
         assert_eq!(split.merged_row_count(), Some(7));
         assert_eq!(split.serialize_split_v1().unwrap(), expected);
+    }
+
+    #[test]
+    fn serialize_indexed_scores_match_java_wire_layout() {
+        let split = v1_data_split_builder()
+            .with_row_ranges(vec![RowRange::new(1, 4), RowRange::new(11, 13)])
+            .build()
+            .unwrap();
+        let scores = [1.0f32, 0.75, 0.5, 0.25, 0.0, -0.5, -1.0];
+        let mut expected = split.serialize_split_v1().unwrap();
+        assert_eq!(expected.pop(), Some(0));
+        expected.push(1);
+        expected.extend_from_slice(&7i32.to_be_bytes());
+        for score in scores {
+            expected.extend_from_slice(&score.to_be_bytes());
+        }
+        assert_eq!(
+            split.serialize_split_v1_with_scores(Some(&scores)).unwrap(),
+            expected
+        );
+        assert!(split
+            .serialize_split_v1_with_scores(Some(&scores[..6]))
+            .is_err());
+        assert!(v1_data_split_builder()
+            .build()
+            .unwrap()
+            .serialize_split_v1_with_scores(Some(&scores))
+            .is_err());
     }
 
     // The scores-stripped IndexedSplit frame the Rust serializer emits (see

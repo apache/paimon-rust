@@ -198,6 +198,14 @@ impl PyTable {
         }
     }
 
+    fn new_vector_search_builder(&self) -> crate::vector_search::PyVectorSearchBuilder {
+        crate::vector_search::PyVectorSearchBuilder::new(Arc::clone(&self.inner))
+    }
+
+    fn new_batch_vector_search_builder(&self) -> crate::vector_search::PyBatchVectorSearchBuilder {
+        crate::vector_search::PyBatchVectorSearchBuilder::new(Arc::clone(&self.inner))
+    }
+
     fn new_batch_write_builder(&self) -> PyBatchWriteBuilder {
         PyBatchWriteBuilder::new(Arc::clone(&self.inner))
     }

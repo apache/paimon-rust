@@ -25,6 +25,7 @@ pub(crate) const QUERY_AUTH_ENABLED_OPTION: &str = "query-auth.enabled";
 const DATA_EVOLUTION_ENABLED_OPTION: &str = "data-evolution.enabled";
 const DATA_EVOLUTION_NESTED_FIELD_ENABLED_OPTION: &str = "data-evolution.nested-field.enabled";
 const FILE_INDEX_READ_ENABLED_OPTION: &str = "file-index.read.enabled";
+const GLOBAL_INDEX_FILTER_REFINE_FROM_DATA_OPTION: &str = "global-index.filter.refine-from-data";
 const GLOBAL_INDEX_ENABLED_OPTION: &str = "global-index.enabled";
 const GLOBAL_INDEX_SEARCH_MODE_OPTION: &str = "global-index.search-mode";
 const SCALAR_INDEX_SEARCH_MODE_OPTION: &str = "scalar-index.search-mode";
@@ -980,6 +981,15 @@ impl<'a> CoreOptions<'a> {
     pub fn global_index_enabled(&self) -> bool {
         self.options
             .get(GLOBAL_INDEX_ENABLED_OPTION)
+            .map(|value| value.eq_ignore_ascii_case("true"))
+            .unwrap_or(true)
+    }
+
+    /// Verify candidate-only scalar index answers against data before vector
+    /// ranking (Java default: true). When false, those candidates are excluded.
+    pub fn global_index_filter_refine_from_data(&self) -> bool {
+        self.options
+            .get(GLOBAL_INDEX_FILTER_REFINE_FROM_DATA_OPTION)
             .map(|value| value.eq_ignore_ascii_case("true"))
             .unwrap_or(true)
     }
