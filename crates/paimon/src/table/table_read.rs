@@ -1302,6 +1302,21 @@ impl<'a> PaimonTableRead<'a> {
         if resolve_predicate_views {
             output_views.retain(|field| !predicate_views.contains(field));
         }
+        // Merge can rebuild larger batches. Yield one authorized row per lookup
+        // so the downstream LIMIT can stop before the next reference is resolved.
+        let stream: ArrowRecordBatchStream = if resolve_predicate_views && self.limit.is_some() {
+            Box::pin(async_stream::try_stream! {
+                let mut stream = stream;
+                while let Some(batch) = stream.next().await {
+                    let batch = batch?;
+                    for row in 0..batch.num_rows() {
+                        yield batch.slice(row, 1);
+                    }
+                }
+            })
+        } else {
+            stream
+        };
         // User predicates see resolved descriptors or payloads, after authorization.
         let stream = match self.table.rest_env().filter(|_| resolve_predicate_views) {
             Some(env) => super::data_evolution_reader::resolve_blob_view_stream(

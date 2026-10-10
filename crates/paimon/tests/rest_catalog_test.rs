@@ -1259,6 +1259,28 @@ async fn test_blob_view_limit_only_resolves_selected_references() {
         );
     }
 
+    // As without authorization, a predicate on the resolved view under LIMIT
+    // must stop before the invalid fourth reference the server still admits.
+    server.set_auth_response(
+        "default",
+        "blob_view_target",
+        rules(&[int_leaf(0, "id", "LESS_THAN", 5)], &[]),
+    );
+    let mut limited = authorized.new_read_builder();
+    limited.with_limit(2);
+    limited.with_filter(
+        PredicateBuilder::new(authorized.schema().fields())
+            .is_not_null("picture")
+            .unwrap(),
+    );
+    assert_eq!(
+        collect_blob_rows(&read_all(&limited).await.unwrap()),
+        vec![
+            (1, "Updated".to_string(), Some(first_payload.clone())),
+            (3, "Repeated again".to_string(), Some(b"bob".to_vec())),
+        ]
+    );
+
     // A view reference and its upstream BLOB can disagree on nullness.
     // Until rules can resolve that dependency safely, reject instead of
     // authorizing rows by the reference bytes.
@@ -3575,6 +3597,139 @@ async fn test_blob_view_mask_alias_resolves_the_source_view() {
             .unwrap()
             .with_filter(predicate);
         assert_eq!(ids(&read_all(&read).await.unwrap()), expected);
+    }
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn test_query_auth_blob_view_predicate_limit_after_pk_merge() {
+    let source = written(
+        "view_limit_source",
+        blob_schema,
+        vec![blob_batch(
+            vec![1, 2],
+            vec!["Skipped", "Kept"],
+            vec![b"skip".to_vec(), b"keep".to_vec()],
+        )],
+    )
+    .await;
+    let picture_id = source.table.schema().fields()[2].id();
+    let reference = |row_id| {
+        BlobViewStruct::new(source.identifier.clone(), picture_id, row_id)
+            .serialize()
+            .unwrap()
+    };
+    let (skipped, kept, missing) = (reference(0), reference(1), reference(99));
+    let batch = |pictures: Vec<Option<&[u8]>>| {
+        RecordBatch::try_from_iter([
+            (
+                "id",
+                Arc::new(Int32Array::from(vec![1, 2, 3, 4])) as arrow_array::ArrayRef,
+            ),
+            (
+                "picture",
+                Arc::new(LargeBinaryArray::from(pictures)) as arrow_array::ArrayRef,
+            ),
+            (
+                "alias",
+                Arc::new(LargeBinaryArray::from(vec![None::<&[u8]>; 4])) as arrow_array::ArrayRef,
+            ),
+        ])
+        .unwrap()
+    };
+    for engine in ["deduplicate", "partial-update"] {
+        let g = written(
+            "view_limit_target",
+            |options| {
+                let mut schema = Schema::builder()
+                    .column("id", DataType::Int(IntType::with_nullable(false)))
+                    .column("picture", DataType::Blob(BlobType::new()))
+                    .column("alias", DataType::Blob(BlobType::new()))
+                    .primary_key(["id"])
+                    .option("bucket", "1")
+                    .option("merge-engine", engine)
+                    .option("blob-view-field", "picture");
+                for (key, value) in options {
+                    schema = schema.option(*key, *value);
+                }
+                schema.build().unwrap()
+            },
+            // Overlapping commits force merging before any view lookup.
+            vec![
+                batch(vec![Some(&missing); 4]),
+                batch(vec![
+                    Some(&missing),
+                    Some(&skipped),
+                    Some(&kept),
+                    Some(&missing),
+                ]),
+            ],
+        )
+        .await;
+        g.ctx.server.add_table_with_schema(
+            "default",
+            "view_limit_source",
+            blob_schema(&[]),
+            source.table.location(),
+        );
+        for target in ["picture", "alias"] {
+            let masks = if target == "alias" {
+                vec![("alias", field_ref_mask(1, "picture", "BLOB"))]
+            } else {
+                vec![]
+            };
+            g.set_rules(&[int_leaf(0, "id", "GREATER_THAN", 1)], &masks);
+            let plan = g.table.new_read_builder().new_scan().plan().await.unwrap();
+            assert!(plan.splits().iter().any(|split| !split.raw_convertible()));
+            for batch_size in [1, 1024] {
+                for descriptors in [false, true] {
+                    let table = g.table.copy_with_options(HashMap::from([
+                        ("read.batch-size".to_string(), batch_size.to_string()),
+                        ("blob-as-descriptor".to_string(), descriptors.to_string()),
+                    ]));
+                    let predicates = PredicateBuilder::new(table.schema().fields());
+                    let label = format!(
+                        "{engine}, {target}, batch={batch_size}, descriptors={descriptors}"
+                    );
+                    for projection in [vec!["id"], vec!["id", target]] {
+                        for limit in [Some(0), Some(1), Some(2), Some(3), None] {
+                            let mut read = table.new_read_builder();
+                            read.with_projection(&projection)
+                                .unwrap()
+                                .with_filter(predicates.is_not_null(target).unwrap());
+                            if let Some(limit) = limit {
+                                read.with_limit(limit);
+                            }
+                            let result = read_all(&read).await;
+                            if let Some(limit @ 0..=2) = limit {
+                                let batches = result
+                                    .unwrap_or_else(|e| panic!("{label}, limit={limit}: {e}"));
+                                assert_eq!(ids(&batches), [2, 3][..limit], "{label}");
+                            } else {
+                                let error = result.unwrap_err().to_string();
+                                assert!(error.contains("row_id=99"), "{label}: {error}");
+                            }
+                        }
+                    }
+                    if !descriptors {
+                        // A rejected candidate must not consume the output quota.
+                        let mut read = table.new_read_builder();
+                        read.with_projection(&["id"])
+                            .unwrap()
+                            .with_filter(
+                                predicates
+                                    .equal(target, Datum::Bytes(b"keep".to_vec()))
+                                    .unwrap(),
+                            )
+                            .with_limit(1);
+                        let batches = read_all(&read)
+                            .await
+                            .unwrap_or_else(|e| panic!("{label}: {e}"));
+                        assert_eq!(ids(&batches), vec![3], "{label}");
+                    }
+                }
+            }
+        }
     }
 }
 
