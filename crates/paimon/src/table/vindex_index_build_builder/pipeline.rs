@@ -16,7 +16,8 @@
 // under the License.
 
 use super::extraction::{
-    data_split_for_shard_ranges, extract_vector_batch, validate_vector_batch_ranges,
+    contains_null_vectors, data_split_for_shard_ranges, extract_vector_batch, local_ids,
+    validate_vector_batch_ranges,
 };
 use super::planning::VindexIndexShard;
 use super::timing::{vector_index_build_timing_enabled, VectorIndexBuildTiming};
@@ -56,6 +57,18 @@ const QUEUE_CAPACITY: usize = 2;
 const BUFFER_BYTES: usize = 8 * 1024 * 1024;
 const REPLAY_TARGET_BYTES: usize = 32 * 1024 * 1024;
 
+pub(super) enum GranuleBuildOutcome {
+    Built(Box<BuiltIndexFile>),
+    Sparse,
+}
+
+#[derive(PartialEq)]
+enum SourceLayout {
+    Dense,
+    Sparse,
+}
+
+#[derive(Clone, Debug)]
 struct Granule {
     range: RowRange,
     file_index: usize,
@@ -189,19 +202,19 @@ fn spawn_add_consumer(
             match item {
                 AddItem::Batch(batch, ids) => {
                     let vectors = extract_vector_batch(&batch, &index_column, dimension)?;
-                    if ids.len() != vectors.row_count {
+                    if ids.len() != vectors.vector_count {
                         return Err(Error::DataInvalid {
                             message: "vindex add batch id count mismatch".to_string(),
                             source: None,
                         });
                     }
                     writer
-                        .add_vectors(&ids, vectors.values, vectors.row_count)
+                        .add_vectors(&ids, &vectors.values, vectors.vector_count)
                         .map_err(|e| Error::UnexpectedError {
                             message: format!("Failed to add vectors to vindex index: {e}"),
                             source: Some(Box::new(e)),
                         })?;
-                    rows_added += vectors.row_count;
+                    rows_added += vectors.vector_count;
                 }
                 AddItem::Spilled(ids, buffer) => {
                     let values = buffer.typed_data::<f32>();
@@ -610,31 +623,6 @@ fn granules_partition_shard(granules: &[Granule], shard_range: &RowRange) -> boo
             .all(|pair| pair[0].range.to().checked_add(1) == Some(pair[1].range.from()))
 }
 
-fn local_ids(row_ids: &[i64], start: i64, row_count: usize) -> Result<Vec<i64>> {
-    let end = start
-        .checked_add(i64::try_from(row_count).map_err(|e| Error::DataInvalid {
-            message: "vindex row count does not fit i64".to_string(),
-            source: Some(Box::new(e)),
-        })?)
-        .ok_or_else(|| Error::DataInvalid {
-            message: "vindex row range overflows i64".to_string(),
-            source: None,
-        })?;
-    row_ids
-        .iter()
-        .map(|row_id| {
-            if *row_id < start || *row_id >= end {
-                Err(Error::DataInvalid {
-                    message: format!("vindex row id {row_id} is outside shard [{start}, {end})"),
-                    source: None,
-                })
-            } else {
-                Ok(*row_id - start)
-            }
-        })
-        .collect()
-}
-
 impl<'a> VindexIndexBuildBuilder<'a> {
     fn open_vector_stream(
         &self,
@@ -786,7 +774,7 @@ impl<'a> VindexIndexBuildBuilder<'a> {
         index_field_id: i32,
         options: &VindexVectorIndexOptions,
         index_meta: Vec<u8>,
-    ) -> Result<BuiltIndexFile> {
+    ) -> Result<GranuleBuildOutcome> {
         let timing_enabled = vector_index_build_timing_enabled();
         let total_start = timing_enabled.then(Instant::now);
         let mut source_batch_wait = Duration::ZERO;
@@ -816,14 +804,15 @@ impl<'a> VindexIndexBuildBuilder<'a> {
         }
         checked_vector_bytes(row_count_usize, dimension)?;
         let eligible = checked_training_vector_count(row_count_usize, options.train_sample_ratio)?;
+        let training_config = options.training_config(row_count_usize)?;
         let retained =
-            default_training_vector_count(eligible, options.config.nlist()).unwrap_or(eligible);
+            default_training_vector_count(eligible, training_config.nlist()).unwrap_or(eligible);
         let plan = self
             .plan_granules(shard, index_column, eligible, retained)
             .await?;
 
         let mut trainer =
-            VectorIndexTrainer::new(options.config.clone()).map_err(|e| Error::DataInvalid {
+            VectorIndexTrainer::new(training_config).map_err(|e| Error::DataInvalid {
                 message: format!("Failed to initialize vindex trainer: {e}"),
                 source: Some(Box::new(e)),
             })?;
@@ -835,7 +824,7 @@ impl<'a> VindexIndexBuildBuilder<'a> {
         let mut next_training_sample = 0usize;
         let mut first_rows = 0usize;
         let mut range_index = 0usize;
-        let first_result: Result<()> = async {
+        let first_result: Result<SourceLayout> = async {
             let mut stream = self.open_vector_stream(
                 shard,
                 plan.first.clone(),
@@ -852,6 +841,7 @@ impl<'a> VindexIndexBuildBuilder<'a> {
                 }
                 let Some(batch) = batch else { break };
                 batch_count += 1;
+                if contains_null_vectors(&batch, index_column) { return Ok(SourceLayout::Sparse); }
                 let vectors = validate_vector_batch_ranges(
                     &batch,
                     index_column,
@@ -860,7 +850,7 @@ impl<'a> VindexIndexBuildBuilder<'a> {
                     &mut range_index,
                     &mut expected_row_id,
                 )?;
-                let batch_end = first_rows.checked_add(vectors.row_count).ok_or_else(|| {
+                let batch_end = first_rows.checked_add(vectors.vector_count).ok_or_else(|| {
                     Error::DataInvalid {
                         message: "vindex first-batch row count overflows usize".to_string(),
                         source: None,
@@ -871,7 +861,7 @@ impl<'a> VindexIndexBuildBuilder<'a> {
                         let sample = training[next_training_sample];
                         match vectors.row_ids.binary_search(&sample) {
                             Ok(row) => row,
-                            Err(row) if row == vectors.row_count => break,
+                            Err(row) if row == vectors.vector_count => break,
                             Err(_) => return Err(Error::DataInvalid {
                                 message: format!("Missing vindex training row {sample}"),
                                 source: None,
@@ -905,8 +895,8 @@ impl<'a> VindexIndexBuildBuilder<'a> {
                     }
                 }
                 let record = SpillRecord {
-                    ids: local_ids(vectors.row_ids, shard.row_range_start, row_count_usize)?,
-                    bytes: vectors.bytes.to_vec(),
+                    ids: local_ids(&vectors.row_ids, shard.row_range_start, row_count_usize)?,
+                    bytes: vectors.bytes().to_vec(),
                 };
                 first_rows = batch_end;
                 if spill.as_ref().unwrap().sender.send(record).await.is_err() {
@@ -937,14 +927,22 @@ impl<'a> VindexIndexBuildBuilder<'a> {
                     source: None,
                 });
             }
-            Ok(())
+            Ok(SourceLayout::Dense)
         }
         .await;
-        if let Err(error) = first_result {
-            return match spill.take().unwrap().finish().await {
-                Ok(_) => Err(error),
-                Err(spill_error) => Err(spill_error),
-            };
+        let first_layout = match first_result {
+            Ok(layout) => layout,
+            Err(error) => {
+                return match spill.take().unwrap().finish().await {
+                    Ok(_) => Err(error),
+                    Err(spill_error) => Err(spill_error),
+                };
+            }
+        };
+
+        if first_layout == SourceLayout::Sparse {
+            spill.take().unwrap().finish().await?;
+            return Ok(GranuleBuildOutcome::Sparse);
         }
 
         let mut training: Option<TrainingTask> = Some(tokio::task::spawn_blocking(
@@ -977,7 +975,7 @@ impl<'a> VindexIndexBuildBuilder<'a> {
         }
 
         let mut rest_rows = 0usize;
-        let producer_result: Result<()> = async {
+        let producer_result: Result<SourceLayout> = async {
             if !plan.rest.is_empty() {
                 let mut stream = self.open_vector_stream(
                     shard,
@@ -999,6 +997,7 @@ impl<'a> VindexIndexBuildBuilder<'a> {
                     if live.is_none() && training.as_ref().is_some_and(|task| task.is_finished()) {
                         go_live!();
                     }
+                    if contains_null_vectors(&batch, &index_column) { return Ok(SourceLayout::Sparse); }
                     let vectors = validate_vector_batch_ranges(
                         &batch,
                         &index_column,
@@ -1007,8 +1006,8 @@ impl<'a> VindexIndexBuildBuilder<'a> {
                         &mut range_index,
                         &mut expected_row_id,
                     )?;
-                    let ids = local_ids(vectors.row_ids, shard.row_range_start, row_count_usize)?;
-                    rest_rows = rest_rows.checked_add(vectors.row_count).ok_or_else(|| {
+                    let ids = local_ids(&vectors.row_ids, shard.row_range_start, row_count_usize)?;
+                    rest_rows = rest_rows.checked_add(vectors.vector_count).ok_or_else(|| {
                         Error::DataInvalid {
                             message: "vindex remaining row count overflows usize".to_string(),
                             source: None,
@@ -1029,7 +1028,7 @@ impl<'a> VindexIndexBuildBuilder<'a> {
                     } else {
                         let record = SpillRecord {
                             ids,
-                            bytes: vectors.bytes.to_vec(),
+                            bytes: vectors.bytes().to_vec(),
                         };
                         if spill.as_ref().unwrap().sender.send(record).await.is_err() {
                             return Err(Error::UnexpectedError {
@@ -1052,28 +1051,46 @@ impl<'a> VindexIndexBuildBuilder<'a> {
                     });
                 }
             }
-            Ok(())
+            Ok(SourceLayout::Dense)
         }
         .await;
 
-        if let Err(producer_error) = producer_result {
+        let rest_layout = match producer_result {
+            Ok(layout) => layout,
+            Err(producer_error) => {
+                if let Some(pipeline) = live.take() {
+                    let (consumer, replay, _, _) = finish_live_pipeline(pipeline).await;
+                    consumer?;
+                    replay?;
+                } else {
+                    let spill_result = match spill.take() {
+                        Some(spill) => spill.finish().await.map(|_| ()),
+                        None => Ok(()),
+                    };
+                    let training_result = match training.take() {
+                        Some(training) => join_training(training).await.map(|_| ()),
+                        None => Ok(()),
+                    };
+                    spill_result?;
+                    training_result?;
+                }
+                return Err(producer_error);
+            }
+        };
+        if rest_layout == SourceLayout::Sparse {
             if let Some(pipeline) = live.take() {
                 let (consumer, replay, _, _) = finish_live_pipeline(pipeline).await;
                 consumer?;
                 replay?;
             } else {
-                let spill_result = match spill.take() {
-                    Some(spill) => spill.finish().await.map(|_| ()),
-                    None => Ok(()),
-                };
-                let training_result = match training.take() {
-                    Some(training) => join_training(training).await.map(|_| ()),
-                    None => Ok(()),
-                };
-                spill_result?;
-                training_result?;
+                if let Some(spill) = spill.take() {
+                    spill.finish().await?;
+                }
+                if let Some(training) = training.take() {
+                    join_training(training).await?;
+                }
             }
-            return Err(producer_error);
+            return Ok(GranuleBuildOutcome::Sparse);
         }
         if live.is_none() {
             go_live!();
@@ -1141,7 +1158,10 @@ impl<'a> VindexIndexBuildBuilder<'a> {
             data_file_count: shard.files.len(),
             file_name: meta.file_name.clone(),
         });
-        Ok(BuiltIndexFile { meta, timing })
+        Ok(GranuleBuildOutcome::Built(Box::new(BuiltIndexFile {
+            meta,
+            timing,
+        })))
     }
 }
 

@@ -1342,13 +1342,17 @@ Supported vindex options:
 |---|---:|---|---|
 | `<index-type>.dimension` | `128` | all vindex types | Vector dimension for `ARRAY<FLOAT>` columns. Existing `VECTOR<FLOAT,N>` columns use `N` from the type. |
 | `<index-type>.distance.metric` | `inner_product` | all vindex types | Distance metric: `inner_product`, `cosine`, or `l2`. |
-| `<index-type>.nlist` | `256` | all IVF types | Number of IVF lists. DiskANN rejects this option. |
+| `<index-type>.nlist` | automatic | all IVF types | Number of IVF lists. When omitted or `auto`, infer it from `expected-vector-count`. DiskANN rejects this option. |
+| `<index-type>.expected-vector-count` | unset, or inferred | all vindex types | Expected number of vectors used for automatic sizing. When omitted, an automatic IVF build counts the shard's non-NULL vectors before training. |
+| `<index-type>.target-recall` | unset | all vindex types | Optional tuning objective in `[0, 1]`; IVF-PQ enables automatic OPQ at values of at least `0.9`. |
+| `<index-type>.max-bytes-per-vector` | unset | all vindex types | Optional persisted-size tuning objective; PQ and RQ can use it to infer encoding width. |
 | `<index-type>.ivf.coarse-assignment` | `auto` | all IVF types | Build-time list assignment mode: `auto` uses Vamana for large centroid matrices; `exact` always uses exact assignment. |
 | `<index-type>.ivf.train.max-points-per-centroid` | `256` | all IVF types | Positive limit on coarse K-means training data: at most `nlist × value` vectors. |
-| `<index-type>.train.sample-ratio` or `fields.<field>.train.sample-ratio` | `1.0` | all vindex types | Fraction of shard rows selected evenly for training. Must be in `(0, 1]`; all rows are still added to the index. The field-specific option takes precedence. |
-| `vindex.build.granule.enabled` | `true` | all IVF types | Use the granule build pipeline. Set to `false` to use the full-spill build path for future index builds. |
-| `<index-type>.pq.m` | `16` | `ivf-pq` | Number of product-quantization sub-vectors. The dimension must be divisible by this value. |
-| `<index-type>.pq.use-opq` | `false` | `ivf-pq` | Whether to enable OPQ before PQ encoding. |
+| `<index-type>.train.sample-ratio` or `fields.<field>.train.sample-ratio` | `1.0` | all vindex types | Fraction of non-NULL vectors selected for training. Must be in `(0, 1]`; all non-NULL vectors are still added to the index. The field-specific option takes precedence. |
+| `vindex.build.granule.enabled` | `true` | all IVF types | Use the granule build pipeline when `nlist` or `expected-vector-count` is explicit. NULL vectors switch to full spill. Set to `false` to always use full spill. |
+| `<index-type>.pq.m` | automatic | `ivf-pq` | Number of product-quantization sub-vectors, inferred from dimension and the code budget when omitted. The dimension must be divisible by an explicit value. |
+| `<index-type>.pq.code-ratio` | `0.0625` | `ivf-pq` | Ratio of PQ-code bytes to raw `f32` vector bytes, in `(0, 0.25]`. An explicit `pq.m` overrides it. |
+| `<index-type>.pq.use-opq` | inferred | `ivf-pq` | Whether to enable OPQ before PQ encoding. When omitted or `auto`, enable it if `target-recall` is at least `0.9`; otherwise disable it. |
 | `ivf-pq.ivf.pq-encoding` | `auto` | `ivf-pq` | Build-time PQ encoding mode: `auto` selects an accelerated backend when supported; `canonical` uses the canonical encoder. |
 | `<index-type>.pq.train.max-points-per-centroid` | `256` | `ivf-pq`, `diskann` | Positive limit on PQ training data: at most `2^pq.bits × value` vectors per subquantizer. |
 | `ivf-rq.rq.bits` | `4`, or inferred | `ivf-rq` | Residual-quantization width in the range `1` to `8`. When omitted, `ivf-rq.max-bytes-per-vector` can select it. |
@@ -1383,6 +1387,11 @@ vindex aliases are also accepted in the `options` string: `dimension`, `metric`,
 `ivf.train.max-points-per-centroid`, `pq.train.max-points-per-centroid`, and the
 `diskann.*` build keys listed in the table. Build options for another index
 family are rejected rather than ignored.
+
+NULL vector rows are skipped, while index manifest `row_count` and the global
+row range still include them. Non-NULL vectors retain their original relative
+row IDs. An all-NULL shard produces no index file. Full-spill training samples
+the compacted non-NULL vector stream at evenly spaced positions, matching Java.
 
 Inspect committed index files with the `$table_indexes` system table:
 

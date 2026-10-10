@@ -21,6 +21,7 @@ use crate::spec::ROW_ID_FIELD_NAME;
 use crate::table::{DataSplit, DataSplitBuilder, RowRange};
 use crate::{Error, Result};
 use arrow_array::{Array, FixedSizeListArray, Float32Array, Int64Array, ListArray, RecordBatch};
+use arrow_buffer::ScalarBuffer;
 
 pub(super) fn data_split_for_shard(shard: &VindexIndexShard) -> Result<DataSplit> {
     data_split_for_shard_ranges(
@@ -44,27 +45,40 @@ pub(super) fn data_split_for_shard_ranges(
         .build()
 }
 
-pub(super) struct ValidatedVectorBatch<'a> {
-    pub(super) values: &'a [f32],
-    pub(super) bytes: &'a [u8],
-    pub(super) row_ids: &'a [i64],
-    pub(super) row_count: usize,
+pub(super) struct ValidatedVectorBatch {
+    pub(super) values: ScalarBuffer<f32>,
+    pub(super) row_ids: ScalarBuffer<i64>,
+    /// Number of non-null vectors, not the number of source rows.
+    pub(super) vector_count: usize,
+    pub(super) source_rows: usize,
 }
 
-pub(super) fn extract_vector_batch<'a>(
-    batch: &'a RecordBatch,
+impl ValidatedVectorBatch {
+    pub(super) fn bytes(&self) -> &[u8] {
+        self.values.inner().as_slice()
+    }
+}
+
+pub(super) fn contains_null_vectors(batch: &RecordBatch, index_column: &str) -> bool {
+    batch
+        .column_by_name(index_column)
+        .is_some_and(|column| column.null_count() != 0)
+}
+
+pub(super) fn extract_vector_batch(
+    batch: &RecordBatch,
     index_column: &str,
     dimension: usize,
-) -> Result<ValidatedVectorBatch<'a>> {
+) -> Result<ValidatedVectorBatch> {
     validate_vector_batch_with(batch, index_column, dimension, |_| Ok(()))
 }
 
-pub(super) fn validate_vector_batch<'a>(
-    batch: &'a RecordBatch,
+pub(super) fn validate_vector_batch(
+    batch: &RecordBatch,
     index_column: &str,
     dimension: usize,
     expected_row_id: &mut i64,
-) -> Result<ValidatedVectorBatch<'a>> {
+) -> Result<ValidatedVectorBatch> {
     validate_vector_batch_with(batch, index_column, dimension, |row_id| {
         if row_id != *expected_row_id {
             return Err(Error::DataInvalid {
@@ -85,14 +99,14 @@ pub(super) fn validate_vector_batch<'a>(
     })
 }
 
-pub(super) fn validate_vector_batch_ranges<'a>(
-    batch: &'a RecordBatch,
+pub(super) fn validate_vector_batch_ranges(
+    batch: &RecordBatch,
     index_column: &str,
     dimension: usize,
     ranges: &[RowRange],
     range_index: &mut usize,
     expected_row_id: &mut i64,
-) -> Result<ValidatedVectorBatch<'a>> {
+) -> Result<ValidatedVectorBatch> {
     validate_vector_batch_with(batch, index_column, dimension, |row_id| {
         let range = ranges.get(*range_index).ok_or_else(|| Error::DataInvalid {
             message: format!("vindex vector extraction got unexpected _ROW_ID {row_id}"),
@@ -126,12 +140,12 @@ pub(super) fn validate_vector_batch_ranges<'a>(
     })
 }
 
-fn validate_vector_batch_with<'a>(
-    batch: &'a RecordBatch,
+fn validate_vector_batch_with(
+    batch: &RecordBatch,
     index_column: &str,
     dimension: usize,
     mut validate_row_id: impl FnMut(i64) -> Result<()>,
-) -> Result<ValidatedVectorBatch<'a>> {
+) -> Result<ValidatedVectorBatch> {
     let vector_index = batch
         .schema()
         .index_of(index_column)
@@ -147,14 +161,30 @@ fn validate_vector_batch_with<'a>(
                 message: format!("_ROW_ID column not found in read batch: {e}"),
                 source: None,
             })?;
+    let row_ids = batch
+        .column(row_id_index)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| Error::DataInvalid {
+            message: "vindex vector extraction requires non-null Int64 _ROW_ID".to_string(),
+            source: None,
+        })?;
+    if row_ids.null_count() != 0 {
+        return Err(Error::DataInvalid {
+            message: "vindex vector extraction found null _ROW_ID".to_string(),
+            source: None,
+        });
+    }
+    for row_id in row_ids.values() {
+        validate_row_id(*row_id)?;
+    }
+
     let column = batch.column(vector_index);
+    if column.null_count() != 0 {
+        return compact_nullable_vectors(column.as_ref(), row_ids, dimension, batch.num_rows());
+    }
+
     let (values, start, end) = if let Some(array) = column.as_any().downcast_ref::<ListArray>() {
-        if array.null_count() != 0 {
-            return Err(Error::DataInvalid {
-                message: "vindex vector extraction found null vector row".to_string(),
-                source: None,
-            });
-        }
         let offsets = array.value_offsets();
         for offsets in offsets.windows(2) {
             let actual = offsets[1] - offsets[0];
@@ -192,12 +222,6 @@ fn validate_vector_batch_with<'a>(
                 source: None,
             });
         }
-        if array.null_count() != 0 {
-            return Err(Error::DataInvalid {
-                message: "vindex vector extraction found null vector row".to_string(),
-                source: None,
-            });
-        }
         let end = batch
             .num_rows()
             .checked_mul(dimension)
@@ -231,30 +255,112 @@ fn validate_vector_batch_with<'a>(
             source: None,
         });
     }
-    let row_ids = batch
-        .column(row_id_index)
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .ok_or_else(|| Error::DataInvalid {
-            message: "vindex vector extraction requires non-null Int64 _ROW_ID".to_string(),
-            source: None,
-        })?;
-    if row_ids.null_count() != 0 {
+    checked_vector_bytes(end - start, 1)?;
+    Ok(ValidatedVectorBatch {
+        values: values.values().slice(start, end - start),
+        row_ids: row_ids.values().clone(),
+        vector_count: batch.num_rows(),
+        source_rows: batch.num_rows(),
+    })
+}
+
+fn compact_nullable_vectors(
+    column: &dyn Array,
+    row_ids: &Int64Array,
+    dimension: usize,
+    source_rows: usize,
+) -> Result<ValidatedVectorBatch> {
+    let list = column.as_any().downcast_ref::<ListArray>();
+    let fixed = column.as_any().downcast_ref::<FixedSizeListArray>();
+    if list.is_none() && fixed.is_none() {
         return Err(Error::DataInvalid {
-            message: "vindex vector extraction found null _ROW_ID".to_string(),
+            message:
+                "vindex vector extraction requires Arrow List<Float32> or FixedSizeList<Float32>"
+                    .into(),
             source: None,
         });
     }
-    for row_id in row_ids.values() {
-        validate_row_id(*row_id)?;
+    if let Some(fixed) = fixed {
+        if fixed.value_length() as usize != dimension {
+            return Err(Error::DataInvalid {
+                message: format!(
+                    "vindex vector dimension mismatch: expected {dimension}, got {}",
+                    fixed.value_length()
+                ),
+                source: None,
+            });
+        }
     }
-
-    let byte_start = checked_vector_bytes(start, 1)?;
-    let byte_end = checked_vector_bytes(end, 1)?;
+    let child = list
+        .map(|list| list.values())
+        .or_else(|| fixed.map(|list| list.values()))
+        .unwrap();
+    if !child.as_any().is::<Float32Array>() {
+        return Err(Error::DataInvalid {
+            message: "vindex vector extraction requires Float32 vector elements".into(),
+            source: None,
+        });
+    }
+    let count = source_rows - column.null_count();
+    checked_vector_bytes(count, dimension)?;
+    let mut values = Vec::with_capacity(count * dimension);
+    let mut ids = Vec::with_capacity(count);
+    for row in 0..source_rows {
+        if column.is_null(row) {
+            continue;
+        }
+        let vector = match list {
+            Some(list) => list.value(row),
+            None => fixed.unwrap().value(row),
+        };
+        if vector.len() != dimension {
+            return Err(Error::DataInvalid {
+                message: format!(
+                    "vindex vector dimension mismatch: expected {dimension}, got {}",
+                    vector.len()
+                ),
+                source: None,
+            });
+        }
+        let vector = vector.as_any().downcast_ref::<Float32Array>().unwrap();
+        if vector.null_count() != 0 {
+            return Err(Error::DataInvalid {
+                message: "vindex vector extraction found null vector element".into(),
+                source: None,
+            });
+        }
+        values.extend_from_slice(vector.values());
+        ids.push(row_ids.value(row));
+    }
     Ok(ValidatedVectorBatch {
-        values: &values.values()[start..end],
-        bytes: &values.values().inner().as_slice()[byte_start..byte_end],
-        row_ids: row_ids.values(),
-        row_count: batch.num_rows(),
+        values: values.into(),
+        row_ids: ids.into(),
+        vector_count: count,
+        source_rows,
     })
+}
+
+pub(super) fn local_ids(row_ids: &[i64], start: i64, row_count: usize) -> Result<Vec<i64>> {
+    let end = start
+        .checked_add(i64::try_from(row_count).map_err(|e| Error::DataInvalid {
+            message: "vindex row count does not fit i64".to_string(),
+            source: Some(Box::new(e)),
+        })?)
+        .ok_or_else(|| Error::DataInvalid {
+            message: "vindex row range overflows i64".to_string(),
+            source: None,
+        })?;
+    row_ids
+        .iter()
+        .map(|row_id| {
+            if *row_id < start || *row_id >= end {
+                Err(Error::DataInvalid {
+                    message: format!("vindex row id {row_id} is outside shard [{start}, {end})"),
+                    source: None,
+                })
+            } else {
+                Ok(*row_id - start)
+            }
+        })
+        .collect()
 }

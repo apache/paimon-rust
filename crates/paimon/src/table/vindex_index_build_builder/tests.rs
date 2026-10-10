@@ -222,7 +222,7 @@ fn extract_vectors_from_batches(
     let mut vectors = Vec::new();
     for batch in batches {
         vectors.extend_from_slice(
-            validate_vector_batch(batch, index_column, dimension, &mut expected_row_id)?.values,
+            &validate_vector_batch(batch, index_column, dimension, &mut expected_row_id)?.values,
         );
     }
     if expected_row_id - row_range_start != expected_row_count {
@@ -1261,3 +1261,6 @@ fn vindex_plan_incremental_prefix_leaves_suffix() {
         );
     }
 }
+
+#[path = "sparse_tests.rs"]
+mod sparse_tests;

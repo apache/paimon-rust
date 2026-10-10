@@ -92,15 +92,27 @@ impl<'a> VindexIndexBuildBuilder<'a> {
         let core_options = CoreOptions::new(&merged_options);
         validate_table_options(self.table, &core_options)?;
         let rows_per_shard = core_options.global_index_row_count_per_shard()?;
+        if let Some(value) = merged_options.get("global-index.build.parallelism") {
+            let parallelism = value
+                .trim()
+                .parse::<usize>()
+                .map_err(|_| Error::ConfigInvalid {
+                    message: "Option 'global-index.build.parallelism' must be greater than 0."
+                        .into(),
+                })?;
+            if parallelism == 0 {
+                return Err(Error::ConfigInvalid {
+                    message: "Option 'global-index.build.parallelism' must be greater than 0."
+                        .into(),
+                });
+            }
+        }
 
         let index_field = find_index_field(self.table, index_column)?;
         validate_vector_field(index_field)?;
-        // The builder consumes shard sizing; it is not a native writer option.
-        let mut writer_options = self.options.clone();
-        writer_options.remove("global-index.row-count-per-shard");
         let vindex_options = VindexVectorIndexOptions::new(
             self.table.schema().options(),
-            &writer_options,
+            &self.options,
             &self.index_type,
             index_field,
         )?;
@@ -194,6 +206,7 @@ impl<'a> VindexIndexBuildBuilder<'a> {
                     return Err(error);
                 }
             };
+            let Some(built) = built else { continue };
             let mut message = CommitMessage::new(shard.partition_bytes.clone(), 0, vec![]);
             message.new_index_files = vec![built.meta];
             messages.push(message);
