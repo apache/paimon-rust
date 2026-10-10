@@ -4708,6 +4708,95 @@ pub(in crate::table) mod tests {
         assert_eq!(collect_i32(&changelog_batches, 3), vec![10, 20]);
     }
 
+    #[cfg(feature = "storage-oss")]
+    #[tokio::test]
+    async fn test_input_changelog_manifests_use_the_io_cache_target() {
+        use crate::io::oss_test_server::TestOss;
+        use crate::table::IncrementalScanMode;
+        use futures::TryStreamExt;
+
+        let origin = TestOss::start().await;
+        let cache = TestOss::start_sharing(&origin).await;
+        let file_io = FileIOBuilder::new("oss")
+            .with_props([
+                ("fs.oss.endpoint", cache.endpoint()),
+                ("fs.oss.accessKeyId", "ak"),
+                ("fs.oss.accessKeySecret", "sk"),
+                ("fs.oss.path-style-access", "true"),
+                ("io-cache.enabled", "true"),
+                ("io-cache.endpoint", cache.endpoint()),
+                ("io-cache.target.default.path-style-access", "true"),
+                ("io-cache.origin.endpoint", origin.endpoint()),
+                ("io-cache.policy", "meta,read,write"),
+            ])
+            .build()
+            .unwrap();
+        let table = Table::new(
+            file_io,
+            Identifier::new("db", "input_changelog"),
+            "oss://bkt/db.db/input_changelog".to_string(),
+            pk_changelog_schema(&[
+                ("changelog-producer", "input"),
+                ("manifest.sidecar.enabled", "true"),
+            ]),
+            None,
+        );
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+        table_write
+            .write_arrow_batch(&make_batch(vec![1, 1], vec![10, 20]))
+            .await
+            .unwrap();
+        let messages = table_write.prepare_commit().await.unwrap();
+        TableCommit::new(table.clone(), "test-user".to_string())
+            .commit(messages)
+            .await
+            .unwrap();
+
+        let read_builder = table.new_read_builder();
+        let plan = read_builder
+            .new_incremental_scan(IncrementalScanMode::Changelog, 0, 1)
+            .plan()
+            .await
+            .unwrap();
+        let batches: Vec<RecordBatch> = read_builder
+            .new_read()
+            .unwrap()
+            .to_incremental_arrow(&plan)
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
+
+        // TableCommit names them manifest-{uuid}-changelog-{count}, plus .avro.sidecar.
+        let changelog_manifests = |requests: Vec<String>| {
+            requests
+                .into_iter()
+                .filter(|r| r.contains("/manifest/manifest-") && r.contains("-changelog-"))
+                .map(|r| {
+                    let (method, key) = r.split_once(' ').unwrap();
+                    let suffix = key.rsplit_once("-changelog-").unwrap().1;
+                    format!("{method} -changelog-{suffix}")
+                })
+                .collect::<Vec<_>>()
+        };
+        let cache_requests = changelog_manifests(cache.take_requests());
+        for request in [
+            "PUT -changelog-0",
+            "PUT -changelog-0.avro.sidecar",
+            "GET -changelog-0",
+        ] {
+            assert!(
+                cache_requests.iter().any(|r| r == request),
+                "{request} not in {cache_requests:?}"
+            );
+        }
+        assert_eq!(
+            changelog_manifests(origin.take_requests()),
+            Vec::<String>::new()
+        );
+    }
+
     #[tokio::test]
     async fn test_input_changelog_metadata_counts_retract_rows() {
         let file_io = test_file_io();

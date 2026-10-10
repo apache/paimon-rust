@@ -23,13 +23,9 @@ use opendal_layer_retry::RetryLayer;
 use opendal_service_oss::OssConfig;
 use url::Url;
 
+use super::cache_routing::{IoCacheRouting, OpClasses, OSS_ENDPOINT};
 use crate::error::Error;
 use crate::Result;
-
-/// Configuration key for OSS endpoint.
-///
-/// Compatible with paimon-java's `fs.oss.endpoint`.
-pub(crate) const OSS_ENDPOINT: &str = "fs.oss.endpoint";
 
 /// Configuration key for OSS access key ID.
 ///
@@ -53,6 +49,9 @@ pub(crate) const OSS_RETRY_COUNT: &str = "fs.oss.retry.count";
 /// Initial exponential retry interval in milliseconds.
 pub(crate) const OSS_RETRY_INTERVAL_MILLIS: &str = "fs.oss.retry.interval.millisecond";
 
+/// Use path-style (`endpoint/bucket/key`) instead of virtual-host (`bucket.endpoint/key`) URLs.
+pub(crate) const OSS_PATH_STYLE_ACCESS: &str = "fs.oss.path-style-access";
+
 const DEFAULT_OSS_RETRY_COUNT: usize = 10;
 const DEFAULT_OSS_RETRY_INTERVAL_MILLIS: u64 = 500;
 
@@ -62,6 +61,58 @@ pub struct OssStorageConfig {
     retry_count: usize,
     retry_interval: Duration,
     user_agent: String,
+    cache: Option<OssCacheConfig>,
+}
+
+#[derive(Debug)]
+struct OssCacheConfig {
+    routing: IoCacheRouting,
+}
+
+/// Endpoint an OSS operator talks to.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum OssRoute {
+    /// Origin, or the only endpoint when io-cache routing is off.
+    Origin,
+    /// The io-cache target at this index, for reads and file status.
+    Target(usize),
+}
+
+/// The io-cache target that some request on a path may use.
+pub(crate) struct OssTargetRoute {
+    pub(crate) route: OssRoute,
+    pub(crate) classes: OpClasses,
+}
+
+impl OssStorageConfig {
+    /// The io-cache target of `path`, when some request on it may leave origin.
+    pub(crate) fn target_route(&self, path: &str) -> Option<OssTargetRoute> {
+        let cache = self.cache.as_ref()?;
+        let (index, classes) = cache.routing.cache_target(path)?;
+        Some(OssTargetRoute {
+            route: OssRoute::Target(index),
+            classes,
+        })
+    }
+
+    /// Service config of the operators on `route`.
+    fn service_for(&self, route: OssRoute) -> Result<OssConfig> {
+        let OssRoute::Target(index) = route else {
+            return Ok(self.service.clone());
+        };
+        let target = self
+            .cache
+            .as_ref()
+            .and_then(|cache| cache.routing.targets().get(index))
+            .filter(|target| target.endpoint.is_some())
+            .ok_or_else(|| Error::ConfigInvalid {
+                message: format!("io-cache target {index} has no endpoint"),
+            })?;
+        let mut service = self.service.clone();
+        service.endpoint = target.endpoint.clone();
+        service.addressing_style = target.path_style_access.then(|| "path".to_string());
+        Ok(service)
+    }
 }
 
 /// Parse paimon catalog options into an [`OssStorageConfig`].
@@ -74,13 +125,22 @@ pub(crate) fn oss_config_parse(mut props: HashMap<String, String>) -> Result<Oss
     let mut cfg = OssConfig::default();
     let user_agent = super::user_agent::oss_user_agent(&props);
 
+    let routing = IoCacheRouting::from_props(&props);
+    // Origin when io-cache routing is on, else `dlf.oss-endpoint` or `fs.oss.endpoint`.
     cfg.endpoint = Some(
-        props
-            .remove(OSS_ENDPOINT)
+        routing
+            .origin()
             .ok_or_else(|| Error::ConfigInvalid {
                 message: format!("Missing required OSS config: {OSS_ENDPOINT}"),
-            })?,
+            })?
+            .to_string(),
     );
+    if props
+        .remove(OSS_PATH_STYLE_ACCESS)
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("true"))
+    {
+        cfg.addressing_style = Some("path".to_string());
+    }
     cfg.access_key_id =
         Some(
             props
@@ -105,11 +165,20 @@ pub(crate) fn oss_config_parse(mut props: HashMap<String, String>) -> Result<Oss
         OSS_RETRY_INTERVAL_MILLIS,
         DEFAULT_OSS_RETRY_INTERVAL_MILLIS,
     )?;
+    let cache = routing.enabled().then(|| {
+        log::info!(
+            "io-cache routing enabled, targets {:?}, origin endpoint {}",
+            routing.targets(),
+            cfg.endpoint.as_deref().unwrap_or_default()
+        );
+        OssCacheConfig { routing }
+    });
     Ok(OssStorageConfig {
         service: cfg,
         retry_count,
         retry_interval: Duration::from_millis(retry_interval_millis),
         user_agent,
+        cache,
     })
 }
 
@@ -125,11 +194,15 @@ where
     }
 }
 
-/// Build an [`Operator`] for the given OSS path.
+/// Build an [`Operator`] for the given OSS path on the endpoint of `route`.
 ///
 /// Parses the bucket name from the `oss://bucket/key` URL and combines it
 /// with the provided [`OssStorageConfig`] to construct an OpenDAL operator.
-pub(crate) fn oss_config_build(cfg: &OssStorageConfig, path: &str) -> Result<Operator> {
+pub(crate) fn oss_config_build(
+    cfg: &OssStorageConfig,
+    path: &str,
+    route: OssRoute,
+) -> Result<Operator> {
     let url = Url::parse(path).map_err(|_| Error::ConfigInvalid {
         message: format!("Invalid OSS url: {path}"),
     })?;
@@ -138,7 +211,7 @@ pub(crate) fn oss_config_build(cfg: &OssStorageConfig, path: &str) -> Result<Ope
         message: format!("Invalid OSS url: {path}, missing bucket"),
     })?;
 
-    let builder = cfg.service.clone().into_builder().bucket(bucket);
+    let builder = cfg.service_for(route)?.into_builder().bucket(bucket);
     let retry = RetryLayer::default()
         .with_min_delay(cfg.retry_interval)
         .with_max_times(cfg.retry_count)
@@ -165,6 +238,7 @@ mod tests {
             retry_count: DEFAULT_OSS_RETRY_COUNT,
             retry_interval: Duration::from_millis(1),
             user_agent: crate::io::user_agent::default_user_agent(),
+            cache: None,
         }
     }
 
@@ -230,6 +304,108 @@ mod tests {
     }
 
     #[test]
+    fn test_oss_path_style_access() {
+        assert_eq!(
+            oss_config_parse(required_props())
+                .unwrap()
+                .service
+                .addressing_style,
+            None
+        );
+        for (value, expected) in [
+            ("true", Some("path")),
+            (" TRUE ", Some("path")),
+            ("false", None),
+        ] {
+            let mut props = required_props();
+            props.insert(OSS_PATH_STYLE_ACCESS.to_string(), value.to_string());
+            let cfg = oss_config_parse(props).unwrap();
+            assert_eq!(cfg.service.addressing_style.as_deref(), expected, "{value}");
+        }
+    }
+
+    fn set(props: &mut HashMap<String, String>, entries: &[(&str, &str)]) {
+        for (key, value) in entries {
+            props.insert(key.to_string(), value.to_string());
+        }
+    }
+
+    #[test]
+    fn test_oss_config_parse_io_cache_endpoints() {
+        let mut props = required_props();
+        set(
+            &mut props,
+            &[
+                ("io-cache.endpoint", "http://cache"),
+                ("io-cache.policy", "read"),
+            ],
+        );
+        // Without io-cache.enabled nothing is routed.
+        assert!(oss_config_parse(props.clone()).unwrap().cache.is_none());
+
+        set(&mut props, &[("io-cache.enabled", "true")]);
+        let cfg = oss_config_parse(props.clone()).unwrap();
+        assert_eq!(
+            cfg.service.endpoint.as_deref(),
+            Some("https://oss-cn-hangzhou.aliyuncs.com")
+        );
+        let cache = cfg.cache.as_ref().unwrap();
+        assert_eq!(
+            cache.routing.targets()[0].endpoint.as_deref(),
+            Some("http://cache")
+        );
+
+        props.insert(
+            "io-cache.origin.endpoint".to_string(),
+            "http://origin".to_string(),
+        );
+        let cfg = oss_config_parse(props.clone()).unwrap();
+        assert_eq!(cfg.service.endpoint.as_deref(), Some("http://origin"));
+        assert!(cfg.cache.is_some());
+
+        props.insert(
+            "dlf.oss-endpoint".to_string(),
+            "http://override".to_string(),
+        );
+        let cfg = oss_config_parse(props).unwrap();
+        assert_eq!(cfg.service.endpoint.as_deref(), Some("http://override"));
+        assert!(cfg.cache.is_none());
+    }
+
+    #[test]
+    fn test_oss_target_service_settings() {
+        let mut props = required_props();
+        set(
+            &mut props,
+            &[
+                (OSS_PATH_STYLE_ACCESS, "true"),
+                ("io-cache.enabled", "true"),
+                ("io-cache.policy", "meta,read"),
+                ("io-cache.targets", "accel,cluster,off"),
+                ("io-cache.target.accel.endpoint", "https://accel"),
+                ("io-cache.target.accel.region", "cn-hangzhou"),
+                ("io-cache.target.cluster.endpoint", "http://10.0.0.1:8080"),
+                ("io-cache.target.cluster.path-style-access", "TRUE"),
+                ("io-cache.target.off.endpoint", ""),
+            ],
+        );
+        let cfg = oss_config_parse(props).unwrap();
+        assert_eq!(cfg.cache.as_ref().unwrap().routing.targets().len(), 3);
+
+        let origin = cfg.service_for(OssRoute::Origin).unwrap();
+        assert_eq!(origin.addressing_style.as_deref(), Some("path"));
+        let accel = cfg.service_for(OssRoute::Target(0)).unwrap();
+        assert_eq!(accel.endpoint.as_deref(), Some("https://accel"));
+        assert_eq!(accel.addressing_style, None);
+        assert_eq!(accel.access_key_id.as_deref(), Some("test-ak"));
+        let cluster = cfg.service_for(OssRoute::Target(1)).unwrap();
+        assert_eq!(cluster.endpoint.as_deref(), Some("http://10.0.0.1:8080"));
+        assert_eq!(cluster.addressing_style.as_deref(), Some("path"));
+        assert!(cfg.service_for(OssRoute::Target(2)).is_err());
+        assert!(cfg.service_for(OssRoute::Target(3)).is_err());
+    }
+
+    #[test]
     fn test_oss_retry_defaults_and_validation() {
         let cfg = oss_config_parse(required_props()).unwrap();
         assert_eq!(cfg.retry_count, DEFAULT_OSS_RETRY_COUNT);
@@ -248,21 +424,26 @@ mod tests {
         let mut cfg = OssConfig::default();
         cfg.endpoint = Some("https://oss-cn-hangzhou.aliyuncs.com".to_string());
 
-        let op = oss_config_build(&storage_config(cfg), "oss://my-bucket/some/path").unwrap();
+        let op = oss_config_build(
+            &storage_config(cfg),
+            "oss://my-bucket/some/path",
+            OssRoute::Origin,
+        )
+        .unwrap();
         assert_eq!(op.info().name(), "my-bucket");
     }
 
     #[test]
     fn test_oss_config_build_invalid_url() {
         let cfg = storage_config(OssConfig::default());
-        let result = oss_config_build(&cfg, "not-a-valid-url");
+        let result = oss_config_build(&cfg, "not-a-valid-url", OssRoute::Origin);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_oss_config_build_missing_bucket() {
         let cfg = storage_config(OssConfig::default());
-        let result = oss_config_build(&cfg, "oss:///path/without/bucket");
+        let result = oss_config_build(&cfg, "oss:///path/without/bucket", OssRoute::Origin);
         assert!(result.is_err());
     }
 
@@ -281,7 +462,8 @@ mod tests {
         cfg.addressing_style = Some("path".to_string());
         cfg.skip_signature = true;
 
-        let op = oss_config_build(&storage_config(cfg), "oss://bucket/path").unwrap();
+        let op =
+            oss_config_build(&storage_config(cfg), "oss://bucket/path", OssRoute::Origin).unwrap();
         assert_eq!(op.read("object").await.unwrap().to_bytes(), "ok");
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
     }
@@ -304,7 +486,7 @@ mod tests {
         cfg.service.addressing_style = Some("path".to_string());
         cfg.service.skip_signature = true;
 
-        let op = oss_config_build(&cfg, "oss://bucket/path").unwrap();
+        let op = oss_config_build(&cfg, "oss://bucket/path", OssRoute::Origin).unwrap();
         assert!(op.read("object").await.is_err());
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
     }
@@ -337,7 +519,7 @@ mod tests {
         cfg.service.addressing_style = Some("path".to_string());
         cfg.service.skip_signature = true;
 
-        let op = oss_config_build(&cfg, "oss://bucket/path").unwrap();
+        let op = oss_config_build(&cfg, "oss://bucket/path", OssRoute::Origin).unwrap();
         assert!(!op.exists("object").await.unwrap());
         assert_eq!(
             *user_agents.lock().unwrap(),
