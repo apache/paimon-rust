@@ -413,6 +413,240 @@ async fn test_rename_branch_rejects_unopenable_source_and_target() {
 }
 
 #[tokio::test]
+async fn test_delete_branch() {
+    let (_tmp, catalog) = create_test_env();
+    let sql_context = create_sql_context(catalog.clone()).await;
+    exec(&sql_context, "CREATE SCHEMA paimon.test_db").await;
+    exec(
+        &sql_context,
+        "CREATE TABLE paimon.test_db.t1 (id INT, name VARCHAR(100), PRIMARY KEY (id))",
+    )
+    .await;
+    exec(
+        &sql_context,
+        "INSERT INTO paimon.test_db.t1 VALUES (1, 'alice')",
+    )
+    .await;
+
+    // Seed a branch through the core manager (create_branch is a separate PR).
+    let table = catalog
+        .get_table(&Identifier::new("test_db", "t1"))
+        .await
+        .unwrap();
+    let bm = BranchManager::new(table.file_io().clone(), table.location().to_string());
+    bm.create_branch("b1").await.unwrap();
+    assert!(bm.branch_exists("b1").await.unwrap(), "seed branch exists");
+
+    exec(
+        &sql_context,
+        "CALL sys.delete_branch(table => 'test_db.t1', branch => 'b1')",
+    )
+    .await;
+
+    assert!(
+        !bm.branch_exists("b1").await.unwrap(),
+        "delete_branch should remove the branch"
+    );
+    let count = row_count(
+        &sql_context,
+        "SELECT * FROM paimon.test_db.`t1$branches` WHERE branch_name = 'b1'",
+    )
+    .await;
+    assert_eq!(count, 0);
+
+    // Deleting a branch that no longer exists is a no-op, not an error.
+    exec(
+        &sql_context,
+        "CALL sys.delete_branch(table => 'test_db.t1', branch => 'b1')",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_delete_branch_preserves_leading_space_identity() {
+    // A branch name keeps its leading/trailing spaces: the shared validator
+    // permits `" b1"` (only all-whitespace is rejected) and the reader treats it
+    // as distinct from `"b1"`. Java `Table.deleteBranches` passes each comma
+    // token through unchanged, so `delete_branch(branch => ' b1')` must drop
+    // `" b1"` and leave `"b1"` intact — trimming the token would delete the
+    // wrong branch.
+    let (_tmp, catalog) = create_test_env();
+    let sql_context = create_sql_context(catalog.clone()).await;
+    exec(&sql_context, "CREATE SCHEMA paimon.test_db").await;
+    exec(
+        &sql_context,
+        "CREATE TABLE paimon.test_db.t1 (id INT, name VARCHAR(100), PRIMARY KEY (id))",
+    )
+    .await;
+    exec(
+        &sql_context,
+        "INSERT INTO paimon.test_db.t1 VALUES (1, 'alice')",
+    )
+    .await;
+
+    let table = catalog
+        .get_table(&Identifier::new("test_db", "t1"))
+        .await
+        .unwrap();
+    let bm = BranchManager::new(table.file_io().clone(), table.location().to_string());
+    bm.create_branch("b1").await.unwrap();
+    bm.create_branch(" b1").await.unwrap();
+
+    exec(
+        &sql_context,
+        "CALL sys.delete_branch(table => 'test_db.t1', branch => ' b1')",
+    )
+    .await;
+
+    assert!(
+        !bm.branch_exists(" b1").await.unwrap(),
+        "the leading-space branch is the one requested and must be deleted"
+    );
+    assert!(
+        bm.branch_exists("b1").await.unwrap(),
+        "the un-spaced branch must survive — trimming the token would delete it"
+    );
+}
+
+#[tokio::test]
+async fn test_delete_branch_preserves_scan_configured_branch() {
+    // A branch named by `scan.primary-branch` / `scan.fallback-branch` is on a
+    // reader's path, so `delete_branch` must refuse it (mirrors Java
+    // `AbstractFileStoreTable.deleteBranch`) while still allowing unrelated
+    // branches to be dropped.
+    for (table_name, option_key) in [
+        ("tp", "scan.primary-branch"),
+        ("tf", "scan.fallback-branch"),
+    ] {
+        let (_tmp, catalog) = create_test_env();
+        let sql_context = create_sql_context(catalog.clone()).await;
+        exec(&sql_context, "CREATE SCHEMA paimon.test_db").await;
+        exec(
+            &sql_context,
+            &format!(
+                "CREATE TABLE paimon.test_db.{table_name} (id INT, name VARCHAR(100), PRIMARY KEY (id)) WITH ('{option_key}' = 'prod')"
+            ),
+        )
+        .await;
+        exec(
+            &sql_context,
+            &format!("INSERT INTO paimon.test_db.{table_name} VALUES (1, 'alice')"),
+        )
+        .await;
+
+        let table = catalog
+            .get_table(&Identifier::new("test_db", table_name))
+            .await
+            .unwrap();
+        let bm = BranchManager::new(table.file_io().clone(), table.location().to_string());
+        bm.create_branch("prod").await.unwrap();
+        bm.create_branch("tmp").await.unwrap();
+
+        // The configured branch cannot be deleted, and the error names the option.
+        assert_sql_error(
+            &sql_context,
+            &format!("CALL sys.delete_branch(table => 'test_db.{table_name}', branch => 'prod')"),
+            option_key,
+        )
+        .await;
+        assert!(
+            bm.branch_exists("prod").await.unwrap(),
+            "{option_key}: protected branch must remain"
+        );
+
+        // An unrelated branch is still deletable, so the guard is not over-broad.
+        exec(
+            &sql_context,
+            &format!("CALL sys.delete_branch(table => 'test_db.{table_name}', branch => 'tmp')"),
+        )
+        .await;
+        assert!(
+            !bm.branch_exists("tmp").await.unwrap(),
+            "{option_key}: unrelated branch should be deletable"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_delete_branch_batch_stops_at_protected_branch() {
+    // A comma-separated request must still catch a protected branch even when
+    // it is not listed first. Matches Java `Table.deleteBranches`, which loops
+    // `deleteBranch` per name; the protected branch is never dropped.
+    let (_tmp, catalog) = create_test_env();
+    let sql_context = create_sql_context(catalog.clone()).await;
+    exec(&sql_context, "CREATE SCHEMA paimon.test_db").await;
+    exec(
+        &sql_context,
+        "CREATE TABLE paimon.test_db.t1 (id INT, name VARCHAR(100), PRIMARY KEY (id)) WITH ('scan.primary-branch' = 'prod')",
+    )
+    .await;
+    exec(
+        &sql_context,
+        "INSERT INTO paimon.test_db.t1 VALUES (1, 'alice')",
+    )
+    .await;
+
+    let table = catalog
+        .get_table(&Identifier::new("test_db", "t1"))
+        .await
+        .unwrap();
+    let bm = BranchManager::new(table.file_io().clone(), table.location().to_string());
+    bm.create_branch("prod").await.unwrap();
+    bm.create_branch("keep").await.unwrap();
+
+    // 'prod' is protected and appears second; the call must fail and leave it.
+    assert_sql_error(
+        &sql_context,
+        "CALL sys.delete_branch(table => 'test_db.t1', branch => 'keep,prod')",
+        "scan.primary-branch",
+    )
+    .await;
+    assert!(
+        bm.branch_exists("prod").await.unwrap(),
+        "protected branch must survive the batch"
+    );
+}
+
+#[tokio::test]
+async fn test_delete_branch_rejects_path_separated_name() {
+    // A separator-bearing name slips past the configured-branch guard (it is not
+    // literally `prod`), so without name validation `branch_exists` finds the real
+    // `branch-prod/schema` directory and `drop_branch` deletes it, destroying the
+    // protected branch's schema. The name must be rejected before any deletion.
+    let (_tmp, catalog) = create_test_env();
+    let sql_context = create_sql_context(catalog.clone()).await;
+    exec(&sql_context, "CREATE SCHEMA paimon.test_db").await;
+    exec(
+        &sql_context,
+        "CREATE TABLE paimon.test_db.t1 (id INT, name VARCHAR(100), PRIMARY KEY (id)) WITH ('scan.primary-branch' = 'prod')",
+    )
+    .await;
+    exec(
+        &sql_context,
+        "INSERT INTO paimon.test_db.t1 VALUES (1, 'alice')",
+    )
+    .await;
+
+    let table = catalog
+        .get_table(&Identifier::new("test_db", "t1"))
+        .await
+        .unwrap();
+    let bm = BranchManager::new(table.file_io().clone(), table.location().to_string());
+    bm.create_branch("prod").await.unwrap();
+
+    assert_sql_error(
+        &sql_context,
+        "CALL sys.delete_branch(table => 'test_db.t1', branch => 'prod/schema')",
+        "path separator",
+    )
+    .await;
+
+    // The protected branch and its schema survive and stay openable.
+    assert!(bm.branch_exists("prod").await.unwrap(), "prod must remain");
+    table.copy_with_branch("prod").await.unwrap();
+}
+
+#[tokio::test]
 async fn test_create_lumina_index_requires_index_column() {
     let (_tmp, sql_context) = setup_table_with_snapshots().await;
 
