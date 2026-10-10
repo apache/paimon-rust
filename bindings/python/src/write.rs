@@ -1459,6 +1459,15 @@ pub struct PyCommitMessage {
     origin: Option<MessageOrigin>,
 }
 
+impl PyCommitMessage {
+    pub(crate) fn new(inner: CommitMessage) -> Self {
+        Self {
+            inner,
+            origin: None,
+        }
+    }
+}
+
 #[pymethods]
 impl PyCommitMessage {
     /// Export the Java `CommitMessageSerializer` v14 body (no version header).

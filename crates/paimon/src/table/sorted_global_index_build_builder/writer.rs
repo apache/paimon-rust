@@ -85,19 +85,24 @@ impl SortedGlobalIndexBuildBuilder<'_> {
             sort_index_rows(&mut rows, &cmp)?;
         }
 
-        self.table
-            .file_io()
-            .mkdirs(&format!(
-                "{}/{INDEX_DIR}/",
-                self.table.location().trim_end_matches('/')
-            ))
-            .await?;
         let file_name = format!("{index_type}-global-index-{}.index", uuid::Uuid::new_v4());
-        let index_path = format!(
-            "{}/{INDEX_DIR}/{}",
-            self.table.location().trim_end_matches('/'),
-            file_name
-        );
+        // Global index placement is a table property, as in Java GlobalIndexFileFactory.
+        let external_path = super::super::external_path::new_index_external_path(
+            self.table.schema().options(),
+            false,
+            "",
+            &file_name,
+        )?;
+        let index_path = external_path.clone().unwrap_or_else(|| {
+            format!(
+                "{}/{INDEX_DIR}/{}",
+                self.table.location().trim_end_matches('/'),
+                file_name,
+            )
+        });
+        if let Some((directory, _)) = index_path.rsplit_once('/') {
+            self.table.file_io().mkdirs(directory).await?;
+        }
         let write_result: Result<(u64, Vec<u8>, i64)> = async {
             let output = self.table.file_io().new_output(&index_path)?;
             let writer = output.writer().await?;
@@ -251,7 +256,7 @@ impl SortedGlobalIndexBuildBuilder<'_> {
             file_size,
             row_count,
             deletion_vectors_ranges: None,
-            external_path: None,
+            external_path,
             global_index_meta: Some(GlobalIndexMeta {
                 row_range_start: shard.row_range_start,
                 row_range_end: shard.row_range_end,
@@ -263,7 +268,9 @@ impl SortedGlobalIndexBuildBuilder<'_> {
                         .map(|field| field.id())
                         .collect()
                 }),
-                source_meta: None,
+                source_meta: Some(
+                    crate::spec::DataEvolutionIndexSourceMeta::new(shard.snapshot_id)?.serialize(),
+                ),
                 index_meta: Some(index_meta),
             }),
         })

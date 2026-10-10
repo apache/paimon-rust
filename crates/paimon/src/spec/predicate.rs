@@ -432,6 +432,28 @@ impl Predicate {
             Predicate::Not(inner) => *inner,
             Predicate::AlwaysTrue => Predicate::AlwaysFalse,
             Predicate::AlwaysFalse => Predicate::AlwaysTrue,
+            Predicate::Leaf {
+                column,
+                index,
+                data_type,
+                op,
+                literals,
+            } if literals.is_empty()
+                && matches!(op, PredicateOperator::In | PredicateOperator::NotIn) =>
+            {
+                // Java negates the leaf function, retaining its NULL exclusion.
+                Predicate::Leaf {
+                    column,
+                    index,
+                    data_type,
+                    op: if op == PredicateOperator::In {
+                        PredicateOperator::NotIn
+                    } else {
+                        PredicateOperator::In
+                    },
+                    literals,
+                }
+            }
             other => Predicate::Not(Box::new(other)),
         }
     }
@@ -923,26 +945,8 @@ fn parse_rest_leaf(
         "GREATER_OR_EQUAL" => binary(one_literal()?, &|l| builder.greater_or_equal(field, l)),
         "LESS_THAN" => binary(one_literal()?, &|l| builder.less_than(field, l)),
         "LESS_OR_EQUAL" => binary(one_literal()?, &|l| builder.less_or_equal(field, l)),
-        "IN" => {
-            // Java In: null literals never match; an empty/all-null list matches nothing.
-            let datums: Vec<Datum> = literals.iter().flatten().cloned().collect();
-            if datums.is_empty() {
-                Ok(Predicate::AlwaysFalse)
-            } else {
-                builder.is_in(field, datums)
-            }
-        }
-        "NOT_IN" => {
-            // Java NotIn: any null literal fails every row; an empty list keeps
-            // exactly the non-null rows.
-            if literals.iter().any(Option::is_none) {
-                Ok(Predicate::AlwaysFalse)
-            } else if literals.is_empty() {
-                builder.is_not_null(field)
-            } else {
-                builder.is_not_in(field, literals.iter().flatten().cloned().collect())
-            }
-        }
+        "IN" => builder.is_in_with_nulls(field, literals),
+        "NOT_IN" => builder.is_not_in_with_nulls(field, literals),
         "STARTS_WITH" => binary(one_literal()?, &|l| builder.starts_with(field, l)),
         "ENDS_WITH" => binary(one_literal()?, &|l| builder.ends_with(field, l)),
         "CONTAINS" => binary(one_literal()?, &|l| builder.contains(field, l)),
@@ -1405,17 +1409,29 @@ impl PredicateBuilder {
     // -- set operators --
 
     pub fn is_in(&self, field: &str, literals: Vec<Datum>) -> Result<Predicate> {
-        if literals.is_empty() {
-            return Ok(Predicate::AlwaysFalse);
-        }
         self.leaf(field, PredicateOperator::In, literals)
     }
 
     pub fn is_not_in(&self, field: &str, literals: Vec<Datum>) -> Result<Predicate> {
-        if literals.is_empty() {
-            return Ok(Predicate::AlwaysTrue);
-        }
         self.leaf(field, PredicateOperator::NotIn, literals)
+    }
+
+    /// Java IN ignores NULL literals; an empty/all-NULL list matches nothing.
+    pub fn is_in_with_nulls(&self, field: &str, literals: Vec<Option<Datum>>) -> Result<Predicate> {
+        self.is_in(field, literals.into_iter().flatten().collect())
+    }
+
+    /// Java NOT IN fails every row if any literal is NULL.
+    pub fn is_not_in_with_nulls(
+        &self,
+        field: &str,
+        literals: Vec<Option<Datum>>,
+    ) -> Result<Predicate> {
+        if literals.iter().any(Option::is_none) {
+            self.resolve_field(field)?;
+            return Ok(Predicate::AlwaysFalse);
+        }
+        self.is_not_in(field, literals.into_iter().flatten().collect())
     }
 
     // -- string operators --
@@ -1643,14 +1659,8 @@ impl PredicateBuilder {
                 });
             }
             PredicateOperator::In | PredicateOperator::NotIn => {
-                if !literals.is_empty() {
-                    return Ok(());
-                }
-                // Empty IN is handled at is_in()/is_not_in() level; this guards
-                // against direct leaf() misuse.
-                return Err(Error::ConfigInvalid {
-                    message: format!("{op} expects at least 1 literal, got 0"),
-                });
+                // Java retains empty set leaves so negation preserves NULL semantics.
+                return Ok(());
             }
             PredicateOperator::ArraysOverlap | PredicateOperator::ArrayContainsAll => return Ok(()),
             PredicateOperator::Between | PredicateOperator::NotBetween => (2, literals.len()),
@@ -2566,15 +2576,50 @@ mod tests {
     // ======================== Empty IN / NOT IN handling ========================
 
     #[test]
-    fn test_in_empty_returns_always_false() {
+    fn test_empty_set_negation_preserves_java_null_semantics() {
         let pb = PredicateBuilder::new(&test_fields());
-        assert_eq!(pb.is_in("id", vec![]).unwrap(), Predicate::AlwaysFalse);
+        assert_eq!(
+            Predicate::negate(pb.is_in("id", vec![]).unwrap()),
+            pb.is_not_in("id", vec![]).unwrap()
+        );
+        assert_eq!(
+            Predicate::negate(pb.is_not_in("id", vec![]).unwrap()),
+            pb.is_in("id", vec![]).unwrap()
+        );
     }
 
     #[test]
-    fn test_not_in_empty_returns_always_true() {
-        let pb = PredicateBuilder::new(&test_fields());
-        assert_eq!(pb.is_not_in("id", vec![]).unwrap(), Predicate::AlwaysTrue);
+    fn nullable_set_literals_follow_java() {
+        let fields = vec![DataField::new(
+            0,
+            "id".into(),
+            DataType::Int(crate::spec::IntType::new()),
+        )];
+        let pb = PredicateBuilder::new(&fields);
+        let predicates = [
+            pb.is_in_with_nulls("id", vec![]).unwrap(),
+            pb.is_not_in_with_nulls("id", vec![]).unwrap(),
+            pb.is_in_with_nulls("id", vec![None, Some(Datum::Int(1))])
+                .unwrap(),
+            pb.is_not_in_with_nulls("id", vec![None, Some(Datum::Int(1))])
+                .unwrap(),
+        ];
+        for (value, expected) in [
+            (None, [false, false, false, false]),
+            (Some(1), [false, true, true, false]),
+            (Some(2), [false, true, false, false]),
+        ] {
+            let mut row = TestBinaryRowBuilder::new(1);
+            if let Some(value) = value {
+                row.write_int(0, value);
+            } else {
+                row.set_null_at(0);
+            }
+            let row = row.build();
+            for (predicate, expected) in predicates.iter().zip(expected) {
+                assert_eq!(eval_row(predicate, &row).unwrap(), expected);
+            }
+        }
     }
 
     // ======================== Constant absorption ========================
@@ -3825,9 +3870,6 @@ mod tests {
             ("NOT_BETWEEN", "[1,null]"),
             // NOT_IN with any null literal fails every row.
             ("NOT_IN", "[1,null]"),
-            // IN with only null literals matches nothing.
-            ("IN", "[null]"),
-            ("IN", "[]"),
         ] {
             let json = rest_leaf_json(function, "id", literals);
             assert!(
@@ -3837,6 +3879,20 @@ mod tests {
                 ),
                 "{function} {literals} must parse to AlwaysFalse"
             );
+        }
+
+        for literals in ["[]", "[null]"] {
+            let parsed =
+                Predicate::from_rest_json(&rest_leaf_json("IN", "id", literals), &fields).unwrap();
+            for value in [None, Some(1)] {
+                let mut row = TestBinaryRowBuilder::new(fields.len() as i32);
+                if let Some(value) = value {
+                    row.write_int(0, value);
+                } else {
+                    row.set_null_at(0);
+                }
+                assert!(!eval_row(&parsed, &row.build()).unwrap());
+            }
         }
 
         // IN drops null literals and keeps the rest.
@@ -3854,7 +3910,7 @@ mod tests {
         assert!(matches!(
             &parsed,
             Predicate::Leaf {
-                op: PredicateOperator::IsNotNull,
+                op: PredicateOperator::NotIn,
                 ..
             }
         ));

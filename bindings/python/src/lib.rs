@@ -21,6 +21,7 @@ mod blob;
 mod blob_uri_reader;
 mod context;
 mod error;
+mod index_build;
 mod merge_into;
 mod oss_cpp;
 mod predicate;

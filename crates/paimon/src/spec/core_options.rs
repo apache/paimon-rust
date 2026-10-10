@@ -36,6 +36,7 @@ const GLOBAL_INDEX_THREAD_NUM_OPTION: &str = "global-index.thread-num";
 const GLOBAL_INDEX_VINDEX_READ_THREAD_NUM_OPTION: &str = "global-index.vindex.read-thread-num";
 const GLOBAL_INDEX_COLUMN_UPDATE_ACTION_OPTION: &str = "global-index.column-update-action";
 pub(crate) const INDEX_FILE_IN_DATA_FILE_DIR_OPTION: &str = "index-file-in-data-file-dir";
+const SORTED_INDEX_RECORDS_PER_FILE_OPTION: &str = "sorted-index.records-per-file";
 const SORTED_INDEX_RECORDS_PER_RANGE_OPTION: &str = "sorted-index.records-per-range";
 const BTREE_INDEX_RECORDS_PER_RANGE_OPTION: &str = "btree-index.records-per-range";
 const BTREE_INDEX_CACHE_SIZE_OPTION: &str = "btree-index.cache-size";
@@ -163,6 +164,7 @@ const DEFAULT_DYNAMIC_BUCKET_TARGET_ROW_NUM: i64 = 2_000_000;
 pub(crate) const MAX_DYNAMIC_BUCKETS: i32 = 32768;
 const DYNAMIC_BUCKET_MAX_BUCKETS_OPTION: &str = "dynamic-bucket.max-buckets";
 const DEFAULT_GLOBAL_INDEX_ROW_COUNT_PER_SHARD: i64 = 100_000;
+const DEFAULT_SORTED_INDEX_RECORDS_PER_FILE: i64 = 25_000_000;
 const DEFAULT_GLOBAL_INDEX_THREAD_NUM: i64 = 32;
 pub(crate) const DEFAULT_GLOBAL_INDEX_VINDEX_READ_THREAD_NUM: usize = 64;
 const MAX_GLOBAL_INDEX_VINDEX_READ_THREAD_NUM: i64 = tokio::sync::Semaphore::MAX_PERMITS as i64;
@@ -1120,17 +1122,18 @@ impl<'a> CoreOptions<'a> {
     }
 
     pub fn sorted_index_records_per_range(&self) -> crate::Result<i64> {
-        let option = if self
-            .options
-            .contains_key(SORTED_INDEX_RECORDS_PER_RANGE_OPTION)
-        {
-            SORTED_INDEX_RECORDS_PER_RANGE_OPTION
-        } else {
-            BTREE_INDEX_RECORDS_PER_RANGE_OPTION
-        };
+        // Java SortedIndexOptions uses records-per-file as the primary key.
+        let option = [
+            SORTED_INDEX_RECORDS_PER_FILE_OPTION,
+            SORTED_INDEX_RECORDS_PER_RANGE_OPTION,
+            BTREE_INDEX_RECORDS_PER_RANGE_OPTION,
+        ]
+        .into_iter()
+        .find(|option| self.options.contains_key(*option))
+        .unwrap_or(SORTED_INDEX_RECORDS_PER_FILE_OPTION);
         let value = self
             .parse_i64_option(option)?
-            .unwrap_or(DEFAULT_GLOBAL_INDEX_ROW_COUNT_PER_SHARD);
+            .unwrap_or(DEFAULT_SORTED_INDEX_RECORDS_PER_FILE);
         if value <= 0 {
             return Err(crate::Error::DataInvalid {
                 message: format!("Option '{}' must be greater than 0, got: {}", option, value),
@@ -2344,7 +2347,7 @@ mod tests {
         );
         assert_eq!(
             core_options.sorted_index_records_per_range().unwrap(),
-            100_000
+            25_000_000
         );
         assert_eq!(
             core_options.btree_index_fallback_scan_max_size().unwrap(),
@@ -2631,6 +2634,7 @@ mod tests {
     #[test]
     fn test_sorted_index_records_per_range_rejects_invalid_values() {
         for option in [
+            SORTED_INDEX_RECORDS_PER_FILE_OPTION,
             SORTED_INDEX_RECORDS_PER_RANGE_OPTION,
             BTREE_INDEX_RECORDS_PER_RANGE_OPTION,
         ] {
@@ -2676,6 +2680,19 @@ mod tests {
                 .unwrap(),
             10
         );
+        let mut primary = options;
+        primary.insert(SORTED_INDEX_RECORDS_PER_FILE_OPTION.into(), "30".into());
+        assert_eq!(
+            CoreOptions::new(&primary)
+                .sorted_index_records_per_range()
+                .unwrap(),
+            30
+        );
+        // A bad primary value must fail rather than silently using an alias.
+        primary.insert(SORTED_INDEX_RECORDS_PER_FILE_OPTION.into(), "0".into());
+        assert!(CoreOptions::new(&primary)
+            .sorted_index_records_per_range()
+            .is_err());
     }
 
     #[test]

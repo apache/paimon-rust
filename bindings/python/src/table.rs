@@ -206,6 +206,12 @@ impl PyTable {
         crate::vector_search::PyBatchVectorSearchBuilder::new(Arc::clone(&self.inner))
     }
 
+    fn new_sorted_global_index_build_builder(
+        &self,
+    ) -> crate::index_build::PySortedGlobalIndexBuildBuilder {
+        crate::index_build::PySortedGlobalIndexBuildBuilder::new(Arc::clone(&self.inner))
+    }
+
     fn new_batch_write_builder(&self) -> PyBatchWriteBuilder {
         PyBatchWriteBuilder::new(Arc::clone(&self.inner))
     }

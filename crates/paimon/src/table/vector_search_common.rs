@@ -18,9 +18,7 @@
 //! Shared vector-search option validation, index I/O helpers, and result ordering.
 
 use crate::lumina::is_lumina_index_type;
-use crate::spec::{
-    field_idx_to_partition_idx, CoreOptions, DataField, Predicate, ROW_ID_FIELD_NAME,
-};
+use crate::spec::{CoreOptions, DataField, Predicate, ROW_ID_FIELD_NAME};
 use crate::table::pk_vector_position_read::{PKEY_VECTOR_POSITION_COLUMN, SEARCH_SCORE_COLUMN};
 use crate::table::read_builder::resolve_projected_fields;
 use crate::table::Table;
@@ -30,20 +28,7 @@ use arrow_array::{Int64Array, RecordBatch};
 use arrow_select::interleave::interleave_record_batch;
 use std::collections::HashMap;
 
-/// Explicit partition filters use table-field indices, like scalar filters.
-/// Reject mixed predicates rather than silently discarding their data conjuncts.
-pub(super) fn validate_partition_filter(table: &Table, filter: &Predicate) -> crate::Result<()> {
-    let mapping =
-        field_idx_to_partition_idx(table.schema().fields(), table.schema().partition_keys());
-    if table.schema().partition_keys().is_empty() || !filter.references_only_mapped_fields(&mapping)
-    {
-        return Err(crate::Error::ConfigInvalid {
-            message: "Partition filter must reference only partition keys of a partitioned table"
-                .to_string(),
-        });
-    }
-    Ok(())
-}
+pub(super) use super::partition_filter::validate_partition_filter;
 
 pub(super) fn add_filter(current: &mut Option<Predicate>, filter: Predicate) {
     *current = Some(match current.take() {

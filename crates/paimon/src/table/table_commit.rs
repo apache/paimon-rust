@@ -48,6 +48,7 @@ const BATCH_COMMIT_IDENTIFIER: i64 = i64::MAX;
 /// Java RollingFileWriter.CHECK_ROLLING_RECORD_CNT.
 const CHECK_ROLLING_RECORD_COUNT: usize = 1000;
 
+mod global_index_source_check;
 mod row_tracking;
 
 const DELETION_VECTORS_INDEX_TYPE: &str = "DELETION_VECTORS";
@@ -1743,6 +1744,8 @@ impl TableCommit {
 
                 let previous =
                     Self::read_prev_index_entries(file_io, &manifest_dir, latest_snapshot).await?;
+                self.check_global_index_sources(latest_snapshot, entries, new_index_entries)
+                    .await?;
                 let mut index_entries = new_index_entries.clone();
                 index_entries.extend(self.global_index_update_entries(
                     &previous,
@@ -1804,6 +1807,8 @@ impl TableCommit {
 
                 let previous =
                     Self::read_prev_index_entries(file_io, &manifest_dir, latest_snapshot).await?;
+                self.check_global_index_sources(latest_snapshot, &entries, &new_index_entries)
+                    .await?;
                 let mut all = previous.clone();
                 match partition_filter.as_ref() {
                     None => all.clear(),
