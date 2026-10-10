@@ -1169,29 +1169,17 @@ impl<'a> PaimonTableRead<'a> {
                     })
             });
         predicates.predicates = before_mask;
-        let blob_options = has_blobs.then(|| self.masked_blob_options(&masks));
         let unresolved_table;
-        if let Some(payload_options) = &blob_options {
+        if has_blobs {
             // Keep payload predicates above authorization too: they can open
             // a descriptor belonging to a row the server excludes.
             inner.data_predicates.clear();
-            let mut options = std::collections::HashMap::from([
-                ("blob-as-descriptor".to_string(), "true".to_string()),
-                ("blob-view.resolve.enabled".to_string(), "false".to_string()),
-            ]);
-            // Views a predicate reads resolve before LIMIT applies. Read one
-            // candidate at a time, as the unrestricted read does, so no
-            // reference past the quota is looked up.
-            let payload_options = CoreOptions::new(payload_options);
-            if self.limit.is_some()
-                && payload_options.blob_view_resolve_enabled()
-                && self.table.rest_env().is_some()
-                && !super::query_auth::leaf_names(&pending)
-                    .is_disjoint(&payload_options.blob_view_fields())
-            {
-                options.insert("read.batch-size".to_string(), "1".to_string());
-            }
-            unresolved_table = self.table.copy_with_options(options);
+            unresolved_table = self
+                .table
+                .copy_with_options(std::collections::HashMap::from([
+                    ("blob-as-descriptor".to_string(), "true".to_string()),
+                    ("blob-view.resolve.enabled".to_string(), "false".to_string()),
+                ]));
             inner.table = &unresolved_table;
         }
         let stream = inner.read_splits(data_splits, &inner.table.schema.core_options())?;
@@ -1203,6 +1191,7 @@ impl<'a> PaimonTableRead<'a> {
             row_filter_factory: None,
             file_fields: schema_fields.clone(),
         };
+        let blob_options = has_blobs.then(|| self.masked_blob_options(&masks));
         let stream = stream.map(move |batch| {
             let batch = batch?;
             let names_match = batch.num_columns() == physical.len()
@@ -1313,6 +1302,21 @@ impl<'a> PaimonTableRead<'a> {
         if resolve_predicate_views {
             output_views.retain(|field| !predicate_views.contains(field));
         }
+        // Merge can rebuild larger batches. Yield one authorized row per lookup
+        // so the downstream LIMIT can stop before the next reference is resolved.
+        let stream: ArrowRecordBatchStream = if resolve_predicate_views && self.limit.is_some() {
+            Box::pin(async_stream::try_stream! {
+                let mut stream = stream;
+                while let Some(batch) = stream.next().await {
+                    let batch = batch?;
+                    for row in 0..batch.num_rows() {
+                        yield batch.slice(row, 1);
+                    }
+                }
+            })
+        } else {
+            stream
+        };
         // User predicates see resolved descriptors or payloads, after authorization.
         let stream = match self.table.rest_env().filter(|_| resolve_predicate_views) {
             Some(env) => super::data_evolution_reader::resolve_blob_view_stream(
