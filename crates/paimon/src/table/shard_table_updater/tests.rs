@@ -19,10 +19,10 @@ use super::*;
 use crate::catalog::Identifier;
 use crate::io::FileIOBuilder;
 use crate::spec::{
-    DataType as PaimonType, IntType, Schema as TableDefinition, TableSchema, VarCharType,
+    DataType as PaimonType, IntType, RowType, Schema as TableDefinition, TableSchema, VarCharType,
 };
 use crate::table::TableCommit;
-use arrow_array::{Int32Array, StringArray};
+use arrow_array::{Int32Array, StringArray, StructArray};
 
 fn table(partitioned: bool) -> Table {
     table_with_io(partitioned, FileIOBuilder::new("memory").build().unwrap())
@@ -82,9 +82,11 @@ async fn seed(table: &Table, data: RecordBatch) {
 
 async fn updater(table: &Table, index: usize, count: usize) -> ShardTableUpdater {
     let mut update = table.new_write_builder().new_update().unwrap();
-    update.with_read_projection(vec!["id".into()]).unwrap();
     update.with_update_type(vec!["value".into()]).unwrap();
-    update.new_shard_updater(index, count).await.unwrap()
+    update
+        .new_shard_updater(index, count, Some(vec![table.schema().fields()[1].clone()]))
+        .await
+        .unwrap()
 }
 
 async fn rows(table: &Table) -> Vec<(i32, i32)> {
@@ -341,15 +343,11 @@ async fn empty_shards_and_invalid_configuration() {
     let mut empty = updater(&table, 2, 3).await;
     assert!(empty.prepare_commit().await.unwrap().is_empty());
     let update = table.new_write_builder().new_update().unwrap();
-    assert!(update.new_shard_updater(0, 0).await.is_err());
-    assert!(update.new_shard_updater(2, 2).await.is_err());
-    let mut bad_projection = update.clone();
-    assert!(bad_projection
-        .with_read_projection(vec!["missing".into()])
-        .is_err());
+    assert!(update.new_shard_updater(0, 0, None).await.is_err());
+    assert!(update.new_shard_updater(2, 2, None).await.is_err());
     let mut bad_columns = update;
     bad_columns.with_update_type(vec![]).unwrap();
-    assert!(bad_columns.new_shard_updater(0, 1).await.is_err());
+    assert!(bad_columns.new_shard_updater(0, 1, None).await.is_err());
 }
 
 #[tokio::test]
@@ -498,4 +496,219 @@ async fn reader_eof_does_not_resurrect_a_failed_group_write() {
         .is_err());
     assert!(update.prepare_commit().await.is_err());
     assert_eq!(rows(&table).await, vec![(1, 10), (2, 20)]);
+}
+
+#[tokio::test]
+async fn read_types_belong_to_each_operation_and_are_independent_of_updates() {
+    let table = table(false);
+    seed(&table, batch(vec!["p", "p"], vec![1, 2], vec![10, 20])).await;
+    let mut update = table.new_write_builder().new_update().unwrap();
+    update.with_update_type(vec!["value".into()]).unwrap();
+    let id_field = table.schema().fields()[1].clone();
+    let mut ids = update
+        .new_shard_updater(0, 1, Some(vec![id_field]))
+        .await
+        .unwrap();
+    let mut originals = update
+        .new_shard_updater(
+            0,
+            1,
+            Some(vec![
+                table.schema().fields()[2].clone(),
+                row_id_data_field(),
+            ]),
+        )
+        .await
+        .unwrap();
+    let read = originals
+        .arrow_reader()
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    assert_eq!(read[0].schema().field(0).name(), "value");
+    assert_eq!(
+        read[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .values(),
+        &[10, 20]
+    );
+    assert_eq!(
+        read[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .values(),
+        &[0, 1]
+    );
+    originals.close();
+    let mut read = ids.arrow_reader().unwrap();
+    while let Some(batch) = read.try_next().await.unwrap() {
+        assert_eq!(batch.schema().fields().len(), 1);
+        assert_eq!(batch.schema().field(0).name(), "id");
+        let source = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        ids.update_by_arrow_batch(values(source.values().iter().map(|id| id * 100).collect()))
+            .await
+            .unwrap();
+    }
+    commit(&table, ids.prepare_commit().await.unwrap()).await;
+    assert_eq!(rows(&table).await, vec![(1, 100), (2, 200)]);
+}
+
+#[tokio::test]
+async fn default_and_empty_read_types_preserve_row_counts() {
+    let table = table(false);
+    seed(&table, batch(vec!["p", "p"], vec![1, 2], vec![10, 20])).await;
+    let mut update = table.new_write_builder().new_update().unwrap();
+    update.with_update_type(vec!["value".into()]).unwrap();
+    let mut full = update.new_shard_updater(0, 1, None).await.unwrap();
+    let batches = full
+        .arrow_reader()
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    assert_eq!(
+        batches[0]
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect::<Vec<_>>(),
+        vec!["p", "id", "value"]
+    );
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
+    full.close();
+    let mut empty = update.new_shard_updater(0, 1, Some(vec![])).await.unwrap();
+    let mut read = empty.arrow_reader().unwrap();
+    while let Some(batch) = read.try_next().await.unwrap() {
+        assert_eq!(batch.num_columns(), 0);
+        assert_eq!(batch.num_rows(), 2);
+        empty
+            .update_by_arrow_batch(values(vec![99; batch.num_rows()]))
+            .await
+            .unwrap();
+    }
+    commit(&table, empty.prepare_commit().await.unwrap()).await;
+    assert_eq!(rows(&table).await, vec![(1, 99), (2, 99)]);
+}
+
+#[tokio::test]
+async fn nested_read_type_prunes_children_and_retains_their_ids() {
+    let definition = TableDefinition::builder()
+        .column("p", PaimonType::VarChar(VarCharType::string_type()))
+        .column("id", PaimonType::Int(IntType::new()))
+        .column("value", PaimonType::Int(IntType::new()))
+        .column(
+            "payload",
+            PaimonType::Row(RowType::new(vec![
+                DataField::new(0, "a".into(), PaimonType::Int(IntType::new())),
+                DataField::new(1, "b".into(), PaimonType::Int(IntType::new())),
+            ])),
+        )
+        .option("data-evolution.enabled", "true")
+        .option("row-tracking.enabled", "true")
+        .build()
+        .unwrap();
+    let table = Table::new(
+        FileIOBuilder::new("memory").build().unwrap(),
+        Identifier::new("db", "nested_shard"),
+        "memory:/nested_shard".into(),
+        TableSchema::new(0, &definition),
+        None,
+    );
+    let data = batch(vec!["p", "p"], vec![1, 2], vec![10, 20]);
+    let payload = StructArray::from(vec![
+        (
+            Arc::new(Field::new("a", DataType::Int32, true)),
+            Arc::new(Int32Array::from(vec![100, 200])) as ArrayRef,
+        ),
+        (
+            Arc::new(Field::new("b", DataType::Int32, true)),
+            Arc::new(Int32Array::from(vec![3, 4])) as ArrayRef,
+        ),
+    ]);
+    let mut fields = data.schema().fields().to_vec();
+    fields.push(Arc::new(Field::new(
+        "payload",
+        payload.data_type().clone(),
+        true,
+    )));
+    let mut columns = data.columns().to_vec();
+    columns.push(Arc::new(payload));
+    seed(
+        &table,
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap(),
+    )
+    .await;
+    let source = &table.schema().fields()[3];
+    let PaimonType::Row(row) = source.data_type() else {
+        panic!("expected ROW")
+    };
+    let read_type = vec![DataField::new(
+        source.id(),
+        source.name().into(),
+        PaimonType::Row(RowType::new(vec![row.fields()[1].clone()])),
+    )];
+    let mut update = table.new_write_builder().new_update().unwrap();
+    update.with_update_type(vec!["value".into()]).unwrap();
+    let mut shard = update
+        .new_shard_updater(0, 1, Some(read_type))
+        .await
+        .unwrap();
+    let mut read = shard.arrow_reader().unwrap();
+    while let Some(batch) = read.try_next().await.unwrap() {
+        let payload = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        assert_eq!(payload.num_columns(), 1);
+        assert_eq!(payload.fields()[0].name(), "b");
+        let source = payload
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(source.values(), &[3, 4]);
+        shard
+            .update_by_arrow_batch(values(source.values().iter().map(|id| id * 100).collect()))
+            .await
+            .unwrap();
+    }
+    commit(&table, shard.prepare_commit().await.unwrap()).await;
+    assert_eq!(rows(&table).await, vec![(1, 300), (2, 400)]);
+}
+
+#[tokio::test]
+async fn read_type_cannot_override_the_internal_row_id() {
+    let table = table(false);
+    seed(&table, batch(vec!["p"], vec![1], vec![10])).await;
+    let mut update = table.new_write_builder().new_update().unwrap();
+    update.with_update_type(vec!["value".into()]).unwrap();
+    for fields in [
+        vec![DataField::new(
+            crate::spec::ROW_ID_FIELD_ID,
+            ROW_ID.into(),
+            PaimonType::Int(IntType::new()),
+        )],
+        vec![row_id_data_field().with_id(0)],
+        vec![row_id_data_field(), row_id_data_field()],
+    ] {
+        let error = update
+            .new_shard_updater(0, 1, Some(fields))
+            .await
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("canonical BIGINT _ROW_ID"));
+    }
+    assert_eq!(rows(&table).await, vec![(1, 10)]);
 }

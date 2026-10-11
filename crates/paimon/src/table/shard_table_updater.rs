@@ -25,6 +25,8 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_stream::try_stream;
 use futures::TryStreamExt;
 
+use crate::spec::{row_id_data_field, DataField};
+
 use super::data_evolution_writer::RowIdFileIndex;
 use super::source::is_data_evolution_normal_file;
 use super::update_input::{cast_update_value, unique_column_index, CastMode};
@@ -58,7 +60,7 @@ struct ReadState {
 pub struct ShardTableUpdater {
     table: Table,
     splits: Vec<DataSplit>,
-    projection: Vec<String>,
+    read_type: Vec<DataField>,
     write_schema: SchemaRef,
     index: RowIdFileIndex,
     writer: Option<DataEvolutionWriter>,
@@ -76,7 +78,7 @@ pub struct ShardTableUpdater {
 impl ShardTableUpdater {
     pub(super) async fn new(
         table: &Table,
-        projection: Option<Vec<String>>,
+        read_type: Option<Vec<DataField>>,
         write_columns: Vec<String>,
         shard: usize,
         shard_count: usize,
@@ -106,18 +108,11 @@ impl ShardTableUpdater {
             .await?;
         let splits = select_shard(plan.splits(), shard, shard_count)?;
         let index = RowIdFileIndex::from_splits(table.clone(), &splits)?;
-        let projection = projection.unwrap_or_else(|| {
-            table
-                .schema()
-                .fields()
-                .iter()
-                .map(|field| field.name().to_string())
-                .collect()
-        });
-        // Resolve names before returning a reader or accepting values.
+        let read_type = read_type.unwrap_or_else(|| table.schema().fields().to_vec());
+        // Validate the same canonical request used by ordinary table readers.
         table
             .new_read_builder()
-            .with_projection(&projection.iter().map(String::as_str).collect::<Vec<_>>())?
+            .with_read_type(with_row_id(&read_type)?)
             .new_read()?;
         let fields = super::data_evolution_fields::project_by_paths(
             table.schema().fields(),
@@ -131,7 +126,7 @@ impl ShardTableUpdater {
         Ok(Self {
             table,
             splits,
-            projection,
+            read_type,
             write_schema,
             index,
             writer: Some(writer),
@@ -172,28 +167,26 @@ impl ShardTableUpdater {
     }
 
     /// Open the shard's single reader. Only requested columns are returned;
-    /// `_ROW_ID` is retained internally even when absent from the projection.
+    /// `_ROW_ID` is retained internally even when absent from the read type.
     pub fn arrow_reader(&mut self) -> crate::Result<ArrowRecordBatchStream> {
         self.ensure_active()?;
         if self.reader_started {
             return Err(invalid("Shard reader can only be opened once"));
         }
-        let mut projection = self.projection.clone();
-        if !projection.iter().any(|name| name == ROW_ID) {
-            projection.push(ROW_ID.into());
-        }
         let mut builder = self.table.new_read_builder();
-        builder.with_projection(&projection.iter().map(String::as_str).collect::<Vec<_>>())?;
+        builder.with_read_type(with_row_id(&self.read_type)?);
         let mut input = builder.new_read()?.to_arrow(&self.splits)?;
         let state = self.state.clone();
-        let output_columns = self.projection.len();
+        let output_columns = self.read_type.len();
         self.reader_started = true;
         Ok(Box::pin(try_stream! {
             loop {
                 let next = input.try_next().await;
                 if next.is_err() { finish_read(&state, true)?; }
                 let Some(batch) = next? else { finish_read(&state, false)?; break; };
-                yield record_rows(&state, batch, output_columns)?;
+                let output = record_rows(&state, batch, output_columns);
+                if output.is_err() { finish_read(&state, true)?; }
+                yield output?;
             }
         }))
     }
@@ -336,6 +329,26 @@ impl ShardTableUpdater {
             state.pending.clear();
         }
     }
+}
+
+/// The caller's read fields must not change the system column used for mapping.
+fn with_row_id(read_type: &[DataField]) -> crate::Result<Vec<DataField>> {
+    let row_id = row_id_data_field();
+    let mut ids = read_type.iter().filter(|field| field.name() == ROW_ID);
+    if let Some(field) = ids.next() {
+        if ids.next().is_some()
+            || field.id() != row_id.id()
+            || !matches!(field.data_type(), crate::spec::DataType::BigInt(_))
+        {
+            return Err(invalid(
+                "Read type must use the canonical BIGINT _ROW_ID field",
+            ));
+        }
+        return Ok(read_type.to_vec());
+    }
+    let mut fields = read_type.to_vec();
+    fields.push(row_id);
+    Ok(fields)
 }
 
 fn select_shard(splits: &[DataSplit], shard: usize, count: usize) -> crate::Result<Vec<DataSplit>> {

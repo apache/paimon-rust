@@ -25,6 +25,7 @@ use std::collections::HashSet;
 
 use arrow_array::RecordBatch;
 
+use crate::spec::DataField;
 use crate::table::{CommitMessage, Table, TableUpdateByRowId};
 
 const ROW_ID: &str = "_ROW_ID";
@@ -50,7 +51,6 @@ pub struct TableUpdate {
     table: Table,
     commit_user: String,
     update_cols: Option<Vec<String>>,
-    read_projection: Option<Vec<String>>,
     blob_uri_reader_factory: Option<std::sync::Arc<dyn crate::io::UriReaderFactory>>,
 }
 
@@ -60,7 +60,6 @@ impl TableUpdate {
             table: table.clone(),
             commit_user,
             update_cols: None,
-            read_projection: None,
             blob_uri_reader_factory: None,
         }
     }
@@ -103,25 +102,22 @@ impl TableUpdate {
             .collect()
     }
 
-    /// Columns returned by a shard updater's reader, in caller order.
-    pub fn with_read_projection(&mut self, projection: Vec<String>) -> crate::Result<&mut Self> {
-        self.table
-            .new_read_builder()
-            .with_projection(&projection.iter().map(String::as_str).collect::<Vec<_>>())?
-            .new_read()?;
-        self.read_projection = Some(projection);
-        Ok(self)
-    }
-
     /// Read and replace columns over one balanced shard of whole file groups.
+    ///
+    /// `read_type` configures this operation's reader, independently of the
+    /// update columns. It preserves field IDs and nested read metadata, just
+    /// like [`ReadBuilder::with_read_type`](super::ReadBuilder::with_read_type).
+    /// `None` reads all table fields; `Some(vec![])` returns zero-column batches
+    /// with their row counts preserved. Row IDs are tracked internally.
     pub async fn new_shard_updater(
         &self,
         shard: usize,
         shard_count: usize,
+        read_type: Option<Vec<DataField>>,
     ) -> crate::Result<super::ShardTableUpdater> {
         let mut updater = super::ShardTableUpdater::new(
             &self.table,
-            self.read_projection.clone(),
+            read_type,
             self.update_cols
                 .clone()
                 .unwrap_or_else(|| self.all_fields()),

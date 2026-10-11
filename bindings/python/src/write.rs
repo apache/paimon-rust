@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 use arrow::datatypes::Schema as ArrowSchema;
 use arrow::pyarrow::FromPyArrow;
 use arrow::record_batch::RecordBatch;
-use paimon::spec::{BlobConsumer, BlobDescriptor, CoreOptions, DataType, Datum};
+use paimon::spec::{BlobConsumer, BlobDescriptor, CoreOptions, DataType, Datum, RowType};
 use paimon::table::{
     CommitMessage, PostponeBucketPlan, PostponeFixedBucketTableWrite, Table, TableCommit,
     TableUpdate, TableUpdateByRowId, TableWrite, COMMIT_MESSAGE_SERIALIZER_VERSION,
@@ -741,9 +741,17 @@ impl UpdateContext {
         py: Python<'_>,
         shard: usize,
         count: usize,
+        read_type: Option<&str>,
     ) -> PyResult<crate::shard_update::PyShardTableUpdator> {
+        let read_type = read_type
+            .map(|json| {
+                serde_json::from_str::<RowType>(json)
+                    .map(|row| row.fields().to_vec())
+                    .map_err(|e| PyValueError::new_err(format!("invalid Paimon read type: {e}")))
+            })
+            .transpose()?;
         let inner = py
-            .detach(|| runtime().block_on(self.inner.new_shard_updater(shard, count)))
+            .detach(|| runtime().block_on(self.inner.new_shard_updater(shard, count, read_type)))
             .map_err(to_py_err)?;
         Ok(crate::shard_update::PyShardTableUpdator::new(
             inner,
@@ -1004,25 +1012,16 @@ impl PyStreamTableUpdate {
         self.context.new_update_by_row_id(py)
     }
 
-    fn with_read_projection<'py>(
-        mut slf: PyRefMut<'py, Self>,
-        projection: Vec<String>,
-    ) -> PyResult<PyRefMut<'py, Self>> {
-        slf.context
-            .inner
-            .with_read_projection(projection)
-            .map_err(to_py_err)?;
-        Ok(slf)
-    }
-
+    #[pyo3(signature = (shard_num, total_shard_count, *, read_type=None))]
     fn new_shard_updator(
         &self,
         py: Python<'_>,
         shard_num: usize,
         total_shard_count: usize,
+        read_type: Option<&str>,
     ) -> PyResult<crate::shard_update::PyShardTableUpdator> {
         self.context
-            .new_shard_updator(py, shard_num, total_shard_count)
+            .new_shard_updator(py, shard_num, total_shard_count, read_type)
     }
 
     fn with_update_type<'py>(
@@ -1116,25 +1115,16 @@ impl PyBatchTableUpdate {
         self.context.new_update_by_row_id(py)
     }
 
-    fn with_read_projection<'py>(
-        mut slf: PyRefMut<'py, Self>,
-        projection: Vec<String>,
-    ) -> PyResult<PyRefMut<'py, Self>> {
-        slf.context
-            .inner
-            .with_read_projection(projection)
-            .map_err(to_py_err)?;
-        Ok(slf)
-    }
-
+    #[pyo3(signature = (shard_num, total_shard_count, *, read_type=None))]
     fn new_shard_updator(
         &self,
         py: Python<'_>,
         shard_num: usize,
         total_shard_count: usize,
+        read_type: Option<&str>,
     ) -> PyResult<crate::shard_update::PyShardTableUpdator> {
         self.context
-            .new_shard_updator(py, shard_num, total_shard_count)
+            .new_shard_updator(py, shard_num, total_shard_count, read_type)
     }
 
     fn with_update_type<'py>(
