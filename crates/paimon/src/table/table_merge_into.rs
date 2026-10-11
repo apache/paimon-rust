@@ -275,14 +275,12 @@ pub(super) async fn merge_into(
     }
     let _ = DataEvolutionWriter::new(table, update_columns.clone())?;
     let snapshot = super::time_travel::resolve_snapshot(table).await?;
-    let scan_table = match &snapshot {
-        Some(snapshot) => table.copy_with_pinned_snapshot(Some(snapshot)),
-        None => table.clone(),
-    }
-    .copy_with_options(HashMap::from([
-        ("scalar-index.search-mode".into(), "FULL".into()),
-        ("scan.mode".into(), "default".into()),
-    ]));
+    let scan_table = table
+        .copy_with_options(HashMap::from([(
+            "scalar-index.search-mode".into(),
+            "FULL".into(),
+        )]))
+        .copy_with_pinned_snapshot(snapshot.as_ref());
     let self_merge = matches!(source, MergeSource::SelfTable);
     if self_merge {
         if on != [(ROW_ID.into(), ROW_ID.into())] || !not_matched.is_empty() {

@@ -120,14 +120,11 @@ impl MergeInput {
         };
         // Pin the source independently, keeping branch/time-travel resolution
         // and the caller's resolved schema. Include L0 as Python plan_for_write.
-        let table = snapshot.as_ref().map_or_else(
-            || table.clone(),
-            |snapshot| {
-                table
-                    .copy_with_pinned_snapshot(Some(snapshot))
-                    .copy_with_options(HashMap::from([("scan.mode".into(), "default".into())]))
-            },
-        );
+        let table = if incremental {
+            table.clone()
+        } else {
+            table.copy_with_pinned_snapshot(snapshot.as_ref())
+        };
         let mut builder = table.new_read_builder();
         builder.with_projection(&names)?;
         let plan = if incremental || snapshot.is_some() {

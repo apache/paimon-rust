@@ -114,10 +114,10 @@ pub(super) async fn update(
     // Updates must include unindexed rows even when normal reads request the
     // partial/detail scalar-index search mode.
     let scan_table = table
-        .copy_with_options(HashMap::from([
-            ("scalar-index.search-mode".into(), "FULL".into()),
-            ("scan.mode".into(), "default".into()),
-        ]))
+        .copy_with_options(HashMap::from([(
+            "scalar-index.search-mode".into(),
+            "FULL".into(),
+        )]))
         .copy_with_pinned_snapshot(Some(&snapshot));
     let mut read_builder = scan_table.new_read_builder();
     let mut projection = Vec::new();
