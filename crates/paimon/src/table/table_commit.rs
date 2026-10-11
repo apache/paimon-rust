@@ -188,6 +188,7 @@ fn reject_compact_increment(messages: &[CommitMessage]) -> Result<()> {
 /// Table commit logic for Paimon write operations.
 ///
 /// Provides atomic commit functionality including append, overwrite and truncate
+#[derive(Clone)]
 pub struct TableCommit {
     table: Table,
     snapshot_manager: SnapshotManager,
@@ -206,6 +207,7 @@ pub struct TableCommit {
     row_tracking_enabled: bool,
     data_evolution_enabled: bool,
     partition_default_name: String,
+    snapshot_properties: Option<HashMap<String, String>>,
 }
 
 impl TableCommit {
@@ -247,12 +249,24 @@ impl TableCommit {
             row_tracking_enabled,
             data_evolution_enabled,
             partition_default_name,
+            snapshot_properties: None,
         }
     }
 
     /// Control empty APPEND snapshots. Java stream commits set this to false.
     pub fn with_ignore_empty_commit(mut self, ignore_empty_commit: bool) -> Self {
         self.ignore_empty_commit = ignore_empty_commit;
+        self
+    }
+
+    /// Attach caller properties to snapshots published by this committer.
+    ///
+    /// Like Java's ManifestCommittable properties, these describe the current
+    /// commit and are not inherited from the previous snapshot. Empty maps are
+    /// omitted. Clone the committer to configure metadata for a single call
+    /// while retaining its publication environment and retry configuration.
+    pub fn with_snapshot_properties(mut self, properties: HashMap<String, String>) -> Self {
+        self.snapshot_properties = (!properties.is_empty()).then_some(properties);
         self
     }
 
@@ -1364,6 +1378,7 @@ impl TableCommit {
             .statistics(statistics_file)
             .next_row_id(next_row_id)
             .index_manifest(resolved.index_manifest_name.clone())
+            .properties(self.snapshot_properties.clone())
             .build();
 
         let statistics = self.generate_partition_statistics(&resolved.entries)?;
@@ -3600,6 +3615,7 @@ mod tests {
         include!("table_commit/recovery_tests.rs");
         include!("table_commit/row_tracking_tests.rs");
         include!("table_commit/abort_tests.rs");
+        include!("table_commit/property_tests.rs");
     }
 
     #[tokio::test]

@@ -1324,6 +1324,14 @@ impl CommitContext {
         py.detach(|| runtime().block_on(self.inner.abort(&messages)))
             .map_err(to_py_err)
     }
+
+    fn committer(&self, properties: Option<HashMap<String, String>>) -> TableCommit {
+        // Properties belong to this call, including retries. The reusable
+        // stream context must not carry them into a later checkpoint.
+        self.inner
+            .clone()
+            .with_snapshot_properties(properties.unwrap_or_default())
+    }
 }
 
 #[pyclass(name = "BatchTableCommit", module = "pypaimon_rust.datafusion")]
@@ -1351,18 +1359,24 @@ impl PyBatchTableCommit {
     /// Rust committers have no background resources to shut down.
     fn close(&self) {}
 
-    fn commit(&mut self, py: Python<'_>, messages: &Bound<'_, PyAny>) -> PyResult<()> {
+    #[pyo3(signature = (messages, snapshot_properties=None))]
+    fn commit(
+        &mut self,
+        py: Python<'_>,
+        messages: &Bound<'_, PyAny>,
+        snapshot_properties: Option<HashMap<String, String>>,
+    ) -> PyResult<()> {
         let messages = self.context.messages(messages, "commit", self.overwrite)?;
         self.check_committed()?;
+        let committer = self.context.committer(snapshot_properties);
         py.detach(|| {
             runtime().block_on(async {
                 if self.overwrite {
-                    self.context
-                        .inner
+                    committer
                         .overwrite(messages, self.static_partition.clone())
                         .await
                 } else {
-                    self.context.inner.commit(messages).await
+                    committer.commit(messages).await
                 }
             })
         })
@@ -1403,19 +1417,18 @@ impl PyStreamTableCommit {
     /// Rust committers have no background resources to shut down.
     fn close(&self) {}
 
+    #[pyo3(signature = (commit_identifier, messages, snapshot_properties=None))]
     fn commit(
         &self,
         py: Python<'_>,
         commit_identifier: i64,
         messages: &Bound<'_, PyAny>,
+        snapshot_properties: Option<HashMap<String, String>>,
     ) -> PyResult<()> {
         let messages = self.context.messages(messages, "commit", false)?;
+        let committer = self.context.committer(snapshot_properties);
         py.detach(|| {
-            runtime().block_on(
-                self.context
-                    .inner
-                    .commit_with_identifier(messages, commit_identifier),
-            )
+            runtime().block_on(committer.commit_with_identifier(messages, commit_identifier))
         })
         .map_err(to_py_err)
     }
