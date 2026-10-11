@@ -16,14 +16,17 @@
 // under the License.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use datafusion::arrow::array::{Array, Int32Array, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
 use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::assert_batches_eq;
 use datafusion::datasource::{MemTable, TableProvider};
 use datafusion::error::{DataFusionError, Result as DFResult};
+use futures::TryStreamExt;
 use paimon::catalog::{Catalog, Database, Identifier, LoadedTable};
 use paimon::spec::{Schema as PaimonSchema, SchemaChange, TableType};
 use paimon::table::Table;
@@ -298,19 +301,78 @@ impl TableEngineResolver for FakeEngineResolver {
     }
 }
 
+#[derive(Debug, Default)]
+struct MetadataEngineResolver {
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+impl TableEngineResolver for MetadataEngineResolver {
+    async fn resolve_table(
+        &self,
+        request: &EngineTableRequest,
+    ) -> DFResult<Option<Arc<dyn TableProvider>>> {
+        FakeEngineResolver.resolve_table(request).await
+    }
+
+    async fn resolve_metadata_table(
+        &self,
+        request: &EngineTableRequest,
+        metadata_table: &str,
+    ) -> DFResult<Option<Arc<dyn TableProvider>>> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(request.database, DB);
+        assert_eq!(request.declared, TableType::IcebergTable);
+        if request.table != "it" {
+            return Ok(None);
+        }
+        match metadata_table {
+            "snapshots" | "manifests" | "history" => {}
+            "broken" => {
+                return Err(DataFusionError::Execution(
+                    "metadata backend exploded".to_string(),
+                ));
+            }
+            _ => return Ok(None),
+        }
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("snapshot_id", DataType::Int32, false),
+            Field::new("operation", DataType::Utf8, false),
+            Field::new("metadata_table", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![2, 4])),
+                Arc::new(StringArray::from(vec!["append", "overwrite"])),
+                Arc::new(StringArray::from(vec![metadata_table; 2])),
+            ],
+        )?;
+        Ok(Some(Arc::new(MemTable::try_new(
+            schema,
+            vec![vec![batch]],
+        )?)))
+    }
+}
+
 struct TestEnv {
     _paimon_dir: TempDir,
     ctx: SQLContext,
+    catalog: Arc<FileSystemCatalog>,
 }
 
 async fn setup() -> TestEnv {
+    setup_with_engine(Some(Arc::new(FakeEngineResolver))).await
+}
+
+async fn setup_with_engine(resolver: Option<Arc<dyn TableEngineResolver>>) -> TestEnv {
     let paimon_dir = TempDir::new().unwrap();
     let warehouse = format!("file://{}", paimon_dir.path().display());
     let mut options = Options::new();
     options.set(CatalogOptions::WAREHOUSE, warehouse);
     let fs_catalog = Arc::new(FileSystemCatalog::new(options).unwrap());
     let typed_catalog = Arc::new(TypedTestCatalog {
-        inner: fs_catalog,
+        inner: Arc::clone(&fs_catalog),
         declared_types: HashMap::from([
             ("it".to_string(), TableType::IcebergTable),
             ("ghost".to_string(), TableType::IcebergTable),
@@ -334,16 +396,15 @@ async fn setup() -> TestEnv {
         ctx.sql(&stmt).await.unwrap().collect().await.unwrap();
     }
 
-    ctx.register_catalog_table_engine(
-        CATALOG,
-        TableType::IcebergTable,
-        Arc::new(FakeEngineResolver),
-    )
-    .unwrap();
+    if let Some(resolver) = resolver {
+        ctx.register_catalog_table_engine(CATALOG, TableType::IcebergTable, resolver)
+            .unwrap();
+    }
 
     TestEnv {
         _paimon_dir: paimon_dir,
         ctx,
+        catalog: fs_catalog,
     }
 }
 
@@ -557,17 +618,363 @@ async fn writes_to_routed_tables_fail_closed() {
 }
 
 #[tokio::test]
-async fn system_tables_on_routed_tables_error() {
+async fn metadata_tables_without_engine_support_are_unavailable() {
     let env = setup().await;
-    let Err(err) = env
+    let schema = env.ctx.ctx().catalog(CATALOG).unwrap().schema(DB).unwrap();
+    for name in ["it$snapshots", "it$history"] {
+        assert!(schema.table(name).await.unwrap().is_none(), "{name}");
+        assert!(!schema.table_exist(name), "{name}");
+        let err = env
+            .ctx
+            .sql(&format!("SELECT * FROM {CATALOG}.{DB}.\"{name}\""))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not found"), "{err}");
+    }
+}
+
+#[tokio::test]
+async fn metadata_tables_without_a_registered_engine_report_the_declared_type() {
+    let env = setup_with_engine(None).await;
+    let schema = env.ctx.ctx().catalog(CATALOG).unwrap().schema(DB).unwrap();
+    for name in ["it$snapshots", "it$history"] {
+        assert!(!schema.table_exist(name), "{name}");
+        let err = schema.table(name).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("no table engine is registered for 'iceberg-table'"),
+            "{err}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn engine_metadata_tables_support_projection_filters_and_aggregation() {
+    let env = setup_with_engine(Some(Arc::new(MetadataEngineResolver::default()))).await;
+    for suffix in ["snapshots", "manifests", "History"] {
+        let batches = env
+            .ctx
+            .sql(&format!(
+                "SELECT operation, snapshot_id FROM {CATALOG}.{DB}.\"it${suffix}\" \
+                 WHERE snapshot_id > 2"
+            ))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_batches_eq!(
+            [
+                "+-----------+-------------+",
+                "| operation | snapshot_id |",
+                "+-----------+-------------+",
+                "| overwrite | 4           |",
+                "+-----------+-------------+",
+            ],
+            &batches
+        );
+        let batches = env
+            .ctx
+            .sql(&format!(
+                "SELECT metadata_table FROM {CATALOG}.{DB}.\"it${suffix}\" \
+                 WHERE snapshot_id > 2"
+            ))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(
+            string_column_values(&batches, "metadata_table"),
+            vec![suffix.to_ascii_lowercase()]
+        );
+        let batches = env
+            .ctx
+            .sql(&format!(
+                "SELECT count(*) AS n FROM {CATALOG}.{DB}.\"it${suffix}\""
+            ))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_batches_eq!(["+---+", "| n |", "+---+", "| 2 |", "+---+"], &batches);
+    }
+}
+
+#[tokio::test]
+async fn metadata_table_existence_matches_the_resolver() {
+    let env = setup_with_engine(Some(Arc::new(MetadataEngineResolver::default()))).await;
+    let schema = env.ctx.ctx().catalog(CATALOG).unwrap().schema(DB).unwrap();
+    for (name, exists) in [
+        ("it$snapshots", true),
+        ("it$history", true),
+        ("it$SNAPSHOTS", true),
+        ("it$History", true),
+        ("it$unknown", false),
+        ("ghost$history", false),
+        ("missing$history", false),
+        ("pt$history", false),
+    ] {
+        assert_eq!(
+            schema.table(name).await.unwrap().is_some(),
+            exists,
+            "{name}"
+        );
+        assert_eq!(schema.table_exist(name), exists, "{name}");
+    }
+}
+
+#[tokio::test]
+async fn metadata_engine_errors_are_surfaced() {
+    let env = setup_with_engine(Some(Arc::new(MetadataEngineResolver::default()))).await;
+    let schema = env.ctx.ctx().catalog(CATALOG).unwrap().schema(DB).unwrap();
+    assert!(schema.table_exist("it$broken"));
+    let err = env
         .ctx
-        .sql(&format!("SELECT * FROM {CATALOG}.{DB}.\"it$snapshots\""))
+        .sql(&format!("SELECT * FROM {CATALOG}.{DB}.\"it$broken\""))
         .await
-    else {
-        panic!("system table on a routed table must fail");
-    };
-    let msg = err.to_string();
-    assert!(msg.contains("cannot be read as a Paimon table"), "{msg}");
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("metadata backend exploded"),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn paimon_system_tables_keep_the_paimon_provider() {
+    let env = setup_with_engine(Some(Arc::new(MetadataEngineResolver::default()))).await;
+    let schema = env.ctx.ctx().catalog(CATALOG).unwrap().schema(DB).unwrap();
+    assert!(schema.table_exist("pt$snapshots"));
+    let batches = env
+        .ctx
+        .sql(&format!(
+            "SELECT snapshot_id FROM {CATALOG}.{DB}.\"pt$snapshots\" ORDER BY snapshot_id"
+        ))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_batches_eq!(
+        [
+            "+-------------+",
+            "| snapshot_id |",
+            "+-------------+",
+            "| 1           |",
+            "| 2           |",
+            "+-------------+",
+        ],
+        &batches
+    );
+}
+
+#[tokio::test]
+async fn routed_metadata_tables_are_read_only() {
+    let env = setup_with_engine(Some(Arc::new(MetadataEngineResolver::default()))).await;
+    let err = async {
+        env.ctx
+            .sql(&format!(
+                "INSERT INTO {CATALOG}.{DB}.\"it$history\" VALUES (5, 'append', 'history')"
+            ))
+            .await?
+            .collect()
+            .await
+    }
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("write is not supported"), "{err}");
+}
+
+#[tokio::test]
+async fn routed_metadata_tables_are_views() {
+    use datafusion::datasource::TableType as DFTableType;
+
+    let env = setup_with_engine(Some(Arc::new(MetadataEngineResolver::default()))).await;
+    let schema = env.ctx.ctx().catalog(CATALOG).unwrap().schema(DB).unwrap();
+    let metadata = schema.table("it$history").await.unwrap().unwrap();
+    assert_eq!(metadata.table_type(), DFTableType::View);
+    let base = schema.table("it").await.unwrap().unwrap();
+    assert_eq!(base.table_type(), DFTableType::Base);
+
+    // Native DROP TABLE must reject metadata views.
+    let result = async {
+        env.ctx
+            .ctx()
+            .sql(&format!("DROP TABLE {CATALOG}.{DB}.\"it$history\""))
+            .await?
+            .collect()
+            .await
+    }
+    .await;
+    assert!(result.is_err(), "{result:?}");
+    assert!(schema.table_exist("it$history"));
+}
+
+#[tokio::test]
+async fn metadata_drop_view_preserves_physical_name_collisions() {
+    for name in ["it$history", "it$History", "pt$snapshots"] {
+        assert_metadata_ddl_preserves_physical_table(
+            name,
+            &format!("DROP VIEW {CATALOG}.{DB}.\"{name}\""),
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn metadata_replace_view_preserves_physical_name_collisions() {
+    for name in ["it$history", "it$History", "pt$snapshots"] {
+        assert_metadata_ddl_preserves_physical_table(
+            name,
+            &format!("CREATE OR REPLACE VIEW {CATALOG}.{DB}.\"{name}\" AS SELECT 42 AS id"),
+        )
+        .await;
+    }
+}
+
+async fn assert_metadata_ddl_preserves_physical_table(name: &str, ddl: &str) {
+    let env = setup_with_engine(Some(Arc::new(MetadataEngineResolver::default()))).await;
+    env.ctx
+        .sql(&format!(
+            "CREATE TABLE {CATALOG}.{DB}.\"{name}\" (id INT NOT NULL)"
+        ))
+        .await
+        .unwrap();
+    let identifier = Identifier::new(DB, name);
+    let table = env.catalog.get_table(&identifier).await.unwrap();
+    let batch = RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![Field::new(
+            "id",
+            DataType::Int32,
+            false,
+        )])),
+        vec![Arc::new(Int32Array::from(vec![7, 9]))],
+    )
+    .unwrap();
+    let builder = table.new_write_builder();
+    let mut write = builder.new_write().unwrap();
+    write.write_arrow_batch(&batch).await.unwrap();
+    let messages = write.prepare_commit().await.unwrap();
+    builder.new_commit().commit(messages).await.unwrap();
+
+    // Use native DDL to bypass SQLContext guards.
+    let result = async { env.ctx.ctx().sql(ddl).await?.collect().await }.await;
+    assert!(
+        table.file_io().exists_dir(table.location()).await.unwrap(),
+        "{ddl} deleted the physical table directory"
+    );
+    let remaining = env.catalog.get_table(&identifier).await.unwrap();
+    let read = remaining.new_read_builder();
+    let plan = read.new_scan().plan().await.unwrap();
+    let batches = read
+        .new_read()
+        .unwrap()
+        .to_arrow(plan.splits())
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    assert_eq!(column_i32(&batches), vec![7, 9], "{ddl}");
+    let error = result.unwrap_err().to_string();
+    assert!(error.contains(name), "{ddl}: {error}");
+}
+
+#[tokio::test]
+async fn metadata_deregistration_reports_read_only() {
+    let env = setup_with_engine(Some(Arc::new(MetadataEngineResolver::default()))).await;
+    let schema = env.ctx.ctx().catalog(CATALOG).unwrap().schema(DB).unwrap();
+    for name in ["it$history", "it$History", "it$unknown", "pt$snapshots"] {
+        let error = schema.deregister_table(name).unwrap_err().to_string();
+        assert!(error.contains("read-only"), "{name}: {error}");
+        assert!(error.contains(&format!("{DB}.{name}")), "{name}: {error}");
+    }
+}
+
+#[tokio::test]
+async fn native_drop_table_still_removes_a_regular_table() {
+    let env = setup().await;
+    let identifier = Identifier::new(DB, "pt");
+    let table = env.catalog.get_table(&identifier).await.unwrap();
+    env.ctx
+        .ctx()
+        .sql(&format!("DROP TABLE {CATALOG}.{DB}.pt"))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert!(!table.file_io().exists_dir(table.location()).await.unwrap());
+    assert!(matches!(
+        env.catalog.get_table(&identifier).await,
+        Err(paimon::Error::TableNotExist { .. })
+    ));
+}
+
+#[tokio::test]
+async fn routed_metadata_tables_reject_branches_and_time_travel() {
+    let env = setup_with_engine(Some(Arc::new(MetadataEngineResolver::default()))).await;
+    let schema = env.ctx.ctx().catalog(CATALOG).unwrap().schema(DB).unwrap();
+    let err = schema.table("it$branch_b1$history").await.unwrap_err();
+    assert!(
+        err.to_string().contains("branches are not supported"),
+        "{err}"
+    );
+    assert!(!schema.table_exist("it$branch_b1$history"));
+
+    env.ctx
+        .ctx()
+        .sql("SET datafusion.sql_parser.dialect = 'databricks'")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    for clause in [
+        "VERSION AS OF 1",
+        "TIMESTAMP AS OF '2020-01-01 00:00:00'",
+        "FOR SYSTEM_TIME AS OF '2020-01-01 00:00:00'",
+    ] {
+        let err = env
+            .ctx
+            .ctx()
+            .sql(&format!(
+                "SELECT * FROM {CATALOG}.{DB}.\"it$history\" {clause}"
+            ))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("time travel is not supported"),
+            "{err}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn metadata_resolution_enforces_session_options_before_calling_the_engine() {
+    for (option, value, error) in [
+        ("query-auth.enabled", "true", "query-auth"),
+        ("scan.version", "1", "time travel"),
+        ("incremental-between", "1,5", "incremental-between"),
+    ] {
+        let resolver = Arc::new(MetadataEngineResolver::default());
+        let env = setup_with_engine(Some(resolver.clone())).await;
+        env.ctx
+            .sql(&format!("SET 'paimon.{option}' = '{value}'"))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let schema = env.ctx.ctx().catalog(CATALOG).unwrap().schema(DB).unwrap();
+        let err = schema.table("it$history").await.unwrap_err();
+        assert!(err.to_string().contains(error), "{err}");
+        if option == "scan.version" {
+            assert!(err.to_string().contains("it$history"), "{err}");
+        }
+        assert!(schema.table_exist("it$history"));
+        assert_eq!(resolver.calls.load(Ordering::Relaxed), 0);
+    }
 }
 
 #[tokio::test]
