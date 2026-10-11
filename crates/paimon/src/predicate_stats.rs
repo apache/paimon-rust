@@ -53,6 +53,9 @@ pub(crate) fn data_leaf_may_match<T: StatsAccessor>(
     if row_count <= 0 {
         return false;
     }
+    if !stats_evolution_is_safe(stats_data_type, predicate_data_type) {
+        return true;
+    }
 
     let null_count = stats.null_count(index);
     let all_null = null_count.map(|count| count == row_count);
@@ -270,6 +273,9 @@ pub(crate) fn data_leaf_must_match<T: StatsAccessor>(
 ) -> bool {
     let row_count = stats.row_count();
     if row_count <= 0 {
+        return false;
+    }
+    if !stats_evolution_is_safe(stats_data_type, predicate_data_type) {
         return false;
     }
 
@@ -568,6 +574,24 @@ fn predicate_must_match_with_schema<T: StatsAccessor>(
     }
 }
 
+fn stats_evolution_is_safe(source: &DataType, target: &DataType) -> bool {
+    // Java's CastExecutors.castLiteralsWithEvolution permits unchanged types
+    // and integer widening. Narrowing can wrap, and timestamp precision changes
+    // alter values even when their Arrow storage types are identical. Neither
+    // the original bounds nor null counts can prove a match after unsafe casts.
+    source.equals_ignore_nullable(target)
+        || matches!(
+            (source, target),
+            (
+                DataType::TinyInt(_),
+                DataType::SmallInt(_) | DataType::Int(_) | DataType::BigInt(_)
+            ) | (
+                DataType::SmallInt(_),
+                DataType::Int(_) | DataType::BigInt(_)
+            ) | (DataType::Int(_), DataType::BigInt(_))
+        )
+}
+
 fn coerce_stats_datum_for_predicate(datum: Datum, predicate_data_type: &DataType) -> Option<Datum> {
     match (datum, predicate_data_type) {
         (datum @ Datum::Bool(_), DataType::Boolean(_))
@@ -781,6 +805,99 @@ mod tests {
 
     fn int_stats(min: i32, max: i32) -> MockStats {
         nullable_int_stats(Some(min), Some(max), Some(0))
+    }
+
+    #[test]
+    fn timestamp_precision_changes_make_bounds_and_null_counts_unknown() {
+        use crate::spec::{LocalZonedTimestampType, TimestampType};
+
+        for (source, target, value) in [
+            (
+                DataType::Timestamp(TimestampType::new(3).unwrap()),
+                DataType::Timestamp(TimestampType::new(1).unwrap()),
+                Datum::Timestamp {
+                    millis: 123,
+                    nanos: 0,
+                },
+            ),
+            (
+                DataType::LocalZonedTimestamp(LocalZonedTimestampType::new(3).unwrap()),
+                DataType::LocalZonedTimestamp(LocalZonedTimestampType::new(1).unwrap()),
+                Datum::LocalZonedTimestamp {
+                    millis: 123,
+                    nanos: 0,
+                },
+            ),
+        ] {
+            let stats = MockStats {
+                row_count: 1,
+                null_count: Some(0),
+                min: Some(value.clone()),
+                max: Some(value.clone()),
+            };
+            // Even a predicate which matches the *old* bounds cannot establish
+            // must-match: NOT would then wrongly prune the converted value.
+            for op in [
+                PredicateOperator::Eq,
+                PredicateOperator::NotEq,
+                PredicateOperator::Lt,
+                PredicateOperator::Gt,
+                PredicateOperator::Between,
+                PredicateOperator::NotBetween,
+                PredicateOperator::IsNull,
+                PredicateOperator::IsNotNull,
+            ] {
+                let literals = [value.clone(), value.clone()];
+                assert!(data_leaf_may_match(
+                    0, &source, &target, op, &literals, &stats
+                ));
+                assert!(!data_leaf_must_match(
+                    0, &source, &target, op, &literals, &stats
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn integer_widening_preserves_stats_pruning_but_narrowing_is_unknown() {
+        use crate::spec::{BigIntType, TinyIntType};
+
+        let source = DataType::Int(IntType::new());
+        let stats = int_stats(128, 128);
+        let widened = DataType::BigInt(BigIntType::new());
+        assert!(!data_leaf_may_match(
+            0,
+            &source,
+            &widened,
+            PredicateOperator::Eq,
+            &[Datum::Long(100)],
+            &stats
+        ));
+        assert!(data_leaf_must_match(
+            0,
+            &source,
+            &widened,
+            PredicateOperator::Eq,
+            &[Datum::Long(128)],
+            &stats
+        ));
+        let narrowed = DataType::TinyInt(TinyIntType::new());
+        assert!(data_leaf_may_match(
+            0,
+            &source,
+            &narrowed,
+            PredicateOperator::Eq,
+            &[Datum::TinyInt(-128)],
+            &stats
+        ));
+        assert!(!data_leaf_must_match(
+            0,
+            &source,
+            &narrowed,
+            PredicateOperator::IsNotNull,
+            &[],
+            &stats
+        ));
     }
 
     fn nullable_int_stats(

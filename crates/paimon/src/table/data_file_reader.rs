@@ -539,18 +539,40 @@ impl DataFileReader {
         for predicate in &predicates {
             crate::arrow::residual::collect_predicate_leaf_refs(predicate, &mut refs);
         }
-        let metadata_residual = (projects_row_id
-            && predicates
-                .iter()
-                .any(|predicate| !matches!(predicate, Predicate::AlwaysTrue)))
+        // A predicate's literals use the current table type. Casting a physical
+        // old-file column inside the decoder can change Java narrowing or
+        // timestamp precision semantics, and filtering there loses those rows
+        // before schema reconciliation. Evaluate the complete predicate after
+        // reconciliation, as Java's schema-evolution reader does.
+        let evolved_predicate = data_fields.as_deref().is_some_and(|fields| {
+            refs.iter().any(|(name, index)| {
+                if crate::spec::is_row_tracking_column(name) {
+                    return false;
+                }
+                table_fields.get(*index).is_some_and(|target| {
+                    fields
+                        .iter()
+                        .find(|source| source.id() == target.id())
+                        .is_none_or(|source| {
+                            !source
+                                .data_type()
+                                .equals_ignore_nullable(target.data_type())
+                        })
+                })
+            })
+        });
+        let post_read_filter = evolved_predicate
+            || (projects_row_id
+                && predicates
+                    .iter()
+                    .any(|predicate| !matches!(predicate, Predicate::AlwaysTrue)))
             || (row_tracking_enabled
                 && refs
                     .iter()
                     .any(|(name, _)| *name == crate::spec::SEQUENCE_NUMBER_FIELD_NAME));
-        if metadata_residual {
-            // Decoder-side filtering can drop rows before positional `_ROW_ID`
-            // attachment. Read predicate-only columns without pushing the filter
-            // down, attach the original ids, then evaluate the exact predicate.
+        if post_read_filter {
+            // Read predicate-only columns without decoder filtering. Reconcile
+            // old-file types and attach original row IDs before exact filtering.
             for (name, index) in refs {
                 if name == crate::spec::SEQUENCE_NUMBER_FIELD_NAME {
                     crate::arrow::residual::push_unique_scan_field(
@@ -572,7 +594,7 @@ impl DataFileReader {
         let projects_row_id = read_type
             .iter()
             .any(|field| field.name() == ROW_ID_FIELD_NAME);
-        let residual_predicates = metadata_residual.then(|| crate::arrow::format::FilePredicates {
+        let residual_predicates = post_read_filter.then(|| crate::arrow::format::FilePredicates {
             predicates: predicates.clone(),
             row_filter_factory: None,
             file_fields: table_fields.clone(),
@@ -582,7 +604,7 @@ impl DataFileReader {
         // post-filter until expression adaptation is proven for that path.
         // Positional `_ROW_ID` materialization must see the unfiltered row
         // stream, so the engine hook stays disabled for this projection.
-        let row_filter_factory = (data_fields.is_none() && !projects_row_id && !metadata_residual)
+        let row_filter_factory = (data_fields.is_none() && !projects_row_id && !post_read_filter)
             .then(|| self.row_filter_factory.clone())
             .flatten();
         let file_io = self.file_io.clone();
@@ -629,7 +651,7 @@ impl DataFileReader {
             mosaic_prefetch,
         )?;
         // Remap predicates from table-level to file-level indices.
-        let file_predicates = if metadata_residual {
+        let file_predicates = if post_read_filter {
             None
         } else {
             let remapped = crate::arrow::filtering::remap_predicates_to_file(
@@ -3297,11 +3319,12 @@ mod tests {
         )
         .unwrap();
         for (case, values, expected_values) in [
-            ("overflow_only", vec![Some(383)], vec![None]),
+            // Java's Number.byteValue keeps the low bits: 383 becomes 127.
+            ("overflow_only", vec![Some(383)], vec![Some(127)]),
             (
                 "mixed",
                 vec![Some(127), Some(383), None],
-                vec![Some(127), None, None],
+                vec![Some(127), Some(127), None],
             ),
         ] {
             let mut avro_writer = apache_avro::Writer::new(&avro_schema, Vec::new());
