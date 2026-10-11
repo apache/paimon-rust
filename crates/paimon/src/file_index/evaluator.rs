@@ -186,8 +186,8 @@ fn devolve_literals(
     if same_type_ignoring_nullability(table_type, data_type) {
         return Some(literals.to_vec());
     }
-    // Narrowing can turn non-null file values into NULL, so reject it even for
-    // predicates without literals, such as IS NULL and IS NOT NULL.
+    // Integer narrowing can wrap values, so it is outside Java's evolution
+    // whitelist, including predicates without literals such as IS NULL.
     if integer_width(table_type)? <= integer_width(data_type)? {
         return None;
     }

@@ -221,6 +221,27 @@ pub(crate) fn evolve_column(
         }
     }
 
+    if matches!(
+        target_type,
+        DataType::TinyInt(_) | DataType::SmallInt(_) | DataType::Int(_) | DataType::BigInt(_)
+    ) && matches!(
+        source_type,
+        DataType::TinyInt(_)
+            | DataType::SmallInt(_)
+            | DataType::Int(_)
+            | DataType::BigInt(_)
+            | DataType::Float(_)
+            | DataType::Double(_)
+            | DataType::Decimal(_)
+    ) {
+        return super::evolution_cast::numeric_to_integer(source, &target_arrow);
+    }
+    if let Some(result) =
+        super::evolution_cast::timestamp_precision(source, source_type, target_type, &target_arrow)?
+    {
+        return Ok(result);
+    }
+
     cast(source, &target_arrow).map_err(|e| crate::Error::UnexpectedError {
         message: format!(
             "failed to cast nested value from {:?} to {:?} during schema evolution",
@@ -1031,6 +1052,49 @@ mod tests {
         let source_type = DataType::Map(MapType::new(string_type(), DataType::Int(IntType::new())));
         let out = evolve_column(&map, &source_type, &string_type()).unwrap();
         assert_eq!(strings(&out).value(0), "{k -> 7}");
+    }
+
+    #[test]
+    fn narrowing_integers_keeps_low_bits_like_java() {
+        let source: ArrayRef = Arc::new(Int64Array::from(vec![
+            Some(128),
+            Some(-129),
+            Some(i64::MAX),
+            Some(i64::MIN),
+            None,
+        ]));
+        let target = DataType::TinyInt(crate::spec::TinyIntType::new());
+        let output = evolve_column(&source, &DataType::BigInt(BigIntType::new()), &target).unwrap();
+        assert_eq!(
+            output
+                .as_any()
+                .downcast_ref::<arrow_array::Int8Array>()
+                .unwrap(),
+            &arrow_array::Int8Array::from(vec![Some(-128), Some(127), Some(-1), Some(0), None]),
+        );
+    }
+
+    #[test]
+    fn timestamp_precision_is_truncated_within_the_same_arrow_unit() {
+        let source: ArrayRef = Arc::new(TimestampMillisecondArray::from(vec![
+            Some(123),
+            Some(-1),
+            Some(-123),
+            None,
+        ]));
+        let output = evolve_column(
+            &source,
+            &DataType::Timestamp(TimestampType::new(3).unwrap()),
+            &DataType::Timestamp(TimestampType::new(1).unwrap()),
+        )
+        .unwrap();
+        assert_eq!(
+            output
+                .as_any()
+                .downcast_ref::<TimestampMillisecondArray>()
+                .unwrap(),
+            &TimestampMillisecondArray::from(vec![Some(100), Some(-100), Some(-200), None]),
+        );
     }
 
     #[test]
