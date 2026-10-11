@@ -35,14 +35,9 @@ pub async fn list_partitions_from_file_system(table: &Table) -> Result<Vec<Parti
     // Manifests carry partition values and per-column stats.
     crate::spec::CoreOptions::new(table.schema().options()).ensure_read_authorized()?;
     let file_io = table.file_io();
-    let snapshot_sm = table.snapshot_manager();
     let manifest_sm = SnapshotManager::new(file_io.clone(), table.location().to_string());
-    let snapshot = match table.travel_snapshot().cloned() {
-        Some(snapshot) => snapshot,
-        None => match snapshot_sm.get_latest_snapshot().await? {
-            Some(snapshot) => snapshot,
-            None => return Ok(Vec::new()),
-        },
+    let Some(snapshot) = table.resolve_read_snapshot().await? else {
+        return Ok(Vec::new());
     };
 
     let base_path = manifest_sm.manifest_path(snapshot.base_manifest_list());

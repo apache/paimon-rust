@@ -1939,6 +1939,9 @@ impl<'a> PaimonTableScan<'a> {
         core_options.ensure_type_paimon_served(&self.table.identifier().full_name())?;
         core_options.validate_scan_options()?;
         core_options.validate_data_file_path_directory()?;
+        // Timestamp windows bypass point-snapshot resolution but must still
+        // reject a schema whose captured selection was invalidated by a copy.
+        self.table.ensure_read_snapshot_current()?;
 
         // File paths and stats, not table columns: the endpoint cannot rule on them.
         let query_auth = CoreOptions::new(self.table.schema().options()).query_auth_enabled();

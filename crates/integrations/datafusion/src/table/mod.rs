@@ -175,7 +175,7 @@ impl PaimonTableProvider {
     }
 
     pub(crate) fn with_pinned_snapshot(mut self, snapshot: &Snapshot) -> Self {
-        self.table = self.table.copy_with_pinned_snapshot(snapshot);
+        self.table = self.table.copy_with_pinned_snapshot(Some(snapshot));
         self
     }
 }

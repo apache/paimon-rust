@@ -467,7 +467,7 @@ async fn branch_write_historical_handles_remain_read_only() {
     append(&main, "seed", batch(vec![1], vec![10])).await;
     let branch = tagged_branch(&main).await;
     let snapshot = latest(&branch).await;
-    let mut historical = branch.copy_with_pinned_snapshot(&snapshot);
+    let mut historical = branch.copy_with_pinned_snapshot(Some(&snapshot));
     // The pinned snapshot remains read-only even with no selector in its options.
     historical.schema = historical
         .schema
