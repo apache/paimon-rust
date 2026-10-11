@@ -20,7 +20,6 @@ use super::postpone_fixed_bucket_router::{
     validate_postpone_fixed_bucket_table, PostponeFixedBucketRouter,
 };
 use crate::resource::ResourceContext;
-use crate::spec::CoreOptions;
 use crate::table::{CommitMessage, PostponeBucketPlan, Table, TableCommit, TableWrite};
 use crate::Result;
 use arrow_array::RecordBatch;
@@ -55,7 +54,7 @@ impl PostponeFixedBucketTableWrite {
         overwrite: bool,
         resources: Option<ResourceContext>,
     ) -> Result<Self> {
-        validate_postpone_fixed_bucket_write(table)?;
+        validate_postpone_fixed_bucket_table(table)?;
         let mut inner = TableWrite::new(table, commit_user)?;
         if let Some(resources) = resources {
             inner = inner.with_resources(resources);
@@ -229,19 +228,6 @@ impl PostponeFixedBucketTableCommit {
     pub async fn abort(&self, messages: &[CommitMessage]) -> Result<()> {
         self.inner.abort(messages).await
     }
-}
-
-fn validate_postpone_fixed_bucket_write(table: &Table) -> Result<()> {
-    validate_postpone_fixed_bucket_table(table)?;
-    if CoreOptions::new(table.schema().options()).deletion_vectors_enabled() {
-        return Err(crate::Error::Unsupported {
-            message: format!(
-                "Table '{}' cannot use postpone fixed-bucket writes with deletion-vectors.enabled=true because deletion-vector scans skip the level-0 files produced by batch writers; use the normal postpone writer or disable deletion vectors",
-                table.identifier().full_name()
-            ),
-        });
-    }
-    Ok(())
 }
 
 #[cfg(test)]
