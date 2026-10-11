@@ -1732,61 +1732,76 @@ mod tests {
     /// key with no replacement is resurrected.
     #[tokio::test]
     async fn dv_merge_on_read_applies_deletion_vectors_before_key_merge() {
-        let file_io = test_file_io();
-        let table_path = "memory:/dv_merge_on_read_with_dv";
-        setup_dirs(&file_io, table_path).await;
-        let table = pk_table(
-            &file_io,
-            table_path,
-            &[
-                ("deletion-vectors.enabled", "true"),
-                ("deletion-vectors.merge-on-read", "true"),
-            ],
-        );
+        for (engine, expected) in [
+            ("deduplicate", 11),
+            ("partial-update", 11),
+            ("aggregation", 21),
+        ] {
+            let file_io = test_file_io();
+            let table_path = "memory:/dv_merge_on_read_with_dv";
+            setup_dirs(&file_io, table_path).await;
+            let table = pk_table(
+                &file_io,
+                table_path,
+                &[
+                    ("merge-engine", engine),
+                    ("deletion-vectors.enabled", "true"),
+                    ("deletion-vectors.merge-on-read", "true"),
+                ],
+            );
+            let table = if engine == "aggregation" {
+                table.copy_with_options(HashMap::from([(
+                    "fields.value.aggregate-function".into(),
+                    "sum".into(),
+                )]))
+            } else {
+                table
+            };
 
-        write_commit(&table, &int_batch(vec![1, 2], vec![Some(10), Some(20)])).await;
-        write_commit(&table, &int_batch(vec![1, 3], vec![Some(11), Some(30)])).await;
+            write_commit(&table, &int_batch(vec![1, 2], vec![Some(10), Some(20)])).await;
+            write_commit(&table, &int_batch(vec![1, 3], vec![Some(11), Some(30)])).await;
 
-        let all_files = table
-            .new_read_builder()
-            .new_scan()
-            .with_scan_all_files()
-            .plan()
-            .await
-            .unwrap();
-        let mut files = all_files
-            .splits()
-            .iter()
-            .flat_map(|split| split.data_files().iter().cloned())
-            .collect::<Vec<_>>();
-        files.sort_by_key(|file| file.min_sequence_number);
-        assert_eq!(files.len(), 2);
-        files[0].level = 1;
+            let all_files = table
+                .new_read_builder()
+                .new_scan()
+                .with_scan_all_files()
+                .plan()
+                .await
+                .unwrap();
+            let mut files = all_files
+                .splits()
+                .iter()
+                .flat_map(|split| split.data_files().iter().cloned())
+                .collect::<Vec<_>>();
+            files.sort_by_key(|file| file.min_sequence_number);
+            assert_eq!(files.len(), 2);
+            files[0].level = 1;
 
-        let deletion_file = write_deletion_file(&file_io, table_path, &[1]).await;
-        let split = DataSplitBuilder::new()
-            .with_snapshot(2)
-            .with_partition(BinaryRow::new(0))
-            .with_bucket(0)
-            .with_bucket_path(format!("{table_path}/bucket-0"))
-            .with_total_buckets(1)
-            .with_data_files(files)
-            .with_data_deletion_files(vec![Some(deletion_file), None])
-            .with_raw_convertible(false)
-            .build()
-            .unwrap();
+            let deletion_file = write_deletion_file(&file_io, table_path, &[1]).await;
+            let split = DataSplitBuilder::new()
+                .with_snapshot(2)
+                .with_partition(BinaryRow::new(0))
+                .with_bucket(0)
+                .with_bucket_path(format!("{table_path}/bucket-0"))
+                .with_total_buckets(1)
+                .with_data_files(files)
+                .with_data_deletion_files(vec![Some(deletion_file), None])
+                .with_raw_convertible(false)
+                .build()
+                .unwrap();
 
-        let batches = table
-            .new_read_builder()
-            .new_read()
-            .unwrap()
-            .to_arrow(&[split])
-            .unwrap()
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
-        assert_eq!(int_column(&batches, "id"), vec![1, 3]);
-        assert_eq!(int_column(&batches, "value"), vec![11, 30]);
+            let batches = table
+                .new_read_builder()
+                .new_read()
+                .unwrap()
+                .to_arrow(&[split])
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            assert_eq!(int_column(&batches, "id"), vec![1, 3]);
+            assert_eq!(int_column(&batches, "value"), vec![expected, 30]);
+        }
     }
 
     /// Disjoint files in one split are consumed as sequential merge groups. A

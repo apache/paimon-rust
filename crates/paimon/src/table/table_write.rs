@@ -1634,8 +1634,6 @@ impl TableWrite {
                     value_fields: self.table.schema().fields().to_vec(),
                     sequence_field_indices: self.sequence_field_indices.clone(),
                     merge_engine: self.merge_engine,
-                    deletion_vectors_enabled: CoreOptions::new(self.table.schema().options())
-                        .deletion_vectors_enabled(),
                     file_index_options: self.file_index_options.clone(),
                 },
                 next_seq,
@@ -3627,41 +3625,6 @@ pub(in crate::table) mod tests {
             .write_arrow_batch(&make_batch(vec![1], vec![10]))
             .await
             .unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_rejects_partial_update_with_deletion_vectors_when_creating_writer() {
-        let file_io = test_file_io();
-        let table_path = "memory:/test_partial_update_dv_table";
-        setup_dirs(&file_io, table_path).await;
-
-        let table = Table::new(
-            file_io,
-            Identifier::new("default", "test_partial_update_dv_table"),
-            table_path.to_string(),
-            TableSchema::new(
-                0,
-                &Schema::builder()
-                    .column("id", DataType::Int(IntType::new()))
-                    .column("value", DataType::Int(IntType::new()))
-                    .primary_key(["id"])
-                    .option("bucket", "1")
-                    .option("merge-engine", "partial-update")
-                    .option("deletion-vectors.enabled", "true")
-                    .build()
-                    .unwrap(),
-            ),
-            None,
-        );
-
-        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
-        let err = table_write
-            .write_arrow_batch(&make_batch(vec![1], vec![10]))
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(err, crate::Error::Unsupported { message } if message.contains("deletion-vectors.enabled=true"))
-        );
     }
 
     #[tokio::test]
