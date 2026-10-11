@@ -94,6 +94,10 @@ class StreamTableScan:
 
 
 class RecordBatchReader:
+    @property
+    def schema(self) -> Optional[pyarrow.Schema]:
+        """Result schema of a SQL stream; None for a table read."""
+        ...
     def __iter__(self) -> "RecordBatchReader": ...
     def __next__(self) -> pyarrow.RecordBatch: ...
     def read_next_batch(self) -> Optional[pyarrow.RecordBatch]: ...
@@ -575,6 +579,14 @@ class SQLContext:
     def sql_with_options(
         self, sql: str, options: SQLOptions
     ) -> List[pyarrow.RecordBatch]: ...
+    def sql_stream(self, sql: str) -> RecordBatchReader:
+        """Stream PyArrow batches; close the reader when stopping early."""
+        ...
+    def sql_stream_with_options(
+        self, sql: str, options: SQLOptions
+    ) -> RecordBatchReader:
+        """Stream results with SQLOptions restrictions."""
+        ...
 
 
 class VectorSearchBuilder:

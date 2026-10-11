@@ -56,6 +56,32 @@ ctx.sql("DROP TEMPORARY TABLE paimon.default.my_temp")
 
 For the full SQL reference, see the [SQL Integration docs](https://paimon.apache.org/docs/master/sql/).
 
+### Streaming SQL results
+
+`sql_stream()` executes one SQL query and returns a `RecordBatchReader`, yielding
+PyArrow batches without collecting the entire result in memory. Close the reader
+when stopping early to release the execution stream:
+
+```python
+from contextlib import closing
+
+with closing(ctx.sql_stream("SELECT id, name FROM paimon.my_db.users")) as reader:
+    for batch in reader:
+        print(batch.to_pydict())
+```
+
+`read_next_batch()` returns `None` when the reader is exhausted or closed.
+`reader.schema` is known before the first batch, so
+`pa.Table.from_batches(reader, schema=reader.schema)` also handles an empty result.
+Statements that write, such as `INSERT`, finish before `sql_stream()` returns.
+Errors during execution can surface while reading a batch and end the stream.
+Operators such as sorting and aggregation may still buffer data during execution.
+
+`sql_stream_with_options(sql, options)` applies `SQLOptions` as `sql_with_options()`
+does: they restrict statements delegated to DataFusion, but not statements Paimon
+handles itself, such as `DELETE`, `UPDATE`, `MERGE INTO` or `DROP TABLE` on a
+Paimon table.
+
 ### Native Vector Search
 
 A table with an existing vector column can search through the Rust core without

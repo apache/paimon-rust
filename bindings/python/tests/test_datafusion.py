@@ -132,30 +132,33 @@ def test_sql_context_rejects_invalid_runtime_resource_configuration(kwargs, mess
         SQLContext(**kwargs)
 
 
-def test_sql_with_options_disables_statements():
+@pytest.mark.parametrize("method", ["sql_with_options", "sql_stream_with_options"])
+def test_sql_with_options_disables_statements(method):
     ctx = SQLContext()
     options = SQLOptions().with_allow_statements(False)
 
     with pytest.raises(ValueError, match="Statement not supported"):
-        ctx.sql_with_options("SET datafusion.execution.batch_size = 1024", options)
+        getattr(ctx, method)("SET datafusion.execution.batch_size = 1024", options)
 
 
-def test_sql_with_options_disables_ddl():
+@pytest.mark.parametrize("method", ["sql_with_options", "sql_stream_with_options"])
+def test_sql_with_options_disables_ddl(method):
     ctx = SQLContext()
     options = SQLOptions().with_allow_ddl(False)
 
     with pytest.raises(ValueError, match="DDL not supported"):
-        ctx.sql_with_options("CREATE VIEW blocked_view AS SELECT 1", options)
+        getattr(ctx, method)("CREATE VIEW blocked_view AS SELECT 1", options)
 
 
-def test_sql_with_options_disables_dml(tmp_path):
+@pytest.mark.parametrize("method", ["sql_with_options", "sql_stream_with_options"])
+def test_sql_with_options_disables_dml(tmp_path, method):
     ctx = SQLContext()
     ctx.register_catalog("paimon", {"warehouse": str(tmp_path / "warehouse")})
     ctx.sql("CREATE TABLE paimon.default.test_table (id INT)")
     options = SQLOptions().with_allow_dml(False)
 
     with pytest.raises(ValueError, match="DML not supported"):
-        ctx.sql_with_options(
+        getattr(ctx, method)(
             "INSERT INTO paimon.default.test_table VALUES (1)", options
         )
 
