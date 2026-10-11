@@ -516,7 +516,7 @@ impl BlobConsumer for PythonBlobConsumer {
     }
 }
 
-fn wrap_messages(
+pub(crate) fn wrap_messages(
     messages: Vec<CommitMessage>,
     table_location: &str,
     commit_user: &str,
@@ -733,6 +733,22 @@ impl UpdateContext {
             result.map_err(to_callback_error)?,
             &self.table_location,
             &self.commit_user,
+        ))
+    }
+
+    fn new_shard_updator(
+        &self,
+        py: Python<'_>,
+        shard: usize,
+        count: usize,
+    ) -> PyResult<crate::shard_update::PyShardTableUpdator> {
+        let inner = py
+            .detach(|| runtime().block_on(self.inner.new_shard_updater(shard, count)))
+            .map_err(to_py_err)?;
+        Ok(crate::shard_update::PyShardTableUpdator::new(
+            inner,
+            self.table_location.clone(),
+            self.commit_user.clone(),
         ))
     }
 
@@ -988,6 +1004,27 @@ impl PyStreamTableUpdate {
         self.context.new_update_by_row_id(py)
     }
 
+    fn with_read_projection<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        projection: Vec<String>,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        slf.context
+            .inner
+            .with_read_projection(projection)
+            .map_err(to_py_err)?;
+        Ok(slf)
+    }
+
+    fn new_shard_updator(
+        &self,
+        py: Python<'_>,
+        shard_num: usize,
+        total_shard_count: usize,
+    ) -> PyResult<crate::shard_update::PyShardTableUpdator> {
+        self.context
+            .new_shard_updator(py, shard_num, total_shard_count)
+    }
+
     fn with_update_type<'py>(
         mut slf: PyRefMut<'py, Self>,
         update_cols: Vec<String>,
@@ -1077,6 +1114,27 @@ impl PyBatchTableUpdate {
 
     fn new_update_by_row_id(&self, py: Python<'_>) -> PyResult<PyTableUpdateByRowId> {
         self.context.new_update_by_row_id(py)
+    }
+
+    fn with_read_projection<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        projection: Vec<String>,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        slf.context
+            .inner
+            .with_read_projection(projection)
+            .map_err(to_py_err)?;
+        Ok(slf)
+    }
+
+    fn new_shard_updator(
+        &self,
+        py: Python<'_>,
+        shard_num: usize,
+        total_shard_count: usize,
+    ) -> PyResult<crate::shard_update::PyShardTableUpdator> {
+        self.context
+            .new_shard_updator(py, shard_num, total_shard_count)
     }
 
     fn with_update_type<'py>(

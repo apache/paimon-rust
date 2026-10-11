@@ -760,6 +760,7 @@ pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> 
     this.add_class::<crate::write::PyBatchTableWrite>()?;
     this.add_class::<crate::write::PyBatchTableUpdate>()?;
     this.add_class::<crate::write::PyTableUpdateByRowId>()?;
+    this.add_class::<crate::shard_update::PyShardTableUpdator>()?;
     this.add_class::<crate::write::PyStreamTableUpdate>()?;
     this.add_class::<crate::write::PyStreamTableWrite>()?;
     this.add_class::<crate::write::PyBatchTableCommit>()?;

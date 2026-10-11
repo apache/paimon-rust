@@ -1316,6 +1316,16 @@ impl RowIdFileIndex {
         })
     }
 
+    /// Anchor of the normal-file group owning a visible row.
+    pub(super) fn first_row_id_for(&self, row_id: i64) -> Result<i64> {
+        find_owning_file(&self.files, row_id)
+            .map(|(_, file)| file.first_row_id)
+            .ok_or_else(|| crate::Error::DataInvalid {
+                message: format!("No file found for _ROW_ID {row_id}"),
+                source: None,
+            })
+    }
+
     pub(super) fn matched_first_row_ids(&self, batches: &[RecordBatch]) -> Result<HashSet<i64>> {
         if batches.iter().all(|batch| batch.num_rows() == 0) {
             return Ok(HashSet::new());

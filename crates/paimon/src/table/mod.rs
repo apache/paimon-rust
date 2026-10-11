@@ -137,6 +137,7 @@ mod row_position_selection;
 mod row_sidecar;
 mod scan_trace;
 pub(crate) mod schema_manager;
+mod shard_table_updater;
 pub(crate) mod snapshot_commit;
 mod snapshot_manager;
 mod sort_merge;
@@ -216,6 +217,7 @@ pub use read_builder::ReadBuilder;
 pub use rest_env::RESTEnv;
 pub use scan_trace::ScanTrace;
 pub use schema_manager::SchemaManager;
+pub use shard_table_updater::ShardTableUpdater;
 pub use snapshot_commit::{RESTSnapshotCommit, RenamingSnapshotCommit, SnapshotCommit};
 pub use snapshot_manager::SnapshotManager;
 pub use source::{

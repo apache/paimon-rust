@@ -50,6 +50,7 @@ pub struct TableUpdate {
     table: Table,
     commit_user: String,
     update_cols: Option<Vec<String>>,
+    read_projection: Option<Vec<String>>,
     blob_uri_reader_factory: Option<std::sync::Arc<dyn crate::io::UriReaderFactory>>,
 }
 
@@ -59,6 +60,7 @@ impl TableUpdate {
             table: table.clone(),
             commit_user,
             update_cols: None,
+            read_projection: None,
             blob_uri_reader_factory: None,
         }
     }
@@ -99,6 +101,36 @@ impl TableUpdate {
             .iter()
             .map(|field| field.name().to_string())
             .collect()
+    }
+
+    /// Columns returned by a shard updater's reader, in caller order.
+    pub fn with_read_projection(&mut self, projection: Vec<String>) -> crate::Result<&mut Self> {
+        self.table
+            .new_read_builder()
+            .with_projection(&projection.iter().map(String::as_str).collect::<Vec<_>>())?
+            .new_read()?;
+        self.read_projection = Some(projection);
+        Ok(self)
+    }
+
+    /// Read and replace columns over one balanced shard of whole file groups.
+    pub async fn new_shard_updater(
+        &self,
+        shard: usize,
+        shard_count: usize,
+    ) -> crate::Result<super::ShardTableUpdater> {
+        let mut updater = super::ShardTableUpdater::new(
+            &self.table,
+            self.read_projection.clone(),
+            self.update_cols
+                .clone()
+                .unwrap_or_else(|| self.all_fields()),
+            shard,
+            shard_count,
+        )
+        .await?;
+        updater.with_blob_uri_reader_factory(self.blob_uri_reader_factory.clone());
+        Ok(updater)
     }
 
     fn columns_for_batch(&self, batch: &RecordBatch) -> Vec<String> {

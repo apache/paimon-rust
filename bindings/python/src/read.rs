@@ -776,6 +776,14 @@ pub struct PyRecordBatchReader {
 }
 
 impl PyRecordBatchReader {
+    pub(crate) fn from_stream(stream: ArrowRecordBatchStream) -> Self {
+        Self {
+            stream: Mutex::new(Some(stream)),
+            closed: AtomicBool::new(false),
+            close_notify: Notify::new(),
+        }
+    }
+
     fn next_record_batch(&self) -> PyResult<Option<RecordBatch>> {
         let mut stream = self
             .stream
