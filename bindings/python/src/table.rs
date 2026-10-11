@@ -206,6 +206,18 @@ impl PyTable {
         crate::hybrid_search::PyHybridSearchBuilder::new(Arc::clone(&self.inner))
     }
 
+    /// Forward one captured Java-format snapshot, or an explicitly empty view.
+    #[pyo3(signature = (snapshot_json))]
+    fn copy_with_pinned_snapshot(&self, snapshot_json: Option<&str>) -> PyResult<Self> {
+        let snapshot = snapshot_json
+            .map(serde_json::from_str::<paimon::spec::Snapshot>)
+            .transpose()
+            .map_err(|error| PyValueError::new_err(format!("Invalid snapshot JSON: {error}")))?;
+        Ok(Self {
+            inner: Arc::new(self.inner.copy_with_pinned_snapshot(snapshot.as_ref())),
+        })
+    }
+
     fn new_vector_search_builder(&self) -> crate::vector_search::PyVectorSearchBuilder {
         crate::vector_search::PyVectorSearchBuilder::new(Arc::clone(&self.inner))
     }

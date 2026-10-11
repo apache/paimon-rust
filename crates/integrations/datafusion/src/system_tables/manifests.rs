@@ -160,15 +160,10 @@ impl TableProvider for ManifestsTable {
 
 async fn collect_manifests(table: &Table) -> paimon::Result<Vec<ManifestFileMeta>> {
     let file_io = table.file_io();
-    let snapshot_sm = table.snapshot_manager();
     let manifest_sm =
         paimon::table::SnapshotManager::new(file_io.clone(), table.location().to_string());
-    let snapshot = match table.travel_snapshot().cloned() {
-        Some(snapshot) => snapshot,
-        None => match snapshot_sm.get_latest_snapshot().await? {
-            Some(snapshot) => snapshot,
-            None => return Ok(Vec::new()),
-        },
+    let Some(snapshot) = table.resolve_read_snapshot().await? else {
+        return Ok(Vec::new());
     };
 
     let base_path = manifest_sm.manifest_path(snapshot.base_manifest_list());

@@ -246,6 +246,23 @@ use crate::spec::{
     SCAN_WATERMARK_OPTION,
 };
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
+/// A captured read view. Absence of this enum means that the view is unresolved.
+#[derive(Debug, Clone)]
+enum ReadSnapshot {
+    Empty,
+    Snapshot(Arc<Snapshot>),
+}
+
+impl ReadSnapshot {
+    fn snapshot(&self) -> Option<&Snapshot> {
+        match self {
+            Self::Empty => None,
+            Self::Snapshot(snapshot) => Some(snapshot),
+        }
+    }
+}
 
 /// Table represents a table in the catalog.
 #[derive(Debug, Clone)]
@@ -264,10 +281,9 @@ pub struct Table {
     /// True when this table copy was switched to a historical schema by
     /// [`Table::copy_with_time_travel`]. Such a copy is read-only.
     time_traveled: bool,
-    /// Snapshot resolved by [`Table::copy_with_time_travel`] from this copy's
-    /// options, so scans don't have to resolve the same selector again.
+    /// Captured snapshot or empty view, so scans don't resolve latest again.
     /// Cleared when [`Table::copy_with_options`] changes the selector.
-    travel_snapshot: Option<Snapshot>,
+    travel_snapshot: Option<ReadSnapshot>,
     /// Explicit options remain overrides across later time-travel copies.
     applied_dynamic_option_keys: HashSet<String>,
 }
@@ -594,6 +610,8 @@ impl Table {
                 || k == crate::spec::SCAN_WATERMARK_OPTION
                 || k == crate::spec::SCAN_SNAPSHOT_ID_OPTION
                 || k == crate::spec::SCAN_TAG_NAME_OPTION
+                || k == "scan.mode"
+                || k == "incremental-between-timestamp"
         });
         Self {
             file_io: self.file_io.clone(),
@@ -653,7 +671,7 @@ impl Table {
     /// same snapshot. The snapshot's schema is loaded when it differs from the
     /// current table schema.
     pub(crate) async fn copy_with_resolved_snapshot(&self, snapshot: &Snapshot) -> Result<Self> {
-        let mut table = self.copy_with_pinned_snapshot(snapshot);
+        let mut table = self.copy_with_pinned_snapshot(Some(snapshot));
         if snapshot.schema_id() != self.schema.id() {
             let schema = self.schema_manager.schema(snapshot.schema_id()).await?;
             let options = table.historical_field_options(&schema);
@@ -667,7 +685,8 @@ impl Table {
     ///
     /// Unlike time travel, pinning must not change the fields used by an already
     /// planned query. The resolved snapshot is cached without additional I/O.
-    pub fn copy_with_pinned_snapshot(&self, snapshot: &Snapshot) -> Self {
+    /// `None` captures an empty view, which remains empty after later commits.
+    pub fn copy_with_pinned_snapshot(&self, snapshot: Option<&Snapshot>) -> Self {
         let mut options = self.schema.options().clone();
         for selector in [
             SCAN_TIMESTAMP_MILLIS_OPTION,
@@ -676,18 +695,35 @@ impl Table {
             SCAN_VERSION_OPTION,
             SCAN_SNAPSHOT_ID_OPTION,
             SCAN_TAG_NAME_OPTION,
+            "incremental-between-timestamp",
+            "scan.file-creation-time-millis",
+            "scan.creation-time-millis",
         ] {
             options.remove(selector);
         }
         options.insert(
-            SCAN_SNAPSHOT_ID_OPTION.to_string(),
-            snapshot.id().to_string(),
+            "scan.mode".to_string(),
+            if snapshot.is_some() {
+                "from-snapshot"
+            } else {
+                "default"
+            }
+            .to_string(),
         );
+        if let Some(snapshot) = snapshot {
+            options.insert(
+                SCAN_SNAPSHOT_ID_OPTION.to_string(),
+                snapshot.id().to_string(),
+            );
+        }
 
         Self {
             schema: self.schema.copy_with_replaced_options(options),
             time_traveled: true,
-            travel_snapshot: Some(snapshot.clone()),
+            travel_snapshot: Some(match snapshot {
+                Some(snapshot) => ReadSnapshot::Snapshot(Arc::new(snapshot.clone())),
+                None => ReadSnapshot::Empty,
+            }),
             ..self.clone()
         }
     }
@@ -807,7 +843,7 @@ impl Table {
                 table.schema = snapshot_schema.copy_with_replaced_options(options);
                 table.time_traveled = true;
             }
-            table.travel_snapshot = Some(snapshot);
+            table.travel_snapshot = Some(ReadSnapshot::Snapshot(Arc::new(snapshot)));
         }
         Ok(table)
     }
@@ -911,8 +947,8 @@ impl Table {
         })
     }
 
-    /// Whether this table copy reads a historical snapshot with its
-    /// historical schema (see [`Table::copy_with_time_travel`]).
+    /// Whether this copy is read-only because its schema was time-traveled or
+    /// its read view was explicitly pinned (including an empty view).
     pub fn is_time_traveled(&self) -> bool {
         self.time_traveled
     }
@@ -922,13 +958,34 @@ impl Table {
     /// "selector set but unresolved" (silent fallback to latest) from a real
     /// travelled read, so they can reject the former instead of reading latest.
     pub fn has_resolved_travel_snapshot(&self) -> bool {
-        self.travel_snapshot.is_some()
+        self.travel_snapshot().is_some()
     }
 
     /// The snapshot resolved by [`Table::copy_with_time_travel`] from this
     /// copy's options, if any. Lets scans skip re-resolving the selector.
     pub fn travel_snapshot(&self) -> Option<&Snapshot> {
-        self.travel_snapshot.as_ref()
+        self.travel_snapshot
+            .as_ref()
+            .and_then(ReadSnapshot::snapshot)
+    }
+
+    /// Resolve the selected read view, reusing complete cached metadata or an
+    /// explicitly empty view. Read latest only when no view has been captured.
+    pub async fn resolve_read_snapshot(&self) -> Result<Option<Snapshot>> {
+        time_travel::resolve_snapshot(self).await
+    }
+
+    /// Reject a captured schema whose read selection was subsequently changed.
+    pub(crate) fn ensure_read_snapshot_current(&self) -> Result<()> {
+        if self.is_time_traveled() && self.travel_snapshot.is_none() {
+            return Err(crate::Error::DataInvalid {
+                message: "Table options changed after time travel; \
+                          use copy_with_time_travel to re-resolve the snapshot and schema"
+                    .to_string(),
+                source: None,
+            });
+        }
+        Ok(())
     }
 }
 

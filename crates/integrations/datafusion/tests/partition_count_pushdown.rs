@@ -623,6 +623,38 @@ async fn test_deletion_vector_zero_groups_and_unknown_cardinality_fallback() {
 }
 
 #[tokio::test]
+async fn test_pinned_empty_view_is_used_by_count_pushdown_and_row_scan() {
+    let (_tmp, catalog, ctx) = setup().await;
+    let table = catalog
+        .get_table(&Identifier::new("test_db", "t"))
+        .await
+        .unwrap();
+    let pinned = table.copy_with_pinned_snapshot(None);
+    ctx.register_temp_table(
+        "paimon.test_db.pinned",
+        Arc::new(paimon_datafusion::PaimonTableProvider::try_new(pinned).unwrap()),
+    )
+    .unwrap();
+    assert_eq!(
+        rows(&ctx, "SELECT COUNT(*) FROM paimon.test_db.pinned").await,
+        vec![row("", 0)]
+    );
+    assert_eq!(
+        rows(&ctx, "SELECT COUNT(id) FROM paimon.test_db.pinned").await,
+        vec![row("", 0)]
+    );
+    let grouped = "SELECT dt, COUNT(*) FROM paimon.test_db.pinned GROUP BY dt";
+    assert!(!scans_table(&ctx, grouped).await);
+    assert!(rows(&ctx, grouped).await.is_empty());
+    assert!(!rows(
+        &ctx,
+        "SELECT dt, COUNT(*) FROM paimon.test_db.t GROUP BY dt"
+    )
+    .await
+    .is_empty());
+}
+
+#[tokio::test]
 async fn test_ungrouped_count_on_unpartitioned_and_empty_tables() {
     let (_tmp, _catalog, ctx) = setup().await;
     exec(&ctx, "CREATE TABLE paimon.test_db.flat (id INT NOT NULL)").await;

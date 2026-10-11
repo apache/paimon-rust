@@ -73,7 +73,7 @@ impl SearchResult {
         vector_column: String,
         hits: ScoredRowIds,
     ) -> Self {
-        let snapshot_id = table.travel_snapshot.as_ref().map(|snapshot| snapshot.id());
+        let snapshot_id = table.travel_snapshot().map(|snapshot| snapshot.id());
         Self {
             table,
             snapshot_id,
