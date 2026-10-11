@@ -425,7 +425,10 @@ class StreamTableWrite:
 
 class BatchTableCommit:
     def close(self) -> None: ...
-    def commit(self, messages: Sequence[CommitMessage]) -> None:
+    def commit(
+        self, messages: Sequence[CommitMessage],
+        snapshot_properties: Optional[Dict[str, str]] = None,
+    ) -> None:
         """Commit once, using the builder's overwrite configuration and batch identifier."""
         ...
     def truncate_table(self) -> None:
@@ -440,7 +443,10 @@ class BatchTableCommit:
 
 class StreamTableCommit:
     def close(self) -> None: ...
-    def commit(self, commit_identifier: int, messages: Sequence[CommitMessage]) -> None:
+    def commit(
+        self, commit_identifier: int, messages: Sequence[CommitMessage],
+        snapshot_properties: Optional[Dict[str, str]] = None,
+    ) -> None:
         """Commit a checkpoint, including empty checkpoints, without filtering retries."""
         ...
     def filter_and_commit(

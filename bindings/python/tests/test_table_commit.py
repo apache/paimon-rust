@@ -156,6 +156,57 @@ def test_deserialized_batch_commit_uses_target_builder(tmp_path):
 
 
 @pytest.mark.parametrize("overwrite", [False, True])
+@pytest.mark.parametrize("properties", [None, {}, {"source": "capture", "label": "中文"}])
+def test_batch_snapshot_properties(tmp_path, overwrite, properties):
+    table = _table(tmp_path)
+    _append(table, [1], [10])
+    builder = table.new_batch_write_builder()
+    if overwrite:
+        builder.with_overwrite()
+    messages = _roundtrip(_prepare(builder, [2], [20]))
+    committer = builder.new_commit()
+    committer.commit(messages, snapshot_properties=properties)
+    snapshot = _snapshot(table)
+    assert snapshot.get("properties") == (properties or None)
+    assert snapshot["commitKind"] == ("OVERWRITE" if overwrite else "APPEND")
+    assert _rows(table) == ([2] if overwrite else [1, 2])
+    with pytest.raises(RuntimeError, match="one-time"):
+        committer.commit(messages, snapshot_properties={"source": "retry"})
+    assert _snapshot(table)["id"] == snapshot["id"]
+
+
+def test_stream_snapshot_properties_are_per_checkpoint(tmp_path):
+    table = _table(tmp_path)
+    builder = table.new_stream_write_builder().with_commit_user("properties-job")
+    committer = builder.new_commit()
+    properties = {"checkpoint": "first"}
+    for identifier, metadata in enumerate([properties, None, {}, {"checkpoint": "fourth"}], 1):
+        messages = _prepare(builder, [identifier], [identifier * 10], identifier)
+        committer.commit(identifier, messages, snapshot_properties=metadata)
+        snapshot = _snapshot(table)
+        assert snapshot["commitIdentifier"] == identifier
+        assert snapshot.get("properties") == (metadata or None)
+        if not metadata:
+            assert "properties" not in snapshot
+    properties["checkpoint"] = "changed"
+    first = json.loads((Path(table.location()) / "snapshot" / "snapshot-1").read_text())
+    assert first["properties"] == {"checkpoint": "first"}
+    assert _rows(table) == [1, 2, 3, 4]
+
+
+def test_empty_stream_snapshot_properties(tmp_path):
+    table = _table(tmp_path)
+    committer = table.new_stream_write_builder().with_commit_user("empty-job").new_commit()
+    committer.commit(42, [], snapshot_properties={"source": "empty"})
+    snapshot = _snapshot(table)
+    assert snapshot["properties"] == {"source": "empty"}
+    assert snapshot["totalRecordCount"] == 0
+    assert snapshot["deltaRecordCount"] == 0
+    committer.commit(43, [])
+    assert "properties" not in _snapshot(table)
+
+
+@pytest.mark.parametrize("overwrite", [False, True])
 @pytest.mark.parametrize("serialized", [False, True])
 def test_batch_bridge_preserves_external_commit_user(tmp_path, overwrite, serialized):
     table = _table(tmp_path, primary_key=True, options={"bucket": "1"})
