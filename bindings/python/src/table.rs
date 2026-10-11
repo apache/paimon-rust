@@ -202,6 +202,10 @@ impl PyTable {
         crate::full_text_search::PyFullTextSearchBuilder::new(Arc::clone(&self.inner))
     }
 
+    fn new_hybrid_search_builder(&self) -> crate::hybrid_search::PyHybridSearchBuilder {
+        crate::hybrid_search::PyHybridSearchBuilder::new(Arc::clone(&self.inner))
+    }
+
     fn new_vector_search_builder(&self) -> crate::vector_search::PyVectorSearchBuilder {
         crate::vector_search::PyVectorSearchBuilder::new(Arc::clone(&self.inner))
     }

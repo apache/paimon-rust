@@ -732,6 +732,8 @@ pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> 
     this.add_class::<crate::full_text_search::PyFullTextScanPlan>()?;
     this.add_class::<crate::full_text_search::PyFullTextRead>()?;
     this.add_class::<crate::full_text_search::PyFullTextSearchResult>()?;
+    this.add_class::<crate::hybrid_search::PyHybridSearchBuilder>()?;
+    this.add_class::<crate::hybrid_search::PyHybridSearchResult>()?;
     this.add_class::<crate::vector_search::PyVectorSearchBuilder>()?;
     this.add_class::<crate::vector_search::PyBatchVectorSearchBuilder>()?;
     this.add_class::<crate::vector_search::PyVectorScan>()?;

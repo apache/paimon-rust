@@ -22,6 +22,7 @@ mod blob_uri_reader;
 mod context;
 mod error;
 mod full_text_search;
+mod hybrid_search;
 mod index_build;
 mod merge_into;
 mod oss_cpp;
