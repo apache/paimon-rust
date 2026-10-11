@@ -334,6 +334,15 @@ class BatchTableUpdate:
     def update_by_arrow_batches_with_row_id(
         self, tables: Iterable[pyarrow.Table]
     ) -> List[CommitMessage]: ...
+    def new_shard_updator(
+        self, shard_num: int, total_shard_count: int, *, read_type: Optional[str] = None
+    ) -> ShardTableUpdator:
+        """Create a shard operation with a Paimon ROW read type encoded as JSON.
+
+        None reads all table fields; an empty ROW reads zero columns while
+        preserving row counts. Read fields are independent of with_update_type.
+        """
+        ...
     def with_update_type(self, update_cols: List[str]) -> "BatchTableUpdate": ...
     def delete_by_row_id(self, row_ids: Sequence[int]) -> List[CommitMessage]: ...
     def upsert_by_arrow_with_key(
@@ -377,6 +386,15 @@ class StreamTableUpdate:
     def update_by_arrow_with_row_id(
         self, table: pyarrow.Table, commit_identifier: int
     ) -> List[CommitMessage]: ...
+    def new_shard_updator(
+        self, shard_num: int, total_shard_count: int, *, read_type: Optional[str] = None
+    ) -> ShardTableUpdator:
+        """Create a shard operation with a Paimon ROW read type encoded as JSON.
+
+        None reads all table fields; an empty ROW reads zero columns while
+        preserving row counts. Read fields are independent of with_update_type.
+        """
+        ...
     def with_update_type(self, update_cols: List[str]) -> "StreamTableUpdate": ...
     def delete_by_row_id(
         self, row_ids: Sequence[int], commit_identifier: int
@@ -660,3 +678,13 @@ class FullTextRead:
 class FullTextSearchResult:
     def __len__(self) -> int: ...
     def row_ids(self) -> Dict[int, float]: ...
+
+class ShardTableUpdator:
+    def arrow_reader(self) -> RecordBatchReader:
+        """Read one captured shard once; values supplied later follow this reader's order."""
+        ...
+    def update_by_arrow_batch(self, data: pyarrow.RecordBatch) -> None: ...
+    def prepare_commit(self) -> List[CommitMessage]:
+        """Require a finished read and exactly as many update rows; repeated calls reuse messages."""
+        ...
+    def close(self) -> None: ...

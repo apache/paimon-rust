@@ -132,6 +132,25 @@ print(f"\nRead: {batches_tt[0].num_rows} rows")
 print(batches_tt[0])
 ```
 
+### Shard column updates
+
+The batch and stream update objects expose
+`new_shard_updator(shard_num, total_shard_count, read_type=...)`. The optional
+`read_type` is a Paimon ROW type encoded as JSON, preserving field IDs and nested
+read metadata. It belongs to this shard operation and is independent of columns
+configured by `with_update_type`. Omitting it reads all table fields; an empty
+ROW reads zero columns with row counts preserved. Core captures one snapshot and
+balances complete Data Evolution file groups by row ID. The returned
+`arrow_reader()` yields projected batches; `update_by_arrow_batch()` receives
+replacement columns in that reader's visible row order, including when deletion
+vectors remove physical rows. Input batch boundaries may differ from read batches.
+
+Finish the reader and supply exactly the same number of rows before calling
+`prepare_commit()`. Core buffers one file group, reuses the normal partial-column
+writer and returns messages with the captured snapshot's conflict check. Repeated
+preparation reuses those messages. `close()` preserves prepared files; commit the
+messages with the matching builder's committer.
+
 ### Prepared MERGE operations
 
 Batch and stream update objects expose `merge_into` to prepare data-evolution

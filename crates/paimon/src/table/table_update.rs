@@ -25,6 +25,7 @@ use std::collections::HashSet;
 
 use arrow_array::RecordBatch;
 
+use crate::spec::DataField;
 use crate::table::{CommitMessage, Table, TableUpdateByRowId};
 
 const ROW_ID: &str = "_ROW_ID";
@@ -99,6 +100,33 @@ impl TableUpdate {
             .iter()
             .map(|field| field.name().to_string())
             .collect()
+    }
+
+    /// Read and replace columns over one balanced shard of whole file groups.
+    ///
+    /// `read_type` configures this operation's reader, independently of the
+    /// update columns. It preserves field IDs and nested read metadata, just
+    /// like [`ReadBuilder::with_read_type`](super::ReadBuilder::with_read_type).
+    /// `None` reads all table fields; `Some(vec![])` returns zero-column batches
+    /// with their row counts preserved. Row IDs are tracked internally.
+    pub async fn new_shard_updater(
+        &self,
+        shard: usize,
+        shard_count: usize,
+        read_type: Option<Vec<DataField>>,
+    ) -> crate::Result<super::ShardTableUpdater> {
+        let mut updater = super::ShardTableUpdater::new(
+            &self.table,
+            read_type,
+            self.update_cols
+                .clone()
+                .unwrap_or_else(|| self.all_fields()),
+            shard,
+            shard_count,
+        )
+        .await?;
+        updater.with_blob_uri_reader_factory(self.blob_uri_reader_factory.clone());
+        Ok(updater)
     }
 
     fn columns_for_batch(&self, batch: &RecordBatch) -> Vec<String> {

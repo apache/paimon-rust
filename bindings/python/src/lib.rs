@@ -29,6 +29,7 @@ mod oss_cpp;
 mod predicate;
 mod read;
 mod schema;
+mod shard_update;
 mod table;
 mod udf;
 mod update_assignment;
