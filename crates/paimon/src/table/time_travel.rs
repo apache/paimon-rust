@@ -134,17 +134,10 @@ async fn resolve_watermark(
 /// subsequently changed is rejected instead of mixing that stale schema with a
 /// different snapshot.
 pub(crate) async fn resolve_snapshot(table: &Table) -> crate::Result<Option<Snapshot>> {
-    if let Some(snapshot) = table.travel_snapshot() {
-        return Ok(Some(snapshot.clone()));
+    if let Some(view) = &table.travel_snapshot {
+        return Ok(view.snapshot().cloned());
     }
-    if table.is_time_traveled() {
-        return Err(Error::DataInvalid {
-            message: "Table options changed after time travel; \
-                      use copy_with_time_travel to re-resolve the snapshot and schema"
-                .to_string(),
-            source: None,
-        });
-    }
+    table.ensure_read_snapshot_current()?;
 
     match travel_to_snapshot(
         &table.snapshot_manager(),
@@ -451,7 +444,7 @@ mod tests {
             assert_eq!(resolved.travel_snapshot().unwrap().id(), 2);
             assert_eq!(resolved.schema().id(), 1);
 
-            let pinned = traveled.copy_with_pinned_snapshot(traveled.travel_snapshot().unwrap());
+            let pinned = traveled.copy_with_pinned_snapshot(traveled.travel_snapshot());
             assert!(!pinned.schema().options().contains_key("scan.timestamp"));
         }
         for timestamp in ["2024-01-02 12:00:01", "2024-01-02 12:00:02"] {
@@ -513,7 +506,7 @@ mod tests {
             .delete_file(&manager.snapshot_path(1))
             .await
             .unwrap();
-        let pinned = table.copy_with_pinned_snapshot(&snapshot);
+        let pinned = table.copy_with_pinned_snapshot(Some(&snapshot));
         assert_eq!(pinned.schema().id(), table.schema().id());
         assert_eq!(pinned.schema().fields(), table.schema().fields());
         assert_eq!(pinned.schema().options().get("custom").unwrap(), "value");
@@ -528,6 +521,119 @@ mod tests {
         );
         assert!(pinned.new_write_builder().new_write().is_err());
         assert!(table.travel_snapshot().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_pinning_replaces_prior_supported_scan_modes() {
+        use futures::TryStreamExt;
+        let (io, path) = setup_evolved_table().await;
+        let table = latest_table(&io, &path);
+        let snapshot = table.resolve_read_snapshot().await.unwrap().unwrap();
+        for extra in [
+            options(&[("scan.mode", "from-snapshot"), ("scan.snapshot-id", "1")]),
+            options(&[
+                ("scan.mode", "from-timestamp"),
+                ("scan.timestamp-millis", "0"),
+            ]),
+            options(&[
+                ("scan.mode", "incremental"),
+                ("incremental-between-timestamp", "0,9999999999999"),
+            ]),
+        ] {
+            let configured = table.copy_with_options(extra);
+            for source in [None, Some(&snapshot)] {
+                let view = configured.copy_with_pinned_snapshot(source);
+                let plan = view.new_read_builder().new_scan().plan().await.unwrap();
+                let builder = view.new_read_builder();
+                let batches: Vec<RecordBatch> = builder
+                    .new_read()
+                    .unwrap()
+                    .to_arrow(plan.splits())
+                    .unwrap()
+                    .try_collect()
+                    .await
+                    .unwrap();
+                let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+                assert_eq!(rows, if source.is_some() { 5 } else { 0 });
+                assert!(!view
+                    .schema()
+                    .options()
+                    .contains_key("incremental-between-timestamp"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pinned_empty_view_survives_commits_and_option_copies() {
+        let io = FileIOBuilder::new("memory").build().unwrap();
+        let path = "memory:/pinned_empty";
+        write_schema_file(&io, path, &schema_v0()).await;
+        let table = make_table(&io, path, schema_v0());
+        let pinned = table.copy_with_pinned_snapshot(None);
+        write_and_commit(&table, &batch_v0(vec![1, 2], vec![10, 20])).await;
+
+        assert_eq!(
+            table.resolve_read_snapshot().await.unwrap().unwrap().id(),
+            1
+        );
+        for view in [
+            pinned.clone(),
+            pinned.copy_with_options(options(&[("read.batch-size", "1")])),
+        ] {
+            assert!(view.resolve_read_snapshot().await.unwrap().is_none());
+            assert!(view
+                .new_read_builder()
+                .new_scan()
+                .plan()
+                .await
+                .unwrap()
+                .splits()
+                .is_empty());
+            assert!(view.new_write_builder().new_write().is_err());
+            assert!(view.is_time_traveled());
+            assert!(!view.has_resolved_travel_snapshot());
+            assert!(crate::catalog::list_partitions_from_file_system(&view)
+                .await
+                .unwrap()
+                .is_empty());
+            assert!(view.partition_row_counts().await.unwrap().is_empty());
+        }
+        for extra in [
+            options(&[("scan.mode", "default")]),
+            options(&[("incremental-between-timestamp", "0,9999999999999")]),
+        ] {
+            let changed = pinned.copy_with_options(extra);
+            assert!(changed.resolve_read_snapshot().await.is_err());
+            assert!(changed.new_read_builder().new_scan().plan().await.is_err());
+            assert!(changed
+                .new_read_builder()
+                .new_scan()
+                .plan_with_trace()
+                .await
+                .is_err());
+        }
+        // Changing the selector must not silently reuse the empty view or the
+        // schema captured by that view. Explicitly re-resolve the pair.
+        let changed = pinned.copy_with_options(options(&[("scan.snapshot-id", "1")]));
+        assert!(changed.resolve_read_snapshot().await.is_err());
+        let selected = changed.copy_with_time_travel(HashMap::new()).await.unwrap();
+        assert_eq!(
+            selected
+                .resolve_read_snapshot()
+                .await
+                .unwrap()
+                .unwrap()
+                .id(),
+            1
+        );
+        let reset = pinned
+            .copy_with_resolved_schema(schema_v0(), "main")
+            .unwrap();
+        assert_eq!(
+            reset.resolve_read_snapshot().await.unwrap().unwrap().id(),
+            1
+        );
+        assert!(!reset.is_time_traveled());
     }
 
     #[tokio::test]

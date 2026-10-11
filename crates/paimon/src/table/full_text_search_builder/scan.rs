@@ -164,7 +164,7 @@ impl FullTextScan {
         plan.next_row_id = snapshot.next_row_id();
         // Pin the data without changing the schema already bound by the query.
         // A schema-only rename does not create a new data snapshot.
-        plan.table = self.table.copy_with_pinned_snapshot(&snapshot);
+        plan.table = self.table.copy_with_pinned_snapshot(Some(&snapshot));
         if let Some(name) = snapshot.index_manifest() {
             let path = self.table.snapshot_manager().manifest_path(name);
             plan.entries = IndexManifest::read(self.table.file_io(), &path).await?;

@@ -276,7 +276,7 @@ pub(super) async fn merge_into(
     let _ = DataEvolutionWriter::new(table, update_columns.clone())?;
     let snapshot = super::time_travel::resolve_snapshot(table).await?;
     let scan_table = match &snapshot {
-        Some(snapshot) => table.copy_with_pinned_snapshot(snapshot),
+        Some(snapshot) => table.copy_with_pinned_snapshot(Some(snapshot)),
         None => table.clone(),
     }
     .copy_with_options(HashMap::from([

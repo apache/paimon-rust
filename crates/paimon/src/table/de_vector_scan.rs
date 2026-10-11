@@ -63,7 +63,7 @@ impl Table {
         CoreOptions::new(self.schema().options()).ensure_read_authorized()?;
         let Some(snapshot) = crate::table::time_travel::resolve_snapshot(self).await? else {
             return Ok(PreparedVectorSearchFilter {
-                table: self.clone(),
+                table: self.copy_with_pinned_snapshot(None),
                 include_row_ids: Arc::new(RoaringTreemap::new()),
             });
         };

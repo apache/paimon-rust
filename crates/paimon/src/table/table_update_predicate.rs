@@ -118,7 +118,7 @@ pub(super) async fn update(
             ("scalar-index.search-mode".into(), "FULL".into()),
             ("scan.mode".into(), "default".into()),
         ]))
-        .copy_with_pinned_snapshot(&snapshot);
+        .copy_with_pinned_snapshot(Some(&snapshot));
     let mut read_builder = scan_table.new_read_builder();
     let mut projection = Vec::new();
     for name in &read_columns {

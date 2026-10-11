@@ -33,6 +33,77 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 #[tokio::test]
+async fn prepared_empty_filter_keeps_its_read_table_empty_after_commit() {
+    let table = vector_test_table().copy_with_options(HashMap::from([
+        ("row-tracking.enabled".to_string(), "true".to_string()),
+        ("data-evolution.enabled".to_string(), "true".to_string()),
+        ("vector-index.search-mode".to_string(), "full".to_string()),
+    ]));
+    let prepared = table
+        .prepare_vector_search_filter(id_gt_filter(&table, 0))
+        .await
+        .unwrap();
+    let field = Arc::new(ArrowField::new("element", ArrowDataType::Float32, true));
+    let mut vectors = ListBuilder::new(Float32Builder::new()).with_field(field.clone());
+    vectors.values().append_value(1.0);
+    vectors.values().append_value(0.0);
+    vectors.append(true);
+    let batch = RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", ArrowDataType::Int32, false),
+            ArrowField::new("embedding", ArrowDataType::List(field), true),
+        ])),
+        vec![
+            Arc::new(Int32Array::from(vec![1])),
+            Arc::new(vectors.finish()),
+        ],
+    )
+    .unwrap();
+    let mut writer = TableWrite::new(&table, "test".to_string()).unwrap();
+    writer.write_arrow_batch(&batch).await.unwrap();
+    TableCommit::new(table.clone(), "test".to_string())
+        .commit(writer.prepare_commit().await.unwrap())
+        .await
+        .unwrap();
+
+    assert!(table.resolve_read_snapshot().await.unwrap().is_some());
+    assert!(prepared
+        .table()
+        .resolve_read_snapshot()
+        .await
+        .unwrap()
+        .is_none());
+    assert!(prepared
+        .table()
+        .new_read_builder()
+        .new_scan()
+        .plan()
+        .await
+        .unwrap()
+        .splits()
+        .is_empty());
+    assert!(prepared
+        .table()
+        .new_vector_search_builder()
+        .with_vector_column("embedding")
+        .with_query_vector(vec![1.0, 0.0])
+        .with_limit(2)
+        .execute()
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(!table
+        .new_vector_search_builder()
+        .with_vector_column("embedding")
+        .with_query_vector(vec![1.0, 0.0])
+        .with_limit(2)
+        .execute()
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
 async fn reader_uses_planned_snapshot_after_snapshot_files_are_removed() {
     let table = de_vector_table().await;
     let options = HashMap::new();

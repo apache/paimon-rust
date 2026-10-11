@@ -629,11 +629,11 @@ impl<'a> HybridSearchBuilder<'a> {
         if let Some(snapshot) = &self.pinned_snapshot {
             return Ok(snapshot
                 .as_ref()
-                .map(|snapshot| self.table.copy_with_pinned_snapshot(snapshot)));
+                .map(|snapshot| self.table.copy_with_pinned_snapshot(Some(snapshot))));
         }
         Ok(super::time_travel::resolve_snapshot(self.table)
             .await?
-            .map(|snapshot| self.table.copy_with_pinned_snapshot(&snapshot)))
+            .map(|snapshot| self.table.copy_with_pinned_snapshot(Some(&snapshot))))
     }
 
     /// Consume the vector search's scored positions, retaining its source files

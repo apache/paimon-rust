@@ -308,19 +308,12 @@ impl TableProvider for PartitionRowCountProvider {
                 return Ok(Some(table));
             }
             let selected = table.copy_with_time_travel_strict(HashMap::new()).await?;
-            let snapshot = match selected.travel_snapshot() {
-                Some(snapshot) => snapshot.clone(),
-                None => {
-                    let Some(snapshot) = table.snapshot_manager().get_latest_snapshot().await?
-                    else {
-                        return Ok(None);
-                    };
-                    snapshot
-                }
+            let Some(snapshot) = selected.resolve_read_snapshot().await? else {
+                return Ok(None);
             };
             // Pin data, not the snapshot's schema: DDL may have changed field
             // positions since the latest data commit or since logical planning.
-            Ok(Some(table.copy_with_pinned_snapshot(&snapshot)))
+            Ok(Some(table.copy_with_pinned_snapshot(Some(&snapshot))))
         })
         .await
         .map_err(to_datafusion_error)?;

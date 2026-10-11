@@ -611,7 +611,7 @@ impl DataEvolutionDeleteWriter {
                 message: "No files with row tracking found in target table".into(),
                 source: None,
             })?;
-        let scan_table = self.table.copy_with_pinned_snapshot(&snapshot);
+        let scan_table = self.table.copy_with_pinned_snapshot(Some(&snapshot));
         let scan = scan_table
             .new_read_builder()
             .new_scan()
@@ -1256,7 +1256,7 @@ impl RowIdFileIndex {
                 files: Vec::new(),
             });
         };
-        let read_table = table.copy_with_pinned_snapshot(&snapshot);
+        let read_table = table.copy_with_pinned_snapshot(Some(&snapshot));
         let plan = read_table.new_read_builder().new_scan().plan().await?;
         Self::from_splits(read_table, plan.splits())
     }

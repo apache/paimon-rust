@@ -124,7 +124,7 @@ impl MergeInput {
             || table.clone(),
             |snapshot| {
                 table
-                    .copy_with_pinned_snapshot(snapshot)
+                    .copy_with_pinned_snapshot(Some(snapshot))
                     .copy_with_options(HashMap::from([("scan.mode".into(), "default".into())]))
             },
         );

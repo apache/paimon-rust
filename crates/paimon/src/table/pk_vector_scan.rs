@@ -304,48 +304,55 @@ impl Scan for PkVectorScan {
     async fn plan(&self) -> crate::Result<PkVectorScanPlan> {
         let snapshot_manager = self.table.snapshot_manager();
 
-        // Data splits first, via the table's own scan resolution (which honors
-        // time travel / scan.snapshot-id). Deriving the snapshot from the scan's
-        // own output — rather than resolving `get_latest_snapshot()` separately —
-        // keeps the index manifest and the data splits on ONE snapshot, matching
-        // Java `PrimaryKeyVectorScan` (resolve one snapshot up front, read data and
-        // index from it). It also avoids a time-travel mismatch (data from the
-        // travelled snapshot, index from latest) and a TOCTOU where a concurrent
-        // commit lands between two independent resolutions.
-        //
-        // The residual scalar filter, when set, is pushed into the read builder so
-        // scan planning drops files whose stats cannot match the predicate, mirroring
-        // Java `PrimaryKeyVectorScan` applying the filter at scan time. Files that
-        // survive are still residual-filtered per row downstream; this only avoids
-        // re-reading files the predicate already excludes.
-        let mut read_builder = self.table.new_read_builder();
+        let options = self.table.schema().core_options();
+        options.ensure_type_paimon_served(&self.table.identifier().full_name())?;
+        options.ensure_read_authorized()?;
+        options.validate_scan_options()?;
+        options.validate_data_file_path_directory()?;
+        self.table.ensure_read_snapshot_current()?;
+        // Point reads reuse one complete snapshot as Java PrimaryKeyVectorScan
+        // does, including tags whose original snapshot JSON has expired.
+        let incremental = options.incremental_timestamp_window()?.is_some();
+        let snapshot = if incremental {
+            None
+        } else {
+            self.table.resolve_read_snapshot().await?
+        };
+        let table = if incremental {
+            self.table.clone()
+        } else {
+            self.table.copy_with_pinned_snapshot(snapshot.as_ref())
+        };
+        // Residual filtering prunes files at scan time and checks each
+        // surviving candidate downstream.
+        let mut read_builder = table.new_read_builder();
         if let Some(filter) = &self.filter {
             read_builder.with_filter(filter.clone());
         }
-        // Plan the data splits and capture the snapshot the scan pinned in one
-        // pass. The trace carries the resolved snapshot id even when the scan
-        // yields zero data splits, so the plan reports its real snapshot id
-        // (required by the cross-route snapshot-consistency guard) instead of
-        // deriving it from a first split that may not exist.
-        let (data_plan, trace) = read_builder
-            .new_scan()
-            .with_scan_all_files()
-            .plan_with_trace()
-            .await?;
+        let data_plan = read_builder.new_scan().with_scan_all_files().plan().await?;
         let data_splits = data_plan.splits().to_vec();
-
-        // No snapshot at all (table never written): nothing to search and no
-        // snapshot to pin. The empty split list makes every downstream consumer
-        // treat this as "no candidates", so this is the only plan without a real
-        // snapshot id.
-        let Some(snapshot_id) = trace.snapshot_id else {
+        // Java accepts only a snapshot scan plan, or an empty incremental plan.
+        // Never widen an incremental selection into a full-snapshot search.
+        if incremental && !data_splits.is_empty() {
+            return Err(data_invalid(
+                "Primary-key vector search requires a snapshot scan, not an incremental scan",
+            ));
+        }
+        if incremental {
+            return Ok(PkVectorScanPlan {
+                snapshot_id: 0,
+                splits: Vec::new(),
+                physical_row_ranges_by_split: None,
+            });
+        }
+        let Some(snapshot) = snapshot else {
             return Ok(PkVectorScanPlan {
                 snapshot_id: 0,
                 splits: Vec::new(),
                 physical_row_ranges_by_split: None,
             });
         };
-        let snapshot = snapshot_manager.get_snapshot(snapshot_id).await?;
+        let snapshot_id = snapshot.id();
 
         // Index-manifest scan into filtered ANN payload tuples.
         let table_path = self.table.location().trim_end_matches('/');
@@ -1159,6 +1166,86 @@ mod tests {
             PredicateBuilder::new(table.schema().fields())
                 .equal(column, Datum::Int(value))
                 .unwrap()
+        }
+
+        #[tokio::test]
+        async fn plan_validates_original_scan_mode_and_rejects_nonempty_incremental_search() {
+            let (_tmp, table) = build_pruning_test_table(false).await;
+            for extra in [
+                HashMap::from([("scan.mode".to_string(), "latest-full".to_string())]),
+                HashMap::from([(
+                    "incremental-between-timestamp".to_string(),
+                    "0,9999999999999".to_string(),
+                )]),
+            ] {
+                let view = table.copy_with_options(extra);
+                assert!(PkVectorScan::new(
+                    &view,
+                    prune_vector_field_id(&view),
+                    PRUNE_INDEX_TYPE.to_string(),
+                    None
+                )
+                .plan()
+                .await
+                .is_err());
+            }
+            let empty_window = table.copy_with_options(HashMap::from([(
+                "incremental-between-timestamp".to_string(),
+                "0,1".to_string(),
+            )]));
+            assert!(PkVectorScan::new(
+                &empty_window,
+                prune_vector_field_id(&empty_window),
+                PRUNE_INDEX_TYPE.to_string(),
+                None
+            )
+            .plan()
+            .await
+            .unwrap()
+            .splits
+            .is_empty());
+        }
+
+        #[tokio::test]
+        async fn plan_uses_complete_retained_tag_metadata_and_explicit_empty_view() {
+            let (_tmp, table) = build_pruning_test_table(false).await;
+            let snapshot = table.resolve_read_snapshot().await.unwrap().unwrap();
+            table.tag_manager().create("kept", &snapshot).await.unwrap();
+            let pinned = table.copy_with_pinned_snapshot(Some(&snapshot));
+            let tagged = table.copy_with_options(HashMap::from([(
+                "scan.tag-name".to_string(),
+                "kept".to_string(),
+            )]));
+            table
+                .file_io()
+                .delete_file(&table.snapshot_manager().snapshot_path(snapshot.id()))
+                .await
+                .unwrap();
+            for view in [pinned, tagged] {
+                let plan = PkVectorScan::new(
+                    &view,
+                    prune_vector_field_id(&view),
+                    PRUNE_INDEX_TYPE.to_string(),
+                    None,
+                )
+                .plan()
+                .await
+                .unwrap();
+                assert_eq!(plan.snapshot_id, snapshot.id());
+                assert_eq!(plan.splits.len(), 1);
+            }
+            let empty = table.copy_with_pinned_snapshot(None);
+            let plan = PkVectorScan::new(
+                &empty,
+                prune_vector_field_id(&empty),
+                PRUNE_INDEX_TYPE.to_string(),
+                None,
+            )
+            .plan()
+            .await
+            .unwrap();
+            assert_eq!(plan.snapshot_id, 0);
+            assert!(plan.splits.is_empty());
         }
 
         #[tokio::test]
