@@ -19,7 +19,10 @@ use super::global_index_build_common::IndexColumns;
 use super::global_index_types::{
     normalize_global_index_type, BTREE_GLOBAL_INDEX_TYPE, SUPPORTED_GLOBAL_INDEX_TYPES_FOR_DROP,
 };
-use crate::spec::{FileKind, IndexFileMeta, IndexManifest};
+use crate::spec::{
+    eval_row, extract_datum, field_idx_to_partition_idx, BinaryRow, DataType, Datum, FileKind,
+    IndexFileMeta, IndexManifest, Predicate, PredicateOperator,
+};
 use crate::table::{CommitMessage, Table, TableCommit};
 use crate::{Error, Result};
 use std::collections::HashMap;
@@ -28,6 +31,7 @@ pub struct GlobalIndexDropBuilder<'a> {
     table: &'a Table,
     index_column: Option<IndexColumns>,
     index_type: String,
+    partition_filter: Option<Predicate>,
     dry_run: bool,
 }
 
@@ -37,6 +41,7 @@ impl<'a> GlobalIndexDropBuilder<'a> {
             table,
             index_column: None,
             index_type: BTREE_GLOBAL_INDEX_TYPE.to_string(),
+            partition_filter: None,
             dry_run: false,
         }
     }
@@ -57,6 +62,16 @@ impl<'a> GlobalIndexDropBuilder<'a> {
     pub fn with_index_type(&mut self, index_type: &str) -> &mut Self {
         self.index_type = index_type.to_string();
         self
+    }
+
+    /// Restrict the drop using table-field indices. Repeated calls combine filters with AND.
+    pub fn with_partition_filter(&mut self, filter: Predicate) -> Result<&mut Self> {
+        super::partition_filter::validate_partition_filter(self.table, &filter)?;
+        self.partition_filter = Some(match self.partition_filter.take() {
+            Some(previous) => Predicate::and(vec![previous, filter]),
+            None => filter,
+        });
+        Ok(self)
     }
 
     /// Return the matched index file count without committing when enabled.
@@ -95,6 +110,21 @@ impl<'a> GlobalIndexDropBuilder<'a> {
             .skip(1)
             .map(|field| field.id())
             .collect::<Vec<_>>();
+        let partition_filter = self
+            .partition_filter
+            .as_ref()
+            .map(|filter| {
+                let mapping = field_idx_to_partition_idx(
+                    self.table.schema().fields(),
+                    self.table.schema().partition_keys(),
+                );
+                filter
+                    .remap_field_index(&mapping)
+                    .ok_or_else(|| Error::ConfigInvalid {
+                        message: "Partition filter must reference only partition keys".to_string(),
+                    })
+            })
+            .transpose()?;
 
         // The table's manager resolves a REST-managed table's latest snapshot
         // through the catalog, like reads and commit validation do.
@@ -131,6 +161,20 @@ impl<'a> GlobalIndexDropBuilder<'a> {
                 )
             {
                 continue;
+            }
+            if let Some(filter) = &partition_filter {
+                // Deletion requires exact matching, not conservative scan pruning.
+                let partition = BinaryRow::from_serialized_bytes(&entry.partition)?;
+                if partition.arity() as usize != self.table.schema().partition_keys().len() {
+                    return Err(Error::DataInvalid {
+                        message: "Index partition row arity does not match partition keys"
+                            .to_string(),
+                        source: None,
+                    });
+                }
+                if !eval_partition_filter(filter, &partition)? {
+                    continue;
+                }
             }
             dropped += 1;
             deletions_by_partition_bucket
@@ -172,6 +216,92 @@ impl<'a> GlobalIndexDropBuilder<'a> {
     }
 }
 
+/// Preserve Java partition comparisons without changing general row evaluation.
+fn eval_partition_filter(predicate: &Predicate, row: &BinaryRow) -> Result<bool> {
+    use std::cmp::Ordering::{Equal, Greater, Less};
+    use PredicateOperator::*;
+
+    match predicate {
+        Predicate::And(children) => {
+            for child in children {
+                if !eval_partition_filter(child, row)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        Predicate::Or(children) => {
+            for child in children {
+                if eval_partition_filter(child, row)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        Predicate::Not(inner) => Ok(!eval_partition_filter(inner, row)?),
+        Predicate::Leaf {
+            index,
+            data_type,
+            op,
+            literals,
+            ..
+        } if matches!(data_type, DataType::Float(_) | DataType::Double(_))
+            && !matches!(op, IsNull | IsNotNull) =>
+        {
+            let Some(value) = extract_datum(row, *index, data_type)? else {
+                return Ok(false);
+            };
+            let compare = |literal: &Datum| {
+                // Widening FLOAT to DOUBLE is exact, including the sign of zero.
+                let (left, right) = match (&value, literal) {
+                    (Datum::Float(left), Datum::Float(right)) => {
+                        (f64::from(*left), f64::from(*right))
+                    }
+                    (Datum::Double(left), Datum::Double(right)) => (*left, *right),
+                    _ => return None,
+                };
+                Some(match (left.is_nan(), right.is_nan()) {
+                    // Java canonicalizes every NaN before comparing floating-point bits.
+                    (true, true) => Equal,
+                    (true, false) => Greater,
+                    (false, true) => Less,
+                    (false, false) => left.total_cmp(&right),
+                })
+            };
+            let first = || literals.first().and_then(compare);
+            Ok(match op {
+                Eq => first() == Some(Equal),
+                NotEq => matches!(first(), Some(Less | Greater)),
+                Lt => first() == Some(Less),
+                LtEq => matches!(first(), Some(Less | Equal)),
+                Gt => first() == Some(Greater),
+                GtEq => matches!(first(), Some(Greater | Equal)),
+                In => literals
+                    .iter()
+                    .any(|literal| compare(literal) == Some(Equal)),
+                NotIn => !literals
+                    .iter()
+                    .any(|literal| compare(literal) == Some(Equal)),
+                Between | NotBetween => {
+                    let between = matches!(first(), Some(Greater | Equal))
+                        && matches!(literals.get(1).and_then(compare), Some(Less | Equal));
+                    if *op == Between {
+                        between
+                    } else {
+                        !between
+                    }
+                }
+                _ => {
+                    return Err(Error::ConfigInvalid {
+                        message: format!("Unsupported floating partition operator '{op}'"),
+                    })
+                }
+            })
+        }
+        _ => eval_row(predicate, row),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -186,6 +316,83 @@ mod tests {
     use chrono::{DateTime, Utc};
     use indexmap::IndexMap;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn test_floating_partition_comparisons_follow_java_ordering() {
+        use crate::spec::{BinaryRowBuilder, DoubleType, FloatType};
+        use PredicateOperator::*;
+
+        for data_type in [
+            DataType::Float(FloatType::new()),
+            DataType::Double(DoubleType::new()),
+        ] {
+            let datum = |value| match data_type {
+                DataType::Float(_) => Datum::Float(value as f32),
+                _ => Datum::Double(value),
+            };
+            // Java compares all NaN signs and payloads equally, above positive infinity.
+            let values = [
+                f64::NEG_INFINITY,
+                -0.0,
+                0.0,
+                f64::INFINITY,
+                f64::NAN,
+                f64::from_bits(0xfff8_1234_5678_0000),
+            ];
+            let mut rows = values
+                .iter()
+                .map(|value| {
+                    let mut row = BinaryRowBuilder::new(1);
+                    row.write_datum(0, &datum(*value), &data_type);
+                    row.build()
+                })
+                .collect::<Vec<_>>();
+            let mut null = BinaryRowBuilder::new(1);
+            null.set_null_at(0);
+            rows.push(null.build());
+            let leaf = |op, literals: Vec<f64>| Predicate::Leaf {
+                column: "f".into(),
+                index: 0,
+                data_type: data_type.clone(),
+                op,
+                literals: literals.into_iter().map(datum).collect(),
+            };
+            for (op, literals, expected) in [
+                (Eq, vec![0.0], vec![2]),
+                (Eq, vec![f64::NAN], vec![4, 5]),
+                (NotEq, vec![0.0], vec![0, 1, 3, 4, 5]),
+                (Lt, vec![0.0], vec![0, 1]),
+                (LtEq, vec![0.0], vec![0, 1, 2]),
+                (Gt, vec![0.0], vec![3, 4, 5]),
+                (GtEq, vec![0.0], vec![2, 3, 4, 5]),
+                (In, vec![-0.0, f64::NAN], vec![1, 4, 5]),
+                (NotIn, vec![-0.0, f64::NAN], vec![0, 2, 3]),
+                (Between, vec![-0.0, 0.0], vec![1, 2]),
+                (NotBetween, vec![-0.0, 0.0], vec![0, 3, 4, 5]),
+                (IsNull, vec![], vec![6]),
+                (IsNotNull, vec![], vec![0, 1, 2, 3, 4, 5]),
+            ] {
+                let predicate = leaf(op, literals);
+                for (i, row) in rows.iter().enumerate() {
+                    assert_eq!(
+                        eval_partition_filter(&predicate, row).unwrap(),
+                        expected.contains(&i),
+                        "{data_type:?}: {op}, row {i}"
+                    );
+                }
+            }
+            let nested = Predicate::and(vec![
+                Predicate::or(vec![leaf(Eq, vec![0.0]), leaf(Eq, vec![f64::NAN])]),
+                Predicate::Not(Box::new(leaf(Eq, vec![0.0]))),
+            ]);
+            for (i, row) in rows.iter().enumerate() {
+                assert_eq!(
+                    eval_partition_filter(&nested, row).unwrap(),
+                    matches!(i, 4 | 5)
+                );
+            }
+        }
+    }
 
     #[tokio::test]
     async fn test_query_auth_table_refuses_index_builds_and_drops() {
@@ -392,6 +599,238 @@ mod tests {
             files.insert(status.path, content.to_vec());
         }
         files
+    }
+
+    async fn partitioned_index_table(path: &str) -> Table {
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("dt", DataType::VarChar(VarCharType::string_type()))
+            .column("name", DataType::VarChar(VarCharType::string_type()))
+            .column("hr", DataType::Int(IntType::new()))
+            .partition_keys(["hr", "dt"])
+            .build()
+            .unwrap();
+        let table = Table::new(
+            FileIOBuilder::new("memory").build().unwrap(),
+            Identifier::new("default", "partitioned_indexes"),
+            path.to_string(),
+            TableSchema::new(0, &schema),
+            None,
+        );
+        setup_dirs(&table).await;
+        let mut messages = Vec::new();
+        for (i, (dt, hr)) in [
+            (Some("2026-10-10"), 1),
+            (Some("2026-10-10"), 2),
+            (Some("2026-10-11"), 1),
+            (Some("2026-10-11"), 2),
+            (None, 1),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut partition = crate::spec::BinaryRowBuilder::new(2);
+            partition.write_int(0, hr);
+            match dt {
+                Some(dt) => partition.write_string(1, dt),
+                None => partition.set_null_at(1),
+            }
+            let start = i as i64 * 10;
+            let end = start + 9;
+            let mut composite =
+                global_index_file("btree", &format!("composite-{i}"), 0, start, end);
+            composite
+                .global_index_meta
+                .as_mut()
+                .unwrap()
+                .extra_field_ids = Some(vec![2]);
+            let mut message = CommitMessage::new(
+                partition.build_serialized(),
+                0,
+                vec![data_file(&format!("data-{i}.parquet"))],
+            );
+            message.new_index_files = vec![
+                global_index_file("btree", &format!("id-{i}"), 0, start, end),
+                composite,
+                global_index_file("btree", &format!("name-{i}"), 2, start, end),
+                global_index_file("bitmap", &format!("bitmap-{i}"), 0, start, end),
+                hash_index_file(&format!("hash-{i}")),
+            ];
+            messages.push(message);
+        }
+        TableCommit::new(table.clone(), "setup".into())
+            .commit(messages)
+            .await
+            .unwrap();
+        table
+    }
+
+    #[tokio::test]
+    async fn test_drop_global_index_partition_filter_preserves_other_entries() {
+        let table = partitioned_index_table("memory:/drop_partition_alternatives").await;
+        let pb = crate::spec::PredicateBuilder::new(table.schema().fields());
+        let filter = Predicate::or(vec![
+            pb.partition_predicate(&[
+                ("dt", Some(crate::spec::Datum::String("2026-10-10".into()))),
+                ("hr", Some(crate::spec::Datum::Int(1))),
+            ])
+            .unwrap(),
+            pb.partition_predicate(&[
+                ("dt", Some(crate::spec::Datum::String("2026-10-11".into()))),
+                ("hr", Some(crate::spec::Datum::Int(2))),
+            ])
+            .unwrap(),
+        ]);
+        for columns in ["id", "id,name"] {
+            let before = table_files(&table).await;
+            let previous_entries = latest_index_entries(&table).await;
+            let snapshot_id = table
+                .snapshot_manager()
+                .get_latest_snapshot()
+                .await
+                .unwrap()
+                .unwrap()
+                .id();
+            let mut builder = table.new_global_index_drop_builder();
+            builder.with_index_column(columns).with_dry_run(true);
+            builder.with_partition_filter(filter.clone()).unwrap();
+            assert_eq!(builder.execute().await.unwrap(), 2);
+            assert_eq!(table_files(&table).await, before);
+
+            builder.with_dry_run(false);
+            assert_eq!(builder.execute().await.unwrap(), 2);
+            let prefix = if columns == "id" { "id" } else { "composite" };
+            let expected = previous_entries
+                .into_iter()
+                .filter(|entry| {
+                    ![format!("{prefix}-0"), format!("{prefix}-3")]
+                        .contains(&entry.index_file.file_name)
+                })
+                .map(|entry| (entry.index_file.file_name.clone(), entry))
+                .collect::<BTreeMap<_, _>>();
+            let remaining = latest_index_entries(&table)
+                .await
+                .into_iter()
+                .map(|entry| (entry.index_file.file_name.clone(), entry))
+                .collect::<BTreeMap<_, _>>();
+            assert_eq!(remaining, expected);
+            assert_eq!(
+                table
+                    .snapshot_manager()
+                    .get_latest_snapshot()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .id(),
+                snapshot_id + 1
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_drop_global_index_partition_filters_combine_with_and() {
+        let table = partitioned_index_table("memory:/drop_partition_and").await;
+        let pb = crate::spec::PredicateBuilder::new(table.schema().fields());
+        let mut builder = table.new_global_index_drop_builder();
+        builder.with_index_column("id").with_dry_run(true);
+        builder
+            .with_partition_filter(
+                pb.equal("dt", crate::spec::Datum::String("2026-10-10".into()))
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(builder.execute().await.unwrap(), 2);
+        builder
+            .with_partition_filter(pb.equal("hr", crate::spec::Datum::Int(2)).unwrap())
+            .unwrap();
+        assert_eq!(builder.execute().await.unwrap(), 1);
+        builder.with_dry_run(false);
+        assert_eq!(builder.execute().await.unwrap(), 1);
+        let remaining = latest_index_entries(&table).await;
+        assert!(!remaining
+            .iter()
+            .any(|entry| entry.index_file.file_name == "id-1"));
+        assert!(remaining
+            .iter()
+            .any(|entry| entry.index_file.file_name == "id-0"));
+    }
+
+    #[tokio::test]
+    async fn test_drop_global_index_partition_no_match_and_null() {
+        let table = partitioned_index_table("memory:/drop_partition_no_match").await;
+        let pb = crate::spec::PredicateBuilder::new(table.schema().fields());
+        let before = table_files(&table).await;
+        for dry_run in [true, false] {
+            let mut builder = table.new_global_index_drop_builder();
+            builder.with_index_column("id").with_dry_run(dry_run);
+            builder
+                .with_partition_filter(pb.equal("hr", crate::spec::Datum::Int(99)).unwrap())
+                .unwrap();
+            assert_eq!(builder.execute().await.unwrap(), 0);
+            assert_eq!(table_files(&table).await, before);
+        }
+        let mut builder = table.new_global_index_drop_builder();
+        builder.with_index_column("id");
+        builder
+            .with_partition_filter(pb.is_null("dt").unwrap())
+            .unwrap();
+        assert_eq!(builder.execute().await.unwrap(), 1);
+        assert!(!latest_index_entries(&table)
+            .await
+            .iter()
+            .any(|entry| entry.index_file.file_name == "id-4"));
+    }
+
+    #[tokio::test]
+    async fn test_drop_global_index_partition_filter_rejects_data_columns() {
+        let table = partitioned_index_table("memory:/drop_partition_invalid").await;
+        let pb = crate::spec::PredicateBuilder::new(table.schema().fields());
+        let before = table_files(&table).await;
+        for filter in [
+            pb.equal("id", crate::spec::Datum::Int(1)).unwrap(),
+            Predicate::or(vec![pb.is_null("dt").unwrap(), pb.is_null("name").unwrap()]),
+        ] {
+            assert!(table
+                .new_global_index_drop_builder()
+                .with_partition_filter(filter)
+                .is_err());
+        }
+        assert_eq!(table_files(&table).await, before);
+        let unpartitioned = test_table("memory:/drop_unpartitioned_filter");
+        assert!(unpartitioned
+            .new_global_index_drop_builder()
+            .with_partition_filter(Predicate::AlwaysTrue)
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn test_drop_global_index_partition_filter_rejects_invalid_rows() {
+        for partition in [vec![0, 0], BinaryRow::new(0).to_serialized_bytes()] {
+            let table = partitioned_index_table("memory:/drop_partition_invalid_row").await;
+            let sm = table.snapshot_manager();
+            let snapshot = sm.get_latest_snapshot().await.unwrap().unwrap();
+            let path = sm.manifest_path(snapshot.index_manifest().unwrap());
+            let mut entries = latest_index_entries(&table).await;
+            entries
+                .iter_mut()
+                .find(|entry| entry.index_file.file_name == "id-0")
+                .unwrap()
+                .partition = partition;
+            IndexManifest::write(table.file_io(), &path, &entries)
+                .await
+                .unwrap();
+            let before = table_files(&table).await;
+            for dry_run in [true, false] {
+                let pb = crate::spec::PredicateBuilder::new(table.schema().fields());
+                let mut builder = table.new_global_index_drop_builder();
+                builder.with_index_column("id").with_dry_run(dry_run);
+                builder
+                    .with_partition_filter(pb.is_null("dt").unwrap())
+                    .unwrap();
+                assert!(builder.execute().await.is_err());
+                assert_eq!(table_files(&table).await, before);
+            }
+        }
     }
 
     #[tokio::test]

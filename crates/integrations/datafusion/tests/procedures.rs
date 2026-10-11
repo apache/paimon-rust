@@ -1133,7 +1133,11 @@ async fn test_drop_global_index_dry_run_rejects_invalid_args() {
         ("dry_run => NULL", "Unsupported argument value"),
         (
             "dry_run => true, partitions => 'pt=p1'",
-            "drop_global_index partitions are not supported yet",
+            "unpartitioned table",
+        ),
+        (
+            "dry_run => true, partitions => NULL",
+            "Unsupported argument value",
         ),
     ] {
         assert_sql_error(
@@ -1145,6 +1149,514 @@ async fn test_drop_global_index_dry_run_rejects_invalid_args() {
         )
         .await;
         assert_eq!(table_files(tmp.path()), before);
+    }
+}
+
+async fn setup_partitioned_global_index_table(
+    table_name: &str,
+    populated: bool,
+) -> (
+    tempfile::TempDir,
+    paimon_datafusion::SQLContext,
+    paimon::Table,
+) {
+    let (tmp, catalog) = create_test_env();
+    let sql_context = create_sql_context(catalog.clone()).await;
+    exec(&sql_context, "CREATE SCHEMA paimon.test_db").await;
+    exec(
+        &sql_context,
+        &format!(
+            "CREATE TABLE paimon.test_db.{table_name} (id INT, dt DATE, name VARCHAR(100), hr INT) \
+             PARTITIONED BY (hr, dt) WITH (\
+                'row-tracking.enabled' = 'true',\
+                'data-evolution.enabled' = 'true',\
+                'global-index.enabled' = 'true',\
+                'sorted-index.records-per-range' = '10'\
+             )"
+        ),
+    )
+    .await;
+    if populated {
+        exec(
+            &sql_context,
+            &format!(
+                "INSERT INTO paimon.test_db.{table_name} (id, dt, name, hr) VALUES \
+                 (1, DATE '2026-10-10', 'a', 1), (2, DATE '2026-10-10', 'b', 2), \
+                 (3, DATE '2026-10-11', 'c', 1), (4, DATE '2026-10-11', 'd', 2), \
+                 (5, DATE '2026-10-12', 'e', 1), (6, NULL, 'f', 1)"
+            ),
+        )
+        .await;
+        for (column, index_type) in [
+            ("id", "btree"),
+            ("name", "btree"),
+            ("id,name", "btree"),
+            ("id", "bitmap"),
+        ] {
+            exec(
+                &sql_context,
+                &format!(
+                    "CALL sys.create_global_index(table => 'test_db.{table_name}', \
+                 index_column => '{column}', index_type => '{index_type}')"
+                ),
+            )
+            .await;
+        }
+    }
+    let table = catalog
+        .get_table(&Identifier::new("test_db", table_name))
+        .await
+        .unwrap();
+    (tmp, sql_context, table)
+}
+
+async fn global_index_entries(
+    table: &paimon::Table,
+) -> BTreeMap<String, paimon::spec::IndexManifestEntry> {
+    let sm = table.snapshot_manager();
+    let snapshot = sm.get_latest_snapshot().await.unwrap().unwrap();
+    let Some(manifest_name) = snapshot.index_manifest() else {
+        return BTreeMap::new();
+    };
+    paimon::spec::IndexManifest::read(table.file_io(), &sm.manifest_path(manifest_name))
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|entry| (entry.index_file.file_name.clone(), entry))
+        .collect()
+}
+
+#[tokio::test]
+async fn test_drop_global_index_partitions_preserve_other_partitions_and_definitions() {
+    let day = |text: &str| {
+        (chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d").unwrap()
+            - chrono::DateTime::UNIX_EPOCH.date_naive())
+        .num_days() as i32
+    };
+    let d10 = Some(day("2026-10-10"));
+    let d11 = Some(day("2026-10-11"));
+    for (case, columns, partitions, selected) in [
+        (
+            "dates",
+            "id",
+            "dt=2026-10-10;dt=2026-10-11",
+            vec![(1, d10), (2, d10), (1, d11), (2, d11)],
+        ),
+        (
+            "pairs",
+            "id",
+            " dt = 2026-10-10, hr = 01 ; hr=2,dt=2026-10-11 ",
+            vec![(1, d10), (2, d11)],
+        ),
+        (
+            "composite",
+            "id,name",
+            "dt=2026-10-10,hr=1;dt=2026-10-11,hr=2",
+            vec![(1, d10), (2, d11)],
+        ),
+        ("null", "id", "dt=__DEFAULT_PARTITION__", vec![(1, None)]),
+    ] {
+        let name = format!("drop_partitions_{case}");
+        let (tmp, sql_context, table) = setup_partitioned_global_index_table(&name, true).await;
+        let before = table_files(tmp.path());
+        let entries = global_index_entries(&table).await;
+        let id = table
+            .schema()
+            .fields()
+            .iter()
+            .find(|field| field.name() == "id")
+            .unwrap()
+            .id();
+        let name_id = table
+            .schema()
+            .fields()
+            .iter()
+            .find(|field| field.name() == "name")
+            .unwrap()
+            .id();
+        let extra_ids = if columns == "id" {
+            vec![]
+        } else {
+            vec![name_id]
+        };
+        let mut expected = entries.clone();
+        expected.retain(|_, entry| {
+            let row = paimon::spec::BinaryRow::from_serialized_bytes(&entry.partition).unwrap();
+            let partition = (
+                row.get_int(0).unwrap(),
+                if row.is_null_at(1) {
+                    None
+                } else {
+                    Some(row.get_int(1).unwrap())
+                },
+            );
+            let target = entry.index_file.index_type == "btree"
+                && entry
+                    .index_file
+                    .global_index_meta
+                    .as_ref()
+                    .is_some_and(|meta| {
+                        meta.index_field_id == id
+                            && meta.extra_field_ids.as_deref().unwrap_or_default() == extra_ids
+                    })
+                && selected.contains(&partition);
+            !target
+        });
+        let matched = entries.len() - expected.len();
+        assert_eq!(matched, selected.len(), "{case}");
+        let snapshot_id = table
+            .snapshot_manager()
+            .get_latest_snapshot()
+            .await
+            .unwrap()
+            .unwrap()
+            .id();
+        let call = format!(
+            "CALL sys.drop_global_index(table => 'test_db.{name}', index_column => '{columns}', \
+             partitions => '{partitions}'"
+        );
+        let result = sql_context
+            .sql(&format!("{call}, dry_run => true)"))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(
+            string_value(result[0].column(0).as_ref(), 0),
+            format!("Would drop {matched} global index file(s)")
+        );
+        assert_eq!(table_files(tmp.path()), before, "{case}");
+        exec(&sql_context, &format!("{call})")).await;
+        assert_eq!(global_index_entries(&table).await, expected, "{case}");
+        assert_eq!(
+            table
+                .snapshot_manager()
+                .get_latest_snapshot()
+                .await
+                .unwrap()
+                .unwrap()
+                .id(),
+            snapshot_id + 1
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_drop_global_index_partitions_no_match_does_not_commit() {
+    for populated in [false, true] {
+        let (tmp, sql_context, _) =
+            setup_partitioned_global_index_table("drop_partitions_empty", populated).await;
+        let before = table_files(tmp.path());
+        for dry_run in [true, false] {
+            let result = sql_context.sql(&format!(
+                "CALL sys.drop_global_index(table => 'test_db.drop_partitions_empty', index_column => 'id', \
+                 partitions => 'dt=2026-10-09', dry_run => {dry_run})"
+            )).await.unwrap().collect().await.unwrap();
+            assert_eq!(
+                string_value(result[0].column(0).as_ref(), 0),
+                if dry_run {
+                    "Would drop 0 global index file(s)"
+                } else {
+                    "OK"
+                }
+            );
+            assert_eq!(table_files(tmp.path()), before);
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_drop_global_index_partitions_string_keys_and_custom_null_name() {
+    let (tmp, catalog) = create_test_env();
+    let sql_context = create_sql_context(catalog.clone()).await;
+    exec(&sql_context, "CREATE SCHEMA paimon.test_db").await;
+    exec(
+        &sql_context,
+        "CREATE TABLE paimon.test_db.drop_string_partitions (id INT, dt VARCHAR(20)) \
+         PARTITIONED BY (dt) WITH ('row-tracking.enabled'='true', 'data-evolution.enabled'='true', \
+         'global-index.enabled'='true', 'partition.default-name'='NULL_PART')",
+    )
+    .await;
+    exec(&sql_context,
+        "INSERT INTO paimon.test_db.drop_string_partitions (id, dt) VALUES \
+         (1, '2026-10-10'), (2, '2026-10-11'), (3, '2026-10-12'), (4, 'a=b'), (5, NULL), (6, 'NULL')"
+    ).await;
+    exec(&sql_context,
+        "CALL sys.create_global_index(table => 'test_db.drop_string_partitions', index_column => 'id')"
+    ).await;
+    let table = catalog
+        .get_table(&Identifier::new("test_db", "drop_string_partitions"))
+        .await
+        .unwrap();
+    let mut expected = global_index_entries(&table).await;
+    assert_eq!(expected.len(), 6);
+    for (partitions, selected, matched) in [
+        (
+            "dt=2026-10-10;dt=2026-10-11",
+            vec![Some("2026-10-10"), Some("2026-10-11")],
+            2,
+        ),
+        ("dt=a=b", vec![Some("a=b")], 1),
+        ("dt=NULL_PART", vec![None], 1),
+    ] {
+        let before = table_files(tmp.path());
+        let call = format!(
+            "CALL sys.drop_global_index(table => 'test_db.drop_string_partitions', \
+             index_column => 'id', partitions => '{partitions}'"
+        );
+        let result = sql_context
+            .sql(&format!("{call}, dry_run => true)"))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(
+            string_value(result[0].column(0).as_ref(), 0),
+            format!("Would drop {matched} global index file(s)")
+        );
+        assert_eq!(table_files(tmp.path()), before);
+        exec(&sql_context, &format!("{call})")).await;
+        expected.retain(|_, entry| {
+            let row = paimon::spec::BinaryRow::from_serialized_bytes(&entry.partition).unwrap();
+            let dt = if row.is_null_at(0) {
+                None
+            } else {
+                Some(row.get_string(0).unwrap())
+            };
+            !selected.contains(&dt)
+        });
+        assert_eq!(global_index_entries(&table).await, expected);
+    }
+}
+
+#[tokio::test]
+async fn test_drop_global_index_floating_partition_identity() {
+    for sql_type in ["FLOAT", "DOUBLE"] {
+        assert_floating_partition_drops(sql_type, &["-0.0", "NaN", "0.0", "1.5"]).await;
+    }
+}
+
+#[tokio::test]
+async fn test_drop_global_index_float_generated_partition_names() {
+    assert_floating_partition_drops("FLOAT", &["147318.12", "-2096723.2", "1.4E-45"]).await;
+}
+
+async fn assert_floating_partition_drops(sql_type: &str, values: &[&str]) {
+    let (tmp, catalog) = create_test_env();
+    let sql_context = create_sql_context(catalog.clone()).await;
+    exec(&sql_context, "CREATE SCHEMA paimon.test_db").await;
+    exec(
+        &sql_context,
+        &format!(
+            "CREATE TABLE paimon.test_db.drop_float_partitions (id INT, f {sql_type}) \
+         PARTITIONED BY (f) WITH ('row-tracking.enabled'='true', 'data-evolution.enabled'='true', \
+         'global-index.enabled'='true')"
+        ),
+    )
+    .await;
+    let rows = values
+        .iter()
+        .enumerate()
+        .map(|(i, value)| format!("({}, CAST('{value}' AS {sql_type}))", i + 1))
+        .collect::<Vec<_>>()
+        .join(", ");
+    exec(
+        &sql_context,
+        &format!("INSERT INTO paimon.test_db.drop_float_partitions (id, f) VALUES {rows}"),
+    )
+    .await;
+    exec(&sql_context,
+        "CALL sys.create_global_index(table => 'test_db.drop_float_partitions', index_column => 'id')"
+    ).await;
+    let table = catalog
+        .get_table(&Identifier::new("test_db", "drop_float_partitions"))
+        .await
+        .unwrap();
+    let directory_names = std::fs::read_dir(table.location().strip_prefix("file://").unwrap())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .filter(|name| name.starts_with("f="))
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        directory_names,
+        values.iter().map(|value| format!("f={value}")).collect()
+    );
+    let mut expected = global_index_entries(&table).await;
+    assert_eq!(expected.len(), values.len());
+    if sql_type == "FLOAT" {
+        let before = table_files(tmp.path());
+        for partitions in ["f=1e100", "f=1e-100", "f=1.234567891", "f=-0.0;f=bad"] {
+            for dry_run in [true, false] {
+                assert_sql_error(
+                    &sql_context,
+                    &format!(
+                        "CALL sys.drop_global_index(table => 'test_db.drop_float_partitions', \
+                     index_column => 'id', partitions => '{partitions}', dry_run => {dry_run})"
+                    ),
+                    "Invalid partitions value",
+                )
+                .await;
+                assert_eq!(table_files(tmp.path()), before);
+            }
+        }
+    }
+    for value in values {
+        // Use the directory name produced by the writer as the procedure parameter.
+        let partition_name = directory_names.get(&format!("f={value}")).unwrap();
+        let selected = if sql_type == "FLOAT" {
+            f64::from(value.parse::<f32>().unwrap())
+        } else {
+            value.parse::<f64>().unwrap()
+        };
+        let before = table_files(tmp.path());
+        let snapshot_id = table
+            .snapshot_manager()
+            .get_latest_snapshot_id()
+            .await
+            .unwrap()
+            .unwrap();
+        let call = format!(
+            "CALL sys.drop_global_index(table => 'test_db.drop_float_partitions', \
+             index_column => 'id', partitions => '{partition_name}'"
+        );
+        let result = sql_context
+            .sql(&format!("{call}, dry_run => true)"))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(
+            string_value(result[0].column(0).as_ref(), 0),
+            "Would drop 1 global index file(s)",
+            "{sql_type}: {partition_name}"
+        );
+        assert_eq!(table_files(tmp.path()), before);
+        exec(&sql_context, &format!("{call})")).await;
+        let previous_len = expected.len();
+        expected.retain(|_, entry| {
+            let row = paimon::spec::BinaryRow::from_serialized_bytes(&entry.partition).unwrap();
+            let actual = if sql_type == "FLOAT" {
+                f64::from(row.get_float(0).unwrap())
+            } else {
+                row.get_double(0).unwrap()
+            };
+            !(actual.to_bits() == selected.to_bits() || (actual.is_nan() && selected.is_nan()))
+        });
+        assert_eq!(expected.len(), previous_len - 1);
+        assert_eq!(
+            global_index_entries(&table).await,
+            expected,
+            "{sql_type}: {partition_name}"
+        );
+        assert_eq!(
+            table
+                .snapshot_manager()
+                .get_latest_snapshot_id()
+                .await
+                .unwrap(),
+            Some(snapshot_id + 1)
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_drop_global_index_partitions_timestamp_and_decimal_are_exact() {
+    let (tmp, catalog) = create_test_env();
+    let sql_context = create_sql_context(catalog.clone()).await;
+    exec(&sql_context, "CREATE SCHEMA paimon.test_db").await;
+    exec(&sql_context,
+        "CREATE TABLE paimon.test_db.drop_typed_partitions (id INT, ts TIMESTAMP(3), price DECIMAL(10,2)) \
+         PARTITIONED BY (ts, price) WITH ('row-tracking.enabled'='true', 'data-evolution.enabled'='true', \
+         'global-index.enabled'='true')"
+    ).await;
+    exec(&sql_context,
+        "INSERT INTO paimon.test_db.drop_typed_partitions (id, ts, price) VALUES \
+         (1, TIMESTAMP '2026-10-10 12:00:00.199', 1.24), (2, TIMESTAMP '2026-10-10 12:00:00.199', 1.23), \
+         (3, TIMESTAMP '2026-10-10 12:00:00.2', 1.24)"
+    ).await;
+    exec(&sql_context,
+        "CALL sys.create_global_index(table => 'test_db.drop_typed_partitions', index_column => 'id')"
+    ).await;
+    let table = catalog
+        .get_table(&Identifier::new("test_db", "drop_typed_partitions"))
+        .await
+        .unwrap();
+    let before = table_files(tmp.path());
+    let mut expected = global_index_entries(&table).await;
+    assert_eq!(expected.len(), 3);
+    let millis =
+        chrono::NaiveDateTime::parse_from_str("2026-10-10 12:00:00.199", "%Y-%m-%d %H:%M:%S%.f")
+            .unwrap()
+            .and_utc()
+            .timestamp_millis();
+    expected.retain(|_, entry| {
+        let row = paimon::spec::BinaryRow::from_serialized_bytes(&entry.partition).unwrap();
+        !(row.get_long(0).unwrap() == millis && row.get_long(1).unwrap() == 124)
+    });
+    assert_eq!(expected.len(), 2);
+    let call = "CALL sys.drop_global_index(table => 'test_db.drop_typed_partitions', index_column => 'id', \
+                partitions => 'ts=2026-10-10 12:00:00.1999,price=1.235'";
+    let result = sql_context
+        .sql(&format!("{call}, dry_run => true)"))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        string_value(result[0].column(0).as_ref(), 0),
+        "Would drop 1 global index file(s)"
+    );
+    assert_eq!(table_files(tmp.path()), before);
+    exec(&sql_context, &format!("{call})")).await;
+    assert_eq!(global_index_entries(&table).await, expected);
+}
+
+#[tokio::test]
+async fn test_drop_global_index_partitions_invalid_parameters_never_commit() {
+    for populated in [false, true] {
+        let (tmp, sql_context, _) =
+            setup_partitioned_global_index_table("drop_partitions_invalid", populated).await;
+        let before = table_files(tmp.path());
+        for partitions in [
+            "",
+            " ",
+            ";",
+            "dt",
+            "dt=",
+            "=2026-10-10",
+            "missing=x",
+            "id=1",
+            "dt=not-a-date",
+            "dt=2026-02-30",
+            "hr=not-an-int",
+            "hr=1.5",
+            "hr=2147483648",
+            "dt=2026-10-10;",
+            ";dt=2026-10-10",
+            "dt=2026-10-10;;dt=2026-10-11",
+            "dt=2026-10-10,",
+            ",dt=2026-10-10",
+            "dt=2026-10-10,,hr=1",
+            "dt=2026-10-10,dt=2026-10-11",
+            "dt=2026-10-10;missing=x",
+            "dt=2026-10-10;hr=bad",
+        ] {
+            for dry_run in [true, false] {
+                assert_sql_error(&sql_context, &format!(
+                    "CALL sys.drop_global_index(table => 'test_db.drop_partitions_invalid', index_column => 'id', \
+                     partitions => '{partitions}', dry_run => {dry_run})"
+                ), "partition").await;
+                assert_eq!(
+                    table_files(tmp.path()),
+                    before,
+                    "{partitions:?}, dry_run={dry_run}"
+                );
+            }
+        }
     }
 }
 
