@@ -206,10 +206,14 @@ impl FileIOProvider for RESTTokenFileIO {
         Ok((op, relative_path, Some(cache_namespace)))
     }
 
-    async fn create_routed(&self, path: &str) -> Result<(RoutedOperator, String, Option<String>)> {
+    async fn create_routed(
+        &self,
+        path: &str,
+        file_prefixes: &[String],
+    ) -> Result<(RoutedOperator, String, Option<String>)> {
         let file_io = self.current_file_io().await?;
         let namespace = file_io.cache_namespace_for_path(path)?;
-        let (op, relative_path) = file_io.create_routed_static(path)?;
+        let (op, relative_path) = file_io.create_routed_static(path, file_prefixes)?;
         Ok((op, relative_path, Some(namespace)))
     }
 }
@@ -552,6 +556,45 @@ mod tests {
                 ]
             );
 
+            server.abort();
+        }
+
+        #[tokio::test]
+        async fn test_token_file_io_routes_files_named_with_table_prefixes() {
+            let origin = TestOss::start().await;
+            let cache = TestOss::start_sharing(&origin).await;
+            let (file_io, server) = io_cache_file_io(&origin, &cache, &[]).await;
+
+            let data =
+                "oss://bkt/db.db/t/bucket-0/custom-123e4567-e89b-12d3-a456-426614174000-1.parquet";
+            file_io
+                .new_output(data)
+                .unwrap()
+                .write(Bytes::from_static(b"data"))
+                .await
+                .unwrap();
+            // Without the table's prefix the name is not known as a data file.
+            file_io.new_input(data).unwrap().read().await.unwrap();
+            assert!(cache.take_requests().is_empty());
+
+            let table_file_io = file_io.with_file_prefixes(["custom-"]);
+            assert_eq!(
+                table_file_io.new_input(data).unwrap().read().await.unwrap(),
+                "data"
+            );
+            assert_eq!(
+                cache.take_requests(),
+                ["GET bkt/db.db/t/bucket-0/custom-123e4567-e89b-12d3-a456-426614174000-1.parquet"]
+            );
+            // An origin-only view, as a Format Table gets, keeps the prefix but not the target.
+            table_file_io
+                .origin_only()
+                .new_input(data)
+                .unwrap()
+                .read()
+                .await
+                .unwrap();
+            assert!(cache.take_requests().is_empty());
             server.abort();
         }
 

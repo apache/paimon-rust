@@ -25,12 +25,13 @@ use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as Arr
 use bytes::Bytes;
 use futures::TryStreamExt;
 
-use super::Table;
+use super::table_write::tests::make_batch;
+use super::{Table, TableCommit, TableWrite};
 use crate::catalog::{Catalog, FileSystemCatalog, Identifier, LoadedTable};
 use crate::common::{CatalogOptions, Options};
 use crate::io::oss_test_server::TestOss;
 use crate::io::FileIOBuilder;
-use crate::spec::{DataType, IntType, Schema};
+use crate::spec::{DataType, IntType, Schema, SchemaBuilder};
 
 const WAREHOUSE: &str = "bkt/warehouse";
 const FILE_NAME: &str = "data-123e4567-e89b-12d3-a456-426614174000-1.parquet";
@@ -214,4 +215,100 @@ async fn object_table_reads_objects_from_origin() {
         "{objects:?}"
     );
     assert_eq!(cache.take_requests(), Vec::<String>::new());
+}
+
+/// A catalog whose data files may be written to and read from the target.
+async fn data_target_catalog(origin: &TestOss, cache: &TestOss) -> FileSystemCatalog {
+    let options = [
+        ("io-cache.policy", "meta,read,write"),
+        ("io-cache.whitelist", "data"),
+    ];
+    catalog(origin, cache, &options).await
+}
+
+fn int_schema() -> SchemaBuilder {
+    Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .column("value", DataType::Int(IntType::new()))
+}
+
+/// Writes and commits `batch`, returning the names of the new data files.
+async fn write_and_commit(table: &Table, batch: &RecordBatch) -> Vec<String> {
+    let mut write = TableWrite::new(table, "io-cache-user".to_string()).unwrap();
+    write.write_arrow_batch(batch).await.unwrap();
+    let messages = write.prepare_commit().await.unwrap();
+    let files = messages
+        .iter()
+        .flat_map(|message| message.new_files.iter().map(|file| file.file_name.clone()))
+        .collect();
+    TableCommit::new(table.clone(), "io-cache-user".to_string())
+        .commit(messages)
+        .await
+        .unwrap();
+    files
+}
+
+/// Methods of the requests on keys containing `fragment`, in order.
+fn methods(requests: &[String], fragment: &str) -> Vec<String> {
+    requests
+        .iter()
+        .filter(|request| request.contains(fragment))
+        .map(|request| request.split_once(' ').unwrap().0.to_string())
+        .collect()
+}
+
+#[track_caller]
+fn assert_reads_and_writes(requests: &[String], fragment: &str) {
+    let methods = methods(requests, fragment);
+    assert!(
+        methods.iter().any(|m| m == "PUT"),
+        "{fragment}: {methods:?}"
+    );
+    assert!(
+        methods.iter().any(|m| m == "GET"),
+        "{fragment}: {methods:?}"
+    );
+}
+
+#[tokio::test]
+async fn data_files_named_with_the_schema_prefix_use_the_target() {
+    let origin = TestOss::start().await;
+    let cache = TestOss::start_sharing(&origin).await;
+    let catalog = data_target_catalog(&origin, &cache).await;
+    // The prefix is only in the table schema, not in the catalog options.
+    let schema = int_schema()
+        .option("data-file.prefix", "custom-")
+        .build()
+        .unwrap();
+    let table = create_table(&catalog, "custom_prefix", schema).await;
+
+    let files = write_and_commit(&table, &make_batch(vec![1, 2], vec![10, 20])).await;
+    assert!(
+        files.iter().all(|file| file.starts_with("custom-")),
+        "{files:?}"
+    );
+    assert_eq!(ids(&table).await, [1, 2]);
+    assert_reads_and_writes(&cache.take_requests(), "/custom-");
+    assert_eq!(
+        methods(&origin.take_requests(), "/custom-"),
+        Vec::<String>::new()
+    );
+
+    // A dynamic prefix adds to the table's own, so both sets of files keep using the target.
+    let dynamic = table.copy_with_options(HashMap::from([(
+        "data-file.prefix".to_string(),
+        "dynamic-".to_string(),
+    )]));
+    let files = write_and_commit(&dynamic, &make_batch(vec![3], vec![30])).await;
+    assert!(
+        files.iter().all(|file| file.starts_with("dynamic-")),
+        "{files:?}"
+    );
+    assert_eq!(ids(&dynamic).await, [1, 2, 3]);
+    let requests = cache.take_requests();
+    assert_reads_and_writes(&requests, "/dynamic-");
+    assert!(methods(&requests, "/custom-").iter().any(|m| m == "GET"));
+    let requests = origin.take_requests();
+    assert_eq!(methods(&requests, "/custom-"), Vec::<String>::new());
+    assert_eq!(methods(&requests, "/dynamic-"), Vec::<String>::new());
 }

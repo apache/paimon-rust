@@ -408,10 +408,11 @@ impl Storage {
     pub(crate) fn create_routed<'a>(
         &self,
         path: &'a str,
+        file_prefixes: &[String],
     ) -> crate::Result<(RoutedOperator, Cow<'a, str>)> {
         #[cfg(feature = "storage-oss")]
         if let Storage::Oss { config, operators } = self {
-            if let Some(target) = config.target_route(path) {
+            if let Some(target) = config.target_route(path, file_prefixes) {
                 let (bucket, relative_path) =
                     Self::bucket_and_relative_path(path, "OSS", &["oss"])?;
                 let operator = |route| {

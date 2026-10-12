@@ -296,13 +296,14 @@ pub struct Table {
     applied_dynamic_option_keys: HashSet<String>,
 }
 
-// Format Table files may be replaced in place under the same name, so they never use io-cache.
+// Format Table files may be replaced in place under the same name, so they never use io-cache;
+// other tables tell io-cache routing the prefixes their data files are named with.
 fn table_file_io(file_io: &FileIO, schema: &TableSchema) -> FileIO {
-    if CoreOptions::new(schema.options()).is_format_table() {
-        file_io.origin_only()
-    } else {
-        file_io.clone()
+    let options = CoreOptions::new(schema.options());
+    if options.is_format_table() {
+        return file_io.origin_only();
     }
+    file_io.with_file_prefixes([options.data_file_prefix(), options.changelog_file_prefix()])
 }
 
 impl Table {
@@ -632,11 +633,12 @@ impl Table {
                 || k == "scan.mode"
                 || k == "incremental-between-timestamp"
         });
+        let schema = self.schema.copy_with_options(extra);
         Self {
-            file_io: self.file_io.clone(),
+            file_io: table_file_io(&self.file_io, &schema),
             identifier: self.identifier.clone(),
             location: self.location.clone(),
-            schema: self.schema.copy_with_options(extra),
+            schema,
             schema_manager: self.schema_manager.clone(),
             branch: self.branch.clone(),
             branch_reference: self.branch_reference,

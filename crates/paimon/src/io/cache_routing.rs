@@ -185,8 +185,9 @@ impl IoCacheRouting {
         &self.targets
     }
 
-    /// Applies the routing rules in order, the first match winning.
-    pub(crate) fn route(&self, op: OpClass, path: &str) -> Target {
+    /// Applies the routing rules in order, the first match winning; `table_prefixes` are the data
+    /// file prefixes of the table that `path` belongs to.
+    pub(crate) fn route(&self, op: OpClass, path: &str, table_prefixes: &[String]) -> Target {
         if self.override_endpoint.is_some() {
             return Target::Override;
         }
@@ -197,8 +198,8 @@ impl IoCacheRouting {
         if !self.policy.contains(op) || !path.starts_with("oss://") {
             return Target::Origin;
         }
-        let Some(file_type) =
-            routable_type(path, &self.data_prefixes).filter(|t| self.whitelist.contains(t))
+        let Some(file_type) = routable_type(path, &self.data_prefixes, table_prefixes)
+            .filter(|t| self.whitelist.contains(t))
         else {
             return Target::Origin;
         };
@@ -216,7 +217,11 @@ impl IoCacheRouting {
     }
 
     /// The target that [`Self::route`] picks for `path`, and the operation classes it serves.
-    pub(crate) fn cache_target(&self, path: &str) -> Option<(usize, OpClasses)> {
+    pub(crate) fn cache_target(
+        &self,
+        path: &str,
+        table_prefixes: &[String],
+    ) -> Option<(usize, OpClasses)> {
         let mut found = None;
         let mut classes = OpClasses::default();
         for op in [
@@ -225,7 +230,7 @@ impl IoCacheRouting {
             OpClass::Read,
             OpClass::Write,
         ] {
-            if let Target::Cache(index) = self.route(op, path) {
+            if let Target::Cache(index) = self.route(op, path, table_prefixes) {
                 found = Some(index);
                 classes.insert(op);
             }
@@ -235,7 +240,7 @@ impl IoCacheRouting {
 
     /// Endpoint of requests that never leave origin.
     pub(crate) fn origin(&self) -> Option<&str> {
-        self.endpoint(self.route(OpClass::Origin, ""))
+        self.endpoint(self.route(OpClass::Origin, "", &[]))
     }
 
     pub(crate) fn endpoint(&self, target: Target) -> Option<&str> {
@@ -249,7 +254,11 @@ impl IoCacheRouting {
 }
 
 /// The type a cache may serve, or `None` when the file must be read from the origin.
-pub(crate) fn routable_type(path: &str, data_prefixes: &[String]) -> Option<FileType> {
+pub(crate) fn routable_type(
+    path: &str,
+    data_prefixes: &[String],
+    table_prefixes: &[String],
+) -> Option<FileType> {
     let path = path.trim_end_matches('/');
     let name = path.rsplit('/').next().unwrap_or(path);
     // Temp files are renamed away once written, whatever prefix they carry.
@@ -257,7 +266,7 @@ pub(crate) fn routable_type(path: &str, data_prefixes: &[String]) -> Option<File
     if temp || FileType::is_mutable(path) {
         return None;
     }
-    if is_data_file_name(name, data_prefixes) {
+    if is_data_file_name(name, data_prefixes.iter().chain(table_prefixes)) {
         return Some(if name.ends_with(".index") {
             FileType::FileIndex
         } else {
@@ -279,9 +288,9 @@ pub(crate) fn routable_type(path: &str, data_prefixes: &[String]) -> Option<File
 }
 
 // Manifests, indexes and statistics share the uuid-count shape but have no extension.
-fn is_data_file_name(name: &str, data_prefixes: &[String]) -> bool {
+fn is_data_file_name<'a>(name: &str, mut prefixes: impl Iterator<Item = &'a String>) -> bool {
     !name.ends_with(MANIFEST_SIDECAR_SUFFIX)
-        && data_prefixes.iter().any(|prefix| {
+        && prefixes.any(|prefix| {
             name.strip_prefix(prefix.as_str())
                 .is_some_and(|rest| DATA_FILE_SUFFIX.is_match(rest))
         })
@@ -376,7 +385,7 @@ fn parse_routes(value: &str) -> Vec<(HashSet<FileType>, String)> {
         .collect()
 }
 
-/// `data-` and `changelog-`, plus the table's own prefixes when they are in the options.
+/// `data-` and `changelog-`, plus the prefixes in the options, such as those of a table token.
 fn data_prefixes(props: &HashMap<String, String>) -> Vec<String> {
     let mut prefixes: Vec<String> = DEFAULT_DATA_PREFIXES.map(String::from).to_vec();
     for key in [DATA_FILE_PREFIX, CHANGELOG_FILE_PREFIX] {
@@ -479,7 +488,9 @@ mod tests {
     }
 
     fn route(routing: &IoCacheRouting, op: OpClass, path: &str) -> Option<String> {
-        routing.endpoint(routing.route(op, path)).map(String::from)
+        routing
+            .endpoint(routing.route(op, path, &[]))
+            .map(String::from)
     }
 
     #[test]
@@ -706,6 +717,17 @@ mod tests {
         assert_endpoint(&single(&[]), OpClass::Read, custom, OSS);
         let custom_prefix = single(&["data-file.prefix=custom-"]);
         assert_endpoint(&custom_prefix, OpClass::Read, custom, CACHE);
+
+        // a table passes the prefixes from its schema with each request
+        let routing = IoCacheRouting::from_props(&single(&[]));
+        let table_prefixes = ["custom-".to_string()];
+        let target = routing.route(OpClass::Read, &resolve(custom), &table_prefixes);
+        assert_eq!(routing.endpoint(target), Some(CACHE));
+        let manifest = routing.route(OpClass::Read, &resolve(MANIFEST_PATH), &table_prefixes);
+        assert_eq!(routing.endpoint(manifest), Some(CACHE));
+        let snapshot = ["snapshot-".to_string()];
+        let target = routing.route(OpClass::Read, &resolve(SNAPSHOT_PATH), &snapshot);
+        assert_eq!(routing.endpoint(target), Some(OSS));
     }
 
     #[test]
@@ -887,12 +909,13 @@ mod tests {
             "oss://b/t/snapshot/snapshot-1.tmp-123e4567-e89b-12d3-a456-426614174000",
             "oss://b/t/bucket-0/data-123e4567-e89b-12d3-a456-426614174000-1.parquet.tmp-123e4567-e89b-12d3-a456-426614174000",
         ] {
-            assert_eq!(routable_type(path, &prefixes), None, "{path}");
+            assert_eq!(routable_type(path, &prefixes, &[]), None, "{path}");
         }
         assert_eq!(
             routable_type(
                 "oss://b/t/bucket-0/data-123e4567-e89b-12d3-a456-426614174000-0.parquet/",
-                &prefixes
+                &prefixes,
+                &[]
             ),
             Some(FileType::Data)
         );
@@ -931,18 +954,24 @@ mod tests {
         ]);
         let both = OpClasses(OpClass::Meta.bit() | OpClass::Read.bit());
         assert_eq!(
-            routing
-                .cache_target("oss://b/t/manifest/manifest-123e4567-e89b-12d3-a456-426614174000-1"),
+            routing.cache_target(
+                "oss://b/t/manifest/manifest-123e4567-e89b-12d3-a456-426614174000-1",
+                &[]
+            ),
             Some((0, both))
         );
         assert_eq!(
             routing.cache_target(
-                "oss://b/t/bucket-0/data-123e4567-e89b-12d3-a456-426614174000-1.parquet"
+                "oss://b/t/bucket-0/data-123e4567-e89b-12d3-a456-426614174000-1.parquet",
+                &[]
             ),
             Some((1, both))
         );
-        assert_eq!(routing.cache_target("oss://b/t/snapshot/snapshot-1"), None);
-        assert_eq!(routing.cache_target("oss://b/t/index/index-1"), None);
+        assert_eq!(
+            routing.cache_target("oss://b/t/snapshot/snapshot-1", &[]),
+            None
+        );
+        assert_eq!(routing.cache_target("oss://b/t/index/index-1", &[]), None);
         assert!(!routing.targets()[0].path_style_access);
         assert!(routing.targets()[1].path_style_access);
     }
@@ -1070,7 +1099,7 @@ mod tests {
         let routing = IoCacheRouting::from_props(options);
         let sorted: BTreeMap<_, _> = options.iter().collect();
         assert_eq!(
-            routing.endpoint(routing.route(op, &resolve(path))),
+            routing.endpoint(routing.route(op, &resolve(path), &[])),
             Some(expect),
             "{op:?} {path} with {sorted:?}"
         );
@@ -1080,7 +1109,7 @@ mod tests {
     fn assert_type(path: &str, expect: Option<FileType>, changes: &[&str]) {
         let prefixes = data_prefixes(&with(&[], changes));
         assert_eq!(
-            routable_type(&resolve(path), &prefixes),
+            routable_type(&resolve(path), &prefixes, &[]),
             expect,
             "{path} with {changes:?}"
         );

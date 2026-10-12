@@ -95,11 +95,13 @@ pub trait FileIOProvider: std::fmt::Debug + Send + Sync + 'static {
         Ok((op, relative_path, None))
     }
 
-    /// Like [`Self::create`], adding the io-cache endpoint for requests that may use it.
+    /// Like [`Self::create`], adding the io-cache endpoint for requests that may use it;
+    /// `file_prefixes` are the data file prefixes of the table that `path` belongs to.
     #[doc(hidden)]
     async fn create_routed(
         &self,
         path: &str,
+        _file_prefixes: &[String],
     ) -> crate::Result<(RoutedOperator, String, Option<String>)> {
         let (op, relative_path, namespace) = self.create_with_cache_namespace(path).await?;
         Ok((RoutedOperator::origin(op), relative_path, namespace))
@@ -120,6 +122,8 @@ pub struct FileIO {
     file_format_metadata_cache: Arc<FileFormatMetadataCacheContext>,
     blob_index_cache: Arc<BlobIndexCacheContext>,
     origin_only: bool,
+    /// Data file prefixes of the table this view serves, for io-cache routing.
+    file_prefixes: Arc<[String]>,
 }
 
 pub(crate) const DEFAULT_FILE_FORMAT_METADATA_CACHE_MAX_BYTES: usize = 50 * 1024 * 1024;
@@ -324,6 +328,22 @@ impl FileIO {
         file_io
     }
 
+    /// A view of this FileIO whose io-cache routing also knows data files named with `prefixes`.
+    pub(crate) fn with_file_prefixes<'a>(
+        &self,
+        prefixes: impl IntoIterator<Item = &'a str>,
+    ) -> Self {
+        let mut file_prefixes = self.file_prefixes.to_vec();
+        for prefix in prefixes {
+            if !prefix.trim().is_empty() && !file_prefixes.iter().any(|known| known == prefix) {
+                file_prefixes.push(prefix.to_string());
+            }
+        }
+        let mut file_io = self.clone();
+        file_io.file_prefixes = file_prefixes.into();
+        file_io
+    }
+
     fn storage(&self) -> crate::Result<&Storage> {
         let FileIOBackend::Storage(storage) = &self.backend else {
             return Err(Error::IoUnsupported {
@@ -342,8 +362,9 @@ impl FileIO {
     pub(crate) fn create_routed_static(
         &self,
         path: &str,
+        file_prefixes: &[String],
     ) -> crate::Result<(RoutedOperator, String)> {
-        let (op, relative_path) = self.storage()?.create_routed(path)?;
+        let (op, relative_path) = self.storage()?.create_routed(path, file_prefixes)?;
         let op = if self.origin_only {
             op.without_cache()
         } else {
@@ -386,11 +407,16 @@ impl FileIO {
     async fn create_routed(&self, path: &str) -> crate::Result<(RoutedOperator, String)> {
         match &self.backend {
             FileIOBackend::Provider(provider) => {
-                let (op, relative_path, _) =
-                    resolve_provider_routed(provider.as_ref(), path, self.origin_only).await?;
+                let (op, relative_path, _) = resolve_provider_routed(
+                    provider.as_ref(),
+                    path,
+                    self.origin_only,
+                    &self.file_prefixes,
+                )
+                .await?;
                 Ok((op, relative_path))
             }
-            FileIOBackend::Storage(_) => self.create_routed_static(path),
+            FileIOBackend::Storage(_) => self.create_routed_static(path, &self.file_prefixes),
         }
     }
 
@@ -399,9 +425,10 @@ impl FileIO {
             FileIOBackend::Provider(provider) => Ok(FileSource::Provider {
                 provider: provider.clone(),
                 origin_only: self.origin_only,
+                file_prefixes: self.file_prefixes.clone(),
             }),
             FileIOBackend::Storage(storage) => {
-                let (op, relative_path) = self.create_routed_static(path)?;
+                let (op, relative_path) = self.create_routed_static(path, &self.file_prefixes)?;
                 let namespace = self.cache_namespace_for_path(path)?;
                 let cache_path =
                     cache_object_path(&namespace, op.origin_operator(), &relative_path);
@@ -852,12 +879,13 @@ async fn resolve_provider_routed(
     provider: &dyn FileIOProvider,
     path: &str,
     origin_only: bool,
+    file_prefixes: &[String],
 ) -> crate::Result<(RoutedOperator, String, Option<String>)> {
     let (op, relative_path, namespace) = if origin_only {
         let (op, relative_path, namespace) = provider.create_with_cache_namespace(path).await?;
         (RoutedOperator::origin(op), relative_path, namespace)
     } else {
-        provider.create_routed(path).await?
+        provider.create_routed(path, file_prefixes).await?
     };
     validate_provider_path(path, &relative_path)?;
     Ok((op, relative_path, namespace))
@@ -1075,6 +1103,7 @@ impl FileIOBuilder {
             file_format_metadata_cache,
             blob_index_cache,
             origin_only: false,
+            file_prefixes: Arc::default(),
         })
     }
 }
@@ -1397,6 +1426,7 @@ enum FileSource {
     Provider {
         provider: Arc<dyn FileIOProvider>,
         origin_only: bool,
+        file_prefixes: Arc<[String]>,
     },
 }
 
@@ -1406,9 +1436,11 @@ impl FileSource {
             Self::Provider {
                 provider,
                 origin_only,
+                file_prefixes,
             } => {
                 let (op, relative_path, namespace) =
-                    resolve_provider_routed(provider.as_ref(), path, *origin_only).await?;
+                    resolve_provider_routed(provider.as_ref(), path, *origin_only, file_prefixes)
+                        .await?;
                 let cache_path = namespace.map(|namespace| {
                     cache_object_path(&namespace, op.origin_operator(), &relative_path)
                 });

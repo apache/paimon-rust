@@ -86,9 +86,13 @@ pub(crate) struct OssTargetRoute {
 
 impl OssStorageConfig {
     /// The io-cache target of `path`, when some request on it may leave origin.
-    pub(crate) fn target_route(&self, path: &str) -> Option<OssTargetRoute> {
+    pub(crate) fn target_route(
+        &self,
+        path: &str,
+        file_prefixes: &[String],
+    ) -> Option<OssTargetRoute> {
         let cache = self.cache.as_ref()?;
-        let (index, classes) = cache.routing.cache_target(path)?;
+        let (index, classes) = cache.routing.cache_target(path, file_prefixes)?;
         Some(OssTargetRoute {
             route: OssRoute::Target(index),
             classes,

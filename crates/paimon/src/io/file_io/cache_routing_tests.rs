@@ -489,7 +489,7 @@ async fn test_routing_is_off_unless_enabled() {
         ("io-cache.policy", "meta,read"),
     ]);
 
-    let (op, _) = file_io.create_routed_static(DATA).unwrap();
+    let (op, _) = file_io.create_routed_static(DATA, &[]).unwrap();
     assert!(op.target().is_none());
     write(&file_io, DATA, b"data").await;
     assert_eq!(read(&file_io, DATA).await, "data");
@@ -500,7 +500,7 @@ async fn test_routing_is_off_unless_enabled() {
 async fn test_cache_key_is_identical_on_target_and_origin() {
     let (_origin, _cache, file_io) = routed("read").await;
 
-    let (op, relative_path) = file_io.create_routed_static(DATA).unwrap();
+    let (op, relative_path) = file_io.create_routed_static(DATA, &[]).unwrap();
     let target = op.target().unwrap();
     let namespace = file_io.cache_namespace_for_path(DATA).unwrap();
     assert_eq!(
