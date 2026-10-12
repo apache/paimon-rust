@@ -17,6 +17,7 @@
 
 //! Common utilities for Paimon.
 
+pub(crate) mod date_time;
 pub mod options;
 
 pub use options::{CatalogOptions, Options};
