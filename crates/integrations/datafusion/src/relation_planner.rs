@@ -63,30 +63,21 @@ impl RelationPlanner for PaimonRelationPlanner {
         let TableFactor::Table {
             ref name,
             ref version,
-            args: None,
             ..
         } = relation
         else {
             return Ok(RelationPlanning::Original(Box::new(relation)));
         };
 
+        let Some(version) = version else {
+            return Ok(RelationPlanning::Original(Box::new(relation)));
+        };
+
         let table_ref = object_name_to_table_reference(name, context)?;
         let source = context
             .context_provider()
-            .get_table_source(table_ref.clone());
-        let Some(version) = version else {
-            if let Some(provider) = source
-                .as_ref()
-                .ok()
-                .and_then(|source| source_as_provider(source).ok())
-            {
-                if let Some(routed) = provider.downcast_ref::<ReadOnlyTableProvider>() {
-                    routed.current_table()?;
-                }
-            }
-            return Ok(RelationPlanning::Original(Box::new(relation)));
-        };
-        let provider = source_as_provider(&source?)?;
+            .get_table_source(table_ref.clone())?;
+        let provider = source_as_provider(&source)?;
 
         if let Some(unavailable) = provider.downcast_ref::<UnavailableEngineTableProvider>() {
             return Err(unavailable.unavailable_error());

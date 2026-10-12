@@ -309,6 +309,7 @@ struct MetadataEngineResolver {
 #[derive(Debug, Default)]
 struct SnapshotEngineResolver {
     calls: AtomicUsize,
+    current_calls: AtomicUsize,
     current_unavailable: bool,
 }
 
@@ -320,6 +321,7 @@ impl TableEngineResolver for SnapshotEngineResolver {
         &self,
         request: &EngineTableRequest,
     ) -> DFResult<Option<Arc<dyn TableProvider>>> {
+        self.current_calls.fetch_add(1, Ordering::Relaxed);
         if self.current_unavailable {
             return Err(DataFusionError::Execution(
                 "current table is unavailable".into(),
@@ -581,37 +583,31 @@ async fn engine_snapshot_uses_historical_data_and_schema() {
 }
 
 #[tokio::test]
-async fn engine_snapshot_remains_readable_when_current_resolution_fails() {
-    let resolver = Arc::new(SnapshotEngineResolver {
-        current_unavailable: true,
-        ..Default::default()
-    });
-    let env = setup_with_engine(Some(resolver.clone())).await;
-    enable_version_syntax(&env).await;
-    for native in [false, true] {
-        let batches = routed_sql(
-            &env,
-            native,
-            &format!(
-                "SELECT h.historical FROM {CATALOG}.{DB}.it VERSION AS OF 10 AS h WHERE h.id = 2"
-            ),
-        )
+async fn sql_context_snapshot_remains_readable_when_current_resolution_fails() {
+    let (env, resolver) = current_unavailable_env().await;
+    let batches = env
+        .ctx
+        .sql(&format!(
+            "SELECT h.historical FROM {CATALOG}.{DB}.it VERSION AS OF 10 AS h WHERE h.id = 2"
+        ))
         .await
         .unwrap()
         .collect()
         .await
         .unwrap();
-        assert_eq!(string_column_values(&batches, "historical"), ["old-b"]);
+    assert_eq!(string_column_values(&batches, "historical"), ["old-b"]);
 
-        let err = routed_sql(
-            &env,
-            native,
-            &format!("SELECT * FROM {CATALOG}.{DB}.it VERSION AS OF 404 WHERE FALSE"),
-        )
+    let err = env
+        .ctx
+        .sql(&format!(
+            "SELECT * FROM {CATALOG}.{DB}.it VERSION AS OF 404 WHERE FALSE"
+        ))
         .await
         .unwrap_err();
-        assert!(err.to_string().contains("snapshot 404"), "{err}");
+    assert!(err.to_string().contains("snapshot 404"), "{err}");
+    assert_eq!(resolver.current_calls.load(Ordering::Relaxed), 0);
 
+    for native in [false, true] {
         for query in [
             format!("SELECT * FROM {CATALOG}.{DB}.it"),
             format!("SELECT * FROM {CATALOG}.{DB}.it WHERE FALSE"),
@@ -628,7 +624,79 @@ async fn engine_snapshot_remains_readable_when_current_resolution_fails() {
             );
         }
     }
-    assert!(resolver.calls.load(Ordering::Relaxed) >= 4);
+}
+
+#[tokio::test]
+async fn raw_session_snapshot_propagates_current_resolution_errors() {
+    let (env, resolver) = current_unavailable_env().await;
+    for suffix in ["", " WHERE FALSE", " LIMIT 0"] {
+        let err = env
+            .ctx
+            .ctx()
+            .sql(&format!(
+                "SELECT * FROM {CATALOG}.{DB}.it VERSION AS OF 10{suffix}"
+            ))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("current table is unavailable"),
+            "{err}"
+        );
+    }
+    assert_eq!(resolver.calls.load(Ordering::Relaxed), 0);
+}
+
+async fn current_unavailable_env() -> (TestEnv, Arc<SnapshotEngineResolver>) {
+    let resolver = Arc::new(SnapshotEngineResolver {
+        current_unavailable: true,
+        ..Default::default()
+    });
+    let env = setup_with_engine(Some(resolver.clone())).await;
+    enable_version_syntax(&env).await;
+    (env, resolver)
+}
+
+#[tokio::test]
+async fn engine_errors_propagate_to_schema_table() {
+    let (env, _) = current_unavailable_env().await;
+    let schema = env.ctx.ctx().catalog(CATALOG).unwrap().schema(DB).unwrap();
+    let err = schema.table("it").await.map(|_| ()).unwrap_err();
+    assert!(
+        err.to_string().contains("current table is unavailable"),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn engine_errors_propagate_to_context_table_provider() {
+    let (env, _) = current_unavailable_env().await;
+    let err = env
+        .ctx
+        .ctx()
+        .table_provider(format!("{CATALOG}.{DB}.it"))
+        .await
+        .map(|_| ())
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("current table is unavailable"),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn engine_errors_propagate_to_context_table() {
+    let (env, _) = current_unavailable_env().await;
+    let err = env
+        .ctx
+        .ctx()
+        .table(format!("{CATALOG}.{DB}.it"))
+        .await
+        .map(|_| ())
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("current table is unavailable"),
+        "{err}"
+    );
 }
 
 #[tokio::test]
