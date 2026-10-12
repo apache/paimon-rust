@@ -47,6 +47,13 @@ const WAREHOUSE: &str = "test_warehouse";
 /// A Format Table with one file in each of `dt=a` and `dt=b`, whose partitions a mock REST
 /// catalog manages. Its data directory is the root of `temp_dir`.
 async fn catalog_managed_format_table(temp_dir: &TempDir) -> (SQLContext, mock_server::RESTServer) {
+    catalog_managed_format_table_with_schema(temp_dir, format_table_schema(true)).await
+}
+
+async fn catalog_managed_format_table_with_schema(
+    temp_dir: &TempDir,
+    schema: Schema,
+) -> (SQLContext, mock_server::RESTServer) {
     let server = start_mock_server(
         WAREHOUSE.to_string(),
         temp_dir.path().to_string_lossy().into_owned(),
@@ -60,7 +67,7 @@ async fn catalog_managed_format_table(temp_dir: &TempDir) -> (SQLContext, mock_s
     server.add_table_with_schema(
         DATABASE,
         TABLE,
-        format_table_schema(true),
+        schema,
         &format!("file://{}", temp_dir.path().display()),
     );
     server.set_table_external(DATABASE, TABLE, false);
@@ -83,6 +90,19 @@ async fn catalog_managed_format_table(temp_dir: &TempDir) -> (SQLContext, mock_s
     let mut context = SQLContext::new();
     context.register_catalog("paimon", catalog).await.unwrap();
     (context, server)
+}
+
+fn partition_last_format_table_schema() -> Schema {
+    Schema::builder()
+        .column("id", DataType::BigInt(BigIntType::new()))
+        .column("name", DataType::VarChar(VarCharType::string_type()))
+        .column("dt", DataType::VarChar(VarCharType::new(255).unwrap()))
+        .partition_keys(["dt"])
+        .option("type", "format-table")
+        .option("file.format", "parquet")
+        .option("metastore.partitioned-table", "true")
+        .build()
+        .unwrap()
 }
 
 /// The same table with its partitions discovered from the directory layout, in a filesystem
@@ -254,6 +274,27 @@ async fn test_insert_into_catalog_managed_format_table_registers_partition() {
             .count(),
         1
     );
+}
+
+#[cfg(not(windows))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_insert_into_catalog_managed_format_table_with_partition_column_last() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (context, _server) =
+        catalog_managed_format_table_with_schema(&temp_dir, partition_last_format_table_schema())
+            .await;
+
+    context
+        .sql(&format!(
+            "INSERT INTO {TABLE_NAME} VALUES (11, 'eleven', 'c')"
+        ))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    assert_eq!(ids(&context, TABLE_NAME).await, [1, 2, 3, 11]);
 }
 
 #[cfg(not(windows))]
