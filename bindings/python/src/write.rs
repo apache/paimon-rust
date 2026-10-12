@@ -788,6 +788,24 @@ impl UpdateContext {
         ))
     }
 
+    fn delete_by_predicate(
+        &self,
+        py: Python<'_>,
+        predicate: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<Vec<PyCommitMessage>> {
+        let predicate = predicate
+            .map(|predicate| dict_to_table_predicate(predicate, self.table.schema(), true))
+            .transpose()?;
+        let messages = py
+            .detach(|| runtime().block_on(self.inner.delete_by_predicate(predicate)))
+            .map_err(to_py_err)?;
+        Ok(wrap_messages(
+            messages,
+            &self.table_location,
+            &self.commit_user,
+        ))
+    }
+
     fn delete_by_row_id(
         &self,
         py: Python<'_>,
@@ -1058,10 +1076,30 @@ impl PyStreamTableUpdate {
         let _ = commit_identifier;
         self.context.delete_by_row_id(py, row_ids)
     }
+
+    #[pyo3(signature = (predicate, commit_identifier))]
+    fn delete_by_predicate(
+        &self,
+        py: Python<'_>,
+        predicate: Option<&Bound<'_, PyDict>>,
+        commit_identifier: i64,
+    ) -> PyResult<Vec<PyCommitMessage>> {
+        let _ = commit_identifier;
+        self.context.delete_by_predicate(py, predicate)
+    }
 }
 
 #[pymethods]
 impl PyBatchTableUpdate {
+    #[pyo3(signature = (predicate))]
+    fn delete_by_predicate(
+        &self,
+        py: Python<'_>,
+        predicate: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<Vec<PyCommitMessage>> {
+        self.context.delete_by_predicate(py, predicate)
+    }
+
     fn _with_blob_uri_reader_factory(
         &mut self,
         py: Python<'_>,

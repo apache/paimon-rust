@@ -2270,24 +2270,12 @@ impl TableCommit {
         let Some(snap) = snapshot else {
             return Ok(vec![]);
         };
-        let file_io = self.snapshot_manager.file_io();
-        let manifest_dir = self.snapshot_manager.manifest_dir();
-        let mut entries = Vec::new();
-        for manifest_list in [snap.base_manifest_list(), snap.delta_manifest_list()] {
-            let manifest_list_path = format!("{manifest_dir}/{manifest_list}");
-            for manifest_file in ManifestList::read(file_io, &manifest_list_path).await? {
-                let manifest_path = format!("{manifest_dir}/{}", manifest_file.file_name());
-                for entry in Manifest::read(file_io, &manifest_path).await? {
-                    if let Some(filter) = partition_filter {
-                        if !filter.matches_entry(entry.partition())? {
-                            continue;
-                        }
-                    }
-                    entries.push(entry);
-                }
-            }
-        }
-        Ok(merge_active_entries(entries))
+        super::snapshot_manifest::read_snapshot_entries(
+            &self.snapshot_manager,
+            snap,
+            partition_filter,
+        )
+        .await
     }
 
     async fn scan_changed_partition_entries(

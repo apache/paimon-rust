@@ -288,6 +288,22 @@ impl TableUpdate {
         .await
     }
 
+    /// Delete rows matching a predicate against one captured snapshot.
+    ///
+    /// Partition-only predicates remove complete data and index metadata,
+    /// including pending files, for append and primary-key tables as well as
+    /// data-evolution tables, without requiring deletion vectors. All other
+    /// predicates (including `None`, which matches all rows) require a
+    /// data-evolution table with row tracking and deletion vectors.
+    /// Returned messages carry the snapshot baseline for conflict detection;
+    /// the caller publishes them through the matching builder's committer.
+    pub async fn delete_by_predicate(
+        &self,
+        predicate: Option<crate::spec::Predicate>,
+    ) -> crate::Result<Vec<CommitMessage>> {
+        super::table_update_delete::delete(&self.table, predicate).await
+    }
+
     /// Delete rows by row ID using deletion vectors.
     pub async fn delete_by_row_id(&self, row_ids: Vec<i64>) -> crate::Result<Vec<CommitMessage>> {
         if row_ids.is_empty() {
