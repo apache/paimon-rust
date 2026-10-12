@@ -36,18 +36,25 @@ See [GitHub Issues](https://github.com/apache/paimon-rust/issues) for the curren
 Released on October 12, 2026.
 
 [Source, signature, and SHA-512 checksum](https://downloads.apache.org/paimon/paimon-rust-0.4.0/)
- · [KEYS](https://downloads.apache.org/paimon/KEYS). Requires Rust 1.94 or later.
+ · [KEYS](https://downloads.apache.org/paimon/KEYS).
+
+The minimum supported Rust version for 0.4.0 is 1.94.
 
 Key features:
 
-- Primary-key vector and hybrid search, DiskANN, quantized IVF, and Java-compatible indexes
-- Read-only object tables, incremental diff, watermark time travel, and deletion-vector merge-on-read
-- Expanded DataFusion SQL and native write APIs across language bindings
-- Batched and streamed `BlobDescriptor` reads, including BLOB maps
-- Custom and cached I/O through OpenDAL operators, local block caches, and C callbacks
+- Expanded primary-key vector and hybrid search with vector/full-text fusion, streamed index builds, DiskANN and quantized IVF backends, scalar pre-filtering, and externally planned bucket splits
+- Java-compatible file and global indexes, including Bloom, Bitmap V1/V2 reads and V2 writes, multi-value array indexes, and exact FM substring search
+- Native read-only object tables and `TableType`-based routing to pluggable external table engines
+- Batch incremental-diff reads, watermark-based time travel, and deletion-vector merge-on-read for uncompacted primary-key snapshots
+- Expanded DataFusion SQL with `ALTER COLUMN`, database lifecycle statements, configurable runtime resources, and the Java-compatible `$consumers` system table
+- Expanded Go table-write support plus postpone-table fixed-bucket write primitives for Rust, C, and Go, with Python commit rollback
+- Standalone `BlobDescriptor` batch reads and seekable streams, with Go batch and stream APIs and `MAP<STRING, BLOB>` descriptor reads
+- Extensible and cached I/O through caller-provided OpenDAL operators, an in-memory local block cache, and C cache callbacks
 
-API change: `BTreeIndexReader::null_bitmap()` now loads lazily and is asynchronous.
-Use `reader.null_bitmap().await?` and handle load errors.
+API compatibility changes:
+
+- `BTreeIndexReader::null_bitmap()` is now asynchronous and returns `io::Result<&RoaringTreemap>`. Downstream Rust callers must replace `reader.null_bitmap()` with `reader.null_bitmap().await?` and handle load errors.
+- BTree readers load the null bitmap on first access and reuse successful loads within the reader. Null bitmap I/O, CRC, and deserialization errors now surface on first access rather than when opening the reader. Failed loads can be retried.
 
 Go Linux amd64 prebuilt binaries require glibc 2.38 or later, OpenSSL 3, and
 `libffi.so.8`. See [Go prerequisites](go-binding.md#prerequisites).
