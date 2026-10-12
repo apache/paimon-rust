@@ -1259,8 +1259,7 @@ async fn test_blob_view_limit_only_resolves_selected_references() {
         );
     }
 
-    // As without authorization, a predicate on the resolved view under LIMIT
-    // must stop before the invalid fourth reference the server still admits.
+    // LIMIT stops before the invalid fourth reference.
     server.set_auth_response(
         "default",
         "blob_view_target",
@@ -3654,7 +3653,7 @@ async fn test_query_auth_blob_view_predicate_limit_after_pk_merge() {
                 }
                 schema.build().unwrap()
             },
-            // Overlapping commits force merging before any view lookup.
+            // Overlapping commits force a merge.
             vec![
                 batch(vec![Some(&missing); 4]),
                 batch(vec![
@@ -3712,7 +3711,7 @@ async fn test_query_auth_blob_view_predicate_limit_after_pk_merge() {
                         }
                     }
                     if !descriptors {
-                        // A rejected candidate must not consume the output quota.
+                        // A rejected candidate consumes no quota.
                         let mut read = table.new_read_builder();
                         read.with_projection(&["id"])
                             .unwrap()
@@ -3729,6 +3728,78 @@ async fn test_query_auth_blob_view_predicate_limit_after_pk_merge() {
                     }
                 }
             }
+        }
+    }
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn test_query_auth_blob_view_predicate_limit_groups_lookups() {
+    let names = vec!["a", "b", "c", "d"];
+    let source = written(
+        "lookup_source",
+        blob_schema,
+        vec![blob_batch(
+            vec![1, 2, 3, 4],
+            names.clone(),
+            names.iter().map(|name| name.as_bytes().to_vec()).collect(),
+        )],
+    )
+    .await;
+    let picture_id = source.table.schema().fields()[2].id();
+    let references: Vec<Vec<u8>> = (0..4)
+        .map(|row_id| {
+            BlobViewStruct::new(source.identifier.clone(), picture_id, row_id)
+                .serialize()
+                .unwrap()
+        })
+        .collect();
+    let g = written(
+        "lookup_target",
+        |options| {
+            let mut options = options.to_vec();
+            options.push(("blob-view-field", "picture"));
+            blob_schema(&options)
+        },
+        vec![blob_batch(vec![1, 2, 3, 4], names, references)],
+    )
+    .await;
+    let server = &g.ctx.server;
+    server.add_table_with_schema(
+        "default",
+        "lookup_source",
+        blob_schema(&[]),
+        source.table.location(),
+    );
+    g.set_rules(&[int_leaf(0, "id", "GREATER_THAN", 0)], &[]);
+    let predicates = PredicateBuilder::new(g.table.schema().fields());
+    // Distinct references load in one request, with and without a payload filter.
+    for descriptors in [false, true] {
+        let table = g.table.copy_with_options(HashMap::from([(
+            "blob-as-descriptor".to_string(),
+            descriptors.to_string(),
+        )]));
+        for (limit, expected) in [
+            (Some(2), vec![1, 2]),
+            (Some(4), vec![1, 2, 3, 4]),
+            (None, vec![1, 2, 3, 4]),
+        ] {
+            let label = format!("descriptors={descriptors}, limit={limit:?}");
+            let mut read = table.new_read_builder();
+            read.with_projection(&["id"])
+                .unwrap()
+                .with_filter(predicates.is_not_null("picture").unwrap());
+            if let Some(limit) = limit {
+                read.with_limit(limit);
+            }
+            let before = server.table_get_call_count("default", "lookup_source");
+            let batches = read_all(&read).await.unwrap();
+            assert_eq!(ids(&batches), expected, "{label}");
+            assert_eq!(
+                server.table_get_call_count("default", "lookup_source") - before,
+                1,
+                "{label}"
+            );
         }
     }
 }

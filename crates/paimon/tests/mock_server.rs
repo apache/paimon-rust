@@ -54,6 +54,7 @@ type PartitionSpecPageResponse = (Vec<HashMap<String, String>>, Option<String>);
 struct MockState {
     databases: HashMap<String, GetDatabaseResponse>,
     tables: HashMap<String, GetTableResponse>,
+    get_table_call_counts: HashMap<String, usize>,
     views: HashMap<String, GetViewResponse>,
     functions: HashMap<String, GetFunctionResponse>,
     tags: HashMap<String, GetTagResponse>,
@@ -825,6 +826,7 @@ impl RESTServer {
         let mut s = state.inner.lock().unwrap();
 
         let key = format!("{db}.{table}");
+        *s.get_table_call_counts.entry(key.clone()).or_default() += 1;
         if let Some(expected) = s.table_read_via.get(&key) {
             if headers
                 .get("X-Paimon-Read-Via")
@@ -2156,6 +2158,17 @@ impl RESTServer {
             .partition_list_name_patterns
             .get(&format!("{database}.{table}"))
             .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Return how many get-table requests the table received.
+    pub fn table_get_call_count(&self, database: &str, table: &str) -> usize {
+        self.inner
+            .lock()
+            .unwrap()
+            .get_table_call_counts
+            .get(&format!("{database}.{table}"))
+            .copied()
             .unwrap_or_default()
     }
 
