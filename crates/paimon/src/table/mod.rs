@@ -85,6 +85,8 @@ mod hybrid_search_builder;
 mod incremental_scan;
 pub(crate) mod index_file_path;
 mod inline_blob;
+#[cfg(all(test, feature = "storage-oss"))]
+mod io_cache_routing_tests;
 mod kv_file_reader;
 mod kv_file_writer;
 mod lumina_index_build_builder;
@@ -294,6 +296,15 @@ pub struct Table {
     applied_dynamic_option_keys: HashSet<String>,
 }
 
+// Format Table files may be replaced in place under the same name, so they never use io-cache.
+fn table_file_io(file_io: &FileIO, schema: &TableSchema) -> FileIO {
+    if CoreOptions::new(schema.options()).is_format_table() {
+        file_io.origin_only()
+    } else {
+        file_io.clone()
+    }
+}
+
 impl Table {
     /// Create a new table.
     pub fn new(
@@ -303,6 +314,7 @@ impl Table {
         schema: TableSchema,
         rest_env: Option<RESTEnv>,
     ) -> Self {
+        let file_io = table_file_io(&file_io, &schema);
         let schema_manager = SchemaManager::new(file_io.clone(), location.clone());
         let branch = DEFAULT_MAIN_BRANCH.to_string();
         Self {
@@ -340,6 +352,7 @@ impl Table {
         identifier.validate()?;
         validate_branch_name(&branch)?;
         schema.validate_resolved_structure()?;
+        let file_io = table_file_io(&file_io, &schema);
         let schema_manager = SchemaManager::new(file_io.clone(), location.clone());
         let schema_manager = if branch == DEFAULT_MAIN_BRANCH {
             schema_manager
@@ -657,6 +670,7 @@ impl Table {
             schema_manager.with_branch(branch)
         };
         Ok(Self {
+            file_io: table_file_io(&self.file_io, &schema),
             schema,
             schema_manager,
             branch: branch.to_string(),

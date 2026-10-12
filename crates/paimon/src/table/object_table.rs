@@ -126,7 +126,8 @@ impl ObjectTable {
             })?
             .to_string();
         Ok(Self {
-            file_io,
+            // Other writers manage these objects and may replace them, so they never use io-cache.
+            file_io: file_io.origin_only(),
             identifier,
             location,
             comment: schema.comment().map(str::to_string),
