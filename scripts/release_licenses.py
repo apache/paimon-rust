@@ -598,6 +598,7 @@ def oss_cpp_wheel_licenses(root: Path, report: Report) -> str:
     curl_license = (root / "third-party-licenses/curl-8.13.0.COPYING").read_text(
         encoding="utf-8"
     )
+    openssl_version = "1.1.1k FIPS" if report.target.startswith("x86_64") else "1.1.1w"
     return "\n".join(
         [
             "",
@@ -608,6 +609,8 @@ def oss_cpp_wheel_licenses(root: Path, report: Report) -> str:
             f'        <pre class="license-text">{html.escape(sdk_notices)}</pre>',
             '        <h3 id="bundled-curl-8.13.0">curl 8.13.0</h3>',
             f'        <pre class="license-text">{html.escape(curl_license)}</pre>',
+            f"        <p>OpenSSL {openssl_version} is also linked statically into the bridge;",
+            "        its license is listed above.</p>",
         ]
     )
 
