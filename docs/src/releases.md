@@ -35,33 +35,22 @@ See [GitHub Issues](https://github.com/apache/paimon-rust/issues) for the curren
 
 Released on October 12, 2026.
 
-The [source archive, signature, and SHA-512 checksum](https://downloads.apache.org/paimon/paimon-rust-0.4.0/)
-are available from the ASF distribution site. Verify the signature with the
-[Apache Paimon KEYS file](https://downloads.apache.org/paimon/KEYS).
-
-The minimum supported Rust version for 0.4.0 is 1.94.
+[Source, signature, and SHA-512 checksum](https://downloads.apache.org/paimon/paimon-rust-0.4.0/)
+ · [KEYS](https://downloads.apache.org/paimon/KEYS). Requires Rust 1.94 or later.
 
 Key features:
 
-- Expanded primary-key vector and hybrid search with vector/full-text fusion, streamed index builds, DiskANN and quantized IVF backends, scalar pre-filtering, and externally planned bucket splits
-- Java-compatible file and global indexes, including Bloom, Bitmap V1/V2 reads and V2 writes, multi-value array indexes, and exact FM substring search
-- Native read-only object tables and `TableType`-based routing to pluggable external table engines
-- Batch incremental-diff reads, watermark-based time travel, and deletion-vector merge-on-read for uncompacted primary-key snapshots
-- Expanded DataFusion SQL with `ALTER COLUMN`, database lifecycle statements, configurable runtime resources, and the Java-compatible `$consumers` system table
-- Expanded Go table-write support plus postpone-table fixed-bucket write primitives for Rust, C, and Go, with Python commit rollback
-- Standalone `BlobDescriptor` batch reads and seekable streams, with Go batch and stream APIs and `MAP<STRING, BLOB>` descriptor reads
-- Extensible and cached I/O through caller-provided OpenDAL operators, an in-memory local block cache, and C cache callbacks
+- Primary-key vector and hybrid search, DiskANN, quantized IVF, and Java-compatible indexes
+- Read-only object tables, incremental diff, watermark time travel, and deletion-vector merge-on-read
+- Expanded DataFusion SQL and native write APIs across language bindings
+- Batched and streamed `BlobDescriptor` reads, including BLOB maps
+- Custom and cached I/O through OpenDAL operators, local block caches, and C callbacks
 
-API compatibility changes:
+API change: `BTreeIndexReader::null_bitmap()` now loads lazily and is asynchronous.
+Use `reader.null_bitmap().await?` and handle load errors.
 
-- `BTreeIndexReader::null_bitmap()` is now asynchronous and returns `io::Result<&RoaringTreemap>`. Downstream Rust callers must replace `reader.null_bitmap()` with `reader.null_bitmap().await?` and handle load errors.
-- BTree readers load the null bitmap on first access and reuse successful loads within the reader. Null bitmap I/O, CRC, and deserialization errors now surface on first access rather than when opening the reader. Failed loads can be retried.
-
-Go Linux runtime requirements:
-
-- The prebuilt Go Linux amd64 library for 0.4.0 requires glibc 2.38 or newer and OpenSSL 3 (`libssl.so.3` and `libcrypto.so.3`).
-- The Go FFI dependency also requires `libffi.so.8`. Older Linux environments may fail to load the module before any table operation; installing libffi alone does not resolve an incompatible glibc version.
-- These requirements concern the Go Linux amd64 prebuilt library, not the separately built Python wheels.
+Go Linux amd64 prebuilt binaries require glibc 2.38 or later, OpenSSL 3, and
+`libffi.so.8`. See [Go prerequisites](go-binding.md#prerequisites).
 
 ### [0.3.0](https://github.com/apache/paimon-rust/releases/tag/v0.3.0)
 
