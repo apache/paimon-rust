@@ -155,7 +155,7 @@ impl RESTEnv {
         schema_id: i64,
         fields: &[crate::spec::DataField],
     ) -> Result<GetTableResponse> {
-        let response = self.api.get_table(&self.identifier).await?;
+        let response = self.current_table_identity_checked().await?;
         let name = self.identifier.full_name();
         let same = |what: &str, loaded: String, now: Option<String>| match now {
             Some(now) if now == loaded => Ok(()),
@@ -168,7 +168,6 @@ impl RESTEnv {
                 source: None,
             }),
         };
-        same("uuid", self.uuid.clone(), response.id.clone())?;
         same(
             "schema",
             schema_id.to_string(),
@@ -190,6 +189,27 @@ impl RESTEnv {
                 ),
                 source: None,
             });
+        }
+        Ok(response)
+    }
+
+    /// Refused unless the identifier still resolves to this catalog entity.
+    pub(crate) async fn current_table_identity_checked(&self) -> Result<GetTableResponse> {
+        let response = self.api.get_table(&self.identifier).await?;
+        let name = self.identifier.full_name();
+        match response.id.as_deref() {
+            Some(uuid) if uuid == self.uuid => {}
+            uuid => {
+                return Err(crate::Error::DataInvalid {
+                    message: format!(
+                        "table '{name}' now resolves to uuid {}, not the {} this handle was loaded \
+                         with; re-load the table before reading it",
+                        uuid.unwrap_or("nothing the server reports"),
+                        self.uuid
+                    ),
+                    source: None,
+                });
+            }
         }
         Ok(response)
     }
