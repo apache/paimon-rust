@@ -34,8 +34,7 @@
 use std::sync::Arc;
 
 use arrow_array::{
-    new_null_array, Array, ArrayRef, Int64Array, ListArray, MapArray, StringArray, StructArray,
-    UInt32Array,
+    new_null_array, Array, ArrayRef, ListArray, MapArray, StringArray, StructArray, UInt32Array,
 };
 use arrow_cast::cast;
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Fields};
@@ -205,20 +204,24 @@ pub(crate) fn evolve_column(
         _ => {}
     }
 
-    // Java `NumericPrimitiveToTimestamp` reads an INTEGER/BIGINT column as epoch
-    // *seconds* (`value.longValue() * 1000` millis, fed to `toLocalDateTime`);
-    // Arrow's Int64->Timestamp cast instead reinterprets the raw value directly
-    // in the column's unit, so a BIGINT epoch column evolved to TIMESTAMP(6)
-    // would read 10^6x too small (~1970). Scale seconds into the target unit
-    // first. Scoped to INTEGER/BIGINT into TIMESTAMP *without* local time zone:
-    // Java's `create()` returns null for every other numeric source, and its
-    // TIMESTAMP-with-local-zone target resolves the offset with
-    // `ZoneId.systemDefault()` (environment dependent) -- both are left to the
-    // Arrow fallthrough below rather than guessed at here.
-    if matches!(source_type, DataType::Int(_) | DataType::BigInt(_)) {
-        if let DataType::Timestamp(ts) = target_type {
-            return numeric_epoch_seconds_to_timestamp(source, &target_arrow, ts.precision());
-        }
+    // Apply the epoch-seconds rule at every leaf, including nested containers.
+    // Numeric -> LTZ depends on Java's system time zone and retains its existing
+    // path; ordinary TIMESTAMP has no such runtime dependency.
+    if matches!(source_type, DataType::Int(_) | DataType::BigInt(_))
+        && matches!(target_type, DataType::Timestamp(_))
+    {
+        return super::evolution_cast::numeric_epoch_seconds_to_timestamp(source, &target_arrow);
+    }
+    if matches!(target_type, DataType::BigInt(_))
+        && matches!(
+            source_type,
+            DataType::Timestamp(_) | DataType::LocalZonedTimestamp(_)
+        )
+    {
+        return super::evolution_cast::timestamp_to_bigint(
+            source,
+            matches!(source_type, DataType::LocalZonedTimestamp(_)),
+        );
     }
 
     if matches!(
@@ -248,49 +251,6 @@ pub(crate) fn evolve_column(
             source.data_type(),
             target_arrow
         ),
-        source: Some(Box::new(e)),
-    })
-}
-
-/// Evolve an INTEGER/BIGINT column into a TIMESTAMP (without local time zone)
-/// the way Java `NumericPrimitiveToTimestamp` does: interpret each value as
-/// epoch seconds and scale it into the target time unit. Nulls are preserved,
-/// and a value that overflows `i64` in the target unit becomes NULL, matching
-/// the safe-cast overflow behavior of the surrounding evolution path.
-fn numeric_epoch_seconds_to_timestamp(
-    source: &ArrayRef,
-    target_arrow: &ArrowDataType,
-    precision: u32,
-) -> crate::Result<ArrayRef> {
-    // Ticks per second for the target unit (precision buckets match
-    // `paimon_type_to_arrow`'s `timestamp_time_unit`).
-    let ticks_per_second: i64 = match precision {
-        0 => 1,
-        1..=3 => 1_000,
-        4..=6 => 1_000_000,
-        _ => 1_000_000_000,
-    };
-    let as_i64 =
-        cast(source, &ArrowDataType::Int64).map_err(|e| crate::Error::UnexpectedError {
-            message: format!(
-                "failed to widen {:?} to Int64 before scaling epoch seconds to timestamp",
-                source.data_type()
-            ),
-            source: Some(Box::new(e)),
-        })?;
-    let seconds = as_i64
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .expect("cast to Int64 yields an Int64Array");
-    // Scale seconds into the unit; a null stays null and an overflow becomes null.
-    let scaled: Int64Array = seconds
-        .iter()
-        .map(|value| value.and_then(|v| v.checked_mul(ticks_per_second)))
-        .collect();
-    // Reinterpret the already-scaled value straight into the timestamp unit
-    // (Arrow's Int64->Timestamp copies it verbatim, no further scaling).
-    cast(&(Arc::new(scaled) as ArrayRef), target_arrow).map_err(|e| crate::Error::UnexpectedError {
-        message: format!("failed to build {target_arrow:?} from scaled epoch seconds"),
         source: Some(Box::new(e)),
     })
 }
@@ -938,6 +898,282 @@ mod tests {
             .downcast_ref::<TimestampMillisecondArray>()
             .expect("millisecond timestamps");
         assert_eq!(millis.value(0), secs * 1_000);
+    }
+
+    #[test]
+    fn evolves_timestamp_to_bigint_as_floored_epoch_seconds() {
+        for (precision, ticks) in [(0, 1_i64), (3, 1_000), (6, 1_000_000), (9, 1_000_000_000)] {
+            for local in [false, true] {
+                let source_type = if local {
+                    DataType::LocalZonedTimestamp(
+                        crate::spec::LocalZonedTimestampType::new(precision).unwrap(),
+                    )
+                } else {
+                    DataType::Timestamp(TimestampType::new(precision).unwrap())
+                };
+                let fraction = if precision == 0 { 0 } else { 1 };
+                let raw: ArrayRef = Arc::new(Int64Array::from(vec![
+                    None,
+                    Some(ticks + fraction),
+                    Some(-1),
+                    Some(-ticks - fraction),
+                    Some(0),
+                    Some((i64::from(i32::MAX) + 3) * ticks),
+                    None,
+                ]));
+                let source = cast(&raw, &paimon_type_to_arrow(&source_type).unwrap())
+                    .unwrap()
+                    .slice(1, 6);
+                let out =
+                    evolve_column(&source, &source_type, &DataType::BigInt(BigIntType::new()))
+                        .unwrap();
+                let values: Vec<_> = out
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .iter()
+                    .collect();
+                assert_eq!(
+                    values,
+                    vec![
+                        Some(1),
+                        Some(-1),
+                        Some(if precision == 0 { -1 } else { -2 }),
+                        Some(0),
+                        Some(i64::from(i32::MAX) + 3),
+                        None
+                    ],
+                    "precision={precision} local={local}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bigint_epoch_seconds_wrap_in_millis_before_timestamp_conversion_like_java() {
+        let source: ArrayRef = Arc::new(Int64Array::from(vec![
+            Some(i64::MAX),
+            Some(i64::MIN),
+            Some(i64::MAX - 1),
+            Some(42),
+            Some(-42),
+            None,
+        ]));
+        for (precision, ticks) in [(0, 1_i64), (3, 1_000), (6, 1_000_000), (9, 1_000_000_000)] {
+            let target = DataType::Timestamp(TimestampType::new(precision).unwrap());
+            let out =
+                evolve_column(&source, &DataType::BigInt(BigIntType::new()), &target).unwrap();
+            let raw = cast(&out, &ArrowDataType::Int64).unwrap();
+            let values: Vec<_> = raw
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .iter()
+                .collect();
+            assert_eq!(
+                values,
+                vec![
+                    Some(-ticks),
+                    Some(0),
+                    Some(-2 * ticks),
+                    Some(42 * ticks),
+                    Some(-42 * ticks),
+                    None
+                ],
+                "precision={precision}"
+            );
+        }
+    }
+
+    #[test]
+    fn timestamp_to_bigint_matches_java_extreme_millis_round_trip() {
+        for (local, expected) in [
+            (
+                false,
+                vec![
+                    Some(9_223_372_036_854_775),
+                    Some(-9_223_372_036_854_776),
+                    None,
+                ],
+            ),
+            (
+                true,
+                vec![Some(-53_757_322_505_225), Some(53_757_322_505_224), None],
+            ),
+        ] {
+            let source_type = if local {
+                DataType::LocalZonedTimestamp(crate::spec::LocalZonedTimestampType::new(3).unwrap())
+            } else {
+                DataType::Timestamp(TimestampType::new(3).unwrap())
+            };
+            let raw: ArrayRef =
+                Arc::new(Int64Array::from(vec![Some(i64::MAX), Some(i64::MIN), None]));
+            let source = cast(&raw, &paimon_type_to_arrow(&source_type).unwrap()).unwrap();
+            let output =
+                evolve_column(&source, &source_type, &DataType::BigInt(BigIntType::new())).unwrap();
+            assert_eq!(
+                output
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .iter()
+                    .collect::<Vec<_>>(),
+                expected,
+                "local={local}"
+            );
+        }
+    }
+
+    #[test]
+    fn bigint_to_timestamp_keeps_lenient_arrow_storage_overflow() {
+        let source: ArrayRef = Arc::new(Int64Array::from(vec![
+            Some(9_223_372_036_854_775),
+            Some(-9_223_372_036_854_775),
+            None,
+        ]));
+        for (precision, expected) in [
+            (
+                0,
+                vec![
+                    Some(9_223_372_036_854_775),
+                    Some(-9_223_372_036_854_775),
+                    None,
+                ],
+            ),
+            (
+                3,
+                vec![
+                    Some(9_223_372_036_854_775_000),
+                    Some(-9_223_372_036_854_775_000),
+                    None,
+                ],
+            ),
+            (6, vec![None, None, None]),
+            (9, vec![None, None, None]),
+        ] {
+            let output = evolve_column(
+                &source,
+                &DataType::BigInt(BigIntType::new()),
+                &DataType::Timestamp(TimestampType::new(precision).unwrap()),
+            )
+            .unwrap();
+            let raw = cast(&output, &ArrowDataType::Int64).unwrap();
+            assert_eq!(
+                raw.as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .iter()
+                    .collect::<Vec<_>>(),
+                expected,
+                "precision={precision}"
+            );
+        }
+    }
+
+    #[test]
+    fn temporal_evolution_recurses_through_nullable_rows_lists_and_maps() {
+        for reverse in [false, true] {
+            let timestamp = DataType::Timestamp(TimestampType::new(6).unwrap());
+            let bigint = DataType::BigInt(BigIntType::new());
+            let (source_type, target_type, raw, expected) = if reverse {
+                (
+                    bigint,
+                    timestamp,
+                    vec![Some(42), Some(i64::MAX), None],
+                    vec![Some(42_000_000), Some(-1_000_000), None],
+                )
+            } else {
+                (
+                    timestamp,
+                    bigint,
+                    vec![Some(42_000_001), Some(-1), None],
+                    vec![Some(42), Some(-1), None],
+                )
+            };
+            let raw: ArrayRef = Arc::new(Int64Array::from(raw));
+            let leaf = cast(&raw, &paimon_type_to_arrow(&source_type).unwrap()).unwrap();
+            let validity = Some(NullBuffer::from(vec![true, false, true]));
+            let values = |array: &ArrayRef| {
+                cast(array, &ArrowDataType::Int64)
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .iter()
+                    .collect::<Vec<_>>()
+            };
+
+            let source_row = row(vec![field(11, "v", source_type.clone())]);
+            let target_row = row(vec![field(11, "v", target_type.clone())]);
+            let ArrowDataType::Struct(fields) = paimon_type_to_arrow(&source_row).unwrap() else {
+                panic!()
+            };
+            let source: ArrayRef = Arc::new(
+                StructArray::try_new(fields, vec![leaf.clone()], validity.clone()).unwrap(),
+            );
+            let out = evolve_column(&source, &source_row, &target_row).unwrap();
+            let out = as_struct(&out);
+            assert_eq!(out.nulls(), source.nulls());
+            assert_eq!(values(out.column(0)), expected, "ROW reverse={reverse}");
+
+            let source: ArrayRef = Arc::new(
+                ListArray::try_new(
+                    Arc::new(ArrowField::new("element", leaf.data_type().clone(), true)),
+                    arrow_buffer::OffsetBuffer::new(vec![0, 2, 2, 3].into()),
+                    leaf.clone(),
+                    validity.clone(),
+                )
+                .unwrap(),
+            );
+            let out = evolve_column(
+                &source,
+                &DataType::Array(ArrayType::new(source_type.clone())),
+                &DataType::Array(ArrayType::new(target_type.clone())),
+            )
+            .unwrap();
+            let out = out.as_any().downcast_ref::<ListArray>().unwrap();
+            assert_eq!(out.nulls(), source.nulls());
+            assert_eq!(out.value_offsets(), &[0, 2, 2, 3]);
+            assert_eq!(values(out.values()), expected, "ARRAY reverse={reverse}");
+
+            let fields = Fields::from(vec![
+                ArrowField::new("key", ArrowDataType::Utf8, false),
+                ArrowField::new("value", leaf.data_type().clone(), true),
+            ]);
+            let entries = StructArray::try_new(
+                fields.clone(),
+                vec![
+                    Arc::new(StringArray::from(vec!["positive", "negative", "null"])) as ArrayRef,
+                    leaf,
+                ],
+                None,
+            )
+            .unwrap();
+            let source: ArrayRef = Arc::new(
+                MapArray::try_new(
+                    Arc::new(ArrowField::new(
+                        "entries",
+                        ArrowDataType::Struct(fields),
+                        false,
+                    )),
+                    arrow_buffer::OffsetBuffer::new(vec![0, 2, 2, 3].into()),
+                    entries,
+                    validity,
+                    false,
+                )
+                .unwrap(),
+            );
+            let out = evolve_column(
+                &source,
+                &DataType::Map(MapType::new(string_type(), source_type)),
+                &DataType::Map(MapType::new(string_type(), target_type)),
+            )
+            .unwrap();
+            let out = out.as_any().downcast_ref::<MapArray>().unwrap();
+            assert_eq!(out.nulls(), source.nulls());
+            assert_eq!(out.value_offsets(), &[0, 2, 2, 3]);
+            assert_eq!(values(out.values()), expected, "MAP reverse={reverse}");
+        }
     }
 
     #[test]

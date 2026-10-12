@@ -83,6 +83,69 @@ pub(super) fn numeric_to_integer(source: &ArrayRef, target: &ArrowType) -> crate
     Ok(result)
 }
 
+/// TimestampToNumericPrimitiveCastRule returns floor-divided epoch seconds,
+/// rather than Arrow's physical timestamp ticks. LTZ uses Java Timestamp's
+/// local-date-time round trip, whose epoch day is an int.
+pub(super) fn timestamp_to_bigint(source: &ArrayRef, local_zoned: bool) -> crate::Result<ArrayRef> {
+    let ArrowType::Timestamp(unit, _) = source.data_type() else {
+        unreachable!("timestamp source validated by evolution dispatch")
+    };
+    let raw = arrow_cast::cast(source, &ArrowType::Int64).map_err(cast_error)?;
+    let values = Int64Array::from_iter(raw.as_primitive::<Int64Type>().iter().map(|value| {
+        value.and_then(|value| {
+            if !local_zoned {
+                return Some(value.div_euclid(ticks_per_second(unit)));
+            }
+            let millis = match unit {
+                TimeUnit::Second => value.checked_mul(1_000)?,
+                TimeUnit::Millisecond => value,
+                TimeUnit::Microsecond => value.div_euclid(1_000),
+                TimeUnit::Nanosecond => value.div_euclid(1_000_000),
+            };
+            // Timestamp.toLocalDateTime casts the epoch day to int, then
+            // Timestamp.fromLocalDateTime reconstructs its milliseconds.
+            let day = millis.div_euclid(86_400_000) as i32;
+            let millis = i64::from(day) * 86_400_000 + millis.rem_euclid(86_400_000);
+            Some(millis.div_euclid(1_000))
+        })
+    }));
+    Ok(Arc::new(values))
+}
+
+/// Java NumericPrimitiveToTimestamp multiplies long seconds by 1000 with
+/// signed-long wrapping. Only after that conversion do we rebuild Arrow's
+/// declared timestamp unit, returning NULL if its storage cannot hold it.
+pub(super) fn numeric_epoch_seconds_to_timestamp(
+    source: &ArrayRef,
+    target_arrow: &ArrowType,
+) -> crate::Result<ArrayRef> {
+    let ArrowType::Timestamp(unit, None) = target_arrow else {
+        unreachable!("ordinary timestamp target validated by evolution dispatch")
+    };
+    let raw = arrow_cast::cast(source, &ArrowType::Int64).map_err(cast_error)?;
+    let values = Int64Array::from_iter(raw.as_primitive::<Int64Type>().iter().map(|value| {
+        value.and_then(|value| {
+            let millis = value.wrapping_mul(1_000);
+            match unit {
+                TimeUnit::Second => Some(millis.div_euclid(1_000)),
+                TimeUnit::Millisecond => Some(millis),
+                TimeUnit::Microsecond => millis.checked_mul(1_000),
+                TimeUnit::Nanosecond => millis.checked_mul(1_000_000),
+            }
+        })
+    }));
+    arrow_cast::cast(&(Arc::new(values) as ArrayRef), target_arrow).map_err(cast_error)
+}
+
+fn ticks_per_second(unit: &TimeUnit) -> i64 {
+    match unit {
+        TimeUnit::Second => 1,
+        TimeUnit::Millisecond => 1_000,
+        TimeUnit::Microsecond => 1_000_000,
+        TimeUnit::Nanosecond => 1_000_000_000,
+    }
+}
+
 /// Match DateTimeUtils.truncate for the same timestamp kind. Work in i128 so
 /// flooring a pre-epoch value cannot overflow the source's i64 unit before
 /// converting to a coarser target unit. Cross-kind timezone casts are handled
