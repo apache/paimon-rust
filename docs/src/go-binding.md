@@ -30,6 +30,17 @@ after the call returns.
 - CGO enabled with a C toolchain
 - Supported platforms: Linux (amd64, arm64), macOS (amd64, arm64)
 
+!!! warning "0.4.0 prebuilt Linux amd64 runtime requirements"
+
+    The Linux amd64 native library shipped in `bindings/go/v0.4.0` requires
+    glibc 2.38 or newer and OpenSSL 3 (`libssl.so.3` and `libcrypto.so.3`).
+    The Go FFI dependency also requires `libffi.so.8`.
+
+    Older Linux environments may fail to load the module before any table
+    operation. Installing libffi alone does not fix an incompatible glibc
+    version. These requirements concern the Go prebuilt library, not the
+    separately built Python wheels.
+
 ## Installation
 
 ```bash

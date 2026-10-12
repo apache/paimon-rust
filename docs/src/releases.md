@@ -25,9 +25,19 @@ Apache Paimon Rust follows [Semantic Versioning](https://semver.org/). All relea
 
 ## Upcoming
 
-### 0.4.0 (In Development)
+### 0.5.0 (In Development)
 
 See [GitHub Issues](https://github.com/apache/paimon-rust/issues) for the current roadmap.
+
+## Past Releases
+
+### [0.4.0](https://github.com/apache/paimon-rust/releases/tag/v0.4.0)
+
+Released on October 12, 2026.
+
+The [source archive, signature, and SHA-512 checksum](https://downloads.apache.org/paimon/paimon-rust-0.4.0/)
+are available from the ASF distribution site. Verify the signature with the
+[Apache Paimon KEYS file](https://downloads.apache.org/paimon/KEYS).
 
 The minimum supported Rust version for 0.4.0 is 1.94.
 
@@ -47,7 +57,11 @@ API compatibility changes:
 - `BTreeIndexReader::null_bitmap()` is now asynchronous and returns `io::Result<&RoaringTreemap>`. Downstream Rust callers must replace `reader.null_bitmap()` with `reader.null_bitmap().await?` and handle load errors.
 - BTree readers load the null bitmap on first access and reuse successful loads within the reader. Null bitmap I/O, CRC, and deserialization errors now surface on first access rather than when opening the reader. Failed loads can be retried.
 
-## Past Releases
+Go Linux runtime requirements:
+
+- The prebuilt Go Linux amd64 library for 0.4.0 requires glibc 2.38 or newer and OpenSSL 3 (`libssl.so.3` and `libcrypto.so.3`).
+- The Go FFI dependency also requires `libffi.so.8`. Older Linux environments may fail to load the module before any table operation; installing libffi alone does not resolve an incompatible glibc version.
+- These requirements concern the Go Linux amd64 prebuilt library, not the separately built Python wheels.
 
 ### [0.3.0](https://github.com/apache/paimon-rust/releases/tag/v0.3.0)
 
