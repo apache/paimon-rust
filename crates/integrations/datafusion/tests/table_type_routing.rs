@@ -306,6 +306,73 @@ struct MetadataEngineResolver {
     calls: AtomicUsize,
 }
 
+#[derive(Debug, Default)]
+struct SnapshotEngineResolver {
+    calls: AtomicUsize,
+}
+
+const LARGE_SNAPSHOT_ID: i64 = 6_251_097_304_546_047_273;
+
+#[async_trait]
+impl TableEngineResolver for SnapshotEngineResolver {
+    async fn resolve_table(
+        &self,
+        request: &EngineTableRequest,
+    ) -> DFResult<Option<Arc<dyn TableProvider>>> {
+        FakeEngineResolver.resolve_table(request).await
+    }
+
+    async fn resolve_metadata_table(
+        &self,
+        request: &EngineTableRequest,
+        metadata_table: &str,
+    ) -> DFResult<Option<Arc<dyn TableProvider>>> {
+        MetadataEngineResolver::default()
+            .resolve_metadata_table(request, metadata_table)
+            .await
+    }
+
+    async fn resolve_table_snapshot(
+        &self,
+        request: &EngineTableRequest,
+        snapshot_id: i64,
+    ) -> DFResult<Option<Arc<dyn TableProvider>>> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(request.database, DB);
+        assert_eq!(request.declared, TableType::IcebergTable);
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        if request.table != "it" {
+            return Ok(None);
+        }
+        let (ids, values) = match snapshot_id {
+            10 => (vec![1, 2], vec!["old-a", "old-b"]),
+            20 => (vec![1, 4], vec!["new-a", "new-d"]),
+            LARGE_SNAPSHOT_ID => (vec![9], vec!["large-id"]),
+            500 => return Err(DataFusionError::Execution("snapshot backend failed".into())),
+            _ => {
+                return Err(DataFusionError::Plan(format!(
+                    "snapshot {snapshot_id} does not exist or has expired"
+                )));
+            }
+        };
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("historical", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(ids)),
+                Arc::new(StringArray::from(values)),
+            ],
+        )?;
+        Ok(Some(Arc::new(MemTable::try_new(
+            schema,
+            vec![vec![batch]],
+        )?)))
+    }
+}
+
 #[async_trait]
 impl TableEngineResolver for MetadataEngineResolver {
     async fn resolve_table(
@@ -416,6 +483,371 @@ fn column_i32(batches: &[RecordBatch]) -> Vec<i32> {
             (0..col.len()).map(|i| col.value(i)).collect::<Vec<_>>()
         })
         .collect()
+}
+
+async fn enable_version_syntax(env: &TestEnv) {
+    env.ctx
+        .ctx()
+        .sql("SET datafusion.sql_parser.dialect = 'databricks'")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+}
+
+async fn snapshot_env() -> (TestEnv, Arc<SnapshotEngineResolver>) {
+    let resolver = Arc::new(SnapshotEngineResolver::default());
+    let env = setup_with_engine(Some(resolver.clone())).await;
+    enable_version_syntax(&env).await;
+    (env, resolver)
+}
+
+async fn routed_sql(
+    env: &TestEnv,
+    native: bool,
+    sql: &str,
+) -> DFResult<datafusion::dataframe::DataFrame> {
+    if native {
+        env.ctx.ctx().sql(sql).await
+    } else {
+        env.ctx.sql(sql).await
+    }
+}
+
+#[tokio::test]
+async fn engine_snapshot_uses_historical_data_and_schema() {
+    let (env, _) = snapshot_env().await;
+    for native in [false, true] {
+        let batches = routed_sql(
+            &env,
+            native,
+            &format!(
+                "SELECT h.historical FROM {CATALOG}.{DB}.it VERSION AS OF 10 AS h WHERE h.id = 2"
+            ),
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+        assert_eq!(string_column_values(&batches, "historical"), ["old-b"]);
+
+        let err = routed_sql(
+            &env,
+            native,
+            &format!("SELECT payload FROM {CATALOG}.{DB}.it VERSION AS OF 10"),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("payload"), "{err}");
+
+        let batches = routed_sql(
+            &env,
+            native,
+            &format!("SELECT payload FROM {CATALOG}.{DB}.it ORDER BY id"),
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+        assert_eq!(string_column_values(&batches, "payload"), ["x", "y"]);
+
+        let mut versions = vec![LARGE_SNAPSHOT_ID.to_string()];
+        if !native {
+            versions.push(format!("'{LARGE_SNAPSHOT_ID}'"));
+        }
+        for version in versions {
+            let batches = routed_sql(
+                &env,
+                native,
+                &format!("SELECT historical FROM {CATALOG}.{DB}.it VERSION AS OF {version}"),
+            )
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+            assert_eq!(string_column_values(&batches, "historical"), ["large-id"]);
+        }
+    }
+}
+
+#[tokio::test]
+async fn engine_snapshots_can_be_joined_with_each_other_and_paimon() {
+    let (env, _) = snapshot_env().await;
+    for native in [false, true] {
+        let batches = routed_sql(
+            &env,
+            native,
+            &format!(
+                "SELECT a.historical AS old_value, b.historical AS new_value \
+             FROM {CATALOG}.{DB}.it VERSION AS OF 10 AS a \
+             JOIN {CATALOG}.{DB}.it VERSION AS OF 20 AS b ON a.id = b.id"
+            ),
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+        assert_batches_eq!(
+            [
+                "+-----------+-----------+",
+                "| old_value | new_value |",
+                "+-----------+-----------+",
+                "| old-a     | new-a     |",
+                "+-----------+-----------+",
+            ],
+            &batches
+        );
+
+        let batches = routed_sql(
+            &env,
+            native,
+            &format!(
+                "SELECT h.historical FROM {CATALOG}.{DB}.it VERSION AS OF 10 AS h \
+             JOIN {CATALOG}.{DB}.pt VERSION AS OF 1 AS p ON h.id = p.id"
+            ),
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+        assert_eq!(string_column_values(&batches, "historical"), ["old-a"]);
+    }
+}
+
+#[tokio::test]
+async fn engine_snapshot_supports_count_and_empty_results() {
+    let (env, _) = snapshot_env().await;
+    for native in [false, true] {
+        let batches = routed_sql(
+            &env,
+            native,
+            &format!("SELECT COUNT(*) AS n FROM {CATALOG}.{DB}.it VERSION AS OF 10"),
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+        assert_batches_eq!(["+---+", "| n |", "+---+", "| 2 |", "+---+"], &batches);
+
+        let df = routed_sql(
+            &env,
+            native,
+            &format!("SELECT historical FROM {CATALOG}.{DB}.it VERSION AS OF 10 WHERE FALSE"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(df.schema().field(0).name(), "historical");
+        assert_eq!(
+            df.collect()
+                .await
+                .unwrap()
+                .iter()
+                .map(RecordBatch::num_rows)
+                .sum::<usize>(),
+            0
+        );
+    }
+}
+
+#[tokio::test]
+async fn engine_snapshot_errors_never_fall_back_to_current_data() {
+    let (env, _) = snapshot_env().await;
+    for native in [false, true] {
+        for (table, version, message) in [
+            ("it", 404, "snapshot 404 does not exist or has expired"),
+            ("it", 500, "snapshot backend failed"),
+            ("ghost", 10, "not found"),
+        ] {
+            let err = routed_sql(
+                &env,
+                native,
+                &format!(
+                    "SELECT * FROM {CATALOG}.{DB}.{table} VERSION AS OF {version} WHERE FALSE"
+                ),
+            )
+            .await
+            .unwrap_err();
+            assert!(err.to_string().contains(message), "{err}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn engine_snapshot_providers_remain_read_only() {
+    use datafusion::catalog::default_table_source::source_as_provider;
+    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+    use datafusion::logical_expr::{dml::InsertOp, LogicalPlan};
+    use datafusion::physical_plan::empty::EmptyExec;
+
+    let (env, _) = snapshot_env().await;
+    for native in [false, true] {
+        let df = routed_sql(
+            &env,
+            native,
+            &format!("SELECT * FROM {CATALOG}.{DB}.it VERSION AS OF 10"),
+        )
+        .await
+        .unwrap();
+        let mut provider = None;
+        df.logical_plan()
+            .apply(|node| {
+                if let LogicalPlan::TableScan(scan) = node {
+                    provider = Some(source_as_provider(&scan.source)?);
+                    return Ok(TreeNodeRecursion::Stop);
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })
+            .unwrap();
+        let provider = provider.unwrap();
+        let err = provider
+            .insert_into(
+                &env.ctx.ctx().state(),
+                Arc::new(EmptyExec::new(provider.schema())),
+                InsertOp::Append,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("write is not supported"), "{err}");
+    }
+}
+
+#[tokio::test]
+async fn engine_snapshot_resolution_checks_session_options() {
+    let (env, resolver) = snapshot_env().await;
+    for (key, value, message) in [
+        ("query-auth.enabled", "true", "query-auth"),
+        ("scan.version", "20", "time travel"),
+        ("incremental-between", "1,5", "incremental-between"),
+    ] {
+        env.ctx
+            .sql(&format!("SET 'paimon.{key}' = '{value}'"))
+            .await
+            .unwrap();
+        for native in [false, true] {
+            let err = routed_sql(
+                &env,
+                native,
+                &format!("SELECT * FROM {CATALOG}.{DB}.it VERSION AS OF 10"),
+            )
+            .await
+            .unwrap_err();
+            assert!(err.to_string().contains(message), "{err}");
+            assert_eq!(resolver.calls.load(Ordering::Relaxed), 0);
+        }
+        env.ctx.sql(&format!("RESET 'paimon.{key}'")).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn engine_snapshot_rejects_unsupported_selectors_and_metadata_tables() {
+    let (env, resolver) = snapshot_env().await;
+    for native in [false, true] {
+        let (selector, message) = if native {
+            (
+                "FOR SYSTEM_TIME AS OF '2020-01-01 00:00:00'",
+                "time travel is not supported",
+            )
+        } else {
+            ("VERSION AS OF 'tag-name'", "integer snapshot id")
+        };
+        for (table, selector, message) in [
+            ("it", selector, message),
+            (
+                "it",
+                "VERSION AS OF 9223372036854775808",
+                "integer snapshot id",
+            ),
+            (
+                "it",
+                "TIMESTAMP AS OF '2020-01-01 00:00:00'",
+                "time travel is not supported",
+            ),
+            (
+                "it$history",
+                "VERSION AS OF 10",
+                "time travel is not supported",
+            ),
+            (
+                "it$branch_b1",
+                "VERSION AS OF 10",
+                "branches are not supported",
+            ),
+        ] {
+            let err = routed_sql(
+                &env,
+                native,
+                &format!("SELECT * FROM {CATALOG}.{DB}.\"{table}\" {selector}"),
+            )
+            .await
+            .unwrap_err();
+            assert!(err.to_string().contains(message), "{selector}: {err}");
+            assert_eq!(resolver.calls.load(Ordering::Relaxed), 0);
+        }
+    }
+}
+
+#[tokio::test]
+async fn engine_snapshot_requires_explicit_resolver_support() {
+    for registered in [false, true] {
+        let resolver =
+            registered.then(|| Arc::new(FakeEngineResolver) as Arc<dyn TableEngineResolver>);
+        let env = setup_with_engine(resolver).await;
+        enable_version_syntax(&env).await;
+        for native in [false, true] {
+            let err = routed_sql(
+                &env,
+                native,
+                &format!("SELECT * FROM {CATALOG}.{DB}.it VERSION AS OF 10 WHERE FALSE"),
+            )
+            .await
+            .unwrap_err();
+            let expected = if registered {
+                "time travel is not supported"
+            } else {
+                "no table engine is registered"
+            };
+            assert!(err.to_string().contains(expected), "{err}");
+        }
+    }
+}
+
+#[test]
+fn engine_snapshot_resolution_on_runtime_workers() {
+    let runtime = paimon_datafusion::runtime::runtime();
+    runtime.block_on(async {
+        let (env, _) = snapshot_env().await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            tokio::spawn(async move {
+                let batches = routed_sql(
+                    &env,
+                    true,
+                    &format!(
+                        "SELECT historical FROM {CATALOG}.{DB}.it VERSION AS OF 10 ORDER BY id"
+                    ),
+                )
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+                assert_eq!(
+                    string_column_values(&batches, "historical"),
+                    ["old-a", "old-b"]
+                );
+            }),
+        )
+        .await
+        .expect("snapshot resolution stalled on a runtime worker")
+        .unwrap();
+    });
 }
 
 #[tokio::test]
@@ -1385,6 +1817,27 @@ async fn registering_on_a_raw_session_installs_the_planner() {
         panic!("registration must install the planner, so this cannot read current data");
     };
     assert!(err.to_string().contains("not supported"), "{err}");
+
+    register_catalog_table_engine(
+        &ctx,
+        CATALOG,
+        TableType::IcebergTable,
+        Arc::new(SnapshotEngineResolver::default()),
+    )
+    .unwrap();
+    let batches = ctx
+        .sql(&format!(
+            "SELECT historical FROM {CATALOG}.{DB}.it VERSION AS OF 10 ORDER BY id"
+        ))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        string_column_values(&batches, "historical"),
+        ["old-a", "old-b"]
+    );
 }
 
 #[tokio::test]

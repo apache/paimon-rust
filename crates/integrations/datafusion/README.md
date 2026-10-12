@@ -24,6 +24,29 @@
 
 This crate contains the integration of [Apache DataFusion](https://datafusion.apache.org/) and [Apache Paimon](https://paimon.apache.org/).
 
+## External engine snapshots
+
+Registered table engines can implement `TableEngineResolver::resolve_table_snapshot`
+to serve an explicit snapshot ID:
+
+```sql
+SELECT * FROM lake.db.events VERSION AS OF 123;
+```
+
+The resolver must return a provider pinned to that snapshot and its historical
+schema. Missing or expired snapshots must return an error; `Ok(None)` means the
+table does not exist. The default implementation rejects time travel, and resolved
+providers remain read-only.
+
+This works through `SQLContext` and a DataFusion `SessionContext` configured with
+the `databricks` SQL dialect. `register_catalog_table_engine` installs the required
+relation planner on a raw session.
+
+External engines support integer snapshot IDs; `SQLContext` also accepts quoted numeric IDs.
+Timestamp, named-reference, branch, and metadata-table time travel remain
+unsupported. Paimon session scan options and query authorization are checked
+before snapshot resolution; they are not translated into external engine options.
+
 ## Reader memory
 
 Paimon Parquet scans use the memory pool from the executing DataFusion `TaskContext`.
