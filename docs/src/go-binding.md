@@ -30,6 +30,11 @@ after the call returns.
 - CGO enabled with a C toolchain
 - Supported platforms: Linux (amd64, arm64), macOS (amd64, arm64)
 
+!!! warning "0.4.0 prebuilt Linux amd64 binaries"
+
+    Require glibc 2.38 or later, OpenSSL 3 (`libssl.so.3`, `libcrypto.so.3`),
+    and `libffi.so.8`. Older environments may fail to load the module.
+
 ## Installation
 
 ```bash

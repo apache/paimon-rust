@@ -25,9 +25,18 @@ Apache Paimon Rust follows [Semantic Versioning](https://semver.org/). All relea
 
 ## Upcoming
 
-### 0.4.0 (In Development)
+### 0.5.0 (In Development)
 
 See [GitHub Issues](https://github.com/apache/paimon-rust/issues) for the current roadmap.
+
+## Past Releases
+
+### [0.4.0](https://github.com/apache/paimon-rust/releases/tag/v0.4.0)
+
+Released on October 12, 2026.
+
+[Source, signature, and SHA-512 checksum](https://downloads.apache.org/paimon/paimon-rust-0.4.0/)
+ · [KEYS](https://downloads.apache.org/paimon/KEYS).
 
 The minimum supported Rust version for 0.4.0 is 1.94.
 
@@ -47,7 +56,8 @@ API compatibility changes:
 - `BTreeIndexReader::null_bitmap()` is now asynchronous and returns `io::Result<&RoaringTreemap>`. Downstream Rust callers must replace `reader.null_bitmap()` with `reader.null_bitmap().await?` and handle load errors.
 - BTree readers load the null bitmap on first access and reuse successful loads within the reader. Null bitmap I/O, CRC, and deserialization errors now surface on first access rather than when opening the reader. Failed loads can be retried.
 
-## Past Releases
+Go Linux amd64 prebuilt binaries require glibc 2.38 or later, OpenSSL 3, and
+`libffi.so.8`. See [Go prerequisites](go-binding.md#prerequisites).
 
 ### [0.3.0](https://github.com/apache/paimon-rust/releases/tag/v0.3.0)
 
