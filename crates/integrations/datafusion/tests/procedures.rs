@@ -1563,6 +1563,241 @@ async fn assert_floating_partition_drops(sql_type: &str, values: &[&str]) {
 }
 
 #[tokio::test]
+async fn test_drop_global_index_ltz_partitions_use_display_timezone() {
+    const CHILD: &str = "PAIMON_DROP_LTZ_PARTITIONS_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        // Local timezone is process-global; isolate it from parallel SQL tests.
+        for timezone in ["Asia/Shanghai", "America/New_York"] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "test_drop_global_index_ltz_partitions_use_display_timezone",
+                ])
+                .env("TZ", timezone)
+                .env(CHILD, timezone)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{timezone}:\n{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        return;
+    }
+    let timezone = std::env::var(CHILD).unwrap();
+    if timezone == "Asia/Shanghai" {
+        let instants = ["1970-01-01 00:00:00+00:00", "1970-01-01 08:00:00+00:00"];
+        for (legacy, input, selected) in [
+            (false, "1970-01-01 08:00:00.000", 0),
+            (false, "1970-01-01T08:00:00.000+08:00", 0),
+            (false, "1970-01-01T08:00:00.000Z", 28_800_000),
+            (false, "0", 0),
+            (true, "1970-01-01T00:00", 0),
+        ] {
+            assert_timestamp_partition_drop(
+                "TIMESTAMP(3) WITH TIME ZONE",
+                legacy,
+                instants,
+                input,
+                (selected, 0),
+            )
+            .await;
+        }
+        assert_timestamp_partition_drop(
+            "TIMESTAMP(3)",
+            false,
+            instants,
+            "1970-01-01 00:00:00.000",
+            (0, 0),
+        )
+        .await;
+        assert_timestamp_partition_drop("TIMESTAMP(3)", true, instants, "1970-01-01T00:00", (0, 0))
+            .await;
+        for (sql_type, input, expected_nanos) in [
+            (
+                "TIMESTAMP(6) WITH TIME ZONE",
+                "1970-01-01 08:00:00.123456",
+                456_000,
+            ),
+            (
+                "TIMESTAMP(9) WITH TIME ZONE",
+                "1970-01-01 08:00:00.123456789",
+                456_789,
+            ),
+        ] {
+            assert_timestamp_partition_drop(
+                sql_type,
+                false,
+                [
+                    "1970-01-01 00:00:00.123456789+00:00",
+                    "1970-01-01 08:00:00.123456789+00:00",
+                ],
+                input,
+                (123, expected_nanos),
+            )
+            .await;
+        }
+    } else {
+        // Summer offset is -04:00, not the timezone's winter offset of -05:00.
+        assert_timestamp_partition_drop(
+            "TIMESTAMP(3) WITH TIME ZONE",
+            false,
+            ["2024-07-01 16:00:00+00:00", "2024-07-01 17:00:00+00:00"],
+            "2024-07-01 12:00:00.000",
+            (1_719_849_600_000, 0),
+        )
+        .await;
+        assert_timestamp_partition_drop(
+            "TIMESTAMP(3) WITH TIME ZONE",
+            false,
+            ["2024-11-03 05:30:00+00:00", "2024-11-03 06:30:00+00:00"],
+            "2024-11-03T01:30:00-04:00",
+            (1_730_611_800_000, 0),
+        )
+        .await;
+    }
+}
+
+async fn assert_timestamp_partition_drop(
+    sql_type: &str,
+    legacy: bool,
+    instants: [&str; 2],
+    input: &str,
+    selected: (i64, i32),
+) {
+    let (tmp, catalog) = create_test_env();
+    let sql_context = create_sql_context(catalog.clone()).await;
+    exec(&sql_context, "CREATE SCHEMA paimon.test_db").await;
+    exec(
+        &sql_context,
+        &format!(
+            "CREATE TABLE paimon.test_db.drop_ltz_partitions (id INT, name STRING, ts {sql_type}) \
+         PARTITIONED BY (ts) WITH ('row-tracking.enabled'='true', 'data-evolution.enabled'='true', \
+         'global-index.enabled'='true', 'partition.legacy-name'='{legacy}')"
+        ),
+    )
+    .await;
+    exec(
+        &sql_context,
+        &format!(
+            "INSERT INTO paimon.test_db.drop_ltz_partitions (id, name, ts) VALUES \
+         (1, 'a', TIMESTAMP '{}'), (2, 'b', TIMESTAMP '{}')",
+            instants[0], instants[1]
+        ),
+    )
+    .await;
+    for (column, index_type) in [("id", "btree"), ("name", "btree"), ("id", "bitmap")] {
+        exec(
+            &sql_context,
+            &format!(
+                "CALL sys.create_global_index(table => 'test_db.drop_ltz_partitions', \
+             index_column => '{column}', index_type => '{index_type}')"
+            ),
+        )
+        .await;
+    }
+    let table = catalog
+        .get_table(&Identifier::new("test_db", "drop_ltz_partitions"))
+        .await
+        .unwrap();
+    let partition_type = table.schema().partition_fields()[0].data_type().clone();
+    let selected_datum = match partition_type {
+        paimon::spec::DataType::Timestamp(_) => paimon::spec::Datum::Timestamp {
+            millis: selected.0,
+            nanos: selected.1,
+        },
+        paimon::spec::DataType::LocalZonedTimestamp(_) => {
+            paimon::spec::Datum::LocalZonedTimestamp {
+                millis: selected.0,
+                nanos: selected.1,
+            }
+        }
+        other => panic!("Unexpected partition type: {other:?}"),
+    };
+    let mut expected = global_index_entries(&table).await;
+    assert_eq!(expected.len(), 6);
+    if input.contains(' ') || legacy {
+        assert_eq!(row_count(&sql_context, &format!(
+            "SELECT * FROM paimon.test_db.`drop_ltz_partitions$partitions` WHERE partition = 'ts={input}'"
+        )).await, 1);
+    }
+    expected.retain(|_, entry| {
+        let row = paimon::spec::BinaryRow::from_serialized_bytes(&entry.partition).unwrap();
+        !(entry.index_file.index_type == "btree"
+            && entry
+                .index_file
+                .global_index_meta
+                .as_ref()
+                .unwrap()
+                .index_field_id
+                == 0
+            && row.get_datum(0, &partition_type).unwrap().as_ref() == Some(&selected_datum))
+    });
+    assert_eq!(expected.len(), 5);
+    let before = table_files(tmp.path());
+    let snapshot_id = table
+        .snapshot_manager()
+        .get_latest_snapshot_id()
+        .await
+        .unwrap()
+        .unwrap();
+    if std::env::var("TZ").unwrap() == "America/New_York" {
+        for invalid in [
+            "2024-03-10 02:30:00",
+            "2024-11-03 01:30:00",
+            "not-a-timestamp",
+        ] {
+            for dry_run in [true, false] {
+                assert_sql_error(&sql_context, &format!(
+                    "CALL sys.drop_global_index(table => 'test_db.drop_ltz_partitions', index_column => 'id', \
+                     partitions => 'ts={input};ts={invalid}', dry_run => {dry_run})"
+                ), "Invalid partitions value").await;
+                assert_eq!(table_files(tmp.path()), before);
+            }
+        }
+    }
+    let call = format!(
+        "CALL sys.drop_global_index(table => 'test_db.drop_ltz_partitions', index_column => 'id', partitions => 'ts={input}'"
+    );
+    let result = sql_context
+        .sql(&format!("{call}, dry_run => true)"))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        string_value(result[0].column(0).as_ref(), 0),
+        "Would drop 1 global index file(s)"
+    );
+    assert_eq!(table_files(tmp.path()), before);
+    exec(&sql_context, &format!("{call})")).await;
+    assert_eq!(
+        global_index_entries(&table).await,
+        expected,
+        "{sql_type}, legacy={legacy}, {input}"
+    );
+    assert_eq!(
+        table
+            .snapshot_manager()
+            .get_latest_snapshot_id()
+            .await
+            .unwrap(),
+        Some(snapshot_id + 1)
+    );
+    assert_eq!(
+        row_count(
+            &sql_context,
+            "SELECT * FROM paimon.test_db.drop_ltz_partitions"
+        )
+        .await,
+        2
+    );
+}
+
+#[tokio::test]
 async fn test_drop_global_index_partitions_timestamp_and_decimal_are_exact() {
     let (tmp, catalog) = create_test_env();
     let sql_context = create_sql_context(catalog.clone()).await;

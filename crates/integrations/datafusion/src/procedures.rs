@@ -44,6 +44,8 @@
 //! `drop_global_index` accepts partition alternatives such as
 //! `partitions => 'dt=2026-10-10,hr=1;dt=2026-10-11,hr=2'`; omitted keys are unrestricted.
 //! Explicit empty or invalid partition specifications fail before deleting any index.
+//! Timezone-less LTZ partition values use local time for non-legacy names and UTC for
+//! legacy names. Ambiguous or nonexistent local times require an explicit offset.
 //!
 //! `column_names` and `excluded_column_names` are comma-separated lists, not SQL arrays:
 //! `column_names => 'id, region'`. Java's Spark procedures take `ARRAY<STRING>` there, but a
@@ -844,13 +846,17 @@ fn parse_global_index_partitions(table: &Table, partitions: &str) -> DFResult<Pr
             let predicate = if value == options.partition_default_name() {
                 pb.is_null(key)
             } else {
-                let datum = parse_global_index_partition_value(value, field.data_type())
-                    .ok_or_else(|| {
-                        DataFusionError::Plan(format!(
-                            "Invalid partitions value '{value}' for column '{key}' with type {:?}",
-                            field.data_type()
-                        ))
-                    })?;
+                let datum = parse_global_index_partition_value(
+                    value,
+                    field.data_type(),
+                    options.legacy_partition_name(),
+                )
+                .ok_or_else(|| {
+                    DataFusionError::Plan(format!(
+                        "Invalid partitions value '{value}' for column '{key}' with type {:?}",
+                        field.data_type()
+                    ))
+                })?;
                 pb.equal(key, datum)
             };
             constraints.push(predicate.map_err(to_datafusion_error)?);
@@ -860,7 +866,11 @@ fn parse_global_index_partitions(table: &Table, partitions: &str) -> DFResult<Pr
     Ok(Predicate::or(alternatives))
 }
 
-fn parse_global_index_partition_value(value: &str, data_type: &DataType) -> Option<Datum> {
+fn parse_global_index_partition_value(
+    value: &str,
+    data_type: &DataType,
+    legacy_partition_name: bool,
+) -> Option<Datum> {
     match data_type {
         DataType::Char(typ) => {
             (value.chars().count() <= typ.length()).then(|| Datum::String(value.to_string()))
@@ -918,11 +928,14 @@ fn parse_global_index_partition_value(value: &str, data_type: &DataType) -> Opti
             })
         }
         DataType::Timestamp(typ) => {
-            parse_global_index_partition_timestamp(value, data_type, typ.precision())
+            parse_global_index_partition_timestamp(value, data_type, typ.precision(), false)
         }
-        DataType::LocalZonedTimestamp(typ) => {
-            parse_global_index_partition_timestamp(value, data_type, typ.precision())
-        }
+        DataType::LocalZonedTimestamp(typ) => parse_global_index_partition_timestamp(
+            value,
+            data_type,
+            typ.precision(),
+            !legacy_partition_name,
+        ),
         _ => paimon::table::parse_format_partition_value(value, data_type),
     }
 }
@@ -931,6 +944,7 @@ fn parse_global_index_partition_timestamp(
     value: &str,
     data_type: &DataType,
     precision: u32,
+    local_timezone: bool,
 ) -> Option<Datum> {
     let arrow_type = paimon::arrow::paimon_type_to_arrow(data_type).ok()?;
     let scalar = if value.bytes().all(|byte| byte.is_ascii_digit()) {
@@ -942,7 +956,23 @@ fn parse_global_index_partition_timestamp(
             .cast_to(&arrow_type)
             .ok()?
     } else {
-        ScalarValue::try_from_string(value.to_string(), &arrow_type).ok()?
+        // Legacy partition names omit seconds when both seconds and fractions are zero.
+        let value = chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M")
+            .map(|value| value.format("%Y-%m-%dT%H:%M:%S").to_string())
+            .unwrap_or_else(|_| value.to_string());
+        let value = if local_timezone {
+            // Non-legacy LTZ names use the system-local timezone. Preserve explicit offsets
+            // and fail on ambiguous/nonexistent local times instead of falling back to UTC.
+            datafusion::arrow::compute::kernels::cast_utils::string_to_datetime(
+                &chrono::Local,
+                &value,
+            )
+            .ok()?
+            .to_rfc3339()
+        } else {
+            value
+        };
+        ScalarValue::try_from_string(value, &arrow_type).ok()?
     };
     let mut datum = crate::filter_pushdown::scalar_to_datum(&scalar, data_type)?;
     let (Datum::Timestamp { millis, nanos } | Datum::LocalZonedTimestamp { millis, nanos }) =
@@ -1437,45 +1467,55 @@ mod tests {
             VarCharType,
         };
         assert_eq!(
-            parse_global_index_partition_value("01", &DataType::Int(IntType::new())),
+            parse_global_index_partition_value("01", &DataType::Int(IntType::new()), true),
             Some(Datum::Int(1))
         );
         for text in ["1.5", "2147483648", "bad"] {
             assert!(
-                parse_global_index_partition_value(text, &DataType::Int(IntType::new())).is_none()
+                parse_global_index_partition_value(text, &DataType::Int(IntType::new()), true)
+                    .is_none()
             );
         }
-        assert!(
-            parse_global_index_partition_value("2026-02-30", &DataType::Date(DateType::new()))
-                .is_none()
-        );
+        assert!(parse_global_index_partition_value(
+            "2026-02-30",
+            &DataType::Date(DateType::new()),
+            true
+        )
+        .is_none());
         assert_eq!(
-            parse_global_index_partition_value("1970-01-02", &DataType::Date(DateType::new())),
+            parse_global_index_partition_value(
+                "1970-01-02",
+                &DataType::Date(DateType::new()),
+                true
+            ),
             Some(Datum::Date(1))
         );
         assert_eq!(
             parse_global_index_partition_value(
                 "a=b",
-                &DataType::VarChar(VarCharType::new(3).unwrap())
+                &DataType::VarChar(VarCharType::new(3).unwrap()),
+                true,
             ),
             Some(Datum::String("a=b".into()))
         );
         assert!(parse_global_index_partition_value(
             "abcd",
-            &DataType::Char(CharType::new(3).unwrap())
+            &DataType::Char(CharType::new(3).unwrap()),
+            true,
         )
         .is_none());
         assert_eq!(
             parse_global_index_partition_value(
                 "12:00:00.123",
-                &DataType::Time(TimeType::new(3).unwrap())
+                &DataType::Time(TimeType::new(3).unwrap()),
+                true,
             ),
             Some(Datum::Time(43_200_123))
         );
         let decimal = DataType::Decimal(DecimalType::new(4, 2).unwrap());
         for (text, unscaled) in [("1.235", 124), ("-1.235", -124), ("1.235e1", 1235)] {
             assert_eq!(
-                parse_global_index_partition_value(text, &decimal),
+                parse_global_index_partition_value(text, &decimal, true),
                 Some(Datum::Decimal {
                     unscaled,
                     precision: 4,
@@ -1484,25 +1524,25 @@ mod tests {
             );
         }
         for text in ["99.995", "bad", "1_2.34"] {
-            assert!(parse_global_index_partition_value(text, &decimal).is_none());
+            assert!(parse_global_index_partition_value(text, &decimal, true).is_none());
         }
         let timestamp = DataType::Timestamp(TimestampType::new(1).unwrap());
         assert_eq!(
-            parse_global_index_partition_value("1970-01-01 00:00:00.199", &timestamp),
+            parse_global_index_partition_value("1970-01-01 00:00:00.199", &timestamp, true),
             Some(Datum::Timestamp {
                 millis: 100,
                 nanos: 0
             })
         );
-        assert!(parse_global_index_partition_value("123", &timestamp).is_none());
-        assert!(parse_global_index_partition_value("bad", &timestamp).is_none());
+        assert!(parse_global_index_partition_value("123", &timestamp, true).is_none());
+        assert!(parse_global_index_partition_value("bad", &timestamp, true).is_none());
         let float = DataType::Float(FloatType::new());
         assert_eq!(
-            parse_global_index_partition_value("1.1", &float),
+            parse_global_index_partition_value("1.1", &float, true),
             Some(Datum::Float(1.1))
         );
         for text in ["1e100", "1e-100", "1.234567891"] {
-            assert!(parse_global_index_partition_value(text, &float).is_none());
+            assert!(parse_global_index_partition_value(text, &float, true).is_none());
         }
     }
 
