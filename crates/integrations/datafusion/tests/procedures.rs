@@ -1567,7 +1567,7 @@ async fn test_drop_global_index_ltz_partitions_use_display_timezone() {
     const CHILD: &str = "PAIMON_DROP_LTZ_PARTITIONS_CHILD";
     if std::env::var_os(CHILD).is_none() {
         // Local timezone is process-global; isolate it from parallel SQL tests.
-        for timezone in ["Asia/Shanghai", "America/New_York"] {
+        for timezone in ["Asia/Shanghai", "America/New_York", "Africa/Monrovia"] {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
@@ -1639,7 +1639,7 @@ async fn test_drop_global_index_ltz_partitions_use_display_timezone() {
             )
             .await;
         }
-    } else {
+    } else if timezone == "America/New_York" {
         // Summer offset is -04:00, not the timezone's winter offset of -05:00.
         assert_timestamp_partition_drop(
             "TIMESTAMP(3) WITH TIME ZONE",
@@ -1657,6 +1657,18 @@ async fn test_drop_global_index_ltz_partitions_use_display_timezone() {
             (1_730_611_800_000, 0),
         )
         .await;
+    } else {
+        // Monrovia's historical offset of -00:44:30 must not shift the instant by 30 seconds.
+        for input in ["1970-12-31 23:15:30.000", "1971-01-01T00:00:00Z"] {
+            assert_timestamp_partition_drop(
+                "TIMESTAMP(3) WITH TIME ZONE",
+                false,
+                ["1971-01-01 00:00:00+00:00", "1971-01-01 00:00:30+00:00"],
+                input,
+                (31_536_000_000, 0),
+            )
+            .await;
+        }
     }
 }
 

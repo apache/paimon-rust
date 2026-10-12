@@ -968,6 +968,8 @@ fn parse_global_index_partition_timestamp(
                 &value,
             )
             .ok()?
+            // RFC3339 rounds offsets containing seconds; UTC preserves the resolved instant.
+            .with_timezone(&chrono::Utc)
             .to_rfc3339()
         } else {
             value
