@@ -18,7 +18,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use paimon::catalog::Identifier;
+use paimon::catalog::{Identifier, RESTToken};
 use paimon::io::FileIO;
 use paimon::spec::TableSchema;
 use paimon::Options;
@@ -90,13 +90,14 @@ impl PyTable {
     /// Reuse the matching REST table response and merged catalog options.
     /// Skips config/get-table requests, preserving REST snapshots and token refresh.
     #[staticmethod]
-    #[pyo3(signature = (response_json, *, database, table, rest_options))]
+    #[pyo3(signature = (response_json, *, database, table, rest_options, initial_data_token=None))]
     fn from_rest_response(
         py: Python<'_>,
         response_json: &str,
         database: &str,
         table: &str,
         rest_options: HashMap<String, String>,
+        initial_data_token: Option<(HashMap<String, String>, i64)>,
     ) -> PyResult<Self> {
         let response: paimon::api::GetTableResponse =
             serde_json::from_str(response_json).map_err(|err| {
@@ -104,16 +105,42 @@ impl PyTable {
             })?;
         let identifier = Identifier::new(database, table);
         let rest_options = complete_storage_options(rest_options);
+        let initial_token =
+            initial_data_token.map(|(token, expires_at)| RESTToken::new(token, expires_at));
         let table = py
             .detach(|| {
-                runtime().block_on(paimon::table::Table::from_rest_response(
+                runtime().block_on(paimon::table::Table::from_rest_response_with_token(
                     identifier,
                     response,
                     Options::from_map(rest_options),
+                    initial_token,
                 ))
             })
             .map_err(to_py_err)?;
         Ok(Self::new(Arc::new(table)))
+    }
+
+    /// Reuse an already obtained table token during REST table construction.
+    /// Rust keeps its normal refresh path when the token expires.
+    #[staticmethod]
+    #[pyo3(signature = (response_json, *, database, table, rest_options, data_token, expires_at_millis))]
+    fn from_rest_response_with_token(
+        py: Python<'_>,
+        response_json: &str,
+        database: &str,
+        table: &str,
+        rest_options: HashMap<String, String>,
+        data_token: HashMap<String, String>,
+        expires_at_millis: i64,
+    ) -> PyResult<Self> {
+        Self::from_rest_response(
+            py,
+            response_json,
+            database,
+            table,
+            rest_options,
+            Some((data_token, expires_at_millis)),
+        )
     }
 
     /// Replace the complete schema while retaining FileIO, REST credentials and branch.
@@ -171,8 +198,44 @@ impl PyTable {
         }
     }
 
+    fn new_full_text_search_builder(&self) -> crate::full_text_search::PyFullTextSearchBuilder {
+        crate::full_text_search::PyFullTextSearchBuilder::new(Arc::clone(&self.inner))
+    }
+
+    fn new_hybrid_search_builder(&self) -> crate::hybrid_search::PyHybridSearchBuilder {
+        crate::hybrid_search::PyHybridSearchBuilder::new(Arc::clone(&self.inner))
+    }
+
+    /// Forward one captured Java-format snapshot, or an explicitly empty view.
+    #[pyo3(signature = (snapshot_json))]
+    fn copy_with_pinned_snapshot(&self, snapshot_json: Option<&str>) -> PyResult<Self> {
+        let snapshot = snapshot_json
+            .map(serde_json::from_str::<paimon::spec::Snapshot>)
+            .transpose()
+            .map_err(|error| PyValueError::new_err(format!("Invalid snapshot JSON: {error}")))?;
+        Ok(Self {
+            inner: Arc::new(self.inner.copy_with_pinned_snapshot(snapshot.as_ref())),
+        })
+    }
+
+    fn new_vector_search_builder(&self) -> crate::vector_search::PyVectorSearchBuilder {
+        crate::vector_search::PyVectorSearchBuilder::new(Arc::clone(&self.inner))
+    }
+
+    fn new_batch_vector_search_builder(&self) -> crate::vector_search::PyBatchVectorSearchBuilder {
+        crate::vector_search::PyBatchVectorSearchBuilder::new(Arc::clone(&self.inner))
+    }
+
+    fn new_global_index_build_builder(&self) -> crate::index_build::PyGlobalIndexBuildBuilder {
+        crate::index_build::PyGlobalIndexBuildBuilder::new(Arc::clone(&self.inner))
+    }
+
     fn new_batch_write_builder(&self) -> PyBatchWriteBuilder {
         PyBatchWriteBuilder::new(Arc::clone(&self.inner))
+    }
+
+    fn new_stream_scan(&self) -> PyResult<crate::read::PyStreamTableScan> {
+        PyReadBuilder::new(Arc::clone(&self.inner)).new_stream_scan()
     }
 
     fn new_postpone_fixed_bucket_write_builder(

@@ -25,16 +25,19 @@ pub(crate) const QUERY_AUTH_ENABLED_OPTION: &str = "query-auth.enabled";
 const DATA_EVOLUTION_ENABLED_OPTION: &str = "data-evolution.enabled";
 const DATA_EVOLUTION_NESTED_FIELD_ENABLED_OPTION: &str = "data-evolution.nested-field.enabled";
 const FILE_INDEX_READ_ENABLED_OPTION: &str = "file-index.read.enabled";
+const GLOBAL_INDEX_FILTER_REFINE_FROM_DATA_OPTION: &str = "global-index.filter.refine-from-data";
 const GLOBAL_INDEX_ENABLED_OPTION: &str = "global-index.enabled";
 const GLOBAL_INDEX_SEARCH_MODE_OPTION: &str = "global-index.search-mode";
 const SCALAR_INDEX_SEARCH_MODE_OPTION: &str = "scalar-index.search-mode";
 const VECTOR_INDEX_SEARCH_MODE_OPTION: &str = "vector-index.search-mode";
 const FULL_TEXT_INDEX_SEARCH_MODE_OPTION: &str = "full-text-index.search-mode";
+const GLOBAL_INDEX_BUILD_PARALLELISM_OPTION: &str = "global-index.build.parallelism";
 const GLOBAL_INDEX_ROW_COUNT_PER_SHARD_OPTION: &str = "global-index.row-count-per-shard";
 const GLOBAL_INDEX_THREAD_NUM_OPTION: &str = "global-index.thread-num";
 const GLOBAL_INDEX_VINDEX_READ_THREAD_NUM_OPTION: &str = "global-index.vindex.read-thread-num";
 const GLOBAL_INDEX_COLUMN_UPDATE_ACTION_OPTION: &str = "global-index.column-update-action";
 pub(crate) const INDEX_FILE_IN_DATA_FILE_DIR_OPTION: &str = "index-file-in-data-file-dir";
+const SORTED_INDEX_RECORDS_PER_FILE_OPTION: &str = "sorted-index.records-per-file";
 const SORTED_INDEX_RECORDS_PER_RANGE_OPTION: &str = "sorted-index.records-per-range";
 const BTREE_INDEX_RECORDS_PER_RANGE_OPTION: &str = "btree-index.records-per-range";
 const BTREE_INDEX_CACHE_SIZE_OPTION: &str = "btree-index.cache-size";
@@ -162,6 +165,7 @@ const DEFAULT_DYNAMIC_BUCKET_TARGET_ROW_NUM: i64 = 2_000_000;
 pub(crate) const MAX_DYNAMIC_BUCKETS: i32 = 32768;
 const DYNAMIC_BUCKET_MAX_BUCKETS_OPTION: &str = "dynamic-bucket.max-buckets";
 const DEFAULT_GLOBAL_INDEX_ROW_COUNT_PER_SHARD: i64 = 100_000;
+const DEFAULT_SORTED_INDEX_RECORDS_PER_FILE: i64 = 25_000_000;
 const DEFAULT_GLOBAL_INDEX_THREAD_NUM: i64 = 32;
 pub(crate) const DEFAULT_GLOBAL_INDEX_VINDEX_READ_THREAD_NUM: usize = 64;
 const MAX_GLOBAL_INDEX_VINDEX_READ_THREAD_NUM: i64 = tokio::sync::Semaphore::MAX_PERMITS as i64;
@@ -527,11 +531,11 @@ impl<'a> CoreOptions<'a> {
     /// that selector is present (the batch-read semantics are identical to
     /// leaving the mode at `default`); an explicit mode without its selector
     /// is malformed input (`Error::DataInvalid`), mirroring Java's
-    /// `SchemaValidation`. All other non-default modes are unimplemented.
+    /// `SchemaValidation`. Incremental timestamp windows reuse the batch
+    /// Delta/Changelog scanner; snapshot/tag ranges remain unimplemented here.
     pub fn validate_scan_options(&self) -> crate::Result<()> {
         for key in [
             INCREMENTAL_BETWEEN_OPTION,
-            INCREMENTAL_BETWEEN_TIMESTAMP_OPTION,
             INCREMENTAL_BETWEEN_SCAN_MODE_OPTION,
         ] {
             if self.options.contains_key(key) {
@@ -540,9 +544,47 @@ impl<'a> CoreOptions<'a> {
                 });
             }
         }
+        let incremental = self.incremental_timestamp_window()?.is_some();
+        if incremental {
+            self.try_changelog_producer()?;
+            if self.is_format_table() {
+                return Err(crate::Error::Unsupported {
+                    message: "Incremental timestamp scans require a Paimon table".into(),
+                });
+            }
+            let selectors = self.configured_time_travel_selectors();
+            if !selectors.is_empty()
+                || self.options.contains_key("scan.file-creation-time-millis")
+                || self.options.contains_key("scan.creation-time-millis")
+            {
+                return Err(crate::Error::DataInvalid {
+                    message: "incremental-between-timestamp cannot be used with point-in-time scan options".into(),
+                    source: None,
+                });
+            }
+        }
         if let Some(mode) = self.options.get(SCAN_MODE_OPTION) {
+            if incremental
+                && !mode.eq_ignore_ascii_case("default")
+                && !mode.eq_ignore_ascii_case("incremental")
+            {
+                return Err(crate::Error::DataInvalid {
+                    message: format!(
+                        "incremental-between-timestamp cannot be used with scan.mode={mode}"
+                    ),
+                    source: None,
+                });
+            }
             let selector_keys: &[&str] = if mode.eq_ignore_ascii_case("default") {
                 return Ok(());
+            } else if mode.eq_ignore_ascii_case("incremental") {
+                if incremental {
+                    return Ok(());
+                }
+                return Err(crate::Error::DataInvalid {
+                    message: "scan.mode=incremental requires incremental-between-timestamp".into(),
+                    source: None,
+                });
             } else if mode.eq_ignore_ascii_case("from-snapshot") {
                 &[
                     SCAN_SNAPSHOT_ID_OPTION,
@@ -573,6 +615,22 @@ impl<'a> CoreOptions<'a> {
             }
         }
         Ok(())
+    }
+
+    /// The numeric timestamp window supported by PyPaimon. Snapshot resolution
+    /// and ordering checks belong to the batch scanner, as in Java.
+    pub(crate) fn incremental_timestamp_window(&self) -> crate::Result<Option<(i64, i64)>> {
+        let Some(raw) = self.options.get(INCREMENTAL_BETWEEN_TIMESTAMP_OPTION) else {
+            return Ok(None);
+        };
+        let parse = || {
+            let (start, end) = raw.split_once(',')?;
+            Some((start.parse::<i64>().ok()?, end.parse::<i64>().ok()?))
+        };
+        parse().map(Some).ok_or_else(|| crate::Error::DataInvalid {
+            message: format!("incremental-between-timestamp requires start(exclusive),end(inclusive) in milliseconds, got: {raw}"),
+            source: None,
+        })
     }
 
     pub fn deletion_vectors_enabled(&self) -> bool {
@@ -930,6 +988,15 @@ impl<'a> CoreOptions<'a> {
             .unwrap_or(true)
     }
 
+    /// Verify candidate-only scalar index answers against data before vector
+    /// ranking (Java default: true). When false, those candidates are excluded.
+    pub fn global_index_filter_refine_from_data(&self) -> bool {
+        self.options
+            .get(GLOBAL_INDEX_FILTER_REFINE_FROM_DATA_OPTION)
+            .map(|value| value.eq_ignore_ascii_case("true"))
+            .unwrap_or(true)
+    }
+
     /// Whether index files are stored in the bucket data-file directory rather
     /// than the table `index/` directory (option `index-file-in-data-file-dir`,
     /// default false).
@@ -989,6 +1056,19 @@ impl<'a> CoreOptions<'a> {
             });
         }
         Ok(value)
+    }
+
+    /// Number of generic global-index shards prepared concurrently by a local
+    /// build, matching PyPaimon's option and default. Each shard may also use
+    /// native worker threads; the default remains one.
+    pub fn global_index_build_parallelism(&self) -> crate::Result<usize> {
+        match self.options.get(GLOBAL_INDEX_BUILD_PARALLELISM_OPTION) {
+            None => Ok(1),
+            Some(raw) => raw.trim().parse::<usize>().ok().filter(|value| *value > 0)
+                .ok_or_else(|| crate::Error::ConfigInvalid {
+                    message: format!("Option '{GLOBAL_INDEX_BUILD_PARALLELISM_OPTION}' must be greater than 0, got: {raw}"),
+                }),
+        }
     }
 
     /// Maximum number of concurrent global-index search tasks, mirroring Java
@@ -1056,17 +1136,18 @@ impl<'a> CoreOptions<'a> {
     }
 
     pub fn sorted_index_records_per_range(&self) -> crate::Result<i64> {
-        let option = if self
-            .options
-            .contains_key(SORTED_INDEX_RECORDS_PER_RANGE_OPTION)
-        {
-            SORTED_INDEX_RECORDS_PER_RANGE_OPTION
-        } else {
-            BTREE_INDEX_RECORDS_PER_RANGE_OPTION
-        };
+        // Java SortedIndexOptions uses records-per-file as the primary key.
+        let option = [
+            SORTED_INDEX_RECORDS_PER_FILE_OPTION,
+            SORTED_INDEX_RECORDS_PER_RANGE_OPTION,
+            BTREE_INDEX_RECORDS_PER_RANGE_OPTION,
+        ]
+        .into_iter()
+        .find(|option| self.options.contains_key(*option))
+        .unwrap_or(SORTED_INDEX_RECORDS_PER_FILE_OPTION);
         let value = self
             .parse_i64_option(option)?
-            .unwrap_or(DEFAULT_GLOBAL_INDEX_ROW_COUNT_PER_SHARD);
+            .unwrap_or(DEFAULT_SORTED_INDEX_RECORDS_PER_FILE);
         if value <= 0 {
             return Err(crate::Error::DataInvalid {
                 message: format!("Option '{}' must be greater than 0, got: {}", option, value),
@@ -1286,7 +1367,7 @@ impl<'a> CoreOptions<'a> {
     pub fn ensure_engine_can_serve(&self, full_name: &str) -> crate::Result<()> {
         self.ensure_query_auth_absent()?;
         self.validate_scan_options()?;
-        if self.has_time_travel_selector() {
+        if self.has_time_travel_selector() || self.incremental_timestamp_window()?.is_some() {
             return Err(crate::Error::Unsupported {
                 message: format!(
                     "time travel is not supported for engine-served table '{full_name}'"
@@ -2280,7 +2361,7 @@ mod tests {
         );
         assert_eq!(
             core_options.sorted_index_records_per_range().unwrap(),
-            100_000
+            25_000_000
         );
         assert_eq!(
             core_options.btree_index_fallback_scan_max_size().unwrap(),
@@ -2468,6 +2549,35 @@ mod tests {
     }
 
     #[test]
+    fn test_global_index_build_parallelism() {
+        assert_eq!(
+            CoreOptions::new(&HashMap::new())
+                .global_index_build_parallelism()
+                .unwrap(),
+            1
+        );
+        for (raw, expected) in [("1", 1), (" 3 ", 3), ("+2", 2), ("1000000", 1000000)] {
+            let options =
+                HashMap::from([(GLOBAL_INDEX_BUILD_PARALLELISM_OPTION.into(), raw.into())]);
+            assert_eq!(
+                CoreOptions::new(&options)
+                    .global_index_build_parallelism()
+                    .unwrap(),
+                expected
+            );
+        }
+        for raw in ["0", "-1", "invalid", "18446744073709551616"] {
+            let options =
+                HashMap::from([(GLOBAL_INDEX_BUILD_PARALLELISM_OPTION.into(), raw.into())]);
+            assert!(CoreOptions::new(&options)
+                .global_index_build_parallelism()
+                .unwrap_err()
+                .to_string()
+                .contains("parallelism"));
+        }
+    }
+
+    #[test]
     fn test_global_index_thread_num_default_and_custom() {
         // Default mirrors Java (32) when unset.
         let empty = HashMap::new();
@@ -2567,6 +2677,7 @@ mod tests {
     #[test]
     fn test_sorted_index_records_per_range_rejects_invalid_values() {
         for option in [
+            SORTED_INDEX_RECORDS_PER_FILE_OPTION,
             SORTED_INDEX_RECORDS_PER_RANGE_OPTION,
             BTREE_INDEX_RECORDS_PER_RANGE_OPTION,
         ] {
@@ -2612,6 +2723,19 @@ mod tests {
                 .unwrap(),
             10
         );
+        let mut primary = options;
+        primary.insert(SORTED_INDEX_RECORDS_PER_FILE_OPTION.into(), "30".into());
+        assert_eq!(
+            CoreOptions::new(&primary)
+                .sorted_index_records_per_range()
+                .unwrap(),
+            30
+        );
+        // A bad primary value must fail rather than silently using an alias.
+        primary.insert(SORTED_INDEX_RECORDS_PER_FILE_OPTION.into(), "0".into());
+        assert!(CoreOptions::new(&primary)
+            .sorted_index_records_per_range()
+            .is_err());
     }
 
     #[test]
@@ -3715,17 +3839,102 @@ mod tests {
 
     #[test]
     fn test_validate_scan_options_rejects_unsupported() {
-        for key in [
-            "incremental-between",
-            "incremental-between-timestamp",
-            "incremental-between-scan-mode",
-        ] {
+        for key in ["incremental-between", "incremental-between-scan-mode"] {
             let options = HashMap::from([(key.to_string(), "x".to_string())]);
             let err = CoreOptions::new(&options)
                 .validate_scan_options()
                 .unwrap_err();
             assert!(matches!(err, crate::Error::Unsupported { message } if message.contains(key)));
         }
+    }
+
+    #[test]
+    fn test_numeric_incremental_timestamp_options_match_java_long_rules() {
+        for value in [
+            "0,100",
+            "100,100",
+            "200,100",
+            "+0,+100",
+            "-100,100",
+            "-9223372036854775808,9223372036854775807",
+        ] {
+            for mode in [None, Some("default"), Some("incremental")] {
+                let mut options =
+                    HashMap::from([("incremental-between-timestamp".into(), value.into())]);
+                if let Some(mode) = mode {
+                    options.insert("scan.mode".into(), mode.into());
+                }
+                assert!(
+                    CoreOptions::new(&options).validate_scan_options().is_ok(),
+                    "{options:?}"
+                );
+            }
+        }
+        for value in [
+            "100",
+            "one,200",
+            "100,200,300",
+            "100, 200",
+            "1_00,200",
+            "0,9223372036854775808",
+            "-9223372036854775809,100",
+        ] {
+            let options = HashMap::from([("incremental-between-timestamp".into(), value.into())]);
+            assert!(
+                matches!(
+                    CoreOptions::new(&options).validate_scan_options(),
+                    Err(crate::Error::DataInvalid { .. })
+                ),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_incremental_timestamp_options_reject_conflicting_and_unservable_routes() {
+        for selector in [
+            "scan.snapshot-id",
+            "scan.tag-name",
+            "scan.version",
+            "scan.watermark",
+            "scan.timestamp",
+            "scan.timestamp-millis",
+            "scan.file-creation-time-millis",
+            "scan.creation-time-millis",
+        ] {
+            let options = HashMap::from([
+                ("incremental-between-timestamp".into(), "0,100".into()),
+                (selector.into(), "1".into()),
+            ]);
+            assert!(
+                matches!(
+                    CoreOptions::new(&options).validate_scan_options(),
+                    Err(crate::Error::DataInvalid { .. })
+                ),
+                "{selector}"
+            );
+        }
+        let options = HashMap::from([("scan.mode".into(), "incremental".into())]);
+        assert!(matches!(
+            CoreOptions::new(&options).validate_scan_options(),
+            Err(crate::Error::DataInvalid { .. })
+        ));
+        let options = HashMap::from([("incremental-between-timestamp".into(), "0,100".into())]);
+        assert!(matches!(
+            CoreOptions::new(&options).ensure_engine_can_serve("db.t"),
+            Err(crate::Error::Unsupported { .. })
+        ));
+        let mut format_options = options.clone();
+        format_options.insert("type".into(), "format-table".into());
+        assert!(matches!(
+            CoreOptions::new(&format_options).validate_scan_options(),
+            Err(crate::Error::Unsupported { .. })
+        ));
+        let mut producer_options = options;
+        producer_options.insert("changelog-producer".into(), "invalid".into());
+        assert!(CoreOptions::new(&producer_options)
+            .validate_scan_options()
+            .is_err());
     }
 
     #[test]
@@ -3738,7 +3947,7 @@ mod tests {
         let ok = HashMap::from([("scan.mode".to_string(), "default".to_string())]);
         assert!(CoreOptions::new(&ok).validate_scan_options().is_ok());
         // unimplemented modes Unsupported
-        for mode in ["compacted-full", "incremental", "latest", "latest-full"] {
+        for mode in ["compacted-full", "latest", "latest-full"] {
             let bad = HashMap::from([("scan.mode".to_string(), mode.to_string())]);
             let err = CoreOptions::new(&bad).validate_scan_options().unwrap_err();
             assert!(

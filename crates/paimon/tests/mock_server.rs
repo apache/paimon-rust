@@ -22,7 +22,7 @@
 
 use axum::{
     extract::{Extension, Json, Path, Query},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{get, post},
     serve, Router,
@@ -54,6 +54,7 @@ type PartitionSpecPageResponse = (Vec<HashMap<String, String>>, Option<String>);
 struct MockState {
     databases: HashMap<String, GetDatabaseResponse>,
     tables: HashMap<String, GetTableResponse>,
+    get_table_call_counts: HashMap<String, usize>,
     views: HashMap<String, GetViewResponse>,
     functions: HashMap<String, GetFunctionResponse>,
     tags: HashMap<String, GetTagResponse>,
@@ -70,6 +71,7 @@ struct MockState {
     list_page_size: Option<usize>,
     no_permission_databases: HashSet<String>,
     no_permission_tables: HashSet<String>,
+    table_read_via: HashMap<String, String>,
     create_partitions_calls: Vec<(String, String, CreatePartitionsRequest)>,
     drop_partitions_calls: Vec<(String, String, DropPartitionsRequest)>,
     create_partitions_error_status: Option<StatusCode>,
@@ -89,6 +91,8 @@ struct MockState {
     drop_policy_error: Option<ErrorResponse>,
     auth_responses: HashMap<String, AuthTableQueryResponse>,
     column_auth: HashMap<String, Vec<String>>,
+    /// The `select` of every auth request, per `"{db}.{table}"`.
+    auth_selects: HashMap<String, Vec<Option<Vec<String>>>>,
     uuid_after_auth: HashMap<String, String>,
     uuid_after_calls: HashMap<String, (String, usize)>,
     /// ECS metadata role name (for token loader testing)
@@ -815,12 +819,32 @@ impl RESTServer {
 
     /// Handle GET /databases/:db/tables/:table - get a specific table.
     pub async fn get_table(
+        headers: HeaderMap,
         Path((db, table)): Path<(String, String)>,
         Extension(state): Extension<Arc<RESTServer>>,
     ) -> impl IntoResponse {
         let mut s = state.inner.lock().unwrap();
 
         let key = format!("{db}.{table}");
+        *s.get_table_call_counts.entry(key.clone()).or_default() += 1;
+        if let Some(expected) = s.table_read_via.get(&key) {
+            if headers
+                .get("X-Paimon-Read-Via")
+                .and_then(|value| value.to_str().ok())
+                != Some(expected)
+            {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(ErrorResponse::new(
+                        Some("table".to_string()),
+                        Some(table.clone()),
+                        Some("Dependency requires Read-Via".to_string()),
+                        Some(403),
+                    )),
+                )
+                    .into_response();
+            }
+        }
         if s.no_permission_tables.contains(&key) {
             let err = ErrorResponse::new(
                 Some("table".to_string()),
@@ -871,8 +895,12 @@ impl RESTServer {
         Extension(state): Extension<Arc<RESTServer>>,
         Json(request): Json<paimon::api::AuthTableQueryRequest>,
     ) -> impl IntoResponse {
-        let s = state.inner.lock().unwrap();
+        let mut s = state.inner.lock().unwrap();
         let key = format!("{db}.{table}");
+        s.auth_selects
+            .entry(key.clone())
+            .or_default()
+            .push(request.select.clone());
 
         // Mirrors the reference server: a null select means the real schema
         // fields, and any column outside the grant denies the query.
@@ -936,6 +964,14 @@ impl RESTServer {
     pub fn set_column_auth(&self, database: &str, table: &str, columns: Vec<String>) {
         let mut s = self.inner.lock().unwrap();
         s.column_auth.insert(format!("{database}.{table}"), columns);
+    }
+
+    pub fn auth_selects(&self, database: &str, table: &str) -> Vec<Option<Vec<String>>> {
+        let s = self.inner.lock().unwrap();
+        s.auth_selects
+            .get(&format!("{database}.{table}"))
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Handle DELETE /databases/:db/tables/:table - drop a table.
@@ -1858,6 +1894,15 @@ impl RESTServer {
             .create_partitions_statistics_error_status = status;
     }
 
+    /// Require the dependency identity on get-table requests for this table.
+    pub fn require_table_read_via(&self, database: &str, table: &str, read_via: String) {
+        self.inner
+            .lock()
+            .unwrap()
+            .table_read_via
+            .insert(format!("{database}.{table}"), read_via);
+    }
+
     /// Make the list-partitions endpoint return the given status.
     pub fn set_list_partitions_error_status(&self, status: Option<StatusCode>) {
         self.inner.lock().unwrap().list_partitions_error_status = status;
@@ -2113,6 +2158,17 @@ impl RESTServer {
             .partition_list_name_patterns
             .get(&format!("{database}.{table}"))
             .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Return how many get-table requests the table received.
+    pub fn table_get_call_count(&self, database: &str, table: &str) -> usize {
+        self.inner
+            .lock()
+            .unwrap()
+            .get_table_call_counts
+            .get(&format!("{database}.{table}"))
+            .copied()
             .unwrap_or_default()
     }
 

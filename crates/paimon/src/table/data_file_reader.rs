@@ -486,34 +486,30 @@ impl DataFileReader {
         )
     }
 
-    /// Read one file with the complete physical data schema supplied by a
-    /// caller such as the KV reader. The format chooses whether it needs the
-    /// full schema or only the projected fields.
-    pub(super) fn read_single_file_stream_with_schema(
+    /// Read one file with the complete physical data schema and optional
+    /// file-local row positions, independent of stable row IDs. The format
+    /// chooses whether it needs the full schema or only the projected fields.
+    pub(super) fn read_single_file_stream_with_schema_and_local_ranges(
         &self,
         split: &DataSplit,
         file_meta: DataFileMeta,
         data_fields: Option<Vec<DataField>>,
         data_schema_fields: Vec<DataField>,
         dv: Option<Arc<DeletionVector>>,
-        row_ranges: Option<Vec<RowRange>>,
+        local_row_ranges: Option<Vec<RowRange>>,
     ) -> crate::Result<ArrowRecordBatchStream> {
-        let local_ranges = row_ranges.as_ref().map(|ranges| {
-            to_local_row_ranges(
-                ranges,
-                file_meta.first_row_id.unwrap_or(0),
-                file_meta.row_count,
-            )
-        });
-        let row_selection =
-            merge_row_selection(file_meta.row_count, dv.as_deref(), local_ranges.as_deref());
+        let row_selection = merge_row_selection(
+            file_meta.row_count,
+            dv.as_deref(),
+            local_row_ranges.as_deref(),
+        );
         self.read_single_file_stream_with_selection(
             split,
             file_meta,
             data_fields,
             Some(data_schema_fields),
             row_selection,
-            local_ranges,
+            local_row_ranges,
         )
     }
 
@@ -543,18 +539,40 @@ impl DataFileReader {
         for predicate in &predicates {
             crate::arrow::residual::collect_predicate_leaf_refs(predicate, &mut refs);
         }
-        let metadata_residual = (projects_row_id
-            && predicates
-                .iter()
-                .any(|predicate| !matches!(predicate, Predicate::AlwaysTrue)))
+        // A predicate's literals use the current table type. Casting a physical
+        // old-file column inside the decoder can change Java narrowing or
+        // timestamp precision semantics, and filtering there loses those rows
+        // before schema reconciliation. Evaluate the complete predicate after
+        // reconciliation, as Java's schema-evolution reader does.
+        let evolved_predicate = data_fields.as_deref().is_some_and(|fields| {
+            refs.iter().any(|(name, index)| {
+                if crate::spec::is_row_tracking_column(name) {
+                    return false;
+                }
+                table_fields.get(*index).is_some_and(|target| {
+                    fields
+                        .iter()
+                        .find(|source| source.id() == target.id())
+                        .is_none_or(|source| {
+                            !source
+                                .data_type()
+                                .equals_ignore_nullable(target.data_type())
+                        })
+                })
+            })
+        });
+        let post_read_filter = evolved_predicate
+            || (projects_row_id
+                && predicates
+                    .iter()
+                    .any(|predicate| !matches!(predicate, Predicate::AlwaysTrue)))
             || (row_tracking_enabled
                 && refs
                     .iter()
                     .any(|(name, _)| *name == crate::spec::SEQUENCE_NUMBER_FIELD_NAME));
-        if metadata_residual {
-            // Decoder-side filtering can drop rows before positional `_ROW_ID`
-            // attachment. Read predicate-only columns without pushing the filter
-            // down, attach the original ids, then evaluate the exact predicate.
+        if post_read_filter {
+            // Read predicate-only columns without decoder filtering. Reconcile
+            // old-file types and attach original row IDs before exact filtering.
             for (name, index) in refs {
                 if name == crate::spec::SEQUENCE_NUMBER_FIELD_NAME {
                     crate::arrow::residual::push_unique_scan_field(
@@ -576,7 +594,7 @@ impl DataFileReader {
         let projects_row_id = read_type
             .iter()
             .any(|field| field.name() == ROW_ID_FIELD_NAME);
-        let residual_predicates = metadata_residual.then(|| crate::arrow::format::FilePredicates {
+        let residual_predicates = post_read_filter.then(|| crate::arrow::format::FilePredicates {
             predicates: predicates.clone(),
             row_filter_factory: None,
             file_fields: table_fields.clone(),
@@ -586,7 +604,7 @@ impl DataFileReader {
         // post-filter until expression adaptation is proven for that path.
         // Positional `_ROW_ID` materialization must see the unfiltered row
         // stream, so the engine hook stays disabled for this projection.
-        let row_filter_factory = (data_fields.is_none() && !projects_row_id && !metadata_residual)
+        let row_filter_factory = (data_fields.is_none() && !projects_row_id && !post_read_filter)
             .then(|| self.row_filter_factory.clone())
             .flatten();
         let file_io = self.file_io.clone();
@@ -633,7 +651,7 @@ impl DataFileReader {
             mosaic_prefetch,
         )?;
         // Remap predicates from table-level to file-level indices.
-        let file_predicates = if metadata_residual {
+        let file_predicates = if post_read_filter {
             None
         } else {
             let remapped = crate::arrow::filtering::remap_predicates_to_file(
@@ -1188,16 +1206,29 @@ fn read_data_fields(
         }
     }
     for expected in expected_fields {
-        if expected.id() == crate::spec::SEQUENCE_NUMBER_FIELD_ID
-            && expected.name() == crate::spec::SEQUENCE_NUMBER_FIELD_NAME
+        if is_physical_system_field(expected)
             && !read_fields.iter().any(|field| field.id() == expected.id())
         {
-            // Row tracking stores this physical system column outside the
-            // logical table schema, including alongside selected MAP keys.
+            // Row tracking and KV files store these columns outside the logical
+            // table schema. Keep them during MAP pruning/schema evolution too;
+            // an audit reader must receive the stored _VALUE_KIND.
             read_fields.push(expected.clone());
         }
     }
     Ok(read_fields)
+}
+
+fn is_physical_system_field(field: &DataField) -> bool {
+    matches!(
+        (field.id(), field.name()),
+        (
+            crate::spec::SEQUENCE_NUMBER_FIELD_ID,
+            crate::spec::SEQUENCE_NUMBER_FIELD_NAME
+        ) | (
+            crate::spec::VALUE_KIND_FIELD_ID,
+            crate::spec::VALUE_KIND_FIELD_NAME
+        )
+    )
 }
 
 fn prune_data_type(
@@ -1682,6 +1713,31 @@ mod row_tests {
             Some("__PAIMON_MAP_SELECTED_KEYS:key")
         );
         assert_eq!(read[1], sequence);
+    }
+
+    #[test]
+    fn schema_pruning_keeps_value_kind_but_does_not_bind_an_alias() {
+        let value_kind = field(
+            crate::spec::VALUE_KIND_FIELD_ID,
+            crate::spec::VALUE_KIND_FIELD_NAME,
+            DataType::TinyInt(crate::spec::TinyIntType::with_nullable(false)),
+        );
+        let read = read_data_fields(&[], std::slice::from_ref(&value_kind), false).unwrap();
+        assert_eq!(read, vec![value_kind]);
+        for alias in [
+            field(
+                10,
+                crate::spec::VALUE_KIND_FIELD_NAME,
+                DataType::Int(IntType::new()),
+            ),
+            field(
+                crate::spec::VALUE_KIND_FIELD_ID,
+                "kind",
+                DataType::Int(IntType::new()),
+            ),
+        ] {
+            assert!(read_data_fields(&[], &[alias], false).unwrap().is_empty());
+        }
     }
 
     #[test]
@@ -3263,11 +3319,12 @@ mod tests {
         )
         .unwrap();
         for (case, values, expected_values) in [
-            ("overflow_only", vec![Some(383)], vec![None]),
+            // Java's Number.byteValue keeps the low bits: 383 becomes 127.
+            ("overflow_only", vec![Some(383)], vec![Some(127)]),
             (
                 "mixed",
                 vec![Some(127), Some(383), None],
-                vec![Some(127), None, None],
+                vec![Some(127), Some(127), None],
             ),
         ] {
             let mut avro_writer = apache_avro::Writer::new(&avro_schema, Vec::new());

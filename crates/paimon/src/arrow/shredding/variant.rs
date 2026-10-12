@@ -866,7 +866,9 @@ fn assemble_array_to_logical(
         }
         DataType::Row(row_type)
             if is_variant_extraction_row(row_type)
-                && (is_variant_storage_array(array) || is_plain_variant_array(array)) =>
+                && (is_variant_storage_array(array)
+                    || is_plain_variant_array(array)
+                    || is_dictionary_variant_storage_array(array)) =>
         {
             Ok(Some(assemble_variant_extraction_array(array, row_type)?))
         }
@@ -904,6 +906,17 @@ pub(crate) fn assemble_variant_extraction_array(
     if let Some(projected) = assemble_plain_variant_projection(input, fields, &metadata)? {
         return Ok(projected);
     }
+    if let Some(projected) = assemble_typed_shredded_projection(input, fields, &metadata)? {
+        return Ok(projected);
+    }
+    assemble_row_wise_variant_extraction(input, fields, &metadata)
+}
+
+fn assemble_row_wise_variant_extraction(
+    input: &StructArray,
+    fields: &[DataField],
+    metadata: &[crate::spec::VariantFieldMetadata],
+) -> Result<ArrayRef> {
     let materialized = materialize_variant_metadata(input)?;
     let input = &materialized;
 
@@ -1066,6 +1079,146 @@ fn assemble_plain_variant_projection(
     )))
 }
 
+/// Column-wise extraction of numeric fields held in typed shredded leaves; `None` means some
+/// path needs the row-wise path (residual values, arrays, nested results or other casts).
+fn assemble_typed_shredded_projection(
+    input: &StructArray,
+    fields: &[DataField],
+    metadata: &[crate::spec::VariantFieldMetadata],
+) -> Result<Option<ArrayRef>> {
+    if fields.is_empty() || !is_shredded_variant_array(input) {
+        return Ok(None);
+    }
+    let mut arrow_fields = Vec::with_capacity(fields.len());
+    let mut columns = Vec::with_capacity(fields.len());
+    for (field, field_metadata) in fields.iter().zip(metadata) {
+        let Some(leaf) = typed_shredded_leaf(input, field_metadata.path()) else {
+            return Ok(None);
+        };
+        let Some(column) = cast_typed_leaf(leaf.as_ref(), field.data_type(), input.nulls()) else {
+            return Ok(None);
+        };
+        arrow_fields.push(ArrowField::new(
+            field.name(),
+            paimon_type_to_arrow(field.data_type())?,
+            field.data_type().is_nullable(),
+        ));
+        columns.push(column);
+    }
+    let validities = (0..input.len()).map(|row| input.is_valid(row)).collect();
+    let array = StructArray::try_new(arrow_fields.into(), columns, Some(null_buffer(validities)))
+        .map_err(|e| Error::UnexpectedError {
+        message: format!("Failed to build Variant extraction StructArray: {e}"),
+        source: Some(Box::new(e)),
+    })?;
+    Ok(Some(Arc::new(array)))
+}
+
+/// The typed leaf of an object-key path, if no valid row needs the residual Variant value.
+fn typed_shredded_leaf(input: &StructArray, path: &str) -> Option<ArrayRef> {
+    let segments = crate::variant::parse_path(path).ok()?;
+    if segments.is_empty() {
+        return None;
+    }
+    let valid = input.nulls();
+    let mut node = input;
+    for segment in &segments {
+        let crate::variant::PathSegment::Key(key) = segment else {
+            return None;
+        };
+        let object = node
+            .column_by_name(VARIANT_TYPED_VALUE_FIELD_NAME)?
+            .as_any()
+            .downcast_ref::<StructArray>()?;
+        if !valid_where(object, valid) {
+            return None;
+        }
+        node = object
+            .column_by_name(key)?
+            .as_any()
+            .downcast_ref::<StructArray>()?;
+        if !valid_where(node, valid) {
+            return None;
+        }
+    }
+    if node
+        .column_by_name(VARIANT_VALUE_FIELD_NAME)
+        .is_some_and(|value| any_valid_where(value.as_ref(), valid))
+    {
+        return None;
+    }
+    node.column_by_name(VARIANT_TYPED_VALUE_FIELD_NAME).cloned()
+}
+
+/// Whether `array` is non-null on every row that `valid` keeps.
+fn valid_where(array: &dyn Array, valid: Option<&NullBuffer>) -> bool {
+    let Some(nulls) = array.nulls() else {
+        return true;
+    };
+    match valid {
+        None => nulls.null_count() == 0,
+        Some(valid) => (valid.inner() & &!nulls.inner()).count_set_bits() == 0,
+    }
+}
+
+/// Whether `array` is non-null on any row that `valid` keeps.
+fn any_valid_where(array: &dyn Array, valid: Option<&NullBuffer>) -> bool {
+    if array.null_count() == array.len() {
+        return false;
+    }
+    match (array.nulls(), valid) {
+        (None, None) => true,
+        (None, Some(valid)) => valid.null_count() < valid.len(),
+        (Some(nulls), None) => nulls.null_count() < nulls.len(),
+        (Some(nulls), Some(valid)) => (valid.inner() & nulls.inner()).count_set_bits() > 0,
+    }
+}
+
+/// Mirrors `cast_variant_to_shredded_value` for numeric leaves, whose casts cannot fail.
+fn cast_typed_leaf(
+    leaf: &dyn Array,
+    data_type: &DataType,
+    valid: Option<&NullBuffer>,
+) -> Option<ArrayRef> {
+    use arrow_array::cast::AsArray;
+    use arrow_array::types::{Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, Int8Type};
+    let nulls = NullBuffer::union(leaf.nulls(), valid);
+    macro_rules! map {
+        ($from:ty, $to:ty, $f:expr) => {{
+            let values = leaf
+                .as_primitive::<$from>()
+                .values()
+                .iter()
+                .map($f)
+                .collect();
+            Arc::new(arrow_array::PrimitiveArray::<$to>::new(values, nulls)) as ArrayRef
+        }};
+    }
+    Some(match (leaf.data_type(), data_type) {
+        (ArrowDataType::Float64, DataType::Float(_)) => {
+            map!(Float64Type, Float32Type, |v| *v as f32)
+        }
+        (ArrowDataType::Float32, DataType::Float(_)) => map!(Float32Type, Float32Type, |v| *v),
+        (ArrowDataType::Int64, DataType::Float(_)) => map!(Int64Type, Float32Type, |v| *v as f32),
+        (ArrowDataType::Int32, DataType::Float(_)) => map!(Int32Type, Float32Type, |v| *v as f32),
+        (ArrowDataType::Int16, DataType::Float(_)) => map!(Int16Type, Float32Type, |v| *v as f32),
+        (ArrowDataType::Int8, DataType::Float(_)) => map!(Int8Type, Float32Type, |v| *v as f32),
+        (ArrowDataType::Float64, DataType::Double(_)) => map!(Float64Type, Float64Type, |v| *v),
+        (ArrowDataType::Float32, DataType::Double(_)) => {
+            map!(Float32Type, Float64Type, |v| *v as f64)
+        }
+        (ArrowDataType::Int64, DataType::Double(_)) => map!(Int64Type, Float64Type, |v| *v as f64),
+        (ArrowDataType::Int32, DataType::Double(_)) => map!(Int32Type, Float64Type, |v| *v as f64),
+        (ArrowDataType::Int16, DataType::Double(_)) => map!(Int16Type, Float64Type, |v| *v as f64),
+        (ArrowDataType::Int8, DataType::Double(_)) => map!(Int8Type, Float64Type, |v| *v as f64),
+        (ArrowDataType::Int64, DataType::BigInt(_)) => map!(Int64Type, Int64Type, |v| *v),
+        (ArrowDataType::Int32, DataType::BigInt(_)) => map!(Int32Type, Int64Type, |v| *v as i64),
+        (ArrowDataType::Int16, DataType::BigInt(_)) => map!(Int16Type, Int64Type, |v| *v as i64),
+        (ArrowDataType::Int8, DataType::BigInt(_)) => map!(Int8Type, Int64Type, |v| *v as i64),
+        _ => return None,
+    })
+}
+
 fn variant_from_storage_row(input: &StructArray, row: usize) -> Result<Option<GenericVariant>> {
     if input.is_null(row) {
         return Ok(None);
@@ -1189,12 +1342,42 @@ fn has_dictionary_variant_metadata(fields: &Fields) -> bool {
             if key.as_ref() == &ArrowDataType::Int32 && value.as_ref() == &ArrowDataType::Binary)
 }
 
+fn is_dictionary_metadata(field: &ArrowField) -> bool {
+    field.name() == VARIANT_METADATA_FIELD_NAME
+        && matches!(field.data_type(), ArrowDataType::Dictionary(key, value)
+            if key.as_ref() == &ArrowDataType::Int32 && value.as_ref() == &ArrowDataType::Binary)
+}
+
+/// Variant storage, shredded or clipped to `metadata` and `value`, whose metadata the Parquet
+/// reader kept dictionary-encoded; recognized by child names, not by order.
+fn is_dictionary_variant_storage_array(array: &dyn Array) -> bool {
+    let ArrowDataType::Struct(fields) = array.data_type() else {
+        return false;
+    };
+    let named = |name: &str| fields.iter().find(|field| field.name() == name);
+    fields.iter().all(|field| {
+        [
+            VARIANT_METADATA_FIELD_NAME,
+            VARIANT_VALUE_FIELD_NAME,
+            VARIANT_TYPED_VALUE_FIELD_NAME,
+        ]
+        .contains(&field.name().as_str())
+    }) && named(VARIANT_METADATA_FIELD_NAME).is_some_and(|field| is_dictionary_metadata(field))
+        && (named(VARIANT_VALUE_FIELD_NAME)
+            .is_some_and(|field| field.data_type() == &ArrowDataType::Binary)
+            || named(VARIANT_TYPED_VALUE_FIELD_NAME).is_some())
+}
+
 /// Turns dictionary-encoded Variant metadata back into Binary for the generic row path.
 fn materialize_variant_metadata(input: &StructArray) -> Result<StructArray> {
-    if !has_dictionary_variant_metadata(input.fields()) {
+    let Some(index) = input
+        .fields()
+        .iter()
+        .position(|field| is_dictionary_metadata(field))
+    else {
         return Ok(input.clone());
-    }
-    let metadata = arrow_cast::cast(input.column(1), &ArrowDataType::Binary).map_err(|e| {
+    };
+    let metadata = arrow_cast::cast(input.column(index), &ArrowDataType::Binary).map_err(|e| {
         Error::DataInvalid {
             message: format!("Failed to decode dictionary Variant metadata: {e}"),
             source: Some(Box::new(e)),
@@ -1205,15 +1388,14 @@ fn materialize_variant_metadata(input: &StructArray) -> Result<StructArray> {
         .iter()
         .map(|f| f.as_ref().clone())
         .collect::<Vec<_>>();
-    fields[1] = fields[1].clone().with_data_type(ArrowDataType::Binary);
-    StructArray::try_new(
-        fields.into(),
-        vec![input.column(0).clone(), metadata],
-        input.nulls().cloned(),
-    )
-    .map_err(|e| Error::DataInvalid {
-        message: format!("Failed to rebuild Variant struct: {e}"),
-        source: Some(Box::new(e)),
+    fields[index] = fields[index].clone().with_data_type(ArrowDataType::Binary);
+    let mut columns = input.columns().to_vec();
+    columns[index] = metadata;
+    StructArray::try_new(fields.into(), columns, input.nulls().cloned()).map_err(|e| {
+        Error::DataInvalid {
+            message: format!("Failed to rebuild Variant struct: {e}"),
+            source: Some(Box::new(e)),
+        }
     })
 }
 
@@ -2218,6 +2400,231 @@ mod tests {
         assert!(ages.is_null(1));
         assert_eq!(names.value(0), "Alice");
         assert_eq!(names.value(1), "Bob");
+    }
+
+    fn shredded_for_test(rows: &[Option<&str>], fields_json: &str) -> StructArray {
+        let logical_fields = vec![DataField::new(
+            1,
+            "v".to_string(),
+            DataType::Variant(VariantType::new()),
+        )];
+        let options = HashMap::from([(
+            "variant.shreddingSchema".to_string(),
+            format!(
+                r#"{{"type":"ROW","fields":[{{"name":"v","type":{{"type":"ROW","fields":{fields_json}}}}}]}}"#
+            ),
+        )]);
+        let physical_fields = configured_variant_shredding_fields(&logical_fields, &options)
+            .unwrap()
+            .expect("shredding fields");
+        let variants = rows
+            .iter()
+            .map(|row| GenericVariant::parse_json(row.unwrap_or("null")).unwrap())
+            .collect::<Vec<_>>();
+        let plain = variant_array_for_test(&variants);
+        let (fields, columns, _) = plain
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap()
+            .clone()
+            .into_parts();
+        let validities = rows.iter().map(Option::is_some).collect();
+        let plain = StructArray::try_new(fields, columns, Some(null_buffer(validities))).unwrap();
+        let batch = RecordBatch::try_new(
+            build_target_arrow_schema(&logical_fields).unwrap(),
+            vec![Arc::new(plain)],
+        )
+        .unwrap();
+        let physical =
+            batch_to_shredded_physical(&batch, &logical_fields, &physical_fields).unwrap();
+        physical
+            .column(0)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap()
+            .clone()
+    }
+
+    fn with_dictionary_metadata(input: &StructArray) -> StructArray {
+        let index = input
+            .fields()
+            .iter()
+            .position(|field| field.name() == VARIANT_METADATA_FIELD_NAME)
+            .unwrap();
+        let dictionary = ArrowDataType::Dictionary(
+            Box::new(ArrowDataType::Int32),
+            Box::new(ArrowDataType::Binary),
+        );
+        let mut fields = input
+            .fields()
+            .iter()
+            .map(|field| field.as_ref().clone())
+            .collect::<Vec<_>>();
+        fields[index] = fields[index].clone().with_data_type(dictionary.clone());
+        let mut columns = input.columns().to_vec();
+        columns[index] = arrow_cast::cast(&columns[index], &dictionary).unwrap();
+        StructArray::try_new(fields.into(), columns, input.nulls().cloned()).unwrap()
+    }
+
+    fn extraction_for_test(
+        paths: &[(DataType, &str)],
+    ) -> (RowType, Vec<crate::spec::VariantFieldMetadata>) {
+        let row_type = variant_extraction_row(
+            true,
+            paths
+                .iter()
+                .map(|(data_type, path)| {
+                    (
+                        data_type.clone(),
+                        path.to_string(),
+                        false,
+                        "UTC".to_string(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let metadata = row_type
+            .fields()
+            .iter()
+            .map(|field| parse_variant_metadata(field.description().unwrap()).unwrap())
+            .collect();
+        (row_type, metadata)
+    }
+
+    #[test]
+    fn typed_shredded_extraction_matches_row_path() {
+        let input = shredded_for_test(
+            &[
+                Some(r#"{"a":1.5e0,"b":7,"n":{"x":3.5e0},"other":"x"}"#),
+                None,
+                Some(r#"{"b":9,"n":{"x":5e-1},"other":1}"#),
+                Some(r#"{"a":-1e300,"b":-9007199254740993,"n":{"x":1e-310}}"#),
+            ],
+            r#"[{"name":"a","type":"DOUBLE"},{"name":"b","type":"BIGINT"},
+                {"name":"n","type":{"type":"ROW","fields":[{"name":"x","type":"DOUBLE"}]}}]"#,
+        );
+        let float = || DataType::Float(FloatType::new());
+        let double = || DataType::Double(crate::spec::DoubleType::new());
+        let bigint = || DataType::BigInt(crate::spec::BigIntType::new());
+        let (row_type, metadata) = extraction_for_test(&[
+            (float(), "$.a"),
+            (double(), "$['a']"),
+            (float(), "$.b"),
+            (double(), "$.b"),
+            (bigint(), "$.b"),
+            (float(), "$.n.x"),
+            (double(), "$.n.x"),
+        ]);
+        let expected =
+            assemble_row_wise_variant_extraction(&input, row_type.fields(), &metadata).unwrap();
+        let typed = assemble_typed_shredded_projection(&input, row_type.fields(), &metadata)
+            .unwrap()
+            .expect("typed leaves take the column-wise path");
+        assert_eq!(typed.as_ref(), expected.as_ref());
+        use arrow_array::cast::AsArray;
+        let typed = typed.as_any().downcast_ref::<StructArray>().unwrap();
+        assert!(typed.is_null(1));
+        assert!(typed.column(0).is_null(2));
+        assert_eq!(
+            typed
+                .column(2)
+                .as_primitive::<arrow_array::types::Float32Type>()
+                .value(3),
+            -9007199254740993_i64 as f32
+        );
+        let dictionary = with_dictionary_metadata(&input);
+        let actual = assemble_variant_extraction_array(&dictionary, &row_type).unwrap();
+        assert_eq!(actual.as_ref(), expected.as_ref());
+    }
+
+    #[test]
+    fn dictionary_storage_without_typed_value_is_assembled() {
+        let input = shredded_for_test(
+            &[
+                Some(r#"{"age":27,"rest":"A"}"#),
+                None,
+                Some(r#"{"age":32,"rest":"B"}"#),
+            ],
+            r#"[{"name":"age","type":"INT"}]"#,
+        );
+        // A residual-only extraction reads the shredded root clipped to metadata and value.
+        let keep =
+            |name: &str| name == VARIANT_METADATA_FIELD_NAME || name == VARIANT_VALUE_FIELD_NAME;
+        let (fields, columns, nulls) = input.clone().into_parts();
+        let (fields, columns): (Vec<_>, Vec<_>) = fields
+            .iter()
+            .zip(columns)
+            .filter(|(field, _)| keep(field.name()))
+            .map(|(field, column)| (field.as_ref().clone(), column))
+            .unzip();
+        let clipped = StructArray::try_new(fields.into(), columns, nulls).unwrap();
+        let dictionary = with_dictionary_metadata(&clipped);
+        assert!(is_dictionary_variant_storage_array(&dictionary));
+        let (row_type, metadata) =
+            extraction_for_test(&[(DataType::VarChar(VarCharType::string_type()), "$.rest")]);
+        let read_fields = vec![DataField::new(
+            1,
+            "v".to_string(),
+            DataType::Row(row_type.clone()),
+        )];
+        let batch = RecordBatch::try_new(
+            Arc::new(arrow_schema::Schema::new(vec![ArrowField::new(
+                "v",
+                dictionary.data_type().clone(),
+                true,
+            )])),
+            vec![Arc::new(dictionary)],
+        )
+        .unwrap();
+        let assembled = assemble_shredded_variant_batch(batch, &read_fields).unwrap();
+        let expected =
+            assemble_row_wise_variant_extraction(&clipped, row_type.fields(), &metadata).unwrap();
+        assert_eq!(assembled.column(0).as_ref(), expected.as_ref());
+        let rest = expected.as_any().downcast_ref::<StructArray>().unwrap();
+        let rest = rest
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(rest.value(0), "A");
+        assert!(rest.is_null(1));
+        assert_eq!(rest.value(2), "B");
+    }
+
+    #[test]
+    fn typed_shredded_extraction_falls_back_for_residual_values() {
+        let input = shredded_for_test(
+            &[
+                Some(r#"{"a":"old","b":1,"n":{"x":1e0}}"#),
+                Some(r#"{"a":2.5e0,"b":2}"#),
+                Some(r#"[1,2]"#),
+                None,
+            ],
+            r#"[{"name":"a","type":"DOUBLE"},{"name":"b","type":"BIGINT"},
+                {"name":"n","type":{"type":"ROW","fields":[{"name":"x","type":"DOUBLE"}]}}]"#,
+        );
+        let float = || DataType::Float(FloatType::new());
+        for paths in [
+            vec![(float(), "$.a")],
+            vec![(float(), "$.b")],
+            vec![(float(), "$.n.x")],
+            vec![(float(), "$.missing")],
+            vec![(DataType::VarChar(VarCharType::string_type()), "$.b")],
+        ] {
+            let (row_type, metadata) = extraction_for_test(&paths);
+            assert!(
+                assemble_typed_shredded_projection(&input, row_type.fields(), &metadata)
+                    .unwrap()
+                    .is_none()
+            );
+            let expected =
+                assemble_row_wise_variant_extraction(&input, row_type.fields(), &metadata).unwrap();
+            let actual =
+                assemble_variant_extraction_array(&with_dictionary_metadata(&input), &row_type)
+                    .unwrap();
+            assert_eq!(actual.as_ref(), expected.as_ref());
+        }
     }
 
     #[test]

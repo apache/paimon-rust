@@ -47,8 +47,9 @@ pub(crate) fn data_evolution_anchor_file(files: &[DataFileMeta]) -> crate::Resul
 // ======================= RowRange ===============================
 
 /// An inclusive row range `[from, to]` in the coordinate system of the read
-/// path: stable row IDs for row-tracked tables, or physical positions for raw
-/// tables without row tracking.
+/// path: stable row IDs for row-tracked append/Data Evolution tables,
+/// split-local positions for ordinary append tables, or file-local physical
+/// positions for primary-key IndexedSplits.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RowRange {
     from: i64,
@@ -498,9 +499,10 @@ pub struct DataSplit {
     /// Deletion file for each data file, same order as `data_files`.
     /// `None` at index `i` means no deletion file for `data_files[i]` (matches Java getDeletionFiles() / List<DeletionFile> with null elements).
     data_deletion_files: Option<Arc<[Option<DeletionFile>]>>,
-    /// IndexedSplit-compatible ranges. Row-tracked tables interpret these as
-    /// stable row IDs; raw tables without row tracking interpret them as
-    /// split-local physical positions over `data_files` in list order.
+    /// IndexedSplit-compatible ranges. Append/Data Evolution reads use stable
+    /// row IDs when tracked, otherwise split-local positions over `data_files`.
+    /// Primary-key IndexedSplits use file-local physical positions, independent
+    /// of row tracking.
     row_ranges: Option<Arc<[RowRange]>>,
     /// Whether the split can be read raw, without the merge reader: its
     /// physical rows are exactly its logical rows (modulo deletion files).
@@ -540,9 +542,19 @@ impl DataSplit {
         self.query_auth_grant.as_ref()
     }
 
+    /// Whether the server attached rules to this split's read: its row counts
+    /// and column statistics then describe rows the read will not return as
+    /// they are.
+    pub fn has_query_auth_rules(&self) -> bool {
+        self.query_auth_grant
+            .as_ref()
+            .is_some_and(|grant| !grant.is_unrestricted())
+    }
+
     pub fn snapshot_id(&self) -> i64 {
         self.snapshot_id
     }
+
     pub fn partition(&self) -> &BinaryRow {
         &self.partition
     }
@@ -575,6 +587,21 @@ impl DataSplit {
     pub(crate) fn with_selected_row_ranges(mut self, ranges: Vec<RowRange>) -> Self {
         self.row_ranges = Some(ranges.into());
         self
+    }
+
+    /// Java PrimaryKeySortedIndexResult preserves each non-raw split whole,
+    /// and turns raw splits into single-file merge-reader inputs. Its ranges
+    /// address physical positions, including when the file tracks row IDs.
+    pub(crate) fn for_pk_index_file(&self, file_index: usize) -> Self {
+        let mut split = self.clone();
+        split.data_files = vec![self.data_files[file_index].clone()].into();
+        split.data_deletion_files = self
+            .data_deletion_files
+            .as_ref()
+            .map(|files| vec![files[file_index].clone()].into());
+        split.row_ranges = None;
+        split.raw_convertible = false;
+        split
     }
 
     /// Whether this split can be read raw (no sort-merge needed); see the
@@ -658,8 +685,18 @@ impl DataSplit {
     /// [`DataFileMeta::ROW_COUNT_UNKNOWN`] — no arithmetic over a placeholder
     /// produces a number a caller may trust.
     ///
+    /// Also `None` under a query-auth row filter, which drops rows the count
+    /// includes, as Java `QueryAuthSplit` does.
+    ///
     /// Reference: [DataSplit.mergedRowCount()](https://github.com/apache/paimon/blob/release-1.3/paimon-core/src/main/java/org/apache/paimon/table/source/DataSplit.java#L133)
     pub fn merged_row_count(&self) -> Option<i64> {
+        if self
+            .query_auth_grant
+            .as_ref()
+            .is_some_and(|grant| !grant.rules().filters.is_empty())
+        {
+            return None;
+        }
         if let Some(ranges) = &self.row_ranges {
             return Some(ranges.iter().map(RowRange::count).sum());
         }
@@ -906,7 +943,27 @@ impl DataSplit {
     /// `IndexedSplit` (type 3) wrapping the DataSplit body plus the ranges. Byte-compatible with
     /// `compatibility/split-v1-data` / `split-v1-indexed`.
     pub fn serialize_split_v1(&self) -> crate::Result<Vec<u8>> {
+        self.serialize_split_v1_with_scores(None)
+    }
+
+    /// Serialize aligned vector scores using Java's IndexedSplit wire format.
+    /// Scores belong to the selection, in ascending expanded-range order.
+    pub fn serialize_split_v1_with_scores(&self, scores: Option<&[f32]>) -> crate::Result<Vec<u8>> {
         self.ensure_serializable_without_grant()?;
+        if let Some(scores) = scores {
+            let count = self.row_ranges.as_ref().and_then(|ranges| {
+                ranges.iter().try_fold(0usize, |count, range| {
+                    let len = range.to().checked_sub(range.from())?.checked_add(1)?;
+                    count.checked_add(usize::try_from(len).ok()?)
+                })
+            });
+            if count != Some(scores.len()) || scores.len() > i32::MAX as usize {
+                return Err(crate::Error::DataInvalid {
+                    message: "IndexedSplit scores must align with selected row ranges".to_string(),
+                    source: None,
+                });
+            }
+        }
         let mut out = Vec::new();
         out.extend_from_slice(&SPLIT_SER_MAGIC.to_be_bytes());
         out.extend_from_slice(&SPLIT_SER_VERSION.to_be_bytes());
@@ -926,7 +983,16 @@ impl DataSplit {
                     out.extend_from_slice(&r.from().to_be_bytes());
                     out.extend_from_slice(&r.to().to_be_bytes());
                 }
-                out.push(0); // scores = null (vector scores are not modeled on the Rust split)
+                match scores {
+                    None => out.push(0),
+                    Some(scores) => {
+                        out.push(1);
+                        out.extend_from_slice(&(scores.len() as i32).to_be_bytes());
+                        for score in scores {
+                            out.extend_from_slice(&score.to_be_bytes());
+                        }
+                    }
+                }
             }
         }
         Ok(out)
@@ -1604,6 +1670,27 @@ mod tests {
     fn test_merged_row_count_raw_convertible_sums_physical_rows() {
         let s = split(vec![file("a", 10, None), file("b", 5, None)], true);
         assert_eq!(s.merged_row_count(), Some(15));
+    }
+
+    #[tokio::test]
+    async fn test_merged_row_count_is_unknown_under_a_row_filter() {
+        let table = crate::table::rest_query_auth_table().await;
+        let grant = |filters| {
+            Some(Arc::new(crate::table::query_auth::QueryAuthGrant::new(
+                table.query_auth_session().unwrap(),
+                None,
+                crate::table::query_auth::Rules {
+                    filters,
+                    masks: Vec::new(),
+                },
+            )))
+        };
+        let s = || split(vec![file("a", 10, None)], true);
+        assert_eq!(s().planned(grant(Vec::new())).merged_row_count(), Some(10));
+        let filtered = s().planned(grant(vec![crate::spec::Predicate::AlwaysTrue]));
+        assert_eq!(filtered.merged_row_count(), None);
+        // The physical count stays, as Java's `rowCount` does.
+        assert_eq!(filtered.row_count(), 10);
     }
 
     /// A placeholder row count must surface as "unknown", not as a number.
@@ -2342,6 +2429,34 @@ mod tests {
         assert_eq!(split.row_count(), 7);
         assert_eq!(split.merged_row_count(), Some(7));
         assert_eq!(split.serialize_split_v1().unwrap(), expected);
+    }
+
+    #[test]
+    fn serialize_indexed_scores_match_java_wire_layout() {
+        let split = v1_data_split_builder()
+            .with_row_ranges(vec![RowRange::new(1, 4), RowRange::new(11, 13)])
+            .build()
+            .unwrap();
+        let scores = [1.0f32, 0.75, 0.5, 0.25, 0.0, -0.5, -1.0];
+        let mut expected = split.serialize_split_v1().unwrap();
+        assert_eq!(expected.pop(), Some(0));
+        expected.push(1);
+        expected.extend_from_slice(&7i32.to_be_bytes());
+        for score in scores {
+            expected.extend_from_slice(&score.to_be_bytes());
+        }
+        assert_eq!(
+            split.serialize_split_v1_with_scores(Some(&scores)).unwrap(),
+            expected
+        );
+        assert!(split
+            .serialize_split_v1_with_scores(Some(&scores[..6]))
+            .is_err());
+        assert!(v1_data_split_builder()
+            .build()
+            .unwrap()
+            .serialize_split_v1_with_scores(Some(&scores))
+            .is_err());
     }
 
     // The scores-stripped IndexedSplit frame the Rust serializer emits (see

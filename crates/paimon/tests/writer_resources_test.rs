@@ -17,11 +17,13 @@
 
 mod common;
 
+use arrow_array::{Array, Int8Array, RecordBatch};
 use common::incremental_helpers::{
-    make_batch, make_partitioned_batch, memory_table, partitioned_pk_schema, pk_schema, setup_dirs,
+    make_batch, make_batch_with_kinds, make_partitioned_batch, memory_table, partitioned_pk_schema,
+    pk_schema, setup_dirs,
 };
 use paimon::resource::{MemoryPool, ResourceContext};
-use paimon::spec::{DataType, IntType, Schema, TableSchema};
+use paimon::spec::{DataType, IntType, RowKind, Schema, TableSchema, VALUE_KIND_FIELD_NAME};
 use paimon::Error;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -51,17 +53,34 @@ async fn assert_no_data_files(io: &paimon::io::FileIO, path: &str) {
     );
 }
 
-#[tokio::test]
-async fn key_value_buffer_shares_limit_and_releases_on_failure() {
-    let path = "memory:/writer_resources_pk";
-    let (io, table) = memory_table(path, pk_schema(&[("file.format", "parquet")]));
-    setup_dirs(&io, path).await;
-    let batch = make_batch(vec![1, 2], vec![10, 20]);
-    let bytes: usize = batch
+fn buffered_pk_bytes(batch: &RecordBatch) -> usize {
+    let bytes = batch
         .columns()
         .iter()
         .map(|column| column.get_buffer_memory_size())
-        .sum();
+        .sum::<usize>();
+    // PK input normalization adds INSERT kinds when callers omit the column.
+    if batch.column_by_name(VALUE_KIND_FIELD_NAME).is_none() {
+        bytes
+            + Int8Array::from(vec![RowKind::Insert.to_value(); batch.num_rows()])
+                .get_buffer_memory_size()
+    } else {
+        bytes
+    }
+}
+
+#[tokio::test]
+async fn key_value_buffer_shares_limit_and_releases_on_failure() {
+    assert_key_value_buffer_limit(make_batch(vec![1, 2], vec![10, 20])).await;
+    assert_key_value_buffer_limit(make_batch_with_kinds(vec![1, 2], vec![10, 20], vec![0, 2]))
+        .await;
+}
+
+async fn assert_key_value_buffer_limit(batch: RecordBatch) {
+    let path = "memory:/writer_resources_pk";
+    let (io, table) = memory_table(path, pk_schema(&[("file.format", "parquet")]));
+    setup_dirs(&io, path).await;
+    let bytes = buffered_pk_bytes(&batch);
     let resources = ResourceContext::builder()
         .memory_limit(bytes)
         .build()
@@ -273,11 +292,7 @@ async fn key_value_flush_rejection_prevents_partial_commit() {
     );
     setup_dirs(&io, path).await;
     let batch = make_batch(vec![1, 2], vec![10, 20]);
-    let bytes: usize = batch
-        .columns()
-        .iter()
-        .map(|column| column.get_buffer_memory_size())
-        .sum();
+    let bytes = buffered_pk_bytes(&batch);
     let resources = ResourceContext::builder()
         .memory_limit(bytes)
         .build()
@@ -291,6 +306,8 @@ async fn key_value_flush_rejection_prevents_partial_commit() {
         write.write_arrow_batch(&batch).await,
         Err(Error::ResourceExhausted { .. })
     ));
+    // The batch must be admitted before its triggered flush exhausts the pool.
+    assert_eq!(resources.metrics().peak_reserved_memory_bytes, bytes);
     assert!(write.prepare_commit().await.is_err());
     assert_eq!(resources.metrics().reserved_memory_bytes, 0);
     assert_no_data_files(&io, path).await;
@@ -302,11 +319,7 @@ async fn key_value_prepare_rejection_cleans_uncommitted_file() {
     let (io, table) = memory_table(path, pk_schema(&[("file.format", "parquet")]));
     setup_dirs(&io, path).await;
     let batch = make_batch(vec![1, 2], vec![10, 20]);
-    let bytes: usize = batch
-        .columns()
-        .iter()
-        .map(|column| column.get_buffer_memory_size())
-        .sum();
+    let bytes = buffered_pk_bytes(&batch);
     let resources = ResourceContext::builder()
         .memory_limit(bytes)
         .build()

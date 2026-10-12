@@ -22,7 +22,7 @@
 //! SELECT * FROM hybrid_search(
 //!   'table_name',
 //!   array(named_struct('field', 'embedding', 'query_vector', array(1.0, 0.0))),
-//!   array(named_struct('column', 'content', 'query', 'paimon')),
+//!   array(named_struct('column', 'content', 'query', '{"match":{"query":"paimon"}}')),
 //!   10,
 //!   'rrf')
 //! ```
@@ -53,7 +53,9 @@ use paimon::table::{HybridSearchRanker, HybridSearchRoute, Table};
 use crate::error::to_datafusion_error;
 use crate::physical_plan::{SearchScoreExec, SearchScoreOutputColumn};
 use crate::runtime::{await_with_runtime, block_on_with_runtime};
-use crate::table::{datafusion_read_fields, PaimonScanBuilder, PaimonTableProvider};
+use crate::table::{
+    datafusion_arrow_schema, datafusion_read_fields, PaimonScanBuilder, PaimonTableProvider,
+};
 use crate::table_function_args::{
     extract_int_literal, extract_string_literal, parse_table_identifier,
 };
@@ -248,8 +250,7 @@ impl TableProvider for HybridSearchTableProvider {
         let inner_schema = self.inner.schema();
         let score_index = inner_schema.fields().len();
         let input_read_fields = search_read_fields(table)?;
-        let input_schema = paimon::arrow::build_target_arrow_schema(&input_read_fields)
-            .map_err(to_datafusion_error)?;
+        let input_schema = datafusion_arrow_schema(&input_read_fields, true)?;
         let row_id_table_index = input_read_fields
             .iter()
             .position(|field| field.name() == ROW_ID_FIELD_NAME)

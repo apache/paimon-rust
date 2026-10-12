@@ -160,16 +160,23 @@ mod tests {
             "deletion-vectors.enabled".to_string(),
             "true".to_string(),
         )]));
-        let error = dv_table
+        let mut write = dv_table
             .new_postpone_fixed_bucket_write_builder()
             .unwrap()
             .with_bucket_plan(bucket_plan(&dv_table, 1))
             .new_write()
-            .err()
             .unwrap();
-        assert!(matches!(error, crate::Error::Unsupported { ref message }
-                if message.contains("postpone fixed-bucket writes")
-                    && message.contains("deletion-vectors.enabled=true")));
+        write
+            .write_arrow_batch(&make_batch(vec![5], vec![50]))
+            .await
+            .unwrap();
+        let messages = write.prepare_commit().await.unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].bucket, 0);
+        assert_eq!(messages[0].total_buckets, Some(1));
+        assert_eq!(messages[0].new_files[0].level, 0);
+        assert_eq!(messages[0].new_files[0].row_count, 1);
+        write.close().await;
     }
 
     #[tokio::test]

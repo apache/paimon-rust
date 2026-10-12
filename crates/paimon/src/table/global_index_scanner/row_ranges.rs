@@ -46,7 +46,7 @@ pub(super) fn bitmap_to_ranges(bitmap: &RoaringTreemap) -> Vec<RowRange> {
 }
 
 /// Intersect two sorted range lists using RowRangeIndex for efficient binary search.
-pub(super) fn intersect_sorted_ranges(a: &[RowRange], b: &[RowRange]) -> Vec<RowRange> {
+pub(crate) fn intersect_sorted_ranges(a: &[RowRange], b: &[RowRange]) -> Vec<RowRange> {
     let idx = RowRangeIndex::from_sorted_ranges(a.to_vec());
     let mut result = Vec::new();
     for r in b {

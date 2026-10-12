@@ -21,16 +21,20 @@ use std::sync::{Arc, Mutex};
 use arrow::datatypes::Schema as ArrowSchema;
 use arrow::pyarrow::FromPyArrow;
 use arrow::record_batch::RecordBatch;
-use paimon::spec::{BlobConsumer, BlobDescriptor, CoreOptions, DataType, Datum};
+use paimon::spec::{BlobConsumer, BlobDescriptor, CoreOptions, DataType, Datum, RowType};
 use paimon::table::{
-    CommitMessage, PostponeBucketPlan, PostponeFixedBucketTableWrite, Table, TableCommit,
-    TableUpdate, TableUpdateByRowId, TableWrite, COMMIT_MESSAGE_SERIALIZER_VERSION,
+    CommitCallback, CommitCallbackContext, CommitMessage, PostponeBucketPlan,
+    PostponeFixedBucketTableWrite, Table, TableCommit, TableUpdate, TableUpdateByRowId, TableWrite,
+    COMMIT_MESSAGE_SERIALIZER_VERSION,
 };
 use paimon_datafusion::runtime::runtime;
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyString};
+use pyo3::{PyTraverseError, PyVisit};
 
+use crate::blob_uri_reader::{callback_error, optional_uri_reader_factory, to_callback_error};
+use crate::commit_callback::PyCommitCallbackContext;
 use crate::error::to_py_err;
 use crate::predicate::{dict_to_table_predicate, py_to_datum};
 
@@ -84,7 +88,6 @@ impl WriteContext {
             ))),
             table_location: self.table.location().to_string(),
             commit_user: self.commit_user.clone(),
-            blob_consumer: None,
         })
     }
 }
@@ -315,6 +318,21 @@ enum WriteTarget {
 }
 
 impl WriteTarget {
+    fn with_blob_uri_reader_factory(
+        &mut self,
+        factory: Option<Arc<dyn paimon::io::UriReaderFactory>>,
+    ) -> paimon::Result<()> {
+        match self {
+            Self::Table(writer) => {
+                writer.with_blob_uri_reader_factory(factory)?;
+            }
+            Self::PostponeFixed(writer) => {
+                writer.with_blob_uri_reader_factory(factory)?;
+            }
+        }
+        Ok(())
+    }
+
     fn with_blob_consumer(
         &mut self,
         consumer: Option<Arc<dyn BlobConsumer>>,
@@ -459,7 +477,6 @@ impl PyPostponeFixedBucketWriteBuilder {
                 ))),
                 table_location: context.table.location().to_string(),
                 commit_user: context.commit_user.clone(),
-                blob_consumer: None,
             },
             prepared: false,
         })
@@ -474,14 +491,12 @@ struct WriteState {
     inner: Option<WriteTarget>,
     table_location: String,
     commit_user: String,
-    blob_consumer: Option<Arc<PythonBlobConsumer>>,
 }
 
 /// Descriptor serialization and exception transport only; record boundaries,
 /// callback timing and requested flushes belong to Rust core.
 struct PythonBlobConsumer {
     callback: Py<PyAny>,
-    error: Mutex<Option<PyErr>>,
 }
 
 impl BlobConsumer for PythonBlobConsumer {
@@ -500,17 +515,11 @@ impl BlobConsumer for PythonBlobConsumer {
                     .is_truthy()
             })
         });
-        result.map_err(|error| {
-            *self.error.lock().unwrap() = Some(error);
-            paimon::Error::DataInvalid {
-                message: "BLOB consumer failed".into(),
-                source: None,
-            }
-        })
+        result.map_err(callback_error)
     }
 }
 
-fn wrap_messages(
+pub(crate) fn wrap_messages(
     messages: Vec<CommitMessage>,
     table_location: &str,
     commit_user: &str,
@@ -562,6 +571,16 @@ struct UpdateContext {
 }
 
 impl UpdateContext {
+    fn with_blob_uri_reader_factory(
+        &mut self,
+        factory: Option<Py<PyAny>>,
+        py: Python<'_>,
+    ) -> PyResult<()> {
+        self.inner
+            .with_blob_uri_reader_factory(optional_uri_reader_factory(factory, py)?);
+        Ok(())
+    }
+
     fn new(context: &WriteContext) -> PyResult<Self> {
         Ok(Self {
             inner: context
@@ -575,6 +594,60 @@ impl UpdateContext {
             table_location: context.table.location().to_string(),
             commit_user: context.commit_user.clone(),
         })
+    }
+
+    fn merge_into(
+        &self,
+        py: Python<'_>,
+        source: Option<&Bound<'_, PyAny>>,
+        on: Vec<(String, String)>,
+        when_matched: &Bound<'_, PyAny>,
+        when_not_matched: &Bound<'_, PyAny>,
+    ) -> PyResult<Vec<PyCommitMessage>> {
+        let source = match source {
+            Some(source) => match source.extract::<PyRef<crate::table::PyTable>>() {
+                Ok(table) => paimon::table::MergeSource::Table(table.inner.clone()),
+                Err(_) => paimon::table::MergeSource::Batches(arrow_table_batches(source)?),
+            },
+            None => paimon::table::MergeSource::SelfTable,
+        };
+        let source_schema = match &source {
+            paimon::table::MergeSource::Batches(batches) => batches[0].schema(),
+            paimon::table::MergeSource::Table(table) => {
+                paimon::arrow::build_target_arrow_schema(table.schema().fields())
+                    .map_err(to_py_err)?
+            }
+            paimon::table::MergeSource::SelfTable => {
+                let schema = paimon::arrow::build_target_arrow_schema(self.table.schema().fields())
+                    .map_err(to_py_err)?;
+                let mut fields = schema.fields().to_vec();
+                fields.push(Arc::new(arrow::datatypes::Field::new(
+                    "_ROW_ID",
+                    arrow::datatypes::DataType::Int64,
+                    false,
+                )));
+                Arc::new(ArrowSchema::new(fields))
+            }
+        };
+        let errors = Arc::new(Mutex::new(None));
+        let (matched, not_matched) = crate::merge_into::from_python(
+            py,
+            &self.table,
+            source_schema,
+            when_matched,
+            when_not_matched,
+            errors.clone(),
+        )?;
+        let result = py
+            .detach(|| runtime().block_on(self.inner.merge_into(source, on, matched, not_matched)));
+        if let Some(error) = errors.lock().unwrap().take() {
+            return Err(error);
+        }
+        Ok(wrap_messages(
+            result.map_err(to_callback_error)?,
+            &self.table_location,
+            &self.commit_user,
+        ))
     }
 
     fn update_by_predicate(
@@ -605,7 +678,7 @@ impl UpdateContext {
             return Err(error);
         }
         Ok(wrap_messages(
-            result.map_err(to_py_err)?,
+            result.map_err(to_callback_error)?,
             &self.table_location,
             &self.commit_user,
         ))
@@ -619,7 +692,7 @@ impl UpdateContext {
         let batches = arrow_table_batches(table)?;
         let messages = py
             .detach(|| runtime().block_on(self.inner.update_by_arrow_with_row_id(batches)))
-            .map_err(to_py_err)?;
+            .map_err(to_callback_error)?;
         Ok(wrap_messages(
             messages,
             &self.table_location,
@@ -660,9 +733,33 @@ impl UpdateContext {
             return Err(error);
         }
         Ok(wrap_messages(
-            result.map_err(to_py_err)?,
+            result.map_err(to_callback_error)?,
             &self.table_location,
             &self.commit_user,
+        ))
+    }
+
+    fn new_shard_updator(
+        &self,
+        py: Python<'_>,
+        shard: usize,
+        count: usize,
+        read_type: Option<&str>,
+    ) -> PyResult<crate::shard_update::PyShardTableUpdator> {
+        let read_type = read_type
+            .map(|json| {
+                serde_json::from_str::<RowType>(json)
+                    .map(|row| row.fields().to_vec())
+                    .map_err(|e| PyValueError::new_err(format!("invalid Paimon read type: {e}")))
+            })
+            .transpose()?;
+        let inner = py
+            .detach(|| runtime().block_on(self.inner.new_shard_updater(shard, count, read_type)))
+            .map_err(to_py_err)?;
+        Ok(crate::shard_update::PyShardTableUpdator::new(
+            inner,
+            self.table_location.clone(),
+            self.commit_user.clone(),
         ))
     }
 
@@ -686,6 +783,24 @@ impl UpdateContext {
         let batches = arrow_upsert_batches(input)?;
         let messages = py
             .detach(|| runtime().block_on(self.inner.upsert_by_arrow_with_key(batches, keys)))
+            .map_err(to_callback_error)?;
+        Ok(wrap_messages(
+            messages,
+            &self.table_location,
+            &self.commit_user,
+        ))
+    }
+
+    fn delete_by_predicate(
+        &self,
+        py: Python<'_>,
+        predicate: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<Vec<PyCommitMessage>> {
+        let predicate = predicate
+            .map(|predicate| dict_to_table_predicate(predicate, self.table.schema(), true))
+            .transpose()?;
+        let messages = py
+            .detach(|| runtime().block_on(self.inner.delete_by_predicate(predicate)))
             .map_err(to_py_err)?;
         Ok(wrap_messages(
             messages,
@@ -711,16 +826,26 @@ impl UpdateContext {
 }
 
 impl WriteState {
+    fn with_blob_uri_reader_factory(
+        &mut self,
+        factory: Option<Py<PyAny>>,
+        py: Python<'_>,
+    ) -> PyResult<()> {
+        let factory = optional_uri_reader_factory(factory, py)?;
+        self.inner
+            .as_mut()
+            .ok_or_else(|| PyRuntimeError::new_err("TableWrite is closed"))?
+            .with_blob_uri_reader_factory(factory)
+            .map_err(to_py_err)
+    }
+
     fn with_blob_consumer(&mut self, callback: Option<Py<PyAny>>, py: Python<'_>) -> PyResult<()> {
         let consumer = callback
             .map(|callback| {
                 if !callback.bind(py).is_callable() {
                     return Err(PyTypeError::new_err("blob_consumer must be callable"));
                 }
-                Ok(Arc::new(PythonBlobConsumer {
-                    callback,
-                    error: Mutex::new(None),
-                }))
+                Ok(Arc::new(PythonBlobConsumer { callback }))
             })
             .transpose()?;
         self.inner
@@ -732,17 +857,11 @@ impl WriteState {
                     .map(|consumer| consumer as Arc<dyn BlobConsumer>),
             )
             .map_err(to_py_err)?;
-        self.blob_consumer = consumer;
         Ok(())
     }
 
     fn write_result(&self, result: paimon::Result<()>) -> PyResult<()> {
-        if let Some(consumer) = &self.blob_consumer {
-            if let Some(error) = consumer.error.lock().unwrap().take() {
-                return Err(error);
-            }
-        }
-        result.map_err(to_py_err)
+        result.map_err(to_callback_error)
     }
 
     fn with_write_type(&mut self, columns: Vec<String>) -> PyResult<()> {
@@ -775,7 +894,7 @@ impl WriteState {
             .ok_or_else(|| PyRuntimeError::new_err("TableWrite is closed"))?;
         let messages = py
             .detach(|| runtime().block_on(inner.prepare_commit()))
-            .map_err(to_py_err)?;
+            .map_err(to_callback_error)?;
         Ok(wrap_messages(
             messages,
             &self.table_location,
@@ -808,6 +927,16 @@ pub struct PyTableUpdateByRowId {
 
 #[pymethods]
 impl PyTableUpdateByRowId {
+    fn _with_blob_uri_reader_factory(
+        &mut self,
+        py: Python<'_>,
+        factory: Option<Py<PyAny>>,
+    ) -> PyResult<()> {
+        let factory = optional_uri_reader_factory(factory, py)?;
+        self.inner.with_blob_uri_reader_factory(factory);
+        Ok(())
+    }
+
     fn update_columns(
         &mut self,
         py: Python<'_>,
@@ -817,7 +946,7 @@ impl PyTableUpdateByRowId {
         let batches = arrow_table_batches(data)?;
         let messages = py
             .detach(|| runtime().block_on(self.inner.update_columns(batches, column_names)))
-            .map_err(to_py_err)?;
+            .map_err(to_callback_error)?;
         Ok(wrap_messages(
             messages,
             &self.table_location,
@@ -847,6 +976,30 @@ pub struct PyStreamTableUpdate {
 
 #[pymethods]
 impl PyStreamTableUpdate {
+    fn _with_blob_uri_reader_factory(
+        &mut self,
+        py: Python<'_>,
+        factory: Option<Py<PyAny>>,
+    ) -> PyResult<()> {
+        self.context.with_blob_uri_reader_factory(factory, py)
+    }
+
+    #[pyo3(signature = (source, *, on, when_matched, when_not_matched, commit_identifier))]
+    fn merge_into(
+        &self,
+        py: Python<'_>,
+        source: Option<&Bound<'_, PyAny>>,
+        on: Vec<(String, String)>,
+        when_matched: &Bound<'_, PyAny>,
+        when_not_matched: &Bound<'_, PyAny>,
+        commit_identifier: i64,
+    ) -> PyResult<Vec<PyCommitMessage>> {
+        // The stream committer applies the identifier to the returned messages.
+        let _ = commit_identifier;
+        self.context
+            .merge_into(py, source, on, when_matched, when_not_matched)
+    }
+
     #[pyo3(signature = (predicate, assignments, commit_identifier, read_columns=None))]
     fn update_by_predicate(
         &self,
@@ -878,6 +1031,18 @@ impl PyStreamTableUpdate {
     ) -> PyResult<PyTableUpdateByRowId> {
         let _ = commit_identifier;
         self.context.new_update_by_row_id(py)
+    }
+
+    #[pyo3(signature = (shard_num, total_shard_count, *, read_type=None))]
+    fn new_shard_updator(
+        &self,
+        py: Python<'_>,
+        shard_num: usize,
+        total_shard_count: usize,
+        read_type: Option<&str>,
+    ) -> PyResult<crate::shard_update::PyShardTableUpdator> {
+        self.context
+            .new_shard_updator(py, shard_num, total_shard_count, read_type)
     }
 
     fn with_update_type<'py>(
@@ -914,10 +1079,51 @@ impl PyStreamTableUpdate {
         let _ = commit_identifier;
         self.context.delete_by_row_id(py, row_ids)
     }
+
+    #[pyo3(signature = (predicate, commit_identifier))]
+    fn delete_by_predicate(
+        &self,
+        py: Python<'_>,
+        predicate: Option<&Bound<'_, PyDict>>,
+        commit_identifier: i64,
+    ) -> PyResult<Vec<PyCommitMessage>> {
+        let _ = commit_identifier;
+        self.context.delete_by_predicate(py, predicate)
+    }
 }
 
 #[pymethods]
 impl PyBatchTableUpdate {
+    #[pyo3(signature = (predicate))]
+    fn delete_by_predicate(
+        &self,
+        py: Python<'_>,
+        predicate: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<Vec<PyCommitMessage>> {
+        self.context.delete_by_predicate(py, predicate)
+    }
+
+    fn _with_blob_uri_reader_factory(
+        &mut self,
+        py: Python<'_>,
+        factory: Option<Py<PyAny>>,
+    ) -> PyResult<()> {
+        self.context.with_blob_uri_reader_factory(factory, py)
+    }
+
+    #[pyo3(signature = (source, *, on, when_matched, when_not_matched))]
+    fn merge_into(
+        &self,
+        py: Python<'_>,
+        source: Option<&Bound<'_, PyAny>>,
+        on: Vec<(String, String)>,
+        when_matched: &Bound<'_, PyAny>,
+        when_not_matched: &Bound<'_, PyAny>,
+    ) -> PyResult<Vec<PyCommitMessage>> {
+        self.context
+            .merge_into(py, source, on, when_matched, when_not_matched)
+    }
+
     #[pyo3(signature = (predicate, assignments, read_columns=None))]
     fn update_by_predicate(
         &self,
@@ -948,6 +1154,18 @@ impl PyBatchTableUpdate {
 
     fn new_update_by_row_id(&self, py: Python<'_>) -> PyResult<PyTableUpdateByRowId> {
         self.context.new_update_by_row_id(py)
+    }
+
+    #[pyo3(signature = (shard_num, total_shard_count, *, read_type=None))]
+    fn new_shard_updator(
+        &self,
+        py: Python<'_>,
+        shard_num: usize,
+        total_shard_count: usize,
+        read_type: Option<&str>,
+    ) -> PyResult<crate::shard_update::PyShardTableUpdator> {
+        self.context
+            .new_shard_updator(py, shard_num, total_shard_count, read_type)
     }
 
     fn with_update_type<'py>(
@@ -982,6 +1200,16 @@ impl PyBatchTableUpdate {
 
 #[pymethods]
 impl PyBatchTableWrite {
+    #[pyo3(signature = (factory))]
+    fn with_blob_uri_reader_factory(
+        mut slf: PyRefMut<'_, Self>,
+        factory: Option<Py<PyAny>>,
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        let py = slf.py();
+        slf.state.with_blob_uri_reader_factory(factory, py)?;
+        Ok(slf)
+    }
+
     #[pyo3(signature = (callback))]
     fn with_blob_consumer(
         mut slf: PyRefMut<'_, Self>,
@@ -1038,6 +1266,16 @@ pub struct PyStreamTableWrite {
 
 #[pymethods]
 impl PyStreamTableWrite {
+    #[pyo3(signature = (factory))]
+    fn with_blob_uri_reader_factory(
+        mut slf: PyRefMut<'_, Self>,
+        factory: Option<Py<PyAny>>,
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        let py = slf.py();
+        slf.state.with_blob_uri_reader_factory(factory, py)?;
+        Ok(slf)
+    }
+
     #[pyo3(signature = (callback))]
     fn with_blob_consumer(
         mut slf: PyRefMut<'_, Self>,
@@ -1085,8 +1323,41 @@ impl PyStreamTableWrite {
     }
 }
 
+/// Transport only: publication and retry notification belong to Rust core.
+struct PythonCommitCallback {
+    // One Python reference shared by the core hook and the GC-visible wrapper.
+    callback: Mutex<Option<Py<PyAny>>>,
+}
+
+#[async_trait::async_trait]
+impl CommitCallback for PythonCommitCallback {
+    async fn call(&self, context: &CommitCallbackContext) -> paimon::Result<()> {
+        // Suspend the runtime context so Python can call Native again, for
+        // example to read the snapshot which triggered this callback.
+        tokio::task::block_in_place(|| {
+            Python::attach(|py| {
+                let callback = self
+                    .callback
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|callback| callback.clone_ref(py));
+                let Some(callback) = callback else {
+                    return Ok(());
+                };
+                callback
+                    .bind(py)
+                    .call1((PyCommitCallbackContext::new(context.clone()),))?;
+                Ok(())
+            })
+        })
+        .map_err(callback_error)
+    }
+}
+
 struct CommitContext {
     inner: TableCommit,
+    callbacks: Vec<Arc<PythonCommitCallback>>,
     table: Arc<Table>,
     commit_user: String,
 }
@@ -1102,6 +1373,7 @@ impl CommitContext {
             .with_ignore_empty_commit(ignore_empty);
         Ok(Self {
             inner,
+            callbacks: Vec::new(),
             table: Arc::clone(table),
             commit_user: commit_user.to_string(),
         })
@@ -1127,6 +1399,46 @@ impl CommitContext {
         py.detach(|| runtime().block_on(self.inner.abort(&messages)))
             .map_err(to_py_err)
     }
+
+    fn add_commit_callback(&mut self, py: Python<'_>, callback: Py<PyAny>) -> PyResult<()> {
+        if !callback.bind(py).is_callable() {
+            return Err(PyTypeError::new_err("Commit callback must be callable"));
+        }
+        let callback = Arc::new(PythonCommitCallback {
+            callback: Mutex::new(Some(callback)),
+        });
+        self.inner
+            .add_commit_callback(callback.clone())
+            .map_err(to_py_err)?;
+        self.callbacks.push(callback);
+        Ok(())
+    }
+
+    fn traverse_callbacks(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
+        for callback in &self.callbacks {
+            visit.call(&*callback.callback.lock().unwrap())?;
+        }
+        Ok(())
+    }
+
+    fn clear_callbacks(&self) {
+        let references = self
+            .callbacks
+            .iter()
+            .map(|callback| callback.callback.lock().unwrap().take())
+            .collect::<Vec<_>>();
+        // Destructors can re-enter Native. Release every lock before dropping
+        // references. PyPaimon owns close() on the original callback objects.
+        drop(references);
+    }
+
+    fn committer(&self, properties: Option<HashMap<String, String>>) -> TableCommit {
+        // Properties belong to this call, including retries. The reusable
+        // stream context must not carry them into a later checkpoint.
+        self.inner
+            .clone()
+            .with_snapshot_properties(properties.unwrap_or_default())
+    }
 }
 
 #[pyclass(name = "BatchTableCommit", module = "pypaimon_rust.datafusion")]
@@ -1151,31 +1463,52 @@ impl PyBatchTableCommit {
 
 #[pymethods]
 impl PyBatchTableCommit {
-    /// Rust committers have no background resources to shut down.
-    fn close(&self) {}
+    fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
+        self.context.traverse_callbacks(visit)
+    }
 
-    fn commit(&mut self, py: Python<'_>, messages: &Bound<'_, PyAny>) -> PyResult<()> {
+    fn __clear__(&mut self) {
+        self.context.clear_callbacks();
+    }
+
+    /// Register an idempotent callback receiving the committed core context.
+    fn add_commit_callback(&mut self, py: Python<'_>, callback: Py<PyAny>) -> PyResult<()> {
+        self.context.add_commit_callback(py, callback)
+    }
+
+    /// Release callback references; callback resources belong to the caller.
+    fn close(&self) {
+        self.context.clear_callbacks();
+    }
+
+    #[pyo3(signature = (messages, snapshot_properties=None))]
+    fn commit(
+        &mut self,
+        py: Python<'_>,
+        messages: &Bound<'_, PyAny>,
+        snapshot_properties: Option<HashMap<String, String>>,
+    ) -> PyResult<()> {
         let messages = self.context.messages(messages, "commit", self.overwrite)?;
         self.check_committed()?;
+        let committer = self.context.committer(snapshot_properties);
         py.detach(|| {
             runtime().block_on(async {
                 if self.overwrite {
-                    self.context
-                        .inner
+                    committer
                         .overwrite(messages, self.static_partition.clone())
                         .await
                 } else {
-                    self.context.inner.commit(messages).await
+                    committer.commit(messages).await
                 }
             })
         })
-        .map_err(to_py_err)
+        .map_err(to_callback_error)
     }
 
     fn truncate_table(&mut self, py: Python<'_>) -> PyResult<()> {
         self.check_committed()?;
         py.detach(|| runtime().block_on(self.context.inner.truncate_table()))
-            .map_err(to_py_err)
+            .map_err(to_callback_error)
     }
 
     fn truncate_partitions(
@@ -1188,7 +1521,7 @@ impl PyBatchTableCommit {
             .map(|spec| partition_spec(py, &self.context.table, spec))
             .collect::<PyResult<Vec<_>>>()?;
         py.detach(|| runtime().block_on(self.context.inner.drop_partitions(partitions)))
-            .map_err(to_py_err)
+            .map_err(to_callback_error)
     }
 
     fn abort(&self, py: Python<'_>, messages: &Bound<'_, PyAny>) -> PyResult<()> {
@@ -1203,24 +1536,38 @@ pub struct PyStreamTableCommit {
 
 #[pymethods]
 impl PyStreamTableCommit {
-    /// Rust committers have no background resources to shut down.
-    fn close(&self) {}
+    fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
+        self.context.traverse_callbacks(visit)
+    }
 
+    fn __clear__(&mut self) {
+        self.context.clear_callbacks();
+    }
+
+    /// Register an idempotent callback receiving the committed core context.
+    fn add_commit_callback(&mut self, py: Python<'_>, callback: Py<PyAny>) -> PyResult<()> {
+        self.context.add_commit_callback(py, callback)
+    }
+
+    /// Release callback references; callback resources belong to the caller.
+    fn close(&self) {
+        self.context.clear_callbacks();
+    }
+
+    #[pyo3(signature = (commit_identifier, messages, snapshot_properties=None))]
     fn commit(
         &self,
         py: Python<'_>,
         commit_identifier: i64,
         messages: &Bound<'_, PyAny>,
+        snapshot_properties: Option<HashMap<String, String>>,
     ) -> PyResult<()> {
         let messages = self.context.messages(messages, "commit", false)?;
+        let committer = self.context.committer(snapshot_properties);
         py.detach(|| {
-            runtime().block_on(
-                self.context
-                    .inner
-                    .commit_with_identifier(messages, commit_identifier),
-            )
+            runtime().block_on(committer.commit_with_identifier(messages, commit_identifier))
         })
-        .map_err(to_py_err)
+        .map_err(to_callback_error)
     }
 
     /// Sort identifiers, filter already committed groups, and return the number committed.
@@ -1240,7 +1587,7 @@ impl PyStreamTableCommit {
             })
             .collect::<PyResult<Vec<_>>>()?;
         py.detach(|| runtime().block_on(self.context.inner.filter_and_commit(commits)))
-            .map_err(to_py_err)
+            .map_err(to_callback_error)
     }
 
     fn abort(&self, py: Python<'_>, messages: &Bound<'_, PyAny>) -> PyResult<()> {
@@ -1308,6 +1655,15 @@ struct MessageOrigin {
 pub struct PyCommitMessage {
     inner: CommitMessage,
     origin: Option<MessageOrigin>,
+}
+
+impl PyCommitMessage {
+    pub(crate) fn new(inner: CommitMessage) -> Self {
+        Self {
+            inner,
+            origin: None,
+        }
+    }
 }
 
 #[pymethods]

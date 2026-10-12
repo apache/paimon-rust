@@ -40,8 +40,8 @@ use datafusion::optimizer::{ApplyOrder, OptimizerConfig, OptimizerRule};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
 use paimon::spec::{
-    variant_extraction_row, BigIntType, BooleanType, DataField, DataType, DecimalType, DoubleType,
-    FloatType, IntType, SmallIntType, TinyIntType, VarCharType,
+    variant_extraction_row, BigIntType, BooleanType, CoreOptions, DataField, DataType, DecimalType,
+    DoubleType, FloatType, IntType, SmallIntType, TinyIntType, VarCharType,
 };
 use paimon::table::Table;
 
@@ -287,6 +287,10 @@ fn build_projection_rewrite(
     let Some(provider) = provider.downcast_ref::<PaimonTableProvider>() else {
         return Ok(None);
     };
+    // Rules run after decoding; above the scan, an extraction sees only the rows they admit.
+    if CoreOptions::new(provider.table().schema().options()).query_auth_enabled() {
+        return Ok(None);
+    }
 
     let mut calls = Vec::new();
     let mut full_columns = HashSet::new();

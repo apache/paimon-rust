@@ -52,6 +52,7 @@ mod full_text_search;
 mod hybrid_search;
 mod lateral_vector_search;
 mod memory;
+mod merge_condition;
 mod merge_into;
 mod partition_count_pushdown;
 mod physical_plan;
@@ -88,6 +89,7 @@ pub use error::to_datafusion_error;
 #[cfg(feature = "fulltext")]
 pub use full_text_search::{register_full_text_search, FullTextSearchFunction};
 pub use hybrid_search::{register_hybrid_search, HybridSearchFunction};
+pub use merge_condition::compile_merge_condition;
 pub use physical_plan::PaimonTableScan;
 pub use relation_planner::PaimonRelationPlanner;
 pub use sql_context::{SQLContext, SQLContextBuilder};

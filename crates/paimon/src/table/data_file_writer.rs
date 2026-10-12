@@ -163,23 +163,46 @@ impl DataFileWriter {
     }
 
     /// Configure only the dedicated BLOB factory; ordinary format factories
-    /// and their write paths do not carry callback state.
-    pub(super) fn set_blob_consumer(
+    /// and their write paths do not carry Blob-specific state.
+    pub(super) fn set_blob_writer_options(
         &mut self,
-        consumer: Arc<dyn crate::spec::BlobConsumer>,
+        consumer: Option<Arc<dyn crate::spec::BlobConsumer>>,
+        uri_reader_factory: Option<Arc<dyn crate::io::UriReaderFactory>>,
     ) -> Result<()> {
         debug_assert!(self.current_writer.is_none());
-        self.format_writer_factory = Some(Arc::new(
-            crate::arrow::format::blob::BlobWriterFactory::new(
-                Some(self.file_io.clone()),
-                self.write_fields.first(),
-                Some(&self.format_options),
-            )?
-            .with_consumer(consumer),
-        ));
+        let mut factory = self.blob_writer_factory()?;
         // Java BlobFormatWriter relinquishes deletion rights whenever a
         // consumer can expose a descriptor, even if a later callback fails.
-        self.delete_file_upon_abort = false;
+        self.delete_file_upon_abort = consumer.is_none();
+        if let Some(consumer) = consumer {
+            factory = factory.with_consumer(consumer);
+        }
+        if let Some(reader) = uri_reader_factory {
+            factory = factory.with_uri_reader_factory(reader);
+        }
+        self.format_writer_factory = Some(Arc::new(factory));
+        Ok(())
+    }
+
+    fn blob_writer_factory(&self) -> Result<crate::arrow::format::blob::BlobWriterFactory> {
+        crate::arrow::format::blob::BlobWriterFactory::new(
+            Some(self.file_io.clone()),
+            self.write_fields.first(),
+            Some(&self.format_options),
+        )
+    }
+
+    pub(super) fn set_blob_update_rows(
+        &mut self,
+        updated: Vec<usize>,
+        reader_factory: Option<Arc<dyn crate::io::UriReaderFactory>>,
+    ) -> Result<()> {
+        debug_assert!(self.current_writer.is_none());
+        let mut factory = self.blob_writer_factory()?.with_update_rows(updated);
+        if let Some(reader_factory) = reader_factory {
+            factory = factory.with_uri_reader_factory(reader_factory);
+        }
+        self.format_writer_factory = Some(Arc::new(factory));
         Ok(())
     }
 

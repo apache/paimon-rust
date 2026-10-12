@@ -73,7 +73,7 @@ impl SearchResult {
         vector_column: String,
         hits: ScoredRowIds,
     ) -> Self {
-        let snapshot_id = table.travel_snapshot.as_ref().map(|snapshot| snapshot.id());
+        let snapshot_id = table.travel_snapshot().map(|snapshot| snapshot.id());
         Self {
             table,
             snapshot_id,
@@ -154,6 +154,21 @@ impl SearchResult {
                 message: "data-evolution search results use global row IDs, not primary-key file positions".to_string(),
             }),
         }
+    }
+
+    /// Snapshot-scoped PK selections in Java SplitSerializer v1 format.
+    /// The ranges are physical file positions and scores are aligned to them.
+    pub fn serialize_primary_key_splits(&self) -> crate::Result<Vec<Vec<u8>>> {
+        self.indexed_splits()?
+            .iter()
+            .map(|selected| {
+                selected
+                    .split
+                    .clone()
+                    .with_selected_row_ranges(selected.row_ranges.clone())
+                    .serialize_split_v1_with_scores(selected.scores.as_deref())
+            })
+            .collect()
     }
 
     /// Snapshot-scoped file metadata and selections, reused when hybrid fusion

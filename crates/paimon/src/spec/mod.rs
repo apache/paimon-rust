@@ -83,6 +83,8 @@ pub use index_file_meta::*;
 
 mod pk_index_source;
 pub use pk_index_source::*;
+mod data_evolution_index_source;
+pub use data_evolution_index_source::*;
 
 mod index_manifest;
 pub use index_manifest::{IndexManifest, IndexManifestEntry};
@@ -111,6 +113,7 @@ pub(crate) use objects_file::{
 };
 pub(crate) mod avro;
 pub(crate) mod stats;
+pub use stats::BinaryTableStats;
 mod types;
 pub use types::*;
 mod partition;

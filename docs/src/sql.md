@@ -1060,6 +1060,24 @@ Create a named tag from a snapshot:
 CALL sys.create_tag(table => 'paimon.my_db.my_table', tag => 'my_tag', snapshot_id => 1);
 ```
 
+`snapshot_id` is optional; omitting it uses the latest snapshot. The optional
+`time_retained` parameter accepts duration strings such as `'1d'`, `'12h'`, `'30min'`,
+or `'500ms'`. A duration string without a unit denotes milliseconds.
+
+```sql
+CALL sys.create_tag(
+    table => 'paimon.my_db.my_table',
+    tag => 'daily_backup',
+    snapshot_id => 1,
+    time_retained => '1d'
+);
+```
+
+When `time_retained` is specified, retention and tag creation time are persisted in
+the tag file. For example, `'1d'` appears as `PT24H` in the `time_retained` column
+of `$tags`. Omitting `time_retained` creates a tag without these metadata fields.
+This procedure does not automatically delete expired tags.
+
 ### create_tag_from_timestamp
 
 Create a named tag from a timestamp (finds the latest snapshot at or before the given time):
@@ -1238,6 +1256,13 @@ Invalid options are rejected before any data is read. NULL values are counted
 in a shard's row count but are not indexed. A later call indexes only rows
 that no `full-text` index on the column covers yet.
 
+Full-text and vindex builds honor `global-index.build.parallelism` from table
+or build options. The default is `1`; higher values bound the number of shards
+built concurrently. Each shard owns its writer and may also use native worker
+threads. Prepared commit messages retain shard plan order. On a build failure,
+all started shards finish before private outputs are cleaned. Files in messages
+already returned to a caller are retained, including after a failed commit.
+
 The current global-index builders require a row-tracking data-evolution table
 with global indexes enabled. They do not support primary-key tables or tables
 with deletion vectors enabled:
@@ -1324,13 +1349,17 @@ Supported vindex options:
 |---|---:|---|---|
 | `<index-type>.dimension` | `128` | all vindex types | Vector dimension for `ARRAY<FLOAT>` columns. Existing `VECTOR<FLOAT,N>` columns use `N` from the type. |
 | `<index-type>.distance.metric` | `inner_product` | all vindex types | Distance metric: `inner_product`, `cosine`, or `l2`. |
-| `<index-type>.nlist` | `256` | all IVF types | Number of IVF lists. DiskANN rejects this option. |
+| `<index-type>.nlist` | automatic | all IVF types | Number of IVF lists. When omitted or `auto`, infer it from `expected-vector-count`. DiskANN rejects this option. |
+| `<index-type>.expected-vector-count` | unset, or inferred | all vindex types | Expected number of vectors used for automatic sizing. When omitted, an automatic IVF build counts the shard's non-NULL vectors before training. |
+| `<index-type>.target-recall` | unset | all vindex types | Optional tuning objective in `[0, 1]`; IVF-PQ enables automatic OPQ at values of at least `0.9`. |
+| `<index-type>.max-bytes-per-vector` | unset | all vindex types | Optional persisted-size tuning objective; PQ and RQ can use it to infer encoding width. |
 | `<index-type>.ivf.coarse-assignment` | `auto` | all IVF types | Build-time list assignment mode: `auto` uses Vamana for large centroid matrices; `exact` always uses exact assignment. |
 | `<index-type>.ivf.train.max-points-per-centroid` | `256` | all IVF types | Positive limit on coarse K-means training data: at most `nlist × value` vectors. |
-| `<index-type>.train.sample-ratio` or `fields.<field>.train.sample-ratio` | `1.0` | all vindex types | Fraction of shard rows selected evenly for training. Must be in `(0, 1]`; all rows are still added to the index. The field-specific option takes precedence. |
-| `vindex.build.granule.enabled` | `true` | all IVF types | Use the granule build pipeline. Set to `false` to use the full-spill build path for future index builds. |
-| `<index-type>.pq.m` | `16` | `ivf-pq` | Number of product-quantization sub-vectors. The dimension must be divisible by this value. |
-| `<index-type>.pq.use-opq` | `false` | `ivf-pq` | Whether to enable OPQ before PQ encoding. |
+| `<index-type>.train.sample-ratio` or `fields.<field>.train.sample-ratio` | `1.0` | all vindex types | Fraction of non-NULL vectors selected for training. Must be in `(0, 1]`; all non-NULL vectors are still added to the index. The field-specific option takes precedence. |
+| `vindex.build.granule.enabled` | `true` | all IVF types | Use the granule build pipeline when `nlist` or `expected-vector-count` is explicit. NULL vectors switch to full spill. Set to `false` to always use full spill. |
+| `<index-type>.pq.m` | automatic | `ivf-pq` | Number of product-quantization sub-vectors, inferred from dimension and the code budget when omitted. The dimension must be divisible by an explicit value. |
+| `<index-type>.pq.code-ratio` | `0.0625` | `ivf-pq` | Ratio of PQ-code bytes to raw `f32` vector bytes, in `(0, 0.25]`. An explicit `pq.m` overrides it. |
+| `<index-type>.pq.use-opq` | inferred | `ivf-pq` | Whether to enable OPQ before PQ encoding. When omitted or `auto`, enable it if `target-recall` is at least `0.9`; otherwise disable it. |
 | `ivf-pq.ivf.pq-encoding` | `auto` | `ivf-pq` | Build-time PQ encoding mode: `auto` selects an accelerated backend when supported; `canonical` uses the canonical encoder. |
 | `<index-type>.pq.train.max-points-per-centroid` | `256` | `ivf-pq`, `diskann` | Positive limit on PQ training data: at most `2^pq.bits × value` vectors per subquantizer. |
 | `ivf-rq.rq.bits` | `4`, or inferred | `ivf-rq` | Residual-quantization width in the range `1` to `8`. When omitted, `ivf-rq.max-bytes-per-vector` can select it. |
@@ -1366,6 +1395,11 @@ vindex aliases are also accepted in the `options` string: `dimension`, `metric`,
 `diskann.*` build keys listed in the table. Build options for another index
 family are rejected rather than ignored.
 
+NULL vector rows are skipped, while index manifest `row_count` and the global
+row range still include them. Non-NULL vectors retain their original relative
+row IDs. An all-NULL shard produces no index file. Full-spill training samples
+the compacted non-NULL vector stream at evenly spaced positions, matching Java.
+
 Inspect committed index files with the `$table_indexes` system table:
 
 ```sql
@@ -1393,6 +1427,25 @@ case-insensitive and surrounding whitespace is ignored.
 To drop a composite BTree definition, pass the same ordered `index_column`
 list used to build it, such as `'category,item_number'`. Scalar indexes and
 definitions with a different column order remain available.
+
+Set `dry_run => true` to return the number of matching index files without
+committing changes to the table:
+
+```sql
+CALL sys.drop_global_index(
+  table => 'paimon.my_db.my_table',
+  index_column => 'id',
+  index_type => 'btree',
+  dry_run => true
+);
+```
+
+The `result` column contains `Would drop N global index file(s)`, including
+when `N` is zero. `dry_run` defaults to `false`; an explicit `false` or an
+omitted argument performs the drop and returns `OK`. Other values are rejected.
+The preview uses the latest snapshot at the time of the call; concurrent changes
+can affect the number of files matched by a later drop. Reads retain the usual
+local-cache behavior. Partition filtering is not supported by this procedure.
 
 ### create_lumina_index
 
@@ -1601,6 +1654,25 @@ When the following conditions are met, `COUNT(*)` retrieves exact row counts dir
 - All splits have a known `merged_row_count`
 - No LIMIT clause
 - Filter predicates only involve partition columns (Exact level)
+
+### Query Authorization
+
+Row filters cannot reference a resolving BLOB view: the stored reference's
+nullness can differ from its upstream value. Other BLOB payloads and output-only
+BLOB views are resolved after row authorization.
+
+When a table in a REST catalog has `'query-auth.enabled' = 'true'`, planning a
+query asks the catalog what the current user may read, and the row filters and
+column masks it returns (see `create_policy`) are applied to the result:
+
+- Rows are filtered on their stored values; masked columns return masked values.
+- BLOB masks keep payload reads lazy. A NULL mask does not read the original
+  BLOB payload.
+- Query filters on masked columns, including partition keys, match masked values.
+- Statistics are not used under a row filter or a mask, and a row filter turns
+  off `LIMIT` pushdown, so such queries read the data.
+- Time travel, branches, system tables, incremental and audit-log reads, and
+  search are refused on such tables.
 
 ## Python Multimodal Helper Functions
 
@@ -2056,6 +2128,40 @@ SELECT * FROM full_text_search('paimon.my_db.docs', 'content', 'paimon search', 
 The function searches across all Tantivy full-text index files for the target column, merges results by relevance score, and returns the top-k matching rows. If no matching index is found, an empty result is returned.
 
 Build the index files with `CALL sys.create_global_index(..., index_type => 'full-text')` (see [create_global_index](#create_global_index)), or with Java Paimon; both write the same format.
+
+### Rust full-text builder
+
+The core builder accepts the structured full-text query DSL used by Java and
+PyPaimon. Scalar and partition predicates are applied before the final Top-K.
+
+```rust,ignore
+let predicate = PredicateBuilder::new(table.schema().fields())
+    .equal("category", Datum::String("news".into()))?;
+let mut builder = table.new_full_text_search_builder();
+builder
+    .with_query("content", r#"{"match":{"query":"paimon"}}"#)
+    .with_filter(predicate)
+    .with_limit(10);
+let plan = builder.new_scan()?.scan().await?;
+let result = builder.new_read()?.read(plan).await?;
+```
+
+`FullTextScanPlan` owns a pinned snapshot and can outlive its scan. Readers
+for the same table, branch, column and filter can reuse the plan with different
+queries or limits. Pinning preserves the query's bound schema, including
+schema-only column renames. `execute_scored()` performs both stages directly.
+
+For Data Evolution, full-text and scalar `fast`, `full`, and `detail` modes
+follow Java's coverage rules. Inexact scalar candidates are read back only
+when `global-index.filter.refine-from-data=true`. Composite scalar indexes
+are excluded from search pre-filters, as in Java. Filtering preserves the
+unfiltered corpus for BM25 scores; Boolean and boosted queries collect leaf
+candidates before applying the final limit. Index shard searches use
+`global-index.thread-num` workers.
+
+The existing `with_text_column()` / `with_query_text()` API continues to
+accept plain text for the SQL table function. Full-text row filters require
+Data Evolution; primary-key materialized reads use `execute_read()`.
 
 
 ## Time Travel

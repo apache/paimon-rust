@@ -39,6 +39,7 @@ pub struct TableUpdateByRowId {
     index: RowIdFileIndex,
     updated: HashMap<i32, HashSet<i64>>,
     messages: Vec<CommitMessage>,
+    blob_uri_reader_factory: Option<std::sync::Arc<dyn crate::io::UriReaderFactory>>,
 }
 
 impl TableUpdateByRowId {
@@ -54,7 +55,18 @@ impl TableUpdateByRowId {
             index,
             updated: HashMap::new(),
             messages: Vec::new(),
+            blob_uri_reader_factory: None,
         })
+    }
+
+    /// URI reader selection for referenced Blob values. Core performs the
+    /// bounded or streamed copy; callers need not materialize payloads.
+    pub fn with_blob_uri_reader_factory(
+        &mut self,
+        factory: Option<std::sync::Arc<dyn crate::io::UriReaderFactory>>,
+    ) -> &mut Self {
+        self.blob_uri_reader_factory = factory;
+        self
     }
 
     /// Stage one logical Arrow table. Its chunks may share a file group.
@@ -74,6 +86,7 @@ impl TableUpdateByRowId {
             .filter(|name| seen.insert(name.clone()))
             .collect::<Vec<_>>();
         let mut writer = DataEvolutionWriter::for_row_id(&self.table, columns.clone())?;
+        writer.with_blob_uri_reader_factory(self.blob_uri_reader_factory.clone());
         let batches = batches
             .into_iter()
             .map(super::update_input::normalize_row_ids)

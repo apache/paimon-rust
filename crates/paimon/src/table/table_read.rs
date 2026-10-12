@@ -42,6 +42,7 @@ use arrow_select::concat::concat as arrow_concat;
 use arrow_select::take::take;
 use futures::{stream, StreamExt};
 use std::cmp::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::Arc;
 
 #[path = "audit_log_table/read.rs"]
@@ -188,7 +189,7 @@ impl<'a> TableRead<'a> {
     ///
     /// The hook is used only by schema-identical raw reads. Callers must still
     /// enforce the expression after the scan because an individual file may not
-    /// be able to build a decoder filter.
+    /// be able to build a decoder filter. A `query-auth.enabled` read refuses it.
     pub fn with_row_filter_factory(self, factory: Arc<dyn crate::arrow::RowFilterFactory>) -> Self {
         match self.0 {
             TableReadKind::Paimon(read) => {
@@ -308,22 +309,6 @@ impl<'a> TableRead<'a> {
             ));
         }
         Ok(())
-    }
-}
-
-/// Every leaf's column name, system columns included.
-fn collect_leaf_column_names(predicate: &Predicate, out: &mut std::collections::HashSet<String>) {
-    match predicate {
-        Predicate::Leaf { column, .. } => {
-            out.insert(column.clone());
-        }
-        Predicate::And(children) | Predicate::Or(children) => {
-            children
-                .iter()
-                .for_each(|child| collect_leaf_column_names(child, out));
-        }
-        Predicate::Not(inner) => collect_leaf_column_names(inner, out),
-        Predicate::AlwaysTrue | Predicate::AlwaysFalse => {}
     }
 }
 
@@ -507,7 +492,14 @@ impl<'a> PaimonTableRead<'a> {
         data_splits: &[DataSplit],
     ) -> crate::Result<ArrowRecordBatchStream> {
         // Streaming primary-key splits are read raw below, so decide here for all.
-        self.ensure_authorized_by_splits(&self.table.schema.core_options(), data_splits)?;
+        if self
+            .ensure_authorized_by_splits(&self.table.schema.core_options(), data_splits)?
+            .is_some()
+        {
+            return Err(super::query_auth::unsupported(
+                "a row-kind read cannot apply a row filter or column masking",
+            ));
+        }
         let schema = audit_schema_for_read_type(&self.read_type, false)?;
         let (streaming, materialized): (Vec<_>, Vec<_>) = data_splits
             .iter()
@@ -974,13 +966,13 @@ impl<'a> PaimonTableRead<'a> {
         reader.read(splits)
     }
 
-    /// Reads only splits carrying a grant that the server imposed nothing;
-    /// nothing is fetched here, so a split without one fails closed.
+    /// Every split must carry this handle's grant; returns it when it restricts
+    /// the read. Nothing is fetched here, so a split without one fails closed.
     fn ensure_authorized_by_splits(
         &self,
         core_options: &CoreOptions,
         data_splits: &[DataSplit],
-    ) -> crate::Result<()> {
+    ) -> crate::Result<Option<Arc<super::query_auth::QueryAuthGrant>>> {
         // Unconditional: unrelated to query-auth.
         core_options.ensure_type_paimon_served(&self.table.identifier().full_name())?;
         // Decided at plan time, as in Java: a split predating the option, or built
@@ -988,7 +980,14 @@ impl<'a> PaimonTableRead<'a> {
         let required = core_options.query_auth_enabled()
             || data_splits.iter().any(|s| s.query_auth_required());
         if !required {
-            return Ok(());
+            return Ok(None);
+        }
+        // Its filters pick their own columns and run before any rule; an
+        // expression failing on a dropped row would put the value in its error.
+        if self.row_filter_factory.is_some() {
+            return Err(super::query_auth::unsupported(
+                "an engine decoder filter would run outside the server's grant",
+            ));
         }
         // Only the catalog mints a session, so a handle without one holds no grant.
         if self.table.query_auth_session().is_none() {
@@ -997,10 +996,7 @@ impl<'a> PaimonTableRead<'a> {
             ));
         }
         // The read's own scope: a caller can plan clean, then read differently.
-        let mut filter_columns = std::collections::HashSet::new();
-        for predicate in &self.data_predicates {
-            collect_leaf_column_names(predicate, &mut filter_columns);
-        }
+        let filter_columns = super::query_auth::leaf_names(&self.data_predicates);
         super::query_auth::reject_system_columns(
             self.read_type
                 .iter()
@@ -1013,7 +1009,13 @@ impl<'a> PaimonTableRead<'a> {
             &self.read_type,
             self.table.schema().fields(),
         )?;
-        // Per split, as Java binds one `QueryAuthSplit` each.
+        super::query_auth::reject_noncanonical_leaves(
+            &self.data_predicates,
+            self.table.schema().fields(),
+        )?;
+        // Per split, as Java binds one `QueryAuthSplit` each; one read applies one
+        // rule set, so a restricted split's grant must cover them all.
+        let mut restricted: Option<&Arc<super::query_auth::QueryAuthGrant>> = None;
         for split in data_splits {
             let Some(grant) = split.query_auth_grant() else {
                 return Err(super::query_auth::unsupported(
@@ -1027,21 +1029,395 @@ impl<'a> PaimonTableRead<'a> {
                      scan",
                 ));
             }
-            if !grant.is_unrestricted() {
+            // The server ruled on these columns only, whether or not it set rules.
+            if let Some(select) = grant.select() {
+                if let Some(outside) = self
+                    .read_type
+                    .iter()
+                    .map(|f| f.name())
+                    .chain(filter_columns.iter().map(String::as_str))
+                    .find(|name| !select.iter().any(|s| s == name))
+                {
+                    return Err(super::query_auth::unsupported(&format!(
+                        "'{outside}' is outside the columns this plan was authorized for; plan \
+                         with it"
+                    )));
+                }
+            }
+            if !grant.is_unrestricted() && restricted.is_none() {
+                restricted = Some(grant);
+            }
+        }
+        if let Some(grant) = restricted {
+            if data_splits
+                .iter()
+                .any(|s| s.query_auth_grant().is_none_or(|g| **g != **grant))
+            {
                 return Err(super::query_auth::unsupported(
-                    "this client cannot apply a row filter or column masking, so it refuses \
-                     rather than return unfiltered rows",
+                    "the splits were planned under different rules; re-plan the scan",
                 ));
             }
         }
-        Ok(())
+        Ok(restricted.cloned())
     }
 
     /// Returns an [`ArrowRecordBatchStream`].
     pub fn to_arrow(&self, data_splits: &[DataSplit]) -> crate::Result<ArrowRecordBatchStream> {
-        let has_primary_keys = !self.table.schema.primary_keys().is_empty();
         let core_options = self.table.schema.core_options();
-        self.ensure_authorized_by_splits(&core_options, data_splits)?;
+        match self.ensure_authorized_by_splits(&core_options, data_splits)? {
+            Some(grant) => self.read_restricted(data_splits, &grant),
+            None => self.read_splits(data_splits, &core_options),
+        }
+    }
+
+    /// Filter rows, apply masks, then evaluate predicates on masked columns.
+    fn read_restricted(
+        &self,
+        data_splits: &[DataSplit],
+        grant: &super::query_auth::QueryAuthGrant,
+    ) -> crate::Result<ArrowRecordBatchStream> {
+        use super::query_auth::{filter_batch, mask_batch, mask_inputs, unsupported};
+        use crate::arrow::format::FilePredicates;
+        use crate::arrow::residual::{filter_record_batch_by_predicates, widen_scan_fields};
+        use std::collections::HashSet;
+
+        let schema_fields = self.table.schema().fields().to_vec();
+        let rules = grant.rules();
+        super::query_auth::reject_throwing_extractions(&self.read_type)?;
+
+        let masked = rules.masked_columns();
+        let columns_of = |predicate: &Predicate| {
+            let mut columns = HashSet::new();
+            predicate.collect_leaf_field_indices(&mut columns);
+            columns
+        };
+        let (after_mask, raw): (Vec<Predicate>, Vec<Predicate>) = self
+            .data_predicates
+            .iter()
+            .cloned()
+            .partition(|p| !columns_of(p).is_disjoint(&masked));
+        let after_mask_columns: HashSet<usize> = after_mask.iter().flat_map(columns_of).collect();
+        let index_of = |field: &DataField| schema_fields.iter().position(|s| s.id() == field.id());
+        let mut needed = rules.filter_columns();
+        let core_options = self.table.schema.core_options();
+        let view_fields = core_options.blob_view_fields();
+        if core_options.blob_view_resolve_enabled() && self.table.rest_env().is_some() {
+            if let Some(field) = needed
+                .iter()
+                .map(|i| &schema_fields[*i])
+                .find(|f| view_fields.contains(f.name()))
+            {
+                return Err(unsupported(&format!(
+                    "the server's row filter reads resolving BLOB view '{}'; its stored \
+                     nullness can differ from the resolved value",
+                    field.name(),
+                )));
+            }
+        }
+        let visible: HashSet<usize> = self
+            .read_type
+            .iter()
+            .filter_map(index_of)
+            .chain(after_mask_columns.iter().copied())
+            .collect();
+        let masks: Vec<_> = rules
+            .masks
+            .iter()
+            .filter(|m| visible.contains(&m.column))
+            .cloned()
+            .collect();
+        needed.extend(&after_mask_columns);
+        masks.iter().for_each(|m| needed.extend(mask_inputs(m)));
+        // Rules require complete input columns.
+        for field in &self.read_type {
+            if let Some(index) = index_of(field) {
+                if (needed.contains(&index) || masked.contains(&index))
+                    && field.data_type() != schema_fields[index].data_type()
+                {
+                    return Err(unsupported(&format!(
+                        "the server's rules involve '{}', which the read projects only in part",
+                        field.name()
+                    )));
+                }
+            }
+        }
+
+        let mut physical = self.read_type.clone();
+        let mut needed: Vec<usize> = needed.into_iter().collect();
+        needed.sort_unstable();
+        for index in needed {
+            let field = &schema_fields[index];
+            if !physical.iter().any(|f| f.id() == field.id()) {
+                physical.push(field.clone());
+            }
+        }
+        let mut predicates = FilePredicates {
+            predicates: self.data_predicates.clone(),
+            row_filter_factory: None,
+            file_fields: schema_fields.clone(),
+        };
+        physical = widen_scan_fields(&physical, Some(&predicates));
+        let mut inner = self.clone();
+        inner.read_type = physical.clone();
+        inner.data_predicates = raw;
+        inner.limit = None;
+        let has_blobs = physical.iter().any(|f| f.data_type().is_blob_file_field());
+        let (before_mask, pending): (Vec<_>, Vec<_>) =
+            predicates.predicates.into_iter().partition(|predicate| {
+                has_blobs
+                    && columns_of(predicate).iter().all(|i| {
+                        !masked.contains(i) && !schema_fields[*i].data_type().is_blob_file_field()
+                    })
+            });
+        predicates.predicates = before_mask;
+        let unresolved_table;
+        if has_blobs {
+            // Keep payload predicates above authorization too: they can open
+            // a descriptor belonging to a row the server excludes.
+            inner.data_predicates.clear();
+            unresolved_table = self
+                .table
+                .copy_with_options(std::collections::HashMap::from([
+                    ("blob-as-descriptor".to_string(), "true".to_string()),
+                    ("blob-view.resolve.enabled".to_string(), "false".to_string()),
+                ]));
+            inner.table = &unresolved_table;
+        }
+        let stream = inner.read_splits(data_splits, &inner.table.schema.core_options())?;
+
+        let filters = rules.filters.clone();
+        let batch_fields = physical.clone();
+        let after_mask = FilePredicates {
+            predicates: after_mask,
+            row_filter_factory: None,
+            file_fields: schema_fields.clone(),
+        };
+        let blob_options = has_blobs.then(|| self.masked_blob_options(&masks));
+        let stream = stream.map(move |batch| {
+            let batch = batch?;
+            let names_match = batch.num_columns() == physical.len()
+                && batch
+                    .schema()
+                    .fields()
+                    .iter()
+                    .zip(&physical)
+                    .all(|(column, field)| column.name() == field.name());
+            if !names_match {
+                return Err(unsupported(
+                    "the read returned columns the rules cannot address",
+                ));
+            }
+            let batch = filter_batch(&batch, &filters, &schema_fields, &physical)?;
+            // Safe ordinary conjuncts avoid masking rows the caller excludes.
+            let batch = filter_record_batch_by_predicates(batch, &predicates, &physical)?;
+            // BLOB masks copy references; consumers resolve payloads lazily.
+            let batch = mask_batch(&batch, &masks, &schema_fields, &physical)?;
+            if has_blobs {
+                Ok(batch)
+            } else {
+                filter_record_batch_by_predicates(batch, &after_mask, &physical)
+            }
+        });
+        let stream: ArrowRecordBatchStream = Box::pin(stream);
+        if let Some(options) = blob_options {
+            return self.finish_authorized_blobs(stream, &batch_fields, &pending, options);
+        }
+        let stream = project_authorized_stream(stream, self.read_type.len());
+        Ok(match self.limit {
+            None => Box::pin(stream),
+            Some(limit) => limit_rows(Box::pin(stream), limit),
+        })
+    }
+
+    /// Copy the source's BLOB representation along with its references.
+    fn masked_blob_options(
+        &self,
+        masks: &[super::query_auth::ColumnMask],
+    ) -> std::collections::HashMap<String, String> {
+        use crate::spec::Transform;
+
+        let fields = self.table.schema().fields();
+        let copies: Vec<_> = masks
+            .iter()
+            .filter_map(|mask| {
+                let source = match &mask.transform {
+                    Transform::FieldRef(index) | Transform::Cast(index, _) => &fields[*index],
+                    _ => return None,
+                };
+                let target = &fields[mask.column];
+                (source.data_type().is_blob_file_field()
+                    && target.data_type().is_blob_file_field()
+                    && source.name() != target.name())
+                .then(|| (source.name(), target.name()))
+            })
+            .collect();
+        let mut options = self.table.schema().options().clone();
+        if copies.is_empty() {
+            return options;
+        }
+        let core_options = self.table.schema().core_options();
+        for (key, original) in [
+            (
+                "blob-descriptor-field",
+                core_options.blob_descriptor_fields(),
+            ),
+            ("blob-view-field", core_options.blob_view_fields()),
+            ("video-frame-field", core_options.video_frame_fields()),
+        ] {
+            let mut selected = original.clone();
+            for &(source, target) in &copies {
+                if original.contains(source) {
+                    selected.insert(target.to_string());
+                } else {
+                    selected.remove(target);
+                }
+            }
+            let mut selected: Vec<_> = selected.into_iter().collect();
+            selected.sort_unstable();
+            options.insert(key.to_string(), selected.join(","));
+        }
+        options
+    }
+
+    fn finish_authorized_blobs(
+        &self,
+        stream: ArrowRecordBatchStream,
+        batch_fields: &[DataField],
+        predicates: &[Predicate],
+        payload_options: std::collections::HashMap<String, String>,
+    ) -> crate::Result<ArrowRecordBatchStream> {
+        use super::managed_blob_reader::{resolve_primary_key_blob_stream, ManagedBlobReadPlan};
+
+        let core_options = &CoreOptions::new(&payload_options);
+        let view_fields = core_options.blob_view_fields();
+        let resolve_views = core_options.blob_view_resolve_enabled()
+            && self.table.rest_env().is_some()
+            && batch_fields.iter().any(|f| view_fields.contains(f.name()));
+        let predicate_views: std::collections::HashSet<_> =
+            super::query_auth::leaf_names(predicates)
+                .intersection(&view_fields)
+                .cloned()
+                .collect();
+        let resolve_predicate_views = resolve_views && !predicate_views.is_empty();
+        let mut output_views = view_fields.clone();
+        if resolve_predicate_views {
+            output_views.retain(|field| !predicate_views.contains(field));
+        }
+        // Never look up views past the rows LIMIT still needs.
+        let quota = self
+            .limit
+            .filter(|_| resolve_predicate_views)
+            .map(|limit| Arc::new(AtomicUsize::new(limit)));
+        let stream = match &quota {
+            Some(quota) => take_within_quota(stream, Arc::clone(quota)),
+            None => stream,
+        };
+        // User predicates see resolved descriptors or payloads, after authorization.
+        let stream = match self.table.rest_env().filter(|_| resolve_predicate_views) {
+            Some(env) => super::data_evolution_reader::resolve_blob_view_stream(
+                stream,
+                predicate_views,
+                env.clone(),
+                core_options.blob_as_descriptor(),
+                self.blob_parallelism,
+            ),
+            None => stream,
+        };
+        // Resolving views owns their upstream FileIO, including REST tokens.
+        // The ordinary Blob plan must not decode those payloads a second time.
+        let blob_plan = ManagedBlobReadPlan::new(
+            &self.read_type,
+            predicates,
+            self.table.schema().fields(),
+            core_options,
+        );
+        let stream = match &blob_plan {
+            Some(plan) => {
+                // The payload filter owns its widened schema. Drop authorization
+                // columns before it resolves columns by position.
+                let fields = plan.scan_fields().to_vec();
+                Box::pin(stream.map(move |batch| {
+                    let batch = batch?;
+                    let indices = fields
+                        .iter()
+                        .map(|f| batch.schema().index_of(f.name()))
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|e| crate::Error::DataInvalid {
+                            message: format!("authorized BLOB filter is missing a column: {e}"),
+                            source: None,
+                        })?;
+                    batch
+                        .project(&indices)
+                        .map_err(|e| crate::Error::DataInvalid {
+                            message: format!("failed to project the authorized batch: {e}"),
+                            source: Some(Box::new(e)),
+                        })
+                })) as ArrowRecordBatchStream
+            }
+            None => {
+                let predicates = crate::arrow::format::FilePredicates {
+                    predicates: predicates.to_vec(),
+                    row_filter_factory: None,
+                    file_fields: self.table.schema().fields().to_vec(),
+                };
+                let fields = batch_fields.to_vec();
+                let stream = stream.map(move |batch| {
+                    crate::arrow::residual::filter_record_batch_by_predicates(
+                        batch?,
+                        &predicates,
+                        &fields,
+                    )
+                });
+                let stream = project_authorized_stream(Box::pin(stream), self.read_type.len());
+                let stream = match self.limit {
+                    Some(limit) => limit_rows(stream, limit),
+                    None => stream,
+                };
+                spend_quota(stream, quota.clone())
+            }
+        };
+        let stream = match self
+            .table
+            .rest_env()
+            .filter(|_| resolve_views && !output_views.is_empty())
+        {
+            Some(env) => super::data_evolution_reader::resolve_blob_view_stream(
+                stream,
+                output_views,
+                env.clone(),
+                core_options.blob_as_descriptor(),
+                self.blob_parallelism,
+            ),
+            None => stream,
+        };
+        Ok(match blob_plan {
+            Some(plan) => {
+                let stream = plan.finish(
+                    stream,
+                    core_options,
+                    self.table.file_io.clone(),
+                    self.blob_parallelism,
+                    self.limit,
+                );
+                spend_quota(stream, quota)
+            }
+            None => resolve_primary_key_blob_stream(
+                stream,
+                &self.read_type,
+                core_options,
+                self.table.file_io.clone(),
+                self.blob_parallelism,
+                None,
+            ),
+        })
+    }
+
+    fn read_splits(
+        &self,
+        data_splits: &[DataSplit],
+        core_options: &CoreOptions<'_>,
+    ) -> crate::Result<ArrowRecordBatchStream> {
+        let has_primary_keys = !self.table.schema.primary_keys().is_empty();
         let merge_engine = core_options.merge_engine()?;
 
         // Route supported PK merge engines through the split-aware reader.
@@ -1056,11 +1432,11 @@ impl<'a> PaimonTableRead<'a> {
                     | MergeEngine::Aggregation
             )
         {
-            return self.read_pk_with_blob(data_splits, &core_options);
+            return self.read_pk_with_blob(data_splits, core_options);
         }
 
         if core_options.data_evolution_enabled() {
-            self.read_with_evolution(data_splits, &core_options)
+            self.read_with_evolution(data_splits, core_options)
         } else {
             self.read_raw(data_splits)
         }
@@ -1244,6 +1620,7 @@ impl<'a> PaimonTableRead<'a> {
             self.read_type().to_vec(),
             self.data_predicates.clone(),
         )
+        .with_blob_as_descriptor(core_options.blob_as_descriptor())
         .with_file_index_read_enabled(core_options.file_index_read_enabled())
         .with_batch_size(Some(core_options.read_batch_size()?))
         .with_blob_parallelism(self.blob_parallelism)
@@ -1261,6 +1638,82 @@ impl<'a> PaimonTableRead<'a> {
         }
         Ok(reader)
     }
+}
+
+fn project_authorized_stream(
+    stream: ArrowRecordBatchStream,
+    columns: usize,
+) -> ArrowRecordBatchStream {
+    let projection: Vec<usize> = (0..columns).collect();
+    Box::pin(stream.map(move |batch| {
+        batch?
+            .project(&projection)
+            .map_err(|e| crate::Error::DataInvalid {
+                message: format!("failed to project the authorized batch: {e}"),
+                source: Some(Box::new(e)),
+            })
+    }))
+}
+
+/// Cuts batches to at most `quota` rows; stages up to `spend_quota` must not
+/// read ahead.
+fn take_within_quota(
+    stream: ArrowRecordBatchStream,
+    quota: Arc<AtomicUsize>,
+) -> ArrowRecordBatchStream {
+    Box::pin(async_stream::try_stream! {
+        let mut stream = stream;
+        while quota.load(AtomicOrdering::Relaxed) > 0 {
+            let Some(batch) = stream.next().await else { break };
+            let batch = batch?;
+            let mut offset = 0;
+            while offset < batch.num_rows() {
+                let width = quota.load(AtomicOrdering::Relaxed).min(batch.num_rows() - offset);
+                if width == 0 {
+                    break;
+                }
+                yield batch.slice(offset, width);
+                offset += width;
+            }
+        }
+    })
+}
+
+/// Subtracts the rows that passed the predicates from `quota`.
+fn spend_quota(
+    stream: ArrowRecordBatchStream,
+    quota: Option<Arc<AtomicUsize>>,
+) -> ArrowRecordBatchStream {
+    let Some(quota) = quota else {
+        return stream;
+    };
+    Box::pin(stream.inspect(move |batch| {
+        if let Ok(batch) = batch {
+            let left = quota.load(AtomicOrdering::Relaxed);
+            let left = left.saturating_sub(batch.num_rows());
+            quota.store(left, AtomicOrdering::Relaxed);
+        }
+    }))
+}
+
+/// Stops once `limit` rows are out, without polling for more.
+fn limit_rows(stream: ArrowRecordBatchStream, limit: usize) -> ArrowRecordBatchStream {
+    Box::pin(stream::unfold(
+        (stream, 0usize),
+        move |(mut inner, emitted)| async move {
+            if emitted >= limit {
+                return None;
+            }
+            match inner.next().await? {
+                Err(e) => Some((Err(e), (inner, limit))),
+                Ok(batch) => {
+                    let batch = batch.slice(0, batch.num_rows().min(limit - emitted));
+                    let emitted = emitted + batch.num_rows();
+                    Some((Ok(batch), (inner, emitted)))
+                }
+            }
+        },
+    ))
 }
 
 fn prepend_insert_row_kind_stream(
@@ -2438,14 +2891,80 @@ mod tests {
 
     fn grant_for(table: &Table, restricted: bool) -> crate::table::query_auth::QueryAuthGrant {
         crate::table::query_auth::QueryAuthGrant::new(
-            crate::api::AuthTableQueryResponse {
-                filter: restricted.then(|| vec!["{}".to_string()]),
-                column_masking: None,
-            },
             table
                 .query_auth_session()
                 .expect("a catalog-loaded table has a session"),
+            None,
+            crate::table::query_auth::Rules {
+                filters: if restricted {
+                    vec![crate::spec::Predicate::AlwaysTrue]
+                } else {
+                    Vec::new()
+                },
+                masks: Vec::new(),
+            },
         )
+    }
+
+    #[tokio::test]
+    async fn test_a_restricted_read_refuses_a_variant_extraction_that_can_fail() {
+        use crate::spec::{
+            variant_extraction_row, ArrayType, DataField, DataType, IntType, MapType, Schema,
+            TableSchema, VarCharType, VariantType,
+        };
+        let variant = || DataType::Variant(VariantType::new());
+        let key = || DataType::VarChar(VarCharType::string_type());
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("payload", variant())
+            .column("items", DataType::Array(ArrayType::new(variant())))
+            .column("tags", DataType::Map(MapType::new(key(), variant())))
+            .option("query-auth.enabled", "true")
+            .build()
+            .unwrap();
+        let table = Table {
+            schema: TableSchema::new(0, &schema),
+            ..crate::table::rest_query_auth_table().await
+        };
+        // `variant_get(..., '$.x', 'INT')` pushed into the read, strict or not.
+        let extraction = |fail_on_error| {
+            let row = variant_extraction_row(
+                true,
+                [(
+                    DataType::Int(IntType::new()),
+                    "$.x".to_string(),
+                    fail_on_error,
+                    "UTC".to_string(),
+                )],
+            )
+            .unwrap();
+            DataType::Row(row)
+        };
+        let read = |field: DataField| TableRead::new(&table, vec![field], Vec::new());
+        let split = split_with_grant(Some(grant_for(&table, true)));
+        // Nested evolution evaluates one inside a collection too.
+        for field in [
+            DataField::new(1, "payload".to_string(), extraction(true)),
+            DataField::new(
+                2,
+                "items".to_string(),
+                DataType::Array(ArrayType::new(extraction(true))),
+            ),
+            DataField::new(
+                3,
+                "tags".to_string(),
+                DataType::Map(MapType::new(key(), extraction(true))),
+            ),
+        ] {
+            let name = field.name().to_string();
+            assert!(
+                matches!(read(field).to_arrow(std::slice::from_ref(&split)), Err(crate::Error::Unsupported { ref message })
+                    if message.contains("Variant extraction")),
+                "a strict cast in '{name}' would run on the rows the rules drop"
+            );
+        }
+        let lenient = DataField::new(1, "payload".to_string(), extraction(false));
+        assert!(read(lenient).to_arrow(&[split]).is_ok());
     }
 
     #[tokio::test]
@@ -2607,17 +3126,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_restricted_grant_on_a_split_refuses_the_read() {
+    async fn test_a_restricted_grant_must_cover_every_split_of_the_read() {
         let table = crate::table::rest_query_auth_table().await;
         let read = TableRead::new(&table, table.schema.fields().to_vec(), Vec::new());
-        let split = split_with_grant(Some(grant_for(&table, true)));
-        assert!(
-            matches!(
-                read.to_arrow(&[split]),
-                Err(crate::Error::Unsupported { ref message }) if message.contains("query-auth.enabled")
-            ),
-            "a row filter this client cannot apply must refuse the read"
-        );
+        let restricted = split_with_grant(Some(grant_for(&table, true)));
+        assert!(read.to_arrow(std::slice::from_ref(&restricted)).is_ok());
+        let unrestricted = split_with_grant(Some(grant_for(&table, false)));
+        for splits in [
+            [restricted.clone(), unrestricted.clone()],
+            [unrestricted, restricted.clone()],
+        ] {
+            assert!(
+                matches!(read.to_arrow(&splits), Err(crate::Error::Unsupported { ref message })
+                    if message.contains("different rules")),
+                "one rule set per read, whatever the order"
+            );
+        }
+        // Streaming primary-key splits are read raw.
+        assert!(matches!(
+            read.to_arrow_with_row_kind(&[restricted]),
+            Err(crate::Error::Unsupported { ref message }) if message.contains("row-kind")
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_a_read_stays_inside_the_authorized_columns() {
+        let table = crate::table::rest_query_auth_table().await;
+        let fields = table.schema.fields().to_vec();
+        // Without rules too: a column permission scoped the grant all the same.
+        for filters in [vec![Predicate::AlwaysTrue], Vec::new()] {
+            // Planned with no columns, as `COUNT(*)` is.
+            let grant = crate::table::query_auth::QueryAuthGrant::new(
+                table.query_auth_session().unwrap(),
+                Some(Vec::new()),
+                crate::table::query_auth::Rules {
+                    filters,
+                    masks: Vec::new(),
+                },
+            );
+            let split = split_with_grant(Some(grant));
+            let narrow = TableRead::new(&table, Vec::new(), Vec::new());
+            assert!(narrow.to_arrow(std::slice::from_ref(&split)).is_ok());
+            let wide = TableRead::new(&table, fields.clone(), Vec::new());
+            assert!(
+                matches!(wide.to_arrow(&[split]), Err(crate::Error::Unsupported { ref message })
+                    if message.contains("outside the columns")),
+                "the server ruled on the planned columns only"
+            );
+        }
     }
 
     #[tokio::test]

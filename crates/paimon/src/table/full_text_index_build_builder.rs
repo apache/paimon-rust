@@ -21,12 +21,11 @@
 //! `NativeFullTextGlobalIndexWriter`: the table's row-id space is cut into
 //! `global-index.row-count-per-shard` shards, each shard's text column is fed to
 //! the shared `paimon-ftindex-core` writer with shard-relative row ids, and every
-//! non-empty shard becomes one `full-text` index file committed in a single
-//! snapshot. Java writes the same archive through the same native core, so the
+//! non-empty shard becomes one unpublished `full-text` index file. Java writes the same archive through the same native core, so the
 //! files are readable by both `FullTextSearchBuilder` and Java.
 
 use crate::spec::{
-    CoreOptions, DataField, DataType, GlobalIndexMeta, IndexFileMeta, ROW_ID_FIELD_NAME,
+    CoreOptions, DataField, DataType, GlobalIndexMeta, IndexFileMeta, Predicate, ROW_ID_FIELD_NAME,
 };
 use crate::table::global_index_build_common::vector::{
     find_index_field, plan_vector_index_shards, VectorIndexShard,
@@ -35,7 +34,7 @@ use crate::table::global_index_build_common::{
     copy_local_file_to_output, indexed_row_ranges, validate_existing_index_overlap,
 };
 use crate::table::global_index_types::FULL_TEXT_GLOBAL_INDEX_TYPE;
-use crate::table::{CommitMessage, DataSplitBuilder, RowRange, Table, TableCommit};
+use crate::table::{CommitMessage, DataSplitBuilder, RowRange, Table};
 use crate::{Error, Result};
 use arrow_array::cast::AsArray;
 use arrow_array::{Array, Int64Array, LargeStringArray, RecordBatch, StringArray, StringViewArray};
@@ -45,15 +44,15 @@ use paimon_ftindex_core::io::PosWriter;
 use paimon_ftindex_core::{FullTextIndexConfig, FullTextIndexWriter};
 use std::collections::{BTreeMap, HashMap};
 
-const INDEX_DIR: &str = "index";
 /// Java `NativeFullTextIndexOptions.FULL_TEXT_PREFIX`: only these options reach
 /// the native writer, with the prefix removed.
 const FULL_TEXT_OPTION_PREFIX: &str = "full-text.";
 
-pub struct FullTextIndexBuildBuilder<'a> {
+pub(super) struct FullTextIndexBuildBuilder<'a> {
     table: &'a Table,
     index_column: Option<String>,
     options: HashMap<String, String>,
+    pub(super) partition_filter: Option<Predicate>,
 }
 
 impl<'a> FullTextIndexBuildBuilder<'a> {
@@ -62,6 +61,7 @@ impl<'a> FullTextIndexBuildBuilder<'a> {
             table,
             index_column: None,
             options: HashMap::new(),
+            partition_filter: None,
         }
     }
 
@@ -77,10 +77,7 @@ impl<'a> FullTextIndexBuildBuilder<'a> {
         self
     }
 
-    /// Build full-text index files for every row range of the latest snapshot
-    /// that is not yet covered by a full-text index on the column. Returns the
-    /// number of index files committed.
-    pub async fn execute(&self) -> Result<usize> {
+    pub(super) async fn prepare(&self) -> Result<(Option<i64>, Vec<CommitMessage>)> {
         // Building the index scans the table's rows.
         CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
 
@@ -101,8 +98,9 @@ impl<'a> FullTextIndexBuildBuilder<'a> {
         // procedure options.
         let mut merged_options = self.table.schema().options().clone();
         merged_options.extend(self.options.clone());
-        let rows_per_shard =
-            CoreOptions::new(&merged_options).global_index_row_count_per_shard()?;
+        let core_options = CoreOptions::new(&merged_options);
+        let rows_per_shard = core_options.global_index_row_count_per_shard()?;
+        let parallelism = core_options.global_index_build_parallelism()?;
 
         let index_field = find_index_field(self.table, index_column)?;
         validate_text_field(index_field)?;
@@ -115,17 +113,15 @@ impl<'a> FullTextIndexBuildBuilder<'a> {
         // The table's manager resolves a REST-managed table's latest snapshot
         // through the catalog, like reads and commit validation do.
         let snapshot_manager = self.table.snapshot_manager();
-        let snapshot = snapshot_manager
-            .get_latest_snapshot()
-            .await?
-            .ok_or_else(|| Error::DataInvalid {
-                message: "Cannot build full-text index without a snapshot".to_string(),
-                source: None,
-            })?;
+        let Some(snapshot) = snapshot_manager.get_latest_snapshot().await? else {
+            return Ok((None, vec![]));
+        };
 
-        let manifest_entries = self
-            .table
-            .new_read_builder()
+        let mut read_builder = self.table.new_read_builder();
+        if let Some(filter) = &self.partition_filter {
+            read_builder.with_filter(filter.clone());
+        }
+        let manifest_entries = read_builder
             .new_scan()
             .with_scan_all_files()
             .plan_manifest_entries(&snapshot)
@@ -150,7 +146,7 @@ impl<'a> FullTextIndexBuildBuilder<'a> {
             "full-text",
         )?;
         if shards.is_empty() {
-            return Ok(0);
+            return Ok((Some(snapshot.id()), vec![]));
         }
 
         validate_existing_index_overlap(
@@ -166,49 +162,36 @@ impl<'a> FullTextIndexBuildBuilder<'a> {
         )
         .await?;
 
-        let commit = TableCommit::new(
-            self.table.clone(),
-            format!(
-                "global-index-{}-create-{}",
-                FULL_TEXT_GLOBAL_INDEX_TYPE,
-                uuid::Uuid::new_v4()
-            ),
-        );
-        let mut messages: Vec<CommitMessage> = Vec::with_capacity(shards.len());
-        for shard in shards {
-            let build_result = self
-                .build_shard(
-                    &shard,
-                    index_column,
-                    &native_options,
-                    index_field.id(),
-                    &index_meta,
-                )
-                .await;
-            let index_file = match build_result {
-                Ok(index_file) => index_file,
-                Err(error) => {
-                    let _ = commit.abort(&messages).await;
-                    return Err(error);
+        let prepared = super::global_index_build_common::preparation::prepare_shards(
+            self.table,
+            shards,
+            parallelism,
+            |shard| {
+                let native_options = &native_options;
+                let index_meta = &index_meta;
+                async move {
+                    let file = self
+                        .build_shard(
+                            &shard,
+                            index_column,
+                            native_options,
+                            index_field.id(),
+                            index_meta,
+                        )
+                        .await?;
+                    // Java skips a shard whose writer saw no rows.
+                    Ok(file.map(|file| {
+                        let mut message = CommitMessage::new(shard.partition_bytes, 0, vec![]);
+                        message.new_index_files = vec![file];
+                        (message, ())
+                    }))
                 }
-            };
-            // Java skips a shard whose writer saw no rows.
-            let Some(index_file) = index_file else {
-                continue;
-            };
-            let mut message = CommitMessage::new(shard.partition_bytes.clone(), 0, vec![]);
-            message.new_index_files = vec![index_file];
-            messages.push(message);
-        }
-        if messages.is_empty() {
-            return Ok(0);
-        }
+            },
+        )
+        .await?;
+        let messages = prepared.into_iter().map(|(message, ())| message).collect();
 
-        let file_count = messages.len();
-        commit
-            .commit_if_latest_snapshot(messages, snapshot.id())
-            .await?;
-        Ok(file_count)
+        Ok((Some(snapshot.id()), messages))
     }
 
     async fn build_shard(
@@ -272,16 +255,13 @@ impl<'a> FullTextIndexBuildBuilder<'a> {
         })
         .await?;
 
-        let table_location = self.table.location().trim_end_matches('/');
         let file_name = format!(
             "{FULL_TEXT_GLOBAL_INDEX_TYPE}-global-index-{}.index",
             uuid::Uuid::new_v4()
         );
-        let index_path = format!("{table_location}/{INDEX_DIR}/{file_name}");
-        self.table
-            .file_io()
-            .mkdirs(&format!("{table_location}/{INDEX_DIR}/"))
-            .await?;
+        let (index_path, external_path) =
+            super::global_index_build_common::prepare_index_file_path(self.table, &file_name)
+                .await?;
         let upload: Result<i64> = async {
             copy_local_file_to_output(
                 local_index.path(),
@@ -312,13 +292,15 @@ impl<'a> FullTextIndexBuildBuilder<'a> {
             file_size,
             row_count: cursor.row_count,
             deletion_vectors_ranges: None,
-            external_path: None,
+            external_path,
             global_index_meta: Some(GlobalIndexMeta {
                 row_range_start: shard.row_range_start,
                 row_range_end: shard.row_range_end,
                 index_field_id,
                 extra_field_ids: None,
-                source_meta: None,
+                source_meta: Some(
+                    crate::spec::DataEvolutionIndexSourceMeta::new(shard.snapshot_id)?.serialize(),
+                ),
                 index_meta: Some(index_meta.to_vec()),
             }),
         }))

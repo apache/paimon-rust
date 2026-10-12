@@ -193,15 +193,31 @@ fn pk_vector_query_dimension(
                 for key in [
                     "dimension".to_string(),
                     format!("{index_type}.dimension"),
+                    format!("{index_type}.index.dimension"),
                     format!("fields.{}.dimension", vector_field.name()),
+                    format!("fields.{}.index.dimension", vector_field.name()),
                 ] {
                     if let Some(value) = query_options.get(&key) {
+                        let key = if key == "dimension" {
+                            format!("{index_type}.dimension")
+                        } else {
+                            key
+                        };
                         dimension_options.insert(key, value.clone());
+                    }
+                }
+                let mut table_dimension_options = table_options.clone();
+                if let Some(value) = table_options.get("dimension") {
+                    if !table_options.contains_key(&format!("{index_type}.dimension"))
+                        && !table_options.contains_key(&format!("{index_type}.index.dimension"))
+                    {
+                        table_dimension_options
+                            .insert(format!("{index_type}.dimension"), value.clone());
                     }
                 }
                 Ok(Some(
                     VindexVectorIndexOptions::new(
-                        table_options,
+                        &table_dimension_options,
                         &dimension_options,
                         index_type,
                         vector_field,

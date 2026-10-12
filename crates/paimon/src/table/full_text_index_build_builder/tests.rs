@@ -169,7 +169,8 @@ async fn test_execute_builds_shards_readable_by_full_text_search() {
     assert!(search(&table, "paimon").await.is_empty());
 
     let file_count = table
-        .new_full_text_index_build_builder()
+        .new_global_index_build_builder()
+        .with_index_type("full-text")
         .with_index_column("name")
         .execute()
         .await
@@ -224,7 +225,8 @@ async fn test_execute_only_indexes_new_rows() {
     write_rows(&table, vec![1, 2], vec![Some("paimon one"), Some("other")]).await;
 
     let builder = || {
-        let mut builder = table.new_full_text_index_build_builder();
+        let mut builder = table.new_global_index_build_builder();
+        builder.with_index_type("full-text");
         builder.with_index_column("name");
         builder
     };
@@ -259,7 +261,8 @@ async fn test_execute_indexes_all_null_shard() {
     // Java's writer counts NULL rows, so an all-NULL shard still yields an
     // (empty) index file that marks the range as indexed.
     let file_count = table
-        .new_full_text_index_build_builder()
+        .new_global_index_build_builder()
+        .with_index_type("full-text")
         .with_index_column("name")
         .execute()
         .await
@@ -275,7 +278,8 @@ async fn test_execute_passes_prefixed_options_to_native_writer() {
     write_rows(&table, vec![1], vec![Some("Running Paimon")]).await;
 
     let file_count = table
-        .new_full_text_index_build_builder()
+        .new_global_index_build_builder()
+        .with_index_type("full-text")
         .with_index_column("name")
         .with_options(HashMap::from([
             ("full-text.stem".to_string(), "false".to_string()),
@@ -309,7 +313,8 @@ async fn test_execute_rejects_invalid_native_options_before_reading() {
     setup_dirs(&table).await;
 
     let err = table
-        .new_full_text_index_build_builder()
+        .new_global_index_build_builder()
+        .with_index_type("full-text")
         .with_index_column("name")
         .with_options(HashMap::from([(
             "full-text.tokenizer".to_string(),
@@ -328,7 +333,8 @@ async fn test_execute_rejects_invalid_native_options_before_reading() {
 async fn test_execute_rejects_unsupported_tables_and_columns() {
     let expect_err = |table: Table, column: &'static str| async move {
         table
-            .new_full_text_index_build_builder()
+            .new_global_index_build_builder()
+            .with_index_type("full-text")
             .with_index_column(column)
             .execute()
             .await
@@ -394,7 +400,8 @@ async fn test_execute_rejects_unsupported_tables_and_columns() {
 async fn test_execute_requires_index_column() {
     let table = test_table("memory:/ft_no_column", table_options("10"));
     let err = table
-        .new_full_text_index_build_builder()
+        .new_global_index_build_builder()
+        .with_index_type("full-text")
         .execute()
         .await
         .unwrap_err();
@@ -611,7 +618,8 @@ async fn test_build_search_and_drop_through_the_catalog_snapshot() {
     );
 
     let file_count = table
-        .new_full_text_index_build_builder()
+        .new_global_index_build_builder()
+        .with_index_type("full-text")
         .with_index_column("name")
         .execute()
         .await

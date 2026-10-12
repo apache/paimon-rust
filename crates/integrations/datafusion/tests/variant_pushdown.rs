@@ -268,6 +268,72 @@ async fn full_variant_projection_prevents_extraction_pushdown() {
 }
 
 #[tokio::test]
+async fn residual_only_extraction_after_add_column_reads_values() {
+    let (_tmp, sql_context) = common::setup_sql_context().await;
+    common::exec(
+        &sql_context,
+        r#"
+        CREATE TABLE paimon.test_db.residual_t (
+            id INT,
+            payload VARIANT
+        ) WITH (
+            'file.format' = 'parquet',
+            'data-evolution.enabled' = 'true',
+            'row-tracking.enabled' = 'true',
+            'variant.shreddingSchema' =
+                '{"type":"ROW","fields":[{"name":"payload","type":{"type":"ROW","fields":[{"name":"age","type":"INT"}]}}]}'
+        )
+        "#,
+    )
+    .await;
+    common::exec(
+        &sql_context,
+        r#"
+        INSERT INTO paimon.test_db.residual_t (id, payload)
+        SELECT 1, parse_json('{"age":27,"rest":"A"}')
+        UNION ALL
+        SELECT 2, parse_json('{"age":32,"rest":"B"}')
+        "#,
+    )
+    .await;
+    common::exec(
+        &sql_context,
+        "ALTER TABLE paimon.test_db.residual_t ADD COLUMN extra INT",
+    )
+    .await;
+
+    let batches = sql_context
+        .sql(
+            r#"
+            SELECT id, try_variant_get(payload, '$.rest', 'string') AS rest
+            FROM paimon.test_db.residual_t
+            ORDER BY id
+            "#,
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let rest = batches
+        .iter()
+        .flat_map(|batch| {
+            let column = batch.column_by_name("rest").unwrap();
+            let column = datafusion::arrow::compute::cast(
+                column,
+                &datafusion::arrow::datatypes::DataType::Utf8,
+            )
+            .unwrap();
+            let strings = column.as_any().downcast_ref::<StringArray>().unwrap();
+            (0..strings.len())
+                .map(|row| strings.value(row).to_string())
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(rest, vec!["A".to_string(), "B".to_string()]);
+}
+
+#[tokio::test]
 async fn data_evolution_row_id_survives_variant_extraction_pushdown() {
     let (_tmp, sql_context) = setup_data_evolution_shredded_variant_table_with_rows().await;
     let sql = r#"

@@ -20,15 +20,19 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use arrow::compute::cast;
-use arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField};
+use arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField, SchemaRef};
 use arrow::pyarrow::{FromPyArrow, ToPyArrow};
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion::catalog::CatalogProvider;
+use datafusion::execution::context::SQLOptions;
 use datafusion::execution::memory_pool::{FairSpillPool, GreedyMemoryPool, MemoryPool};
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
-use datafusion::logical_expr::{Signature, TypeSignature, Volatility};
+use datafusion::logical_expr::{LogicalPlan, Signature, TypeSignature, Volatility};
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion_ffi::catalog_provider::FFI_CatalogProvider;
 use datafusion_ffi::proto::logical_extension_codec::FFI_LogicalExtensionCodec;
+use futures::StreamExt;
 use paimon::catalog::Identifier;
 use paimon::{Catalog, CatalogFactory, Options};
 use paimon_datafusion::{PaimonCatalogProvider, SQLContext};
@@ -38,14 +42,15 @@ use pyo3::types::PyCapsule;
 
 use crate::blob::PyBlobReaderRegistry;
 use crate::error::{df_to_py_err, to_py_err};
+use crate::read::PyRecordBatchReader;
 use crate::table::PyTable;
 use crate::udf::{build_python_scalar_udf, udf, PyPythonScalarUDFObject};
 use paimon_datafusion::runtime::runtime;
 
-fn pyarrow_compatible_batch(batch: &RecordBatch) -> arrow::error::Result<RecordBatch> {
+/// Returns `None` when the schema is already PyArrow compatible.
+fn pyarrow_compatible_schema(schema: &arrow::datatypes::Schema) -> Option<SchemaRef> {
     let mut changed = false;
-    let fields = batch
-        .schema()
+    let fields = schema
         .fields()
         .iter()
         .map(|field| {
@@ -59,13 +64,18 @@ fn pyarrow_compatible_batch(batch: &RecordBatch) -> arrow::error::Result<RecordB
         .collect::<Vec<_>>();
 
     if !changed {
-        return Ok(batch.clone());
+        return None;
     }
-
-    let schema = Arc::new(arrow::datatypes::Schema::new_with_metadata(
+    Some(Arc::new(arrow::datatypes::Schema::new_with_metadata(
         fields,
-        batch.schema().metadata().clone(),
-    ));
+        schema.metadata().clone(),
+    )))
+}
+
+fn pyarrow_compatible_batch(batch: &RecordBatch) -> arrow::error::Result<RecordBatch> {
+    let Some(schema) = pyarrow_compatible_schema(batch.schema_ref()) else {
+        return Ok(batch.clone());
+    };
     let columns = batch
         .columns()
         .iter()
@@ -81,6 +91,31 @@ fn pyarrow_compatible_batch(batch: &RecordBatch) -> arrow::error::Result<RecordB
     let options = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
 
     RecordBatch::try_new_with_options(schema, columns, &options)
+}
+
+/// DataFusion runs these plans only while their result stream is polled.
+/// `EXPLAIN ANALYZE` executes its input, so a wrapped write counts too.
+fn is_write_plan(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::Dml(_) | LogicalPlan::Copy(_) => true,
+        LogicalPlan::Analyze(analyze) => is_write_plan(&analyze.input),
+        _ => false,
+    }
+}
+
+fn query_result_batch(batch: &RecordBatch) -> PyResult<RecordBatch> {
+    pyarrow_compatible_batch(batch).map_err(|err| {
+        PyValueError::new_err(format!(
+            "Failed to convert query result for PyArrow compatibility: {err}"
+        ))
+    })
+}
+
+fn batches_to_pyarrow(py: Python<'_>, batches: &[RecordBatch]) -> PyResult<Vec<Py<PyAny>>> {
+    batches
+        .iter()
+        .map(|batch| Ok(query_result_batch(batch)?.to_pyarrow(py)?.unbind()))
+        .collect()
 }
 
 const OSS_IMPL: &str = "fs.oss.impl";
@@ -339,6 +374,39 @@ impl PaimonCatalog {
     }
 }
 
+#[pyclass(name = "SQLOptions", module = "pypaimon_rust.datafusion")]
+pub struct PySQLOptions {
+    inner: SQLOptions,
+}
+
+#[pymethods]
+impl PySQLOptions {
+    #[new]
+    fn new() -> Self {
+        Self {
+            inner: SQLOptions::new(),
+        }
+    }
+
+    #[pyo3(signature = (allow = true))]
+    fn with_allow_ddl(mut slf: PyRefMut<'_, Self>, allow: bool) -> PyRefMut<'_, Self> {
+        slf.inner = slf.inner.with_allow_ddl(allow);
+        slf
+    }
+
+    #[pyo3(signature = (allow = true))]
+    fn with_allow_dml(mut slf: PyRefMut<'_, Self>, allow: bool) -> PyRefMut<'_, Self> {
+        slf.inner = slf.inner.with_allow_dml(allow);
+        slf
+    }
+
+    #[pyo3(signature = (allow = true))]
+    fn with_allow_statements(mut slf: PyRefMut<'_, Self>, allow: bool) -> PyRefMut<'_, Self> {
+        slf.inner = slf.inner.with_allow_statements(allow);
+        slf
+    }
+}
+
 /// A SQL context that supports registering multiple Paimon catalogs and executing SQL.
 #[pyclass(name = "SQLContext")]
 pub struct PySQLContext {
@@ -346,6 +414,41 @@ pub struct PySQLContext {
 }
 
 impl PySQLContext {
+    fn execute_sql_stream(
+        &self,
+        py: Python<'_>,
+        sql: &str,
+        options: SQLOptions,
+    ) -> PyResult<PyRecordBatchReader> {
+        let stream = py.detach(|| {
+            runtime().block_on(async {
+                let df = self
+                    .inner
+                    .sql_with_options(sql, options)
+                    .await
+                    .map_err(df_to_py_err)?;
+                if !is_write_plan(df.logical_plan()) {
+                    return df.execute_stream().await.map_err(df_to_py_err);
+                }
+                // Finish the write before returning, so it does not depend on
+                // the caller reading or closing the result.
+                let schema = Arc::clone(df.schema().inner());
+                let batches = df.collect().await.map_err(df_to_py_err)?;
+                let stream = futures::stream::iter(batches.into_iter().map(Ok));
+                let stream: SendableRecordBatchStream =
+                    Box::pin(RecordBatchStreamAdapter::new(schema, stream));
+                Ok(stream)
+            })
+        })?;
+        let schema = stream.schema();
+        let schema = pyarrow_compatible_schema(&schema).unwrap_or(schema);
+        let stream = stream.map(|batch| query_result_batch(&batch.map_err(df_to_py_err)?));
+        Ok(PyRecordBatchReader::from_py_stream(
+            Some(schema),
+            Box::pin(stream),
+        ))
+    }
+
     fn build_sql_context(
         memory_pool_type: Option<String>,
         memory_pool_bytes: Option<usize>,
@@ -649,17 +752,43 @@ impl PySQLContext {
                 df.collect().await.map_err(df_to_py_err)
             })
         })?;
-        batches
-            .iter()
-            .map(|batch| {
-                let batch = pyarrow_compatible_batch(batch).map_err(|err| {
-                    PyValueError::new_err(format!(
-                        "Failed to convert query result for PyArrow compatibility: {err}"
-                    ))
-                })?;
-                Ok(batch.to_pyarrow(py)?.unbind())
+        batches_to_pyarrow(py, &batches)
+    }
+
+    fn sql_with_options(
+        &self,
+        py: Python<'_>,
+        sql: String,
+        options: PyRef<'_, PySQLOptions>,
+    ) -> PyResult<Vec<Py<PyAny>>> {
+        let rt = runtime();
+        let options = options.inner;
+        let batches = py.detach(|| {
+            rt.block_on(async {
+                let df = self
+                    .inner
+                    .sql_with_options(&sql, options)
+                    .await
+                    .map_err(df_to_py_err)?;
+                df.collect().await.map_err(df_to_py_err)
             })
-            .collect()
+        })?;
+        batches_to_pyarrow(py, &batches)
+    }
+
+    /// Stream SQL results. Close the reader when stopping early.
+    fn sql_stream(&self, py: Python<'_>, sql: String) -> PyResult<PyRecordBatchReader> {
+        self.execute_sql_stream(py, &sql, SQLOptions::new())
+    }
+
+    /// Stream SQL results using the supplied options.
+    fn sql_stream_with_options(
+        &self,
+        py: Python<'_>,
+        sql: String,
+        options: PyRef<'_, PySQLOptions>,
+    ) -> PyResult<PyRecordBatchReader> {
+        self.execute_sql_stream(py, &sql, options.inner)
     }
 }
 
@@ -667,8 +796,25 @@ pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> 
     let this = PyModule::new(py, "datafusion")?;
     this.add_class::<PaimonCatalog>()?;
     this.add_class::<crate::table::PyTable>()?;
+    this.add_class::<crate::index_build::PyGlobalIndexBuildBuilder>()?;
+    this.add_class::<crate::full_text_search::PyFullTextSearchBuilder>()?;
+    this.add_class::<crate::full_text_search::PyFullTextScan>()?;
+    this.add_class::<crate::full_text_search::PyFullTextScanPlan>()?;
+    this.add_class::<crate::full_text_search::PyFullTextRead>()?;
+    this.add_class::<crate::full_text_search::PyFullTextSearchResult>()?;
+    this.add_class::<crate::hybrid_search::PyHybridSearchBuilder>()?;
+    this.add_class::<crate::hybrid_search::PyHybridSearchResult>()?;
+    this.add_class::<crate::vector_search::PyVectorSearchBuilder>()?;
+    this.add_class::<crate::vector_search::PyBatchVectorSearchBuilder>()?;
+    this.add_class::<crate::vector_search::PyVectorScan>()?;
+    this.add_class::<crate::vector_search::PyVectorScanPlan>()?;
+    this.add_class::<crate::vector_search::PyVectorRead>()?;
+    this.add_class::<crate::vector_search::PyBatchVectorRead>()?;
+    this.add_class::<crate::vector_search::PySearchResult>()?;
+    this.add_class::<crate::vector_search::PySearchResultReadBuilder>()?;
     this.add_class::<crate::read::PyReadBuilder>()?;
     this.add_class::<crate::read::PyTableScan>()?;
+    this.add_class::<crate::read::PyStreamTableScan>()?;
     this.add_class::<crate::read::PyPlan>()?;
     this.add_class::<crate::read::PyTableRead>()?;
     this.add_class::<crate::read::PyRecordBatchReader>()?;
@@ -676,6 +822,7 @@ pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> 
     this.add_class::<crate::schema::PyTableSchema>()?;
     this.add_class::<crate::schema::PyDataField>()?;
     this.add_class::<PyPythonScalarUDFObject>()?;
+    this.add_class::<PySQLOptions>()?;
     this.add_class::<PySQLContext>()?;
     this.add_class::<crate::write::PyBatchWriteBuilder>()?;
     this.add_class::<crate::write::PyPostponeFixedBucketWriteBuilder>()?;
@@ -683,11 +830,16 @@ pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> 
     this.add_class::<crate::write::PyBatchTableWrite>()?;
     this.add_class::<crate::write::PyBatchTableUpdate>()?;
     this.add_class::<crate::write::PyTableUpdateByRowId>()?;
+    this.add_class::<crate::shard_update::PyShardTableUpdator>()?;
     this.add_class::<crate::write::PyStreamTableUpdate>()?;
     this.add_class::<crate::write::PyStreamTableWrite>()?;
     this.add_class::<crate::write::PyBatchTableCommit>()?;
     this.add_class::<crate::write::PyStreamTableCommit>()?;
     this.add_class::<crate::write::PyCommitMessage>()?;
+    this.add_class::<crate::commit_callback::PyCommitCallbackContext>()?;
+    this.add_class::<crate::commit_callback::PyManifestEntry>()?;
+    this.add_class::<crate::commit_callback::PyDataFileMeta>()?;
+    this.add_class::<crate::commit_callback::PyBinaryTableStats>()?;
     this.add_function(wrap_pyfunction!(udf, &this)?)?;
     this.add_class::<crate::snapshot::PySnapshot>()?;
     this.add_class::<crate::tag::PyTag>()?;

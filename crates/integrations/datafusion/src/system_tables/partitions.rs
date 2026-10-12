@@ -122,7 +122,7 @@ impl TableProvider for PartitionsTable {
         _limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         let table = self.table.clone();
-        let partitions = if table.travel_snapshot().is_some() {
+        let partitions = if table.travel_snapshot().is_some() || table.is_time_traveled() {
             crate::runtime::await_with_runtime(async move {
                 list_partitions_from_file_system(&table).await
             })

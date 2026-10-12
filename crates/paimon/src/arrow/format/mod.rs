@@ -476,6 +476,21 @@ fn supported_write_formats() -> Vec<&'static str> {
     ]
 }
 
+/// Reject unavailable factories before a table writer accepts any data.
+pub(crate) fn validate_write_format(format: &str) -> crate::Result<()> {
+    let extension = format!(".{}", format.to_ascii_lowercase());
+    let supported = supported_write_formats();
+    if supported.contains(&extension.as_str()) {
+        return Ok(());
+    }
+    Err(Error::Unsupported {
+        message: format!(
+            "unsupported write format '{format}': expected {}",
+            supported.join(", ")
+        ),
+    })
+}
+
 /// Reusable factory for one rolling writer, mirroring Java FormatWriterFactory.
 /// Output and compression belong to each file; schema/options belong to the factory.
 #[async_trait]
@@ -711,6 +726,22 @@ mod tests {
     use super::*;
     use crate::io::FileIOBuilder;
     use crate::spec::{DataType, IntType};
+
+    #[test]
+    fn write_format_validation_matches_compiled_factories() {
+        for extension in supported_write_formats() {
+            validate_write_format(extension.trim_start_matches('.')).unwrap();
+        }
+        validate_write_format("PARQUET").unwrap();
+        assert!(matches!(
+            validate_write_format("lance"),
+            Err(Error::Unsupported { .. })
+        ));
+        assert_eq!(
+            validate_write_format("vortex").is_ok(),
+            cfg!(feature = "vortex")
+        );
+    }
 
     #[test]
     fn format_selects_physical_or_projected_fields() {

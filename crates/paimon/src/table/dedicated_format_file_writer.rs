@@ -258,13 +258,15 @@ impl AppendDedicatedFormatFileWriter {
         self
     }
 
-    pub(crate) fn with_blob_consumer(
+    pub(crate) fn with_blob_writer_options(
         mut self,
         consumer: Option<Arc<dyn crate::spec::BlobConsumer>>,
+        uri_reader_factory: Option<Arc<dyn crate::io::UriReaderFactory>>,
     ) -> Result<Self> {
-        if let Some(consumer) = consumer {
+        if consumer.is_some() || uri_reader_factory.is_some() {
             for blob in &mut self.blob_writers {
-                blob.writer.set_blob_consumer(consumer.clone())?;
+                blob.writer
+                    .set_blob_writer_options(consumer.clone(), uri_reader_factory.clone())?;
             }
         }
         Ok(self)
@@ -506,12 +508,15 @@ mod tests {
             if has_consumer {
                 let received = descriptors.clone();
                 writer = writer
-                    .with_blob_consumer(Some(Arc::new(
-                        move |_: &str, descriptor: Option<&crate::spec::BlobDescriptor>| {
-                            received.lock().unwrap().push(descriptor.unwrap().clone());
-                            Ok(false)
-                        },
-                    )))
+                    .with_blob_writer_options(
+                        Some(Arc::new(
+                            move |_: &str, descriptor: Option<&crate::spec::BlobDescriptor>| {
+                                received.lock().unwrap().push(descriptor.unwrap().clone());
+                                Ok(false)
+                            },
+                        )),
+                        None,
+                    )
                     .unwrap();
             }
             writer.write(&batch).await.unwrap();

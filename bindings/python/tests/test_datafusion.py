@@ -30,7 +30,13 @@ import pyarrow as pa
 import pytest
 from datafusion import SessionContext
 
-from pypaimon_rust.datafusion import PaimonCatalog, PythonScalarUDF, SQLContext, udf
+from pypaimon_rust.datafusion import (
+    PaimonCatalog,
+    PythonScalarUDF,
+    SQLContext,
+    SQLOptions,
+    udf,
+)
 
 WAREHOUSE = os.environ.get("PAIMON_TEST_WAREHOUSE", "/tmp/paimon-warehouse")
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
@@ -124,6 +130,37 @@ def test_sql_context_accepts_runtime_resource_configuration():
 def test_sql_context_rejects_invalid_runtime_resource_configuration(kwargs, message):
     with pytest.raises(ValueError, match=message):
         SQLContext(**kwargs)
+
+
+@pytest.mark.parametrize("method", ["sql_with_options", "sql_stream_with_options"])
+def test_sql_with_options_disables_statements(method):
+    ctx = SQLContext()
+    options = SQLOptions().with_allow_statements(False)
+
+    with pytest.raises(ValueError, match="Statement not supported"):
+        getattr(ctx, method)("SET datafusion.execution.batch_size = 1024", options)
+
+
+@pytest.mark.parametrize("method", ["sql_with_options", "sql_stream_with_options"])
+def test_sql_with_options_disables_ddl(method):
+    ctx = SQLContext()
+    options = SQLOptions().with_allow_ddl(False)
+
+    with pytest.raises(ValueError, match="DDL not supported"):
+        getattr(ctx, method)("CREATE VIEW blocked_view AS SELECT 1", options)
+
+
+@pytest.mark.parametrize("method", ["sql_with_options", "sql_stream_with_options"])
+def test_sql_with_options_disables_dml(tmp_path, method):
+    ctx = SQLContext()
+    ctx.register_catalog("paimon", {"warehouse": str(tmp_path / "warehouse")})
+    ctx.sql("CREATE TABLE paimon.default.test_table (id INT)")
+    options = SQLOptions().with_allow_dml(False)
+
+    with pytest.raises(ValueError, match="DML not supported"):
+        getattr(ctx, method)(
+            "INSERT INTO paimon.default.test_table VALUES (1)", options
+        )
 
 
 def test_video_snapshot_builtin_registered_on_context_init():

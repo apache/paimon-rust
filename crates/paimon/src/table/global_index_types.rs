@@ -55,14 +55,14 @@ pub const SUPPORTED_GLOBAL_INDEX_TYPES_FOR_DROP: &str =
     "btree, bitmap, multivalue, fm, full-text, lumina, lumina-vector-ann, ivf-flat, ivf-pq, ivf-sq, ivf-rq, diskann";
 
 /// Canonicalize any supported global index type to a stable `&'static str`, or
-/// `None` if unsupported. Case-insensitive. Order: sorted -> full-text -> lumina
-/// -> vindex.
+/// `None` if unsupported. Case-insensitive and shared by build and drop.
+/// Order: scalar -> full-text -> lumina -> vindex.
 ///
 /// Both lumina aliases (`lumina`, `lumina-vector-ann`) canonicalize to
 /// `"lumina"`; each vindex type keeps its own identity so dropping one vindex
 /// type never matches another on the same column. Callers should compare the
 /// canonical form of BOTH the request and each stored entry's `index_type`.
-pub fn normalize_global_index_type_for_drop(index_type: &str) -> Option<&'static str> {
+pub fn normalize_global_index_type(index_type: &str) -> Option<&'static str> {
     if let Some(queryable) = normalize_queryable_global_index_type(index_type) {
         return Some(queryable);
     }
@@ -100,77 +100,47 @@ mod tests {
 
     #[test]
     fn sorted_types_canonicalize_case_insensitively() {
-        assert_eq!(normalize_global_index_type_for_drop("BTREE"), Some("btree"));
+        assert_eq!(normalize_global_index_type("BTREE"), Some("btree"));
+        assert_eq!(normalize_global_index_type("Bitmap"), Some("bitmap"));
         assert_eq!(
-            normalize_global_index_type_for_drop("Bitmap"),
-            Some("bitmap")
-        );
-        assert_eq!(
-            normalize_global_index_type_for_drop("MultiValue"),
+            normalize_global_index_type("MultiValue"),
             Some("multivalue")
         );
-        assert_eq!(normalize_global_index_type_for_drop("FM"), Some("fm"));
+        assert_eq!(normalize_global_index_type("FM"), Some("fm"));
     }
 
     #[test]
     fn full_text_canonicalizes_case_insensitively() {
-        assert_eq!(
-            normalize_global_index_type_for_drop("full-text"),
-            Some("full-text")
-        );
-        assert_eq!(
-            normalize_global_index_type_for_drop("Full-Text"),
-            Some("full-text")
-        );
+        assert_eq!(normalize_global_index_type("full-text"), Some("full-text"));
+        assert_eq!(normalize_global_index_type("Full-Text"), Some("full-text"));
         // Full-text is dropped by its own identity, never as a queryable scalar index.
         assert_eq!(normalize_queryable_global_index_type("full-text"), None);
     }
 
     #[test]
     fn lumina_aliases_canonicalize_to_lumina() {
+        assert_eq!(normalize_global_index_type("lumina"), Some("lumina"));
         assert_eq!(
-            normalize_global_index_type_for_drop("lumina"),
+            normalize_global_index_type("lumina-vector-ann"),
             Some("lumina")
         );
-        assert_eq!(
-            normalize_global_index_type_for_drop("lumina-vector-ann"),
-            Some("lumina")
-        );
-        assert_eq!(
-            normalize_global_index_type_for_drop("LUMINA"),
-            Some("lumina")
-        );
+        assert_eq!(normalize_global_index_type("LUMINA"), Some("lumina"));
     }
 
     #[test]
     fn vindex_types_keep_distinct_identity() {
-        assert_eq!(
-            normalize_global_index_type_for_drop("ivf-flat"),
-            Some("ivf-flat")
-        );
-        assert_eq!(
-            normalize_global_index_type_for_drop("IVF-PQ"),
-            Some("ivf-pq")
-        );
-        assert_eq!(
-            normalize_global_index_type_for_drop("IVF-SQ"),
-            Some("ivf-sq")
-        );
-        assert_eq!(
-            normalize_global_index_type_for_drop("IVF-RQ"),
-            Some("ivf-rq")
-        );
-        assert_eq!(
-            normalize_global_index_type_for_drop("DiskANN"),
-            Some("diskann")
-        );
+        assert_eq!(normalize_global_index_type("ivf-flat"), Some("ivf-flat"));
+        assert_eq!(normalize_global_index_type("IVF-PQ"), Some("ivf-pq"));
+        assert_eq!(normalize_global_index_type("IVF-SQ"), Some("ivf-sq"));
+        assert_eq!(normalize_global_index_type("IVF-RQ"), Some("ivf-rq"));
+        assert_eq!(normalize_global_index_type("DiskANN"), Some("diskann"));
     }
 
     #[test]
     fn unsupported_types_return_none() {
-        assert_eq!(normalize_global_index_type_for_drop("hash"), None);
-        assert_eq!(normalize_global_index_type_for_drop("ivf-hnsw-flat"), None);
-        assert_eq!(normalize_global_index_type_for_drop("ivf-hnsw-sq"), None);
-        assert_eq!(normalize_global_index_type_for_drop(""), None);
+        assert_eq!(normalize_global_index_type("hash"), None);
+        assert_eq!(normalize_global_index_type("ivf-hnsw-flat"), None);
+        assert_eq!(normalize_global_index_type("ivf-hnsw-sq"), None);
+        assert_eq!(normalize_global_index_type(""), None);
     }
 }

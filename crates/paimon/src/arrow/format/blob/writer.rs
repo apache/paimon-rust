@@ -23,19 +23,29 @@ use super::{
     BLOB_MAP_MAGIC_NUMBER, BLOB_MAP_VERSION,
 };
 use crate::arrow::format::{FormatFileWriter, FormatWriteResult, FormatWriterFactory};
-use crate::io::{FileIO, FileRead, FileWrite, OutputFile};
+use crate::io::uri_reader::ReusingBlobRefStreamProvider;
+use crate::io::{FileIO, FileRead, FileWrite, OutputFile, UriInputStream, UriReaderFactory};
 use crate::spec::{BlobConsumer, BlobDescriptor, CoreOptions, DataField, DataType};
 use crate::{Error, Result};
 use arrow_array::{
     Array, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Int16Array, Int32Array,
     Int64Array, Int8Array, LargeBinaryArray, ListArray, MapArray, RecordBatch, StringArray,
-    Time32MillisecondArray,
+    StructArray, Time32MillisecondArray,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
 use crc32fast::Hasher;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+
+/// Positions are relative to the logical update range, across rolled files.
+/// Java's BlobPlaceholder has index length -2; an explicit NULL has length -1.
+#[derive(Clone)]
+struct BlobUpdateRows {
+    updated: Arc<[usize]>,
+    next_position: Arc<AtomicUsize>,
+}
 
 // Remote FileRead ranges open new requests. Keep read-ahead independent of
 // the Java-sized copy buffer so a 4 KiB buffer does not mean 4 KiB GETs.
@@ -45,11 +55,17 @@ const SOURCE_READ_SIZE: u64 = 8 * 1024 * 1024;
 #[path = "writer_consumer_tests.rs"]
 mod consumer_tests;
 
+#[cfg(test)]
+#[path = "writer_uri_reader_tests.rs"]
+mod uri_reader_tests;
+
 pub(crate) struct BlobWriterFactory {
     file_io: Option<FileIO>,
     field: Option<DataField>,
     consumer: Option<Arc<dyn BlobConsumer>>,
+    uri_reader_factory: Option<Arc<dyn UriReaderFactory>>,
     copy_buffer_size: usize,
+    update_rows: Option<BlobUpdateRows>,
 }
 
 impl BlobWriterFactory {
@@ -63,13 +79,30 @@ impl BlobWriterFactory {
             file_io,
             field: field.cloned(),
             consumer: None,
+            uri_reader_factory: None,
             copy_buffer_size: CoreOptions::new(options.unwrap_or(&defaults))
                 .blob_copy_buffer_size()?,
+            update_rows: None,
         })
     }
 
     pub(crate) fn with_consumer(mut self, consumer: Arc<dyn BlobConsumer>) -> Self {
         self.consumer = Some(consumer);
+        self
+    }
+
+    pub(crate) fn with_uri_reader_factory(mut self, factory: Arc<dyn UriReaderFactory>) -> Self {
+        self.uri_reader_factory = Some(factory);
+        self
+    }
+
+    /// Emit placeholders for unchanged rows of a column with a physical baseline.
+    pub(crate) fn with_update_rows(mut self, updated: Vec<usize>) -> Self {
+        debug_assert!(updated.windows(2).all(|pair| pair[0] < pair[1]));
+        self.update_rows = Some(BlobUpdateRows {
+            updated: updated.into(),
+            next_position: Arc::new(AtomicUsize::new(0)),
+        });
         self
     }
 }
@@ -94,7 +127,9 @@ impl FormatWriterFactory for BlobWriterFactory {
                 self.field.as_ref(),
             )?
             .with_copy_buffer_size(self.copy_buffer_size)
-            .with_consumer(self.consumer.clone()),
+            .with_uri_reader_factory(self.uri_reader_factory.clone())
+            .with_consumer(self.consumer.clone())
+            .with_update_rows(self.update_rows.clone()),
         ))
     }
 }
@@ -106,9 +141,12 @@ pub(crate) struct BlobFormatWriter {
     path: String,
     field_name: String,
     consumer: Option<Arc<dyn BlobConsumer>>,
+    uri_reader_factory: Option<Arc<dyn UriReaderFactory>>,
+    reference_streams: ReusingBlobRefStreamProvider,
     copy_buffer_size: usize,
     bytes_written: u64,
     lengths: Vec<i64>,
+    update_rows: Option<BlobUpdateRows>,
 }
 
 fn invalid(message: impl Into<String>) -> Error {
@@ -147,9 +185,12 @@ impl BlobFormatWriter {
             path: output.location().to_string(),
             field_name: field.map_or_else(String::new, |field| field.name().to_string()),
             consumer: None,
+            uri_reader_factory: None,
+            reference_streams: ReusingBlobRefStreamProvider::default(),
             copy_buffer_size: 4 * 1024,
             bytes_written: 0,
             lengths: Vec::new(),
+            update_rows: None,
         })
     }
 
@@ -159,8 +200,21 @@ impl BlobFormatWriter {
         self
     }
 
+    pub(crate) fn with_uri_reader_factory(
+        mut self,
+        factory: Option<Arc<dyn UriReaderFactory>>,
+    ) -> Self {
+        self.uri_reader_factory = factory;
+        self
+    }
+
     fn with_consumer(mut self, consumer: Option<Arc<dyn BlobConsumer>>) -> Self {
         self.consumer = consumer;
+        self
+    }
+
+    fn with_update_rows(mut self, rows: Option<BlobUpdateRows>) -> Self {
+        self.update_rows = rows;
         self
     }
 
@@ -249,6 +303,15 @@ impl BlobFormatWriter {
         }
         let descriptor = BlobDescriptor::deserialize(value)?;
         let range = descriptor.range_spec()?;
+        let factory = match &self.uri_reader_factory {
+            Some(factory) if factory.supports_uri(descriptor.uri())? => Some(factory.clone()),
+            _ => None,
+        };
+        if let Some(factory) = factory {
+            return self
+                .copy_custom_reference(factory.as_ref(), &descriptor, hasher)
+                .await;
+        }
         let file_io = self.file_io.as_ref().ok_or_else(|| {
             invalid("BlobFormatWriter received a BlobDescriptor but has no FileIO to resolve it")
         })?;
@@ -279,6 +342,94 @@ impl BlobFormatWriter {
         self.copy_payload(reader.as_ref(), offset..end, hasher, descriptor.uri())
             .await?;
         Ok(length_i64)
+    }
+
+    async fn copy_custom_reference(
+        &mut self,
+        factory: &dyn UriReaderFactory,
+        descriptor: &BlobDescriptor,
+        hasher: &mut Hasher,
+    ) -> Result<i64> {
+        let range = descriptor.range_spec()?;
+        let reader = factory.create(descriptor.uri())?;
+        let length = match range.length() {
+            Some(length) => {
+                let mut sources = std::mem::take(&mut self.reference_streams);
+                let result = async {
+                    sources
+                        .prepare(reader, descriptor.uri(), range.offset())
+                        .await?;
+                    let result = self
+                        .copy_uri_stream(sources.stream(), Some(length), hasher)
+                        .await;
+                    match result {
+                        Ok(length) => {
+                            sources.advance(length);
+                            Ok(length)
+                        }
+                        Err(error) => {
+                            let _ = sources.close().await;
+                            Err(error)
+                        }
+                    }
+                }
+                .await;
+                self.reference_streams = sources;
+                result?
+            }
+            None => {
+                // Unknown-length references read to EOF on their own stream;
+                // do not consume or replace the cached bounded source.
+                let mut stream = reader.new_input_stream(descriptor.uri()).await?;
+                let result = async {
+                    if range.offset() != 0 {
+                        stream.seek(range.offset()).await?;
+                    }
+                    self.copy_uri_stream(stream.as_mut(), None, hasher).await
+                }
+                .await;
+                let close = stream.close().await;
+                let length = result?;
+                close?;
+                length
+            }
+        };
+        i64::try_from(length).map_err(|_| invalid("BLOB payload exceeds i64"))
+    }
+
+    async fn copy_uri_stream(
+        &mut self,
+        stream: &mut dyn UriInputStream,
+        length: Option<u64>,
+        hasher: &mut Hasher,
+    ) -> Result<u64> {
+        let mut copied = 0_u64;
+        loop {
+            let requested = length.map_or(self.copy_buffer_size, |length| {
+                (length - copied).min(self.copy_buffer_size as u64) as usize
+            });
+            if requested == 0 {
+                return Ok(copied);
+            }
+            let bytes = stream.read(requested).await?;
+            if bytes.len() > requested {
+                return Err(invalid("URI stream returned more bytes than requested"));
+            }
+            if bytes.is_empty() {
+                if length.is_some_and(|length| length != copied) {
+                    return Err(invalid(format!(
+                        "Unexpected EOF copying BLOB payload: expected {} bytes, received {copied}",
+                        length.unwrap()
+                    )));
+                }
+                return Ok(copied);
+            }
+            copied = copied
+                .checked_add(bytes.len() as u64)
+                .filter(|length| *length <= i64::MAX as u64)
+                .ok_or_else(|| invalid("BLOB payload exceeds i64"))?;
+            self.write_bytes(bytes, hasher).await?;
+        }
     }
 
     async fn copy_payload(
@@ -348,7 +499,7 @@ impl BlobFormatWriter {
     async fn write_collection(
         &mut self,
         values: &LargeBinaryArray,
-        keys: Option<Vec<Vec<u8>>>,
+        keys: Option<Vec<Option<Vec<u8>>>>,
     ) -> Result<()> {
         let (start, mut hasher) = self.start_record().await?;
         let (magic, version) = if keys.is_some() {
@@ -366,6 +517,10 @@ impl BlobFormatWriter {
         let key_lengths = if let Some(keys) = keys {
             let mut lengths = Vec::with_capacity(keys.len());
             for key in keys {
+                let Some(key) = key else {
+                    lengths.push(-1);
+                    continue;
+                };
                 lengths.push(
                     i64::try_from(key.len()).map_err(|_| invalid("BLOB MAP key exceeds i64"))?,
                 );
@@ -407,7 +562,22 @@ impl FormatFileWriter for BlobFormatWriter {
         }
         let column = batch.column(0);
         let kind = self.kind.clone();
+        let first_position = self
+            .update_rows
+            .as_ref()
+            .map_or(0, |rows| rows.next_position.load(Ordering::Relaxed));
+        let end_position = first_position
+            .checked_add(batch.num_rows())
+            .ok_or_else(|| invalid("BLOB update row position overflows usize"))?;
         for row in 0..batch.num_rows() {
+            if self
+                .update_rows
+                .as_ref()
+                .is_some_and(|rows| rows.updated.binary_search(&(first_position + row)).is_err())
+            {
+                self.lengths.push(-2);
+                continue;
+            }
             if column.is_null(row) {
                 self.lengths.push(-1);
                 if let Some(consumer) = &self.consumer {
@@ -430,17 +600,16 @@ impl FormatFileWriter for BlobFormatWriter {
                         .await?;
                 }
                 BlobFieldKind::Map(key_type) => {
-                    let map = column
-                        .as_any()
-                        .downcast_ref::<MapArray>()
-                        .ok_or_else(|| invalid("MAP<X, BLOB> writer requires MapArray"))?;
-                    let entries = map.value(row);
+                    let entries = map_entries(column.as_ref(), row)?;
                     // Java validates all keys before starting the record.
                     let keys = serialize_map_keys(entries.column(0).as_ref(), key_type)?;
                     self.write_collection(blob_values(entries.column(1).as_ref())?, Some(keys))
                         .await?;
                 }
             }
+        }
+        if let Some(rows) = &self.update_rows {
+            rows.next_position.store(end_position, Ordering::Relaxed);
         }
         Ok(())
     }
@@ -455,17 +624,27 @@ impl FormatFileWriter for BlobFormatWriter {
         self.writer.flush().await
     }
     async fn close(mut self: Box<Self>) -> Result<FormatWriteResult> {
-        let index = encode_delta_varints_write(&self.lengths);
-        let length =
-            i32::try_from(index.len()).map_err(|_| invalid("BLOB file index exceeds i32"))?;
-        self.writer.write(index.into()).await?;
-        self.writer
-            .write(Bytes::copy_from_slice(&length.to_le_bytes()))
-            .await?;
-        self.writer
-            .write(Bytes::from_static(&[BLOB_FORMAT_VERSION]))
-            .await?;
-        self.writer.close().await?;
+        let footer = async {
+            let index = encode_delta_varints_write(&self.lengths);
+            let length =
+                i32::try_from(index.len()).map_err(|_| invalid("BLOB file index exceeds i32"))?;
+            self.writer.write(index.into()).await?;
+            self.writer
+                .write(Bytes::copy_from_slice(&length.to_le_bytes()))
+                .await?;
+            self.writer
+                .write(Bytes::from_static(&[BLOB_FORMAT_VERSION]))
+                .await?;
+            Ok::<_, Error>(length)
+        }
+        .await;
+        // Close both source and destination even if the footer or one close
+        // fails, keeping the first failure primary, like Java's finally blocks.
+        let source_close = self.reference_streams.close().await;
+        let output_close = self.writer.close().await;
+        let length = footer?;
+        source_close?;
+        output_close?;
         Ok(FormatWriteResult::new(
             self.bytes_written + length as u64 + 5,
         ))
@@ -499,12 +678,34 @@ fn validate_key_type(key_type: &DataType) -> Result<()> {
     }
 }
 
-fn serialize_map_keys(array: &dyn Array, key_type: &DataType) -> Result<Vec<Vec<u8>>> {
+/// Arrow Map cannot represent NULL keys. Row updates may transport entries
+/// as a list of key/value structs; physical bytes still use Java's map layout.
+fn map_entries(array: &dyn Array, row: usize) -> Result<StructArray> {
+    if let Some(map) = array.as_any().downcast_ref::<MapArray>() {
+        return Ok(map.value(row));
+    }
+    if let Some(list) = array.as_any().downcast_ref::<ListArray>() {
+        if let Some(entries) = list.value(row).as_any().downcast_ref::<StructArray>() {
+            if entries.num_columns() == 2 && entries.null_count() == 0 {
+                return Ok(entries.clone());
+            }
+        }
+    }
+    Err(invalid(
+        "MAP<X, BLOB> writer requires MapArray or a list of key/value structs",
+    ))
+}
+
+fn serialize_map_keys(array: &dyn Array, key_type: &DataType) -> Result<Vec<Option<Vec<u8>>>> {
     let mut seen = HashSet::new();
     let mut keys = Vec::with_capacity(array.len());
     for row in 0..array.len() {
         if array.is_null(row) {
-            return Err(invalid("Arrow MAP keys must not be null"));
+            if !seen.insert(None) {
+                return Err(invalid("MAP<X, BLOB> keys must be unique"));
+            }
+            keys.push(None);
+            continue;
         }
         macro_rules! fixed {
             ($array:ty) => {
@@ -576,10 +777,10 @@ fn serialize_map_keys(array: &dyn Array, key_type: &DataType) -> Result<Vec<Vec<
                 })
             }
         };
-        if !seen.insert(key.clone()) {
+        if !seen.insert(Some(key.clone())) {
             return Err(invalid("MAP<X, BLOB> keys must be unique"));
         }
-        keys.push(key);
+        keys.push(Some(key));
     }
     Ok(keys)
 }
@@ -715,7 +916,11 @@ mod tests {
             ),
         ];
         for (data_type, array) in types {
-            let keys = serialize_map_keys(array.as_ref(), &data_type).unwrap();
+            let keys = serialize_map_keys(array.as_ref(), &data_type)
+                .unwrap()
+                .into_iter()
+                .map(Option::unwrap)
+                .collect::<Vec<_>>();
             let bytes: Vec<_> = keys.iter().cloned().map(Bytes::from).collect();
             let restored = super::super::decode_blob_map_keys(&bytes, &data_type).unwrap();
             assert_eq!(restored.to_data(), array.to_data(), "{data_type:?}");
@@ -747,5 +952,20 @@ mod tests {
             assert!(error.to_string().contains("unique"));
         }
         assert!(validate_key_type(&DataType::Float(FloatType::new())).is_err());
+    }
+
+    #[test]
+    fn nullable_map_keys_distinguish_java_null_and_empty_encodings() {
+        let kind = DataType::VarChar(VarCharType::new(10).unwrap());
+        let keys = StringArray::from(vec![None, Some(""), Some("normal")]);
+        assert_eq!(
+            serialize_map_keys(&keys, &kind).unwrap(),
+            vec![None, Some(vec![]), Some(b"normal".to_vec())]
+        );
+        let duplicate = StringArray::from(vec![None::<&str>, None]);
+        assert!(serialize_map_keys(&duplicate, &kind)
+            .unwrap_err()
+            .to_string()
+            .contains("unique"));
     }
 }

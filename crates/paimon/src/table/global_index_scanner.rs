@@ -32,6 +32,7 @@ mod row_ranges;
 
 pub(crate) use deletion_vectors::deleted_row_ranges_for_data_evolution_dvs;
 use entry::{validate_fm_file_sets, GlobalIndexEntry, GlobalIndexEntryMeta, GlobalIndexFileKind};
+pub(super) use row_ranges::intersect_sorted_ranges;
 use row_ranges::unindexed_ranges_for_indexed_coverage;
 pub(crate) use row_ranges::{
     search_limit_with_deleted_rows, unindexed_ranges_for_global_index_entries, RowRangeIndex,
@@ -168,7 +169,7 @@ impl GlobalIndexScanner {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn create_with_fm_options(
+    pub(super) fn create_with_fm_options(
         file_io: &FileIO,
         table_path: &str,
         global_index_thread_num: usize,
@@ -363,6 +364,60 @@ impl GlobalIndexScanner {
                 .entry(path)
                 .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
         )
+    }
+
+    /// Scalar candidates and Java's exactness contract for searches which rank
+    /// rows before applying the row predicate.
+    pub(super) async fn matching_ranges_with_exactness(
+        &self,
+        predicate: &Predicate,
+    ) -> Result<Option<(Vec<RowRange>, bool)>> {
+        let Some(result) = self.evaluate(predicate).await? else {
+            return Ok(None);
+        };
+        let exact = result.fully_evaluated
+            && self.is_exact_predicate(predicate, &result.evaluated_field_ids);
+        Ok(Some((result.row_ranges, exact)))
+    }
+
+    fn is_exact_predicate(
+        &self,
+        predicate: &Predicate,
+        evaluated_fields: &std::collections::HashSet<i32>,
+    ) -> bool {
+        use crate::spec::PredicateOperator;
+        match predicate {
+            Predicate::Leaf { column, op, .. } => {
+                predicates::is_sorted_global_index_supported_op(*op)
+                    && !matches!(
+                        op,
+                        PredicateOperator::Contains
+                            | PredicateOperator::EndsWith
+                            | PredicateOperator::Like
+                    )
+                    && crate::table::find_field_id_by_name(&self.schema_fields, column)
+                        .is_some_and(|id| evaluated_fields.contains(&id))
+            }
+            Predicate::And(children) | Predicate::Or(children) => children
+                .iter()
+                .all(|child| self.is_exact_predicate(child, evaluated_fields)),
+            // The index evaluator declines NOT; its child's contributing
+            // field IDs cannot prove that this conjunct was evaluated.
+            Predicate::Not(_) | Predicate::AlwaysFalse => false,
+            Predicate::AlwaysTrue => true,
+        }
+    }
+
+    /// Matching positions without data-evolution's unindexed row-id extension.
+    /// Source-backed PK indexes cover a validated immutable source group.
+    pub(super) async fn matching_ranges(
+        &self,
+        predicate: &Predicate,
+    ) -> Result<Option<Vec<RowRange>>> {
+        Ok(self
+            .evaluate(predicate)
+            .await?
+            .map(|result| result.row_ranges))
     }
 }
 

@@ -30,7 +30,7 @@ use indexmap::IndexMap;
 
 use super::update_input::unique_column_index;
 use super::upsert_key_matcher::UpsertKeyMatcher;
-use super::write_batch_normalize::normalize_write_array;
+use super::write_batch_normalize::{normalize_blob_write_field, normalize_write_array};
 use crate::spec::{
     batch_to_serialized_bytes, extract_datum, BinaryRow, BinaryRowBuilder, CoreOptions, DataField,
 };
@@ -87,6 +87,7 @@ pub(super) struct TableUpsert {
     keys: Vec<String>,
     update_columns: Vec<String>,
     source: Vec<RecordBatch>,
+    blob_uri_reader_factory: Option<Arc<dyn crate::io::UriReaderFactory>>,
 }
 
 impl TableUpsert {
@@ -137,7 +138,15 @@ impl TableUpsert {
             keys,
             update_columns,
             source: Vec::new(),
+            blob_uri_reader_factory: None,
         })
+    }
+
+    pub(super) fn with_blob_uri_reader_factory(
+        &mut self,
+        factory: Option<Arc<dyn crate::io::UriReaderFactory>>,
+    ) {
+        self.blob_uri_reader_factory = factory;
     }
 
     /// Add rows containing the keys and columns to write. Column order may
@@ -161,16 +170,24 @@ impl TableUpsert {
         }
         let mut columns = Vec::with_capacity(target.fields().len());
         let mut fields = Vec::new();
-        for field in target.fields() {
+        let inline = CoreOptions::new(self.table.schema().options()).blob_inline_fields();
+        for (index, field) in target.fields().iter().enumerate() {
             let Some(column) = batch.column_by_name(field.name()) else {
                 continue;
             };
-            columns.push(
-                normalize_write_array(column, field.data_type()).map_err(|error| {
-                    invalid(format!("Invalid upsert column '{}': {error}", field.name()))
-                })?,
-            );
-            fields.push(field.clone());
+            let logical = &self.table.schema().fields()[index];
+            let normalized =
+                if logical.data_type().is_blob_file_field() && !inline.contains(logical.name()) {
+                    normalize_blob_write_field(column, field)
+                } else {
+                    normalize_write_array(column, field.data_type())
+                        .map(|column| (field.as_ref().clone(), column))
+                };
+            let (field, column) = normalized.map_err(|error| {
+                invalid(format!("Invalid upsert column '{}': {error}", field.name()))
+            })?;
+            columns.push(column);
+            fields.push(Arc::new(field));
         }
         let ordered = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
             .map_err(|error| invalid(format!("cannot order upsert columns: {error}")))?;
@@ -335,6 +352,7 @@ impl TableUpsert {
                     &self.table,
                     self.update_columns.clone(),
                 )?;
+                update.with_blob_uri_reader_factory(self.blob_uri_reader_factory.clone());
                 if let Some(snapshot_id) = plan.snapshot_id() {
                     update.pin_read_snapshot(snapshot_id);
                 }
@@ -357,6 +375,7 @@ impl TableUpsert {
                     .new_write_builder()
                     .with_commit_user(self.commit_user.clone())?
                     .new_write()?;
+                append.with_blob_uri_reader_factory(self.blob_uri_reader_factory.clone())?;
                 append.with_write_type(
                     group[0]
                         .schema()

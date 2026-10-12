@@ -68,10 +68,15 @@ pub(crate) fn resolved_primary_key_blob_fields(
     }
     let descriptor_fields = options.blob_descriptor_fields();
     let inline_fields = options.blob_inline_fields();
+    let video_fields = options.video_frame_fields();
     fields
         .iter()
         .enumerate()
         .filter_map(|(index, field)| {
+            // Video frames remain lazy VideoFrameDescriptors, a distinct format.
+            if video_fields.contains(field.name()) {
+                return None;
+            }
             let kind = managed_blob_kind(field.data_type())?;
             (!inline_fields.contains(field.name()) || descriptor_fields.contains(field.name()))
                 .then_some((index, kind))
@@ -592,6 +597,46 @@ mod tests {
     use arrow_array::StringArray;
     use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
     use arrow_schema::{Field, Schema};
+
+    #[tokio::test]
+    async fn video_frames_remain_lazy_descriptors() {
+        use crate::spec::{BlobType, DataType, VideoFrameDescriptor};
+        use futures::TryStreamExt;
+
+        let frame = VideoFrameDescriptor::new("memory:/must-not-open-video".into(), 0, 8, 2, -1, 0)
+            .unwrap()
+            .serialize();
+        let fields = [DataField::new(
+            0,
+            "frame".into(),
+            DataType::Blob(BlobType::new()),
+        )];
+        let batch = RecordBatch::try_from_iter([(
+            "frame",
+            Arc::new(LargeBinaryArray::from(vec![frame.as_slice()])) as ArrayRef,
+        )])
+        .unwrap();
+        let options = HashMap::from([("video-frame-field".into(), "frame".into())]);
+        let stream = Box::pin(futures::stream::iter([Ok(batch)]));
+        let batches: Vec<_> = resolve_primary_key_blob_stream(
+            stream,
+            &fields,
+            &CoreOptions::new(&options),
+            FileIOBuilder::new("memory").build().unwrap(),
+            2,
+            None,
+        )
+        .try_collect()
+        .await
+        .unwrap();
+        assert_eq!(batches.len(), 1);
+        let values = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<LargeBinaryArray>()
+            .unwrap();
+        assert_eq!(values.value(0), frame);
+    }
 
     #[tokio::test]
     async fn payload_filter_short_circuits_boolean_branches_and_null_checks() {

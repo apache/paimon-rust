@@ -18,16 +18,24 @@
 use pyo3::prelude::*;
 
 mod blob;
+mod blob_uri_reader;
+mod commit_callback;
 mod context;
 mod error;
+mod full_text_search;
+mod hybrid_search;
+mod index_build;
+mod merge_into;
 mod oss_cpp;
 mod predicate;
 mod read;
 mod schema;
+mod shard_update;
 mod table;
 mod udf;
 mod update_assignment;
 mod variant;
+mod vector_search;
 mod write;
 // ---- #285: observability ----
 mod partition;

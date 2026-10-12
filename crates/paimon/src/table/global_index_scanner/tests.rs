@@ -3903,3 +3903,123 @@ async fn test_between_unmatched_file_drops_remaining_match() {
              whose key range is [0, 198] — got {ranges:?}"
     );
 }
+
+#[tokio::test]
+async fn scalar_exactness_keeps_string_candidates_and_dropped_conjuncts_inexact() {
+    let io = crate::io::FileIOBuilder::new("memory").build().unwrap();
+    let mut fields = string_schema_fields();
+    fields.push(DataField::new(
+        2,
+        "other".to_string(),
+        fields[0].data_type().clone(),
+    ));
+    let mut entry = make_global_index_entry(
+        "unused.index",
+        1,
+        100,
+        109,
+        &BTreeIndexMeta::new(Some(b"alpha".to_vec()), Some(b"zeta".to_vec()), false),
+    );
+    entry.index_file.row_count = 10;
+    entry.index_file.file_size = 100;
+    let scanner = GlobalIndexScanner::create(&io, "memory:/absent", 1, 0, 0, &[entry], &fields)
+        .unwrap()
+        .unwrap();
+    let builder = crate::spec::PredicateBuilder::new(&fields);
+    let exact = builder
+        .less_than("name", Datum::String("zz".to_string()))
+        .unwrap();
+    let (ranges, is_exact) = scanner
+        .matching_ranges_with_exactness(&exact)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(ranges, vec![RowRange::new(100, 109)]);
+    assert!(is_exact);
+    for candidate in [
+        builder
+            .contains("name", Datum::String("needle".to_string()))
+            .unwrap(),
+        builder
+            .ends_with("name", Datum::String("needle".to_string()))
+            .unwrap(),
+        builder
+            .like("name", Datum::String("%needle%".to_string()), None)
+            .unwrap(),
+        builder
+            .equal("other", Datum::String("needle".to_string()))
+            .unwrap(),
+        Predicate::negate(exact.clone()),
+    ] {
+        let filter = Predicate::and(vec![exact.clone(), candidate]);
+        let (ranges, is_exact) = scanner
+            .matching_ranges_with_exactness(&filter)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ranges, vec![RowRange::new(100, 109)]);
+        assert!(!is_exact, "{filter:?}");
+    }
+}
+
+#[tokio::test]
+async fn scalar_exactness_detects_unsupported_conjunct_on_same_fm_field() {
+    let io = crate::io::FileIOBuilder::new("memory").build().unwrap();
+    let path = "memory:/fm_exactness";
+    let output = VecFileWrite::new();
+    let mut writer =
+        FMGlobalIndexWriter::new(Box::new(output.clone()), FMWriteOptions::default()).unwrap();
+    writer.write(None, 0).await.unwrap();
+    writer.write(Some(b"alpha"), 1).await.unwrap();
+    let result = writer.finish().await.unwrap();
+    io.new_output(&format!("{path}/index/name.fm"))
+        .unwrap()
+        .write(bytes::Bytes::from(output.to_vec()))
+        .await
+        .unwrap();
+    let mut entry = make_global_index_entry_with_type(
+        "fm",
+        "name.fm",
+        1,
+        0,
+        1,
+        &BTreeIndexMeta::new(None, None, true),
+    );
+    entry.index_file.row_count = result.row_count as i64;
+    entry.index_file.file_size = output.to_vec().len() as i64;
+    entry
+        .index_file
+        .global_index_meta
+        .as_mut()
+        .unwrap()
+        .index_meta = Some(result.index_meta);
+    let fields = string_schema_fields();
+    let scanner = GlobalIndexScanner::create(&io, path, 1, i64::MAX, i64::MAX, &[entry], &fields)
+        .unwrap()
+        .unwrap();
+    let builder = crate::spec::PredicateBuilder::new(&fields);
+    let is_null = builder.is_null("name").unwrap();
+    let (ranges, exact) = scanner
+        .matching_ranges_with_exactness(&is_null)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(ranges, vec![RowRange::new(0, 0)]);
+    assert!(exact);
+    let filter = Predicate::and(vec![
+        is_null,
+        builder
+            .starts_with("name", Datum::String("a".to_string()))
+            .unwrap(),
+    ]);
+    let (ranges, exact) = scanner
+        .matching_ranges_with_exactness(&filter)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(ranges, vec![RowRange::new(0, 0)]);
+    assert!(
+        !exact,
+        "FM must not mark a dropped startsWith conjunct exact"
+    );
+}

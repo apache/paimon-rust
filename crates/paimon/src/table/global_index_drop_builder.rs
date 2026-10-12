@@ -17,8 +17,7 @@
 
 use super::global_index_build_common::IndexColumns;
 use super::global_index_types::{
-    normalize_global_index_type_for_drop, BTREE_GLOBAL_INDEX_TYPE,
-    SUPPORTED_GLOBAL_INDEX_TYPES_FOR_DROP,
+    normalize_global_index_type, BTREE_GLOBAL_INDEX_TYPE, SUPPORTED_GLOBAL_INDEX_TYPES_FOR_DROP,
 };
 use crate::spec::{FileKind, IndexFileMeta, IndexManifest};
 use crate::table::{CommitMessage, Table, TableCommit};
@@ -29,6 +28,7 @@ pub struct GlobalIndexDropBuilder<'a> {
     table: &'a Table,
     index_column: Option<IndexColumns>,
     index_type: String,
+    dry_run: bool,
 }
 
 impl<'a> GlobalIndexDropBuilder<'a> {
@@ -37,6 +37,7 @@ impl<'a> GlobalIndexDropBuilder<'a> {
             table,
             index_column: None,
             index_type: BTREE_GLOBAL_INDEX_TYPE.to_string(),
+            dry_run: false,
         }
     }
 
@@ -58,6 +59,12 @@ impl<'a> GlobalIndexDropBuilder<'a> {
         self
     }
 
+    /// Return the matched index file count without committing when enabled.
+    pub fn with_dry_run(&mut self, dry_run: bool) -> &mut Self {
+        self.dry_run = dry_run;
+        self
+    }
+
     pub async fn execute(&self) -> Result<usize> {
         // Dropping an index reads the index manifest.
         crate::spec::CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
@@ -65,13 +72,11 @@ impl<'a> GlobalIndexDropBuilder<'a> {
         self.table.ensure_not_branch_reference_for_write()?;
 
         let index_type =
-            normalize_global_index_type_for_drop(&self.index_type).ok_or_else(|| {
-                Error::Unsupported {
-                    message: format!(
-                        "unsupported global index type '{}'; supported: {}",
-                        self.index_type, SUPPORTED_GLOBAL_INDEX_TYPES_FOR_DROP
-                    ),
-                }
+            normalize_global_index_type(&self.index_type).ok_or_else(|| Error::Unsupported {
+                message: format!(
+                    "unsupported global index type '{}'; supported: {}",
+                    self.index_type, SUPPORTED_GLOBAL_INDEX_TYPES_FOR_DROP
+                ),
             })?;
         let index_column = self
             .index_column
@@ -113,9 +118,7 @@ impl<'a> GlobalIndexDropBuilder<'a> {
             if entry.kind != FileKind::Add {
                 continue;
             }
-            if normalize_global_index_type_for_drop(&entry.index_file.index_type)
-                != Some(index_type)
-            {
+            if normalize_global_index_type(&entry.index_file.index_type) != Some(index_type) {
                 continue;
             }
             let Some(global_meta) = entry.index_file.global_index_meta.as_ref() else {
@@ -135,8 +138,8 @@ impl<'a> GlobalIndexDropBuilder<'a> {
                 .or_default()
                 .push(entry.index_file);
         }
-        if dropped == 0 {
-            return Ok(0);
+        if self.dry_run || dropped == 0 {
+            return Ok(dropped);
         }
 
         let mut groups = deletions_by_partition_bucket
@@ -182,6 +185,7 @@ mod tests {
     use crate::table::TableCommit;
     use chrono::{DateTime, Utc};
     use indexmap::IndexMap;
+    use std::collections::BTreeMap;
 
     #[tokio::test]
     async fn test_query_auth_table_refuses_index_builds_and_drops() {
@@ -195,18 +199,21 @@ mod tests {
             );
         };
 
+        for dry_run in [false, true] {
+            refused(
+                table
+                    .new_global_index_drop_builder()
+                    .with_index_type("btree")
+                    .with_dry_run(dry_run)
+                    .execute()
+                    .await
+                    .unwrap_err(),
+                "dropping a global index",
+            );
+        }
         refused(
             table
-                .new_global_index_drop_builder()
-                .with_index_type("btree")
-                .execute()
-                .await
-                .unwrap_err(),
-            "dropping a global index",
-        );
-        refused(
-            table
-                .new_btree_global_index_build_builder()
+                .new_global_index_build_builder()
                 .execute()
                 .await
                 .unwrap_err(),
@@ -214,7 +221,8 @@ mod tests {
         );
         refused(
             table
-                .new_vindex_index_build_builder("vector")
+                .new_global_index_build_builder()
+                .with_index_type("vector")
                 .execute()
                 .await
                 .unwrap_err(),
@@ -222,7 +230,8 @@ mod tests {
         );
         refused(
             table
-                .new_lumina_index_build_builder()
+                .new_global_index_build_builder()
+                .with_index_type("lumina")
                 .execute()
                 .await
                 .unwrap_err(),
@@ -363,6 +372,161 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    async fn table_files(table: &Table) -> BTreeMap<String, Vec<u8>> {
+        let mut files = BTreeMap::new();
+        for status in table
+            .file_io()
+            .list_status_recursive(&format!("{}/", table.location()))
+            .await
+            .unwrap()
+        {
+            let content = table
+                .file_io()
+                .new_input(&status.path)
+                .unwrap()
+                .read()
+                .await
+                .unwrap();
+            files.insert(status.path, content.to_vec());
+        }
+        files
+    }
+
+    #[tokio::test]
+    async fn test_drop_global_index_dry_run_preserves_files() {
+        for index_type in [
+            "btree",
+            "bitmap",
+            "multivalue",
+            "fm",
+            "full-text",
+            "lumina",
+            "ivf-flat",
+            "ivf-pq",
+            "ivf-sq",
+            "ivf-rq",
+            "diskann",
+        ] {
+            let table = test_table(&format!("memory:/dry_run_{index_type}"));
+            setup_dirs(&table).await;
+            let mut message = CommitMessage::new(vec![], 0, vec![data_file("data.parquet")]);
+            message.new_index_files = vec![
+                global_index_file(index_type, "id-0.index", 0, 0, 9),
+                global_index_file(index_type, "id-1.index", 0, 10, 19),
+                global_index_file(index_type, "name.index", 1, 0, 19),
+                hash_index_file("hash.index"),
+            ];
+            TableCommit::new(table.clone(), "test-user".into())
+                .commit(vec![message])
+                .await
+                .unwrap();
+            let before = table_files(&table).await;
+
+            let mut builder = table.new_global_index_drop_builder();
+            builder
+                .with_index_column("id")
+                .with_index_type(index_type)
+                .with_dry_run(true);
+            assert_eq!(builder.execute().await.unwrap(), 2, "{index_type}");
+            assert_eq!(table_files(&table).await, before, "{index_type}");
+            assert_eq!(latest_index_entries(&table).await.len(), 4);
+
+            builder.with_dry_run(false);
+            assert_eq!(builder.execute().await.unwrap(), 2, "{index_type}");
+            assert_eq!(latest_index_entries(&table).await.len(), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_drop_global_index_dry_run_matches_full_column_list() {
+        let table = test_table("memory:/dry_run_composite");
+        setup_dirs(&table).await;
+        let mut composite = global_index_file("btree", "id-name.index", 0, 0, 9);
+        composite
+            .global_index_meta
+            .as_mut()
+            .unwrap()
+            .extra_field_ids = Some(vec![1]);
+        let mut reversed = global_index_file("btree", "name-id.index", 1, 0, 9);
+        reversed.global_index_meta.as_mut().unwrap().extra_field_ids = Some(vec![0]);
+        let mut message = CommitMessage::new(vec![], 0, vec![data_file("data.parquet")]);
+        message.new_index_files = vec![
+            global_index_file("btree", "id.index", 0, 0, 9),
+            composite,
+            reversed,
+            global_index_file("bitmap", "bitmap-id.index", 0, 0, 9),
+        ];
+        TableCommit::new(table.clone(), "test-user".into())
+            .commit(vec![message])
+            .await
+            .unwrap();
+        let before = table_files(&table).await;
+
+        for columns in ["id", "id,name", "name,id"] {
+            assert_eq!(
+                table
+                    .new_global_index_drop_builder()
+                    .with_index_column(columns)
+                    .with_dry_run(true)
+                    .execute()
+                    .await
+                    .unwrap(),
+                1,
+                "{columns}"
+            );
+        }
+        assert_eq!(table_files(&table).await, before);
+    }
+
+    #[tokio::test]
+    async fn test_drop_global_index_dry_run_without_match() {
+        for (case, index_files) in [
+            ("no_snapshot", None),
+            ("no_index_manifest", Some(vec![])),
+            (
+                "no_match",
+                Some(vec![global_index_file("btree", "name.index", 1, 0, 9)]),
+            ),
+        ] {
+            let table = test_table(&format!("memory:/dry_run_{case}"));
+            setup_dirs(&table).await;
+            if let Some(index_files) = index_files {
+                let mut message = CommitMessage::new(vec![], 0, vec![data_file("data.parquet")]);
+                message.new_index_files = index_files;
+                TableCommit::new(table.clone(), "test-user".into())
+                    .commit(vec![message])
+                    .await
+                    .unwrap();
+            }
+            let before = table_files(&table).await;
+            assert_eq!(
+                table
+                    .new_global_index_drop_builder()
+                    .with_index_column("id")
+                    .with_dry_run(true)
+                    .execute()
+                    .await
+                    .unwrap(),
+                0,
+                "{case}"
+            );
+            assert_eq!(table_files(&table).await, before, "{case}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_drop_global_index_dry_run_validates_columns() {
+        let table = test_table("memory:/dry_run_invalid_columns");
+        for column in [None, Some(""), Some(" "), Some(", ,"), Some("missing")] {
+            let mut builder = table.new_global_index_drop_builder();
+            builder.with_dry_run(true);
+            if let Some(column) = column {
+                builder.with_index_column(column);
+            }
+            assert!(builder.execute().await.is_err(), "{column:?}");
+        }
     }
 
     #[tokio::test]

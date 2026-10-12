@@ -536,7 +536,7 @@ mod tests {
             .unwrap();
 
         let index_err = table
-            .new_btree_global_index_build_builder()
+            .new_global_index_build_builder()
             .with_index_column("value")
             .execute()
             .await

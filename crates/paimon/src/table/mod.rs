@@ -27,6 +27,8 @@ mod bitmap_global_index_writer;
 #[cfg(test)]
 mod blob_consumer_tests;
 mod blob_resolver;
+#[cfg(test)]
+mod blob_uri_reader_tests;
 mod branch_manager;
 #[cfg(test)]
 mod branch_write_tests;
@@ -38,6 +40,7 @@ mod bucket_assigner_fixed;
 mod bucket_filter;
 mod bucket_function;
 mod chunk_shuffle;
+mod commit_callback;
 mod commit_message;
 mod consumer_manager;
 pub(crate) mod cow_writer;
@@ -72,9 +75,11 @@ mod full_text_index_adapter;
 mod full_text_index_build_builder;
 #[cfg(feature = "fulltext")]
 mod full_text_search_builder;
+mod global_index_build_builder;
 pub(crate) mod global_index_build_common;
 mod global_index_drop_builder;
 pub(crate) mod global_index_scanner;
+mod global_index_search_filter;
 mod global_index_types;
 mod hybrid_search_builder;
 mod incremental_scan;
@@ -106,6 +111,7 @@ mod pk_full_text_read;
 mod pk_full_text_scan;
 mod pk_search_position;
 mod pk_search_ranker;
+mod pk_sorted_index_scan;
 mod pk_vector_bucket_split;
 mod pk_vector_data_file_reader;
 mod pk_vector_indexed_split_read;
@@ -132,18 +138,26 @@ mod row_position_selection;
 mod row_sidecar;
 mod scan_trace;
 pub(crate) mod schema_manager;
+mod shard_table_updater;
 pub(crate) mod snapshot_commit;
 mod snapshot_manager;
+mod snapshot_manifest;
 mod sort_merge;
 mod sorted_global_index_build_builder;
 mod sorted_global_index_options;
 mod source;
 mod stats_filter;
+mod stream_table_scan;
 pub(crate) mod table_commit;
+mod table_merge_input;
+mod table_merge_into;
+#[cfg(test)]
+mod table_merge_into_tests;
 mod table_read;
 mod table_scan;
 mod table_update;
 mod table_update_by_row_id;
+mod table_update_delete;
 mod table_update_predicate;
 mod table_upsert;
 pub(crate) mod table_write;
@@ -169,6 +183,7 @@ pub use audit_log_table::AuditLogTable;
 pub use batch_vector_search_builder::BatchVectorSearchBuilder;
 pub use blob_resolver::{BlobReader, BlobStream};
 pub use branch_manager::BranchManager;
+pub use commit_callback::{CommitCallback, CommitCallbackContext};
 pub use commit_message::{CommitMessage, COMMIT_MESSAGE_SERIALIZER_VERSION};
 pub use consumer_manager::ConsumerManager;
 pub use cow_writer::{CopyOnWriteMergeWriter, FileInfo};
@@ -180,21 +195,19 @@ pub use format_partition::{
 pub use format_partition_stats::FormatTablePartitionStatsCollector;
 pub use format_partition_truncate::FormatTableTruncator;
 #[cfg(feature = "fulltext")]
-pub use full_text_index_build_builder::FullTextIndexBuildBuilder;
-#[cfg(feature = "fulltext")]
-pub use full_text_search_builder::FullTextSearchBuilder;
-use futures::stream::BoxStream;
-pub use global_index_drop_builder::GlobalIndexDropBuilder;
-pub use global_index_types::{
-    normalize_global_index_type_for_drop, SUPPORTED_GLOBAL_INDEX_TYPES_FOR_DROP,
+pub use full_text_search_builder::{
+    FullTextRead, FullTextScan, FullTextScanPlan, FullTextSearchBuilder,
 };
+use futures::stream::BoxStream;
+pub use global_index_build_builder::GlobalIndexBuildBuilder;
+pub use global_index_drop_builder::GlobalIndexDropBuilder;
+pub use global_index_types::{normalize_global_index_type, SUPPORTED_GLOBAL_INDEX_TYPES_FOR_DROP};
 pub use hybrid_search_builder::{
     HybridSearchBuilder, HybridSearchRanker, HybridSearchRoute, HybridSearchRouteKind,
 };
 pub use incremental_scan::{
     IncrementalPlan, IncrementalScan, IncrementalScanMode, IncrementalSplit,
 };
-pub use lumina_index_build_builder::LuminaIndexBuildBuilder;
 pub use object_table::{ObjectEntry, ObjectTable};
 pub use partition_row_count::PartitionRowCount;
 pub use partition_stat::PartitionStat;
@@ -208,15 +221,17 @@ pub use read_builder::ReadBuilder;
 pub use rest_env::RESTEnv;
 pub use scan_trace::ScanTrace;
 pub use schema_manager::SchemaManager;
+pub use shard_table_updater::ShardTableUpdater;
 pub use snapshot_commit::{RESTSnapshotCommit, RenamingSnapshotCommit, SnapshotCommit};
 pub use snapshot_manager::SnapshotManager;
-pub use sorted_global_index_build_builder::{
-    BTreeGlobalIndexBuildBuilder, SortedGlobalIndexBuildBuilder,
-};
 pub use source::{
     merge_row_ranges, DataSplit, DataSplitBuilder, DeletionFile, PartitionBucket, Plan, RowRange,
 };
+pub use stream_table_scan::StreamTableScan;
 pub use table_commit::TableCommit;
+pub use table_merge_into::{
+    MergeAssignment, MergeCondition, MergeSource, WhenMatched, WhenNotMatched,
+};
 pub use table_read::{AuditLogRead, TableRead};
 pub use table_scan::{AuditLogScan, TableScan};
 pub use table_update::TableUpdate;
@@ -227,7 +242,6 @@ pub use update_assignment::UpdateAssignment;
 pub use vector_read::{BatchVectorRead, VectorRead};
 pub use vector_scan::{VectorScan, VectorScanPlan};
 pub use vector_search_builder::VectorSearchBuilder;
-pub use vindex_index_build_builder::VindexIndexBuildBuilder;
 pub use write_builder::WriteBuilder;
 
 use crate::catalog::{validate_branch_name, Identifier, DEFAULT_MAIN_BRANCH};
@@ -238,6 +252,23 @@ use crate::spec::{
     SCAN_WATERMARK_OPTION,
 };
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
+/// A captured read view. Absence of this enum means that the view is unresolved.
+#[derive(Debug, Clone)]
+enum ReadSnapshot {
+    Empty,
+    Snapshot(Arc<Snapshot>),
+}
+
+impl ReadSnapshot {
+    fn snapshot(&self) -> Option<&Snapshot> {
+        match self {
+            Self::Empty => None,
+            Self::Snapshot(snapshot) => Some(snapshot),
+        }
+    }
+}
 
 /// Table represents a table in the catalog.
 #[derive(Debug, Clone)]
@@ -256,10 +287,9 @@ pub struct Table {
     /// True when this table copy was switched to a historical schema by
     /// [`Table::copy_with_time_travel`]. Such a copy is read-only.
     time_traveled: bool,
-    /// Snapshot resolved by [`Table::copy_with_time_travel`] from this copy's
-    /// options, so scans don't have to resolve the same selector again.
+    /// Captured snapshot or empty view, so scans don't resolve latest again.
     /// Cleared when [`Table::copy_with_options`] changes the selector.
-    travel_snapshot: Option<Snapshot>,
+    travel_snapshot: Option<ReadSnapshot>,
     /// Explicit options remain overrides across later time-travel copies.
     applied_dynamic_option_keys: HashSet<String>,
 }
@@ -435,10 +465,12 @@ impl Table {
     }
 
     /// Whether this user may read this table; `None` when it is not
-    /// `query-auth.enabled`. `query_auth` is the loaded option, as in Java.
+    /// `query-auth.enabled`. `query_auth` is the loaded option, as in Java;
+    /// `select` is what the read touches, `None` for the whole table.
     pub(crate) async fn authorize_read(
         &self,
         query_auth: bool,
+        select: Option<Vec<String>>,
     ) -> Result<Option<std::sync::Arc<query_auth::QueryAuthGrant>>> {
         let local = CoreOptions::new(self.schema.options());
         let Some(rest_env) = &self.rest_env else {
@@ -469,13 +501,12 @@ impl Table {
             query_auth::unsupported("this table handle was assembled rather than loaded")
         })?;
 
-        // Naming a system column here would fail the server's column check.
         let response = rest_env
-            .table_query_auth(self.schema.id(), self.schema.fields(), None)
+            .table_query_auth(self.schema.id(), self.schema.fields(), select.clone())
             .await?;
-        Ok(Some(std::sync::Arc::new(query_auth::QueryAuthGrant::new(
-            response, session,
-        ))))
+        Ok(Some(std::sync::Arc::new(
+            query_auth::QueryAuthGrant::parse(&response, session, select, self.schema.fields())?,
+        )))
     }
 
     /// Handed out once per catalog-loaded table; wraps only after 2^64 loads.
@@ -514,6 +545,11 @@ impl Table {
         ReadBuilder::new(self)
     }
 
+    /// Create a stateful streaming scan. Configure filters through a read builder.
+    pub fn new_stream_scan(&self) -> Result<StreamTableScan> {
+        self.new_read_builder().new_stream_scan()
+    }
+
     /// Create a full-text search builder.
     ///
     /// Reference: [FullTextSearchBuilderImpl](https://github.com/apache/paimon/blob/master/paimon-core/src/main/java/org/apache/paimon/table/source/FullTextSearchBuilderImpl.java)
@@ -537,32 +573,13 @@ impl Table {
         BatchVectorSearchBuilder::new(self)
     }
 
-    /// Create a builder for `full-text` global index files.
-    ///
-    /// Reference: [NativeFullTextGlobalIndexWriter](https://github.com/apache/paimon/blob/master/paimon-full-text/src/main/java/org/apache/paimon/fulltext/index/NativeFullTextGlobalIndexWriter.java)
-    #[cfg(feature = "fulltext")]
-    pub fn new_full_text_index_build_builder(&self) -> FullTextIndexBuildBuilder<'_> {
-        FullTextIndexBuildBuilder::new(self)
-    }
-
-    pub fn new_lumina_index_build_builder(&self) -> LuminaIndexBuildBuilder<'_> {
-        LuminaIndexBuildBuilder::new(self)
-    }
-
-    pub fn new_sorted_global_index_build_builder(&self) -> SortedGlobalIndexBuildBuilder<'_> {
-        SortedGlobalIndexBuildBuilder::new(self)
-    }
-
-    pub fn new_btree_global_index_build_builder(&self) -> BTreeGlobalIndexBuildBuilder<'_> {
-        self.new_sorted_global_index_build_builder()
+    /// Build global index files selected by index type, without publishing them.
+    pub fn new_global_index_build_builder(&self) -> GlobalIndexBuildBuilder<'_> {
+        GlobalIndexBuildBuilder::new(self)
     }
 
     pub fn new_global_index_drop_builder(&self) -> GlobalIndexDropBuilder<'_> {
         GlobalIndexDropBuilder::new(self)
-    }
-
-    pub fn new_vindex_index_build_builder(&self, index_type: &str) -> VindexIndexBuildBuilder<'_> {
-        VindexIndexBuildBuilder::new(self, index_type)
     }
 
     /// Create a write builder for write/commit.
@@ -599,6 +616,8 @@ impl Table {
                 || k == crate::spec::SCAN_WATERMARK_OPTION
                 || k == crate::spec::SCAN_SNAPSHOT_ID_OPTION
                 || k == crate::spec::SCAN_TAG_NAME_OPTION
+                || k == "scan.mode"
+                || k == "incremental-between-timestamp"
         });
         Self {
             file_io: self.file_io.clone(),
@@ -658,7 +677,7 @@ impl Table {
     /// same snapshot. The snapshot's schema is loaded when it differs from the
     /// current table schema.
     pub(crate) async fn copy_with_resolved_snapshot(&self, snapshot: &Snapshot) -> Result<Self> {
-        let mut table = self.copy_with_pinned_snapshot(snapshot);
+        let mut table = self.copy_with_pinned_snapshot(Some(snapshot));
         if snapshot.schema_id() != self.schema.id() {
             let schema = self.schema_manager.schema(snapshot.schema_id()).await?;
             let options = table.historical_field_options(&schema);
@@ -672,7 +691,8 @@ impl Table {
     ///
     /// Unlike time travel, pinning must not change the fields used by an already
     /// planned query. The resolved snapshot is cached without additional I/O.
-    pub fn copy_with_pinned_snapshot(&self, snapshot: &Snapshot) -> Self {
+    /// `None` captures an empty view, which remains empty after later commits.
+    pub fn copy_with_pinned_snapshot(&self, snapshot: Option<&Snapshot>) -> Self {
         let mut options = self.schema.options().clone();
         for selector in [
             SCAN_TIMESTAMP_MILLIS_OPTION,
@@ -681,18 +701,35 @@ impl Table {
             SCAN_VERSION_OPTION,
             SCAN_SNAPSHOT_ID_OPTION,
             SCAN_TAG_NAME_OPTION,
+            "incremental-between-timestamp",
+            "scan.file-creation-time-millis",
+            "scan.creation-time-millis",
         ] {
             options.remove(selector);
         }
         options.insert(
-            SCAN_SNAPSHOT_ID_OPTION.to_string(),
-            snapshot.id().to_string(),
+            "scan.mode".to_string(),
+            if snapshot.is_some() {
+                "from-snapshot"
+            } else {
+                "default"
+            }
+            .to_string(),
         );
+        if let Some(snapshot) = snapshot {
+            options.insert(
+                SCAN_SNAPSHOT_ID_OPTION.to_string(),
+                snapshot.id().to_string(),
+            );
+        }
 
         Self {
             schema: self.schema.copy_with_replaced_options(options),
             time_traveled: true,
-            travel_snapshot: Some(snapshot.clone()),
+            travel_snapshot: Some(match snapshot {
+                Some(snapshot) => ReadSnapshot::Snapshot(Arc::new(snapshot.clone())),
+                None => ReadSnapshot::Empty,
+            }),
             ..self.clone()
         }
     }
@@ -812,7 +849,7 @@ impl Table {
                 table.schema = snapshot_schema.copy_with_replaced_options(options);
                 table.time_traveled = true;
             }
-            table.travel_snapshot = Some(snapshot);
+            table.travel_snapshot = Some(ReadSnapshot::Snapshot(Arc::new(snapshot)));
         }
         Ok(table)
     }
@@ -866,12 +903,12 @@ impl Table {
             // Catalog branches may have no schema directory in the data store.
             // Load their schema, identity and FileIO through the same catalog.
             let identifier = env.identifier().with_branch(&branch)?;
-            let mut table = env.get_table(&identifier).await?;
-            if table.location() != self.location()
-                || table
-                    .rest_env
-                    .as_ref()
-                    .is_none_or(|branch_env| branch_env.uuid() != env.uuid())
+            let (current, mut table) = tokio::try_join!(
+                env.current_table_identity_checked(),
+                env.get_table(&identifier)
+            )?;
+            if current.path.as_deref() != Some(self.location())
+                || table.location() != self.location()
             {
                 return Err(crate::Error::DataInvalid {
                     message: format!(
@@ -916,8 +953,8 @@ impl Table {
         })
     }
 
-    /// Whether this table copy reads a historical snapshot with its
-    /// historical schema (see [`Table::copy_with_time_travel`]).
+    /// Whether this copy is read-only because its schema was time-traveled or
+    /// its read view was explicitly pinned (including an empty view).
     pub fn is_time_traveled(&self) -> bool {
         self.time_traveled
     }
@@ -927,13 +964,34 @@ impl Table {
     /// "selector set but unresolved" (silent fallback to latest) from a real
     /// travelled read, so they can reject the former instead of reading latest.
     pub fn has_resolved_travel_snapshot(&self) -> bool {
-        self.travel_snapshot.is_some()
+        self.travel_snapshot().is_some()
     }
 
     /// The snapshot resolved by [`Table::copy_with_time_travel`] from this
     /// copy's options, if any. Lets scans skip re-resolving the selector.
     pub fn travel_snapshot(&self) -> Option<&Snapshot> {
-        self.travel_snapshot.as_ref()
+        self.travel_snapshot
+            .as_ref()
+            .and_then(ReadSnapshot::snapshot)
+    }
+
+    /// Resolve the selected read view, reusing complete cached metadata or an
+    /// explicitly empty view. Read latest only when no view has been captured.
+    pub async fn resolve_read_snapshot(&self) -> Result<Option<Snapshot>> {
+        time_travel::resolve_snapshot(self).await
+    }
+
+    /// Reject a captured schema whose read selection was subsequently changed.
+    pub(crate) fn ensure_read_snapshot_current(&self) -> Result<()> {
+        if self.is_time_traveled() && self.travel_snapshot.is_none() {
+            return Err(crate::Error::DataInvalid {
+                message: "Table options changed after time travel; \
+                          use copy_with_time_travel to re-resolve the snapshot and schema"
+                    .to_string(),
+                source: None,
+            });
+        }
+        Ok(())
     }
 }
 

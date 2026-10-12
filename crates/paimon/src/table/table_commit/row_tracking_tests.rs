@@ -423,19 +423,22 @@ async fn row_tracking_ignore_index_update_preserves_index_metadata() {
     let commit = TableCommit::new(table, "test-user".into());
     let mut file = test_data_file("initial.parquet", 10);
     file.file_source = Some(0);
-    let mut seed = CommitMessage::new(EMPTY_SERIALIZED_ROW.clone(), 0, vec![file]);
-    let index = test_global_index_file("global-name.index", 1, 0, 9);
-    seed.new_index_files.push(index.clone());
+    let seed = CommitMessage::new(EMPTY_SERIALIZED_ROW.clone(), 0, vec![file]);
     commit.commit(vec![seed]).await.unwrap();
+    // Global indexes reference row IDs assigned by a completed data commit.
+    let mut indexes = CommitMessage::new(EMPTY_SERIALIZED_ROW.clone(), 0, vec![]);
+    let index = test_global_index_file("global-name.index", 1, 0, 9);
+    indexes.new_index_files.push(index.clone());
+    commit.commit(vec![indexes]).await.unwrap();
     let mut partial = test_data_file("updated.parquet", 10);
     partial.file_source = Some(0);
     partial.first_row_id = Some(0);
     partial.write_cols = Some(vec!["name".into()]);
     let mut update = CommitMessage::new(EMPTY_SERIALIZED_ROW.clone(), 0, vec![partial]);
-    update.check_from_snapshot = Some(1);
+    update.check_from_snapshot = Some(2);
     commit.commit(vec![update]).await.unwrap();
     let snapshot = latest_snapshot(&io, path).await.unwrap();
-    assert_eq!(snapshot.id(), 2);
+    assert_eq!(snapshot.id(), 3);
     assert_eq!(snapshot.next_row_id(), Some(10));
     let index_entries = IndexManifest::read(
         &io,

@@ -46,7 +46,7 @@ struct NormalizedFilter {
 /// Exact filters are fully enforced by paimon-core scan planning using only
 /// partition-owned semantics, without requiring residual filtering above the
 /// scan.
-fn is_exact_filter_pushdown_for_schema(
+pub(super) fn is_exact_filter_pushdown_for_schema(
     fields: &[DataField],
     partition_keys: &[String],
     filter: &Predicate,
@@ -65,7 +65,8 @@ pub(super) fn split_scan_predicates(
     filter: Predicate,
 ) -> (Option<Predicate>, Vec<Predicate>) {
     let partition_keys = table.schema().partition_keys();
-    if partition_keys.is_empty() {
+    // Auth rules may mask partition keys; retain the full read predicate.
+    if partition_keys.is_empty() || table.schema().core_options().query_auth_enabled() {
         (None, filter.split_and())
     } else {
         split_partition_and_data_predicates(filter, table.schema().fields(), partition_keys)
@@ -298,13 +299,18 @@ impl<'a> ReadBuilder<'a> {
         }
     }
 
+    /// Create a stateful streaming scan using the configured filter and read type.
+    pub fn new_stream_scan(&self) -> Result<super::StreamTableScan> {
+        super::StreamTableScan::new(self.new_scan())
+    }
+
     /// Create a batch incremental scan over snapshot id range
     /// `(start_exclusive, end_inclusive]`.
     ///
     /// Filters and projection configured on this builder are pushed into the
-    /// incremental plan (partition / bucket pruning on the delta path).
-    /// Use [`IncrementalScan::plan_combined_delta`] to merge APPEND deltas into
-    /// one ordinary batch plan instead of preserving each snapshot separately.
+    /// incremental plan (including partition / bucket pruning).
+    /// Use [`IncrementalScan::plan_combined`] to pack DELTA or CHANGELOG files
+    /// across the range into one batch plan.
     pub fn new_incremental_scan(
         &self,
         mode: IncrementalScanMode,
@@ -443,11 +449,13 @@ impl<'a> PaimonReadBuilder<'a> {
     /// Exact filters are fully enforced by paimon-core scan planning, without
     /// requiring residual filtering above the scan.
     pub fn is_exact_filter_pushdown(&self, filter: &Predicate) -> bool {
-        is_exact_filter_pushdown_for_schema(
-            self.table.schema().fields(),
-            self.table.schema().partition_keys(),
-            filter,
-        )
+        // Masked partition predicates may need a read-side residual.
+        !self.table.schema().core_options().query_auth_enabled()
+            && is_exact_filter_pushdown_for_schema(
+                self.table.schema().fields(),
+                self.table.schema().partition_keys(),
+                filter,
+            )
     }
 
     /// Set row ID ranges `[from, to]` (inclusive). An empty vector selects no rows.

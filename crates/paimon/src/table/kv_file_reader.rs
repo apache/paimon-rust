@@ -717,7 +717,7 @@ impl KeyValueFileReader {
                                 // Only the PK-only predicate projection may run before
                                 // sort-merge. A value index can match an old version of
                                 // a key, so it must not prune merge inputs here.
-                                let row_ranges = if file_index_read_enabled {
+                                let local_row_ranges = if file_index_read_enabled {
                                     match evaluate_file_index(
                                         &run_file_io,
                                         split.bucket_path(),
@@ -750,13 +750,13 @@ impl KeyValueFileReader {
                                     )),
                                     None => None,
                                 };
-                                let mut file_stream = reader.read_single_file_stream_with_schema(
+                                let mut file_stream = reader.read_single_file_stream_with_schema_and_local_ranges(
                                     split.as_ref(),
                                     file_meta,
                                     data_fields,
                                     data_schema_fields,
                                     deletion_vector,
-                                    row_ranges,
+                                    local_row_ranges,
                                 )?;
                                 while let Some(batch) = file_stream.next().await {
                                     yield batch?;
@@ -1732,61 +1732,76 @@ mod tests {
     /// key with no replacement is resurrected.
     #[tokio::test]
     async fn dv_merge_on_read_applies_deletion_vectors_before_key_merge() {
-        let file_io = test_file_io();
-        let table_path = "memory:/dv_merge_on_read_with_dv";
-        setup_dirs(&file_io, table_path).await;
-        let table = pk_table(
-            &file_io,
-            table_path,
-            &[
-                ("deletion-vectors.enabled", "true"),
-                ("deletion-vectors.merge-on-read", "true"),
-            ],
-        );
+        for (engine, expected) in [
+            ("deduplicate", 11),
+            ("partial-update", 11),
+            ("aggregation", 21),
+        ] {
+            let file_io = test_file_io();
+            let table_path = "memory:/dv_merge_on_read_with_dv";
+            setup_dirs(&file_io, table_path).await;
+            let table = pk_table(
+                &file_io,
+                table_path,
+                &[
+                    ("merge-engine", engine),
+                    ("deletion-vectors.enabled", "true"),
+                    ("deletion-vectors.merge-on-read", "true"),
+                ],
+            );
+            let table = if engine == "aggregation" {
+                table.copy_with_options(HashMap::from([(
+                    "fields.value.aggregate-function".into(),
+                    "sum".into(),
+                )]))
+            } else {
+                table
+            };
 
-        write_commit(&table, &int_batch(vec![1, 2], vec![Some(10), Some(20)])).await;
-        write_commit(&table, &int_batch(vec![1, 3], vec![Some(11), Some(30)])).await;
+            write_commit(&table, &int_batch(vec![1, 2], vec![Some(10), Some(20)])).await;
+            write_commit(&table, &int_batch(vec![1, 3], vec![Some(11), Some(30)])).await;
 
-        let all_files = table
-            .new_read_builder()
-            .new_scan()
-            .with_scan_all_files()
-            .plan()
-            .await
-            .unwrap();
-        let mut files = all_files
-            .splits()
-            .iter()
-            .flat_map(|split| split.data_files().iter().cloned())
-            .collect::<Vec<_>>();
-        files.sort_by_key(|file| file.min_sequence_number);
-        assert_eq!(files.len(), 2);
-        files[0].level = 1;
+            let all_files = table
+                .new_read_builder()
+                .new_scan()
+                .with_scan_all_files()
+                .plan()
+                .await
+                .unwrap();
+            let mut files = all_files
+                .splits()
+                .iter()
+                .flat_map(|split| split.data_files().iter().cloned())
+                .collect::<Vec<_>>();
+            files.sort_by_key(|file| file.min_sequence_number);
+            assert_eq!(files.len(), 2);
+            files[0].level = 1;
 
-        let deletion_file = write_deletion_file(&file_io, table_path, &[1]).await;
-        let split = DataSplitBuilder::new()
-            .with_snapshot(2)
-            .with_partition(BinaryRow::new(0))
-            .with_bucket(0)
-            .with_bucket_path(format!("{table_path}/bucket-0"))
-            .with_total_buckets(1)
-            .with_data_files(files)
-            .with_data_deletion_files(vec![Some(deletion_file), None])
-            .with_raw_convertible(false)
-            .build()
-            .unwrap();
+            let deletion_file = write_deletion_file(&file_io, table_path, &[1]).await;
+            let split = DataSplitBuilder::new()
+                .with_snapshot(2)
+                .with_partition(BinaryRow::new(0))
+                .with_bucket(0)
+                .with_bucket_path(format!("{table_path}/bucket-0"))
+                .with_total_buckets(1)
+                .with_data_files(files)
+                .with_data_deletion_files(vec![Some(deletion_file), None])
+                .with_raw_convertible(false)
+                .build()
+                .unwrap();
 
-        let batches = table
-            .new_read_builder()
-            .new_read()
-            .unwrap()
-            .to_arrow(&[split])
-            .unwrap()
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
-        assert_eq!(int_column(&batches, "id"), vec![1, 3]);
-        assert_eq!(int_column(&batches, "value"), vec![11, 30]);
+            let batches = table
+                .new_read_builder()
+                .new_read()
+                .unwrap()
+                .to_arrow(&[split])
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            assert_eq!(int_column(&batches, "id"), vec![1, 3]);
+            assert_eq!(int_column(&batches, "value"), vec![expected, 30]);
+        }
     }
 
     /// Disjoint files in one split are consumed as sequential merge groups. A
@@ -3065,6 +3080,155 @@ mod tests {
         assert_eq!(int_column(&batches, "id"), vec![1]);
         assert_eq!(int_column(&batches, "a"), vec![5]);
         assert_eq!(int_column(&batches, "b"), vec![7]);
+    }
+
+    #[tokio::test]
+    async fn kv_read_partial_update_remove_record_on_delete() {
+        let file_io = test_file_io();
+        let table_path = "memory:/kv_partial_update_remove_record_on_delete";
+        setup_dirs(&file_io, table_path).await;
+        let table = pk_table(
+            &file_io,
+            table_path,
+            &[
+                ("merge-engine", "partial-update"),
+                ("partial-update.remove-record-on-delete", "true"),
+            ],
+        );
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", ArrowDataType::Int32, false),
+            ArrowField::new("value", ArrowDataType::Int32, true),
+            ArrowField::new(
+                crate::spec::VALUE_KIND_FIELD_NAME,
+                ArrowDataType::Int8,
+                false,
+            ),
+        ]));
+        let make = |value: Option<i32>, kind: i8| {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from(vec![1])),
+                    Arc::new(Int32Array::from(vec![value])),
+                    Arc::new(Int8Array::from(vec![kind])),
+                ],
+            )
+            .unwrap()
+        };
+
+        write_commit(&table, &make(Some(10), 0)).await;
+        assert_eq!(
+            int_column(&read_rows(&table, None, None).await, "value"),
+            vec![10]
+        );
+
+        write_commit(&table, &make(Some(99), 1)).await;
+        assert_eq!(
+            int_column(&read_rows(&table, None, None).await, "value"),
+            vec![10]
+        );
+
+        write_commit(&table, &make(Some(20), 2)).await;
+        assert_eq!(
+            int_column(&read_rows(&table, None, None).await, "value"),
+            vec![20]
+        );
+
+        write_commit(&table, &make(None, 3)).await;
+        let rows = read_rows(&table, None, None).await;
+        assert!(rows.iter().all(|batch| batch.num_rows() == 0), "{rows:?}");
+
+        write_commit(&table, &make(None, 0)).await;
+        let rows = read_rows(&table, None, None).await;
+        assert_eq!(int_column(&rows, "id"), vec![1]);
+        let value = rows[0].column(rows[0].schema().index_of("value").unwrap());
+        assert!(value.is_null(0));
+
+        write_commit(&table, &make(Some(30), 3)).await;
+        write_commit(&table, &make(None, 0)).await;
+        assert_eq!(
+            int_column(&read_rows(&table, None, None).await, "value"),
+            vec![30]
+        );
+
+        let mut write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+        write
+            .write_arrow_batch(&int_batch(vec![1], vec![Some(40)]))
+            .await
+            .unwrap();
+        write.write_arrow_batch(&make(None, 3)).await.unwrap();
+        let messages = write.prepare_commit().await.unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].new_files.len(), 1);
+        assert_eq!(messages[0].new_files[0].delete_row_count, Some(1));
+        TableCommit::new(table.clone(), "test-user".to_string())
+            .commit(messages)
+            .await
+            .unwrap();
+        let rows = read_rows(&table, None, None).await;
+        assert!(rows.iter().all(|batch| batch.num_rows() == 0), "{rows:?}");
+    }
+
+    #[tokio::test]
+    async fn kv_read_partial_update_mixed_value_kind_schemas() {
+        for (nullable, insert_kind) in [(true, None), (true, Some(0)), (false, Some(0))] {
+            for kinds_first in [false, true] {
+                let file_io = test_file_io();
+                let table_path = format!(
+                    "memory:/kv_partial_update_mixed_kinds_{nullable}_{insert_kind:?}_{kinds_first}"
+                );
+                setup_dirs(&file_io, &table_path).await;
+                let table = pk_table(
+                    &file_io,
+                    &table_path,
+                    &[
+                        ("merge-engine", "partial-update"),
+                        ("partial-update.remove-record-on-delete", "true"),
+                    ],
+                );
+                let ordinary = int_batch(vec![1, 3, 4], vec![Some(10), Some(30), Some(40)]);
+                let explicit_kinds = RecordBatch::try_new(
+                    Arc::new(ArrowSchema::new(vec![
+                        ArrowField::new("id", ArrowDataType::Int32, false),
+                        ArrowField::new("value", ArrowDataType::Int32, true),
+                        ArrowField::new(VALUE_KIND_FIELD_NAME, ArrowDataType::Int8, nullable),
+                    ])),
+                    vec![
+                        Arc::new(Int32Array::from(vec![2, 3, 4])),
+                        Arc::new(Int32Array::from(vec![Some(20), None, Some(42)])),
+                        Arc::new(Int8Array::from(vec![insert_kind, Some(3), Some(2)])),
+                    ],
+                )
+                .unwrap();
+                let batches = if kinds_first {
+                    [&explicit_kinds, &ordinary]
+                } else {
+                    [&ordinary, &explicit_kinds]
+                };
+                let mut write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+                for batch in batches {
+                    write.write_arrow_batch(batch).await.unwrap();
+                }
+                let messages = write.prepare_commit().await.unwrap();
+                TableCommit::new(table.clone(), "test-user".to_string())
+                    .commit(messages)
+                    .await
+                    .unwrap();
+
+                let batches = read_rows(&table, None, None).await;
+                let mut rows: Vec<_> = int_column(&batches, "id")
+                    .into_iter()
+                    .zip(int_column(&batches, "value"))
+                    .collect();
+                rows.sort_unstable();
+                let expected = if kinds_first {
+                    vec![(1, 10), (2, 20), (3, 30), (4, 40)]
+                } else {
+                    vec![(1, 10), (2, 20), (4, 42)]
+                };
+                assert_eq!(rows, expected, "{table_path}");
+            }
+        }
     }
 
     #[tokio::test]

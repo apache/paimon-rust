@@ -1046,14 +1046,39 @@ def test_filter_out_of_range_raises():
                 {"method": "equal", "field": "small", "literals": [9999]})
 
 
-def test_filter_wrong_literal_count_raises():
+@pytest.mark.parametrize("literals", [[], [1, 2]])
+def test_filter_wrong_literal_count_raises(literals):
     with tempfile.TemporaryDirectory() as warehouse:
         table = _make_table_with_data(warehouse)
         b = table.new_read_builder()
         with pytest.raises(ValueError):
-            b.with_filter({"method": "equal", "field": "id", "literals": [1, 2]})
-        with pytest.raises(ValueError):
-            b.with_filter({"method": "in", "field": "id", "literals": []})
+            b.with_filter({"method": "equal", "field": "id", "literals": literals})
+
+
+@pytest.mark.parametrize("method, literals, expected_ids", [
+    ("in", [], []),
+    ("notIn", [], [2, 3]),
+    ("in", [None], []),
+    ("notIn", [None], []),
+    ("in", [None, 10], [2]),
+    ("notIn", [None, 10], []),
+    ("in", [10], [2]),
+    ("notIn", [10], [3]),
+])
+def test_filter_set_predicates_follow_java_null_semantics(method, literals, expected_ids):
+    with tempfile.TemporaryDirectory() as warehouse:
+        ctx = SQLContext()
+        ctx.register_catalog("paimon", {"warehouse": warehouse})
+        ctx.sql("CREATE SCHEMA paimon.setdb")
+        ctx.sql("CREATE TABLE paimon.setdb.t (id INT, value INT)")
+        ctx.sql("INSERT INTO paimon.setdb.t VALUES (1, NULL), (2, 10), (3, 20)")
+        table = PaimonCatalog({"warehouse": warehouse}).get_table("setdb.t")
+        builder = table.new_read_builder().with_filter({
+            "method": method, "field": "value", "literals": literals,
+        }).with_projection(["id"])
+        batches = builder.new_read().read(builder.new_scan().plan().splits())
+        actual_ids = sorted(value for batch in batches for value in batch.column(0).to_pylist())
+        assert actual_ids == expected_ids
 
 
 def test_filter_compound_with_unsupported_child_fails():
@@ -1315,11 +1340,11 @@ def test_explicit_scan_mode_without_selector_raises():
             table.new_read_builder({"scan.mode": "from-snapshot"})
 
 
-def test_unimplemented_scan_mode_raises_not_implemented():
+def test_incremental_scan_mode_requires_timestamp_window():
     with tempfile.TemporaryDirectory() as warehouse:
         _make_two_snapshot_table(warehouse)
         table = PaimonCatalog({"warehouse": warehouse}).get_table("tdb.t")
-        with pytest.raises(NotImplementedError):
+        with pytest.raises(ValueError, match="incremental-between-timestamp"):
             table.new_read_builder({"scan.mode": "incremental"})
 
 
@@ -1547,6 +1572,40 @@ def test_incremental_changelog_and_auto_plan_physical_changelog_files():
         assert empty.splits() == []
 
 
+@pytest.mark.parametrize("mode", ["changelog", "auto"])
+def test_batch_incremental_changelog_packing_sharding_and_limits(mode):
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_input_changelog_table(warehouse)
+        builder = table.new_read_builder().with_include_row_kind(True)
+        full = builder.new_incremental_scan(0, 2, mode).plan()
+        # Java packs changelogs over the whole range, rather than once per
+        # snapshot. The two commits in this bucket fit into one split.
+        assert len(full.splits()) == 1
+        assert len(_native_split_file_names(full.splits())) == 2
+        names, rows = [], []
+        for index in range(3):
+            scan = builder.new_incremental_scan(0, 2, mode).with_shard(index, 3)
+            plan = scan.plan()
+            assert plan.snapshot_id() == 2
+            assert all(split.is_streaming() for split in plan.splits())
+            names.extend(_native_split_file_names(plan.splits()))
+            batches = builder.new_read().read(plan.splits())
+            if batches:
+                rows.extend(pa.Table.from_batches(batches).to_pylist())
+            for boundary in (0, 2):
+                empty = builder.new_incremental_scan(boundary, boundary, mode).with_shard(index, 3).plan()
+                assert empty.snapshot_id() == boundary
+                assert empty.splits() == []
+        assert sorted(names) == sorted(_native_split_file_names(full.splits()))
+        assert sorted((row['rowkind'], row['id'], row['value']) for row in rows) == [
+            ('+I', 1, 'a'), ('+I', 2, 'b'), ('+I', 3, 'c')]
+        limited = (table.new_read_builder().with_limit(1).with_include_row_kind(True))
+        plan = limited.new_incremental_scan(0, 2, mode).with_shard(0, 3).plan()
+        result = pa.Table.from_batches(limited.new_read().read(plan.splits())).to_pylist()
+        assert len(result) == 1
+        assert result[0] in rows
+
+
 def test_incremental_changelog_keeps_filter_projection_and_validates_mode():
     with tempfile.TemporaryDirectory() as warehouse:
         table = _make_input_changelog_table(warehouse)
@@ -1730,3 +1789,28 @@ def test_incremental_row_positions_use_combined_delta_batch():
         builder.with_row_ranges([(1, 3)]).with_limit(2)
         plan = builder.new_incremental_scan(0, 2).with_row_position_slice(2, 5).plan()
         assert pa.Table.from_batches(builder.new_read().read(plan.splits())).column("id").to_pylist() == [2, 3]
+
+
+@pytest.mark.parametrize("window,snapshot,expected", [
+    ("0,100", 1, [dict(id=1, name="a")]),
+    ("100,200", 2, [dict(id=2, name="b"), dict(id=3, name="c")]),
+    ("100,150", 1, []),
+    ("100,100", None, []),
+])
+@pytest.mark.parametrize("mode", ["default", "incremental"])
+def test_numeric_timestamp_window_options_use_core_scan(tmp_path, window, snapshot, expected, mode):
+    from pathlib import Path
+
+    _make_two_snapshot_table(str(tmp_path))
+    table = PaimonCatalog({"warehouse": str(tmp_path)}).get_table("tdb.t")
+    for identifier, timestamp in [(1, 100), (2, 200)]:
+        path = Path(table.location()) / "snapshot" / ("snapshot-%s" % identifier)
+        data = json.loads(path.read_text())
+        data["timeMillis"] = timestamp
+        path.write_text(json.dumps(data))
+    builder = table.new_read_builder({"scan.mode": mode, "incremental-between-timestamp": window})
+    plan = builder.new_scan().plan()
+    assert plan.snapshot_id() == snapshot
+    batches = list(builder.new_read().read(plan.splits()))
+    actual = [row for batch in batches for row in batch.to_pylist()]
+    assert sorted(actual, key=lambda row: row["id"]) == expected
