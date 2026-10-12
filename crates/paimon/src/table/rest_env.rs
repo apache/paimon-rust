@@ -557,7 +557,12 @@ fn response_identifier(
     })?;
     let identifier = Identifier::new(database, name);
     identifier.validate()?;
-    if &identifier != requested {
+    // A REST catalog may return the canonical case for an otherwise matching identifier.
+    if !identifier
+        .database()
+        .eq_ignore_ascii_case(requested.database())
+        || !identifier.object().eq_ignore_ascii_case(requested.object())
+    {
         return Err(Error::DataInvalid {
             message: format!(
                 "Table response identifier '{}' does not match requested identifier '{}'",
@@ -627,6 +632,32 @@ mod tests {
     use super::*;
     use crate::common::CatalogOptions;
     use crate::io::cache::create_local_cache;
+
+    #[test]
+    fn response_identifier_accepts_canonicalized_ascii_case() {
+        let requested = Identifier::new("Default", "MixedTable");
+        let response: GetTableResponse =
+            serde_json::from_str(r#"{"database":"default","name":"mixedtable"}"#).unwrap();
+
+        let actual = response_identifier(&requested, &response).unwrap();
+
+        assert_eq!(actual, Identifier::new("default", "mixedtable"));
+    }
+
+    #[test]
+    fn response_identifier_rejects_a_different_table() {
+        let requested = Identifier::new("default", "requested");
+        let response: GetTableResponse =
+            serde_json::from_str(r#"{"database":"default","name":"different"}"#).unwrap();
+
+        let error = response_identifier(&requested, &response).unwrap_err();
+
+        assert!(matches!(
+            error,
+            Error::DataInvalid { message, .. }
+                if message.contains("does not match requested identifier")
+        ));
+    }
 
     #[tokio::test]
     async fn dependency_reads_preserve_the_outermost_identifier_and_catalog_options() {
