@@ -42,6 +42,7 @@ use arrow_select::concat::concat as arrow_concat;
 use arrow_select::take::take;
 use futures::{stream, StreamExt};
 use std::cmp::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::Arc;
 
 #[path = "audit_log_table/read.rs"]
@@ -1302,6 +1303,15 @@ impl<'a> PaimonTableRead<'a> {
         if resolve_predicate_views {
             output_views.retain(|field| !predicate_views.contains(field));
         }
+        // Never look up views past the rows LIMIT still needs.
+        let quota = self
+            .limit
+            .filter(|_| resolve_predicate_views)
+            .map(|limit| Arc::new(AtomicUsize::new(limit)));
+        let stream = match &quota {
+            Some(quota) => take_within_quota(stream, Arc::clone(quota)),
+            None => stream,
+        };
         // User predicates see resolved descriptors or payloads, after authorization.
         let stream = match self.table.rest_env().filter(|_| resolve_predicate_views) {
             Some(env) => super::data_evolution_reader::resolve_blob_view_stream(
@@ -1359,10 +1369,11 @@ impl<'a> PaimonTableRead<'a> {
                     )
                 });
                 let stream = project_authorized_stream(Box::pin(stream), self.read_type.len());
-                match self.limit {
+                let stream = match self.limit {
                     Some(limit) => limit_rows(stream, limit),
                     None => stream,
-                }
+                };
+                spend_quota(stream, quota.clone())
             }
         };
         let stream = match self
@@ -1380,13 +1391,16 @@ impl<'a> PaimonTableRead<'a> {
             None => stream,
         };
         Ok(match blob_plan {
-            Some(plan) => plan.finish(
-                stream,
-                core_options,
-                self.table.file_io.clone(),
-                self.blob_parallelism,
-                self.limit,
-            ),
+            Some(plan) => {
+                let stream = plan.finish(
+                    stream,
+                    core_options,
+                    self.table.file_io.clone(),
+                    self.blob_parallelism,
+                    self.limit,
+                );
+                spend_quota(stream, quota)
+            }
             None => resolve_primary_key_blob_stream(
                 stream,
                 &self.read_type,
@@ -1638,6 +1652,47 @@ fn project_authorized_stream(
                 message: format!("failed to project the authorized batch: {e}"),
                 source: Some(Box::new(e)),
             })
+    }))
+}
+
+/// Cuts batches to at most `quota` rows; stages up to `spend_quota` must not
+/// read ahead.
+fn take_within_quota(
+    stream: ArrowRecordBatchStream,
+    quota: Arc<AtomicUsize>,
+) -> ArrowRecordBatchStream {
+    Box::pin(async_stream::try_stream! {
+        let mut stream = stream;
+        while quota.load(AtomicOrdering::Relaxed) > 0 {
+            let Some(batch) = stream.next().await else { break };
+            let batch = batch?;
+            let mut offset = 0;
+            while offset < batch.num_rows() {
+                let width = quota.load(AtomicOrdering::Relaxed).min(batch.num_rows() - offset);
+                if width == 0 {
+                    break;
+                }
+                yield batch.slice(offset, width);
+                offset += width;
+            }
+        }
+    })
+}
+
+/// Subtracts the rows that passed the predicates from `quota`.
+fn spend_quota(
+    stream: ArrowRecordBatchStream,
+    quota: Option<Arc<AtomicUsize>>,
+) -> ArrowRecordBatchStream {
+    let Some(quota) = quota else {
+        return stream;
+    };
+    Box::pin(stream.inspect(move |batch| {
+        if let Ok(batch) = batch {
+            let left = quota.load(AtomicOrdering::Relaxed);
+            let left = left.saturating_sub(batch.num_rows());
+            quota.store(left, AtomicOrdering::Relaxed);
+        }
     }))
 }
 
