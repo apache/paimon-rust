@@ -204,6 +204,12 @@ pub(crate) fn evolve_column(
         _ => {}
     }
 
+    if let Some(result) =
+        super::evolution_string::temporal_to_string(source, source_type, target_type)?
+    {
+        return Ok(result);
+    }
+
     // Apply the epoch-seconds rule at every leaf, including nested containers.
     // Numeric -> LTZ depends on Java's system time zone and retains its existing
     // path; ordinary TIMESTAMP has no such runtime dependency.
@@ -344,14 +350,17 @@ fn render_string_values(
                 .collect())
         }
         _ => {
-            let casted = cast(source, &ArrowDataType::Utf8).map_err(|error| {
-                crate::Error::UnexpectedError {
-                    message: format!(
-                        "failed to render {:?} as string during schema evolution",
-                        source.data_type()
-                    ),
-                    source: Some(Box::new(error)),
-                }
+            let casted = evolve_column(
+                source,
+                source_type,
+                &DataType::VarChar(crate::spec::VarCharType::string_type()),
+            )
+            .map_err(|error| crate::Error::UnexpectedError {
+                message: format!(
+                    "failed to render {:?} as string during schema evolution",
+                    source.data_type()
+                ),
+                source: Some(Box::new(error)),
             })?;
             let strings = casted
                 .as_any()
@@ -622,6 +631,29 @@ mod tests {
     };
     use arrow_buffer::NullBuffer;
     use arrow_schema::{DataType as ArrowDataType, Fields};
+
+    #[test]
+    fn timestamp_string_evolution_uses_java_separator_and_precision() {
+        let source: ArrayRef = Arc::new(TimestampMillisecondArray::from(vec![
+            Some(0),
+            Some(-1),
+            None,
+        ]));
+        let result = evolve_column(
+            &source,
+            &DataType::Timestamp(TimestampType::new(3).unwrap()),
+            &DataType::VarChar(VarCharType::string_type()),
+        )
+        .unwrap();
+        assert_eq!(
+            result.as_any().downcast_ref::<StringArray>().unwrap(),
+            &StringArray::from(vec![
+                Some("1970-01-01 00:00:00.000"),
+                Some("1969-12-31 23:59:59.999"),
+                None
+            ])
+        );
+    }
 
     #[test]
     fn selected_map_read_type_uses_key_metadata_not_child_names() {
