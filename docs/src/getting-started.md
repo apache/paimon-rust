@@ -437,10 +437,11 @@ and writes (with `write` in the policy) of files that Paimon writes once under a
 unique name can use a target:
 manifests, statistics, indexes, and data files. A data file is
 recognized by the name Paimon writers give it: a data or changelog file prefix
-followed by `{uuid}-{count}.{extension}`. The prefixes are `data-` and
-`changelog-`, the table's `data-file.prefix` and `changelog-file.prefix`, and
-these two options when they are in the catalog options or the token.
-Everything else uses
+followed by `{uuid}-{count}.{extension}`, the same after the postpone writer's
+`-u-{commit user}-s-{write id}-w-`, or `{uuid}.managed.blob` for a managed BLOB
+pack. The prefixes are `data-` and `changelog-`, the table's
+`data-file.prefix` and `changelog-file.prefix`, and these two options when they
+are in the catalog options or the token. Everything else uses
 origin: a writer's own existence checks, listing, deletes, renames and copies, files
 rewritten in place (such as `LATEST`, tags and temporary files), sequentially
 numbered metadata (`snapshot-N`, `schema-N`, `changelog/changelog-N`), unknown

@@ -20,7 +20,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow_array::{Int32Array, RecordBatch};
+use arrow_array::{Array, Int32Array, LargeBinaryArray, RecordBatch};
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
 use bytes::Bytes;
 use futures::TryStreamExt;
@@ -31,7 +31,7 @@ use crate::catalog::{Catalog, FileSystemCatalog, Identifier, LoadedTable};
 use crate::common::{CatalogOptions, Options};
 use crate::io::oss_test_server::TestOss;
 use crate::io::FileIOBuilder;
-use crate::spec::{DataType, IntType, Schema, SchemaBuilder};
+use crate::spec::{BlobType, DataType, IntType, Schema, SchemaBuilder};
 
 const WAREHOUSE: &str = "bkt/warehouse";
 const FILE_NAME: &str = "data-123e4567-e89b-12d3-a456-426614174000-1.parquet";
@@ -311,4 +311,85 @@ async fn data_files_named_with_the_schema_prefix_use_the_target() {
     let requests = origin.take_requests();
     assert_eq!(methods(&requests, "/custom-"), Vec::<String>::new());
     assert_eq!(methods(&requests, "/dynamic-"), Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn postpone_bucket_files_use_the_target() {
+    let origin = TestOss::start().await;
+    let cache = TestOss::start_sharing(&origin).await;
+    let catalog = data_target_catalog(&origin, &cache).await;
+    let schema = int_schema()
+        .primary_key(["id"])
+        .option("bucket", "-2")
+        .build()
+        .unwrap();
+    let table = create_table(&catalog, "postpone", schema).await;
+
+    let files = write_and_commit(&table, &make_batch(vec![1, 2], vec![10, 20])).await;
+    let [file] = files.as_slice() else {
+        panic!("expected one postpone file, got {files:?}");
+    };
+    assert!(file.starts_with("data--u-io-cache-user-s-"), "{file}");
+    // Postpone files are read once compaction assigns their rows to buckets.
+    let path = format!("{}/bucket-postpone/{file}", table.location());
+    table
+        .file_io()
+        .new_input(&path)
+        .unwrap()
+        .read()
+        .await
+        .unwrap();
+
+    assert_eq!(methods(&cache.take_requests(), file), ["PUT", "GET"]);
+    assert_eq!(methods(&origin.take_requests(), file), Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn managed_blob_packs_use_the_target() {
+    let origin = TestOss::start().await;
+    let cache = TestOss::start_sharing(&origin).await;
+    let catalog = data_target_catalog(&origin, &cache).await;
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .column("payload", DataType::Blob(BlobType::new()))
+        .primary_key(["id"])
+        .option("bucket", "1")
+        .option("file.format", "parquet")
+        .build()
+        .unwrap();
+    let table = create_table(&catalog, "managed_blob", schema).await;
+
+    let batch = RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", ArrowDataType::Int32, false),
+            ArrowField::new("payload", ArrowDataType::LargeBinary, true),
+        ])),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2])),
+            Arc::new(LargeBinaryArray::from(vec![
+                Some(b"hello".as_slice()),
+                Some(b"world".as_slice()),
+            ])),
+        ],
+    )
+    .unwrap();
+    write_and_commit(&table, &batch).await;
+    let payloads: Vec<Vec<u8>> = read(&table)
+        .await
+        .iter()
+        .flat_map(|batch| {
+            let column = batch.column_by_name("payload").unwrap();
+            let column = column.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
+            (0..column.len())
+                .map(|row| column.value(row).to_vec())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(payloads, [b"hello".to_vec(), b"world".to_vec()]);
+
+    assert_reads_and_writes(&cache.take_requests(), ".managed.blob");
+    assert_eq!(
+        methods(&origin.take_requests(), ".managed.blob"),
+        Vec::<String>::new()
+    );
 }

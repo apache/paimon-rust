@@ -48,10 +48,14 @@ const CHANGELOG_FILE_PREFIX: &str = "changelog-file.prefix";
 const DEFAULT_DATA_PREFIXES: [&str; 2] = ["data-", "changelog-"];
 const MANIFEST_SIDECAR_SUFFIX: &str = ".avro.sidecar";
 
-// Data files are named {prefix}{uuid}-{count}.{extension}; this matches what follows the prefix.
+// What follows a data file prefix: {uuid}-{count}.{extension}, also after the postpone writer's
+// -u-{commit user}-s-{write id}-w-, or a managed BLOB pack {uuid}.managed.blob.
 const UUID: &str = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
 static DATA_FILE_SUFFIX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(&format!(r"^{UUID}-[0-9]+\..+$")).expect("valid data file pattern")
+    Regex::new(&format!(
+        r"^(?:(?:-u-.+-s-[0-9]+-w-)?{UUID}-[0-9]+\..+|{UUID}\.managed\.blob)$"
+    ))
+    .expect("valid data file pattern")
 });
 // Other types are routed only under the names Paimon writes; Format Table files may be replaced
 // in place. TableCommit names changelog manifests manifest-{uuid}-changelog-{count}.
@@ -721,8 +725,10 @@ mod tests {
         // a table passes the prefixes from its schema with each request
         let routing = IoCacheRouting::from_props(&single(&[]));
         let table_prefixes = ["custom-".to_string()];
-        let target = routing.route(OpClass::Read, &resolve(custom), &table_prefixes);
-        assert_eq!(routing.endpoint(target), Some(CACHE));
+        for path in [custom, "bucket-postpone/custom--u-user-s-1-w-{uuid}-0.orc"] {
+            let target = routing.route(OpClass::Read, &resolve(path), &table_prefixes);
+            assert_eq!(routing.endpoint(target), Some(CACHE), "{path}");
+        }
         let manifest = routing.route(OpClass::Read, &resolve(MANIFEST_PATH), &table_prefixes);
         assert_eq!(routing.endpoint(manifest), Some(CACHE));
         let snapshot = ["snapshot-".to_string()];
@@ -762,6 +768,12 @@ mod tests {
             "dt=1/part-00000-1a2b.snappy.parquet",
             "dt=1/bucket-0/data-1.parquet",
             "dt=1/bucket-0/custom-{uuid}-0.orc",
+            "bucket-postpone/data--u-user-s-x-w-{uuid}-0.parquet",
+            "bucket-postpone/data--u--s-1-w-{uuid}-0.parquet",
+            "bucket-postpone/custom--u-user-s-1-w-{uuid}-0.parquet",
+            "dt=1/bucket-0/data-{uuid}.blob",
+            "dt=1/bucket-0/data-{uuid}.managed.blob.{uuid}.tmp",
+            "dt=1/bucket-0/data-old.managed.blob",
             "README",
         ] {
             assert_type(path, None, &[]);
@@ -822,6 +834,22 @@ mod tests {
         );
         let file_index = "dt=1/bucket-0/data-{uuid}-0.parquet.index";
         assert_type(file_index, Some(FileType::FileIndex), &[]);
+        let blob_references = "dt=1/bucket-0/data-{uuid}-0.parquet.blobref";
+        assert_type(blob_references, Some(FileType::Data), &[]);
+        let pack = "dt=1/bucket-0/data-{uuid}.managed.blob";
+        assert_type(pack, Some(FileType::Data), &[]);
+        // the postpone writer puts its commit user and write id before {uuid}-{count}
+        for postpone in [
+            "bucket-postpone/data--u-io-cache-user-s-7-w-{uuid}-0.parquet",
+            "dt=1/bucket-postpone/data--u-{uuid}-s-2147483647-w-{uuid}-12.orc",
+            "bucket-postpone/changelog--u-user-s-0-w-{uuid}-0.parquet",
+        ] {
+            assert_type(postpone, Some(FileType::Data), &[]);
+            let index = format!("{postpone}.index");
+            assert_type(&index, Some(FileType::FileIndex), &[]);
+            let blob_references = format!("{postpone}.blobref");
+            assert_type(&blob_references, Some(FileType::Data), &[]);
+        }
         assert_type("index/index-{uuid}-0", Some(FileType::BucketIndex), &[]);
         let btree = "index/btree-global-index-{uuid}.index";
         assert_type(btree, Some(FileType::GlobalIndex), &[]);
