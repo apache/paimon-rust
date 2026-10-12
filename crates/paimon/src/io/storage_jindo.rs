@@ -30,6 +30,10 @@ use opendal::{Error as OpendalError, OperationContext, Operator, Result as Opend
 use tokio::sync::{OnceCell, Semaphore};
 
 use crate::error::{Error, JINDO_FORK_ERROR};
+use crate::io::user_agent::{
+    DLF_ACCESS_TRACKING_EXTENDED_INFO, OSS_USER_AGENT_EXTENDED, OSS_USER_AGENT_FEATURES,
+    OSS_USER_AGENT_MODULE, USER_AGENT_EXTENDED, USER_AGENT_FEATURES, USER_AGENT_MODULE,
+};
 use crate::Result;
 
 const OSS_IMPL: &str = "fs.oss.impl";
@@ -159,10 +163,7 @@ pub(crate) fn jindo_config_parse(mut props: HashMap<String, String>) -> Result<J
         None => DEFAULT_JINDO_MAX_CONCURRENT_READS,
     };
     props.remove(OSS_IMPL);
-    props.insert(
-        "fs.oss.user.agent.features".to_string(),
-        "paimon-rust".to_string(),
-    );
+    configure_jindo_user_agent(&mut props);
     props
         .entry("logger.appender".to_string())
         .or_insert_with(|| "file".to_string());
@@ -182,6 +183,50 @@ pub(crate) fn jindo_config_parse(mut props: HashMap<String, String>) -> Result<J
         max_concurrent_reads,
         properties: props,
     })
+}
+
+fn configure_jindo_user_agent(props: &mut HashMap<String, String>) {
+    let effective = |oss_key: &str, common_key: &str| {
+        props
+            .get(oss_key)
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| {
+                props
+                    .get(common_key)
+                    .filter(|value| !value.trim().is_empty())
+            })
+            .map(|value| value.trim().to_string())
+    };
+    let module = effective(OSS_USER_AGENT_MODULE, USER_AGENT_MODULE);
+    let features = effective(OSS_USER_AGENT_FEATURES, USER_AGENT_FEATURES);
+    let extended = effective(OSS_USER_AGENT_EXTENDED, USER_AGENT_EXTENDED);
+    let access_tracking = props
+        .get(DLF_ACCESS_TRACKING_EXTENDED_INFO)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+
+    if let Some(module) = module {
+        props.insert(OSS_USER_AGENT_MODULE.to_string(), module);
+    }
+    let mut features: Vec<&str> = features
+        .as_deref()
+        .map(str::split_whitespace)
+        .into_iter()
+        .flatten()
+        .collect();
+    if !features.contains(&"paimon-rust") {
+        features.insert(0, "paimon-rust");
+    }
+    props.insert(OSS_USER_AGENT_FEATURES.to_string(), features.join(" "));
+
+    let extended = [extended, access_tracking]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if !extended.is_empty() {
+        props.insert(OSS_USER_AGENT_EXTENDED.to_string(), extended);
+    }
 }
 
 pub(crate) fn jindo_config_build(config: &JindoStorageConfig, bucket: &str) -> Result<Operator> {
@@ -1257,6 +1302,91 @@ mod tests {
         );
         assert!(!config.properties.contains_key(OSS_IMPL));
         assert!(!config.properties.contains_key(JINDO_MAX_CONCURRENT_READS));
+        assert_eq!(
+            config
+                .properties
+                .get(OSS_USER_AGENT_FEATURES)
+                .map(String::as_str),
+            Some("paimon-rust")
+        );
+    }
+
+    #[test]
+    fn test_jindo_user_agent_from_catalog_options() {
+        let config = jindo_config_parse(HashMap::from([
+            (
+                USER_AGENT_MODULE.to_string(),
+                "training-app/1.0".to_string(),
+            ),
+            (
+                USER_AGENT_FEATURES.to_string(),
+                "sdk-v2 training".to_string(),
+            ),
+            (USER_AGENT_EXTENDED.to_string(), "env=prod".to_string()),
+            (
+                DLF_ACCESS_TRACKING_EXTENDED_INFO.to_string(),
+                "username=test@example.com".to_string(),
+            ),
+        ]))
+        .unwrap();
+        assert_eq!(
+            config
+                .properties
+                .get(OSS_USER_AGENT_MODULE)
+                .map(String::as_str),
+            Some("training-app/1.0")
+        );
+        assert_eq!(
+            config
+                .properties
+                .get(OSS_USER_AGENT_FEATURES)
+                .map(String::as_str),
+            Some("paimon-rust sdk-v2 training")
+        );
+        assert_eq!(
+            config
+                .properties
+                .get(OSS_USER_AGENT_EXTENDED)
+                .map(String::as_str),
+            Some("env=prod username=test@example.com")
+        );
+    }
+
+    #[test]
+    fn test_jindo_oss_user_agent_options_take_precedence() {
+        let config = jindo_config_parse(HashMap::from([
+            (USER_AGENT_MODULE.to_string(), "common/1.0".to_string()),
+            (OSS_USER_AGENT_MODULE.to_string(), "oss/1.0".to_string()),
+            (USER_AGENT_FEATURES.to_string(), "common".to_string()),
+            (
+                OSS_USER_AGENT_FEATURES.to_string(),
+                "oss paimon-rust".to_string(),
+            ),
+            (USER_AGENT_EXTENDED.to_string(), "common-info".to_string()),
+            (OSS_USER_AGENT_EXTENDED.to_string(), "oss-info".to_string()),
+        ]))
+        .unwrap();
+        assert_eq!(
+            config
+                .properties
+                .get(OSS_USER_AGENT_MODULE)
+                .map(String::as_str),
+            Some("oss/1.0")
+        );
+        assert_eq!(
+            config
+                .properties
+                .get(OSS_USER_AGENT_FEATURES)
+                .map(String::as_str),
+            Some("oss paimon-rust")
+        );
+        assert_eq!(
+            config
+                .properties
+                .get(OSS_USER_AGENT_EXTENDED)
+                .map(String::as_str),
+            Some("oss-info")
+        );
     }
 
     #[test]
@@ -1510,6 +1640,7 @@ mod tests {
         list_page_requests: Arc<AtomicUsize>,
         range_requests: Arc<AtomicUsize>,
         unavailable_requests: Arc<AtomicUsize>,
+        user_agents: Arc<Mutex<Vec<String>>>,
     }
 
     #[cfg(target_os = "linux")]
@@ -1520,6 +1651,13 @@ mod tests {
         headers: HeaderMap,
     ) -> Response<Body> {
         const DATA: &[u8] = b"0123456789";
+        state.user_agents.lock().unwrap().push(
+            headers
+                .get("user-agent")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_string(),
+        );
         if method == Method::HEAD {
             if uri.path().ends_with("/collision") {
                 return Response::builder()
@@ -1725,6 +1863,15 @@ mod tests {
                 "true".to_string(),
             ),
             ("fs.oss.retry.count".to_string(), "0".to_string()),
+            (
+                USER_AGENT_MODULE.to_string(),
+                "training-app/1.0".to_string(),
+            ),
+            (
+                USER_AGENT_FEATURES.to_string(),
+                "sdk-v2 training".to_string(),
+            ),
+            (USER_AGENT_EXTENDED.to_string(), "env=test".to_string()),
         ]);
         let config = jindo_config_parse(properties.clone()).unwrap();
         let operator = jindo_config_build(&config, "jindo-test-bucket").unwrap();
@@ -1787,6 +1934,19 @@ mod tests {
         assert_eq!(state.list_page_requests.load(Ordering::SeqCst), 3);
         assert_eq!(state.range_requests.load(Ordering::SeqCst), 1);
         assert_eq!(state.unavailable_requests.load(Ordering::SeqCst), 1);
+        let user_agents = state.user_agents.lock().unwrap();
+        assert!(!user_agents.is_empty());
+        assert!(
+            user_agents.iter().all(|value| {
+                value.contains("training-app/1.0")
+                    && value.contains("paimon-rust")
+                    && value.contains("sdk-v2")
+                    && value.contains("training")
+                    && value.contains("env=test")
+            }),
+            "unexpected Jindo User-Agent: {user_agents:?}"
+        );
+        drop(user_agents);
 
         let fork_operator = jindo_config_build(&config, "jindo-test-bucket").unwrap();
         assert_operator_rejects_reuse_after_fork(fork_operator).await;
