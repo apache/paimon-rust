@@ -33,9 +33,9 @@ cmake --build build/oss-cpp
 cargo build -p paimon --features storage-oss-cpp
 ```
 
-The Python binding already includes this feature, but neither the bridge nor
-the SDK is bundled in its wheel. Install both on each worker. Tested on Linux
-with SDK 0.2.0 (`c13a82038b0696f99c32f4e86b623ffcc9e62140`).
+Linux `pypaimon-rust` wheels bundle the bridge and SDK. Source builds and other
+platforms still require a separate bridge. The bundled SDK is 0.2.0
+(`c13a82038b0696f99c32f4e86b623ffcc9e62140`).
 
 ## Configure
 
@@ -43,7 +43,6 @@ Set the native table/catalog FileIO options:
 
 ```text
 fs.oss.impl = cpp
-fs.oss.cpp.library.path = /absolute/path/liboss_cpp_bridge.so
 fs.oss.endpoint = https://oss-cn-shanghai-internal.aliyuncs.com
 fs.oss.region = cn-shanghai
 ```
@@ -52,10 +51,9 @@ Use the existing `fs.oss.accessKeyId`, `fs.oss.accessKeySecret` and optional
 `fs.oss.securityToken` credentials. REST catalog credentials still refresh;
 static FileIO credentials do not.
 
-Python bindings also discover `liboss_cpp_bridge.so` (Linux) or
-`liboss_cpp_bridge.dylib` (macOS) beside `pypaimon_oss_cpp/__init__.py`.
-An explicit `fs.oss.cpp.library.path` takes precedence. The companion package
-is not yet published.
+Python bindings discover the bridge in `pypaimon_rust`, then in
+`pypaimon_oss_cpp` if installed. Set `fs.oss.cpp.library.path` only to override
+discovery or for a source build.
 
 | Option | Default |
 |---|---:|

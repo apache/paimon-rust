@@ -54,6 +54,7 @@ include = [
     { path = "NOTICE", format = "wheel" },
     { path = "THIRD-PARTY-LICENSES.html", format = "wheel" },
     { path = "python/pypaimon_rust/py.typed", format = ["sdist", "wheel"] },
+    { path = "python/pypaimon_rust/liboss_cpp_bridge.*", format = "wheel" },
 ]
 exclude = [
     { path = "licenses/**", format = "sdist" },

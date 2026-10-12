@@ -22,7 +22,9 @@ use std::path::{Path, PathBuf};
 const LIBRARY_PATH: &str = "fs.oss.cpp.library.path";
 
 pub(crate) fn complete_options(options: HashMap<String, String>) -> HashMap<String, String> {
-    complete_options_with(options, || discover_library("pypaimon_oss_cpp"))
+    complete_options_with(options, || {
+        discover_library("pypaimon_rust").or_else(|| discover_library("pypaimon_oss_cpp"))
+    })
 }
 
 fn complete_options_with(
