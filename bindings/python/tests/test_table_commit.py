@@ -506,3 +506,74 @@ def test_close_cleans_unprepared_output_but_preserves_prepared_files(tmp_path, b
             for row in pq.ParquetFile(path).read(columns=["id"]).to_pylist()] == [1]
     if bucket != "-2":
         assert _rows(table) == [1]
+
+
+@pytest.mark.parametrize('stream', [False, True])
+@pytest.mark.parametrize('close', [False, True])
+@pytest.mark.parametrize('bound_method', [False, True])
+def test_commit_callback_owner_cycle_is_collected(tmp_path, stream, close, bound_method):
+    import gc
+    import weakref
+
+    table = _table(tmp_path)
+    builder = table.new_stream_write_builder() if stream else table.new_batch_write_builder()
+    commit = builder.new_commit()
+
+    class Owner:
+        def __init__(self, committer):
+            self.committer = committer
+
+        def __call__(self, snapshot_json, entries, identifier):
+            pass
+
+    owner = Owner(commit)
+    reference = weakref.ref(owner)
+    callback = owner.__call__ if bound_method else owner
+    commit._add_commit_callback(callback)
+    # Register more than one reference so GC traversal must count each edge.
+    commit._add_commit_callback(callback)
+    if close:
+        commit.close()
+    del callback, owner, commit
+    gc.collect()
+    assert reference() is None
+
+
+@pytest.mark.parametrize('stream', [False, True])
+def test_commit_callback_bridge_preserves_error_and_publication(tmp_path, stream):
+    table = _table(tmp_path)
+    builder = table.new_stream_write_builder() if stream else table.new_batch_write_builder()
+    commit = builder.new_commit()
+    seen = []
+    error = LookupError('notification failed')
+
+    def callback(snapshot_json, entries, identifier):
+        snapshot = json.loads(snapshot_json)
+        assert snapshot['id'] == 1
+        assert snapshot['commitIdentifier'] == identifier
+        assert len(entries) == 1
+        kind, buckets, message = entries[0]
+        assert kind == 0
+        assert buckets == -1
+        assert isinstance(message, CommitMessage)
+        assert _rows(table) == [1]  # Re-enter the Native runtime during notification.
+        seen.append(snapshot)
+        raise error
+
+    commit._add_commit_callback(callback)
+    messages = _prepare(builder, [1], [10], 7 if stream else None)
+    with pytest.raises(LookupError) as raised:
+        commit.commit(7, messages) if stream else commit.commit(messages)
+    assert raised.value is error
+    assert len(seen) == 1
+    assert _rows(table) == [1]
+    assert table.latest_snapshot().id() == 1
+    commit.close()
+
+
+def test_commit_callback_rejects_non_callable_before_publication(tmp_path):
+    table = _table(tmp_path)
+    commit = table.new_batch_write_builder().new_commit()
+    with pytest.raises(TypeError, match='must be callable'):
+        commit._add_commit_callback(42)
+    assert table.latest_snapshot() is None

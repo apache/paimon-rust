@@ -35,14 +35,14 @@ impl std::fmt::Debug for PythonCallbackError {
 
 impl std::fmt::Display for PythonCallbackError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("Python Blob callback failed")
+        f.write_str("Python callback failed")
     }
 }
 impl std::error::Error for PythonCallbackError {}
 
 pub(crate) fn callback_error(error: PyErr) -> paimon::Error {
     paimon::Error::UnexpectedError {
-        message: "Python Blob callback failed".into(),
+        message: "Python callback failed".into(),
         source: Some(Box::new(PythonCallbackError(error))),
     }
 }

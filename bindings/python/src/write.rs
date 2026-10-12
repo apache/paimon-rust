@@ -21,15 +21,17 @@ use std::sync::{Arc, Mutex};
 use arrow::datatypes::Schema as ArrowSchema;
 use arrow::pyarrow::FromPyArrow;
 use arrow::record_batch::RecordBatch;
-use paimon::spec::{BlobConsumer, BlobDescriptor, CoreOptions, DataType, Datum, RowType};
+use paimon::spec::{BlobConsumer, BlobDescriptor, CoreOptions, DataType, Datum, FileKind, RowType};
 use paimon::table::{
-    CommitMessage, PostponeBucketPlan, PostponeFixedBucketTableWrite, Table, TableCommit,
-    TableUpdate, TableUpdateByRowId, TableWrite, COMMIT_MESSAGE_SERIALIZER_VERSION,
+    CommitCallback, CommitCallbackContext, CommitMessage, PostponeBucketPlan,
+    PostponeFixedBucketTableWrite, Table, TableCommit, TableUpdate, TableUpdateByRowId, TableWrite,
+    COMMIT_MESSAGE_SERIALIZER_VERSION,
 };
 use paimon_datafusion::runtime::runtime;
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyString};
+use pyo3::{PyTraverseError, PyVisit};
 
 use crate::blob_uri_reader::{callback_error, optional_uri_reader_factory, to_callback_error};
 use crate::error::to_py_err;
@@ -1320,8 +1322,67 @@ impl PyStreamTableWrite {
     }
 }
 
+/// Transport only: publication and retry notification belong to Rust core.
+struct PythonCommitCallback {
+    // One Python reference shared by the core hook and the GC-visible wrapper.
+    callback: Mutex<Option<Py<PyAny>>>,
+}
+
+#[async_trait::async_trait]
+impl CommitCallback for PythonCommitCallback {
+    async fn call(&self, context: &CommitCallbackContext) -> paimon::Result<()> {
+        let snapshot = serde_json::to_string(&context.snapshot).map_err(|error| {
+            paimon::Error::UnexpectedError {
+                message: "Cannot serialize commit callback snapshot".into(),
+                source: Some(Box::new(error)),
+            }
+        })?;
+        // Suspend the runtime context so Python can call Native again, for
+        // example to read the snapshot which triggered this callback.
+        tokio::task::block_in_place(|| {
+            Python::attach(|py| {
+                let callback = self
+                    .callback
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|callback| callback.clone_ref(py));
+                let Some(callback) = callback else {
+                    return Ok(());
+                };
+                let entries = context
+                    .commit_entries
+                    .iter()
+                    .map(|entry| {
+                        let message = CommitMessage::new(
+                            entry.partition().to_vec(),
+                            entry.bucket(),
+                            vec![entry.file().clone()],
+                        );
+                        Ok((
+                            if *entry.kind() == FileKind::Add {
+                                0u8
+                            } else {
+                                1u8
+                            },
+                            entry.total_buckets(),
+                            Py::new(py, PyCommitMessage::new(message))?,
+                        ))
+                    })
+                    .collect::<PyResult<Vec<_>>>()?;
+                callback
+                    .bind(py)
+                    .call1((snapshot, entries, context.identifier))?;
+                Ok(())
+            })
+        })
+        .map_err(callback_error)
+    }
+}
+
 struct CommitContext {
     inner: TableCommit,
+    callbacks: Vec<Arc<PythonCommitCallback>>,
     table: Arc<Table>,
     commit_user: String,
 }
@@ -1337,6 +1398,7 @@ impl CommitContext {
             .with_ignore_empty_commit(ignore_empty);
         Ok(Self {
             inner,
+            callbacks: Vec::new(),
             table: Arc::clone(table),
             commit_user: commit_user.to_string(),
         })
@@ -1361,6 +1423,38 @@ impl CommitContext {
         let messages = self.messages(messages, "abort", false)?;
         py.detach(|| runtime().block_on(self.inner.abort(&messages)))
             .map_err(to_py_err)
+    }
+
+    fn add_commit_callback(&mut self, py: Python<'_>, callback: Py<PyAny>) -> PyResult<()> {
+        if !callback.bind(py).is_callable() {
+            return Err(PyTypeError::new_err("Commit callback must be callable"));
+        }
+        let callback = Arc::new(PythonCommitCallback {
+            callback: Mutex::new(Some(callback)),
+        });
+        self.inner
+            .add_commit_callback(callback.clone())
+            .map_err(to_py_err)?;
+        self.callbacks.push(callback);
+        Ok(())
+    }
+
+    fn traverse_callbacks(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
+        for callback in &self.callbacks {
+            visit.call(&*callback.callback.lock().unwrap())?;
+        }
+        Ok(())
+    }
+
+    fn clear_callbacks(&self) {
+        let references = self
+            .callbacks
+            .iter()
+            .map(|callback| callback.callback.lock().unwrap().take())
+            .collect::<Vec<_>>();
+        // Destructors can re-enter Native. Release every lock before dropping
+        // references. PyPaimon owns close() on the original callback objects.
+        drop(references);
     }
 
     fn committer(&self, properties: Option<HashMap<String, String>>) -> TableCommit {
@@ -1394,8 +1488,23 @@ impl PyBatchTableCommit {
 
 #[pymethods]
 impl PyBatchTableCommit {
-    /// Rust committers have no background resources to shut down.
-    fn close(&self) {}
+    fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
+        self.context.traverse_callbacks(visit)
+    }
+
+    fn __clear__(&mut self) {
+        self.context.clear_callbacks();
+    }
+
+    /// Internal bridge to PyPaimon's CommitCallbackContext using the v14 protocol.
+    fn _add_commit_callback(&mut self, py: Python<'_>, callback: Py<PyAny>) -> PyResult<()> {
+        self.context.add_commit_callback(py, callback)
+    }
+
+    /// Release callback references; callback resources belong to the caller.
+    fn close(&self) {
+        self.context.clear_callbacks();
+    }
 
     #[pyo3(signature = (messages, snapshot_properties=None))]
     fn commit(
@@ -1418,13 +1527,13 @@ impl PyBatchTableCommit {
                 }
             })
         })
-        .map_err(to_py_err)
+        .map_err(to_callback_error)
     }
 
     fn truncate_table(&mut self, py: Python<'_>) -> PyResult<()> {
         self.check_committed()?;
         py.detach(|| runtime().block_on(self.context.inner.truncate_table()))
-            .map_err(to_py_err)
+            .map_err(to_callback_error)
     }
 
     fn truncate_partitions(
@@ -1437,7 +1546,7 @@ impl PyBatchTableCommit {
             .map(|spec| partition_spec(py, &self.context.table, spec))
             .collect::<PyResult<Vec<_>>>()?;
         py.detach(|| runtime().block_on(self.context.inner.drop_partitions(partitions)))
-            .map_err(to_py_err)
+            .map_err(to_callback_error)
     }
 
     fn abort(&self, py: Python<'_>, messages: &Bound<'_, PyAny>) -> PyResult<()> {
@@ -1452,8 +1561,23 @@ pub struct PyStreamTableCommit {
 
 #[pymethods]
 impl PyStreamTableCommit {
-    /// Rust committers have no background resources to shut down.
-    fn close(&self) {}
+    fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
+        self.context.traverse_callbacks(visit)
+    }
+
+    fn __clear__(&mut self) {
+        self.context.clear_callbacks();
+    }
+
+    /// Internal bridge to PyPaimon's CommitCallbackContext using the v14 protocol.
+    fn _add_commit_callback(&mut self, py: Python<'_>, callback: Py<PyAny>) -> PyResult<()> {
+        self.context.add_commit_callback(py, callback)
+    }
+
+    /// Release callback references; callback resources belong to the caller.
+    fn close(&self) {
+        self.context.clear_callbacks();
+    }
 
     #[pyo3(signature = (commit_identifier, messages, snapshot_properties=None))]
     fn commit(
@@ -1468,7 +1592,7 @@ impl PyStreamTableCommit {
         py.detach(|| {
             runtime().block_on(committer.commit_with_identifier(messages, commit_identifier))
         })
-        .map_err(to_py_err)
+        .map_err(to_callback_error)
     }
 
     /// Sort identifiers, filter already committed groups, and return the number committed.
@@ -1488,7 +1612,7 @@ impl PyStreamTableCommit {
             })
             .collect::<PyResult<Vec<_>>>()?;
         py.detach(|| runtime().block_on(self.context.inner.filter_and_commit(commits)))
-            .map_err(to_py_err)
+            .map_err(to_callback_error)
     }
 
     fn abort(&self, py: Python<'_>, messages: &Bound<'_, PyAny>) -> PyResult<()> {

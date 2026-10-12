@@ -77,7 +77,7 @@ pub struct ManifestEntry {
 
 #[allow(dead_code)]
 impl ManifestEntry {
-    pub(crate) fn kind(&self) -> &FileKind {
+    pub fn kind(&self) -> &FileKind {
         &self.kind
     }
 
@@ -86,7 +86,7 @@ impl ManifestEntry {
         &self.partition
     }
 
-    pub(crate) fn bucket(&self) -> i32 {
+    pub fn bucket(&self) -> i32 {
         self.bucket
     }
 

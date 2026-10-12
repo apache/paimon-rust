@@ -436,6 +436,11 @@ class StreamTableWrite:
         ...
 
 class BatchTableCommit:
+    def _add_commit_callback(
+        self, callback: Callable[[str, Sequence[Tuple[int, int, CommitMessage]], int], None],
+    ) -> None:
+        """Internal PyPaimon callback bridge: snapshot JSON and ordered file entries."""
+        ...
     def close(self) -> None: ...
     def commit(
         self, messages: Sequence[CommitMessage],
@@ -454,6 +459,11 @@ class BatchTableCommit:
         ...
 
 class StreamTableCommit:
+    def _add_commit_callback(
+        self, callback: Callable[[str, Sequence[Tuple[int, int, CommitMessage]], int], None],
+    ) -> None:
+        """Internal PyPaimon callback bridge: snapshot JSON and ordered file entries."""
+        ...
     def close(self) -> None: ...
     def commit(
         self, commit_identifier: int, messages: Sequence[CommitMessage],
