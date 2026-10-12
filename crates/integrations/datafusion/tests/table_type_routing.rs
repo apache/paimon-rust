@@ -309,6 +309,7 @@ struct MetadataEngineResolver {
 #[derive(Debug, Default)]
 struct SnapshotEngineResolver {
     calls: AtomicUsize,
+    current_unavailable: bool,
 }
 
 const LARGE_SNAPSHOT_ID: i64 = 6_251_097_304_546_047_273;
@@ -319,6 +320,11 @@ impl TableEngineResolver for SnapshotEngineResolver {
         &self,
         request: &EngineTableRequest,
     ) -> DFResult<Option<Arc<dyn TableProvider>>> {
+        if self.current_unavailable {
+            return Err(DataFusionError::Execution(
+                "current table is unavailable".into(),
+            ));
+        }
         FakeEngineResolver.resolve_table(request).await
     }
 
@@ -572,6 +578,57 @@ async fn engine_snapshot_uses_historical_data_and_schema() {
             assert_eq!(string_column_values(&batches, "historical"), ["large-id"]);
         }
     }
+}
+
+#[tokio::test]
+async fn engine_snapshot_remains_readable_when_current_resolution_fails() {
+    let resolver = Arc::new(SnapshotEngineResolver {
+        current_unavailable: true,
+        ..Default::default()
+    });
+    let env = setup_with_engine(Some(resolver.clone())).await;
+    enable_version_syntax(&env).await;
+    for native in [false, true] {
+        let batches = routed_sql(
+            &env,
+            native,
+            &format!(
+                "SELECT h.historical FROM {CATALOG}.{DB}.it VERSION AS OF 10 AS h WHERE h.id = 2"
+            ),
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+        assert_eq!(string_column_values(&batches, "historical"), ["old-b"]);
+
+        let err = routed_sql(
+            &env,
+            native,
+            &format!("SELECT * FROM {CATALOG}.{DB}.it VERSION AS OF 404 WHERE FALSE"),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("snapshot 404"), "{err}");
+
+        for query in [
+            format!("SELECT * FROM {CATALOG}.{DB}.it"),
+            format!("SELECT * FROM {CATALOG}.{DB}.it WHERE FALSE"),
+            format!("SELECT COUNT(*) FROM {CATALOG}.{DB}.it LIMIT 0"),
+            format!(
+                "SELECT h.historical FROM {CATALOG}.{DB}.it VERSION AS OF 10 AS h \
+                 JOIN {CATALOG}.{DB}.it AS c ON h.id = c.id"
+            ),
+        ] {
+            let err = routed_sql(&env, native, &query).await.unwrap_err();
+            assert!(
+                err.to_string().contains("current table is unavailable"),
+                "{err}"
+            );
+        }
+    }
+    assert!(resolver.calls.load(Ordering::Relaxed) >= 4);
 }
 
 #[tokio::test]

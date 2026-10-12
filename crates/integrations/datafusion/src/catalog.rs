@@ -26,7 +26,7 @@ use async_trait::async_trait;
 use datafusion::catalog::{CatalogProvider, MemorySchemaProvider, SchemaProvider};
 use datafusion::common::{plan_datafusion_err, Column};
 use datafusion::datasource::{TableProvider, TableType};
-use datafusion::error::Result as DFResult;
+use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::SessionState;
 use datafusion::logical_expr::{expr_fn::cast, Expr, LogicalPlan, LogicalPlanBuilder};
 use datafusion::prelude::SessionContext;
@@ -108,7 +108,7 @@ pub trait TableEngineResolver: Debug + Send + Sync {
 /// Delegates reads to the engine and rejects DML.
 #[derive(Debug, Clone)]
 pub(crate) struct ReadOnlyTableProvider {
-    inner: Arc<dyn TableProvider>,
+    inner: Result<Arc<dyn TableProvider>, Arc<DataFusionError>>,
     pub(crate) declared: PaimonTableType,
     pub(crate) table_name: String,
     metadata_table: bool,
@@ -118,6 +118,12 @@ pub(crate) struct ReadOnlyTableProvider {
 }
 
 impl ReadOnlyTableProvider {
+    pub(crate) fn current_table(&self) -> DFResult<&Arc<dyn TableProvider>> {
+        self.inner
+            .as_ref()
+            .map_err(|error| DataFusionError::Shared(Arc::clone(error)))
+    }
+
     pub(crate) fn unsupported_time_travel(&self) -> datafusion::error::DataFusionError {
         plan_datafusion_err!(
             "time travel is not supported for routed '{}' tables ('{}'); \
@@ -171,7 +177,7 @@ async fn resolve_engine_snapshot(
                 plan_datafusion_err!("table '{table_name}' was not found at snapshot {snapshot_id}")
             })?;
         Ok(Arc::new(ReadOnlyTableProvider {
-            inner,
+            inner: Ok(inner),
             declared: request.declared,
             table_name,
             metadata_table: false,
@@ -186,31 +192,48 @@ async fn resolve_engine_snapshot(
 #[async_trait]
 impl TableProvider for ReadOnlyTableProvider {
     fn schema(&self) -> datafusion::arrow::datatypes::SchemaRef {
-        self.inner.schema()
+        self.inner.as_ref().map_or_else(
+            |_| Arc::new(datafusion::arrow::datatypes::Schema::empty()),
+            |inner| inner.schema(),
+        )
     }
 
     fn constraints(&self) -> Option<&datafusion::common::Constraints> {
-        self.inner.constraints()
+        self.inner
+            .as_ref()
+            .ok()
+            .and_then(|inner| inner.constraints())
     }
 
     fn table_type(&self) -> TableType {
         if self.metadata_table {
             TableType::View
         } else {
-            self.inner.table_type()
+            self.inner
+                .as_ref()
+                .map_or(TableType::Base, |inner| inner.table_type())
         }
     }
 
     fn get_table_definition(&self) -> Option<&str> {
-        self.inner.get_table_definition()
+        self.inner
+            .as_ref()
+            .ok()
+            .and_then(|inner| inner.get_table_definition())
     }
 
     fn get_logical_plan(&self) -> Option<std::borrow::Cow<'_, LogicalPlan>> {
-        self.inner.get_logical_plan()
+        self.inner
+            .as_ref()
+            .ok()
+            .and_then(|inner| inner.get_logical_plan())
     }
 
     fn get_column_default(&self, column: &str) -> Option<&Expr> {
-        self.inner.get_column_default(column)
+        self.inner
+            .as_ref()
+            .ok()
+            .and_then(|inner| inner.get_column_default(column))
     }
 
     async fn scan(
@@ -220,18 +243,23 @@ impl TableProvider for ReadOnlyTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DFResult<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
-        self.inner.scan(state, projection, filters, limit).await
+        self.current_table()?
+            .scan(state, projection, filters, limit)
+            .await
     }
 
     fn supports_filters_pushdown(
         &self,
         filters: &[&Expr],
     ) -> DFResult<Vec<datafusion::logical_expr::TableProviderFilterPushDown>> {
-        self.inner.supports_filters_pushdown(filters)
+        self.current_table()?.supports_filters_pushdown(filters)
     }
 
     fn statistics(&self) -> Option<datafusion::common::Statistics> {
-        self.inner.statistics()
+        self.inner
+            .as_ref()
+            .ok()
+            .and_then(|inner| inner.statistics())
     }
 
     async fn insert_into(
@@ -904,9 +932,13 @@ impl SchemaProvider for PaimonSchemaProvider {
                     let resolved = match system_name {
                         Some(system_name) => {
                             let system_name = system_name.to_ascii_lowercase();
-                            resolver.resolve_metadata_table(&request, &system_name).await?
+                            resolver.resolve_metadata_table(&request, &system_name).await?.map(Ok)
                         }
-                        None => resolver.resolve_table(&request).await?,
+                        None => match resolver.resolve_table(&request).await {
+                            Ok(table) => table.map(Ok),
+                            // DataFusion preloads tables before the planner selects a snapshot.
+                            Err(error) => Some(Err(Arc::new(error))),
+                        }
                     };
                     Ok(resolved.map(|inner| {
                         Arc::new(ReadOnlyTableProvider {
