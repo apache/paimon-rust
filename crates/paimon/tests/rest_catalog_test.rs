@@ -5211,7 +5211,7 @@ async fn test_rest_catalog_manages_policies_end_to_end() {
 }
 
 #[tokio::test]
-async fn test_branch_write_copy_loads_catalog_schema_without_schema_files() {
+async fn test_branch_write_copy_loads_catalog_schema_with_distinct_identity() {
     let ctx = setup_catalog(vec!["default"]).await;
     let path = "memory:/branch-write";
     ctx.server
@@ -5226,7 +5226,8 @@ async fn test_branch_write_copy_loads_catalog_schema_without_schema_files() {
         .add_table_with_schema("default", "t$branch_dev", branch_schema.clone(), path);
     ctx.server
         .set_table_schema_id("default", "t$branch_dev", branch_schema, 7);
-    ctx.server.set_table_uuid("default", "t$branch_dev", "t");
+    ctx.server
+        .set_table_uuid("default", "t$branch_dev", "branch-t");
     let main = ctx
         .catalog
         .get_table(&Identifier::new("default", "t"))
@@ -5264,27 +5265,26 @@ async fn test_branch_write_copy_loads_catalog_schema_without_schema_files() {
 }
 
 #[tokio::test]
-async fn test_branch_write_copy_rejects_replaced_identity_or_location() {
+async fn test_branch_write_copy_rejects_replaced_source_identity_or_location() {
     let ctx = setup_catalog(vec!["default"]).await;
     let path = "memory:/branch-identity";
     ctx.server
         .add_table_with_schema("default", "t", test_schema(), path);
     ctx.server
         .add_table_with_schema("default", "t$branch_dev", test_schema(), path);
-    ctx.server.set_table_uuid("default", "t$branch_dev", "t");
+    ctx.server
+        .set_table_uuid("default", "t$branch_dev", "branch-t");
     let main = ctx
         .catalog
         .get_table(&Identifier::new("default", "t"))
         .await
         .unwrap();
-    main.copy_with_branch("dev").await.unwrap();
+    let branch = main.copy_with_branch("dev").await.unwrap();
     ctx.server
-        .set_table_uuid("default", "t$branch_dev", "recreated-table");
-    let error = main.copy_with_branch("dev").await.unwrap_err();
+        .set_table_uuid("default", "t$branch_dev", "recreated-branch");
+    let error = branch.copy_with_branch("main").await.unwrap_err();
     assert!(
-        error
-            .to_string()
-            .contains("no longer belongs to the loaded table"),
+        error.to_string().contains("now resolves to uuid"),
         "{error}"
     );
     ctx.server.add_table_with_schema(
@@ -5293,8 +5293,9 @@ async fn test_branch_write_copy_rejects_replaced_identity_or_location() {
         test_schema(),
         "memory:/replacement",
     );
-    ctx.server.set_table_uuid("default", "t$branch_dev", "t");
-    let error = main.copy_with_branch("dev").await.unwrap_err();
+    ctx.server
+        .set_table_uuid("default", "t$branch_dev", "branch-t");
+    let error = branch.copy_with_branch("main").await.unwrap_err();
     assert!(
         error
             .to_string()

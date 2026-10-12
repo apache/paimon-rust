@@ -903,12 +903,12 @@ impl Table {
             // Catalog branches may have no schema directory in the data store.
             // Load their schema, identity and FileIO through the same catalog.
             let identifier = env.identifier().with_branch(&branch)?;
-            let mut table = env.get_table(&identifier).await?;
-            if table.location() != self.location()
-                || table
-                    .rest_env
-                    .as_ref()
-                    .is_none_or(|branch_env| branch_env.uuid() != env.uuid())
+            let (current, mut table) = tokio::try_join!(
+                env.current_table_identity_checked(),
+                env.get_table(&identifier)
+            )?;
+            if current.path.as_deref() != Some(self.location())
+                || table.location() != self.location()
             {
                 return Err(crate::Error::DataInvalid {
                     message: format!(
