@@ -361,24 +361,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libssl-dev
-          cmake -S .oss-cpp-sdk -B build/oss-sdk -DCMAKE_BUILD_TYPE=Release \
-            -DUSE_SYSTEM_CURL=OFF -DUSE_SYSTEM_OPENSSL=ON \
-            -DOPENSSL_USE_STATIC_LIBS=ON -DBUILD_SHARED_LIBS=OFF \
-            -DCMAKE_CXX_FLAGS=-Wno-error=maybe-uninitialized \
-            -DCMAKE_INSTALL_PREFIX="$PWD/build/oss-install"
-          cmake --build build/oss-sdk -j 2
-          cmake --install build/oss-sdk
-          cmake -S integrations/oss-cpp -B build/oss-cpp \
-            -DCMAKE_PREFIX_PATH="$PWD/build/oss-install" \
-            -DOPENSSL_USE_STATIC_LIBS=ON \
-            -DCMAKE_SHARED_LINKER_FLAGS=-Wl,--no-undefined
-          cmake --build build/oss-cpp -j 2
-          if readelf -d build/oss-cpp/liboss_cpp_bridge.so | \
-            grep -Eq 'Shared library: \[lib(ssl|crypto|curl)'; then
-            echo 'OSS C++ bridge depends on system OpenSSL or curl' >&2
-            exit 1
-          fi
-          echo "OSS_CPP_BRIDGE_LIBRARY=$PWD/build/oss-cpp/liboss_cpp_bridge.so" >> "$GITHUB_ENV"
+          bash scripts/build_python_oss_cpp_bridge.sh x86_64-unknown-linux-gnu
+          echo "OSS_CPP_BRIDGE_LIBRARY=$PWD/bindings/python/python/pypaimon_rust/liboss_cpp_bridge.so" >> "$GITHUB_ENV"
 
       - name: OSS C++ SDK Integration Test
         if: matrix.suite == 'oss-cpp'
