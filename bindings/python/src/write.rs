@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 use arrow::datatypes::Schema as ArrowSchema;
 use arrow::pyarrow::FromPyArrow;
 use arrow::record_batch::RecordBatch;
-use paimon::spec::{BlobConsumer, BlobDescriptor, CoreOptions, DataType, Datum, FileKind, RowType};
+use paimon::spec::{BlobConsumer, BlobDescriptor, CoreOptions, DataType, Datum, RowType};
 use paimon::table::{
     CommitCallback, CommitCallbackContext, CommitMessage, PostponeBucketPlan,
     PostponeFixedBucketTableWrite, Table, TableCommit, TableUpdate, TableUpdateByRowId, TableWrite,
@@ -34,6 +34,7 @@ use pyo3::types::{PyBytes, PyDict, PyString};
 use pyo3::{PyTraverseError, PyVisit};
 
 use crate::blob_uri_reader::{callback_error, optional_uri_reader_factory, to_callback_error};
+use crate::commit_callback::PyCommitCallbackContext;
 use crate::error::to_py_err;
 use crate::predicate::{dict_to_table_predicate, py_to_datum};
 
@@ -1331,12 +1332,6 @@ struct PythonCommitCallback {
 #[async_trait::async_trait]
 impl CommitCallback for PythonCommitCallback {
     async fn call(&self, context: &CommitCallbackContext) -> paimon::Result<()> {
-        let snapshot = serde_json::to_string(&context.snapshot).map_err(|error| {
-            paimon::Error::UnexpectedError {
-                message: "Cannot serialize commit callback snapshot".into(),
-                source: Some(Box::new(error)),
-            }
-        })?;
         // Suspend the runtime context so Python can call Native again, for
         // example to read the snapshot which triggered this callback.
         tokio::task::block_in_place(|| {
@@ -1350,29 +1345,9 @@ impl CommitCallback for PythonCommitCallback {
                 let Some(callback) = callback else {
                     return Ok(());
                 };
-                let entries = context
-                    .commit_entries
-                    .iter()
-                    .map(|entry| {
-                        let message = CommitMessage::new(
-                            entry.partition().to_vec(),
-                            entry.bucket(),
-                            vec![entry.file().clone()],
-                        );
-                        Ok((
-                            if *entry.kind() == FileKind::Add {
-                                0u8
-                            } else {
-                                1u8
-                            },
-                            entry.total_buckets(),
-                            Py::new(py, PyCommitMessage::new(message))?,
-                        ))
-                    })
-                    .collect::<PyResult<Vec<_>>>()?;
                 callback
                     .bind(py)
-                    .call1((snapshot, entries, context.identifier))?;
+                    .call1((PyCommitCallbackContext::new(context.clone()),))?;
                 Ok(())
             })
         })
@@ -1496,8 +1471,8 @@ impl PyBatchTableCommit {
         self.context.clear_callbacks();
     }
 
-    /// Internal bridge to PyPaimon's CommitCallbackContext using the v14 protocol.
-    fn _add_commit_callback(&mut self, py: Python<'_>, callback: Py<PyAny>) -> PyResult<()> {
+    /// Register an idempotent callback receiving the committed core context.
+    fn add_commit_callback(&mut self, py: Python<'_>, callback: Py<PyAny>) -> PyResult<()> {
         self.context.add_commit_callback(py, callback)
     }
 
@@ -1569,8 +1544,8 @@ impl PyStreamTableCommit {
         self.context.clear_callbacks();
     }
 
-    /// Internal bridge to PyPaimon's CommitCallbackContext using the v14 protocol.
-    fn _add_commit_callback(&mut self, py: Python<'_>, callback: Py<PyAny>) -> PyResult<()> {
+    /// Register an idempotent callback receiving the committed core context.
+    fn add_commit_callback(&mut self, py: Python<'_>, callback: Py<PyAny>) -> PyResult<()> {
         self.context.add_commit_callback(py, callback)
     }
 

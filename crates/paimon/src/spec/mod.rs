@@ -113,6 +113,7 @@ pub(crate) use objects_file::{
 };
 pub(crate) mod avro;
 pub(crate) mod stats;
+pub use stats::BinaryTableStats;
 mod types;
 pub use types::*;
 mod partition;
