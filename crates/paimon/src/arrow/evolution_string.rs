@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use arrow_array::{cast::AsArray, types::Int64Type, ArrayRef, StringArray, Time32MillisecondArray};
 use arrow_schema::{DataType as ArrowType, TimeUnit};
-use chrono::{DateTime, Local};
+use jiff::tz::TimeZone;
 
 use crate::common::date_time::{format_epoch_timestamp, format_time};
 use crate::spec::DataType;
@@ -59,37 +59,15 @@ pub(super) fn temporal_to_string(
             let ArrowType::Timestamp(unit, _) = source.data_type() else {
                 return Err(invalid("Expected TIMESTAMP array"));
             };
+            let zone = local.then(TimeZone::system);
             let raw = arrow_cast::cast(source, &ArrowType::Int64)
                 .map_err(|error| invalid(error.to_string()))?;
             raw.as_primitive::<Int64Type>()
                 .iter()
                 .map(|value| {
-                    value
-                        .map(|value| {
-                            let millis = match unit {
-                                TimeUnit::Second => value.wrapping_mul(1000),
-                                TimeUnit::Millisecond => value,
-                                TimeUnit::Microsecond => value.div_euclid(1000),
-                                TimeUnit::Nanosecond => value.div_euclid(1_000_000),
-                            };
-                            let seconds = millis.div_euclid(1000);
-                            let sub_milli = match unit {
-                                TimeUnit::Microsecond => value.rem_euclid(1000) * 1000,
-                                TimeUnit::Nanosecond => value.rem_euclid(1_000_000),
-                                _ => 0,
-                            };
-                            let nanos = (millis.rem_euclid(1000) * 1_000_000 + sub_milli) as u32;
-                            let seconds = if local {
-                                let dt = DateTime::from_timestamp(seconds, nanos).ok_or_else(|| {
-                                    invalid(format!("Timestamp {value} is out of range for local string conversion"))
-                                })?;
-                                seconds + i64::from(dt.with_timezone(&Local).offset().local_minus_utc())
-                            } else { seconds };
-                            Ok(format_epoch_timestamp(seconds, nanos, precision))
-                        })
-                        .transpose()
+                    value.map(|value| render_timestamp(value, unit, precision, zone.as_ref()))
                 })
-                .collect::<crate::Result<Vec<_>>>()?
+                .collect::<Vec<_>>()
         }
         _ => return Ok(None),
     };
@@ -107,6 +85,54 @@ pub(super) fn temporal_to_string(
     Ok(Some(Arc::new(StringArray::from_iter(strings))))
 }
 
+fn render_timestamp(
+    value: i64,
+    unit: &TimeUnit,
+    precision: u32,
+    zone: Option<&TimeZone>,
+) -> String {
+    let millis = match unit {
+        TimeUnit::Second => value.wrapping_mul(1000),
+        TimeUnit::Millisecond => value,
+        TimeUnit::Microsecond => value.div_euclid(1000),
+        TimeUnit::Nanosecond => value.div_euclid(1_000_000),
+    };
+    let sub_milli = match unit {
+        TimeUnit::Microsecond => value.rem_euclid(1000) * 1000,
+        TimeUnit::Nanosecond => value.rem_euclid(1_000_000),
+        _ => 0,
+    };
+    let millis = match zone {
+        Some(zone) => {
+            let offset = local_offset(millis.div_euclid(1000), zone);
+            // Timestamp.fromLocalDateTime uses signed long millisecond storage.
+            // Applying an offset can wrap and change the millisecond fraction.
+            millis.wrapping_add(i64::from(offset) * 1000)
+        }
+        None => millis,
+    };
+    let nanos = (millis.rem_euclid(1000) * 1_000_000 + sub_milli) as u32;
+    format_epoch_timestamp(millis.div_euclid(1000), nanos, precision)
+}
+
+fn local_offset(seconds: i64, zone: &TimeZone) -> i32 {
+    let timestamp = jiff::Timestamp::from_second(seconds).unwrap_or_else(|_| {
+        if seconds < 0 {
+            // Java ZoneRules uses its first wall offset before recorded history.
+            jiff::Timestamp::MIN
+        } else {
+            // Java's final transition rules repeat with the Gregorian calendar:
+            // 400 years contain 146097 days, a whole number of weeks. Look up
+            // the same month/day/weekday/time in 2370..2770, after historical
+            // transitions, while retaining the original millis for formatting.
+            const CYCLE_SECONDS: i64 = 146_097 * 86_400;
+            jiff::Timestamp::from_second(seconds.rem_euclid(CYCLE_SECONDS) + CYCLE_SECONDS)
+                .expect("a projected Gregorian cycle is within jiff's timestamp range")
+        }
+    });
+    zone.to_offset(timestamp).seconds()
+}
+
 fn invalid(message: impl Into<String>) -> crate::Error {
     crate::Error::DataInvalid {
         message: message.into(),
@@ -119,7 +145,7 @@ mod tests {
     use super::*;
     use crate::arrow::nested_evolution::evolve_column;
     use crate::spec::{CharType, TimeType, TimestampType, VarCharType};
-    use arrow_array::{Int64Array, TimestampNanosecondArray};
+    use arrow_array::{Array, Int64Array, TimestampNanosecondArray};
 
     fn strings(source: ArrayRef, source_type: DataType, target: DataType) -> StringArray {
         evolve_column(&source, &source_type, &target)
@@ -289,5 +315,115 @@ mod tests {
             actual,
             StringArray::from(vec![Some("5471-09-26 16:47:04.384"), None])
         );
+    }
+
+    #[test]
+    fn local_timestamp_string_extreme_millis_does_not_fail_the_batch() {
+        use crate::spec::LocalZonedTimestampType;
+        use arrow_array::TimestampMillisecondArray;
+        let source: ArrayRef = Arc::new(
+            TimestampMillisecondArray::from(vec![Some(0), Some(i64::MAX), None, Some(i64::MIN)])
+                .with_timezone("UTC"),
+        );
+        let result = evolve_column(
+            &source,
+            &DataType::LocalZonedTimestamp(LocalZonedTimestampType::new(3).unwrap()),
+            &DataType::VarChar(VarCharType::string_type()),
+        );
+        let result = result.expect("LTZ conversion must not fail on a non-NULL extreme value");
+        assert_eq!(result.len(), 4);
+        assert_eq!(result.null_count(), 1);
+        assert!(result.is_null(2));
+        assert!(result.is_valid(0) && result.is_valid(1) && result.is_valid(3));
+    }
+
+    #[test]
+    fn local_timestamp_strings_match_java_extremes_and_zone_rules() {
+        // Golden strings from Java CastExecutors in these explicitly selected
+        // zones, including far-future DST and historical offsets with seconds.
+        let values = [
+            i64::MAX,
+            i64::MIN,
+            i64::MAX - 181 * 86_400_000,
+            1_704_067_200_000,
+            1_719_792_000_000,
+        ];
+        for (name, expected) in [
+            (
+                "UTC",
+                [
+                    "/+-.-04-06 07:12:55.807",
+                    "5471-09-26 16:47:04.192",
+                    "/+---10-08 07:12:55.807",
+                    "2024-01-01 00:00:00.000",
+                    "2024-07-01 00:00:00.000",
+                ],
+            ),
+            (
+                "Asia/Shanghai",
+                [
+                    "5471-09-27 00:47:04.191",
+                    "5471-09-27 00:52:47.192",
+                    "/+---10-08 15:12:55.807",
+                    "2024-01-01 08:00:00.000",
+                    "2024-07-01 08:00:00.000",
+                ],
+            ),
+            (
+                "America/New_York",
+                [
+                    "/+-.-04-06 03:12:55.807",
+                    "/+-.-04-06 02:16:53.808",
+                    "/+---10-08 02:12:55.807",
+                    "2023-12-31 19:00:00.000",
+                    "2024-06-30 20:00:00.000",
+                ],
+            ),
+            (
+                "Australia/Sydney",
+                [
+                    "5471-09-27 02:47:04.191",
+                    "5471-09-27 02:51:56.192",
+                    "/+---10-08 18:12:55.807",
+                    "2024-01-01 11:00:00.000",
+                    "2024-07-01 10:00:00.000",
+                ],
+            ),
+        ] {
+            let zone = TimeZone::get(name).unwrap();
+            for (value, expected) in values.into_iter().zip(expected) {
+                assert_eq!(
+                    render_timestamp(value, &TimeUnit::Millisecond, 3, Some(&zone)),
+                    expected,
+                    "{value} in {name}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn local_timestamp_preserves_sub_millisecond_digits_in_all_ranges() {
+        let zone = TimeZone::get("America/New_York").unwrap();
+        for (value, unit, precision, expected) in [
+            (
+                i64::MAX,
+                TimeUnit::Microsecond,
+                6,
+                "4247-01-09 23:00:54.775807",
+            ),
+            (-1, TimeUnit::Microsecond, 6, "1969-12-31 18:59:59.999999"),
+            (
+                i64::MAX,
+                TimeUnit::Nanosecond,
+                9,
+                "2262-04-11 19:47:16.854775807",
+            ),
+            (-1, TimeUnit::Nanosecond, 9, "1969-12-31 18:59:59.999999999"),
+        ] {
+            assert_eq!(
+                render_timestamp(value, &unit, precision, Some(&zone)),
+                expected
+            );
+        }
     }
 }
