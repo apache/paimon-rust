@@ -30,6 +30,7 @@ use crate::spec::{
     ManifestFileMeta, ManifestList, PartitionComputer, PartitionStatistics, Predicate, Snapshot,
     EMPTY_SERIALIZED_ROW, MANIFEST_ENTRY_SCHEMA, POSTPONE_BUCKET,
 };
+use crate::table::commit_callback::{CommitCallback, CommitCallbackContext};
 use crate::table::commit_message::CommitMessage;
 use crate::table::format_table_commit::FormatTableCommit;
 use crate::table::global_index_build_common::same_extra_field_ids;
@@ -208,6 +209,7 @@ pub struct TableCommit {
     data_evolution_enabled: bool,
     partition_default_name: String,
     snapshot_properties: Option<HashMap<String, String>>,
+    commit_callbacks: Vec<Arc<dyn CommitCallback>>,
 }
 
 impl TableCommit {
@@ -250,7 +252,35 @@ impl TableCommit {
             data_evolution_enabled,
             partition_default_name,
             snapshot_properties: None,
+            commit_callbacks: Vec::new(),
         }
+    }
+
+    /// Register an idempotent notification for confirmed Paimon snapshots.
+    pub fn add_commit_callback(&mut self, callback: Arc<dyn CommitCallback>) -> Result<()> {
+        if self.table.is_format_table() {
+            return Err(crate::Error::Unsupported {
+                message: "Commit callbacks require a Paimon table snapshot".into(),
+            });
+        }
+        self.commit_callbacks.push(callback);
+        Ok(())
+    }
+
+    async fn notify_commit_callbacks(
+        &self,
+        snapshot: Snapshot,
+        commit_entries: Vec<ManifestEntry>,
+    ) -> Result<()> {
+        let context = CommitCallbackContext {
+            identifier: snapshot.commit_identifier(),
+            snapshot,
+            commit_entries,
+        };
+        for callback in &self.commit_callbacks {
+            callback.call(&context).await?;
+        }
+        Ok(())
     }
 
     /// Control empty APPEND snapshots. Java stream commits set this to false.
@@ -1017,8 +1047,8 @@ impl TableCommit {
                     filter_committed = false;
                 }
                 if let Some(start_snapshot_id) = duplicate_check_start_snapshot_id {
-                    if self
-                        .is_duplicate_commit(
+                    if let Some(snapshot) = self
+                        .find_duplicate_commit(
                             start_snapshot_id,
                             &latest_snapshot,
                             commit_identifier,
@@ -1026,6 +1056,10 @@ impl TableCommit {
                         )
                         .await?
                     {
+                        if !self.commit_callbacks.is_empty() {
+                            let entries = self.read_delta_entries(None, &snapshot).await?;
+                            self.notify_commit_callbacks(snapshot, entries).await?;
+                        }
                         break;
                     }
                 }
@@ -1195,7 +1229,13 @@ impl TableCommit {
             )
             .await
         {
-            Ok(true) => return Ok(CommitAttemptResult::Success),
+            Ok(true) => {
+                if !self.commit_callbacks.is_empty() {
+                    self.notify_commit_callbacks(snapshot, resolved.entries)
+                        .await?;
+                }
+                return Ok(CommitAttemptResult::Success);
+            }
             Ok(false) => None,
             Err(error) => Some(error),
         };
@@ -1680,13 +1720,13 @@ impl TableCommit {
     }
 
     /// Check if this commit was already completed during an in-process retry.
-    async fn is_duplicate_commit(
+    async fn find_duplicate_commit(
         &self,
         start_snapshot_id: i64,
         latest_snapshot: &Option<Snapshot>,
         commit_identifier: i64,
         commit_kind: &CommitKind,
-    ) -> Result<bool> {
+    ) -> Result<Option<Snapshot>> {
         if let Some(latest) = latest_snapshot {
             for snapshot_id in (start_snapshot_id..=latest.id()).rev() {
                 let snap = if snapshot_id == latest.id() {
@@ -1698,11 +1738,11 @@ impl TableCommit {
                     && snap.commit_identifier() == commit_identifier
                     && snap.commit_kind() == commit_kind
                 {
-                    return Ok(true);
+                    return Ok(Some(snap));
                 }
             }
         }
-        Ok(false)
+        Ok(None)
     }
 
     /// Resolve commit entries and merge index entries based on the plan type.
@@ -3604,6 +3644,7 @@ mod tests {
         include!("table_commit/row_tracking_tests.rs");
         include!("table_commit/abort_tests.rs");
         include!("table_commit/property_tests.rs");
+        include!("table_commit/callback_tests.rs");
     }
 
     #[tokio::test]
@@ -4374,13 +4415,15 @@ mod tests {
         let snap_manager = SnapshotManager::new(file_io.clone(), table_path.to_string());
         let latest = snap_manager.get_latest_snapshot().await.unwrap();
         assert!(commit
-            .is_duplicate_commit(1, &latest, 7, &CommitKind::APPEND)
+            .find_duplicate_commit(1, &latest, 7, &CommitKind::APPEND)
             .await
-            .unwrap());
-        assert!(!commit
-            .is_duplicate_commit(1, &latest, 8, &CommitKind::APPEND)
+            .unwrap()
+            .is_some());
+        assert!(commit
+            .find_duplicate_commit(1, &latest, 8, &CommitKind::APPEND)
             .await
-            .unwrap());
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]

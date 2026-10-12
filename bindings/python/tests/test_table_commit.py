@@ -506,3 +506,143 @@ def test_close_cleans_unprepared_output_but_preserves_prepared_files(tmp_path, b
             for row in pq.ParquetFile(path).read(columns=["id"]).to_pylist()] == [1]
     if bucket != "-2":
         assert _rows(table) == [1]
+
+
+@pytest.mark.parametrize('stream', [False, True])
+@pytest.mark.parametrize('close', [False, True])
+@pytest.mark.parametrize('bound_method', [False, True])
+def test_commit_callback_owner_cycle_is_collected(tmp_path, stream, close, bound_method):
+    import gc
+    import weakref
+
+    table = _table(tmp_path)
+    builder = table.new_stream_write_builder() if stream else table.new_batch_write_builder()
+    commit = builder.new_commit()
+
+    class Owner:
+        def __init__(self, committer):
+            self.committer = committer
+
+        def __call__(self, context):
+            pass
+
+    owner = Owner(commit)
+    reference = weakref.ref(owner)
+    callback = owner.__call__ if bound_method else owner
+    commit.add_commit_callback(callback)
+    # Register more than one reference so GC traversal must count each edge.
+    commit.add_commit_callback(callback)
+    if close:
+        commit.close()
+    del callback, owner, commit
+    gc.collect()
+    assert reference() is None
+
+
+@pytest.mark.parametrize('stream', [False, True])
+def test_commit_callback_bridge_preserves_error_and_publication(tmp_path, stream):
+    table = _table(tmp_path)
+    builder = table.new_stream_write_builder() if stream else table.new_batch_write_builder()
+    commit = builder.new_commit()
+    seen = []
+    error = LookupError('notification failed')
+
+    def callback(context):
+        assert isinstance(context, datafusion.CommitCallbackContext)
+        assert context.snapshot.id() == 1
+        assert context.identifier == (7 if stream else (2 ** 63 - 1))
+        assert len(context.commit_entries) == 1
+        entry = context.commit_entries[0]
+        assert isinstance(entry, datafusion.ManifestEntry)
+        assert entry.kind == 0
+        assert entry.total_buckets == -1
+        assert entry.bucket == 0
+        assert isinstance(entry.file, datafusion.DataFileMeta)
+        assert entry.file.row_count == 1
+        assert entry.file.file_name.endswith('.parquet')
+        assert _rows(table) == [1]  # Re-enter the Native runtime during notification.
+        seen.append(context)
+        raise error
+
+    commit.add_commit_callback(callback)
+    messages = _prepare(builder, [1], [10], 7 if stream else None)
+    with pytest.raises(LookupError) as raised:
+        commit.commit(7, messages) if stream else commit.commit(messages)
+    assert raised.value is error
+    assert len(seen) == 1
+    assert _rows(table) == [1]
+    assert table.latest_snapshot().id() == 1
+    commit.close()
+
+
+def test_commit_callback_rejects_non_callable_before_publication(tmp_path):
+    table = _table(tmp_path)
+    commit = table.new_batch_write_builder().new_commit()
+    with pytest.raises(TypeError, match='must be callable'):
+        commit.add_commit_callback(42)
+    assert table.latest_snapshot() is None
+
+
+@pytest.mark.parametrize('stream', [False, True])
+def test_public_commit_callback_retains_typed_core_context(tmp_path, stream):
+    import gc
+
+    table = _table(tmp_path, options={
+        'row-tracking.enabled': 'true', 'data-evolution.enabled': 'true'})
+    builder = table.new_stream_write_builder() if stream else table.new_batch_write_builder()
+    if stream:
+        builder.with_commit_user('callback-user')
+    commit = builder.new_commit()
+    contexts = []
+    commit.add_commit_callback(contexts.append)
+    assert not hasattr(commit, '_add_commit_callback')
+    messages = _prepare(builder, [1, 2], [10, 20], 7 if stream else None)
+    if stream:
+        commit.commit(7, messages, snapshot_properties={'source': 'typed-callback'})
+    else:
+        commit.commit(messages, snapshot_properties={'source': 'typed-callback'})
+    commit.close()
+    del messages, builder, commit
+    gc.collect()
+
+    assert len(contexts) == 1
+    context = contexts[0]
+    assert isinstance(context, datafusion.CommitCallbackContext)
+    assert isinstance(context.snapshot, datafusion.Snapshot)
+    assert context.snapshot.id() == 1
+    assert context.snapshot.schema_id() == 0
+    assert context.snapshot.commit_identifier() == context.identifier
+    assert context.snapshot.next_row_id() == 2
+    assert context.snapshot.properties() == {'source': 'typed-callback'}
+    if stream:
+        assert context.snapshot.commit_user() == 'callback-user'
+    entry = context.commit_entries[0]
+    file = entry.file
+    assert isinstance(entry.partition, bytes)
+    assert file.row_count == 2
+    assert file.file_size > 0
+    assert file.first_row_id == 0
+    assert file.min_sequence_number == file.max_sequence_number == 1
+    assert file.schema_id == 0
+    assert file.file_source == 0
+    assert file.external_path is None
+    assert file.write_cols is None
+    assert isinstance(file.value_stats, datafusion.BinaryTableStats)
+    assert file.value_stats.null_counts == [0, 0]
+    assert file.value_stats.min_values != file.value_stats.max_values
+    assert file.creation_time is not None
+    assert file.delete_row_count == 0
+    # Views are read-only; returned Python lists/maps cannot mutate core metadata.
+    with pytest.raises(AttributeError):
+        context.identifier = 99
+    with pytest.raises(AttributeError):
+        entry.kind = 1
+    with pytest.raises(AttributeError):
+        file.row_count = 99
+    context.commit_entries.clear()
+    file.extra_files.append('not-a-real-file')
+    context.snapshot.properties()['source'] = 'changed'
+    assert len(context.commit_entries) == 1
+    assert file.extra_files == []
+    assert context.snapshot.properties() == {'source': 'typed-callback'}
+    assert _rows(table) == [1, 2]

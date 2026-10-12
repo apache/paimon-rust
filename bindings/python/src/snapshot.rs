@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::HashMap;
+
 use paimon::spec::Snapshot;
 use pyo3::prelude::*;
 
@@ -45,6 +47,30 @@ impl PySnapshot {
 
     fn delta_record_count(&self) -> Option<i64> {
         self.inner.delta_record_count()
+    }
+
+    fn schema_id(&self) -> i64 {
+        self.inner.schema_id()
+    }
+
+    fn commit_user(&self) -> String {
+        self.inner.commit_user().to_string()
+    }
+
+    fn commit_identifier(&self) -> i64 {
+        self.inner.commit_identifier()
+    }
+
+    fn next_row_id(&self) -> Option<i64> {
+        self.inner.next_row_id()
+    }
+
+    fn properties(&self) -> Option<HashMap<String, String>> {
+        self.inner.properties().cloned()
+    }
+
+    fn uuid(&self) -> Option<String> {
+        self.inner.uuid().map(str::to_string)
     }
 
     fn commit_kind(&self) -> String {
