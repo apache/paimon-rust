@@ -158,15 +158,11 @@ pub(crate) fn provider_for_table(
         .map(Some)
 }
 
-/// Loads `<base>$<system_name>` from the catalog and wraps it as a system
-/// table provider.
-///
-/// - Unknown `system_name` → `Ok(None)` (DataFusion reports "table not found")
-/// - Base table missing    → `Err(Plan)` so users can distinguish it from an
-///   unknown system name
+/// Builds a system-table provider from a loaded Paimon table.
 pub(crate) async fn load(
     catalog: Arc<dyn Catalog>,
-    database: String,
+    identifier: Identifier,
+    mut table: Table,
     object: ParsedObjectName,
     system_name: String,
     dynamic_options: HashMap<String, String>,
@@ -185,36 +181,25 @@ pub(crate) async fn load(
     paimon::spec::CoreOptions::new(&dynamic_options)
         .ensure_read_authorized()
         .map_err(to_datafusion_error)?;
-    let identifier = Identifier::new(database, object.table().to_string());
-    match catalog.get_table(&identifier).await {
-        Ok(mut table) => {
-            crate::table_loader::ensure_paimon_served(&table, &identifier)?;
-            paimon::spec::CoreOptions::new(table.schema().options())
-                .ensure_read_authorized()
+    crate::table_loader::ensure_paimon_served(&table, &identifier)?;
+    paimon::spec::CoreOptions::new(table.schema().options())
+        .ensure_read_authorized()
+        .map_err(to_datafusion_error)?;
+    if let Some(branch) = object.branch() {
+        if !system_name.eq_ignore_ascii_case("branches") {
+            table = table
+                .copy_with_branch(branch)
+                .await
                 .map_err(to_datafusion_error)?;
-            if let Some(branch) = object.branch() {
-                if !system_name.eq_ignore_ascii_case("branches") {
-                    table = table
-                        .copy_with_branch(branch)
-                        .await
-                        .map_err(to_datafusion_error)?;
-                }
-            }
-            if system_name.eq_ignore_ascii_case("audit_log") && !dynamic_options.is_empty() {
-                table = table
-                    .copy_with_time_travel(dynamic_options)
-                    .await
-                    .map_err(to_datafusion_error)?;
-            }
-            provider_for_table(catalog, identifier, table, &system_name)
         }
-        Err(paimon::Error::TableNotExist { .. }) => Err(DataFusionError::Plan(format!(
-            "Cannot read system table `${system_name}`: \
-             base table `{}` does not exist",
-            object.table()
-        ))),
-        Err(e) => Err(to_datafusion_error(e)),
     }
+    if system_name.eq_ignore_ascii_case("audit_log") && !dynamic_options.is_empty() {
+        table = table
+            .copy_with_time_travel(dynamic_options)
+            .await
+            .map_err(to_datafusion_error)?;
+    }
+    provider_for_table(catalog, identifier, table, &system_name)
 }
 
 #[cfg(test)]
