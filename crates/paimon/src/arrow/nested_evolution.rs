@@ -204,6 +204,11 @@ pub(crate) fn evolve_column(
         _ => {}
     }
 
+    if let Some(result) = super::evolution_decimal::cast_decimal(source, source_type, target_type)?
+    {
+        return Ok(result);
+    }
+
     if let Some(result) =
         super::evolution_string::temporal_to_string(source, source_type, target_type)?
     {
