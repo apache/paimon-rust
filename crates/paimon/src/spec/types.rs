@@ -887,6 +887,11 @@ impl FromStr for CharType {
             .fail();
         }
 
+        // Java DataTypeJsonParser defaults a bare CHAR to length one.
+        if s == "CHAR" || s == "CHAR NOT NULL" {
+            return Self::with_nullable(s == "CHAR", Self::DEFAULT_LENGTH);
+        }
+
         let (open_bracket, close_bracket) = serde_utils::extract_brackets_pos(s, "CharType")?;
         let length_str = &s[open_bracket + 1..close_bracket];
         let length = length_str
@@ -2897,6 +2902,7 @@ mod tests {
     fn test_default_length_string_types_match_java() {
         // Java DataTypeJsonParser uses each type's DEFAULT_LENGTH when omitted.
         let cases = [
+            ("CHAR", DataType::Char(CharType::default())),
             ("VARCHAR", DataType::VarChar(VarCharType::default())),
             ("BINARY", DataType::Binary(BinaryType::default())),
             ("VARBINARY", DataType::VarBinary(VarBinaryType::default())),

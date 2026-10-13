@@ -1812,7 +1812,7 @@ mod tests {
         };
         let s = || split(vec![file("a", 10, None)], true);
         assert_eq!(s().planned(grant(Vec::new())).merged_row_count(), Some(10));
-        let filtered = s().planned(grant(vec![crate::spec::Predicate::AlwaysTrue]));
+        let filtered = s().planned(grant(vec![crate::spec::Predicate::AlwaysTrue.into()]));
         assert_eq!(filtered.merged_row_count(), None);
         // The physical count stays, as Java's `rowCount` does.
         assert_eq!(filtered.row_count(), 10);

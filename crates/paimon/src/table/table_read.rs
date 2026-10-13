@@ -2897,7 +2897,7 @@ mod tests {
             None,
             crate::table::query_auth::Rules {
                 filters: if restricted {
-                    vec![crate::spec::Predicate::AlwaysTrue]
+                    vec![crate::spec::Predicate::AlwaysTrue.into()]
                 } else {
                     Vec::new()
                 },
@@ -3160,7 +3160,10 @@ mod tests {
                 table.query_auth_session().unwrap(),
                 Some(Vec::new()),
                 crate::table::query_auth::Rules {
-                    filters,
+                    filters: filters
+                        .into_iter()
+                        .map(crate::table::query_auth::RowFilter::from)
+                        .collect(),
                     masks: Vec::new(),
                 },
             );
