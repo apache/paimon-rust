@@ -26,29 +26,15 @@ This crate contains the integration of [Apache DataFusion](https://datafusion.ap
 
 ## External engine snapshots
 
-Registered table engines can implement `TableEngineResolver::resolve_table_snapshot`
-to serve an explicit snapshot ID:
-
-```sql
-SELECT * FROM lake.db.events VERSION AS OF 123;
-```
-
-The resolver must return a provider pinned to that snapshot and its historical
-schema. Missing or expired snapshots must return an error; `Ok(None)` means the
-table does not exist. The default implementation rejects time travel, and resolved
-providers remain read-only.
+Implement `TableEngineResolver::resolve_table_snapshot` to support
+`VERSION AS OF <snapshot_id>` on external data tables (integer IDs only).
+Providers must use the snapshot's data and schema. Missing snapshots are errors;
+`Ok(None)` means the table is missing. Resolved providers remain read-only.
 
 `SQLContext` needs no dialect setting and resolves snapshots independently of the
-current provider.
-
-Raw `SessionContext` needs a dialect supporting `VERSION AS OF` and
-`register_catalog_table_engine`. It preloads the current provider, so loading errors
-also fail snapshot queries.
-
-External engines support integer snapshot IDs; `SQLContext` also accepts quoted numeric IDs.
-Timestamp, named-reference, branch, and metadata-table time travel remain
-unsupported. Paimon session scan options and query authorization are checked
-before snapshot resolution; they are not translated into external engine options.
+current provider. Raw `SessionContext` needs `register_catalog_table_engine` and a
+dialect supporting `VERSION AS OF`; it preloads the current provider and propagates
+loading errors.
 
 ## Reader memory
 
