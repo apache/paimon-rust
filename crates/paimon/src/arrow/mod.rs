@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod date_extract;
+pub(crate) use date_extract::evaluate_date_extract;
 mod evolution_cast;
 mod evolution_decimal;
 mod evolution_string;

@@ -387,6 +387,9 @@ pub(crate) fn mask_batch(
                 // Arrow strings do not enforce CHAR/VARCHAR width.
                 apply_declared_width(&cast, to)
             }
+            Transform::DateExtract(index, part) => {
+                crate::arrow::evaluate_date_extract(&input(*index)?, *part)?
+            }
             Transform::Upper(_)
             | Transform::Lower(_)
             | Transform::Concat(_)
@@ -417,9 +420,9 @@ fn mask_can_be_null(transform: &Transform, fields: &[DataField]) -> bool {
     };
     match transform {
         Transform::Null => true,
-        Transform::FieldRef(index) | Transform::Cast(index, _) => {
-            fields[*index].data_type().is_nullable()
-        }
+        Transform::FieldRef(index)
+        | Transform::Cast(index, _)
+        | Transform::DateExtract(index, _) => fields[*index].data_type().is_nullable(),
         // Only a null separator makes CONCAT_WS null.
         Transform::ConcatWs(inputs) => inputs.first().is_some_and(nullable),
         _ => transform.inputs().iter().any(nullable),
@@ -434,7 +437,9 @@ fn mask_output_type(transform: &Transform, fields: &[DataField]) -> Option<arrow
             crate::arrow::paimon_type_to_arrow(fields[*index].data_type()).ok()
         }
         Transform::Cast(_, to) => crate::arrow::paimon_type_to_arrow(to).ok(),
-        Transform::Length(_) | Transform::BitLength(_) => Some(arrow_schema::DataType::Int32),
+        Transform::Length(_) | Transform::BitLength(_) | Transform::DateExtract(_, _) => {
+            Some(arrow_schema::DataType::Int32)
+        }
         _ => Some(arrow_schema::DataType::Utf8),
     }
 }
@@ -653,6 +658,54 @@ mod tests {
 
     fn string() -> DataType {
         DataType::VarChar(VarCharType::string_type())
+    }
+
+    #[test]
+    fn calendar_masks_read_reordered_operands_and_preserve_int_nulls() {
+        let fields = vec![
+            field(0, "n", DataType::Int(IntType::new())),
+            field(1, "d", DataType::Date(DateType::new())),
+        ];
+        let read_fields = vec![fields[1].clone(), fields[0].clone(), fields[0].clone()];
+        let source = batch(
+            &read_fields,
+            vec![
+                Arc::new(Date32Array::from(vec![Some(20087), Some(-1), None])),
+                Arc::new(Int32Array::from(vec![0, 0, 0])),
+                Arc::new(Int32Array::from(vec![0, 0, 0])),
+            ],
+        );
+        let mask = r#"{"name":"YEAR_OF_WEEK","fieldRef":{"name":"d","index":99,"type":"DATE"}}"#;
+        let rules = parse(&[], &[("n", mask)], &fields).unwrap();
+        assert_eq!(mask_inputs(&rules.masks[0]), HashSet::from([1]));
+        let result = mask_batch(&source, &rules.masks, &fields, &read_fields).unwrap();
+        for position in [1, 2] {
+            assert_eq!(
+                result
+                    .column(position)
+                    .as_primitive::<arrow_array::types::Int32Type>(),
+                &Int32Array::from(vec![Some(2025), Some(1970), None])
+            );
+        }
+        assert_eq!(result.column(0), source.column(0));
+    }
+
+    #[test]
+    fn calendar_mask_types_nullability_and_cross_mask_reads_fail_closed() {
+        let mut fields = vec![
+            field(0, "n", DataType::Int(IntType::new())),
+            field(1, "d", DataType::Date(DateType::new())),
+            field(2, "text", string()),
+        ];
+        let mask = r#"{"name":"YEAR","fieldRef":{"name":"d","index":99,"type":"DATE NOT NULL"}}"#;
+        assert!(refusal(parse(&[], &[("text", mask)], &fields)).contains("produces"));
+        assert!(refusal(parse(&[], &[("n", mask), ("d", NULL)], &fields))
+            .contains("reads 'd', which is masked too"));
+        // Nullability comes from the actual schema, not the stale rule metadata.
+        fields[0] = field(0, "n", DataType::Int(IntType::with_nullable(false)));
+        assert!(refusal(parse(&[], &[("n", mask)], &fields)).contains("can produce null"));
+        fields[1] = field(1, "d", DataType::Date(DateType::with_nullable(false)));
+        assert!(parse(&[], &[("n", mask)], &fields).is_ok());
     }
 
     #[test]
