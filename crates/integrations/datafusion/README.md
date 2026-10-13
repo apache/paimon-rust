@@ -38,24 +38,13 @@ schema. Missing or expired snapshots must return an error; `Ok(None)` means the
 table does not exist. The default implementation rejects time travel, and resolved
 providers remain read-only.
 
-`SQLContext` handles time-travel syntax directly, with no parser dialect setting
-required. It resolves snapshots without loading the current engine provider, so a
-historical snapshot can remain readable when that provider cannot be loaded.
+`SQLContext` needs no dialect setting and resolves snapshots independently of the
+current provider.
 
-For a raw DataFusion `SessionContext`, call `register_catalog_table_engine` to
-install the relation planner and select a parser dialect that recognizes
-`VERSION AS OF`, for example:
-
-```sql
-SET datafusion.sql_parser.dialect = 'databricks';
-```
-
-The dialect controls SQL parsing only. Snapshot reads use the registered table
-engine, and no Databricks service is required.
-
-DataFusion preloads the current provider before invoking the relation planner.
-If loading the current provider fails, raw SQL snapshot queries return that error.
-Use `SQLContext` when snapshot reads must work independently of the current provider.
+For raw `SessionContext`, use `register_catalog_table_engine` and a compatible parser
+dialect, e.g. `SET datafusion.sql_parser.dialect = 'databricks'`.
+This selects parsing rules only; no Databricks service is required.
+Raw sessions preload the current provider, so loading errors also fail snapshot queries.
 
 External engines support integer snapshot IDs; `SQLContext` also accepts quoted numeric IDs.
 Timestamp, named-reference, branch, and metadata-table time travel remain
