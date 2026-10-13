@@ -49,9 +49,7 @@ pub(crate) type SessionStateProvider = Arc<dyn Fn() -> Option<SessionState> + Se
 /// providers, so registrations stay visible to schemas obtained earlier.
 type TableEngines = Arc<RwLock<HashMap<PaimonTableType, Arc<dyn TableEngineResolver>>>>;
 
-/// What an engine is asked to resolve. Non-exhaustive so later releases can
-/// carry more of the request — a snapshot selector, say — without breaking
-/// existing resolvers.
+/// Identifies an engine-owned table.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct EngineTableRequest {
@@ -71,10 +69,7 @@ impl EngineTableRequest {
     }
 }
 
-/// Resolves tables owned by another engine (see
-/// [`PaimonCatalogProvider::register_table_engine`]). `Ok(None)` means not
-/// found; errors propagate, so an engine failure never looks like a missing
-/// table.
+/// Resolves external tables. `Ok(None)` means missing; engine errors propagate.
 #[async_trait]
 pub trait TableEngineResolver: Debug + Send + Sync {
     /// Resolve a request to the engine's table provider.
@@ -82,6 +77,21 @@ pub trait TableEngineResolver: Debug + Send + Sync {
         &self,
         request: &EngineTableRequest,
     ) -> DFResult<Option<Arc<dyn TableProvider>>>;
+
+    /// Resolve an exact snapshot and its schema.
+    /// Missing snapshots are errors; `Ok(None)` means the table is missing.
+    async fn resolve_table_snapshot(
+        &self,
+        request: &EngineTableRequest,
+        _snapshot_id: i64,
+    ) -> DFResult<Option<Arc<dyn TableProvider>>> {
+        Err(plan_datafusion_err!(
+            "time travel is not supported for routed '{}' tables ('{}.{}')",
+            request.declared,
+            request.database,
+            request.table
+        ))
+    }
 
     /// Resolves `<table>$<metadata_table>`; returns `Ok(None)` if missing or unsupported.
     /// The request names the base table; `metadata_table` is ASCII-lowercase.
@@ -95,14 +105,82 @@ pub trait TableEngineResolver: Debug + Send + Sync {
     }
 }
 
-/// Read-only wrapper around an engine-resolved provider: reads delegate,
-/// DML is rejected even when the engine's own provider is writable.
-#[derive(Debug)]
+/// Delegates reads to the engine and rejects DML.
+#[derive(Debug, Clone)]
 pub(crate) struct ReadOnlyTableProvider {
     inner: Arc<dyn TableProvider>,
     pub(crate) declared: PaimonTableType,
     pub(crate) table_name: String,
     metadata_table: bool,
+    request: EngineTableRequest,
+    resolver: Arc<dyn TableEngineResolver>,
+    dynamic_options: DynamicOptions,
+}
+
+impl ReadOnlyTableProvider {
+    pub(crate) fn unsupported_time_travel(&self) -> datafusion::error::DataFusionError {
+        plan_datafusion_err!(
+            "time travel is not supported for routed '{}' tables ('{}'); \
+             only VERSION AS OF with an integer snapshot id is supported on data tables",
+            self.declared,
+            self.table_name
+        )
+    }
+
+    pub(crate) async fn at_snapshot(&self, snapshot_id: i64) -> DFResult<Arc<dyn TableProvider>> {
+        if self.metadata_table {
+            return Err(self.unsupported_time_travel());
+        }
+        resolve_engine_snapshot(
+            self.request.clone(),
+            Arc::clone(&self.resolver),
+            Arc::clone(&self.dynamic_options),
+            snapshot_id,
+        )
+        .await
+    }
+}
+
+pub(crate) fn parse_engine_snapshot_id(version: &str) -> DFResult<i64> {
+    version.parse().map_err(|_| {
+        plan_datafusion_err!(
+            "external table time travel requires an integer snapshot id in VERSION AS OF, got '{version}'"
+        )
+    })
+}
+
+async fn resolve_engine_snapshot(
+    request: EngineTableRequest,
+    resolver: Arc<dyn TableEngineResolver>,
+    dynamic_options: DynamicOptions,
+    snapshot_id: i64,
+) -> DFResult<Arc<dyn TableProvider>> {
+    await_with_runtime(async move {
+        let table_name = format!("{}.{}", request.database, request.table);
+        let options = dynamic_options
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        paimon::spec::CoreOptions::new(&options)
+            .ensure_engine_can_serve(&table_name)
+            .map_err(to_datafusion_error)?;
+        let inner = resolver
+            .resolve_table_snapshot(&request, snapshot_id)
+            .await?
+            .ok_or_else(|| {
+                plan_datafusion_err!("table '{table_name}' was not found at snapshot {snapshot_id}")
+            })?;
+        Ok(Arc::new(ReadOnlyTableProvider {
+            inner,
+            declared: request.declared,
+            table_name,
+            metadata_table: false,
+            request,
+            resolver,
+            dynamic_options,
+        }) as Arc<dyn TableProvider>)
+    })
+    .await
 }
 
 #[async_trait]
@@ -170,20 +248,16 @@ impl TableProvider for ReadOnlyTableProvider {
     }
 }
 
-/// Metadata-only provider for an external table whose engine is not registered.
-///
-/// DataFusion's information schema asks every catalog table for its schema.
-/// Returning this provider keeps those metadata queries available without
-/// weakening the fail-closed behavior for actual table reads or writes.
+/// Exposes an unregistered engine's table schema while rejecting scans and writes.
 #[derive(Debug)]
-struct UnavailableEngineTableProvider {
+pub(crate) struct UnavailableEngineTableProvider {
     schema: datafusion::arrow::datatypes::SchemaRef,
     declared: PaimonTableType,
     table_name: String,
 }
 
 impl UnavailableEngineTableProvider {
-    fn unavailable_error(&self) -> datafusion::error::DataFusionError {
+    pub(crate) fn unavailable_error(&self) -> datafusion::error::DataFusionError {
         plan_datafusion_err!(
             "no table engine is registered for '{}' tables ('{}')",
             self.declared,
@@ -347,6 +421,34 @@ impl PaimonCatalogProvider {
 
     fn table_engines(&self) -> TableEngines {
         Arc::clone(&self.table_engines)
+    }
+
+    pub(crate) async fn table_at_snapshot(
+        &self,
+        request: EngineTableRequest,
+        snapshot_id: i64,
+    ) -> DFResult<Arc<dyn TableProvider>> {
+        let resolver = self
+            .table_engines
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&request.declared)
+            .cloned()
+            .ok_or_else(|| {
+                plan_datafusion_err!(
+                    "no table engine is registered for '{}' tables ('{}.{}')",
+                    request.declared,
+                    request.database,
+                    request.table
+                )
+            })?;
+        resolve_engine_snapshot(
+            request,
+            resolver,
+            Arc::clone(&self.dynamic_options),
+            snapshot_id,
+        )
+        .await
     }
 
     fn paimon_schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
@@ -812,6 +914,9 @@ impl SchemaProvider for PaimonSchemaProvider {
                             declared,
                             table_name,
                             metadata_table,
+                            request,
+                            resolver: Arc::clone(resolver),
+                            dynamic_options,
                         }) as Arc<dyn TableProvider>
                     }))
                 }
