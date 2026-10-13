@@ -1934,19 +1934,20 @@ mod tests {
         assert_eq!(state.list_page_requests.load(Ordering::SeqCst), 3);
         assert_eq!(state.range_requests.load(Ordering::SeqCst), 1);
         assert_eq!(state.unavailable_requests.load(Ordering::SeqCst), 1);
-        let user_agents = state.user_agents.lock().unwrap();
-        assert!(!user_agents.is_empty());
-        assert!(
-            user_agents.iter().all(|value| {
-                value.contains("training-app/1.0")
-                    && value.contains("paimon-rust")
-                    && value.contains("sdk-v2")
-                    && value.contains("training")
-                    && value.contains("env=test")
-            }),
-            "unexpected Jindo User-Agent: {user_agents:?}"
-        );
-        drop(user_agents);
+        {
+            let user_agents = state.user_agents.lock().unwrap();
+            assert!(!user_agents.is_empty());
+            assert!(
+                user_agents.iter().all(|value| {
+                    value.contains("training-app/1.0")
+                        && value.contains("paimon-rust")
+                        && value.contains("sdk-v2")
+                        && value.contains("training")
+                        && value.contains("env=test")
+                }),
+                "unexpected Jindo User-Agent: {user_agents:?}"
+            );
+        }
 
         let fork_operator = jindo_config_build(&config, "jindo-test-bucket").unwrap();
         assert_operator_rejects_reuse_after_fork(fork_operator).await;
