@@ -771,8 +771,8 @@ impl DataSplit {
         DataSplitBuilder::new()
     }
 
-    /// The Java-compatible frames have no field for the marker, so a reader would
-    /// rebuild the split without it. Serde keeps it; these two must refuse.
+    /// A bare DataSplit frame has no authorization marker and must refuse.
+    /// SplitSerializer can instead transport the Java QueryAuthSplit wrapper.
     fn ensure_serializable_without_grant(&self) -> crate::Result<()> {
         if self.query_auth_required {
             return Err(crate::table::query_auth::unsupported(
@@ -940,7 +940,8 @@ impl DataSplit {
 
     /// Java `SplitSerializer#serialize` frame: magic + version + type id + body. The cross-language
     /// entry point. A plain split serializes as `DataSplit` (type 1); a split carrying row ranges as
-    /// `IndexedSplit` (type 3) wrapping the DataSplit body plus the ranges. Byte-compatible with
+    /// `IndexedSplit` (type 3) wrapping the DataSplit body plus the ranges. Authorized metadata
+    /// uses `QueryAuthSplit` (type 5), retaining the complete captured REST response. Byte-compatible with
     /// `compatibility/split-v1-data` / `split-v1-indexed`.
     pub fn serialize_split_v1(&self) -> crate::Result<Vec<u8>> {
         self.serialize_split_v1_with_scores(None)
@@ -949,6 +950,29 @@ impl DataSplit {
     /// Serialize aligned vector scores using Java's IndexedSplit wire format.
     /// Scores belong to the selection, in ascending expanded-range order.
     pub fn serialize_split_v1_with_scores(&self, scores: Option<&[f32]>) -> crate::Result<Vec<u8>> {
+        if self.query_auth_required {
+            let response = self
+                .query_auth_grant
+                .as_ref()
+                .and_then(|grant| grant.response())
+                .ok_or_else(|| {
+                    crate::table::query_auth::unsupported(
+                        "the split has no live wire authorization",
+                    )
+                })?;
+            // The nested DataSplit contains metadata only. The outer frame
+            // carries the rules and cannot decode as an ordinary DataSplit.
+            let mut metadata = self.clone();
+            metadata.query_auth_required = false;
+            metadata.query_auth_grant = None;
+            let mut out = Vec::new();
+            out.extend_from_slice(&SPLIT_SER_MAGIC.to_be_bytes());
+            out.extend_from_slice(&SPLIT_SER_VERSION.to_be_bytes());
+            out.extend_from_slice(&SPLIT_SER_TYPE_QUERY_AUTH_SPLIT.to_be_bytes());
+            out.extend_from_slice(&metadata.serialize_split_v1_with_scores(scores)?);
+            write_auth_response(&mut out, response)?;
+            return Ok(out);
+        }
         self.ensure_serializable_without_grant()?;
         if let Some(scores) = scores {
             let count = self.row_ranges.as_ref().and_then(|ranges| {
@@ -999,42 +1023,68 @@ impl DataSplit {
     }
 
     /// Reverse of [`DataSplit::serialize_split_v1`]: parse a Java `SplitSerializer` frame into a
-    /// `DataSplit` (type 1) or an `IndexedSplit` (type 3, which carries `row_ranges`). Other split
-    /// type ids, and IndexedSplit vector scores, are unsupported. Consumes the entire buffer.
+    /// `DataSplit` (type 1), an `IndexedSplit` (type 3, which carries `row_ranges`), or a
+    /// `QueryAuthSplit` (type 5, retaining the authorization-required marker without minting
+    /// a grant). Other type ids, and IndexedSplit vector scores, are unsupported.
+    /// Consumes the entire buffer.
     pub fn deserialize_split_v1(data: &[u8]) -> crate::Result<DataSplit> {
         let mut cur = data;
-        let magic = read_i64(&mut cur)?;
+        let split = Self::read_split_v1(&mut cur, 0)?;
+        if !cur.is_empty() {
+            return Err(crate::Error::DataInvalid {
+                message: format!("{} trailing bytes after SPLIT_V1 frame", cur.len()),
+                source: None,
+            });
+        }
+        Ok(split)
+    }
+
+    fn read_split_v1(cur: &mut &[u8], depth: usize) -> crate::Result<DataSplit> {
+        if depth >= 32 {
+            return Err(crate::Error::DataInvalid {
+                message: "QueryAuthSplit nesting exceeds 32".into(),
+                source: None,
+            });
+        }
+        let magic = read_i64(cur)?;
         if magic != SPLIT_SER_MAGIC {
             return Err(crate::Error::DataInvalid {
                 message: format!("invalid SPLIT_V1 magic: {magic:#018x}"),
                 source: None,
             });
         }
-        let version = read_i32(&mut cur)?;
+        let version = read_i32(cur)?;
         if version != SPLIT_SER_VERSION {
             return Err(crate::Error::Unsupported {
                 message: format!("SplitSerializer version {version} not supported"),
             });
         }
-        let type_id = read_i32(&mut cur)?;
+        let type_id = read_i32(cur)?;
         let split = match type_id {
-            SPLIT_SER_TYPE_DATA_SPLIT => Self::read_body(&mut cur)?,
+            SPLIT_SER_TYPE_QUERY_AUTH_SPLIT => {
+                let split = Self::read_split_v1(cur, depth + 1)?;
+                read_auth_response(cur)?;
+                // Rules transported in a frame are not a grant minted by this
+                // catalog session. Reading it still requires the original split.
+                split.planned(None)
+            }
+            SPLIT_SER_TYPE_DATA_SPLIT => Self::read_body(cur)?,
             SPLIT_SER_TYPE_INDEXED_SPLIT => {
-                let im = read_i64(&mut cur)?;
+                let im = read_i64(cur)?;
                 if im != INDEXED_SPLIT_MAGIC {
                     return Err(crate::Error::DataInvalid {
                         message: format!("invalid IndexedSplit magic: {im:#018x}"),
                         source: None,
                     });
                 }
-                let iv = read_i32(&mut cur)?;
+                let iv = read_i32(cur)?;
                 if iv != INDEXED_SPLIT_VERSION {
                     return Err(crate::Error::Unsupported {
                         message: format!("IndexedSplit version {iv} not supported"),
                     });
                 }
-                let body = Self::read_body(&mut cur)?;
-                let ranges_n = read_i32(&mut cur)?;
+                let body = Self::read_body(cur)?;
+                let ranges_n = read_i32(cur)?;
                 if ranges_n < 0 {
                     return Err(crate::Error::DataInvalid {
                         message: "negative row_ranges count".into(),
@@ -1045,8 +1095,8 @@ impl DataSplit {
                 // 16 bytes (two i64), so a crafted huge count cannot over-reserve.
                 let mut ranges = Vec::with_capacity((ranges_n as usize).min(cur.len() / 16));
                 for _ in 0..ranges_n {
-                    let from = read_i64(&mut cur)?;
-                    let to = read_i64(&mut cur)?;
+                    let from = read_i64(cur)?;
+                    let to = read_i64(cur)?;
                     if from > to {
                         return Err(crate::Error::DataInvalid {
                             message: format!("row range from {from} > to {to}"),
@@ -1055,7 +1105,7 @@ impl DataSplit {
                     }
                     ranges.push(RowRange::new(from, to));
                 }
-                let scores_flag = read_u8(&mut cur)?;
+                let scores_flag = read_u8(cur)?;
                 if scores_flag != 0 {
                     return Err(crate::Error::Unsupported {
                         message: "IndexedSplit scores are not supported".into(),
@@ -1071,12 +1121,6 @@ impl DataSplit {
                 });
             }
         };
-        if !cur.is_empty() {
-            return Err(crate::Error::DataInvalid {
-                message: format!("{} trailing bytes after SPLIT_V1 frame", cur.len()),
-                source: None,
-            });
-        }
         Ok(split)
     }
 }
@@ -1094,6 +1138,87 @@ const SPLIT_SER_MAGIC: i64 = 0x53504C49545F5631; // "SPLIT_V1"
 const SPLIT_SER_VERSION: i32 = 1;
 const SPLIT_SER_TYPE_DATA_SPLIT: i32 = 1;
 const SPLIT_SER_TYPE_INDEXED_SPLIT: i32 = 3;
+const SPLIT_SER_TYPE_QUERY_AUTH_SPLIT: i32 = 5;
+
+fn write_auth_response(
+    out: &mut Vec<u8>,
+    response: &crate::api::AuthTableQueryResponse,
+) -> crate::Result<()> {
+    fn string(out: &mut Vec<u8>, value: &str) -> crate::Result<()> {
+        let length = i32::try_from(value.len()).map_err(|e| crate::Error::DataInvalid {
+            message: e.to_string(),
+            source: None,
+        })?;
+        out.extend_from_slice(&length.to_be_bytes());
+        out.extend_from_slice(value.as_bytes());
+        Ok(())
+    }
+    out.push(1);
+    match &response.filter {
+        None => out.push(0),
+        Some(filters) => {
+            out.push(1);
+            out.extend_from_slice(&(filters.len() as i32).to_be_bytes());
+            for filter in filters {
+                string(out, filter)?;
+            }
+        }
+    }
+    match &response.column_masking {
+        None => out.push(0),
+        Some(masks) => {
+            out.push(1);
+            out.extend_from_slice(&(masks.len() as i32).to_be_bytes());
+            let mut masks: Vec<_> = masks.iter().collect();
+            // Java's TreeMap compares UTF-16 units, including supplementary keys.
+            masks.sort_by(|(a, _), (b, _)| a.encode_utf16().cmp(b.encode_utf16()));
+            for (name, mask) in masks {
+                string(out, name)?;
+                string(out, mask)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Consume wire rules without creating a trusted grant from untrusted bytes.
+fn read_auth_response(cur: &mut &[u8]) -> crate::Result<()> {
+    fn string(cur: &mut &[u8]) -> crate::Result<()> {
+        let length = read_i32(cur)?;
+        if length < 0 {
+            return Err(crate::Error::DataInvalid {
+                message: "NULL authorization rule in QueryAuthSplit".into(),
+                source: None,
+            });
+        }
+        let bytes = take(cur, length as usize)?;
+        std::str::from_utf8(bytes).map_err(|e| crate::Error::DataInvalid {
+            message: e.to_string(),
+            source: None,
+        })?;
+        Ok(())
+    }
+    if read_u8(cur)? == 0 {
+        return Ok(());
+    }
+    for multiplier in [1, 2] {
+        if read_u8(cur)? != 0 {
+            let count = read_i32(cur)?;
+            if count < 0 || count as usize > cur.len() / (4 * multiplier) {
+                return Err(crate::Error::DataInvalid {
+                    message: "invalid QueryAuthSplit rule count".into(),
+                    source: None,
+                });
+            }
+            for _ in 0..count {
+                for _ in 0..multiplier {
+                    string(cur)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
 
 /// Java `IndexedSplit#MAGIC` / `VERSION`.
 const INDEXED_SPLIT_MAGIC: i64 = -938472394838495695;
@@ -2192,6 +2317,105 @@ mod tests {
                 "{err:?}"
             );
         }
+    }
+
+    #[test]
+    fn query_auth_frame_matches_java_and_does_not_restore_a_live_grant() {
+        let response = crate::api::AuthTableQueryResponse {
+            filter: Some(vec!["row甲🙂\0".into()]),
+            column_masking: Some(std::collections::HashMap::from([
+                ("\u{e000}".into(), "bmp".into()),
+                ("𐀀".into(), "supplementary".into()),
+            ])),
+        };
+        // Captured from Java QueryAuthSplit.serialize: UTF-8 with int length,
+        // NUL as one byte, and keys sorted by UTF-16 code units.
+        let expected = hex::decode("0101000000010000000b726f77e794b2f09f998200010000000200000004f09080800000000d737570706c656d656e7461727900000003ee808000000003626d70").unwrap();
+        let mut tail = Vec::new();
+        write_auth_response(&mut tail, &response).unwrap();
+        assert_eq!(tail, expected);
+        let grant =
+            QueryAuthGrant::parse(&crate::api::AuthTableQueryResponse::default(), 1, None, &[])
+                .unwrap();
+        // Use a valid parsed policy for the live frame. The arbitrary strings
+        // above test transport independently of grant validation.
+        let mut frame_tail = Vec::new();
+        write_auth_response(&mut frame_tail, grant.response().unwrap()).unwrap();
+        let ordinary = v1_data_split_builder().build().unwrap();
+        let marked = ordinary.clone().planned(Some(Arc::new(grant)));
+        assert!(marked.serialize().is_err());
+        let frame = marked.serialize_split_v1().unwrap();
+        let mut expected_frame = Vec::new();
+        expected_frame.extend_from_slice(&SPLIT_SER_MAGIC.to_be_bytes());
+        expected_frame.extend_from_slice(&SPLIT_SER_VERSION.to_be_bytes());
+        expected_frame.extend_from_slice(&SPLIT_SER_TYPE_QUERY_AUTH_SPLIT.to_be_bytes());
+        expected_frame.extend_from_slice(&ordinary.serialize_split_v1().unwrap());
+        expected_frame.extend_from_slice(&frame_tail);
+        assert_eq!(frame, expected_frame);
+        let copy = DataSplit::deserialize_split_v1(&frame).unwrap();
+        assert!(copy.query_auth_required());
+        assert!(copy.query_auth_grant().is_none());
+        assert_eq!(copy.data_files(), ordinary.data_files());
+        assert!(copy.serialize().is_err());
+        assert!(copy.serialize_split_v1().is_err());
+    }
+
+    #[test]
+    fn deserialize_java_query_auth_golden_keeps_the_required_marker() {
+        // Java SplitSerializer(QueryAuthSplit(DataSplit v9, policy)) with BMP,
+        // supplementary and NUL text in its policy strings.
+        let split =
+            DataSplit::deserialize_split_v1(include_bytes!("goldens/split_v1_query_auth.bin"))
+                .unwrap();
+        assert_eq!(split.bucket(), 3);
+        assert_eq!(split.data_files().len(), 2);
+        assert!(split.query_auth_required());
+        assert!(split.query_auth_grant().is_none());
+        assert!(split.serialize_split_v1().is_err());
+    }
+
+    #[test]
+    fn query_auth_frame_bounds_policy_lengths_and_nesting() {
+        let ordinary = v1_data_split_builder()
+            .build()
+            .unwrap()
+            .serialize_split_v1()
+            .unwrap();
+        let mut prefix = Vec::new();
+        prefix.extend_from_slice(&SPLIT_SER_MAGIC.to_be_bytes());
+        prefix.extend_from_slice(&SPLIT_SER_VERSION.to_be_bytes());
+        prefix.extend_from_slice(&SPLIT_SER_TYPE_QUERY_AUTH_SPLIT.to_be_bytes());
+        let mut frame = prefix.clone();
+        frame.extend_from_slice(&ordinary);
+        let policy_start = frame.len();
+        let response = crate::api::AuthTableQueryResponse {
+            filter: Some(vec!["甲".repeat(30000)]),
+            column_masking: Some(Default::default()),
+        };
+        write_auth_response(&mut frame, &response).unwrap();
+        assert!(DataSplit::deserialize_split_v1(&frame)
+            .unwrap()
+            .query_auth_required());
+        for tail in [
+            vec![1, 0],
+            vec![1, 1, 0x7f, 0xff, 0xff, 0xff],
+            vec![1, 1, 0xff, 0xff, 0xff, 0xff],
+            vec![1, 1, 0, 0, 0, 1, 0xff, 0xff, 0xff, 0xff, 0],
+        ] {
+            frame.truncate(policy_start);
+            frame.extend_from_slice(&tail);
+            assert!(DataSplit::deserialize_split_v1(&frame).is_err());
+        }
+        let mut nested = prefix.repeat(33);
+        nested.extend_from_slice(&ordinary);
+        nested.extend_from_slice(&[0; 33]);
+        assert!(DataSplit::deserialize_split_v1(&nested).is_err());
+        frame.truncate(policy_start);
+        frame.extend_from_slice(&[0, 0]);
+        assert!(
+            DataSplit::deserialize_split_v1(&frame).is_err(),
+            "trailing bytes"
+        );
     }
 
     #[test]

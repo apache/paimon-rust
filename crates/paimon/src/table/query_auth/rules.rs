@@ -391,6 +391,9 @@ pub(crate) fn mask_batch(
             | Transform::Lower(_)
             | Transform::Concat(_)
             | Transform::ConcatWs(_) => string_mask(batch, &mask.transform, &input)?,
+            _ => {
+                crate::arrow::evaluate_string_transform(&mask.transform, batch.num_rows(), &input)?
+            }
         };
         let masked = cast_to(&masked, &target_type)?;
         for position in targets {
@@ -408,6 +411,8 @@ pub(crate) fn mask_batch(
 fn mask_can_be_null(transform: &Transform, fields: &[DataField]) -> bool {
     let nullable = |input: &TransformInput| match input {
         TransformInput::Literal(literal) => literal.is_none(),
+        TransformInput::Integer(value) => value.is_none(),
+        TransformInput::IntegerText(_) => false,
         TransformInput::Field(index) => fields[*index].data_type().is_nullable(),
     };
     match transform {
@@ -415,11 +420,9 @@ fn mask_can_be_null(transform: &Transform, fields: &[DataField]) -> bool {
         Transform::FieldRef(index) | Transform::Cast(index, _) => {
             fields[*index].data_type().is_nullable()
         }
-        Transform::Upper(inputs) | Transform::Lower(inputs) | Transform::Concat(inputs) => {
-            inputs.iter().any(nullable)
-        }
         // Only a null separator makes CONCAT_WS null.
         Transform::ConcatWs(inputs) => inputs.first().is_some_and(nullable),
+        _ => transform.inputs().iter().any(nullable),
     }
 }
 
@@ -431,10 +434,8 @@ fn mask_output_type(transform: &Transform, fields: &[DataField]) -> Option<arrow
             crate::arrow::paimon_type_to_arrow(fields[*index].data_type()).ok()
         }
         Transform::Cast(_, to) => crate::arrow::paimon_type_to_arrow(to).ok(),
-        Transform::Upper(_)
-        | Transform::Lower(_)
-        | Transform::Concat(_)
-        | Transform::ConcatWs(_) => Some(arrow_schema::DataType::Utf8),
+        Transform::Length(_) | Transform::BitLength(_) => Some(arrow_schema::DataType::Int32),
+        _ => Some(arrow_schema::DataType::Utf8),
     }
 }
 
@@ -536,6 +537,9 @@ fn string_mask(
         .iter()
         .map(|i| match i {
             TransformInput::Literal(literal) => Ok(StringInput::Literal(literal.as_deref())),
+            TransformInput::Integer(_) | TransformInput::IntegerText(_) => {
+                Err(unsupported("string mask has an integer input"))
+            }
             TransformInput::Field(index) => Ok(StringInput::Column(
                 cast_to(&input(*index)?, &arrow_schema::DataType::Utf8)?
                     .as_string::<i32>()
@@ -649,6 +653,50 @@ mod tests {
 
     fn string() -> DataType {
         DataType::VarChar(VarCharType::string_type())
+    }
+
+    #[test]
+    fn extended_string_masks_match_java_character_semantics() {
+        let fields = vec![DataField::new(0, "value".into(), string())];
+        let source = batch(
+            &fields,
+            vec![Arc::new(StringArray::from(vec![
+                Some("甲🙂乙"),
+                Some("abcabc"),
+                Some(""),
+                None,
+            ]))],
+        );
+        for (rule, expected) in [
+            (
+                r#"{"name":"SUBSTRING","inputs":[{"name":"value","type":"STRING"},2,2]}"#,
+                vec![Some("🙂乙"), Some("bc"), Some(""), None],
+            ),
+            (
+                r#"{"name":"TRIM","trimFlag":"BOTH","inputs":[{"name":"value","type":"STRING"},"甲乙ac"]}"#,
+                vec![Some("🙂"), Some("bcab"), Some(""), None],
+            ),
+            (
+                r#"{"name":"PAD","direction":"LEFT","inputs":[{"name":"value","type":"STRING"},5,"🙂x"]}"#,
+                vec![Some("🙂x甲🙂乙"), Some("abcab"), Some("🙂x🙂x🙂"), None],
+            ),
+            (
+                r#"{"name":"TRANSLATE","inputs":[{"name":"value","type":"STRING"},"甲🙂乙aba","XY"]}"#,
+                vec![Some("XY"), Some("cc"), Some(""), None],
+            ),
+            (
+                r#"{"name":"OVERLAY","inputs":[{"name":"value","type":"STRING"},"x",2,1]}"#,
+                vec![Some("甲x乙"), Some("axcabc"), Some("x"), None],
+            ),
+        ] {
+            let rules = parse(&[], &[("value", rule)], &fields).unwrap();
+            let result = mask_batch(&source, &rules.masks, &fields, &fields).unwrap();
+            assert_eq!(
+                result.column(0).as_string::<i32>(),
+                &StringArray::from(expected),
+                "{rule}"
+            );
+        }
     }
 
     fn batch(fields: &[DataField], columns: Vec<ArrayRef>) -> RecordBatch {
