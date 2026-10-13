@@ -1423,7 +1423,10 @@ impl SQLContext {
                     };
                     rename_to = Some(Identifier::new(identifier.database().to_string(), new_name));
                 }
-                AlterTableOperation::SetTblProperties { table_properties } => {
+                AlterTableOperation::SetTblProperties { table_properties }
+                | AlterTableOperation::SetOptionsParens {
+                    options: table_properties,
+                } => {
                     for opt in table_properties {
                         if let SqlOption::KeyValue { key, value } = opt {
                             let v = value.to_string();
@@ -6739,6 +6742,34 @@ mod tests {
         } else {
             panic!("expected AlterTable call");
         }
+    }
+
+    #[tokio::test]
+    async fn test_alter_table_set_options() {
+        let catalog = Arc::new(MockCatalog::new());
+        let sql_context = make_sql_context(catalog.clone()).await;
+
+        sql_context
+            .sql(
+                "ALTER TABLE mydb.t1 SET (\
+                 'snapshot.num-retained.min' = '5', \
+                 'snapshot.num-retained.max' = '10'\
+                 )",
+            )
+            .await
+            .unwrap();
+
+        let calls = catalog.take_calls();
+        let [CatalogCall::AlterTable { changes, .. }] = calls.as_slice() else {
+            panic!("expected one AlterTable call, got {calls:?}");
+        };
+        assert_eq!(
+            changes,
+            &[
+                SchemaChange::set_option("snapshot.num-retained.min".to_string(), "5".to_string()),
+                SchemaChange::set_option("snapshot.num-retained.max".to_string(), "10".to_string()),
+            ]
+        );
     }
 
     #[tokio::test]
