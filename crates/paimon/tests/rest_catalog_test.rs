@@ -4449,6 +4449,78 @@ async fn test_query_auth_refuses_a_mask_that_reads_another_masked_column() {
 
 #[cfg(not(windows))]
 #[tokio::test]
+async fn test_query_auth_calendar_masks_read_hidden_operands_before_filter_and_limit() {
+    use arrow_array::{Date32Array, TimestampMillisecondArray};
+    use paimon::spec::{DateType, TimestampType};
+    for (primary_key, evolution) in [(false, false), (true, false), (false, true)] {
+        let schema = |options: &[(&str, &str)]| {
+            let mut builder = Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("n", DataType::Int(IntType::new()))
+                .column("d", DataType::Date(DateType::new()))
+                .column("ts", DataType::Timestamp(TimestampType::new(3).unwrap()));
+            if primary_key {
+                builder = builder.primary_key(["id"]).option("bucket", "1");
+            }
+            if evolution {
+                builder = builder
+                    .option("data-evolution.enabled", "true")
+                    .option("row-tracking.enabled", "true");
+            }
+            for (key, value) in options {
+                builder = builder.option(*key, *value);
+            }
+            builder.build().unwrap()
+        };
+        let source = RecordBatch::try_from_iter(vec![
+            (
+                "id",
+                Arc::new(Int32Array::from(vec![1, 2, 3])) as Arc<dyn Array>,
+            ),
+            ("n", Arc::new(Int32Array::from(vec![0, 0, 0]))),
+            (
+                "d",
+                Arc::new(Date32Array::from(vec![Some(20087), Some(-1), None])),
+            ),
+            (
+                "ts",
+                Arc::new(TimestampMillisecondArray::from(vec![
+                    Some(1735516800000),
+                    Some(-1),
+                    None,
+                ])),
+            ),
+        ])
+        .unwrap();
+        let g = written("calendar_mask", schema, vec![source]).await;
+        for (name, type_) in [("d", "DATE"), ("ts", "TIMESTAMP(3)")] {
+            g.set_rules(&[], &[("n", serde_json::json!({
+                "name": "YEAR_OF_WEEK", "fieldRef": {"name": name, "index": 99, "type": type_},
+            }))]);
+            let mut builder = g.table.new_read_builder();
+            builder.with_projection(&["n"]).unwrap();
+            let batches = read_all(&builder).await.unwrap();
+            let values: Vec<_> = batches
+                .iter()
+                .flat_map(|batch| column::<Int32Array>(batch, "n").iter())
+                .collect();
+            assert_eq!(values, vec![Some(2025), Some(1970), None]);
+            assert!(batches.iter().all(|batch| batch.num_columns() == 1));
+            // The raw zero in n must not prune away a matching masked value.
+            builder.with_filter(
+                PredicateBuilder::new(g.table.schema().fields())
+                    .equal("n", Datum::Int(1970))
+                    .unwrap(),
+            );
+            builder.with_projection(&["id"]).unwrap();
+            builder.with_limit(1);
+            assert_eq!(ids(&read_all(&builder).await.unwrap()), vec![2]);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
 async fn test_query_auth_widens_an_integer_mask() {
     let schema = |options: &[(&str, &str)]| {
         let mut builder = Schema::builder()

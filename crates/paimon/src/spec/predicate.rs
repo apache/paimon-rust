@@ -1198,6 +1198,8 @@ pub enum Transform {
     FieldRef(usize),
     /// `CAST`: a field cast to a type.
     Cast(usize, DataType),
+    /// Extract a Gregorian calendar field from DATE or TIMESTAMP.
+    DateExtract(usize, DatePart),
     /// String transforms over mixed literal / field inputs.
     Upper(Vec<TransformInput>),
     /// Lowercase of the inputs.
@@ -1220,6 +1222,58 @@ pub enum Transform {
     Translate(Vec<TransformInput>),
     /// SQL overlay with optional replacement length.
     Overlay(Vec<TransformInput>),
+}
+
+/// Calendar fields exposed by Java DateExtractTransform subclasses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DatePart {
+    /// Proleptic Gregorian year, including year zero and negative years.
+    Year,
+    /// Month numbered 1 through 12.
+    Month,
+    /// Day of month, numbered 1 through 31.
+    Day,
+    /// Hour of day, or zero for DATE.
+    Hour,
+    /// Minute of hour, or zero for DATE.
+    Minute,
+    /// Second of minute, or zero for DATE.
+    Second,
+    /// Quarter numbered 1 through 4.
+    Quarter,
+    /// Day of year, numbered 1 through 366.
+    DayOfYear,
+    /// Monday is zero; Sunday is six.
+    Weekday,
+    /// Monday is one; Sunday is seven.
+    IsoDayOfWeek,
+    /// Sunday is one; Saturday is seven.
+    DayOfWeek,
+    /// ISO week of the week-based year, numbered 1 through 53.
+    Week,
+    /// ISO week-based year, which can differ from the calendar year.
+    YearOfWeek,
+}
+
+impl DatePart {
+    pub(crate) fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "YEAR" => Self::Year,
+            "MONTH" => Self::Month,
+            "DAY" => Self::Day,
+            "HOUR" => Self::Hour,
+            "MINUTE" => Self::Minute,
+            "SECOND" => Self::Second,
+            "QUARTER" => Self::Quarter,
+            "DAY_OF_YEAR" => Self::DayOfYear,
+            "WEEKDAY" => Self::Weekday,
+            "ISO_DAY_OF_WEEK" => Self::IsoDayOfWeek,
+            "DAY_OF_WEEK" => Self::DayOfWeek,
+            "WEEK" => Self::Week,
+            "YEAR_OF_WEEK" => Self::YearOfWeek,
+            _ => return None,
+        })
+    }
 }
 
 /// The ends selected by Java's TRIM transform.
@@ -1268,7 +1322,9 @@ impl Transform {
     pub fn collect_field_indices(&self, out: &mut std::collections::HashSet<usize>) {
         match self {
             Transform::Null => {}
-            Transform::FieldRef(index) | Transform::Cast(index, _) => {
+            Transform::FieldRef(index)
+            | Transform::Cast(index, _)
+            | Transform::DateExtract(index, _) => {
                 out.insert(*index);
             }
             _ => {
@@ -1414,7 +1470,56 @@ fn parse_rest_transform(value: &serde_json::Value, fields: &[DataField]) -> Resu
             &[2, 3],
             false,
         )?)),
+        name if DatePart::from_name(name).is_some() => {
+            let input = value
+                .get("fieldRef")
+                .ok_or_else(|| rest_json_err("calendar transform without fieldRef"))?;
+            check_calendar_input_type(input)?;
+            let index = field_ref_index(input)?;
+            if !matches!(fields[index].data_type(), DataType::Date(_))
+                && !matches!(fields[index].data_type(), DataType::Timestamp(t) if t.precision() <= 9)
+            {
+                return Err(rest_json_err(
+                    "calendar transforms require DATE or TIMESTAMP without time zone",
+                ));
+            }
+            Ok(Transform::DateExtract(
+                index,
+                DatePart::from_name(name).unwrap(),
+            ))
+        }
         other => Err(rest_json_err(format!("transform `{other}`"))),
+    }
+}
+
+/// Validate Java's atomic FieldRef type spellings before binding the current schema.
+fn check_calendar_input_type(input: &serde_json::Value) -> Result<()> {
+    static TYPE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(concat!(
+            r"(?i)^\s*(?:DATE(?:\s+(?:NOT\s+)?NULL)?|",
+            r"TIMESTAMP\s*\(\s*([0-9]+)\s*\)",
+            r"(?:\s*WITHOUT\s+TIME\s+ZONE(?:\s+(?:NOT\s+)?NULL)?|\s*(?:NOT\s+)?NULL)?|",
+            r"TIMESTAMP(?:\s+WITHOUT\s+TIME\s+ZONE)?(?:\s+(?:NOT\s+)?NULL)?)\s*$"
+        ))
+        .unwrap()
+    });
+    let stored = input.get("type").and_then(serde_json::Value::as_str);
+    if stored
+        .and_then(|stored| TYPE.captures(stored))
+        .is_some_and(|captures| {
+            captures.get(1).is_none_or(|precision| {
+                precision
+                    .as_str()
+                    .parse::<u32>()
+                    .is_ok_and(|precision| precision <= 9)
+            })
+        })
+    {
+        Ok(())
+    } else {
+        Err(rest_json_err(
+            "calendar transforms require DATE or TIMESTAMP without time zone",
+        ))
     }
 }
 
@@ -2308,6 +2413,108 @@ mod tests {
             DataField::new(2, "dt".to_string(), DataType::Date(DateType::new())),
             DataField::new(3, "hr".to_string(), DataType::Int(IntType::new())),
         ]
+    }
+
+    #[test]
+    fn calendar_masks_parse_and_collect_the_date_operand() {
+        let fields = vec![DataField::new(
+            7,
+            "d".into(),
+            DataType::Date(crate::spec::DateType::new()),
+        )];
+        for name in [
+            "YEAR",
+            "MONTH",
+            "DAY",
+            "HOUR",
+            "MINUTE",
+            "SECOND",
+            "QUARTER",
+            "DAY_OF_YEAR",
+            "WEEKDAY",
+            "ISO_DAY_OF_WEEK",
+            "DAY_OF_WEEK",
+            "WEEK",
+            "YEAR_OF_WEEK",
+        ] {
+            let transform = Transform::from_rest_json(
+                &format!(
+                    r#"{{"name":"{name}","fieldRef":{{"index":99,"name":"d","type":"DATE"}}}}"#
+                ),
+                &fields,
+            )
+            .unwrap();
+            let mut indices = std::collections::HashSet::new();
+            transform.collect_field_indices(&mut indices);
+            assert_eq!(indices, std::collections::HashSet::from([0]));
+        }
+    }
+
+    #[test]
+    fn calendar_masks_validate_stored_and_rebound_types() {
+        let parse = |stored: serde_json::Value, actual: &str| {
+            let fields = vec![DataField::new(
+                7,
+                "d".into(),
+                serde_json::from_value(serde_json::json!(actual)).unwrap(),
+            )];
+            Transform::from_rest_json(
+                &serde_json::json!({
+                    "name": "YEAR",
+                    "fieldRef": {"name": "d", "index": 99, "type": stored},
+                })
+                .to_string(),
+                &fields,
+            )
+        };
+        for stored in [
+            "INT",
+            "BIGINT",
+            "TIME(3)",
+            "TIMESTAMP(3) WITH LOCAL TIME ZONE",
+            "TIMESTAMP(10)",
+            "DATENULL",
+            "TIMESTAMP(3) WITHOUT TIME ZONENULL",
+            "TIMESTAMP(3) WITHOUT TIME ZONENOT NULL",
+        ] {
+            assert!(
+                parse(serde_json::json!(stored), "DATE").is_err(),
+                "{stored}"
+            );
+        }
+        for actual in ["INT", "TIME(3)", "TIMESTAMP(3) WITH LOCAL TIME ZONE"] {
+            assert!(
+                parse(serde_json::json!("DATE"), actual).is_err(),
+                "{actual}"
+            );
+        }
+        for stored in [
+            serde_json::json!("DATE"),
+            serde_json::json!("DATE NOT NULL"),
+            serde_json::json!("TIMESTAMP"),
+            serde_json::json!("TIMESTAMP WITHOUT TIME ZONE"),
+            serde_json::json!("TIMESTAMP(3)"),
+            serde_json::json!("TIMESTAMP(3)NOT NULL"),
+            serde_json::json!("TIMESTAMP(3) WITHOUT TIME ZONE"),
+            serde_json::json!("TIMESTAMP(3)WITHOUT TIME ZONE"),
+        ] {
+            // Name rebinding permits DATE <-> TIMESTAMP and ignores stale indices.
+            for actual in ["DATE", "TIMESTAMP(6)"] {
+                assert!(
+                    parse(stored.clone(), actual).is_ok(),
+                    "{stored} -> {actual}"
+                );
+            }
+        }
+        for stored in [
+            serde_json::json!({"type": "DATE"}),
+            serde_json::json!({"type": "TIMESTAMP(6)"}),
+            serde_json::json!("TIMESTAMP(٣)"),
+            serde_json::json!("TIMESTAMP(３)"),
+            serde_json::Value::Null,
+        ] {
+            assert!(parse(stored.clone(), "DATE").is_err(), "{stored}");
+        }
     }
 
     #[test]
