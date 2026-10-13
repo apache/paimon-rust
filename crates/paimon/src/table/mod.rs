@@ -657,6 +657,8 @@ impl Table {
         // path; supplied fields, IDs, keys, comments and branch must all match.
         // REST synthesizes creation times independently in different clients.
         if self.query_auth_session.is_some()
+            && !self.time_traveled
+            && self.travel_snapshot.is_none()
             && branch == self.branch
             && schema.has_same_definition(&self.schema)
         {

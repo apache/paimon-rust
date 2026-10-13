@@ -479,6 +479,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_resolved_schema_copy_cannot_reauthorize_a_historical_handle() {
+        let table = crate::table::rest_query_auth_table().await;
+        let grant = super::QueryAuthGrant::new(
+            table.query_auth_session().unwrap(),
+            None,
+            Default::default(),
+        );
+        let mut travelled = table.clone();
+        travelled.time_traveled = true;
+        let pinned = table.copy_with_pinned_snapshot(None);
+        for view in [travelled, pinned] {
+            let schema = view
+                .schema()
+                .copy_with_replaced_options(table.schema().options().clone());
+            let copy = view.copy_with_resolved_schema(schema, "main").unwrap();
+            assert!(copy.query_auth_session().is_none());
+            assert!(!grant.matches_table(&copy));
+        }
+    }
+
+    #[tokio::test]
     async fn test_a_grant_does_not_cross_into_a_travelled_or_branch_view() {
         let table = crate::table::rest_query_auth_table().await;
         let grant = super::QueryAuthGrant::new(
