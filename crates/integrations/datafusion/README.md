@@ -27,13 +27,16 @@ This crate contains the integration of [Apache DataFusion](https://datafusion.ap
 ## External engine snapshots
 
 Implement `TableEngineResolver::resolve_table_snapshot` to support
-`VERSION AS OF <snapshot_id>` on external data tables (integer IDs only).
+`VERSION AS OF <snapshot_id>` on external data tables (integer IDs only), and
+`resolve_table_at_timestamp` to support `TIMESTAMP AS OF '<yyyy-MM-dd HH:mm:ss>'`.
+The timestamp is read in the local time zone and passed as epoch milliseconds;
+the engine picks the snapshot.
 Providers must use the snapshot's data and schema. Missing snapshots are errors;
 `Ok(None)` means the table is missing. Resolved providers remain read-only.
 
 `SQLContext` needs no dialect setting and resolves snapshots independently of the
 current provider. Raw `SessionContext` needs `register_catalog_table_engine` and a
-dialect supporting `VERSION AS OF`; it preloads the current provider and propagates
+dialect supporting these clauses; it preloads the current provider and propagates
 loading errors.
 
 ## Reader memory

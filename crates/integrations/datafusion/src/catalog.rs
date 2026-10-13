@@ -93,6 +93,22 @@ pub trait TableEngineResolver: Debug + Send + Sync {
         ))
     }
 
+    /// Resolve the table as of `timestamp_millis` (epoch milliseconds) and its
+    /// schema; the engine picks the snapshot. A time with no snapshot is an error;
+    /// `Ok(None)` means the table is missing.
+    async fn resolve_table_at_timestamp(
+        &self,
+        request: &EngineTableRequest,
+        _timestamp_millis: i64,
+    ) -> DFResult<Option<Arc<dyn TableProvider>>> {
+        Err(plan_datafusion_err!(
+            "timestamp time travel is not supported for routed '{}' tables ('{}.{}')",
+            request.declared,
+            request.database,
+            request.table
+        ))
+    }
+
     /// Resolves `<table>$<metadata_table>`; returns `Ok(None)` if missing or unsupported.
     /// The request names the base table; `metadata_table` is ASCII-lowercase.
     /// Session scan options are checked before this call.
@@ -117,25 +133,50 @@ pub(crate) struct ReadOnlyTableProvider {
     dynamic_options: DynamicOptions,
 }
 
+/// The historical state requested from an engine.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum EngineTimeTravel {
+    Snapshot(i64),
+    TimestampMillis(i64),
+}
+
+impl std::fmt::Display for EngineTimeTravel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Snapshot(id) => write!(f, "snapshot {id}"),
+            Self::TimestampMillis(millis) => write!(f, "timestamp-millis {millis}"),
+        }
+    }
+}
+
+pub(crate) fn unsupported_engine_time_travel(
+    declared: PaimonTableType,
+    table_name: &str,
+) -> datafusion::error::DataFusionError {
+    plan_datafusion_err!(
+        "time travel is not supported for routed '{declared}' tables ('{table_name}'); \
+         only VERSION AS OF with an integer snapshot id and TIMESTAMP AS OF \
+         are supported on data tables"
+    )
+}
+
 impl ReadOnlyTableProvider {
     pub(crate) fn unsupported_time_travel(&self) -> datafusion::error::DataFusionError {
-        plan_datafusion_err!(
-            "time travel is not supported for routed '{}' tables ('{}'); \
-             only VERSION AS OF with an integer snapshot id is supported on data tables",
-            self.declared,
-            self.table_name
-        )
+        unsupported_engine_time_travel(self.declared, &self.table_name)
     }
 
-    pub(crate) async fn at_snapshot(&self, snapshot_id: i64) -> DFResult<Arc<dyn TableProvider>> {
+    pub(crate) async fn at_time_travel(
+        &self,
+        travel: EngineTimeTravel,
+    ) -> DFResult<Arc<dyn TableProvider>> {
         if self.metadata_table {
             return Err(self.unsupported_time_travel());
         }
-        resolve_engine_snapshot(
+        resolve_engine_time_travel(
             self.request.clone(),
             Arc::clone(&self.resolver),
             Arc::clone(&self.dynamic_options),
-            snapshot_id,
+            travel,
         )
         .await
     }
@@ -149,11 +190,11 @@ pub(crate) fn parse_engine_snapshot_id(version: &str) -> DFResult<i64> {
     })
 }
 
-async fn resolve_engine_snapshot(
+async fn resolve_engine_time_travel(
     request: EngineTableRequest,
     resolver: Arc<dyn TableEngineResolver>,
     dynamic_options: DynamicOptions,
-    snapshot_id: i64,
+    travel: EngineTimeTravel,
 ) -> DFResult<Arc<dyn TableProvider>> {
     await_with_runtime(async move {
         let table_name = format!("{}.{}", request.database, request.table);
@@ -164,12 +205,17 @@ async fn resolve_engine_snapshot(
         paimon::spec::CoreOptions::new(&options)
             .ensure_engine_can_serve(&table_name)
             .map_err(to_datafusion_error)?;
-        let inner = resolver
-            .resolve_table_snapshot(&request, snapshot_id)
-            .await?
-            .ok_or_else(|| {
-                plan_datafusion_err!("table '{table_name}' was not found at snapshot {snapshot_id}")
-            })?;
+        let resolved = match travel {
+            EngineTimeTravel::Snapshot(id) => resolver.resolve_table_snapshot(&request, id).await?,
+            EngineTimeTravel::TimestampMillis(millis) => {
+                resolver
+                    .resolve_table_at_timestamp(&request, millis)
+                    .await?
+            }
+        };
+        let inner = resolved.ok_or_else(|| {
+            plan_datafusion_err!("table '{table_name}' was not found at {travel}")
+        })?;
         Ok(Arc::new(ReadOnlyTableProvider {
             inner,
             declared: request.declared,
@@ -423,10 +469,10 @@ impl PaimonCatalogProvider {
         Arc::clone(&self.table_engines)
     }
 
-    pub(crate) async fn table_at_snapshot(
+    pub(crate) async fn table_at_time_travel(
         &self,
         request: EngineTableRequest,
-        snapshot_id: i64,
+        travel: EngineTimeTravel,
     ) -> DFResult<Arc<dyn TableProvider>> {
         let resolver = self
             .table_engines
@@ -442,13 +488,8 @@ impl PaimonCatalogProvider {
                     request.table
                 )
             })?;
-        resolve_engine_snapshot(
-            request,
-            resolver,
-            Arc::clone(&self.dynamic_options),
-            snapshot_id,
-        )
-        .await
+        resolve_engine_time_travel(request, resolver, Arc::clone(&self.dynamic_options), travel)
+            .await
     }
 
     fn paimon_schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {

@@ -773,8 +773,6 @@ impl SQLContext {
         sql: &str,
         sql_options: SQLOptions,
     ) -> DFResult<DataFrame> {
-        use paimon::spec::{SCAN_TIMESTAMP_MILLIS_OPTION, SCAN_VERSION_OPTION};
-
         let mut tracker = crate::merge_into::TempTableTracker::new(self);
 
         let version_clauses = extract_all_version_as_of(sql);
@@ -797,8 +795,7 @@ impl SQLContext {
                     &catalog,
                     &catalog_name,
                     &identifier,
-                    SCAN_VERSION_OPTION,
-                    info.version.clone(),
+                    TimeTravelClause::Version(info.version.clone()),
                 )
                 .await?;
 
@@ -818,8 +815,7 @@ impl SQLContext {
                     &catalog,
                     &catalog_name,
                     &identifier,
-                    SCAN_TIMESTAMP_MILLIS_OPTION,
-                    millis.to_string(),
+                    TimeTravelClause::TimestampMillis(millis),
                 )
                 .await?;
 
@@ -865,9 +861,11 @@ impl SQLContext {
         catalog: &Arc<dyn Catalog>,
         catalog_name: &str,
         identifier: &Identifier,
-        option: &str,
-        value: String,
+        clause: TimeTravelClause,
     ) -> DFResult<Arc<dyn TableProvider>> {
+        use crate::catalog::EngineTimeTravel;
+        use paimon::spec::{SCAN_TIMESTAMP_MILLIS_OPTION, SCAN_VERSION_OPTION};
+
         let parsed = identifier
             .parsed_object_name()
             .map_err(to_datafusion_error)?;
@@ -887,15 +885,20 @@ impl SQLContext {
                     identifier.full_name()
                 ));
             }
-            if parsed.system_table().is_some() || option != paimon::spec::SCAN_VERSION_OPTION {
-                return Err(plan_datafusion_err!(
-                    "time travel is not supported for routed '{}' tables ('{}'); \
-                     only VERSION AS OF with an integer snapshot id is supported on data tables",
+            if parsed.system_table().is_some() {
+                return Err(crate::catalog::unsupported_engine_time_travel(
                     external.declared(),
-                    identifier.full_name()
+                    &identifier.full_name(),
                 ));
             }
-            let snapshot_id = crate::catalog::parse_engine_snapshot_id(&value)?;
+            let travel = match clause {
+                TimeTravelClause::Version(version) => {
+                    EngineTimeTravel::Snapshot(crate::catalog::parse_engine_snapshot_id(&version)?)
+                }
+                TimeTravelClause::TimestampMillis(millis) => {
+                    EngineTimeTravel::TimestampMillis(millis)
+                }
+            };
             let provider = self
                 .ctx
                 .catalog(catalog_name)
@@ -906,19 +909,25 @@ impl SQLContext {
                     plan_datafusion_err!("Catalog '{catalog_name}' is not a Paimon catalog")
                 })?;
             return provider
-                .table_at_snapshot(
+                .table_at_time_travel(
                     crate::EngineTableRequest::new(
                         base.database().to_string(),
                         base.object().to_string(),
                         external.declared(),
                     ),
-                    snapshot_id,
+                    travel,
                 )
                 .await;
         }
 
         let (table, base, system_name) =
             crate::table_loader::loaded_table_for_read(loaded, identifier).await?;
+        let (option, value) = match clause {
+            TimeTravelClause::Version(version) => (SCAN_VERSION_OPTION, version),
+            TimeTravelClause::TimestampMillis(millis) => {
+                (SCAN_TIMESTAMP_MILLIS_OPTION, millis.to_string())
+            }
+        };
         let mut options = self.dynamic_options.read().unwrap().clone();
         options.insert(option.to_string(), value);
         let table = table
@@ -3582,6 +3591,12 @@ struct TimestampAsOfInfo {
     timestamp: String,
     /// Byte range (start, end) covering "table_name TIMESTAMP AS OF 'ts'"
     clause_range: (usize, usize),
+}
+
+/// A parsed `VERSION AS OF` or `TIMESTAMP AS OF` selector.
+enum TimeTravelClause {
+    Version(String),
+    TimestampMillis(i64),
 }
 
 /// Check whether a SQL string contains a time-travel keyword (`VERSION AS OF` or
