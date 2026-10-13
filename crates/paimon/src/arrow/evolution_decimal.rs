@@ -25,7 +25,7 @@ use arrow_array::{
     ArrayRef, Decimal128Array,
 };
 
-use crate::common::number::format_java_float;
+use crate::common::number::java_double_decimal_text;
 use crate::spec::DataType;
 
 /// Match NumericPrimitiveToDecimalCastRule and StringToDecimalCastRule.
@@ -74,7 +74,7 @@ fn float_decimal(value: f64, precision: u32, scale: u32) -> crate::Result<Option
     if !value.is_finite() {
         return Err(invalid("Non-finite decimal schema-evolution value"));
     }
-    decimal_text(&format_java_float(value), precision, scale)
+    decimal_text(&java_double_decimal_text(value), precision, scale)
 }
 
 /// Parse only the digits needed by the target, so a long mantissa or exponent
@@ -205,6 +205,29 @@ mod tests {
             ])
             .with_precision_and_scale(5, 2)
             .unwrap()
+        );
+    }
+
+    #[test]
+    fn decimal_digits_match_java_8_11_and_17_rather_than_modern_shortest_text() {
+        let value = f64::from_bits(0xc381_e88f_38c0_c8fd);
+        let source: ArrayRef = Arc::new(Float64Array::from(vec![Some(value), Some(-value), None]));
+        assert_eq!(
+            decimals(&source, DataType::Double(DoubleType::new()), 38, 20),
+            Decimal128Array::from(vec![
+                Some(-16_130_484_589_462_313_600_000_000_000_000_000_000),
+                Some(16_130_484_589_462_313_600_000_000_000_000_000_000),
+                None,
+            ])
+            .with_precision_and_scale(38, 20)
+            .unwrap()
+        );
+        let source: ArrayRef = Arc::new(Float64Array::from(vec![1e23]));
+        assert_eq!(
+            decimals(&source, DataType::Double(DoubleType::new()), 38, 6),
+            Decimal128Array::from(vec![99_999_999_999_999_990_000_000_000_000_i128])
+                .with_precision_and_scale(38, 6)
+                .unwrap()
         );
     }
 
