@@ -210,9 +210,14 @@ pub(crate) fn evolve_column(
         return Ok(result);
     }
 
-    // Apply the epoch-seconds rule at every leaf, including nested containers.
-    // Numeric -> LTZ depends on Java's system time zone and retains its existing
-    // path; ordinary TIMESTAMP has no such runtime dependency.
+    if let Some(result) =
+        super::evolution_temporal::cast_temporal(source, source_type, target_type)?
+    {
+        return Ok(result);
+    }
+
+    // Apply the ordinary TIMESTAMP epoch-seconds rule at every leaf,
+    // including nested containers.
     if matches!(source_type, DataType::Int(_) | DataType::BigInt(_))
         && matches!(target_type, DataType::Timestamp(_))
     {

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Java temporal string formatting shared by casts and partition paths.
+//! Java temporal calendars, local-zone conversions and string formatting.
 
 use chrono::{Datelike, NaiveDateTime, Timelike};
 
@@ -72,7 +72,7 @@ pub(crate) fn format_timestamp(dt: NaiveDateTime, precision: u32) -> String {
 /// Java Timestamp.toLocalDateTime stores its epoch day in a signed int.
 /// Use Gregorian arithmetic so that this also covers dates beyond chrono's range.
 pub(crate) fn format_epoch_timestamp(seconds: i64, nanos: u32, precision: u32) -> String {
-    let (year, month, day) = epoch_day_to_date(seconds.div_euclid(86_400) as i32);
+    let (year, month, day) = epoch_day_to_date(i64::from(seconds.div_euclid(86_400) as i32));
     let time = seconds.rem_euclid(86_400) as u32;
     format_timestamp_parts(
         (year, month, day),
@@ -82,9 +82,9 @@ pub(crate) fn format_epoch_timestamp(seconds: i64, nanos: u32, precision: u32) -
     )
 }
 
-fn epoch_day_to_date(day: i32) -> (i32, u32, u32) {
+pub(crate) fn epoch_day_to_date(day: i64) -> (i32, u32, u32) {
     // Gregorian eras start on March 1, so the leap day is at the end of a year.
-    let days = i64::from(day) + 719_468;
+    let days = day + 719_468;
     let era = days.div_euclid(146_097);
     let day_of_era = days - era * 146_097;
     let year_of_era =
@@ -131,4 +131,114 @@ fn format_timestamp_parts(
     } else {
         format!("{ymdhms}.{fraction}")
     }
+}
+
+/// Java ZoneRules uses its earliest wall offset before recorded history and
+/// repeats its final transition rules on the Gregorian 400-year cycle.
+pub(crate) fn local_offset(seconds: i64, zone: &jiff::tz::TimeZone) -> i32 {
+    let timestamp = jiff::Timestamp::from_second(seconds).unwrap_or_else(|_| {
+        if seconds < 0 {
+            jiff::Timestamp::MIN
+        } else {
+            jiff::Timestamp::from_second(project_future_seconds(seconds)).unwrap()
+        }
+    });
+    zone.to_offset(timestamp).seconds()
+}
+
+fn project_future_seconds(seconds: i64) -> i64 {
+    const CYCLE_SECONDS: i64 = 146_097 * 86_400;
+    seconds.rem_euclid(CYCLE_SECONDS) + CYCLE_SECONDS
+}
+
+/// LocalDateTime.atZone: earlier offset in an overlap; shift forward in a gap.
+pub(crate) fn local_to_utc_seconds(seconds: i64, zone: &jiff::tz::TimeZone) -> crate::Result<i64> {
+    let projected = match jiff::Timestamp::from_second(seconds) {
+        Ok(timestamp) => timestamp,
+        Err(_) if seconds < 0 => return Ok(seconds - i64::from(local_offset(seconds, zone))),
+        Err(_) => jiff::Timestamp::from_second(project_future_seconds(seconds)).unwrap(),
+    };
+    let datetime = jiff::tz::TimeZone::UTC.to_datetime(projected);
+    let utc = match zone.to_timestamp(datetime) {
+        Ok(utc) => utc,
+        Err(_) if seconds < 0 => {
+            // A valid boundary wall time can have a UTC instant below jiff's
+            // minimum. Java can still resolve it with the earliest offset.
+            return Ok(seconds - i64::from(local_offset(seconds, zone)));
+        }
+        Err(_) => {
+            // The same edge exists at the upper bound. Resolve an equivalent
+            // future calendar date before applying its offset to the wide value.
+            let projected = jiff::Timestamp::from_second(project_future_seconds(seconds)).unwrap();
+            let datetime = jiff::tz::TimeZone::UTC.to_datetime(projected);
+            let utc = zone
+                .to_timestamp(datetime)
+                .map_err(|error| crate::Error::DataInvalid {
+                    message: format!("Cannot resolve local timestamp in {zone:?}: {error}"),
+                    source: None,
+                })?;
+            return Ok(seconds + utc.as_second() - projected.as_second());
+        }
+    };
+    Ok(seconds + utc.as_second() - projected.as_second())
+}
+
+/// DateTimeUtils.toInternal(LocalDate), including Java int overflow and signed division.
+pub(crate) fn epoch_day_to_java_date(day: i64) -> i32 {
+    let (year, month, day) = epoch_day_to_date(day);
+    let a = (14 - month as i32) / 12;
+    let y = year + 4800 - a;
+    let m = month as i32 + 12 * a - 3;
+    (day as i32 + (153 * m + 2) / 5)
+        .wrapping_add(365_i32.wrapping_mul(y))
+        .wrapping_add(y / 4 - y / 100 + y / 400 - 32_045)
+        .wrapping_sub(2_440_588)
+}
+
+/// DateTimeUtils.toLocalDate uses signed int Julian arithmetic. Validate the
+/// resulting date as LocalDate.of does, then recover its proleptic epoch day.
+pub(crate) fn java_date_to_epoch_day(date: i32) -> crate::Result<i64> {
+    let j = date.wrapping_add(2_440_588).wrapping_add(32_044);
+    let g = j / 146_097;
+    let dg = j % 146_097;
+    let c = (dg / 36_524 + 1) * 3 / 4;
+    let dc = dg - c * 36_524;
+    let b = dc / 1461;
+    let db = dc % 1461;
+    let a = (db / 365 + 1) * 3 / 4;
+    let da = db - a * 365;
+    let y = g * 400 + c * 100 + b * 4 + a;
+    let m = (da * 5 + 308) / 153 - 2;
+    let d = da - (m + 4) * 153 / 5 + 122;
+    let year = y - 4800 + (m + 2) / 12;
+    let month = (m + 2) % 12 + 1;
+    let day = d + 1;
+    let leap = year % 400 == 0 || year % 4 == 0 && year % 100 != 0;
+    let days = match month {
+        2 => {
+            if leap {
+                29
+            } else {
+                28
+            }
+        }
+        4 | 6 | 9 | 11 => 30,
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        _ => 0,
+    };
+    if day < 1 || day > days {
+        return Err(crate::Error::DataInvalid {
+            message: format!("Invalid Java DATE conversion: {year}-{month}-{day}"),
+            source: None,
+        });
+    }
+    let year = i64::from(year) - i64::from(month <= 2);
+    let era = year.div_euclid(400);
+    let yoe = year - era * 400;
+    let march = i64::from(month) + if month > 2 { -3 } else { 9 };
+    Ok(
+        era * 146_097 + yoe * 365 + yoe / 4 - yoe / 100 + (153 * march + 2) / 5 + i64::from(day)
+            - 1
+            - 719_468,
+    )
 }

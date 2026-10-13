@@ -23,7 +23,7 @@ use arrow_array::{cast::AsArray, types::Int64Type, ArrayRef, StringArray, Time32
 use arrow_schema::{DataType as ArrowType, TimeUnit};
 use jiff::tz::TimeZone;
 
-use crate::common::date_time::{format_epoch_timestamp, format_time};
+use crate::common::date_time::{format_epoch_timestamp, format_time, local_offset};
 use crate::spec::DataType;
 
 /// Return None when this is not a temporal-to-character conversion.
@@ -113,24 +113,6 @@ fn render_timestamp(
     };
     let nanos = (millis.rem_euclid(1000) * 1_000_000 + sub_milli) as u32;
     format_epoch_timestamp(millis.div_euclid(1000), nanos, precision)
-}
-
-fn local_offset(seconds: i64, zone: &TimeZone) -> i32 {
-    let timestamp = jiff::Timestamp::from_second(seconds).unwrap_or_else(|_| {
-        if seconds < 0 {
-            // Java ZoneRules uses its first wall offset before recorded history.
-            jiff::Timestamp::MIN
-        } else {
-            // Java's final transition rules repeat with the Gregorian calendar:
-            // 400 years contain 146097 days, a whole number of weeks. Look up
-            // the same month/day/weekday/time in 2370..2770, after historical
-            // transitions, while retaining the original millis for formatting.
-            const CYCLE_SECONDS: i64 = 146_097 * 86_400;
-            jiff::Timestamp::from_second(seconds.rem_euclid(CYCLE_SECONDS) + CYCLE_SECONDS)
-                .expect("a projected Gregorian cycle is within jiff's timestamp range")
-        }
-    });
-    zone.to_offset(timestamp).seconds()
 }
 
 fn invalid(message: impl Into<String>) -> crate::Error {
