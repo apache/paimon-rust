@@ -41,10 +41,9 @@ providers remain read-only.
 `SQLContext` needs no dialect setting and resolves snapshots independently of the
 current provider.
 
-For raw `SessionContext`, use `register_catalog_table_engine` and a compatible parser
-dialect, e.g. `SET datafusion.sql_parser.dialect = 'databricks'`.
-This selects parsing rules only; no Databricks service is required.
-Raw sessions preload the current provider, so loading errors also fail snapshot queries.
+Raw `SessionContext` needs a dialect supporting `VERSION AS OF` and
+`register_catalog_table_engine`. It preloads the current provider, so loading errors
+also fail snapshot queries.
 
 External engines support integer snapshot IDs; `SQLContext` also accepts quoted numeric IDs.
 Timestamp, named-reference, branch, and metadata-table time travel remain
