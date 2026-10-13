@@ -26,6 +26,8 @@ pub(crate) mod partition;
 mod read_budget;
 pub(crate) mod residual;
 mod row_filter;
+mod string_transform;
+pub(crate) use string_transform::evaluate_string_transform;
 pub(crate) mod schema_evolution;
 pub(crate) mod shredding;
 mod variant;

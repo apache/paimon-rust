@@ -178,6 +178,36 @@ impl TableSchema {
     /// fail, so the stored value wins instead, and an absent one leaves the
     /// default standing.
     pub fn copy_with_options(&self, mut extra: HashMap<String, String>) -> Self {
+        self.retain_immutable_options(&mut extra);
+        let mut new_schema = self.clone();
+        new_schema.options.extend(extra);
+        new_schema
+    }
+
+    /// REST returns a Schema without its creation timestamp. Independently
+    /// loaded copies can have different local timestamps while describing the
+    /// same schema. Options are compared separately when copying a handle.
+    pub(crate) fn has_same_definition(&self, other: &Self) -> bool {
+        self.version == other.version
+            && self.id == other.id
+            && self.fields == other.fields
+            && self.highest_field_id == other.highest_field_id
+            && self.partition_keys == other.partition_keys
+            && self.primary_keys == other.primary_keys
+            && self.comment == other.comment
+    }
+
+    /// Replace dynamic options without allowing an override of stored immutable
+    /// options. Unlike merging, absence in this map removes a mutable option.
+    pub(crate) fn copy_with_replaced_dynamic_options(
+        &self,
+        mut options: HashMap<String, String>,
+    ) -> Self {
+        self.retain_immutable_options(&mut options);
+        self.copy_with_replaced_options(options)
+    }
+
+    fn retain_immutable_options(&self, extra: &mut HashMap<String, String>) {
         if self.core_options().query_auth_enabled() {
             extra.insert(QUERY_AUTH_ENABLED_OPTION.to_string(), "true".to_string());
         }
@@ -194,9 +224,6 @@ impl TableSchema {
                 None => extra.remove(key),
             };
         }
-        let mut new_schema = self.clone();
-        new_schema.options.extend(extra);
-        new_schema
     }
 
     /// Create a copy of this schema with the options replaced entirely,

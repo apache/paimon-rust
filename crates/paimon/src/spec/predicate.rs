@@ -1206,13 +1206,51 @@ pub enum Transform {
     Concat(Vec<TransformInput>),
     /// Concatenation where the first input is the separator.
     ConcatWs(Vec<TransformInput>),
+    /// SQL substring with one-based, zero or negative positions.
+    Substring(Vec<TransformInput>),
+    /// Remove whole characters at the requested ends.
+    Trim(Vec<TransformInput>, TrimFlag),
+    /// Number of Unicode characters, as INT.
+    Length(TransformInput),
+    /// Number of UTF-8 bits, as INT.
+    BitLength(TransformInput),
+    /// SQL LPAD/RPAD.
+    Pad(Vec<TransformInput>, PadDirection),
+    /// Map or delete Unicode characters.
+    Translate(Vec<TransformInput>),
+    /// SQL overlay with optional replacement length.
+    Overlay(Vec<TransformInput>),
 }
 
-/// One input of a string [`Transform`].
+/// The ends selected by Java's TRIM transform.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrimFlag {
+    /// Remove leading characters.
+    Leading,
+    /// Remove trailing characters.
+    Trailing,
+    /// Remove characters at both ends.
+    Both,
+}
+
+/// The side selected by Java's PAD transform.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PadDirection {
+    /// Prefix the padding.
+    Left,
+    /// Append the padding.
+    Right,
+}
+
+/// One input of a [`Transform`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum TransformInput {
     /// A string literal (`None` = a JSON `null` input, i.e. SQL NULL).
     Literal(Option<String>),
+    /// An integer position or length, checked as a Java int when evaluated.
+    Integer(Option<i64>),
+    /// SUBSTRING parses string and large integral positions only after NULL checks.
+    IntegerText(String),
     /// A field reference.
     Field(usize),
 }
@@ -1233,16 +1271,29 @@ impl Transform {
             Transform::FieldRef(index) | Transform::Cast(index, _) => {
                 out.insert(*index);
             }
-            Transform::Upper(inputs)
-            | Transform::Lower(inputs)
-            | Transform::Concat(inputs)
-            | Transform::ConcatWs(inputs) => {
-                for input in inputs {
+            _ => {
+                for input in self.inputs() {
                     if let TransformInput::Field(index) = input {
                         out.insert(*index);
                     }
                 }
             }
+        }
+    }
+
+    pub(crate) fn inputs(&self) -> &[TransformInput] {
+        match self {
+            Self::Upper(inputs)
+            | Self::Lower(inputs)
+            | Self::Concat(inputs)
+            | Self::ConcatWs(inputs)
+            | Self::Substring(inputs)
+            | Self::Trim(inputs, _)
+            | Self::Pad(inputs, _)
+            | Self::Translate(inputs)
+            | Self::Overlay(inputs) => inputs,
+            Self::Length(input) | Self::BitLength(input) => std::slice::from_ref(input),
+            _ => &[],
         }
     }
 }
@@ -1273,6 +1324,7 @@ fn parse_rest_transform(value: &serde_json::Value, fields: &[DataField]) -> Resu
                 serde_json::Value::Null => Ok(TransformInput::Literal(None)),
                 serde_json::Value::Object(_) => {
                     let index = field_ref_index(input)?;
+                    check_input_type(input, false)?;
                     match fields[index].data_type() {
                         DataType::Char(_) | DataType::VarChar(_) => {
                             Ok(TransformInput::Field(index))
@@ -1319,7 +1371,168 @@ fn parse_rest_transform(value: &serde_json::Value, fields: &[DataField]) -> Resu
         "LOWER" => Ok(Transform::Lower(string_inputs(1, 1)?)),
         "CONCAT" => Ok(Transform::Concat(string_inputs(0, usize::MAX)?)),
         "CONCAT_WS" => Ok(Transform::ConcatWs(string_inputs(2, usize::MAX)?)),
+        "SUBSTRING" => Ok(Transform::Substring(transform_inputs(
+            value,
+            fields,
+            2,
+            3,
+            &[1, 2],
+            true,
+        )?)),
+        "TRIM" => {
+            let flag = match str_prop(value, "trimFlag")? {
+                "LEADING" => TrimFlag::Leading,
+                "TRAILING" => TrimFlag::Trailing,
+                "BOTH" => TrimFlag::Both,
+                flag => return Err(rest_json_err(format!("invalid trimFlag `{flag}`"))),
+            };
+            Ok(Transform::Trim(string_inputs(1, 2)?, flag))
+        }
+        "LENGTH" => Ok(Transform::Length(string_inputs(1, 1)?.remove(0))),
+        "BIT_LENGTH" => Ok(Transform::BitLength(string_inputs(1, 1)?.remove(0))),
+        "PAD" => {
+            let direction = match str_prop(value, "direction")? {
+                "LEFT" => PadDirection::Left,
+                "RIGHT" => PadDirection::Right,
+                direction => {
+                    return Err(rest_json_err(format!(
+                        "invalid PAD direction `{direction}`"
+                    )))
+                }
+            };
+            Ok(Transform::Pad(
+                transform_inputs(value, fields, 3, 3, &[1], false)?,
+                direction,
+            ))
+        }
+        "TRANSLATE" => Ok(Transform::Translate(string_inputs(3, 3)?)),
+        "OVERLAY" => Ok(Transform::Overlay(transform_inputs(
+            value,
+            fields,
+            3,
+            4,
+            &[2, 3],
+            false,
+        )?)),
         other => Err(rest_json_err(format!("transform `{other}`"))),
+    }
+}
+
+/// Bind mixed string/integer inputs by name to the actual table schema.
+fn transform_inputs(
+    value: &serde_json::Value,
+    fields: &[DataField],
+    min: usize,
+    max: usize,
+    integers: &[usize],
+    string_positions: bool,
+) -> Result<Vec<TransformInput>> {
+    let inputs = value
+        .get("inputs")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| rest_json_err("transform without inputs"))?;
+    if !(min..=max).contains(&inputs.len()) {
+        return Err(rest_json_err(format!(
+            "transform expects {min}..={max} inputs, got {}",
+            inputs.len()
+        )));
+    }
+    inputs
+        .iter()
+        .enumerate()
+        .map(|(slot, input)| {
+            let integer = integers.contains(&slot);
+            match input {
+                serde_json::Value::Null => Ok(if integer {
+                    TransformInput::Integer(None)
+                } else {
+                    TransformInput::Literal(None)
+                }),
+                serde_json::Value::String(text) if !integer => {
+                    Ok(TransformInput::Literal(Some(text.clone())))
+                }
+                serde_json::Value::String(text) if string_positions => {
+                    Ok(TransformInput::IntegerText(text.clone()))
+                }
+                serde_json::Value::Number(number) if integer => {
+                    // arbitrary_precision retains the lexical integer even beyond
+                    // i64. SUBSTRING must not convert it before row NULL checks.
+                    let text = number.to_string();
+                    if text
+                        .strip_prefix('-')
+                        .unwrap_or(&text)
+                        .bytes()
+                        .all(|c| c.is_ascii_digit())
+                    {
+                        match number.as_i64() {
+                            Some(number) => Ok(TransformInput::Integer(Some(number))),
+                            None if string_positions => Ok(TransformInput::IntegerText(text)),
+                            None => Err(rest_json_err("position exceeds BIGINT range")),
+                        }
+                    } else {
+                        Err(rest_json_err("position must be an integral number"))
+                    }
+                }
+                serde_json::Value::Object(_) => {
+                    let name = str_prop(input, "name")?;
+                    if !string_positions {
+                        check_input_type(input, integer)?;
+                    } else if let Some(stored) = input.get("type").filter(|value| !value.is_null())
+                    {
+                        serde_json::from_value::<DataType>(stored.clone())
+                            .map_err(rest_json_err)?;
+                    }
+                    let index = fields
+                        .iter()
+                        .position(|field| field.name() == name)
+                        .ok_or_else(|| rest_json_err(format!("unknown field `{name}`")))?;
+                    let valid = if integer {
+                        matches!(
+                            fields[index].data_type(),
+                            DataType::TinyInt(_)
+                                | DataType::SmallInt(_)
+                                | DataType::Int(_)
+                                | DataType::BigInt(_)
+                        )
+                    } else {
+                        matches!(
+                            fields[index].data_type(),
+                            DataType::Char(_) | DataType::VarChar(_)
+                        )
+                    };
+                    if !valid {
+                        return Err(rest_json_err(format!(
+                            "invalid type for transform input `{name}`"
+                        )));
+                    }
+                    Ok(TransformInput::Field(index))
+                }
+                _ => Err(rest_json_err(format!("invalid transform input {input}"))),
+            }
+        })
+        .collect()
+}
+
+/// Java checks the wire FieldRef family before replacing it from the schema.
+/// SUBSTRING deliberately allows arbitrary stored families and validates the
+/// rebound field at execution instead.
+fn check_input_type(input: &serde_json::Value, integer: bool) -> Result<()> {
+    let stored: DataType = input
+        .get("type")
+        .and_then(|value| serde_json::from_value(value.clone()).ok())
+        .ok_or_else(|| rest_json_err("transform field without a parseable type"))?;
+    let valid = if integer {
+        matches!(
+            stored,
+            DataType::TinyInt(_) | DataType::SmallInt(_) | DataType::Int(_) | DataType::BigInt(_)
+        )
+    } else {
+        matches!(stored, DataType::Char(_) | DataType::VarChar(_))
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(rest_json_err("invalid stored type for transform field"))
     }
 }
 

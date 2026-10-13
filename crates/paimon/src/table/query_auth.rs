@@ -24,12 +24,20 @@ pub(crate) use rules::{filter_batch, mask_batch, mask_inputs, ColumnMask, Rules}
 
 /// The server's answer for one user on one table; `session` ties it to the
 /// handle that asked, as the response names no table or user.
-#[derive(Debug, PartialEq)]
+#[derive(Debug)]
 pub(crate) struct QueryAuthGrant {
     session: u64,
     /// The columns the request asked about; `None` asked about the whole table.
     select: Option<Vec<String>>,
     rules: Rules,
+    /// Original wire rules for Java QueryAuthSplit metadata transport.
+    response: Option<AuthTableQueryResponse>,
+}
+
+impl PartialEq for QueryAuthGrant {
+    fn eq(&self, other: &Self) -> bool {
+        self.session == other.session && self.select == other.select && self.rules == other.rules
+    }
 }
 
 impl QueryAuthGrant {
@@ -40,7 +48,9 @@ impl QueryAuthGrant {
         select: Option<Vec<String>>,
         fields: &[crate::spec::DataField],
     ) -> crate::Result<Self> {
-        Ok(Self::new(session, select, Rules::parse(response, fields)?))
+        let mut grant = Self::new(session, select, Rules::parse(response, fields)?);
+        grant.response = Some(response.clone());
+        Ok(grant)
     }
 
     pub(crate) fn new(session: u64, select: Option<Vec<String>>, rules: Rules) -> Self {
@@ -48,7 +58,12 @@ impl QueryAuthGrant {
             session,
             select,
             rules,
+            response: None,
         }
+    }
+
+    pub(crate) fn response(&self) -> Option<&AuthTableQueryResponse> {
+        self.response.as_ref()
     }
 
     /// No row filter and no masking.
@@ -405,13 +420,83 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_a_schema_replaced_copy_loses_its_session() {
+    async fn test_options_only_schema_replacement_keeps_its_session() {
         let table = crate::table::rest_query_auth_table().await;
         assert!(table.query_auth_session().is_some());
+        let mut json = serde_json::to_value(table.schema()).unwrap();
+        json["timeMillis"] = serde_json::json!(1);
         let copy = table
-            .copy_with_resolved_schema(table.schema().clone(), "main")
+            .copy_with_resolved_schema(serde_json::from_value(json).unwrap(), "main")
             .unwrap();
-        assert!(copy.query_auth_session().is_none());
+        assert_eq!(copy.query_auth_session(), table.query_auth_session());
+        let table = table.copy_with_options(std::collections::HashMap::from([
+            ("scan.snapshot-id".into(), "7".into()),
+            ("read.batch-size".into(), "99".into()),
+        ]));
+        let schema = table
+            .schema()
+            .copy_with_replaced_options(std::collections::HashMap::from([
+                ("query-auth.enabled".into(), "false".into()),
+                ("type".into(), "format".into()),
+                ("data-file.path-directory".into(), "/tmp/other".into()),
+            ]));
+        let copy = table.copy_with_resolved_schema(schema, "main").unwrap();
+        assert_eq!(copy.query_auth_session(), table.query_auth_session());
+        assert!(copy.schema().core_options().query_auth_enabled());
+        for key in [
+            "scan.snapshot-id",
+            "read.batch-size",
+            "type",
+            "data-file.path-directory",
+        ] {
+            assert!(!copy.schema().options().contains_key(key), "{key}");
+        }
+        assert!(!copy.reads_another_schema().unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_changed_schema_or_branch_loses_its_session() {
+        let table = crate::table::rest_query_auth_table().await;
+        let mut json = serde_json::to_value(table.schema()).unwrap();
+        json["id"] = serde_json::json!(table.schema().id() + 1);
+        let changed = serde_json::from_value(json).unwrap();
+        assert!(table
+            .copy_with_resolved_schema(changed, "main")
+            .unwrap()
+            .query_auth_session()
+            .is_none());
+        assert!(table
+            .copy_with_resolved_schema(table.schema().clone(), "test")
+            .unwrap()
+            .query_auth_session()
+            .is_none());
+        let assembled = crate::table::query_auth_table();
+        assert!(assembled
+            .copy_with_resolved_schema(assembled.schema().clone(), "main")
+            .unwrap()
+            .query_auth_session()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn test_resolved_schema_copy_cannot_reauthorize_a_historical_handle() {
+        let table = crate::table::rest_query_auth_table().await;
+        let grant = super::QueryAuthGrant::new(
+            table.query_auth_session().unwrap(),
+            None,
+            Default::default(),
+        );
+        let mut travelled = table.clone();
+        travelled.time_traveled = true;
+        let pinned = table.copy_with_pinned_snapshot(None);
+        for view in [travelled, pinned] {
+            let schema = view
+                .schema()
+                .copy_with_replaced_options(table.schema().options().clone());
+            let copy = view.copy_with_resolved_schema(schema, "main").unwrap();
+            assert!(copy.query_auth_session().is_none());
+            assert!(!grant.matches_table(&copy));
+        }
     }
 
     #[tokio::test]

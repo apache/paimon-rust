@@ -645,11 +645,33 @@ impl Table {
     /// and does not perform time travel. Unlike that constructor, it retains the
     /// FileIO provider, REST environment and identity of this table. The branch
     /// selects its metadata namespace without loading a different schema.
+    /// An options-only replacement of the catalog-loaded schema keeps its REST
+    /// authorization session and the stored immutable options.
     /// Any cached time-travel resolution is discarded: subsequent scans resolve
     /// the supplied options without replacing the supplied fields.
     pub fn copy_with_resolved_schema(&self, schema: TableSchema, branch: &str) -> Result<Self> {
         schema.validate_resolved_structure()?;
         validate_branch_name(branch)?;
+        // An options-only copy still reads the exact schema loaded by the
+        // catalog. Preserve its session through the existing dynamic-option
+        // path; supplied fields, IDs, keys, comments and branch must all match.
+        // REST synthesizes creation times independently in different clients.
+        if self.query_auth_session.is_some()
+            && !self.time_traveled
+            && self.travel_snapshot.is_none()
+            && branch == self.branch
+            && schema.has_same_definition(&self.schema)
+        {
+            return Ok(Self {
+                schema: self
+                    .schema
+                    .copy_with_replaced_dynamic_options(schema.options().clone()),
+                time_traveled: false,
+                travel_snapshot: None,
+                applied_dynamic_option_keys: HashSet::new(),
+                ..self.clone()
+            });
+        }
         let schema_manager = SchemaManager::new(self.file_io.clone(), self.location.clone());
         let schema_manager = if branch == DEFAULT_MAIN_BRANCH {
             schema_manager
