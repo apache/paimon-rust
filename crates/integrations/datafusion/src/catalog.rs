@@ -718,6 +718,24 @@ impl PaimonCatalogProvider {
             .get(database)
             .is_some_and(|db| db.table_exist(table_name))
     }
+
+    /// Returns the temp table or view with the given name in the specified database.
+    pub(crate) async fn temp_table(
+        &self,
+        database: &str,
+        table_name: &str,
+    ) -> DFResult<Option<Arc<dyn TableProvider>>> {
+        let temp = self
+            .temp_tables
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(database)
+            .cloned();
+        match temp {
+            Some(temp) => temp.table(table_name).await,
+            None => Ok(None),
+        }
+    }
 }
 
 /// Represents a [`SchemaProvider`] for the Paimon [`Catalog`], managing
