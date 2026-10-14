@@ -22,6 +22,9 @@ use std::cmp::Ordering;
 use num_bigint::BigUint;
 use num_traits::ToPrimitive;
 
+mod floating;
+pub(crate) use floating::parse_java_float;
+
 /// Character.digit for decimal BMP digits (Java scans UTF-16 chars).
 pub(crate) fn java_decimal_digit(ch: char) -> Option<u8> {
     const ZEROES: &[u32] = &[
@@ -84,6 +87,39 @@ fn integer_text_error(message: impl Into<String>) -> crate::Error {
 /// fixed-width and arbitrary-precision arithmetic use different upper endpoints.
 /// The result is coefficient/exponent text, rather than a display format.
 pub(crate) fn java_double_decimal_text(value: f64) -> String {
+    java_floating_decimal_text(value, false)
+}
+
+/// Java 8/11/17 Number.toString, including FLOAT's own rounding interval.
+pub(crate) fn java_number_string(value: f64, single_precision: bool) -> String {
+    if !value.is_finite() || value == 0.0 {
+        return format_java_float(value);
+    }
+    let text = java_floating_decimal_text(value, single_precision);
+    let (negative, digits, exponent) = decimal_parts(&text);
+    let sign = if negative { "-" } else { "" };
+    if !(-3..7).contains(&exponent) {
+        return format!(
+            "{sign}{}.{}E{exponent}",
+            &digits[..1],
+            if digits.len() > 1 { &digits[1..] } else { "0" }
+        );
+    }
+    let point = exponent + 1;
+    if point <= 0 {
+        format!("{sign}0.{}{digits}", "0".repeat((-point) as usize))
+    } else if point as usize >= digits.len() {
+        format!(
+            "{sign}{digits}{}.0",
+            "0".repeat(point as usize - digits.len())
+        )
+    } else {
+        let point = point as usize;
+        format!("{sign}{}.{}", &digits[..point], &digits[point..])
+    }
+}
+
+fn java_floating_decimal_text(value: f64, single_precision: bool) -> String {
     debug_assert!(value.is_finite());
     if value == 0.0 {
         return "0".into();
@@ -92,7 +128,7 @@ pub(crate) fn java_double_decimal_text(value: f64) -> String {
     let sign = if bits >> 63 != 0 { "-" } else { "" };
     let mut exponent = ((bits >> 52) & 2047) as i32 - 1023;
     let mut mantissa = bits & ((1_u64 << 52) - 1);
-    let significant = if exponent == -1023 {
+    let mut significant = if exponent == -1023 {
         let significant = 64 - mantissa.leading_zeros() as i32;
         let normalize = 53 - significant;
         mantissa <<= normalize;
@@ -102,6 +138,14 @@ pub(crate) fn java_double_decimal_text(value: f64) -> String {
         mantissa |= 1_u64 << 52;
         53
     };
+    if single_precision {
+        let bits = (value as f32).to_bits();
+        significant = if bits & 0x7f80_0000 == 0 {
+            (32 - (bits & 0x007f_ffff).leading_zeros()) as i32
+        } else {
+            24
+        };
+    }
     let trailing = mantissa.trailing_zeros() as i32;
     let width = 53 - trailing;
     let tiny = (width - exponent - 1).max(0);

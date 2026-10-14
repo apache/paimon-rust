@@ -82,6 +82,40 @@ pub(crate) fn format_epoch_timestamp(seconds: i64, nanos: u32, precision: u32) -
     )
 }
 
+/// Java Timestamp.toString uses LocalDateTime's ISO form, not a SQL CAST form.
+pub(crate) fn format_iso_timestamp(seconds: i64, nanos: u32) -> String {
+    let (year, month, day) = epoch_day_to_date(i64::from(seconds.div_euclid(86_400) as i32));
+    let year = if (0..=9999).contains(&year) {
+        format!("{year:04}")
+    } else if year < 0 {
+        format!("-{:04}", -year)
+    } else {
+        format!("+{year}")
+    };
+    let time = seconds.rem_euclid(86_400);
+    let second = time % 60;
+    let mut text = format!(
+        "{year}-{month:02}-{day:02}T{:02}:{:02}",
+        time / 3600,
+        time / 60 % 60
+    );
+    if second != 0 || nanos != 0 {
+        text.push_str(&format!(":{second:02}"));
+    }
+    if nanos != 0 {
+        let precision = if nanos.is_multiple_of(1_000_000) {
+            3
+        } else if nanos.is_multiple_of(1000) {
+            6
+        } else {
+            9
+        };
+        text.push('.');
+        text.push_str(&format!("{nanos:09}")[..precision]);
+    }
+    text
+}
+
 pub(crate) fn epoch_day_to_date(day: i64) -> (i32, u32, u32) {
     // Gregorian eras start on March 1, so the leap day is at the end of a year.
     let days = day + 719_468;
@@ -186,10 +220,14 @@ pub(crate) fn local_to_utc_seconds(seconds: i64, zone: &jiff::tz::TimeZone) -> c
 /// DateTimeUtils.toInternal(LocalDate), including Java int overflow and signed division.
 pub(crate) fn epoch_day_to_java_date(day: i64) -> i32 {
     let (year, month, day) = epoch_day_to_date(day);
-    let a = (14 - month as i32) / 12;
+    ymd_to_java_date(year, month as i32, day as i32)
+}
+
+pub(crate) fn ymd_to_java_date(year: i32, month: i32, day: i32) -> i32 {
+    let a = (14 - month) / 12;
     let y = year + 4800 - a;
-    let m = month as i32 + 12 * a - 3;
-    (day as i32 + (153 * m + 2) / 5)
+    let m = month + 12 * a - 3;
+    (day + (153 * m + 2) / 5)
         .wrapping_add(365_i32.wrapping_mul(y))
         .wrapping_add(y / 4 - y / 100 + y / 400 - 32_045)
         .wrapping_sub(2_440_588)
@@ -198,21 +236,7 @@ pub(crate) fn epoch_day_to_java_date(day: i64) -> i32 {
 /// DateTimeUtils.toLocalDate uses signed int Julian arithmetic. Validate the
 /// resulting date as LocalDate.of does, then recover its proleptic epoch day.
 pub(crate) fn java_date_to_epoch_day(date: i32) -> crate::Result<i64> {
-    let j = date.wrapping_add(2_440_588).wrapping_add(32_044);
-    let g = j / 146_097;
-    let dg = j % 146_097;
-    let c = (dg / 36_524 + 1) * 3 / 4;
-    let dc = dg - c * 36_524;
-    let b = dc / 1461;
-    let db = dc % 1461;
-    let a = (db / 365 + 1) * 3 / 4;
-    let da = db - a * 365;
-    let y = g * 400 + c * 100 + b * 4 + a;
-    let m = (da * 5 + 308) / 153 - 2;
-    let d = da - (m + 4) * 153 / 5 + 122;
-    let year = y - 4800 + (m + 2) / 12;
-    let month = (m + 2) % 12 + 1;
-    let day = d + 1;
+    let (year, month, day) = java_date_parts(date);
     let leap = year % 400 == 0 || year % 4 == 0 && year % 100 != 0;
     let days = match month {
         2 => {
@@ -232,13 +256,34 @@ pub(crate) fn java_date_to_epoch_day(date: i32) -> crate::Result<i64> {
             source: None,
         });
     }
+    Ok(ymd_to_epoch_day(year, month, day))
+}
+
+pub(crate) fn java_date_parts(date: i32) -> (i32, i32, i32) {
+    let j = date.wrapping_add(2_440_588).wrapping_add(32_044);
+    let g = j / 146_097;
+    let dg = j % 146_097;
+    let c = (dg / 36_524 + 1) * 3 / 4;
+    let dc = dg - c * 36_524;
+    let b = dc / 1461;
+    let db = dc % 1461;
+    let a = (db / 365 + 1) * 3 / 4;
+    let da = db - a * 365;
+    let y = g * 400 + c * 100 + b * 4 + a;
+    let m = (da * 5 + 308) / 153 - 2;
+    let d = da - (m + 4) * 153 / 5 + 122;
+    let year = y - 4800 + (m + 2) / 12;
+    let month = (m + 2) % 12 + 1;
+    let day = d + 1;
+    (year, month, day)
+}
+
+pub(crate) fn ymd_to_epoch_day(year: i32, month: i32, day: i32) -> i64 {
     let year = i64::from(year) - i64::from(month <= 2);
     let era = year.div_euclid(400);
     let yoe = year - era * 400;
     let march = i64::from(month) + if month > 2 { -3 } else { 9 };
-    Ok(
-        era * 146_097 + yoe * 365 + yoe / 4 - yoe / 100 + (153 * march + 2) / 5 + i64::from(day)
-            - 1
-            - 719_468,
-    )
+    era * 146_097 + yoe * 365 + yoe / 4 - yoe / 100 + (153 * march + 2) / 5 + i64::from(day)
+        - 1
+        - 719_468
 }

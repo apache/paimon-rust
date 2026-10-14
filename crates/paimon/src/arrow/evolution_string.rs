@@ -32,6 +32,15 @@ pub(super) fn temporal_to_string(
     source_type: &DataType,
     target_type: &DataType,
 ) -> crate::Result<Option<ArrayRef>> {
+    temporal_to_string_in_zone(source, source_type, target_type, &TimeZone::system())
+}
+
+pub(super) fn temporal_to_string_in_zone(
+    source: &ArrayRef,
+    source_type: &DataType,
+    target_type: &DataType,
+    local_zone: &TimeZone,
+) -> crate::Result<Option<ArrayRef>> {
     let (length, pad) = match target_type {
         DataType::Char(t) => (t.length(), true),
         DataType::VarChar(t) => (t.length() as usize, false),
@@ -59,13 +68,14 @@ pub(super) fn temporal_to_string(
             let ArrowType::Timestamp(unit, _) = source.data_type() else {
                 return Err(invalid("Expected TIMESTAMP array"));
             };
-            let zone = local.then(TimeZone::system);
             let raw = arrow_cast::cast(source, &ArrowType::Int64)
                 .map_err(|error| invalid(error.to_string()))?;
             raw.as_primitive::<Int64Type>()
                 .iter()
                 .map(|value| {
-                    value.map(|value| render_timestamp(value, unit, precision, zone.as_ref()))
+                    value.map(|value| {
+                        render_timestamp(value, unit, precision, local.then_some(local_zone))
+                    })
                 })
                 .collect::<Vec<_>>()
         }

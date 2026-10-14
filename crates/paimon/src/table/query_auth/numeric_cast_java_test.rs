@@ -20,13 +20,12 @@
 //! text was also verified on Java 8. No NaN or signed-zero cases are included.
 
 use super::row_filter::RowFilter;
-use super::rules::{check_cast_source, check_transform_cast, evaluate_transform};
+use super::rules::evaluate_transform;
+use super::transform::AuthTransform;
+use crate::arrow::cast_test_utils::{external, source};
 use crate::arrow::paimon_type_to_arrow;
-use crate::spec::{DataField, DataType, Transform};
-use arrow_array::{
-    cast::AsArray, types::*, Array, ArrayRef, BooleanArray, Decimal128Array, Float32Array,
-    Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, StringArray,
-};
+use crate::spec::{DataField, DataType};
+use arrow_array::ArrayRef;
 use serde_json::{json, Value};
 use std::sync::Arc;
 
@@ -99,95 +98,6 @@ const JAVA_CASES: &str = r##"{"name":"BIGINT_to_TINYINT","fields":[{"name":"v","
 {"name":"DECIMAL(38,1)_compact_double_DOUBLE","fields":[{"name":"v","type":"DECIMAL(38,1)"}],"rows":[["900719925474099.3"],["900719925474099.5"],["-900719925474099.3"],[null]],"transform":{"name":"CAST","fieldRef":{"index":99,"name":"v","type":"DECIMAL(38,1)"},"type":"DOUBLE"},"expected":{"name":"DECIMAL(38,1)_compact_double_DOUBLE","results":[900719925474099.2,900719925474099.5,-900719925474099.2,null]}}
 {"name":"DECIMAL(38,1)_compact_double_FLOAT","fields":[{"name":"v","type":"DECIMAL(38,1)"}],"rows":[["900719925474099.3"],["900719925474099.5"],["-900719925474099.3"],[null]],"transform":{"name":"CAST","fieldRef":{"index":99,"name":"v","type":"DECIMAL(38,1)"},"type":"FLOAT"},"expected":{"name":"DECIMAL(38,1)_compact_double_FLOAT","results":[900719938895872.0,900719938895872.0,-900719938895872.0,null]}}"##;
 
-fn source(value: &Value, data_type: &DataType) -> ArrayRef {
-    let nullable = value.is_null();
-    macro_rules! integral {
-        ($array:ty, $ty:ty) => {
-            Arc::new(<$array>::from(vec![if nullable {
-                None
-            } else {
-                Some(value.as_i64().unwrap() as $ty)
-            }])) as ArrayRef
-        };
-    }
-    match data_type {
-        DataType::TinyInt(_) => integral!(Int8Array, i8),
-        DataType::SmallInt(_) => integral!(Int16Array, i16),
-        DataType::Int(_) => integral!(Int32Array, i32),
-        DataType::BigInt(_) => integral!(Int64Array, i64),
-        DataType::Float(_) => Arc::new(Float32Array::from(vec![value.as_f64().map(|v| v as f32)])),
-        DataType::Double(_) => Arc::new(Float64Array::from(vec![value.as_f64()])),
-        DataType::Boolean(_) => Arc::new(BooleanArray::from(vec![value.as_bool()])),
-        DataType::Char(_) | DataType::VarChar(_) => {
-            Arc::new(StringArray::from(vec![value.as_str()]))
-        }
-        DataType::Decimal(t) => {
-            let value = value.as_str().map(|value| {
-                let negative = value.starts_with('-');
-                let value = value.trim_start_matches(['-', '+']);
-                let (whole, fraction) = value.split_once('.').unwrap_or((value, ""));
-                let mut digits = format!("{whole}{fraction}");
-                digits.extend(std::iter::repeat_n(
-                    '0',
-                    t.scale() as usize - fraction.len(),
-                ));
-                let unscaled = digits.parse::<i128>().unwrap();
-                if negative {
-                    -unscaled
-                } else {
-                    unscaled
-                }
-            });
-            Arc::new(
-                Decimal128Array::from(vec![value])
-                    .with_precision_and_scale(t.precision() as u8, t.scale() as i8)
-                    .unwrap(),
-            )
-        }
-        _ => panic!("unexpected golden source type {data_type:?}"),
-    }
-}
-
-fn external(value: &ArrayRef) -> Value {
-    if value.is_null(0) {
-        return Value::Null;
-    }
-    macro_rules! number {
-        ($ty:ty) => {
-            json!(value.as_primitive::<$ty>().value(0))
-        };
-    }
-    match value.data_type() {
-        arrow_schema::DataType::Int8 => number!(Int8Type),
-        arrow_schema::DataType::Int16 => number!(Int16Type),
-        arrow_schema::DataType::Int32 => number!(Int32Type),
-        arrow_schema::DataType::Int64 => number!(Int64Type),
-        arrow_schema::DataType::Float32 => {
-            json!(f64::from(value.as_primitive::<Float32Type>().value(0)))
-        }
-        arrow_schema::DataType::Float64 => number!(Float64Type),
-        arrow_schema::DataType::Boolean => json!(value.as_boolean().value(0)),
-        arrow_schema::DataType::Utf8 => json!(value.as_string::<i32>().value(0)),
-        arrow_schema::DataType::Decimal128(_, _) => {
-            // Format target decimals via the same plain representation as Java.
-            let from = crate::arrow::arrow_fields_to_paimon(&[arrow_schema::Field::new(
-                "v",
-                value.data_type().clone(),
-                true,
-            )])
-            .unwrap()[0]
-                .data_type()
-                .clone();
-            let text: DataType = serde_json::from_value(json!("STRING")).unwrap();
-            let strings = crate::arrow::cast_numeric(value, &from, &text)
-                .unwrap()
-                .unwrap();
-            json!(strings.as_string::<i32>().value(0))
-        }
-        other => panic!("unexpected golden target type {other:?}"),
-    }
-}
-
 #[test]
 fn existing_numeric_casts_match_java_golden_vectors() {
     for line in JAVA_CASES.lines() {
@@ -212,28 +122,24 @@ fn existing_numeric_casts_match_java_golden_vectors() {
             case.get("predicate").cloned()
         };
         let definition = case.get("transform");
-        let transform = definition
-            .map(|definition| Transform::from_rest_json(&definition.to_string(), &fields).unwrap());
-        let validation = if let Some(transform) = &transform {
-            check_transform_cast(transform, &fields)
-                .and_then(|_| check_cast_source(transform, definition.unwrap(), &fields))
+        let parsed_transform = definition
+            .map(|definition| AuthTransform::from_rest_json(&definition.to_string(), &fields));
+        let validation = if let Some(transform) = &parsed_transform {
+            transform.as_ref().map(|_| ()).map_err(|e| e.to_string())
         } else {
-            RowFilter::parse(&predicate.as_ref().unwrap().to_string(), &fields).map(|_| ())
+            RowFilter::parse(&predicate.as_ref().unwrap().to_string(), &fields)
+                .map(|_| ())
+                .map_err(|e| e.to_string())
         };
         if case["expected"].get("parseError").is_some() {
             assert!(validation.is_err(), "{name}");
             continue;
         }
-        if validation.is_err() {
-            // The Native subset explicitly declines source-type rebinding.
-            let stored: DataType =
-                serde_json::from_value(definition.unwrap()["fieldRef"]["type"].clone()).unwrap();
-            assert!(
-                !stored.equals_ignore_nullable(fields[0].data_type()),
-                "unexpected refusal: {name}: {validation:?}"
-            );
-            continue;
-        }
+        assert!(
+            validation.is_ok(),
+            "unexpected refusal: {name}: {validation:?}"
+        );
+        let transform = parsed_transform.map(Result::unwrap);
         for (row, expected) in case["rows"]
             .as_array()
             .unwrap()
@@ -265,7 +171,6 @@ fn existing_numeric_casts_match_java_golden_vectors() {
                     1,
                     &|index| Ok(inputs[index].clone()),
                     &paimon_type_to_arrow(&target).unwrap(),
-                    &fields,
                 )
             };
             if expected.get("error").is_some() {

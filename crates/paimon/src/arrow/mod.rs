@@ -19,6 +19,11 @@ mod date_extract;
 pub(crate) use date_extract::evaluate_date_extract;
 mod cast_width;
 pub(crate) use cast_width::apply_declared_width;
+mod cast_executor;
+pub(crate) use cast_executor::CastExecutor;
+#[cfg(test)]
+mod cast_completion_java_test;
+mod cast_text;
 mod evolution_cast;
 pub(crate) use evolution_cast::{cast_numeric, supports_numeric_cast};
 mod evolution_decimal;
@@ -813,3 +818,6 @@ mod tests {
         assert!(!paimon_fields[1].data_type().is_nullable());
     }
 }
+
+#[cfg(test)]
+pub(crate) mod cast_test_utils;

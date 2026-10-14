@@ -20,7 +20,9 @@
 #[cfg(test)]
 mod numeric_cast_java_test;
 mod row_filter;
+mod transform;
 pub(crate) use row_filter::RowFilter;
+mod mask_output;
 mod rules;
 
 use crate::api::AuthTableQueryResponse;

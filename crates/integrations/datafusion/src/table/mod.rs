@@ -95,6 +95,24 @@ pub(crate) fn datafusion_arrow_schema(
     )))
 }
 
+/// The schema visible to SQL before authorization is fetched.
+fn query_auth_output_schema(table: &Table, schema: ArrowSchemaRef) -> ArrowSchemaRef {
+    if !table.schema().core_options().query_auth_enabled() {
+        return schema;
+    }
+    // Authorization is fetched while planning, after logical optimization.
+    // A mask can null a NOT NULL table column, so optimizers must not fold
+    // IS NULL beforehand. Keep physical read fields canonical and unchanged.
+    Arc::new(Schema::new_with_metadata(
+        schema
+            .fields()
+            .iter()
+            .map(|field| field.as_ref().clone().with_nullable(true))
+            .collect::<Vec<_>>(),
+        schema.metadata().clone(),
+    ))
+}
+
 /// Read-only table provider for a Paimon table.
 ///
 /// Supports full table scan, column projection, and predicate pushdown for
@@ -127,7 +145,7 @@ impl PaimonTableProvider {
         let identifier = table.identifier().clone();
         crate::table_loader::ensure_paimon_served(&table, &identifier)?;
         let fields = datafusion_read_fields(&table);
-        let schema = datafusion_arrow_schema(&fields, true)?;
+        let schema = query_auth_output_schema(&table, datafusion_arrow_schema(&fields, true)?);
         Ok(Self {
             table,
             schema,
@@ -166,7 +184,10 @@ impl PaimonTableProvider {
             return Ok(self);
         }
         let fields = datafusion_read_fields(&self.table);
-        self.schema = datafusion_arrow_schema(&fields, schema_force_view_types)?;
+        self.schema = query_auth_output_schema(
+            &self.table,
+            datafusion_arrow_schema(&fields, schema_force_view_types)?,
+        );
         Ok(self)
     }
 

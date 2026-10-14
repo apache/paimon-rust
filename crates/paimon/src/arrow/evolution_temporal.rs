@@ -54,11 +54,30 @@ pub(super) fn cast_temporal(
     cast_in_zone(source, from, to, &zone)
 }
 
-fn cast_in_zone(
+pub(super) fn cast_in_zone(
     source: &ArrayRef,
     from: &DataType,
     to: &DataType,
     zone: &TimeZone,
+) -> crate::Result<Option<ArrayRef>> {
+    cast_in_zone_with_storage(source, from, to, zone, false)
+}
+
+pub(super) fn cast_in_zone_strict(
+    source: &ArrayRef,
+    from: &DataType,
+    to: &DataType,
+    zone: &TimeZone,
+) -> crate::Result<Option<ArrayRef>> {
+    cast_in_zone_with_storage(source, from, to, zone, true)
+}
+
+fn cast_in_zone_with_storage(
+    source: &ArrayRef,
+    from: &DataType,
+    to: &DataType,
+    zone: &TimeZone,
+    strict: bool,
 ) -> crate::Result<Option<ArrayRef>> {
     let ltz = matches!(from, DataType::LocalZonedTimestamp(_));
     let timestamp = matches!(
@@ -173,6 +192,24 @@ fn cast_in_zone(
                     }
                     TimeUnit::Nanosecond => i128::from(millis) * 1_000_000 + i128::from(sub_milli),
                 };
+                if strict {
+                    let divisor = match unit {
+                        TimeUnit::Second => 1_000_000_000,
+                        TimeUnit::Millisecond => 1_000_000,
+                        TimeUnit::Microsecond => 1000,
+                        TimeUnit::Nanosecond => 1,
+                    };
+                    if i128::from(millis) * 1_000_000 + i128::from(sub_milli) != ticks * divisor
+                        || i64::try_from(ticks).is_err()
+                    {
+                        return Err(crate::Error::DataInvalid {
+                            message:
+                                "Java timestamp result cannot be represented by the Arrow target"
+                                    .into(),
+                            source: None,
+                        });
+                    }
+                }
                 i64::try_from(ticks).ok()
             }
             _ => unreachable!(),
@@ -194,7 +231,7 @@ fn cast_in_zone(
     }))
 }
 
-fn timestamp_parts(value: i64, unit: &TimeUnit) -> (i64, i64) {
+pub(super) fn timestamp_parts(value: i64, unit: &TimeUnit) -> (i64, i64) {
     match unit {
         TimeUnit::Second => (value.wrapping_mul(1000), 0),
         TimeUnit::Millisecond => (value, 0),
