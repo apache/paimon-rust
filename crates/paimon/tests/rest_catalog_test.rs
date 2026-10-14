@@ -4521,6 +4521,86 @@ async fn test_query_auth_calendar_masks_read_hidden_operands_before_filter_and_l
 
 #[cfg(not(windows))]
 #[tokio::test]
+async fn test_query_auth_transformed_filter_precedes_mask_user_filter_and_limit() {
+    use arrow_array::Date32Array;
+    use paimon::spec::DateType;
+    for (primary_key, evolution) in [(false, false), (true, false), (false, true)] {
+        let schema = |options: &[(&str, &str)]| {
+            let mut builder = Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("value", DataType::VarChar(VarCharType::string_type()))
+                .column("source", DataType::VarChar(VarCharType::string_type()))
+                .column("p", DataType::BigInt(BigIntType::new()))
+                .column("d", DataType::Date(DateType::new()));
+            if primary_key {
+                builder = builder.primary_key(["id"]).option("bucket", "1");
+            }
+            if evolution {
+                builder = builder
+                    .option("data-evolution.enabled", "true")
+                    .option("row-tracking.enabled", "true");
+            }
+            for (key, value) in options {
+                builder = builder.option(*key, *value);
+            }
+            builder.build().unwrap()
+        };
+        let source = RecordBatch::try_from_iter(vec![
+            (
+                "id",
+                Arc::new(Int32Array::from(vec![1, 2, 3, 4])) as Arc<dyn Array>,
+            ),
+            ("value", Arc::new(StringArray::from(vec!["raw"; 4]))),
+            (
+                "source",
+                Arc::new(StringArray::from(vec![
+                    Some("old"),
+                    Some("abc"),
+                    Some("xyz"),
+                    None,
+                ])),
+            ),
+            (
+                "p",
+                Arc::new(Int64Array::from(vec![i64::MAX, 1, i64::MAX, i64::MAX])),
+            ),
+            (
+                "d",
+                Arc::new(Date32Array::from(vec![
+                    Some(19782),
+                    Some(20087),
+                    Some(-1),
+                    None,
+                ])),
+            ),
+        ])
+        .unwrap();
+        let g = written("transformed_filter", schema, vec![source]).await;
+        let filter = serde_json::json!({"kind":"COMPOUND","function":"AND","children":[
+            {"kind":"LEAF","transform":{"name":"YEAR_OF_WEEK","fieldRef":{"name":"d","type":"DATE","index":99}},"function":"EQUAL","literals":[2025]},
+            {"kind":"LEAF","transform":{"name":"SUBSTRING","inputs":[{"name":"source","type":"STRING"},{"name":"p","type":"BIGINT"},1]},"function":"EQUAL","literals":["a"]}
+        ]});
+        g.set_rules(
+            &[filter],
+            &[(
+                "value",
+                serde_json::json!({"name":"CONCAT","inputs":["visible"]}),
+            )],
+        );
+        let mut builder = g.table.new_read_builder();
+        builder.with_projection(&["id"]).unwrap();
+        builder.with_filter(
+            PredicateBuilder::new(g.table.schema().fields())
+                .equal("value", Datum::String("visible".into()))
+                .unwrap(),
+        );
+        builder.with_limit(1);
+        assert_eq!(ids(&read_all(&builder).await.unwrap()), vec![2]);
+    }
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
 async fn test_query_auth_widens_an_integer_mask() {
     let schema = |options: &[(&str, &str)]| {
         let mut builder = Schema::builder()

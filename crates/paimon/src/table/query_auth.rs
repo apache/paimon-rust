@@ -17,6 +17,8 @@
 
 //! What the REST server authorized a user to read from one table.
 
+mod row_filter;
+pub(crate) use row_filter::RowFilter;
 mod rules;
 
 use crate::api::AuthTableQueryResponse;

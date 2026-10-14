@@ -18,6 +18,7 @@
 //! Apply the server's row filters and column masks to read batches.
 
 use super::unsupported;
+use super::RowFilter;
 use crate::api::AuthTableQueryResponse;
 use crate::arrow::residual::{evaluate_exact_leaf_predicate, sanitize_filter_mask};
 use crate::spec::{DataField, Predicate, Transform, TransformInput};
@@ -37,7 +38,7 @@ pub(crate) struct ColumnMask {
 /// One grant's rules, indexed by table schema.
 #[derive(Debug, Default, PartialEq)]
 pub(crate) struct Rules {
-    pub(crate) filters: Vec<Predicate>,
+    pub(crate) filters: Vec<RowFilter>,
     pub(crate) masks: Vec<ColumnMask>,
 }
 
@@ -50,15 +51,15 @@ impl Rules {
                 return Err(unsupported("the server sent an empty row filter"));
             }
             let filter =
-                Predicate::from_rest_json(json, fields).map_err(
-                    |e| match mentioned_system_column(json) {
+                RowFilter::parse(json, fields).map_err(|e| {
+                    match mentioned_system_column(json) {
                         Some(name) => unsupported(&format!(
                             "the server's row filter reads the system column '{name}', which a \
                          query-auth read never projects"
                         )),
                         None => unsupported(&format!("cannot parse the server's row filter: {e}")),
-                    },
-                )?;
+                    }
+                })?;
             filters.push(filter);
         }
 
@@ -130,7 +131,7 @@ impl Rules {
     pub(crate) fn filter_columns(&self) -> HashSet<usize> {
         let mut out = HashSet::new();
         for filter in &self.filters {
-            filter.collect_leaf_field_indices(&mut out);
+            filter.collect_field_indices(&mut out);
         }
         out
     }
@@ -160,13 +161,16 @@ fn check_mask_fits(transform: &Transform, target: &DataField, fields: &[DataFiel
             target.name()
         )));
     }
+    check_transform_cast(transform, fields)
+}
+
+pub(super) fn check_transform_cast(transform: &Transform, fields: &[DataField]) -> Result<()> {
     if let Transform::Cast(index, to) = transform {
         let from = fields[*index].data_type();
         if !cast_agrees_with_java(from, to) {
             return Err(unsupported(&format!(
-                "the mask on '{}' casts {from:?} to {to:?}, which this client does not convert as \
-                 Java does",
-                target.name()
+                "the server's transform casts {from:?} to {to:?}, which this client does not \
+                 convert as Java does"
             )));
         }
     }
@@ -216,28 +220,28 @@ fn mentioned_system_column(json: &str) -> Option<&'static str> {
 /// cannot be evaluated is an error, never a kept row.
 pub(crate) fn filter_batch(
     batch: &RecordBatch,
-    filters: &[Predicate],
+    filters: &[RowFilter],
     schema_fields: &[DataField],
     batch_fields: &[DataField],
 ) -> Result<RecordBatch> {
-    let mut keep: Option<BooleanArray> = None;
+    let mut result = batch.clone();
+    // Java ANDs the server's entries in order, so later transforms never see
+    // a row an earlier rule rejected.
     for filter in filters {
-        let mask = rule_mask(batch, filter, schema_fields, batch_fields)?;
-        keep = Some(match keep {
-            Some(existing) => combine(&existing, &mask, false)?,
-            None => mask,
-        });
+        if result.num_rows() == 0 {
+            break;
+        }
+        let keep = filter.evaluate(&result, schema_fields, batch_fields)?;
+        result =
+            arrow_select::filter::filter_record_batch(&result, &keep).map_err(|e| eval_err(&e))?;
     }
-    let Some(keep) = keep else {
-        return Ok(batch.clone());
-    };
-    arrow_select::filter::filter_record_batch(batch, &keep).map_err(|e| eval_err(&e))
+    Ok(result)
 }
 
 /// Java leaf semantics: a null value fails every leaf but `IS NULL`, for the
 /// negated functions too. The REST parser builds no `NOT`, so two-valued
 /// AND/OR over those leaves is exactly Java's `test`.
-fn rule_mask(
+pub(super) fn rule_mask(
     batch: &RecordBatch,
     predicate: &Predicate,
     schema_fields: &[DataField],
@@ -288,7 +292,7 @@ fn combine(left: &BooleanArray, right: &BooleanArray, or: bool) -> Result<Boolea
 }
 
 /// The column holding `field`, matched by id and name so an alias cannot stand in.
-fn column_of(
+pub(super) fn column_of(
     batch: &RecordBatch,
     field: &DataField,
     batch_fields: &[DataField],
@@ -312,7 +316,7 @@ fn column_of(
 
 /// Java's `Float.compare` puts every NaN above every number; Arrow's total
 /// order puts a negative NaN below them, so `f < 0` would admit it.
-fn canonicalize_nan(column: &ArrayRef) -> ArrayRef {
+pub(super) fn canonicalize_nan(column: &ArrayRef) -> ArrayRef {
     match column.data_type() {
         arrow_schema::DataType::Float32 => match column.as_any().downcast_ref::<Float32Array>() {
             Some(values) if values.iter().any(|v| v.is_some_and(f32::is_nan)) => {
@@ -379,25 +383,7 @@ pub(crate) fn mask_batch(
             )));
         };
         let target_type = batch.schema().field(first).data_type().clone();
-        let masked: ArrayRef = match &mask.transform {
-            Transform::Null => arrow_array::new_null_array(&target_type, batch.num_rows()),
-            Transform::FieldRef(index) => input(*index)?,
-            Transform::Cast(index, to) => {
-                let cast = cast_to(&input(*index)?, &crate::arrow::paimon_type_to_arrow(to)?)?;
-                // Arrow strings do not enforce CHAR/VARCHAR width.
-                apply_declared_width(&cast, to)
-            }
-            Transform::DateExtract(index, part) => {
-                crate::arrow::evaluate_date_extract(&input(*index)?, *part)?
-            }
-            Transform::Upper(_)
-            | Transform::Lower(_)
-            | Transform::Concat(_)
-            | Transform::ConcatWs(_) => string_mask(batch, &mask.transform, &input)?,
-            _ => {
-                crate::arrow::evaluate_string_transform(&mask.transform, batch.num_rows(), &input)?
-            }
-        };
+        let masked = evaluate_transform(&mask.transform, batch.num_rows(), &input, &target_type)?;
         let masked = cast_to(&masked, &target_type)?;
         for position in targets {
             columns[position] = Arc::clone(&masked);
@@ -409,6 +395,53 @@ pub(crate) fn mask_batch(
         &arrow_array::RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
     )
     .map_err(|e| eval_err(&e))
+}
+
+/// Execute one expression on complete input fields. Both filters and masks use
+/// this path, so width, NULL and calendar semantics cannot drift between them.
+pub(super) fn evaluate_transform(
+    transform: &Transform,
+    rows: usize,
+    input: &dyn Fn(usize) -> Result<ArrayRef>,
+    null_type: &arrow_schema::DataType,
+) -> Result<ArrayRef> {
+    match transform {
+        Transform::Null => Ok(arrow_array::new_null_array(null_type, rows)),
+        Transform::FieldRef(index) => input(*index),
+        Transform::Cast(index, to) => {
+            let cast = cast_to(&input(*index)?, &crate::arrow::paimon_type_to_arrow(to)?)?;
+            Ok(apply_declared_width(&cast, to))
+        }
+        Transform::DateExtract(index, part) => {
+            crate::arrow::evaluate_date_extract(&input(*index)?, *part)
+        }
+        Transform::Upper(_)
+        | Transform::Lower(_)
+        | Transform::Concat(_)
+        | Transform::ConcatWs(_) => string_mask(rows, transform, input),
+        _ => crate::arrow::evaluate_string_transform(transform, rows, input),
+    }
+}
+
+pub(super) fn transform_output_type(
+    transform: &Transform,
+    fields: &[DataField],
+) -> Result<crate::spec::DataType> {
+    use crate::spec::{BooleanType, DataType, IntType, VarCharType};
+    Ok(match transform {
+        // NullTransform.outputType is BOOLEAN, except a mask adopts its target.
+        Transform::Null => DataType::Boolean(BooleanType::new()),
+        Transform::FieldRef(index) => fields
+            .get(*index)
+            .ok_or_else(|| unsupported("the server's transform reads an unknown column"))?
+            .data_type()
+            .clone(),
+        Transform::Cast(_, to) => to.clone(),
+        Transform::Length(_) | Transform::BitLength(_) | Transform::DateExtract(_, _) => {
+            DataType::Int(IntType::new())
+        }
+        _ => DataType::VarChar(VarCharType::string_type()),
+    })
 }
 
 fn mask_can_be_null(transform: &Transform, fields: &[DataField]) -> bool {
@@ -431,16 +464,12 @@ fn mask_can_be_null(transform: &Transform, fields: &[DataField]) -> bool {
 
 /// `None` lets a NULL mask adopt the target's type.
 fn mask_output_type(transform: &Transform, fields: &[DataField]) -> Option<arrow_schema::DataType> {
-    match transform {
-        Transform::Null => None,
-        Transform::FieldRef(index) => {
-            crate::arrow::paimon_type_to_arrow(fields[*index].data_type()).ok()
-        }
-        Transform::Cast(_, to) => crate::arrow::paimon_type_to_arrow(to).ok(),
-        Transform::Length(_) | Transform::BitLength(_) | Transform::DateExtract(_, _) => {
-            Some(arrow_schema::DataType::Int32)
-        }
-        _ => Some(arrow_schema::DataType::Utf8),
+    if matches!(transform, Transform::Null) {
+        None
+    } else {
+        transform_output_type(transform, fields)
+            .and_then(|t| crate::arrow::paimon_type_to_arrow(&t))
+            .ok()
     }
 }
 
@@ -525,7 +554,7 @@ impl StringInput<'_> {
 }
 
 fn string_mask(
-    batch: &RecordBatch,
+    rows: usize,
     transform: &Transform,
     input: &dyn Fn(usize) -> Result<ArrayRef>,
 ) -> Result<ArrayRef> {
@@ -558,7 +587,7 @@ fn string_mask(
             StringInput::Column(array) => return Ok(Arc::new(string_case(array, upper))),
             StringInput::Literal(value) => value,
         };
-        let mut values = StringBuilder::with_capacity(batch.num_rows(), 0);
+        let mut values = StringBuilder::with_capacity(rows, 0);
         match literal {
             Some(value) => values.append_value_n(
                 if upper {
@@ -566,14 +595,14 @@ fn string_mask(
                 } else {
                     value.to_lowercase()
                 },
-                batch.num_rows(),
+                rows,
             ),
-            None => values.append_nulls(batch.num_rows()),
+            None => values.append_nulls(rows),
         }
         return Ok(Arc::new(values.finish()));
     }
-    let mut values = StringBuilder::with_capacity(batch.num_rows(), 0);
-    for row in 0..batch.num_rows() {
+    let mut values = StringBuilder::with_capacity(rows, 0);
+    for row in 0..rows {
         let (parts, separator) = if matches!(transform, Transform::ConcatWs(_)) {
             let Some(separator) = resolved[0].value(row) else {
                 values.append_null();
@@ -850,6 +879,15 @@ mod tests {
     }
 
     #[test]
+    fn transformed_row_filter_reads_hidden_source_as_java_does() {
+        let fields = typed_fields();
+        let filter = r#"{"kind":"LEAF","transform":{"name":"UPPER","inputs":[{"name":"s","type":"STRING","index":99}]},"function":"EQUAL","literals":["BANANA"]}"#;
+        let rules = parse(&[filter], &[], &fields).unwrap();
+        assert_eq!(rules.filter_columns(), HashSet::from([5]));
+        assert_eq!(kept(&rules.filters), vec![2]);
+    }
+
+    #[test]
     fn test_parse_reads_the_rules() {
         let fields = rule_fields();
         let rules = parse(
@@ -1083,7 +1121,7 @@ mod tests {
     }
 
     /// The rows of the typed batch that `filters` keep.
-    fn kept(filters: &[Predicate]) -> Vec<i32> {
+    fn kept(filters: &[RowFilter]) -> Vec<i32> {
         let fields = typed_fields();
         ids(&filter_batch(&typed_batch(), filters, &fields, &fields).unwrap())
     }
@@ -1186,11 +1224,11 @@ mod tests {
             (b.is_not_in("ts", vec![ts(1000, 0)]), vec![1, 2, 3]),
         ];
         for (predicate, expected) in cases {
-            let predicate = predicate.unwrap();
+            let predicate = RowFilter::Predicate(predicate.unwrap());
             assert_eq!(
                 kept(std::slice::from_ref(&predicate)),
                 expected,
-                "{predicate}"
+                "{predicate:?}"
             );
         }
     }
@@ -1320,11 +1358,16 @@ mod tests {
             literals: vec![Datum::String("1".to_string())],
         };
         for (filter, reason) in [
-            (Predicate::Not(Box::new(filters[0].clone())), "has a NOT"),
+            (Predicate::Not(Box::new(Predicate::AlwaysTrue)), "has a NOT"),
             (Predicate::And(Vec::new()), "empty AND/OR"),
             (mistyped, "cannot evaluate"),
         ] {
-            let message = refusal(filter_batch(&rows, &[filter], &fields, &fields));
+            let message = refusal(filter_batch(
+                &rows,
+                &[RowFilter::Predicate(filter)],
+                &fields,
+                &fields,
+            ));
             assert!(message.contains(reason), "{message}");
         }
         let message = refusal(filter_batch(&rows, &filters, &fields[..1], &fields));
