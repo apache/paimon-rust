@@ -3257,8 +3257,10 @@ async fn test_blob_masks_keep_predicates_and_projection_lazy() {
                 Some(serde_json::json!({"name": "FIELD_REF", "fieldRef": field})),
             ),
             (
-                "cast",
-                Some(serde_json::json!({"name": "CAST", "fieldRef": field, "type": "BLOB"})),
+                "field-ref-rebound",
+                Some(serde_json::json!({"name": "FIELD_REF", "fieldRef": {
+                    "index": 99, "name": "payload", "type": "BLOB NOT NULL",
+                }})),
             ),
         ] {
             let masks: Vec<_> = mask.into_iter().map(|mask| ("payload", mask)).collect();
@@ -3393,7 +3395,9 @@ async fn test_blob_mask_alias_keeps_the_source_reference_format() {
         let field = serde_json::json!({"index": 1, "name": "payload", "type": "BLOB"});
         for mask in [
             serde_json::json!({"name": "FIELD_REF", "fieldRef": field}),
-            serde_json::json!({"name": "CAST", "fieldRef": field, "type": "BLOB"}),
+            serde_json::json!({"name": "FIELD_REF", "fieldRef": {
+                "index": 99, "name": "payload", "type": "BLOB NOT NULL",
+            }}),
         ] {
             g.set_rules(&[int_leaf(0, "id", "GREATER_THAN", 0)], &[("alias", mask)]);
             let predicates = PredicateBuilder::new(g.table.schema().fields());
@@ -3923,10 +3927,10 @@ fn upper(index: usize, column: &str) -> serde_json::Value {
 #[tokio::test]
 async fn test_query_auth_rules_this_client_cannot_parse_fail_closed_at_planning() {
     let g = guarded("unparseable", &["id"]).await;
-    let widened = serde_json::json!({
+    let unsupported_cast = serde_json::json!({
         "name": "CAST",
-        "fieldRef": {"index": 0, "name": "id", "type": "INT"},
-        "type": "BIGINT",
+        "fieldRef": {"index": 0, "name": "id", "type": "DOUBLE"},
+        "type": "BOOLEAN",
     });
     for response in [
         // Not a predicate, or nothing at all.
@@ -3941,14 +3945,48 @@ async fn test_query_auth_rules_this_client_cannot_parse_fail_closed_at_planning(
         // Columns the table does not have.
         rules(&[int_leaf(0, "missing", "EQUAL", 1)], &[]),
         rules(&[], &[("missing", serde_json::json!({"name": "NULL"}))]),
-        // A mask must keep its column's type.
-        rules(&[], &[("id", widened)]),
+        // An unsupported original executor is invalid even for an empty table.
+        rules(&[], &[("id", unsupported_cast)]),
+        // Java emits FIELD_REF for BLOB identity; an explicit CAST has no executor.
+        rules(
+            &[],
+            &[(
+                "id",
+                serde_json::json!({
+                    "name": "CAST",
+                    "fieldRef": {"index": 0, "name": "id", "type": "BLOB"},
+                    "type": "BLOB",
+                }),
+            )],
+        ),
     ] {
         g.ctx
             .server
             .set_auth_response("default", "unparseable", response.clone());
         assert_refused(plan_err(&g.table, &format!("{response:?}")).await);
     }
+}
+
+#[tokio::test]
+async fn test_query_auth_empty_table_defers_mask_output_class_checks() {
+    let g = guarded("empty_mask_output", &["id"]).await;
+    // Java checks the output object's class only for a non-NULL active row.
+    // INT -> BIGINT is a valid executor even when the target column is INT.
+    g.set_rules(
+        &[],
+        &[(
+            "id",
+            serde_json::json!({
+                "name": "CAST",
+                "fieldRef": {"index": 0, "name": "id", "type": "INT"},
+                "type": "BIGINT",
+            }),
+        )],
+    );
+    let builder = g.table.new_read_builder();
+    let plan = builder.new_scan().plan().await.unwrap();
+    assert!(plan.splits().is_empty());
+    assert!(read_all(&builder).await.unwrap().is_empty());
 }
 
 #[tokio::test]

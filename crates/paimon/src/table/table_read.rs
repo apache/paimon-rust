@@ -1240,7 +1240,7 @@ impl<'a> PaimonTableRead<'a> {
         let copies: Vec<_> = masks
             .iter()
             .filter_map(|mask| {
-                let source = match &mask.transform {
+                let source = match mask.transform.expression() {
                     Transform::FieldRef(index) | Transform::Cast(index, _) => &fields[*index],
                     _ => return None,
                 };

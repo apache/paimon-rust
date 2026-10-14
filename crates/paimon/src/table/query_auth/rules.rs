@@ -17,6 +17,7 @@
 
 //! Apply the server's row filters and column masks to read batches.
 
+use super::transform::AuthTransform;
 use super::unsupported;
 use super::RowFilter;
 use crate::api::AuthTableQueryResponse;
@@ -32,7 +33,7 @@ use std::sync::Arc;
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ColumnMask {
     pub(crate) column: usize,
-    pub(crate) transform: Transform,
+    pub(crate) transform: AuthTransform,
 }
 
 /// One grant's rules, indexed by table schema.
@@ -87,12 +88,11 @@ impl Rules {
                         "the server masks '{column}', which is not a column"
                     ))
                 })?;
-            let transform = Transform::from_rest_json(json, fields).map_err(|e| {
+            let transform = AuthTransform::from_rest_json(json, fields).map_err(|e| {
                 unsupported(&format!(
                     "cannot parse the server's mask on '{column}': {e}"
                 ))
             })?;
-            check_mask_fits(&transform, &fields[target], fields)?;
             masks.push(ColumnMask {
                 column: target,
                 transform,
@@ -142,62 +142,6 @@ pub(crate) fn mask_inputs(mask: &ColumnMask) -> HashSet<usize> {
     let mut out = HashSet::new();
     mask.transform.collect_field_indices(&mut out);
     out
-}
-
-/// Preserve the target's type and nullability.
-fn check_mask_fits(transform: &Transform, target: &DataField, fields: &[DataField]) -> Result<()> {
-    let column_type = crate::arrow::paimon_type_to_arrow(target.data_type())?;
-    if let Some(output) = mask_output_type(transform, fields) {
-        if output != column_type {
-            return Err(unsupported(&format!(
-                "the mask on '{}' produces {output:?}, but the column is {column_type:?}",
-                target.name()
-            )));
-        }
-    }
-    if !target.data_type().is_nullable() && mask_can_be_null(transform, fields) {
-        return Err(unsupported(&format!(
-            "the mask on '{}' can produce null, but the column is NOT NULL",
-            target.name()
-        )));
-    }
-    check_transform_cast(transform, fields)
-}
-
-pub(super) fn check_transform_cast(transform: &Transform, fields: &[DataField]) -> Result<()> {
-    if let Transform::Cast(index, to) = transform {
-        let from = fields[*index].data_type();
-        if !cast_agrees_with_java(from, to) {
-            return Err(unsupported(&format!(
-                "the server's transform casts {from:?} to {to:?}, which this client does not \
-                 convert as Java does"
-            )));
-        }
-    }
-    Ok(())
-}
-
-/// Arrow and Java disagree on casts such as INT -> TIMESTAMP.
-fn cast_agrees_with_java(from: &crate::spec::DataType, to: &crate::spec::DataType) -> bool {
-    use crate::spec::DataType as Paimon;
-    let string = |t: &Paimon| matches!(t, Paimon::Char(_) | Paimon::VarChar(_));
-    let bytes = |t: &Paimon| matches!(t, Paimon::Binary(_) | Paimon::VarBinary(_));
-    let integer_bits = |t: &Paimon| match t {
-        Paimon::TinyInt(_) => Some(8),
-        Paimon::SmallInt(_) => Some(16),
-        Paimon::Int(_) => Some(32),
-        Paimon::BigInt(_) => Some(64),
-        _ => None,
-    };
-    let same = matches!(
-        (from.copy_with_nullable(true), to.copy_with_nullable(true)),
-        (Ok(from), Ok(to)) if from == to
-    );
-    let widening = matches!((integer_bits(from), integer_bits(to)), (Some(a), Some(b)) if a < b);
-    same || widening
-        || string(to)
-            && (string(from) || integer_bits(from).is_some() || matches!(from, Paimon::Boolean(_)))
-        || bytes(to) && (bytes(from) || string(from))
 }
 
 fn mentioned_system_column(json: &str) -> Option<&'static str> {
@@ -384,13 +328,35 @@ pub(crate) fn mask_batch(
         };
         let target_type = batch.schema().field(first).data_type().clone();
         let masked = evaluate_transform(&mask.transform, batch.num_rows(), &input, &target_type)?;
-        let masked = cast_to(&masked, &target_type)?;
+        let masked = super::mask_output::convert(&masked, &target_type)?;
         for position in targets {
             columns[position] = Arc::clone(&masked);
         }
     }
+    // Masks may produce NULL for a NOT NULL table column. Only the output
+    // schema changes; physical fields retain their declarations and metadata.
+    let fields = batch
+        .schema()
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(position, field)| {
+            if masks
+                .iter()
+                .any(|mask| schema_fields[mask.column].id() == batch_fields[position].id())
+            {
+                Arc::new(field.as_ref().clone().with_nullable(true))
+            } else {
+                Arc::clone(field)
+            }
+        })
+        .collect::<Vec<_>>();
+    let schema = Arc::new(arrow_schema::Schema::new_with_metadata(
+        fields,
+        batch.schema().metadata().clone(),
+    ));
     RecordBatch::try_new_with_options(
-        batch.schema(),
+        schema,
         columns,
         &arrow_array::RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
     )
@@ -400,26 +366,26 @@ pub(crate) fn mask_batch(
 /// Execute one expression on complete input fields. Both filters and masks use
 /// this path, so width, NULL and calendar semantics cannot drift between them.
 pub(super) fn evaluate_transform(
-    transform: &Transform,
+    transform: &AuthTransform,
     rows: usize,
     input: &dyn Fn(usize) -> Result<ArrayRef>,
     null_type: &arrow_schema::DataType,
 ) -> Result<ArrayRef> {
-    match transform {
+    if let (Transform::Cast(index, _), Some(cast)) = (transform.expression(), &transform.cast) {
+        return cast.cast(&input(*index)?);
+    }
+    match transform.expression() {
         Transform::Null => Ok(arrow_array::new_null_array(null_type, rows)),
         Transform::FieldRef(index) => input(*index),
-        Transform::Cast(index, to) => {
-            let cast = cast_to(&input(*index)?, &crate::arrow::paimon_type_to_arrow(to)?)?;
-            Ok(apply_declared_width(&cast, to))
-        }
+        Transform::Cast(_, _) => unreachable!("a CAST has its original executor"),
         Transform::DateExtract(index, part) => {
             crate::arrow::evaluate_date_extract(&input(*index)?, *part)
         }
         Transform::Upper(_)
         | Transform::Lower(_)
         | Transform::Concat(_)
-        | Transform::ConcatWs(_) => string_mask(rows, transform, input),
-        _ => crate::arrow::evaluate_string_transform(transform, rows, input),
+        | Transform::ConcatWs(_) => string_mask(rows, transform.expression(), input),
+        _ => crate::arrow::evaluate_string_transform(transform.expression(), rows, input),
     }
 }
 
@@ -444,89 +410,7 @@ pub(super) fn transform_output_type(
     })
 }
 
-fn mask_can_be_null(transform: &Transform, fields: &[DataField]) -> bool {
-    let nullable = |input: &TransformInput| match input {
-        TransformInput::Literal(literal) => literal.is_none(),
-        TransformInput::Integer(value) => value.is_none(),
-        TransformInput::IntegerText(_) => false,
-        TransformInput::Field(index) => fields[*index].data_type().is_nullable(),
-    };
-    match transform {
-        Transform::Null => true,
-        Transform::FieldRef(index)
-        | Transform::Cast(index, _)
-        | Transform::DateExtract(index, _) => fields[*index].data_type().is_nullable(),
-        // Only a null separator makes CONCAT_WS null.
-        Transform::ConcatWs(inputs) => inputs.first().is_some_and(nullable),
-        _ => transform.inputs().iter().any(nullable),
-    }
-}
-
-/// `None` lets a NULL mask adopt the target's type.
-fn mask_output_type(transform: &Transform, fields: &[DataField]) -> Option<arrow_schema::DataType> {
-    if matches!(transform, Transform::Null) {
-        None
-    } else {
-        transform_output_type(transform, fields)
-            .and_then(|t| crate::arrow::paimon_type_to_arrow(&t))
-            .ok()
-    }
-}
-
 /// Match Java's truncation and fixed-width padding.
-fn apply_declared_width(array: &ArrayRef, to: &crate::spec::DataType) -> ArrayRef {
-    use crate::spec::DataType as Paimon;
-    match to {
-        Paimon::VarChar(t) => fit_strings(array, t.length() as usize, false),
-        Paimon::Char(t) => fit_strings(array, t.length(), true),
-        Paimon::VarBinary(t) => fit_bytes(array, t.length() as usize, false),
-        Paimon::Binary(t) => fit_bytes(array, t.length(), true),
-        _ => Arc::clone(array),
-    }
-}
-
-/// Counts characters, as Java does.
-fn fit_strings(array: &ArrayRef, length: usize, pad: bool) -> ArrayRef {
-    let Some(strings) = array.as_any().downcast_ref::<arrow_array::StringArray>() else {
-        return Arc::clone(array);
-    };
-    let fitted: arrow_array::StringArray = strings
-        .iter()
-        .map(|value| {
-            value.map(|value| {
-                let chars = value.chars().count();
-                if chars > length {
-                    value.chars().take(length).collect::<String>()
-                } else if pad && chars < length {
-                    format!("{value}{}", " ".repeat(length - chars))
-                } else {
-                    value.to_string()
-                }
-            })
-        })
-        .collect();
-    Arc::new(fitted)
-}
-
-fn fit_bytes(array: &ArrayRef, length: usize, pad: bool) -> ArrayRef {
-    let Some(bytes) = array.as_any().downcast_ref::<arrow_array::BinaryArray>() else {
-        return Arc::clone(array);
-    };
-    let fitted: arrow_array::BinaryArray = bytes
-        .iter()
-        .map(|value| {
-            value.map(|value| {
-                let mut value = value.to_vec();
-                if value.len() > length || pad {
-                    value.resize(length, 0);
-                }
-                value
-            })
-        })
-        .collect();
-    Arc::new(fitted)
-}
-
 /// Fail on invalid casts, as Java does.
 fn cast_to(array: &ArrayRef, to: &arrow_schema::DataType) -> Result<ArrayRef> {
     if array.data_type() == to {
@@ -720,19 +604,40 @@ mod tests {
     }
 
     #[test]
-    fn calendar_mask_types_nullability_and_cross_mask_reads_fail_closed() {
+    fn calendar_masks_preserve_types_and_cross_mask_guards_but_allow_nulls() {
         let mut fields = vec![
             field(0, "n", DataType::Int(IntType::new())),
             field(1, "d", DataType::Date(DateType::new())),
             field(2, "text", string()),
         ];
         let mask = r#"{"name":"YEAR","fieldRef":{"name":"d","index":99,"type":"DATE NOT NULL"}}"#;
-        assert!(refusal(parse(&[], &[("text", mask)], &fields)).contains("produces"));
+        let rules = parse(&[], &[("text", mask)], &fields).unwrap();
+        let rows = batch(
+            &fields,
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(Date32Array::from(vec![0])),
+                Arc::new(StringArray::from(vec!["raw"])),
+            ],
+        );
+        assert!(mask_batch(&rows, &rules.masks, &fields, &fields).is_err());
+        let null_rows = batch(
+            &fields,
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(Date32Array::from(vec![None::<i32>])),
+                Arc::new(StringArray::from(vec!["raw"])),
+            ],
+        );
+        assert!(mask_batch(&null_rows, &rules.masks, &fields, &fields)
+            .unwrap()
+            .column(2)
+            .is_null(0));
         assert!(refusal(parse(&[], &[("n", mask), ("d", NULL)], &fields))
             .contains("reads 'd', which is masked too"));
         // Nullability comes from the actual schema, not the stale rule metadata.
         fields[0] = field(0, "n", DataType::Int(IntType::with_nullable(false)));
-        assert!(refusal(parse(&[], &[("n", mask)], &fields)).contains("can produce null"));
+        assert!(parse(&[], &[("n", mask)], &fields).is_ok());
         fields[1] = field(1, "d", DataType::Date(DateType::with_nullable(false)));
         assert!(parse(&[], &[("n", mask)], &fields).is_ok());
     }
@@ -842,9 +747,18 @@ mod tests {
     }
 
     fn cast(field: &str, to: &str) -> String {
+        let from = match field {
+            "id" => "INT",
+            "n" => "BIGINT",
+            "bin" => "BYTES",
+            "b" => "VARBINARY(10)",
+            "d" => "DOUBLE",
+            "ts" => "TIMESTAMP(3)",
+            "i" => "INT",
+            _ => "STRING",
+        };
         format!(
-            r#"{{"name":"CAST","fieldRef":{},"type":"{to}"}}"#,
-            input(field)
+            r#"{{"name":"CAST","fieldRef":{{"index":0,"name":"{field}","type":"{from}"}},"type":"{to}"}}"#
         )
     }
 
@@ -918,11 +832,14 @@ mod tests {
             vec![
                 ColumnMask {
                     column: 0,
-                    transform: Transform::Null
+                    transform: AuthTransform::from_expression(Transform::Null, &fields)
                 },
                 ColumnMask {
                     column: 1,
-                    transform: Transform::Upper(vec![TransformInput::Field(1)])
+                    transform: AuthTransform::from_expression(
+                        Transform::Upper(vec![TransformInput::Field(1)]),
+                        &fields
+                    )
                 },
             ]
         );
@@ -1007,7 +924,7 @@ mod tests {
     }
 
     #[test]
-    fn test_a_mask_must_keep_the_column_type() {
+    fn mask_output_class_is_checked_only_on_non_null_values() {
         let fields = rule_fields();
         for (column, mask) in [
             ("id", string_transform("UPPER", &[&input("name")])),
@@ -1017,8 +934,16 @@ mod tests {
             ("id", cast("id", "BIGINT")),
             ("name", cast("name", "BINARY(3)")),
         ] {
-            let message = refusal(parse(&[], &[(column, &mask)], &fields));
-            assert!(message.contains("produces"), "{mask}: {message}");
+            let rules = parse(&[], &[(column, &mask)], &fields).unwrap();
+            assert!(
+                mask_batch(&mask_rows(), &rules.masks, &fields, &fields).is_err(),
+                "{mask}"
+            );
+            let empty = mask_rows().slice(0, 0);
+            assert!(
+                mask_batch(&empty, &rules.masks, &fields, &fields).is_ok(),
+                "{mask}"
+            );
         }
         for (column, mask) in [
             ("id", NULL.to_string()),
@@ -1030,27 +955,94 @@ mod tests {
     }
 
     #[test]
-    fn test_a_not_null_column_takes_only_a_mask_that_cannot_be_null() {
+    fn cast_masks_preserve_original_executor_and_ignore_nullable_only_rebinding() {
+        let mut fields = vec![
+            field(0, "v", DataType::Int(IntType::new())),
+            field(1, "masked", string()),
+        ];
+        let mask =
+            r#"{"name":"CAST","fieldRef":{"name":"v","type":"INT NOT NULL"},"type":"STRING"}"#;
+        assert!(parse(&[], &[("masked", mask)], &fields).is_ok());
+        fields[0] = field(0, "v", DataType::BigInt(crate::spec::BigIntType::new()));
+        assert!(parse(&[], &[("masked", mask)], &fields).is_ok());
+    }
+
+    #[test]
+    fn identity_decimal_mask_preserves_not_null_source() {
+        let decimal =
+            DataType::Decimal(crate::spec::DecimalType::with_nullable(false, 4, 2).unwrap());
+        let fields = vec![field(0, "v", decimal)];
+        let mask = r#"{"name":"CAST","fieldRef":{"name":"v","type":"DECIMAL(4,2)"},"type":"DECIMAL(4,2)"}"#;
+        let rules = parse(&[], &[("v", mask)], &fields).unwrap();
+        let rows = batch(
+            &fields,
+            vec![Arc::new(
+                Decimal128Array::from(vec![101, -9999, 0])
+                    .with_precision_and_scale(4, 2)
+                    .unwrap(),
+            )],
+        );
+        let masked = mask_batch(&rows, &rules.masks, &fields, &fields).unwrap();
+        assert_eq!(masked.column(0).to_data(), rows.column(0).to_data());
+        assert!(masked.schema().field(0).is_nullable());
+        assert!(!rows.schema().field(0).is_nullable());
+    }
+
+    #[test]
+    fn decimal_masks_allow_precision_overflow_on_not_null_target() {
+        let fields = vec![
+            field(0, "v", DataType::Int(IntType::with_nullable(false))),
+            field(
+                1,
+                "masked",
+                DataType::Decimal(crate::spec::DecimalType::with_nullable(false, 4, 2).unwrap()),
+            ),
+        ];
+        let mask = r#"{"name":"CAST","fieldRef":{"name":"v","type":"INT"},"type":"DECIMAL(4,2)"}"#;
+        let rules = parse(&[], &[("masked", mask)], &fields).unwrap();
+        let rows = batch(
+            &fields,
+            vec![
+                Arc::new(Int32Array::from(vec![1000, 99])),
+                Arc::new(
+                    Decimal128Array::from(vec![0, 0])
+                        .with_precision_and_scale(4, 2)
+                        .unwrap(),
+                ),
+            ],
+        );
+        let masked = mask_batch(&rows, &rules.masks, &fields, &fields).unwrap();
+        assert!(masked.schema().field(1).is_nullable());
+        assert!(!rows.schema().field(1).is_nullable());
+        assert_eq!(
+            masked
+                .column(1)
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![None, Some(9900)]
+        );
+    }
+
+    #[test]
+    fn test_a_not_null_column_accepts_nullable_masks_like_java() {
         let fields = rule_fields();
         let (name, nn) = (input("name"), input("nn"));
-        for (mask, fits) in [
-            (NULL.to_string(), false),
-            (field_ref("name"), false),
-            (field_ref("nn"), true),
-            (cast("name", "STRING"), false),
-            (cast("nn", "VARCHAR(3)"), true),
-            (string_transform("UPPER", &[&nn]), true),
-            (string_transform("CONCAT", &[&nn, "null"]), false),
-            (string_transform("CONCAT_WS", &["null", &nn]), false),
-            // Only the separator can make CONCAT_WS null.
-            (string_transform("CONCAT_WS", &[r#""-""#, &nn, &name]), true),
+        for mask in [
+            NULL.to_string(),
+            field_ref("name"),
+            field_ref("nn"),
+            cast("name", "STRING"),
+            cast("nn", "VARCHAR(3)"),
+            string_transform("UPPER", &[&nn]),
+            string_transform("CONCAT", &[&nn, "null"]),
+            string_transform("CONCAT_WS", &["null", &nn]),
+            string_transform("CONCAT_WS", &[r#""-""#, &nn, &name]),
         ] {
             let parsed = parse(&[], &[("nn", &mask)], &fields);
-            if fits {
-                assert!(parsed.is_ok(), "{mask}: {parsed:?}");
-            } else {
-                assert!(refusal(parsed).contains("can produce null"), "{mask}");
-            }
+            assert!(parsed.is_ok(), "{mask}: {parsed:?}");
         }
     }
 
@@ -1470,7 +1462,7 @@ mod tests {
     }
 
     #[test]
-    fn test_a_cast_java_converts_differently_is_refused() {
+    fn test_casts_use_the_existing_python_java_subset() {
         let fields = vec![
             field(0, "n", DataType::BigInt(crate::spec::BigIntType::new())),
             field(
@@ -1484,17 +1476,21 @@ mod tests {
             field(5, "i", DataType::Int(IntType::new())),
         ];
         for (target, mask) in [
+            ("ts", cast("i", "TIMESTAMP(3)")),
+            ("d", cast("b", "DOUBLE")),
+        ] {
+            let message = refusal(parse(&[], &[(target, &mask)], &fields));
+            assert!(
+                message.contains("existing Python/Java scalar"),
+                "{mask}: {message}"
+            );
+        }
+        for (target, mask) in [
+            ("n", cast("s", "BIGINT")),
             ("ts", cast("n", "TIMESTAMP(3)")),
             ("s", cast("d", "VARCHAR(10)")),
             ("s", cast("b", "VARCHAR(10)")),
-            // Java trims the string first.
-            ("n", cast("s", "BIGINT")),
             ("i", cast("n", "INT")),
-        ] {
-            let message = refusal(parse(&[], &[(target, &mask)], &fields));
-            assert!(message.contains("as Java does"), "{mask}: {message}");
-        }
-        for (target, mask) in [
             ("s", cast("n", "VARCHAR(10)")),
             ("b", cast("s", "VARBINARY(10)")),
             ("ts", cast("ts", "TIMESTAMP(3)")),
@@ -1693,11 +1689,11 @@ mod tests {
         let masks = [
             ColumnMask {
                 column: 0,
-                transform: Transform::Null,
+                transform: AuthTransform::from_expression(Transform::Null, &fields),
             },
             ColumnMask {
                 column: 1,
-                transform: Transform::Cast(0, string()),
+                transform: AuthTransform::from_expression(Transform::Cast(0, string()), &fields),
             },
         ];
         let out = mask_batch(&mask_rows(), &masks, &fields, &fields).unwrap();

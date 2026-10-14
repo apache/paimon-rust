@@ -204,8 +204,7 @@ pub(crate) fn evolve_column(
         _ => {}
     }
 
-    if let Some(result) = super::evolution_decimal::cast_decimal(source, source_type, target_type)?
-    {
+    if let Some(result) = super::cast_numeric(source, source_type, target_type)? {
         return Ok(result);
     }
 
@@ -240,21 +239,6 @@ pub(crate) fn evolve_column(
         );
     }
 
-    if matches!(
-        target_type,
-        DataType::TinyInt(_) | DataType::SmallInt(_) | DataType::Int(_) | DataType::BigInt(_)
-    ) && matches!(
-        source_type,
-        DataType::TinyInt(_)
-            | DataType::SmallInt(_)
-            | DataType::Int(_)
-            | DataType::BigInt(_)
-            | DataType::Float(_)
-            | DataType::Double(_)
-            | DataType::Decimal(_)
-    ) {
-        return super::evolution_cast::numeric_to_integer(source, &target_arrow);
-    }
     if let Some(result) =
         super::evolution_cast::timestamp_precision(source, source_type, target_type, &target_arrow)?
     {

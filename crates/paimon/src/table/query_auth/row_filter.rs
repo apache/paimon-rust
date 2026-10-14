@@ -18,9 +18,9 @@
 //! REST row predicates evaluated on transform outputs, as Java LeafPredicate does.
 
 use super::rules::{
-    canonicalize_nan, check_transform_cast, column_of, evaluate_transform, rule_mask,
-    transform_output_type,
+    canonicalize_nan, column_of, evaluate_transform, rule_mask, transform_output_type,
 };
+use super::transform::AuthTransform;
 use super::unsupported;
 use crate::spec::{DataField, DataType, Predicate, Transform};
 use crate::Result;
@@ -33,7 +33,7 @@ pub(crate) enum RowFilter {
     Predicate(Predicate),
     /// The predicate compares the transform's result, not its source column.
     Transformed {
-        transform: Transform,
+        transform: AuthTransform,
         predicate: Predicate,
         data_type: DataType,
     },
@@ -77,8 +77,9 @@ impl RowFilter {
                 }
             }
             Some("LEAF") => {
-                let transform = Transform::from_rest_json(&value["transform"].to_string(), fields)?;
-                let data_type = transform_output_type(&transform, fields)?;
+                let transform =
+                    AuthTransform::from_rest_json(&value["transform"].to_string(), fields)?;
+                let data_type = transform_output_type(transform.expression(), fields)?;
                 if matches!(data_type, DataType::Binary(_) | DataType::VarBinary(_))
                     && value["literals"]
                         .as_array()
@@ -88,26 +89,11 @@ impl RowFilter {
                         "Java predicates do not support non-null binary literals",
                     ));
                 }
-                if matches!(transform, Transform::FieldRef(_))
+                if matches!(transform.expression(), Transform::FieldRef(_))
                     && !matches!(value["function"].as_str(), Some("TRUE" | "FALSE"))
                 {
                     return Predicate::from_rest_json(&value.to_string(), fields)
                         .map(Self::Predicate);
-                }
-                check_transform_cast(&transform, fields)?;
-                if let Transform::Cast(index, _) = &transform {
-                    // Java preserves the original cast executor when rebinding.
-                    // Do not silently choose a different cast for an evolved input.
-                    let stored: DataType =
-                        serde_json::from_value(value["transform"]["fieldRef"]["type"].clone())
-                            .map_err(|e| unsupported(&format!("invalid CAST source type: {e}")))?;
-                    if stored.copy_with_nullable(true)?
-                        != fields[*index].data_type().copy_with_nullable(true)?
-                    {
-                        return Err(unsupported(
-                            "CAST with a rebound source type requires its original Java executor",
-                        ));
-                    }
                 }
 
                 let output = vec![DataField::new(0, "value".into(), data_type.clone())];
@@ -467,6 +453,18 @@ mod tests {
     }
 
     #[test]
+    fn numeric_cast_filters_use_java_narrowing() {
+        assert_eq!(
+            kept(leaf(
+                json!({"name":"CAST","fieldRef":input("p","BIGINT"),"type":"TINYINT"}),
+                "EQUAL",
+                json!([2])
+            )),
+            vec![0]
+        );
+    }
+
+    #[test]
     fn calendar_outputs_are_ints_and_keep_all_source_dependencies() {
         let rule = leaf(
             json!({"name":"YEAR_OF_WEEK","fieldRef":input("d","DATE")}),
@@ -612,9 +610,29 @@ mod tests {
             "TRUE",
             json!([]),
         );
-        assert!(RowFilter::parse(&rebound.to_string(), &fields)
-            .unwrap_err()
-            .to_string()
-            .contains("rebound source"));
+        let filter = RowFilter::parse(&rebound.to_string(), &fields).unwrap();
+        assert!(filter.evaluate(&rows(), &fields, &fields).is_err());
+        let nullable = RecordBatch::try_from_iter(vec![(
+            "s",
+            Arc::new(StringArray::from(vec![None::<&str>])) as ArrayRef,
+        )])
+        .unwrap();
+        assert_eq!(
+            filter
+                .evaluate(&nullable, &fields, &fields[1..2])
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![Some(true)]
+        );
+        let guarded = json!({"kind":"COMPOUND","function":"AND","children":[
+            leaf(json!({"name":"NULL"}),"FALSE",json!([])),rebound
+        ]});
+        let filter = RowFilter::parse(&guarded.to_string(), &fields).unwrap();
+        assert!(filter
+            .evaluate(&rows(), &fields, &fields)
+            .unwrap()
+            .iter()
+            .all(|v| v == Some(false)));
     }
 }
