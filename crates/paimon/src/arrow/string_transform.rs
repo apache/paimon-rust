@@ -287,12 +287,6 @@ fn invalid(message: &str) -> crate::Error {
 /// Integer.parseInt uses Character.digit on UTF-16 chars: decimal digits in
 /// BMP scripts are accepted, supplementary digits and whitespace are rejected.
 fn parse_integer(text: &str) -> Result<i32> {
-    const ZEROES: &[u32] = &[
-        0x0030, 0x0660, 0x06f0, 0x07c0, 0x0966, 0x09e6, 0x0a66, 0x0ae6, 0x0b66, 0x0be6, 0x0c66,
-        0x0ce6, 0x0d66, 0x0de6, 0x0e50, 0x0ed0, 0x0f20, 0x1040, 0x1090, 0x17e0, 0x1810, 0x1946,
-        0x19d0, 0x1a80, 0x1a90, 0x1b50, 0x1bb0, 0x1c40, 0x1c50, 0xa620, 0xa8d0, 0xa900, 0xa9d0,
-        0xa9f0, 0xaa50, 0xabf0, 0xff10,
-    ];
     let (negative, digits) = match text.strip_prefix('-') {
         Some(digits) => (true, digits),
         None => (false, text.strip_prefix('+').unwrap_or(text)),
@@ -303,12 +297,8 @@ fn parse_integer(text: &str) -> Result<i32> {
     // Accumulate negatively, so i32::MIN remains representable.
     let mut value = 0i32;
     for ch in digits.chars() {
-        let digit = ZEROES
-            .iter()
-            .find_map(|zero| {
-                (u32::from(ch) >= *zero && u32::from(ch) < zero + 10)
-                    .then(|| (u32::from(ch) - zero) as i32)
-            })
+        let digit = crate::common::number::java_decimal_digit(ch)
+            .map(i32::from)
             .ok_or_else(|| invalid("invalid Java integer position"))?;
         value = value
             .checked_mul(10)

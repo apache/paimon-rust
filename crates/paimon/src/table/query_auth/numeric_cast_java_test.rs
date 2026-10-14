@@ -1,0 +1,278 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+//! Golden CAST vectors from Java CastExecutors / PredicateRemapper.
+//! Generated against Paimon master 8de6fdbda9 with Java 17; Double decimal
+//! text was also verified on Java 8. No NaN or signed-zero cases are included.
+
+use super::row_filter::RowFilter;
+use super::rules::{check_cast_source, check_transform_cast, evaluate_transform};
+use crate::arrow::paimon_type_to_arrow;
+use crate::spec::{DataField, DataType, Transform};
+use arrow_array::{
+    cast::AsArray, types::*, Array, ArrayRef, BooleanArray, Decimal128Array, Float32Array,
+    Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, StringArray,
+};
+use serde_json::{json, Value};
+use std::sync::Arc;
+
+const JAVA_CASES: &str = r##"{"name":"BIGINT_to_TINYINT","fields":[{"name":"v","type":"BIGINT"}],"rows":[[-9223372036854775808],[9223372036854775807],[128],[255],[256],[-129],[-257],[32768],[65535],[65536],[2147483648],[4294967296],[4294967297],[9007199791611905],[null]],"transform":{"name":"CAST","fieldRef":{"index":99,"name":"v","type":"BIGINT"},"type":"TINYINT"},"expected":{"name":"BIGINT_to_TINYINT","results":[0,-1,-128,-1,0,127,-1,0,-1,0,0,0,1,1,null]}}
+{"name":"BIGINT_to_SMALLINT","fields":[{"name":"v","type":"BIGINT"}],"rows":[[-9223372036854775808],[9223372036854775807],[128],[255],[256],[-129],[-257],[32768],[65535],[65536],[2147483648],[4294967296],[4294967297],[9007199791611905],[null]],"transform":{"name":"CAST","fieldRef":{"index":99,"name":"v","type":"BIGINT"},"type":"SMALLINT"},"expected":{"name":"BIGINT_to_SMALLINT","results":[0,-1,128,255,256,-129,-257,-32768,-1,0,0,0,1,1,null]}}
+{"name":"BIGINT_to_INT","fields":[{"name":"v","type":"BIGINT"}],"rows":[[-9223372036854775808],[9223372036854775807],[128],[255],[256],[-129],[-257],[32768],[65535],[65536],[2147483648],[4294967296],[4294967297],[9007199791611905],[null]],"transform":{"name":"CAST","fieldRef":{"index":99,"name":"v","type":"BIGINT"},"type":"INT"},"expected":{"name":"BIGINT_to_INT","results":[0,-1,128,255,256,-129,-257,32768,65535,65536,-2147483648,0,1,536870913,null]}}
+{"name":"BIGINT_to_FLOAT","fields":[{"name":"v","type":"BIGINT"}],"rows":[[-9223372036854775808],[9223372036854775807],[128],[255],[256],[-129],[-257],[32768],[65535],[65536],[2147483648],[4294967296],[4294967297],[9007199791611905],[null]],"transform":{"name":"CAST","fieldRef":{"index":99,"name":"v","type":"BIGINT"},"type":"FLOAT"},"expected":{"name":"BIGINT_to_FLOAT","results":[-9.223372036854776e+18,9.223372036854776e+18,128.0,255.0,256.0,-129.0,-257.0,32768.0,65535.0,65536.0,2147483648.0,4294967296.0,4294967296.0,9007200328482816.0,null]}}
+{"name":"BIGINT_to_DOUBLE","fields":[{"name":"v","type":"BIGINT"}],"rows":[[-9223372036854775808],[9223372036854775807],[128],[255],[256],[-129],[-257],[32768],[65535],[65536],[2147483648],[4294967296],[4294967297],[9007199791611905],[null]],"transform":{"name":"CAST","fieldRef":{"index":99,"name":"v","type":"BIGINT"},"type":"DOUBLE"},"expected":{"name":"BIGINT_to_DOUBLE","results":[-9.223372036854776e+18,9.223372036854776e+18,128.0,255.0,256.0,-129.0,-257.0,32768.0,65535.0,65536.0,2147483648.0,4294967296.0,4294967297.0,9007199791611904.0,null]}}
+{"name":"BIGINT_to_DECIMAL(5,0)","fields":[{"name":"v","type":"BIGINT"}],"rows":[[-9223372036854775808],[9223372036854775807],[128],[255],[256],[-129],[-257],[32768],[65535],[65536],[2147483648],[4294967296],[4294967297],[9007199791611905],[null]],"transform":{"name":"CAST","fieldRef":{"index":99,"name":"v","type":"BIGINT"},"type":"DECIMAL(5,0)"},"expected":{"name":"BIGINT_to_DECIMAL(5,0)","results":[null,null,"128","255","256","-129","-257","32768","65535","65536",null,null,null,null,null]}}
+{"name":"BIGINT_to_DECIMAL(4,2)","fields":[{"name":"v","type":"BIGINT"}],"rows":[[-9223372036854775808],[9223372036854775807],[128],[255],[256],[-129],[-257],[32768],[65535],[65536],[2147483648],[4294967296],[4294967297],[9007199791611905],[null]],"transform":{"name":"CAST","fieldRef":{"index":99,"name":"v","type":"BIGINT"},"type":"DECIMAL(4,2)"},"expected":{"name":"BIGINT_to_DECIMAL(4,2)","results":[null,null,null,null,null,null,null,null,null,null,null,null,null,null,null]}}
+{"name":"FLOAT_to_TINYINT","fields":[{"name":"v","type":"FLOAT"}],"rows":[[1.9],[-1.9],[127.9],[128.1],[-129.9],[2147483647.0],[2147483648.5],[4294967297.0],[1e+30],[-1e+30],[null]],"transform":{"name":"CAST","fieldRef":{"index":99,"name":"v","type":"FLOAT"},"type":"TINYINT"},"expected":{"name":"FLOAT_to_TINYINT","results":[1,-1,127,-128,127,-1,-1,-1,-1,0,null]}}
+{"name":"FLOAT_to_SMALLINT","fields":[{"name":"v","type":"FLOAT"}],"rows":[[1.9],[-1.9],[127.9],[128.1],[-129.9],[2147483647.0],[2147483648.5],[4294967297.0],[1e+30],[-1e+30],[null]],"transform":{"name":"CAST","fieldRef":{"index":99,"name":"v","type":"FLOAT"},"type":"SMALLINT"},"expected":{"name":"FLOAT_to_SMALLINT","results":[1,-1,127,128,-129,-1,-1,-1,-1,0,null]}}
+{"name":"FLOAT_to_INT","fields":[{"name":"v","type":"FLOAT"}],"rows":[[1.9],[-1.9],[127.9],[128.1],[-129.9],[2147483647.0],[2147483648.5],[4294967297.0],[1e+30],[-1e+30],[null]],"transform":{"name":"CAST","fieldRef":{"index":99,"name":"v","type":"FLOAT"},"type":"INT"},"expected":{"name":"FLOAT_to_INT","results":[1,-1,127,128,-129,2147483647,2147483647,2147483647,2147483647,-2147483648,null]}}
+{"name":"FLOAT_to_BIGINT","fields":[{"name":"v","type":"FLOAT"}],"rows":[[1.9],[-1.9],[127.9],[128.1],[-129.9],[2147483647.0],[2147483648.5],[4294967297.0],[1e+30],[-1e+30],[null]],"transform":{"name":"CAST","fieldRef":{"index":99,"name":"v","type":"FLOAT"},"type":"BIGINT"},"expected":{"name":"FLOAT_to_BIGINT","results":[1,-1,127,128,-129,2147483648,2147483648,4294967296,9223372036854775807,-9223372036854775808,null]}}
+{"name":"FLOAT_to_DECIMAL(4,2)","fields":[{"name":"v","type":"FLOAT"}],"rows":[[1.005],[-1.005],[2.675],[-2.675],[99.994],[99.995],[1e+20],[1e+23],[1e+30],[null]],"transform":{"name":"CAST","fieldRef":{"index":99,"name":"v","type":"FLOAT"},"type":"DECIMAL(4,2)"},"expected":{"name":"FLOAT_to_DECIMAL(4,2)","results":["1.00","-1.00","2.67","-2.67","99.99",null,null,null,null,null]}}
+{"name":"FLOAT_to_DECIMAL(38,0)","fields":[{"name":"v","type":"FLOAT"}],"rows":[[1.005],[-1.005],[2.675],[-2.675],[99.994],[99.995],[1e+20],[1e+23],[1e+30],[null]],"transform":{"name":"CAST","fieldRef":{"index":99,"name":"v","type":"FLOAT"},"type":"DECIMAL(38,0)"},"expected":{"name":"FLOAT_to_DECIMAL(38,0)","results":["1","-1","3","-3","100","100","100000002004087730000","99999997781963080000000","1000000015047466200000000000000",null]}}
+{"name":"FLOAT_to_DECIMAL(38,18)","fields":[{"name":"v","type":"FLOAT"}],"rows":[[1.005],[-1.005],[2.675],[-2.675],[99.994],[99.995],[1e+20],[1e+23],[1e+30],[null]],"transform":{"name":"CAST","fieldRef":{"index":99,"name":"v","type":"FLOAT"},"type":"DECIMAL(38,18)"},"expected":{"name":"FLOAT_to_DECIMAL(38,18)","results":["1.004999995231628400","-1.004999995231628400","2.674999952316284000","-2.674999952316284000","99.994003295898440000","99.995002746582030000",null,null,null,null]}}
+{"name":"DOUBLE_to_TINYINT","fields":[{"name":"v","type":"DOUBLE"}],"rows":[[1.9],[-1.9],[127.9],[128.1],[-129.9],[2147483647.0],[2147483648.5],[4294967297.0],[1e+30],[-1e+30],[null]],"transform":{"name":"CAST","fieldRef":{"index":99,"name":"v","type":"DOUBLE"},"type":"TINYINT"},"expected":{"name":"DOUBLE_to_TINYINT","results":[1,-1,127,-128,127,-1,-1,-1,-1,0,null]}}
+{"name":"DOUBLE_to_SMALLINT","fields":[{"name":"v","type":"DOUBLE"}],"rows":[[1.9],[-1.9],[127.9],[128.1],[-129.9],[2147483647.0],[2147483648.5],[4294967297.0],[1e+30],[-1e+30],[null]],"transform":{"name":"CAST","fieldRef":{"index":99,"name":"v","type":"DOUBLE"},"type":"SMALLINT"},"expected":{"name":"DOUBLE_to_SMALLINT","results":[1,-1,127,128,-129,-1,-1,-1,-1,0,null]}}
+{"name":"DOUBLE_to_INT","fields":[{"name":"v","type":"DOUBLE"}],"rows":[[1.9],[-1.9],[127.9],[128.1],[-129.9],[2147483647.0],[2147483648.5],[4294967297.0],[1e+30],[-1e+30],[null]],"transform":{"name":"CAST","fieldRef":{"index":99,"name":"v","type":"DOUBLE"},"type":"INT"},"expected":{"name":"DOUBLE_to_INT","results":[1,-1,127,128,-129,2147483647,2147483647,2147483647,2147483647,-2147483648,null]}}
+{"name":"DOUBLE_to_BIGINT","fields":[{"name":"v","type":"DOUBLE"}],"rows":[[1.9],[-1.9],[127.9],[128.1],[-129.9],[2147483647.0],[2147483648.5],[4294967297.0],[1e+30],[-1e+30],[null]],"transform":{"name":"CAST","fieldRef":{"index":99,"name":"v","type":"DOUBLE"},"type":"BIGINT"},"expected":{"name":"DOUBLE_to_BIGINT","results":[1,-1,127,128,-129,2147483647,2147483648,4294967297,9223372036854775807,-9223372036854775808,null]}}
+{"name":"DOUBLE_to_DECIMAL(4,2)","fields":[{"name":"v","type":"DOUBLE"}],"rows":[[1.005],[-1.005],[2.675],[-2.675],[99.994],[99.995],[1e+20],[1e+23],[1e+30],[null]],"transform":{"name":"CAST","fieldRef":{"index":99,"name":"v","type":"DOUBLE"},"type":"DECIMAL(4,2)"},"expected":{"name":"DOUBLE_to_DECIMAL(4,2)","results":["1.01","-1.01","2.68","-2.68","99.99",null,null,null,null,null]}}
+{"name":"DOUBLE_to_DECIMAL(38,0)","fields":[{"name":"v","type":"DOUBLE"}],"rows":[[1.005],[-1.005],[2.675],[-2.675],[99.994],[99.995],[1e+20],[1e+23],[1e+30],[null]],"transform":{"name":"CAST","fieldRef":{"index":99,"name":"v","type":"DOUBLE"},"type":"DECIMAL(38,0)"},"expected":{"name":"DOUBLE_to_DECIMAL(38,0)","results":["1","-1","3","-3","100","100","100000000000000000000","99999999999999990000000","1000000000000000000000000000000",null]}}
+{"name":"DOUBLE_to_DECIMAL(38,18)","fields":[{"name":"v","type":"DOUBLE"}],"rows":[[1.005],[-1.005],[2.675],[-2.675],[99.994],[99.995],[1e+20],[1e+23],[1e+30],[null]],"transform":{"name":"CAST","fieldRef":{"index":99,"name":"v","type":"DOUBLE"},"type":"DECIMAL(38,18)"},"expected":{"name":"DOUBLE_to_DECIMAL(38,18)","results":["1.005000000000000000","-1.005000000000000000","2.675000000000000000","-2.675000000000000000","99.994000000000000000","99.995000000000000000",null,null,null,null]}}
+{"name":"INT_to_DOUBLE","fields":[{"name":"v","type":"INT"}],"rows":[[-2147483648],[2147483647],[1],[null]],"transform":{"name":"CAST","fieldRef":{"index":99,"name":"v","type":"INT"},"type":"DOUBLE"},"expected":{"name":"INT_to_DOUBLE","results":[-2147483648.0,2147483647.0,1.0,null]}}
+{"name":"INT_to_FLOAT","fields":[{"name":"v","type":"INT"}],"rows":[[-2147483648],[2147483647],[16777217],[null]],"transform":{"name":"CAST","fieldRef":{"index":99,"name":"v","type":"INT"},"type":"FLOAT"},"expected":{"name":"INT_to_FLOAT","results":[-2147483648.0,2147483648.0,16777216.0,null]}}
+{"name":"BOOLEAN_to_TINYINT","fields":[{"name":"v","type":"BOOLEAN"}],"rows":[[true],[false],[null]],"transform":{"name":"CAST","fieldRef":{"index":99,"name":"v","type":"BOOLEAN"},"type":"TINYINT"},"expected":{"name":"BOOLEAN_to_TINYINT","results":[1,0,null]}}
+{"name":"BOOLEAN_to_INT","fields":[{"name":"v","type":"BOOLEAN"}],"rows":[[true],[false],[null]],"transform":{"name":"CAST","fieldRef":{"index":99,"name":"v","type":"BOOLEAN"},"type":"INT"},"expected":{"name":"BOOLEAN_to_INT","results":[1,0,null]}}
+{"name":"BOOLEAN_to_BIGINT","fields":[{"name":"v","type":"BOOLEAN"}],"rows":[[true],[false],[null]],"transform":{"name":"CAST","fieldRef":{"index":99,"name":"v","type":"BOOLEAN"},"type":"BIGINT"},"expected":{"name":"BOOLEAN_to_BIGINT","results":[1,0,null]}}
+{"name":"BOOLEAN_to_FLOAT","fields":[{"name":"v","type":"BOOLEAN"}],"rows":[[true],[false],[null]],"transform":{"name":"CAST","fieldRef":{"index":99,"name":"v","type":"BOOLEAN"},"type":"FLOAT"},"expected":{"name":"BOOLEAN_to_FLOAT","results":[1.0,0.0,null]}}
+{"name":"BOOLEAN_to_DOUBLE","fields":[{"name":"v","type":"BOOLEAN"}],"rows":[[true],[false],[null]],"transform":{"name":"CAST","fieldRef":{"index":99,"name":"v","type":"BOOLEAN"},"type":"DOUBLE"},"expected":{"name":"BOOLEAN_to_DOUBLE","results":[1.0,0.0,null]}}
+{"name":"STRING_to_TINYINT","fields":[{"name":"v","type":"STRING"}],"rows":[[""],["+"],["-"],["."],[".5"],["1."],["1.99"],["+1.99"],["-1.99"],[" 1"],["1 "],["1e3"],["1.2.3"],["1.a"],["１"],["٢"],["1_0"],["0x10"],["128"],["-129"],["32768"],["-32769"],["2147483648"],["-2147483649"],["9223372036854775808"],["-9223372036854775809"],["2147483647.99"],["-2147483648.99"],["9223372036854775807.99"],["-9223372036854775808.99"],[null]],"transform":{"name":"CAST","fieldRef":{"index":99,"name":"v","type":"STRING"},"type":"TINYINT"},"expected":{"name":"STRING_to_TINYINT","results":[{"error":"NumberFormatException"},{"error":"NumberFormatException"},{"error":"NumberFormatException"},0,0,1,1,1,-1,{"error":"NumberFormatException"},{"error":"NumberFormatException"},{"error":"NumberFormatException"},{"error":"NumberFormatException"},{"error":"NumberFormatException"},{"error":"NumberFormatException"},{"error":"NumberFormatException"},{"error":"NumberFormatException"},{"error":"NumberFormatException"},{"error":"NumberFormatException"},{"error":"NumberFormatException"},{"error":"NumberFormatException"},{"error":"NumberFormatException"},{"error":"NumberFormatException"},{"error":"NumberFormatException"},{"error":"NumberFormatException"},{"error":"NumberFormatException"},{"error":"NumberFormatException"},{"error":"NumberFormatException"},{"error":"NumberFormatException"},{"error":"NumberFormatException"},null]}}
+{"name":"STRING_to_SMALLINT","fields":[{"name":"v","type":"STRING"}],"rows":[[""],["+"],["-"],["."],[".5"],["1."],["1.99"],["+1.99"],["-1.99"],[" 1"],["1 "],["1e3"],["1.2.3"],["1.a"],["１"],["٢"],["1_0"],["0x10"],["128"],["-129"],["32768"],["-32769"],["2147483648"],["-2147483649"],["9223372036854775808"],["-9223372036854775809"],["2147483647.99"],["-2147483648.99"],["9223372036854775807.99"],["-9223372036854775808.99"],[null]],"transform":{"name":"CAST","fieldRef":{"index":99,"name":"v","type":"STRING"},"type":"SMALLINT"},"expected":{"name":"STRING_to_SMALLINT","results":[{"error":"NumberFormatException"},{"error":"NumberFormatException"},{"error":"NumberFormatException"},0,0,1,1,1,-1,{"error":"NumberFormatException"},{"error":"NumberFormatException"},{"error":"NumberFormatException"},{"error":"NumberFormatException"},{"error":"NumberFormatException"},{"error":"NumberFormatException"},{"error":"NumberFormatException"},{"error":"NumberFormatException"},{"error":"NumberFormatException"},128,-129,{"error":"NumberFormatException"},{"error":"NumberFormatException"},{"error":"NumberFormatException"},{"error":"NumberFormatException"},{"error":"NumberFormatException"},{"error":"NumberFormatException"},{"error":"NumberFormatException"},{"error":"NumberFormatException"},{"error":"NumberFormatException"},{"error":"NumberFormatException"},null]}}
+{"name":"STRING_to_INT","fields":[{"name":"v","type":"STRING"}],"rows":[[""],["+"],["-"],["."],[".5"],["1."],["1.99"],["+1.99"],["-1.99"],[" 1"],["1 "],["1e3"],["1.2.3"],["1.a"],["１"],["٢"],["1_0"],["0x10"],["128"],["-129"],["32768"],["-32769"],["2147483648"],["-2147483649"],["9223372036854775808"],["-9223372036854775809"],["2147483647.99"],["-2147483648.99"],["9223372036854775807.99"],["-9223372036854775808.99"],[null]],"transform":{"name":"CAST","fieldRef":{"index":99,"name":"v","type":"STRING"},"type":"INT"},"expected":{"name":"STRING_to_INT","results":[{"error":"NumberFormatException"},{"error":"NumberFormatException"},{"error":"NumberFormatException"},0,0,1,1,1,-1,{"error":"NumberFormatException"},{"error":"NumberFormatException"},{"error":"NumberFormatException"},{"error":"NumberFormatException"},{"error":"NumberFormatException"},{"error":"NumberFormatException"},{"error":"NumberFormatException"},{"error":"NumberFormatException"},{"error":"NumberFormatException"},128,-129,32768,-32769,{"error":"NumberFormatException"},{"error":"NumberFormatException"},{"error":"NumberFormatException"},{"error":"NumberFormatException"},2147483647,-2147483648,{"error":"NumberFormatException"},{"error":"NumberFormatException"},null]}}
+{"name":"STRING_to_BIGINT","fields":[{"name":"v","type":"STRING"}],"rows":[[""],["+"],["-"],["."],[".5"],["1."],["1.99"],["+1.99"],["-1.99"],[" 1"],["1 "],["1e3"],["1.2.3"],["1.a"],["１"],["٢"],["1_0"],["0x10"],["128"],["-129"],["32768"],["-32769"],["2147483648"],["-2147483649"],["9223372036854775808"],["-9223372036854775809"],["2147483647.99"],["-2147483648.99"],["9223372036854775807.99"],["-9223372036854775808.99"],[null]],"transform":{"name":"CAST","fieldRef":{"index":99,"name":"v","type":"STRING"},"type":"BIGINT"},"expected":{"name":"STRING_to_BIGINT","results":[{"error":"NumberFormatException"},{"error":"NumberFormatException"},{"error":"NumberFormatException"},0,0,1,1,1,-1,{"error":"NumberFormatException"},{"error":"NumberFormatException"},{"error":"NumberFormatException"},{"error":"NumberFormatException"},{"error":"NumberFormatException"},{"error":"NumberFormatException"},{"error":"NumberFormatException"},{"error":"NumberFormatException"},{"error":"NumberFormatException"},128,-129,32768,-32769,2147483648,-2147483649,{"error":"NumberFormatException"},{"error":"NumberFormatException"},2147483647,-2147483648,9223372036854775807,-9223372036854775808,null]}}
+{"name":"STRING_to_BOOLEAN","fields":[{"name":"v","type":"STRING"}],"rows":[["t"],["TRUE"],["TrUe"],["y"],["YeS"],["1"],["f"],["FALSE"],["FaLsE"],["n"],["No"],["0"],[" true"],["true "],["\ttrue"],["on"],["off"],["2"],[""],["1.0"],[null]],"transform":{"name":"CAST","fieldRef":{"index":99,"name":"v","type":"STRING"},"type":"BOOLEAN"},"expected":{"name":"STRING_to_BOOLEAN","results":[true,true,true,true,true,true,false,false,false,false,false,false,{"error":"RuntimeException"},{"error":"RuntimeException"},{"error":"RuntimeException"},{"error":"RuntimeException"},{"error":"RuntimeException"},{"error":"RuntimeException"},{"error":"RuntimeException"},{"error":"RuntimeException"},null]}}
+{"name":"STRING_to_DECIMAL(4,2)","fields":[{"name":"v","type":"STRING"}],"rows":[["1.005"],["-1.005"],["99.994"],["99.995"],["9999"],["1e3"],["1E+3"],["1E-3"],[".5"],["1."],["+1.005"],["1_0"],[" 1.005"],["1.005 "],["１２.３４"],["١٢.٣٤"],["bad"],[""],[null]],"transform":{"name":"CAST","fieldRef":{"index":99,"name":"v","type":"STRING"},"type":"DECIMAL(4,2)"},"expected":{"name":"STRING_to_DECIMAL(4,2)","results":["1.01","-1.01","99.99",null,null,null,null,"0.00","0.50","1.00","1.01",{"error":"NumberFormatException"},{"error":"NumberFormatException"},{"error":"NumberFormatException"},"12.34","12.34",{"error":"NumberFormatException"},{"error":"NumberFormatException"},null]}}
+{"name":"STRING_to_DECIMAL(38,0)","fields":[{"name":"v","type":"STRING"}],"rows":[["1.005"],["-1.005"],["99.994"],["99.995"],["9999"],["1e3"],["1E+3"],["1E-3"],[".5"],["1."],["+1.005"],["1_0"],[" 1.005"],["1.005 "],["１２.３４"],["١٢.٣٤"],["bad"],[""],[null]],"transform":{"name":"CAST","fieldRef":{"index":99,"name":"v","type":"STRING"},"type":"DECIMAL(38,0)"},"expected":{"name":"STRING_to_DECIMAL(38,0)","results":["1","-1","100","100","9999","1000","1000","0","1","1","1",{"error":"NumberFormatException"},{"error":"NumberFormatException"},{"error":"NumberFormatException"},"12","12",{"error":"NumberFormatException"},{"error":"NumberFormatException"},null]}}
+{"name":"STRING_to_DECIMAL(38,18)","fields":[{"name":"v","type":"STRING"}],"rows":[["1.005"],["-1.005"],["99.994"],["99.995"],["9999"],["1e3"],["1E+3"],["1E-3"],[".5"],["1."],["+1.005"],["1_0"],[" 1.005"],["1.005 "],["１２.３４"],["١٢.٣٤"],["bad"],[""],[null]],"transform":{"name":"CAST","fieldRef":{"index":99,"name":"v","type":"STRING"},"type":"DECIMAL(38,18)"},"expected":{"name":"STRING_to_DECIMAL(38,18)","results":["1.005000000000000000","-1.005000000000000000","99.994000000000000000","99.995000000000000000","9999.000000000000000000","1000.000000000000000000","1000.000000000000000000","0.001000000000000000","0.500000000000000000","1.000000000000000000","1.005000000000000000",{"error":"NumberFormatException"},{"error":"NumberFormatException"},{"error":"NumberFormatException"},"12.340000000000000000","12.340000000000000000",{"error":"NumberFormatException"},{"error":"NumberFormatException"},null]}}
+{"name":"DECIMAL(38,3)_to_TINYINT","fields":[{"name":"v","type":"DECIMAL(38,3)"}],"rows":[["1.999"],["-1.999"],["127.999"],["128.999"],["32768.999"],["2147483648.999"],["9223372036854775808.999"],["18446744073709551617.999"],["99999999999999999999999999999999999.999"],[null]],"transform":{"name":"CAST","fieldRef":{"index":99,"name":"v","type":"DECIMAL(38,3)"},"type":"TINYINT"},"expected":{"name":"DECIMAL(38,3)_to_TINYINT","results":[1,-1,127,-128,0,0,0,1,-1,null]}}
+{"name":"DECIMAL(38,3)_to_SMALLINT","fields":[{"name":"v","type":"DECIMAL(38,3)"}],"rows":[["1.999"],["-1.999"],["127.999"],["128.999"],["32768.999"],["2147483648.999"],["9223372036854775808.999"],["18446744073709551617.999"],["99999999999999999999999999999999999.999"],[null]],"transform":{"name":"CAST","fieldRef":{"index":99,"name":"v","type":"DECIMAL(38,3)"},"type":"SMALLINT"},"expected":{"name":"DECIMAL(38,3)_to_SMALLINT","results":[1,-1,127,128,-32768,0,0,1,-1,null]}}
+{"name":"DECIMAL(38,3)_to_INT","fields":[{"name":"v","type":"DECIMAL(38,3)"}],"rows":[["1.999"],["-1.999"],["127.999"],["128.999"],["32768.999"],["2147483648.999"],["9223372036854775808.999"],["18446744073709551617.999"],["99999999999999999999999999999999999.999"],[null]],"transform":{"name":"CAST","fieldRef":{"index":99,"name":"v","type":"DECIMAL(38,3)"},"type":"INT"},"expected":{"name":"DECIMAL(38,3)_to_INT","results":[1,-1,127,128,32768,-2147483648,0,1,-1,null]}}
+{"name":"DECIMAL(38,3)_to_BIGINT","fields":[{"name":"v","type":"DECIMAL(38,3)"}],"rows":[["1.999"],["-1.999"],["127.999"],["128.999"],["32768.999"],["2147483648.999"],["9223372036854775808.999"],["18446744073709551617.999"],["99999999999999999999999999999999999.999"],[null]],"transform":{"name":"CAST","fieldRef":{"index":99,"name":"v","type":"DECIMAL(38,3)"},"type":"BIGINT"},"expected":{"name":"DECIMAL(38,3)_to_BIGINT","results":[1,-1,127,128,32768,2147483648,-9223372036854775808,1,3136633892082024447,null]}}
+{"name":"DECIMAL(38,3)_to_FLOAT","fields":[{"name":"v","type":"DECIMAL(38,3)"}],"rows":[["1.999"],["-1.999"],["127.999"],["128.999"],["32768.999"],["2147483648.999"],["9223372036854775808.999"],["18446744073709551617.999"],["99999999999999999999999999999999999.999"],[null]],"transform":{"name":"CAST","fieldRef":{"index":99,"name":"v","type":"DECIMAL(38,3)"},"type":"FLOAT"},"expected":{"name":"DECIMAL(38,3)_to_FLOAT","results":[1.9989999532699585,-1.9989999532699585,127.9990005493164,128.99899291992188,32769.0,2147483648.0,9.223372036854776e+18,1.8446744073709552e+19,1.0000000409184788e+35,null]}}
+{"name":"DECIMAL(38,3)_to_DOUBLE","fields":[{"name":"v","type":"DECIMAL(38,3)"}],"rows":[["1.999"],["-1.999"],["127.999"],["128.999"],["32768.999"],["2147483648.999"],["9223372036854775808.999"],["18446744073709551617.999"],["99999999999999999999999999999999999.999"],[null]],"transform":{"name":"CAST","fieldRef":{"index":99,"name":"v","type":"DECIMAL(38,3)"},"type":"DOUBLE"},"expected":{"name":"DECIMAL(38,3)_to_DOUBLE","results":[1.999,-1.999,127.999,128.999,32768.999,2147483648.999,9.223372036854776e+18,1.8446744073709552e+19,1e+35,null]}}
+{"name":"DECIMAL(38,3)_to_DECIMAL(4,2)","fields":[{"name":"v","type":"DECIMAL(38,3)"}],"rows":[["1.005"],["-1.005"],["99.994"],["99.995"],["999.499"],["999.500"],[null]],"transform":{"name":"CAST","fieldRef":{"index":99,"name":"v","type":"DECIMAL(38,3)"},"type":"DECIMAL(4,2)"},"expected":{"name":"DECIMAL(38,3)_to_DECIMAL(4,2)","results":["1.01","-1.01","99.99",null,null,null,null]}}
+{"name":"DECIMAL(38,3)_to_DECIMAL(3,0)","fields":[{"name":"v","type":"DECIMAL(38,3)"}],"rows":[["1.005"],["-1.005"],["99.994"],["99.995"],["999.499"],["999.500"],[null]],"transform":{"name":"CAST","fieldRef":{"index":99,"name":"v","type":"DECIMAL(38,3)"},"type":"DECIMAL(3,0)"},"expected":{"name":"DECIMAL(38,3)_to_DECIMAL(3,0)","results":["1","-1","100","100","999",null,null]}}
+{"name":"DECIMAL(38,3)_to_DECIMAL(38,10)","fields":[{"name":"v","type":"DECIMAL(38,3)"}],"rows":[["1.005"],["-1.005"],["99.994"],["99.995"],["999.499"],["999.500"],[null]],"transform":{"name":"CAST","fieldRef":{"index":99,"name":"v","type":"DECIMAL(38,3)"},"type":"DECIMAL(38,10)"},"expected":{"name":"DECIMAL(38,3)_to_DECIMAL(38,10)","results":["1.0050000000","-1.0050000000","99.9940000000","99.9950000000","999.4990000000","999.5000000000",null]}}
+{"name":"DECIMAL(38,10)_to_STRING","fields":[{"name":"v","type":"DECIMAL(38,10)"}],"rows":[["0.0000000123"],["-0.0000000123"],["0.0000000000"],["10000000000000000000000.0000000000"],[null]],"transform":{"name":"CAST","fieldRef":{"index":99,"name":"v","type":"DECIMAL(38,10)"},"type":"STRING"},"expected":{"name":"DECIMAL(38,10)_to_STRING","results":["0.0000000123","-0.0000000123","0.0000000000","10000000000000000000000.0000000000",null]}}
+{"name":"DECIMAL(38,10)_to_VARCHAR(3)","fields":[{"name":"v","type":"DECIMAL(38,10)"}],"rows":[["0.0000000123"],["-0.0000000123"],["0.0000000000"],[null]],"transform":{"name":"CAST","fieldRef":{"index":99,"name":"v","type":"DECIMAL(38,10)"},"type":"VARCHAR(3)"},"expected":{"name":"DECIMAL(38,10)_to_VARCHAR(3)","results":["0.0","-0.","0.0",null]}}
+{"name":"BIGINT_to_TINYINT_stored_INT","fields":[{"name":"v","type":"BIGINT"}],"rows":[[4294967297],[null]],"transform":{"name":"CAST","fieldRef":{"index":99,"name":"v","type":"INT"},"type":"TINYINT"},"expected":{"name":"BIGINT_to_TINYINT_stored_INT","results":[1,null]}}
+{"name":"DOUBLE_to_DECIMAL(4,2)_stored_INT","fields":[{"name":"v","type":"DOUBLE"}],"rows":[[1.9],[null]],"transform":{"name":"CAST","fieldRef":{"index":99,"name":"v","type":"INT"},"type":"DECIMAL(4,2)"},"expected":{"name":"DOUBLE_to_DECIMAL(4,2)_stored_INT","results":["1.00",null]}}
+{"name":"BIGINT_to_DECIMAL(38,0)_stored_DOUBLE","fields":[{"name":"v","type":"BIGINT"}],"rows":[[9007199254740993],[null]],"transform":{"name":"CAST","fieldRef":{"index":99,"name":"v","type":"DOUBLE"},"type":"DECIMAL(38,0)"},"expected":{"name":"BIGINT_to_DECIMAL(38,0)_stored_DOUBLE","results":["9007199254740992",null]}}
+{"name":"DECIMAL(12,3)_to_INT_stored_INT","fields":[{"name":"v","type":"DECIMAL(12,3)"}],"rows":[["1.999"],[null]],"transform":{"name":"CAST","fieldRef":{"index":99,"name":"v","type":"INT"},"type":"INT"},"expected":{"name":"DECIMAL(12,3)_to_INT_stored_INT","results":[{"error":"ClassCastException"},null]}}
+{"name":"INT_to_INT_stored_DECIMAL(12,3)","fields":[{"name":"v","type":"INT"}],"rows":[[1],[null]],"transform":{"name":"CAST","fieldRef":{"index":99,"name":"v","type":"DECIMAL(12,3)"},"type":"INT"},"expected":{"name":"INT_to_INT_stored_DECIMAL(12,3)","results":[{"error":"ClassCastException"},null]}}
+{"name":"INT_to_INT_stored_BOOLEAN","fields":[{"name":"v","type":"INT"}],"rows":[[1],[null]],"transform":{"name":"CAST","fieldRef":{"index":99,"name":"v","type":"BOOLEAN"},"type":"INT"},"expected":{"name":"INT_to_INT_stored_BOOLEAN","results":[{"error":"ClassCastException"},null]}}
+{"name":"INT_to_INT_stored_STRING","fields":[{"name":"v","type":"INT"}],"rows":[[1],[null]],"transform":{"name":"CAST","fieldRef":{"index":99,"name":"v","type":"STRING"},"type":"INT"},"expected":{"name":"INT_to_INT_stored_STRING","results":[{"error":"ClassCastException"},null]}}
+{"name":"STRING_to_INT_stored_INT","fields":[{"name":"v","type":"STRING"}],"rows":[["1"],[null]],"transform":{"name":"CAST","fieldRef":{"index":99,"name":"v","type":"INT"},"type":"INT"},"expected":{"name":"STRING_to_INT_stored_INT","results":[{"error":"ClassCastException"},null]}}
+{"name":"DECIMAL(18,4)_to_DECIMAL(4,2)_stored_DECIMAL(12,3)","fields":[{"name":"v","type":"DECIMAL(18,4)"}],"rows":[["1.0050"],[null]],"transform":{"name":"CAST","fieldRef":{"index":99,"name":"v","type":"DECIMAL(12,3)"},"type":"DECIMAL(4,2)"},"expected":{"name":"DECIMAL(18,4)_to_DECIMAL(4,2)_stored_DECIMAL(12,3)","results":["1.01",null]}}
+{"name":"short_circuit_string_int_AND","fields":[{"name":"id","type":"INT"},{"name":"v","type":"STRING"}],"rows":[[0,"bad"],[1,"1.9"],[2,null]],"predicate":{"kind":"COMPOUND","function":"AND","children":[{"kind":"LEAF","transform":{"name":"FIELD_REF","fieldRef":{"index":0,"name":"id","type":"INT"}},"function":"EQUAL","literals":[1]},{"kind":"LEAF","transform":{"name":"CAST","fieldRef":{"index":1,"name":"v","type":"STRING"},"type":"INT"},"function":"EQUAL","literals":[1]}]},"expected":{"name":"short_circuit_string_int_AND","results":[false,true,false]}}
+{"name":"short_circuit_string_int_OR","fields":[{"name":"id","type":"INT"},{"name":"v","type":"STRING"}],"rows":[[0,"bad"],[1,"1.9"],[2,null]],"predicate":{"kind":"COMPOUND","function":"OR","children":[{"kind":"LEAF","transform":{"name":"FIELD_REF","fieldRef":{"index":0,"name":"id","type":"INT"}},"function":"EQUAL","literals":[1]},{"kind":"LEAF","transform":{"name":"CAST","fieldRef":{"index":1,"name":"v","type":"STRING"},"type":"INT"},"function":"EQUAL","literals":[1]}]},"expected":{"name":"short_circuit_string_int_OR","results":[{"error":"NumberFormatException"},true,false]}}
+{"name":"separate_string_int_filters","fields":[{"name":"id","type":"INT"},{"name":"v","type":"STRING"}],"rows":[[0,"bad"],[1,"1.9"],[2,null]],"filters":[{"kind":"LEAF","transform":{"name":"FIELD_REF","fieldRef":{"index":0,"name":"id","type":"INT"}},"function":"EQUAL","literals":[1]},{"kind":"LEAF","transform":{"name":"CAST","fieldRef":{"index":1,"name":"v","type":"STRING"},"type":"INT"},"function":"EQUAL","literals":[1]}],"expected":{"name":"separate_string_int_filters","results":[false,true,false]}}
+{"name":"bad_cast_before_function_TRUE","fields":[{"name":"v","type":"STRING"}],"rows":[["bad"],["1.9"],[null]],"predicate":{"kind":"LEAF","transform":{"name":"CAST","fieldRef":{"index":0,"name":"v","type":"STRING"},"type":"INT"},"function":"TRUE","literals":[]},"expected":{"name":"bad_cast_before_function_TRUE","results":[{"error":"NumberFormatException"},true,true]}}
+{"name":"bad_cast_before_function_FALSE","fields":[{"name":"v","type":"STRING"}],"rows":[["bad"],["1.9"],[null]],"predicate":{"kind":"LEAF","transform":{"name":"CAST","fieldRef":{"index":0,"name":"v","type":"STRING"},"type":"INT"},"function":"FALSE","literals":[]},"expected":{"name":"bad_cast_before_function_FALSE","results":[{"error":"NumberFormatException"},false,false]}}
+{"name":"bad_cast_before_function_EQUAL","fields":[{"name":"v","type":"STRING"}],"rows":[["bad"],["1.9"],[null]],"predicate":{"kind":"LEAF","transform":{"name":"CAST","fieldRef":{"index":0,"name":"v","type":"STRING"},"type":"INT"},"function":"EQUAL","literals":[null]},"expected":{"name":"bad_cast_before_function_EQUAL","results":[{"error":"NumberFormatException"},false,false]}}
+{"name":"decimal_overflow_IS_NULL","fields":[{"name":"v","type":"STRING"}],"rows":[["99.994"],["99.995"],["bad"],[null]],"predicate":{"kind":"LEAF","transform":{"name":"CAST","fieldRef":{"index":0,"name":"v","type":"STRING"},"type":"DECIMAL(4,2)"},"function":"IS_NULL","literals":[]},"expected":{"name":"decimal_overflow_IS_NULL","results":[false,true,{"error":"NumberFormatException"},true]}}
+{"name":"decimal_overflow_IS_NOT_NULL","fields":[{"name":"v","type":"STRING"}],"rows":[["99.994"],["99.995"],["bad"],[null]],"predicate":{"kind":"LEAF","transform":{"name":"CAST","fieldRef":{"index":0,"name":"v","type":"STRING"},"type":"DECIMAL(4,2)"},"function":"IS_NOT_NULL","literals":[]},"expected":{"name":"decimal_overflow_IS_NOT_NULL","results":[true,false,{"error":"NumberFormatException"},false]}}
+{"name":"DECIMAL(18,1)_compact_double_DOUBLE","fields":[{"name":"v","type":"DECIMAL(18,1)"}],"rows":[["900719925474099.3"],["900719925474099.5"],["-900719925474099.3"],[null]],"transform":{"name":"CAST","fieldRef":{"index":99,"name":"v","type":"DECIMAL(18,1)"},"type":"DOUBLE"},"expected":{"name":"DECIMAL(18,1)_compact_double_DOUBLE","results":[900719925474099.2,900719925474099.6,-900719925474099.2,null]}}
+{"name":"DECIMAL(18,1)_compact_double_FLOAT","fields":[{"name":"v","type":"DECIMAL(18,1)"}],"rows":[["900719925474099.3"],["900719925474099.5"],["-900719925474099.3"],[null]],"transform":{"name":"CAST","fieldRef":{"index":99,"name":"v","type":"DECIMAL(18,1)"},"type":"FLOAT"},"expected":{"name":"DECIMAL(18,1)_compact_double_FLOAT","results":[900719938895872.0,900719938895872.0,-900719938895872.0,null]}}
+{"name":"DECIMAL(38,1)_compact_double_DOUBLE","fields":[{"name":"v","type":"DECIMAL(38,1)"}],"rows":[["900719925474099.3"],["900719925474099.5"],["-900719925474099.3"],[null]],"transform":{"name":"CAST","fieldRef":{"index":99,"name":"v","type":"DECIMAL(38,1)"},"type":"DOUBLE"},"expected":{"name":"DECIMAL(38,1)_compact_double_DOUBLE","results":[900719925474099.2,900719925474099.5,-900719925474099.2,null]}}
+{"name":"DECIMAL(38,1)_compact_double_FLOAT","fields":[{"name":"v","type":"DECIMAL(38,1)"}],"rows":[["900719925474099.3"],["900719925474099.5"],["-900719925474099.3"],[null]],"transform":{"name":"CAST","fieldRef":{"index":99,"name":"v","type":"DECIMAL(38,1)"},"type":"FLOAT"},"expected":{"name":"DECIMAL(38,1)_compact_double_FLOAT","results":[900719938895872.0,900719938895872.0,-900719938895872.0,null]}}"##;
+
+fn source(value: &Value, data_type: &DataType) -> ArrayRef {
+    let nullable = value.is_null();
+    macro_rules! integral {
+        ($array:ty, $ty:ty) => {
+            Arc::new(<$array>::from(vec![if nullable {
+                None
+            } else {
+                Some(value.as_i64().unwrap() as $ty)
+            }])) as ArrayRef
+        };
+    }
+    match data_type {
+        DataType::TinyInt(_) => integral!(Int8Array, i8),
+        DataType::SmallInt(_) => integral!(Int16Array, i16),
+        DataType::Int(_) => integral!(Int32Array, i32),
+        DataType::BigInt(_) => integral!(Int64Array, i64),
+        DataType::Float(_) => Arc::new(Float32Array::from(vec![value.as_f64().map(|v| v as f32)])),
+        DataType::Double(_) => Arc::new(Float64Array::from(vec![value.as_f64()])),
+        DataType::Boolean(_) => Arc::new(BooleanArray::from(vec![value.as_bool()])),
+        DataType::Char(_) | DataType::VarChar(_) => {
+            Arc::new(StringArray::from(vec![value.as_str()]))
+        }
+        DataType::Decimal(t) => {
+            let value = value.as_str().map(|value| {
+                let negative = value.starts_with('-');
+                let value = value.trim_start_matches(['-', '+']);
+                let (whole, fraction) = value.split_once('.').unwrap_or((value, ""));
+                let mut digits = format!("{whole}{fraction}");
+                digits.extend(std::iter::repeat_n(
+                    '0',
+                    t.scale() as usize - fraction.len(),
+                ));
+                let unscaled = digits.parse::<i128>().unwrap();
+                if negative {
+                    -unscaled
+                } else {
+                    unscaled
+                }
+            });
+            Arc::new(
+                Decimal128Array::from(vec![value])
+                    .with_precision_and_scale(t.precision() as u8, t.scale() as i8)
+                    .unwrap(),
+            )
+        }
+        _ => panic!("unexpected golden source type {data_type:?}"),
+    }
+}
+
+fn external(value: &ArrayRef) -> Value {
+    if value.is_null(0) {
+        return Value::Null;
+    }
+    macro_rules! number {
+        ($ty:ty) => {
+            json!(value.as_primitive::<$ty>().value(0))
+        };
+    }
+    match value.data_type() {
+        arrow_schema::DataType::Int8 => number!(Int8Type),
+        arrow_schema::DataType::Int16 => number!(Int16Type),
+        arrow_schema::DataType::Int32 => number!(Int32Type),
+        arrow_schema::DataType::Int64 => number!(Int64Type),
+        arrow_schema::DataType::Float32 => {
+            json!(f64::from(value.as_primitive::<Float32Type>().value(0)))
+        }
+        arrow_schema::DataType::Float64 => number!(Float64Type),
+        arrow_schema::DataType::Boolean => json!(value.as_boolean().value(0)),
+        arrow_schema::DataType::Utf8 => json!(value.as_string::<i32>().value(0)),
+        arrow_schema::DataType::Decimal128(_, _) => {
+            // Format target decimals via the same plain representation as Java.
+            let from = crate::arrow::arrow_fields_to_paimon(&[arrow_schema::Field::new(
+                "v",
+                value.data_type().clone(),
+                true,
+            )])
+            .unwrap()[0]
+                .data_type()
+                .clone();
+            let text: DataType = serde_json::from_value(json!("STRING")).unwrap();
+            let strings = crate::arrow::cast_numeric(value, &from, &text)
+                .unwrap()
+                .unwrap();
+            json!(strings.as_string::<i32>().value(0))
+        }
+        other => panic!("unexpected golden target type {other:?}"),
+    }
+}
+
+#[test]
+fn existing_numeric_casts_match_java_golden_vectors() {
+    for line in JAVA_CASES.lines() {
+        let case: Value = serde_json::from_str(line).unwrap();
+        let name = case["name"].as_str().unwrap();
+        let fields: Vec<_> = case["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .enumerate()
+            .map(|(i, field)| {
+                DataField::new(
+                    i as i32,
+                    field["name"].as_str().unwrap().into(),
+                    serde_json::from_value(field["type"].clone()).unwrap(),
+                )
+            })
+            .collect();
+        let predicate = if let Some(filters) = case.get("filters") {
+            Some(json!({"kind":"COMPOUND", "function":"AND", "children":filters}))
+        } else {
+            case.get("predicate").cloned()
+        };
+        let definition = case.get("transform");
+        let transform = definition
+            .map(|definition| Transform::from_rest_json(&definition.to_string(), &fields).unwrap());
+        let validation = if let Some(transform) = &transform {
+            check_transform_cast(transform, &fields)
+                .and_then(|_| check_cast_source(transform, definition.unwrap(), &fields))
+        } else {
+            RowFilter::parse(&predicate.as_ref().unwrap().to_string(), &fields).map(|_| ())
+        };
+        if case["expected"].get("parseError").is_some() {
+            assert!(validation.is_err(), "{name}");
+            continue;
+        }
+        if validation.is_err() {
+            // The Native subset explicitly declines source-type rebinding.
+            let stored: DataType =
+                serde_json::from_value(definition.unwrap()["fieldRef"]["type"].clone()).unwrap();
+            assert!(
+                !stored.equals_ignore_nullable(fields[0].data_type()),
+                "unexpected refusal: {name}: {validation:?}"
+            );
+            continue;
+        }
+        for (row, expected) in case["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .zip(case["expected"]["results"].as_array().unwrap())
+        {
+            let inputs: Vec<_> = fields
+                .iter()
+                .zip(row.as_array().unwrap())
+                .map(|(field, value)| source(value, field.data_type()))
+                .collect();
+            let result = if let Some(predicate) = &predicate {
+                let filter = RowFilter::parse(&predicate.to_string(), &fields).unwrap();
+                let batch = arrow_array::RecordBatch::try_from_iter(
+                    fields
+                        .iter()
+                        .zip(inputs.iter())
+                        .map(|(field, input)| (field.name(), input.clone())),
+                )
+                .unwrap();
+                filter
+                    .evaluate(&batch, &fields, &fields)
+                    .map(|mask| Arc::new(mask) as ArrayRef)
+            } else {
+                let target: DataType =
+                    serde_json::from_value(definition.unwrap()["type"].clone()).unwrap();
+                evaluate_transform(
+                    transform.as_ref().unwrap(),
+                    1,
+                    &|index| Ok(inputs[index].clone()),
+                    &paimon_type_to_arrow(&target).unwrap(),
+                    &fields,
+                )
+            };
+            if expected.get("error").is_some() {
+                assert!(result.is_err(), "{name}: {row}: {result:?}");
+            } else {
+                assert_eq!(external(&result.unwrap()), *expected, "{name}: {row}");
+            }
+        }
+    }
+}

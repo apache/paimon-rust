@@ -18,8 +18,8 @@
 //! REST row predicates evaluated on transform outputs, as Java LeafPredicate does.
 
 use super::rules::{
-    canonicalize_nan, check_transform_cast, column_of, evaluate_transform, rule_mask,
-    transform_output_type,
+    canonicalize_nan, check_cast_source, check_transform_cast, column_of, evaluate_transform,
+    rule_mask, transform_output_type,
 };
 use super::unsupported;
 use crate::spec::{DataField, DataType, Predicate, Transform};
@@ -95,20 +95,7 @@ impl RowFilter {
                         .map(Self::Predicate);
                 }
                 check_transform_cast(&transform, fields)?;
-                if let Transform::Cast(index, _) = &transform {
-                    // Java preserves the original cast executor when rebinding.
-                    // Do not silently choose a different cast for an evolved input.
-                    let stored: DataType =
-                        serde_json::from_value(value["transform"]["fieldRef"]["type"].clone())
-                            .map_err(|e| unsupported(&format!("invalid CAST source type: {e}")))?;
-                    if stored.copy_with_nullable(true)?
-                        != fields[*index].data_type().copy_with_nullable(true)?
-                    {
-                        return Err(unsupported(
-                            "CAST with a rebound source type requires its original Java executor",
-                        ));
-                    }
-                }
+                check_cast_source(&transform, &value["transform"], fields)?;
 
                 let output = vec![DataField::new(0, "value".into(), data_type.clone())];
                 let mut leaf = value.clone();
@@ -177,6 +164,7 @@ impl RowFilter {
                     batch.num_rows(),
                     &input,
                     &crate::arrow::paimon_type_to_arrow(data_type)?,
+                    fields,
                 )?;
                 let field = DataField::new(0, "value".into(), data_type.clone());
                 let values = canonicalize_nan(&values);
@@ -464,6 +452,18 @@ mod tests {
                 assert!(RowFilter::parse(&rule.to_string(), &fields()).is_err());
             }
         }
+    }
+
+    #[test]
+    fn numeric_cast_filters_use_java_narrowing() {
+        assert_eq!(
+            kept(leaf(
+                json!({"name":"CAST","fieldRef":input("p","BIGINT"),"type":"TINYINT"}),
+                "EQUAL",
+                json!([2])
+            )),
+            vec![0]
+        );
     }
 
     #[test]

@@ -17,7 +17,10 @@
 
 mod date_extract;
 pub(crate) use date_extract::evaluate_date_extract;
+mod cast_width;
+pub(crate) use cast_width::apply_declared_width;
 mod evolution_cast;
+pub(crate) use evolution_cast::{cast_numeric, supports_numeric_cast};
 mod evolution_decimal;
 mod evolution_string;
 mod evolution_temporal;

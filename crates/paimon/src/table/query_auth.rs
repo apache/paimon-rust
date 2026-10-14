@@ -17,6 +17,8 @@
 
 //! What the REST server authorized a user to read from one table.
 
+#[cfg(test)]
+mod numeric_cast_java_test;
 mod row_filter;
 pub(crate) use row_filter::RowFilter;
 mod rules;

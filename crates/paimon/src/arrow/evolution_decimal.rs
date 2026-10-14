@@ -21,8 +21,8 @@ use std::sync::Arc;
 
 use arrow_array::{
     cast::AsArray,
-    types::{Float32Type, Float64Type},
-    ArrayRef, Decimal128Array,
+    types::{Float32Type, Float64Type, Int64Type},
+    ArrayRef, Decimal128Array, StringArray,
 };
 
 use crate::common::number::java_double_decimal_text;
@@ -61,6 +61,23 @@ pub(super) fn cast_decimal(
             .iter()
             .map(|v| v.map(|v| decimal_text(v, precision, scale)).transpose())
             .collect::<crate::Result<Vec<_>>>()?,
+        DataType::Decimal(_) => decimal_to_string(source)?
+            .as_string::<i32>()
+            .iter()
+            .map(|v| v.map(|v| decimal_text(v, precision, scale)).transpose())
+            .collect::<crate::Result<Vec<_>>>()?,
+        DataType::TinyInt(_) | DataType::SmallInt(_) | DataType::Int(_) | DataType::BigInt(_) => {
+            let integers = arrow_cast::cast(source, &arrow_schema::DataType::Int64)
+                .map_err(|error| invalid(error.to_string()))?;
+            integers
+                .as_primitive::<Int64Type>()
+                .iter()
+                .map(|v| {
+                    v.map(|v| decimal_text(&v.to_string(), precision, scale))
+                        .transpose()
+                })
+                .collect::<crate::Result<Vec<_>>>()?
+        }
         _ => return Ok(None),
     };
     let values = values.into_iter().map(Option::flatten);
@@ -68,6 +85,36 @@ pub(super) fn cast_decimal(
         .with_precision_and_scale(precision as u8, scale as i8)
         .map_err(|e| invalid(e.to_string()))?;
     Ok(Some(Arc::new(result)))
+}
+
+/// Decimal.toString delegates to BigDecimal.toPlainString, including scaled zero.
+pub(super) fn decimal_to_string(source: &ArrayRef) -> crate::Result<ArrayRef> {
+    let arrow_schema::DataType::Decimal128(_, scale) = source.data_type() else {
+        return Err(invalid("Expected DECIMAL array"));
+    };
+    let scale = u32::try_from(*scale).map_err(|_| invalid("Invalid DECIMAL scale"))?;
+    let divisor = 10_u128.pow(scale);
+    Ok(Arc::new(StringArray::from_iter(
+        source
+            .as_primitive::<arrow_array::types::Decimal128Type>()
+            .iter()
+            .map(|value| {
+                value.map(|value| {
+                    let negative = if value < 0 { "-" } else { "" };
+                    let value = value.unsigned_abs();
+                    if scale == 0 {
+                        format!("{negative}{value}")
+                    } else {
+                        format!(
+                            "{negative}{}.{:0width$}",
+                            value / divisor,
+                            value % divisor,
+                            width = scale as usize
+                        )
+                    }
+                })
+            }),
+    )))
 }
 
 fn float_decimal(value: f64, precision: u32, scale: u32) -> crate::Result<Option<i128>> {
@@ -81,6 +128,21 @@ fn float_decimal(value: f64, precision: u32, scale: u32) -> crate::Result<Option
 /// never requires a large power of ten. Invalid text is an error; a valid
 /// number exceeding target precision returns NULL, as Decimal.fromBigDecimal.
 fn decimal_text(text: &str, precision: u32, scale: u32) -> crate::Result<Option<i128>> {
+    // BigDecimal accepts BMP decimal digits; BinaryStringUtils integer casts
+    // deliberately use a different ASCII-only grammar.
+    let normalized;
+    let text = if text.is_ascii() {
+        text
+    } else {
+        normalized = text
+            .chars()
+            .map(|ch| {
+                crate::common::number::java_decimal_digit(ch)
+                    .map_or(ch, |digit| char::from(b'0' + digit))
+            })
+            .collect::<String>();
+        &normalized
+    };
     let invalid_text = || invalid(format!("Invalid decimal schema-evolution value: {text}"));
     let (mantissa, exponent) = text
         .split_once(['e', 'E'])

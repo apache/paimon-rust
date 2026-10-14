@@ -22,6 +22,62 @@ use std::cmp::Ordering;
 use num_bigint::BigUint;
 use num_traits::ToPrimitive;
 
+/// Character.digit for decimal BMP digits (Java scans UTF-16 chars).
+pub(crate) fn java_decimal_digit(ch: char) -> Option<u8> {
+    const ZEROES: &[u32] = &[
+        0x0030, 0x0660, 0x06f0, 0x07c0, 0x0966, 0x09e6, 0x0a66, 0x0ae6, 0x0b66, 0x0be6, 0x0c66,
+        0x0ce6, 0x0d66, 0x0de6, 0x0e50, 0x0ed0, 0x0f20, 0x1040, 0x1090, 0x17e0, 0x1810, 0x1946,
+        0x19d0, 0x1a80, 0x1a90, 0x1b50, 0x1bb0, 0x1c40, 0x1c50, 0xa620, 0xa8d0, 0xa900, 0xa9d0,
+        0xa9f0, 0xaa50, 0xabf0, 0xff10,
+    ];
+
+    ZEROES.iter().find_map(|zero| {
+        (u32::from(ch) >= *zero && u32::from(ch) < zero + 10).then(|| (u32::from(ch) - zero) as u8)
+    })
+}
+
+/// BinaryStringUtils integer text: truncate fractions and reject overflow.
+pub(crate) fn parse_java_integer(text: &str, min: i64, max: i64) -> crate::Result<i64> {
+    let bytes = text.as_bytes();
+    if bytes.is_empty() {
+        return Err(integer_text_error("Empty integer value"));
+    }
+    let negative = bytes[0] == b'-';
+    let mut index = usize::from(negative || bytes[0] == b'+');
+    if index == bytes.len() {
+        return Err(integer_text_error(format!("Invalid integer value: {text}")));
+    }
+
+    // Accumulate a negative value so the signed minimum remains representable.
+    // Like Java, the digits before '.' may be empty; the fractional part does
+    // not affect the result but must contain only decimal digits.
+    let limit = if negative { min } else { -max };
+    let mut value = 0_i64;
+    while index < bytes.len() && bytes[index] != b'.' {
+        let digit = bytes[index];
+        if !digit.is_ascii_digit() {
+            return Err(integer_text_error(format!("Invalid integer value: {text}")));
+        }
+        value = value
+            .checked_mul(10)
+            .and_then(|value| value.checked_sub(i64::from(digit - b'0')))
+            .filter(|value| *value >= limit)
+            .ok_or_else(|| integer_text_error(format!("Integer value overflow: {text}")))?;
+        index += 1;
+    }
+    if index < bytes.len() && !bytes[index + 1..].iter().all(u8::is_ascii_digit) {
+        return Err(integer_text_error(format!("Invalid integer value: {text}")));
+    }
+    Ok(if negative { value } else { -value })
+}
+
+fn integer_text_error(message: impl Into<String>) -> crate::Error {
+    crate::Error::DataInvalid {
+        message: message.into(),
+        source: None,
+    }
+}
+
 /// Numeric digits selected by Java 8/11/17 Double.toString, for BigDecimal.valueOf.
 /// Its integral shortcut retains digits that the JDK 19+ shortest converter
 /// discards. The remaining cases generate digits from the IEEE-754 interval;

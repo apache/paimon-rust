@@ -427,37 +427,8 @@ fn numeric_default(text: &str) -> bool {
 }
 
 fn parse_java_integer(text: &str, min: i64, max: i64) -> std::result::Result<i64, ArrowError> {
-    let bytes = text.as_bytes();
-    if bytes.is_empty() {
-        return Err(cast_error("Empty integer default"));
-    }
-    let negative = bytes[0] == b'-';
-    let mut index = usize::from(negative || bytes[0] == b'+');
-    if index == bytes.len() {
-        return Err(cast_error(format!("Invalid integer default: {text}")));
-    }
-
-    // Accumulate a negative value so the signed minimum remains representable.
-    // Like Java, the digits before '.' may be empty; the fractional part does
-    // not affect the result but must contain only decimal digits.
-    let limit = if negative { min } else { -max };
-    let mut value = 0_i64;
-    while index < bytes.len() && bytes[index] != b'.' {
-        let digit = bytes[index];
-        if !digit.is_ascii_digit() {
-            return Err(cast_error(format!("Invalid integer default: {text}")));
-        }
-        value = value
-            .checked_mul(10)
-            .and_then(|value| value.checked_sub(i64::from(digit - b'0')))
-            .filter(|value| *value >= limit)
-            .ok_or_else(|| cast_error(format!("Integer default overflow: {text}")))?;
-        index += 1;
-    }
-    if index < bytes.len() && !bytes[index + 1..].iter().all(u8::is_ascii_digit) {
-        return Err(cast_error(format!("Invalid integer default: {text}")));
-    }
-    Ok(if negative { value } else { -value })
+    crate::common::number::parse_java_integer(text, min, max)
+        .map_err(|error| cast_error(error.to_string()))
 }
 
 #[derive(Clone)]
