@@ -1563,6 +1563,171 @@ async fn assert_floating_partition_drops(sql_type: &str, values: &[&str]) {
 }
 
 #[tokio::test]
+async fn test_drop_global_index_native_timestamp_partition_identity() {
+    use paimon::spec::{DataType, Datum, IntType, LocalZonedTimestampType, Schema, TimestampType};
+
+    for precision in [1, 2, 4, 5, 7, 8] {
+        for zoned in [false, true] {
+            let (tmp, catalog) = create_test_env();
+            let sql_context = create_sql_context(catalog.clone()).await;
+            exec(&sql_context, "CREATE SCHEMA paimon.test_db").await;
+            let data_type = if zoned {
+                DataType::LocalZonedTimestamp(LocalZonedTimestampType::new(precision).unwrap())
+            } else {
+                DataType::Timestamp(TimestampType::new(precision).unwrap())
+            };
+            let schema = Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("other", DataType::Int(IntType::new()))
+                .column("ts", data_type.clone())
+                .partition_keys(["ts"])
+                .options([
+                    ("row-tracking.enabled".into(), "true".into()),
+                    ("data-evolution.enabled".into(), "true".into()),
+                    ("global-index.enabled".into(), "true".into()),
+                    ("partition.legacy-name".into(), "false".into()),
+                ])
+                .build()
+                .unwrap();
+            let identifier = Identifier::new("test_db", "drop_native_timestamp");
+            catalog
+                .create_table(&identifier, schema, false)
+                .await
+                .unwrap();
+            let (first, selected, millis, nanos) = match precision {
+                1 | 2 => ("100", "199", 199, 0),
+                4 | 5 => ("123400", "123499", 123, 499_000),
+                _ => ("123456700", "123456799", 123, 456_799),
+            };
+            exec(
+                &sql_context,
+                &format!(
+                    "INSERT INTO paimon.test_db.drop_native_timestamp (id, other, ts) VALUES \
+                 (1, 10, TIMESTAMP '1970-01-01 00:00:00.{first}Z'), \
+                 (2, 20, TIMESTAMP '1970-01-01 00:00:00.{selected}Z')"
+                ),
+            )
+            .await;
+            for (column, index_type) in [("id", "btree"), ("other", "btree"), ("id", "bitmap")] {
+                exec(
+                    &sql_context,
+                    &format!(
+                        "CALL sys.create_global_index(table => 'test_db.drop_native_timestamp', \
+                     index_column => '{column}', index_type => '{index_type}')"
+                    ),
+                )
+                .await;
+            }
+            let table = catalog.get_table(&identifier).await.unwrap();
+            assert_eq!(table.schema().partition_fields()[0].data_type(), &data_type);
+            assert_eq!(
+                row_count(
+                    &sql_context,
+                    &format!(
+                        "SELECT * FROM paimon.test_db.`drop_native_timestamp$partitions` \
+                 WHERE partition LIKE 'ts=%.{selected}'"
+                    )
+                )
+                .await,
+                1
+            );
+            let selected_datum = if zoned {
+                Datum::LocalZonedTimestamp { millis, nanos }
+            } else {
+                Datum::Timestamp { millis, nanos }
+            };
+            let mut expected = global_index_entries(&table).await;
+            assert_eq!(expected.len(), 6);
+            expected.retain(|_, entry| {
+                let row = paimon::spec::BinaryRow::from_serialized_bytes(&entry.partition).unwrap();
+                !(entry.index_file.index_type == "btree"
+                    && entry
+                        .index_file
+                        .global_index_meta
+                        .as_ref()
+                        .unwrap()
+                        .index_field_id
+                        == 0
+                    && row.get_datum(0, &data_type).unwrap().as_ref() == Some(&selected_datum))
+            });
+            assert_eq!(expected.len(), 5);
+            let before = table_files(tmp.path());
+            let snapshot_id = table
+                .snapshot_manager()
+                .get_latest_snapshot_id()
+                .await
+                .unwrap()
+                .unwrap();
+            let suffix = if zoned { "Z" } else { "" };
+            let absent = format!("{}8", &selected[..selected.len() - 1]);
+            let no_match = format!(
+                "CALL sys.drop_global_index(table => 'test_db.drop_native_timestamp', \
+                 index_column => 'id', partitions => 'ts=1970-01-01T00:00:00.{absent}{suffix}'"
+            );
+            let batches = sql_context
+                .sql(&format!("{no_match}, dry_run => true)"))
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+            assert_eq!(
+                string_value(batches[0].column(0).as_ref(), 0),
+                "Would drop 0 global index file(s)"
+            );
+            exec(&sql_context, &format!("{no_match})")).await;
+            assert_eq!(table_files(tmp.path()), before);
+            for dry_run in [true, false] {
+                assert_sql_error(&sql_context, &format!(
+                    "CALL sys.drop_global_index(table => 'test_db.drop_native_timestamp', \
+                     index_column => 'id', partitions => 'ts=1970-01-01T00:00:00.{selected}{suffix};\
+                     ts=1970-01-01T00:00:00.1234567891{suffix}', dry_run => {dry_run})"
+                ), "Invalid partitions value").await;
+                assert_eq!(table_files(tmp.path()), before);
+            }
+            let call = format!(
+                "CALL sys.drop_global_index(table => 'test_db.drop_native_timestamp', \
+                 index_column => 'id', partitions => 'ts=1970-01-01T00:00:00.{selected}{suffix}'"
+            );
+            let batches = sql_context
+                .sql(&format!("{call}, dry_run => true)"))
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+            assert_eq!(
+                string_value(batches[0].column(0).as_ref(), 0),
+                "Would drop 1 global index file(s)"
+            );
+            assert_eq!(table_files(tmp.path()), before);
+            exec(&sql_context, &format!("{call})")).await;
+            assert_eq!(
+                global_index_entries(&table).await,
+                expected,
+                "{data_type:?}"
+            );
+            assert_eq!(
+                table
+                    .snapshot_manager()
+                    .get_latest_snapshot_id()
+                    .await
+                    .unwrap(),
+                Some(snapshot_id + 1)
+            );
+            assert_eq!(
+                row_count(
+                    &sql_context,
+                    "SELECT * FROM paimon.test_db.drop_native_timestamp"
+                )
+                .await,
+                2
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn test_drop_global_index_ltz_partitions_use_display_timezone() {
     const CHILD: &str = "PAIMON_DROP_LTZ_PARTITIONS_CHILD";
     if std::env::var_os(CHILD).is_none() {
@@ -1844,8 +2009,23 @@ async fn test_drop_global_index_partitions_timestamp_and_decimal_are_exact() {
         !(row.get_long(0).unwrap() == millis && row.get_long(1).unwrap() == 124)
     });
     assert_eq!(expected.len(), 2);
-    let call = "CALL sys.drop_global_index(table => 'test_db.drop_typed_partitions', index_column => 'id', \
+    let no_match = "CALL sys.drop_global_index(table => 'test_db.drop_typed_partitions', index_column => 'id', \
                 partitions => 'ts=2026-10-10 12:00:00.1999,price=1.235'";
+    let result = sql_context
+        .sql(&format!("{no_match}, dry_run => true)"))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        string_value(result[0].column(0).as_ref(), 0),
+        "Would drop 0 global index file(s)"
+    );
+    exec(&sql_context, &format!("{no_match})")).await;
+    assert_eq!(table_files(tmp.path()), before);
+    let call = "CALL sys.drop_global_index(table => 'test_db.drop_typed_partitions', index_column => 'id', \
+                partitions => 'ts=2026-10-10 12:00:00.199,price=1.235'";
     let result = sql_context
         .sql(&format!("{call}, dry_run => true)"))
         .await

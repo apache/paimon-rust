@@ -946,48 +946,49 @@ fn parse_global_index_partition_timestamp(
     precision: u32,
     local_timezone: bool,
 ) -> Option<Datum> {
-    let arrow_type = paimon::arrow::paimon_type_to_arrow(data_type).ok()?;
-    let scalar = if value.bytes().all(|byte| byte.is_ascii_digit()) {
+    if value.bytes().all(|byte| byte.is_ascii_digit()) {
         // Java only accepts numeric timestamps at these precisions.
         if !matches!(precision, 0 | 3 | 6 | 9) {
             return None;
         }
-        ScalarValue::Int64(Some(value.parse().ok()?))
+        let arrow_type = paimon::arrow::paimon_type_to_arrow(data_type).ok()?;
+        let scalar = ScalarValue::Int64(Some(value.parse().ok()?))
             .cast_to(&arrow_type)
-            .ok()?
-    } else {
-        // Legacy partition names omit seconds when both seconds and fractions are zero.
-        let value = chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M")
-            .map(|value| value.format("%Y-%m-%dT%H:%M:%S").to_string())
-            .unwrap_or_else(|_| value.to_string());
-        let value = if local_timezone {
-            // Non-legacy LTZ names use the system-local timezone. Preserve explicit offsets
-            // and fail on ambiguous/nonexistent local times instead of falling back to UTC.
-            datafusion::arrow::compute::kernels::cast_utils::string_to_datetime(
-                &chrono::Local,
-                &value,
-            )
-            .ok()?
-            // RFC3339 rounds offsets containing seconds; UTC preserves the resolved instant.
-            .with_timezone(&chrono::Utc)
-            .to_rfc3339()
-        } else {
-            value
-        };
-        ScalarValue::try_from_string(value, &arrow_type).ok()?
-    };
-    let mut datum = crate::filter_pushdown::scalar_to_datum(&scalar, data_type)?;
-    let (Datum::Timestamp { millis, nanos } | Datum::LocalZonedTimestamp { millis, nanos }) =
-        &mut datum
-    else {
+            .ok()?;
+        return crate::filter_pushdown::scalar_to_datum(&scalar, data_type);
+    }
+    // Arrow accepts extra fractional digits by truncating them; reject any loss of identity.
+    if value.split_once('.').is_some_and(|(_, fraction)| {
+        fraction
+            .bytes()
+            .take_while(u8::is_ascii_digit)
+            .skip(9)
+            .any(|byte| byte != b'0')
+    }) {
         return None;
+    }
+    // Legacy partition names omit seconds when both seconds and fractions are zero.
+    let value = chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M")
+        .map(|value| value.format("%Y-%m-%dT%H:%M:%S").to_string())
+        .unwrap_or_else(|_| value.to_string());
+    let timestamp = if local_timezone {
+        // Non-legacy LTZ names use the system-local timezone. Preserve explicit offsets
+        // and fail on ambiguous/nonexistent local times instead of falling back to UTC.
+        datafusion::arrow::compute::kernels::cast_utils::string_to_datetime(&chrono::Local, &value)
+            .ok()?
+            .with_timezone(&chrono::Utc)
+    } else {
+        datafusion::arrow::compute::kernels::cast_utils::string_to_datetime(&chrono::Utc, &value)
+            .ok()?
     };
-    // Paimon truncates to the declared precision, which may be between Arrow time units.
-    let millis_quantum = 10_i64.pow(3_u32.saturating_sub(precision));
-    *millis = millis.div_euclid(millis_quantum) * millis_quantum;
-    let nanos_quantum = 10_i32.pow(9 - precision);
-    *nanos = *nanos / nanos_quantum * nanos_quantum;
-    Some(datum)
+    // Stored partitions can retain fractions beyond the declared precision or Arrow unit.
+    let millis = timestamp.timestamp_millis();
+    let nanos = (timestamp.timestamp_subsec_nanos() % 1_000_000) as i32;
+    match data_type {
+        DataType::Timestamp(_) => Some(Datum::Timestamp { millis, nanos }),
+        DataType::LocalZonedTimestamp(_) => Some(Datum::LocalZonedTimestamp { millis, nanos }),
+        _ => None,
+    }
 }
 
 /// Canonicalize a procedure's `index_type` argument: trim, then lowercase.
@@ -1532,7 +1533,7 @@ mod tests {
         assert_eq!(
             parse_global_index_partition_value("1970-01-01 00:00:00.199", &timestamp, true),
             Some(Datum::Timestamp {
-                millis: 100,
+                millis: 199,
                 nanos: 0
             })
         );
@@ -1545,6 +1546,43 @@ mod tests {
         );
         for text in ["1e100", "1e-100", "1.234567891"] {
             assert!(parse_global_index_partition_value(text, &float, true).is_none());
+        }
+    }
+
+    #[test]
+    fn test_global_index_timestamp_partition_values_preserve_identity() {
+        use paimon::spec::{LocalZonedTimestampType, TimestampType};
+
+        for precision in 0..=9 {
+            for zoned in [false, true] {
+                let data_type = if zoned {
+                    DataType::LocalZonedTimestamp(LocalZonedTimestampType::new(precision).unwrap())
+                } else {
+                    DataType::Timestamp(TimestampType::new(precision).unwrap())
+                };
+                for (text, millis, nanos) in [
+                    ("1970-01-01T00:00:00.123456789Z", 123, 456_789),
+                    ("1969-12-31T23:59:59.999999999Z", -1, 999_999),
+                    ("2500-01-01T00:00:00Z", 16_725_225_600_000, 0),
+                ] {
+                    let expected = if zoned {
+                        Datum::LocalZonedTimestamp { millis, nanos }
+                    } else {
+                        Datum::Timestamp { millis, nanos }
+                    };
+                    assert_eq!(
+                        parse_global_index_partition_value(text, &data_type, true),
+                        Some(expected),
+                        "{data_type:?}: {text}"
+                    );
+                }
+                assert!(parse_global_index_partition_value(
+                    "1970-01-01T00:00:00.1234567891Z",
+                    &data_type,
+                    true,
+                )
+                .is_none());
+            }
         }
     }
 
