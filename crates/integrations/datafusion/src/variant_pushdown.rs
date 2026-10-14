@@ -389,7 +389,7 @@ fn build_projection_rewrite(
         .transpose()?;
 
     let arrow_schema =
-        paimon::arrow::build_target_arrow_schema(&read_type).map_err(to_datafusion_error)?;
+        paimon::arrow::build_read_arrow_schema(&read_type).map_err(to_datafusion_error)?;
     let schema = Arc::new(DFSchema::try_from_qualified_schema(
         scan.table_name.clone(),
         arrow_schema.as_ref(),

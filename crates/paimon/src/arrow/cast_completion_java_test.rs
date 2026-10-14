@@ -298,6 +298,94 @@ fn unrepresentable(expected: &Value, target: &ArrowType) -> bool {
 }
 
 #[test]
+fn schema_evolution_scalar_casts_match_actual_java() {
+    let zone = jiff::tz::TimeZone::system();
+    let zone = match zone.iana_name() {
+        Some("Asia/Shanghai") => "Asia/Shanghai",
+        Some("America/New_York") => "America/New_York",
+        Some("UTC" | "Etc/UTC" | "Etc/GMT" | "GMT") => "UTC",
+        _ => return,
+    };
+    let mut tested = 0;
+    let mut failures = Vec::new();
+    for line in CASES.lines() {
+        let case: Value = serde_json::from_str(line).unwrap();
+        let from: DataType = serde_json::from_value(case["fields"][0]["type"].clone()).unwrap();
+        let original: DataType =
+            serde_json::from_value(case["transform"]["fieldRef"]["type"].clone()).unwrap();
+        if from != original {
+            continue;
+        }
+        let target: DataType = serde_json::from_value(case["transform"]["type"].clone()).unwrap();
+        let target_arrow = paimon_type_to_arrow(&target).unwrap();
+        for (row, expected) in case["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .zip(case["expected"][zone]["results"].as_array().unwrap())
+        {
+            let Some(source) = source(&row[0], &from) else {
+                continue;
+            };
+            // These outputs cannot be represented by Arrow, independently of
+            // Java's executor. Storage-boundary behavior has dedicated tests.
+            if unrepresentable(expected, &paimon_type_to_arrow(&target).unwrap()) {
+                continue;
+            }
+            if matches!(source.data_type(), ArrowType::Binary)
+                && row[0].as_array().is_some_and(|bytes| {
+                    std::str::from_utf8(
+                        &bytes
+                            .iter()
+                            .map(|v| v.as_u64().unwrap() as u8)
+                            .collect::<Vec<_>>(),
+                    )
+                    .is_err()
+                })
+            {
+                continue;
+            }
+            let actual = super::nested_evolution::evolve_column(&source, &from, &target);
+            tested += 1;
+            if expected.get("error").is_some() {
+                if actual.is_ok() {
+                    failures.push(format!(
+                        "{} input {} expected an error, got {:?}",
+                        case["name"],
+                        row[0],
+                        actual.map(|v| external(&v))
+                    ));
+                }
+            } else if !actual.as_ref().is_ok_and(|value| {
+                let value = external(value);
+                if expected.is_number()
+                    && matches!(target_arrow, ArrowType::Float32 | ArrowType::Float64)
+                {
+                    value.as_f64() == expected.as_f64()
+                } else {
+                    value == *expected
+                }
+            }) {
+                failures.push(format!(
+                    "{} input {} expected {}, got {:?}",
+                    case["name"],
+                    row[0],
+                    expected,
+                    actual.map(|v| external(&v))
+                ));
+            }
+        }
+    }
+    assert!(tested > 500, "too few Java cases: {tested}");
+    assert!(
+        failures.is_empty(),
+        "{} mismatches in {tested} Java cases: {:#?}",
+        failures.len(),
+        &failures[..failures.len().min(30)]
+    );
+}
+
+#[test]
 fn cast_completion_matches_actual_java_in_three_zones() {
     let mut tested = 0;
     for line in CASES.lines() {
@@ -389,7 +477,7 @@ fn existing_python_java_capability_matrix_is_complete() {
         "01111110111000000000",
         "11111111111000000000",
         "11111111111000000000",
-        "11111111111000000000",
+        "11111111111000001111",
         "11111111111000001111",
         "01111111111000000000",
         "01111111111000000000",

@@ -96,7 +96,10 @@ impl CastExecutor {
                     to,
                     DataType::Float(_) | DataType::Double(_) | DataType::Date(_)
                 ) || timestamp(to))
-            || matches!(from, DataType::BigInt(_) | DataType::Date(_)) && timestamp(to)
+            || matches!(
+                from,
+                DataType::Int(_) | DataType::BigInt(_) | DataType::Date(_)
+            ) && timestamp(to)
             || timestamp(from)
                 && (timestamp(to)
                     || matches!(
@@ -277,7 +280,8 @@ impl CastExecutor {
                     .collect::<crate::Result<Vec<_>>>()?;
                 strict_cast(&(Arc::new(Int64Array::from(values)) as ArrayRef), &target)?
             }
-        } else if matches!(self.from, DataType::BigInt(_)) && timestamp(&self.to) {
+        } else if matches!(self.from, DataType::Int(_) | DataType::BigInt(_)) && timestamp(&self.to)
+        {
             self.require(number(&self.current))?;
             let (source, _) = self.number_input(&source)?;
             let long = super::evolution_cast::numeric_to_integer(&source, &ArrowType::Int64)?;

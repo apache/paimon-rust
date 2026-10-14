@@ -26,7 +26,7 @@ use super::read_limit::take_limited_batch;
 use crate::arrow::format::blob::DEFAULT_BLOB_READ_PARALLELISM;
 use crate::arrow::format::FilePredicates;
 use crate::arrow::format::MosaicPrefetchOptions;
-use crate::arrow::{build_target_arrow_schema, ReadBudget};
+use crate::arrow::ReadBudget;
 use crate::deletion_vector::{DeletionVector, DeletionVectorFactory};
 use crate::file_index::evaluator::evaluate_file_index;
 use crate::file_index::file_index_result::FileIndexResult;
@@ -163,7 +163,7 @@ impl DataEvolutionReader {
             .filter(|f| f.name() != ROW_ID_FIELD_NAME)
             .cloned()
             .collect();
-        let output_schema = build_target_arrow_schema(&read_type)?;
+        let output_schema = crate::arrow::build_read_arrow_schema(&read_type)?;
 
         // Widen the file read set with predicate columns not already projected
         // so the residual filter can evaluate every leaf. Extras land strictly
@@ -197,7 +197,7 @@ impl DataEvolutionReader {
             }
             None => None,
         };
-        let wide_output_schema = build_target_arrow_schema(&wide_read_type)?;
+        let wide_output_schema = crate::arrow::build_read_arrow_schema(&wide_read_type)?;
 
         Ok(Self {
             file_io,
@@ -996,7 +996,7 @@ impl DataEvolutionReader {
         // Match the input cap so a LIMIT cannot resolve payloads for rows that
         // are only going to be discarded from the merge output.
         let merge_batch_size = batch_size.unwrap_or(1024).clamp(1, 1024);
-        let target_schema = build_target_arrow_schema(&read_type)?;
+        let target_schema = crate::arrow::build_read_arrow_schema(&read_type)?;
 
         Ok(try_stream! {
             let (file_infos, file_schema_nested_enabled) = load_file_infos(
@@ -1931,7 +1931,7 @@ fn read_vector_bunch_with_null_gaps_stream(
         }
     }
 
-    let target_schema = build_target_arrow_schema(read_fields)?;
+    let target_schema = crate::arrow::build_read_arrow_schema(read_fields)?;
     let null_batch_size = batch_size.unwrap_or(1024).max(1);
     let split = split.clone();
 
@@ -7744,7 +7744,8 @@ mod tests {
             None,
         );
 
-        let row_schema = build_target_arrow_schema(std::slice::from_ref(&id_field)).unwrap();
+        let row_schema =
+            crate::arrow::build_target_arrow_schema(std::slice::from_ref(&id_field)).unwrap();
         let batch = RecordBatch::try_new(
             row_schema.clone(),
             vec![Arc::new(Int32Array::from(vec![1, 2]))],

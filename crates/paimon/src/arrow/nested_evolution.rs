@@ -34,12 +34,14 @@
 use std::sync::Arc;
 
 use arrow_array::{
-    new_null_array, Array, ArrayRef, ListArray, MapArray, StringArray, StructArray, UInt32Array,
+    new_null_array, Array, ArrayRef, BooleanArray, GenericListArray, ListArray, MapArray,
+    OffsetSizeTrait, StringArray, StructArray, UInt32Array,
 };
+use arrow_buffer::{NullBuffer, OffsetBuffer};
 use arrow_cast::cast;
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Fields};
 
-use crate::arrow::paimon_type_to_arrow;
+use crate::arrow::paimon_type_to_arrow_for_read;
 use crate::spec::{
     is_variant_extraction_row_type, map_selected_keys, DataField, DataType, MapType, RowType,
 };
@@ -62,13 +64,26 @@ pub(crate) fn evolve_field(
             if is_variant_extraction_row_type(target.data_type()) {
                 // A format read plan may already have assembled the synthetic
                 // ROW while its field context still describes the VARIANT.
-                if source.data_type() == &paimon_type_to_arrow(target.data_type())? {
-                    return Ok(source.clone());
+                if source
+                    .as_any()
+                    .downcast_ref::<StructArray>()
+                    .is_some_and(|rows| {
+                        rows.column_names()
+                            == row
+                                .fields()
+                                .iter()
+                                .map(|field| field.name())
+                                .collect::<Vec<_>>()
+                    })
+                {
+                    return evolve_column(source, target.data_type(), target.data_type());
                 }
-                return crate::arrow::shredding::variant::assemble_variant_extraction_array(
-                    source.as_ref(),
-                    row,
-                );
+                let assembled =
+                    crate::arrow::shredding::variant::assemble_variant_extraction_array(
+                        source.as_ref(),
+                        row,
+                    )?;
+                return evolve_column(&assembled, target.data_type(), target.data_type());
             }
         }
     }
@@ -89,8 +104,20 @@ pub(crate) fn selected_map_to_row(
                 message: "Selected MAP input must be a MapArray".into(),
                 source: None,
             })?;
-    let names = map
-        .keys()
+    if !matches!(
+        map_type.key_type(),
+        DataType::Char(_) | DataType::VarChar(_)
+    ) {
+        return Err(crate::Error::Unsupported {
+            message: "Selected MAP keys must have a character string type".into(),
+        });
+    }
+    let normalized_keys = evolve_column(
+        map.keys(),
+        map_type.key_type(),
+        &DataType::VarChar(crate::spec::VarCharType::string_type()),
+    )?;
+    let names = normalized_keys
         .as_any()
         .downcast_ref::<StringArray>()
         .ok_or_else(|| crate::Error::DataInvalid {
@@ -123,7 +150,8 @@ pub(crate) fn selected_map_to_row(
             field.data_type(),
         )?);
     }
-    let ArrowDataType::Struct(fields) = paimon_type_to_arrow(&DataType::Row(row_type.clone()))?
+    let ArrowDataType::Struct(fields) =
+        paimon_type_to_arrow_for_read(&DataType::Row(row_type.clone()))?
     else {
         unreachable!()
     };
@@ -141,14 +169,35 @@ pub(crate) fn selected_map_to_row(
 /// actually holds) with `target_type` (the type the read schema wants).
 ///
 /// Recurses through ROW so an added, dropped, renamed or promoted nested field
-/// is handled at any depth. Non-nested mismatches fall back to Arrow `cast`,
-/// mirroring the top-level promotion path.
+/// is handled at any depth. Leaf conversions use the Java-compatible scalar
+/// executors also used by top-level old-file reads.
 pub(crate) fn evolve_column(
     source: &ArrayRef,
     source_type: &DataType,
     target_type: &DataType,
 ) -> crate::Result<ArrayRef> {
-    let target_arrow = paimon_type_to_arrow(target_type)?;
+    // DECIMAL has at most 38 digits in Paimon, but Arrow metadata may use the
+    // wider Decimal256 storage for the same logical type. Normalize storage
+    // before dispatching Java numeric executors, preserving precision/scale.
+    if matches!(source_type, DataType::Decimal(_))
+        && matches!(source.data_type(), ArrowDataType::Decimal256(_, _))
+    {
+        let source_arrow = paimon_type_to_arrow_for_read(source_type)?;
+        let normalized = arrow_cast::cast_with_options(
+            source,
+            &source_arrow,
+            &arrow_cast::CastOptions {
+                safe: false,
+                ..Default::default()
+            },
+        )
+        .map_err(|error| crate::Error::DataInvalid {
+            message: format!("failed to normalize DECIMAL storage: {error}"),
+            source: None,
+        })?;
+        return evolve_column(&normalized, source_type, target_type);
+    }
+    let target_arrow = paimon_type_to_arrow_for_read(target_type)?;
     // Arrow equality alone is NOT enough to skip the walk: `paimon_type_to_arrow`
     // drops field ids, so a nested child that was dropped and re-added under the
     // same name and type produces an identical Arrow struct while carrying a
@@ -159,6 +208,25 @@ pub(crate) fn evolve_column(
     // not actually match the target still goes through the cast below.
     if source_type.equals_ignore_nullable(target_type) && source.data_type() == &target_arrow {
         return Ok(source.clone());
+    }
+    if source_type.equals_ignore_nullable(target_type)
+        && !matches!(
+            source_type,
+            DataType::Row(_) | DataType::Array(_) | DataType::Map(_) | DataType::Multiset(_)
+        )
+    {
+        return arrow_cast::cast_with_options(
+            source,
+            &target_arrow,
+            &arrow_cast::CastOptions {
+                safe: false,
+                ..Default::default()
+            },
+        )
+        .map_err(|error| crate::Error::DataInvalid {
+            message: format!("failed to normalize schema-evolution storage: {error}"),
+            source: None,
+        });
     }
 
     if matches!(target_type, DataType::VarChar(_) | DataType::Char(_))
@@ -180,7 +248,21 @@ pub(crate) fn evolve_column(
         // nothing to evolve — leave it to the cast below, as before.
         (DataType::Row(_), DataType::Row(_))
             if is_variant_extraction_row_type(target_type)
-                || is_variant_extraction_row_type(source_type) => {}
+                || is_variant_extraction_row_type(source_type) =>
+        {
+            return arrow_cast::cast_with_options(
+                source,
+                &target_arrow,
+                &arrow_cast::CastOptions {
+                    safe: false,
+                    ..Default::default()
+                },
+            )
+            .map_err(|error| crate::Error::DataInvalid {
+                message: format!("failed to normalize variant-extraction ROW storage: {error}"),
+                source: None,
+            });
+        }
         (DataType::Row(target_row), DataType::Row(source_row)) => {
             return evolve_struct(source, source_row, target_row)
         }
@@ -245,13 +327,21 @@ pub(crate) fn evolve_column(
         return Ok(result);
     }
 
-    cast(source, &target_arrow).map_err(|e| crate::Error::UnexpectedError {
+    // Old-file reads and authorization use the same Java executor for lexical
+    // parsing, numeric text and character/binary widths. Arrow's default cast
+    // can otherwise silently replace invalid strings with NULL.
+    if super::CastExecutor::supports(source_type, target_type) {
+        return super::CastExecutor::new(
+            source_type.clone(),
+            source_type.clone(),
+            target_type.clone(),
+        )?
+        .cast(source);
+    }
+    Err(crate::Error::Unsupported {
         message: format!(
-            "failed to cast nested value from {:?} to {:?} during schema evolution",
-            source.data_type(),
-            target_arrow
+            "Cannot cast from type {source_type} to type {target_type} during schema evolution"
         ),
-        source: Some(Box::new(e)),
     })
 }
 
@@ -273,8 +363,18 @@ fn render_string_values(
             let children = row_type
                 .fields()
                 .iter()
-                .enumerate()
-                .map(|(index, field)| render_string_values(rows.column(index), field.data_type()))
+                .map(|field| {
+                    let column = rows.column_by_name(field.name()).ok_or_else(|| {
+                        crate::Error::DataInvalid {
+                            message: format!(
+                                "missing historical ROW field '{}' during string conversion",
+                                field.name()
+                            ),
+                            source: None,
+                        }
+                    })?;
+                    render_string_values(&visible_struct_child(column, rows)?, field.data_type())
+                })
                 .collect::<crate::Result<Vec<_>>>()?;
             Ok((0..rows.len())
                 .map(|index| {
@@ -292,12 +392,7 @@ fn render_string_values(
                 .collect())
         }
         DataType::Array(array_type) => {
-            let rows = source.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
-                crate::Error::DataInvalid {
-                    message: format!("expected ARRAY array, got {:?}", source.data_type()),
-                    source: None,
-                }
-            })?;
+            let rows = visible_list(source)?;
             let values = render_string_values(rows.values(), array_type.element_type())?;
             let offsets = rows.value_offsets();
             Ok((0..rows.len())
@@ -316,12 +411,7 @@ fn render_string_values(
                 .collect())
         }
         DataType::Map(map_type) => {
-            let rows = source.as_any().downcast_ref::<MapArray>().ok_or_else(|| {
-                crate::Error::DataInvalid {
-                    message: format!("expected MAP array, got {:?}", source.data_type()),
-                    source: None,
-                }
-            })?;
+            let rows = visible_map(as_map_array(source, "MAP")?)?;
             let keys = render_string_values(rows.keys(), map_type.key_type())?;
             let values = render_string_values(rows.values(), map_type.value_type())?;
             let offsets = rows.value_offsets();
@@ -396,11 +486,11 @@ fn evolve_struct(
     let mut fields: Vec<Arc<ArrowField>> = Vec::with_capacity(target_row.fields().len());
     let mut arrays: Vec<ArrayRef> = Vec::with_capacity(target_row.fields().len());
     for target_field in target_row.fields() {
-        let target_arrow = paimon_type_to_arrow(target_field.data_type())?;
+        let target_arrow = paimon_type_to_arrow_for_read(target_field.data_type())?;
         fields.push(Arc::new(ArrowField::new(
             target_field.name(),
             target_arrow.clone(),
-            target_field.data_type().is_nullable(),
+            true,
         )));
 
         // Pair by id (Java: `createIndexMapping` over the ROW's fields).
@@ -431,7 +521,11 @@ fn evolve_struct(
                         ),
                         source: None,
                     })?;
-                arrays.push(evolve_field(column, source_field, target_field)?)
+                arrays.push(evolve_field(
+                    &visible_struct_child(column, source_struct)?,
+                    source_field,
+                    target_field,
+                )?)
             }
         }
     }
@@ -452,45 +546,13 @@ fn evolve_list(
     source_element: &DataType,
     target_element: &DataType,
 ) -> crate::Result<ArrayRef> {
-    // A Paimon ARRAY converts to an Arrow `List`, but a decoded column can arrive
-    // in another list layout — an external Parquet file's embedded Arrow schema
-    // may yield `LargeList` or `FixedSizeList`. Normalize the layout with Arrow's
-    // own cast (which range-checks large offsets) before reconciling the element,
-    // so those files stay readable.
-    let normalized;
-    let list = match source.as_any().downcast_ref::<ListArray>() {
-        Some(list) => list,
-        None => {
-            let source_layout = ArrowDataType::List(Arc::new(ArrowField::new(
-                "element",
-                paimon_type_to_arrow(source_element)?,
-                source_element.is_nullable(),
-            )));
-            normalized = cast(source, &source_layout).map_err(|e| crate::Error::DataInvalid {
-                message: format!(
-                    "expected a list array for ARRAY schema evolution, got {:?}, which does not convert to {source_layout:?}: {e}",
-                    source.data_type()
-                ),
-                source: None,
-            })?;
-            normalized
-                .as_any()
-                .downcast_ref::<ListArray>()
-                .ok_or_else(|| crate::Error::DataInvalid {
-                    message: format!(
-                        "normalizing {:?} did not yield a list array",
-                        source.data_type()
-                    ),
-                    source: None,
-                })?
-        }
-    };
+    let list = visible_list(source)?;
 
     let values = evolve_column(list.values(), source_element, target_element)?;
     let element_field = Arc::new(ArrowField::new(
         "element",
-        paimon_type_to_arrow(target_element)?,
-        target_element.is_nullable(),
+        paimon_type_to_arrow_for_read(target_element)?,
+        true,
     ));
     let evolved = ListArray::try_new(
         element_field,
@@ -505,6 +567,166 @@ fn evolve_list(
     Ok(Arc::new(evolved))
 }
 
+/// Normalize physical offsets without casting children before field-id evolution.
+/// Arrow metadata can store logical ARRAYs as LargeList or FixedSizeList. Their
+/// children still describe the historical file schema and must remain intact.
+fn normalize_list(source: &ArrayRef) -> crate::Result<ListArray> {
+    if let Some(list) = source.as_any().downcast_ref::<ListArray>() {
+        return Ok(list.clone());
+    }
+    let child = match source.data_type() {
+        ArrowDataType::LargeList(child) | ArrowDataType::FixedSizeList(child, _) => child,
+        _ => {
+            return Err(crate::Error::DataInvalid {
+                message: format!("expected ARRAY array, got {:?}", source.data_type()),
+                source: None,
+            });
+        }
+    };
+    let normalized = cast(source, &ArrowDataType::List(child.clone())).map_err(|e| {
+        crate::Error::DataInvalid {
+            message: format!("failed to normalize ARRAY offsets: {e}"),
+            source: None,
+        }
+    })?;
+    normalized
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .cloned()
+        .ok_or_else(|| crate::Error::DataInvalid {
+            message: "normalizing ARRAY offsets did not yield a ListArray".into(),
+            source: None,
+        })
+}
+
+fn visible_struct_child(column: &ArrayRef, rows: &StructArray) -> crate::Result<ArrayRef> {
+    if rows.null_count() == 0 {
+        return Ok(column.clone());
+    }
+    let hidden = BooleanArray::from(
+        (0..rows.len())
+            .map(|row| rows.is_null(row))
+            .collect::<Vec<_>>(),
+    );
+    arrow_select::nullif::nullif(column.as_ref(), &hidden).map_err(|error| {
+        crate::Error::DataInvalid {
+            message: format!("failed to mask a NULL ROW child: {error}"),
+            source: None,
+        }
+    })
+}
+
+/// Only convert elements the visible containers can observe. Slices may retain
+/// unrelated prefix/suffix values; NULL containers can also own physical slots.
+/// Java's array/map getters never evaluate those slots.
+fn visible_entries<O: OffsetSizeTrait>(
+    offsets: &[O],
+    nulls: Option<&NullBuffer>,
+    values: &ArrayRef,
+) -> crate::Result<(OffsetBuffer<i32>, ArrayRef)> {
+    let start = offsets[0].as_usize();
+    let end = offsets[offsets.len() - 1].as_usize();
+    let has_hidden_entries = (0..offsets.len() - 1).any(|row| {
+        nulls.is_some_and(|nulls| nulls.is_null(row)) && offsets[row] != offsets[row + 1]
+    });
+    let mut result_offsets = Vec::with_capacity(offsets.len());
+    result_offsets.push(0);
+    let selected = if has_hidden_entries {
+        let mut pieces = Vec::new();
+        let mut count = 0usize;
+        for row in 0..offsets.len() - 1 {
+            let from = offsets[row].as_usize();
+            let to = offsets[row + 1].as_usize();
+            if nulls.is_none_or(|nulls| nulls.is_valid(row)) && from != to {
+                pieces.push(values.slice(from, to - from));
+                count += to - from;
+            }
+            result_offsets.push(i32::try_from(count).map_err(|error| {
+                crate::Error::DataInvalid {
+                    message: format!(
+                        "ARRAY/MAP visible offsets exceed Arrow List storage: {error}"
+                    ),
+                    source: None,
+                }
+            })?);
+        }
+        if pieces.is_empty() {
+            values.slice(start, 0)
+        } else {
+            arrow_select::concat::concat(
+                &pieces.iter().map(|part| part.as_ref()).collect::<Vec<_>>(),
+            )
+            .map_err(|error| crate::Error::DataInvalid {
+                message: format!("failed to gather visible ARRAY/MAP entries: {error}"),
+                source: None,
+            })?
+        }
+    } else {
+        for offset in &offsets[1..] {
+            result_offsets.push(i32::try_from(offset.as_usize() - start).map_err(|error| {
+                crate::Error::DataInvalid {
+                    message: format!(
+                        "ARRAY/MAP visible offsets exceed Arrow List storage: {error}"
+                    ),
+                    source: None,
+                }
+            })?);
+        }
+        values.slice(start, end - start)
+    };
+    Ok((OffsetBuffer::new(result_offsets.into()), selected))
+}
+
+fn visible_generic_list<O: OffsetSizeTrait>(
+    list: &GenericListArray<O>,
+) -> crate::Result<ListArray> {
+    let (offsets, values) = visible_entries(list.value_offsets(), list.nulls(), list.values())?;
+    let child = match list.data_type() {
+        ArrowDataType::List(child) | ArrowDataType::LargeList(child) => child.clone(),
+        _ => unreachable!(),
+    };
+    ListArray::try_new(child, offsets, values, list.nulls().cloned()).map_err(|error| {
+        crate::Error::DataInvalid {
+            message: format!("failed to build visible ARRAY: {error}"),
+            source: None,
+        }
+    })
+}
+
+fn visible_list(source: &ArrayRef) -> crate::Result<ListArray> {
+    if let Some(list) = source
+        .as_any()
+        .downcast_ref::<arrow_array::LargeListArray>()
+    {
+        return visible_generic_list(list);
+    }
+    visible_generic_list(&normalize_list(source)?)
+}
+
+fn visible_map(map: &MapArray) -> crate::Result<MapArray> {
+    let entries: ArrayRef = Arc::new(map.entries().clone());
+    let (offsets, entries) = visible_entries(map.value_offsets(), map.nulls(), &entries)?;
+    let entries = entries
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .unwrap()
+        .clone();
+    let ArrowDataType::Map(field, sorted) = map.data_type() else {
+        unreachable!()
+    };
+    MapArray::try_new(
+        field.clone(),
+        offsets,
+        entries,
+        map.nulls().cloned(),
+        *sorted,
+    )
+    .map_err(|error| crate::Error::DataInvalid {
+        message: format!("failed to build visible MAP: {error}"),
+        source: None,
+    })
+}
+
 /// Rebuild a MAP whose key or value type evolved, reusing the source offsets and
 /// validity. Mirrors Java `SchemaEvolutionUtil.createMapCastExecutor`.
 fn evolve_map(
@@ -512,7 +734,7 @@ fn evolve_map(
     source_map: &MapType,
     target_map: &MapType,
 ) -> crate::Result<ArrayRef> {
-    let map = as_map_array(source, "MAP")?;
+    let map = visible_map(as_map_array(source, "MAP")?)?;
     let keys = evolve_column(map.keys(), source_map.key_type(), target_map.key_type())?;
     let values = evolve_column(
         map.values(),
@@ -520,14 +742,18 @@ fn evolve_map(
         target_map.value_type(),
     )?;
     rebuild_map(
-        map,
+        &map,
         keys,
         values,
-        ArrowField::new("key", paimon_type_to_arrow(target_map.key_type())?, false),
+        ArrowField::new(
+            "key",
+            paimon_type_to_arrow_for_read(target_map.key_type())?,
+            false,
+        ),
         ArrowField::new(
             "value",
-            paimon_type_to_arrow(target_map.value_type())?,
-            target_map.value_type().is_nullable(),
+            paimon_type_to_arrow_for_read(target_map.value_type())?,
+            true,
         ),
     )
 }
@@ -546,16 +772,16 @@ fn evolve_multiset(
     source_element: &DataType,
     target_element: &DataType,
 ) -> crate::Result<ArrayRef> {
-    let map = as_map_array(source, "MULTISET")?;
+    let map = visible_map(as_map_array(source, "MULTISET")?)?;
     let elements = evolve_column(map.keys(), source_element, target_element)?;
     let counts = map.values().clone();
     rebuild_map(
-        map,
+        &map,
         elements,
         counts,
         ArrowField::new(
             "key",
-            paimon_type_to_arrow(target_element)?,
+            paimon_type_to_arrow_for_read(target_element)?,
             target_element.is_nullable(),
         ),
         ArrowField::new("value", ArrowDataType::Int32, false),
@@ -718,6 +944,42 @@ mod tests {
         assert_eq!(output.column(2).null_count(), 3);
     }
 
+    #[test]
+    fn selected_map_normalizes_large_string_keys_in_sliced_input() {
+        use arrow_array::builder::{Int32Builder, LargeStringBuilder, MapBuilder};
+        let mut builder = MapBuilder::new(None, LargeStringBuilder::new(), Int32Builder::new());
+        for (key, value) in [("prefix", 99), ("key", 7), ("key", 9), ("suffix", 88)] {
+            builder.keys().append_value(key);
+            builder.values().append_value(value);
+            if key != "key" || value == 9 {
+                builder.append(true).unwrap();
+            }
+        }
+        let source: ArrayRef = Arc::new(builder.finish());
+        let source_field = field(
+            10,
+            "attrs",
+            DataType::Map(MapType::new(
+                DataType::VarChar(VarCharType::string_type()),
+                DataType::Int(IntType::new()),
+            )),
+        );
+        let requested =
+            crate::spec::map_selected_keys_field(&source_field, &["key".into(), "prefix".into()])
+                .unwrap();
+        let output = evolve_field(&source.slice(1, 1), &source_field, &requested).unwrap();
+        let output = output.as_any().downcast_ref::<StructArray>().unwrap();
+        assert_eq!(
+            output
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap(),
+            &Int32Array::from(vec![7])
+        );
+        assert_eq!(output.column(1).null_count(), 1);
+    }
+
     fn field(id: i32, name: &str, dt: DataType) -> DataField {
         DataField::new(id, name.to_string(), dt)
     }
@@ -784,7 +1046,10 @@ mod tests {
 
         // The rebuilt struct must match the type the read schema declares, or
         // RecordBatch assembly would reject it.
-        assert_eq!(out.data_type(), &paimon_type_to_arrow(&target).unwrap());
+        assert_eq!(
+            out.data_type(),
+            &paimon_type_to_arrow_for_read(&target).unwrap()
+        );
         let evolved = as_struct(&out);
         assert_eq!(
             evolved.column_names(),
@@ -901,7 +1166,10 @@ mod tests {
 
         let ts6 = DataType::Timestamp(TimestampType::new(6).unwrap());
         let micros = evolve_column(&source, &source_type, &ts6).unwrap();
-        assert_eq!(micros.data_type(), &paimon_type_to_arrow(&ts6).unwrap());
+        assert_eq!(
+            micros.data_type(),
+            &paimon_type_to_arrow_for_read(&ts6).unwrap()
+        );
         let micros = micros
             .as_any()
             .downcast_ref::<TimestampMicrosecondArray>()
@@ -947,7 +1215,7 @@ mod tests {
                     Some((i64::from(i32::MAX) + 3) * ticks),
                     None,
                 ]));
-                let source = cast(&raw, &paimon_type_to_arrow(&source_type).unwrap())
+                let source = cast(&raw, &paimon_type_to_arrow_for_read(&source_type).unwrap())
                     .unwrap()
                     .slice(1, 6);
                 let out =
@@ -1034,7 +1302,7 @@ mod tests {
             };
             let raw: ArrayRef =
                 Arc::new(Int64Array::from(vec![Some(i64::MAX), Some(i64::MIN), None]));
-            let source = cast(&raw, &paimon_type_to_arrow(&source_type).unwrap()).unwrap();
+            let source = cast(&raw, &paimon_type_to_arrow_for_read(&source_type).unwrap()).unwrap();
             let output =
                 evolve_column(&source, &source_type, &DataType::BigInt(BigIntType::new())).unwrap();
             assert_eq!(
@@ -1117,7 +1385,7 @@ mod tests {
                 )
             };
             let raw: ArrayRef = Arc::new(Int64Array::from(raw));
-            let leaf = cast(&raw, &paimon_type_to_arrow(&source_type).unwrap()).unwrap();
+            let leaf = cast(&raw, &paimon_type_to_arrow_for_read(&source_type).unwrap()).unwrap();
             let validity = Some(NullBuffer::from(vec![true, false, true]));
             let values = |array: &ArrayRef| {
                 cast(array, &ArrowDataType::Int64)
@@ -1131,7 +1399,8 @@ mod tests {
 
             let source_row = row(vec![field(11, "v", source_type.clone())]);
             let target_row = row(vec![field(11, "v", target_type.clone())]);
-            let ArrowDataType::Struct(fields) = paimon_type_to_arrow(&source_row).unwrap() else {
+            let ArrowDataType::Struct(fields) = paimon_type_to_arrow_for_read(&source_row).unwrap()
+            else {
                 panic!()
             };
             let source: ArrayRef = Arc::new(
@@ -1140,7 +1409,11 @@ mod tests {
             let out = evolve_column(&source, &source_row, &target_row).unwrap();
             let out = as_struct(&out);
             assert_eq!(out.nulls(), source.nulls());
-            assert_eq!(values(out.column(0)), expected, "ROW reverse={reverse}");
+            assert_eq!(
+                values(out.column(0)),
+                vec![expected[0], None, expected[2]],
+                "ROW reverse={reverse}"
+            );
 
             let source: ArrayRef = Arc::new(
                 ListArray::try_new(
@@ -1483,7 +1756,7 @@ mod tests {
 
         assert_eq!(
             out.data_type(),
-            &paimon_type_to_arrow(&target_type).unwrap()
+            &paimon_type_to_arrow_for_read(&target_type).unwrap()
         );
         let list = out
             .as_any()
@@ -1551,7 +1824,7 @@ mod tests {
 
         assert_eq!(
             out.data_type(),
-            &paimon_type_to_arrow(&target_type).unwrap()
+            &paimon_type_to_arrow_for_read(&target_type).unwrap()
         );
         let map = out
             .as_any()
@@ -1686,6 +1959,289 @@ mod tests {
     }
 
     #[test]
+    fn casts_only_visible_list_elements_including_null_container_slots() {
+        let values: ArrayRef = Arc::new(StringArray::from(vec![
+            "bad-prefix",
+            "1.9",
+            "bad-null",
+            "-2.5",
+            "bad-suffix",
+        ]));
+        let array: ArrayRef = Arc::new(
+            ListArray::try_new(
+                Arc::new(ArrowField::new("item", ArrowDataType::Utf8, true)),
+                OffsetBuffer::new(vec![0i32, 1, 2, 3, 4, 5].into()),
+                values,
+                Some(NullBuffer::from(vec![true, true, false, true, true])),
+            )
+            .unwrap(),
+        );
+        let source_type = DataType::Array(ArrayType::new(DataType::VarChar(
+            VarCharType::string_type(),
+        )));
+        let target_type = DataType::Array(ArrayType::new(DataType::Int(IntType::new())));
+        let output = evolve_column(&array.slice(1, 3), &source_type, &target_type).unwrap();
+        let rows = output.as_any().downcast_ref::<ListArray>().unwrap();
+        assert_eq!(rows.value_offsets(), &[0, 1, 1, 2]);
+        assert_eq!(
+            rows.values().as_any().downcast_ref::<Int32Array>().unwrap(),
+            &Int32Array::from(vec![1, -2])
+        );
+        assert!(rows.is_null(1));
+        assert!(evolve_column(&array.slice(0, 1), &source_type, &target_type).is_err());
+    }
+
+    #[test]
+    fn casts_only_children_of_non_null_rows() {
+        let child: ArrayRef = Arc::new(StringArray::from(vec!["1.9", "bad", "-2.5"]));
+        let array: ArrayRef = Arc::new(
+            StructArray::try_new(
+                Fields::from(vec![ArrowField::new("old", ArrowDataType::Utf8, true)]),
+                vec![child],
+                Some(NullBuffer::from(vec![true, false, true])),
+            )
+            .unwrap(),
+        );
+        let output = evolve_column(
+            &array,
+            &row(vec![field(1, "old", string_type())]),
+            &row(vec![field(1, "renamed", DataType::Int(IntType::new()))]),
+        )
+        .unwrap();
+        let rows = as_struct(&output);
+        assert_eq!(
+            rows.column_by_name("renamed")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap(),
+            &Int32Array::from(vec![Some(1), None, Some(-2)])
+        );
+        assert!(rows.is_null(1));
+    }
+
+    #[test]
+    fn read_schema_allows_decimal_overflow_nulls_without_relaxing_writes() {
+        let source_type = DataType::Array(ArrayType::new(DataType::Decimal(
+            DecimalType::with_nullable(false, 6, 3).unwrap(),
+        )));
+        let target_type = DataType::Array(ArrayType::new(DataType::Decimal(
+            DecimalType::with_nullable(false, 3, 2).unwrap(),
+        )));
+        let source: ArrayRef = Arc::new(
+            ListArray::try_new(
+                Arc::new(ArrowField::new(
+                    "element",
+                    ArrowDataType::Decimal128(6, 3),
+                    false,
+                )),
+                OffsetBuffer::new(vec![0, 2].into()),
+                Arc::new(
+                    Decimal128Array::from(vec![9995, 1000])
+                        .with_precision_and_scale(6, 3)
+                        .unwrap(),
+                ),
+                None,
+            )
+            .unwrap(),
+        );
+        let output = evolve_column(&source, &source_type, &target_type).unwrap();
+        output.to_data().validate_full().unwrap();
+        let list = output.as_any().downcast_ref::<ListArray>().unwrap();
+        assert_eq!(
+            list.values()
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![None, Some(100)]
+        );
+        let fields = vec![field(1, "value", target_type)];
+        let read_schema = crate::arrow::build_read_arrow_schema(&fields).unwrap();
+        arrow_array::RecordBatch::try_new(read_schema, vec![output]).unwrap();
+        let write_schema = crate::arrow::build_target_arrow_schema(&fields).unwrap();
+        let ArrowDataType::List(child) = write_schema.field(0).data_type() else {
+            panic!()
+        };
+        assert!(!child.is_nullable());
+    }
+
+    #[test]
+    fn assembled_variant_rows_normalize_runtime_nullability_and_large_strings() {
+        let row = crate::spec::variant_extraction_row(
+            true,
+            vec![
+                (
+                    DataType::Int(IntType::with_nullable(false)),
+                    "$.x".into(),
+                    false,
+                    "UTC".into(),
+                ),
+                (
+                    DataType::VarChar(VarCharType::string_type()),
+                    "$.s".into(),
+                    false,
+                    "UTC".into(),
+                ),
+            ],
+        )
+        .unwrap();
+        let target = field(1, "payload", DataType::Row(row));
+        let source_field = field(
+            1,
+            "payload",
+            DataType::Variant(crate::spec::VariantType::new()),
+        );
+        let source: ArrayRef = Arc::new(
+            StructArray::try_new(
+                vec![
+                    ArrowField::new("0", ArrowDataType::Int32, false),
+                    ArrowField::new("1", ArrowDataType::LargeUtf8, true),
+                ]
+                .into(),
+                vec![
+                    Arc::new(Int32Array::from(vec![7])),
+                    Arc::new(arrow_array::LargeStringArray::from(vec!["text"])),
+                ],
+                None,
+            )
+            .unwrap(),
+        );
+        for output in [
+            evolve_column(&source, target.data_type(), target.data_type()).unwrap(),
+            evolve_field(&source, &source_field, &target).unwrap(),
+        ] {
+            assert_eq!(
+                output.data_type(),
+                &paimon_type_to_arrow_for_read(target.data_type()).unwrap()
+            );
+            let rows = as_struct(&output);
+            assert_eq!(
+                rows.column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .value(0),
+                7
+            );
+            assert_eq!(
+                rows.column(1)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap()
+                    .value(0),
+                "text"
+            );
+        }
+        let variant = crate::variant::GenericVariant::parse_json(r#"{"x":7,"s":"text"}"#).unwrap();
+        let ArrowDataType::Struct(fields) = crate::arrow::variant_arrow_type() else {
+            panic!()
+        };
+        let raw: ArrayRef = Arc::new(
+            StructArray::try_new(
+                fields,
+                vec![
+                    Arc::new(arrow_array::BinaryArray::from(vec![Some(variant.value())])),
+                    Arc::new(arrow_array::BinaryArray::from(vec![Some(
+                        variant.metadata(),
+                    )])),
+                ],
+                None,
+            )
+            .unwrap(),
+        );
+        let fresh = evolve_field(&raw, &source_field, &target).unwrap();
+        assert_eq!(
+            fresh.data_type(),
+            &paimon_type_to_arrow_for_read(target.data_type()).unwrap()
+        );
+    }
+
+    #[test]
+    fn casts_only_entries_of_non_null_maps() {
+        let fields = Fields::from(vec![
+            ArrowField::new("key", ArrowDataType::Utf8, false),
+            ArrowField::new("value", ArrowDataType::Utf8, true),
+        ]);
+        let entries = StructArray::new(
+            fields.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["one", "hidden", "two"])),
+                Arc::new(StringArray::from(vec!["1.9", "bad", "-2.5"])),
+            ],
+            None,
+        );
+        let array: ArrayRef = Arc::new(
+            MapArray::try_new(
+                Arc::new(ArrowField::new(
+                    "entries",
+                    ArrowDataType::Struct(fields),
+                    false,
+                )),
+                OffsetBuffer::new(vec![0i32, 1, 2, 3].into()),
+                entries,
+                Some(NullBuffer::from(vec![true, false, true])),
+                false,
+            )
+            .unwrap(),
+        );
+        let from = DataType::Map(MapType::new(string_type(), string_type()));
+        let to = DataType::Map(MapType::new(string_type(), DataType::Int(IntType::new())));
+        let output = evolve_column(&array, &from, &to).unwrap();
+        let rows = output.as_any().downcast_ref::<MapArray>().unwrap();
+        assert_eq!(rows.value_offsets(), &[0, 1, 1, 2]);
+        assert_eq!(
+            rows.values().as_any().downcast_ref::<Int32Array>().unwrap(),
+            &Int32Array::from(vec![1, -2])
+        );
+        assert!(rows.is_null(1));
+    }
+
+    #[test]
+    fn renders_large_list_strings_in_sliced_containers() {
+        let array: ArrayRef = Arc::new(
+            arrow_array::LargeListArray::try_new(
+                Arc::new(ArrowField::new("item", ArrowDataType::Int32, true)),
+                arrow_buffer::OffsetBuffer::new(vec![0i64, 1, 3, 3, 4, 5].into()),
+                Arc::new(Int32Array::from(vec![
+                    Some(9),
+                    Some(1),
+                    None,
+                    Some(7),
+                    Some(8),
+                ])),
+                Some(arrow_buffer::NullBuffer::from(vec![
+                    true, true, true, false, true,
+                ])),
+            )
+            .unwrap(),
+        );
+        let array_type = DataType::Array(ArrayType::new(DataType::Int(IntType::new())));
+        let output = evolve_column(&array.slice(1, 3), &array_type, &string_type()).unwrap();
+        assert_eq!(
+            strings(&output),
+            StringArray::from(vec![Some("[1, null]"), Some("[]"), None])
+        );
+
+        let source: ArrayRef = Arc::new(StructArray::new(
+            Fields::from(vec![ArrowField::new("a", array.data_type().clone(), true)]),
+            vec![array],
+            None,
+        ));
+        let output = evolve_column(
+            &source.slice(1, 3),
+            &row(vec![field(4, "a", array_type)]),
+            &string_type(),
+        )
+        .unwrap();
+        assert_eq!(
+            strings(&output),
+            StringArray::from(vec!["{[1, null]}", "{[]}", "{null}"])
+        );
+    }
+
+    #[test]
     fn evolves_a_large_list_element() {
         // A format table's embedded Arrow schema can decode a Paimon ARRAY as a
         // LargeList; the logical types still have to reconcile.
@@ -1721,7 +2277,7 @@ mod tests {
 
         assert_eq!(
             out.data_type(),
-            &paimon_type_to_arrow(&target_type).unwrap()
+            &paimon_type_to_arrow_for_read(&target_type).unwrap()
         );
         let list = out
             .as_any()
@@ -1761,7 +2317,7 @@ mod tests {
 
         assert_eq!(
             out.data_type(),
-            &paimon_type_to_arrow(&source_type).unwrap(),
+            &paimon_type_to_arrow_for_read(&source_type).unwrap(),
             "the layout must be normalized to the Paimon ARRAY's Arrow type"
         );
         assert_eq!(out.len(), 2);

@@ -21,7 +21,6 @@ use super::{
     audit_sequence_number_enabled, rowkind_array_from_column, PaimonTableRead, TableRead,
     TableReadKind, MAX_MERGE_INPUT_STREAMS,
 };
-use crate::arrow::build_target_arrow_schema;
 use crate::spec::{
     DataField, DataType, MergeEngine, TinyIntType, ROW_KIND_FIELD_ID, SEQUENCE_NUMBER_FIELD_ID,
     VALUE_KIND_FIELD_ID, VALUE_KIND_FIELD_NAME,
@@ -79,7 +78,7 @@ impl<'a> AuditLogRead<'a> {
                 source: None,
             });
         }
-        let audit_schema = build_target_arrow_schema(&output_read_type)?;
+        let audit_schema = crate::arrow::build_read_arrow_schema(&output_read_type)?;
         let mut read_type: Vec<_> = output_read_type
             .iter()
             .filter(|field| field.id() != ROW_KIND_FIELD_ID)

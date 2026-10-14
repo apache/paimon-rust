@@ -44,7 +44,7 @@ pub(super) fn cast_temporal(
             DataType::LocalZonedTimestamp(_),
             DataType::Timestamp(_) | DataType::Date(_) | DataType::Time(_)
         ) | (
-            DataType::Date(_) | DataType::BigInt(_),
+            DataType::Date(_) | DataType::Int(_) | DataType::BigInt(_),
             DataType::LocalZonedTimestamp(_)
         )
     ) {
@@ -96,12 +96,15 @@ fn cast_in_zone_with_storage(
     );
     let numeric = matches!(
         (from, to),
-        (DataType::BigInt(_), DataType::LocalZonedTimestamp(_))
+        (
+            DataType::Int(_) | DataType::BigInt(_),
+            DataType::LocalZonedTimestamp(_)
+        )
     );
-    if !cross
-        && !date
-        && !numeric
-        && !(timestamp && matches!(to, DataType::Date(_) | DataType::Time(_)))
+    if !(cross
+        || date
+        || numeric
+        || timestamp && matches!(to, DataType::Date(_) | DataType::Time(_)))
     {
         return Ok(None);
     }

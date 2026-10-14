@@ -32,7 +32,7 @@ use super::sort_merge::{
 };
 use crate::arrow::format::MosaicPrefetchOptions;
 use crate::arrow::shredding::variant::assemble_variant_extraction_array;
-use crate::arrow::{build_target_arrow_schema, ReadBudget};
+use crate::arrow::ReadBudget;
 use crate::deletion_vector::DeletionVectorFactory;
 use crate::file_index::evaluator::evaluate_file_index;
 use crate::file_index::file_index_result::FileIndexResult;
@@ -524,10 +524,10 @@ impl KeyValueFileReader {
         internal_read_type.push(value_kind_field);
         internal_read_type.extend(user_fields.clone());
 
-        let internal_schema = build_target_arrow_schema(&internal_read_type)?;
+        let internal_schema = crate::arrow::build_read_arrow_schema(&internal_read_type)?;
 
         // Output schema: user's read_type order
-        let output_schema = build_target_arrow_schema(&self.config.read_type)?;
+        let output_schema = crate::arrow::build_read_arrow_schema(&self.config.read_type)?;
 
         // Indices within internal_schema (offset 2 for _SEQ and _VK).
         let seq_index = 0;
@@ -628,7 +628,7 @@ impl KeyValueFileReader {
         let mut merge_output_fields: Vec<DataField> = Vec::new();
         merge_output_fields.extend(key_fields);
         merge_output_fields.extend(value_fields);
-        let merge_output_schema = build_target_arrow_schema(&merge_output_fields)?;
+        let merge_output_schema = crate::arrow::build_read_arrow_schema(&merge_output_fields)?;
 
         Ok(try_stream! {
             for split_group in &split_groups {
@@ -838,7 +838,10 @@ impl KeyValueFileReader {
                                 match config.read_type[out_idx].data_type() {
                                     PaimonDataType::Row(row) if is_variant_extraction_row(row) =>
                                     {
-                                        assemble_variant_extraction_array(column.as_ref(), row)
+                                        let assembled = assemble_variant_extraction_array(column.as_ref(), row)?;
+                                        crate::arrow::nested_evolution::evolve_column(
+                                            &assembled, config.read_type[out_idx].data_type(), config.read_type[out_idx].data_type(),
+                                        )
                                     }
                                     _ => {
                                         let source = merge_read_type.iter().find(|field| field.id() == config.read_type[out_idx].id()).unwrap();

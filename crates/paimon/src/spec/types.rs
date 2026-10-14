@@ -119,15 +119,10 @@ fn type_base_name(s: &str) -> &str {
 
 /// Nullability of a plain keyword type (`NAME` or `NAME NOT NULL`), `None` when `s` is neither.
 fn plain_type_nullable(s: &str, name: &str) -> Option<bool> {
-    let (base, rest) = s.split_once(' ').unwrap_or((s, ""));
-    if base != name {
-        None
-    } else if rest.is_empty() {
-        Some(true)
-    } else if rest.contains("NOT NULL") {
-        Some(false)
-    } else {
-        None
+    match s.strip_prefix(name)?.trim() {
+        "" => Some(true),
+        "NOT NULL" => Some(false),
+        _ => None,
     }
 }
 
@@ -199,6 +194,7 @@ impl DataType {
             "TINYINT" => DataType::TinyInt(TinyIntType::with_nullable(plain("TINYINT")?)),
             "SMALLINT" => DataType::SmallInt(SmallIntType::with_nullable(plain("SMALLINT")?)),
             "INT" => DataType::Int(IntType::with_nullable(plain("INT")?)),
+            "INTEGER" => DataType::Int(IntType::with_nullable(plain("INTEGER")?)),
             "BIGINT" => DataType::BigInt(BigIntType::with_nullable(plain("BIGINT")?)),
             "FLOAT" => DataType::Float(FloatType::with_nullable(plain("FLOAT")?)),
             "DOUBLE" => DataType::Double(DoubleType::with_nullable(plain("DOUBLE")?)),
@@ -1014,6 +1010,9 @@ impl FromStr for DecimalType {
     type Err = Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if let Some(nullable) = plain_type_nullable(s, "DECIMAL") {
+            return Self::with_nullable(nullable, Self::DEFAULT_PRECISION, Self::DEFAULT_SCALE);
+        }
         if !s.starts_with(serde_utils::DECIMAL::NAME) {
             return DataTypeInvalidSnafu {
                 message: "Invalid DECIMAL type. Expected string to start with 'DECIMAL'.",
@@ -1289,6 +1288,11 @@ impl FromStr for LocalZonedTimestampType {
     type Err = Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if let Some(nullable) = plain_type_nullable(s, "TIMESTAMP_LTZ")
+            .or_else(|| plain_type_nullable(s, "TIMESTAMP WITH LOCAL TIME ZONE"))
+        {
+            return Self::with_nullable(nullable, Self::DEFAULT_PRECISION);
+        }
         // PyPaimon persists the TIMESTAMP_LTZ(p) alias for this type.
         let alias = s.starts_with("TIMESTAMP_LTZ(");
         if !alias && (!s.starts_with(serde_utils::LocalZonedTimestamp::NAME) || !s.contains("WITH"))
@@ -1442,6 +1446,9 @@ impl FromStr for TimeType {
     type Err = Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if let Some(nullable) = plain_type_nullable(s, "TIME") {
+            return Self::with_nullable(nullable, Self::DEFAULT_PRECISION);
+        }
         if !s.starts_with(serde_utils::TIME::NAME) || s.contains("STAMP") {
             return DataTypeInvalidSnafu {
                 message: "Invalid TIME type. Expected string to start with 'TIME'.",
@@ -1539,6 +1546,9 @@ impl FromStr for TimestampType {
     type Err = Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if let Some(nullable) = plain_type_nullable(s, "TIMESTAMP") {
+            return Self::with_nullable(nullable, Self::DEFAULT_PRECISION);
+        }
         if !s.starts_with(serde_utils::TIMESTAMP::NAME)
             || s.starts_with("TIMESTAMP_LTZ")
             || s.contains("WITH LOCAL TIME ZONE")
@@ -2917,6 +2927,40 @@ mod tests {
                     assert_eq!(parsed, expected, "{input}");
                     assert_eq!(parsed.to_string(), format!("{name}(1){suffix}"));
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn test_atomic_defaults_and_integer_alias_match_java() {
+        let cases = [
+            ("INTEGER", DataType::Int(IntType::new())),
+            ("DECIMAL", DataType::Decimal(DecimalType::default())),
+            ("TIME", DataType::Time(TimeType::default())),
+            ("TIMESTAMP", DataType::Timestamp(TimestampType::default())),
+            (
+                "TIMESTAMP_LTZ",
+                DataType::LocalZonedTimestamp(LocalZonedTimestampType::default()),
+            ),
+            (
+                "TIMESTAMP WITH LOCAL TIME ZONE",
+                DataType::LocalZonedTimestamp(LocalZonedTimestampType::default()),
+            ),
+        ];
+        for (name, expected) in cases {
+            for nullable in [true, false] {
+                let input = format!("{name}{}", if nullable { "" } else { " NOT NULL" });
+                let parsed: DataType = serde_json::from_value(serde_json::json!(input)).unwrap();
+                assert_eq!(
+                    parsed,
+                    expected.copy_with_nullable(nullable).unwrap(),
+                    "{input}"
+                );
+                assert_eq!(
+                    serde_json::from_str::<DataType>(&serde_json::to_string(&parsed).unwrap())
+                        .unwrap(),
+                    parsed
+                );
             }
         }
     }
