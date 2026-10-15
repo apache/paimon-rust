@@ -24,7 +24,7 @@
 //! - Java `PartitionPathUtils` for path escaping and assembly
 
 use crate::common::date_time::{format_time, format_timestamp};
-use crate::common::number::format_java_float;
+use crate::common::number::format_java_float as format_java_floating;
 use crate::error::*;
 use crate::spec::types::DataType;
 use crate::spec::BinaryRow;
@@ -393,7 +393,7 @@ fn format_partition_value(
         DataType::Int(_) => row.get_int(pos)?.to_string(),
         DataType::BigInt(_) => row.get_long(pos)?.to_string(),
         DataType::Float(_) => format_java_float(row.get_float(pos)?),
-        DataType::Double(_) => format_java_float(row.get_double(pos)?),
+        DataType::Double(_) => format_java_floating(row.get_double(pos)?),
 
         DataType::Char(_) | DataType::VarChar(_) => {
             let s = row.get_string(pos)?;
@@ -483,6 +483,13 @@ fn format_partition_value(
     };
 
     Ok(value)
+}
+
+/// Java's shortest-decimal string contract (JDK 19+), including its notation
+/// thresholds and closest choice among one- and two-digit decimals. Rust's
+/// shortest Display chooses different digits at ties; Ryū uses ties-to-even.
+pub fn format_java_float(value: f32) -> String {
+    format_java_floating(value)
 }
 
 /// Decode as Java's UTF-8 decoder does for `BinaryString.toString()`.

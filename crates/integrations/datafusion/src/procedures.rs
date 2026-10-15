@@ -41,6 +41,11 @@
 //!
 //! The `index_type` argument of the three global index procedures is
 //! case-insensitive and surrounding whitespace is ignored.
+//! `drop_global_index` accepts partition alternatives such as
+//! `partitions => 'dt=2026-10-10,hr=1;dt=2026-10-11,hr=2'`; omitted keys are unrestricted.
+//! Explicit empty or invalid partition specifications fail before deleting any index.
+//! Timezone-less LTZ partition values use local time for non-legacy names and UTC for
+//! legacy names. Ambiguous or nonexistent local times require an explicit offset.
 //!
 //! `column_names` and `excluded_column_names` are comma-separated lists, not SQL arrays:
 //! `column_names => 'id, region'`. Java's Spark procedures take `ARRAY<STRING>` there, but a
@@ -53,6 +58,7 @@ use std::sync::Arc;
 use datafusion::arrow::array::{ArrayRef, StringArray};
 use datafusion::arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::common::ScalarValue;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::prelude::{DataFrame, SessionContext};
 use datafusion::sql::sqlparser::ast::{
@@ -65,7 +71,7 @@ use paimon::api::{
 };
 use paimon::catalog::{Catalog, Identifier, RESTCatalog};
 use paimon::lumina::{is_lumina_index_type, LUMINA_IDENTIFIER};
-use paimon::spec::Snapshot;
+use paimon::spec::{CoreOptions, DataType, Datum, Predicate, PredicateBuilder, Snapshot};
 use paimon::table::{
     normalize_global_index_type, BranchManager, SnapshotManager, Table, TagManager,
     SUPPORTED_GLOBAL_INDEX_TYPES_FOR_DROP,
@@ -173,8 +179,6 @@ fn declared_parameters(proc_name: &str) -> Option<&'static [&'static str]> {
         "create_tag_from_timestamp" => &["table", "tag", "timestamp"],
         "rename_branch" => &["table", "from_branch", "to_branch"],
         "create_global_index" => &["table", "index_column", "index_type", "options"],
-        // `partitions` is declared but not yet implemented; it still reaches its
-        // own "not supported yet" error rather than being reported as unknown.
         "drop_global_index" => &[
             "table",
             "index_column",
@@ -776,17 +780,17 @@ async fn proc_drop_global_index(
             "unsupported global index type '{index_type_arg}'; supported: {SUPPORTED_GLOBAL_INDEX_TYPES_FOR_DROP}"
         )));
     }
-    if args.contains_key("partitions") {
-        return Err(DataFusionError::NotImplemented(
-            "drop_global_index partitions are not supported yet".to_string(),
-        ));
-    }
     let dry_run = bool_arg(args, "dry_run")?;
 
     let mut builder = table.new_global_index_drop_builder();
     builder.with_index_column(index_column);
     builder.with_index_type(index_type);
     builder.with_dry_run(dry_run);
+    if let Some(partitions) = args.get("partitions") {
+        builder
+            .with_partition_filter(parse_global_index_partitions(&table, partitions)?)
+            .map_err(to_datafusion_error)?;
+    }
     let dropped = builder.execute().await.map_err(to_datafusion_error)?;
     if dry_run {
         return utf8_result(
@@ -798,6 +802,193 @@ async fn proc_drop_global_index(
         );
     }
     ok_result(ctx)
+}
+
+/// Semicolon-separated alternatives, each containing comma-separated key=value constraints.
+fn parse_global_index_partitions(table: &Table, partitions: &str) -> DFResult<Predicate> {
+    let partition_fields = table.schema().partition_fields();
+    if partition_fields.is_empty() {
+        return Err(DataFusionError::Plan(
+            "Cannot filter global index partitions on an unpartitioned table".to_string(),
+        ));
+    }
+    let pb = PredicateBuilder::new(table.schema().fields());
+    let options = CoreOptions::new(table.schema().options());
+    let mut alternatives = Vec::new();
+    for partition in partitions.split(';') {
+        let mut constraints = Vec::new();
+        let mut keys = std::collections::HashSet::new();
+        for entry in partition.split(',') {
+            let (key, value) = entry.split_once('=').ok_or_else(|| {
+                DataFusionError::Plan(format!(
+                    "Invalid partitions entry '{entry}'. Expected key=value"
+                ))
+            })?;
+            // Java ParameterUtils uses String.trim(), not Unicode whitespace trimming.
+            let key = key.trim_matches(|ch| ch <= ' ');
+            let value = value.trim_matches(|ch| ch <= ' ');
+            let field = partition_fields
+                .iter()
+                .find(|field| field.name() == key)
+                .ok_or_else(|| {
+                    DataFusionError::Plan(format!("Column '{key}' is not a partition column"))
+                })?;
+            if !keys.insert(key) {
+                return Err(DataFusionError::Plan(format!(
+                    "Duplicate partition column '{key}'"
+                )));
+            }
+            if value.is_empty() {
+                return Err(DataFusionError::Plan(format!(
+                    "Empty partitions value for column '{key}'"
+                )));
+            }
+            let predicate = if value == options.partition_default_name() {
+                pb.is_null(key)
+            } else {
+                let datum = parse_global_index_partition_value(
+                    value,
+                    field.data_type(),
+                    options.legacy_partition_name(),
+                )
+                .ok_or_else(|| {
+                    DataFusionError::Plan(format!(
+                        "Invalid partitions value '{value}' for column '{key}' with type {:?}",
+                        field.data_type()
+                    ))
+                })?;
+                pb.equal(key, datum)
+            };
+            constraints.push(predicate.map_err(to_datafusion_error)?);
+        }
+        alternatives.push(Predicate::and(constraints));
+    }
+    Ok(Predicate::or(alternatives))
+}
+
+fn parse_global_index_partition_value(
+    value: &str,
+    data_type: &DataType,
+    legacy_partition_name: bool,
+) -> Option<Datum> {
+    match data_type {
+        DataType::Char(typ) => {
+            (value.chars().count() <= typ.length()).then(|| Datum::String(value.to_string()))
+        }
+        DataType::VarChar(typ) => (value.chars().count() <= typ.length() as usize)
+            .then(|| Datum::String(value.to_string())),
+        DataType::Binary(_) => Some(Datum::Bytes(value.as_bytes().to_vec())),
+        DataType::VarBinary(typ) => {
+            (value.len() <= typ.length() as usize).then(|| Datum::Bytes(value.as_bytes().to_vec()))
+        }
+        DataType::Float(_) => {
+            // Match TypeUtils.castFromString's check for FLOAT precision loss.
+            let double = value.parse::<f64>().ok()?;
+            let float = value.parse::<f32>().ok()?;
+            (f64::from(float) == double
+                || (float.is_nan() && double.is_nan())
+                || paimon::spec::format_java_float(float).parse::<f64>().ok()? == double)
+                .then_some(Datum::Float(float))
+        }
+        DataType::Double(_) => value.parse().ok().map(Datum::Double),
+        DataType::Decimal(typ) => {
+            // Java Decimal.fromBigDecimal rounds HALF_UP; Arrow's string cast truncates.
+            if value.contains('_') {
+                return None;
+            }
+            let decimal = value
+                .parse::<bigdecimal::BigDecimal>()
+                .ok()?
+                .with_scale_round(i64::from(typ.scale()), bigdecimal::RoundingMode::HalfUp);
+            let unscaled = decimal
+                .as_bigint_and_exponent()
+                .0
+                .to_string()
+                .parse::<i128>()
+                .ok()?;
+            if unscaled
+                .unsigned_abs()
+                .checked_ilog10()
+                .map_or(1, |log| log + 1)
+                > typ.precision()
+            {
+                return None;
+            }
+            Some(Datum::Decimal {
+                unscaled,
+                precision: typ.precision(),
+                scale: typ.scale(),
+            })
+        }
+        DataType::Time(_) => {
+            paimon::table::parse_format_partition_value(value, data_type).or_else(|| {
+                let arrow_type = paimon::arrow::paimon_type_to_arrow(data_type).ok()?;
+                let scalar = ScalarValue::try_from_string(value.to_string(), &arrow_type).ok()?;
+                crate::filter_pushdown::scalar_to_datum(&scalar, data_type)
+            })
+        }
+        DataType::Timestamp(typ) => {
+            parse_global_index_partition_timestamp(value, data_type, typ.precision(), false)
+        }
+        DataType::LocalZonedTimestamp(typ) => parse_global_index_partition_timestamp(
+            value,
+            data_type,
+            typ.precision(),
+            !legacy_partition_name,
+        ),
+        _ => paimon::table::parse_format_partition_value(value, data_type),
+    }
+}
+
+fn parse_global_index_partition_timestamp(
+    value: &str,
+    data_type: &DataType,
+    precision: u32,
+    local_timezone: bool,
+) -> Option<Datum> {
+    if value.bytes().all(|byte| byte.is_ascii_digit()) {
+        // Java only accepts numeric timestamps at these precisions.
+        if !matches!(precision, 0 | 3 | 6 | 9) {
+            return None;
+        }
+        let arrow_type = paimon::arrow::paimon_type_to_arrow(data_type).ok()?;
+        let scalar = ScalarValue::Int64(Some(value.parse().ok()?))
+            .cast_to(&arrow_type)
+            .ok()?;
+        return crate::filter_pushdown::scalar_to_datum(&scalar, data_type);
+    }
+    // Arrow accepts extra fractional digits by truncating them; reject any loss of identity.
+    if value.split_once('.').is_some_and(|(_, fraction)| {
+        fraction
+            .bytes()
+            .take_while(u8::is_ascii_digit)
+            .skip(9)
+            .any(|byte| byte != b'0')
+    }) {
+        return None;
+    }
+    // Legacy partition names omit seconds when both seconds and fractions are zero.
+    let value = chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M")
+        .map(|value| value.format("%Y-%m-%dT%H:%M:%S").to_string())
+        .unwrap_or_else(|_| value.to_string());
+    let timestamp = if local_timezone {
+        // Non-legacy LTZ names use the system-local timezone. Preserve explicit offsets
+        // and fail on ambiguous/nonexistent local times instead of falling back to UTC.
+        datafusion::arrow::compute::kernels::cast_utils::string_to_datetime(&chrono::Local, &value)
+            .ok()?
+            .with_timezone(&chrono::Utc)
+    } else {
+        datafusion::arrow::compute::kernels::cast_utils::string_to_datetime(&chrono::Utc, &value)
+            .ok()?
+    };
+    // Stored partitions can retain fractions beyond the declared precision or Arrow unit.
+    let millis = timestamp.timestamp_millis();
+    let nanos = (timestamp.timestamp_subsec_nanos() % 1_000_000) as i32;
+    match data_type {
+        DataType::Timestamp(_) => Some(Datum::Timestamp { millis, nanos }),
+        DataType::LocalZonedTimestamp(_) => Some(Datum::LocalZonedTimestamp { millis, nanos }),
+        _ => None,
+    }
 }
 
 /// Canonicalize a procedure's `index_type` argument: trim, then lowercase.
@@ -1271,6 +1462,129 @@ mod tests {
     use super::*;
     use paimon::io::FileIOBuilder;
     use paimon::spec::CommitKind;
+
+    #[test]
+    fn test_global_index_partition_values_are_typed_and_strict() {
+        use paimon::spec::{
+            CharType, DateType, DecimalType, FloatType, IntType, TimeType, TimestampType,
+            VarCharType,
+        };
+        assert_eq!(
+            parse_global_index_partition_value("01", &DataType::Int(IntType::new()), true),
+            Some(Datum::Int(1))
+        );
+        for text in ["1.5", "2147483648", "bad"] {
+            assert!(
+                parse_global_index_partition_value(text, &DataType::Int(IntType::new()), true)
+                    .is_none()
+            );
+        }
+        assert!(parse_global_index_partition_value(
+            "2026-02-30",
+            &DataType::Date(DateType::new()),
+            true
+        )
+        .is_none());
+        assert_eq!(
+            parse_global_index_partition_value(
+                "1970-01-02",
+                &DataType::Date(DateType::new()),
+                true
+            ),
+            Some(Datum::Date(1))
+        );
+        assert_eq!(
+            parse_global_index_partition_value(
+                "a=b",
+                &DataType::VarChar(VarCharType::new(3).unwrap()),
+                true,
+            ),
+            Some(Datum::String("a=b".into()))
+        );
+        assert!(parse_global_index_partition_value(
+            "abcd",
+            &DataType::Char(CharType::new(3).unwrap()),
+            true,
+        )
+        .is_none());
+        assert_eq!(
+            parse_global_index_partition_value(
+                "12:00:00.123",
+                &DataType::Time(TimeType::new(3).unwrap()),
+                true,
+            ),
+            Some(Datum::Time(43_200_123))
+        );
+        let decimal = DataType::Decimal(DecimalType::new(4, 2).unwrap());
+        for (text, unscaled) in [("1.235", 124), ("-1.235", -124), ("1.235e1", 1235)] {
+            assert_eq!(
+                parse_global_index_partition_value(text, &decimal, true),
+                Some(Datum::Decimal {
+                    unscaled,
+                    precision: 4,
+                    scale: 2
+                })
+            );
+        }
+        for text in ["99.995", "bad", "1_2.34"] {
+            assert!(parse_global_index_partition_value(text, &decimal, true).is_none());
+        }
+        let timestamp = DataType::Timestamp(TimestampType::new(1).unwrap());
+        assert_eq!(
+            parse_global_index_partition_value("1970-01-01 00:00:00.199", &timestamp, true),
+            Some(Datum::Timestamp {
+                millis: 199,
+                nanos: 0
+            })
+        );
+        assert!(parse_global_index_partition_value("123", &timestamp, true).is_none());
+        assert!(parse_global_index_partition_value("bad", &timestamp, true).is_none());
+        let float = DataType::Float(FloatType::new());
+        assert_eq!(
+            parse_global_index_partition_value("1.1", &float, true),
+            Some(Datum::Float(1.1))
+        );
+        for text in ["1e100", "1e-100", "1.234567891"] {
+            assert!(parse_global_index_partition_value(text, &float, true).is_none());
+        }
+    }
+
+    #[test]
+    fn test_global_index_timestamp_partition_values_preserve_identity() {
+        use paimon::spec::{LocalZonedTimestampType, TimestampType};
+
+        for precision in 0..=9 {
+            for zoned in [false, true] {
+                let data_type = if zoned {
+                    DataType::LocalZonedTimestamp(LocalZonedTimestampType::new(precision).unwrap())
+                } else {
+                    DataType::Timestamp(TimestampType::new(precision).unwrap())
+                };
+                for (text, millis, nanos) in [
+                    ("1970-01-01T00:00:00.123456789Z", 123, 456_789),
+                    ("1969-12-31T23:59:59.999999999Z", -1, 999_999),
+                    ("2500-01-01T00:00:00Z", 16_725_225_600_000, 0),
+                ] {
+                    let expected = if zoned {
+                        Datum::LocalZonedTimestamp { millis, nanos }
+                    } else {
+                        Datum::Timestamp { millis, nanos }
+                    };
+                    assert_eq!(
+                        parse_global_index_partition_value(text, &data_type, true),
+                        Some(expected),
+                        "{data_type:?}: {text}"
+                    );
+                }
+                assert!(parse_global_index_partition_value(
+                    "1970-01-01T00:00:00.1234567891Z",
+                    &data_type,
+                    true,
+                )
+                .is_none());
+            }
+        }
+    }
 
     fn test_file_io() -> paimon::io::FileIO {
         FileIOBuilder::new("memory").build().unwrap()
