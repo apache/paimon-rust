@@ -25,8 +25,8 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
 use crate::error::to_py_err;
+use crate::global_index_result::PyGlobalIndexResult;
 use crate::predicate::dict_to_table_predicate;
-use crate::search_result::PySearchResult;
 
 #[derive(Clone, Default)]
 struct SearchConfig {
@@ -165,7 +165,7 @@ impl PyVectorSearchBuilder {
         let inner = builder.new_read().map_err(to_py_err)?;
         Ok(PyVectorRead { inner })
     }
-    fn execute_local(&self, py: Python<'_>) -> PyResult<PySearchResult> {
+    fn execute_local(&self, py: Python<'_>) -> PyResult<PyGlobalIndexResult> {
         let mut builder = self.config.single(&self.table).map_err(to_py_err)?;
         if let Some(query) = &self.query {
             builder.with_query_vector(query.clone());
@@ -173,7 +173,7 @@ impl PyVectorSearchBuilder {
         let results = py
             .detach(|| runtime().block_on(builder.execute()))
             .map_err(to_py_err)?;
-        Ok(PySearchResult::new(results))
+        Ok(PyGlobalIndexResult::new(results))
     }
 }
 
@@ -260,7 +260,7 @@ impl PyBatchVectorSearchBuilder {
         let inner = builder.new_read().map_err(to_py_err)?;
         Ok(PyBatchVectorRead { inner })
     }
-    fn execute_batch_local(&self, py: Python<'_>) -> PyResult<Vec<PySearchResult>> {
+    fn execute_batch_local(&self, py: Python<'_>) -> PyResult<Vec<PyGlobalIndexResult>> {
         let mut builder = self.config.batch(&self.table).map_err(to_py_err)?;
         if let Some(query) = &self.query {
             builder.with_query_vectors(query.clone());
@@ -268,7 +268,7 @@ impl PyBatchVectorSearchBuilder {
         let results = py
             .detach(|| runtime().block_on(builder.execute()))
             .map_err(to_py_err)?;
-        Ok(results.into_iter().map(PySearchResult::new).collect())
+        Ok(results.into_iter().map(PyGlobalIndexResult::new).collect())
     }
 }
 
@@ -306,9 +306,9 @@ pub struct PyVectorRead {
 
 #[pymethods]
 impl PyVectorRead {
-    fn read_plan(&self, py: Python<'_>, plan: &PyVectorScanPlan) -> PyResult<PySearchResult> {
+    fn read_plan(&self, py: Python<'_>, plan: &PyVectorScanPlan) -> PyResult<PyGlobalIndexResult> {
         py.detach(|| runtime().block_on(self.inner.read(plan.inner.clone())))
-            .map(PySearchResult::new)
+            .map(PyGlobalIndexResult::new)
             .map_err(to_py_err)
     }
 }
@@ -324,9 +324,9 @@ impl PyBatchVectorRead {
         &self,
         py: Python<'_>,
         plan: &PyVectorScanPlan,
-    ) -> PyResult<Vec<PySearchResult>> {
+    ) -> PyResult<Vec<PyGlobalIndexResult>> {
         py.detach(|| runtime().block_on(self.inner.read(plan.inner.clone())))
-            .map(|results| results.into_iter().map(PySearchResult::new).collect())
+            .map(|results| results.into_iter().map(PyGlobalIndexResult::new).collect())
             .map_err(to_py_err)
     }
 }

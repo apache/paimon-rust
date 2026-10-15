@@ -16,21 +16,24 @@
 // under the License.
 
 use crate::error::to_py_err;
+use crate::read::extract_splits;
 use arrow::pyarrow::ToPyArrow;
 use futures::TryStreamExt;
-use paimon::table::SearchResult;
+use paimon::table::GlobalIndexResult;
+use paimon::table::RowRange;
 use paimon_datafusion::runtime::runtime;
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use std::collections::HashMap;
 
-#[pyclass(name = "SearchResult", module = "pypaimon_rust.datafusion")]
-pub struct PySearchResult {
-    pub(crate) inner: SearchResult,
+#[pyclass(name = "GlobalIndexResult", module = "pypaimon_rust.datafusion")]
+pub struct PyGlobalIndexResult {
+    pub(crate) inner: GlobalIndexResult,
 }
 
-impl PySearchResult {
-    pub(crate) fn new(inner: SearchResult) -> Self {
+impl PyGlobalIndexResult {
+    pub(crate) fn new(inner: GlobalIndexResult) -> Self {
         Self { inner }
     }
 }
@@ -38,12 +41,44 @@ impl PySearchResult {
 type PySearchPosition = (Py<PyBytes>, i32, String, i64, f32);
 
 #[pymethods]
-impl PySearchResult {
+impl PyGlobalIndexResult {
+    #[staticmethod]
+    fn from_splits(snapshot_id: Option<i64>, splits: &Bound<'_, PyAny>) -> PyResult<Self> {
+        Ok(Self {
+            inner: GlobalIndexResult::from_splits(snapshot_id, extract_splits(splits)?),
+        })
+    }
+
+    #[staticmethod]
+    fn from_row_ranges(ranges: Vec<(i64, i64)>) -> PyResult<Self> {
+        let ranges = ranges
+            .into_iter()
+            .map(|(from, to)| {
+                if from > to {
+                    Err(PyValueError::new_err("row range start must be <= end"))
+                } else {
+                    Ok(RowRange::new(from, to))
+                }
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        Ok(Self {
+            inner: GlobalIndexResult::from_row_ranges(ranges),
+        })
+    }
+
+    #[staticmethod]
+    fn from_scored_row_ids(scores: HashMap<u64, f32>) -> Self {
+        Self {
+            inner: GlobalIndexResult::from_scored_row_ids(
+                paimon::vector_search::ScoredRowIds::from_scored_map(scores),
+            ),
+        }
+    }
     fn snapshot_id(&self) -> Option<i64> {
         self.inner.snapshot_id()
     }
-    fn new_read_builder(&self) -> PySearchResultReadBuilder {
-        PySearchResultReadBuilder {
+    fn new_read_builder(&self) -> PyGlobalIndexResultReadBuilder {
+        PyGlobalIndexResultReadBuilder {
             result: self.inner.clone(),
             projection: None,
         }
@@ -88,14 +123,17 @@ impl PySearchResult {
     }
 }
 
-#[pyclass(name = "SearchResultReadBuilder", module = "pypaimon_rust.datafusion")]
-pub struct PySearchResultReadBuilder {
-    result: SearchResult,
+#[pyclass(
+    name = "GlobalIndexResultReadBuilder",
+    module = "pypaimon_rust.datafusion"
+)]
+pub struct PyGlobalIndexResultReadBuilder {
+    result: GlobalIndexResult,
     projection: Option<Vec<String>>,
 }
 
 #[pymethods]
-impl PySearchResultReadBuilder {
+impl PyGlobalIndexResultReadBuilder {
     fn with_projection(mut slf: PyRefMut<'_, Self>, columns: Vec<String>) -> PyRefMut<'_, Self> {
         slf.projection = Some(columns);
         slf

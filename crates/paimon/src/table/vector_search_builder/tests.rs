@@ -614,7 +614,7 @@ async fn result_read_empty_plan_lumina_array_float_is_admitted() {
 #[tokio::test]
 async fn result_read_projection_reserved_name_fails_loud() {
     // Projecting a reserved metadata / row-id column must fail loud. The guard
-    // lives in `resolve_materialize_read_type`, which `SearchResultReadBuilder::read` invokes
+    // lives in `resolve_materialize_read_type`, which `GlobalIndexResultReadBuilder::read` invokes
     // before the empty-plan early return; assert on the resolver directly here.
     let table = pk_vector_table(&[
         ("pk-vector.index.columns", "embedding"),

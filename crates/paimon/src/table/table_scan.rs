@@ -1670,18 +1670,12 @@ impl<'a> PaimonTableScan<'a> {
         } else if self.scan_all_files || self.is_streaming() {
             Some("Global-index results require a batch data scan")
         } else {
-            match result {
-                GlobalIndexResult::Splits { .. }
-                    if self.table.schema().primary_keys().is_empty() =>
-                {
-                    Some("Split-based global-index results require a primary-key table")
-                }
-                GlobalIndexResult::RowRanges(_) | GlobalIndexResult::ScoredRowIds(_)
-                    if !options.data_evolution_enabled() =>
-                {
-                    Some("Row-range global-index results require a Data Evolution table")
-                }
-                _ => None,
+            if result.is_split_result() && self.table.schema().primary_keys().is_empty() {
+                Some("Split-based global-index results require a primary-key table")
+            } else if !result.is_split_result() && !options.data_evolution_enabled() {
+                Some("Row-range global-index results require a Data Evolution table")
+            } else {
+                None
             }
         };
         match message {
@@ -1696,20 +1690,14 @@ impl<'a> PaimonTableScan<'a> {
         if self.table.schema().core_options().query_auth_enabled() {
             return None;
         }
-        match self.global_index_result()? {
-            GlobalIndexResult::Splits {
-                snapshot_id,
-                splits,
-            } => {
-                let mut plan = Plan::new(splits.clone());
-                if let Some(id) = snapshot_id {
-                    plan = plan.with_snapshot_id(*id);
-                }
-                Some(plan)
-            }
-            GlobalIndexResult::RowRanges(_) | GlobalIndexResult::ScoredRowIds(_) => None,
+        let result = self.global_index_result()?;
+        let mut plan = Plan::new(result.splits().ok()?.to_vec());
+        if let Some(id) = result.snapshot_id() {
+            plan = plan.with_snapshot_id(id);
         }
+        Some(plan)
     }
+
     fn snapshot_levels(&self) -> Option<&std::ops::RangeInclusive<i32>> {
         self.split_selection
             .as_deref()

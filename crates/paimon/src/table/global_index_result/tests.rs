@@ -40,10 +40,10 @@ async fn pk_supplied_result_preserves_snapshot_splits_and_ignores_planning_hints
     builder.with_limit(0).with_filter(id_gt_filter(&table, 100));
     let scan = builder
         .new_scan()
-        .with_global_index_result(GlobalIndexResult::Splits {
-            snapshot_id: Some(42),
-            splits: vec![split.clone()],
-        })
+        .with_global_index_result(GlobalIndexResult::from_splits(
+            Some(42),
+            vec![split.clone()],
+        ))
         .unwrap()
         .with_shard(1, 2)
         .unwrap();
@@ -78,10 +78,7 @@ async fn empty_pk_result_retains_its_snapshot_and_does_not_scan_latest() {
         let scan = table
             .new_read_builder()
             .new_scan()
-            .with_global_index_result(GlobalIndexResult::Splits {
-                snapshot_id,
-                splits: vec![],
-            })
+            .with_global_index_result(GlobalIndexResult::from_splits(snapshot_id, vec![]))
             .unwrap();
         let plan = scan.plan().await.unwrap();
         assert!(plan.splits().is_empty());
@@ -97,33 +94,30 @@ async fn result_address_spaces_and_conflicting_selections_are_validated() {
     assert!(pk
         .new_read_builder()
         .new_scan()
-        .with_global_index_result(GlobalIndexResult::RowRanges(vec![]))
+        .with_global_index_result(GlobalIndexResult::from_row_ranges(vec![]))
         .is_err());
     for table in [&de, &append] {
         assert!(table
             .new_read_builder()
             .new_scan()
-            .with_global_index_result(GlobalIndexResult::Splits {
-                snapshot_id: None,
-                splits: vec![]
-            })
+            .with_global_index_result(GlobalIndexResult::from_splits(None, vec![]))
             .is_err());
     }
     assert!(append
         .new_read_builder()
         .new_scan()
-        .with_global_index_result(GlobalIndexResult::RowRanges(vec![]))
+        .with_global_index_result(GlobalIndexResult::from_row_ranges(vec![]))
         .is_err());
     let mut builder = de.new_read_builder();
     builder.with_row_ranges(vec![]);
     assert!(builder
         .new_scan()
-        .with_global_index_result(GlobalIndexResult::RowRanges(vec![]))
+        .with_global_index_result(GlobalIndexResult::from_row_ranges(vec![]))
         .is_err());
     let scan = de
         .new_read_builder()
         .new_scan()
-        .with_global_index_result(GlobalIndexResult::RowRanges(vec![]))
+        .with_global_index_result(GlobalIndexResult::from_row_ranges(vec![]))
         .unwrap();
     assert!(scan.clone().with_row_ranges(vec![]).plan().await.is_err());
     assert!(scan.clone().with_scan_all_files().plan().await.is_err());
@@ -133,14 +127,15 @@ async fn result_address_spaces_and_conflicting_selections_are_validated() {
         .new_scan()
         .with_chunk_shuffle(1, 1)
         .unwrap()
-        .with_global_index_result(GlobalIndexResult::RowRanges(vec![]))
+        .with_global_index_result(GlobalIndexResult::from_row_ranges(vec![]))
         .is_err());
 }
 
 #[tokio::test]
 async fn de_scores_follow_final_ranges_after_distribution_and_limit() {
     let table = de_vector_table().await;
-    let hits = GlobalIndexResult::ScoredRowIds(ScoredRowIds::new(vec![2, 0], vec![0.8, 0.1]));
+    let hits =
+        GlobalIndexResult::from_scored_row_ids(ScoredRowIds::new(vec![2, 0], vec![0.8, 0.1]));
     let mut builder = table.new_read_builder();
     builder.with_projection(&["id"]).unwrap();
     let plan = builder
@@ -188,7 +183,7 @@ async fn de_scores_follow_final_ranges_after_distribution_and_limit() {
     builder.with_limit(1);
     let plan = builder
         .new_scan()
-        .with_global_index_result(GlobalIndexResult::ScoredRowIds(ScoredRowIds::new(
+        .with_global_index_result(GlobalIndexResult::from_scored_row_ids(ScoredRowIds::new(
             vec![2, 0],
             vec![0.8, 0.1],
         )))
@@ -224,9 +219,10 @@ async fn de_search_results_can_be_reused_by_an_ordinary_scan() {
         .collect::<HashMap<_, _>>();
     let plan = result
         .table()
+        .unwrap()
         .new_read_builder()
         .new_scan()
-        .with_global_index_result(result.to_global_index_result().unwrap())
+        .with_global_index_result(result.clone())
         .unwrap()
         .plan()
         .await
@@ -261,7 +257,7 @@ async fn invalid_scored_ids_do_not_become_a_full_scan() {
         assert!(table
             .new_read_builder()
             .new_scan()
-            .with_global_index_result(GlobalIndexResult::ScoredRowIds(hits))
+            .with_global_index_result(GlobalIndexResult::from_scored_row_ids(hits))
             .unwrap()
             .plan()
             .await
@@ -277,10 +273,10 @@ async fn supplied_pk_result_cannot_bypass_required_authorization() {
     let scan = table
         .new_read_builder()
         .new_scan()
-        .with_global_index_result(GlobalIndexResult::Splits {
-            snapshot_id: Some(42),
-            splits: vec![selected_split()],
-        })
+        .with_global_index_result(GlobalIndexResult::from_splits(
+            Some(42),
+            vec![selected_split()],
+        ))
         .unwrap();
     assert!(scan.plan().await.is_err());
     assert!(scan.plan_with_trace().await.is_err());
@@ -328,7 +324,7 @@ async fn de_combined_incremental_results_retain_the_window_and_scores() {
     let scan = table
         .new_read_builder()
         .new_incremental_scan(IncrementalScanMode::Delta, start, end)
-        .with_global_index_result(GlobalIndexResult::ScoredRowIds(ScoredRowIds::new(
+        .with_global_index_result(GlobalIndexResult::from_scored_row_ids(ScoredRowIds::new(
             vec![0, 3],
             vec![0.1, 0.9],
         )))
@@ -345,9 +341,35 @@ async fn de_combined_incremental_results_retain_the_window_and_scores() {
     assert!(table
         .new_read_builder()
         .new_incremental_scan(IncrementalScanMode::Delta, start, end)
-        .with_global_index_result(GlobalIndexResult::Splits {
-            snapshot_id: Some(end),
-            splits: vec![]
-        })
+        .with_global_index_result(GlobalIndexResult::from_splits(Some(end), vec![]))
         .is_err());
+}
+
+#[tokio::test]
+async fn external_selections_need_a_table_scan_for_reads() {
+    let ranges = GlobalIndexResult::from_row_ranges(vec![RowRange::new(0, i64::MAX)]);
+    assert_eq!(
+        ranges.len(),
+        usize::try_from(i128::from(i64::MAX) + 1).unwrap_or(usize::MAX)
+    );
+    let split = selected_split();
+    let physical = GlobalIndexResult::from_splits(Some(42), vec![split.clone()]);
+    assert_eq!(physical.len(), 1);
+    assert_eq!(
+        physical.serialize_primary_key_splits().unwrap(),
+        vec![split.serialize_split_v1().unwrap()]
+    );
+    for result in [
+        ranges,
+        physical,
+        GlobalIndexResult::from_scored_row_ids(ScoredRowIds::new(vec![1], vec![0.5])),
+    ] {
+        let error = match result.new_read_builder().read().await {
+            Ok(_) => panic!("external selection unexpectedly retained a source table"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("require a result returned by a table search"));
+    }
 }

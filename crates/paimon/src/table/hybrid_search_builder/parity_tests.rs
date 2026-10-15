@@ -133,7 +133,16 @@ async fn full_text_route_uses_java_structured_query() {
         )
         .unwrap();
     builder.with_limit(4);
-    assert_eq!(builder.execute_scored().await.unwrap().row_ids, vec![2]);
+    assert_eq!(
+        builder
+            .execute_scored()
+            .await
+            .unwrap()
+            .into_row_ids()
+            .unwrap()
+            .row_ids,
+        vec![2]
+    );
 }
 
 #[tokio::test]
@@ -187,8 +196,8 @@ async fn both_routes_filter_before_top_k_and_accumulate_predicates() {
         .with_partition_filter(pb.equal("pt", Datum::Int(1)).unwrap())
         .unwrap();
     let result = builder.execute_scored().await.unwrap();
-    assert_eq!(result.row_ids, vec![6]);
-    assert!((result.scores[0] - 2.0 / 61.0).abs() < 1e-6);
+    assert_eq!(result.row_ids().unwrap().row_ids, vec![6]);
+    assert!((result.row_ids().unwrap().scores[0] - 2.0 / 61.0).abs() < 1e-6);
     builder
         .with_partition_filter(pb.equal("pt", Datum::Int(0)).unwrap())
         .unwrap();
@@ -212,6 +221,8 @@ async fn scalar_coverage_and_refinement_are_shared_by_both_routes() {
             .with_filter(keep.clone())
             .execute_scored()
             .await
+            .unwrap()
+            .into_row_ids()
             .unwrap()
             .row_ids;
         ids.sort_unstable();
@@ -241,6 +252,8 @@ async fn scalar_coverage_and_refinement_are_shared_by_both_routes() {
             .with_filter(candidate.clone())
             .execute_scored()
             .await
+            .unwrap()
+            .into_row_ids()
             .unwrap()
             .row_ids;
         ids.sort_unstable();
@@ -272,15 +285,24 @@ async fn concurrent_routes_preserve_weights_limits_and_java_fusion() {
             .with_ranker(ranker)
             .unwrap();
         let result = builder.execute_scored().await.unwrap();
-        assert_eq!(result.row_ids, ids, "ranker {ranker}");
-        for (actual, expected) in result.scores.iter().zip(scores) {
+        assert_eq!(result.row_ids().unwrap().row_ids, ids, "ranker {ranker}");
+        for (actual, expected) in result.row_ids().unwrap().scores.iter().zip(scores) {
             assert!(
                 (actual - expected).abs() < 1e-6,
                 "ranker {ranker}: {actual} != {expected}"
             );
         }
         builder.with_limit(1);
-        assert_eq!(builder.execute_scored().await.unwrap().row_ids, vec![3]);
+        assert_eq!(
+            builder
+                .execute_scored()
+                .await
+                .unwrap()
+                .into_row_ids()
+                .unwrap()
+                .row_ids,
+            vec![3]
+        );
     }
 }
 
@@ -314,6 +336,8 @@ async fn retained_tag_keeps_both_routes_on_the_expired_snapshot() {
     let mut old = mixed_query(&tagged, 16)
         .execute_scored()
         .await
+        .unwrap()
+        .into_row_ids()
         .unwrap()
         .row_ids;
     old.sort_unstable();
@@ -356,6 +380,8 @@ async fn caller_pinned_empty_and_snapshot_views_do_not_read_latest() {
         .with_snapshot(Some(&snapshot))
         .execute_scored()
         .await
+        .unwrap()
+        .into_row_ids()
         .unwrap()
         .row_ids;
     old.sort_unstable();

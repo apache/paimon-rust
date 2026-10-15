@@ -373,7 +373,7 @@ async fn drain_ids_and_scores(stream: ArrowRecordBatchStream) -> (Vec<i32>, Vec<
     (ids, scores)
 }
 
-/// Single-query `SearchResultReadBuilder::read` into `(id, score)` tuples.
+/// Single-query `GlobalIndexResultReadBuilder::read` into `(id, score)` tuples.
 async fn single_read(table: &Table, query: Vec<f32>, limit: usize) -> (Vec<i32>, Vec<f32>) {
     let mut builder = table.new_vector_search_builder();
     builder

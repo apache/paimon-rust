@@ -311,7 +311,7 @@ impl<'a> IncrementalScan<'a> {
     /// batch. Unlike PK split results, this must retain the snapshot window.
     /// Use [`Self::plan_combined`] to retain aligned scores on the final splits.
     pub fn with_global_index_result(mut self, result: GlobalIndexResult) -> crate::Result<Self> {
-        if matches!(result, GlobalIndexResult::Splits { .. }) {
+        if result.is_split_result() {
             return Err(crate::Error::Unsupported {
                 message: "Split-based results require an ordinary batch scan".into(),
             });

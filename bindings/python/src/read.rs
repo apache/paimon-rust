@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::global_index_result::PyGlobalIndexResult;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -106,7 +107,7 @@ fn apply_read_config(
 /// any iterable (list/tuple/generator). Runs under the GIL since it touches
 /// Python objects. A non-iterable argument or a non-`Split` element raises
 /// `TypeError`.
-fn extract_splits(splits: &Bound<'_, PyAny>) -> PyResult<Vec<DataSplit>> {
+pub(crate) fn extract_splits(splits: &Bound<'_, PyAny>) -> PyResult<Vec<DataSplit>> {
     let iter = splits
         .try_iter()
         .map_err(|_| PyTypeError::new_err("read() expects a sequence of Split objects"))?;
@@ -661,17 +662,9 @@ impl PyTableScan {
     /// Supply an evaluated selection; validation and authorization stay in core.
     fn with_global_index_result<'py>(
         mut slf: PyRefMut<'py, Self>,
-        result: &Bound<'py, PyAny>,
+        result: PyRef<'py, PyGlobalIndexResult>,
     ) -> PyResult<PyRefMut<'py, Self>> {
-        let result = if let Ok(result) = result.extract::<PyRef<PyGlobalIndexResult>>() {
-            result.inner.clone()
-        } else if let Ok(result) = result.extract::<PyRef<crate::search_result::PySearchResult>>() {
-            result.inner.to_global_index_result().map_err(to_py_err)?
-        } else {
-            return Err(PyTypeError::new_err(
-                "Expected GlobalIndexResult or SearchResult",
-            ));
-        };
+        let result = result.inner.clone();
         if let Some(incremental) = slf.incremental_scan {
             slf.core_incremental_scan(
                 incremental.start_snapshot_id,
@@ -977,52 +970,6 @@ impl PyPlan {
 #[pyclass(name = "Split", module = "pypaimon_rust.datafusion")]
 pub struct PySplit {
     pub(crate) inner: DataSplit,
-}
-
-/// Transport an external result without interpreting physical file positions
-/// in the Python binding. SearchResult is accepted directly by TableScan too.
-#[pyclass(name = "GlobalIndexResult", module = "pypaimon_rust.datafusion")]
-pub struct PyGlobalIndexResult {
-    inner: GlobalIndexResult,
-}
-
-#[pymethods]
-impl PyGlobalIndexResult {
-    #[staticmethod]
-    fn from_splits(snapshot_id: Option<i64>, splits: &Bound<'_, PyAny>) -> PyResult<Self> {
-        Ok(Self {
-            inner: GlobalIndexResult::Splits {
-                snapshot_id,
-                splits: extract_splits(splits)?,
-            },
-        })
-    }
-
-    #[staticmethod]
-    fn from_row_ranges(ranges: Vec<(i64, i64)>) -> PyResult<Self> {
-        let ranges = ranges
-            .into_iter()
-            .map(|(from, to)| {
-                if from > to {
-                    Err(PyValueError::new_err("row range start must be <= end"))
-                } else {
-                    Ok(RowRange::new(from, to))
-                }
-            })
-            .collect::<PyResult<Vec<_>>>()?;
-        Ok(Self {
-            inner: GlobalIndexResult::RowRanges(ranges),
-        })
-    }
-
-    #[staticmethod]
-    fn from_scored_row_ids(scores: HashMap<u64, f32>) -> Self {
-        Self {
-            inner: GlobalIndexResult::ScoredRowIds(
-                paimon::vector_search::ScoredRowIds::from_scored_map(scores),
-            ),
-        }
-    }
 }
 
 impl PySplit {

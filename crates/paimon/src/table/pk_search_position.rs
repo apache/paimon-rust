@@ -222,7 +222,7 @@ mod tests {
 
     #[test]
     fn from_vector_position_preserves_score_and_validates_position() {
-        // SearchResult already converted distance to score; fusion must preserve it.
+        // GlobalIndexResult already converted distance to score; fusion must preserve it.
         let mut hit = vector_position(0.5);
         let position = PrimaryKeySearchPosition::from_vector_position(&hit).unwrap();
         assert_eq!(position.score(), 0.5);

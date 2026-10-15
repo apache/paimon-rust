@@ -31,8 +31,8 @@ use std::collections::HashMap;
 use std::ffi::{c_char, c_void};
 
 use paimon::spec::Predicate;
+use paimon::table::GlobalIndexResult;
 use paimon::table::{ArrowRecordBatchStream, Table, VectorSearchBuilder};
-use paimon::vector_search::SearchResult;
 
 use crate::error::{check_non_null, paimon_error, validate_cstr, PaimonErrorCode};
 use crate::result::{
@@ -320,7 +320,7 @@ pub unsafe extern "C" fn paimon_vector_search_builder_execute_read(
 }
 
 pub(crate) async fn materialize_search_result(
-    result: SearchResult,
+    result: GlobalIndexResult,
     projection: Option<&[String]>,
 ) -> paimon::Result<ArrowRecordBatchStream> {
     let mut reader = result.new_read_builder();

@@ -3118,7 +3118,7 @@ fn test_two_commits_same_builder() {
 //
 // Two storage shapes are exercised end-to-end through the C `execute_read`
 // terminal, each compared against an independent core Rust
-// `SearchResultReadBuilder::read()` reference:
+// `GlobalIndexResultReadBuilder::read()` reference:
 //
 //   * A primary-key vector table backed by a real vindex IVF-flat ANN segment
 //     built in-process (bucket-local ANN search, residual filter supported).
