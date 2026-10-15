@@ -156,7 +156,11 @@ class ReadBuilder:
         ...
     def new_scan(self) -> TableScan: ...
     def new_stream_scan(self) -> StreamTableScan:
-        """Create a stateful stream scan retaining filters, read type and ranges."""
+        """Create a stateful stream scan retaining filters, read type and ranges.
+
+        REST query authorization refreshes on every plan/poll. Returned splits
+        retain that plan's rules; failures do not consume the failing snapshot.
+        """
         ...
     def new_incremental_scan(
         self,

@@ -373,7 +373,6 @@ impl<'a> IncrementalScan<'a> {
     /// must exist and supplies snapshot metadata. Snapshot deletion vectors and
     /// automatic global-index pruning do not apply to these historical events.
     pub async fn plan_combined_delta(&self) -> crate::Result<Plan> {
-        CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
         let mode = self.resolve_mode();
         if mode != IncrementalScanMode::Delta {
             return Err(crate::Error::Unsupported {
@@ -388,7 +387,7 @@ impl<'a> IncrementalScan<'a> {
         mode: IncrementalScanMode,
         trace: Option<&mut ScanTrace>,
     ) -> crate::Result<Plan> {
-        CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
+        let scan = self.scan.authorize_snapshot_read().await?;
         // Row positions and shuffled chunks refer to one APPEND-delta row
         // space. Changelog supports Java's file/bucket shard selection only.
         if mode == IncrementalScanMode::Changelog
@@ -438,8 +437,7 @@ impl<'a> IncrementalScan<'a> {
             })
             .map(str::to_owned)
             .collect();
-        self.scan
-            .plan_incremental_lists_with_trace(&end_snapshot, manifest_lists, trace)
+        scan.plan_incremental_lists_with_trace(&end_snapshot, manifest_lists, trace)
             .await
     }
 

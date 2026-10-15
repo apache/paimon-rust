@@ -534,16 +534,24 @@ impl<'a> PaimonTableRead<'a> {
         &self,
         data_splits: &[DataSplit],
     ) -> crate::Result<ArrowRecordBatchStream> {
-        // Streaming primary-key splits are read raw below, so decide here for all.
-        if self
-            .ensure_authorized_by_splits(&self.table.schema.core_options(), data_splits)?
-            .is_some()
-        {
-            return Err(super::query_auth::unsupported(
-                "a row-kind read cannot apply a row filter or column masking",
-            ));
-        }
+        let grant =
+            self.ensure_authorized_by_splits(&self.table.schema.core_options(), data_splits)?;
         let data_splits = self.matching_splits(data_splits)?;
+        if let Some(grant) = grant {
+            let mut read = self.clone();
+            // The metadata column travels with the Arrow batch through filters
+            // and masks, but is never an authorization operand or physical field.
+            read.read_type.insert(0, row_kind_field());
+            return read.read_restricted(&data_splits, &grant, true);
+        }
+        self.read_row_kind_splits(&data_splits)
+    }
+
+    /// Read the already-authorized file set, preserving physical change kinds.
+    fn read_row_kind_splits(
+        &self,
+        data_splits: &[DataSplit],
+    ) -> crate::Result<ArrowRecordBatchStream> {
         let schema = audit_schema_for_read_type(&self.read_type, false)?;
         let (streaming, materialized): (Vec<_>, Vec<_>) = data_splits
             .iter()
@@ -555,14 +563,14 @@ impl<'a> PaimonTableRead<'a> {
         let mut streams = Vec::with_capacity(2);
         if !materialized.is_empty() {
             streams.push(prepend_insert_row_kind_stream(
-                self.to_arrow(&materialized)?,
+                self.read_splits(&materialized, &self.table.schema.core_options())?,
                 Arc::clone(&schema),
             )?);
         }
         if !streaming.is_empty() {
             if self.table.schema().primary_keys().is_empty() {
                 streams.push(prepend_insert_row_kind_stream(
-                    self.to_arrow(&streaming)?,
+                    self.read_splits(&streaming, &self.table.schema.core_options())?,
                     Arc::clone(&schema),
                 )?);
             } else {
@@ -1122,7 +1130,7 @@ impl<'a> PaimonTableRead<'a> {
         let grant = self.ensure_authorized_by_splits(&core_options, data_splits)?;
         let data_splits = self.matching_splits(data_splits)?;
         match grant {
-            Some(grant) => self.read_restricted(&data_splits, &grant),
+            Some(grant) => self.read_restricted(&data_splits, &grant, false),
             None => self.read_splits(&data_splits, &core_options),
         }
     }
@@ -1132,6 +1140,7 @@ impl<'a> PaimonTableRead<'a> {
         &self,
         data_splits: &[DataSplit],
         grant: &super::query_auth::QueryAuthGrant,
+        include_row_kind: bool,
     ) -> crate::Result<ArrowRecordBatchStream> {
         use super::query_auth::{filter_batch, mask_batch, mask_inputs, unsupported};
         use crate::arrow::format::FilePredicates;
@@ -1240,7 +1249,14 @@ impl<'a> PaimonTableRead<'a> {
                 ]));
             inner.table = &unresolved_table;
         }
-        let stream = inner.read_splits(data_splits, &inner.table.schema.core_options())?;
+        let stream = if include_row_kind {
+            // The source creates rowkind from _VALUE_KIND (or +I for snapshot
+            // rows); do not ask the physical format reader to load it.
+            inner.read_type.remove(0);
+            inner.read_row_kind_splits(data_splits)?
+        } else {
+            inner.read_splits(data_splits, &inner.table.schema.core_options())?
+        };
 
         let filters = rules.filters.clone();
         let batch_fields = physical.clone();
@@ -1801,16 +1817,20 @@ fn prepend_insert_row_kind(
     })
 }
 
+fn row_kind_field() -> DataField {
+    DataField::new(
+        ROW_KIND_FIELD_ID,
+        ROW_KIND_FIELD_NAME.to_string(),
+        DataType::VarChar(crate::spec::VarCharType::string_type()),
+    )
+}
+
 fn audit_schema_for_read_type(
     read_type: &[DataField],
     include_sequence: bool,
 ) -> crate::Result<Arc<ArrowSchema>> {
     let mut fields = Vec::with_capacity(read_type.len() + 2);
-    fields.push(DataField::new(
-        ROW_KIND_FIELD_ID,
-        ROW_KIND_FIELD_NAME.to_string(),
-        DataType::VarChar(crate::spec::VarCharType::string_type()),
-    ));
+    fields.push(row_kind_field());
     if include_sequence {
         fields.push(DataField::new(
             SEQUENCE_NUMBER_FIELD_ID,
@@ -3198,12 +3218,11 @@ mod tests {
                     if message.contains("different rules")),
                 "one rule set per read, whatever the order"
             );
+            assert!(matches!(read.to_arrow_with_row_kind(&splits),
+                Err(crate::Error::Unsupported { ref message }) if message.contains("different rules")));
         }
-        // Streaming primary-key splits are read raw.
-        assert!(matches!(
-            read.to_arrow_with_row_kind(&[restricted]),
-            Err(crate::Error::Unsupported { ref message }) if message.contains("row-kind")
-        ));
+        // Row-kind reads preserve the same grant requirement as normal reads.
+        assert!(read.to_arrow_with_row_kind(&[restricted]).is_ok());
     }
 
     #[tokio::test]

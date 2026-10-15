@@ -121,7 +121,7 @@ impl StreamTableScan {
 
     pub async fn plan(&mut self) -> Result<Option<Plan>> {
         // Validate even when the table is empty or no follow-up is available.
-        self.scan.validate_snapshot_read()?;
+        let scan = self.scan.authorize_snapshot_read().await?;
         if self.next_snapshot_id.is_none() && !self.consumer_restored {
             if let Some(consumer_id) = &self.consumer_id {
                 let next = self
@@ -143,7 +143,7 @@ impl StreamTableScan {
             };
             let next = snapshot.id() + 1;
             let watermark = snapshot.watermark();
-            let plan = self.plan_initial_snapshot(snapshot).await?;
+            let plan = self.plan_initial_snapshot(snapshot, scan).await?;
             self.next_snapshot_id = Some(next);
             self.watermark = watermark;
             return Ok(Some(plan));
@@ -186,7 +186,7 @@ impl StreamTableScan {
             }
             let watermark = snapshot.watermark();
             // Keep the failing snapshot retryable if planning or a callback fails.
-            let plan = self.scan.plan_selected_snapshot(snapshot, mode).await?;
+            let plan = scan.plan_selected_snapshot(snapshot, mode).await?;
             self.next_snapshot_id = Some(id + 1);
             self.watermark = watermark;
             if !plan.splits().is_empty() {
@@ -195,9 +195,13 @@ impl StreamTableScan {
         }
     }
 
-    async fn plan_initial_snapshot(&self, snapshot: Snapshot) -> Result<Plan> {
-        let options = self.scan.snapshot_table().schema().options();
-        let mut scan = self.scan.clone();
+    async fn plan_initial_snapshot(
+        &self,
+        snapshot: Snapshot,
+        mut scan: TableScan<'static>,
+    ) -> Result<Plan> {
+        let table = scan.snapshot_table().clone();
+        let options = table.schema().options();
         let parse = |key, default| -> Result<i32> {
             options
                 .get(key)

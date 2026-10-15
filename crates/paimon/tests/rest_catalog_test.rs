@@ -5830,3 +5830,7 @@ async fn test_query_auth_explicit_partition_selector() {
         assert_forbidden(selector_only.new_scan().plan().await.unwrap_err());
     }
 }
+
+#[cfg(not(windows))]
+#[path = "rest_catalog/authorized_snapshot_scans.rs"]
+mod authorized_snapshot_scans;
