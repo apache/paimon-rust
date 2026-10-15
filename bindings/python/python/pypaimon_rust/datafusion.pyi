@@ -144,6 +144,13 @@ class ReadBuilder:
         """Set the maximum number of concurrent BLOB range reads. Must be positive."""
         ...
     def with_filter(self, predicate: dict) -> "ReadBuilder": ...
+    def with_partition_filter(self, predicate: Optional[dict]) -> "ReadBuilder":
+        """Replace scan-only partition selection; None restores derived pruning.
+
+        Only partition fields are allowed. Ordinary filters still apply to read
+        rows. Query authorization rejects selectors on masked partition fields.
+        """
+        ...
     def with_row_ranges(self, ranges: Sequence[tuple[int, int]]) -> "ReadBuilder":
         """Set Data Evolution row ranges. Empty selects no rows; format tables are unsupported."""
         ...

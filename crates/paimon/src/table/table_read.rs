@@ -40,6 +40,7 @@ use arrow_schema::Schema as ArrowSchema;
 use arrow_select::concat::concat as arrow_concat;
 use arrow_select::take::take;
 use futures::{stream, StreamExt};
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::Arc;
@@ -151,6 +152,18 @@ impl<'a> TableRead<'a> {
         match self.0 {
             TableReadKind::Paimon(read) => Self(TableReadKind::Paimon(read.with_filter(filter))),
             TableReadKind::Format(read) => Self(TableReadKind::Format(read.with_filter(filter))),
+        }
+    }
+
+    /// Ordinary partition conjuncts are evaluated against split metadata,
+    /// since partition columns may be absent from physical data files. The
+    /// predicate uses partition-row indices, not table-field indices.
+    pub(crate) fn with_partition_predicate(self, predicate: Option<Predicate>) -> Self {
+        match self.0 {
+            TableReadKind::Paimon(read) => Self(TableReadKind::Paimon(
+                read.with_partition_predicate(predicate),
+            )),
+            TableReadKind::Format(_) => self,
         }
     }
 
@@ -316,6 +329,7 @@ struct PaimonTableRead<'a> {
     table: &'a Table,
     read_type: Vec<DataField>,
     data_predicates: Vec<Predicate>,
+    partition_predicate: Option<Predicate>,
     row_filter_factory: Option<Arc<dyn crate::arrow::RowFilterFactory>>,
     parquet_read_budget: Option<Arc<ReadBudget>>,
     resources: Option<ResourceContext>,
@@ -335,6 +349,7 @@ impl<'a> PaimonTableRead<'a> {
             table,
             read_type,
             data_predicates,
+            partition_predicate: None,
             row_filter_factory: None,
             parquet_read_budget: None,
             resources: None,
@@ -365,13 +380,38 @@ impl<'a> PaimonTableRead<'a> {
     /// [`ReadBuilder::with_filter`](crate::table::ReadBuilder::with_filter)
     /// for per-format exceptions).
     pub fn with_filter(mut self, filter: Predicate) -> Self {
-        let (_, data_predicates) = split_scan_predicates(self.table, filter);
+        let (partition_predicate, data_predicates) = split_scan_predicates(self.table, filter);
+        self.partition_predicate = partition_predicate;
         // Keep the FULL data predicate (including `And`/`Or`/`Not`). Native
         // pushdown / stats pruning skip compound nodes they cannot use, and the
         // residual pass applies the full predicate exactly. Pruning here would
         // drop compound predicates before the residual could enforce them.
         self.data_predicates = data_predicates;
         self
+    }
+
+    fn with_partition_predicate(mut self, predicate: Option<Predicate>) -> Self {
+        self.partition_predicate = predicate;
+        self
+    }
+
+    /// Clone split metadata only if at least one split is rejected. Authorization
+    /// must be checked against the original list before calling this method.
+    fn matching_splits<'s>(&self, splits: &'s [DataSplit]) -> crate::Result<Cow<'s, [DataSplit]>> {
+        let Some(predicate) = &self.partition_predicate else {
+            return Ok(Cow::Borrowed(splits));
+        };
+        let mut retained: Option<Vec<DataSplit>> = None;
+        for (index, split) in splits.iter().enumerate() {
+            if crate::spec::eval_row(predicate, split.partition())? {
+                if let Some(retained) = &mut retained {
+                    retained.push(split.clone());
+                }
+            } else {
+                retained.get_or_insert_with(|| splits[..index].to_vec());
+            }
+        }
+        Ok(retained.map_or(Cow::Borrowed(splits), Cow::Owned))
     }
 
     fn with_row_filter_factory(mut self, factory: Arc<dyn crate::arrow::RowFilterFactory>) -> Self {
@@ -428,6 +468,7 @@ impl<'a> PaimonTableRead<'a> {
         }
         // Delta / Changelog rows are read as-is from planned files (no full-table
         // merge against historical base versions).
+        let data_splits = self.matching_splits(&data_splits)?;
         self.new_data_file_reader()?.read(&data_splits)
     }
 
@@ -440,6 +481,7 @@ impl<'a> PaimonTableRead<'a> {
         let table = self.table.clone();
         let read_type = self.read_type.clone();
         let data_predicates = self.data_predicates.clone();
+        let partition_predicate = self.partition_predicate.clone();
         let parquet_read_budget = self.parquet_read_budget()?;
         let blob_parallelism = self.blob_parallelism;
 
@@ -448,9 +490,11 @@ impl<'a> PaimonTableRead<'a> {
                 let table = table.clone();
                 let read_type = read_type.clone();
                 let data_predicates = data_predicates.clone();
+                let partition_predicate = partition_predicate.clone();
                 let parquet_read_budget = Arc::clone(&parquet_read_budget);
                 let worker: ArrowRecordBatchStream = Box::pin(async_stream::try_stream! {
                     let pair_read = PaimonTableRead::new(&table, read_type, data_predicates)
+                        .with_partition_predicate(partition_predicate)
                         .with_parquet_read_budget(parquet_read_budget)
                         .with_blob_parallelism(blob_parallelism);
                     let mut pair_stream = pair_read.to_diff_after_image_stream(&before, &after)?;
@@ -499,6 +543,7 @@ impl<'a> PaimonTableRead<'a> {
                 "a row-kind read cannot apply a row filter or column masking",
             ));
         }
+        let data_splits = self.matching_splits(data_splits)?;
         let schema = audit_schema_for_read_type(&self.read_type, false)?;
         let (streaming, materialized): (Vec<_>, Vec<_>) = data_splits
             .iter()
@@ -538,6 +583,7 @@ impl<'a> PaimonTableRead<'a> {
         let table = self.table.clone();
         let read_type = self.read_type.clone();
         let data_predicates = self.data_predicates.clone();
+        let partition_predicate = self.partition_predicate.clone();
         let row_filter_factory = self.row_filter_factory.clone();
         let parquet_read_budget = self.parquet_read_budget()?;
         let resources = self.resources.clone();
@@ -552,6 +598,7 @@ impl<'a> PaimonTableRead<'a> {
                     table: &table,
                     read_type: read_type.clone(),
                     data_predicates: data_predicates.clone(),
+                    partition_predicate: partition_predicate.clone(),
                     row_filter_factory: row_filter_factory.clone(),
                     parquet_read_budget: Some(parquet_read_budget.clone()),
                     resources: resources.clone(),
@@ -590,6 +637,7 @@ impl<'a> PaimonTableRead<'a> {
     ) -> crate::Result<ArrowRecordBatchStream> {
         use super::managed_blob_reader::{resolve_primary_key_blob_stream, ManagedBlobReadPlan};
 
+        let data_splits = self.matching_splits(data_splits)?;
         let core_options = self.table.schema().core_options();
         let user_read_type = self.read_type.clone();
         let audit_schema = audit_schema_for_read_type(&user_read_type, include_sequence)?;
@@ -647,7 +695,7 @@ impl<'a> PaimonTableRead<'a> {
         .with_parquet_read_budget(Some(self.parquet_read_budget()?))
         .with_table_options(self.table.schema().options().clone())
         .with_mosaic_prefetch(configured_mosaic_prefetch(self.table)?);
-        let raw_stream = reader.read(data_splits)?;
+        let raw_stream = reader.read(&data_splits)?;
         let raw_stream = if let Some(plan) = blob_plan {
             plan.finish(
                 raw_stream,
@@ -724,6 +772,7 @@ impl<'a> PaimonTableRead<'a> {
         let table = self.table.clone();
         let read_type = self.read_type.clone();
         let data_predicates = self.data_predicates.clone();
+        let partition_predicate = self.partition_predicate.clone();
         let parquet_read_budget = self.parquet_read_budget()?;
         let blob_parallelism = self.blob_parallelism;
 
@@ -732,9 +781,11 @@ impl<'a> PaimonTableRead<'a> {
                 let table = table.clone();
                 let read_type = read_type.clone();
                 let data_predicates = data_predicates.clone();
+                let partition_predicate = partition_predicate.clone();
                 let parquet_read_budget = Arc::clone(&parquet_read_budget);
                 let worker: ArrowRecordBatchStream = Box::pin(async_stream::try_stream! {
                     let pair_read = PaimonTableRead::new(&table, read_type, data_predicates)
+                        .with_partition_predicate(partition_predicate)
                         .with_parquet_read_budget(parquet_read_budget)
                         .with_blob_parallelism(blob_parallelism);
                     let mut pair_stream =
@@ -782,12 +833,14 @@ impl<'a> PaimonTableRead<'a> {
         let table = self.table.clone();
         let read_type_for_output = self.read_type.clone();
         let data_predicates = self.data_predicates.clone();
+        let partition_predicate = self.partition_predicate.clone();
         let parquet_read_budget = self.parquet_read_budget()?;
         let blob_parallelism = self.blob_parallelism;
 
         Ok(Box::pin(async_stream::try_stream! {
             let core_options = CoreOptions::new(table.schema().options());
             let pair_read = PaimonTableRead::new(&table, diff_read_type.clone(), data_predicates)
+                .with_partition_predicate(partition_predicate)
                 .with_parquet_read_budget(parquet_read_budget)
                 .with_blob_parallelism(blob_parallelism);
             let before_stream =
@@ -868,6 +921,7 @@ impl<'a> PaimonTableRead<'a> {
 
         let table = self.table.clone();
         let data_predicates = self.data_predicates.clone();
+        let partition_predicate = self.partition_predicate.clone();
         let before = before.to_vec();
         let after = after.to_vec();
         let parquet_read_budget = self.parquet_read_budget()?;
@@ -876,6 +930,7 @@ impl<'a> PaimonTableRead<'a> {
         Ok(Box::pin(async_stream::try_stream! {
             let core_options = CoreOptions::new(table.schema().options());
             let pair_read = PaimonTableRead::new(&table, diff_read_type.clone(), data_predicates)
+                .with_partition_predicate(partition_predicate)
                 .with_parquet_read_budget(parquet_read_budget)
                 .with_blob_parallelism(blob_parallelism);
             let before_stream = pair_read.read_pk_sorted_for_diff_with_type(
@@ -928,6 +983,7 @@ impl<'a> PaimonTableRead<'a> {
         core_options: &CoreOptions,
         read_type: &[DataField],
     ) -> crate::Result<ArrowRecordBatchStream> {
+        let splits = self.matching_splits(splits)?;
         if splits.is_empty() {
             return Ok(Box::pin(futures::stream::empty()));
         }
@@ -962,7 +1018,7 @@ impl<'a> PaimonTableRead<'a> {
                 mosaic_prefetch: configured_mosaic_prefetch(self.table)?,
             },
         );
-        reader.read(splits)
+        reader.read(&splits)
     }
 
     /// Every split must carry this handle's grant; returns it when it restricts
@@ -1063,9 +1119,11 @@ impl<'a> PaimonTableRead<'a> {
     /// Returns an [`ArrowRecordBatchStream`].
     pub fn to_arrow(&self, data_splits: &[DataSplit]) -> crate::Result<ArrowRecordBatchStream> {
         let core_options = self.table.schema.core_options();
-        match self.ensure_authorized_by_splits(&core_options, data_splits)? {
-            Some(grant) => self.read_restricted(data_splits, &grant),
-            None => self.read_splits(data_splits, &core_options),
+        let grant = self.ensure_authorized_by_splits(&core_options, data_splits)?;
+        let data_splits = self.matching_splits(data_splits)?;
+        match grant {
+            Some(grant) => self.read_restricted(&data_splits, &grant),
+            None => self.read_splits(&data_splits, &core_options),
         }
     }
 

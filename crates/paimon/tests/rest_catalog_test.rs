@@ -5719,3 +5719,114 @@ async fn test_branch_write_copy_rejects_replaced_source_identity_or_location() {
         "{error}"
     );
 }
+
+/// Explicit selectors are scan-only and must not turn into masked row filters.
+#[cfg(not(windows))]
+#[tokio::test]
+async fn test_query_auth_explicit_partition_selector() {
+    for data_evolution in [false, true] {
+        let schema = |options: &[(&str, &str)]| {
+            let mut builder = Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("dept", DataType::VarChar(VarCharType::new(255).unwrap()))
+                .column("region", DataType::VarChar(VarCharType::new(255).unwrap()))
+                .partition_keys(["region", "dept"]);
+            if data_evolution {
+                builder = builder
+                    .option("data-evolution.enabled", "true")
+                    .option("row-tracking.enabled", "true");
+            }
+            for (key, value) in options {
+                builder = builder.option(*key, *value);
+            }
+            builder.build().unwrap()
+        };
+        let batch = RecordBatch::try_from_iter([
+            (
+                "id",
+                Arc::new(Int32Array::from(vec![1, 2, 3, 4])) as arrow_array::ArrayRef,
+            ),
+            (
+                "dept",
+                Arc::new(StringArray::from(vec!["eng", "ops", "eng", "ops"]))
+                    as arrow_array::ArrayRef,
+            ),
+            (
+                "region",
+                Arc::new(StringArray::from(vec!["east", "east", "west", "west"]))
+                    as arrow_array::ArrayRef,
+            ),
+        ])
+        .unwrap();
+        let g = written("explicit_parts", schema, vec![batch]).await;
+        let predicates = PredicateBuilder::new(g.table.schema().fields());
+        let equal = |field: &str, value: &str| {
+            predicates
+                .equal(field, Datum::String(value.into()))
+                .unwrap()
+        };
+        g.set_rules(&[], &[("dept", upper(1, "dept"))]);
+        let mut read = g.table.new_read_builder();
+        read.with_projection(&["id"])
+            .unwrap()
+            .with_filter(equal("dept", "ENG"))
+            .with_partition_filter(Some(equal("region", "east")))
+            .unwrap()
+            .with_limit(1);
+        let plan = read.new_scan().plan().await.unwrap();
+        assert_eq!(plan.splits().len(), 2);
+        assert_eq!(ids(&read_all(&read).await.unwrap()), [1]);
+        let selected = g.ctx.server.auth_selects("default", "explicit_parts");
+        assert!(selected.iter().all(|select| {
+            let mut fields = select.clone().unwrap();
+            fields.sort();
+            fields == ["dept", "id", "region"]
+        }));
+
+        // A mask on another partition key must not reject an unmasked selector.
+        let mut selector_only = g.table.new_read_builder();
+        selector_only
+            .with_projection(&["id"])
+            .unwrap()
+            .with_partition_filter(Some(equal("region", "west")))
+            .unwrap();
+        assert_eq!(ids(&read_all(&selector_only).await.unwrap()), [3, 4]);
+
+        // A selector on a masked key is unsafe even with an empty result/LIMIT 0.
+        for limit in [0, 1] {
+            let mut masked = g.table.new_read_builder();
+            masked
+                .with_projection(&["id"])
+                .unwrap()
+                .with_limit(limit)
+                .with_partition_filter(Some(equal("dept", "missing")))
+                .unwrap();
+            let error = masked.new_scan().plan().await.unwrap_err();
+            assert!(
+                error.to_string().contains("partition key 'dept' is masked"),
+                "{error}"
+            );
+        }
+        // Validate names before equality predicates become opaque partition sets.
+        let forged = Predicate::Leaf {
+            column: "id".into(),
+            index: 1,
+            data_type: g.table.schema().fields()[1].data_type().clone(),
+            op: PredicateOperator::Eq,
+            literals: vec![Datum::String("eng".into())],
+        };
+        assert_disagreeing_leaf(
+            g.table
+                .new_read_builder()
+                .with_partition_filter(Some(forged))
+                .unwrap_err(),
+        );
+
+        // An explicit scan-only operand must be included in column authorization.
+        g.set_rules(&[], &[]);
+        g.ctx
+            .server
+            .set_column_auth("default", "explicit_parts", vec!["id".into()]);
+        assert_forbidden(selector_only.new_scan().plan().await.unwrap_err());
+    }
+}

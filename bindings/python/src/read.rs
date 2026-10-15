@@ -127,6 +127,7 @@ pub struct PyReadBuilder {
     read_type: Option<Vec<DataField>>,
     limit: Option<usize>,
     filter: Option<Predicate>,
+    partition_filter: Option<Predicate>,
     row_ranges: Option<Vec<RowRange>>,
     case_sensitive: bool,
     blob_parallelism: Option<usize>,
@@ -141,6 +142,7 @@ impl PyReadBuilder {
             read_type: None,
             limit: None,
             filter: None,
+            partition_filter: None,
             row_ranges: None,
             case_sensitive: true,
             blob_parallelism: None,
@@ -189,6 +191,7 @@ impl PyReadBuilder {
             read_type: None,
             limit: None,
             filter: None,
+            partition_filter: None,
             row_ranges: None,
             case_sensitive: true,
             blob_parallelism: None,
@@ -291,6 +294,26 @@ impl PyReadBuilder {
         Ok(slf)
     }
 
+    /// Set a scan-only partition selector using table fields. None clears it.
+    #[pyo3(signature = (predicate))]
+    fn with_partition_filter<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        predicate: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        let filter = predicate
+            .map(|predicate| {
+                dict_to_table_predicate(predicate, slf.table.schema(), slf.case_sensitive)
+            })
+            .transpose()?;
+        // Validation and all partition/query-auth semantics belong to core.
+        slf.table
+            .new_read_builder()
+            .with_partition_filter(filter.clone())
+            .map_err(to_py_err)?;
+        slf.partition_filter = filter;
+        Ok(slf)
+    }
+
     /// Set inclusive row ID ranges for Data Evolution scan planning.
     /// Planned splits carry the ranges used by readers.
     fn with_row_ranges(
@@ -317,6 +340,7 @@ impl PyReadBuilder {
             read_type: self.read_type.clone(),
             limit: self.limit,
             filter: self.filter.clone(),
+            partition_filter: self.partition_filter.clone(),
             row_ranges: self.row_ranges.clone(),
             case_sensitive: self.case_sensitive,
             incremental_scan: None,
@@ -379,6 +403,7 @@ pub struct PyTableScan {
     read_type: Option<Vec<DataField>>,
     limit: Option<usize>,
     filter: Option<Predicate>,
+    partition_filter: Option<Predicate>,
     row_ranges: Option<Vec<RowRange>>,
     case_sensitive: bool,
     incremental_scan: Option<PyIncrementalScan>,
@@ -479,6 +504,11 @@ impl PyTableScan {
             &self.filter,
             self.case_sensitive,
         )?;
+        if let Some(filter) = &self.partition_filter {
+            builder
+                .with_partition_filter(Some(filter.clone()))
+                .map_err(to_py_err)?;
+        }
         if let Some(row_ranges) = &self.row_ranges {
             builder.with_row_ranges(row_ranges.clone());
         }

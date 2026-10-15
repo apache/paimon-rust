@@ -222,6 +222,40 @@ impl<'a> ReadBuilder<'a> {
         self
     }
 
+    /// Select partitions at scan time, independently of the row filter.
+    ///
+    /// The predicate uses table-field indices and may reference only partition
+    /// keys. Like Java's `ReadBuilder.withPartitionFilter`, this replaces the
+    /// partition pruning derived from `with_filter`; the row filter still applies
+    /// during reading. `None` restores derived partition pruning. Query-auth
+    /// scans reject selectors on masked keys because they cannot be checked
+    /// against the masked values after scanning. Format tables are unsupported.
+    pub fn with_partition_filter(&mut self, filter: Option<Predicate>) -> Result<&mut Self> {
+        let table = match &self.kind {
+            ReadBuilderKind::Paimon(builder) => builder.table,
+            ReadBuilderKind::Format(_) => {
+                return Err(Error::Unsupported {
+                    message: "Explicit partition filters are not supported for format tables"
+                        .into(),
+                })
+            }
+        };
+        if let Some(filter) = &filter {
+            super::partition_filter::validate_partition_filter(table, filter)?;
+            if table.schema().core_options().query_auth_enabled() {
+                super::query_auth::reject_noncanonical_leaves(
+                    std::slice::from_ref(filter),
+                    table.schema().fields(),
+                )?;
+            }
+        }
+        match &mut self.kind {
+            ReadBuilderKind::Paimon(builder) => builder.partition_filter = filter.map(Box::new),
+            ReadBuilderKind::Format(_) => unreachable!("format tables rejected above"),
+        }
+        Ok(self)
+    }
+
     /// Whether a translated predicate is exact at the table-provider boundary.
     pub fn is_exact_filter_pushdown(&self, filter: &Predicate) -> bool {
         match &self.kind {
@@ -355,6 +389,7 @@ struct PaimonReadBuilder<'a> {
     /// ("last projection setter wins").
     projection_names: Option<Vec<String>>,
     filter: NormalizedFilter,
+    partition_filter: Option<Box<Predicate>>,
     limit: Option<usize>,
     /// Ranges the caller set. Each `with_row_ranges` replaces them.
     explicit_row_ranges: Option<Vec<RowRange>>,
@@ -373,6 +408,7 @@ impl<'a> PaimonReadBuilder<'a> {
             read_type: None,
             projection_names: None,
             filter: NormalizedFilter::default(),
+            partition_filter: None,
             limit: None,
             explicit_row_ranges: None,
             derived_row_ranges: None,
@@ -534,15 +570,24 @@ impl<'a> PaimonReadBuilder<'a> {
     /// does return `Result` and surfaces the error to the caller. This keeps the
     /// scan infallible without silently discarding an error that a read would hit.
     pub fn new_scan(&self) -> TableScan<'a> {
-        let partition_filter = self.filter.partition_predicate.clone().map(|pred| {
+        let partition_predicate = match &self.partition_filter {
+            Some(filter) => extract_predicate_for_keys(
+                filter,
+                self.table.schema().fields(),
+                self.table.schema().partition_keys(),
+            ),
+            None => self.filter.partition_predicate.clone(),
+        };
+        let partition_filter = partition_predicate.map(|pred| {
             PartitionFilter::from_predicate(pred, &self.table.schema().partition_fields())
         });
         let read_type = self.resolve_read_type().unwrap_or(None);
+        let data_predicates = self.scan_data_predicates();
         let scan_predicates =
-            super::managed_blob_reader::scan_predicates(self.table, &self.filter.data_predicates);
+            super::managed_blob_reader::scan_predicates(self.table, &data_predicates);
         // A payload predicate is evaluated after descriptor resolution. A
         // scan limit must not count rows which may fail that residual filter.
-        let scan_limit = if scan_predicates.len() == self.filter.data_predicates.len() {
+        let scan_limit = if scan_predicates.len() == data_predicates.len() {
             self.limit
         } else {
             None
@@ -557,7 +602,7 @@ impl<'a> PaimonReadBuilder<'a> {
         )
         .with_projected_read_field_ids(projected_read_field_ids_with_predicates(
             &read_type,
-            &self.filter.data_predicates,
+            &data_predicates,
             self.table.schema().fields(),
         ))
     }
@@ -590,9 +635,41 @@ impl<'a> PaimonReadBuilder<'a> {
             None => configured_parquet_read_budget(self.table)?,
         };
         TableRead::new(self.table, read_type, self.filter.data_predicates.clone())
+            .with_partition_predicate(self.filter.partition_predicate.clone())
             .with_parquet_read_budget(parquet_read_budget)
             .with_blob_parallelism(self.blob_parallelism)
             .map(|read| read.with_limit(self.limit))
+    }
+
+    /// An explicit selector replaces derived partition pruning. Retain the
+    /// ordinary partition conjuncts for safe stats/LIMIT decisions, rebound from
+    /// the partition row to the table layout (partition order may differ).
+    fn scan_data_predicates(&self) -> Vec<Predicate> {
+        let mut predicates = self.filter.data_predicates.clone();
+        if self.partition_filter.is_none() {
+            return predicates;
+        }
+        if let Some(partition) = &self.filter.partition_predicate {
+            let mapping = self
+                .table
+                .schema()
+                .partition_keys()
+                .iter()
+                .map(|name| {
+                    self.table
+                        .schema()
+                        .fields()
+                        .iter()
+                        .position(|field| field.name() == name)
+                })
+                .collect::<Vec<_>>();
+            predicates.push(
+                partition
+                    .remap_field_index(&mapping)
+                    .expect("partition fields belong to the table schema"),
+            );
+        }
+        predicates
     }
 
     /// Resolve the effective read type, deferring projection name resolution to
@@ -2118,9 +2195,11 @@ mod tests {
             None,
         );
 
+        let mut partition = crate::spec::BinaryRowBuilder::new(1);
+        partition.write_string(0, "2024-01-01");
         let split = DataSplitBuilder::new()
             .with_snapshot(1)
-            .with_partition(BinaryRow::new(1))
+            .with_partition(partition.build())
             .with_bucket(0)
             .with_bucket_path(local_file_path(&bucket_dir))
             .with_total_buckets(1)

@@ -1814,3 +1814,75 @@ def test_numeric_timestamp_window_options_use_core_scan(tmp_path, window, snapsh
     batches = list(builder.new_read().read(plan.splits()))
     actual = [row for batch in batches for row in batch.to_pylist()]
     assert sorted(actual, key=lambda row: row["id"]) == expected
+
+
+def _read_partition_ids(builder, plan):
+    return sorted(row["id"] for batch in builder.new_read().read_arrow(plan.splits())
+                  for row in batch.to_pylist())
+
+
+@pytest.mark.parametrize("selector_first", [False, True])
+def test_explicit_partition_selector_is_independent_from_the_row_filter(selector_first):
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_partitioned_table(warehouse)
+        builder = table.new_read_builder().with_projection(["id"])
+        selector = {"method": "in", "field": "dt", "literals": ["p1", "p2"]}
+        row_filter = {"method": "equal", "field": "dt", "literals": ["p2"]}
+        if selector_first:
+            builder.with_partition_filter(selector).with_filter(row_filter)
+        else:
+            builder.with_filter(row_filter).with_partition_filter(selector)
+        assert _read_partition_ids(builder, builder.new_scan().plan()) == [3]
+        # A scan-only constraint must not be applied as a reader residual.
+        selector_only = table.new_read_builder().with_projection(["id"]).with_partition_filter(selector)
+        all_rows = table.new_read_builder().new_scan().plan()
+        assert _read_partition_ids(selector_only, all_rows) == [1, 2, 3, 4]
+        assert _read_partition_ids(selector_only, selector_only.new_scan().plan()) == [1, 2, 3]
+        # The normal partition predicate must also apply with independent splits.
+        normal = table.new_read_builder().with_projection(["id"]).with_filter(row_filter)
+        assert _read_partition_ids(normal, all_rows) == [3]
+
+
+def test_partition_selector_replacement_clear_validation_and_case_sensitivity():
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_partitioned_table(warehouse)
+        builder = table.new_read_builder().with_projection(["id"]).with_case_sensitive(False)
+        def selector(value):
+            return {"method": "equal", "field": "DT", "literals": [value]}
+        builder.with_partition_filter(selector("p1"))
+        scan = builder.new_scan()
+        builder.with_partition_filter(selector("p2"))
+        assert _read_partition_ids(builder, scan.plan()) == [1, 2]
+        assert _read_partition_ids(builder, builder.new_scan().plan()) == [3]
+        with pytest.raises(ValueError, match="only partition keys"):
+            builder.with_partition_filter({"method": "or", "children": [
+                selector("p3"), {"method": "equal", "field": "id", "literals": [4]}]})
+        assert _read_partition_ids(builder, builder.new_scan().plan()) == [3]
+        builder.with_partition_filter(None)
+        assert _read_partition_ids(builder, builder.new_scan().plan()) == [1, 2, 3, 4]
+        with pytest.raises(ValueError):
+            table.new_read_builder().with_partition_filter(selector("p1"))
+
+
+def test_partition_selector_survives_incremental_and_stream_scan_capture():
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_partitioned_table(warehouse)
+        builder = table.new_read_builder().with_projection(["id"]).with_partition_filter(
+            {"method": "equal", "field": "dt", "literals": ["p1"]})
+        incremental = builder.new_incremental_scan(0, 1)
+        stream = builder.new_stream_scan()
+        builder.with_partition_filter({"method": "equal", "field": "dt", "literals": ["p3"]})
+        assert _read_partition_ids(builder, incremental.plan()) == [1, 2]
+        assert _read_partition_ids(builder, stream.plan()) == [1, 2]
+        assert stream.checkpoint() == 2
+        stream.restore(1)
+        assert _read_partition_ids(builder, stream.plan()) == [1, 2]
+
+
+def test_conflicting_explicit_selector_and_ordinary_partition_filter_return_no_rows():
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_partitioned_table(warehouse)
+        builder = table.new_read_builder().with_projection(["id"]).with_limit(1)
+        builder.with_partition_filter({"method": "equal", "field": "dt", "literals": ["p1"]})
+        builder.with_filter({"method": "equal", "field": "dt", "literals": ["p3"]})
+        assert _read_partition_ids(builder, builder.new_scan().plan()) == []
