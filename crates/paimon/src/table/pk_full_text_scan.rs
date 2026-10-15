@@ -43,6 +43,7 @@ fn data_invalid(message: impl Into<String>) -> crate::Error {
 /// bucket-split invariants (unique data files; each payload covers ≥1 active
 /// source; no active file double-covered; uncovered files active/non-duplicate/
 /// not-covered; and covered ∪ uncovered == every active data file in the split).
+#[derive(Clone)]
 pub(crate) struct PrimaryKeyFullTextSearchSplit {
     pub data_split: DataSplit,
     pub current_payloads: Vec<IndexFileMeta>,
@@ -248,6 +249,7 @@ impl BucketAccumulator {
 }
 
 /// The per-bucket search splits produced by planning.
+#[derive(Clone)]
 pub(crate) struct PrimaryKeyFullTextScanPlan {
     // The snapshot the plan resolved during planning (pinned before the index
     // manifest is read); the read guards every split against it before searching.

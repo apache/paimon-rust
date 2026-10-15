@@ -38,7 +38,7 @@ use crate::table::{
     find_field_id_by_name, merge_row_ranges, ArrowRecordBatchStream, RowRange, Table,
 };
 use arrow_array::{Array, Int64Array, LargeStringArray, RecordBatch, StringArray};
-use futures::{stream, StreamExt, TryStreamExt};
+use futures::{StreamExt, TryStreamExt};
 use paimon_ftindex_core::io::PosWriter;
 use paimon_ftindex_core::{FullTextIndexConfig, FullTextIndexWriter};
 use roaring::RoaringTreemap;
@@ -119,11 +119,15 @@ impl<'a> FullTextSearchBuilder<'a> {
     /// the search against full-text indexes.
     ///
     /// Reference: `FullTextSearchBuilder.executeLocal()`
+    /// For primary-key file positions, use [`Self::execute_scored`].
     pub async fn execute(&self) -> crate::Result<Vec<RowRange>> {
-        Ok(self.execute_scored().await?.to_row_ranges())
+        self.execute_scored().await?.row_ids()?.to_row_ranges()
     }
 
-    pub async fn execute_scored(&self) -> crate::Result<SearchResult> {
+    /// Search one snapshot without materializing user columns. Results carry
+    /// global row IDs or primary-key file positions and can be read later with
+    /// [`crate::table::SearchResult::new_read_builder`].
+    pub async fn execute_scored(&self) -> crate::Result<crate::table::SearchResult> {
         let read = self.new_read()?;
         read.read(self.new_scan()?.scan().await?).await
     }
@@ -178,15 +182,6 @@ impl<'a> FullTextSearchBuilder<'a> {
                 .ok_or_else(|| crate::Error::ConfigInvalid {
                     message: "Text column must be set via with_text_column()".to_string(),
                 })?;
-        let query_text = self
-            .query_text
-            .as_deref()
-            .ok_or_else(|| crate::Error::ConfigInvalid {
-                message: "Query text must be set via with_query_text()".to_string(),
-            })?;
-        let limit = self.limit.ok_or_else(|| crate::Error::ConfigInvalid {
-            message: "Limit must be set via with_limit()".to_string(),
-        })?;
 
         if !resolves_to_pk_full_text_path(&core, text_column) {
             return Err(crate::Error::Unsupported {
@@ -197,74 +192,7 @@ impl<'a> FullTextSearchBuilder<'a> {
             });
         }
 
-        // FAST-only: reject FULL/DETAIL loud rather than silently degrading.
-        if core.full_text_index_search_mode()? != GlobalIndexSearchMode::Fast {
-            return Err(crate::Error::DataInvalid {
-                message: "primary-key full-text search supports only the FAST global-index search \
-                          mode"
-                    .to_string(),
-                source: None,
-            });
-        }
-
-        // Reject a non-positive limit at construction, before the empty-plan fast
-        // path — an empty table must not mask an invalid limit (mirrors Java
-        // `PrimaryKeyFullTextRead`, and matches `search_bucket`'s own guard).
-        if limit == 0 {
-            return Err(crate::Error::ConfigInvalid {
-                message: "Limit must be positive".to_string(),
-            });
-        }
-
-        // Resolve the queried column's schema field id for the scan/field-id guard.
-        let field_id = find_field_id_by_name(self.table.schema().fields(), text_column)
-            .ok_or_else(|| crate::Error::DataInvalid {
-                message: format!("full-text search column '{text_column}' does not exist"),
-                source: None,
-            })?;
-
-        if let Some(filter) = &self.filter {
-            let (_, data) = super::bucket_filter::split_partition_and_data_predicates(
-                filter.clone(),
-                self.table.schema().fields(),
-                self.table.schema().partition_keys(),
-            );
-            if !data.is_empty() {
-                return Err(crate::Error::Unsupported {
-                    message: "Primary-key full-text search does not support non-partition filters"
-                        .into(),
-                });
-            }
-        }
-        let plan = PrimaryKeyFullTextScan::new(self.table, field_id, self.filter.clone())
-            .plan()
-            .await?;
-        if plan.splits.is_empty() {
-            return Ok(Box::pin(stream::empty()));
-        }
-
-        // A predicate-free materialization reader projecting the user table
-        // columns (mirrors `table_read.rs::new_data_file_reader` with an empty
-        // predicate list). The PK read appends the score column itself.
-        let materialize_reader = DataFileReader::new(
-            self.table.file_io().clone(),
-            self.table.schema_manager().clone(),
-            self.table.schema().id(),
-            self.table.schema().fields().to_vec(),
-            self.table.schema().fields().to_vec(),
-            Vec::new(),
-        )
-        .with_table_options(self.table.schema().options().clone());
-        let read = PrimaryKeyFullTextRead::new(
-            self.table.file_io().clone(),
-            materialize_reader,
-            self.table.location().trim_end_matches('/').to_string(),
-            self.table
-                .schema()
-                .core_options()
-                .index_file_in_data_file_dir(),
-        );
-        read.read(&plan, query_text, limit).await
+        self.execute_scored().await?.new_read_builder().read().await
     }
 }
 
@@ -1414,10 +1342,28 @@ mod tests {
         )
     }
 
-    // (d) The PK full-text path produces physical positions, not global row-ids:
-    // `execute` / `execute_scored` must fail loud and point callers at execute_read.
     #[tokio::test]
-    async fn pk_full_text_execute_fails_loud_use_execute_read() {
+    async fn pk_full_text_scan_and_read_accept_an_empty_pk_table() {
+        let table = pk_full_text_table("pk_ft_plan_read_empty", &[]);
+        let mut builder = table.new_full_text_search_builder();
+        builder
+            .with_query("body", r#"{"match":{"query":"alpha"}}"#)
+            .with_limit(10);
+        let plan = builder.new_scan().unwrap().scan().await.unwrap();
+        assert_eq!(plan.snapshot_id(), None);
+        assert!(builder
+            .new_read()
+            .unwrap()
+            .read(plan)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    // (d) The PK full-text path produces physical positions, not global row-ids:
+    // Only the ranges-only `execute` API rejects the physical-position result.
+    #[tokio::test]
+    async fn pk_full_text_ranges_reject_physical_positions() {
         let table = pk_full_text_table("pk_ft_execute_loud", &[]);
         let err = table
             .new_full_text_search_builder()
@@ -1428,26 +1374,26 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(&err, crate::Error::DataInvalid { message, .. } if message.contains("execute_read")),
-            "PK full-text execute must fail loud pointing at execute_read, got: {err}"
+            matches!(&err, crate::Error::Unsupported { message } if message.contains("physical file positions")),
+            "the ranges-only API must reject primary-key file positions, got: {err}"
         );
     }
 
     #[tokio::test]
-    async fn pk_full_text_execute_scored_fails_loud_use_execute_read() {
+    async fn pk_full_text_scored_empty_result_keeps_its_address_space() {
         let table = pk_full_text_table("pk_ft_scored_loud", &[]);
-        let err = table
+        let result = table
             .new_full_text_search_builder()
             .with_text_column("body")
             .with_query_text(r#"{"match":{"query":"alpha"}}"#)
             .with_limit(10)
             .execute_scored()
             .await
-            .unwrap_err();
-        assert!(
-            matches!(&err, crate::Error::DataInvalid { message, .. } if message.contains("global row ids")),
-            "PK full-text execute_scored must fail loud, got: {err}"
-        );
+            .unwrap();
+        assert_eq!(result.snapshot_id(), None);
+        assert!(result.positions().unwrap().is_empty());
+        assert!(result.row_ids().is_err());
+        assert!(result.serialize_primary_key_splits().unwrap().is_empty());
     }
 
     // (c) FAST-only: FULL / DETAIL global-index search modes must fail loud on the
@@ -1521,7 +1467,7 @@ mod tests {
 
     // Dispatch: with data-evolution ENABLED, a configured pk-full-text column must
     // NOT resolve to the PK path (mirrors Java `primaryKeyFullTextDefinition`), so
-    // execute_scored takes the append/DE path instead of the PK fail-loud guard.
+    // execute_scored returns global row IDs rather than physical PK positions.
     #[tokio::test]
     async fn data_evolution_enabled_does_not_take_pk_path() {
         let de_on = HashMap::from([

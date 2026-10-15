@@ -135,10 +135,99 @@ fn query(table: &Table) -> FullTextSearchBuilder<'_> {
     builder
 }
 
-fn ids(result: SearchResult) -> Vec<u64> {
-    let mut ids = result.row_ids;
+fn ids(result: crate::table::SearchResult) -> Vec<u64> {
+    let mut ids = result.into_row_ids().unwrap().row_ids;
     ids.sort_unstable();
     ids
+}
+
+#[tokio::test]
+async fn full_text_result_reads_projection_and_scores_from_the_captured_snapshot() {
+    let table = new_table(false);
+    append(&table, 0, 8).await;
+    index(&table, "full-text", "text").await;
+    let result = query(&table).execute_scored().await.unwrap();
+    let snapshot = result.snapshot_id().unwrap();
+    let expected = result.row_ids().unwrap();
+    assert!(result.positions().is_err());
+    append(&table, 8, 4).await;
+    assert!(
+        table
+            .snapshot_manager()
+            .get_latest_snapshot_id()
+            .await
+            .unwrap()
+            .unwrap()
+            > snapshot
+    );
+
+    let batches: Vec<RecordBatch> = result
+        .new_read_builder()
+        .with_projection(&["label", "id"])
+        .read()
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    let mut user_ids = Vec::new();
+    let mut scores = Vec::new();
+    for batch in batches {
+        assert_eq!(
+            batch
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| f.name().as_str())
+                .collect::<Vec<_>>(),
+            ["label", "id", "__paimon_search_score"]
+        );
+        user_ids.extend_from_slice(
+            batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .values(),
+        );
+        scores.extend_from_slice(
+            batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<arrow_array::Float32Array>()
+                .unwrap()
+                .values(),
+        );
+    }
+    assert_eq!(
+        user_ids,
+        expected
+            .row_ids
+            .iter()
+            .map(|id| *id as i32)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(scores, expected.scores);
+    let batches: Vec<RecordBatch> = result
+        .new_read_builder()
+        .with_projection(&[])
+        .read()
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+        expected.len()
+    );
+    assert!(batches.iter().all(|batch| batch.num_columns() == 1));
+    assert!(result
+        .new_read_builder()
+        .with_projection(&["missing"])
+        .read()
+        .await
+        .is_err());
 }
 
 #[tokio::test]
@@ -293,7 +382,7 @@ async fn empty_string_filters_preserve_java_search_refinement() {
     }
 }
 
-async fn user_ids(table: &Table, result: SearchResult) -> Vec<i32> {
+async fn user_ids(table: &Table, result: crate::table::SearchResult) -> Vec<i32> {
     let mut builder = table.new_read_builder();
     builder.with_projection(&["id", ROW_ID_FIELD_NAME]).unwrap();
     let plan = builder.new_scan().plan().await.unwrap();
@@ -322,6 +411,8 @@ async fn user_ids(table: &Table, result: SearchResult) -> Vec<i32> {
         }
     }
     let mut values = result
+        .row_ids()
+        .unwrap()
         .row_ids
         .iter()
         .map(|id| mapping[id])
@@ -461,6 +552,8 @@ async fn raw_filter_keeps_bm25_statistics_of_the_whole_corpus() {
         .await
         .unwrap();
     assert_eq!(ids(filtered.clone()), vec![1, 5, 7, 9, 11]);
+    let unfiltered = unfiltered.into_row_ids().unwrap();
+    let filtered = filtered.into_row_ids().unwrap();
     let scores: HashMap<_, _> = unfiltered
         .row_ids
         .into_iter()

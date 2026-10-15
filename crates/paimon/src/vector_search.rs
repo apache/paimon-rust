@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub use crate::table::vector_search_result::{
+pub use crate::table::search_result::{
     PrimaryKeySearchPosition, SearchResult, SearchResultReadBuilder,
 };
 

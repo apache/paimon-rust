@@ -18,17 +18,15 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::pyarrow::ToPyArrow;
-use futures::TryStreamExt;
 use paimon::spec::Predicate;
 use paimon::table::{BatchVectorRead, Table, VectorRead, VectorScan, VectorScanPlan};
-use paimon::vector_search::SearchResult;
 use paimon_datafusion::runtime::runtime;
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict};
+use pyo3::types::PyDict;
 
 use crate::error::to_py_err;
 use crate::predicate::dict_to_table_predicate;
+use crate::search_result::PySearchResult;
 
 #[derive(Clone, Default)]
 struct SearchConfig {
@@ -330,101 +328,5 @@ impl PyBatchVectorRead {
         py.detach(|| runtime().block_on(self.inner.read(plan.inner.clone())))
             .map(|results| results.into_iter().map(PySearchResult::new).collect())
             .map_err(to_py_err)
-    }
-}
-
-#[pyclass(name = "SearchResult", module = "pypaimon_rust.datafusion")]
-pub struct PySearchResult {
-    inner: SearchResult,
-}
-
-impl PySearchResult {
-    fn new(inner: SearchResult) -> Self {
-        Self { inner }
-    }
-}
-
-type PySearchPosition = (Py<PyBytes>, i32, String, i64, f32);
-
-#[pymethods]
-impl PySearchResult {
-    fn snapshot_id(&self) -> Option<i64> {
-        self.inner.snapshot_id()
-    }
-    fn new_read_builder(&self) -> PySearchResultReadBuilder {
-        PySearchResultReadBuilder {
-            result: self.inner.clone(),
-            projection: None,
-        }
-    }
-    fn __len__(&self) -> usize {
-        self.inner.len()
-    }
-    fn row_ids(&self) -> PyResult<HashMap<u64, f32>> {
-        let hits = self.inner.row_ids().map_err(to_py_err)?;
-        Ok(hits
-            .row_ids
-            .iter()
-            .copied()
-            .zip(hits.scores.iter().copied())
-            .collect())
-    }
-    fn positions(&self, py: Python<'_>) -> PyResult<Vec<PySearchPosition>> {
-        Ok(self
-            .inner
-            .positions()
-            .map_err(to_py_err)?
-            .iter()
-            .map(|position| {
-                (
-                    PyBytes::new(py, &position.partition.to_serialized_bytes()).unbind(),
-                    position.bucket,
-                    position.data_file_name.clone(),
-                    position.row_position,
-                    position.score,
-                )
-            })
-            .collect())
-    }
-    fn splits(&self, py: Python<'_>) -> PyResult<Vec<Py<PyBytes>>> {
-        Ok(self
-            .inner
-            .serialize_primary_key_splits()
-            .map_err(to_py_err)?
-            .iter()
-            .map(|bytes| PyBytes::new(py, bytes).unbind())
-            .collect())
-    }
-}
-
-#[pyclass(name = "SearchResultReadBuilder", module = "pypaimon_rust.datafusion")]
-pub struct PySearchResultReadBuilder {
-    result: SearchResult,
-    projection: Option<Vec<String>>,
-}
-
-#[pymethods]
-impl PySearchResultReadBuilder {
-    fn with_projection(mut slf: PyRefMut<'_, Self>, columns: Vec<String>) -> PyRefMut<'_, Self> {
-        slf.projection = Some(columns);
-        slf
-    }
-    fn read(&self, py: Python<'_>) -> PyResult<Vec<Py<PyAny>>> {
-        let batches = py
-            .detach(|| {
-                runtime().block_on(async {
-                    let mut builder = self.result.new_read_builder();
-                    if let Some(projection) = &self.projection {
-                        let columns: Vec<&str> = projection.iter().map(String::as_str).collect();
-                        builder.with_projection(&columns);
-                    }
-                    builder.read().await?.try_collect::<Vec<_>>().await
-                })
-            })
-            .map_err(to_py_err)?;
-        batches
-            .iter()
-            .map(|batch| batch.to_pyarrow(py).map(Bound::unbind))
-            .collect()
     }
 }

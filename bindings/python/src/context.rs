@@ -801,7 +801,6 @@ pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> 
     this.add_class::<crate::full_text_search::PyFullTextScan>()?;
     this.add_class::<crate::full_text_search::PyFullTextScanPlan>()?;
     this.add_class::<crate::full_text_search::PyFullTextRead>()?;
-    this.add_class::<crate::full_text_search::PyFullTextSearchResult>()?;
     this.add_class::<crate::hybrid_search::PyHybridSearchBuilder>()?;
     this.add_class::<crate::hybrid_search::PyHybridSearchResult>()?;
     this.add_class::<crate::vector_search::PyVectorSearchBuilder>()?;
@@ -810,8 +809,8 @@ pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> 
     this.add_class::<crate::vector_search::PyVectorScanPlan>()?;
     this.add_class::<crate::vector_search::PyVectorRead>()?;
     this.add_class::<crate::vector_search::PyBatchVectorRead>()?;
-    this.add_class::<crate::vector_search::PySearchResult>()?;
-    this.add_class::<crate::vector_search::PySearchResultReadBuilder>()?;
+    this.add_class::<crate::search_result::PySearchResult>()?;
+    this.add_class::<crate::search_result::PySearchResultReadBuilder>()?;
     this.add_class::<crate::read::PyReadBuilder>()?;
     this.add_class::<crate::read::PyTableScan>()?;
     this.add_class::<crate::read::PyStreamTableScan>()?;
