@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::global_index_result::PyGlobalIndexResult;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -26,7 +27,8 @@ use futures::stream::BoxStream;
 use futures::TryStreamExt;
 use paimon::spec::{is_variant_extraction_row, DataField, DataType, Predicate, RowType};
 use paimon::table::{
-    ArrowRecordBatchStream, DataSplit, IncrementalScanMode, RowRange, StreamTableScan, Table,
+    ArrowRecordBatchStream, DataSplit, GlobalIndexResult, IncrementalScanMode, RowRange,
+    StreamTableScan, Table,
 };
 use paimon_datafusion::runtime::runtime;
 use pyo3::exceptions::{PyBaseException, PyRuntimeError, PyTypeError, PyValueError};
@@ -105,7 +107,7 @@ fn apply_read_config(
 /// any iterable (list/tuple/generator). Runs under the GIL since it touches
 /// Python objects. A non-iterable argument or a non-`Split` element raises
 /// `TypeError`.
-fn extract_splits(splits: &Bound<'_, PyAny>) -> PyResult<Vec<DataSplit>> {
+pub(crate) fn extract_splits(splits: &Bound<'_, PyAny>) -> PyResult<Vec<DataSplit>> {
     let iter = splits
         .try_iter()
         .map_err(|_| PyTypeError::new_err("read() expects a sequence of Split objects"))?;
@@ -344,6 +346,7 @@ impl PyReadBuilder {
             row_ranges: self.row_ranges.clone(),
             case_sensitive: self.case_sensitive,
             incremental_scan: None,
+            global_index_result: None,
             row_position_slice: None,
             row_position_shard: None,
             chunk_shuffle: None,
@@ -407,6 +410,7 @@ pub struct PyTableScan {
     row_ranges: Option<Vec<RowRange>>,
     case_sensitive: bool,
     incremental_scan: Option<PyIncrementalScan>,
+    global_index_result: Option<GlobalIndexResult>,
     row_position_slice: Option<(u64, u64)>,
     row_position_shard: Option<(u64, u64)>,
     chunk_shuffle: Option<PyChunkShuffle>,
@@ -443,6 +447,11 @@ fn parse_incremental_scan_mode(mode: &str) -> PyResult<IncrementalScanMode> {
 impl PyTableScan {
     fn core_scan(&self) -> PyResult<paimon::table::TableScan<'_>> {
         let mut scan = self.read_builder()?.new_scan();
+        if let Some(result) = &self.global_index_result {
+            scan = scan
+                .with_global_index_result(result.clone())
+                .map_err(to_py_err)?;
+        }
         if let Some((start, end)) = self.row_position_slice {
             scan = scan
                 .with_row_position_slice(start, end)
@@ -471,6 +480,11 @@ impl PyTableScan {
         mode: IncrementalScanMode,
     ) -> PyResult<paimon::table::IncrementalScan<'_>> {
         let mut scan = self.read_builder()?.new_incremental_scan(mode, start, end);
+        if let Some(result) = &self.global_index_result {
+            scan = scan
+                .with_global_index_result(result.clone())
+                .map_err(to_py_err)?;
+        }
         if let Some((start, end)) = self.row_position_slice {
             scan = scan
                 .with_row_position_slice(start, end)
@@ -645,6 +659,29 @@ impl PyStreamTableScan {
 
 #[pymethods]
 impl PyTableScan {
+    /// Supply an evaluated selection; validation and authorization stay in core.
+    fn with_global_index_result<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        result: PyRef<'py, PyGlobalIndexResult>,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        let result = result.inner.clone();
+        if let Some(incremental) = slf.incremental_scan {
+            slf.core_incremental_scan(
+                incremental.start_snapshot_id,
+                incremental.end_snapshot_id,
+                incremental.mode,
+            )?
+            .with_global_index_result(result.clone())
+            .map_err(to_py_err)?;
+        } else {
+            slf.core_scan()?
+                .with_global_index_result(result.clone())
+                .map_err(to_py_err)?;
+        }
+        slf.global_index_result = Some(result);
+        Ok(slf)
+    }
+
     /// Select a half-open range of append-table row positions.
     fn with_row_position_slice(
         mut slf: PyRefMut<'_, Self>,
@@ -972,7 +1009,7 @@ impl PySplit {
     ///
     /// This is deliberately separate from the constructor used by pickle:
     /// pickle bytes are an opaque Rust JSON encoding, while this method accepts
-    /// Java/Python-compatible DataSplit and score-free IndexedSplit frames.
+    /// Java/Python-compatible DataSplit and IndexedSplit frames, including scores.
     #[staticmethod]
     fn deserialize(state: &Bound<'_, PyBytes>) -> PyResult<Self> {
         Ok(Self {

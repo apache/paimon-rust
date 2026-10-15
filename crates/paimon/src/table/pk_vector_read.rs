@@ -43,7 +43,7 @@ use crate::table::vector_search_common::{
     reorder_and_strip_position, vindex_concurrency_limits, RankedRow, VectorIndexBackend,
 };
 use crate::table::{ArrowRecordBatchStream, RowRange, Table};
-use crate::vector_search::{GlobalIndexIOMeta, SearchResult, VectorSearch};
+use crate::vector_search::{GlobalIndexIOMeta, GlobalIndexResult, VectorSearch};
 use crate::vindex::pkvector::ann::{AnnSegmentSource, PkVectorAnnSearcher, VindexAnnSearcher};
 use crate::vindex::pkvector::bucket::{BucketActiveFile, BucketAnnSegment, ExactFileSearchFuture};
 use crate::vindex::pkvector::metric::VectorSearchMetric;
@@ -92,7 +92,7 @@ impl PkVectorRead {
 impl Read for PkVectorRead {
     type Plan = PkVectorScanPlan;
 
-    async fn read(&self, plan: PkVectorScanPlan) -> crate::Result<Vec<SearchResult>> {
+    async fn read(&self, plan: PkVectorScanPlan) -> crate::Result<Vec<GlobalIndexResult>> {
         let core = CoreOptions::new(self.table.schema().options());
         let queries: Vec<&[f32]> = self.queries.iter().map(Vec::as_slice).collect();
         let candidates = search_pk_candidates_batch_with_plan(
@@ -111,7 +111,7 @@ impl Read for PkVectorRead {
         candidates
             .into_iter()
             .map(|candidates| {
-                SearchResult::from_primary_key(
+                GlobalIndexResult::from_primary_key(
                     table.clone(),
                     plan.snapshot_id,
                     candidates,

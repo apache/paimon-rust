@@ -23,7 +23,7 @@ use crate::table::vector_search_test_utils::{
     de_vector_table, id_gt_filter, vector_test_table, vector_test_table_at,
 };
 use crate::table::{TableCommit, TableWrite};
-use crate::vector_search::SearchResult;
+use crate::vector_search::GlobalIndexResult;
 use arrow_array::builder::{Float32Builder, ListBuilder};
 use arrow_array::{ArrayRef, Float32Array, Int32Array, RecordBatch};
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
@@ -341,7 +341,7 @@ async fn de_scalar_filter_with_no_matching_rows_returns_empty() {
         .await
         .unwrap();
     assert_eq!(results.len(), 2);
-    assert!(results.iter().all(SearchResult::is_empty));
+    assert!(results.iter().all(GlobalIndexResult::is_empty));
 }
 
 #[tokio::test]

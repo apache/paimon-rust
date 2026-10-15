@@ -42,7 +42,7 @@ use crate::table::vector_search_common::{
 use crate::table::{
     find_field_id_by_name, merge_row_ranges, ArrowRecordBatchStream, RowRange, Table,
 };
-use crate::vector_search::{GlobalIndexIOMeta, ScoredRowIds, SearchResult, VectorSearch};
+use crate::vector_search::{GlobalIndexIOMeta, GlobalIndexResult, ScoredRowIds, VectorSearch};
 use crate::vindex::executor::{
     acquire_process_global_search_permit, drain_indexed_jobs,
     ensure_global_index_executor_capacity, execute_global_index_with_guard,
@@ -185,7 +185,7 @@ pub(super) async fn materialize_row_ids(
 impl Read for DeVectorRead {
     type Plan = DeVectorScanPlan;
 
-    async fn read(&self, plan: DeVectorScanPlan) -> crate::Result<Vec<SearchResult>> {
+    async fn read(&self, plan: DeVectorScanPlan) -> crate::Result<Vec<GlobalIndexResult>> {
         let DeVectorScanPlan {
             table,
             index_entries,
@@ -201,7 +201,7 @@ impl Read for DeVectorRead {
                 .into_iter()
                 .zip(&self.vector_searches)
                 .map(|(hits, query)| {
-                    SearchResult::from_row_ids(table.clone(), query.field_name.clone(), hits)
+                    GlobalIndexResult::from_row_ids(table.clone(), query.field_name.clone(), hits)
                 })
                 .collect()
         };

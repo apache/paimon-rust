@@ -494,7 +494,7 @@ pub struct DataSplit {
     partition: Arc<BinaryRow>,
     bucket: i32,
     bucket_path: Arc<str>,
-    total_buckets: i32,
+    total_buckets: Option<i32>,
     data_files: Arc<[DataFileMeta]>,
     /// Deletion file for each data file, same order as `data_files`.
     /// `None` at index `i` means no deletion file for `data_files[i]` (matches Java getDeletionFiles() / List<DeletionFile> with null elements).
@@ -504,6 +504,9 @@ pub struct DataSplit {
     /// Primary-key IndexedSplits use file-local physical positions, independent
     /// of row tracking.
     row_ranges: Option<Arc<[RowRange]>>,
+    /// Optional IndexedSplit scores, aligned to expanded row ranges.
+    #[serde(default)]
+    scores: Option<Arc<[f32]>>,
     /// Whether the split can be read raw, without the merge reader: its
     /// physical rows are exactly its logical rows (modulo deletion files).
     /// Mirrors Java `DataSplit#rawConvertible`.
@@ -565,7 +568,7 @@ impl DataSplit {
         &self.bucket_path
     }
     pub fn total_buckets(&self) -> i32 {
-        self.total_buckets
+        self.total_buckets.unwrap_or(1)
     }
 
     pub fn data_files(&self) -> &[DataFileMeta] {
@@ -581,10 +584,24 @@ impl DataSplit {
         self.row_ranges.as_deref()
     }
 
+    pub fn scores(&self) -> Option<&[f32]> {
+        self.scores.as_deref()
+    }
+
+    /// Attach scores in ascending expanded-range order, as in Java IndexedSplit.
+    pub fn with_scores(mut self, scores: Vec<f32>) -> crate::Result<Self> {
+        validate_scores(self.row_ranges(), &scores)?;
+        self.scores = Some(scores.into());
+        Ok(self)
+    }
+
     /// Narrow an already planned split without rebuilding or copying its file
     /// and deletion-vector metadata. Ranges use the same coordinate system as
     /// the existing `row_ranges` field.
     pub(crate) fn with_selected_row_ranges(mut self, ranges: Vec<RowRange>) -> Self {
+        // Scores describe the old selection; callers must supply scores for
+        // the new one explicitly rather than silently misaligning them.
+        self.scores = None;
         self.row_ranges = Some(ranges.into());
         self
     }
@@ -600,6 +617,7 @@ impl DataSplit {
             .as_ref()
             .map(|files| vec![files[file_index].clone()].into());
         split.row_ranges = None;
+        split.scores = None;
         split.raw_convertible = false;
         split
     }
@@ -797,8 +815,13 @@ impl DataSplit {
         out.extend_from_slice(&p);
         out.extend_from_slice(&self.bucket.to_be_bytes());
         write_java_utf(&mut out, &self.bucket_path)?;
-        out.push(1); // totalBuckets present (version >= 6)
-        out.extend_from_slice(&self.total_buckets.to_be_bytes());
+        match self.total_buckets {
+            Some(total) => {
+                out.push(1);
+                out.extend_from_slice(&total.to_be_bytes());
+            }
+            None => out.push(0),
+        }
         out.extend_from_slice(&0i32.to_be_bytes()); // deprecated beforeFiles count
         out.push(0); // beforeDeletionFiles = null list
         out.extend_from_slice(&(self.data_files.len() as i32).to_be_bytes());
@@ -935,7 +958,9 @@ impl DataSplit {
         if let Some(dels) = data_deletion_files {
             builder = builder.with_data_deletion_files(dels);
         }
-        builder.build()
+        let mut split = builder.build()?;
+        split.total_buckets = total_buckets;
+        Ok(split)
     }
 
     /// Java `SplitSerializer#serialize` frame: magic + version + type id + body. The cross-language
@@ -944,7 +969,7 @@ impl DataSplit {
     /// uses `QueryAuthSplit` (type 5), retaining the complete captured REST response. Byte-compatible with
     /// `compatibility/split-v1-data` / `split-v1-indexed`.
     pub fn serialize_split_v1(&self) -> crate::Result<Vec<u8>> {
-        self.serialize_split_v1_with_scores(None)
+        self.serialize_split_v1_with_scores(self.scores())
     }
 
     /// Serialize aligned vector scores using Java's IndexedSplit wire format.
@@ -975,18 +1000,7 @@ impl DataSplit {
         }
         self.ensure_serializable_without_grant()?;
         if let Some(scores) = scores {
-            let count = self.row_ranges.as_ref().and_then(|ranges| {
-                ranges.iter().try_fold(0usize, |count, range| {
-                    let len = range.to().checked_sub(range.from())?.checked_add(1)?;
-                    count.checked_add(usize::try_from(len).ok()?)
-                })
-            });
-            if count != Some(scores.len()) || scores.len() > i32::MAX as usize {
-                return Err(crate::Error::DataInvalid {
-                    message: "IndexedSplit scores must align with selected row ranges".to_string(),
-                    source: None,
-                });
-            }
+            validate_scores(self.row_ranges(), scores)?;
         }
         let mut out = Vec::new();
         out.extend_from_slice(&SPLIT_SER_MAGIC.to_be_bytes());
@@ -1025,7 +1039,7 @@ impl DataSplit {
     /// Reverse of [`DataSplit::serialize_split_v1`]: parse a Java `SplitSerializer` frame into a
     /// `DataSplit` (type 1), an `IndexedSplit` (type 3, which carries `row_ranges`), or a
     /// `QueryAuthSplit` (type 5, retaining the authorization-required marker without minting
-    /// a grant). Other type ids, and IndexedSplit vector scores, are unsupported.
+    /// a grant). IndexedSplit scores retain their range alignment. Other type ids are unsupported.
     /// Consumes the entire buffer.
     pub fn deserialize_split_v1(data: &[u8]) -> crate::Result<DataSplit> {
         let mut cur = data;
@@ -1105,14 +1119,21 @@ impl DataSplit {
                     }
                     ranges.push(RowRange::new(from, to));
                 }
-                let scores_flag = read_u8(cur)?;
-                if scores_flag != 0 {
-                    return Err(crate::Error::Unsupported {
-                        message: "IndexedSplit scores are not supported".into(),
-                    });
-                }
                 let mut body = body;
                 body.row_ranges = Some(ranges.into());
+                if read_u8(cur)? != 0 {
+                    let count = read_i32(cur)?;
+                    if count < 0 || count as usize > cur.len() / 4 {
+                        return Err(crate::Error::DataInvalid {
+                            message: "Invalid IndexedSplit scores count".into(),
+                            source: None,
+                        });
+                    }
+                    let scores = (0..count)
+                        .map(|_| read_i32(cur).map(|bits| f32::from_bits(bits as u32)))
+                        .collect::<crate::Result<Vec<_>>>()?;
+                    body = body.with_scores(scores)?;
+                }
                 body
             }
             other => {
@@ -1123,6 +1144,22 @@ impl DataSplit {
         };
         Ok(split)
     }
+}
+
+fn validate_scores(ranges: Option<&[RowRange]>, scores: &[f32]) -> crate::Result<()> {
+    let count = ranges.and_then(|ranges| {
+        ranges.iter().try_fold(0usize, |count, range| {
+            let len = range.to().checked_sub(range.from())?.checked_add(1)?;
+            count.checked_add(usize::try_from(len).ok()?)
+        })
+    });
+    if count != Some(scores.len()) || scores.len() > i32::MAX as usize {
+        return Err(crate::Error::DataInvalid {
+            message: "IndexedSplit scores must align with selected row ranges".into(),
+            source: None,
+        });
+    }
+    Ok(())
 }
 
 /// Java `DataSplit#MAGIC` / `VERSION` for the serialize format.
@@ -1538,10 +1575,11 @@ impl DataSplitBuilder {
             partition: Arc::new(partition),
             bucket: self.bucket,
             bucket_path: bucket_path.into(),
-            total_buckets: self.total_buckets,
+            total_buckets: Some(self.total_buckets),
             data_files: data_files.into(),
             data_deletion_files: self.data_deletion_files.map(Into::into),
             row_ranges: self.row_ranges.map(Into::into),
+            scores: None,
             raw_convertible: self.raw_convertible,
             is_streaming: self.is_streaming,
         })
@@ -2683,9 +2721,7 @@ mod tests {
             .is_err());
     }
 
-    // The scores-stripped IndexedSplit frame the Rust serializer emits (see
-    // `serialize_indexed_split_v1_matches_golden`): the Java golden's trailing vector scores are
-    // replaced by a `false` scores flag, which is the exact byte form `deserialize_split_v1` supports.
+    // A score-free frame derived from the Java fixture.
     fn indexed_split_v1_no_scores() -> Vec<u8> {
         let golden = include_bytes!("goldens/split_v1_indexed.bin");
         let scores_len = 1 + 4 + 3 * 4; // writeBoolean(true) + count + 3 floats
@@ -2727,13 +2763,56 @@ mod tests {
     }
 
     #[test]
-    fn deserialize_split_v1_rejects_indexed_scores() {
-        // The raw Java golden carries vector scores, which the Rust split cannot model.
+    fn deserialize_split_v1_rejects_misaligned_indexed_scores() {
+        // This historical Java fixture has three scores for seven positions.
         let golden = include_bytes!("goldens/split_v1_indexed.bin");
         assert!(matches!(
             DataSplit::deserialize_split_v1(golden),
-            Err(crate::Error::Unsupported { .. })
+            Err(crate::Error::DataInvalid { .. })
         ));
+    }
+
+    #[test]
+    fn indexed_scores_round_trip_and_reject_malformed_payloads() {
+        let split = DataSplit::deserialize_split_v1(&indexed_split_v1_no_scores()).unwrap();
+        let values = vec![0.5, 1.25, -2.0, 4.0, 5.0, 6.0, 7.0];
+        let split = split.with_scores(values.clone()).unwrap();
+        let bytes = split.serialize_split_v1().unwrap();
+        let restored = DataSplit::deserialize_split_v1(&bytes).unwrap();
+        assert_eq!(restored.scores(), Some(values.as_slice()));
+        assert_eq!(restored, split);
+        assert_eq!(restored.serialize_split_v1().unwrap(), bytes);
+        assert_eq!(
+            serde_json::from_slice::<DataSplit>(&serde_json::to_vec(&split).unwrap()).unwrap(),
+            split
+        );
+        assert!(restored.clone().with_scores(vec![1.0]).is_err());
+        assert!(restored
+            .with_selected_row_ranges(vec![RowRange::new(1, 1)])
+            .scores()
+            .is_none());
+        let count_offset = bytes.len() - values.len() * 4 - 4;
+        for count in [-1, 0, 6, i32::MAX] {
+            let mut malformed = bytes.clone();
+            malformed[count_offset..count_offset + 4].copy_from_slice(&count.to_be_bytes());
+            assert!(DataSplit::deserialize_split_v1(&malformed).is_err());
+        }
+        for length in count_offset..bytes.len() {
+            assert!(DataSplit::deserialize_split_v1(&bytes[..length]).is_err());
+        }
+    }
+
+    #[test]
+    fn absent_total_buckets_round_trips_without_materializing_a_default() {
+        let mut split = v1_data_split_builder().build().unwrap();
+        let present_len = split.serialize_split_v1().unwrap().len();
+        split.total_buckets = None;
+        let bytes = split.serialize_split_v1().unwrap();
+        assert_eq!(bytes.len(), present_len - 4);
+        let restored = DataSplit::deserialize_split_v1(&bytes).unwrap();
+        assert_eq!(restored.total_buckets(), 1);
+        assert_eq!(restored.total_buckets, None);
+        assert_eq!(restored.serialize_split_v1().unwrap(), bytes);
     }
 
     #[test]

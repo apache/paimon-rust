@@ -18,13 +18,14 @@
 //! Hybrid configuration forwarding; snapshot, routes and fusion belong to core.
 
 use crate::error::to_py_err;
+use crate::global_index_result::PyGlobalIndexResult;
 use crate::predicate::dict_to_table_predicate;
 use paimon::spec::{Predicate, Snapshot};
 use paimon::table::{HybridSearchRanker, HybridSearchRoute, Table};
-use paimon::vector_search::ScoredRowIds;
 use paimon_datafusion::runtime::runtime;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -176,31 +177,10 @@ impl PyHybridSearchBuilder {
         Ok(slf)
     }
 
-    fn execute_local(&self, py: Python<'_>) -> PyResult<PyHybridSearchResult> {
+    fn execute_local(&self, py: Python<'_>) -> PyResult<PyGlobalIndexResult> {
         let builder = self.builder();
         py.detach(|| runtime().block_on(builder.execute_scored()))
-            .map(|inner| PyHybridSearchResult { inner })
+            .map(PyGlobalIndexResult::new)
             .map_err(to_py_err)
-    }
-}
-
-#[pyclass(name = "HybridSearchResult", module = "pypaimon_rust.datafusion")]
-pub struct PyHybridSearchResult {
-    inner: ScoredRowIds,
-}
-
-#[pymethods]
-impl PyHybridSearchResult {
-    fn __len__(&self) -> usize {
-        self.inner.len()
-    }
-
-    fn row_ids(&self) -> HashMap<u64, f32> {
-        self.inner
-            .row_ids
-            .iter()
-            .copied()
-            .zip(self.inner.scores.iter().copied())
-            .collect()
     }
 }

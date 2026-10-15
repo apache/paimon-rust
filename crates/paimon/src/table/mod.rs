@@ -78,6 +78,7 @@ mod full_text_search_builder;
 mod global_index_build_builder;
 pub(crate) mod global_index_build_common;
 mod global_index_drop_builder;
+mod global_index_result;
 pub(crate) mod global_index_scanner;
 mod global_index_search_filter;
 mod global_index_types;
@@ -138,7 +139,6 @@ mod row_position_selection;
 mod row_sidecar;
 mod scan_trace;
 pub(crate) mod schema_manager;
-pub(crate) mod search_result;
 mod shard_table_updater;
 pub(crate) mod snapshot_commit;
 mod snapshot_manager;
@@ -202,6 +202,9 @@ pub use full_text_search_builder::{
 use futures::stream::BoxStream;
 pub use global_index_build_builder::GlobalIndexBuildBuilder;
 pub use global_index_drop_builder::GlobalIndexDropBuilder;
+pub use global_index_result::{
+    GlobalIndexResult, GlobalIndexResultReadBuilder, PrimaryKeySearchPosition,
+};
 pub use global_index_types::{normalize_global_index_type, SUPPORTED_GLOBAL_INDEX_TYPES_FOR_DROP};
 pub use hybrid_search_builder::{
     HybridSearchBuilder, HybridSearchRanker, HybridSearchRoute, HybridSearchRouteKind,
@@ -222,7 +225,6 @@ pub use read_builder::ReadBuilder;
 pub use rest_env::RESTEnv;
 pub use scan_trace::ScanTrace;
 pub use schema_manager::SchemaManager;
-pub use search_result::{PrimaryKeySearchPosition, SearchResult, SearchResultReadBuilder};
 pub use shard_table_updater::ShardTableUpdater;
 pub use snapshot_commit::{RESTSnapshotCommit, RenamingSnapshotCommit, SnapshotCommit};
 pub use snapshot_manager::SnapshotManager;

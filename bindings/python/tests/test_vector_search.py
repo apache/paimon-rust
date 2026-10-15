@@ -18,7 +18,7 @@
 import pyarrow as pa
 import pytest
 
-from pypaimon_rust.datafusion import PaimonCatalog, SQLContext
+from pypaimon_rust.datafusion import GlobalIndexResult, PaimonCatalog, SQLContext
 
 
 @pytest.fixture
@@ -57,6 +57,7 @@ def test_filters_accumulate_and_partition_uses_table_schema(table):
               .with_filter({'method': 'lessThan', 'field': 'id', 'literals': [4]})
               .with_partition_filter({'method': 'equal', 'field': 'pt', 'literals': [1]})
               .execute_local())
+    assert isinstance(result, GlobalIndexResult)
     assert len(result) == 1
     assert list(result.row_ids().values()) == [1.0]
     assert result.snapshot_id() == 1
@@ -104,6 +105,7 @@ def test_batch_order_empty_results_and_scan_reuse(table):
                .with_query_vectors(queries).with_limit(1))
     plan = builder.new_vector_search_scan().scan()
     results = builder.new_batch_vector_search_read().read_batch_plan(plan)
+    assert all(isinstance(r, GlobalIndexResult) for r in results)
     assert [r.row_ids() for r in results] == [
         _single(table).with_query_vector(q).with_limit(1).execute_local().row_ids() for q in queries]
     assert [r.row_ids() for r in builder.execute_batch_local()] == [r.row_ids() for r in results]
@@ -125,3 +127,18 @@ def test_invalid_query_is_reported_before_planning(table, query):
 def test_single_vector_keyword_matches_stub(table):
     builder = _single(table).with_query_vector(vector=[1, 0]).with_limit(1)
     assert builder.execute_local().row_ids() == _single(table).with_limit(1).execute_local().row_ids()
+
+
+def test_external_result_uses_same_scan_type_without_search_context(table):
+    found = _single(table).with_limit(1).execute_local()
+    external = GlobalIndexResult.from_scored_row_ids(found.row_ids())
+    builder = table.new_read_builder().with_projection(['id'])
+    plan = builder.new_scan().with_global_index_result(external).plan()
+    expected = pa.Table.from_batches(found.new_read_builder().with_projection(['id']).read())
+    actual = pa.Table.from_batches(builder.new_read().read(plan.splits()))
+    assert actual.column('id').to_pylist() == expected.column('id').to_pylist()
+    assert external.row_ids() == found.row_ids()
+    with pytest.raises(Exception, match='require a result returned by a table search'):
+        external.new_read_builder().read()
+    with pytest.raises(TypeError):
+        builder.new_scan().with_global_index_result(found.row_ids())

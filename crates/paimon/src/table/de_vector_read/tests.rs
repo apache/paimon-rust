@@ -95,7 +95,7 @@ fn make_lumina_entry(
     }
 }
 
-// ---- Task B: search-and-read (`SearchResultReadBuilder::read`) tests ----
+// ---- Task B: search-and-read (`GlobalIndexResultReadBuilder::read`) tests ----
 
 /// Build a small materialization batch: user column `id: Int32`, the internal
 /// `_PKEY_VECTOR_POSITION: Int64`, and `__paimon_search_score: Float32` (mirroring

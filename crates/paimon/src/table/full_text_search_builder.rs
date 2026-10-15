@@ -126,8 +126,8 @@ impl<'a> FullTextSearchBuilder<'a> {
 
     /// Search one snapshot without materializing user columns. Results carry
     /// global row IDs or primary-key file positions and can be read later with
-    /// [`crate::table::SearchResult::new_read_builder`].
-    pub async fn execute_scored(&self) -> crate::Result<crate::table::SearchResult> {
+    /// [`crate::table::GlobalIndexResult::new_read_builder`].
+    pub async fn execute_scored(&self) -> crate::Result<crate::table::GlobalIndexResult> {
         let read = self.new_read()?;
         read.read(self.new_scan()?.scan().await?).await
     }

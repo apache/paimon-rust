@@ -18,8 +18,8 @@
 //! Thin bindings over core full-text Scan -> Plan -> Read.
 
 use crate::error::to_py_err;
+use crate::global_index_result::PyGlobalIndexResult;
 use crate::predicate::dict_to_table_predicate;
-use crate::search_result::PySearchResult;
 use paimon::spec::Predicate;
 use paimon::table::{FullTextRead, FullTextScan, FullTextScanPlan, Table};
 use paimon_datafusion::runtime::runtime;
@@ -123,10 +123,10 @@ impl PyFullTextSearchBuilder {
                 .map_err(to_py_err)?,
         })
     }
-    fn execute_local(&self, py: Python<'_>) -> PyResult<PySearchResult> {
+    fn execute_local(&self, py: Python<'_>) -> PyResult<PyGlobalIndexResult> {
         let builder = self.config.builder(&self.table).map_err(to_py_err)?;
         py.detach(|| runtime().block_on(builder.execute_scored()))
-            .map(PySearchResult::new)
+            .map(PyGlobalIndexResult::new)
             .map_err(to_py_err)
     }
 }
@@ -161,9 +161,13 @@ pub struct PyFullTextRead {
 }
 #[pymethods]
 impl PyFullTextRead {
-    fn read_plan(&self, py: Python<'_>, plan: &PyFullTextScanPlan) -> PyResult<PySearchResult> {
+    fn read_plan(
+        &self,
+        py: Python<'_>,
+        plan: &PyFullTextScanPlan,
+    ) -> PyResult<PyGlobalIndexResult> {
         py.detach(|| runtime().block_on(self.inner.read(plan.inner.clone())))
-            .map(PySearchResult::new)
+            .map(PyGlobalIndexResult::new)
             .map_err(to_py_err)
     }
 }

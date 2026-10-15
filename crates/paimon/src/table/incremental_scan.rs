@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::{DataSplit, Plan, ScanTrace, SnapshotManager, Table, TableScan};
+use super::{DataSplit, GlobalIndexResult, Plan, ScanTrace, SnapshotManager, Table, TableScan};
 use crate::spec::{CommitKind, CoreOptions};
 
 /// Java IncrementalDeltaStartingScanner.betweenTimestamps. Resolve both bounds
@@ -307,6 +307,19 @@ impl<'a> IncrementalScan<'a> {
         Ok(self)
     }
 
+    /// Intersect a DE global-row-ID selection with the combined incremental
+    /// batch. Unlike PK split results, this must retain the snapshot window.
+    /// Use [`Self::plan_combined`] to retain aligned scores on the final splits.
+    pub fn with_global_index_result(mut self, result: GlobalIndexResult) -> crate::Result<Self> {
+        if result.is_split_result() {
+            return Err(crate::Error::Unsupported {
+                message: "Split-based results require an ordinary batch scan".into(),
+            });
+        }
+        self.scan = self.scan.with_global_index_result(result)?;
+        Ok(self)
+    }
+
     pub async fn plan(&self) -> crate::Result<IncrementalPlan> {
         let mode = self.resolve_mode();
         self.validate_per_snapshot_plan(mode).await?;
@@ -326,9 +339,10 @@ impl<'a> IncrementalScan<'a> {
         if self.scan.has_row_position_selection()
             || self.scan.has_chunk_shuffle()
             || self.scan.has_shard()
+            || self.scan.has_global_index_result()
         {
             return Err(crate::Error::Unsupported {
-                message: "Incremental row-position selection and chunk_shuffle require combined Delta planning; sharding requires combined Delta or Changelog planning"
+                message: "Incremental row-position selection and chunk_shuffle require combined Delta planning; sharding and global-index results require combined Delta or Changelog planning"
                     .into(),
             });
         }
@@ -437,8 +451,10 @@ impl<'a> IncrementalScan<'a> {
             })
             .map(str::to_owned)
             .collect();
-        scan.plan_incremental_lists_with_trace(&end_snapshot, manifest_lists, trace)
-            .await
+        let plan = scan
+            .plan_incremental_lists_with_trace(&end_snapshot, manifest_lists, trace)
+            .await?;
+        self.scan.attach_global_index_scores(plan)
     }
 
     fn resolve_mode(&self) -> IncrementalScanMode {
