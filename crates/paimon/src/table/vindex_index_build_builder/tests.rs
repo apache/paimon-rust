@@ -481,6 +481,120 @@ async fn write_vectors(table: &Table, ids: Vec<i32>, vectors: Vec<Vec<f32>>) {
         .unwrap();
 }
 
+#[tokio::test]
+async fn vector_build_with_deletion_vectors_preserves_physical_coverage() {
+    for granule in [false, true] {
+        for deleted in [vec![0, 2], vec![0, 1, 2, 3]] {
+            let path = format!("memory:/vector_build_dv_{granule}_{}", deleted.len());
+            let mut options = vindex_e2e_options("10");
+            options.insert("ivf-flat.metric".into(), "l2".into());
+            options.insert("deletion-vectors.enabled".into(), "true".into());
+            options.insert("vindex.build.granule.enabled".into(), granule.to_string());
+            let table = test_table_with_io(
+                FileIOBuilder::new("memory").build().unwrap(),
+                &path,
+                vindex_schema_builder(options).build().unwrap(),
+            );
+            setup_dirs(table.file_io(), &path).await;
+            write_vectors(
+                &table,
+                vec![1, 2, 3, 4],
+                vec![vec![1., 0.], vec![0., 1.], vec![1., 1.], vec![2., 2.]],
+            )
+            .await;
+            let writer = table.new_write_builder();
+            let delete = writer.new_update().unwrap();
+            writer
+                .new_commit()
+                .commit(delete.delete_by_row_id(deleted.clone()).await.unwrap())
+                .await
+                .unwrap();
+            let mut builder = table.new_global_index_build_builder();
+            builder
+                .with_index_type(IVF_FLAT_IDENTIFIER)
+                .with_index_column("embedding");
+            let messages = builder.build().await.unwrap();
+            let files = messages
+                .iter()
+                .flat_map(|m| &m.new_index_files)
+                .collect::<Vec<_>>();
+            assert_eq!(files.len(), 1);
+            assert_eq!(files[0].row_count, 4);
+            let meta = files[0].global_index_meta.as_ref().unwrap();
+            assert_eq!((meta.row_range_start, meta.row_range_end), (0, 3));
+            writer.new_commit().commit(messages).await.unwrap();
+            let result = table
+                .new_vector_search_builder()
+                .with_vector_column("embedding")
+                .with_query_vector(vec![1., 1.])
+                .with_limit(10)
+                .with_options(HashMap::from([("ivf.nprobe".into(), "10".into())]))
+                .execute()
+                .await
+                .unwrap();
+            let mut ids = result.row_ids().unwrap().row_ids.clone();
+            ids.sort_unstable();
+            assert_eq!(
+                ids,
+                if deleted.len() == 2 {
+                    vec![1, 3]
+                } else {
+                    vec![]
+                }
+            );
+            // The closest physical vector (row 2) is deleted. Top-K must
+            // continue to a live candidate rather than return an empty result.
+            let result = table
+                .new_vector_search_builder()
+                .with_vector_column("embedding")
+                .with_query_vector(vec![1., 1.])
+                .with_limit(1)
+                .with_options(HashMap::from([("ivf.nprobe".into(), "10".into())]))
+                .execute()
+                .await
+                .unwrap();
+            assert_eq!(
+                result.row_ids().unwrap().row_ids,
+                if deleted.len() == 2 { vec![1] } else { vec![] }
+            );
+            assert!(builder.build().await.unwrap().is_empty());
+
+            write_vectors(&table, vec![5, 6], vec![vec![3., 3.], vec![4., 4.]]).await;
+            let messages = builder.build().await.unwrap();
+            let file = &messages[0].new_index_files[0];
+            assert_eq!(file.row_count, 2);
+            let meta = file.global_index_meta.as_ref().unwrap();
+            assert_eq!((meta.row_range_start, meta.row_range_end), (4, 5));
+            writer
+                .new_commit()
+                .commit(delete.delete_by_row_id(vec![1, 4]).await.unwrap())
+                .await
+                .unwrap();
+            writer.new_commit().commit(messages).await.unwrap();
+            let result = table
+                .new_vector_search_builder()
+                .with_vector_column("embedding")
+                .with_query_vector(vec![1., 1.])
+                .with_limit(10)
+                .with_options(HashMap::from([("ivf.nprobe".into(), "10".into())]))
+                .execute()
+                .await
+                .unwrap();
+            let mut ids = result.row_ids().unwrap().row_ids.clone();
+            ids.sort_unstable();
+            assert_eq!(
+                ids,
+                if deleted.len() == 2 {
+                    vec![3, 5]
+                } else {
+                    vec![5]
+                }
+            );
+            assert!(builder.build().await.unwrap().is_empty());
+        }
+    }
+}
+
 /// Commit a synthetic vindex `IndexFileMeta` covering `[start, end]` for
 /// `field_id` directly into the index manifest, without invoking the native
 /// builder. Mirrors the Lumina/btree tests so the incremental gap logic can

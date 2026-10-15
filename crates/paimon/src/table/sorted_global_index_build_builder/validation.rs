@@ -49,13 +49,6 @@ pub(super) fn validate_table_options(table: &Table, core_options: &CoreOptions) 
             message: "Sorted global index build does not support primary-key tables".to_string(),
         });
     }
-    if core_options.deletion_vectors_enabled() {
-        return Err(Error::Unsupported {
-            message:
-                "Sorted global index build does not support tables with deletion-vectors.enabled=true"
-                    .to_string(),
-        });
-    }
     Ok(())
 }
 

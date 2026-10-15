@@ -38,6 +38,8 @@ use crate::{Error, Result};
 
 /// Build global indexes by type, like Java's `GlobalIndexer.create`.
 /// Sorting and native writer selection are internal implementation details.
+/// Scalar and vindex builds include physical rows deleted by deletion vectors;
+/// queries filter those rows using the snapshot selected for the query.
 pub struct GlobalIndexBuildBuilder<'a> {
     table: &'a Table,
     columns: Option<IndexColumns>,

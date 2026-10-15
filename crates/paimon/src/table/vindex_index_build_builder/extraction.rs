@@ -34,6 +34,9 @@ pub(super) fn data_split_for_shard_ranges(
     shard: &VindexIndexShard,
     row_ranges: Vec<RowRange>,
 ) -> Result<DataSplit> {
+    // Java builds over stable physical row IDs, including deleted vectors.
+    // Do not attach deletion files: live-row filtering belongs to the query
+    // snapshot, and filtering here would leave holes in the training input.
     DataSplitBuilder::new()
         .with_snapshot(shard.snapshot_id)
         .with_partition(shard.partition.clone())

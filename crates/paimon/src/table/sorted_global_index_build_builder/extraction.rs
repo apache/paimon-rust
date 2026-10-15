@@ -179,6 +179,9 @@ pub(super) fn build_read_splits_for_shard(
                 return None;
             }
             let raw_convertible = files.len() == 1;
+            // Like Java's global-index build splits, deliberately omit deletion
+            // files: indexes cover physical row IDs. Readers apply the query
+            // snapshot's deletion vectors, including deletes after this build.
             Some(
                 DataSplitBuilder::new()
                     .with_snapshot(shard.snapshot_id)

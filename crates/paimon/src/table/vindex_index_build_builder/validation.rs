@@ -47,13 +47,6 @@ pub(super) fn validate_table_options(table: &Table, core_options: &CoreOptions) 
             message: "vindex index build does not support primary-key tables".to_string(),
         });
     }
-    if core_options.deletion_vectors_enabled() {
-        return Err(Error::Unsupported {
-            message:
-                "vindex index build does not support tables with deletion-vectors.enabled=true"
-                    .to_string(),
-        });
-    }
     Ok(())
 }
 
