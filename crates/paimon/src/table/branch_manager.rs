@@ -68,6 +68,15 @@ impl BranchManager {
         )
     }
 
+    /// [`branch_path`](Self::branch_path) in directory form (`branch/branch-my_branch/`).
+    ///
+    /// OpenDAL trims whitespace from both ends of a path, and a recursive delete
+    /// the backend cannot do natively lists by key prefix. The trailing `/` keeps
+    /// `prod ` from resolving to `prod`, and `b1` from also matching `b10/`.
+    fn branch_dir(&self, branch_name: &str) -> String {
+        format!("{}/", self.branch_path(branch_name))
+    }
+
     /// Validate branch name format.
     ///
     /// Rules:
@@ -116,8 +125,7 @@ impl BranchManager {
 
     /// Check if a branch exists.
     pub async fn branch_exists(&self, branch_name: &str) -> crate::Result<bool> {
-        let path = format!("{}/", self.branch_path(branch_name));
-        self.file_io.exists(&path).await
+        self.file_io.exists(&self.branch_dir(branch_name)).await
     }
 
     /// List all branch names sorted ascending. Returns an empty vector when the
@@ -204,8 +212,10 @@ impl BranchManager {
                 source: None,
             });
         }
-        let path = self.branch_path(branch_name);
-        self.file_io.delete_dir(&path).await?;
+        // Delete the same directory form that `branch_exists` checked.
+        self.file_io
+            .delete_dir(&self.branch_dir(branch_name))
+            .await?;
         Ok(())
     }
 
@@ -550,6 +560,24 @@ mod tests {
 
         bm.drop_branch("to_drop").await.unwrap();
         assert!(!bm.branch_exists("to_drop").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_drop_branch_deletes_only_the_named_directory() {
+        // The memory backend deletes recursively by key prefix, as S3 and OSS do.
+        let file_io = test_file_io();
+        let table_path = "memory:/test_drop_branch_exact".to_string();
+        let schema_manager = SchemaManager::new(file_io.clone(), table_path.clone());
+        write_schema(&file_io, &schema_manager, &test_schema()).await;
+
+        let bm = BranchManager::new(file_io, table_path);
+        for name in ["b1", "b10", "prod", "prod "] {
+            bm.create_branch(name).await.unwrap();
+        }
+        bm.drop_branch("b1").await.unwrap();
+        bm.drop_branch("prod ").await.unwrap();
+
+        assert_eq!(bm.list_all().await.unwrap(), vec!["b10", "prod"]);
     }
 
     #[tokio::test]

@@ -340,6 +340,55 @@ async fn test_delete_branch_preserves_leading_space_identity() {
 }
 
 #[tokio::test]
+async fn test_delete_branch_preserves_trailing_space_identity() {
+    // `"prod "` passes every guard as a branch distinct from the protected
+    // `prod`, so deleting it must not resolve to `prod`'s directory.
+    let (_tmp, catalog) = create_test_env();
+    let sql_context = create_sql_context(catalog.clone()).await;
+    exec(&sql_context, "CREATE SCHEMA paimon.test_db").await;
+    exec(
+        &sql_context,
+        "CREATE TABLE paimon.test_db.t1 (id INT, name VARCHAR(100), PRIMARY KEY (id)) WITH ('scan.primary-branch' = 'prod')",
+    )
+    .await;
+    exec(
+        &sql_context,
+        "INSERT INTO paimon.test_db.t1 VALUES (1, 'alice')",
+    )
+    .await;
+    exec(
+        &sql_context,
+        "CALL sys.create_tag(table => 'test_db.t1', tag => 'v1')",
+    )
+    .await;
+
+    let table = catalog
+        .get_table(&Identifier::new("test_db", "t1"))
+        .await
+        .unwrap();
+    let bm = BranchManager::new(table.file_io().clone(), table.location().to_string());
+    bm.create_branch_from_tag("prod", "v1").await.unwrap();
+    bm.create_branch_from_tag("prod ", "v1").await.unwrap();
+
+    exec(
+        &sql_context,
+        "CALL sys.delete_branch(table => 'test_db.t1', branch => 'prod ')",
+    )
+    .await;
+
+    assert!(!bm.branch_exists("prod ").await.unwrap());
+    assert_eq!(
+        collect_id_name(
+            &sql_context,
+            "SELECT id, name FROM paimon.test_db.`t1$branch_prod`"
+        )
+        .await,
+        vec![(1, "alice".to_string())],
+        "the protected branch must stay readable"
+    );
+}
+
+#[tokio::test]
 async fn test_delete_branch_preserves_scan_configured_branch() {
     // A branch named by `scan.primary-branch` / `scan.fallback-branch` is on a
     // reader's path, so `delete_branch` must refuse it (mirrors Java
