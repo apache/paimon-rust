@@ -2751,7 +2751,7 @@ mod hybrid_search_tests {
     use std::sync::Arc;
 
     #[cfg(feature = "fulltext")]
-    use datafusion::arrow::array::{Array, Int64Array};
+    use datafusion::arrow::array::{Array, Int64Array, StringViewArray};
     use datafusion::arrow::array::{Float32Array, Int32Array};
     use paimon::catalog::Identifier;
     use paimon::table::BranchManager;
@@ -2904,7 +2904,7 @@ mod hybrid_search_tests {
             assert!((score - expected).abs() < 1e-6);
         }
 
-        let empty_batches = ctx
+        let missing_error = ctx
             .sql(
                 "SELECT __paimon_search_score FROM hybrid_search( \
                  'paimon.default.test_java_vindex_vector', \
@@ -2918,10 +2918,29 @@ mod hybrid_search_tests {
                  'rrf')",
             )
             .await
-            .expect("empty hybrid_search score SQL should parse")
+            .expect("invalid-column hybrid_search SQL should parse")
             .collect()
             .await
-            .expect("empty hybrid_search score query should execute");
+            .expect_err("an unknown vector column must not silently return empty");
+        assert!(missing_error.to_string().contains("does not exist"));
+        super::common::exec(
+            &ctx,
+            "CREATE TABLE paimon.default.hybrid_empty (id INT, embedding ARRAY<FLOAT>) \
+             WITH ('row-tracking.enabled' = 'true')",
+        )
+        .await;
+        let empty_batches = ctx
+            .sql(
+                "SELECT __paimon_search_score FROM hybrid_search( \
+             'paimon.default.hybrid_empty', \
+             array(named_struct('field', 'embedding', 'query_vector', array(1.0), 'limit', 3)), \
+             array(), 3, 'rrf')",
+            )
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
         assert_eq!(
             empty_batches
                 .iter()
@@ -2933,19 +2952,22 @@ mod hybrid_search_tests {
 
     #[cfg(feature = "fulltext")]
     #[tokio::test]
-    async fn test_hybrid_search_score_with_row_tracking_only_fulltext() {
+    async fn test_hybrid_search_score_with_fulltext_definition() {
         let (_tmp, ctx) = super::common::setup_sql_context().await;
         super::common::exec(
             &ctx,
             "CREATE TABLE paimon.test_db.hybrid_raw_fulltext (id INT, content STRING) \
              WITH ( \
                'row-tracking.enabled' = 'true', \
+               'bucket' = '-1', \
+               'data-evolution.enabled' = 'true', \
+               'global-index.enabled' = 'true', \
                'global-index.search-mode' = 'full')",
         )
         .await;
         super::common::exec(
             &ctx,
-            "INSERT INTO paimon.test_db.hybrid_raw_fulltext VALUES \
+            "INSERT INTO paimon.test_db.hybrid_raw_fulltext (id, content) VALUES \
              (1, 'paimon search'), (2, 'other'), (3, 'paimon table')",
         )
         .await;
@@ -2955,11 +2977,26 @@ mod hybrid_search_tests {
              array(), \
              array(named_struct( \
                'column', 'content', \
-               'query', 'paimon', \
+               'query', '{\"match\":{\"query\":\"paimon\"}}', \
                'limit', 10, \
                'weight', 1.0)), \
              10, \
              'rrf')";
+        // Java returns empty without a full-text definition, even in FULL mode.
+        let before = ctx
+            .sql(&format!("SELECT id FROM {SEARCH}"))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert!(before.iter().all(|batch| batch.num_rows() == 0));
+        super::common::exec(
+            &ctx,
+            "CALL sys.create_global_index(table => 'test_db.hybrid_raw_fulltext', \
+             index_column => 'content', index_type => 'full-text')",
+        )
+        .await;
         let explicit_sql = format!("SELECT id, __paimon_search_score FROM {SEARCH} ORDER BY id");
         let explicit_batches = ctx
             .sql(&explicit_sql)
@@ -3038,10 +3075,25 @@ mod hybrid_search_tests {
             2
         );
         for batch in &star_batches {
-            assert_eq!(batch.num_columns(), 3);
+            assert_eq!(batch.num_columns(), 4);
             assert!(batch.column_by_name("__paimon_search_score").is_some());
-            assert!(batch.column_by_name("_ROW_ID").is_none());
+            assert!(batch.column_by_name("_ROW_ID").is_some());
         }
+        let mut text = star_batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column_by_name("content")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<StringViewArray>()
+                    .unwrap()
+                    .iter()
+                    .map(|value| value.unwrap().to_string())
+            })
+            .collect::<Vec<_>>();
+        text.sort();
+        assert_eq!(text, vec!["paimon search", "paimon table"]);
     }
 
     #[tokio::test]

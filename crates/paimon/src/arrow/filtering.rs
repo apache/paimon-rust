@@ -17,7 +17,7 @@
 
 use crate::arrow::schema_evolution::create_index_mapping;
 pub(crate) use crate::predicate_stats::{predicates_may_match_with_schema, StatsAccessor};
-use crate::spec::{is_row_id_column, DataField, Predicate, PredicateOperator};
+use crate::spec::{is_row_tracking_column, DataField, Predicate, PredicateOperator};
 
 /// Remap predicates from table-level indices to file-level indices.
 /// Predicates referencing fields not present in the file are resolved based on
@@ -44,10 +44,10 @@ fn remap_predicate(predicate: &Predicate, mapping: &[Option<usize>]) -> Predicat
             op,
             literals,
         } => {
-            // `_ROW_ID` is not a file column and has no per-file position, so
+            // Row-tracking metadata has no logical-table position, so
             // mapping its placeholder index would collapse the leaf to a
             // constant. Keep it; the residual resolves it by name.
-            if is_row_id_column(column) {
+            if is_row_tracking_column(column) {
                 return predicate.clone();
             }
             match mapping.get(*index).copied().flatten() {

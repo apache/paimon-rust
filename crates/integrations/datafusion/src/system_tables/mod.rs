@@ -158,15 +158,11 @@ pub(crate) fn provider_for_table(
         .map(Some)
 }
 
-/// Loads `<base>$<system_name>` from the catalog and wraps it as a system
-/// table provider.
-///
-/// - Unknown `system_name` → `Ok(None)` (DataFusion reports "table not found")
-/// - Base table missing    → `Err(Plan)` so users can distinguish it from an
-///   unknown system name
+/// Builds a system-table provider from a loaded Paimon table.
 pub(crate) async fn load(
     catalog: Arc<dyn Catalog>,
-    database: String,
+    identifier: Identifier,
+    mut table: Table,
     object: ParsedObjectName,
     system_name: String,
     dynamic_options: HashMap<String, String>,
@@ -185,41 +181,124 @@ pub(crate) async fn load(
     paimon::spec::CoreOptions::new(&dynamic_options)
         .ensure_read_authorized()
         .map_err(to_datafusion_error)?;
-    let identifier = Identifier::new(database, object.table().to_string());
-    match catalog.get_table(&identifier).await {
-        Ok(mut table) => {
-            crate::table_loader::ensure_paimon_served(&table, &identifier)?;
-            paimon::spec::CoreOptions::new(table.schema().options())
-                .ensure_read_authorized()
+    crate::table_loader::ensure_paimon_served(&table, &identifier)?;
+    paimon::spec::CoreOptions::new(table.schema().options())
+        .ensure_read_authorized()
+        .map_err(to_datafusion_error)?;
+    if let Some(branch) = object.branch() {
+        if !system_name.eq_ignore_ascii_case("branches") {
+            table = table
+                .copy_with_branch(branch)
+                .await
                 .map_err(to_datafusion_error)?;
-            if let Some(branch) = object.branch() {
-                if !system_name.eq_ignore_ascii_case("branches") {
-                    table = table
-                        .copy_with_branch(branch)
-                        .await
-                        .map_err(to_datafusion_error)?;
-                }
-            }
-            if system_name.eq_ignore_ascii_case("audit_log") && !dynamic_options.is_empty() {
-                table = table
-                    .copy_with_time_travel(dynamic_options)
-                    .await
-                    .map_err(to_datafusion_error)?;
-            }
-            provider_for_table(catalog, identifier, table, &system_name)
         }
-        Err(paimon::Error::TableNotExist { .. }) => Err(DataFusionError::Plan(format!(
-            "Cannot read system table `${system_name}`: \
-             base table `{}` does not exist",
-            object.table()
-        ))),
-        Err(e) => Err(to_datafusion_error(e)),
     }
+    if system_name.eq_ignore_ascii_case("audit_log") && !dynamic_options.is_empty() {
+        table = table
+            .copy_with_time_travel(dynamic_options)
+            .await
+            .map_err(to_datafusion_error)?;
+    }
+    provider_for_table(catalog, identifier, table, &system_name)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{is_registered, parse_object_name_for_datafusion, SYSTEM_TABLE_NAMES, TABLES};
+
+    #[tokio::test]
+    async fn pinned_empty_view_has_no_manifest_index_or_partition_rows() {
+        use std::sync::Arc;
+
+        use datafusion::arrow::array::{Int32Array, RecordBatch};
+        use datafusion::execution::context::SessionContext;
+        use paimon::catalog::Identifier;
+        use paimon::spec::{DataType, IntType, Schema};
+        use paimon::table::TableCommit;
+        use paimon::{Catalog, CatalogOptions, FileSystemCatalog, Options};
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut options = Options::new();
+        options.set(
+            CatalogOptions::WAREHOUSE,
+            format!("file://{}", temp.path().display()),
+        );
+        let catalog = Arc::new(FileSystemCatalog::new(options).unwrap());
+        catalog
+            .create_database("db", true, Default::default())
+            .await
+            .unwrap();
+        let identifier = Identifier::new("db", "indexed");
+        catalog
+            .create_table(
+                &identifier,
+                Schema::builder()
+                    .column("id", DataType::Int(IntType::new()))
+                    .column("pt", DataType::Int(IntType::new()))
+                    .partition_keys(["pt"])
+                    .option("row-tracking.enabled", "true")
+                    .option("data-evolution.enabled", "true")
+                    .option("global-index.enabled", "true")
+                    .build()
+                    .unwrap(),
+                false,
+            )
+            .await
+            .unwrap();
+        let table = catalog.get_table(&identifier).await.unwrap();
+        let batch = RecordBatch::try_from_iter(vec![
+            ("id", Arc::new(Int32Array::from(vec![1, 2])) as _),
+            ("pt", Arc::new(Int32Array::from(vec![0, 1])) as _),
+        ])
+        .unwrap();
+        let builder = table.new_write_builder().with_commit_user("test").unwrap();
+        let mut writer = builder.new_write().unwrap();
+        writer.write_arrow_batch(&batch).await.unwrap();
+        TableCommit::new(table.clone(), "test".to_string())
+            .commit(writer.prepare_commit().await.unwrap())
+            .await
+            .unwrap();
+        table
+            .new_global_index_build_builder()
+            .with_index_column("id")
+            .with_index_type("btree")
+            .execute()
+            .await
+            .unwrap();
+
+        let ctx = SessionContext::new();
+        for (name, builder) in [
+            ("manifests", super::manifests::build as super::Builder),
+            (
+                "table_indexes",
+                super::table_indexes::build as super::Builder,
+            ),
+        ] {
+            for empty in [false, true] {
+                let view = if empty {
+                    table.copy_with_pinned_snapshot(None)
+                } else {
+                    table.clone()
+                };
+                let provider = builder(view).unwrap();
+                let batches = ctx.read_table(provider).unwrap().collect().await.unwrap();
+                let count: usize = batches.iter().map(RecordBatch::num_rows).sum();
+                assert_eq!(count == 0, empty, "{name}, empty={empty}");
+            }
+        }
+        for empty in [false, true] {
+            let view = if empty {
+                table.copy_with_pinned_snapshot(None)
+            } else {
+                table.clone()
+            };
+            let provider =
+                super::partitions::build(catalog.clone(), identifier.clone(), view).unwrap();
+            let batches = ctx.read_table(provider).unwrap().collect().await.unwrap();
+            let count: usize = batches.iter().map(RecordBatch::num_rows).sum();
+            assert_eq!(count, if empty { 0 } else { 2 });
+        }
+    }
 
     /// Guards against the two registries drifting: anything in `TABLES` must
     /// also be in `SYSTEM_TABLE_NAMES`, and the only name allowed to be in

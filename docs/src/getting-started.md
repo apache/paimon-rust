@@ -124,6 +124,30 @@ cross-backend rename is rejected.
 with `with_provider` on the same builder. Without a provider, property-based
 storage configuration behaves as before.
 
+## Parquet Dictionary Encoding
+
+Dictionary encoding is enabled by default. Disable it for all columns with
+`parquet.enable.dictionary=false`, or override one column with
+`parquet.enable.dictionary#event_time=false` (Java-compatible syntax).
+Paths use dot-separated physical Parquet leaves, not logical MAP keys.
+These options affect new writes only.
+
+## Parquet Row Groups and Pages
+
+The Parquet writer accepts Java's sizing keys as plain integers:
+`parquet.block.size` (row group bytes), `parquet.page.size`,
+`parquet.dictionary.page.size`, `parquet.page.row.count.limit` and
+`parquet.page.size.row.check.min`. As in Java, `file.block-size` (for example
+`32 mb`) overrides `parquet.block.size`. Unset keys keep the parquet-rs
+defaults: no row group byte limit with at most 1,048,576 rows, 1 MiB data and
+dictionary pages, and 20,000 rows per page. parquet-rs checks page limits between
+write batches of `parquet.page.size.row.check.min` rows (1,024 by default, and
+never more than the effective page row limit), so a page can exceed its row limit
+by up to one batch. With a row group byte limit, the writer passes rows in slices
+of at most a quarter of the limit and closes the row group once its encoded size
+reaches the limit, so large or skewed batches stay close to it. These options
+affect new writes only.
+
 ## Parquet Page Pruning
 
 Parquet Page Index pruning is enabled by default. Set
@@ -186,9 +210,19 @@ When supported indexes are configured, each data file gets its own index.
 The complete serialized index is embedded in the manifest when its size
 is at most `file-index.in-manifest-threshold` (default `500 B`); larger indexes
 are stored beside the data file as a `.index` sidecar. Indexed write failures
-return an error and clean up newly created files on a best-effort basis.
-Use commit `abort` to clean up files after a successful `prepare_commit`
-when the prepared write will not be committed.
+return an error. Failed preparation discards outputs from that invocation before
+returning any messages. Files handed off by an earlier successful preparation
+remain available, including after a later preparation or Paimon Table commit
+exception. Explicit commit `abort` deletes newly written files only when the caller
+knows those messages are uncommitted and will never be submitted. Never call it
+when the Paimon Table commit outcome is unknown: publication can succeed even when
+its response fails.
+
+Format Tables follow Java's two-phase publication: validation failures discard
+staging only; append publication or partition-registration failures roll back new
+targets; overwrite failures retain replacement targets after old data is removed.
+Successfully registered append targets also survive a later abort. Cleanup attempts
+every file, and a cleanup failure does not replace the original commit error.
 
 `file-index.read.enabled` controls only reading, independently of index creation.
 Existing files are not backfilled. Index generation is not supported for

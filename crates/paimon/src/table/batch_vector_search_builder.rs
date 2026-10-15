@@ -21,6 +21,7 @@ use crate::spec::{CoreOptions, Predicate};
 use crate::table::de_vector_scan::PreparedVectorSearchFilter;
 use crate::table::vector_read::BatchVectorRead;
 use crate::table::vector_scan::{PlanContext, VectorScan};
+use crate::table::vector_search_common::{add_filter, validate_partition_filter};
 use crate::table::Table;
 use crate::vector_search::SearchResult;
 use roaring::RoaringTreemap;
@@ -68,7 +69,7 @@ impl<'a> BatchVectorSearchBuilder<'a> {
     }
 
     pub fn with_options(&mut self, options: HashMap<String, String>) -> &mut Self {
-        self.options = options;
+        self.options.extend(options);
         self
     }
 
@@ -76,10 +77,16 @@ impl<'a> BatchVectorSearchBuilder<'a> {
     /// before vector Top-K. See [`crate::table::VectorSearchBuilder::with_filter`] for the
     /// primary-key and data-evolution execution semantics.
     pub fn with_filter(&mut self, filter: Predicate) -> &mut Self {
-        self.filter = Some(filter);
+        add_filter(&mut self.filter, filter);
         self.include_row_ids = None;
         self.prepared_filter = None;
         self
+    }
+
+    /// Add a partition-only predicate expressed against the table schema.
+    pub fn with_partition_filter(&mut self, filter: Predicate) -> crate::Result<&mut Self> {
+        validate_partition_filter(self.table, &filter)?;
+        Ok(self.with_filter(filter))
     }
 
     /// Attach a prepared scalar pre-filter together with the exact table

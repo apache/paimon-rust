@@ -55,7 +55,7 @@ use datafusion::arrow::compute::cast;
 use datafusion::arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
-use datafusion::common::TableReference;
+use datafusion::common::{plan_datafusion_err, TableReference};
 use datafusion::datasource::{MemTable, TableProvider};
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::context::SQLOptions;
@@ -86,7 +86,7 @@ use paimon::spec::{
 };
 
 use crate::error::to_datafusion_error;
-use crate::table_loader::load_table_for_read;
+use crate::table::PaimonTableProvider;
 use crate::{BlobReaderRegistry, DynamicOptions};
 
 /// A SQL context that supports registering multiple Paimon catalogs and executing SQL.
@@ -766,22 +766,13 @@ impl SQLContext {
         }
     }
 
-    /// Handle SQL queries containing time-travel syntax (`VERSION AS OF` / `TIMESTAMP AS OF`).
-    ///
-    /// DataFusion's default SQL parser does not support these clauses, so we:
-    /// 1. Extract all table name + version/timestamp pairs (skipping string literals and comments)
-    /// 2. Strip the time-travel clauses from the SQL
-    /// 3. For each table, create a `PaimonTableProvider` with the appropriate scan options
-    ///    (merged with session-scoped dynamic options)
-    /// 4. Register them as UUID-named temp tables, execute the rewritten SQL, then deregister
+    /// Rewrite time-travel references to temporary snapshot providers.
+    /// The tracker removes registrations after planning.
     async fn handle_time_travel_query(
         &self,
         sql: &str,
         sql_options: SQLOptions,
     ) -> DFResult<DataFrame> {
-        use crate::table::PaimonTableProvider;
-        use paimon::spec::{SCAN_TIMESTAMP_MILLIS_OPTION, SCAN_VERSION_OPTION};
-
         let mut tracker = crate::merge_into::TempTableTracker::new(self);
 
         let version_clauses = extract_all_version_as_of(sql);
@@ -793,42 +784,20 @@ impl SQLContext {
             ));
         }
 
-        // Collect all replacements: (clause_range, uuid_name)
         let mut replacements: Vec<((usize, usize), String)> = Vec::new();
 
-        // Process all VERSION AS OF clauses
         for info in &version_clauses {
             let table_ref: datafusion::common::TableReference = info.table_name.as_str().into();
-            let (catalog, _catalog_name, identifier) =
+            let (catalog, catalog_name, identifier) =
                 self.resolve_table_name_from_ref(&table_ref)?;
-
-            let (paimon_table, base_identifier, system_name) =
-                load_table_for_read(&catalog, &identifier).await?;
-
-            // Merge dynamic options with time-travel options
-            let mut options = self.dynamic_options.read().unwrap().clone();
-            options.insert(SCAN_VERSION_OPTION.to_string(), info.version.clone());
-
-            let table_with_options = paimon_table
-                .copy_with_time_travel(options)
-                .await
-                .map_err(|e| DataFusionError::External(Box::new(e)))?;
-            let provider: Arc<dyn TableProvider> = if let Some(system_name) = system_name {
-                crate::system_tables::provider_for_table(
-                    Arc::clone(&catalog),
-                    base_identifier,
-                    table_with_options,
-                    &system_name,
-                )?
-                .ok_or_else(|| {
-                    DataFusionError::Plan(format!("Unknown Paimon system table: {system_name}"))
-                })?
-            } else {
-                Arc::new(PaimonTableProvider::try_new_with_blob_reader_registry(
-                    table_with_options,
-                    self.blob_reader_registry.clone(),
-                )?)
-            };
+            let provider = self
+                .time_travel_provider(
+                    &catalog,
+                    &catalog_name,
+                    &identifier,
+                    TimeTravelClause::Version(info.version.clone()),
+                )
+                .await?;
 
             let uuid_name = format!("__paimon_tt_{}", uuid::Uuid::new_v4().as_simple());
             self.register_temp_table(uuid_name.as_str(), provider)?;
@@ -836,41 +805,19 @@ impl SQLContext {
             replacements.push((info.clause_range, uuid_name));
         }
 
-        // Process all TIMESTAMP AS OF clauses
         for info in &timestamp_clauses {
             let table_ref: datafusion::common::TableReference = info.table_name.as_str().into();
-            let (catalog, _catalog_name, identifier) =
+            let (catalog, catalog_name, identifier) =
                 self.resolve_table_name_from_ref(&table_ref)?;
-
-            let (paimon_table, base_identifier, system_name) =
-                load_table_for_read(&catalog, &identifier).await?;
-
             let millis = Self::parse_timestamp_to_millis(&info.timestamp)?;
-
-            // Merge dynamic options with time-travel options
-            let mut options = self.dynamic_options.read().unwrap().clone();
-            options.insert(SCAN_TIMESTAMP_MILLIS_OPTION.to_string(), millis.to_string());
-
-            let table_with_options = paimon_table
-                .copy_with_time_travel(options)
-                .await
-                .map_err(|e| DataFusionError::External(Box::new(e)))?;
-            let provider: Arc<dyn TableProvider> = if let Some(system_name) = system_name {
-                crate::system_tables::provider_for_table(
-                    Arc::clone(&catalog),
-                    base_identifier,
-                    table_with_options,
-                    &system_name,
-                )?
-                .ok_or_else(|| {
-                    DataFusionError::Plan(format!("Unknown Paimon system table: {system_name}"))
-                })?
-            } else {
-                Arc::new(PaimonTableProvider::try_new_with_blob_reader_registry(
-                    table_with_options,
-                    self.blob_reader_registry.clone(),
-                )?)
-            };
+            let provider = self
+                .time_travel_provider(
+                    &catalog,
+                    &catalog_name,
+                    &identifier,
+                    TimeTravelClause::TimestampMillis(millis),
+                )
+                .await?;
 
             let uuid_name = format!("__paimon_tt_{}", uuid::Uuid::new_v4().as_simple());
             self.register_temp_table(uuid_name.as_str(), provider)?;
@@ -878,11 +825,9 @@ impl SQLContext {
             replacements.push((info.clause_range, uuid_name));
         }
 
-        // Sort replacements by position (descending) so that replacements
-        // from right to left don't shift indices of earlier ones
+        // Replace from right to left to preserve byte offsets.
         replacements.sort_by_key(|r| std::cmp::Reverse(r.0 .0));
 
-        // Build the rewritten SQL by replacing each clause from right to left
         let mut rewritten_sql = sql.to_string();
         for ((start, end), uuid_name) in &replacements {
             rewritten_sql = format!(
@@ -893,7 +838,6 @@ impl SQLContext {
             );
         }
 
-        // Execute the rewritten SQL; tracker auto-deregisters on drop.
         let current_catalog = self.current_catalog_name();
         let current_database = self
             .ctx
@@ -910,6 +854,102 @@ impl SQLContext {
         )
         .await?;
         self.ctx.sql_with_options(&expanded, sql_options).await
+    }
+
+    async fn time_travel_provider(
+        &self,
+        catalog: &Arc<dyn Catalog>,
+        catalog_name: &str,
+        identifier: &Identifier,
+        clause: TimeTravelClause,
+    ) -> DFResult<Arc<dyn TableProvider>> {
+        use crate::catalog::EngineTimeTravel;
+        use paimon::spec::{SCAN_TIMESTAMP_MILLIS_OPTION, SCAN_VERSION_OPTION};
+
+        let parsed = identifier
+            .parsed_object_name()
+            .map_err(to_datafusion_error)?;
+        let base = Identifier::new(
+            identifier.database().to_string(),
+            parsed.table().to_string(),
+        );
+        let loaded = catalog
+            .load_table(&base)
+            .await
+            .map_err(to_datafusion_error)?;
+        if let paimon::catalog::LoadedTable::External(external) = &loaded {
+            if parsed.branch().is_some() {
+                return Err(plan_datafusion_err!(
+                    "branches are not supported for '{}' tables ('{}')",
+                    external.declared(),
+                    identifier.full_name()
+                ));
+            }
+            if parsed.system_table().is_some() {
+                return Err(crate::catalog::unsupported_engine_time_travel(
+                    external.declared(),
+                    &identifier.full_name(),
+                ));
+            }
+            let travel = match clause {
+                TimeTravelClause::Version(version) => {
+                    EngineTimeTravel::Snapshot(crate::catalog::parse_engine_snapshot_id(&version)?)
+                }
+                TimeTravelClause::TimestampMillis(millis) => {
+                    EngineTimeTravel::TimestampMillis(millis)
+                }
+            };
+            let provider = self
+                .ctx
+                .catalog(catalog_name)
+                .ok_or_else(|| plan_datafusion_err!("Unknown catalog '{catalog_name}'"))?;
+            let provider = provider
+                .downcast_ref::<crate::catalog::PaimonCatalogProvider>()
+                .ok_or_else(|| {
+                    plan_datafusion_err!("Catalog '{catalog_name}' is not a Paimon catalog")
+                })?;
+            return provider
+                .table_at_time_travel(
+                    crate::EngineTableRequest::new(
+                        base.database().to_string(),
+                        base.object().to_string(),
+                        external.declared(),
+                    ),
+                    travel,
+                )
+                .await;
+        }
+
+        let (table, base, system_name) =
+            crate::table_loader::loaded_table_for_read(loaded, identifier).await?;
+        let (option, value) = match clause {
+            TimeTravelClause::Version(version) => (SCAN_VERSION_OPTION, version),
+            TimeTravelClause::TimestampMillis(millis) => {
+                (SCAN_TIMESTAMP_MILLIS_OPTION, millis.to_string())
+            }
+        };
+        let mut options = self.dynamic_options.read().unwrap().clone();
+        options.insert(option.to_string(), value);
+        let table = table
+            .copy_with_time_travel(options)
+            .await
+            .map_err(to_datafusion_error)?;
+        if let Some(system_name) = system_name {
+            crate::system_tables::provider_for_table(
+                Arc::clone(catalog),
+                base,
+                table,
+                &system_name,
+            )?
+            .ok_or_else(|| plan_datafusion_err!("Unknown Paimon system table: {system_name}"))
+        } else {
+            Ok(Arc::new(
+                PaimonTableProvider::try_new_with_blob_reader_registry(
+                    table,
+                    self.blob_reader_registry.clone(),
+                )?,
+            ))
+        }
     }
 
     /// Parse a timestamp string to milliseconds since epoch (using local timezone).
@@ -1222,6 +1262,17 @@ impl SQLContext {
         name: &ObjectName,
         sql_options: SQLOptions,
     ) -> DFResult<DataFrame> {
+        // Temporary objects shadow catalog tables; as in DataFusion, one without a
+        // definition shows NULL.
+        if let Some((catalog_name, database, table, temp)) = self.temp_table_for(name).await? {
+            return self.show_create_result(
+                catalog_name,
+                database,
+                table,
+                temp.get_table_definition(),
+                true,
+            );
+        }
         let (catalog, catalog_name, identifier) = self.resolve_catalog_and_table(name)?;
         let table = match catalog.get_table(&identifier).await {
             Ok(table) => table,
@@ -1232,19 +1283,76 @@ impl SQLContext {
         };
         crate::table_loader::ensure_paimon_served(&table, &identifier)?;
         let definition = crate::table::build_table_definition(&table)?;
+        self.show_create_result(
+            catalog_name,
+            identifier.database().to_string(),
+            identifier.object().to_string(),
+            Some(&definition),
+            false,
+        )
+    }
 
+    /// The temporary table or view `name` resolves to in queries.
+    async fn temp_table_for(
+        &self,
+        name: &ObjectName,
+    ) -> DFResult<Option<(String, String, String, Arc<dyn TableProvider>)>> {
+        let enable_ident_normalization = self.ctx.enable_ident_normalization();
+        let parts: Vec<String> = name
+            .0
+            .iter()
+            .filter_map(|part| part.as_ident())
+            .map(|ident| normalize_schema_identifier(ident, enable_ident_normalization))
+            .collect();
+        let table_ref = match parts.as_slice() {
+            [table] => TableReference::bare(table.as_str()),
+            [database, table] => TableReference::partial(database.as_str(), table.as_str()),
+            [catalog, database, table] => {
+                TableReference::full(catalog.as_str(), database.as_str(), table.as_str())
+            }
+            _ => return Ok(None),
+        };
+        let (catalog_name, database, table) = self.resolve_temp_table_name(table_ref)?;
+        // Queries resolve information_schema before consulting the catalog.
+        if database == datafusion::catalog::information_schema::INFORMATION_SCHEMA
+            && self.ctx.copied_config().information_schema()
+        {
+            return Ok(None);
+        }
+        let Some(catalog_provider) = self.ctx.catalog(&catalog_name) else {
+            return Ok(None);
+        };
+        let Some(provider) =
+            catalog_provider.downcast_ref::<crate::catalog::PaimonCatalogProvider>()
+        else {
+            return Ok(None);
+        };
+        Ok(provider
+            .temp_table(&database, &table)
+            .await?
+            .map(|temp| (catalog_name, database, table, temp)))
+    }
+
+    fn show_create_result(
+        &self,
+        catalog_name: String,
+        database: String,
+        table: String,
+        definition: Option<&str>,
+        nullable: bool,
+    ) -> DFResult<DataFrame> {
         let schema = Arc::new(Schema::new(vec![
             Field::new("table_catalog", ArrowDataType::Utf8, false),
             Field::new("table_schema", ArrowDataType::Utf8, false),
             Field::new("table_name", ArrowDataType::Utf8, false),
-            Field::new("definition", ArrowDataType::Utf8, false),
+            Field::new("definition", ArrowDataType::Utf8, nullable),
         ]));
         let batch = RecordBatch::try_new(
             schema,
             vec![
                 Arc::new(StringArray::from(vec![catalog_name])),
-                Arc::new(StringArray::from(vec![identifier.database().to_string()])),
-                Arc::new(StringArray::from(vec![identifier.object().to_string()])),
+                Arc::new(StringArray::from(vec![database])),
+                Arc::new(StringArray::from(vec![table])),
                 Arc::new(StringArray::from(vec![definition])),
             ],
         )?;
@@ -1423,7 +1531,10 @@ impl SQLContext {
                     };
                     rename_to = Some(Identifier::new(identifier.database().to_string(), new_name));
                 }
-                AlterTableOperation::SetTblProperties { table_properties } => {
+                AlterTableOperation::SetTblProperties { table_properties }
+                | AlterTableOperation::SetOptionsParens {
+                    options: table_properties,
+                } => {
                     for opt in table_properties {
                         if let SqlOption::KeyValue { key, value } = opt {
                             let v = value.to_string();
@@ -3548,6 +3659,12 @@ struct TimestampAsOfInfo {
     timestamp: String,
     /// Byte range (start, end) covering "table_name TIMESTAMP AS OF 'ts'"
     clause_range: (usize, usize),
+}
+
+/// A parsed `VERSION AS OF` or `TIMESTAMP AS OF` selector.
+enum TimeTravelClause {
+    Version(String),
+    TimestampMillis(i64),
 }
 
 /// Check whether a SQL string contains a time-travel keyword (`VERSION AS OF` or
@@ -6744,6 +6861,34 @@ mod tests {
         } else {
             panic!("expected AlterTable call");
         }
+    }
+
+    #[tokio::test]
+    async fn test_alter_table_set_options() {
+        let catalog = Arc::new(MockCatalog::new());
+        let sql_context = make_sql_context(catalog.clone()).await;
+
+        sql_context
+            .sql(
+                "ALTER TABLE mydb.t1 SET (\
+                 'snapshot.num-retained.min' = '5', \
+                 'snapshot.num-retained.max' = '10'\
+                 )",
+            )
+            .await
+            .unwrap();
+
+        let calls = catalog.take_calls();
+        let [CatalogCall::AlterTable { changes, .. }] = calls.as_slice() else {
+            panic!("expected one AlterTable call, got {calls:?}");
+        };
+        assert_eq!(
+            changes,
+            &[
+                SchemaChange::set_option("snapshot.num-retained.min".to_string(), "5".to_string()),
+                SchemaChange::set_option("snapshot.num-retained.max".to_string(), "10".to_string()),
+            ]
+        );
     }
 
     #[tokio::test]

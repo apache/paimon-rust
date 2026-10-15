@@ -21,11 +21,28 @@
 
 use crate::predicate_stats::data_leaf_may_match;
 use crate::spec::{
-    eval_row, extract_datum, BinaryRow, BinaryRowBuilder, DataField, Datum, ManifestFileMeta,
-    Predicate, PredicateBuilder, PredicateOperator,
+    eval_row, extract_datum, field_idx_to_partition_idx, BinaryRow, BinaryRowBuilder, DataField,
+    Datum, ManifestFileMeta, Predicate, PredicateBuilder, PredicateOperator,
 };
 use crate::table::stats_filter::FileStatsRows;
 use std::collections::HashSet;
+
+/// Explicit partition filters use table-field indices and must not contain data predicates.
+pub(super) fn validate_partition_filter(
+    table: &super::Table,
+    filter: &Predicate,
+) -> crate::Result<()> {
+    let mapping =
+        field_idx_to_partition_idx(table.schema().fields(), table.schema().partition_keys());
+    if table.schema().partition_keys().is_empty() || !filter.references_only_mapped_fields(&mapping)
+    {
+        return Err(crate::Error::ConfigInvalid {
+            message: "Partition filter must reference only partition keys of a partitioned table"
+                .to_string(),
+        });
+    }
+    Ok(())
+}
 
 /// Per-field min/max bounds for stats-based manifest pruning.
 #[derive(Debug, Clone)]

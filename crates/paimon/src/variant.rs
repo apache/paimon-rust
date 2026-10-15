@@ -169,17 +169,21 @@ impl<'a> VariantRef<'a> {
     }
 
     pub fn get_path(&self, path: &str) -> Result<Option<VariantRef<'a>>> {
+        self.get_path_segments(&parse_path(path)?)
+    }
+
+    fn get_path_segments(&self, segments: &[PathSegment]) -> Result<Option<VariantRef<'a>>> {
         let mut current = *self;
-        for segment in parse_path(path)? {
+        for segment in segments {
             match (segment, current.kind()?) {
                 (PathSegment::Key(key), VariantKind::Object) => {
-                    let Some(next) = current.get_field_by_key(&key)? else {
+                    let Some(next) = current.get_field_by_key(key)? else {
                         return Ok(None);
                     };
                     current = next;
                 }
                 (PathSegment::Index(index), VariantKind::Array) => {
-                    let Some(next) = current.get_element_at_index(index)? else {
+                    let Some(next) = current.get_element_at_index(*index)? else {
                         return Ok(None);
                     };
                     current = next;
@@ -1230,12 +1234,12 @@ fn write_json(value: &[u8], metadata: &[u8], pos: usize, out: &mut String) -> Re
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum PathSegment {
+pub(crate) enum PathSegment {
     Key(String),
     Index(usize),
 }
 
-fn parse_path(path: &str) -> Result<Vec<PathSegment>> {
+pub(crate) fn parse_path(path: &str) -> Result<Vec<PathSegment>> {
     let bytes = path.as_bytes();
     if !bytes.starts_with(b"$") {
         return data_invalid(format!("Invalid Variant path: {path}"));
@@ -2682,6 +2686,81 @@ pub(crate) fn rebuild_shredded(
     builder.result()
 }
 
+/// Resolve a path directly against a clipped shredded schema. Unrequested
+/// physical siblings and a pruned parent `value` are not needed to rebuild
+/// the selected subtree. Whole-value rebuilding remains strict.
+pub(crate) fn extract_shredded_path(
+    row: &ShreddedRow,
+    schema: &VariantSchema,
+    path: &str,
+) -> Result<Option<GenericVariant>> {
+    let metadata = binary_field(row, schema.top_level_metadata_idx)?;
+    if !shredded_row_has_value(row, schema) && schema.variant_idx.is_some() {
+        return data_invalid("Malformed shredded Variant: missing value");
+    }
+    extract_shredded_segments(row, schema, metadata, &parse_path(path)?)
+}
+
+fn extract_shredded_segments(
+    row: &ShreddedRow,
+    schema: &VariantSchema,
+    metadata: &[u8],
+    segments: &[PathSegment],
+) -> Result<Option<GenericVariant>> {
+    let Some((segment, remaining)) = segments.split_first() else {
+        if !shredded_row_has_value(row, schema) {
+            return Ok(None);
+        }
+        let mut builder = VariantBuilder::new();
+        rebuild_shredded_into(row, metadata, schema, &mut builder)?;
+        return builder.result().map(Some);
+    };
+    if let Some(typed) = schema.typed_idx.and_then(|index| row.field(index)) {
+        match (segment, typed) {
+            (PathSegment::Key(key), ShreddedValue::Row(object))
+                if schema.object_schema.is_some() =>
+            {
+                if let Some(index) = schema.object_field_index(key) {
+                    let Some(ShreddedValue::Row(child)) = object.field(index) else {
+                        return data_invalid("Malformed shredded Variant object field");
+                    };
+                    return extract_shredded_segments(
+                        child,
+                        &schema.object_schema.as_ref().unwrap()[index].schema,
+                        metadata,
+                        remaining,
+                    );
+                }
+            }
+            (PathSegment::Index(index), ShreddedValue::List(elements))
+                if schema.array_schema.is_some() =>
+            {
+                return match elements.get(*index) {
+                    Some(element) => extract_shredded_segments(
+                        element,
+                        schema.array_schema.as_ref().unwrap(),
+                        metadata,
+                        remaining,
+                    ),
+                    None => Ok(None),
+                };
+            }
+            _ => {}
+        }
+    }
+    match optional_binary_field(row, schema.variant_idx)? {
+        Some(value) => {
+            let variant = GenericVariant::from_parts(value.to_vec(), metadata.to_vec())?;
+            variant
+                .as_ref()?
+                .get_path_segments(segments)?
+                .map(|selected| selected.to_owned_variant())
+                .transpose()
+        }
+        None => Ok(None),
+    }
+}
+
 pub(crate) fn cast_variant_to_shredded_value(
     variant: VariantRef<'_>,
     data_type: &DataType,
@@ -3305,6 +3384,37 @@ mod tests {
             panic!("expected row shredding type");
         };
         build_variant_schema(&physical).unwrap()
+    }
+
+    #[test]
+    fn clipped_shredded_paths_do_not_rebuild_unrequested_parent_values() {
+        let full = simple_object_shredding_schema();
+        let mut clipped = full.clone();
+        clipped.variant_idx = None;
+        for (json, expected) in [
+            (r#"{"age":7,"city":"x","extra":true}"#, Some("7")),
+            ("42", None),
+            ("null", None),
+            ("[]", None),
+            ("{}", None),
+        ] {
+            let variant = GenericVariant::parse_json(json).unwrap();
+            let shredded = cast_shredded(&variant, &full).unwrap();
+            let actual = extract_shredded_path(&shredded, &clipped, "$.age").unwrap();
+            assert_eq!(
+                actual.map(|value| value.to_json().unwrap()).as_deref(),
+                expected,
+                "{json}"
+            );
+        }
+        let malformed = ShreddedRow::new(full.num_fields);
+        assert!(extract_shredded_path(&malformed, &full, "$.age").is_err());
+        let scalar = GenericVariant::parse_json("42").unwrap();
+        let row = cast_shredded(&scalar, &full).unwrap();
+        assert!(
+            rebuild_shredded(&row, &clipped).is_err(),
+            "whole values still require the pruned fallback"
+        );
     }
 
     #[test]

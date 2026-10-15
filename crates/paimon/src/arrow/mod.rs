@@ -15,6 +15,20 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod date_extract;
+pub(crate) use date_extract::evaluate_date_extract;
+mod cast_width;
+pub(crate) use cast_width::apply_declared_width;
+mod cast_executor;
+pub(crate) use cast_executor::CastExecutor;
+#[cfg(test)]
+mod cast_completion_java_test;
+mod cast_text;
+mod evolution_cast;
+pub(crate) use evolution_cast::{cast_numeric, supports_numeric_cast};
+mod evolution_decimal;
+mod evolution_string;
+mod evolution_temporal;
 pub(crate) mod filtering;
 pub(crate) mod format;
 pub(crate) mod nested_evolution;
@@ -22,7 +36,10 @@ pub(crate) mod partition;
 mod read_budget;
 pub(crate) mod residual;
 mod row_filter;
+mod string_transform;
+pub(crate) use string_transform::evaluate_string_transform;
 pub(crate) mod schema_evolution;
+pub use schema_evolution::cast_array_for_schema_evolution;
 pub(crate) mod shredding;
 mod variant;
 
@@ -362,6 +379,90 @@ pub fn build_target_arrow_schema(fields: &[DataField]) -> crate::Result<Arc<Arro
         })
         .collect::<crate::Result<Vec<_>>>()?;
     Ok(Arc::new(ArrowSchema::new(arrow_fields)))
+}
+
+/// Read results can contain NULL after a Java cast overflows or a historical
+/// file lacks a requested field, even when the current logical type is NOT NULL.
+/// Keep those runtime values representable without relaxing the writer schema.
+pub(crate) fn paimon_type_to_arrow_for_read(dt: &PaimonDataType) -> crate::Result<ArrowDataType> {
+    Ok(match dt {
+        PaimonDataType::Row(row) => ArrowDataType::Struct(
+            row.fields()
+                .iter()
+                .map(|field| {
+                    Ok(ArrowField::new(
+                        field.name(),
+                        paimon_type_to_arrow_for_read(field.data_type())?,
+                        true,
+                    ))
+                })
+                .collect::<crate::Result<Vec<_>>>()?
+                .into(),
+        ),
+        PaimonDataType::Array(array) => ArrowDataType::List(Arc::new(ArrowField::new(
+            "element",
+            paimon_type_to_arrow_for_read(array.element_type())?,
+            true,
+        ))),
+        PaimonDataType::Map(map) => ArrowDataType::Map(
+            Arc::new(ArrowField::new(
+                "entries",
+                ArrowDataType::Struct(
+                    vec![
+                        ArrowField::new(
+                            "key",
+                            paimon_type_to_arrow_for_read(map.key_type())?,
+                            false,
+                        ),
+                        ArrowField::new(
+                            "value",
+                            paimon_type_to_arrow_for_read(map.value_type())?,
+                            true,
+                        ),
+                    ]
+                    .into(),
+                ),
+                false,
+            )),
+            false,
+        ),
+        PaimonDataType::Multiset(multiset) => ArrowDataType::Map(
+            Arc::new(ArrowField::new(
+                "entries",
+                ArrowDataType::Struct(
+                    vec![
+                        ArrowField::new(
+                            "key",
+                            paimon_type_to_arrow_for_read(multiset.element_type())?,
+                            multiset.element_type().is_nullable(),
+                        ),
+                        ArrowField::new("value", ArrowDataType::Int32, false),
+                    ]
+                    .into(),
+                ),
+                false,
+            )),
+            false,
+        ),
+        _ => paimon_type_to_arrow(dt)?,
+    })
+}
+
+/// Build the nullable runtime schema used by table readers. Logical table
+/// constraints and the schema used to validate/write new records are unchanged.
+pub fn build_read_arrow_schema(fields: &[DataField]) -> crate::Result<Arc<ArrowSchema>> {
+    let fields = fields
+        .iter()
+        .map(|field| {
+            Ok(arrow_field_with_paimon_id(
+                field.name(),
+                paimon_type_to_arrow_for_read(field.data_type())?,
+                true,
+                field.id(),
+            ))
+        })
+        .collect::<crate::Result<Vec<_>>>()?;
+    Ok(Arc::new(ArrowSchema::new(fields)))
 }
 
 #[cfg(test)]
@@ -802,3 +903,6 @@ mod tests {
         assert!(!paimon_fields[1].data_type().is_nullable());
     }
 }
+
+#[cfg(test)]
+pub(crate) mod cast_test_utils;

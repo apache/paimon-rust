@@ -30,6 +30,8 @@ doc = false
 [dependencies]
 arrow = { workspace = true, features = ["pyarrow"] }
 arrow-row = { workspace = true }
+async-trait = "0.1.81"
+bytes = "1.7.1"
 chrono = "0.4.38"
 datafusion = { workspace = true }
 datafusion-ffi = { workspace = true }

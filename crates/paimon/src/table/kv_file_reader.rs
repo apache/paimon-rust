@@ -32,15 +32,15 @@ use super::sort_merge::{
 };
 use crate::arrow::format::MosaicPrefetchOptions;
 use crate::arrow::shredding::variant::assemble_variant_extraction_array;
-use crate::arrow::{build_target_arrow_schema, ReadBudget};
+use crate::arrow::ReadBudget;
 use crate::deletion_vector::DeletionVectorFactory;
 use crate::file_index::evaluator::evaluate_file_index;
 use crate::file_index::file_index_result::FileIndexResult;
 use crate::io::FileIO;
 use crate::spec::{
-    is_variant_extraction_row, is_variant_extraction_row_type, BigIntType, CoreOptions, DataField,
-    DataFileMeta, DataType as PaimonDataType, MergeEngine, PartialUpdateConfig, Predicate,
-    TinyIntType, SEQUENCE_NUMBER_FIELD_ID, SEQUENCE_NUMBER_FIELD_NAME, VALUE_KIND_FIELD_ID,
+    is_variant_extraction_row, BigIntType, CoreOptions, DataField, DataFileMeta,
+    DataType as PaimonDataType, MergeEngine, PartialUpdateConfig, Predicate, TinyIntType,
+    SEQUENCE_NUMBER_FIELD_ID, SEQUENCE_NUMBER_FIELD_NAME, VALUE_KIND_FIELD_ID,
     VALUE_KIND_FIELD_NAME,
 };
 use crate::table::schema_manager::SchemaManager;
@@ -124,6 +124,11 @@ pub(super) fn retain_primary_key_conjuncts(
         .iter()
         .filter_map(|p| p.project_field_index_inclusive(&mapping))
         .collect()
+}
+
+fn contains_variant_extraction(field: &DataField) -> bool {
+    crate::spec::is_variant_extraction_row_type(field.data_type())
+        || matches!(field.data_type(), PaimonDataType::Row(row) if row.fields().iter().any(contains_variant_extraction))
 }
 
 fn widen_partial_update_sequence_group_fields(
@@ -397,27 +402,33 @@ impl KeyValueFileReader {
         // File readers run before PK deduplication. Keep Variant values in their
         // logical storage type until the visible row has been selected: a strict
         // extraction must not fail on an older, overwritten version.
+        let aggregate_fields = if self.config.merge_engine == MergeEngine::PartialUpdate {
+            PartialUpdateConfig::new(&self.config.table_options).validated_aggregate_functions(
+                &self.config.table_fields,
+                &self.config.table_primary_keys,
+            )?
+        } else {
+            HashMap::new()
+        };
         let merge_read_type: Vec<DataField> = self
             .config
             .read_type
             .iter()
             .map(|field| {
-                if !is_variant_extraction_row_type(field.data_type()) {
-                    return Ok(field.clone());
-                }
-                self.config
+                let source = self
+                    .config
                     .table_fields
                     .iter()
-                    .find(|source| source.id() == field.id())
-                    .filter(|source| matches!(source.data_type(), PaimonDataType::Variant(_)))
-                    .cloned()
-                    .ok_or_else(|| Error::DataInvalid {
-                        message: format!(
-                            "Variant extraction field '{}' has no matching VARIANT table field",
-                            field.name()
-                        ),
-                        source: None,
-                    })
+                    .find(|source| source.id() == field.id());
+                if let Some(source) = source {
+                    let aggregate = self.config.merge_engine == MergeEngine::Aggregation
+                        || aggregate_fields.contains_key(source.name());
+                    let has_variant = contains_variant_extraction(field);
+                    if field.data_type() != source.data_type() && (has_variant || aggregate) {
+                        return Ok(source.clone());
+                    }
+                }
+                Ok(field.clone())
             })
             .collect::<crate::Result<_>>()?;
 
@@ -495,7 +506,10 @@ impl KeyValueFileReader {
         let user_fields = crate::arrow::residual::widen_scan_fields(
             &user_fields,
             residual_file_predicates.as_ref(),
-        );
+        )
+        .into_iter()
+        .filter(|field| !matches!(field.id(), SEQUENCE_NUMBER_FIELD_ID | VALUE_KIND_FIELD_ID))
+        .collect();
         let user_fields = widen_partial_update_sequence_group_fields(
             self.config.merge_engine,
             &self.config.table_options,
@@ -510,14 +524,21 @@ impl KeyValueFileReader {
         internal_read_type.push(value_kind_field);
         internal_read_type.extend(user_fields.clone());
 
-        let internal_schema = build_target_arrow_schema(&internal_read_type)?;
+        let internal_schema = crate::arrow::build_read_arrow_schema(&internal_read_type)?;
 
         // Output schema: user's read_type order
-        let output_schema = build_target_arrow_schema(&self.config.read_type)?;
+        let output_schema = crate::arrow::build_read_arrow_schema(&self.config.read_type)?;
 
         // Indices within internal_schema (offset 2 for _SEQ and _VK).
         let seq_index = 0;
         let value_kind_index = 1;
+        let mut predicate_refs = Vec::new();
+        for predicate in &self.config.predicates {
+            crate::arrow::residual::collect_predicate_leaf_refs(predicate, &mut predicate_refs);
+        }
+        let needs_sequence = predicate_refs
+            .iter()
+            .any(|(name, _)| *name == SEQUENCE_NUMBER_FIELD_NAME);
         let key_indices: Vec<usize> = self
             .config
             .primary_keys
@@ -536,6 +557,7 @@ impl KeyValueFileReader {
             .filter(|(index, field)| {
                 !key_names.contains(field.name())
                     && (*index >= 2
+                        || (needs_sequence && field.id() == SEQUENCE_NUMBER_FIELD_ID)
                         || self
                             .config
                             .read_type
@@ -606,7 +628,7 @@ impl KeyValueFileReader {
         let mut merge_output_fields: Vec<DataField> = Vec::new();
         merge_output_fields.extend(key_fields);
         merge_output_fields.extend(value_fields);
-        let merge_output_schema = build_target_arrow_schema(&merge_output_fields)?;
+        let merge_output_schema = crate::arrow::build_read_arrow_schema(&merge_output_fields)?;
 
         Ok(try_stream! {
             for split_group in &split_groups {
@@ -695,7 +717,7 @@ impl KeyValueFileReader {
                                 // Only the PK-only predicate projection may run before
                                 // sort-merge. A value index can match an old version of
                                 // a key, so it must not prune merge inputs here.
-                                let row_ranges = if file_index_read_enabled {
+                                let local_row_ranges = if file_index_read_enabled {
                                     match evaluate_file_index(
                                         &run_file_io,
                                         split.bucket_path(),
@@ -728,13 +750,13 @@ impl KeyValueFileReader {
                                     )),
                                     None => None,
                                 };
-                                let mut file_stream = reader.read_single_file_stream_with_schema(
+                                let mut file_stream = reader.read_single_file_stream_with_schema_and_local_ranges(
                                     split.as_ref(),
                                     file_meta,
                                     data_fields,
                                     data_schema_fields,
                                     deletion_vector,
-                                    row_ranges,
+                                    local_row_ranges,
                                 )?;
                                 while let Some(batch) = file_stream.next().await {
                                     yield batch?;
@@ -816,9 +838,15 @@ impl KeyValueFileReader {
                                 match config.read_type[out_idx].data_type() {
                                     PaimonDataType::Row(row) if is_variant_extraction_row(row) =>
                                     {
-                                        assemble_variant_extraction_array(column.as_ref(), row)
+                                        let assembled = assemble_variant_extraction_array(column.as_ref(), row)?;
+                                        crate::arrow::nested_evolution::evolve_column(
+                                            &assembled, config.read_type[out_idx].data_type(), config.read_type[out_idx].data_type(),
+                                        )
                                     }
-                                    _ => Ok(column.clone()),
+                                    _ => {
+                                        let source = merge_read_type.iter().find(|field| field.id() == config.read_type[out_idx].id()).unwrap();
+                                        crate::arrow::nested_evolution::evolve_field(column, source, &config.read_type[out_idx])
+                                    },
                                 }
                             })
                             .collect::<crate::Result<Vec<_>>>()?;
@@ -1207,9 +1235,9 @@ mod tests {
             vec![Datum::Long(102)],
         );
         let mut read_builder = table.new_read_builder();
-        read_builder
-            .with_projection(&["id", "value", crate::spec::ROW_ID_FIELD_NAME])
-            .unwrap();
+        // Untracked PK tables do not advertise ROW_ID. A hand-built predicate
+        // must still be rejected rather than binding its placeholder index.
+        read_builder.with_projection(&["id", "value"]).unwrap();
         read_builder.with_filter(row_id);
         let plan = read_builder.new_scan().plan().await.unwrap();
         let err = read_builder
@@ -1707,61 +1735,76 @@ mod tests {
     /// key with no replacement is resurrected.
     #[tokio::test]
     async fn dv_merge_on_read_applies_deletion_vectors_before_key_merge() {
-        let file_io = test_file_io();
-        let table_path = "memory:/dv_merge_on_read_with_dv";
-        setup_dirs(&file_io, table_path).await;
-        let table = pk_table(
-            &file_io,
-            table_path,
-            &[
-                ("deletion-vectors.enabled", "true"),
-                ("deletion-vectors.merge-on-read", "true"),
-            ],
-        );
+        for (engine, expected) in [
+            ("deduplicate", 11),
+            ("partial-update", 11),
+            ("aggregation", 21),
+        ] {
+            let file_io = test_file_io();
+            let table_path = "memory:/dv_merge_on_read_with_dv";
+            setup_dirs(&file_io, table_path).await;
+            let table = pk_table(
+                &file_io,
+                table_path,
+                &[
+                    ("merge-engine", engine),
+                    ("deletion-vectors.enabled", "true"),
+                    ("deletion-vectors.merge-on-read", "true"),
+                ],
+            );
+            let table = if engine == "aggregation" {
+                table.copy_with_options(HashMap::from([(
+                    "fields.value.aggregate-function".into(),
+                    "sum".into(),
+                )]))
+            } else {
+                table
+            };
 
-        write_commit(&table, &int_batch(vec![1, 2], vec![Some(10), Some(20)])).await;
-        write_commit(&table, &int_batch(vec![1, 3], vec![Some(11), Some(30)])).await;
+            write_commit(&table, &int_batch(vec![1, 2], vec![Some(10), Some(20)])).await;
+            write_commit(&table, &int_batch(vec![1, 3], vec![Some(11), Some(30)])).await;
 
-        let all_files = table
-            .new_read_builder()
-            .new_scan()
-            .with_scan_all_files()
-            .plan()
-            .await
-            .unwrap();
-        let mut files = all_files
-            .splits()
-            .iter()
-            .flat_map(|split| split.data_files().iter().cloned())
-            .collect::<Vec<_>>();
-        files.sort_by_key(|file| file.min_sequence_number);
-        assert_eq!(files.len(), 2);
-        files[0].level = 1;
+            let all_files = table
+                .new_read_builder()
+                .new_scan()
+                .with_scan_all_files()
+                .plan()
+                .await
+                .unwrap();
+            let mut files = all_files
+                .splits()
+                .iter()
+                .flat_map(|split| split.data_files().iter().cloned())
+                .collect::<Vec<_>>();
+            files.sort_by_key(|file| file.min_sequence_number);
+            assert_eq!(files.len(), 2);
+            files[0].level = 1;
 
-        let deletion_file = write_deletion_file(&file_io, table_path, &[1]).await;
-        let split = DataSplitBuilder::new()
-            .with_snapshot(2)
-            .with_partition(BinaryRow::new(0))
-            .with_bucket(0)
-            .with_bucket_path(format!("{table_path}/bucket-0"))
-            .with_total_buckets(1)
-            .with_data_files(files)
-            .with_data_deletion_files(vec![Some(deletion_file), None])
-            .with_raw_convertible(false)
-            .build()
-            .unwrap();
+            let deletion_file = write_deletion_file(&file_io, table_path, &[1]).await;
+            let split = DataSplitBuilder::new()
+                .with_snapshot(2)
+                .with_partition(BinaryRow::new(0))
+                .with_bucket(0)
+                .with_bucket_path(format!("{table_path}/bucket-0"))
+                .with_total_buckets(1)
+                .with_data_files(files)
+                .with_data_deletion_files(vec![Some(deletion_file), None])
+                .with_raw_convertible(false)
+                .build()
+                .unwrap();
 
-        let batches = table
-            .new_read_builder()
-            .new_read()
-            .unwrap()
-            .to_arrow(&[split])
-            .unwrap()
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
-        assert_eq!(int_column(&batches, "id"), vec![1, 3]);
-        assert_eq!(int_column(&batches, "value"), vec![11, 30]);
+            let batches = table
+                .new_read_builder()
+                .new_read()
+                .unwrap()
+                .to_arrow(&[split])
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            assert_eq!(int_column(&batches, "id"), vec![1, 3]);
+            assert_eq!(int_column(&batches, "value"), vec![expected, 30]);
+        }
     }
 
     /// Disjoint files in one split are consumed as sequential merge groups. A
@@ -3040,6 +3083,155 @@ mod tests {
         assert_eq!(int_column(&batches, "id"), vec![1]);
         assert_eq!(int_column(&batches, "a"), vec![5]);
         assert_eq!(int_column(&batches, "b"), vec![7]);
+    }
+
+    #[tokio::test]
+    async fn kv_read_partial_update_remove_record_on_delete() {
+        let file_io = test_file_io();
+        let table_path = "memory:/kv_partial_update_remove_record_on_delete";
+        setup_dirs(&file_io, table_path).await;
+        let table = pk_table(
+            &file_io,
+            table_path,
+            &[
+                ("merge-engine", "partial-update"),
+                ("partial-update.remove-record-on-delete", "true"),
+            ],
+        );
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", ArrowDataType::Int32, false),
+            ArrowField::new("value", ArrowDataType::Int32, true),
+            ArrowField::new(
+                crate::spec::VALUE_KIND_FIELD_NAME,
+                ArrowDataType::Int8,
+                false,
+            ),
+        ]));
+        let make = |value: Option<i32>, kind: i8| {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from(vec![1])),
+                    Arc::new(Int32Array::from(vec![value])),
+                    Arc::new(Int8Array::from(vec![kind])),
+                ],
+            )
+            .unwrap()
+        };
+
+        write_commit(&table, &make(Some(10), 0)).await;
+        assert_eq!(
+            int_column(&read_rows(&table, None, None).await, "value"),
+            vec![10]
+        );
+
+        write_commit(&table, &make(Some(99), 1)).await;
+        assert_eq!(
+            int_column(&read_rows(&table, None, None).await, "value"),
+            vec![10]
+        );
+
+        write_commit(&table, &make(Some(20), 2)).await;
+        assert_eq!(
+            int_column(&read_rows(&table, None, None).await, "value"),
+            vec![20]
+        );
+
+        write_commit(&table, &make(None, 3)).await;
+        let rows = read_rows(&table, None, None).await;
+        assert!(rows.iter().all(|batch| batch.num_rows() == 0), "{rows:?}");
+
+        write_commit(&table, &make(None, 0)).await;
+        let rows = read_rows(&table, None, None).await;
+        assert_eq!(int_column(&rows, "id"), vec![1]);
+        let value = rows[0].column(rows[0].schema().index_of("value").unwrap());
+        assert!(value.is_null(0));
+
+        write_commit(&table, &make(Some(30), 3)).await;
+        write_commit(&table, &make(None, 0)).await;
+        assert_eq!(
+            int_column(&read_rows(&table, None, None).await, "value"),
+            vec![30]
+        );
+
+        let mut write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+        write
+            .write_arrow_batch(&int_batch(vec![1], vec![Some(40)]))
+            .await
+            .unwrap();
+        write.write_arrow_batch(&make(None, 3)).await.unwrap();
+        let messages = write.prepare_commit().await.unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].new_files.len(), 1);
+        assert_eq!(messages[0].new_files[0].delete_row_count, Some(1));
+        TableCommit::new(table.clone(), "test-user".to_string())
+            .commit(messages)
+            .await
+            .unwrap();
+        let rows = read_rows(&table, None, None).await;
+        assert!(rows.iter().all(|batch| batch.num_rows() == 0), "{rows:?}");
+    }
+
+    #[tokio::test]
+    async fn kv_read_partial_update_mixed_value_kind_schemas() {
+        for (nullable, insert_kind) in [(true, None), (true, Some(0)), (false, Some(0))] {
+            for kinds_first in [false, true] {
+                let file_io = test_file_io();
+                let table_path = format!(
+                    "memory:/kv_partial_update_mixed_kinds_{nullable}_{insert_kind:?}_{kinds_first}"
+                );
+                setup_dirs(&file_io, &table_path).await;
+                let table = pk_table(
+                    &file_io,
+                    &table_path,
+                    &[
+                        ("merge-engine", "partial-update"),
+                        ("partial-update.remove-record-on-delete", "true"),
+                    ],
+                );
+                let ordinary = int_batch(vec![1, 3, 4], vec![Some(10), Some(30), Some(40)]);
+                let explicit_kinds = RecordBatch::try_new(
+                    Arc::new(ArrowSchema::new(vec![
+                        ArrowField::new("id", ArrowDataType::Int32, false),
+                        ArrowField::new("value", ArrowDataType::Int32, true),
+                        ArrowField::new(VALUE_KIND_FIELD_NAME, ArrowDataType::Int8, nullable),
+                    ])),
+                    vec![
+                        Arc::new(Int32Array::from(vec![2, 3, 4])),
+                        Arc::new(Int32Array::from(vec![Some(20), None, Some(42)])),
+                        Arc::new(Int8Array::from(vec![insert_kind, Some(3), Some(2)])),
+                    ],
+                )
+                .unwrap();
+                let batches = if kinds_first {
+                    [&explicit_kinds, &ordinary]
+                } else {
+                    [&ordinary, &explicit_kinds]
+                };
+                let mut write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+                for batch in batches {
+                    write.write_arrow_batch(batch).await.unwrap();
+                }
+                let messages = write.prepare_commit().await.unwrap();
+                TableCommit::new(table.clone(), "test-user".to_string())
+                    .commit(messages)
+                    .await
+                    .unwrap();
+
+                let batches = read_rows(&table, None, None).await;
+                let mut rows: Vec<_> = int_column(&batches, "id")
+                    .into_iter()
+                    .zip(int_column(&batches, "value"))
+                    .collect();
+                rows.sort_unstable();
+                let expected = if kinds_first {
+                    vec![(1, 10), (2, 20), (3, 30), (4, 40)]
+                } else {
+                    vec![(1, 10), (2, 20), (4, 42)]
+                };
+                assert_eq!(rows, expected, "{table_path}");
+            }
+        }
     }
 
     #[tokio::test]

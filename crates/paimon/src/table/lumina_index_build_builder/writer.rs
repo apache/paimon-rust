@@ -23,14 +23,10 @@ use super::LuminaIndexBuildBuilder;
 use crate::lumina::ffi::LuminaBuilder;
 use crate::lumina::{LuminaIndexMeta, LUMINA_IDENTIFIER};
 use crate::spec::{GlobalIndexMeta, IndexFileMeta};
+use crate::table::global_index_build_common::copy_local_file_to_output;
 use crate::table::{CommitMessage, TableCommit};
 use crate::{Error, Result};
-use bytes::Bytes;
-use std::path::{Path, PathBuf};
-use tokio::io::AsyncReadExt;
-
-const INDEX_DIR: &str = "index";
-const COPY_BUFFER_SIZE: usize = 1024 * 1024;
+use std::path::PathBuf;
 
 impl LuminaIndexBuildBuilder<'_> {
     pub(super) async fn build_index_file(
@@ -63,18 +59,11 @@ impl LuminaIndexBuildBuilder<'_> {
         builder.dump(&temp_path_str)?;
 
         let file_name = format!("lumina-global-index-{}.index", uuid::Uuid::new_v4());
-        self.table
-            .file_io()
-            .mkdirs(&format!(
-                "{}/{INDEX_DIR}/",
-                self.table.location().trim_end_matches('/')
-            ))
+        let (index_path, external_path) =
+            crate::table::global_index_build_common::prepare_index_file_path(
+                self.table, &file_name,
+            )
             .await?;
-        let index_path = format!(
-            "{}/{INDEX_DIR}/{}",
-            self.table.location().trim_end_matches('/'),
-            file_name
-        );
         let write_result: Result<i64> = async {
             copy_local_file_to_output(&temp_path, self.table.file_io().new_output(&index_path)?)
                 .await?;
@@ -99,13 +88,15 @@ impl LuminaIndexBuildBuilder<'_> {
             file_size,
             row_count,
             deletion_vectors_ranges: None,
-            external_path: None,
+            external_path,
             global_index_meta: Some(GlobalIndexMeta {
                 row_range_start: shard.row_range_start,
                 row_range_end: shard.row_range_end,
                 index_field_id,
                 extra_field_ids: None,
-                source_meta: None,
+                source_meta: Some(
+                    crate::spec::DataEvolutionIndexSourceMeta::new(shard.snapshot_id)?.serialize(),
+                ),
                 index_meta: Some(index_meta),
             }),
         })
@@ -120,6 +111,7 @@ pub(super) async fn abort_on_build_error<T>(
     match result {
         Ok(value) => Ok(value),
         Err(error) => {
+            // This build has not submitted or exposed any prepared shard.
             let _ = commit.abort(messages).await;
             Err(error)
         }
@@ -189,34 +181,4 @@ impl Drop for TempFileGuard {
             let _ = std::fs::remove_file(path);
         }
     }
-}
-
-async fn copy_local_file_to_output(
-    source_path: &Path,
-    output: crate::io::OutputFile,
-) -> Result<()> {
-    let mut source =
-        tokio::fs::File::open(source_path)
-            .await
-            .map_err(|e| Error::UnexpectedError {
-                message: format!("Failed to open temporary Lumina index file: {e}"),
-                source: None,
-            })?;
-    let mut writer = output.writer().await?;
-    let mut buffer = vec![0u8; COPY_BUFFER_SIZE];
-
-    loop {
-        let len = source
-            .read(&mut buffer)
-            .await
-            .map_err(|e| Error::UnexpectedError {
-                message: format!("Failed to read temporary Lumina index file: {e}"),
-                source: None,
-            })?;
-        if len == 0 {
-            break;
-        }
-        writer.write(Bytes::copy_from_slice(&buffer[..len])).await?;
-    }
-    writer.close().await
 }

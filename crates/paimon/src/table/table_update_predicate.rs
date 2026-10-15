@@ -18,6 +18,7 @@
 //! Predicate matching and assignment orchestration for TableUpdate.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use futures::TryStreamExt;
@@ -101,10 +102,10 @@ fn validate(
 
 pub(super) async fn update(
     table: &Table,
-    commit_user: &str,
     predicate: Option<Predicate>,
     assignments: Vec<(String, UpdateAssignment)>,
     read_columns: Vec<String>,
+    blob_uri_reader_factory: Option<Arc<dyn crate::io::UriReaderFactory>>,
 ) -> crate::Result<Vec<CommitMessage>> {
     let combine_all = validate(table, &assignments, &read_columns)?;
     let Some(snapshot) = super::time_travel::resolve_snapshot(table).await? else {
@@ -113,11 +114,11 @@ pub(super) async fn update(
     // Updates must include unindexed rows even when normal reads request the
     // partial/detail scalar-index search mode.
     let scan_table = table
-        .copy_with_options(HashMap::from([
-            ("scalar-index.search-mode".into(), "FULL".into()),
-            ("scan.mode".into(), "default".into()),
-        ]))
-        .copy_with_pinned_snapshot(&snapshot);
+        .copy_with_options(HashMap::from([(
+            "scalar-index.search-mode".into(),
+            "FULL".into(),
+        )]))
+        .copy_with_pinned_snapshot(Some(&snapshot));
     let mut read_builder = scan_table.new_read_builder();
     let mut projection = Vec::new();
     for name in &read_columns {
@@ -135,7 +136,8 @@ pub(super) async fn update(
     let plan = read_builder.new_scan().with_scan_all_files().plan().await?;
     let index = RowIdFileIndex::from_splits(scan_table.clone(), plan.splits())?;
     let groups = ordered_file_groups(plan.splits())?;
-    let mut updater = TableUpdateByRowId::with_index(table, commit_user.into(), index)?;
+    let mut updater = TableUpdateByRowId::with_index(table, index)?;
+    updater.with_blob_uri_reader_factory(blob_uri_reader_factory);
     let reader = read_builder.new_read()?;
     let schema = crate::arrow::build_target_arrow_schema(table.schema().fields())?;
     let columns: Vec<_> = assignments.iter().map(|(name, _)| name.clone()).collect();
@@ -163,9 +165,8 @@ pub(super) async fn update(
         Ok(updater.commit_messages().to_vec())
     }
     .await;
-    if result.is_err() {
-        let _ = updater.abort().await;
-    }
+    // Preserve earlier prepared groups on failure. Never delete files based
+    // on CommitMessage when a callback or a later update fails.
     result
 }
 

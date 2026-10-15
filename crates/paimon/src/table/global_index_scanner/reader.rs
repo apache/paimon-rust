@@ -160,14 +160,25 @@ impl GlobalIndexScanner {
             file_result = Some(bitmap);
         }
 
+        // Datum literals are non-null. Only an equality that will actually be
+        // queried makes IS NOT NULL redundant; a declined query still declines
+        // the entire entry below, regardless of predicate order.
+        let has_btree_equality = entry.index_type == GlobalIndexFileKind::BTree
+            && plan.matching_predicates.iter().any(|&idx| {
+                let (op, literals, _) = &effective_predicates[idx];
+                *op == PredicateOperator::Eq && literals.len() == 1
+            });
         for &idx in &plan.matching_predicates {
+            let (op, literals, data_type) = &effective_predicates[idx];
+            if has_btree_equality && *op == PredicateOperator::IsNotNull {
+                continue;
+            }
             #[cfg(test)]
             if let Some(probe) = &self.query_io_probe {
                 probe
                     .predicate_queries
                     .fetch_add(1, super::TestOrdering::SeqCst);
             }
-            let (op, literals, data_type) = &effective_predicates[idx];
             let queried = reader
                 .as_ref()
                 .expect("reader is opened when predicates match")

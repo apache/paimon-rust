@@ -18,7 +18,7 @@
 //! Row-ID updates sharing one target snapshot and file index.
 
 use super::data_evolution_writer::RowIdFileIndex;
-use crate::table::{CommitMessage, DataEvolutionWriter, Table, TableCommit};
+use crate::table::{CommitMessage, DataEvolutionWriter, Table};
 use arrow_array::RecordBatch;
 use std::collections::{HashMap, HashSet};
 
@@ -36,31 +36,37 @@ fn invalid(message: impl Into<String>) -> crate::Error {
 /// of the same file group; updating a common column of that group is rejected.
 pub struct TableUpdateByRowId {
     table: Table,
-    commit_user: String,
     index: RowIdFileIndex,
     updated: HashMap<i32, HashSet<i64>>,
     messages: Vec<CommitMessage>,
+    blob_uri_reader_factory: Option<std::sync::Arc<dyn crate::io::UriReaderFactory>>,
 }
 
 impl TableUpdateByRowId {
-    pub(crate) async fn new(table: &Table, commit_user: String) -> crate::Result<Self> {
-        Self::with_index(table, commit_user, RowIdFileIndex::load(table, None).await?)
+    pub(crate) async fn new(table: &Table) -> crate::Result<Self> {
+        Self::with_index(table, RowIdFileIndex::load(table, None).await?)
     }
 
-    pub(super) fn with_index(
-        table: &Table,
-        commit_user: String,
-        index: RowIdFileIndex,
-    ) -> crate::Result<Self> {
+    pub(super) fn with_index(table: &Table, index: RowIdFileIndex) -> crate::Result<Self> {
         // Validate table layout without fixing any update columns.
         let _ = DataEvolutionWriter::new(table, Vec::new())?;
         Ok(Self {
             table: table.clone(),
-            commit_user,
             index,
             updated: HashMap::new(),
             messages: Vec::new(),
+            blob_uri_reader_factory: None,
         })
+    }
+
+    /// URI reader selection for referenced Blob values. Core performs the
+    /// bounded or streamed copy; callers need not materialize payloads.
+    pub fn with_blob_uri_reader_factory(
+        &mut self,
+        factory: Option<std::sync::Arc<dyn crate::io::UriReaderFactory>>,
+    ) -> &mut Self {
+        self.blob_uri_reader_factory = factory;
+        self
     }
 
     /// Stage one logical Arrow table. Its chunks may share a file group.
@@ -80,6 +86,7 @@ impl TableUpdateByRowId {
             .filter(|name| seen.insert(name.clone()))
             .collect::<Vec<_>>();
         let mut writer = DataEvolutionWriter::for_row_id(&self.table, columns.clone())?;
+        writer.with_blob_uri_reader_factory(self.blob_uri_reader_factory.clone());
         let batches = batches
             .into_iter()
             .map(super::update_input::normalize_row_ids)
@@ -120,13 +127,12 @@ impl TableUpdateByRowId {
         &self.messages
     }
 
-    /// Abort staged, uncommitted files after a failed operation.
+    /// Reset update state while preserving prepared files.
     pub async fn abort(&mut self) -> crate::Result<()> {
-        let result = TableCommit::new(self.table.clone(), self.commit_user.clone())
-            .abort(&self.messages)
-            .await;
+        // Never delete CommitMessage files. They may already be published even
+        // when the caller received an exception from commit.
         self.messages.clear();
         self.updated.clear();
-        result
+        Ok(())
     }
 }

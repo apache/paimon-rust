@@ -46,7 +46,7 @@ struct NormalizedFilter {
 /// Exact filters are fully enforced by paimon-core scan planning using only
 /// partition-owned semantics, without requiring residual filtering above the
 /// scan.
-fn is_exact_filter_pushdown_for_schema(
+pub(super) fn is_exact_filter_pushdown_for_schema(
     fields: &[DataField],
     partition_keys: &[String],
     filter: &Predicate,
@@ -65,7 +65,8 @@ pub(super) fn split_scan_predicates(
     filter: Predicate,
 ) -> (Option<Predicate>, Vec<Predicate>) {
     let partition_keys = table.schema().partition_keys();
-    if partition_keys.is_empty() {
+    // Auth rules may mask partition keys; retain the full read predicate.
+    if partition_keys.is_empty() || table.schema().core_options().query_auth_enabled() {
         (None, filter.split_and())
     } else {
         split_partition_and_data_predicates(filter, table.schema().fields(), partition_keys)
@@ -221,6 +222,40 @@ impl<'a> ReadBuilder<'a> {
         self
     }
 
+    /// Select partitions at scan time, independently of the row filter.
+    ///
+    /// The predicate uses table-field indices and may reference only partition
+    /// keys. Like Java's `ReadBuilder.withPartitionFilter`, this replaces the
+    /// partition pruning derived from `with_filter`; the row filter still applies
+    /// during reading. `None` restores derived partition pruning. Query-auth
+    /// scans reject selectors on masked keys because they cannot be checked
+    /// against the masked values after scanning. Format tables are unsupported.
+    pub fn with_partition_filter(&mut self, filter: Option<Predicate>) -> Result<&mut Self> {
+        let table = match &self.kind {
+            ReadBuilderKind::Paimon(builder) => builder.table,
+            ReadBuilderKind::Format(_) => {
+                return Err(Error::Unsupported {
+                    message: "Explicit partition filters are not supported for format tables"
+                        .into(),
+                })
+            }
+        };
+        if let Some(filter) = &filter {
+            super::partition_filter::validate_partition_filter(table, filter)?;
+            if table.schema().core_options().query_auth_enabled() {
+                super::query_auth::reject_noncanonical_leaves(
+                    std::slice::from_ref(filter),
+                    table.schema().fields(),
+                )?;
+            }
+        }
+        match &mut self.kind {
+            ReadBuilderKind::Paimon(builder) => builder.partition_filter = filter.map(Box::new),
+            ReadBuilderKind::Format(_) => unreachable!("format tables rejected above"),
+        }
+        Ok(self)
+    }
+
     /// Whether a translated predicate is exact at the table-provider boundary.
     pub fn is_exact_filter_pushdown(&self, filter: &Predicate) -> bool {
         match &self.kind {
@@ -298,13 +333,18 @@ impl<'a> ReadBuilder<'a> {
         }
     }
 
+    /// Create a stateful streaming scan using the configured filter and read type.
+    pub fn new_stream_scan(&self) -> Result<super::StreamTableScan> {
+        super::StreamTableScan::new(self.new_scan())
+    }
+
     /// Create a batch incremental scan over snapshot id range
     /// `(start_exclusive, end_inclusive]`.
     ///
     /// Filters and projection configured on this builder are pushed into the
-    /// incremental plan (partition / bucket pruning on the delta path).
-    /// Use [`IncrementalScan::plan_combined_delta`] to merge APPEND deltas into
-    /// one ordinary batch plan instead of preserving each snapshot separately.
+    /// incremental plan (including partition / bucket pruning).
+    /// Use [`IncrementalScan::plan_combined`] to pack DELTA or CHANGELOG files
+    /// across the range into one batch plan.
     pub fn new_incremental_scan(
         &self,
         mode: IncrementalScanMode,
@@ -349,6 +389,7 @@ struct PaimonReadBuilder<'a> {
     /// ("last projection setter wins").
     projection_names: Option<Vec<String>>,
     filter: NormalizedFilter,
+    partition_filter: Option<Box<Predicate>>,
     limit: Option<usize>,
     /// Ranges the caller set. Each `with_row_ranges` replaces them.
     explicit_row_ranges: Option<Vec<RowRange>>,
@@ -367,6 +408,7 @@ impl<'a> PaimonReadBuilder<'a> {
             read_type: None,
             projection_names: None,
             filter: NormalizedFilter::default(),
+            partition_filter: None,
             limit: None,
             explicit_row_ranges: None,
             derived_row_ranges: None,
@@ -389,7 +431,7 @@ impl<'a> PaimonReadBuilder<'a> {
         let projection_names: Vec<String> = columns.iter().map(|c| (*c).to_string()).collect();
         validate_projection_possible(
             self.table.identifier().full_name(),
-            self.table.schema.fields(),
+            &self.table.schema.fields_with_read_metadata(),
             &projection_names,
         )?;
         self.projection_names = Some(projection_names);
@@ -443,11 +485,13 @@ impl<'a> PaimonReadBuilder<'a> {
     /// Exact filters are fully enforced by paimon-core scan planning, without
     /// requiring residual filtering above the scan.
     pub fn is_exact_filter_pushdown(&self, filter: &Predicate) -> bool {
-        is_exact_filter_pushdown_for_schema(
-            self.table.schema().fields(),
-            self.table.schema().partition_keys(),
-            filter,
-        )
+        // Masked partition predicates may need a read-side residual.
+        !self.table.schema().core_options().query_auth_enabled()
+            && is_exact_filter_pushdown_for_schema(
+                self.table.schema().fields(),
+                self.table.schema().partition_keys(),
+                filter,
+            )
     }
 
     /// Set row ID ranges `[from, to]` (inclusive). An empty vector selects no rows.
@@ -526,15 +570,24 @@ impl<'a> PaimonReadBuilder<'a> {
     /// does return `Result` and surfaces the error to the caller. This keeps the
     /// scan infallible without silently discarding an error that a read would hit.
     pub fn new_scan(&self) -> TableScan<'a> {
-        let partition_filter = self.filter.partition_predicate.clone().map(|pred| {
+        let partition_predicate = match &self.partition_filter {
+            Some(filter) => extract_predicate_for_keys(
+                filter,
+                self.table.schema().fields(),
+                self.table.schema().partition_keys(),
+            ),
+            None => self.filter.partition_predicate.clone(),
+        };
+        let partition_filter = partition_predicate.map(|pred| {
             PartitionFilter::from_predicate(pred, &self.table.schema().partition_fields())
         });
         let read_type = self.resolve_read_type().unwrap_or(None);
+        let data_predicates = self.scan_data_predicates();
         let scan_predicates =
-            super::managed_blob_reader::scan_predicates(self.table, &self.filter.data_predicates);
+            super::managed_blob_reader::scan_predicates(self.table, &data_predicates);
         // A payload predicate is evaluated after descriptor resolution. A
         // scan limit must not count rows which may fail that residual filter.
-        let scan_limit = if scan_predicates.len() == self.filter.data_predicates.len() {
+        let scan_limit = if scan_predicates.len() == data_predicates.len() {
             self.limit
         } else {
             None
@@ -549,7 +602,7 @@ impl<'a> PaimonReadBuilder<'a> {
         )
         .with_projected_read_field_ids(projected_read_field_ids_with_predicates(
             &read_type,
-            &self.filter.data_predicates,
+            &data_predicates,
             self.table.schema().fields(),
         ))
     }
@@ -572,6 +625,8 @@ impl<'a> PaimonReadBuilder<'a> {
             Some(fields) => fields,
         };
 
+        crate::spec::validate_selected_map_fields(self.table.schema.fields(), &read_type)?;
+
         // Pass the FULL data predicate through (including `And`/`Or`/`Not`).
         // Pushdown/stats skip compound nodes; the residual pass enforces the full
         // predicate exactly. Pruning here would drop compound predicates.
@@ -580,9 +635,41 @@ impl<'a> PaimonReadBuilder<'a> {
             None => configured_parquet_read_budget(self.table)?,
         };
         TableRead::new(self.table, read_type, self.filter.data_predicates.clone())
+            .with_partition_predicate(self.filter.partition_predicate.clone())
             .with_parquet_read_budget(parquet_read_budget)
             .with_blob_parallelism(self.blob_parallelism)
             .map(|read| read.with_limit(self.limit))
+    }
+
+    /// An explicit selector replaces derived partition pruning. Retain the
+    /// ordinary partition conjuncts for safe stats/LIMIT decisions, rebound from
+    /// the partition row to the table layout (partition order may differ).
+    fn scan_data_predicates(&self) -> Vec<Predicate> {
+        let mut predicates = self.filter.data_predicates.clone();
+        if self.partition_filter.is_none() {
+            return predicates;
+        }
+        if let Some(partition) = &self.filter.partition_predicate {
+            let mapping = self
+                .table
+                .schema()
+                .partition_keys()
+                .iter()
+                .map(|name| {
+                    self.table
+                        .schema()
+                        .fields()
+                        .iter()
+                        .position(|field| field.name() == name)
+                })
+                .collect::<Vec<_>>();
+            predicates.push(
+                partition
+                    .remap_field_index(&mapping)
+                    .expect("partition fields belong to the table schema"),
+            );
+        }
+        predicates
     }
 
     /// Resolve the effective read type, deferring projection name resolution to
@@ -604,7 +691,7 @@ impl<'a> PaimonReadBuilder<'a> {
     ) -> Result<Vec<DataField>> {
         resolve_projected_fields(
             self.table.identifier().full_name(),
-            self.table.schema.fields(),
+            &self.table.schema.fields_with_read_metadata(),
             projection_names,
             self.case_sensitive,
         )
@@ -630,9 +717,6 @@ pub(super) fn validate_projection_possible(
         .map(|f| f.name().to_ascii_lowercase())
         .collect();
     for name in projection_names {
-        if name == crate::spec::ROW_ID_FIELD_NAME {
-            continue;
-        }
         if !folded_names.contains(&name.to_ascii_lowercase()) {
             return Err(Error::ColumnNotExist {
                 full_name: full_name.clone(),
@@ -691,11 +775,6 @@ pub(super) fn resolve_projected_fields(
             });
         }
 
-        if name == crate::spec::ROW_ID_FIELD_NAME {
-            resolved.push(crate::spec::row_id_data_field());
-            continue;
-        }
-
         let field = if case_sensitive {
             sensitive_index.get(name.as_str()).copied()
         } else {
@@ -724,7 +803,10 @@ pub(super) fn resolve_projected_fields(
 pub(super) fn projected_read_field_ids_from_fields(fields: &[DataField]) -> HashSet<i32> {
     fields
         .iter()
-        .filter(|field| !is_system_projection_field(field.id()))
+        .filter(|field| {
+            field.id() == crate::spec::SEQUENCE_NUMBER_FIELD_ID
+                || !is_system_projection_field(field.id())
+        })
         .map(|field| field.id())
         .collect::<HashSet<_>>()
 }
@@ -746,9 +828,14 @@ fn projected_read_field_ids_with_predicates(
         crate::arrow::residual::collect_predicate_leaf_refs(predicate, &mut refs);
     }
     for (name, index) in refs {
+        if name == crate::spec::SEQUENCE_NUMBER_FIELD_NAME {
+            // The version provider need not write any projected user column.
+            field_ids.insert(crate::spec::SEQUENCE_NUMBER_FIELD_ID);
+            continue;
+        }
         // Not in `table_fields`, and excluded from this set anyway — files never
         // list it in `write_cols`.
-        if crate::spec::is_row_id_column(name) {
+        if crate::spec::is_row_tracking_column(name) {
             continue;
         }
         let Some(field) = table_fields.get(index) else {
@@ -1651,6 +1738,66 @@ mod tests {
     }
 
     #[test]
+    fn test_metadata_projection_case_insensitive_collision_is_ambiguous() {
+        for (user, metadata) in [
+            ("_sequence_number", "_SEQUENCE_NUMBER"),
+            ("_row_id", "_ROW_ID"),
+        ] {
+            let untracked = TableSchema::new(
+                0,
+                &Schema::builder()
+                    .column(user, DataType::Int(IntType::new()))
+                    .build()
+                    .unwrap(),
+            );
+            let tracked = untracked.copy_with_options(HashMap::from([(
+                "row-tracking.enabled".into(),
+                "true".into(),
+            )]));
+            let fields = tracked.fields_with_read_metadata();
+            let metadata_fields = fields
+                .iter()
+                .filter(|field| field.id() != 0)
+                .cloned()
+                .collect::<Vec<_>>();
+            for name in [user, metadata] {
+                let err =
+                    super::resolve_projected_fields("db.t".into(), &fields, &[name.into()], false)
+                        .unwrap_err();
+                assert!(
+                    matches!(err, crate::Error::ConfigInvalid { message } if message.contains("Ambiguous"))
+                );
+                let resolved = super::resolve_projected_fields(
+                    "db.t".into(),
+                    &metadata_fields,
+                    &[name.into()],
+                    false,
+                )
+                .unwrap();
+                assert_eq!(resolved[0].name(), metadata);
+                let resolved = super::resolve_projected_fields(
+                    "db.t".into(),
+                    &untracked.fields_with_read_metadata(),
+                    &[name.into()],
+                    false,
+                )
+                .unwrap();
+                assert_eq!(resolved[0].name(), user);
+                assert_eq!(resolved[0].id(), 0);
+            }
+            let fields = super::resolve_projected_fields(
+                "db.t".into(),
+                &fields,
+                &[user.into(), metadata.into()],
+                true,
+            )
+            .unwrap();
+            assert_eq!(fields[0].id(), 0);
+            assert_ne!(fields[1].id(), 0);
+        }
+    }
+
+    #[test]
     fn test_resolve_projection_case_insensitive_dedups_by_folded_name() {
         // With case-insensitive matching, `["Name","name"]` both resolve to the
         // canonical `Name` field, so it must be flagged as a duplicate rather
@@ -2048,9 +2195,11 @@ mod tests {
             None,
         );
 
+        let mut partition = crate::spec::BinaryRowBuilder::new(1);
+        partition.write_string(0, "2024-01-01");
         let split = DataSplitBuilder::new()
             .with_snapshot(1)
-            .with_partition(BinaryRow::new(1))
+            .with_partition(partition.build())
             .with_bucket(0)
             .with_bucket_path(local_file_path(&bucket_dir))
             .with_total_buckets(1)

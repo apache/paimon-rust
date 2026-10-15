@@ -52,6 +52,11 @@ Use the existing `fs.oss.accessKeyId`, `fs.oss.accessKeySecret` and optional
 `fs.oss.securityToken` credentials. REST catalog credentials still refresh;
 static FileIO credentials do not.
 
+Python bindings also discover `liboss_cpp_bridge.so` (Linux) or
+`liboss_cpp_bridge.dylib` (macOS) beside `pypaimon_oss_cpp/__init__.py`.
+An explicit `fs.oss.cpp.library.path` takes precedence. The companion package
+is not yet published.
+
 | Option | Default |
 |---|---:|
 | `fs.oss.cpp.max.concurrent.requests` | 8 |

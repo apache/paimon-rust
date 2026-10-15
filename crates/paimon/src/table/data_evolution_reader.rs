@@ -22,10 +22,11 @@ use super::data_file_reader::{
     append_null_row_id_column, attach_row_id, expand_selected_row_ids,
     file_index_selection_to_local_ranges, insert_column_at, DataFileReadTiming, DataFileReader,
 };
+use super::read_limit::take_limited_batch;
 use crate::arrow::format::blob::DEFAULT_BLOB_READ_PARALLELISM;
 use crate::arrow::format::FilePredicates;
 use crate::arrow::format::MosaicPrefetchOptions;
-use crate::arrow::{build_target_arrow_schema, ReadBudget};
+use crate::arrow::ReadBudget;
 use crate::deletion_vector::{DeletionVector, DeletionVectorFactory};
 use crate::file_index::evaluator::evaluate_file_index;
 use crate::file_index::file_index_result::FileIndexResult;
@@ -34,7 +35,7 @@ use crate::spec::{
     BlobDescriptor, BlobViewStruct, CoreOptions, DataField, DataFileMeta, DataType, Predicate,
     ROW_ID_FIELD_NAME,
 };
-use crate::table::dedicated_format_file_writer::is_blob_file_name;
+use crate::table::dedicated_format_file_writer::is_blob_or_video_file_name;
 use crate::table::schema_manager::SchemaManager;
 use crate::table::source::any_range_overlaps_file;
 use crate::table::stats_filter::group_by_overlapping_row_id;
@@ -141,15 +142,6 @@ pub(crate) struct DataEvolutionReader {
     read_timing: Option<Arc<DataFileReadTiming>>,
 }
 
-fn take_limited_batch(batch: RecordBatch, remaining: &mut Option<usize>) -> RecordBatch {
-    let Some(left) = remaining else {
-        return batch;
-    };
-    let taken = batch.num_rows().min(*left);
-    *left -= taken;
-    batch.slice(0, taken)
-}
-
 impl DataEvolutionReader {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
@@ -171,7 +163,7 @@ impl DataEvolutionReader {
             .filter(|f| f.name() != ROW_ID_FIELD_NAME)
             .cloned()
             .collect();
-        let output_schema = build_target_arrow_schema(&read_type)?;
+        let output_schema = crate::arrow::build_read_arrow_schema(&read_type)?;
 
         // Widen the file read set with predicate columns not already projected
         // so the residual filter can evaluate every leaf. Extras land strictly
@@ -205,7 +197,7 @@ impl DataEvolutionReader {
             }
             None => None,
         };
-        let wide_output_schema = build_target_arrow_schema(&wide_read_type)?;
+        let wide_output_schema = crate::arrow::build_read_arrow_schema(&wide_read_type)?;
 
         Ok(Self {
             file_io,
@@ -280,7 +272,7 @@ impl DataEvolutionReader {
                 split
                     .data_files()
                     .iter()
-                    .any(|file| is_blob_file_name(&file.file_name))
+                    .any(|file| is_blob_or_video_file_name(&file.file_name))
             })
             // A legacy raw file without first_row_id cannot be addressed by
             // the preselection's global row ranges. Keep its existing read
@@ -451,7 +443,8 @@ impl DataEvolutionReader {
             // LIMIT reads resolve views only after the surviving batch has
             // been selected. Eagerly scanning every split here can fail on a
             // reference beyond the quota and load unrelated upstream blobs.
-            let mut blob_view_lookup = if self.limit.is_some() && resolve_blob_views {
+            let mut blob_view_lookup = if resolve_blob_views && (self.limit.is_some() || splits.iter().any(|split|
+                split.data_files().iter().any(|file| file.extra_files.iter().any(|name| name.ends_with(".row"))))) {
                 Some(BlobViewLookup::default())
             } else {
                 self.preload_blob_view_lookup(&splits, filter_before_blob_resolution)
@@ -533,7 +526,8 @@ impl DataEvolutionReader {
                             .await?;
 
                             let has_row_id = file_meta.first_row_id.is_some();
-                            let mut effective_row_ranges = if has_row_id { row_ranges.clone() } else { None };
+                            let requested_row_ranges = if has_row_id { row_ranges.clone() } else { None };
+                            let mut effective_row_ranges = requested_row_ranges.clone();
                             if read_raw_file_index {
                                 // Independent files can apply a physical row selection
                                 // before decoding. Column-merge groups cannot: an older
@@ -615,12 +609,13 @@ impl DataEvolutionReader {
                                         .data_evolution_nested_field_enabled()
                                         || file_schema_nested_enabled,
                                 )
-                                .read_single_file_stream(
+                                .read_single_file_stream_with_requested_ranges(
                                 &split,
                                 file_meta,
                                 data_fields,
                                 deletion_vector,
                                 effective_row_ranges,
+                                requested_row_ranges,
                             )?;
                             while remaining != Some(0) {
                                 let Some(batch) = stream.next().await else { break };
@@ -703,6 +698,7 @@ impl DataEvolutionReader {
                             &split,
                             &prepared_group,
                             effective_row_ranges,
+                            row_ranges.clone(),
                             expected_output_rows,
                             anchor_deletion_vector,
                         )?;
@@ -772,7 +768,13 @@ impl DataEvolutionReader {
     /// trailing.
     fn project_output(&self, filtered: RecordBatch) -> crate::Result<RecordBatch> {
         let final_width = self.output_schema.fields().len();
-        if filtered.num_columns() == final_width {
+        if filtered.num_columns() == final_width
+            && !filtered
+                .schema()
+                .fields()
+                .iter()
+                .any(|field| super::row_sidecar::is_blob_data(field))
+        {
             return Ok(filtered);
         }
         let columns = filtered.columns()[..final_width].to_vec();
@@ -811,24 +813,28 @@ impl DataEvolutionReader {
             return self.project_output(batch);
         }
 
-        if self.limit.is_some() {
-            if let (Some(lookup), Some(rest_env)) =
-                (blob_view_lookup.as_mut(), self.blob_view_rest_env.clone())
-            {
-                lookup
-                    .load_missing(rest_env, &batch, &self.blob_view_fields)
-                    .await?;
-            }
+        if let (Some(lookup), Some(rest_env)) =
+            (blob_view_lookup.as_mut(), self.blob_view_rest_env.clone())
+        {
+            lookup
+                .load_missing(rest_env, &batch, &self.blob_view_fields)
+                .await?;
         }
-        batch = self.resolve_blob_view_columns(batch, blob_view_lookup.as_ref())?;
+        batch = self
+            .resolve_blob_view_columns(batch, blob_view_lookup.as_ref())
+            .await?;
         let mut batch = if !self.blob_as_descriptor && !descriptor_fields.is_empty() {
-            resolve_descriptor_columns(
-                batch,
-                descriptor_fields,
-                &self.file_io,
-                &self.blob_read_limiter,
-            )
-            .await?
+            // View payloads were resolved with their upstream table's FileIO.
+            let fields = if blob_view_lookup.is_some() {
+                descriptor_fields
+                    .difference(&self.blob_view_fields)
+                    .cloned()
+                    .collect()
+            } else {
+                descriptor_fields.clone()
+            };
+            resolve_descriptor_columns(batch, &fields, &self.file_io, &self.blob_read_limiter)
+                .await?
         } else {
             batch
         };
@@ -928,7 +934,7 @@ impl DataEvolutionReader {
         fields
     }
 
-    fn resolve_blob_view_columns(
+    async fn resolve_blob_view_columns(
         &self,
         batch: RecordBatch,
         lookup: Option<&BlobViewLookup>,
@@ -937,7 +943,14 @@ impl DataEvolutionReader {
             return Ok(batch);
         };
 
-        replace_blob_view_columns(batch, &self.blob_view_fields, lookup)
+        replace_blob_view_columns(
+            batch,
+            &self.blob_view_fields,
+            lookup,
+            self.blob_as_descriptor,
+            &self.blob_read_limiter,
+        )
+        .await
     }
 
     /// Merge multiple logical sources column-wise for data evolution.
@@ -950,6 +963,7 @@ impl DataEvolutionReader {
         split: &DataSplit,
         prepared_group: &PreparedMergeGroup,
         row_ranges: Option<Vec<RowRange>>,
+        requested_row_ranges: Option<Vec<RowRange>>,
         expected_output_rows: usize,
         anchor_deletion_vector: Option<DeletionVectorContext>,
     ) -> crate::Result<ArrowRecordBatchStream> {
@@ -982,7 +996,7 @@ impl DataEvolutionReader {
         // Match the input cap so a LIMIT cannot resolve payloads for rows that
         // are only going to be discarded from the merge output.
         let merge_batch_size = batch_size.unwrap_or(1024).clamp(1, 1024);
-        let target_schema = build_target_arrow_schema(&read_type)?;
+        let target_schema = crate::arrow::build_read_arrow_schema(&read_type)?;
 
         Ok(try_stream! {
             let (file_infos, file_schema_nested_enabled) = load_file_infos(
@@ -1065,6 +1079,7 @@ impl DataEvolutionReader {
                             &split,
                             source,
                             row_ranges.clone(),
+                            requested_row_ranges.clone(),
                             file_io.clone(),
                             schema_manager.clone(),
                             table_schema_id,
@@ -1173,6 +1188,15 @@ impl DataEvolutionReader {
                         .unwrap_or_else(|| {
                             arrow_array::new_null_array(target_field.data_type(), rows_to_emit)
                         });
+                    let array = if let Some((source_idx, field_offset)) = provider {
+                        crate::arrow::nested_evolution::evolve_field(
+                            &array,
+                            &source_plan.sources[*source_idx].read_fields()[*field_offset],
+                            &read_type[idx],
+                        )?
+                    } else {
+                        array
+                    };
                     columns.push(array);
                 }
 
@@ -1183,8 +1207,15 @@ impl DataEvolutionReader {
                 }
 
                 emitted_rows += rows_to_emit;
+                let blob_data_fields = source_plan.column_plan.iter().enumerate().filter_map(|(idx, provider)| {
+                    let (source_idx, field_offset) = provider.as_ref()?;
+                    let (batch, _) = source_cursors[*source_idx].as_ref()?;
+                    super::row_sidecar::is_blob_data(batch.schema().field(*field_offset))
+                        .then(|| target_schema.field(idx).name().clone())
+                }).collect();
+                let merged_schema = super::row_sidecar::mark_blob_data(&target_schema, &blob_data_fields);
                 let merged =
-                    RecordBatch::try_new(target_schema.clone(), columns).map_err(|e| {
+                    RecordBatch::try_new(merged_schema, columns).map_err(|e| {
                         Error::UnexpectedError {
                             message: format!("Failed to build merged RecordBatch: {e}"),
                             source: Some(Box::new(e)),
@@ -1262,7 +1293,8 @@ where
     let mut descriptor_columns = Vec::new();
 
     for (idx, field) in schema.fields().iter().enumerate() {
-        if blob_descriptor_fields.contains(field.name()) {
+        if blob_descriptor_fields.contains(field.name()) && !super::row_sidecar::is_blob_data(field)
+        {
             if let Some(bin_col) = batch
                 .column(idx)
                 .as_any()
@@ -1316,7 +1348,7 @@ fn predicate_references_any_field(
         Predicate::Leaf { column, index, .. } => {
             // Never a BLOB column; resolving its placeholder index would force
             // every BLOB to be resolved before filtering.
-            if crate::spec::is_row_id_column(column) {
+            if crate::spec::is_row_tracking_column(column) {
                 return false;
             }
             field_names.contains(column)
@@ -1338,7 +1370,7 @@ fn collect_blob_view_structs(
     view_structs: &mut HashSet<BlobViewStruct>,
 ) -> crate::Result<()> {
     for (idx, field) in batch.schema().fields().iter().enumerate() {
-        if !blob_view_fields.contains(field.name()) {
+        if !blob_view_fields.contains(field.name()) || super::row_sidecar::is_blob_data(field) {
             continue;
         }
         let col = large_binary_column(batch, idx, field.name())?;
@@ -1362,26 +1394,29 @@ fn collect_blob_view_structs(
     Ok(())
 }
 
-fn replace_blob_view_columns(
+async fn replace_blob_view_columns(
     batch: RecordBatch,
     blob_view_fields: &HashSet<String>,
     lookup: &BlobViewLookup,
+    blob_as_descriptor: bool,
+    limiter: &BlobReadLimiter,
 ) -> crate::Result<RecordBatch> {
     let schema = batch.schema();
     let mut columns: Vec<Arc<dyn arrow_array::Array>> = Vec::with_capacity(batch.num_columns());
     let mut changed = false;
 
     for (idx, field) in schema.fields().iter().enumerate() {
-        if !blob_view_fields.contains(field.name()) {
+        if !blob_view_fields.contains(field.name()) || super::row_sidecar::is_blob_data(field) {
             columns.push(batch.column(idx).clone());
             continue;
         }
 
         let col = large_binary_column(&batch, idx, field.name())?;
-        let mut builder = arrow_array::builder::LargeBinaryBuilder::new();
-        for row in 0..col.len() {
+        let mut values = vec![None; col.len()];
+        let mut by_table: HashMap<crate::catalog::Identifier, Vec<(usize, Vec<u8>)>> =
+            HashMap::new();
+        for (row, slot) in values.iter_mut().enumerate() {
             if col.is_null(row) {
-                builder.append_null();
                 continue;
             }
 
@@ -1397,11 +1432,35 @@ fn replace_blob_view_columns(
             }
             let view_struct = BlobViewStruct::deserialize(value)?;
             match lookup.descriptor(&view_struct)? {
-                None => builder.append_null(),
-                Some(descriptor) => builder.append_value(descriptor.serialize()),
+                None => {}
+                Some(descriptor) if blob_as_descriptor => *slot = Some(descriptor.serialize()),
+                Some(descriptor) => by_table
+                    .entry(view_struct.identifier().clone())
+                    .or_default()
+                    .push((row, descriptor.serialize())),
             }
         }
-        columns.push(Arc::new(builder.finish()));
+        for (identifier, entries) in by_table {
+            let file_io = lookup
+                .file_ios
+                .get(&identifier)
+                .ok_or_else(|| Error::DataInvalid {
+                    message: format!("Missing upstream FileIO for {}", identifier.full_name()),
+                    source: None,
+                })?;
+            let descriptors =
+                LargeBinaryArray::from_iter_values(entries.iter().map(|(_, value)| value));
+            let payloads = super::blob_resolver::resolve_descriptor_column(
+                &descriptors,
+                file_io,
+                limiter.clone(),
+            )
+            .await?;
+            for ((row, _), value) in entries.into_iter().zip(payloads.iter()) {
+                values[row] = value.map(<[u8]>::to_vec);
+            }
+        }
+        columns.push(Arc::new(LargeBinaryArray::from_iter(values)));
         changed = true;
     }
 
@@ -1433,6 +1492,28 @@ fn large_binary_column<'a>(
 #[derive(Debug, Default)]
 struct BlobViewLookup {
     descriptors: HashMap<BlobViewStruct, Option<BlobDescriptor>>,
+    file_ios: HashMap<crate::catalog::Identifier, FileIO>,
+    rest_env: Option<RESTEnv>,
+}
+
+/// Resolve view references only after the caller has selected authorized rows.
+pub(crate) fn resolve_blob_view_stream(
+    stream: ArrowRecordBatchStream,
+    fields: HashSet<String>,
+    rest_env: RESTEnv,
+    blob_as_descriptor: bool,
+    blob_parallelism: usize,
+) -> ArrowRecordBatchStream {
+    Box::pin(async_stream::try_stream! {
+        let limiter = BlobReadLimiter::with_parallelism(blob_parallelism);
+        let mut stream = stream;
+        let mut lookup = BlobViewLookup::default();
+        while let Some(batch) = stream.next().await {
+            let batch = batch?;
+            lookup.load_missing(rest_env.clone(), &batch, &fields).await?;
+            yield replace_blob_view_columns(batch, &fields, &lookup, blob_as_descriptor, &limiter).await?;
+        }
+    })
 }
 
 impl BlobViewLookup {
@@ -1446,8 +1527,11 @@ impl BlobViewLookup {
         collect_blob_view_structs(batch, blob_view_fields, &mut view_structs)?;
         view_structs.retain(|view| !self.descriptors.contains_key(view));
         if !view_structs.is_empty() {
-            let loaded = Self::load(rest_env, view_structs).await?;
+            let loaded =
+                Self::load(self.rest_env.clone().unwrap_or(rest_env), view_structs).await?;
             self.descriptors.extend(loaded.descriptors);
+            self.file_ios.extend(loaded.file_ios);
+            self.rest_env = loaded.rest_env;
         }
         Ok(())
     }
@@ -1457,101 +1541,106 @@ impl BlobViewLookup {
             return Ok(Self::default());
         }
 
-        let mut by_table_and_field: HashMap<
-            (crate::catalog::Identifier, i32),
-            Vec<BlobViewStruct>,
-        > = HashMap::new();
+        let rest_env = rest_env.for_dependency_reads().await?;
+        let mut by_table: HashMap<crate::catalog::Identifier, Vec<BlobViewStruct>> = HashMap::new();
         for view_struct in view_structs {
-            by_table_and_field
-                .entry((view_struct.identifier().clone(), view_struct.field_id()))
+            by_table
+                .entry(view_struct.identifier().clone())
                 .or_default()
                 .push(view_struct);
         }
 
-        let mut lookup = Self::default();
-        for ((identifier, field_id), refs) in by_table_and_field {
+        let mut lookup = Self {
+            rest_env: Some(rest_env.clone()),
+            ..Self::default()
+        };
+        for (identifier, refs) in by_table {
             let table = rest_env.get_table(&identifier).await?;
-            let field = table
+            lookup
+                .file_ios
+                .insert(identifier.clone(), table.file_io().clone());
+            let field_ids: HashSet<_> = refs.iter().map(BlobViewStruct::field_id).collect();
+            // Java groups fields and row ranges by table. One projected scan
+            // keeps all referenced fields on the same upstream snapshot.
+            let fields: Vec<_> = table
                 .schema()
                 .fields()
                 .iter()
-                .find(|field| field.id() == field_id)
+                .filter(|field| field_ids.contains(&field.id()))
                 .cloned()
-                .ok_or_else(|| Error::DataInvalid {
-                    message: format!(
-                        "Cannot find blob field id {field_id} in upstream table {}",
-                        identifier.full_name()
-                    ),
-                    source: None,
-                })?;
-            if !field.data_type().is_blob_type() {
-                return Err(Error::DataInvalid {
-                    message: format!(
-                        "Field id {field_id} in upstream table {} is not a BLOB field",
-                        identifier.full_name()
-                    ),
-                    source: None,
-                });
+                .collect();
+            for id in &field_ids {
+                if !fields.iter().any(|field| field.id() == *id) {
+                    return Err(Error::DataInvalid {
+                        message: format!(
+                            "Cannot find blob field id {id} in upstream table {}",
+                            identifier.full_name()
+                        ),
+                        source: None,
+                    });
+                }
+            }
+            for field in &fields {
+                if !field.data_type().is_blob_type() {
+                    return Err(Error::DataInvalid {
+                        message: format!(
+                            "Field id {} in upstream table {} is not a BLOB field",
+                            field.id(),
+                            identifier.full_name()
+                        ),
+                        source: None,
+                    });
+                }
             }
 
-            let mut options = HashMap::new();
-            options.insert("blob-as-descriptor".to_string(), "true".to_string());
-            let table = table.copy_with_options(options);
-            let row_ranges = row_ranges_for_blob_view_refs(&refs);
+            let table = table.copy_with_options(HashMap::from([(
+                "blob-as-descriptor".to_string(),
+                "true".to_string(),
+            )]));
+            let mut read_fields = fields.clone();
+            read_fields.push(crate::spec::row_id_data_field());
             let mut read_builder = table.new_read_builder();
-            read_builder.with_read_type(vec![field.clone(), crate::spec::row_id_data_field()]);
-            read_builder.with_row_ranges(row_ranges);
+            read_builder.with_read_type(read_fields);
+            read_builder.with_row_ranges(row_ranges_for_blob_view_refs(&refs));
             let plan = read_builder.new_scan().plan().await?;
-            let read = read_builder.new_read()?;
-            let mut stream = read.to_arrow(plan.splits())?;
+            let mut stream = read_builder.new_read()?.to_arrow(plan.splits())?;
 
             while let Some(batch) = stream.next().await {
                 let batch = batch?;
-                let blob_col = batch
-                    .column(0)
-                    .as_any()
-                    .downcast_ref::<LargeBinaryArray>()
-                    .ok_or_else(|| Error::DataInvalid {
-                        message: format!(
-                            "Upstream blob field '{}' did not read as LargeBinaryArray",
-                            field.name()
-                        ),
-                        source: None,
-                    })?;
                 let row_id_col = batch
-                    .column(1)
+                    .column(fields.len())
                     .as_any()
                     .downcast_ref::<Int64Array>()
                     .ok_or_else(|| Error::DataInvalid {
                         message: "Upstream _ROW_ID did not read as Int64Array".to_string(),
                         source: None,
                     })?;
-
-                for row in 0..batch.num_rows() {
-                    if row_id_col.is_null(row) {
-                        continue;
+                for (index, field) in fields.iter().enumerate() {
+                    let blob_col = large_binary_column(&batch, index, field.name())?;
+                    for row in 0..batch.num_rows() {
+                        if row_id_col.is_null(row) {
+                            continue;
+                        }
+                        let view_struct = BlobViewStruct::new(
+                            identifier.clone(),
+                            field.id(),
+                            row_id_col.value(row),
+                        );
+                        let descriptor = if blob_col.is_null(row) {
+                            None
+                        } else {
+                            let value = blob_col.value(row);
+                            if !BlobDescriptor::is_blob_descriptor(value) {
+                                return Err(Error::DataInvalid {
+                                    message: format!("BlobViewStruct {} field_id={} row_id={} resolved to non-BlobDescriptor bytes",
+                                                     identifier.full_name(), field.id(), row_id_col.value(row)),
+                                    source: None,
+                                });
+                            }
+                            Some(BlobDescriptor::deserialize(value)?)
+                        };
+                        lookup.descriptors.insert(view_struct, descriptor);
                     }
-                    let view_struct =
-                        BlobViewStruct::new(identifier.clone(), field_id, row_id_col.value(row));
-                    if blob_col.is_null(row) {
-                        lookup.descriptors.insert(view_struct, None);
-                        continue;
-                    }
-                    let value = blob_col.value(row);
-                    if !BlobDescriptor::is_blob_descriptor(value) {
-                        return Err(Error::DataInvalid {
-                            message: format!(
-                                "BlobViewStruct {} field_id={} row_id={} resolved to non-BlobDescriptor bytes",
-                                identifier.full_name(),
-                                field_id,
-                                row_id_col.value(row)
-                            ),
-                            source: None,
-                        });
-                    }
-                    lookup
-                        .descriptors
-                        .insert(view_struct, Some(BlobDescriptor::deserialize(value)?));
                 }
             }
 
@@ -1618,6 +1707,7 @@ fn open_source_stream(
     split: &DataSplit,
     source: &FieldSource,
     row_ranges: Option<Vec<RowRange>>,
+    requested_row_ranges: Option<Vec<RowRange>>,
     file_io: FileIO,
     schema_manager: SchemaManager,
     table_schema_id: i64,
@@ -1708,12 +1798,13 @@ fn open_source_stream(
             file, data_fields, ..
         } => {
             let deletion_vector = shifted_deletion_vector_for_file(file, anchor_deletion_vector)?;
-            file_reader.read_single_file_stream(
+            file_reader.read_single_file_stream_with_requested_ranges(
                 split,
                 file.as_ref().clone(),
                 data_fields.clone(),
                 deletion_vector,
                 row_ranges,
+                requested_row_ranges,
             )
         }
         FieldSource::BlobBunch { bunch, .. } => {
@@ -1733,17 +1824,9 @@ fn open_source_stream(
         FieldSource::VectorBunch {
             bunch, data_fields, ..
         } => {
-            let anchor = crate::table::source::data_evolution_anchor_file(split.data_files())?;
-            let first_row_id = anchor.first_row_id.ok_or_else(|| Error::DataInvalid {
-                message: format!(
-                    "Data-evolution anchor file '{}' is missing first_row_id",
-                    anchor.file_name
-                ),
-                source: None,
-            })?;
             let selected_ranges = selected_absolute_row_ranges_for_file(
-                first_row_id,
-                anchor.row_count,
+                bunch.expected_first_row_id,
+                bunch.expected_row_count,
                 row_ranges.as_deref(),
                 anchor_deletion_vector.map(|context| context.deletion_vector.as_ref()),
             )?;
@@ -1848,7 +1931,7 @@ fn read_vector_bunch_with_null_gaps_stream(
         }
     }
 
-    let target_schema = build_target_arrow_schema(read_fields)?;
+    let target_schema = crate::arrow::build_read_arrow_schema(read_fields)?;
     let null_batch_size = batch_size.unwrap_or(1024).max(1);
     let split = split.clone();
 
@@ -2139,7 +2222,8 @@ impl PreparedMergeGroup {
         let data_files: Vec<&DataFileMeta> = files
             .iter()
             .filter(|file| {
-                !is_blob_file_name(&file.file_name) && !is_vector_store_file_name(&file.file_name)
+                !is_blob_or_video_file_name(&file.file_name)
+                    && !is_vector_store_file_name(&file.file_name)
             })
             .collect();
         if data_files.is_empty() {
@@ -2327,7 +2411,7 @@ fn build_source_plan_with_row_id_pushdown(
 
     for (file_idx, file) in prepared_group.files.iter().enumerate() {
         let info = &file_infos[file_idx];
-        if is_blob_file_name(&file.file_name) {
+        if is_blob_or_video_file_name(&file.file_name) {
             let field_id = resolve_blob_field_id(file, info)?;
             let expected_row_count = expected_blob_row_count.ok_or_else(|| Error::DataInvalid {
                 message: format!(
@@ -2377,6 +2461,7 @@ fn build_source_plan_with_row_id_pushdown(
                 let source_idx = sources.len();
                 sources.push(FieldSource::VectorBunch {
                     bunch: VectorBunch::new(
+                        prepared_group.first_row_id,
                         prepared_group.logical_row_count,
                         file.schema_id,
                         format_suffix,
@@ -2432,6 +2517,13 @@ fn build_source_plan_with_row_id_pushdown(
                 data_fields: info.data_fields.clone(),
                 read_fields: Vec::new(),
             });
+            // Java rowTypeWithRowTracking adds this metadata provider even
+            // when write_cols omits the physical sequence column. The newest
+            // normal file supplies the group version, independently of the
+            // requested data columns.
+            normal_providers
+                .entry(crate::spec::SEQUENCE_NUMBER_FIELD_ID)
+                .or_insert(source_idx);
             for &field_id in &info.field_ids {
                 // first normal file that carries the id wins (preserve existing semantics)
                 normal_providers.entry(field_id).or_insert(source_idx);
@@ -2499,7 +2591,13 @@ fn build_source_plan_with_row_id_pushdown(
                 }
             }
         }
-        let source_idx = if field.data_type().is_blob_file_field()
+        let source_field = table_fields
+            .iter()
+            .find(|source| source.id() == field.id())
+            .filter(|_| crate::spec::is_map_selected_keys_field(field))
+            .filter(|source| source.data_type().is_blob_file_field())
+            .unwrap_or(field);
+        let source_idx = if source_field.data_type().is_blob_file_field()
             && !blob_descriptor_fields.contains(field.name())
         {
             blob_source_indices.get(&field.id()).copied()
@@ -2516,7 +2614,7 @@ fn build_source_plan_with_row_id_pushdown(
         };
 
         if let Some(source_idx) = source_idx {
-            let field_offset = sources[source_idx].add_read_field(field.clone());
+            let field_offset = sources[source_idx].add_read_field(source_field.clone());
             column_plan.push(Some((source_idx, field_offset)));
             nested_plan.push(None);
         } else if !field.data_type().is_nullable() {
@@ -2673,7 +2771,7 @@ impl BlobBunch {
             self.logical_ranges.is_none(),
             "Cannot add files to a finalized blob bunch"
         );
-        if !is_blob_file_name(&file.file_name) {
+        if !is_blob_or_video_file_name(&file.file_name) {
             return Err(Error::DataInvalid {
                 message: "Only blob file can be added to a blob bunch.".to_string(),
                 source: None,
@@ -2910,6 +3008,7 @@ struct VectorBunch {
     schema_id: i64,
     format_suffix: String,
     normalized_write_cols: Vec<String>,
+    expected_first_row_id: i64,
     expected_row_count: i64,
     latest_first_row_id: i64,
     expected_next_first_row_id: i64,
@@ -2920,6 +3019,7 @@ struct VectorBunch {
 
 impl VectorBunch {
     fn new(
+        expected_first_row_id: i64,
         expected_row_count: i64,
         schema_id: i64,
         format_suffix: String,
@@ -2930,6 +3030,7 @@ impl VectorBunch {
             schema_id,
             format_suffix,
             normalized_write_cols,
+            expected_first_row_id,
             expected_row_count,
             latest_first_row_id: -1,
             expected_next_first_row_id: -1,
@@ -3050,7 +3151,7 @@ fn normalize_merge_group(files: Vec<DataFileMeta>) -> crate::Result<Vec<DataFile
     let mut blob_files = Vec::new();
 
     for file in files {
-        if is_blob_file_name(&file.file_name) {
+        if is_blob_or_video_file_name(&file.file_name) {
             blob_files.push(file);
         } else if is_vector_store_file_name(&file.file_name) {
             vector_files.push(file);
@@ -3138,6 +3239,107 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn blob_view_payloads_use_each_upstream_file_io_even_for_the_same_uri() {
+        let uri = "memory:/referenced-payload";
+        let first_io = FileIO::from_path(uri).unwrap().build().unwrap();
+        let second_io = FileIO::from_path(uri).unwrap().build().unwrap();
+        first_io
+            .new_output(uri)
+            .unwrap()
+            .write(Bytes::from_static(b"first"))
+            .await
+            .unwrap();
+        second_io
+            .new_output(uri)
+            .unwrap()
+            .write(Bytes::from_static(b"other"))
+            .await
+            .unwrap();
+        let first = BlobViewStruct::new(Identifier::new("db", "first"), 1, 0);
+        let second = BlobViewStruct::new(Identifier::new("db", "second"), 1, 0);
+        let null = BlobViewStruct::new(first.identifier().clone(), 1, 1);
+        let descriptor = BlobDescriptor::new(uri.to_string(), 0, 5);
+        let mut lookup = BlobViewLookup::default();
+        lookup
+            .descriptors
+            .insert(first.clone(), Some(descriptor.clone()));
+        lookup
+            .descriptors
+            .insert(second.clone(), Some(descriptor.clone()));
+        lookup.descriptors.insert(null.clone(), None);
+        lookup.file_ios.insert(first.identifier().clone(), first_io);
+        lookup
+            .file_ios
+            .insert(second.identifier().clone(), second_io);
+        let refs = [
+            Some(first.serialize().unwrap()),
+            None,
+            Some(second.serialize().unwrap()),
+            Some(first.serialize().unwrap()),
+            Some(null.serialize().unwrap()),
+        ];
+        let batch = RecordBatch::try_from_iter([(
+            "payload",
+            Arc::new(LargeBinaryArray::from_iter(refs)) as arrow_array::ArrayRef,
+        )])
+        .unwrap();
+        let fields = HashSet::from(["payload".to_string()]);
+        let result = replace_blob_view_columns(
+            batch.clone(),
+            &fields,
+            &lookup,
+            false,
+            &BlobReadLimiter::new(),
+        )
+        .await
+        .unwrap();
+        let values = large_binary_column(&result, 0, "payload")
+            .unwrap()
+            .iter()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            values,
+            vec![
+                Some(b"first".as_slice()),
+                None,
+                Some(b"other".as_slice()),
+                Some(b"first".as_slice()),
+                None
+            ]
+        );
+        // Descriptor output must not open payload files.
+        lookup.file_ios.clear();
+        let result = replace_blob_view_columns(
+            batch.clone(),
+            &fields,
+            &lookup,
+            true,
+            &BlobReadLimiter::new(),
+        )
+        .await
+        .unwrap();
+        let expected = descriptor.serialize();
+        assert_eq!(
+            large_binary_column(&result, 0, "payload")
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![
+                Some(expected.as_slice()),
+                None,
+                Some(expected.as_slice()),
+                Some(expected.as_slice()),
+                None
+            ]
+        );
+        let error =
+            replace_blob_view_columns(batch, &fields, &lookup, false, &BlobReadLimiter::new())
+                .await
+                .unwrap_err();
+        assert!(error.to_string().contains("Missing upstream FileIO"));
+    }
 
     mod blob_test_utils {
         include!(concat!(env!("CARGO_MANIFEST_DIR"), "/blob_test_utils.rs"));
@@ -3753,7 +3955,7 @@ mod tests {
 
     #[test]
     fn test_vector_bunch_aggregates_contiguous_segments() {
-        let mut bunch = VectorBunch::new(30, 0, "parquet".to_string(), vec!["emb".to_string()]);
+        let mut bunch = VectorBunch::new(0, 30, 0, "parquet".to_string(), vec!["emb".to_string()]);
         bunch
             .add(
                 data_file("v1.vector.parquet", 0, 10, 1, Some(vec!["emb"])),
@@ -3786,7 +3988,7 @@ mod tests {
 
     #[test]
     fn test_vector_bunch_rejects_gap() {
-        let mut bunch = VectorBunch::new(30, 0, "parquet".to_string(), vec!["emb".to_string()]);
+        let mut bunch = VectorBunch::new(0, 30, 0, "parquet".to_string(), vec!["emb".to_string()]);
         bunch
             .add(
                 data_file("v1.vector.parquet", 0, 10, 1, Some(vec!["emb"])),
@@ -3807,7 +4009,7 @@ mod tests {
 
     #[test]
     fn test_vector_bunch_ignores_same_first_row_id_lower_seq() {
-        let mut bunch = VectorBunch::new(30, 0, "parquet".to_string(), vec!["emb".to_string()]);
+        let mut bunch = VectorBunch::new(0, 30, 0, "parquet".to_string(), vec!["emb".to_string()]);
         bunch
             .add(
                 data_file("v-high.vector.parquet", 0, 10, 3, Some(vec!["emb"])),
@@ -3828,7 +4030,7 @@ mod tests {
 
     #[test]
     fn test_vector_bunch_rejects_same_first_row_id_higher_seq() {
-        let mut bunch = VectorBunch::new(30, 0, "parquet".to_string(), vec!["emb".to_string()]);
+        let mut bunch = VectorBunch::new(0, 30, 0, "parquet".to_string(), vec!["emb".to_string()]);
         bunch
             .add(
                 data_file("v-low.vector.parquet", 0, 10, 2, Some(vec!["emb"])),
@@ -3846,7 +4048,7 @@ mod tests {
 
     #[test]
     fn test_vector_bunch_ignores_overlapping_lower_seq() {
-        let mut bunch = VectorBunch::new(30, 0, "parquet".to_string(), vec!["emb".to_string()]);
+        let mut bunch = VectorBunch::new(0, 30, 0, "parquet".to_string(), vec!["emb".to_string()]);
         bunch
             .add(
                 data_file("v1.vector.parquet", 0, 10, 3, Some(vec!["emb"])),
@@ -3866,7 +4068,7 @@ mod tests {
 
     #[test]
     fn test_selected_vector_bunch_rejects_partial_higher_sequence_overlap() {
-        let mut bunch = VectorBunch::new(30, 0, "parquet".to_string(), vec!["emb".to_string()])
+        let mut bunch = VectorBunch::new(0, 30, 0, "parquet".to_string(), vec!["emb".to_string()])
             .with_row_id_pushdown(true);
         bunch
             .add(
@@ -3891,7 +4093,7 @@ mod tests {
 
     #[test]
     fn test_vector_bunch_rejects_row_count_overflow() {
-        let mut bunch = VectorBunch::new(15, 0, "parquet".to_string(), vec!["emb".to_string()]);
+        let mut bunch = VectorBunch::new(0, 15, 0, "parquet".to_string(), vec!["emb".to_string()]);
         bunch
             .add(
                 data_file("v1.vector.parquet", 0, 10, 1, Some(vec!["emb"])),
@@ -3910,7 +4112,7 @@ mod tests {
     #[test]
     fn test_vector_bunch_rejects_key_identity_mismatch() {
         // schema_id mismatch
-        let mut bunch = VectorBunch::new(30, 0, "parquet".to_string(), vec!["emb".to_string()]);
+        let mut bunch = VectorBunch::new(0, 30, 0, "parquet".to_string(), vec!["emb".to_string()]);
         bunch
             .add(
                 data_file("v1.vector.parquet", 0, 10, 1, Some(vec!["emb"])),
@@ -3923,7 +4125,7 @@ mod tests {
         assert!(matches!(err, Error::DataInvalid { .. }));
 
         // format_suffix mismatch
-        let mut bunch2 = VectorBunch::new(30, 0, "parquet".to_string(), vec!["emb".to_string()]);
+        let mut bunch2 = VectorBunch::new(0, 30, 0, "parquet".to_string(), vec!["emb".to_string()]);
         bunch2
             .add(
                 data_file("v1.vector.parquet", 0, 10, 1, Some(vec!["emb"])),
@@ -3939,7 +4141,7 @@ mod tests {
         assert!(matches!(err2, Error::DataInvalid { .. }));
 
         // normalized_write_cols mismatch
-        let mut bunch3 = VectorBunch::new(30, 0, "parquet".to_string(), vec!["emb".to_string()]);
+        let mut bunch3 = VectorBunch::new(0, 30, 0, "parquet".to_string(), vec!["emb".to_string()]);
         bunch3
             .add(
                 data_file("v1.vector.parquet", 0, 10, 1, Some(vec!["emb"])),
@@ -3957,7 +4159,7 @@ mod tests {
 
     #[test]
     fn test_vector_bunch_rejects_non_vector_file() {
-        let mut bunch = VectorBunch::new(30, 0, "parquet".to_string(), vec!["emb".to_string()]);
+        let mut bunch = VectorBunch::new(0, 30, 0, "parquet".to_string(), vec!["emb".to_string()]);
         let err = bunch
             .add(
                 data_file("v1.parquet", 0, 10, 1, Some(vec!["emb"])),
@@ -3993,7 +4195,7 @@ mod tests {
             .files
             .iter()
             .map(|file| {
-                if is_blob_file_name(&file.file_name) {
+                if is_blob_or_video_file_name(&file.file_name) {
                     resolved_info(vec![2])
                 } else {
                     resolved_info(vec![1])
@@ -4138,6 +4340,37 @@ mod tests {
         assert!(
             matches!(err, Error::DataInvalid { message, .. } if message.contains("exceeds the expected"))
         );
+    }
+
+    #[test]
+    fn selected_map_blob_uses_the_blob_provider_and_original_map_type() {
+        let map = DataField::new(
+            2,
+            "payload".into(),
+            DataType::Map(crate::spec::MapType::new(
+                DataType::VarChar(crate::spec::VarCharType::string_type()),
+                DataType::Blob(BlobType::new()),
+            )),
+        );
+        let selected = crate::spec::map_selected_keys_field(&map, &["key".into()]).unwrap();
+        let files = vec![
+            data_file("others.parquet", 0, 3, 1, Some(vec!["id"])),
+            data_file("payload.blob", 0, 3, 1, Some(vec!["payload"])),
+        ];
+        let group = PreparedMergeGroup::new(&files).unwrap();
+        let plan = build_source_plan_with_row_id_pushdown(
+            &group,
+            &[resolved_info(vec![1]), resolved_info(vec![2])],
+            &[selected],
+            std::slice::from_ref(&map),
+            &HashSet::new(),
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(plan.column_plan, vec![Some((1, 0))]);
+        assert!(matches!(plan.sources[1], FieldSource::BlobBunch { .. }));
+        assert_eq!(plan.sources[1].read_fields(), &[map]);
     }
 
     #[test]
@@ -5856,6 +6089,81 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_filtered_vector_read_keeps_each_merge_group_range() {
+        let tempdir = tempdir().unwrap();
+        let bucket_dir = tempdir.path().join("bucket-0");
+        fs::create_dir_all(&bucket_dir).unwrap();
+        let mut files = Vec::new();
+        for (index, first_row_id) in [100, 200].into_iter().enumerate() {
+            let ids = vec![index as i32 * 2 + 1, index as i32 * 2 + 2];
+            let normal_name = format!("data-{index}.parquet");
+            let vector_name = format!("data-{index}.vector.parquet");
+            let normal_path = bucket_dir.join(&normal_name);
+            let vector_path = bucket_dir.join(&vector_name);
+            write_int_parquet_file(&normal_path, vec![("id", ids)], None);
+            let vector = vec![index as f32 + 1.0, index as f32 + 2.0];
+            write_fixed_size_list_parquet(
+                &vector_path,
+                "embedding",
+                2,
+                &[Some(vector.clone()), Some(vector)],
+            );
+            for (name, path, columns) in [
+                (normal_name, normal_path, vec!["id"]),
+                (vector_name, vector_path, vec!["embedding"]),
+            ] {
+                files.push(data_file_meta_with_path(
+                    &name,
+                    first_row_id,
+                    2,
+                    1,
+                    path.metadata().unwrap().len() as i64,
+                    Some(columns),
+                ));
+            }
+        }
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("embedding", vector_float_type(2))
+            .option("data-evolution.enabled", "true")
+            .option("row-tracking.enabled", "true")
+            .build()
+            .unwrap();
+        let table = Table::new(
+            FileIOBuilder::new("file").build().unwrap(),
+            Identifier::new("default", "vector_groups"),
+            local_file_path(tempdir.path()),
+            TableSchema::new(0, &schema),
+            None,
+        );
+        // A Python plan can bundle multiple independent file groups in one
+        // split. Each group's vectors must use its own normal-file anchor.
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(local_file_path(&bucket_dir))
+            .with_total_buckets(1)
+            .with_data_files(files)
+            .with_row_ranges(vec![RowRange::new(100, 100), RowRange::new(201, 201)])
+            .build()
+            .unwrap();
+        let batches = TableRead::new(&table, table.schema().fields().to_vec(), Vec::new())
+            .to_arrow(&[split])
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(collect_int_values(&batches, "id"), vec![1, 4]);
+        assert_fixed_size_list(
+            &batches,
+            "embedding",
+            2,
+            &[Some(vec![1.0, 2.0]), Some(vec![2.0, 3.0])],
+        );
+    }
+
     /// (2) Same shape but the dedicated vector file is `.vector.vortex`.
     #[cfg(feature = "vortex")]
     #[tokio::test]
@@ -7052,7 +7360,7 @@ mod tests {
             .await
             .unwrap();
         table
-            .new_btree_global_index_build_builder()
+            .new_global_index_build_builder()
             .with_index_column("id")
             .execute()
             .await
@@ -7436,7 +7744,8 @@ mod tests {
             None,
         );
 
-        let row_schema = build_target_arrow_schema(std::slice::from_ref(&id_field)).unwrap();
+        let row_schema =
+            crate::arrow::build_target_arrow_schema(std::slice::from_ref(&id_field)).unwrap();
         let batch = RecordBatch::try_new(
             row_schema.clone(),
             vec![Arc::new(Int32Array::from(vec![1, 2]))],

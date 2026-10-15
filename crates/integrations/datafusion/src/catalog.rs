@@ -49,9 +49,7 @@ pub(crate) type SessionStateProvider = Arc<dyn Fn() -> Option<SessionState> + Se
 /// providers, so registrations stay visible to schemas obtained earlier.
 type TableEngines = Arc<RwLock<HashMap<PaimonTableType, Arc<dyn TableEngineResolver>>>>;
 
-/// What an engine is asked to resolve. Non-exhaustive so later releases can
-/// carry more of the request — a snapshot selector, say — without breaking
-/// existing resolvers.
+/// Identifies an engine-owned table.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct EngineTableRequest {
@@ -71,10 +69,7 @@ impl EngineTableRequest {
     }
 }
 
-/// Resolves tables owned by another engine (see
-/// [`PaimonCatalogProvider::register_table_engine`]). `Ok(None)` means not
-/// found; errors propagate, so an engine failure never looks like a missing
-/// table.
+/// Resolves external tables. `Ok(None)` means missing; engine errors propagate.
 #[async_trait]
 pub trait TableEngineResolver: Debug + Send + Sync {
     /// Resolve a request to the engine's table provider.
@@ -82,15 +77,156 @@ pub trait TableEngineResolver: Debug + Send + Sync {
         &self,
         request: &EngineTableRequest,
     ) -> DFResult<Option<Arc<dyn TableProvider>>>;
+
+    /// Resolve an exact snapshot and its schema.
+    /// Missing snapshots are errors; `Ok(None)` means the table is missing.
+    async fn resolve_table_snapshot(
+        &self,
+        request: &EngineTableRequest,
+        _snapshot_id: i64,
+    ) -> DFResult<Option<Arc<dyn TableProvider>>> {
+        Err(plan_datafusion_err!(
+            "time travel is not supported for routed '{}' tables ('{}.{}')",
+            request.declared,
+            request.database,
+            request.table
+        ))
+    }
+
+    /// Resolve the table as of `timestamp_millis` (epoch milliseconds) and its
+    /// schema; the engine picks the snapshot. A time with no snapshot is an error;
+    /// `Ok(None)` means the table is missing.
+    async fn resolve_table_at_timestamp(
+        &self,
+        request: &EngineTableRequest,
+        _timestamp_millis: i64,
+    ) -> DFResult<Option<Arc<dyn TableProvider>>> {
+        Err(plan_datafusion_err!(
+            "timestamp time travel is not supported for routed '{}' tables ('{}.{}')",
+            request.declared,
+            request.database,
+            request.table
+        ))
+    }
+
+    /// Resolves `<table>$<metadata_table>`; returns `Ok(None)` if missing or unsupported.
+    /// The request names the base table; `metadata_table` is ASCII-lowercase.
+    /// Session scan options are checked before this call.
+    async fn resolve_metadata_table(
+        &self,
+        _request: &EngineTableRequest,
+        _metadata_table: &str,
+    ) -> DFResult<Option<Arc<dyn TableProvider>>> {
+        Ok(None)
+    }
 }
 
-/// Read-only wrapper around an engine-resolved provider: reads delegate,
-/// DML is rejected even when the engine's own provider is writable.
-#[derive(Debug)]
+/// Delegates reads to the engine and rejects DML.
+#[derive(Debug, Clone)]
 pub(crate) struct ReadOnlyTableProvider {
     inner: Arc<dyn TableProvider>,
     pub(crate) declared: PaimonTableType,
     pub(crate) table_name: String,
+    metadata_table: bool,
+    request: EngineTableRequest,
+    resolver: Arc<dyn TableEngineResolver>,
+    dynamic_options: DynamicOptions,
+}
+
+/// The historical state requested from an engine.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum EngineTimeTravel {
+    Snapshot(i64),
+    TimestampMillis(i64),
+}
+
+impl std::fmt::Display for EngineTimeTravel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Snapshot(id) => write!(f, "snapshot {id}"),
+            Self::TimestampMillis(millis) => write!(f, "timestamp-millis {millis}"),
+        }
+    }
+}
+
+pub(crate) fn unsupported_engine_time_travel(
+    declared: PaimonTableType,
+    table_name: &str,
+) -> datafusion::error::DataFusionError {
+    plan_datafusion_err!(
+        "time travel is not supported for routed '{declared}' tables ('{table_name}'); \
+         only VERSION AS OF with an integer snapshot id and TIMESTAMP AS OF \
+         are supported on data tables"
+    )
+}
+
+impl ReadOnlyTableProvider {
+    pub(crate) fn unsupported_time_travel(&self) -> datafusion::error::DataFusionError {
+        unsupported_engine_time_travel(self.declared, &self.table_name)
+    }
+
+    pub(crate) async fn at_time_travel(
+        &self,
+        travel: EngineTimeTravel,
+    ) -> DFResult<Arc<dyn TableProvider>> {
+        if self.metadata_table {
+            return Err(self.unsupported_time_travel());
+        }
+        resolve_engine_time_travel(
+            self.request.clone(),
+            Arc::clone(&self.resolver),
+            Arc::clone(&self.dynamic_options),
+            travel,
+        )
+        .await
+    }
+}
+
+pub(crate) fn parse_engine_snapshot_id(version: &str) -> DFResult<i64> {
+    version.parse().map_err(|_| {
+        plan_datafusion_err!(
+            "external table time travel requires an integer snapshot id in VERSION AS OF, got '{version}'"
+        )
+    })
+}
+
+async fn resolve_engine_time_travel(
+    request: EngineTableRequest,
+    resolver: Arc<dyn TableEngineResolver>,
+    dynamic_options: DynamicOptions,
+    travel: EngineTimeTravel,
+) -> DFResult<Arc<dyn TableProvider>> {
+    await_with_runtime(async move {
+        let table_name = format!("{}.{}", request.database, request.table);
+        let options = dynamic_options
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        paimon::spec::CoreOptions::new(&options)
+            .ensure_engine_can_serve(&table_name)
+            .map_err(to_datafusion_error)?;
+        let resolved = match travel {
+            EngineTimeTravel::Snapshot(id) => resolver.resolve_table_snapshot(&request, id).await?,
+            EngineTimeTravel::TimestampMillis(millis) => {
+                resolver
+                    .resolve_table_at_timestamp(&request, millis)
+                    .await?
+            }
+        };
+        let inner = resolved.ok_or_else(|| {
+            plan_datafusion_err!("table '{table_name}' was not found at {travel}")
+        })?;
+        Ok(Arc::new(ReadOnlyTableProvider {
+            inner,
+            declared: request.declared,
+            table_name,
+            metadata_table: false,
+            request,
+            resolver,
+            dynamic_options,
+        }) as Arc<dyn TableProvider>)
+    })
+    .await
 }
 
 #[async_trait]
@@ -104,7 +240,11 @@ impl TableProvider for ReadOnlyTableProvider {
     }
 
     fn table_type(&self) -> TableType {
-        self.inner.table_type()
+        if self.metadata_table {
+            TableType::View
+        } else {
+            self.inner.table_type()
+        }
     }
 
     fn get_table_definition(&self) -> Option<&str> {
@@ -154,20 +294,16 @@ impl TableProvider for ReadOnlyTableProvider {
     }
 }
 
-/// Metadata-only provider for an external table whose engine is not registered.
-///
-/// DataFusion's information schema asks every catalog table for its schema.
-/// Returning this provider keeps those metadata queries available without
-/// weakening the fail-closed behavior for actual table reads or writes.
+/// Exposes an unregistered engine's table schema while rejecting scans and writes.
 #[derive(Debug)]
-struct UnavailableEngineTableProvider {
+pub(crate) struct UnavailableEngineTableProvider {
     schema: datafusion::arrow::datatypes::SchemaRef,
     declared: PaimonTableType,
     table_name: String,
 }
 
 impl UnavailableEngineTableProvider {
-    fn unavailable_error(&self) -> datafusion::error::DataFusionError {
+    pub(crate) fn unavailable_error(&self) -> datafusion::error::DataFusionError {
         plan_datafusion_err!(
             "no table engine is registered for '{}' tables ('{}')",
             self.declared,
@@ -331,6 +467,29 @@ impl PaimonCatalogProvider {
 
     fn table_engines(&self) -> TableEngines {
         Arc::clone(&self.table_engines)
+    }
+
+    pub(crate) async fn table_at_time_travel(
+        &self,
+        request: EngineTableRequest,
+        travel: EngineTimeTravel,
+    ) -> DFResult<Arc<dyn TableProvider>> {
+        let resolver = self
+            .table_engines
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&request.declared)
+            .cloned()
+            .ok_or_else(|| {
+                plan_datafusion_err!(
+                    "no table engine is registered for '{}' tables ('{}.{}')",
+                    request.declared,
+                    request.database,
+                    request.table
+                )
+            })?;
+        resolve_engine_time_travel(request, resolver, Arc::clone(&self.dynamic_options), travel)
+            .await
     }
 
     fn paimon_schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
@@ -559,6 +718,24 @@ impl PaimonCatalogProvider {
             .get(database)
             .is_some_and(|db| db.table_exist(table_name))
     }
+
+    /// Returns the temp table or view with the given name in the specified database.
+    pub(crate) async fn temp_table(
+        &self,
+        database: &str,
+        table_name: &str,
+    ) -> DFResult<Option<Arc<dyn TableProvider>>> {
+        let temp = self
+            .temp_tables
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(database)
+            .cloned();
+        match temp {
+            Some(temp) => temp.table(table_name).await,
+            None => Ok(None),
+        }
+    }
 }
 
 /// Represents a [`SchemaProvider`] for the Paimon [`Catalog`], managing
@@ -692,21 +869,7 @@ impl SchemaProvider for PaimonSchemaProvider {
         }
 
         let object = system_tables::parse_object_name_for_datafusion(name)?;
-        if let Some(system_name) = object.system_table().map(str::to_string) {
-            let dynamic_options = self
-                .dynamic_options
-                .read()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone();
-            return await_with_runtime(system_tables::load(
-                Arc::clone(&self.catalog),
-                self.database.clone(),
-                object,
-                system_name,
-                dynamic_options,
-            ))
-            .await;
-        }
+        let system_name = object.system_table().map(str::to_string);
 
         let catalog = Arc::clone(&self.catalog);
         let dynamic_options = Arc::clone(&self.dynamic_options);
@@ -724,6 +887,15 @@ impl SchemaProvider for PaimonSchemaProvider {
         await_with_runtime(async move {
             match catalog.load_table(&identifier).await {
                 Ok(paimon::catalog::LoadedTable::Object(table)) => {
+                    if let Some(system_name) = &system_name {
+                        if !system_tables::is_registered(system_name) {
+                            return Ok(None);
+                        }
+                        return Err(plan_datafusion_err!(
+                            "table '{}' is declared 'object-table' and cannot be read as a Paimon table",
+                            identifier.full_name()
+                        ));
+                    }
                     if branch.is_some() {
                         return Err(plan_datafusion_err!(
                             "branches are not supported for 'object-table' tables ('{}')",
@@ -751,7 +923,16 @@ impl SchemaProvider for PaimonSchemaProvider {
                             identifier.full_name()
                         ));
                     }
+                    // Keep the metadata suffix in errors.
+                    let table_name = format!("{}.{}", identifier.database(), name);
                     let Some(resolver) = table_engines.get(&declared) else {
+                        if system_name.is_some() {
+                            return Err(plan_datafusion_err!(
+                                "no table engine is registered for '{}' tables ('{}')",
+                                declared,
+                                table_name
+                            ));
+                        }
                         let schema = match external.fields() {
                             Some(fields) => crate::table::datafusion_arrow_schema(
                                 fields,
@@ -765,33 +946,55 @@ impl SchemaProvider for PaimonSchemaProvider {
                             table_name: identifier.full_name(),
                         }) as Arc<dyn TableProvider>));
                     };
-                    // The Paimon arm below applies these; an engine would
-                    // ignore them and answer from current data. A missing
-                    // engine only exposes catalog metadata, so read-specific
-                    // session options do not apply to that fallback.
+                    // Engines cannot apply Paimon scan options or query authorization.
                     let session_options = dynamic_options
                         .read()
                         .unwrap_or_else(|e| e.into_inner())
                         .clone();
                     paimon::spec::CoreOptions::new(&session_options)
-                        .ensure_engine_can_serve(&identifier.full_name())
+                        .ensure_engine_can_serve(&table_name)
                         .map_err(to_datafusion_error)?;
-                    let resolved = resolver
-                        .resolve_table(&EngineTableRequest::new(
-                            identifier.database().to_string(),
-                            identifier.object().to_string(),
-                            declared,
-                        ))
-                        .await?;
+                    let request = EngineTableRequest::new(
+                        identifier.database().to_string(),
+                        identifier.object().to_string(),
+                        declared,
+                    );
+                    let metadata_table = system_name.is_some();
+                    let resolved = match system_name {
+                        Some(system_name) => {
+                            let system_name = system_name.to_ascii_lowercase();
+                            resolver.resolve_metadata_table(&request, &system_name).await?
+                        }
+                        None => resolver.resolve_table(&request).await?,
+                    };
                     Ok(resolved.map(|inner| {
                         Arc::new(ReadOnlyTableProvider {
                             inner,
                             declared,
-                            table_name: identifier.full_name(),
+                            table_name,
+                            metadata_table,
+                            request,
+                            resolver: Arc::clone(resolver),
+                            dynamic_options,
                         }) as Arc<dyn TableProvider>
                     }))
                 }
                 Ok(paimon::catalog::LoadedTable::Paimon(table)) => {
+                    if let Some(system_name) = system_name {
+                        let opts = dynamic_options
+                            .read()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .clone();
+                        return system_tables::load(
+                            catalog,
+                            identifier,
+                            *table,
+                            object,
+                            system_name,
+                            opts,
+                        )
+                        .await;
+                    }
                     let mut table = *table;
                     if let Some(branch) = branch.as_deref() {
                         table = table
@@ -824,6 +1027,16 @@ impl SchemaProvider for PaimonSchemaProvider {
                     Ok(Some(Arc::new(provider) as Arc<dyn TableProvider>))
                 }
                 Err(paimon::Error::TableNotExist { .. }) => {
+                    if let Some(system_name) = system_name {
+                        return if system_tables::is_registered(&system_name) {
+                            Err(plan_datafusion_err!(
+                                "Cannot read system table `${system_name}`: base table `{}` does not exist",
+                                object.table()
+                            ))
+                        } else {
+                            Ok(None)
+                        };
+                    }
                     if branch.is_some() {
                         return Ok(None);
                     }
@@ -924,19 +1137,16 @@ impl SchemaProvider for PaimonSchemaProvider {
                 return false;
             }
         };
-        if let Some(system_name) = object.system_table() {
-            if !system_tables::is_registered(system_name) {
-                return false;
-            }
-        }
-
         let catalog = Arc::clone(&self.catalog);
+        let dynamic_options = Arc::clone(&self.dynamic_options);
         let identifier = Identifier::new(self.database.clone(), object.table().to_string());
         let branch = object.branch().map(str::to_string);
         let is_branches_table = object
             .system_table()
             .is_some_and(|name| name.eq_ignore_ascii_case("branches"));
-        let has_system_suffix = object.system_table().is_some();
+        let system_name = object.system_table().map(str::to_string);
+        let has_system_suffix = system_name.is_some();
+        let table_name = format!("{}.{}", self.database, name);
         let engines: HashMap<PaimonTableType, Arc<dyn TableEngineResolver>> = self
             .table_engines
             .read()
@@ -950,37 +1160,57 @@ impl SchemaProvider for PaimonSchemaProvider {
                     }
                     Ok(paimon::catalog::LoadedTable::External(external)) => {
                         let declared = external.declared();
-                        // Paimon-only; `table()` rejects them here too.
-                        if branch.is_some() || has_system_suffix {
+                        if branch.is_some() {
                             return false;
                         }
                         match engines.get(&declared) {
-                            Some(resolver) => match resolver
-                                .resolve_table(&EngineTableRequest::new(
+                            Some(resolver) => {
+                                let request = EngineTableRequest::new(
                                     identifier.database().to_string(),
                                     identifier.object().to_string(),
                                     declared,
-                                ))
-                                .await
-                            {
-                                Ok(table) => table.is_some(),
-                                // Report failures as existing so `table()`
-                                // surfaces the real error.
-                                Err(err) => {
-                                    log::warn!(
-                                        "failed to probe engine table existence for '{}': {err}",
-                                        identifier.full_name()
-                                    );
-                                    true
+                                );
+                                let resolved = async {
+                                    if let Some(system_name) = system_name {
+                                        let opts = dynamic_options
+                                            .read()
+                                            .unwrap_or_else(|e| e.into_inner())
+                                            .clone();
+                                        paimon::spec::CoreOptions::new(&opts)
+                                            .ensure_engine_can_serve(&table_name)
+                                            .map_err(to_datafusion_error)?;
+                                        let system_name = system_name.to_ascii_lowercase();
+                                        resolver
+                                            .resolve_metadata_table(&request, &system_name)
+                                            .await
+                                    } else {
+                                        resolver.resolve_table(&request).await
+                                    }
                                 }
-                            },
-                            // `table()` returns a metadata-only provider in this
-                            // case, so the SchemaProvider existence contract
-                            // requires the same answer here.
-                            None => true,
+                                .await;
+                                match resolved {
+                                    Ok(table) => table.is_some(),
+                                    // Let `table()` report the engine error.
+                                    Err(err) => {
+                                        log::warn!(
+                                            "failed to probe engine table existence for '{}': {err}",
+                                            table_name
+                                        );
+                                        true
+                                    }
+                                }
+                            }
+                            // Only base tables have a metadata-only fallback.
+                            None => !has_system_suffix,
                         }
                     }
                     Ok(paimon::catalog::LoadedTable::Paimon(table)) => {
+                        if system_name
+                            .as_deref()
+                            .is_some_and(|name| !system_tables::is_registered(name))
+                        {
+                            return false;
+                        }
                         if let Some(branch) = branch.as_deref() {
                             if is_branches_table {
                                 return true;
@@ -991,7 +1221,7 @@ impl SchemaProvider for PaimonSchemaProvider {
                         }
                     }
                     Err(paimon::Error::TableNotExist { .. }) => {
-                        if branch.is_some() {
+                        if branch.is_some() || has_system_suffix {
                             return false;
                         }
                         match catalog.get_view(&identifier).await {
@@ -1032,6 +1262,15 @@ impl SchemaProvider for PaimonSchemaProvider {
     }
 
     fn deregister_table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
+        // View DDL can reach this callback for metadata tables.
+        let object = system_tables::parse_object_name_for_datafusion(name)?;
+        if object.system_table().is_some() {
+            return Err(plan_datafusion_err!(
+                "Metadata table '{}.{}' is read-only",
+                self.database,
+                name
+            ));
+        }
         let catalog = Arc::clone(&self.catalog);
         let identifier = Identifier::new(self.database.clone(), name);
         block_on_with_runtime(

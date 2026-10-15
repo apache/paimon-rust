@@ -54,6 +54,7 @@ use crate::table::source::{
 use crate::table::ScanTrace;
 use futures::{StreamExt, TryStreamExt};
 use indexmap::IndexMap;
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -197,7 +198,7 @@ async fn read_manifest_bytes_with_sidecar(
 fn validate_incremental_entries(entries: &[ManifestEntry]) -> crate::Result<()> {
     if entries.iter().any(|entry| *entry.kind() != FileKind::Add) {
         return Err(crate::Error::DataInvalid {
-            message: "Incremental delta manifests must contain only ADD entries".into(),
+            message: "Incremental manifests must contain only ADD entries".into(),
             source: None,
         });
     }
@@ -212,7 +213,8 @@ enum IncrementalSplitMode {
 
 enum ManifestListSource<'a> {
     Snapshot(&'a Snapshot),
-    AppendDeltas(&'a [Snapshot]),
+    IncrementalLists(Vec<String>),
+    IncrementalList(&'a str),
 }
 
 /// Reads all manifest entries for a snapshot (base + delta manifest lists, then each manifest file).
@@ -244,17 +246,17 @@ async fn read_all_manifest_entries(
     manifest_parallelism: usize,
     trace: Option<&mut ScanTrace>,
 ) -> crate::Result<Vec<ManifestEntry>> {
-    let incremental = matches!(&source, ManifestListSource::AppendDeltas(_));
+    let incremental = !matches!(&source, ManifestListSource::Snapshot(_));
     let (mut manifest_files, delta) = match source {
         ManifestListSource::Snapshot(snapshot) => futures::try_join!(
             read_manifest_list(file_io, table_path, snapshot.base_manifest_list()),
             read_manifest_list(file_io, table_path, snapshot.delta_manifest_list()),
         )?,
-        ManifestListSource::AppendDeltas(snapshots) => {
-            let names = snapshots
-                .iter()
-                .map(|snapshot| snapshot.delta_manifest_list().to_string())
-                .collect::<Vec<_>>();
+        ManifestListSource::IncrementalList(name) => (
+            Vec::new(),
+            read_manifest_list(file_io, table_path, name).await?,
+        ),
+        ManifestListSource::IncrementalLists(names) => {
             let delta = futures::stream::iter(names)
                 .map(|name| async move { read_manifest_list(file_io, table_path, &name).await })
                 .buffered(manifest_parallelism)
@@ -901,7 +903,7 @@ fn is_vector_store_file_name(file_name: &str) -> bool {
 }
 
 fn is_normal_data_file(file: &DataFileMeta) -> bool {
-    !crate::table::dedicated_format_file_writer::is_blob_file_name(&file.file_name)
+    !crate::table::dedicated_format_file_writer::is_blob_or_video_file_name(&file.file_name)
         && !is_vector_store_file_name(&file.file_name)
 }
 
@@ -1012,6 +1014,11 @@ async fn prune_data_evolution_group_by_read_fields(
     } else {
         None
     };
+    let sequence_idx = if read_field_ids.contains(&SEQUENCE_NUMBER_FIELD_ID) {
+        Some(data_evolution_sequence_file_index(&group)?)
+    } else {
+        None
+    };
 
     let mut keep = Vec::with_capacity(group.len());
     for (idx, file) in group.iter().enumerate() {
@@ -1035,6 +1042,11 @@ async fn prune_data_evolution_group_by_read_fields(
             keep.push(anchor_idx);
         }
     }
+    if let Some(sequence_idx) = sequence_idx {
+        if !keep.contains(&sequence_idx) {
+            keep.push(sequence_idx);
+        }
+    }
 
     if keep.is_empty() {
         keep.push(data_evolution_representative_file(&group)?);
@@ -1047,11 +1059,30 @@ async fn prune_data_evolution_group_by_read_fields(
         }
     }
 
+    if sequence_idx.is_some() {
+        // Preserve original order for equal-sequence metadata providers.
+        keep.sort_unstable();
+    }
     let mut files = group.into_iter().map(Some).collect::<Vec<_>>();
     Ok(keep
         .into_iter()
         .filter_map(|idx| files.get_mut(idx).and_then(Option::take))
         .collect())
+}
+
+/// The newest normal file supplies row-tracking sequence metadata. It must
+/// survive user-column pruning even if it only wrote an unprojected column.
+fn data_evolution_sequence_file_index(group: &[DataFileMeta]) -> crate::Result<usize> {
+    group
+        .iter()
+        .enumerate()
+        .filter(|(_, file)| is_normal_data_file(file))
+        .min_by_key(|(idx, file)| (std::cmp::Reverse(file.max_sequence_number), *idx))
+        .map(|(idx, _)| idx)
+        .ok_or_else(|| crate::Error::DataInvalid {
+            message: "Data-evolution sequence metadata requires a normal data file".into(),
+            source: None,
+        })
 }
 
 #[derive(Debug, Clone)]
@@ -1063,7 +1094,136 @@ enum TableScanKind<'a> {
     Format(FormatTableScan<'a>),
 }
 
+/// File set to plan from one selected snapshot. Streaming progress is managed
+/// separately by StreamTableScan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SnapshotScanMode {
+    All,
+    Delta,
+    Changelog,
+}
+
+#[derive(Clone)]
+struct BucketFilter(std::sync::Arc<dyn Fn(i32) -> crate::Result<bool> + Send + Sync>);
+
+impl std::fmt::Debug for BucketFilter {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("BucketFilter")
+    }
+}
+
+impl BucketFilter {
+    fn test(&self, bucket: i32) -> crate::Result<bool> {
+        (self.0)(bucket)
+    }
+}
+
 impl<'a> TableScan<'a> {
+    pub(super) fn into_owned_paimon_scan(self) -> crate::Result<TableScan<'static>> {
+        let TableScanKind::Paimon(scan) = self.0 else {
+            return Err(crate::Error::Unsupported {
+                message: "StreamTableScan requires a Paimon table".into(),
+            });
+        };
+        Ok(TableScan(TableScanKind::Paimon(PaimonTableScan {
+            table: ScanTable::Owned(std::sync::Arc::new((*scan.table).clone())),
+            partition_filter: scan.partition_filter,
+            data_predicates: scan.data_predicates,
+            bucket_predicate: scan.bucket_predicate,
+            limit: scan.limit,
+            row_ranges: scan.row_ranges,
+            split_selection: scan.split_selection,
+            row_range_optimization_disabled: scan.row_range_optimization_disabled,
+            scan_all_files: scan.scan_all_files,
+            incremental_split_mode: scan.incremental_split_mode,
+            projected_read_field_ids: scan.projected_read_field_ids,
+            query_auth_grant: scan.query_auth_grant,
+        })))
+    }
+
+    pub(super) fn snapshot_table(&self) -> &Table {
+        let TableScanKind::Paimon(scan) = &self.0 else {
+            unreachable!("snapshot scans only contain Paimon tables")
+        };
+        &scan.table
+    }
+
+    /// One authorization scope for a single plan/poll. The long-lived stream
+    /// retains the original ungranted scan so the next poll refreshes the rules.
+    pub(super) async fn authorize_snapshot_read(&self) -> crate::Result<Self> {
+        match &self.0 {
+            TableScanKind::Paimon(scan) => Ok(Self(TableScanKind::Paimon(
+                scan.authorized_scan().await?.into_owned(),
+            ))),
+            TableScanKind::Format(_) => Err(crate::Error::Unsupported {
+                message: "Snapshot authorization requires a Paimon table".into(),
+            }),
+        }
+    }
+
+    pub(super) fn validate_snapshot_read(&self) -> crate::Result<()> {
+        let TableScanKind::Paimon(scan) = &self.0 else {
+            unreachable!("snapshot scans only contain Paimon tables")
+        };
+        scan.validate_read_options()
+    }
+
+    pub(super) fn with_snapshot_levels(mut self, levels: std::ops::RangeInclusive<i32>) -> Self {
+        if let TableScanKind::Paimon(scan) = &mut self.0 {
+            scan.split_selection
+                .get_or_insert_with(Default::default)
+                .snapshot_levels = Some(levels);
+        }
+        self
+    }
+
+    pub(super) fn only_read_snapshot_real_buckets(mut self) -> Self {
+        if let TableScanKind::Paimon(scan) = &mut self.0 {
+            scan.split_selection
+                .get_or_insert_with(Default::default)
+                .only_real_buckets = true;
+        }
+        self
+    }
+
+    pub(super) fn with_snapshot_bucket_filter(
+        mut self,
+        filter: impl Fn(i32) -> crate::Result<bool> + Send + Sync + 'static,
+    ) -> Self {
+        if let TableScanKind::Paimon(scan) = &mut self.0 {
+            let selection = scan.split_selection.get_or_insert_with(Default::default);
+            selection.bucket_filter = Some(BucketFilter(std::sync::Arc::new(filter)));
+        }
+        self
+    }
+
+    pub(super) async fn plan_selected_snapshot(
+        &self,
+        snapshot: crate::spec::Snapshot,
+        mode: SnapshotScanMode,
+    ) -> crate::Result<Plan> {
+        self.validate_snapshot_read()?;
+        let TableScanKind::Paimon(scan) = &self.0 else {
+            unreachable!("snapshot scans only contain Paimon tables")
+        };
+        // Snapshot planning preserves the selected file set. Scan policies
+        // explicitly decide whether unassigned buckets should be hidden.
+        let mut scan = scan.clone();
+        scan.scan_all_files = true;
+        scan.split_selection
+            .get_or_insert_with(Default::default)
+            .snapshot_mode = Some(mode);
+        let plan = match mode {
+            SnapshotScanMode::All => {
+                let fields = scan.projected_read_field_ids()?;
+                scan.plan_snapshot(snapshot, fields.as_ref(), None).await
+            }
+            SnapshotScanMode::Delta => scan.plan_snapshot_delta(&snapshot).await,
+            SnapshotScanMode::Changelog => scan.plan_snapshot_changelog(&snapshot, None).await,
+        }?;
+        scan.finish_plan(plan).await
+    }
+
     pub(crate) fn new(
         table: &'a Table,
         partition_filter: Option<PartitionFilter>,
@@ -1128,6 +1288,7 @@ impl<'a> TableScan<'a> {
     /// `seed` must render as a decimal integer. Accepting any `ToString` seed
     /// keeps ordinary Rust integer calls ergonomic while allowing language
     /// bindings to preserve arbitrary-precision integer seeds.
+    /// Only predicates on unmasked partition keys are supported.
     pub fn with_chunk_shuffle(self, seed: impl ToString, chunk_size: u64) -> crate::Result<Self> {
         let config = ChunkShuffle::from_decimal_seed(&seed.to_string(), chunk_size)?;
         match self.0 {
@@ -1149,7 +1310,13 @@ impl<'a> TableScan<'a> {
                                 .to_string(),
                     });
                 }
-                if !scan.data_predicates.is_empty() {
+                if !scan.data_predicates.is_empty()
+                    && !super::read_builder::is_exact_filter_pushdown_for_schema(
+                        scan.table.schema().fields(),
+                        scan.table.schema().partition_keys(),
+                        &Predicate::and(scan.data_predicates.clone()),
+                    )
+                {
                     return Err(crate::Error::Unsupported {
                         message: "chunk_shuffle only supports partition predicates".to_string(),
                     });
@@ -1157,6 +1324,10 @@ impl<'a> TableScan<'a> {
                 scan.split_selection = Some(Box::new(ScanSplitSelection {
                     mode: Some(ScanSplitMode::ChunkShuffle(config)),
                     shard: scan.shard(),
+                    bucket_filter: scan.bucket_filter().cloned(),
+                    only_real_buckets: scan.only_real_buckets(),
+                    snapshot_mode: scan.snapshot_mode(),
+                    snapshot_levels: scan.snapshot_levels().cloned(),
                 }));
                 Ok(Self(TableScanKind::Paimon(scan)))
             }
@@ -1166,10 +1337,13 @@ impl<'a> TableScan<'a> {
         }
     }
 
-    /// Select one balanced worker shard for a distributed scan.
+    /// Select one worker shard using Java `SnapshotReaderImpl.withShard` rules.
     ///
-    /// Sharding is scan-level state, independent of the selected planning
-    /// strategy, so callers may configure it before or after chunk shuffling.
+    /// Append tables and primary-key tables with deletion vectors or first-row
+    /// use `abs(String.hashCode(file_name) % count)`. Other tables use
+    /// `bucket % count`, keeping all versions of a key or row-id group together.
+    /// Chunk shuffling instead distributes balanced ranges of shuffled chunks;
+    /// callers may configure the shard before or after chunk shuffling.
     pub fn with_shard(mut self, index: usize, count: usize) -> crate::Result<Self> {
         if count == 0 || index >= count {
             return Err(crate::Error::DataInvalid {
@@ -1193,6 +1367,10 @@ impl<'a> TableScan<'a> {
                         scan.split_selection = Some(Box::new(ScanSplitSelection {
                             mode: None,
                             shard: Some((index, count)),
+                            bucket_filter: None,
+                            only_real_buckets: false,
+                            snapshot_mode: None,
+                            snapshot_levels: None,
                         }));
                     }
                 }
@@ -1251,6 +1429,10 @@ impl<'a> TableScan<'a> {
                 scan.split_selection = Some(Box::new(ScanSplitSelection {
                     mode: Some(ScanSplitMode::RowPosition(selection)),
                     shard: None,
+                    bucket_filter: scan.bucket_filter().cloned(),
+                    only_real_buckets: scan.only_real_buckets(),
+                    snapshot_mode: scan.snapshot_mode(),
+                    snapshot_levels: scan.snapshot_levels().cloned(),
                 }));
                 Ok(Self(TableScanKind::Paimon(scan)))
             }
@@ -1287,15 +1469,21 @@ impl<'a> TableScan<'a> {
         }
     }
 
-    pub(crate) async fn plan_snapshot_deltas(
+    pub(crate) async fn plan_incremental_lists_with_trace(
         &self,
-        snapshots: &[Snapshot],
         end_snapshot: &Snapshot,
+        manifest_lists: Vec<String>,
+        trace: Option<&mut ScanTrace>,
     ) -> crate::Result<Plan> {
         match &self.0 {
-            TableScanKind::Paimon(scan) => scan.plan_snapshot_deltas(snapshots, end_snapshot).await,
+            TableScanKind::Paimon(scan) => {
+                let plan = scan
+                    .plan_incremental_lists(end_snapshot, manifest_lists, trace)
+                    .await?;
+                scan.finish_plan(plan).await
+            }
             TableScanKind::Format(_) => Err(crate::Error::Unsupported {
-                message: "Format tables do not support incremental delta scan".to_string(),
+                message: "Format tables do not support incremental batch scans".to_string(),
             }),
         }
     }
@@ -1323,9 +1511,13 @@ impl<'a> TableScan<'a> {
     }
 
     /// Plan data splits from a snapshot's changelog manifest list only.
-    pub(crate) async fn plan_snapshot_changelog(&self, snapshot: &Snapshot) -> crate::Result<Plan> {
+    pub(crate) async fn plan_snapshot_changelog_with_trace(
+        &self,
+        snapshot: &Snapshot,
+        trace: Option<&mut ScanTrace>,
+    ) -> crate::Result<Plan> {
         match &self.0 {
-            TableScanKind::Paimon(scan) => scan.plan_snapshot_changelog(snapshot).await,
+            TableScanKind::Paimon(scan) => scan.plan_snapshot_changelog(snapshot, trace).await,
             TableScanKind::Format(_) => Err(crate::Error::Unsupported {
                 message: "Format tables do not support incremental changelog scan".to_string(),
             }),
@@ -1364,15 +1556,38 @@ enum ScanSplitMode {
     ChunkShuffle(ChunkShuffle),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 struct ScanSplitSelection {
     mode: Option<ScanSplitMode>,
     shard: Option<(usize, usize)>,
+    bucket_filter: Option<BucketFilter>,
+    only_real_buckets: bool,
+    snapshot_mode: Option<SnapshotScanMode>,
+    snapshot_levels: Option<std::ops::RangeInclusive<i32>>,
+}
+
+// A stream scan owns its table so clients can retain the scan across polls.
+// Batch scans keep borrowing their table and retain their existing lifetime.
+#[derive(Debug, Clone)]
+enum ScanTable<'a> {
+    Borrowed(&'a Table),
+    Owned(std::sync::Arc<Table>),
+}
+
+impl std::ops::Deref for ScanTable<'_> {
+    type Target = Table;
+
+    fn deref(&self) -> &Table {
+        match self {
+            Self::Borrowed(table) => table,
+            Self::Owned(table) => table,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 struct PaimonTableScan<'a> {
-    table: &'a Table,
+    table: ScanTable<'a>,
     partition_filter: Option<PartitionFilter>,
     data_predicates: Vec<Predicate>,
     bucket_predicate: Option<Predicate>,
@@ -1393,9 +1608,36 @@ struct PaimonTableScan<'a> {
     scan_all_files: bool,
     incremental_split_mode: Option<IncrementalSplitMode>,
     projected_read_field_ids: Option<HashSet<i32>>,
+    /// Only set on an ephemeral copy after authorization. Never stored back into
+    /// StreamTableScan, and never reconstructed from serialized split metadata.
+    query_auth_grant: Option<Arc<super::query_auth::QueryAuthGrant>>,
 }
 
 impl<'a> PaimonTableScan<'a> {
+    fn snapshot_levels(&self) -> Option<&std::ops::RangeInclusive<i32>> {
+        self.split_selection
+            .as_deref()
+            .and_then(|selection| selection.snapshot_levels.as_ref())
+    }
+
+    fn snapshot_mode(&self) -> Option<SnapshotScanMode> {
+        self.split_selection
+            .as_deref()
+            .and_then(|selection| selection.snapshot_mode)
+    }
+
+    fn only_real_buckets(&self) -> bool {
+        self.split_selection
+            .as_deref()
+            .is_some_and(|selection| selection.only_real_buckets)
+    }
+
+    fn bucket_filter(&self) -> Option<&BucketFilter> {
+        self.split_selection
+            .as_deref()
+            .and_then(|selection| selection.bucket_filter.as_ref())
+    }
+
     fn row_position_selection(&self) -> Option<RowPositionSelection> {
         match self
             .split_selection
@@ -1437,7 +1679,7 @@ impl<'a> PaimonTableScan<'a> {
         row_ranges: Option<Vec<RowRange>>,
     ) -> Self {
         Self {
-            table,
+            table: ScanTable::Borrowed(table),
             partition_filter,
             data_predicates,
             bucket_predicate,
@@ -1448,6 +1690,7 @@ impl<'a> PaimonTableScan<'a> {
             scan_all_files: false,
             incremental_split_mode: None,
             projected_read_field_ids: None,
+            query_auth_grant: None,
         }
     }
 
@@ -1505,33 +1748,52 @@ impl<'a> PaimonTableScan<'a> {
     /// for `scan.version`; the strict selectors mirror Java's typed
     /// `scan.snapshot-id` / `scan.tag-name` handling.
     pub async fn plan(&self) -> crate::Result<Plan> {
-        let grant = self.authorize_query().await?;
-        self.validate_shard_strategy()?;
-        let data_evolution_read_field_ids = self.projected_read_field_ids()?;
-        let plan = match super::time_travel::resolve_snapshot(self.table).await? {
+        let scan = self.authorized_scan().await?;
+        if let Some((start, end)) = scan
+            .table
+            .schema()
+            .core_options()
+            .incremental_timestamp_window()?
+        {
+            let plan = scan.plan_timestamp_window(start, end, None).await?;
+            return Ok(plan);
+        }
+        let data_evolution_read_field_ids = scan.projected_read_field_ids()?;
+        let plan = match super::time_travel::resolve_snapshot(&scan.table).await? {
             Some(snapshot) => {
-                self.plan_snapshot(snapshot, data_evolution_read_field_ids.as_ref(), None)
+                scan.plan_snapshot(snapshot, data_evolution_read_field_ids.as_ref(), None)
                     .await?
             }
             None => Plan::new(Vec::new()),
         };
-        self.check_planned_files(&plan, grant.is_some()).await?;
-        Ok(plan.planned(grant))
+        scan.finish_plan(plan).await
     }
 
     /// Plan the full scan and return metadata-pruning trace counters.
     pub async fn plan_with_trace(&self) -> crate::Result<(Plan, ScanTrace)> {
-        let grant = self.authorize_query().await?;
-        self.validate_shard_strategy()?;
+        let scan = self.authorized_scan().await?;
         let mut trace = ScanTrace {
-            limit: self.limit,
+            limit: scan.limit,
             ..Default::default()
         };
-        let data_evolution_read_field_ids = self.projected_read_field_ids()?;
-        let plan = match super::time_travel::resolve_snapshot(self.table).await? {
+        if let Some((start, end)) = scan
+            .table
+            .schema()
+            .core_options()
+            .incremental_timestamp_window()?
+        {
+            let plan = scan
+                .plan_timestamp_window(start, end, Some(&mut trace))
+                .await?;
+            trace.snapshot_id = plan.snapshot_id();
+            trace.planned_data_file_bytes = plan.planned_data_file_bytes();
+            return Ok((plan, trace));
+        }
+        let data_evolution_read_field_ids = scan.projected_read_field_ids()?;
+        let plan = match super::time_travel::resolve_snapshot(&scan.table).await? {
             Some(snapshot) => {
                 trace.snapshot_id = Some(snapshot.id());
-                let plan = self
+                let plan = scan
                     .plan_snapshot(
                         snapshot,
                         data_evolution_read_field_ids.as_ref(),
@@ -1543,8 +1805,125 @@ impl<'a> PaimonTableScan<'a> {
             }
             None => Plan::new(Vec::new()),
         };
-        self.check_planned_files(&plan, grant.is_some()).await?;
-        Ok((plan.planned(grant), trace))
+        Ok((scan.finish_plan(plan).await?, trace))
+    }
+
+    /// Keep pruning off masked columns and apply limits after row filtering.
+    fn restricted_by(&self, grant: &Arc<super::query_auth::QueryAuthGrant>) -> Self {
+        let rules = grant.rules();
+        let fields = self.table.schema().fields();
+        let masked: HashSet<&str> = rules
+            .masks
+            .iter()
+            .map(|m| fields[m.column].name())
+            .collect();
+        // By name: the bucket predicate is indexed by bucket-key position.
+        let touches_masked = |predicate: &Predicate| {
+            super::query_auth::leaf_names(std::slice::from_ref(predicate))
+                .iter()
+                .any(|name| masked.contains(name.as_str()))
+        };
+        let mut scan = self.clone();
+        scan.query_auth_grant = Some(Arc::clone(grant));
+        scan.data_predicates.retain(|p| !touches_masked(p));
+        if scan.bucket_predicate.as_ref().is_some_and(touches_masked) {
+            scan.bucket_predicate = None;
+        }
+        let dropped = scan.data_predicates.len() != self.data_predicates.len();
+        if !rules.filters.is_empty() || dropped {
+            scan.limit = scan.limit.filter(|limit| *limit == 0);
+        }
+        // Derive partition pruning only after excluding masked predicates.
+        if scan.partition_filter.is_none()
+            && !scan.data_predicates.is_empty()
+            && !self.table.schema().partition_keys().is_empty()
+        {
+            let (partition, data) = super::bucket_filter::split_partition_and_data_predicates(
+                Predicate::and(std::mem::take(&mut scan.data_predicates)),
+                fields,
+                self.table.schema().partition_keys(),
+            );
+            scan.partition_filter = partition.map(|predicate| {
+                PartitionFilter::from_predicate(predicate, &self.table.schema().partition_fields())
+            });
+            scan.data_predicates = data;
+        }
+        // Keep files for every column used by the rules.
+        if let Some(ids) = scan.projected_read_field_ids.as_mut() {
+            let mut columns = rules.filter_columns();
+            for mask in &rules.masks {
+                columns.insert(mask.column);
+                columns.extend(super::query_auth::mask_inputs(mask));
+            }
+            ids.extend(
+                columns
+                    .into_iter()
+                    .filter_map(|i| fields.get(i))
+                    .map(|f| f.id()),
+            );
+        }
+        scan
+    }
+
+    /// Java's `select`: the projection plus what the filters read; `None` (the
+    /// whole table) without a projection.
+    fn query_auth_select(&self) -> Option<Vec<String>> {
+        let ids = self.projected_read_field_ids.as_ref()?;
+        let mut select: Vec<String> = self
+            .table
+            .schema()
+            .fields()
+            .iter()
+            .filter(|f| ids.contains(&f.id()))
+            .map(|f| f.name().to_string())
+            .collect();
+        for key in self.partition_filter_columns() {
+            if !select.contains(&key) {
+                select.push(key);
+            }
+        }
+        Some(select)
+    }
+
+    /// Columns the caller's partition filter reads; a pinned partition set reads them all.
+    fn partition_filter_columns(&self) -> Vec<String> {
+        match &self.partition_filter {
+            None => Vec::new(),
+            Some(PartitionFilter::Predicate(predicate)) => {
+                super::query_auth::leaf_names(std::slice::from_ref(predicate))
+                    .into_iter()
+                    .collect()
+            }
+            Some(PartitionFilter::PartitionSet { .. }) => {
+                self.table.schema().partition_keys().to_vec()
+            }
+        }
+    }
+
+    async fn plan_timestamp_window(
+        &self,
+        start: i64,
+        end: i64,
+        trace: Option<&mut ScanTrace>,
+    ) -> crate::Result<Plan> {
+        let Some((start, end)) = super::incremental_scan::timestamp_snapshot_range(
+            &self.table.snapshot_manager(),
+            start,
+            end,
+        )
+        .await?
+        else {
+            return Ok(Plan::new(Vec::new()));
+        };
+        super::IncrementalScan::new(
+            &self.table,
+            TableScan(TableScanKind::Paimon(self.clone())),
+            super::IncrementalScanMode::Auto,
+            start,
+            end,
+        )
+        .plan_combined_with_trace(trace)
+        .await
     }
 
     /// The grant predates the manifest read, so the table can have been
@@ -1566,6 +1945,26 @@ impl<'a> PaimonTableScan<'a> {
         .await
     }
 
+    async fn authorized_scan(&self) -> crate::Result<Cow<'_, Self>> {
+        // Timestamp-window planning delegates to combined incremental planning
+        // within the same operation. Reuse its scope, not another REST request.
+        if self.query_auth_grant.is_some() {
+            self.validate_read_options()?;
+            return Ok(Cow::Borrowed(self));
+        }
+        let grant = self.authorize_query().await?;
+        Ok(match grant {
+            Some(grant) => Cow::Owned(self.restricted_by(&grant)),
+            None => Cow::Borrowed(self),
+        })
+    }
+
+    async fn finish_plan(&self, plan: Plan) -> crate::Result<Plan> {
+        self.check_planned_files(&plan, self.query_auth_grant.is_some())
+            .await?;
+        Ok(plan.planned(self.query_auth_grant.clone()))
+    }
+
     /// Authorize this scan and return the grant for the caller to stamp.
     async fn authorize_query(
         &self,
@@ -1573,7 +1972,11 @@ impl<'a> PaimonTableScan<'a> {
         let core_options = CoreOptions::new(self.table.schema().options());
         // Unconditional: unrelated to query-auth.
         core_options.ensure_type_paimon_served(&self.table.identifier().full_name())?;
+        core_options.validate_scan_options()?;
         core_options.validate_data_file_path_directory()?;
+        // Timestamp windows bypass point-snapshot resolution but must still
+        // reject a schema whose captured selection was invalidated by a copy.
+        self.table.ensure_read_snapshot_current()?;
 
         // File paths and stats, not table columns: the endpoint cannot rule on them.
         let query_auth = CoreOptions::new(self.table.schema().options()).query_auth_enabled();
@@ -1596,14 +1999,50 @@ impl<'a> PaimonTableScan<'a> {
         if query_auth && touches_row_id {
             super::query_auth::reject_system_columns([ROW_ID_FIELD_NAME])?;
         }
+        // Pruning resolves leaves by index; global indexes and the partition scope by name.
+        if query_auth {
+            let schema = self.table.schema();
+            super::query_auth::reject_noncanonical_leaves(&self.data_predicates, schema.fields())?;
+            if let Some(PartitionFilter::Predicate(predicate)) = &self.partition_filter {
+                super::query_auth::reject_noncanonical_leaves(
+                    std::slice::from_ref(predicate),
+                    &schema.partition_fields(),
+                )?;
+            }
+        }
 
-        let grant = self.table.authorize_read(query_auth).await?;
-        // A plan already answers COUNT/MIN/MAX from row counts and bounds.
-        if grant.as_ref().is_some_and(|g| !g.is_unrestricted()) {
-            return Err(super::query_auth::unsupported(
-                "a plan already carries file paths, row counts and column bounds that a row \
-                 filter or column masking must not expose",
-            ));
+        let grant = self
+            .table
+            .authorize_read(query_auth, self.query_auth_select())
+            .await?;
+        if let Some(grant) = &grant {
+            let fields = self.table.schema().fields();
+            let masked: Vec<&str> = grant
+                .rules()
+                .masks
+                .iter()
+                .map(|m| fields[m.column].name())
+                .collect();
+            if self.chunk_shuffle().is_some()
+                && super::query_auth::leaf_names(&self.data_predicates)
+                    .iter()
+                    .any(|name| masked.contains(&name.as_str()))
+            {
+                return Err(super::query_auth::unsupported(
+                    "chunk_shuffle only supports unmasked partition predicates",
+                ));
+            }
+            // Explicit partition selectors cannot be reapplied after masking.
+            if let Some(key) = self
+                .partition_filter_columns()
+                .into_iter()
+                .find(|key| masked.contains(&key.as_str()))
+            {
+                return Err(super::query_auth::unsupported(&format!(
+                    "the partition key '{key}' is masked, so a filter on it would match the raw \
+                     value"
+                )));
+            }
         }
         Ok(grant)
     }
@@ -1612,16 +2051,85 @@ impl<'a> PaimonTableScan<'a> {
     /// included.
     fn validate_read_options(&self) -> crate::Result<()> {
         let options = CoreOptions::new(self.table.schema().options());
-        options.ensure_read_authorized()?;
+        if !self
+            .query_auth_grant
+            .as_ref()
+            .is_some_and(|grant| grant.matches_table(&self.table))
+        {
+            options.ensure_read_authorized()?;
+        }
         options.validate_data_file_path_directory()
     }
 
-    fn validate_shard_strategy(&self) -> crate::Result<()> {
-        if self.shard().is_some() && self.chunk_shuffle().is_none() {
-            return Err(crate::Error::Unsupported {
-                message: "with_shard currently requires chunk_shuffle".to_string(),
-            });
+    /// Filter before split grouping and LIMIT. In particular, file-name shards
+    /// cannot be selected from packed splits: one split can contain files owned
+    /// by several workers. Keep chunk-shuffle input complete until shuffling.
+    fn retain_shard_entries(&self, entries: &mut Vec<ManifestEntry>) -> crate::Result<()> {
+        self.retain_bucket_entries(entries)?;
+        let Some((index, count)) = self.shard().filter(|_| self.chunk_shuffle().is_none()) else {
+            return Ok(());
+        };
+        let options = self.table.schema().core_options();
+        let has_primary_keys = !self.table.schema().primary_keys().is_empty();
+        let initial_state = self.snapshot_mode() == Some(SnapshotScanMode::All);
+        // Initial stream state merges overlapping key versions, including
+        // L0 files. Keep each bucket intact until that merge has completed.
+        // Follow-up physical events and ordinary raw scans retain Java's
+        // SplitGenerator.alwaysRawConvertible file-name distribution.
+        let by_file_name = if has_primary_keys {
+            !initial_state
+                && (options.deletion_vectors_enabled()
+                    || options.merge_engine()? == crate::spec::MergeEngine::FirstRow)
+        } else {
+            !options.data_evolution_enabled()
+        };
+        entries.retain(|entry| {
+            if by_file_name {
+                let hash = entry
+                    .file()
+                    .file_name
+                    .encode_utf16()
+                    .fold(0i32, |hash, unit| {
+                        hash.wrapping_mul(31).wrapping_add(i32::from(unit))
+                    });
+                // Take the signed remainder before abs, as Java does. Widening
+                // also handles Integer.MIN_VALUE without overflow.
+                ((i128::from(hash) % count as i128).unsigned_abs() as usize) == index
+            } else {
+                let bucket = i128::from(entry.bucket());
+                // Initial state includes postpone buckets. Assign them to
+                // one worker as well, rather than dropping a negative remainder.
+                let bucket = if initial_state { bucket.abs() } else { bucket };
+                bucket % count as i128 == index as i128
+            }
+        });
+        Ok(())
+    }
+
+    fn retain_bucket_entries(&self, entries: &mut Vec<ManifestEntry>) -> crate::Result<()> {
+        let filter = self.bucket_filter();
+        let only_real = self.only_real_buckets();
+        let levels = self.snapshot_levels();
+        if filter.is_none() && !only_real && levels.is_none() {
+            return Ok(());
         }
+        let mut selected = Vec::with_capacity(entries.len());
+        for entry in std::mem::take(entries) {
+            if levels.is_some_and(|levels| !levels.contains(&entry.file().level)) {
+                continue;
+            }
+            if only_real && entry.bucket() < 0 {
+                continue;
+            }
+            if filter
+                .map(|filter| filter.test(entry.bucket()))
+                .transpose()?
+                .unwrap_or(true)
+            {
+                selected.push(entry);
+            }
+        }
+        *entries = selected;
         Ok(())
     }
 
@@ -1778,6 +2286,25 @@ impl<'a> PaimonTableScan<'a> {
         }
     }
 
+    fn pk_sorted_index_definitions(
+        &self,
+    ) -> crate::Result<Vec<super::pk_sorted_index_scan::Definition>> {
+        let schema = self.table.schema();
+        let options = schema.core_options();
+        if schema.primary_keys().is_empty()
+            || self.is_streaming()
+            || self.scan_all_files
+            || self.row_range_optimization_disabled
+            || self.snapshot_mode().is_some()
+            || options.query_auth_enabled()
+            || !options.global_index_enabled()
+            || self.data_predicates.is_empty()
+        {
+            return Ok(Vec::new());
+        }
+        super::pk_sorted_index_scan::definitions(schema.fields(), schema.options())
+    }
+
     async fn read_index_manifest_entries(
         &self,
         snapshot: &Snapshot,
@@ -1921,7 +2448,8 @@ impl<'a> PaimonTableScan<'a> {
 
     fn requires_key_merge(&self) -> bool {
         let options = self.table.schema().core_options();
-        self.is_streaming()
+        self.snapshot_mode() == Some(SnapshotScanMode::All)
+            || self.is_streaming()
             || match options.merge_engine() {
                 Ok(crate::spec::MergeEngine::FirstRow) => !self.skip_level_zero(),
                 _ => {
@@ -1964,27 +2492,29 @@ impl<'a> PaimonTableScan<'a> {
             snapshot,
             snapshot.delta_manifest_list(),
             data_evolution_read_field_ids.as_ref(),
+            None,
         )
         .await
     }
 
-    /// Plan all selected APPEND deltas together. Entries are merged before
-    /// splitting so versions of a primary key cannot escape into separate plans.
-    async fn plan_snapshot_deltas(
+    /// Pack all selected delta or changelog files as one batch, as Java's
+    /// IncrementalDeltaStartingScanner does. Every physical event is retained;
+    /// sharding, split costs and LIMIT apply to the complete selected range.
+    async fn plan_incremental_lists(
         &self,
-        snapshots: &[Snapshot],
         end_snapshot: &Snapshot,
+        manifest_lists: Vec<String>,
+        trace: Option<&mut ScanTrace>,
     ) -> crate::Result<Plan> {
         self.validate_read_options()?;
-        self.validate_shard_strategy()?;
         let data_evolution_read_field_ids = self.projected_read_field_ids()?;
         let mut scan = self.clone();
         scan.incremental_split_mode = Some(IncrementalSplitMode::Batch);
         scan.plan_snapshot_from_lists(
             end_snapshot,
-            ManifestListSource::AppendDeltas(snapshots),
+            ManifestListSource::IncrementalLists(manifest_lists),
             data_evolution_read_field_ids.as_ref(),
-            None,
+            trace,
         )
         .await
     }
@@ -1994,7 +2524,11 @@ impl<'a> PaimonTableScan<'a> {
     /// Reuses the same split-building path as a full snapshot plan, but only
     /// reads the changelog manifest list and keeps ADD entries. Snapshots
     /// without a changelog list yield an empty plan.
-    pub(crate) async fn plan_snapshot_changelog(&self, snapshot: &Snapshot) -> crate::Result<Plan> {
+    pub(crate) async fn plan_snapshot_changelog(
+        &self,
+        snapshot: &Snapshot,
+        trace: Option<&mut ScanTrace>,
+    ) -> crate::Result<Plan> {
         self.validate_read_options()?;
         let Some(list_name) = snapshot.changelog_manifest_list() else {
             return Ok(Plan::new(Vec::new()).with_snapshot_id(snapshot.id()));
@@ -2006,6 +2540,7 @@ impl<'a> PaimonTableScan<'a> {
             snapshot,
             list_name,
             data_evolution_read_field_ids.as_ref(),
+            trace,
         )
         .await
     }
@@ -2015,54 +2550,13 @@ impl<'a> PaimonTableScan<'a> {
         snapshot: &Snapshot,
         manifest_list_name: &str,
         data_evolution_read_field_ids: Option<&HashSet<i32>>,
+        trace: Option<&mut ScanTrace>,
     ) -> crate::Result<Plan> {
-        if matches!(self.limit, Some(0)) {
-            return Ok(Plan::new(Vec::new()).with_snapshot_id(snapshot.id()));
-        }
-        let core_options = CoreOptions::new(self.table.schema().options());
-        let data_evolution_enabled = core_options.data_evolution_enabled();
-        let global_index_settings =
-            self.global_index_scan_settings(&core_options, data_evolution_enabled)?;
-        let index_entries = self
-            .read_index_manifest_entries(
-                snapshot,
-                global_index_settings.is_some(),
-                core_options.deletion_vectors_enabled() && !self.is_streaming(),
-            )
-            .await?;
-        let manifest_row_ranges = self
-            .manifest_row_ranges(snapshot, index_entries.as_deref(), global_index_settings)
-            .await?;
-        if manifest_row_ranges.as_ref().is_some_and(Vec::is_empty) {
-            return Ok(Plan::new(Vec::new()).with_snapshot_id(snapshot.id()));
-        }
-        // Positional scans count all candidate row IDs. Pruning a preceding
-        // manifest or file here would renumber the surviving rows; intersect
-        // explicit/global-index ranges after assigning positions instead.
-        let row_range_index = if data_evolution_enabled && self.row_position_selection().is_none() {
-            manifest_row_ranges.clone().map(RowRangeIndex::create)
-        } else {
-            None
-        };
-        let entries = self
-            .plan_manifest_list_entries(manifest_list_name, row_range_index.as_ref())
-            .await?;
-        let effective_row_ranges = self
-            .effective_row_ranges(
-                snapshot,
-                &entries,
-                index_entries.as_deref(),
-                global_index_settings,
-                manifest_row_ranges,
-            )
-            .await?;
-        self.plan_snapshot_from_entries(
-            snapshot.clone(),
-            entries,
+        self.plan_snapshot_from_lists(
+            snapshot,
+            ManifestListSource::IncrementalList(manifest_list_name),
             data_evolution_read_field_ids,
-            index_entries,
-            effective_row_ranges,
-            None,
+            trace,
         )
         .await
     }
@@ -2120,6 +2614,7 @@ impl<'a> PaimonTableScan<'a> {
                 None,
                 before_index_entries,
                 None,
+                &[],
                 None,
             )
             .await?;
@@ -2130,6 +2625,7 @@ impl<'a> PaimonTableScan<'a> {
                 None,
                 after_index_entries,
                 None,
+                &[],
                 None,
             )
             .await?;
@@ -2157,132 +2653,6 @@ impl<'a> PaimonTableScan<'a> {
             });
         }
         Ok(())
-    }
-
-    /// Read entries from a single manifest list (delta or changelog) with
-    /// partition / bucket filter pushdown matching the full scan path.
-    async fn plan_manifest_list_entries(
-        &self,
-        manifest_list_name: &str,
-        row_range_index: Option<&RowRangeIndex>,
-    ) -> crate::Result<Vec<ManifestEntry>> {
-        let file_io = self.table.file_io();
-        let table_path = self.table.location();
-        let core_options = CoreOptions::new(self.table.schema().options());
-        let has_primary_keys = !self.table.schema().primary_keys().is_empty();
-        let partition_fields = self.table.schema().partition_fields();
-
-        let mut manifest_metas =
-            read_manifest_list(file_io, table_path, manifest_list_name).await?;
-
-        if let Some(pf) = self.partition_filter.as_ref() {
-            manifest_metas.retain(|meta| pf.matches_manifest(meta, &partition_fields));
-        }
-        if let Some(index) = row_range_index {
-            retain_manifest_row_ranges(&mut manifest_metas, index);
-        }
-
-        let bucket_key_fields: Vec<DataField> = if self.bucket_predicate.is_none() {
-            Vec::new()
-        } else {
-            let bucket_keys = core_options.bucket_key().unwrap_or_else(|| {
-                if has_primary_keys {
-                    self.table.schema().trimmed_primary_keys()
-                } else {
-                    Vec::new()
-                }
-            });
-            bucket_keys
-                .iter()
-                .filter_map(|key| {
-                    self.table
-                        .schema()
-                        .fields()
-                        .iter()
-                        .find(|f| f.name() == key)
-                        .cloned()
-                })
-                .collect::<Vec<_>>()
-        };
-        let bucket_function_type = core_options.bucket_function_type()?;
-
-        retain_manifest_buckets(
-            &mut manifest_metas,
-            has_primary_keys && !self.scan_all_files,
-            self.bucket_predicate.as_ref(),
-            &bucket_key_fields,
-            bucket_function_type,
-        );
-
-        let base_path = format!("{}/{}", table_path.trim_end_matches('/'), MANIFEST_DIR);
-        let shared_cache = SharedSchemaCache::new();
-        let partition_filter = self.partition_filter.as_ref();
-        let bucket_predicate = self.bucket_predicate.as_ref();
-        let scan_all_files = self.scan_all_files;
-
-        let mut entries = Vec::new();
-        for meta in manifest_metas {
-            let path = format!("{base_path}/{}", meta.file_name());
-            // This path validates incremental/changelog manifests before its
-            // existing post-read row-range pruning, so do not hide DELETEs at
-            // the block layer.
-            let bytes = read_manifest_bytes_with_sidecar(
-                file_io,
-                &path,
-                &meta,
-                core_options.manifest_sidecar_enabled(),
-                ManifestSidecarPruning {
-                    row_range_index: None,
-                    partition_filter,
-                    partition_arity: partition_fields.len(),
-                    bucket_predicate,
-                    bucket_key_fields: &bucket_key_fields,
-                    bucket_function_type,
-                },
-            )
-            .await?;
-            let mut bucket_cache: HashMap<i32, Option<HashSet<i32>>> = HashMap::new();
-            let manifest_entries = crate::spec::avro::from_manifest_bytes_filtered_shared(
-                &bytes,
-                &shared_cache,
-                &mut |_kind, partition_bytes, bucket, total_buckets| {
-                    if has_primary_keys && !scan_all_files && bucket < 0 {
-                        return false;
-                    }
-                    if let Some(pred) = bucket_predicate {
-                        let targets = bucket_cache.entry(total_buckets).or_insert_with(|| {
-                            compute_target_buckets(
-                                pred,
-                                &bucket_key_fields,
-                                bucket_function_type,
-                                total_buckets,
-                            )
-                        });
-                        if let Some(targets) = targets {
-                            if !targets.contains(&bucket) {
-                                return false;
-                            }
-                        }
-                    }
-                    if let Some(pf) = partition_filter {
-                        match pf.matches_entry(partition_bytes) {
-                            Ok(false) => return false,
-                            Ok(true) => {}
-                            Err(_) => {}
-                        }
-                    }
-                    true
-                },
-            )?;
-            entries.extend(manifest_entries);
-        }
-        validate_incremental_entries(&entries)?;
-        let entries = if let Some(index) = row_range_index {
-            retain_manifest_entry_row_ranges(entries, index)
-        } else {
-            entries
-        };
-        Ok(entries)
     }
 
     async fn plan_snapshot(
@@ -2317,10 +2687,11 @@ impl<'a> PaimonTableScan<'a> {
         let data_evolution_enabled = core_options.data_evolution_enabled();
         let global_index_settings =
             self.global_index_scan_settings(&core_options, data_evolution_enabled)?;
+        let pk_sorted_index_definitions = self.pk_sorted_index_definitions()?;
         let index_entries = self
             .read_index_manifest_entries(
                 snapshot,
-                global_index_settings.is_some(),
+                global_index_settings.is_some() || !pk_sorted_index_definitions.is_empty(),
                 core_options.deletion_vectors_enabled() && !self.is_streaming(),
             )
             .await?;
@@ -2363,18 +2734,21 @@ impl<'a> PaimonTableScan<'a> {
             data_evolution_read_field_ids,
             index_entries,
             effective_row_ranges,
+            &pk_sorted_index_definitions,
             trace,
         )
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn plan_snapshot_from_entries(
         &self,
         snapshot: Snapshot,
-        entries: Vec<ManifestEntry>,
+        mut entries: Vec<ManifestEntry>,
         data_evolution_read_field_ids: Option<&HashSet<i32>>,
         index_entries: Option<Vec<IndexManifestEntry>>,
         effective_row_ranges: Option<Vec<RowRange>>,
+        pk_sorted_index_definitions: &[super::pk_sorted_index_scan::Definition],
         mut trace: Option<&mut ScanTrace>,
     ) -> crate::Result<Plan> {
         let table_path = self.table.location();
@@ -2388,6 +2762,8 @@ impl<'a> PaimonTableScan<'a> {
         let target_split_size = core_options.source_split_target_size();
         let open_file_cost = core_options.source_split_open_file_cost();
         let partition_keys = self.table.schema().partition_keys();
+
+        self.retain_shard_entries(&mut entries)?;
 
         let row_position_selection = self.row_position_selection();
         let append_row_position_selection = (!data_evolution_enabled)
@@ -2441,7 +2817,7 @@ impl<'a> PaimonTableScan<'a> {
                 for entry in entries {
                     if entry.file().schema_id == current_schema_id
                         || data_file_matches_predicates_for_table(
-                            self.table,
+                            &self.table,
                             entry.file(),
                             &stats_pruning_predicates,
                             &key_stats_predicates,
@@ -2578,7 +2954,7 @@ impl<'a> PaimonTableScan<'a> {
                     let mut groups = Vec::with_capacity(before);
                     for group in row_id_groups {
                         if data_evolution_group_matches_predicates_for_table(
-                            self.table,
+                            &self.table,
                             &group,
                             &self.data_predicates,
                             &mut stats_schema_cache,
@@ -2787,7 +3163,19 @@ impl<'a> PaimonTableScan<'a> {
             splits
         };
         let splits = if let Some(config) = self.chunk_shuffle() {
-            chunk_shuffle_splits(self.table, splits, config, self.shard()).await?
+            chunk_shuffle_splits(&self.table, splits, config, self.shard()).await?
+        } else {
+            splits
+        };
+        let splits = if !pk_sorted_index_definitions.is_empty() {
+            super::pk_sorted_index_scan::refine(
+                &self.table,
+                splits,
+                index_entries.as_deref().unwrap_or_default(),
+                pk_sorted_index_definitions,
+                &self.data_predicates,
+            )
+            .await?
         } else {
             splits
         };
@@ -3263,6 +3651,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    &[],
                     None,
                 )
                 .await
@@ -3420,6 +3809,269 @@ mod tests {
             ("source.split.target-size".to_string(), "1b".to_string()),
             ("source.split.open-file-cost".to_string(), "1b".to_string()),
         ]))
+    }
+
+    #[tokio::test]
+    async fn test_plain_shard_uses_java_file_names_before_limit() {
+        let table = scan_trace_small_split_table("memory:/plain_file_shards");
+        setup_scan_trace_dirs(&table).await;
+        // Java String.hashCode fixtures: Aa and BB collide at 2112;
+        // polygenelubricants hashes to Integer.MIN_VALUE.
+        let names = ["Aa", "BB", "polygenelubricants", "😀", "a"];
+        let files = names
+            .iter()
+            .map(|name| stats_trace_file(name, 0, 1))
+            .collect();
+        TableCommit::new(table.clone(), "file-shards".into())
+            .commit(vec![CommitMessage::new(
+                BinaryRowBuilder::new(0).build_serialized(),
+                0,
+                files,
+            )])
+            .await
+            .unwrap();
+
+        // abs(hash % 3), rather than abs(hash) % 3 or floorMod(hash, 3).
+        let expected = [
+            vec!["Aa", "BB"],
+            vec!["a", "😀"],
+            vec!["polygenelubricants"],
+        ];
+        for (index, expected) in expected.iter().enumerate() {
+            let scan = table
+                .new_read_builder()
+                .new_scan()
+                .with_shard(index, 3)
+                .unwrap();
+            let plan = scan.plan().await.unwrap();
+            let mut actual = plan
+                .splits()
+                .iter()
+                .flat_map(|s| s.data_files())
+                .map(|f| f.file_name.as_str())
+                .collect::<Vec<_>>();
+            actual.sort_unstable();
+            assert_eq!(&actual, expected);
+            assert_eq!(plan.snapshot_id(), Some(1));
+            let limited = table
+                .new_read_builder()
+                .with_limit(1)
+                .new_scan()
+                .with_shard(index, 3)
+                .unwrap()
+                .plan()
+                .await
+                .unwrap();
+            assert_eq!(limited.splits().len(), 1);
+            assert!(expected.contains(&limited.splits()[0].data_files()[0].file_name.as_str()));
+        }
+        let empty = table
+            .new_read_builder()
+            .new_scan()
+            .with_shard(5, 100)
+            .unwrap()
+            .plan()
+            .await
+            .unwrap();
+        assert!(empty.splits().is_empty());
+        assert_eq!(empty.snapshot_id(), Some(1));
+    }
+
+    #[tokio::test]
+    async fn test_plain_pk_shards_keep_every_version_in_the_bucket() {
+        for engine in ["deduplicate", "partial-update", "aggregation"] {
+            let table = pk_stats_gate_table(&format!("memory:/bucket_shards_{engine}"))
+                .copy_with_options(HashMap::from([
+                    ("bucket".into(), "4".into()),
+                    ("merge-engine".into(), engine.into()),
+                    ("source.split.target-size".into(), "1b".into()),
+                ]));
+            setup_scan_trace_dirs(&table).await;
+            let commit = TableCommit::new(table.clone(), "bucket-shards".into());
+            for version in 0..2 {
+                let messages = (0..4)
+                    .map(|bucket| {
+                        let mut file =
+                            pk_stats_file(&format!("b{bucket}-v{version}"), (1, 2), (1, 2));
+                        file.min_key = int_stats_row(Some(1));
+                        file.max_key = int_stats_row(Some(2));
+                        file.level = 0;
+                        CommitMessage::new(
+                            BinaryRowBuilder::new(0).build_serialized(),
+                            bucket,
+                            vec![file],
+                        )
+                    })
+                    .collect();
+                commit.commit(messages).await.unwrap();
+            }
+            for index in 0..6 {
+                let mut builder = table.new_read_builder();
+                builder.with_limit(1);
+                let (plan, trace) = builder
+                    .new_scan()
+                    .with_shard(index, 6)
+                    .unwrap()
+                    .plan_with_trace()
+                    .await
+                    .unwrap();
+                assert_eq!(plan.snapshot_id(), Some(2));
+                assert_eq!(trace.final_splits, plan.splits().len());
+                if index < 4 {
+                    assert_eq!(plan.splits().len(), 1);
+                    let split = &plan.splits()[0];
+                    assert_eq!(split.bucket(), index as i32);
+                    assert!(!split.raw_convertible());
+                    assert_eq!(split.data_files().len(), 2);
+                    let names = split
+                        .data_files()
+                        .iter()
+                        .map(|f| f.file_name.as_str())
+                        .collect::<HashSet<_>>();
+                    assert_eq!(
+                        names,
+                        HashSet::from([
+                            format!("b{index}-v0").as_str(),
+                            format!("b{index}-v1").as_str()
+                        ])
+                    );
+                } else {
+                    assert!(plan.splits().is_empty());
+                }
+            }
+            // Time travel and incremental batches use the same shard before
+            // splitting. Neither may accidentally consult the newest state.
+            let old =
+                table.copy_with_options(HashMap::from([("scan.snapshot-id".into(), "1".into())]));
+            let old_plan = old
+                .new_read_builder()
+                .new_scan()
+                .with_shard(3, 4)
+                .unwrap()
+                .plan()
+                .await
+                .unwrap();
+            assert_eq!(old_plan.snapshot_id(), Some(1));
+            assert_eq!(old_plan.splits()[0].data_files()[0].file_name, "b3-v0");
+            let delta = table
+                .new_read_builder()
+                .new_incremental_scan(crate::table::IncrementalScanMode::Delta, 1, 2)
+                .with_shard(3, 4)
+                .unwrap()
+                .plan_combined_delta()
+                .await
+                .unwrap();
+            assert_eq!(delta.snapshot_id(), Some(2));
+            assert_eq!(delta.splits().len(), 1);
+            assert!(delta.splits()[0].is_streaming());
+            assert_eq!(delta.splits()[0].data_files()[0].file_name, "b3-v1");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_plain_raw_pk_shards_use_file_names_instead_of_buckets() {
+        for (engine, dv) in [("first-row", false), ("deduplicate", true)] {
+            for all_files in [false, true] {
+                let table =
+                    pk_stats_gate_table(&format!("memory:/raw_shards_{engine}_{all_files}"))
+                        .copy_with_options(HashMap::from([
+                            ("merge-engine".into(), engine.into()),
+                            ("deletion-vectors.enabled".into(), dv.to_string()),
+                            ("source.split.target-size".into(), "1b".into()),
+                        ]));
+                setup_scan_trace_dirs(&table).await;
+                let files = ["Aa", "BB", "polygenelubricants", "😀", "a"]
+                    .iter()
+                    .map(|name| pk_stats_file(name, (1, 2), (1, 2)))
+                    .collect();
+                TableCommit::new(table.clone(), "raw-shards".into())
+                    .commit(vec![CommitMessage::new(
+                        BinaryRowBuilder::new(0).build_serialized(),
+                        0,
+                        files,
+                    )])
+                    .await
+                    .unwrap();
+                let expected = [
+                    vec!["Aa", "BB"],
+                    vec!["a", "😀"],
+                    vec!["polygenelubricants"],
+                ];
+                for (index, expected) in expected.iter().enumerate() {
+                    let scan = table.new_read_builder().new_scan();
+                    let scan = if all_files {
+                        scan.with_scan_all_files()
+                    } else {
+                        scan
+                    };
+                    let plan = scan.with_shard(index, 3).unwrap().plan().await.unwrap();
+                    let mut names = plan
+                        .splits()
+                        .iter()
+                        .flat_map(|split| split.data_files())
+                        .map(|file| file.file_name.as_str())
+                        .collect::<Vec<_>>();
+                    names.sort_unstable();
+                    assert_eq!(&names, expected, "{engine}, all_files={all_files}");
+                    assert!(plan.splits().iter().all(|split| split.bucket() == 0));
+                }
+                // Streaming reads retain L0 and still select by file name.
+                let delta = table
+                    .new_read_builder()
+                    .new_incremental_scan(crate::table::IncrementalScanMode::Delta, 0, 1)
+                    .with_shard(2, 3)
+                    .unwrap()
+                    .plan_combined_delta()
+                    .await
+                    .unwrap();
+                assert_eq!(delta.splits().len(), 1);
+                assert_eq!(
+                    delta.splits()[0].data_files()[0].file_name,
+                    "polygenelubricants"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_plain_data_evolution_shards_keep_column_groups_in_the_bucket() {
+        let table = data_evolution_test_table(
+            "memory:/de_bucket_shards",
+            two_column_schema(0, "id", "name"),
+        )
+        .copy_with_options(HashMap::from([("bucket".into(), "-1".into())]));
+        setup_scan_trace_dirs(&table).await;
+        let messages = vec![CommitMessage::new(
+            BinaryRowBuilder::new(0).build_serialized(),
+            0,
+            vec![
+                make_evo_file_with_cols("id", 2, 1, 0, &["id"]),
+                make_evo_file_with_cols("name", 2, 2, 0, &["name"]),
+            ],
+        )];
+        TableCommit::new(table.clone(), "de-shards".into())
+            .commit(messages)
+            .await
+            .unwrap();
+        for index in 0..3 {
+            let plan = table
+                .new_read_builder()
+                .new_scan()
+                .with_shard(index, 3)
+                .unwrap()
+                .plan()
+                .await
+                .unwrap();
+            assert_eq!(plan.snapshot_id(), Some(1));
+            if index == 0 {
+                assert_eq!(plan.splits().len(), 1);
+                assert_eq!(plan.splits()[0].bucket(), index as i32);
+                assert_eq!(plan.splits()[0].data_files().len(), 2);
+                assert!(!plan.splits()[0].raw_convertible());
+            } else {
+                assert!(plan.splits().is_empty());
+            }
+        }
     }
 
     pub(super) async fn setup_scan_trace_dirs(table: &Table) {
@@ -4468,6 +5120,7 @@ mod tests {
                             None,
                             None,
                             None,
+                            &[],
                             None,
                         )
                         .await
@@ -4545,6 +5198,7 @@ mod tests {
                                 None,
                                 None,
                                 None,
+                                &[],
                                 None,
                             )
                             .await
@@ -4641,6 +5295,7 @@ mod tests {
                         None,
                         None,
                         None,
+                        &[],
                         None,
                     )
                     .await
@@ -6090,6 +6745,64 @@ mod tests {
         assert!(entries.is_none());
     }
 
+    #[tokio::test]
+    async fn test_pk_index_scan_uses_resolved_definitions_instead_of_option_presence() {
+        let table = pk_stats_gate_table("memory:/pk_index_definition_gate");
+        setup_scan_trace_dirs(&table).await;
+        TableCommit::new(table.clone(), "definition-gate".into())
+            .commit(vec![CommitMessage::new(
+                BinaryRow::new(0).to_serialized_bytes(),
+                0,
+                vec![pk_stats_file("data.parquet", (1, 2), (10, 20))],
+            )])
+            .await
+            .unwrap();
+        let snapshot = table
+            .snapshot_manager()
+            .get_latest_snapshot()
+            .await
+            .unwrap()
+            .unwrap();
+        let mut json = serde_json::to_value(&snapshot).unwrap();
+        json["indexManifest"] = serde_json::json!("missing-index-manifest");
+        let snapshot: Snapshot = serde_json::from_value(json).unwrap();
+        let predicate = PredicateBuilder::new(table.schema().fields())
+            .equal("value", Datum::Int(10))
+            .unwrap();
+        for (key, columns, enabled, uses_index) in [
+            ("pk-btree.index.columns", "", true, false),
+            ("pk-btree.index.columns", "unknown", true, false),
+            ("pk-bitmap.index.columns", "unknown", true, false),
+            ("pk-btree.index.columns", "value", false, false),
+            ("pk-btree.index.columns", "value", true, true),
+            ("pk-bitmap.index.columns", "value", true, true),
+        ] {
+            let configured = table.copy_with_options(HashMap::from([
+                (key.into(), columns.into()),
+                ("global-index.enabled".into(), enabled.to_string()),
+            ]));
+            let scan =
+                PaimonTableScan::new(&configured, None, vec![predicate.clone()], None, None, None);
+            let plan = scan.plan_snapshot(snapshot.clone(), None, None).await;
+            if uses_index {
+                assert!(plan
+                    .unwrap_err()
+                    .to_string()
+                    .contains("missing-index-manifest"));
+            } else {
+                let plan = plan.unwrap();
+                assert_eq!(plan.snapshot_id(), Some(snapshot.id()));
+                let files: Vec<_> = plan
+                    .splits()
+                    .iter()
+                    .flat_map(|split| split.data_files())
+                    .map(|file| file.file_name.as_str())
+                    .collect();
+                assert_eq!(files, vec!["data.parquet"]);
+            }
+        }
+    }
+
     // ======================== Bucket predicate filtering ========================
 
     fn bucket_key_fields() -> Vec<DataField> {
@@ -6532,7 +7245,7 @@ mod tests {
         assert_eq!(delta.snapshot_id(), Some(1));
         let changelog = builder
             .new_scan()
-            .plan_snapshot_changelog(&snapshot)
+            .plan_snapshot_changelog_with_trace(&snapshot, None)
             .await
             .unwrap();
         assert!(changelog.splits().is_empty());
@@ -6604,3 +7317,7 @@ mod tests {
         assert_eq!(empty.snapshot_id(), Some(1));
     }
 }
+
+#[cfg(test)]
+#[path = "snapshot_scan_tests.rs"]
+mod snapshot_tests;

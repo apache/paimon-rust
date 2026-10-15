@@ -19,6 +19,7 @@ pub(crate) mod cache;
 mod file_io;
 pub(crate) mod uri_reader;
 pub use file_io::*;
+pub use uri_reader::{UriInputStream, UriReader, UriReaderFactory};
 
 mod storage;
 pub use storage::*;

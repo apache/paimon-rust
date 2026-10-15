@@ -52,6 +52,8 @@ pub(super) fn supported_key_type(data_type: &DataType) -> bool {
             | DataType::Int16
             | DataType::Int32
             | DataType::Int64
+            | DataType::Float32
+            | DataType::Float64
             | DataType::UInt8
             | DataType::UInt16
             | DataType::UInt32

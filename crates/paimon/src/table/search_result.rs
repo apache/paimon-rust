@@ -45,7 +45,9 @@ pub struct PrimaryKeySearchPosition {
 #[derive(Debug, Clone)]
 enum SearchHits {
     DataEvolution {
-        vector_column: String,
+        // Vector results retain their target-column validation at read time;
+        // full-text columns have already been validated by FullTextRead.
+        vector_column: Option<String>,
         hits: ScoredRowIds,
     },
     PrimaryKey {
@@ -54,9 +56,9 @@ enum SearchHits {
     },
 }
 
-/// Ranked vector-search hits together with the source snapshot needed to read them.
+/// Ranked search hits together with the source snapshot needed to read them.
 ///
-/// Both single and batch searches return this type. DE hits use global row IDs;
+/// Single/batch vector and full-text searches return this type. DE hits use global row IDs;
 /// PK hits use physical file positions, as in Java's `PrimaryKeyScoredResult`.
 /// Searching does not materialize projected user columns. Use
 /// [`new_read_builder`](Self::new_read_builder) when rows are needed.
@@ -73,15 +75,54 @@ impl SearchResult {
         vector_column: String,
         hits: ScoredRowIds,
     ) -> Self {
-        let snapshot_id = table.travel_snapshot.as_ref().map(|snapshot| snapshot.id());
+        let snapshot_id = table.travel_snapshot().map(|snapshot| snapshot.id());
         Self {
             table,
             snapshot_id,
             hits: SearchHits::DataEvolution {
-                vector_column,
+                vector_column: Some(vector_column),
                 hits,
             },
         }
+    }
+
+    #[cfg(feature = "fulltext")]
+    pub(super) fn from_full_text_row_ids(table: Arc<Table>, hits: ScoredRowIds) -> Self {
+        let snapshot_id = table.travel_snapshot().map(|snapshot| snapshot.id());
+        Self {
+            table,
+            snapshot_id,
+            hits: SearchHits::DataEvolution {
+                vector_column: None,
+                hits,
+            },
+        }
+    }
+
+    #[cfg(feature = "fulltext")]
+    pub(super) fn from_full_text_primary_key(
+        table: Arc<Table>,
+        snapshot_id: i64,
+        candidates: Vec<super::pk_full_text_read::PrimaryKeyFullTextCandidate>,
+        source_splits: &[super::pk_full_text_scan::PrimaryKeyFullTextSearchSplit],
+    ) -> crate::Result<Self> {
+        let positions = candidates
+            .iter()
+            .map(|c| PrimaryKeySearchPosition {
+                partition: c.partition.clone(),
+                bucket: c.bucket,
+                data_file_name: c.data_file_name.clone(),
+                row_position: c.row_position,
+                score: c.score,
+            })
+            .collect();
+        let splits =
+            super::pk_full_text_read::build_full_text_indexed_splits(candidates, source_splits)?;
+        Ok(Self {
+            table,
+            snapshot_id: (snapshot_id != 0).then_some(snapshot_id),
+            hits: SearchHits::PrimaryKey { positions, splits },
+        })
     }
 
     pub(super) fn from_primary_key(
@@ -156,6 +197,21 @@ impl SearchResult {
         }
     }
 
+    /// Snapshot-scoped PK selections in Java SplitSerializer v1 format.
+    /// The ranges are physical file positions and scores are aligned to them.
+    pub fn serialize_primary_key_splits(&self) -> crate::Result<Vec<Vec<u8>>> {
+        self.indexed_splits()?
+            .iter()
+            .map(|selected| {
+                selected
+                    .split
+                    .clone()
+                    .with_selected_row_ranges(selected.row_ranges.clone())
+                    .serialize_split_v1_with_scores(selected.scores.as_deref())
+            })
+            .collect()
+    }
+
     /// Snapshot-scoped file metadata and selections, reused when hybrid fusion
     /// builds its final selections without scanning the source table again.
     pub(super) fn indexed_splits(&self) -> crate::Result<&[PkVectorIndexedSplit]> {
@@ -185,7 +241,7 @@ fn no_global_row_ids() -> crate::Error {
 
 /// Reads selected user columns and `__paimon_search_score`, in relevance order.
 /// Internal global row IDs and PK positions are not output. Reading a result
-/// never reruns vector search or replans its primary-key source files.
+/// never reruns search or replans its primary-key source files.
 #[derive(Debug, Clone)]
 pub struct SearchResultReadBuilder<'a> {
     result: &'a SearchResult,
@@ -208,8 +264,12 @@ impl SearchResultReadBuilder<'_> {
                 vector_column,
                 hits,
             } => {
-                let read_type =
-                    DeVectorRead::read_type(table, vector_column, self.projection.as_deref())?;
+                let read_type = match vector_column {
+                    Some(column) => {
+                        DeVectorRead::read_type(table, column, self.projection.as_deref())?
+                    }
+                    None => resolve_materialize_read_type(table, self.projection.as_deref())?,
+                };
                 materialize_row_ids(table, hits, read_type).await
             }
             SearchHits::PrimaryKey { positions, splits } => {

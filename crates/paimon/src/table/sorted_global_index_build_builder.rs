@@ -37,8 +37,8 @@ use super::sorted_global_index_options::SortedIndexWriteOptions;
 use crate::btree::key_serde::KeyComparator;
 use crate::btree::{make_key_comparator, serialize_datum};
 use crate::fm_index::{FMOptions, FMWriteOptions};
-use crate::spec::{CoreOptions, DataType, Datum};
-use crate::table::{CommitMessage, RowRange, SnapshotManager, Table, TableCommit};
+use crate::spec::{CoreOptions, DataType, Datum, Predicate};
+use crate::table::{CommitMessage, RowRange, Table, TableCommit};
 use crate::{Error, Result};
 use std::collections::HashMap;
 
@@ -63,16 +63,13 @@ fn make_index_key_codec(index_type: &str, data_type: &DataType) -> (KeyComparato
     }
 }
 
-pub struct SortedGlobalIndexBuildBuilder<'a> {
+pub(super) struct SortedGlobalIndexBuildBuilder<'a> {
     table: &'a Table,
     index_column: Option<IndexColumns>,
     index_type: String,
     options: HashMap<String, String>,
+    partition_filter: Option<Predicate>,
 }
-
-/// Backward-compatible name retained for callers that used the original
-/// BTree-only builder API before it also supported bitmap and multivalue.
-pub type BTreeGlobalIndexBuildBuilder<'a> = SortedGlobalIndexBuildBuilder<'a>;
 
 impl<'a> SortedGlobalIndexBuildBuilder<'a> {
     pub(crate) fn new(table: &'a Table) -> Self {
@@ -81,12 +78,8 @@ impl<'a> SortedGlobalIndexBuildBuilder<'a> {
             index_column: None,
             index_type: BTREE_GLOBAL_INDEX_TYPE.to_string(),
             options: HashMap::new(),
+            partition_filter: None,
         }
-    }
-
-    pub fn with_index_column(&mut self, column: &str) -> &mut Self {
-        self.index_column = Some(IndexColumns::Column(column.to_string()));
-        self
     }
 
     /// Select BTree columns in physical tuple-key order.
@@ -107,7 +100,29 @@ impl<'a> SortedGlobalIndexBuildBuilder<'a> {
         self
     }
 
-    pub async fn execute(&self) -> Result<usize> {
+    /// Restrict the build to partitions using table-field indices.
+    /// Multiple calls combine the partition predicates with AND.
+    pub fn with_partition_filter(&mut self, filter: Predicate) -> Result<&mut Self> {
+        super::partition_filter::validate_partition_filter(self.table, &filter)?;
+        self.partition_filter = Some(match self.partition_filter.take() {
+            Some(previous) => Predicate::and(vec![previous, filter]),
+            None => filter,
+        });
+        Ok(self)
+    }
+
+    fn new_commit(&self) -> TableCommit {
+        TableCommit::new(
+            self.table.clone(),
+            format!(
+                "global-index-{}-create-{}",
+                self.index_type,
+                uuid::Uuid::new_v4()
+            ),
+        )
+    }
+
+    pub(super) async fn prepare(&self) -> Result<(Option<i64>, Vec<CommitMessage>)> {
         // Building the index scans the table's rows.
         CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
 
@@ -159,21 +174,15 @@ impl<'a> SortedGlobalIndexBuildBuilder<'a> {
             .collect::<Vec<_>>();
         let extra_field_ids = (!extra_field_ids.is_empty()).then_some(extra_field_ids);
 
-        let snapshot_manager = SnapshotManager::new(
-            self.table.file_io().clone(),
-            self.table.location().to_string(),
-        );
-        let snapshot = snapshot_manager
-            .get_latest_snapshot()
-            .await?
-            .ok_or_else(|| Error::DataInvalid {
-                message: "Cannot build sorted global index without a snapshot".to_string(),
-                source: None,
-            })?;
+        let Some(snapshot) = self.table.snapshot_manager().get_latest_snapshot().await? else {
+            return Ok((None, vec![]));
+        };
 
-        let manifest_entries = self
-            .table
-            .new_read_builder()
+        let mut read_builder = self.table.new_read_builder();
+        if let Some(filter) = &self.partition_filter {
+            read_builder.with_filter(filter.clone());
+        }
+        let manifest_entries = read_builder
             .new_scan()
             .with_scan_all_files()
             .plan_manifest_entries(&snapshot)
@@ -198,7 +207,7 @@ impl<'a> SortedGlobalIndexBuildBuilder<'a> {
             &indexed,
         )?;
         if shards.is_empty() {
-            return Ok(0);
+            return Ok((Some(snapshot.id()), vec![]));
         }
 
         crate::table::global_index_build_common::validate_existing_index_overlap(
@@ -214,14 +223,7 @@ impl<'a> SortedGlobalIndexBuildBuilder<'a> {
         )
         .await?;
 
-        let commit = TableCommit::new(
-            self.table.clone(),
-            format!(
-                "global-index-{}-create-{}",
-                index_type,
-                uuid::Uuid::new_v4()
-            ),
-        );
+        let commit = self.new_commit();
         let shard_count = shards.len();
         let mut messages = Vec::with_capacity(shard_count);
         for shard in shards {
@@ -231,6 +233,8 @@ impl<'a> SortedGlobalIndexBuildBuilder<'a> {
             {
                 Ok(index_file) => index_file,
                 Err(error) => {
+                    // Earlier outputs are private to this preparation; nothing
+                    // has been returned to a caller or submitted for commit.
                     let _ = commit.abort(&messages).await;
                     return Err(error);
                 }
@@ -241,13 +245,12 @@ impl<'a> SortedGlobalIndexBuildBuilder<'a> {
             messages.push(message);
         }
 
-        commit
-            .commit_if_latest_snapshot(messages, snapshot.id())
-            .await?;
-
-        Ok(shard_count)
+        Ok((Some(snapshot.id()), messages))
     }
 }
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod preparation_tests;

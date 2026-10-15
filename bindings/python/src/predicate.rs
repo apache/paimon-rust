@@ -15,7 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use paimon::spec::{DataField, DataType, Datum, DecimalType, Predicate, PredicateBuilder};
+use paimon::spec::{
+    DataField, DataType, Datum, DecimalType, Predicate, PredicateBuilder, TableSchema,
+};
 use pyo3::exceptions::{PyNotImplementedError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyTzInfoAccess;
@@ -372,7 +374,7 @@ const METHOD_NOT_SUPPORTED: &[&str] = &["not"];
 ///
 /// Errors:
 /// - `ValueError` for unknown fields, missing keys, wrong literal counts, `None`
-///   literals, empty/missing `children`, non-dict children, or non-list
+///   comparison literals outside IN/NOT IN, empty/missing `children`, non-dict children, or non-list
 ///   `literals`/`children`.
 /// - `NotImplementedError` for unsupported operators or unsupported literal types.
 pub(crate) fn dict_to_predicate(
@@ -419,29 +421,13 @@ pub(crate) fn dict_to_predicate(
     }
 }
 
-/// Convert against table fields plus the synthesized `_ROW_ID` field.
+/// Use the core read schema, including only metadata the table provides.
 pub(crate) fn dict_to_table_predicate(
     node: &Bound<'_, PyDict>,
-    fields: &[DataField],
+    schema: &TableSchema,
     case_sensitive: bool,
 ) -> PyResult<Predicate> {
-    use paimon::spec::{BigIntType, ROW_ID_FIELD_ID, ROW_ID_FIELD_NAME};
-    let mut fields = fields.to_vec();
-    let has_row_id = fields.iter().any(|field| {
-        if case_sensitive {
-            field.name() == ROW_ID_FIELD_NAME
-        } else {
-            field.name().eq_ignore_ascii_case(ROW_ID_FIELD_NAME)
-        }
-    });
-    if !has_row_id {
-        fields.push(DataField::new(
-            ROW_ID_FIELD_ID,
-            ROW_ID_FIELD_NAME.into(),
-            DataType::BigInt(BigIntType::with_nullable(true)),
-        ));
-    }
-    dict_to_predicate(node, &fields, case_sensitive)
+    dict_to_predicate(node, &schema.fields_with_read_metadata(), case_sensitive)
 }
 
 /// Resolve a leaf's field name to its schema [`DataType`] under the given case
@@ -496,7 +482,7 @@ fn leaf_to_predicate(
 
     // Convert literals (DataType-driven), wrapping NotImplemented type messages
     // with field context.
-    let to_datums = |obj: Option<Bound<'_, PyAny>>| -> PyResult<Vec<Datum>> {
+    let to_nullable_datums = |obj: Option<Bound<'_, PyAny>>| -> PyResult<Vec<Option<Datum>>> {
         let mut out = Vec::new();
         if let Some(obj) = obj {
             let list = obj
@@ -504,17 +490,28 @@ fn leaf_to_predicate(
                 .map_err(|_| PyValueError::new_err("'literals' must be a list"))?;
             for item in list.iter() {
                 if item.is_none() {
-                    return Err(PyValueError::new_err(
-                        "None is not a valid comparison literal; use isNull/isNotNull",
-                    ));
+                    out.push(None);
+                    continue;
                 }
-                out.push(
+                out.push(Some(
                     py_to_datum(&item, &data_type)
                         .map_err(|e| with_field_context(e, &field, &data_type))?,
-                );
+                ));
             }
         }
         Ok(out)
+    };
+    let to_datums = |obj| -> PyResult<Vec<Datum>> {
+        to_nullable_datums(obj)?
+            .into_iter()
+            .map(|value| {
+                value.ok_or_else(|| {
+                    PyValueError::new_err(
+                        "None is not a valid comparison literal; use isNull/isNotNull",
+                    )
+                })
+            })
+            .collect()
     };
 
     let result = match method {
@@ -532,20 +529,8 @@ fn leaf_to_predicate(
             ensure_no_literals(method, literals_obj)?;
             pb.is_not_null(&field)
         }
-        "in" => {
-            let ds = to_datums(literals_obj)?;
-            if ds.is_empty() {
-                return Err(PyValueError::new_err("'in' requires at least 1 literal"));
-            }
-            pb.is_in(&field, ds)
-        }
-        "notIn" => {
-            let ds = to_datums(literals_obj)?;
-            if ds.is_empty() {
-                return Err(PyValueError::new_err("'notIn' requires at least 1 literal"));
-            }
-            pb.is_not_in(&field, ds)
-        }
+        "in" => pb.is_in_with_nulls(&field, to_nullable_datums(literals_obj)?),
+        "notIn" => pb.is_not_in_with_nulls(&field, to_nullable_datums(literals_obj)?),
         "startsWith" => pb.starts_with(&field, one(to_datums(literals_obj)?)?),
         "endsWith" => pb.ends_with(&field, one(to_datums(literals_obj)?)?),
         "contains" => pb.contains(&field, one(to_datums(literals_obj)?)?),
@@ -921,13 +906,29 @@ mod tests {
     }
 
     #[test]
-    fn string_op_empty_pattern_folds_to_is_not_null() {
+    fn string_op_empty_pattern_preserves_java_operator() {
         Python::attach(|py| {
             let fields = test_fields();
-            for method in ["startsWith", "endsWith", "contains"] {
+            for (method, op) in [
+                ("startsWith", PredicateOperator::StartsWith),
+                ("endsWith", PredicateOperator::EndsWith),
+                ("contains", PredicateOperator::Contains),
+            ] {
                 let dict = str_leaf_dict(py, method, "name", &[""]);
                 let pred = dict_to_predicate(&dict, &fields, true).unwrap();
-                expect_leaf_op(&pred, PredicateOperator::IsNotNull);
+                expect_leaf_op(&pred, op);
+            }
+        });
+    }
+
+    #[test]
+    fn like_empty_and_all_wildcard_patterns_stay_like() {
+        Python::attach(|py| {
+            let fields = test_fields();
+            for pattern in ["", "%", "%%", "%%%"] {
+                let dict = str_leaf_dict(py, "like", "name", &[pattern]);
+                let pred = dict_to_predicate(&dict, &fields, true).unwrap();
+                expect_leaf_op(&pred, PredicateOperator::Like);
             }
         });
     }
@@ -1080,6 +1081,41 @@ mod tests {
             d.set_item("literals", lits).unwrap();
             let err = dict_to_predicate(&d, &fields, true).unwrap_err();
             assert!(err.is_instance_of::<PyValueError>(py));
+        });
+    }
+
+    #[test]
+    fn nullable_and_empty_set_literals_use_core_semantics() {
+        Python::attach(|py| {
+            let fields = test_fields();
+            let pb = PredicateBuilder::new(&fields);
+            for method in ["in", "notIn"] {
+                let dict = leaf_dict(py, method, "id", &[]);
+                let expected = if method == "in" {
+                    pb.is_in("id", vec![]).unwrap()
+                } else {
+                    pb.is_not_in("id", vec![]).unwrap()
+                };
+                assert_eq!(dict_to_predicate(&dict, &fields, true).unwrap(), expected);
+                dict.set_item(
+                    "literals",
+                    PyList::new(
+                        py,
+                        [
+                            py.None(),
+                            1i32.into_pyobject(py).unwrap().into_any().unbind(),
+                        ],
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+                let expected = if method == "in" {
+                    pb.is_in("id", vec![Datum::Int(1)]).unwrap()
+                } else {
+                    Predicate::AlwaysFalse
+                };
+                assert_eq!(dict_to_predicate(&dict, &fields, true).unwrap(), expected);
+            }
         });
     }
 

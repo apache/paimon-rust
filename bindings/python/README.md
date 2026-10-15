@@ -56,6 +56,56 @@ ctx.sql("DROP TEMPORARY TABLE paimon.default.my_temp")
 
 For the full SQL reference, see the [SQL Integration docs](https://paimon.apache.org/docs/master/sql/).
 
+### Streaming SQL results
+
+`sql_stream()` executes one SQL query and returns a `RecordBatchReader`, yielding
+PyArrow batches without collecting the entire result in memory. Close the reader
+when stopping early to release the execution stream:
+
+```python
+from contextlib import closing
+
+with closing(ctx.sql_stream("SELECT id, name FROM paimon.my_db.users")) as reader:
+    for batch in reader:
+        print(batch.to_pydict())
+```
+
+`read_next_batch()` returns `None` when the reader is exhausted or closed.
+`reader.schema` is known before the first batch, so
+`pa.Table.from_batches(reader, schema=reader.schema)` also handles an empty result.
+Statements that write, such as `INSERT`, finish before `sql_stream()` returns.
+Errors during execution can surface while reading a batch and end the stream.
+Operators such as sorting and aggregation may still buffer data during execution.
+
+`sql_stream_with_options(sql, options)` applies `SQLOptions` as `sql_with_options()`
+does: they restrict statements delegated to DataFusion, but not statements Paimon
+handles itself, such as `DELETE`, `UPDATE`, `MERGE INTO` or `DROP TABLE` on a
+Paimon table.
+
+### Native Vector Search
+
+A table with an existing vector column can search through the Rust core without
+materializing user rows in Python:
+
+```python
+search = (table.new_vector_search_builder()
+          .with_vector_column("embedding")
+          .with_query_vector([1.0, 0.0])
+          .with_limit(10))
+plan = search.new_vector_search_scan().scan()
+result = search.new_vector_search_read().read_plan(plan)
+batches = result.new_read_builder().with_projection(["id"]).read()
+```
+
+The plan pins one snapshot and can be reused with different queries. Scalar and
+partition filters are applied before ranking. Batch builders return one result
+per input query, in input order, including empty results.
+
+Data Evolution results expose scored global row IDs through `row_ids()`. PK
+results expose physical positions and Java-compatible scored split bytes;
+`new_read_builder()` reads both result types from their source snapshot and
+returns projected columns plus `__paimon_search_score` in relevance order.
+
 ### Native Read / Write
 
 Beyond SQL, you can use the lower-level read and write APIs directly from Python.
@@ -107,6 +157,68 @@ batches_tt = read_builder_tt.new_read().read(plan_tt.splits())
 print(f"\nRead: {batches_tt[0].num_rows} rows")
 print(batches_tt[0])
 ```
+
+### Shard column updates
+
+The batch and stream update objects expose
+`new_shard_updator(shard_num, total_shard_count, read_type=...)`. The optional
+`read_type` is a Paimon ROW type encoded as JSON, preserving field IDs and nested
+read metadata. It belongs to this shard operation and is independent of columns
+configured by `with_update_type`. Omitting it reads all table fields; an empty
+ROW reads zero columns with row counts preserved. Core captures one snapshot and
+balances complete Data Evolution file groups by row ID. The returned
+`arrow_reader()` yields projected batches; `update_by_arrow_batch()` receives
+replacement columns in that reader's visible row order, including when deletion
+vectors remove physical rows. Input batch boundaries may differ from read batches.
+
+Finish the reader and supply exactly the same number of rows before calling
+`prepare_commit()`. Core buffers one file group, reuses the normal partial-column
+writer and returns messages with the captured snapshot's conflict check. Repeated
+preparation reuses those messages. `close()` preserves prepared files; commit the
+messages with the matching builder's committer.
+
+### Prepared MERGE operations
+
+Batch and stream update objects expose `merge_into` to prepare data-evolution
+updates, deletion vectors and inserts without publishing a snapshot. Rust core
+owns matching, ordered action selection and file staging. SQL conditions are
+compiled by the Rust DataFusion adapter. PyPaimon's existing `WhenMatched` and
+`WhenNotMatched` APIs normalize into these core clauses; no Python join runs on
+the native path.
+
+Source NULL keys do not match target NULL keys. Multiple source matches are
+rejected before action conditions, except for a sole unconditional DELETE.
+Self-merge uses the target's pinned row IDs. A later action failure retains files already prepared by earlier actions, even
+when the operation cannot return their messages. Returned messages may only be
+explicitly aborted by a caller that knows publication has been abandoned.
+
+The source may also be a native `Table`. Core resolves its branch and snapshot
+selectors once, projects the source keys and referenced columns, and reads the
+logical rows through the ordinary reader, including primary-key merge engines.
+The source does not require data evolution or row tracking. Arrow batches keep
+their chunk boundaries; matching gathers only the contributing source chunks.
+
+Numeric `incremental-between-timestamp` options select `(start, end]` in core,
+including for table-source MERGE. AUTO reads APPEND deltas without a changelog
+producer and physical changelogs otherwise; OVERWRITE snapshots are skipped.
+Equal bounds return an empty plan. Window plans and all their splits identify
+the ending snapshot, including when no selected files remain. The existing
+`new_scan()` honors these options; no new Python API is required.
+
+### Custom Blob URI sources
+
+Before the first Arrow write, call
+`writer.with_blob_uri_reader_factory(factory)` to copy referenced Blob payloads
+from custom sources. The factory provides `create(uri)`, returning a reader with
+`new_input_stream(uri)`. Streams provide bounded `read(size)`, `close()`, and
+optionally `seek(offset)`; an empty read means EOF. Return the same reader object
+when sources share reader identity so consecutive reference windows can reuse an
+open stream. Pass `None` to restore the default URI reader before writing.
+
+Rust handles descriptor ranges, successful short reads, stream reuse, reopening
+and closure for scalar, array and map Blob writes, including managed primary-key
+Blob packs. Exceptions raised by Python source callbacks are propagated to the
+caller. The Python layer does not copy payloads or cache source streams.
 
 ### Native commit from serialized messages
 
@@ -197,8 +309,13 @@ mode. `CommitMessage.deserialize(body, version=14)` decodes it without a table
 or builder. Submit decoded messages to their originating table; commit identity
 and overwrite mode come from the configured committer. Messages returned directly
 by local writers retain their table and commit-user checks.
-Only v14 is supported. `abort(messages)` deletes newly written files and must
-only be used for messages known not to have committed. Compact increments remain
+Only v14 is supported. `abort(messages)` deletes newly written files for an
+explicitly abandoned write, matching Java. Call it only for messages known to be
+uncommitted that will never be submitted. A commit exception does not prove failure:
+publication may have succeeded before the response failed. Internal error paths
+preserve submitted files instead of calling `abort`. Preparation failures can clean
+outputs that have not been handed off to the caller.
+Compact increments remain
 unsupported by the Rust committer and are rejected.
 
 ### Tables resolved outside the Rust catalog

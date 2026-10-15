@@ -190,7 +190,7 @@ async fn global_index_ranges_intersect_positions_after_candidate_assignment() {
         append_ids(&table, 3, 6).await;
         assert!(
             table
-                .new_btree_global_index_build_builder()
+                .new_global_index_build_builder()
                 .with_index_column("id")
                 .with_index_type(index_type)
                 .execute()

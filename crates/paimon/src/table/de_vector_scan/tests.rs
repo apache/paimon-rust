@@ -27,9 +27,81 @@ use crate::vector_search::SearchResult;
 use arrow_array::builder::{Float32Builder, ListBuilder};
 use arrow_array::{ArrayRef, Float32Array, Int32Array, RecordBatch};
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+use futures::TryStreamExt;
 use roaring::RoaringTreemap;
 use std::collections::HashMap;
 use std::sync::Arc;
+
+#[tokio::test]
+async fn prepared_empty_filter_keeps_its_read_table_empty_after_commit() {
+    let table = vector_test_table().copy_with_options(HashMap::from([
+        ("row-tracking.enabled".to_string(), "true".to_string()),
+        ("data-evolution.enabled".to_string(), "true".to_string()),
+        ("vector-index.search-mode".to_string(), "full".to_string()),
+    ]));
+    let prepared = table
+        .prepare_vector_search_filter(id_gt_filter(&table, 0))
+        .await
+        .unwrap();
+    let field = Arc::new(ArrowField::new("element", ArrowDataType::Float32, true));
+    let mut vectors = ListBuilder::new(Float32Builder::new()).with_field(field.clone());
+    vectors.values().append_value(1.0);
+    vectors.values().append_value(0.0);
+    vectors.append(true);
+    let batch = RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", ArrowDataType::Int32, false),
+            ArrowField::new("embedding", ArrowDataType::List(field), true),
+        ])),
+        vec![
+            Arc::new(Int32Array::from(vec![1])),
+            Arc::new(vectors.finish()),
+        ],
+    )
+    .unwrap();
+    let mut writer = TableWrite::new(&table, "test".to_string()).unwrap();
+    writer.write_arrow_batch(&batch).await.unwrap();
+    TableCommit::new(table.clone(), "test".to_string())
+        .commit(writer.prepare_commit().await.unwrap())
+        .await
+        .unwrap();
+
+    assert!(table.resolve_read_snapshot().await.unwrap().is_some());
+    assert!(prepared
+        .table()
+        .resolve_read_snapshot()
+        .await
+        .unwrap()
+        .is_none());
+    assert!(prepared
+        .table()
+        .new_read_builder()
+        .new_scan()
+        .plan()
+        .await
+        .unwrap()
+        .splits()
+        .is_empty());
+    assert!(prepared
+        .table()
+        .new_vector_search_builder()
+        .with_vector_column("embedding")
+        .with_query_vector(vec![1.0, 0.0])
+        .with_limit(2)
+        .execute()
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(!table
+        .new_vector_search_builder()
+        .with_vector_column("embedding")
+        .with_query_vector(vec![1.0, 0.0])
+        .with_limit(2)
+        .execute()
+        .await
+        .unwrap()
+        .is_empty());
+}
 
 #[tokio::test]
 async fn reader_uses_planned_snapshot_after_snapshot_files_are_removed() {
@@ -86,7 +158,7 @@ async fn reader_reuses_queries_without_leaking_plan_filters() {
     let filter = id_gt_filter(&table, 1);
     let empty_filter = id_gt_filter(&table, 99);
     // One reader executes filtered, empty, and unfiltered plans. The plan owns
-    // the allow-list; neither it nor the empty result can alter later queries.
+    // the predicate; neither it nor the empty result can alter later queries.
     for (filter, expected) in [
         (Some(&filter), [vec![2, 1], vec![1, 2]]),
         (Some(&empty_filter), [vec![], vec![]]),
@@ -361,4 +433,213 @@ async fn de_scalar_filter_applies_to_unindexed_raw_fallback() {
         .unwrap();
 
     assert_eq!(result.row_ids().unwrap().row_ids, vec![3]);
+}
+
+#[tokio::test]
+async fn unevaluable_scalar_filter_routes_covered_ranges_to_raw_in_every_mode() {
+    let table = de_vector_table().await;
+    for mode in ["fast", "full", "detail"] {
+        let table = table.copy_with_options(HashMap::from([(
+            "vector-index.search-mode".to_string(),
+            mode.to_string(),
+        )]));
+        let filter = id_gt_filter(&table, 0);
+        let mut plan = DeVectorScan::new(&table, Some(&filter), None, None)
+            .plan()
+            .await
+            .unwrap();
+        // Keep the committed IVF shards but remove the scalar index from this
+        // plan. A data-derived ANN allow-list can lose hits with nprobe=1.
+        plan.index_entries
+            .retain(|entry| entry.index_file.index_type == "ivf-flat");
+        let read = DeVectorRead::new(
+            "embedding",
+            &[&[1.0, 0.0], &[0.0, 1.0]],
+            3,
+            &HashMap::from([("ivf.nprobe".to_string(), "1".to_string())]),
+        )
+        .unwrap();
+        let results = read.read(plan).await.unwrap();
+        for result in results {
+            let mut ids = result.row_ids().unwrap().row_ids.clone();
+            ids.sort_unstable();
+            assert_eq!(ids, vec![0, 1, 2], "{mode}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn exact_and_partial_scalar_indexes_obey_refinement_switch() {
+    let table = de_vector_table().await;
+    let predicate = crate::spec::PredicateBuilder::new(table.schema().fields());
+    let exact = id_gt_filter(&table, 1);
+    let partial = Predicate::and(vec![
+        exact.clone(),
+        predicate.is_not_null("embedding").unwrap(),
+    ]);
+    let contradiction = Predicate::and(vec![exact.clone(), Predicate::negate(exact.clone())]);
+    for mode in ["fast", "full", "detail"] {
+        for refine in [false, true] {
+            let table = table.copy_with_options(HashMap::from([
+                ("vector-index.search-mode".to_string(), mode.to_string()),
+                (
+                    "global-index.filter.refine-from-data".to_string(),
+                    refine.to_string(),
+                ),
+            ]));
+            for (filter, expected) in [
+                (&exact, 2),
+                (&partial, if refine { 2 } else { 0 }),
+                (&contradiction, 0),
+            ] {
+                let results = table
+                    .new_batch_vector_search_builder()
+                    .with_vector_column("embedding")
+                    .with_query_vectors(vec![vec![1.0, 0.0], vec![0.0, 1.0]])
+                    .with_limit(3)
+                    .with_options(HashMap::from([("ivf.nprobe".to_string(), "2".to_string())]))
+                    .with_filter(filter.clone())
+                    .execute()
+                    .await
+                    .unwrap();
+                assert_eq!(results.len(), 2);
+                for result in results {
+                    assert_eq!(
+                        result.row_ids().unwrap().len(),
+                        expected,
+                        "{mode}, refine={refine}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn scalar_filter_ignores_composite_index_definitions() {
+    let table = de_vector_table().await.copy_with_options(HashMap::from([
+        ("vector-index.search-mode".to_string(), "fast".to_string()),
+        (
+            "global-index.filter.refine-from-data".to_string(),
+            "false".to_string(),
+        ),
+    ]));
+    let filter = id_gt_filter(&table, 0);
+    let mut plan = DeVectorScan::new(&table, Some(&filter), None, None)
+        .plan()
+        .await
+        .unwrap();
+    let embedding_id =
+        crate::table::find_field_id_by_name(table.schema().fields(), "embedding").unwrap();
+    for entry in &mut plan.index_entries {
+        if entry.index_file.index_type == "btree" {
+            // A multi-field definition cannot supply Java's per-column scalar
+            // coverage, regardless of whether its leading field is indexed.
+            entry
+                .index_file
+                .global_index_meta
+                .as_mut()
+                .unwrap()
+                .extra_field_ids = Some(vec![embedding_id]);
+        }
+    }
+    let results = DeVectorRead::new("embedding", &[&[1.0, 0.0]], 3, &HashMap::new())
+        .unwrap()
+        .read(plan)
+        .await
+        .unwrap();
+    assert_eq!(results[0].row_ids().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn scalar_coverage_gaps_follow_scalar_and_vector_modes() {
+    for vector_covers_tail in [false, true] {
+        let table = de_vector_table().await;
+        let element = Arc::new(ArrowField::new("element", ArrowDataType::Float32, true));
+        let mut vectors = ListBuilder::new(Float32Builder::new()).with_field(element.clone());
+        vectors.values().append_slice(&[3.0, 3.0]);
+        vectors.append(true);
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("id", ArrowDataType::Int32, false),
+                ArrowField::new("embedding", ArrowDataType::List(element), true),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![4])) as ArrayRef,
+                Arc::new(vectors.finish()) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let mut writer = TableWrite::new(&table, "coverage-test".to_string()).unwrap();
+        writer.write_arrow_batch(&batch).await.unwrap();
+        TableCommit::new(table.clone(), "coverage-test".to_string())
+            .commit(writer.prepare_commit().await.unwrap())
+            .await
+            .unwrap();
+        if vector_covers_tail {
+            table
+                .new_global_index_build_builder()
+                .with_index_type(crate::vindex::IVF_FLAT_IDENTIFIER)
+                .with_index_column("embedding")
+                .with_options(HashMap::from([(
+                    "ivf-flat.nlist".to_string(),
+                    "1".to_string(),
+                )]))
+                .execute()
+                .await
+                .unwrap();
+        }
+        let filter = id_gt_filter(&table, 3);
+        for scalar_mode in ["fast", "full", "detail"] {
+            for vector_mode in ["fast", "full", "detail"] {
+                for builder_options in [false, true] {
+                    let modes = HashMap::from([
+                        (
+                            "vector-index.search-mode".to_string(),
+                            vector_mode.to_string(),
+                        ),
+                        (
+                            "scalar-index.search-mode".to_string(),
+                            scalar_mode.to_string(),
+                        ),
+                    ]);
+                    let mut table_options = if builder_options {
+                        HashMap::from([
+                            ("vector-index.search-mode".to_string(), "fast".to_string()),
+                            ("scalar-index.search-mode".to_string(), "fast".to_string()),
+                        ])
+                    } else {
+                        modes.clone()
+                    };
+                    table_options.insert(
+                        "global-index.filter.refine-from-data".to_string(),
+                        "false".to_string(),
+                    );
+                    let table = table.copy_with_options(table_options);
+                    let mut builder = table.new_batch_vector_search_builder();
+                    builder
+                        .with_vector_column("embedding")
+                        .with_query_vectors(vec![vec![0.0, 0.0], vec![1.0, 0.0]])
+                        .with_limit(10)
+                        .with_filter(filter.clone());
+                    if builder_options {
+                        builder.with_options(modes);
+                    }
+                    let expected = if (vector_covers_tail && scalar_mode != "fast")
+                        || (!vector_covers_tail && vector_mode != "fast")
+                    {
+                        vec![3]
+                    } else {
+                        vec![]
+                    };
+                    let results = builder.execute().await.unwrap();
+                    assert_eq!(results.len(), 2);
+                    for result in results {
+                        assert_eq!(result.row_ids().unwrap().row_ids, expected,
+                            "scalar={scalar_mode}, vector={vector_mode}, vector_covers_tail={vector_covers_tail}, builder_options={builder_options}");
+                    }
+                }
+            }
+        }
+    }
 }

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Custom [`RelationPlanner`] for Paimon time travel via `VERSION AS OF` and `TIMESTAMP AS OF`.
+//! Time-travel planning for Paimon tables and registered engines.
 
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -24,6 +24,7 @@ use std::sync::Arc;
 use datafusion::catalog::default_table_source::{provider_as_source, source_as_provider};
 use datafusion::common::plan_datafusion_err;
 use datafusion::common::TableReference;
+use datafusion::datasource::TableProvider;
 use datafusion::error::Result as DFResult;
 use datafusion::logical_expr::builder::LogicalPlanBuilder;
 use datafusion::logical_expr::planner::{
@@ -32,15 +33,13 @@ use datafusion::logical_expr::planner::{
 use datafusion::sql::sqlparser::ast::{self, TableFactor, TableVersion};
 use paimon::spec::{SCAN_TIMESTAMP_MILLIS_OPTION, SCAN_VERSION_OPTION};
 
-use crate::catalog::ReadOnlyTableProvider;
+use crate::catalog::{
+    parse_engine_snapshot_id, EngineTimeTravel, ReadOnlyTableProvider,
+    UnavailableEngineTableProvider,
+};
 use crate::table::{ObjectTableProvider, PaimonTableProvider};
 
-/// A [`RelationPlanner`] that intercepts `VERSION AS OF` and `TIMESTAMP AS OF`
-/// clauses on Paimon tables and resolves them to time travel options.
-///
-/// - `VERSION AS OF <integer or string>` → sets `scan.version` option on the table.
-///   At scan time, the version is resolved: tag name (if exists) → snapshot id → error.
-/// - `TIMESTAMP AS OF <timestamp string>` → parsed as a timestamp, sets `scan.timestamp-millis`.
+/// Resolves Paimon time travel, and registered engine snapshot IDs and timestamps.
 #[derive(Debug)]
 pub struct PaimonRelationPlanner;
 
@@ -62,7 +61,6 @@ impl RelationPlanner for PaimonRelationPlanner {
         relation: TableFactor,
         context: &mut dyn RelationPlannerContext,
     ) -> DFResult<RelationPlanning> {
-        // Only handle Table factors with a version clause.
         let TableFactor::Table {
             ref name,
             ref version,
@@ -76,27 +74,40 @@ impl RelationPlanner for PaimonRelationPlanner {
             return Ok(RelationPlanning::Original(Box::new(relation)));
         };
 
-        // Resolve the table reference.
         let table_ref = object_name_to_table_reference(name, context)?;
         let source = context
             .context_provider()
             .get_table_source(table_ref.clone())?;
         let provider = source_as_provider(&source)?;
 
-        // Every version clause, not just the two resolved below: falling
-        // through drops the clause silently.
+        if let Some(unavailable) = provider.downcast_ref::<UnavailableEngineTableProvider>() {
+            return Err(unavailable.unavailable_error());
+        }
+
         if let Some(routed) = provider.downcast_ref::<ReadOnlyTableProvider>() {
-            return Err(plan_datafusion_err!(
-                "time travel is not supported for routed '{}' tables ('{}')",
-                routed.declared,
-                routed.table_name
-            ));
+            let travel = match version {
+                TableVersion::VersionAsOf(expr) => {
+                    let options = resolve_version_as_of(expr)?;
+                    EngineTimeTravel::Snapshot(parse_engine_snapshot_id(
+                        &options[SCAN_VERSION_OPTION],
+                    )?)
+                }
+                TableVersion::TimestampAsOf(expr) => {
+                    EngineTimeTravel::TimestampMillis(timestamp_as_of_millis(expr)?)
+                }
+                _ => return Err(routed.unsupported_time_travel()),
+            };
+            let routed = routed.clone();
+            let new_provider = crate::runtime::block_on_with_runtime(
+                async move { routed.at_time_travel(travel).await },
+                "engine time travel resolution thread panicked",
+            )?;
+            return plan_scan(relation, table_ref, new_provider);
         }
 
         let Some(paimon_provider) = provider.downcast_ref::<PaimonTableProvider>() else {
-            // Ours, but with no snapshot to rewrite onto: refuse, because
-            // handing them on reaches the default planner, which drops the
-            // clause. Any other provider is another engine's, clause and all.
+            // Reject unsupported Paimon providers before the default planner drops the clause.
+            // Leave foreign providers to their own planner.
             if provider.is::<ObjectTableProvider>()
                 || crate::system_tables::is_system_table_provider(provider.as_ref())
             {
@@ -109,12 +120,10 @@ impl RelationPlanner for PaimonRelationPlanner {
 
         let extra_options = match version {
             TableVersion::VersionAsOf(expr) => resolve_version_as_of(expr)?,
-            // Same timestamp expression as `TIMESTAMP AS OF`.
             TableVersion::TimestampAsOf(expr) | TableVersion::ForSystemTimeAsOf(expr) => {
                 resolve_timestamp_as_of(expr)?
             }
-            // `AT(...)` and `CHANGES(...)` name neither a snapshot nor a
-            // timestamp; dropping the clause would answer with current rows.
+            // Never let unsupported version clauses fall through to current data.
             _ => {
                 return Err(plan_datafusion_err!(
                     "this time-travel syntax is not supported for Paimon tables; \
@@ -123,9 +132,7 @@ impl RelationPlanner for PaimonRelationPlanner {
             }
         };
 
-        // Resolving time travel may switch the table to the snapshot's schema,
-        // which requires async IO; this planner hook is synchronous, so bridge
-        // through the shared runtime like other sync DataFusion callbacks.
+        // Snapshot schema resolution needs async I/O inside this synchronous hook.
         let table = paimon_provider.table().clone();
         let new_table = crate::runtime::block_on_with_runtime(
             async move { table.copy_with_time_travel(extra_options).await },
@@ -133,18 +140,22 @@ impl RelationPlanner for PaimonRelationPlanner {
         )
         .map_err(crate::to_datafusion_error)?;
         let new_provider = PaimonTableProvider::try_new(new_table)?;
-        let new_source = provider_as_source(Arc::new(new_provider));
-
-        // Destructure to get alias.
-        let TableFactor::Table { alias, .. } = relation else {
-            unreachable!()
-        };
-
-        let plan = LogicalPlanBuilder::scan(table_ref, new_source, None)?.build()?;
-        Ok(RelationPlanning::Planned(Box::new(PlannedRelation::new(
-            plan, alias,
-        ))))
+        plan_scan(relation, table_ref, Arc::new(new_provider))
     }
+}
+
+fn plan_scan(
+    relation: TableFactor,
+    table_ref: TableReference,
+    provider: Arc<dyn TableProvider>,
+) -> DFResult<RelationPlanning> {
+    let TableFactor::Table { alias, .. } = relation else {
+        unreachable!()
+    };
+    let plan = LogicalPlanBuilder::scan(table_ref, provider_as_source(provider), None)?.build()?;
+    Ok(RelationPlanning::Planned(Box::new(PlannedRelation::new(
+        plan, alias,
+    ))))
 }
 
 /// Convert a sqlparser `ObjectName` to a DataFusion `TableReference`.
@@ -207,14 +218,19 @@ fn resolve_version_as_of(expr: &ast::Expr) -> DFResult<HashMap<String, String>> 
 
 /// Resolve `TIMESTAMP AS OF <expr>` into `scan.timestamp-millis` option.
 fn resolve_timestamp_as_of(expr: &ast::Expr) -> DFResult<HashMap<String, String>> {
+    let millis = timestamp_as_of_millis(expr)?;
+    Ok(HashMap::from([(
+        SCAN_TIMESTAMP_MILLIS_OPTION.to_string(),
+        millis.to_string(),
+    )]))
+}
+
+/// Parse the timestamp string of `TIMESTAMP AS OF <expr>` to epoch millis.
+fn timestamp_as_of_millis(expr: &ast::Expr) -> DFResult<i64> {
     match expr {
         ast::Expr::Value(v) => match &v.value {
             ast::Value::SingleQuotedString(s) | ast::Value::DoubleQuotedString(s) => {
-                let millis = parse_timestamp_to_millis(s)?;
-                Ok(HashMap::from([(
-                    SCAN_TIMESTAMP_MILLIS_OPTION.to_string(),
-                    millis.to_string(),
-                )]))
+                parse_timestamp_to_millis(s)
             }
             _ => Err(datafusion::error::DataFusionError::Plan(format!(
                 "Unsupported TIMESTAMP AS OF expression: {expr}. Expected a timestamp string."

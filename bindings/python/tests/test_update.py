@@ -22,6 +22,49 @@ import pypaimon_rust.datafusion as datafusion
 from pypaimon_rust.datafusion import PaimonCatalog, SQLContext
 
 
+def test_upsert_batches_preserve_missing_fields_nulls_and_stream_updates(tmp_path):
+    context = SQLContext()
+    context.register_catalog('paimon', {'warehouse': str(tmp_path)})
+    context.sql('CREATE SCHEMA paimon.shapes')
+    context.sql("""CREATE TABLE paimon.shapes.t (id INT, name STRING, score INT) WITH (
+        'row-tracking.enabled' = 'true', 'data-evolution.enabled' = 'true')""")
+    context.sql("INSERT INTO paimon.shapes.t (id, name, score) VALUES (1, 'a', 10), (1, 'b', 11), (2, 'c', 20)")
+    table = PaimonCatalog({'warehouse': str(tmp_path)}).get_table('shapes.t')
+
+    def batch(values):
+        schema = pa.schema([(name, pa.string() if name == 'name' else pa.int32()) for name in values])
+        return pa.RecordBatch.from_pydict(values, schema=schema)
+
+    builder = table.new_batch_write_builder()
+    update = builder.new_update().with_update_type(['name'])
+    messages = update.upsert_by_arrow_with_key([
+        batch({'id': [1], 'score': [999]}),
+        batch({'id': [3], 'score': [30]}),
+        batch({'name': [None], 'id': [1]}),
+        batch({'id': [2], 'name': ['new'], 'score': [999]}),
+    ], ['id'])
+    builder.new_commit().commit(messages)
+    assert pa.Table.from_batches(context.sql(
+        'SELECT id, name, score FROM paimon.shapes.t ORDER BY id, score')).to_pylist() == [
+        {'id': 1, 'name': None, 'score': 10},
+        {'id': 1, 'name': None, 'score': 11},
+        {'id': 2, 'name': 'new', 'score': 20},
+        {'id': 3, 'name': None, 'score': 30},
+    ]
+    stream = table.new_stream_write_builder().with_commit_user('shape-stream')
+    messages = stream.new_update().with_update_type(['score']).upsert_by_arrow_with_key(
+        [batch({'id': [1], 'score': [100]}), batch({'id': [3], 'score': [300], 'name': ['ignored']})],
+        ['id'], 101)
+    stream.new_commit().commit(101, messages)
+    assert pa.Table.from_batches(context.sql(
+        'SELECT id, name, score FROM paimon.shapes.t ORDER BY id, score')).to_pylist() == [
+        {'id': 1, 'name': None, 'score': 100},
+        {'id': 1, 'name': None, 'score': 100},
+        {'id': 2, 'name': 'new', 'score': 20},
+        {'id': 3, 'name': None, 'score': 300},
+    ]
+
+
 def test_table_upsert_updates_duplicate_targets_and_appends(tmp_path):
     assert not hasattr(datafusion, '_match_upsert_keys')
     assert not hasattr(datafusion, 'UpsertKeyMatcher')
@@ -172,13 +215,16 @@ def test_grouped_batch_update_checks_input_table_file_overlap(tmp_path):
         'grouped_updates.t')
 
     before = set(tmp_path.rglob('*.parquet'))
+    snapshot_id = table.latest_snapshot().id()
     overlap = table.new_batch_write_builder().new_update()
     with pytest.raises(ValueError, match='overlapping first_row_ids.*0'):
         overlap.update_by_arrow_batches_with_row_id(iter([
             pa.table({'_ROW_ID': [0], 'name': ['A']}),
             pa.table({'_ROW_ID': [1], 'name': ['B']}),
         ]))
-    assert set(tmp_path.rglob('*.parquet')) == before
+    assert set(tmp_path.rglob('*.parquet')) > before
+    assert table.latest_snapshot().id() == snapshot_id
+    before = set(tmp_path.rglob('*.parquet'))
 
     def failing_tables():
         yield pa.table({'_ROW_ID': [0], 'name': ['A']})
@@ -186,7 +232,11 @@ def test_grouped_batch_update_checks_input_table_file_overlap(tmp_path):
 
     with pytest.raises(RuntimeError, match='input failed'):
         overlap.update_by_arrow_batches_with_row_id(failing_tables())
-    assert set(tmp_path.rglob('*.parquet')) == before
+    assert set(tmp_path.rglob('*.parquet')) > before
+    assert table.latest_snapshot().id() == snapshot_id
+    unchanged = pa.Table.from_batches(context.sql(
+        'SELECT id, name FROM paimon.grouped_updates.t')).sort_by('id').to_pydict()
+    assert unchanged == {'id': [1, 2, 3, 4], 'name': ['a', 'b', 'c', 'd']}
 
     builder = table.new_batch_write_builder()
     messages = builder.new_update().update_by_arrow_batches_with_row_id(iter([
@@ -271,7 +321,7 @@ def test_stream_row_id_update_and_factory(tmp_path):
     assert actual == {'id': [1, 2], 'value': [11, 22]}
 
 
-def test_predicate_update_owns_scan_callbacks_and_rollback(tmp_path):
+def test_predicate_update_owns_scan_callbacks_and_preserves_prepared_files(tmp_path):
     assert not hasattr(datafusion, '_MatchedBatchUpdateWriter')
     context = SQLContext()
     context.register_catalog('paimon', {'warehouse': str(tmp_path)})
@@ -303,6 +353,7 @@ def test_predicate_update_owns_scan_callbacks_and_rollback(tmp_path):
                       'score': [100, 999, 999, 999]}
 
     before = set(tmp_path.rglob('*.parquet'))
+    snapshot_id = table.latest_snapshot().id()
     seen.clear()
 
     def fail_second(rows):
@@ -314,7 +365,11 @@ def test_predicate_update_owns_scan_callbacks_and_rollback(tmp_path):
     with pytest.raises(RuntimeError, match='callback failure'):
         update.update_by_predicate(None, {'value': fail_second}, read_columns=['value'])
     assert len(seen) == 2
-    assert set(tmp_path.rglob('*.parquet')) == before
+    assert set(tmp_path.rglob('*.parquet')) > before
+    assert table.latest_snapshot().id() == snapshot_id
+    unchanged = pa.Table.from_batches(context.sql(
+        'SELECT id, value, score FROM paimon.pred_updates.t')).sort_by('id').to_pydict()
+    assert unchanged == actual
     assert update.update_by_predicate(
         {'method': 'equal', 'field': 'id', 'literals': [99]},
         {'value': 'bad-int'}) == []
@@ -374,3 +429,82 @@ def test_update_can_transfer_and_be_collected_on_another_thread(tmp_path, kind, 
         finally:
             if enabled:
                 gc.enable()
+
+
+@pytest.mark.parametrize('stream', [False, True])
+def test_prepared_merge_conditions_chunks_and_lazy_literals(tmp_path, stream):
+    context = SQLContext()
+    context.register_catalog('paimon', {'warehouse': str(tmp_path)})
+    context.sql('CREATE SCHEMA paimon.prepared_merge')
+    context.sql("""CREATE TABLE paimon.prepared_merge.t (id INT, value INT) WITH (
+        'row-tracking.enabled' = 'true', 'data-evolution.enabled' = 'true',
+        'deletion-vectors.enabled' = 'true')""")
+    # Separate commits force the clause to consume values across target files.
+    context.sql('INSERT INTO paimon.prepared_merge.t (id, value) VALUES (1, 10)')
+    context.sql('INSERT INTO paimon.prepared_merge.t (id, value) VALUES (2, 20)')
+    table = PaimonCatalog({'warehouse': str(tmp_path)}).get_table('prepared_merge.t')
+    builder = (table.new_stream_write_builder().with_commit_user('prepared-merge')
+               if stream else table.new_batch_write_builder())
+    source = pa.table({'id': [1, 2], 'value': [11, 22]}, schema=pa.schema([
+        ('id', pa.int32()), ('value', pa.int32())]))
+    update = builder.new_update()
+    kwargs = dict(commit_identifier=42) if stream else {}
+    false_clause = dict(delete=False, condition=dict(sql='"s.value" < 0'),
+                        assignments=[('value', 'literal', 'invalid int')])
+    assert update.merge_into(source, on=[('id', 'id')], when_matched=[false_clause],
+                             when_not_matched=[], **kwargs) == []
+    messages = update.merge_into(source, on=[('id', 'id')], when_matched=[
+        dict(delete=False, condition=dict(sql='"s.value" IN (SELECT v FROM (VALUES (11), (22)) AS m(v))'),
+             assignments=[('value', 'literal', pa.chunked_array([[100], [200]]))])],
+        when_not_matched=[], **kwargs)
+    # Preparation leaves the visible snapshot unchanged.
+
+    def rows():
+        return pa.Table.from_batches(context.sql(
+            'SELECT id, value FROM paimon.prepared_merge.t ORDER BY id')).to_pylist()
+    assert rows() == [dict(id=1, value=10), dict(id=2, value=20)]
+    commit = builder.new_commit()
+    commit.commit(42, messages) if stream else commit.commit(messages)
+    assert rows() == [dict(id=1, value=100), dict(id=2, value=200)]
+
+
+@pytest.mark.parametrize('stream', [False, True])
+@pytest.mark.parametrize('historical', [False, True])
+def test_prepared_merge_accepts_native_table_sources(tmp_path, stream, historical):
+    import json
+    from pathlib import Path
+
+    context = SQLContext()
+    context.register_catalog('paimon', {'warehouse': str(tmp_path)})
+    context.sql('CREATE SCHEMA paimon.table_merge')
+    context.sql("""CREATE TABLE paimon.table_merge.target (id INT, value INT) WITH (
+        'row-tracking.enabled' = 'true', 'data-evolution.enabled' = 'true')""")
+    # An ordinary append source needs neither row tracking nor data evolution.
+    context.sql('CREATE TABLE paimon.table_merge.source (source_id INT, amount INT, flag INT)')
+    context.sql('INSERT INTO paimon.table_merge.target (id, value) VALUES (1, 10), (2, 20)')
+    for values in ['(1, 11, 1)', '(3, 33, 1)', '(2, 22, 1)']:
+        context.sql('INSERT INTO paimon.table_merge.source (source_id, amount, flag) VALUES ' + values)
+    catalog = PaimonCatalog({'warehouse': str(tmp_path)})
+    target, source = catalog.get_table('table_merge.target'), catalog.get_table('table_merge.source')
+    if historical:
+        schema = json.loads((Path(source.location()) / 'schema' / 'schema-0').read_text())
+        schema['options']['scan.snapshot-id'] = '2'
+        source = source.copy_with_resolved_schema(json.dumps(schema))
+    source_snapshot = source.latest_snapshot().id()
+    target_snapshot = target.latest_snapshot().id()
+    builder = (target.new_stream_write_builder().with_commit_user('source-merge')
+               if stream else target.new_batch_write_builder())
+    kwargs = dict(commit_identifier=42) if stream else {}
+    condition = dict(sql='"s.flag" = 1')
+    messages = builder.new_update().merge_into(
+        source, on=[('id', 'source_id')], when_matched=[
+            dict(delete=False, condition=condition, assignments=[('value', 'source', 'amount')])],
+        when_not_matched=[dict(condition=condition, assignments=[
+            ('id', 'source', 'source_id'), ('value', 'source', 'amount')])], **kwargs)
+    assert target.latest_snapshot().id() == target_snapshot
+    assert source.latest_snapshot().id() == source_snapshot
+    commit = builder.new_commit()
+    commit.commit(42, messages) if stream else commit.commit(messages)
+    actual = pa.Table.from_batches(context.sql(
+        'SELECT id, value FROM paimon.table_merge.target ORDER BY id')).to_pylist()
+    assert actual == [dict(id=1, value=11), dict(id=2, value=20 if historical else 22), dict(id=3, value=33)]

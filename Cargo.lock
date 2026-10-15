@@ -4645,7 +4645,7 @@ dependencies = [
 
 [[package]]
 name = "paimon"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "apache-avro",
  "arrow-arith",
@@ -4708,6 +4708,7 @@ dependencies = [
  "regex",
  "reqwest 0.12.28",
  "roaring",
+ "ryu",
  "serde",
  "serde_bytes",
  "serde_json",
@@ -4731,7 +4732,7 @@ dependencies = [
 
 [[package]]
 name = "paimon-c"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4750,13 +4751,14 @@ dependencies = [
 
 [[package]]
 name = "paimon-datafusion"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
  "arrow-select",
  "async-trait",
  "axum",
+ "bigdecimal",
  "bytes",
  "chrono",
  "constant_time_eq",
@@ -4796,7 +4798,7 @@ dependencies = [
 
 [[package]]
 name = "paimon-integration-tests"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -4821,7 +4823,7 @@ dependencies = [
 
 [[package]]
 name = "paimon-rest-server"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -4837,7 +4839,7 @@ dependencies = [
 
 [[package]]
 name = "paimon-tpcds-bench"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -5379,10 +5381,12 @@ dependencies = [
 
 [[package]]
 name = "pypaimon_rust"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "arrow",
  "arrow-row",
+ "async-trait",
+ "bytes",
  "chrono",
  "datafusion",
  "datafusion-ffi",
@@ -6043,9 +6047,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.45"
+version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
+checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "aws-lc-rs",
  "once_cell",

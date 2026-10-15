@@ -52,6 +52,7 @@ pub struct RESTTokenFileIO {
     path: String,
     catalog_options: Options,
     api: Arc<RESTApi>,
+    initial_token: Mutex<Option<RESTToken>>,
     state: RwLock<Option<TokenState>>,
     refresh_lock: Mutex<()>,
     local_cache: Option<Arc<LocalCache>>,
@@ -81,11 +82,19 @@ impl RESTTokenFileIO {
             path,
             catalog_options,
             api,
+            initial_token: Mutex::new(None),
             state: RwLock::new(None),
             refresh_lock: Mutex::new(()),
             local_cache,
             file_io_cache,
         }
+    }
+
+    /// Reuse a token already obtained by a caller for this table. Normal REST
+    /// refresh remains available when that token approaches expiration.
+    pub(crate) fn with_initial_token(mut self, token: RESTToken) -> Self {
+        self.initial_token = Mutex::new(Some(token));
+        self
     }
 
     pub(crate) async fn build_file_io(self: &Arc<Self>) -> Result<FileIO> {
@@ -103,7 +112,14 @@ impl RESTTokenFileIO {
             return Ok(file_io);
         }
 
-        let token = self.refresh_token().await?;
+        let initial_token = self.initial_token.lock().await.take();
+        let token = match initial_token.as_ref() {
+            Some(token) if !Self::is_token_expired(token) => RESTToken::new(
+                self.merge_token_with_catalog_options(token.token.clone()),
+                token.expire_at_millis,
+            ),
+            _ => self.refresh_token().await?,
+        };
         let file_io = self.build_static_file_io(&token)?;
         *self.state.write().await = Some(TokenState {
             token,
@@ -314,6 +330,55 @@ mod tests {
             .unwrap();
         assert_eq!(bytes, Bytes::from_static(b"data"));
         assert_eq!(requests.load(Ordering::SeqCst), 2);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_initial_token_skips_first_request_and_still_refreshes() {
+        let table_directory = tempfile::tempdir().unwrap();
+        let file_path = table_directory.path().join("data");
+        let (options, api, requests, server) = token_api().await;
+        let file_io_cache = file_io_cache(&options);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let token_file_io = Arc::new(
+            RESTTokenFileIO::new(
+                Identifier::new("database", "table"),
+                table_directory.path().to_string_lossy().into_owned(),
+                options,
+                api,
+                None,
+                file_io_cache,
+            )
+            .with_initial_token(RESTToken::new(
+                HashMap::new(),
+                now + TOKEN_EXPIRATION_SAFE_TIME_MILLIS * 2,
+            )),
+        );
+
+        let file_io = token_file_io.build_file_io().await.unwrap();
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+        assert!(!file_io
+            .exists(file_path.to_string_lossy().as_ref())
+            .await
+            .unwrap());
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+
+        token_file_io
+            .state
+            .write()
+            .await
+            .as_mut()
+            .unwrap()
+            .token
+            .expire_at_millis = 0;
+        assert!(!file_io
+            .exists(file_path.to_string_lossy().as_ref())
+            .await
+            .unwrap());
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
         server.abort();
     }
 

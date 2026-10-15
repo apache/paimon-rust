@@ -17,12 +17,13 @@
 
 //! Plans global-index vector searches against one snapshot and resolves scalar pre-filters.
 
-use crate::spec::{CoreOptions, IndexManifest, IndexManifestEntry, Predicate, ROW_ID_FIELD_NAME};
+use crate::spec::{CoreOptions, IndexManifest, IndexManifestEntry, Predicate};
+use crate::table::bucket_filter::split_partition_and_data_predicates;
+use crate::table::global_index_search_filter::matching_row_ids_for_filter;
+use crate::table::partition_filter::PartitionFilter;
 use crate::table::vector_scan::Scan;
 use crate::table::Table;
 use crate::vindex::vector_search_timing_enabled;
-use arrow_array::{Array, Int64Array};
-use futures::TryStreamExt;
 use roaring::RoaringTreemap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -52,61 +53,6 @@ fn same_vector_search_table(left: &Table, right: &Table) -> bool {
         && left.branch() == right.branch()
 }
 
-async fn matching_row_ids_for_filter(
-    table: &Table,
-    filter: &Predicate,
-) -> crate::Result<RoaringTreemap> {
-    let mut read_builder = table.new_read_builder();
-    read_builder
-        .with_projection(&[ROW_ID_FIELD_NAME])?
-        .with_filter(filter.clone());
-    let plan = read_builder.new_scan().plan().await?;
-    let read = read_builder.new_read()?;
-    let mut stream = read.to_arrow(plan.splits())?;
-    let mut row_ids = RoaringTreemap::new();
-    while let Some(batch) = stream.try_next().await? {
-        let index =
-            batch
-                .schema()
-                .index_of(ROW_ID_FIELD_NAME)
-                .map_err(|_| crate::Error::DataInvalid {
-                    message: format!(
-                        "scalar vector pre-filter read is missing {ROW_ID_FIELD_NAME}"
-                    ),
-                    source: None,
-                })?;
-        let values = batch
-            .column(index)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .ok_or_else(|| crate::Error::DataInvalid {
-                message: format!(
-                    "scalar vector pre-filter {ROW_ID_FIELD_NAME} column is not Int64"
-                ),
-                source: None,
-            })?;
-        for row in 0..values.len() {
-            if values.is_null(row) {
-                return Err(crate::Error::DataInvalid {
-                    message: format!(
-                        "scalar vector pre-filter produced a null {ROW_ID_FIELD_NAME}"
-                    ),
-                    source: None,
-                });
-            }
-            let row_id = values.value(row);
-            let row_id = u64::try_from(row_id).map_err(|_| crate::Error::DataInvalid {
-                message: format!(
-                    "scalar vector pre-filter produced a negative {ROW_ID_FIELD_NAME}: {row_id}"
-                ),
-                source: None,
-            })?;
-            row_ids.insert(row_id);
-        }
-    }
-    Ok(row_ids)
-}
-
 impl Table {
     /// Resolve a scalar predicate once and pin all later vector-search/read
     /// stages to the same snapshot.
@@ -117,12 +63,12 @@ impl Table {
         CoreOptions::new(self.schema().options()).ensure_read_authorized()?;
         let Some(snapshot) = crate::table::time_travel::resolve_snapshot(self).await? else {
             return Ok(PreparedVectorSearchFilter {
-                table: self.clone(),
+                table: self.copy_with_pinned_snapshot(None),
                 include_row_ids: Arc::new(RoaringTreemap::new()),
             });
         };
         let table = self.copy_with_resolved_snapshot(&snapshot).await?;
-        let include_row_ids = matching_row_ids_for_filter(&table, &filter).await?;
+        let include_row_ids = matching_row_ids_for_filter(&table, &filter, None).await?;
         Ok(PreparedVectorSearchFilter {
             table,
             include_row_ids: Arc::new(include_row_ids),
@@ -160,6 +106,7 @@ pub(super) struct DeVectorScanPlan {
     pub(super) table: Table,
     pub(super) index_entries: Vec<IndexManifestEntry>,
     pub(super) include_row_ids: Option<Arc<RoaringTreemap>>,
+    pub(super) filter: Option<Predicate>,
     pub(super) timing: Option<DeVectorScanTiming>,
     pub(super) next_row_id: Option<i64>,
     pub(super) skip_search: bool,
@@ -172,6 +119,7 @@ impl DeVectorScanPlan {
             skip_search: true,
             index_entries: Vec::new(),
             include_row_ids: None,
+            filter: None,
             next_row_id: None,
             timing,
         }
@@ -254,14 +202,11 @@ impl Scan for DeVectorScan {
         };
         plan.next_row_id = snapshot.next_row_id();
 
+        plan.filter = self.filter.clone();
         plan.include_row_ids = if let Some(prepared) = self.prepared_filter.as_ref() {
             Some(Arc::clone(prepared.include_row_ids()))
         } else if let Some(include_row_ids) = self.include_row_ids.as_ref() {
             Some(Arc::clone(include_row_ids))
-        } else if let Some(filter) = self.filter.as_ref() {
-            Some(Arc::new(
-                matching_row_ids_for_filter(&plan.table, filter).await?,
-            ))
         } else {
             None
         };
@@ -281,6 +226,24 @@ impl Scan for DeVectorScan {
             }
             None => Vec::new(),
         };
+        if let Some(filter) = &self.filter {
+            let (partition, _) = split_partition_and_data_predicates(
+                filter.clone(),
+                plan.table.schema().fields(),
+                plan.table.schema().partition_keys(),
+            );
+            if let Some(partition) = partition {
+                let fields = plan.table.schema().partition_fields();
+                let partition = PartitionFilter::from_predicate(partition, &fields);
+                let mut entries = Vec::with_capacity(plan.index_entries.len());
+                for entry in plan.index_entries {
+                    if partition.matches_entry(&entry.partition)? {
+                        entries.push(entry);
+                    }
+                }
+                plan.index_entries = entries;
+            }
+        }
         if let Some(timing) = &mut plan.timing {
             timing.manifest = manifest_start.map_or(Duration::ZERO, |start| start.elapsed());
         }

@@ -243,7 +243,7 @@ impl FormatTableWriter {
 
         let mut groups: HashMap<Vec<u8>, Vec<usize>> = HashMap::new();
         let mut specs = HashMap::new();
-        let partition_fields = self.table.schema().partition_fields();
+        let schema_fields = self.table.schema().fields();
         let options = CoreOptions::new(self.table.schema().options());
         let computer = crate::spec::PartitionComputer::new(
             self.table.schema().partition_keys(),
@@ -252,12 +252,8 @@ impl FormatTableWriter {
             options.legacy_partition_name(),
         )?;
         for row_index in 0..batch.num_rows() {
-            let partition = BinaryRow::from_arrow(
-                &batch,
-                row_index,
-                &self.partition_indices,
-                &partition_fields,
-            )?;
+            let partition =
+                BinaryRow::from_arrow(&batch, row_index, &self.partition_indices, schema_fields)?;
             let key = partition.to_serialized_bytes();
             groups.entry(key.clone()).or_default().push(row_index);
             if let std::collections::hash_map::Entry::Vacant(entry) = specs.entry(key) {
@@ -427,13 +423,13 @@ impl FormatTableWriter {
             .await?
             .size as i64;
         let mut message = CommitMessage::new(key.to_vec(), 0, Vec::new());
-        message.format_file = Some(FormatFileCommit {
-            staged_path: file.staged_path.clone(),
-            target_path: file.target_path,
-            partition: partition.spec.clone(),
-            record_count: file.record_count,
-            file_size: size,
-        });
+        message.format_file = Some(FormatFileCommit::new(
+            file.staged_path.clone(),
+            file.target_path,
+            partition.spec.clone(),
+            file.record_count,
+            size,
+        ));
         self.owned_staging.remove(&file.staged_path);
         self.prepared.push(message);
         Ok(())

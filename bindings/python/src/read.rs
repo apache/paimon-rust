@@ -19,22 +19,24 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use arrow::datatypes::SchemaRef;
 use arrow::pyarrow::ToPyArrow;
 use arrow::record_batch::RecordBatch;
+use futures::stream::BoxStream;
 use futures::TryStreamExt;
 use paimon::spec::{is_variant_extraction_row, DataField, DataType, Predicate, RowType};
-use paimon::table::{ArrowRecordBatchStream, DataSplit, IncrementalScanMode, RowRange, Table};
+use paimon::table::{
+    ArrowRecordBatchStream, DataSplit, IncrementalScanMode, RowRange, StreamTableScan, Table,
+};
 use paimon_datafusion::runtime::runtime;
-use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
+use pyo3::exceptions::{PyBaseException, PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
+use pyo3::{PyTraverseError, PyVisit};
 use tokio::sync::Notify;
 
 use crate::error::to_py_err;
 use crate::predicate::dict_to_table_predicate;
-
-const MAP_SELECTED_KEYS_PREFIX: &str = "__PAIMON_MAP_SELECTED_KEYS:";
-const MAP_SELECTED_KEYS_DELIMITER: char = ';';
 
 struct PyReadProjection<'a> {
     columns: &'a Option<Vec<String>>,
@@ -99,106 +101,6 @@ fn apply_read_config(
     Ok(())
 }
 
-/// Resolve flat output paths to the authoritative nested read type used by the
-/// core reader. ROW children are pruned recursively. MAP values remain MAPs,
-/// but their requested string keys are carried in the temporary field
-/// description so shared-shredding Parquet files can prune physical columns.
-fn project_nested_read_type(
-    fields: &[DataField],
-    paths: &[Vec<String>],
-) -> PyResult<Vec<DataField>> {
-    if paths.iter().any(Vec::is_empty) {
-        return Err(PyValueError::new_err(
-            "nested projection paths must not be empty",
-        ));
-    }
-
-    let mut result = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    for path in paths {
-        let name = &path[0];
-        if !seen.insert(name.clone()) {
-            continue;
-        }
-        let field = fields
-            .iter()
-            .find(|field| field.name() == name)
-            .ok_or_else(|| {
-                PyValueError::new_err(format!(
-                    "nested projection field '{}' does not exist",
-                    path.join(".")
-                ))
-            })?;
-        let matching: Vec<&[String]> = paths
-            .iter()
-            .filter(|candidate| candidate.first() == Some(name))
-            .map(|candidate| candidate[1..].as_ref())
-            .collect();
-        result.push(project_nested_field(field, &matching, name)?);
-    }
-    Ok(result)
-}
-
-fn project_nested_field(
-    field: &DataField,
-    tails: &[&[String]],
-    full_name: &str,
-) -> PyResult<DataField> {
-    if tails.iter().any(|tail| tail.is_empty()) {
-        return Ok(field.clone());
-    }
-    match field.data_type() {
-        DataType::Row(row) => {
-            let child_paths: Vec<Vec<String>> = tails.iter().map(|tail| tail.to_vec()).collect();
-            let children = project_nested_read_type(row.fields(), &child_paths).map_err(|_| {
-                PyValueError::new_err(format!(
-                    "nested projection field '{}' does not exist",
-                    tails
-                        .first()
-                        .map(|tail| format!("{full_name}.{}", tail.join(".")))
-                        .unwrap_or_else(|| full_name.to_string())
-                ))
-            })?;
-            Ok(DataField::new(
-                field.id(),
-                field.name().to_string(),
-                DataType::Row(RowType::with_nullable(
-                    field.data_type().is_nullable(),
-                    children,
-                )),
-            )
-            .with_description(field.description().map(str::to_string)))
-        }
-        DataType::Map(_) if tails.iter().all(|tail| tail.len() == 1) => {
-            let mut keys = Vec::new();
-            for tail in tails {
-                let key = &tail[0];
-                if key.contains(MAP_SELECTED_KEYS_DELIMITER)
-                    || key.starts_with(MAP_SELECTED_KEYS_PREFIX)
-                {
-                    // Keep the complete MAP for keys which cannot be encoded
-                    // by the cross-language selected-key convention.
-                    return Ok(field.clone());
-                }
-                if !keys.contains(key) {
-                    keys.push(key.clone());
-                }
-            }
-            Ok(field.clone().with_description(Some(format!(
-                "{MAP_SELECTED_KEYS_PREFIX}{}",
-                keys.join(&MAP_SELECTED_KEYS_DELIMITER.to_string())
-            ))))
-        }
-        _ => Err(PyValueError::new_err(format!(
-            "nested projection field '{}' is not a ROW or MAP",
-            tails
-                .first()
-                .map(|tail| format!("{full_name}.{}", tail.join(".")))
-                .unwrap_or_else(|| full_name.to_string())
-        ))),
-    }
-}
-
 /// Extract a sequence of Python `Split` objects into core `DataSplit`s. Accepts
 /// any iterable (list/tuple/generator). Runs under the GIL since it touches
 /// Python objects. A non-iterable argument or a non-`Split` element raises
@@ -225,6 +127,7 @@ pub struct PyReadBuilder {
     read_type: Option<Vec<DataField>>,
     limit: Option<usize>,
     filter: Option<Predicate>,
+    partition_filter: Option<Predicate>,
     row_ranges: Option<Vec<RowRange>>,
     case_sensitive: bool,
     blob_parallelism: Option<usize>,
@@ -239,6 +142,7 @@ impl PyReadBuilder {
             read_type: None,
             limit: None,
             filter: None,
+            partition_filter: None,
             row_ranges: None,
             case_sensitive: true,
             blob_parallelism: None,
@@ -287,6 +191,7 @@ impl PyReadBuilder {
             read_type: None,
             limit: None,
             filter: None,
+            partition_filter: None,
             row_ranges: None,
             case_sensitive: true,
             blob_parallelism: None,
@@ -338,39 +243,7 @@ impl PyReadBuilder {
         Ok(slf)
     }
 
-    /// Project top-level fields or nested ROW leaves by their exact name paths.
-    /// MAP paths keep the complete MAP so the caller can extract literal keys.
-    fn with_nested_projection(
-        mut slf: PyRefMut<'_, Self>,
-        paths: Vec<Vec<String>>,
-    ) -> PyResult<PyRefMut<'_, Self>> {
-        let schema = slf.table.schema();
-        let mut read_type = project_nested_read_type(schema.fields(), &paths)?;
-        let options = schema.options();
-        let has_default_aggregation = options.contains_key("fields.default-aggregate-function");
-        for projected in &mut read_type {
-            let selected_map = matches!(projected.data_type(), DataType::Map(_))
-                && projected
-                    .description()
-                    .is_some_and(|description| description.starts_with(MAP_SELECTED_KEYS_PREFIX));
-            let has_field_aggregation =
-                options.contains_key(&format!("fields.{}.aggregate-function", projected.name()));
-            if selected_map && (has_default_aggregation || has_field_aggregation) {
-                // Merge engines may need the complete MAP to calculate the
-                // projected key. Match PyPaimon's complete-MAP fallback.
-                *projected = schema
-                    .fields()
-                    .iter()
-                    .find(|field| field.name() == projected.name())
-                    .expect("nested projection came from this schema")
-                    .clone();
-            }
-        }
-        slf.read_type = Some(read_type);
-        slf.projection = None;
-        Ok(slf)
-    }
-
+    /// Limit the number of visible rows.
     fn with_limit(mut slf: PyRefMut<'_, Self>, limit: usize) -> PyRefMut<'_, Self> {
         slf.limit = Some(limit);
         slf
@@ -416,9 +289,28 @@ impl PyReadBuilder {
         mut slf: PyRefMut<'py, Self>,
         predicate: &Bound<'_, PyDict>,
     ) -> PyResult<PyRefMut<'py, Self>> {
-        let filter =
-            dict_to_table_predicate(predicate, slf.table.schema().fields(), slf.case_sensitive)?;
+        let filter = dict_to_table_predicate(predicate, slf.table.schema(), slf.case_sensitive)?;
         slf.filter = Some(filter);
+        Ok(slf)
+    }
+
+    /// Set a scan-only partition selector using table fields. None clears it.
+    #[pyo3(signature = (predicate))]
+    fn with_partition_filter<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        predicate: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        let filter = predicate
+            .map(|predicate| {
+                dict_to_table_predicate(predicate, slf.table.schema(), slf.case_sensitive)
+            })
+            .transpose()?;
+        // Validation and all partition/query-auth semantics belong to core.
+        slf.table
+            .new_read_builder()
+            .with_partition_filter(filter.clone())
+            .map_err(to_py_err)?;
+        slf.partition_filter = filter;
         Ok(slf)
     }
 
@@ -448,6 +340,7 @@ impl PyReadBuilder {
             read_type: self.read_type.clone(),
             limit: self.limit,
             filter: self.filter.clone(),
+            partition_filter: self.partition_filter.clone(),
             row_ranges: self.row_ranges.clone(),
             case_sensitive: self.case_sensitive,
             incremental_scan: None,
@@ -456,6 +349,18 @@ impl PyReadBuilder {
             chunk_shuffle: None,
             shard: None,
         }
+    }
+
+    /// Create a stateful Java-compatible stream scan.
+    pub(crate) fn new_stream_scan(&self) -> PyResult<PyStreamTableScan> {
+        Ok(PyStreamTableScan {
+            scan: self
+                .new_scan()
+                .read_builder()?
+                .new_stream_scan()
+                .map_err(to_py_err)?,
+            bucket_filter: Arc::new(Mutex::new(PyBucketFilterState::default())),
+        })
     }
 
     /// Plan physical changes in (start_snapshot_id, end_snapshot_id] as one
@@ -498,6 +403,7 @@ pub struct PyTableScan {
     read_type: Option<Vec<DataField>>,
     limit: Option<usize>,
     filter: Option<Predicate>,
+    partition_filter: Option<Predicate>,
     row_ranges: Option<Vec<RowRange>>,
     case_sensitive: bool,
     incremental_scan: Option<PyIncrementalScan>,
@@ -598,10 +504,142 @@ impl PyTableScan {
             &self.filter,
             self.case_sensitive,
         )?;
+        if let Some(filter) = &self.partition_filter {
+            builder
+                .with_partition_filter(Some(filter.clone()))
+                .map_err(to_py_err)?;
+        }
         if let Some(row_ranges) = &self.row_ranges {
             builder.with_row_ranges(row_ranges.clone());
         }
         Ok(builder)
+    }
+}
+
+/// A thin wrapper: planning, cursor and consumer progress belong to core.
+#[pyclass(name = "StreamTableScan", module = "pypaimon_rust.datafusion")]
+pub struct PyStreamTableScan {
+    scan: StreamTableScan,
+    bucket_filter: Arc<Mutex<PyBucketFilterState>>,
+}
+
+// The wrapper and core closure share one Python reference per object, so GC
+// can traverse every retained reference exactly once through the wrapper.
+#[derive(Default)]
+struct PyBucketFilterState {
+    filter: Option<Py<PyAny>>,
+    error: Option<Py<PyBaseException>>,
+}
+
+#[pymethods]
+impl PyStreamTableScan {
+    fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
+        let state = self.bucket_filter.lock().unwrap();
+        visit.call(&state.filter)?;
+        visit.call(&state.error)
+    }
+
+    fn __clear__(&mut self) {
+        let references = {
+            let mut state = self.bucket_filter.lock().unwrap();
+            (state.filter.take(), state.error.take())
+        };
+        // Drop Python references outside the lock: destructors may re-enter
+        // Python. The core closure sees an empty filter and retains no cycle.
+        drop(references);
+    }
+
+    #[pyo3(signature = (filter = None))]
+    fn with_bucket_filter(
+        mut slf: PyRefMut<'_, Self>,
+        filter: Option<Py<PyAny>>,
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        if filter
+            .as_ref()
+            .is_some_and(|filter| !filter.bind(slf.py()).is_callable())
+        {
+            return Err(PyTypeError::new_err("bucket filter must be callable"));
+        }
+        let previous_filter =
+            std::mem::replace(&mut slf.bucket_filter.lock().unwrap().filter, filter);
+        drop(previous_filter);
+        let state = Arc::clone(&slf.bucket_filter);
+        slf.scan.with_bucket_filter(move |bucket| {
+            Python::attach(|py| {
+                // Release the lock before invoking Python: callbacks may run
+                // GC, which traverses this same state.
+                let filter = state
+                    .lock()
+                    .unwrap()
+                    .filter
+                    .as_ref()
+                    .map(|filter| filter.clone_ref(py));
+                let Some(filter) = filter else {
+                    return Ok(true);
+                };
+                filter
+                    .call1(py, (bucket,))
+                    .and_then(|result| result.is_truthy(py))
+                    .map_err(|error| {
+                        let error = error.into_value(py);
+                        let previous_error = state.lock().unwrap().error.replace(error);
+                        drop(previous_error);
+                        paimon::Error::UnexpectedError {
+                            message: "Python bucket filter failed".into(),
+                            source: None,
+                        }
+                    })
+            })
+        });
+        Ok(slf)
+    }
+
+    fn with_consumer_id(
+        mut slf: PyRefMut<'_, Self>,
+        consumer_id: String,
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        slf.scan.with_consumer_id(consumer_id).map_err(to_py_err)?;
+        Ok(slf)
+    }
+
+    fn with_shard(
+        mut slf: PyRefMut<'_, Self>,
+        index: usize,
+        count: usize,
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        slf.scan.with_shard(index, count).map_err(to_py_err)?;
+        Ok(slf)
+    }
+
+    fn checkpoint(&self) -> Option<i64> {
+        self.scan.checkpoint()
+    }
+
+    fn watermark(&self) -> Option<i64> {
+        self.scan.watermark()
+    }
+
+    #[pyo3(signature = (next_snapshot_id = None))]
+    fn restore(&mut self, next_snapshot_id: Option<i64>) -> PyResult<()> {
+        self.scan.restore(next_snapshot_id).map_err(to_py_err)
+    }
+
+    fn notify_checkpoint_complete(
+        &self,
+        py: Python<'_>,
+        next_snapshot: Option<i64>,
+    ) -> PyResult<()> {
+        py.detach(|| runtime().block_on(self.scan.notify_checkpoint_complete(next_snapshot)))
+            .map_err(to_py_err)
+    }
+
+    fn plan(&mut self, py: Python<'_>) -> PyResult<Option<PyPlan>> {
+        let plan = py.detach(|| runtime().block_on(self.scan.plan()));
+        let error = self.bucket_filter.lock().unwrap().error.take();
+        if let Some(error) = error {
+            return Err(PyErr::from_value(error.into_bound(py).into_any()));
+        }
+        plan.map(|plan| plan.map(PyPlan::from)).map_err(to_py_err)
     }
 }
 
@@ -649,7 +687,7 @@ impl PyTableScan {
         Ok(slf)
     }
 
-    /// Select one balanced worker shard for a distributed scan.
+    /// Select a Java file-name or bucket shard, or balanced shuffled chunks.
     fn with_shard(
         mut slf: PyRefMut<'_, Self>,
         index: usize,
@@ -740,11 +778,9 @@ impl PyTableRead {
         py: Python<'_>,
         splits: &Bound<'_, PyAny>,
     ) -> PyResult<PyRecordBatchReader> {
-        Ok(PyRecordBatchReader {
-            stream: Mutex::new(Some(self.read_stream(py, splits)?)),
-            closed: AtomicBool::new(false),
-            close_notify: Notify::new(),
-        })
+        Ok(PyRecordBatchReader::from_stream(
+            self.read_stream(py, splits)?,
+        ))
     }
 
     /// Read the given splits into a list of PyArrow RecordBatches.
@@ -764,12 +800,29 @@ impl PyTableRead {
 
 #[pyclass(name = "RecordBatchReader", module = "pypaimon_rust.datafusion")]
 pub struct PyRecordBatchReader {
-    stream: Mutex<Option<ArrowRecordBatchStream>>,
+    schema: Option<SchemaRef>,
+    stream: Mutex<Option<BoxStream<'static, PyResult<RecordBatch>>>>,
     closed: AtomicBool,
     close_notify: Notify,
 }
 
 impl PyRecordBatchReader {
+    pub(crate) fn from_stream(stream: ArrowRecordBatchStream) -> Self {
+        Self::from_py_stream(None, Box::pin(stream.map_err(to_py_err)))
+    }
+
+    pub(crate) fn from_py_stream(
+        schema: Option<SchemaRef>,
+        stream: BoxStream<'static, PyResult<RecordBatch>>,
+    ) -> Self {
+        Self {
+            schema,
+            stream: Mutex::new(Some(stream)),
+            closed: AtomicBool::new(false),
+            close_notify: Notify::new(),
+        }
+    }
+
     fn next_record_batch(&self) -> PyResult<Option<RecordBatch>> {
         let mut stream = self
             .stream
@@ -780,18 +833,16 @@ impl PyRecordBatchReader {
             return Ok(None);
         }
         let result = match stream.as_mut() {
-            Some(stream) => runtime()
-                .block_on(async {
-                    tokio::select! {
-                        biased;
-                        _ = self.close_notify.notified() => Ok(None),
-                        batch = stream.try_next() => batch,
-                    }
-                })
-                .map_err(to_py_err),
+            Some(stream) => runtime().block_on(async {
+                tokio::select! {
+                    biased;
+                    _ = self.close_notify.notified() => Ok(None),
+                    batch = stream.try_next() => batch,
+                }
+            }),
             None => Ok(None),
         };
-        if self.closed.load(Ordering::Acquire) {
+        if self.closed.load(Ordering::Acquire) || !matches!(result, Ok(Some(_))) {
             stream.take();
         }
         result
@@ -806,9 +857,7 @@ impl PyRecordBatchReader {
 
     fn close_reader(&self) {
         self.closed.store(true, Ordering::Release);
-        // notify_one stores a permit when next_record_batch has not started
-        // polling yet, avoiding a lost wake-up between its closed check and
-        // the select.
+        // notify_one retains a permit if the read has not started polling.
         self.close_notify.notify_one();
         if let Ok(mut stream) = self.stream.try_lock() {
             stream.take();
@@ -818,6 +867,15 @@ impl PyRecordBatchReader {
 
 #[pymethods]
 impl PyRecordBatchReader {
+    /// Result schema, known before the first batch for SQL streams.
+    #[getter]
+    fn schema(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+        self.schema
+            .as_ref()
+            .map(|schema| Ok(schema.to_pyarrow(py)?.unbind()))
+            .transpose()
+    }
+
     fn read_next_batch(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
         self.next_batch(py)
     }
@@ -953,100 +1011,27 @@ mod tests {
 
     use super::*;
 
-    use paimon::spec::{DataField, DataType, IntType, MapType, RowType, VarCharType};
-
     #[test]
-    fn nested_projection_prunes_rows_and_marks_selected_map_keys() {
-        let fields = vec![
-            DataField::new(0, "id".to_string(), DataType::Int(IntType::new())),
-            DataField::new(
-                1,
-                "payload".to_string(),
-                DataType::Row(RowType::new(vec![
-                    DataField::new(2, "version".to_string(), DataType::Int(IntType::new())),
-                    DataField::new(
-                        3,
-                        "details".to_string(),
-                        DataType::Row(RowType::new(vec![
-                            DataField::new(
-                                4,
-                                "name".to_string(),
-                                DataType::VarChar(VarCharType::string_type()),
-                            ),
-                            DataField::new(5, "score".to_string(), DataType::Int(IntType::new())),
-                        ])),
-                    ),
-                ])),
-            ),
-            DataField::new(
-                6,
-                "attrs".to_string(),
-                DataType::Map(MapType::new(
-                    DataType::VarChar(VarCharType::string_type()),
-                    DataType::Int(IntType::new()),
-                )),
-            ),
-        ];
+    fn record_batch_reader_releases_stream_on_completion_or_error() {
+        for fail in [false, true] {
+            let resource = Arc::new(());
+            let weak = Arc::downgrade(&resource);
+            let stream: ArrowRecordBatchStream = Box::pin(futures::stream::poll_fn(move |_cx| {
+                let _resource = &resource;
+                Poll::Ready(fail.then(|| {
+                    Err(paimon::Error::Unsupported {
+                        message: "read failed".to_string(),
+                    })
+                }))
+            }));
+            let reader = PyRecordBatchReader::from_stream(stream);
+            assert!(weak.upgrade().is_some());
 
-        let projected = project_nested_read_type(
-            &fields,
-            &[
-                vec![
-                    "payload".to_string(),
-                    "details".to_string(),
-                    "score".to_string(),
-                ],
-                vec!["id".to_string()],
-                vec!["attrs".to_string(), "selected".to_string()],
-            ],
-        )
-        .unwrap();
-
-        assert_eq!(
-            projected.iter().map(DataField::name).collect::<Vec<_>>(),
-            vec!["payload", "id", "attrs"]
-        );
-        let DataType::Row(payload) = projected[0].data_type() else {
-            panic!("payload must remain a row");
-        };
-        assert_eq!(payload.fields().len(), 1);
-        assert_eq!(payload.fields()[0].name(), "details");
-        let DataType::Row(details) = payload.fields()[0].data_type() else {
-            panic!("details must remain a row");
-        };
-        assert_eq!(
-            details
-                .fields()
-                .iter()
-                .map(DataField::name)
-                .collect::<Vec<_>>(),
-            vec!["score"]
-        );
-        assert_eq!(projected[2].data_type(), fields[2].data_type());
-        assert_eq!(
-            projected[2].description(),
-            Some("__PAIMON_MAP_SELECTED_KEYS:selected")
-        );
-    }
-
-    #[test]
-    fn nested_projection_rejects_an_invalid_struct_path() {
-        let fields = vec![DataField::new(
-            1,
-            "payload".to_string(),
-            DataType::Row(RowType::new(vec![DataField::new(
-                2,
-                "version".to_string(),
-                DataType::Int(IntType::new()),
-            )])),
-        )];
-
-        let error = project_nested_read_type(
-            &fields,
-            &[vec!["payload".to_string(), "missing".to_string()]],
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("payload.missing"));
+            let result = reader.next_record_batch();
+            assert_eq!(result.is_err(), fail);
+            assert!(weak.upgrade().is_none());
+            assert!(matches!(reader.next_record_batch(), Ok(None)));
+        }
     }
 
     #[test]
@@ -1060,11 +1045,7 @@ mod tests {
             }
             Poll::<Option<paimon::Result<RecordBatch>>>::Pending
         }));
-        let reader = Arc::new(PyRecordBatchReader {
-            stream: Mutex::new(Some(stream)),
-            closed: AtomicBool::new(false),
-            close_notify: Notify::new(),
-        });
+        let reader = Arc::new(PyRecordBatchReader::from_stream(stream));
         let worker_reader = Arc::clone(&reader);
         let (result_tx, result_rx) = mpsc::channel();
         let worker = std::thread::spawn(move || {

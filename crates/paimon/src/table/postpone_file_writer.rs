@@ -94,6 +94,14 @@ pub(crate) struct PostponeFileWriter {
 }
 
 impl PostponeFileWriter {
+    pub(super) fn with_blob_uri_reader_factory(
+        mut self,
+        factory: Option<Arc<dyn crate::io::UriReaderFactory>>,
+    ) -> Self {
+        self.managed_blob_writer.set_uri_reader_factory(factory);
+        self
+    }
+
     pub(crate) fn new(file_io: FileIO, config: PostponeWriteConfig) -> Result<Self> {
         let paths = DataFilePathFactory::new(
             &config.table_location,

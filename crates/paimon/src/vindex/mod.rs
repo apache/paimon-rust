@@ -36,9 +36,6 @@ pub const DISKANN_IDENTIFIER: &str = "diskann";
 
 const DEFAULT_DIMENSION: &str = "128";
 const DEFAULT_METRIC: &str = "inner_product";
-const DEFAULT_NLIST: &str = "256";
-const DEFAULT_PQ_M: &str = "16";
-const DEFAULT_PQ_USE_OPQ: &str = "false";
 const DEFAULT_TRAIN_SAMPLE_RATIO: f64 = 1.0;
 const VINDEX_BUILD_GRANULE_ENABLED: &str = "vindex.build.granule.enabled";
 const VECTOR_SEARCH_TIMING_ENV: &str = "PAIMON_LOG_VECTOR_SEARCH_TIMING";
@@ -112,7 +109,7 @@ pub(crate) fn native_index_type(index_type: &str) -> Option<&'static str> {
 
 #[derive(Debug)]
 pub(crate) struct VindexVectorIndexOptions {
-    pub config: VectorIndexConfig,
+    dimension: usize,
     pub native_options: HashMap<String, String>,
     pub train_sample_ratio: f64,
     pub granule_build_enabled: bool,
@@ -132,143 +129,171 @@ impl VindexVectorIndexOptions {
             })?;
 
         validate_user_option_keys(user_options, index_type, field.name())?;
-        validate_index_type_option(table_options, user_options, native_index_type)?;
-
+        validate_index_type_option(user_options, native_index_type)?;
         let mut native_options = HashMap::new();
-        native_options.insert("index.type".to_string(), native_index_type.to_string());
-        native_options.insert(
-            "dimension".to_string(),
-            resolve_dimension(table_options, user_options, index_type, field)?,
-        );
-        if index_type != DISKANN_IDENTIFIER {
-            native_options.insert(
-                "nlist".to_string(),
-                option_value(
-                    table_options,
-                    user_options,
-                    field.name(),
-                    index_type,
-                    "nlist",
-                    "nlist",
-                    DEFAULT_NLIST,
-                ),
-            );
-        }
-        native_options.insert(
-            "metric".to_string(),
-            normalize_metric(&option_value(
-                table_options,
-                user_options,
-                field.name(),
-                index_type,
-                "metric",
-                "distance.metric",
-                DEFAULT_METRIC,
-            )),
-        );
+        // Source precedence is build > table; within each source, field > index
+        // > native keys. Table options follow Java; explicit builder options
+        // also accept the documented Rust/SQL native aliases.
+        collect_native_options(
+            &mut native_options,
+            table_options,
+            index_type,
+            field.name(),
+            false,
+        )?;
+        collect_native_options(
+            &mut native_options,
+            user_options,
+            index_type,
+            field.name(),
+            true,
+        )?;
+        native_options.insert("index.type".into(), native_index_type.into());
+        let dimension = match field.data_type() {
+            DataType::Vector(vector) => vector.length().to_string(),
+            _ => native_options
+                .get("dimension")
+                .cloned()
+                .unwrap_or_else(|| DEFAULT_DIMENSION.into()),
+        };
+        native_options.insert("dimension".into(), dimension);
+        let metric = native_options
+            .entry("metric".into())
+            .or_insert_with(|| DEFAULT_METRIC.into());
+        *metric = normalize_metric(metric);
 
-        if index_type == IVF_PQ_IDENTIFIER {
-            native_options.insert(
-                "pq.m".to_string(),
-                option_value(
-                    table_options,
-                    user_options,
-                    field.name(),
-                    index_type,
-                    "pq.m",
-                    "pq.m",
-                    DEFAULT_PQ_M,
-                ),
-            );
-            native_options.insert(
-                "use-opq".to_string(),
-                option_value(
-                    table_options,
-                    user_options,
-                    field.name(),
-                    index_type,
-                    "use-opq",
-                    "pq.use-opq",
-                    DEFAULT_PQ_USE_OPQ,
-                ),
-            );
-        }
-        if index_type == IVF_RQ_IDENTIFIER {
-            for key in ["rq.bits", "max-bytes-per-vector"] {
-                if let Some(value) = optional_value(
-                    table_options,
-                    user_options,
-                    field.name(),
-                    index_type,
-                    key,
-                    key,
-                ) {
-                    native_options.insert(key.to_string(), value);
-                }
-            }
-        }
-        if index_type == DISKANN_IDENTIFIER {
-            for &(native_key, paimon_suffix) in DISKANN_OPTION_KEYS {
-                if let Some(value) = optional_value(
-                    table_options,
-                    user_options,
-                    field.name(),
-                    index_type,
-                    native_key,
-                    paimon_suffix,
-                ) {
-                    native_options.insert(native_key.to_string(), value);
-                }
-            }
-        }
-        for key in [
-            "ivf.coarse-assignment",
-            "ivf.pq-encoding",
-            "ivf.train.max-points-per-centroid",
-            "pq.train.max-points-per-centroid",
-        ] {
-            if is_allowed_native_key(key, index_type) {
-                if let Some(value) = optional_value(
-                    table_options,
-                    user_options,
-                    field.name(),
-                    index_type,
-                    key,
-                    key,
-                ) {
-                    native_options.insert(key.to_string(), value);
-                }
-            }
-        }
-
-        let config = VectorIndexConfig::from_options(&native_options).map_err(|e| {
-            crate::Error::DataInvalid {
-                message: format!("Invalid vindex options: {e}"),
-                source: Some(Box::new(e)),
-            }
-        })?;
+        // Like Java, compile the native configuration only when training begins.
+        // A synthetic count can reject budgets satisfied by the real vector count.
+        let dimension = native_options["dimension"]
+            .trim()
+            .parse::<usize>()
+            .ok()
+            .filter(|dimension| *dimension > 0)
+            .ok_or_else(|| crate::Error::DataInvalid {
+                message: "vindex vector dimension must be a positive integer".into(),
+                source: None,
+            })?;
         let train_sample_ratio =
             resolve_train_sample_ratio(table_options, user_options, index_type, field.name())?;
         let granule_build_enabled = resolve_granule_build_enabled(table_options, user_options)?;
         Ok(Self {
-            config,
+            dimension,
             native_options,
             train_sample_ratio,
             granule_build_enabled,
         })
     }
 
+    pub(crate) fn needs_vector_count(&self) -> bool {
+        self.native_options
+            .get("index.type")
+            .is_some_and(|kind| kind.starts_with("ivf_"))
+            && self
+                .native_options
+                .get("nlist")
+                .is_none_or(|value| value.trim() == "auto")
+            && !self.native_options.contains_key("expected-vector-count")
+    }
+
+    pub(crate) fn training_config(&self, vector_count: usize) -> crate::Result<VectorIndexConfig> {
+        compile_training_config(&self.native_options, vector_count)
+    }
+
     pub fn dimension(&self) -> usize {
-        self.config.dimension()
+        self.dimension
+    }
+}
+
+fn compile_training_config(
+    native_options: &HashMap<String, String>,
+    vector_count: usize,
+) -> crate::Result<VectorIndexConfig> {
+    let mut options = native_options.clone();
+    // Java NativeVectorGlobalIndexWriter.trainingOptions uses valid vectors.
+    if options
+        .get("index.type")
+        .is_some_and(|kind| kind.starts_with("ivf_"))
+        && options
+            .get("nlist")
+            .is_none_or(|value| value.trim() == "auto")
+    {
+        options
+            .entry("expected-vector-count".into())
+            .or_insert_with(|| vector_count.to_string());
+    }
+    VectorIndexConfig::from_options(&options).map_err(|error| crate::Error::DataInvalid {
+        message: format!("Invalid vindex options: {error}"),
+        source: Some(Box::new(error)),
+    })
+}
+
+fn validate_user_option_keys(
+    options: &HashMap<String, String>,
+    index_type: &str,
+    field: &str,
+) -> crate::Result<()> {
+    let mut unknown = options
+        .keys()
+        .filter(|key| {
+            if matches!(
+                key.as_str(),
+                "index.type"
+                    | "global-index.row-count-per-shard"
+                    | "global-index.build.parallelism"
+            ) {
+                return false;
+            }
+            if key.as_str() == VINDEX_BUILD_GRANULE_ENABLED {
+                return index_type == DISKANN_IDENTIFIER;
+            }
+            let suffix = key
+                .strip_prefix(&format!("{index_type}."))
+                .or_else(|| key.strip_prefix(&format!("fields.{field}.")))
+                .unwrap_or(key);
+            if suffix == "train.sample-ratio" {
+                return key.as_str() == suffix;
+            }
+            native_option_key(suffix).is_none_or(|key| !native_option_applies(key, index_type))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    unknown.sort();
+    Err(crate::Error::ConfigInvalid {
+        message: format!(
+            "Unknown vindex option(s) for index_type '{index_type}': {}",
+            unknown.join(", ")
+        ),
+    })
+}
+
+fn native_option_applies(key: &str, index_type: &str) -> bool {
+    match key {
+        "dimension"
+        | "metric"
+        | "expected-vector-count"
+        | "target-recall"
+        | "deployment-profile" => true,
+        "nlist" => index_type != DISKANN_IDENTIFIER,
+        "use-opq" => index_type == IVF_PQ_IDENTIFIER,
+        "rq.bits" => index_type == IVF_RQ_IDENTIFIER,
+        "pq.m" | "pq.code-ratio" => matches!(index_type, IVF_PQ_IDENTIFIER | DISKANN_IDENTIFIER),
+        "max-bytes-per-vector" => true,
+        key if is_native_build_option(key) => build_option_applies(key, index_type),
+        key => {
+            index_type == DISKANN_IDENTIFIER
+                && DISKANN_OPTION_KEYS.iter().any(|(native, _)| key == *native)
+        }
     }
 }
 
 fn validate_index_type_option(
-    table_options: &HashMap<String, String>,
     user_options: &HashMap<String, String>,
     expected_native: &str,
 ) -> crate::Result<()> {
-    for options in [table_options, user_options] {
+    for options in [user_options] {
         if let Some(value) = options.get("index.type") {
             let normalized = value.trim().to_ascii_lowercase().replace('-', "_");
             if normalized != expected_native {
@@ -285,52 +310,91 @@ fn validate_index_type_option(
     Ok(())
 }
 
-fn validate_user_option_keys(
-    user_options: &HashMap<String, String>,
-    index_type: &str,
-    field_name: &str,
-) -> crate::Result<()> {
-    let mut unknown = user_options
-        .keys()
-        .filter(|key| !is_supported_user_option_key(key, index_type, field_name))
-        .cloned()
-        .collect::<Vec<_>>();
-    if unknown.is_empty() {
-        return Ok(());
+fn native_option_key(key: &str) -> Option<&str> {
+    match key {
+        "index.dimension" | "dimension" => Some("dimension"),
+        "distance.metric" | "metric" => Some("metric"),
+        "pq.use-opq" | "use-opq" => Some("use-opq"),
+        "nlist"
+        | "expected-vector-count"
+        | "ivf.coarse-assignment"
+        | "ivf.pq-encoding"
+        | "ivf.train.max-points-per-centroid"
+        | "pq.train.max-points-per-centroid"
+        | "pq.m"
+        | "pq.code-ratio"
+        | "pq.bits"
+        | "rq.bits"
+        | "target-recall"
+        | "max-bytes-per-vector"
+        | "deployment-profile" => Some(key),
+        _ => DISKANN_OPTION_KEYS
+            .iter()
+            .find_map(|(native, suffix)| (key == *native || key == *suffix).then_some(*native)),
     }
-
-    unknown.sort();
-    Err(crate::Error::ConfigInvalid {
-        message: format!(
-            "Unknown vindex option(s) for index_type '{}': {}",
-            index_type,
-            unknown.join(", ")
-        ),
-    })
 }
 
-fn is_supported_user_option_key(key: &str, index_type: &str, field_name: &str) -> bool {
-    if key == "index.type" {
-        return true;
-    }
-    if key == VINDEX_BUILD_GRANULE_ENABLED {
-        return index_type != DISKANN_IDENTIFIER;
-    }
-    if is_allowed_native_key(key, index_type) {
-        return true;
-    }
+fn is_native_build_option(key: &str) -> bool {
+    matches!(
+        key,
+        "ivf.coarse-assignment"
+            | "ivf.pq-encoding"
+            | "ivf.train.max-points-per-centroid"
+            | "pq.train.max-points-per-centroid"
+    )
+}
 
-    let index_prefix = format!("{index_type}.");
-    if let Some(suffix) = key.strip_prefix(&index_prefix) {
-        return is_allowed_paimon_suffix(suffix, index_type);
+fn build_option_applies(key: &str, index_type: &str) -> bool {
+    match key {
+        "ivf.pq-encoding" => index_type == IVF_PQ_IDENTIFIER,
+        "pq.train.max-points-per-centroid" => {
+            matches!(index_type, IVF_PQ_IDENTIFIER | DISKANN_IDENTIFIER)
+        }
+        _ => index_type != DISKANN_IDENTIFIER,
     }
+}
 
-    let field_prefix = format!("fields.{field_name}.");
-    if let Some(suffix) = key.strip_prefix(&field_prefix) {
-        return is_allowed_paimon_suffix(suffix, index_type);
+fn collect_native_options(
+    result: &mut HashMap<String, String>,
+    options: &HashMap<String, String>,
+    index_type: &str,
+    field_name: &str,
+    validate: bool,
+) -> crate::Result<()> {
+    for prefix in [
+        String::new(),
+        format!("{index_type}."),
+        format!("fields.{field_name}."),
+    ] {
+        for (key, value) in options {
+            let Some(suffix) = key.strip_prefix(&prefix) else {
+                continue;
+            };
+            let Some(native_key) = native_option_key(suffix) else {
+                continue;
+            };
+            // Schema options follow Java. Explicit Rust/SQL builder options also
+            // accept the documented native aliases.
+            if prefix.is_empty()
+                && !validate
+                && (key != native_key || !is_native_build_option(native_key))
+            {
+                continue;
+            }
+            if is_native_build_option(native_key) && !build_option_applies(native_key, index_type) {
+                if validate {
+                    return Err(crate::Error::ConfigInvalid {
+                        message: format!(
+                            "Option '{key}' is not supported for index type '{index_type}'."
+                        ),
+                    });
+                }
+                continue;
+            }
+            result.insert(native_key.into(), value.clone());
+        }
     }
-
-    false
+    Ok(())
 }
 
 fn resolve_granule_build_enabled(
@@ -349,56 +413,6 @@ fn resolve_granule_build_enabled(
                 ),
             }),
         None => Ok(true),
-    }
-}
-
-fn is_allowed_native_key(key: &str, index_type: &str) -> bool {
-    match key {
-        "dimension" | "metric" => true,
-        "nlist" => index_type != DISKANN_IDENTIFIER,
-        "use-opq" => index_type == IVF_PQ_IDENTIFIER,
-        "rq.bits" => index_type == IVF_RQ_IDENTIFIER,
-        "max-bytes-per-vector" => {
-            matches!(index_type, IVF_RQ_IDENTIFIER | DISKANN_IDENTIFIER)
-        }
-        "pq.m" if index_type == IVF_PQ_IDENTIFIER => true,
-        "ivf.coarse-assignment" | "ivf.train.max-points-per-centroid" => {
-            index_type != DISKANN_IDENTIFIER
-        }
-        "ivf.pq-encoding" => index_type == IVF_PQ_IDENTIFIER,
-        "pq.train.max-points-per-centroid" => {
-            matches!(index_type, IVF_PQ_IDENTIFIER | DISKANN_IDENTIFIER)
-        }
-        _ => {
-            index_type == DISKANN_IDENTIFIER
-                && DISKANN_OPTION_KEYS
-                    .iter()
-                    .any(|(native_key, _)| *native_key == key)
-        }
-    }
-}
-
-fn is_allowed_paimon_suffix(suffix: &str, index_type: &str) -> bool {
-    match suffix {
-        "dimension" | "distance.metric" => true,
-        "nlist" => index_type != DISKANN_IDENTIFIER,
-        "train.sample-ratio" => true,
-        "pq.use-opq" => index_type == IVF_PQ_IDENTIFIER,
-        "rq.bits" => index_type == IVF_RQ_IDENTIFIER,
-        "max-bytes-per-vector" => {
-            matches!(index_type, IVF_RQ_IDENTIFIER | DISKANN_IDENTIFIER)
-        }
-        "pq.m" if index_type == IVF_PQ_IDENTIFIER => true,
-        "ivf.coarse-assignment"
-        | "ivf.pq-encoding"
-        | "ivf.train.max-points-per-centroid"
-        | "pq.train.max-points-per-centroid" => is_allowed_native_key(suffix, index_type),
-        _ => {
-            index_type == DISKANN_IDENTIFIER
-                && DISKANN_OPTION_KEYS
-                    .iter()
-                    .any(|(_, paimon_suffix)| *paimon_suffix == suffix)
-        }
     }
 }
 
@@ -428,6 +442,7 @@ fn resolve_train_sample_ratio(
         return Ok(DEFAULT_TRAIN_SAMPLE_RATIO);
     };
     let ratio = value
+        .trim()
         .parse::<f64>()
         .map_err(|_| crate::Error::ConfigInvalid {
             message: format!("Invalid vindex train.sample-ratio: '{value}'"),
@@ -440,69 +455,6 @@ fn resolve_train_sample_ratio(
         });
     }
     Ok(ratio)
-}
-
-fn resolve_dimension(
-    table_options: &HashMap<String, String>,
-    user_options: &HashMap<String, String>,
-    index_type: &str,
-    field: &DataField,
-) -> crate::Result<String> {
-    if let DataType::Vector(vector) = field.data_type() {
-        return Ok(vector.length().to_string());
-    }
-
-    Ok(option_value(
-        table_options,
-        user_options,
-        field.name(),
-        index_type,
-        "dimension",
-        "dimension",
-        DEFAULT_DIMENSION,
-    ))
-}
-
-fn option_value(
-    table_options: &HashMap<String, String>,
-    user_options: &HashMap<String, String>,
-    field_name: &str,
-    index_type: &str,
-    native_key: &str,
-    paimon_suffix: &str,
-    default_value: &str,
-) -> String {
-    optional_value(
-        table_options,
-        user_options,
-        field_name,
-        index_type,
-        native_key,
-        paimon_suffix,
-    )
-    .unwrap_or_else(|| default_value.to_string())
-}
-
-fn optional_value(
-    table_options: &HashMap<String, String>,
-    user_options: &HashMap<String, String>,
-    field_name: &str,
-    index_type: &str,
-    native_key: &str,
-    paimon_suffix: &str,
-) -> Option<String> {
-    for options in [user_options, table_options] {
-        for key in [
-            format!("fields.{field_name}.{paimon_suffix}"),
-            format!("{index_type}.{paimon_suffix}"),
-            native_key.to_string(),
-        ] {
-            if let Some(value) = options.get(&key) {
-                return Some(value.clone());
-            }
-        }
-    }
-    None
 }
 
 fn normalize_metric(metric: &str) -> String {
@@ -540,7 +492,7 @@ mod tests {
         )
         .unwrap();
         let n = 512;
-        let dimension = options.config.dimension();
+        let dimension = options.training_config(512).unwrap().dimension();
         let data = (0..n * dimension)
             .map(|offset| {
                 let row = offset / dimension;
@@ -548,7 +500,8 @@ mod tests {
                 (row % 4) as f32 * 20.0 + column as f32 * 0.01 + row as f32 * 0.0001
             })
             .collect::<Vec<_>>();
-        let training = VectorIndexTrainer::train(options.config, &data, n).unwrap();
+        let training =
+            VectorIndexTrainer::train(options.training_config(n).unwrap(), &data, n).unwrap();
         let mut writer = VectorIndexWriter::new(training);
         writer
             .add_vectors(&(0..n as i64).collect::<Vec<_>>(), &data, n)
@@ -656,7 +609,7 @@ mod tests {
                 .map(String::as_str),
             Some("canonical")
         );
-        let resolved = options.config.resolved();
+        let resolved = options.training_config(512).unwrap().resolved();
         assert!(!resolved.use_approximate_coarse_assignment);
         assert!(resolved.canonical_pq_encoding);
         assert_eq!(resolved.ivf_train_max_points_per_centroid, Some(32));
@@ -673,7 +626,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            diskann.config.resolved().pq_train_max_points_per_centroid,
+            diskann
+                .training_config(512)
+                .unwrap()
+                .resolved()
+                .pq_train_max_points_per_centroid,
             Some(16)
         );
     }
@@ -698,7 +655,10 @@ mod tests {
             options.native_options.get("rq.bits").map(String::as_str),
             Some("3")
         );
-        assert_eq!(options.config.resolved().rq_bits, Some(3));
+        assert_eq!(
+            options.training_config(512).unwrap().resolved().rq_bits,
+            Some(3)
+        );
 
         let defaults = VindexVectorIndexOptions::new(
             &HashMap::new(),
@@ -707,7 +667,10 @@ mod tests {
             &array_float_field(),
         )
         .unwrap();
-        assert_eq!(defaults.config.resolved().rq_bits, Some(4));
+        assert_eq!(
+            defaults.training_config(512).unwrap().resolved().rq_bits,
+            Some(4)
+        );
         assert!(!defaults.native_options.contains_key("rq.bits"));
 
         let capacity_goal = HashMap::from([
@@ -722,7 +685,10 @@ mod tests {
             &array_float_field(),
         )
         .unwrap();
-        assert_eq!(inferred.config.resolved().rq_bits, Some(3));
+        assert_eq!(
+            inferred.training_config(512).unwrap().resolved().rq_bits,
+            Some(3)
+        );
         assert_eq!(
             inferred
                 .native_options
@@ -739,6 +705,8 @@ mod tests {
             IVF_RQ_IDENTIFIER,
             &array_float_field(),
         )
+        .unwrap()
+        .training_config(512)
         .expect_err("rq.bits outside 1..=8 must be rejected");
         assert!(error.to_string().contains("rq.bits"));
     }
@@ -790,7 +758,7 @@ mod tests {
             &array_float_field(),
         )
         .unwrap();
-        let resolved = options.config.resolved();
+        let resolved = options.training_config(512).unwrap().resolved();
 
         assert_eq!(resolved.pq_m, Some(16));
         assert_eq!(resolved.pq_bits, Some(4));
@@ -1083,6 +1051,8 @@ mod tests {
             IVF_PQ_IDENTIFIER,
             &array_float_field(),
         )
+        .unwrap()
+        .training_config(512)
         .expect_err("invalid native config should be rejected");
 
         assert!(
@@ -1091,23 +1061,29 @@ mod tests {
     }
 
     #[test]
-    fn test_vindex_options_reject_unknown_user_options() {
-        let table_options = HashMap::new();
-        let user_options = HashMap::from([
-            ("ivf-flat.dimension".to_string(), "8".to_string()),
-            ("ivf-flat.nlsit".to_string(), "4".to_string()),
-        ]);
-
-        let err = VindexVectorIndexOptions::new(
-            &table_options,
-            &user_options,
+    fn test_vindex_table_options_ignore_unprefixed_keys_like_java() {
+        let options = VindexVectorIndexOptions::new(
+            &HashMap::from([
+                ("dimension".into(), "7".into()),
+                ("metric".into(), "invalid".into()),
+                ("index.type".into(), "diskann".into()),
+                ("nlist".into(), "0".into()),
+                ("ivf-flat.nlsit".into(), "4".into()),
+                ("global-index.build.parallelism".into(), "2".into()),
+            ]),
+            &HashMap::new(),
             IVF_FLAT_IDENTIFIER,
             &array_float_field(),
         )
-        .expect_err("unknown user option should be rejected");
-
-        assert!(
-            matches!(err, crate::Error::ConfigInvalid { message } if message.contains("ivf-flat.nlsit"))
+        .unwrap();
+        assert_eq!(options.dimension(), 128);
+        assert_eq!(options.native_options["metric"], "inner_product");
+        assert_eq!(options.native_options["index.type"], "ivf_flat");
+        assert!(!options.native_options.contains_key("nlist"));
+        assert!(options.needs_vector_count());
+        assert_eq!(
+            options.training_config(1000).unwrap().nlist(),
+            paimon_vindex_core::autotune::infer_ivf_nlist(1000).unwrap()
         );
     }
 
@@ -1115,14 +1091,16 @@ mod tests {
     fn test_vindex_options_reject_non_applicable_user_options() {
         for (index_type, key) in [
             (IVF_FLAT_IDENTIFIER, "ivf-flat.pq.m"),
+            (IVF_FLAT_IDENTIFIER, "ivf-pq.dimension"),
+            (IVF_FLAT_IDENTIFIER, "ivf-flat.nlsit"),
+            (IVF_FLAT_IDENTIFIER, "diskann.max-degree"),
+            (DISKANN_IDENTIFIER, "diskann.nlist"),
+            (DISKANN_IDENTIFIER, VINDEX_BUILD_GRANULE_ENABLED),
             (IVF_FLAT_IDENTIFIER, "ivf-flat.ivf.pq-encoding"),
             (
                 IVF_FLAT_IDENTIFIER,
                 "ivf-flat.pq.train.max-points-per-centroid",
             ),
-            (IVF_FLAT_IDENTIFIER, "diskann.max-degree"),
-            (DISKANN_IDENTIFIER, "diskann.nlist"),
-            (DISKANN_IDENTIFIER, VINDEX_BUILD_GRANULE_ENABLED),
             (DISKANN_IDENTIFIER, "diskann.ivf.coarse-assignment"),
             (
                 DISKANN_IDENTIFIER,
@@ -1164,7 +1142,7 @@ mod tests {
         );
         assert_eq!(
             options.native_options.get("nlist").map(String::as_str),
-            Some("256")
+            None
         );
     }
 

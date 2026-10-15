@@ -23,7 +23,7 @@ use super::table_read::{configured_mosaic_prefetch, configured_parquet_read_budg
 use super::{ArrowRecordBatchStream, Table};
 use crate::arrow::format::blob::DEFAULT_BLOB_READ_PARALLELISM;
 use crate::arrow::partition::partition_array;
-use crate::arrow::{build_target_arrow_schema, ReadBudget};
+use crate::arrow::ReadBudget;
 use crate::resource::ResourceContext;
 use crate::spec::{DataField, Predicate};
 use crate::{DataSplit, Error};
@@ -132,7 +132,7 @@ impl<'a> FormatTableRead<'a> {
         // `TableRead` is public and can be constructed and filtered directly.
         super::row_id_predicate::reject_row_id_filter(&self.data_predicates, "format tables")?;
         let read_type = self.read_type.clone();
-        let output_schema = build_target_arrow_schema(&read_type)?;
+        let output_schema = crate::arrow::build_read_arrow_schema(&read_type)?;
         let partition_keys = self.table.schema().partition_keys().to_vec();
         let partition_fields = self.table.schema().partition_fields();
         let (data_read_type, data_columns, partition_columns) =

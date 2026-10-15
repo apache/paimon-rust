@@ -26,7 +26,7 @@
 use crate::error::*;
 use crate::spec::binary_row::BinaryRow;
 use crate::spec::types::DataType;
-use crate::spec::{is_row_id_column, DataField};
+use crate::spec::{is_row_tracking_column, DataField};
 use std::cmp::Ordering;
 use std::fmt;
 
@@ -432,6 +432,28 @@ impl Predicate {
             Predicate::Not(inner) => *inner,
             Predicate::AlwaysTrue => Predicate::AlwaysFalse,
             Predicate::AlwaysFalse => Predicate::AlwaysTrue,
+            Predicate::Leaf {
+                column,
+                index,
+                data_type,
+                op,
+                literals,
+            } if literals.is_empty()
+                && matches!(op, PredicateOperator::In | PredicateOperator::NotIn) =>
+            {
+                // Java negates the leaf function, retaining its NULL exclusion.
+                Predicate::Leaf {
+                    column,
+                    index,
+                    data_type,
+                    op: if op == PredicateOperator::In {
+                        PredicateOperator::NotIn
+                    } else {
+                        PredicateOperator::In
+                    },
+                    literals,
+                }
+            }
             other => Predicate::Not(Box::new(other)),
         }
     }
@@ -468,7 +490,7 @@ impl Predicate {
                 op,
                 literals,
             } => {
-                if is_row_id_column(column) {
+                if is_row_tracking_column(column) {
                     return None;
                 }
                 let new_index = (*mapping.get(*index)?)?;
@@ -510,7 +532,7 @@ impl Predicate {
     pub(crate) fn references_only_mapped_fields(&self, mapping: &[Option<usize>]) -> bool {
         match self {
             Predicate::Leaf { column, index, .. } => {
-                !is_row_id_column(column) && mapping.get(*index).is_some_and(Option::is_some)
+                !is_row_tracking_column(column) && mapping.get(*index).is_some_and(Option::is_some)
             }
             Predicate::And(children) | Predicate::Or(children) => children
                 .iter()
@@ -522,7 +544,7 @@ impl Predicate {
 
     /// Project leaf field indices from table schema space into a smaller field space.
     ///
-    /// A `_ROW_ID` leaf never maps — see [`is_row_id_column`].
+    /// A row-tracking metadata leaf never maps — see [`is_row_tracking_column`].
     ///
     /// Unlike [`Self::remap_field_index`], mixed `AND` subtrees keep the children
     /// that can be projected and drop the rest. `OR` and `NOT` still require all
@@ -542,7 +564,7 @@ impl Predicate {
                 op,
                 literals,
             } => {
-                if is_row_id_column(column) {
+                if is_row_tracking_column(column) {
                     return None;
                 }
                 let new_index = (*mapping.get(*index)?)?;
@@ -923,26 +945,8 @@ fn parse_rest_leaf(
         "GREATER_OR_EQUAL" => binary(one_literal()?, &|l| builder.greater_or_equal(field, l)),
         "LESS_THAN" => binary(one_literal()?, &|l| builder.less_than(field, l)),
         "LESS_OR_EQUAL" => binary(one_literal()?, &|l| builder.less_or_equal(field, l)),
-        "IN" => {
-            // Java In: null literals never match; an empty/all-null list matches nothing.
-            let datums: Vec<Datum> = literals.iter().flatten().cloned().collect();
-            if datums.is_empty() {
-                Ok(Predicate::AlwaysFalse)
-            } else {
-                builder.is_in(field, datums)
-            }
-        }
-        "NOT_IN" => {
-            // Java NotIn: any null literal fails every row; an empty list keeps
-            // exactly the non-null rows.
-            if literals.iter().any(Option::is_none) {
-                Ok(Predicate::AlwaysFalse)
-            } else if literals.is_empty() {
-                builder.is_not_null(field)
-            } else {
-                builder.is_not_in(field, literals.iter().flatten().cloned().collect())
-            }
-        }
+        "IN" => builder.is_in_with_nulls(field, literals),
+        "NOT_IN" => builder.is_not_in_with_nulls(field, literals),
         "STARTS_WITH" => binary(one_literal()?, &|l| builder.starts_with(field, l)),
         "ENDS_WITH" => binary(one_literal()?, &|l| builder.ends_with(field, l)),
         "CONTAINS" => binary(one_literal()?, &|l| builder.contains(field, l)),
@@ -1037,12 +1041,144 @@ fn json_to_datum(value: &serde_json::Value, data_type: &DataType) -> Result<Datu
             .as_str()
             .map(|s| Datum::String(s.to_string()))
             .ok_or_else(type_err),
-        // Temporal/decimal literals fail closed: Java's own JSON deserializer
-        // cannot round-trip them.
+        // Java `LeafPredicate.toJsonFriendly`: ISO strings, and a plain decimal
+        // string rounded HALF_UP to the column scale (`Decimal.fromBigDecimal`).
+        DataType::Date(_) => value
+            .as_str()
+            .and_then(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
+            .map(|date| {
+                let epoch = chrono::DateTime::UNIX_EPOCH.date_naive();
+                Datum::Date((date - epoch).num_days() as i32)
+            })
+            .ok_or_else(type_err),
+        DataType::Time(_) => value
+            .as_str()
+            .and_then(|s| {
+                chrono::NaiveTime::parse_from_str(s, "%H:%M:%S%.f")
+                    .or_else(|_| chrono::NaiveTime::parse_from_str(s, "%H:%M"))
+                    .ok()
+            })
+            .filter(|time| !is_leap_second(time))
+            .map(|time| {
+                use chrono::Timelike;
+                let millis =
+                    time.num_seconds_from_midnight() * 1000 + time.nanosecond() / 1_000_000;
+                Datum::Time(millis as i32)
+            })
+            .ok_or_else(type_err),
+        DataType::Timestamp(_) => value
+            .as_str()
+            .and_then(|s| {
+                chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f")
+                    .or_else(|_| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M"))
+                    .ok()
+            })
+            .filter(|datetime| !is_leap_second(datetime))
+            .map(|datetime| {
+                let (millis, nanos) = millis_and_nanos(datetime.and_utc());
+                Datum::Timestamp { millis, nanos }
+            })
+            .ok_or_else(type_err),
+        DataType::LocalZonedTimestamp(_) => value
+            .as_str()
+            .and_then(parse_instant)
+            .map(|instant| {
+                let (millis, nanos) = millis_and_nanos(instant);
+                Datum::LocalZonedTimestamp { millis, nanos }
+            })
+            .ok_or_else(type_err),
+        DataType::Decimal(decimal) => value
+            .as_str()
+            .and_then(|s| decimal_literal(s, decimal.precision(), decimal.scale()))
+            .ok_or_else(type_err),
         other => Err(rest_json_err(format!(
             "literal conversion for type {other:?} is not supported"
         ))),
     }
+}
+
+/// Java `Instant.toString()` is UTC with a signed year outside 0000..=9999,
+/// which RFC 3339 cannot carry.
+fn parse_instant(text: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    match text.strip_suffix('Z') {
+        Some(local) => chrono::NaiveDateTime::parse_from_str(local, "%Y-%m-%dT%H:%M:%S%.f")
+            .ok()
+            .and_then(fold_leap_second)
+            .map(|datetime| datetime.and_utc()),
+        None => chrono::DateTime::parse_from_rfc3339(text)
+            .ok()
+            .and_then(fold_leap_second)
+            .map(|instant| instant.to_utc()),
+    }
+}
+
+/// chrono reads second 60 as a leap second; Java's `LocalTime` and `LocalDateTime` refuse it.
+fn is_leap_second(time: &impl chrono::Timelike) -> bool {
+    time.nanosecond() >= 1_000_000_000
+}
+
+/// Java's `Instant.parse` folds `23:59:60` into `23:59:59` and refuses any other leap second.
+fn fold_leap_second<T: chrono::Timelike>(time: T) -> Option<T> {
+    if !is_leap_second(&time) {
+        Some(time)
+    } else if time.hour() == 23 && time.minute() == 59 {
+        time.with_nanosecond(time.nanosecond() - 1_000_000_000)
+    } else {
+        None
+    }
+}
+
+/// Epoch millis and the nanos within that milli, as Paimon `Timestamp` keeps them.
+fn millis_and_nanos(instant: chrono::DateTime<chrono::Utc>) -> (i64, i32) {
+    (
+        instant.timestamp_millis(),
+        (instant.timestamp_subsec_nanos() % 1_000_000) as i32,
+    )
+}
+
+/// `None` when the rounded value no longer fits `precision`, where Java gives a
+/// null literal.
+fn decimal_literal(text: &str, precision: u32, scale: u32) -> Option<Datum> {
+    let (negative, digits) = match text.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, text.strip_prefix('+').unwrap_or(text)),
+    };
+    let (whole, fraction) = digits.split_once('.').unwrap_or((digits, ""));
+    if whole.is_empty() && fraction.is_empty()
+        || !whole
+            .chars()
+            .chain(fraction.chars())
+            .all(|c| c.is_ascii_digit())
+    {
+        return None;
+    }
+    let mut unscaled: i128 = 0;
+    for c in whole.chars().chain(fraction.chars()) {
+        unscaled = unscaled
+            .checked_mul(10)?
+            .checked_add(i128::from(c as u8 - b'0'))?;
+    }
+    let literal_scale = fraction.len() as u32;
+    if literal_scale > scale {
+        let divisor = 10i128.checked_pow(literal_scale - scale)?;
+        let (quotient, remainder) = (unscaled / divisor, unscaled % divisor);
+        // HALF_UP on the magnitude, before the sign is applied; `remainder * 2`
+        // can overflow at 38 digits.
+        unscaled = quotient + i128::from(remainder >= divisor - remainder);
+    } else {
+        unscaled = unscaled.checked_mul(10i128.checked_pow(scale - literal_scale)?)?;
+    }
+    let digit_count = unscaled.checked_ilog10().map_or(1, |log| log + 1);
+    // Java counts the digits of the rounded value, dropping leading zeros, so
+    // `0.05` at scale 2 has precision 1.
+    if digit_count > precision {
+        return None;
+    }
+    Some(Datum::Decimal {
+        unscaled: if negative { -unscaled } else { unscaled },
+        precision,
+        scale,
+    })
 }
 
 fn int_datum(value: &serde_json::Value, build: impl Fn(i64) -> Option<Datum>) -> Result<Datum> {
@@ -1062,6 +1198,8 @@ pub enum Transform {
     FieldRef(usize),
     /// `CAST`: a field cast to a type.
     Cast(usize, DataType),
+    /// Extract a Gregorian calendar field from DATE or TIMESTAMP.
+    DateExtract(usize, DatePart),
     /// String transforms over mixed literal / field inputs.
     Upper(Vec<TransformInput>),
     /// Lowercase of the inputs.
@@ -1070,13 +1208,103 @@ pub enum Transform {
     Concat(Vec<TransformInput>),
     /// Concatenation where the first input is the separator.
     ConcatWs(Vec<TransformInput>),
+    /// SQL substring with one-based, zero or negative positions.
+    Substring(Vec<TransformInput>),
+    /// Remove whole characters at the requested ends.
+    Trim(Vec<TransformInput>, TrimFlag),
+    /// Number of Unicode characters, as INT.
+    Length(TransformInput),
+    /// Number of UTF-8 bits, as INT.
+    BitLength(TransformInput),
+    /// SQL LPAD/RPAD.
+    Pad(Vec<TransformInput>, PadDirection),
+    /// Map or delete Unicode characters.
+    Translate(Vec<TransformInput>),
+    /// SQL overlay with optional replacement length.
+    Overlay(Vec<TransformInput>),
 }
 
-/// One input of a string [`Transform`].
+/// Calendar fields exposed by Java DateExtractTransform subclasses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DatePart {
+    /// Proleptic Gregorian year, including year zero and negative years.
+    Year,
+    /// Month numbered 1 through 12.
+    Month,
+    /// Day of month, numbered 1 through 31.
+    Day,
+    /// Hour of day, or zero for DATE.
+    Hour,
+    /// Minute of hour, or zero for DATE.
+    Minute,
+    /// Second of minute, or zero for DATE.
+    Second,
+    /// Quarter numbered 1 through 4.
+    Quarter,
+    /// Day of year, numbered 1 through 366.
+    DayOfYear,
+    /// Monday is zero; Sunday is six.
+    Weekday,
+    /// Monday is one; Sunday is seven.
+    IsoDayOfWeek,
+    /// Sunday is one; Saturday is seven.
+    DayOfWeek,
+    /// ISO week of the week-based year, numbered 1 through 53.
+    Week,
+    /// ISO week-based year, which can differ from the calendar year.
+    YearOfWeek,
+}
+
+impl DatePart {
+    pub(crate) fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "YEAR" => Self::Year,
+            "MONTH" => Self::Month,
+            "DAY" => Self::Day,
+            "HOUR" => Self::Hour,
+            "MINUTE" => Self::Minute,
+            "SECOND" => Self::Second,
+            "QUARTER" => Self::Quarter,
+            "DAY_OF_YEAR" => Self::DayOfYear,
+            "WEEKDAY" => Self::Weekday,
+            "ISO_DAY_OF_WEEK" => Self::IsoDayOfWeek,
+            "DAY_OF_WEEK" => Self::DayOfWeek,
+            "WEEK" => Self::Week,
+            "YEAR_OF_WEEK" => Self::YearOfWeek,
+            _ => return None,
+        })
+    }
+}
+
+/// The ends selected by Java's TRIM transform.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrimFlag {
+    /// Remove leading characters.
+    Leading,
+    /// Remove trailing characters.
+    Trailing,
+    /// Remove characters at both ends.
+    Both,
+}
+
+/// The side selected by Java's PAD transform.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PadDirection {
+    /// Prefix the padding.
+    Left,
+    /// Append the padding.
+    Right,
+}
+
+/// One input of a [`Transform`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum TransformInput {
     /// A string literal (`None` = a JSON `null` input, i.e. SQL NULL).
     Literal(Option<String>),
+    /// An integer position or length, checked as a Java int when evaluated.
+    Integer(Option<i64>),
+    /// SUBSTRING parses string and large integral positions only after NULL checks.
+    IntegerText(String),
     /// A field reference.
     Field(usize),
 }
@@ -1094,19 +1322,34 @@ impl Transform {
     pub fn collect_field_indices(&self, out: &mut std::collections::HashSet<usize>) {
         match self {
             Transform::Null => {}
-            Transform::FieldRef(index) | Transform::Cast(index, _) => {
+            Transform::FieldRef(index)
+            | Transform::Cast(index, _)
+            | Transform::DateExtract(index, _) => {
                 out.insert(*index);
             }
-            Transform::Upper(inputs)
-            | Transform::Lower(inputs)
-            | Transform::Concat(inputs)
-            | Transform::ConcatWs(inputs) => {
-                for input in inputs {
+            _ => {
+                for input in self.inputs() {
                     if let TransformInput::Field(index) = input {
                         out.insert(*index);
                     }
                 }
             }
+        }
+    }
+
+    pub(crate) fn inputs(&self) -> &[TransformInput] {
+        match self {
+            Self::Upper(inputs)
+            | Self::Lower(inputs)
+            | Self::Concat(inputs)
+            | Self::ConcatWs(inputs)
+            | Self::Substring(inputs)
+            | Self::Trim(inputs, _)
+            | Self::Pad(inputs, _)
+            | Self::Translate(inputs)
+            | Self::Overlay(inputs) => inputs,
+            Self::Length(input) | Self::BitLength(input) => std::slice::from_ref(input),
+            _ => &[],
         }
     }
 }
@@ -1137,6 +1380,7 @@ fn parse_rest_transform(value: &serde_json::Value, fields: &[DataField]) -> Resu
                 serde_json::Value::Null => Ok(TransformInput::Literal(None)),
                 serde_json::Value::Object(_) => {
                     let index = field_ref_index(input)?;
+                    check_input_type(input, false)?;
                     match fields[index].data_type() {
                         DataType::Char(_) | DataType::VarChar(_) => {
                             Ok(TransformInput::Field(index))
@@ -1183,7 +1427,217 @@ fn parse_rest_transform(value: &serde_json::Value, fields: &[DataField]) -> Resu
         "LOWER" => Ok(Transform::Lower(string_inputs(1, 1)?)),
         "CONCAT" => Ok(Transform::Concat(string_inputs(0, usize::MAX)?)),
         "CONCAT_WS" => Ok(Transform::ConcatWs(string_inputs(2, usize::MAX)?)),
+        "SUBSTRING" => Ok(Transform::Substring(transform_inputs(
+            value,
+            fields,
+            2,
+            3,
+            &[1, 2],
+            true,
+        )?)),
+        "TRIM" => {
+            let flag = match str_prop(value, "trimFlag")? {
+                "LEADING" => TrimFlag::Leading,
+                "TRAILING" => TrimFlag::Trailing,
+                "BOTH" => TrimFlag::Both,
+                flag => return Err(rest_json_err(format!("invalid trimFlag `{flag}`"))),
+            };
+            Ok(Transform::Trim(string_inputs(1, 2)?, flag))
+        }
+        "LENGTH" => Ok(Transform::Length(string_inputs(1, 1)?.remove(0))),
+        "BIT_LENGTH" => Ok(Transform::BitLength(string_inputs(1, 1)?.remove(0))),
+        "PAD" => {
+            let direction = match str_prop(value, "direction")? {
+                "LEFT" => PadDirection::Left,
+                "RIGHT" => PadDirection::Right,
+                direction => {
+                    return Err(rest_json_err(format!(
+                        "invalid PAD direction `{direction}`"
+                    )))
+                }
+            };
+            Ok(Transform::Pad(
+                transform_inputs(value, fields, 3, 3, &[1], false)?,
+                direction,
+            ))
+        }
+        "TRANSLATE" => Ok(Transform::Translate(string_inputs(3, 3)?)),
+        "OVERLAY" => Ok(Transform::Overlay(transform_inputs(
+            value,
+            fields,
+            3,
+            4,
+            &[2, 3],
+            false,
+        )?)),
+        name if DatePart::from_name(name).is_some() => {
+            let input = value
+                .get("fieldRef")
+                .ok_or_else(|| rest_json_err("calendar transform without fieldRef"))?;
+            check_calendar_input_type(input)?;
+            let index = field_ref_index(input)?;
+            if !matches!(fields[index].data_type(), DataType::Date(_))
+                && !matches!(fields[index].data_type(), DataType::Timestamp(t) if t.precision() <= 9)
+            {
+                return Err(rest_json_err(
+                    "calendar transforms require DATE or TIMESTAMP without time zone",
+                ));
+            }
+            Ok(Transform::DateExtract(
+                index,
+                DatePart::from_name(name).unwrap(),
+            ))
+        }
         other => Err(rest_json_err(format!("transform `{other}`"))),
+    }
+}
+
+/// Validate Java's atomic FieldRef type spellings before binding the current schema.
+fn check_calendar_input_type(input: &serde_json::Value) -> Result<()> {
+    static TYPE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(concat!(
+            r"(?i)^\s*(?:DATE(?:\s+(?:NOT\s+)?NULL)?|",
+            r"TIMESTAMP\s*\(\s*([0-9]+)\s*\)",
+            r"(?:\s*WITHOUT\s+TIME\s+ZONE(?:\s+(?:NOT\s+)?NULL)?|\s*(?:NOT\s+)?NULL)?|",
+            r"TIMESTAMP(?:\s+WITHOUT\s+TIME\s+ZONE)?(?:\s+(?:NOT\s+)?NULL)?)\s*$"
+        ))
+        .unwrap()
+    });
+    let stored = input.get("type").and_then(serde_json::Value::as_str);
+    if stored
+        .and_then(|stored| TYPE.captures(stored))
+        .is_some_and(|captures| {
+            captures.get(1).is_none_or(|precision| {
+                precision
+                    .as_str()
+                    .parse::<u32>()
+                    .is_ok_and(|precision| precision <= 9)
+            })
+        })
+    {
+        Ok(())
+    } else {
+        Err(rest_json_err(
+            "calendar transforms require DATE or TIMESTAMP without time zone",
+        ))
+    }
+}
+
+/// Bind mixed string/integer inputs by name to the actual table schema.
+fn transform_inputs(
+    value: &serde_json::Value,
+    fields: &[DataField],
+    min: usize,
+    max: usize,
+    integers: &[usize],
+    string_positions: bool,
+) -> Result<Vec<TransformInput>> {
+    let inputs = value
+        .get("inputs")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| rest_json_err("transform without inputs"))?;
+    if !(min..=max).contains(&inputs.len()) {
+        return Err(rest_json_err(format!(
+            "transform expects {min}..={max} inputs, got {}",
+            inputs.len()
+        )));
+    }
+    inputs
+        .iter()
+        .enumerate()
+        .map(|(slot, input)| {
+            let integer = integers.contains(&slot);
+            match input {
+                serde_json::Value::Null => Ok(if integer {
+                    TransformInput::Integer(None)
+                } else {
+                    TransformInput::Literal(None)
+                }),
+                serde_json::Value::String(text) if !integer => {
+                    Ok(TransformInput::Literal(Some(text.clone())))
+                }
+                serde_json::Value::String(text) if string_positions => {
+                    Ok(TransformInput::IntegerText(text.clone()))
+                }
+                serde_json::Value::Number(number) if integer => {
+                    // arbitrary_precision retains the lexical integer even beyond
+                    // i64. SUBSTRING must not convert it before row NULL checks.
+                    let text = number.to_string();
+                    if text
+                        .strip_prefix('-')
+                        .unwrap_or(&text)
+                        .bytes()
+                        .all(|c| c.is_ascii_digit())
+                    {
+                        match number.as_i64() {
+                            Some(number) => Ok(TransformInput::Integer(Some(number))),
+                            None if string_positions => Ok(TransformInput::IntegerText(text)),
+                            None => Err(rest_json_err("position exceeds BIGINT range")),
+                        }
+                    } else {
+                        Err(rest_json_err("position must be an integral number"))
+                    }
+                }
+                serde_json::Value::Object(_) => {
+                    let name = str_prop(input, "name")?;
+                    if !string_positions {
+                        check_input_type(input, integer)?;
+                    } else if let Some(stored) = input.get("type").filter(|value| !value.is_null())
+                    {
+                        serde_json::from_value::<DataType>(stored.clone())
+                            .map_err(rest_json_err)?;
+                    }
+                    let index = fields
+                        .iter()
+                        .position(|field| field.name() == name)
+                        .ok_or_else(|| rest_json_err(format!("unknown field `{name}`")))?;
+                    let valid = if integer {
+                        matches!(
+                            fields[index].data_type(),
+                            DataType::TinyInt(_)
+                                | DataType::SmallInt(_)
+                                | DataType::Int(_)
+                                | DataType::BigInt(_)
+                        )
+                    } else {
+                        matches!(
+                            fields[index].data_type(),
+                            DataType::Char(_) | DataType::VarChar(_)
+                        )
+                    };
+                    if !valid {
+                        return Err(rest_json_err(format!(
+                            "invalid type for transform input `{name}`"
+                        )));
+                    }
+                    Ok(TransformInput::Field(index))
+                }
+                _ => Err(rest_json_err(format!("invalid transform input {input}"))),
+            }
+        })
+        .collect()
+}
+
+/// Java checks the wire FieldRef family before replacing it from the schema.
+/// SUBSTRING deliberately allows arbitrary stored families and validates the
+/// rebound field at execution instead.
+fn check_input_type(input: &serde_json::Value, integer: bool) -> Result<()> {
+    let stored: DataType = input
+        .get("type")
+        .and_then(|value| serde_json::from_value(value.clone()).ok())
+        .ok_or_else(|| rest_json_err("transform field without a parseable type"))?;
+    let valid = if integer {
+        matches!(
+            stored,
+            DataType::TinyInt(_) | DataType::SmallInt(_) | DataType::Int(_) | DataType::BigInt(_)
+        )
+    } else {
+        matches!(stored, DataType::Char(_) | DataType::VarChar(_))
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(rest_json_err("invalid stored type for transform field"))
     }
 }
 
@@ -1273,34 +1727,45 @@ impl PredicateBuilder {
     // -- set operators --
 
     pub fn is_in(&self, field: &str, literals: Vec<Datum>) -> Result<Predicate> {
-        if literals.is_empty() {
-            return Ok(Predicate::AlwaysFalse);
-        }
         self.leaf(field, PredicateOperator::In, literals)
     }
 
     pub fn is_not_in(&self, field: &str, literals: Vec<Datum>) -> Result<Predicate> {
-        if literals.is_empty() {
-            return Ok(Predicate::AlwaysTrue);
-        }
         self.leaf(field, PredicateOperator::NotIn, literals)
+    }
+
+    /// Java IN ignores NULL literals; an empty/all-NULL list matches nothing.
+    pub fn is_in_with_nulls(&self, field: &str, literals: Vec<Option<Datum>>) -> Result<Predicate> {
+        self.is_in(field, literals.into_iter().flatten().collect())
+    }
+
+    /// Java NOT IN fails every row if any literal is NULL.
+    pub fn is_not_in_with_nulls(
+        &self,
+        field: &str,
+        literals: Vec<Option<Datum>>,
+    ) -> Result<Predicate> {
+        if literals.iter().any(Option::is_none) {
+            self.resolve_field(field)?;
+            return Ok(Predicate::AlwaysFalse);
+        }
+        self.is_not_in(field, literals.into_iter().flatten().collect())
     }
 
     // -- string operators --
 
-    /// `field LIKE 'pat%'` shape. Empty pattern → `IsNotNull(field)` (every
-    /// non-null string starts with the empty string). Non-string `pattern`
-    /// → [`Error::ConfigInvalid`].
+    /// `field LIKE 'pat%'` shape. Retains an empty pattern as a string leaf,
+    /// matching Java. Non-string `pattern` → [`Error::ConfigInvalid`].
     pub fn starts_with(&self, field: &str, pattern: Datum) -> Result<Predicate> {
         self.string_leaf(field, PredicateOperator::StartsWith, pattern)
     }
 
-    /// `field LIKE '%pat'` shape. Empty pattern → `IsNotNull(field)`.
+    /// `field LIKE '%pat'` shape, including an empty pattern.
     pub fn ends_with(&self, field: &str, pattern: Datum) -> Result<Predicate> {
         self.string_leaf(field, PredicateOperator::EndsWith, pattern)
     }
 
-    /// `field LIKE '%pat%'` shape. Empty pattern → `IsNotNull(field)`.
+    /// `field LIKE '%pat%'` shape, including an empty pattern.
     pub fn contains(&self, field: &str, pattern: Datum) -> Result<Predicate> {
         self.string_leaf(field, PredicateOperator::Contains, pattern)
     }
@@ -1329,14 +1794,13 @@ impl PredicateBuilder {
     /// `%mid%` / no-wildcard patterns into [`PredicateOperator::StartsWith`] /
     /// [`PredicateOperator::EndsWith`] / [`PredicateOperator::Contains`] /
     /// [`PredicateOperator::Eq`]; falls back to a [`PredicateOperator::Like`]
-    /// leaf for anything more complex (`_`, multi-segment `%`, escaped
-    /// wildcards). The `Like` evaluator follows arrow_string `like` kernel
-    /// semantics for the residual cases.
+    /// leaf for empty or all-wildcard patterns and anything more complex
+    /// (`_`, multi-segment `%`, escaped wildcards). The `Like` evaluator follows
+    /// arrow_string `like` kernel semantics for the residual cases.
     ///
     /// `escape == None` defaults to `\`. Any other ESCAPE character is
     /// rejected with [`Error::ConfigInvalid`] (the DataFusion translator turns
-    /// that into a fall-open). Empty pattern → [`PredicateOperator::Eq`] of the
-    /// empty string (SQL semantics: only the empty string matches).
+    /// that into a fall-open).
     pub fn like(&self, field: &str, pattern: Datum, escape: Option<char>) -> Result<Predicate> {
         let pattern_str = match &pattern {
             Datum::String(s) => s.clone(),
@@ -1356,7 +1820,7 @@ impl PredicateBuilder {
         }
 
         match optimize_like_pattern(&pattern_str) {
-            LikeShape::EmptyOrLiteral(s) => self.equal(field, Datum::String(s)),
+            LikeShape::Literal(s) => self.equal(field, Datum::String(s)),
             LikeShape::StartsWith(prefix) => self.starts_with(field, Datum::String(prefix)),
             LikeShape::EndsWith(suffix) => self.ends_with(field, Datum::String(suffix)),
             LikeShape::Contains(mid) => self.contains(field, Datum::String(mid)),
@@ -1391,17 +1855,11 @@ impl PredicateBuilder {
         matches!(datum_cmp(low, high), Some(Ordering::Greater))
     }
 
-    /// Shared body for the three string operators: empty-string short-circuit
-    /// and literal-type guard ([`leaf`] still cross-checks against the column
-    /// type, so non-string columns are rejected there).
+    /// Shared literal-type guard for the three string operators. Preserve
+    /// empty string leaves: search refinement depends on the original operator,
+    /// even when row evaluation is equivalent to `IsNotNull`.
     fn string_leaf(&self, field: &str, op: PredicateOperator, pattern: Datum) -> Result<Predicate> {
         match &pattern {
-            // Every non-null string starts with / ends with / contains the
-            // empty string, and a NULL value matches none of them — i.e. the
-            // empty pattern is exactly `IsNotNull`. Folding to `AlwaysTrue`
-            // would wrongly retain NULL rows (and drop the field reference,
-            // keeping the predicate out of the data-pruning path).
-            Datum::String(s) if s.is_empty() => return self.is_not_null(field),
             Datum::String(_) => {}
             other => {
                 return Err(Error::ConfigInvalid {
@@ -1511,14 +1969,8 @@ impl PredicateBuilder {
                 });
             }
             PredicateOperator::In | PredicateOperator::NotIn => {
-                if !literals.is_empty() {
-                    return Ok(());
-                }
-                // Empty IN is handled at is_in()/is_not_in() level; this guards
-                // against direct leaf() misuse.
-                return Err(Error::ConfigInvalid {
-                    message: format!("{op} expects at least 1 literal, got 0"),
-                });
+                // Java retains empty set leaves so negation preserves NULL semantics.
+                return Ok(());
             }
             PredicateOperator::ArraysOverlap | PredicateOperator::ArrayContainsAll => return Ok(()),
             PredicateOperator::Between | PredicateOperator::NotBetween => (2, literals.len()),
@@ -1802,10 +2254,8 @@ fn eval_leaf(op: PredicateOperator, datum: Option<&Datum>, literals: &[Datum]) -
 /// literal substrings extracted from the pattern (with escape sequences
 /// already decoded).
 enum LikeShape {
-    /// Empty pattern, or a pattern that contains no wildcards / escapes —
-    /// equivalent to `Eq <literal>` (where the literal is the unescaped
-    /// pattern, possibly empty).
-    EmptyOrLiteral(String),
+    /// Nonempty pattern with no wildcards or escapes, equivalent to `Eq`.
+    Literal(String),
     /// `prefix%` (exactly one trailing `%`, no other wildcards or escapes).
     StartsWith(String),
     /// `%suffix`.
@@ -1823,14 +2273,14 @@ enum LikeShape {
 /// [`LikeShape::Residual`] (the simple shape rules don't account for escaped
 /// wildcards).
 fn optimize_like_pattern(pattern: &str) -> LikeShape {
-    if pattern.contains('\\') || pattern.contains('_') {
+    if pattern.is_empty() || pattern.contains('\\') || pattern.contains('_') {
         return LikeShape::Residual;
     }
     let bytes = pattern.as_bytes();
     let percent_count = bytes.iter().filter(|b| **b == b'%').count();
     match percent_count {
-        0 => LikeShape::EmptyOrLiteral(pattern.to_string()),
-        1 => {
+        0 => LikeShape::Literal(pattern.to_string()),
+        1 if pattern.len() > 1 => {
             if let Some(prefix) = pattern.strip_suffix('%') {
                 LikeShape::StartsWith(prefix.to_string())
             } else if let Some(suffix) = pattern.strip_prefix('%') {
@@ -1839,10 +2289,7 @@ fn optimize_like_pattern(pattern: &str) -> LikeShape {
                 LikeShape::Residual
             }
         }
-        2 if pattern.starts_with('%') && pattern.ends_with('%') => {
-            // `%%` reduces to `Contains('')`, which itself short-circuits to
-            // `IsNotNull` at the StartsWith/EndsWith/Contains builder boundary
-            // — so no special-casing here.
+        2 if pattern.len() > 2 && pattern.starts_with('%') && pattern.ends_with('%') => {
             LikeShape::Contains(pattern[1..pattern.len() - 1].to_string())
         }
         _ => LikeShape::Residual,
@@ -1966,6 +2413,108 @@ mod tests {
             DataField::new(2, "dt".to_string(), DataType::Date(DateType::new())),
             DataField::new(3, "hr".to_string(), DataType::Int(IntType::new())),
         ]
+    }
+
+    #[test]
+    fn calendar_masks_parse_and_collect_the_date_operand() {
+        let fields = vec![DataField::new(
+            7,
+            "d".into(),
+            DataType::Date(crate::spec::DateType::new()),
+        )];
+        for name in [
+            "YEAR",
+            "MONTH",
+            "DAY",
+            "HOUR",
+            "MINUTE",
+            "SECOND",
+            "QUARTER",
+            "DAY_OF_YEAR",
+            "WEEKDAY",
+            "ISO_DAY_OF_WEEK",
+            "DAY_OF_WEEK",
+            "WEEK",
+            "YEAR_OF_WEEK",
+        ] {
+            let transform = Transform::from_rest_json(
+                &format!(
+                    r#"{{"name":"{name}","fieldRef":{{"index":99,"name":"d","type":"DATE"}}}}"#
+                ),
+                &fields,
+            )
+            .unwrap();
+            let mut indices = std::collections::HashSet::new();
+            transform.collect_field_indices(&mut indices);
+            assert_eq!(indices, std::collections::HashSet::from([0]));
+        }
+    }
+
+    #[test]
+    fn calendar_masks_validate_stored_and_rebound_types() {
+        let parse = |stored: serde_json::Value, actual: &str| {
+            let fields = vec![DataField::new(
+                7,
+                "d".into(),
+                serde_json::from_value(serde_json::json!(actual)).unwrap(),
+            )];
+            Transform::from_rest_json(
+                &serde_json::json!({
+                    "name": "YEAR",
+                    "fieldRef": {"name": "d", "index": 99, "type": stored},
+                })
+                .to_string(),
+                &fields,
+            )
+        };
+        for stored in [
+            "INT",
+            "BIGINT",
+            "TIME(3)",
+            "TIMESTAMP(3) WITH LOCAL TIME ZONE",
+            "TIMESTAMP(10)",
+            "DATENULL",
+            "TIMESTAMP(3) WITHOUT TIME ZONENULL",
+            "TIMESTAMP(3) WITHOUT TIME ZONENOT NULL",
+        ] {
+            assert!(
+                parse(serde_json::json!(stored), "DATE").is_err(),
+                "{stored}"
+            );
+        }
+        for actual in ["INT", "TIME(3)", "TIMESTAMP(3) WITH LOCAL TIME ZONE"] {
+            assert!(
+                parse(serde_json::json!("DATE"), actual).is_err(),
+                "{actual}"
+            );
+        }
+        for stored in [
+            serde_json::json!("DATE"),
+            serde_json::json!("DATE NOT NULL"),
+            serde_json::json!("TIMESTAMP"),
+            serde_json::json!("TIMESTAMP WITHOUT TIME ZONE"),
+            serde_json::json!("TIMESTAMP(3)"),
+            serde_json::json!("TIMESTAMP(3)NOT NULL"),
+            serde_json::json!("TIMESTAMP(3) WITHOUT TIME ZONE"),
+            serde_json::json!("TIMESTAMP(3)WITHOUT TIME ZONE"),
+        ] {
+            // Name rebinding permits DATE <-> TIMESTAMP and ignores stale indices.
+            for actual in ["DATE", "TIMESTAMP(6)"] {
+                assert!(
+                    parse(stored.clone(), actual).is_ok(),
+                    "{stored} -> {actual}"
+                );
+            }
+        }
+        for stored in [
+            serde_json::json!({"type": "DATE"}),
+            serde_json::json!({"type": "TIMESTAMP(6)"}),
+            serde_json::json!("TIMESTAMP(٣)"),
+            serde_json::json!("TIMESTAMP(３)"),
+            serde_json::Value::Null,
+        ] {
+            assert!(parse(stored.clone(), "DATE").is_err(), "{stored}");
+        }
     }
 
     #[test]
@@ -2434,15 +2983,50 @@ mod tests {
     // ======================== Empty IN / NOT IN handling ========================
 
     #[test]
-    fn test_in_empty_returns_always_false() {
+    fn test_empty_set_negation_preserves_java_null_semantics() {
         let pb = PredicateBuilder::new(&test_fields());
-        assert_eq!(pb.is_in("id", vec![]).unwrap(), Predicate::AlwaysFalse);
+        assert_eq!(
+            Predicate::negate(pb.is_in("id", vec![]).unwrap()),
+            pb.is_not_in("id", vec![]).unwrap()
+        );
+        assert_eq!(
+            Predicate::negate(pb.is_not_in("id", vec![]).unwrap()),
+            pb.is_in("id", vec![]).unwrap()
+        );
     }
 
     #[test]
-    fn test_not_in_empty_returns_always_true() {
-        let pb = PredicateBuilder::new(&test_fields());
-        assert_eq!(pb.is_not_in("id", vec![]).unwrap(), Predicate::AlwaysTrue);
+    fn nullable_set_literals_follow_java() {
+        let fields = vec![DataField::new(
+            0,
+            "id".into(),
+            DataType::Int(crate::spec::IntType::new()),
+        )];
+        let pb = PredicateBuilder::new(&fields);
+        let predicates = [
+            pb.is_in_with_nulls("id", vec![]).unwrap(),
+            pb.is_not_in_with_nulls("id", vec![]).unwrap(),
+            pb.is_in_with_nulls("id", vec![None, Some(Datum::Int(1))])
+                .unwrap(),
+            pb.is_not_in_with_nulls("id", vec![None, Some(Datum::Int(1))])
+                .unwrap(),
+        ];
+        for (value, expected) in [
+            (None, [false, false, false, false]),
+            (Some(1), [false, true, true, false]),
+            (Some(2), [false, true, false, false]),
+        ] {
+            let mut row = TestBinaryRowBuilder::new(1);
+            if let Some(value) = value {
+                row.write_int(0, value);
+            } else {
+                row.set_null_at(0);
+            }
+            let row = row.build();
+            for (predicate, expected) in predicates.iter().zip(expected) {
+                assert_eq!(eval_row(predicate, &row).unwrap(), expected);
+            }
+        }
     }
 
     // ======================== Constant absorption ========================
@@ -3096,22 +3680,28 @@ mod tests {
     }
 
     #[test]
-    fn test_builder_string_ops_empty_pattern_is_not_null() {
+    fn test_builder_string_ops_preserve_empty_pattern() {
         let pb = PredicateBuilder::new(&test_fields());
-        // An empty pattern matches every non-null string and no NULL, so it is
-        // exactly `IsNotNull` (not `AlwaysTrue`, which would retain NULL rows).
-        for build in [
-            pb.starts_with("name", Datum::String(String::new())),
-            pb.ends_with("name", Datum::String(String::new())),
-            pb.contains("name", Datum::String(String::new())),
+        for (build, op) in [
+            (
+                pb.starts_with("name", Datum::String(String::new())),
+                PredicateOperator::StartsWith,
+            ),
+            (
+                pb.ends_with("name", Datum::String(String::new())),
+                PredicateOperator::EndsWith,
+            ),
+            (
+                pb.contains("name", Datum::String(String::new())),
+                PredicateOperator::Contains,
+            ),
         ] {
-            assert!(matches!(
-                build.unwrap(),
-                Predicate::Leaf {
-                    op: PredicateOperator::IsNotNull,
-                    ..
-                }
-            ));
+            assert_leaf(&build.unwrap(), op, "");
+            let literals = [Datum::String(String::new())];
+            for value in ["", "paimon"] {
+                assert!(eval_leaf(op, Some(&Datum::String(value.into())), &literals));
+            }
+            assert!(!eval_leaf(op, None, &literals));
         }
     }
 
@@ -3192,12 +3782,6 @@ mod tests {
             PredicateOperator::Eq,
             "foo",
         );
-        // Empty pattern → Eq("") (only empty string matches).
-        assert_leaf(
-            &pb.like("name", Datum::String(String::new()), None).unwrap(),
-            PredicateOperator::Eq,
-            "",
-        );
         // prefix% → StartsWith.
         assert_leaf(
             &pb.like("name", Datum::String("foo%".to_string()), None)
@@ -3245,6 +3829,32 @@ mod tests {
             PredicateOperator::Like,
             r"foo\%",
         );
+    }
+
+    #[test]
+    fn test_like_empty_and_all_wildcard_patterns_preserve_java_leaves() {
+        let pb = PredicateBuilder::new(&test_fields());
+        for pattern in ["", "%", "%%", "%%%"] {
+            let predicate = pb
+                .like("name", Datum::String(pattern.into()), None)
+                .unwrap();
+            assert_leaf(&predicate, PredicateOperator::Like, pattern);
+            let literals = [Datum::String(pattern.into())];
+            assert!(eval_leaf(
+                PredicateOperator::Like,
+                Some(&Datum::String(String::new())),
+                &literals
+            ));
+            assert_eq!(
+                eval_leaf(
+                    PredicateOperator::Like,
+                    Some(&Datum::String("paimon".into())),
+                    &literals
+                ),
+                !pattern.is_empty()
+            );
+            assert!(!eval_leaf(PredicateOperator::Like, None, &literals));
+        }
     }
 
     #[test]
@@ -3666,8 +4276,11 @@ mod tests {
                 "must parse {function}: {json}"
             );
         }
-        // DATE has no Java-round-trippable wire form; every shape fails closed.
-        for literals in ["[19000]", "[\"2022-01-15\"]", "[[2022,1,15]]"] {
+        // DATE travels as an ISO string since Java #9640; the older Jackson
+        // shapes still fail closed.
+        let json = rest_leaf_json("EQUAL", "dt", "[\"2022-01-15\"]");
+        assert!(Predicate::from_rest_json(&json, &fields).is_ok(), "{json}");
+        for literals in ["[19000]", "[[2022,1,15]]"] {
             let json = rest_leaf_json("EQUAL", "dt", literals);
             assert!(
                 Predicate::from_rest_json(&json, &fields).is_err(),
@@ -3690,9 +4303,6 @@ mod tests {
             ("NOT_BETWEEN", "[1,null]"),
             // NOT_IN with any null literal fails every row.
             ("NOT_IN", "[1,null]"),
-            // IN with only null literals matches nothing.
-            ("IN", "[null]"),
-            ("IN", "[]"),
         ] {
             let json = rest_leaf_json(function, "id", literals);
             assert!(
@@ -3702,6 +4312,20 @@ mod tests {
                 ),
                 "{function} {literals} must parse to AlwaysFalse"
             );
+        }
+
+        for literals in ["[]", "[null]"] {
+            let parsed =
+                Predicate::from_rest_json(&rest_leaf_json("IN", "id", literals), &fields).unwrap();
+            for value in [None, Some(1)] {
+                let mut row = TestBinaryRowBuilder::new(fields.len() as i32);
+                if let Some(value) = value {
+                    row.write_int(0, value);
+                } else {
+                    row.set_null_at(0);
+                }
+                assert!(!eval_row(&parsed, &row.build()).unwrap());
+            }
         }
 
         // IN drops null literals and keeps the rest.
@@ -3719,7 +4343,7 @@ mod tests {
         assert!(matches!(
             &parsed,
             Predicate::Leaf {
-                op: PredicateOperator::IsNotNull,
+                op: PredicateOperator::NotIn,
                 ..
             }
         ));
@@ -3763,6 +4387,104 @@ mod tests {
                 Predicate::from_rest_json(&json, &double_fields).is_ok(),
                 "{json}"
             );
+        }
+    }
+
+    #[test]
+    fn test_from_rest_json_reads_java_temporal_and_decimal_literals() {
+        use crate::spec::{DecimalType, LocalZonedTimestampType, TimeType, TimestampType};
+        let literal = |data_type: DataType, json: &str| {
+            let fields = vec![DataField::new(0, "c".to_string(), data_type)];
+            let leaf = rest_leaf_json_typed("EQUAL", "c", "ANY", &format!("[{json}]"));
+            Predicate::from_rest_json(&leaf, &fields).map(|p| match p {
+                Predicate::Leaf { literals, .. } => literals[0].clone(),
+                other => panic!("expected leaf, got {other:?}"),
+            })
+        };
+        let date = || DataType::Date(DateType::new());
+        assert_eq!(
+            literal(date(), r#""2024-01-15""#).unwrap(),
+            Datum::Date(19737)
+        );
+        assert_eq!(literal(date(), r#""1969-12-31""#).unwrap(), Datum::Date(-1));
+        // Java signs a year outside 0000..=9999.
+        assert_eq!(
+            literal(date(), r#""+10000-01-01""#).unwrap(),
+            Datum::Date(2_932_897)
+        );
+        assert_eq!(
+            literal(date(), r#""-0001-01-01""#).unwrap(),
+            Datum::Date(-719_893)
+        );
+
+        let time = || DataType::Time(TimeType::new(3).unwrap());
+        assert_eq!(
+            literal(time(), r#""10:15""#).unwrap(),
+            Datum::Time(36_900_000)
+        );
+        assert_eq!(
+            literal(time(), r#""10:15:30.123456""#).unwrap(),
+            Datum::Time(36_930_123)
+        );
+
+        let timestamp = || DataType::Timestamp(TimestampType::new(9).unwrap());
+        let at = |millis, nanos| Datum::Timestamp { millis, nanos };
+        // `LocalDateTime.toString()` drops zero seconds.
+        assert_eq!(
+            literal(timestamp(), r#""2024-01-15T10:15""#).unwrap(),
+            at(1_705_313_700_000, 0)
+        );
+        assert_eq!(
+            literal(timestamp(), r#""2024-01-15T10:15:30.123456789""#).unwrap(),
+            at(1_705_313_730_123, 456_789)
+        );
+        assert_eq!(
+            literal(timestamp(), r#""+10000-01-01T00:00""#).unwrap(),
+            at(253_402_300_800_000, 0)
+        );
+        let instant = || DataType::LocalZonedTimestamp(LocalZonedTimestampType::new(6).unwrap());
+        let utc = |millis| Datum::LocalZonedTimestamp { millis, nanos: 0 };
+        for (json, millis) in [
+            (r#""2024-01-15T10:15:30.5Z""#, 1_705_313_730_500),
+            (r#""+10000-01-01T00:00:00Z""#, 253_402_300_800_000),
+            (r#""-0001-01-01T00:00:00Z""#, -62_198_755_200_000),
+            (r#""2024-01-15T18:15:30.5+08:00""#, 1_705_313_730_500),
+            (r#""2016-12-31T23:59:60.5Z""#, 1_483_228_799_500),
+        ] {
+            assert_eq!(literal(instant(), json).unwrap(), utc(millis), "{json}");
+        }
+
+        // Rounded HALF_UP to the column scale, then checked against its precision.
+        let decimal = || DataType::Decimal(DecimalType::new(5, 2).unwrap());
+        let unscaled = |datum: Datum| match datum {
+            Datum::Decimal { unscaled, .. } => unscaled,
+            other => panic!("expected decimal, got {other:?}"),
+        };
+        assert_eq!(unscaled(literal(decimal(), r#""123.45""#).unwrap()), 12345);
+        assert_eq!(unscaled(literal(decimal(), r#""1.005""#).unwrap()), 101);
+        assert_eq!(unscaled(literal(decimal(), r#""-1.005""#).unwrap()), -101);
+        assert_eq!(unscaled(literal(decimal(), r#""7""#).unwrap()), 700);
+        let one_digit = || DataType::Decimal(DecimalType::new(1, 0).unwrap());
+        let nines = format!(r#""0.{}""#, "9".repeat(38));
+        assert_eq!(unscaled(literal(one_digit(), &nines).unwrap()), 1);
+        assert!(
+            literal(decimal(), r#""999.995""#).is_err(),
+            "rounds past DECIMAL(5, 2)"
+        );
+
+        for (data_type, json) in [
+            (date(), r#""2024-13-01""#),
+            (date(), "19737"),
+            (timestamp(), r#""2024-01-15 10:15:30""#),
+            (instant(), r#""2024-01-15T10:15:30""#),
+            (instant(), r#""2016-12-31T23:30:60Z""#),
+            (instant(), r#""2016-12-31T12:59:60+08:00""#),
+            (time(), r#""23:59:60""#),
+            (timestamp(), r#""2016-12-31T23:59:60""#),
+            (decimal(), r#""1e3""#),
+            (decimal(), "1.5"),
+        ] {
+            assert!(literal(data_type, json).is_err(), "{json}");
         }
     }
 

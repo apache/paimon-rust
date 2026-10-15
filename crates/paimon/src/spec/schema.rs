@@ -99,6 +99,26 @@ impl TableSchema {
         &self.fields
     }
 
+    /// Logical fields followed by the metadata available to table reads.
+    /// Row tracking provides ROW_ID and SEQUENCE_NUMBER; primary-key files
+    /// provide SEQUENCE_NUMBER independently of row tracking. Keeping this
+    /// schema shared makes projection and predicate name resolution agree.
+    pub fn fields_with_read_metadata(&self) -> Vec<DataField> {
+        let mut fields = self.fields.clone();
+        let row_tracking = CoreOptions::new(&self.options).row_tracking_enabled();
+        if row_tracking && !fields.iter().any(|field| field.name() == ROW_ID_FIELD_NAME) {
+            fields.push(row_id_data_field());
+        }
+        if (row_tracking || !self.primary_keys.is_empty())
+            && !fields
+                .iter()
+                .any(|field| field.name() == SEQUENCE_NUMBER_FIELD_NAME)
+        {
+            fields.push(sequence_number_data_field());
+        }
+        fields
+    }
+
     pub fn highest_field_id(&self) -> i32 {
         self.highest_field_id
     }
@@ -158,6 +178,36 @@ impl TableSchema {
     /// fail, so the stored value wins instead, and an absent one leaves the
     /// default standing.
     pub fn copy_with_options(&self, mut extra: HashMap<String, String>) -> Self {
+        self.retain_immutable_options(&mut extra);
+        let mut new_schema = self.clone();
+        new_schema.options.extend(extra);
+        new_schema
+    }
+
+    /// REST returns a Schema without its creation timestamp. Independently
+    /// loaded copies can have different local timestamps while describing the
+    /// same schema. Options are compared separately when copying a handle.
+    pub(crate) fn has_same_definition(&self, other: &Self) -> bool {
+        self.version == other.version
+            && self.id == other.id
+            && self.fields == other.fields
+            && self.highest_field_id == other.highest_field_id
+            && self.partition_keys == other.partition_keys
+            && self.primary_keys == other.primary_keys
+            && self.comment == other.comment
+    }
+
+    /// Replace dynamic options without allowing an override of stored immutable
+    /// options. Unlike merging, absence in this map removes a mutable option.
+    pub(crate) fn copy_with_replaced_dynamic_options(
+        &self,
+        mut options: HashMap<String, String>,
+    ) -> Self {
+        self.retain_immutable_options(&mut options);
+        self.copy_with_replaced_options(options)
+    }
+
+    fn retain_immutable_options(&self, extra: &mut HashMap<String, String>) {
         if self.core_options().query_auth_enabled() {
             extra.insert(QUERY_AUTH_ENABLED_OPTION.to_string(), "true".to_string());
         }
@@ -174,9 +224,6 @@ impl TableSchema {
                 None => extra.remove(key),
             };
         }
-        let mut new_schema = self.clone();
-        new_schema.options.extend(extra);
-        new_schema
     }
 
     /// Create a copy of this schema with the options replaced entirely,
@@ -1147,17 +1194,26 @@ pub(crate) fn row_id_data_field() -> DataField {
     )
 }
 
-/// `_ROW_ID` is synthesized by the reader and is not a table column, so
-/// `PredicateBuilder` cannot resolve it and callers hand-build the leaf with a
-/// placeholder index. Every index-based resolution must recognize it by name
-/// instead, or it binds the predicate to whatever field sits at that index.
-///
-/// The other reserved names are excluded on purpose. `_SEQUENCE_NUMBER` and
-/// `_VALUE_KIND` are physical columns of a KV file and do have a position; none
-/// of them is ever referenced by a predicate. Widening this to every reserved
-/// name would instead break a schema that predates their rejection.
+/// `_ROW_ID` conditions alone can be converted to positional row ranges.
 pub(crate) fn is_row_id_column(name: &str) -> bool {
     name == ROW_ID_FIELD_NAME
+}
+
+/// Java's row-tracking version column. A missing or NULL physical value is
+/// supplied from the data file's max sequence number.
+pub(crate) fn sequence_number_data_field() -> DataField {
+    DataField::new(
+        SEQUENCE_NUMBER_FIELD_ID,
+        SEQUENCE_NUMBER_FIELD_NAME.to_string(),
+        DataType::BigInt(crate::spec::BigIntType::with_nullable(false)),
+    )
+}
+
+/// Row-tracking metadata has no index in the logical table schema. Resolve
+/// predicates by reserved name instead of interpreting a placeholder index as
+/// a user column. `_VALUE_KIND` remains a physical KV column.
+pub(crate) fn is_row_tracking_column(name: &str) -> bool {
+    is_row_id_column(name) || name == SEQUENCE_NUMBER_FIELD_NAME
 }
 
 /// Must match Java Paimon's `SpecialFields.ROW_KIND` (Integer.MAX_VALUE - 4).
@@ -1648,6 +1704,36 @@ impl Schema {
         primary_keys: &[String],
         options: &HashMap<String, String>,
     ) -> crate::Result<()> {
+        let core_options = CoreOptions::new(options);
+        let video_fields = core_options.video_frame_fields();
+        if !video_fields.is_empty() && !primary_keys.is_empty() {
+            return Err(crate::Error::ConfigInvalid {
+                message: "'video-frame-field' only supports append-only tables".into(),
+            });
+        }
+        for name in video_fields {
+            if !fields
+                .iter()
+                .any(|field| field.name() == name && field.data_type().is_blob_type())
+            {
+                return Err(crate::Error::ConfigInvalid { message: format!("Field '{name}' in 'video-frame-field' must be a scalar BLOB field in table schema") });
+            }
+            for (option, names) in [
+                (
+                    "blob-descriptor-field",
+                    core_options.blob_descriptor_fields(),
+                ),
+                ("blob-view-field", core_options.blob_view_fields()),
+            ] {
+                if names.contains(&name) {
+                    return Err(crate::Error::ConfigInvalid {
+                        message: format!(
+                            "Field '{name}' in 'video-frame-field' can not also be in '{option}'"
+                        ),
+                    });
+                }
+            }
+        }
         let blob_field_names = Self::top_level_blob_field_names(fields);
         for field in fields {
             if !Self::is_top_level_blob_file_type(field.data_type())
@@ -1666,7 +1752,6 @@ impl Schema {
             return Ok(());
         }
 
-        let core_options = CoreOptions::new(options);
         let blob_descriptor_fields = core_options.blob_descriptor_fields();
         let blob_view_fields = core_options.blob_view_fields();
         let mut overlapping_fields = blob_view_fields

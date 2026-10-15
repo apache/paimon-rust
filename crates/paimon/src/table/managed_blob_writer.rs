@@ -87,6 +87,8 @@ pub(crate) struct ManagedBlobWriter {
     bucket_dir: String,
     file_prefix: String,
     target_file_size: u64,
+    copy_buffer_size: usize,
+    uri_reader_factory: Option<Arc<dyn crate::io::UriReaderFactory>>,
     fields: Vec<ManagedBlobField>,
     uncommitted_paths: Vec<String>,
 }
@@ -104,13 +106,16 @@ impl ManagedBlobWriteState {
         value_fields: &[DataField],
         options: &CoreOptions<'_>,
     ) -> Result<Self> {
-        let writer = ManagedBlobWriter::new(
+        let mut writer = ManagedBlobWriter::new(
             file_io.clone(),
             bucket_dir.to_string(),
             file_prefix,
             options.blob_target_file_size(),
             managed_blob_fields(value_fields, options),
         )?;
+        if let Some(writer) = &mut writer {
+            writer.copy_buffer_size = options.blob_copy_buffer_size()?;
+        }
         Ok(Self {
             writer: writer.map(|writer| tokio::sync::Mutex::new(Box::new(writer))),
         })
@@ -118,6 +123,15 @@ impl ManagedBlobWriteState {
 
     pub(crate) fn enabled(&self) -> bool {
         self.writer.is_some()
+    }
+
+    pub(crate) fn set_uri_reader_factory(
+        &mut self,
+        factory: Option<Arc<dyn crate::io::UriReaderFactory>>,
+    ) {
+        if let Some(writer) = &mut self.writer {
+            writer.get_mut().uri_reader_factory = factory;
+        }
     }
 
     pub(crate) async fn externalize(&mut self, batch: RecordBatch) -> Result<RecordBatch> {
@@ -164,6 +178,8 @@ impl ManagedBlobWriter {
             bucket_dir,
             file_prefix: file_prefix.to_string(),
             target_file_size,
+            copy_buffer_size: 4 * 1024,
+            uri_reader_factory: None,
             fields: fields
                 .into_iter()
                 .map(|(index, kind)| ManagedBlobField {
@@ -356,8 +372,12 @@ impl ManagedBlobWriter {
                 uuid::Uuid::new_v4()
             );
             let output = self.file_io.new_output(&path)?;
-            let writer =
-                Box::new(BlobFormatWriter::new(&output, Some(self.file_io.clone())).await?);
+            let writer = Box::new(
+                BlobFormatWriter::new(&output, Some(self.file_io.clone()), None)
+                    .await?
+                    .with_copy_buffer_size(self.copy_buffer_size)
+                    .with_uri_reader_factory(self.uri_reader_factory.clone()),
+            );
             self.uncommitted_paths.push(path.clone());
             self.fields[field_index].current = Some(ManagedBlobPack { path, writer });
         }
@@ -387,7 +407,11 @@ impl ManagedBlobWriter {
 
     pub(crate) async fn abort(&mut self) {
         for field in &mut self.fields {
-            field.current.take();
+            if let Some(pack) = field.current.take() {
+                // Finish source and destination cleanup before removing an
+                // unprepared pack, like Java abortCurrent's closeQuietly.
+                let _ = pack.writer.close().await;
+            }
         }
         for path in self.uncommitted_paths.drain(..) {
             let _ = self.file_io.delete_file(&path).await;

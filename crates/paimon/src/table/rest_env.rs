@@ -20,7 +20,7 @@
 use crate::api::rest_api::RESTApi;
 use crate::api::rest_error::RestError;
 use crate::api::GetTableResponse;
-use crate::catalog::{Identifier, RESTTokenFileIO};
+use crate::catalog::{Identifier, RESTToken, RESTTokenFileIO};
 use crate::common::{CatalogOptions, Options};
 use crate::error::Error;
 use crate::io::cache::{create_local_cache_with_namespace, LocalCache};
@@ -39,6 +39,17 @@ impl Table {
         response: crate::api::GetTableResponse,
         rest_options: Options,
     ) -> Result<Self> {
+        Self::from_rest_response_with_token(identifier, response, rest_options, None).await
+    }
+
+    /// As `from_rest_response`, but reuse a matching table data token already
+    /// fetched by the caller. Rust will refresh it from REST after expiry.
+    pub async fn from_rest_response_with_token(
+        identifier: Identifier,
+        response: crate::api::GetTableResponse,
+        rest_options: Options,
+        initial_token: Option<RESTToken>,
+    ) -> Result<Self> {
         identifier.validate()?;
         // Reject a stale or misrouted response before initializing auth or local-cache resources.
         response_identifier(&identifier, &response)?;
@@ -55,7 +66,7 @@ impl Table {
             .unwrap_or(false);
         let local_cache = create_local_cache_with_namespace(&rest_options, api.options())?;
         let file_io_cache = FileIOCacheContext::from_props(api.options().to_map())?;
-        RESTEnv::build_table(
+        RESTEnv::build_table_with_token(
             &identifier,
             response,
             api,
@@ -63,6 +74,7 @@ impl Table {
             data_token_enabled,
             local_cache,
             file_io_cache,
+            initial_token,
         )
         .await
     }
@@ -143,7 +155,7 @@ impl RESTEnv {
         schema_id: i64,
         fields: &[crate::spec::DataField],
     ) -> Result<GetTableResponse> {
-        let response = self.api.get_table(&self.identifier).await?;
+        let response = self.current_table_identity_checked().await?;
         let name = self.identifier.full_name();
         let same = |what: &str, loaded: String, now: Option<String>| match now {
             Some(now) if now == loaded => Ok(()),
@@ -156,7 +168,6 @@ impl RESTEnv {
                 source: None,
             }),
         };
-        same("uuid", self.uuid.clone(), response.id.clone())?;
         same(
             "schema",
             schema_id.to_string(),
@@ -182,6 +193,27 @@ impl RESTEnv {
         Ok(response)
     }
 
+    /// Refused unless the identifier still resolves to this catalog entity.
+    pub(crate) async fn current_table_identity_checked(&self) -> Result<GetTableResponse> {
+        let response = self.api.get_table(&self.identifier).await?;
+        let name = self.identifier.full_name();
+        match response.id.as_deref() {
+            Some(uuid) if uuid == self.uuid => {}
+            uuid => {
+                return Err(crate::Error::DataInvalid {
+                    message: format!(
+                        "table '{name}' now resolves to uuid {}, not the {} this handle was loaded \
+                         with; re-load the table before reading it",
+                        uuid.unwrap_or("nothing the server reports"),
+                        self.uuid
+                    ),
+                    source: None,
+                });
+            }
+        }
+        Ok(response)
+    }
+
     /// Get the table identifier.
     pub fn identifier(&self) -> &Identifier {
         &self.identifier
@@ -190,6 +222,31 @@ impl RESTEnv {
     /// Catalog identity used to reject commits against a replaced table.
     pub fn uuid(&self) -> &str {
         &self.uuid
+    }
+
+    /// Attach Java's outermost table identity to dependency requests. The
+    /// dependency client is separate so ordinary requests retain their headers.
+    pub(crate) async fn for_dependency_reads(&self) -> Result<Self> {
+        let key = format!("{}{}", RESTApi::HEADER_PREFIX, RESTApi::READ_VIA_HEADER);
+        let mut options = self.api.options().clone();
+        if options.get(&key).is_some() {
+            return Ok(self.clone());
+        }
+        let identifier =
+            serde_json::to_string(&self.identifier).map_err(|error| Error::DataInvalid {
+                message: "Cannot serialize dependency read identifier".to_string(),
+                source: Some(Box::new(error)),
+            })?;
+        options.set(
+            key,
+            crate::api::rest_util::RESTUtil::encode_string(&identifier),
+        );
+        let api = Arc::new(RESTApi::new(options.clone(), false).await?);
+        Ok(Self {
+            api,
+            options,
+            ..self.clone()
+        })
     }
 
     /// Load a table through the same REST catalog environment.
@@ -245,6 +302,31 @@ impl RESTEnv {
         data_token_enabled: bool,
         local_cache: Option<Arc<LocalCache>>,
         file_io_cache: FileIOCacheContext,
+    ) -> Result<Table> {
+        Self::build_table_with_token(
+            identifier,
+            response,
+            api,
+            options,
+            data_token_enabled,
+            local_cache,
+            file_io_cache,
+            None,
+        )
+        .await
+    }
+
+    // Keep the REST construction inputs explicit, including the optional initial token.
+    #[allow(clippy::too_many_arguments)]
+    async fn build_table_with_token(
+        identifier: &Identifier,
+        response: crate::api::GetTableResponse,
+        api: Arc<RESTApi>,
+        options: Options,
+        data_token_enabled: bool,
+        local_cache: Option<Arc<LocalCache>>,
+        file_io_cache: FileIOCacheContext,
+        initial_token: Option<RESTToken>,
     ) -> Result<Table> {
         let identifier = response_identifier(identifier, &response)?;
         let schema = response.schema.ok_or_else(|| Error::DataInvalid {
@@ -303,7 +385,7 @@ impl RESTEnv {
             source: None,
         })?;
 
-        let file_io = Self::build_file_io(
+        let file_io = Self::build_file_io_with_token(
             &identifier,
             &table_path,
             api.clone(),
@@ -311,6 +393,7 @@ impl RESTEnv {
             data_token_enabled && !is_external,
             local_cache.clone(),
             file_io_cache.clone(),
+            initial_token,
         )
         .await?;
 
@@ -407,17 +490,44 @@ impl RESTEnv {
         local_cache: Option<Arc<LocalCache>>,
         file_io_cache: FileIOCacheContext,
     ) -> Result<FileIO> {
+        Self::build_file_io_with_token(
+            identifier,
+            path,
+            api,
+            options,
+            use_data_token,
+            local_cache,
+            file_io_cache,
+            None,
+        )
+        .await
+    }
+
+    // Match the existing FileIO builder while passing through the optional initial token.
+    #[allow(clippy::too_many_arguments)]
+    async fn build_file_io_with_token(
+        identifier: &Identifier,
+        path: &str,
+        api: Arc<RESTApi>,
+        options: &Options,
+        use_data_token: bool,
+        local_cache: Option<Arc<LocalCache>>,
+        file_io_cache: FileIOCacheContext,
+        initial_token: Option<RESTToken>,
+    ) -> Result<FileIO> {
         if use_data_token {
-            return Arc::new(RESTTokenFileIO::new(
+            let mut token_file_io = RESTTokenFileIO::new(
                 identifier.clone(),
                 path.to_string(),
                 options.clone(),
                 api,
                 local_cache,
                 file_io_cache,
-            ))
-            .build_file_io()
-            .await;
+            );
+            if let Some(token) = initial_token {
+                token_file_io = token_file_io.with_initial_token(token);
+            }
+            return Arc::new(token_file_io).build_file_io().await;
         }
 
         let mut builder = FileIO::from_path(path)?.with_props(options.to_map());
@@ -467,7 +577,12 @@ fn response_identifier(
     })?;
     let identifier = Identifier::new(database, name);
     identifier.validate()?;
-    if &identifier != requested {
+    // A REST catalog may return the canonical case for an otherwise matching identifier.
+    if !identifier
+        .database()
+        .eq_ignore_ascii_case(requested.database())
+        || !identifier.object().eq_ignore_ascii_case(requested.object())
+    {
         return Err(Error::DataInvalid {
             message: format!(
                 "Table response identifier '{}' does not match requested identifier '{}'",
@@ -537,6 +652,93 @@ mod tests {
     use super::*;
     use crate::common::CatalogOptions;
     use crate::io::cache::create_local_cache;
+
+    #[test]
+    fn response_identifier_accepts_canonicalized_ascii_case() {
+        let requested = Identifier::new("Default", "MixedTable");
+        let response: GetTableResponse =
+            serde_json::from_str(r#"{"database":"default","name":"mixedtable"}"#).unwrap();
+
+        let actual = response_identifier(&requested, &response).unwrap();
+
+        assert_eq!(actual, Identifier::new("default", "mixedtable"));
+    }
+
+    #[test]
+    fn response_identifier_rejects_a_different_table() {
+        let requested = Identifier::new("default", "requested");
+        let response: GetTableResponse =
+            serde_json::from_str(r#"{"database":"default","name":"different"}"#).unwrap();
+
+        let error = response_identifier(&requested, &response).unwrap_err();
+
+        assert!(matches!(
+            error,
+            Error::DataInvalid { message, .. }
+                if message.contains("does not match requested identifier")
+        ));
+    }
+
+    #[tokio::test]
+    async fn dependency_reads_preserve_the_outermost_identifier_and_catalog_options() {
+        let table = crate::table::rest_query_auth_table().await;
+        let mut env = table.rest_env().unwrap().clone();
+        env.identifier = Identifier::new("db 空格", "root$branch_dev");
+        let mut options = env.api.options().clone();
+        options.set("prefix", "configured-prefix");
+        options.set("header.X-Custom", "kept");
+        env.api = Arc::new(RESTApi::new(options, false).await.unwrap());
+        // The API has the merged server configuration, while env.options can
+        // still be the original catalog options.
+        let dependency = env.for_dependency_reads().await.unwrap();
+        let key = "header.X-Paimon-Read-Via";
+        assert!(env.api.options().get(key).is_none());
+        assert!(!Arc::ptr_eq(&env.api, &dependency.api));
+        assert_eq!(
+            dependency.api.options().get("prefix").unwrap(),
+            "configured-prefix"
+        );
+        assert_eq!(
+            dependency.api.options().get("header.X-Custom").unwrap(),
+            "kept"
+        );
+        let decoded =
+            crate::api::RESTUtil::decode_string(dependency.api.options().get(key).unwrap());
+        assert_eq!(
+            decoded,
+            r#"{"database":"db 空格","object":"root$branch_dev"}"#
+        );
+        let mut nested = dependency.clone();
+        nested.identifier = Identifier::new("other", "middle");
+        let nested = nested.for_dependency_reads().await.unwrap();
+        assert!(Arc::ptr_eq(&dependency.api, &nested.api));
+        assert_eq!(
+            nested.api.options().get(key),
+            dependency.api.options().get(key)
+        );
+    }
+
+    #[tokio::test]
+    async fn dependency_reads_preserve_an_explicit_read_via() {
+        let table = crate::table::rest_query_auth_table().await;
+        let mut env = table.rest_env().unwrap().clone();
+        let mut options = env.api.options().clone();
+        options.set(
+            "header.X-Paimon-Read-Via",
+            "an-already-encoded-outermost-table",
+        );
+        env.api = Arc::new(RESTApi::new(options, false).await.unwrap());
+        let dependency = env.for_dependency_reads().await.unwrap();
+        assert!(Arc::ptr_eq(&env.api, &dependency.api));
+        assert_eq!(
+            dependency
+                .api
+                .options()
+                .get("header.X-Paimon-Read-Via")
+                .unwrap(),
+            "an-already-encoded-outermost-table"
+        );
+    }
 
     #[tokio::test]
     async fn test_rest_env_clones_catalog_local_cache() {

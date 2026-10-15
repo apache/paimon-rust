@@ -29,8 +29,8 @@ use crate::arrow::{ReadBudget, RowFilter, RowFilterContext};
 use crate::io::{FileRead, OutputFile};
 use crate::spec::stats::BinaryTableStats;
 use crate::spec::{
-    is_row_id_column, BinaryRowBuilder, CoreOptions, DataField, DataType, Datum, MetadataStatsMode,
-    Predicate, PredicateOperator,
+    is_row_tracking_column, BinaryRowBuilder, CoreOptions, DataField, DataType, Datum,
+    MetadataStatsMode, Predicate, PredicateOperator,
 };
 use crate::table::{ArrowRecordBatchStream, RowRange};
 use crate::Error;
@@ -288,6 +288,7 @@ pub(crate) struct ParquetFormatWriter {
     write_fields: Option<Vec<DataField>>,
     stats_modes: Option<Vec<MetadataStatsMode>>,
     stats_dense_store: bool,
+    max_row_group_bytes: Option<usize>,
 }
 
 pub(crate) struct ParquetWriterFactory {
@@ -369,11 +370,12 @@ impl ParquetFormatWriter {
         let codec = parse_compression(compression, zstd_level)?;
         let core_options = CoreOptions::new(format_options);
         let page_index_enabled = core_options.parquet_write_page_index_enabled()?;
+        let props = parquet_writer_properties(codec, page_index_enabled, format_options)?;
+        let max_row_group_bytes = props.max_row_group_bytes();
         let async_write = output.async_writer().await?;
         let input_schema = schema;
         let schema = timestamp_millis_schema(&input_schema);
-        let inner =
-            create_parquet_arrow_writer(async_write, schema.clone(), codec, page_index_enabled)?;
+        let inner = create_parquet_arrow_writer(async_write, schema.clone(), props)?;
         let stats_modes = write_fields
             .map(|fields| core_options.metadata_stats_modes(fields.iter().map(DataField::name)))
             .transpose()?;
@@ -384,25 +386,26 @@ impl ParquetFormatWriter {
             write_fields: write_fields.map(|fields| fields.to_vec()),
             stats_modes,
             stats_dense_store: core_options.metadata_stats_dense_store(),
+            max_row_group_bytes,
         })
+    }
+
+    async fn write_physical(&mut self, batch: &RecordBatch) -> crate::Result<()> {
+        self.inner
+            .write(batch)
+            .await
+            .map_err(|e| crate::Error::DataInvalid {
+                message: format!("Failed to write parquet batch: {e}"),
+                source: None,
+            })
     }
 }
 
 fn create_parquet_arrow_writer(
     async_write: Box<dyn crate::io::AsyncFileWrite>,
     schema: arrow_schema::SchemaRef,
-    codec: Compression,
-    page_index_enabled: bool,
+    props: WriterProperties,
 ) -> crate::Result<AsyncArrowWriter<Box<dyn crate::io::AsyncFileWrite>>> {
-    let props = WriterProperties::builder()
-        .set_compression(codec)
-        .set_statistics_enabled(if page_index_enabled {
-            EnabledStatistics::Page
-        } else {
-            EnabledStatistics::Chunk
-        })
-        .set_offset_index_disabled(!page_index_enabled)
-        .build();
     // Commit one final Arrow schema at close, after shredding metadata is known.
     let options = parquet::arrow::arrow_writer::ArrowWriterOptions::new()
         .with_properties(props)
@@ -413,6 +416,176 @@ fn create_parquet_arrow_writer(
             source: None,
         }
     })
+}
+
+fn parquet_writer_properties(
+    codec: Compression,
+    page_index_enabled: bool,
+    options: &HashMap<String, String>,
+) -> crate::Result<WriterProperties> {
+    const DICTIONARY: &str = "parquet.enable.dictionary";
+    const COLUMN_PREFIX: &str = "parquet.enable.dictionary#";
+    let mut props = WriterProperties::builder()
+        .set_compression(codec)
+        .set_statistics_enabled(if page_index_enabled {
+            EnabledStatistics::Page
+        } else {
+            EnabledStatistics::Chunk
+        })
+        .set_offset_index_disabled(!page_index_enabled);
+    let parse = |key: &str, value: &str| match value.trim().to_ascii_lowercase().as_str() {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => Err(crate::Error::ConfigInvalid {
+            message: format!("Option '{key}' must be true or false, got: {value}"),
+        }),
+    };
+    if let Some(value) = options.get(DICTIONARY) {
+        props = props.set_dictionary_enabled(parse(DICTIONARY, value)?);
+    }
+    for (key, value) in options {
+        if let Some(path) = key.strip_prefix(COLUMN_PREFIX) {
+            if path.split('.').any(str::is_empty) {
+                return Err(crate::Error::ConfigInvalid {
+                    message: format!("Option '{key}' requires a nonempty Parquet column path"),
+                });
+            }
+            props = props.set_column_dictionary_enabled(
+                parquet::schema::types::ColumnPath::new(
+                    path.split('.').map(str::to_owned).collect(),
+                ),
+                parse(key, value)?,
+            );
+        }
+    }
+    Ok(parquet_sizing_properties(props, options)?.build())
+}
+
+/// Java's parquet writer sizing keys; `file.block-size` overrides `parquet.block.size` as in
+/// Java's `ParquetFileFormat`.
+fn parquet_sizing_properties(
+    mut props: parquet::file::properties::WriterPropertiesBuilder,
+    options: &HashMap<String, String>,
+) -> crate::Result<parquet::file::properties::WriterPropertiesBuilder> {
+    const BLOCK_SIZE: &str = "parquet.block.size";
+    const PAGE_SIZE: &str = "parquet.page.size";
+    const DICTIONARY_PAGE_SIZE: &str = "parquet.dictionary.page.size";
+    const PAGE_ROW_COUNT_LIMIT: &str = "parquet.page.row.count.limit";
+    const PAGE_SIZE_ROW_CHECK_MIN: &str = "parquet.page.size.row.check.min";
+    let positive = |key: &str| -> crate::Result<Option<usize>> {
+        options
+            .get(key)
+            .map(|value| {
+                value
+                    .trim()
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|parsed| *parsed > 0)
+                    .ok_or_else(|| crate::Error::ConfigInvalid {
+                        message: format!("Option '{key}' must be a positive integer, got: {value}"),
+                    })
+            })
+            .transpose()
+    };
+    let file_block_size = CoreOptions::new(options)
+        .file_block_size()?
+        .map(|bytes| {
+            usize::try_from(bytes)
+                .ok()
+                .filter(|bytes| *bytes > 0)
+                .ok_or_else(|| crate::Error::ConfigInvalid {
+                    message: format!("Option 'file.block-size' must be positive, got: {bytes}"),
+                })
+        })
+        .transpose()?;
+    let block_size = match file_block_size {
+        Some(bytes) => Some(bytes),
+        None => positive(BLOCK_SIZE)?,
+    };
+    if let Some(bytes) = block_size {
+        props = props.set_max_row_group_bytes(Some(bytes));
+    }
+    if let Some(bytes) = positive(PAGE_SIZE)? {
+        props = props.set_data_page_size_limit(bytes);
+    }
+    if let Some(bytes) = positive(DICTIONARY_PAGE_SIZE)? {
+        props = props.set_dictionary_page_size_limit(bytes);
+    }
+    // parquet-rs checks page limits between write batches, so the batch bounds the check interval.
+    let row_check = positive(PAGE_SIZE_ROW_CHECK_MIN)?;
+    let page_rows = positive(PAGE_ROW_COUNT_LIMIT)?;
+    if let Some(rows) = page_rows {
+        props = props.set_data_page_row_count_limit(rows);
+    }
+    if row_check.is_some() || page_rows.is_some() {
+        let limit =
+            page_rows.unwrap_or(parquet::file::properties::DEFAULT_DATA_PAGE_ROW_COUNT_LIMIT);
+        let batch = row_check.unwrap_or(parquet::file::properties::DEFAULT_WRITE_BATCH_SIZE);
+        props = props.set_write_batch_size(batch.min(limit));
+    }
+    Ok(props)
+}
+
+/// Bytes the rows of a (possibly sliced) batch occupy; unlike `get_array_memory_size`, list
+/// values and dictionaries outside the slice are not counted.
+fn batch_slice_bytes(batch: &RecordBatch) -> usize {
+    batch
+        .columns()
+        .iter()
+        .map(|column| array_slice_bytes(column.as_ref()))
+        .sum()
+}
+
+fn array_slice_bytes(array: &dyn arrow_array::Array) -> usize {
+    use arrow_array::cast::AsArray;
+    use arrow_array::{Array, ArrayRef};
+    use arrow_schema::DataType as ArrowDataType;
+    let nulls = array.nulls().map_or(0, |nulls| nulls.len().div_ceil(8));
+    let list_bytes = |values: &ArrayRef, start: usize, end: usize, offset_width: usize| {
+        offset_width * (array.len() + 1)
+            + nulls
+            + array_slice_bytes(values.slice(start, end - start).as_ref())
+    };
+    match array.data_type() {
+        ArrowDataType::List(_) => {
+            let list = array.as_list::<i32>();
+            let offsets = list.value_offsets();
+            let (start, end) = (offsets[0] as usize, offsets[list.len()] as usize);
+            list_bytes(list.values(), start, end, 4)
+        }
+        ArrowDataType::LargeList(_) => {
+            let list = array.as_list::<i64>();
+            let offsets = list.value_offsets();
+            let (start, end) = (offsets[0] as usize, offsets[list.len()] as usize);
+            list_bytes(list.values(), start, end, 8)
+        }
+        ArrowDataType::Map(_, _) => {
+            let map = array.as_map();
+            let offsets = map.value_offsets();
+            let (start, end) = (offsets[0] as usize, offsets[map.len()] as usize);
+            let entries: ArrayRef = Arc::new(map.entries().clone());
+            list_bytes(&entries, start, end, 4)
+        }
+        ArrowDataType::Struct(_) => {
+            nulls
+                + array
+                    .as_struct()
+                    .columns()
+                    .iter()
+                    .map(|column| array_slice_bytes(column.as_ref()))
+                    .sum::<usize>()
+        }
+        ArrowDataType::Dictionary(_, _) => {
+            let dictionary = array.as_any_dictionary();
+            let values = dictionary.values();
+            let value_bytes = array_slice_bytes(values.as_ref());
+            array_slice_bytes(dictionary.keys()) + value_bytes * array.len() / values.len().max(1)
+        }
+        _ => array
+            .to_data()
+            .get_slice_memory_size()
+            .unwrap_or_else(|_| array.get_array_memory_size()),
+    }
 }
 
 /// Every `file.compression` value a parquet write accepts.
@@ -491,13 +664,29 @@ impl FormatFileWriter for ParquetFormatWriter {
             physical_batch = cast_record_batch_to_schema(batch, &self.schema)?;
             &physical_batch
         };
-        self.inner
-            .write(batch)
-            .await
-            .map_err(|e| crate::Error::DataInvalid {
-                message: format!("Failed to write parquet batch: {e}"),
-                source: None,
-            })
+        let Some(limit) = self.max_row_group_bytes else {
+            return self.write_physical(batch).await;
+        };
+        // parquet-rs splits by bytes only once a row group holds rows, so write slices of at
+        // most a quarter of the limit, measured on their own rows, and close the group here.
+        let target = (limit / 4).max(1);
+        let rows = batch.num_rows();
+        let guess = (target / batch_slice_bytes(batch).div_ceil(rows.max(1)).max(1)).max(1);
+        let mut offset = 0;
+        while offset < rows {
+            let mut len = guess.min(rows - offset);
+            let mut slice = batch.slice(offset, len);
+            while len > 1 && batch_slice_bytes(&slice) > target {
+                len /= 2;
+                slice = batch.slice(offset, len);
+            }
+            self.write_physical(&slice).await?;
+            offset += len;
+            if self.inner.in_progress_size() >= limit {
+                self.flush().await?;
+            }
+        }
+        Ok(())
     }
 
     fn num_bytes(&self) -> usize {
@@ -623,6 +812,74 @@ fn cast_record_batch_to_schema(
     })
 }
 
+/// Options for per-row-group readers; they keep the main reader's Variant metadata schema.
+fn rebuilt_reader_options(variant_schema: &Option<arrow_schema::SchemaRef>) -> ArrowReaderOptions {
+    match variant_schema {
+        Some(schema) => ArrowReaderOptions::new().with_schema(Arc::clone(schema)),
+        None => ArrowReaderOptions::new(),
+    }
+}
+
+/// Index of the Binary `metadata` child of a plain or shredded Variant struct.
+fn variant_metadata_child(children: &arrow_schema::Fields) -> Option<usize> {
+    let shredded = children.iter().any(|child| child.name() == "typed_value");
+    if !shredded && !crate::arrow::is_variant_arrow_fields(children) {
+        return None;
+    }
+    children.iter().position(|child| {
+        child.name() == "metadata" && child.data_type() == &arrow_schema::DataType::Binary
+    })
+}
+
+/// File schema with `metadata: Dictionary(Int32, Binary)` for Variant columns read for extraction.
+fn dictionary_variant_metadata_schema(
+    schema: &arrow_schema::SchemaRef,
+    read_fields: &[DataField],
+) -> Option<arrow_schema::SchemaRef> {
+    let mut changed = false;
+    let fields = schema
+        .fields()
+        .iter()
+        .map(|field| {
+            let extraction = read_fields.iter().any(|read| {
+                read.name() == field.name()
+                    && crate::spec::is_variant_extraction_row_type(read.data_type())
+            });
+            match field.data_type() {
+                arrow_schema::DataType::Struct(children) if extraction => {
+                    let Some(metadata) = variant_metadata_child(children) else {
+                        return Arc::clone(field);
+                    };
+                    changed = true;
+                    let mut children = children
+                        .iter()
+                        .map(|child| child.as_ref().clone())
+                        .collect::<Vec<_>>();
+                    children[metadata] = children[metadata].clone().with_data_type(
+                        arrow_schema::DataType::Dictionary(
+                            Box::new(arrow_schema::DataType::Int32),
+                            Box::new(arrow_schema::DataType::Binary),
+                        ),
+                    );
+                    Arc::new(
+                        field
+                            .as_ref()
+                            .clone()
+                            .with_data_type(arrow_schema::DataType::Struct(children.into())),
+                    )
+                }
+                _ => Arc::clone(field),
+            }
+        })
+        .collect::<Vec<_>>();
+    changed.then(|| {
+        Arc::new(arrow_schema::Schema::new_with_metadata(
+            fields,
+            schema.metadata().clone(),
+        ))
+    })
+}
+
 #[async_trait]
 impl FormatFileReader for ParquetFormatReader {
     async fn read_batch_stream(
@@ -656,9 +913,24 @@ impl FormatFileReader for ParquetFormatReader {
                 arrow_options = arrow_options.with_offset_index_policy(PageIndexPolicy::Optional);
             }
         }
-        let mut batch_stream_builder =
-            ParquetRecordBatchStreamBuilder::new_with_options(arrow_file_reader, arrow_options)
-                .await?;
+        let mut batch_stream_builder = ParquetRecordBatchStreamBuilder::new_with_options(
+            arrow_file_reader,
+            arrow_options.clone(),
+        )
+        .await?;
+        // Variant columns read only for extraction keep their metadata dictionary-encoded.
+        let variant_schema =
+            dictionary_variant_metadata_schema(batch_stream_builder.schema(), read_fields);
+        if let Some(schema) = variant_schema.clone() {
+            let reader_metadata = ArrowReaderMetadata::try_new(
+                Arc::clone(batch_stream_builder.metadata()),
+                arrow_options.with_schema(schema),
+            )?;
+            let reader = ArrowFileReader::new(file_size, Arc::clone(&shared_reader))
+                .with_metadata_cache_enabled(self.metadata_cache_enabled);
+            batch_stream_builder =
+                ParquetRecordBatchStreamBuilder::new_with_metadata(reader, reader_metadata);
+        }
 
         let parquet_schema = batch_stream_builder.parquet_schema().clone();
 
@@ -686,28 +958,19 @@ impl FormatFileReader for ParquetFormatReader {
             crate::arrow::residual::widen_scan_fields(read_fields, predicates)
         };
 
-        let root_schema = parquet_schema.root_schema();
-        let root_indices: Vec<usize> = scan_fields
-            .iter()
-            .filter_map(|f| {
-                root_schema
-                    .get_fields()
-                    .iter()
-                    .position(|pf| pf.name() == f.name())
-            })
-            .collect();
-
         // Build the MAP plan before the projection mask: a selected-key MAP
         // can then decode only __field_mapping plus the direct/overflow
         // children which may contain the requested keys.
         let map_read_plan =
             MapShreddingReadPlan::create(&scan_fields, batch_stream_builder.schema())?
                 .map(Arc::new);
-        let mask = if let Some(plan) = map_read_plan.as_deref() {
-            map_shredding_projection_mask(&parquet_schema, &root_indices, plan)
-        } else {
-            ProjectionMask::roots(&parquet_schema, root_indices)
-        };
+        let mask = read_type_projection_mask(
+            &parquet_schema,
+            &scan_fields,
+            map_read_plan.as_deref(),
+            preds,
+            &null_shredded_residuals(batch_stream_builder.metadata()),
+        );
         batch_stream_builder = batch_stream_builder.with_projection(mask.clone());
 
         let mut decoder_predicates = build_parquet_row_filter(&parquet_schema, preds, file_fields)?
@@ -883,7 +1146,7 @@ impl FormatFileReader for ParquetFormatReader {
             let row_group_count = selected_row_groups.len();
             let reader_metadata = ArrowReaderMetadata::try_new(
                 batch_stream_builder.metadata().clone(),
-                ArrowReaderOptions::new(),
+                rebuilt_reader_options(&variant_schema),
             )?;
             let read_budget = Arc::clone(read_budget.expect("checked above"));
             let (row_group_tx, mut row_group_rx) = mpsc::channel(row_group_parallelism);
@@ -981,7 +1244,7 @@ impl FormatFileReader for ParquetFormatReader {
             let selected = selected_row_groups.expect("resource-aware reads need a selection plan");
             let metadata = ArrowReaderMetadata::try_new(
                 batch_stream_builder.metadata().clone(),
-                ArrowReaderOptions::new(),
+                rebuilt_reader_options(&variant_schema),
             )?;
             let residual = (!all_enforced).then(|| FilePredicates {
                 predicates: preds.to_vec(),
@@ -1060,29 +1323,149 @@ impl FormatFileReader for ParquetFormatReader {
     }
 }
 
-fn map_shredding_projection_mask(
-    parquet_schema: &parquet::schema::types::SchemaDescriptor,
-    selected_roots: &[usize],
-    plan: &MapShreddingReadPlan,
-) -> ProjectionMask {
-    let selected_roots: std::collections::HashSet<usize> = selected_roots.iter().copied().collect();
-    let root_fields = parquet_schema.root_schema().get_fields();
-    let leaves = (0..parquet_schema.num_columns()).filter(|leaf_index| {
-        let root_index = parquet_schema.get_column_root_idx(*leaf_index);
-        if !selected_roots.contains(&root_index) {
-            return false;
+/// Shredded object-field residuals (`typed_value.<key>.value`) that every row group's
+/// statistics prove null; candidates for the extraction-time skip below.
+fn null_shredded_residuals(metadata: &ParquetMetaData) -> std::collections::HashSet<Vec<String>> {
+    let schema = metadata.file_metadata().schema_descr();
+    (0..schema.num_columns())
+        .filter(|&leaf| {
+            let column = schema.column(leaf);
+            let parts = column.path().parts();
+            parts.len() >= 3
+                && parts[parts.len() - 1] == "value"
+                && parts[parts.len() - 3] == "typed_value"
+                && metadata.num_row_groups() > 0
+                && metadata.row_groups().iter().all(|row_group| {
+                    let chunk = row_group.column(leaf);
+                    chunk
+                        .statistics()
+                        .and_then(|statistics| statistics.null_count_opt())
+                        .is_some_and(|nulls| i64::try_from(nulls).ok() == Some(chunk.num_values()))
+                })
+        })
+        .map(|leaf| schema.column(leaf).path().parts().to_vec())
+        .collect()
+}
+
+/// Of the projected all-null residuals, the ones Variant extraction may leave
+/// unread while keeping each field's structural definition levels intact.
+fn skippable_residuals(
+    projected: &std::collections::HashSet<Vec<String>>,
+    candidates: &[Vec<String>],
+) -> std::collections::HashSet<Vec<String>> {
+    let mut candidates = candidates.to_vec();
+    candidates.sort_by_key(|path| std::cmp::Reverse(path.len()));
+    let mut skippable = std::collections::HashSet::new();
+    for candidate in &candidates {
+        let group = &candidate[..candidate.len() - 1];
+        let keeps_field_presence = projected.iter().any(|leaf| {
+            leaf.len() > group.len()
+                && leaf[..group.len()] == group[..]
+                && leaf[group.len()] == "typed_value"
+                && !skippable.contains(leaf)
+        });
+        if keeps_field_presence {
+            skippable.insert(candidate.clone());
         }
-        let root_name = root_fields[root_index].name();
-        let Some(children) = plan.projected_physical_children(root_name) else {
-            return true;
+    }
+    skippable
+}
+
+fn read_type_projection_mask(
+    parquet_schema: &parquet::schema::types::SchemaDescriptor,
+    read_fields: &[DataField],
+    map_plan: Option<&MapShreddingReadPlan>,
+    predicates: &[Predicate],
+    null_residuals: &std::collections::HashSet<Vec<String>>,
+) -> ProjectionMask {
+    fn requested_paths(
+        field: &DataField,
+        physical: &parquet::schema::types::Type,
+        path: &mut Vec<String>,
+        output: &mut std::collections::HashSet<Vec<String>>,
+        null_residuals: &std::collections::HashSet<Vec<String>>,
+    ) {
+        if crate::spec::is_map_selected_keys_field(field) {
+            // Selected-key ROW children name logical MAP keys, not physical
+            // Parquet children. Shared MAPs use their read plan above; other
+            // MAPs must remain complete for the core's key-to-ROW assembly.
+            super::variant_projection::all_leaves(physical, path, output);
+            return;
+        }
+        let data_type = field.data_type();
+        if let DataType::Row(row) = data_type {
+            if crate::spec::is_variant_extraction_row_type(data_type) {
+                let projected = super::variant_projection::projected_paths(row, physical);
+                let candidates = null_residuals
+                    .iter()
+                    .filter(|residual| {
+                        residual.starts_with(path.as_slice())
+                            && projected.contains(&residual[path.len()..])
+                    })
+                    .map(|residual| residual[path.len()..].to_vec())
+                    .collect::<Vec<_>>();
+                let skippable = skippable_residuals(&projected, &candidates);
+                for parts in projected {
+                    if skippable.contains(&parts) {
+                        continue;
+                    }
+                    let mut full = path.clone();
+                    full.extend(parts);
+                    output.insert(full);
+                }
+                return;
+            }
+            if !physical.is_primitive() {
+                for field in row.fields() {
+                    if let Some(child) = physical
+                        .get_fields()
+                        .iter()
+                        .find(|child| child.name() == field.name())
+                    {
+                        path.push(child.name().to_string());
+                        requested_paths(field, child, path, output, null_residuals);
+                        path.pop();
+                    }
+                }
+                return;
+            }
+        }
+        super::variant_projection::all_leaves(physical, path, output);
+    }
+    let mut predicate_refs = Vec::new();
+    for predicate in predicates {
+        crate::arrow::residual::collect_predicate_leaf_refs(predicate, &mut predicate_refs);
+    }
+    let roots = parquet_schema.root_schema().get_fields();
+    let mut selected = std::collections::HashSet::new();
+    for field in read_fields {
+        let Some(root) = roots.iter().find(|root| root.name() == field.name()) else {
+            continue;
         };
-        parquet_schema
-            .column(*leaf_index)
-            .path()
-            .parts()
-            .get(1)
-            .is_some_and(|child| children.contains(child))
-    });
+        let mut path = vec![root.name().to_string()];
+        if predicate_refs
+            .iter()
+            .any(|(column, _)| *column == field.name())
+        {
+            super::variant_projection::all_leaves(root, &mut path, &mut selected);
+        } else if let Some(children) =
+            map_plan.and_then(|plan| plan.projected_physical_children(field.name()))
+        {
+            for child in root
+                .get_fields()
+                .iter()
+                .filter(|child| children.contains(child.name()))
+            {
+                path.push(child.name().to_string());
+                super::variant_projection::all_leaves(child, &mut path, &mut selected);
+                path.pop();
+            }
+        } else {
+            requested_paths(field, root, &mut path, &mut selected, null_residuals);
+        }
+    }
+    let leaves = (0..parquet_schema.num_columns())
+        .filter(|&leaf| selected.contains(parquet_schema.column(leaf).path().parts()));
     ProjectionMask::leaves(parquet_schema, leaves)
 }
 
@@ -1418,7 +1801,7 @@ fn parquet_leaf_row_filter_accepted(
     }
     // Not in the file, so the decoder cannot evaluate it. Rejecting the leaf
     // rejects any enclosing predicate too, leaving it to the post-scan residual.
-    if is_row_id_column(column) {
+    if is_row_tracking_column(column) {
         return Ok(false);
     }
     let Some(file_field) = file_fields.get(index) else {
@@ -2894,7 +3277,7 @@ fn split_ranges_for_concurrency(merged: Vec<Range<u64>>, concurrency: usize) -> 
 #[cfg(test)]
 #[allow(clippy::type_complexity)] // test row literals use nested Option<Vec<(&str, Option<i64>)>>
 mod tests {
-    use super::build_parquet_row_filter;
+    use super::{build_parquet_row_filter, parquet_writer_properties};
     use super::{
         forward_row_group_batches, parquet_granules, parse_compression, supported_compressions,
         FilePredicates, ParquetFormatReader, ParquetFormatWriter, ParquetRowGroupMessage,
@@ -2934,6 +3317,141 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::mpsc;
+
+    #[test]
+    fn selected_map_rows_keep_all_map_leaves_without_a_shredding_plan() {
+        use crate::spec::RowType;
+        let descriptor = SchemaDescriptor::new(Arc::new(
+            parse_message_type(
+                "message schema {
+                optional group attrs (MAP) { repeated group key_value {
+                    required binary key (STRING); optional int32 value;
+                } }
+                optional group profile {
+                    optional group attrs (MAP) { repeated group key_value {
+                        required binary key (STRING); optional int32 value;
+                    } }
+                    optional int32 unused;
+                }
+                optional int32 unused;
+            }",
+            )
+            .unwrap(),
+        ));
+        let map_type = DataType::Map(MapType::new(
+            DataType::VarChar(VarCharType::string_type()),
+            DataType::Int(IntType::new()),
+        ));
+        let top = crate::spec::map_selected_keys_field(
+            &DataField::new(10, "attrs".into(), map_type.clone()),
+            &["wanted".into()],
+        )
+        .unwrap();
+        // A literal key can even collide with a Parquet layout field name.
+        let nested = crate::spec::map_selected_keys_field(
+            &DataField::new(21, "attrs".into(), map_type),
+            &["key_value".into()],
+        )
+        .unwrap();
+        let fields = vec![
+            top,
+            DataField::new(
+                20,
+                "profile".into(),
+                DataType::Row(RowType::new(vec![nested])),
+            ),
+        ];
+        let mask =
+            super::read_type_projection_mask(&descriptor, &fields, None, &[], &Default::default());
+        for index in 0..4 {
+            assert!(mask.leaf_included(index), "Missing MAP leaf {index}");
+        }
+        assert!(!mask.leaf_included(4));
+        assert!(!mask.leaf_included(5));
+    }
+
+    #[test]
+    fn nested_read_type_masks_physical_leaves_and_keeps_predicate_inputs() {
+        use crate::spec::RowType;
+        let descriptor = SchemaDescriptor::new(Arc::new(parse_message_type(
+            "message schema { optional group profile { optional int32 score; optional binary unused; } optional int32 id; }"
+        ).unwrap()));
+        let fields = vec![
+            DataField::new(
+                10,
+                "profile".into(),
+                DataType::Row(RowType::new(vec![
+                    DataField::new(11, "score".into(), DataType::Int(IntType::new())),
+                    DataField::new(
+                        12,
+                        "unused".into(),
+                        DataType::VarChar(VarCharType::string_type()),
+                    ),
+                ])),
+            ),
+            DataField::new(20, "id".into(), DataType::Int(IntType::new())),
+        ];
+        let selected =
+            crate::spec::project_read_type(&fields, &[vec!["profile".into(), "score".into()]])
+                .unwrap();
+        let mask = super::read_type_projection_mask(
+            &descriptor,
+            &selected,
+            None,
+            &[],
+            &Default::default(),
+        );
+        assert!(mask.leaf_included(0));
+        assert!(!mask.leaf_included(1));
+        assert!(!mask.leaf_included(2));
+        let predicate = PredicateBuilder::new(&fields).is_null("profile").unwrap();
+        let widened = super::read_type_projection_mask(
+            &descriptor,
+            &selected,
+            None,
+            &[predicate],
+            &Default::default(),
+        );
+        assert!(widened.leaf_included(0));
+        assert!(widened.leaf_included(1));
+        assert!(!widened.leaf_included(2));
+    }
+
+    #[test]
+    fn null_residual_skip_keeps_field_structure() {
+        fn leaf(parts: &[&str]) -> Vec<String> {
+            parts.iter().map(|part| part.to_string()).collect()
+        }
+        let projected = [
+            leaf(&["metadata"]),
+            leaf(&["typed_value", "obj", "value"]),
+            leaf(&["typed_value", "obj", "typed_value", "x", "value"]),
+            leaf(&["typed_value", "y", "value"]),
+            leaf(&["typed_value", "y", "typed_value"]),
+        ]
+        .into_iter()
+        .collect::<std::collections::HashSet<_>>();
+        let candidates = vec![
+            leaf(&["typed_value", "obj", "value"]),
+            leaf(&["typed_value", "obj", "typed_value", "x", "value"]),
+            leaf(&["typed_value", "y", "value"]),
+        ];
+        let skippable = super::skippable_residuals(&projected, &candidates);
+        // y keeps its typed leaf, so its all-null residual is skippable.
+        assert!(skippable.contains(&leaf(&["typed_value", "y", "value"])));
+        // x is residual-only: its value is the group's sole leaf and stays.
+        assert!(!skippable.contains(&leaf(&["typed_value", "obj", "typed_value", "x", "value"])));
+        // obj's residual is skippable because x.value survives below it.
+        assert!(skippable.contains(&leaf(&["typed_value", "obj", "value"])));
+        let no_typed_leaf = projected
+            .iter()
+            .filter(|path| path.as_slice() != leaf(&["typed_value", "y", "typed_value"]).as_slice())
+            .cloned()
+            .collect::<std::collections::HashSet<_>>();
+        let without = super::skippable_residuals(&no_typed_leaf, &candidates);
+        assert!(!without.contains(&leaf(&["typed_value", "y", "value"])));
+        assert!(without.contains(&leaf(&["typed_value", "obj", "value"])));
+    }
 
     fn test_fields() -> Vec<DataField> {
         vec![
@@ -3923,6 +4441,7 @@ mod tests {
                 write_fields: None,
                 stats_modes: None,
                 stats_dense_store: false,
+                max_row_group_bytes: None,
             }),
             Some(&resources),
         );
@@ -3949,6 +4468,287 @@ mod tests {
             .map(|batch| batch.unwrap().num_rows())
             .sum();
         assert_eq!(total_rows, 9);
+    }
+
+    #[tokio::test]
+    async fn test_parquet_writer_dictionary_options() {
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        use parquet::schema::types::ColumnPath;
+
+        for global in [true, false] {
+            let options = HashMap::from([
+                ("parquet.enable.dictionary".to_owned(), global.to_string()),
+                (
+                    "parquet.enable.dictionary#value".to_owned(),
+                    (!global).to_string(),
+                ),
+                (
+                    "parquet.enable.dictionary#nested.value".to_owned(),
+                    "false".to_owned(),
+                ),
+            ]);
+            let props =
+                parquet_writer_properties(Compression::UNCOMPRESSED, true, &options).unwrap();
+            assert_eq!(props.dictionary_enabled(&ColumnPath::from("id")), global);
+            assert_eq!(
+                props.dictionary_enabled(&ColumnPath::from("value")),
+                !global
+            );
+            assert!(
+                !props.dictionary_enabled(&ColumnPath::new(vec!["nested".into(), "value".into()]))
+            );
+            let file_io = FileIOBuilder::new("memory").build().unwrap();
+            let path = "memory:/dictionary_options.parquet";
+            let schema = writer_arrow_schema();
+            let batch = writer_test_batch(&schema, vec![1, 1, 1], vec![10, 10, 10]);
+            let mut writer = ParquetFormatWriter::new(
+                &file_io.new_output(path).unwrap(),
+                schema,
+                "zstd",
+                1,
+                None,
+                &options,
+            )
+            .await
+            .unwrap();
+            writer.write(&batch).await.unwrap();
+            Box::new(writer).close().await.unwrap();
+            let bytes = file_io.new_input(path).unwrap().read().await.unwrap();
+            let reader = ParquetRecordBatchReaderBuilder::try_new(bytes).unwrap();
+            let columns = reader.metadata().row_group(0).columns();
+            assert_eq!(columns[0].dictionary_page_offset().is_some(), global);
+            assert_eq!(columns[1].dictionary_page_offset().is_some(), !global);
+            let actual = reader.build().unwrap().next().unwrap().unwrap();
+            assert_eq!(actual, batch);
+        }
+        let props =
+            parquet_writer_properties(Compression::UNCOMPRESSED, true, &HashMap::new()).unwrap();
+        assert!(props.dictionary_enabled(&ColumnPath::from("id")));
+    }
+
+    #[tokio::test]
+    async fn test_parquet_writer_nested_dictionary_option() {
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+        let child = Arc::new(ArrowField::new("value", ArrowDataType::Int32, false));
+        let fields: arrow_schema::Fields = vec![child].into();
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "nested",
+            ArrowDataType::Struct(fields.clone()),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StructArray::new(
+                fields,
+                vec![Arc::new(Int32Array::from(vec![7, 7, 7]))],
+                None,
+            ))],
+        )
+        .unwrap();
+        for enabled in [true, false] {
+            let file_io = FileIOBuilder::new("memory").build().unwrap();
+            let path = "memory:/nested_dictionary.parquet";
+            let options = HashMap::from([(
+                "parquet.enable.dictionary#nested.value".to_owned(),
+                enabled.to_string(),
+            )]);
+            let mut writer = ParquetFormatWriter::new(
+                &file_io.new_output(path).unwrap(),
+                schema.clone(),
+                "zstd",
+                1,
+                None,
+                &options,
+            )
+            .await
+            .unwrap();
+            writer.write(&batch).await.unwrap();
+            Box::new(writer).close().await.unwrap();
+            let bytes = file_io.new_input(path).unwrap().read().await.unwrap();
+            let reader = ParquetRecordBatchReaderBuilder::try_new(bytes).unwrap();
+            assert_eq!(
+                reader
+                    .metadata()
+                    .row_group(0)
+                    .column(0)
+                    .dictionary_page_offset()
+                    .is_some(),
+                enabled
+            );
+            assert_eq!(reader.build().unwrap().next().unwrap().unwrap(), batch);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_parquet_writer_invalid_dictionary_options_create_no_file() {
+        for (key, value) in [
+            ("parquet.enable.dictionary", "invalid"),
+            ("parquet.enable.dictionary#value", "invalid"),
+            ("parquet.enable.dictionary#", "false"),
+            ("parquet.enable.dictionary#a..b", "false"),
+        ] {
+            let file_io = FileIOBuilder::new("memory").build().unwrap();
+            let path = "memory:/invalid_dictionary.parquet";
+            let options = HashMap::from([(key.to_owned(), value.to_owned())]);
+            let result = ParquetFormatWriter::new(
+                &file_io.new_output(path).unwrap(),
+                writer_arrow_schema(),
+                "zstd",
+                1,
+                None,
+                &options,
+            )
+            .await;
+            assert!(matches!(result, Err(crate::Error::ConfigInvalid { .. })));
+            assert!(!file_io.exists(path).await.unwrap());
+        }
+    }
+
+    #[test]
+    fn test_parquet_writer_sizing_options() {
+        let defaults =
+            parquet_writer_properties(Compression::UNCOMPRESSED, true, &HashMap::new()).unwrap();
+        assert_eq!(defaults.max_row_group_bytes(), None);
+        assert_eq!(
+            defaults.write_batch_size(),
+            parquet::file::properties::DEFAULT_WRITE_BATCH_SIZE
+        );
+        let mut options = HashMap::from([
+            ("parquet.block.size".to_owned(), "1048576".to_owned()),
+            ("parquet.page.size".to_owned(), "65536".to_owned()),
+            (
+                "parquet.dictionary.page.size".to_owned(),
+                "32768".to_owned(),
+            ),
+            ("parquet.page.row.count.limit".to_owned(), "500".to_owned()),
+        ]);
+        let props = parquet_writer_properties(Compression::UNCOMPRESSED, true, &options).unwrap();
+        assert_eq!(props.max_row_group_bytes(), Some(1_048_576));
+        assert_eq!(props.data_page_size_limit(), 65_536);
+        assert_eq!(props.dictionary_page_size_limit(), 32_768);
+        assert_eq!(props.data_page_row_count_limit(), 500);
+        assert_eq!(props.write_batch_size(), 500);
+
+        options.insert("file.block-size".to_owned(), "2 mb".to_owned());
+        options.insert("parquet.block.size".to_owned(), "128mb".to_owned());
+        options.insert(
+            "parquet.page.size.row.check.min".to_owned(),
+            "100".to_owned(),
+        );
+        let props = parquet_writer_properties(Compression::UNCOMPRESSED, true, &options).unwrap();
+        assert_eq!(props.max_row_group_bytes(), Some(2 * 1024 * 1024));
+        assert_eq!(props.write_batch_size(), 100);
+
+        // Without an explicit page row limit, the default one still bounds the check interval.
+        let options = HashMap::from([(
+            "parquet.page.size.row.check.min".to_owned(),
+            "65536".to_owned(),
+        )]);
+        let props = parquet_writer_properties(Compression::UNCOMPRESSED, true, &options).unwrap();
+        assert_eq!(
+            props.data_page_row_count_limit(),
+            parquet::file::properties::DEFAULT_DATA_PAGE_ROW_COUNT_LIMIT
+        );
+        assert_eq!(
+            props.write_batch_size(),
+            parquet::file::properties::DEFAULT_DATA_PAGE_ROW_COUNT_LIMIT
+        );
+    }
+
+    #[tokio::test]
+    async fn test_parquet_writer_invalid_sizing_options_create_no_file() {
+        for (key, value) in [
+            ("parquet.block.size", "0"),
+            ("parquet.block.size", "128mb"),
+            ("parquet.page.size", "-1"),
+            ("parquet.dictionary.page.size", "x"),
+            ("parquet.page.row.count.limit", "0"),
+            ("parquet.page.size.row.check.min", ""),
+            ("file.block-size", "0 b"),
+            ("file.block-size", "invalid"),
+        ] {
+            let file_io = FileIOBuilder::new("memory").build().unwrap();
+            let path = "memory:/invalid_sizing.parquet";
+            let options = HashMap::from([(key.to_owned(), value.to_owned())]);
+            let result = ParquetFormatWriter::new(
+                &file_io.new_output(path).unwrap(),
+                writer_arrow_schema(),
+                "zstd",
+                1,
+                None,
+                &options,
+            )
+            .await;
+            assert!(
+                matches!(result, Err(crate::Error::ConfigInvalid { .. })),
+                "{key}={value}"
+            );
+            assert!(!file_io.exists(path).await.unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_parquet_writer_sizing_options_shape_the_file() {
+        use parquet::arrow::arrow_reader::{ArrowReaderOptions, ParquetRecordBatchReaderBuilder};
+
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let path = "memory:/sizing_options.parquet";
+        let options = HashMap::from([
+            ("parquet.enable.dictionary".to_owned(), "false".to_owned()),
+            ("parquet.block.size".to_owned(), "16384".to_owned()),
+            ("parquet.page.row.count.limit".to_owned(), "100".to_owned()),
+        ]);
+        let schema = writer_arrow_schema();
+        let mut writer = ParquetFormatWriter::new(
+            &file_io.new_output(path).unwrap(),
+            schema.clone(),
+            "none",
+            1,
+            None,
+            &options,
+        )
+        .await
+        .unwrap();
+        for chunk in 0..40 {
+            let ids = (chunk * 100..(chunk + 1) * 100).collect::<Vec<i32>>();
+            let values = ids.iter().map(|id| id.wrapping_mul(7919)).collect();
+            writer
+                .write(&writer_test_batch(&schema, ids, values))
+                .await
+                .unwrap();
+        }
+        Box::new(writer).close().await.unwrap();
+
+        let bytes = file_io.new_input(path).unwrap().read().await.unwrap();
+        let reader = ParquetRecordBatchReaderBuilder::try_new_with_options(
+            bytes,
+            ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Required),
+        )
+        .unwrap();
+        let metadata = reader.metadata().clone();
+        assert!(metadata.num_row_groups() > 1);
+        let offsets = metadata.offset_index().expect("page index");
+        for (row_group, columns) in metadata.row_groups().iter().zip(offsets) {
+            assert!(row_group.compressed_size() <= 2 * 16384);
+            for column in columns {
+                let firsts = column
+                    .page_locations()
+                    .iter()
+                    .map(|page| page.first_row_index)
+                    .chain(std::iter::once(row_group.num_rows()))
+                    .collect::<Vec<_>>();
+                // parquet-rs checks the limit between write batches, so a split batch can add one batch.
+                assert!(firsts.windows(2).all(|pair| pair[1] - pair[0] < 200));
+                assert!(firsts.len() > (row_group.num_rows() / 100) as usize);
+            }
+        }
+        let rows = reader
+            .build()
+            .unwrap()
+            .map(|batch| batch.unwrap().num_rows())
+            .sum::<usize>();
+        assert_eq!(rows, 4000);
     }
 
     #[tokio::test]
@@ -6538,6 +7338,127 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn selected_map_rows_decode_complete_maps_before_core_assembly() {
+        use crate::spec::RowType;
+        let map_type = map_shredding_fields()[1].data_type().clone();
+        let fields = vec![
+            DataField::new(10, "attrs".into(), map_type.clone()),
+            DataField::new(
+                20,
+                "profile".into(),
+                DataType::Row(RowType::new(vec![
+                    DataField::new(21, "attrs".into(), map_type),
+                    DataField::new(22, "unused".into(), DataType::Int(IntType::new())),
+                ])),
+            ),
+        ];
+        let rows = vec![
+            Some(vec![("wanted", Some(10)), ("key_value", Some(11))]),
+            None,
+            Some(vec![]),
+            Some(vec![
+                ("wanted", Some(40)),
+                ("wanted", Some(50)),
+                ("key_value", Some(41)),
+            ]),
+        ];
+        let schema = build_target_arrow_schema(&fields).unwrap();
+        let ArrowDataType::Struct(profile_fields) = schema.field(1).data_type() else {
+            panic!("profile must be ROW");
+        };
+        let profile = StructArray::new(
+            profile_fields.clone(),
+            vec![
+                Arc::new(build_int64_map_array(&rows)),
+                Arc::new(Int32Array::from(vec![1, 2, 3, 4])),
+            ],
+            Some(NullBuffer::from(vec![true, false, true, true])),
+        );
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(build_int64_map_array(&rows)), Arc::new(profile)],
+        )
+        .unwrap();
+        let requested = crate::spec::project_read_type(
+            &fields,
+            &[
+                vec!["attrs".into(), "wanted".into()],
+                vec!["attrs".into(), "missing".into()],
+                vec!["profile".into(), "attrs".into(), "key_value".into()],
+            ],
+        )
+        .unwrap();
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let path = "memory:/selected_map_complete_fallback.parquet";
+        let output = file_io.new_output(path).unwrap();
+        let mut writer =
+            create_format_writer(&output, schema, "zstd", 1, None, Some(&fields), None)
+                .await
+                .unwrap();
+        writer.write(&batch).await.unwrap();
+        let file_size = writer.close().await.unwrap().file_size;
+        let batches = create_format_reader(path, false, &requested)
+            .unwrap()
+            .read_batch_stream(
+                Box::new(file_io.new_input(path).unwrap().reader().await.unwrap()),
+                file_size,
+                &requested,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_int64_map_rows(
+            batches[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<MapArray>()
+                .unwrap(),
+            &rows,
+        );
+        let top = crate::arrow::nested_evolution::evolve_field(
+            batches[0].column(0),
+            &fields[0],
+            &requested[0],
+        )
+        .unwrap();
+        let top = top.as_any().downcast_ref::<StructArray>().unwrap();
+        assert!(top.is_null(1));
+        assert_eq!(
+            top.column(0).as_any().downcast_ref::<Int64Array>().unwrap(),
+            &Int64Array::from(vec![Some(10), None, None, Some(40)]),
+        );
+        assert_eq!(top.column(1).null_count(), 4);
+        let profile = crate::arrow::nested_evolution::evolve_field(
+            batches[0].column(1),
+            &fields[1],
+            &requested[1],
+        )
+        .unwrap();
+        let profile = profile.as_any().downcast_ref::<StructArray>().unwrap();
+        assert!(profile.is_null(1));
+        assert_eq!(profile.num_columns(), 1);
+        let attrs = profile
+            .column(0)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        assert_eq!(
+            attrs
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap(),
+            &Int64Array::from(vec![Some(11), None, None, Some(41)]),
+        );
+    }
+
+    #[tokio::test]
     async fn test_parquet_map_shredding_write_read_roundtrip() {
         let rows: Vec<Option<Vec<(&str, Option<i64>)>>> = vec![
             Some(vec![("a", Some(10)), ("b", None), ("c", Some(30))]), // c overflows
@@ -6979,5 +7900,500 @@ mod tests {
             panic!("expected DataInvalid, got {err:?}");
         };
         assert!(message.contains("file.compression"), "message: {message}");
+    }
+
+    #[tokio::test]
+    async fn variant_extraction_reads_metadata_as_dictionary() {
+        let rows = [r#"{"x":1,"y":2.5}"#, r#"{"y":-1,"x":4}"#, r#"{"x":6}"#];
+        let variants = rows
+            .iter()
+            .map(|json| GenericVariant::parse_json(json).unwrap())
+            .collect::<Vec<_>>();
+        let ArrowDataType::Struct(variant_fields) = variant_arrow_type() else {
+            unreachable!()
+        };
+        let column = StructArray::new(
+            variant_fields.clone(),
+            vec![
+                Arc::new(BinaryArray::from_iter_values(
+                    variants.iter().map(|v| v.value()),
+                )),
+                Arc::new(BinaryArray::from_iter_values(
+                    variants.iter().map(|v| v.metadata()),
+                )),
+            ],
+            None,
+        );
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "v",
+            ArrowDataType::Struct(variant_fields),
+            true,
+        )]));
+        let batch =
+            RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(column.clone())]).unwrap();
+        let mut buf = Vec::new();
+        let mut writer = AsyncArrowWriter::try_new(&mut buf, schema, None).unwrap();
+        writer.write(&batch).await.unwrap();
+        writer.close().await.unwrap();
+
+        let float = || DataType::Float(crate::spec::FloatType::new());
+        let row_type = crate::spec::variant_extraction_row(
+            true,
+            vec![
+                (float(), "$.x".to_string(), false, "UTC".to_string()),
+                (float(), "$.y".to_string(), false, "UTC".to_string()),
+            ],
+        )
+        .unwrap();
+        let fields = vec![DataField::new(
+            0,
+            "v".to_string(),
+            DataType::Row(row_type.clone()),
+        )];
+        let data = Bytes::from(buf);
+        let batches = ParquetFormatReader::default()
+            .read_batch_stream(
+                Box::new(TrackingFileRead::new(data.clone())),
+                data.len() as u64,
+                &fields,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let read = batches[0]
+            .column_by_name("v")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        assert!(matches!(
+            read.column(1).data_type(),
+            ArrowDataType::Dictionary(key, value)
+                if key.as_ref() == &ArrowDataType::Int32 && value.as_ref() == &ArrowDataType::Binary
+        ));
+        let expected =
+            crate::arrow::shredding::variant::assemble_variant_extraction_array(&column, &row_type)
+                .unwrap();
+        let actual =
+            crate::arrow::shredding::variant::assemble_variant_extraction_array(read, &row_type)
+                .unwrap();
+        assert_eq!(actual.as_ref(), expected.as_ref());
+    }
+
+    #[tokio::test]
+    async fn shredded_variant_extraction_skips_null_residuals() {
+        let fields = vec![DataField::new(
+            0,
+            "v".to_string(),
+            DataType::Variant(VariantType::new()),
+        )];
+        let options = HashMap::from([(
+            "variant.shreddingSchema".to_string(),
+            r#"{"type":"ROW","fields":[{"name":"v","type":{"type":"ROW","fields":[{"name":"x","type":"DOUBLE"},{"name":"y","type":"BIGINT"}]}}]}"#.to_string(),
+        )]);
+        let variants = [r#"{"x":1.5e0,"y":2,"z":"rest"}"#, r#"{"x":4e0,"y":"text"}"#]
+            .iter()
+            .map(|json| GenericVariant::parse_json(json).unwrap())
+            .collect::<Vec<_>>();
+        let ArrowDataType::Struct(variant_fields) = variant_arrow_type() else {
+            unreachable!()
+        };
+        let column = StructArray::new(
+            variant_fields,
+            vec![
+                Arc::new(BinaryArray::from_iter_values(
+                    variants.iter().map(|v| v.value()),
+                )),
+                Arc::new(BinaryArray::from_iter_values(
+                    variants.iter().map(|v| v.metadata()),
+                )),
+            ],
+            None,
+        );
+        let schema = build_target_arrow_schema(&fields).unwrap();
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(column.clone())]).unwrap();
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let path = format!("memory:/null_residuals_{}.parquet", uuid::Uuid::new_v4());
+        let mut writer = create_format_writer(
+            &file_io.new_output(&path).unwrap(),
+            schema,
+            "zstd",
+            1,
+            None,
+            Some(&fields),
+            Some(&options),
+        )
+        .await
+        .unwrap();
+        writer.write(&batch).await.unwrap();
+        writer.close().await.unwrap();
+        let data = file_io.new_input(&path).unwrap().read().await.unwrap();
+
+        let double = || DataType::Double(crate::spec::DoubleType::new());
+        let row_type = crate::spec::variant_extraction_row(
+            true,
+            ["$.x", "$.y"]
+                .iter()
+                .map(|path| (double(), path.to_string(), false, "UTC".to_string()))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let read_fields = vec![DataField::new(
+            0,
+            "v".to_string(),
+            DataType::Row(row_type.clone()),
+        )];
+        let batches = ParquetFormatReader::default()
+            .read_batch_stream(
+                Box::new(TrackingFileRead::new(data.clone())),
+                data.len() as u64,
+                &read_fields,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let read = batches[0]
+            .column_by_name("v")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let typed = read
+            .column_by_name("typed_value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let group = |key: &str| {
+            typed
+                .column_by_name(key)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .unwrap()
+                .clone()
+        };
+        assert!(group("x").column_by_name("value").is_none());
+        assert!(group("y").column_by_name("value").is_some());
+        let expected =
+            crate::arrow::shredding::variant::assemble_variant_extraction_array(&column, &row_type)
+                .unwrap();
+        let actual =
+            crate::arrow::shredding::variant::assemble_variant_extraction_array(read, &row_type)
+                .unwrap();
+        assert_eq!(actual.as_ref(), expected.as_ref());
+    }
+
+    #[tokio::test]
+    async fn shredded_variant_extraction_preserves_null_groups() {
+        let fields = vec![DataField::new(
+            0,
+            "v".to_string(),
+            DataType::Variant(VariantType::new()),
+        )];
+        let options = HashMap::from([(
+            "variant.shreddingSchema".to_string(),
+            r#"{"type":"ROW","fields":[{"name":"v","type":{"type":"ROW","fields":[{"name":"obj","type":{"type":"ROW","fields":[{"name":"x","type":"VARIANT"}]}},{"name":"y","type":"BIGINT"}]}}]}"#.to_string(),
+        )]);
+        let variants = [r#"{"obj":{},"y":2}"#, r#"{"y":3}"#]
+            .iter()
+            .map(|json| GenericVariant::parse_json(json).unwrap())
+            .collect::<Vec<_>>();
+        let ArrowDataType::Struct(variant_fields) = variant_arrow_type() else {
+            unreachable!()
+        };
+        let column = StructArray::new(
+            variant_fields,
+            vec![
+                Arc::new(BinaryArray::from_iter_values(
+                    variants.iter().map(|v| v.value()),
+                )),
+                Arc::new(BinaryArray::from_iter_values(
+                    variants.iter().map(|v| v.metadata()),
+                )),
+            ],
+            None,
+        );
+        let schema = build_target_arrow_schema(&fields).unwrap();
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(column.clone())]).unwrap();
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let path = format!("memory:/null_groups_{}.parquet", uuid::Uuid::new_v4());
+        let mut writer = create_format_writer(
+            &file_io.new_output(&path).unwrap(),
+            schema,
+            "zstd",
+            1,
+            None,
+            Some(&fields),
+            Some(&options),
+        )
+        .await
+        .unwrap();
+        writer.write(&batch).await.unwrap();
+        writer.close().await.unwrap();
+        let data = file_io.new_input(&path).unwrap().read().await.unwrap();
+        let row_type = crate::spec::variant_extraction_row(
+            true,
+            vec![
+                (
+                    DataType::VarChar(crate::spec::VarCharType::string_type()),
+                    "$.obj".to_string(),
+                    false,
+                    "UTC".to_string(),
+                ),
+                (
+                    DataType::Double(crate::spec::DoubleType::new()),
+                    "$.y".to_string(),
+                    false,
+                    "UTC".to_string(),
+                ),
+            ],
+        )
+        .unwrap();
+        let read_fields = vec![DataField::new(
+            0,
+            "v".to_string(),
+            DataType::Row(row_type.clone()),
+        )];
+        let batches = ParquetFormatReader::default()
+            .read_batch_stream(
+                Box::new(TrackingFileRead::new(data.clone())),
+                data.len() as u64,
+                &read_fields,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let read = batches[0]
+            .column_by_name("v")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let expected =
+            crate::arrow::shredding::variant::assemble_variant_extraction_array(&column, &row_type)
+                .unwrap();
+        let actual =
+            crate::arrow::shredding::variant::assemble_variant_extraction_array(read, &row_type)
+                .unwrap();
+        assert_eq!(actual.as_ref(), expected.as_ref());
+    }
+
+    #[tokio::test]
+    async fn shredded_variant_extraction_preserves_absent_variant_child() {
+        let fields = vec![DataField::new(
+            0,
+            "v".to_string(),
+            DataType::Variant(VariantType::new()),
+        )];
+        let options = HashMap::from([(
+            "variant.shreddingSchema".to_string(),
+            r#"{"type":"ROW","fields":[{"name":"v","type":{"type":"ROW","fields":[{"name":"w","type":"VARIANT"},{"name":"y","type":"BIGINT"}]}}]}"#.to_string(),
+        )]);
+        let variants = [r#"{"y":2}"#, r#"{"y":3}"#]
+            .iter()
+            .map(|json| GenericVariant::parse_json(json).unwrap())
+            .collect::<Vec<_>>();
+        let ArrowDataType::Struct(variant_fields) = variant_arrow_type() else {
+            unreachable!()
+        };
+        let column = StructArray::new(
+            variant_fields,
+            vec![
+                Arc::new(BinaryArray::from_iter_values(
+                    variants.iter().map(|v| v.value()),
+                )),
+                Arc::new(BinaryArray::from_iter_values(
+                    variants.iter().map(|v| v.metadata()),
+                )),
+            ],
+            None,
+        );
+        let schema = build_target_arrow_schema(&fields).unwrap();
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(column.clone())]).unwrap();
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let path = format!("memory:/absent_child_{}.parquet", uuid::Uuid::new_v4());
+        let mut writer = create_format_writer(
+            &file_io.new_output(&path).unwrap(),
+            schema,
+            "zstd",
+            1,
+            None,
+            Some(&fields),
+            Some(&options),
+        )
+        .await
+        .unwrap();
+        writer.write(&batch).await.unwrap();
+        writer.close().await.unwrap();
+        let data = file_io.new_input(&path).unwrap().read().await.unwrap();
+
+        let row_type = crate::spec::variant_extraction_row(
+            true,
+            vec![(
+                DataType::Variant(VariantType::new()),
+                "$.w".to_string(),
+                false,
+                "UTC".to_string(),
+            )],
+        )
+        .unwrap();
+        let read_fields = vec![DataField::new(
+            0,
+            "v".to_string(),
+            DataType::Row(row_type.clone()),
+        )];
+        let batches = ParquetFormatReader::default()
+            .read_batch_stream(
+                Box::new(TrackingFileRead::new(data.clone())),
+                data.len() as u64,
+                &read_fields,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let read = batches[0]
+            .column_by_name("v")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let expected =
+            crate::arrow::shredding::variant::assemble_variant_extraction_array(&column, &row_type)
+                .unwrap();
+        let actual =
+            crate::arrow::shredding::variant::assemble_variant_extraction_array(read, &row_type)
+                .unwrap();
+        assert_eq!(actual.as_ref(), expected.as_ref());
+    }
+
+    #[tokio::test]
+    async fn shredded_variant_extraction_reads_metadata_as_dictionary() {
+        let fields = vec![DataField::new(
+            0,
+            "v".to_string(),
+            DataType::Variant(VariantType::new()),
+        )];
+        let options = HashMap::from([(
+            "variant.shreddingSchema".to_string(),
+            r#"{"type":"ROW","fields":[{"name":"v","type":{"type":"ROW","fields":[{"name":"x","type":"DOUBLE"},{"name":"y","type":"BIGINT"}]}}]}"#.to_string(),
+        )]);
+        let rows = [
+            r#"{"x":1.5e0,"y":2,"z":"rest"}"#,
+            r#"{"y":-1,"x":4e0}"#,
+            r#"{"x":"text","y":6}"#,
+        ];
+        let variants = rows
+            .iter()
+            .map(|json| GenericVariant::parse_json(json).unwrap())
+            .collect::<Vec<_>>();
+        let ArrowDataType::Struct(variant_fields) = variant_arrow_type() else {
+            unreachable!()
+        };
+        let column = StructArray::new(
+            variant_fields,
+            vec![
+                Arc::new(BinaryArray::from_iter_values(
+                    variants.iter().map(|v| v.value()),
+                )),
+                Arc::new(BinaryArray::from_iter_values(
+                    variants.iter().map(|v| v.metadata()),
+                )),
+            ],
+            None,
+        );
+        let schema = build_target_arrow_schema(&fields).unwrap();
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(column.clone())]).unwrap();
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let path = format!(
+            "memory:/shredded_dictionary_{}.parquet",
+            uuid::Uuid::new_v4()
+        );
+        let mut writer = create_format_writer(
+            &file_io.new_output(&path).unwrap(),
+            schema,
+            "zstd",
+            1,
+            None,
+            Some(&fields),
+            Some(&options),
+        )
+        .await
+        .unwrap();
+        writer.write(&batch).await.unwrap();
+        writer.close().await.unwrap();
+        let data = file_io.new_input(&path).unwrap().read().await.unwrap();
+
+        let float = || DataType::Float(crate::spec::FloatType::new());
+        for paths in [vec!["$.y", "$.x"], vec!["$.y"]] {
+            let row_type = crate::spec::variant_extraction_row(
+                true,
+                paths
+                    .iter()
+                    .map(|path| (float(), path.to_string(), false, "UTC".to_string()))
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+            let read_fields = vec![DataField::new(
+                0,
+                "v".to_string(),
+                DataType::Row(row_type.clone()),
+            )];
+            let batches = ParquetFormatReader::default()
+                .read_batch_stream(
+                    Box::new(TrackingFileRead::new(data.clone())),
+                    data.len() as u64,
+                    &read_fields,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            let read = batches[0]
+                .column_by_name("v")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .unwrap();
+            assert!(read.column_by_name("typed_value").is_some());
+            assert!(matches!(
+                read.column_by_name("metadata").unwrap().data_type(),
+                ArrowDataType::Dictionary(key, value)
+                    if key.as_ref() == &ArrowDataType::Int32 && value.as_ref() == &ArrowDataType::Binary
+            ));
+            let expected = crate::arrow::shredding::variant::assemble_variant_extraction_array(
+                &column, &row_type,
+            )
+            .unwrap();
+            let actual = crate::arrow::shredding::variant::assemble_variant_extraction_array(
+                read, &row_type,
+            )
+            .unwrap();
+            assert_eq!(actual.as_ref(), expected.as_ref());
+        }
     }
 }

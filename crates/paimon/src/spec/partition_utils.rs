@@ -23,6 +23,8 @@
 //! - Java `InternalRowPartitionComputer` for value formatting
 //! - Java `PartitionPathUtils` for path escaping and assembly
 
+use crate::common::date_time::{format_time, format_timestamp};
+use crate::common::number::format_java_float as format_java_floating;
 use crate::error::*;
 use crate::spec::types::DataType;
 use crate::spec::BinaryRow;
@@ -390,6 +392,8 @@ fn format_partition_value(
         DataType::SmallInt(_) => row.get_short(pos)?.to_string(),
         DataType::Int(_) => row.get_int(pos)?.to_string(),
         DataType::BigInt(_) => row.get_long(pos)?.to_string(),
+        DataType::Float(_) => format_java_float(row.get_float(pos)?),
+        DataType::Double(_) => format_java_floating(row.get_double(pos)?),
 
         DataType::Char(_) | DataType::VarChar(_) => {
             let s = row.get_string(pos)?;
@@ -434,7 +438,7 @@ fn format_partition_value(
             if legacy {
                 format_timestamp_legacy(dt)
             } else {
-                format_timestamp_non_legacy(dt, t.precision())
+                format_timestamp(dt, t.precision())
             }
         }
 
@@ -450,7 +454,7 @@ fn format_partition_value(
             if legacy {
                 format_timestamp_legacy(dt)
             } else {
-                format_timestamp_non_legacy(dt, t.precision())
+                format_timestamp(dt, t.precision())
             }
         }
 
@@ -463,12 +467,7 @@ fn format_partition_value(
             }
         }
 
-        // Float/Double: Rust f32/f64 Display differs from Java Float/Double.toString()
-        // on edge-case values. This could silently produce wrong partition paths.
-        // Since float partition keys are extremely rare, reject them explicitly.
-        DataType::Float(_)
-        | DataType::Double(_)
-        | DataType::Binary(_)
+        DataType::Binary(_)
         | DataType::VarBinary(_)
         | DataType::Variant(_)
         | DataType::Blob(_)
@@ -484,6 +483,13 @@ fn format_partition_value(
     };
 
     Ok(value)
+}
+
+/// Java's shortest-decimal string contract (JDK 19+), including its notation
+/// thresholds and closest choice among one- and two-digit decimals. Rust's
+/// shortest Display chooses different digits at ties; Ryū uses ties-to-even.
+pub fn format_java_float(value: f32) -> String {
+    format_java_floating(value)
 }
 
 /// Decode as Java's UTF-8 decoder does for `BinaryString.toString()`.
@@ -559,43 +565,6 @@ fn format_date(epoch_days: i32) -> String {
     let date = NaiveDate::from_num_days_from_ce_opt(epoch_days + 719_163)
         .unwrap_or(NaiveDate::from_ymd_opt(1970, 1, 1).unwrap());
     date.format("%Y-%m-%d").to_string()
-}
-
-/// Format millis-since-midnight to `HH:mm:ss[.f...]` for non-legacy TIME partitions.
-///
-/// Matches Java `DateTimeUtils.formatTimestampMillis(time, precision)`:
-/// outputs up to `precision` fractional digits, stripping trailing zeros.
-fn format_time(millis_of_day: i32, precision: u32) -> String {
-    let mut ms = millis_of_day;
-    // Handle negative millis (same guard as Java)
-    while ms < 0 {
-        ms += 86_400_000;
-    }
-    let ms = ms as u32;
-    let h = ms / 3_600_000;
-    let m = (ms % 3_600_000) / 60_000;
-    let s = (ms % 60_000) / 1_000;
-    let mut frac_ms = ms % 1_000;
-
-    let hms = format!("{h:02}:{m:02}:{s:02}");
-    if precision == 0 || frac_ms == 0 {
-        return hms;
-    }
-
-    // Emit up to `precision` digits, each extracted from the ms value.
-    // Matches Java's digit-by-digit loop with trailing-zero break.
-    let mut frac = String::with_capacity(precision as usize);
-    let mut remaining = precision;
-    while remaining > 0 {
-        frac.push((b'0' + (frac_ms / 100) as u8) as char);
-        frac_ms = (frac_ms % 100) * 10;
-        if frac_ms == 0 {
-            break;
-        }
-        remaining -= 1;
-    }
-
-    format!("{hms}.{frac}")
 }
 
 /// Format an unscaled i128 value with the given scale to a plain decimal string.
@@ -709,30 +678,6 @@ fn format_timestamp_legacy(dt: NaiveDateTime) -> String {
         result.push_str(&frac[..digits]);
     }
     result
-}
-
-/// Format a timestamp using non-legacy `DateTimeUtils.formatTimestamp()` semantics.
-///
-/// Always uses space separator: `yyyy-MM-dd HH:mm:ss[.fraction]`.
-/// Fraction: pad nano to 9 digits, strip trailing zeros while keeping at least `precision` digits.
-fn format_timestamp_non_legacy(dt: NaiveDateTime, precision: u32) -> String {
-    let nano = dt.nanosecond();
-    let ymdhms = dt.format("%Y-%m-%d %H:%M:%S").to_string();
-
-    // Whole seconds keep the declared precision; nonzero fractions are never truncated.
-    let nano_str = format!("{nano:09}");
-    let mut fraction = &nano_str[..];
-
-    // Strip trailing zeros, but don't go below the precision boundary.
-    while fraction.len() > precision as usize && fraction.ends_with('0') {
-        fraction = &fraction[..fraction.len() - 1];
-    }
-
-    if fraction.is_empty() {
-        ymdhms
-    } else {
-        format!("{ymdhms}.{fraction}")
-    }
 }
 
 /// Escape a path component following Java `PartitionPathUtils.escapePathName`.
@@ -1337,20 +1282,11 @@ mod tests {
             .and_hms_nano_opt(12, 0, 0, 123_000_000)
             .unwrap();
         // Precision is a minimum fraction width, not a truncation boundary.
-        assert_eq!(
-            format_timestamp_non_legacy(dt, 0),
-            "2024-01-01 12:00:00.123"
-        );
+        assert_eq!(format_timestamp(dt, 0), "2024-01-01 12:00:00.123");
         // precision=3 → strip trailing zeros down to 3 digits
-        assert_eq!(
-            format_timestamp_non_legacy(dt, 3),
-            "2024-01-01 12:00:00.123"
-        );
+        assert_eq!(format_timestamp(dt, 3), "2024-01-01 12:00:00.123");
         // precision=9 → preserve all 9 digits (no stripping since len == precision)
-        assert_eq!(
-            format_timestamp_non_legacy(dt, 9),
-            "2024-01-01 12:00:00.123000000"
-        );
+        assert_eq!(format_timestamp(dt, 9), "2024-01-01 12:00:00.123000000");
     }
 
     #[test]
@@ -1366,7 +1302,7 @@ mod tests {
             (6, "2024-01-01 12:00:00.000000"),
             (9, "2024-01-01 12:00:00.000000000"),
         ] {
-            assert_eq!(format_timestamp_non_legacy(dt, precision), expected);
+            assert_eq!(format_timestamp(dt, precision), expected);
         }
     }
 
@@ -1383,7 +1319,7 @@ mod tests {
                 .unwrap()
                 .and_hms_nano_opt(12, 0, 0, nanos)
                 .unwrap();
-            assert_eq!(format_timestamp_non_legacy(dt, precision), expected);
+            assert_eq!(format_timestamp(dt, precision), expected);
         }
     }
 
@@ -1514,20 +1450,57 @@ mod tests {
             |b| b.write_int(0, 0),
             true,
         );
-        // Float
-        assert_single_partition_err(
-            "f",
-            DataType::Float(FloatType::new()),
-            |b| b.write_int(0, 0),
-            true,
-        );
-        // Double
-        assert_single_partition_err(
-            "d",
-            DataType::Double(DoubleType::new()),
-            |b| b.write_int(0, 0),
-            true,
-        );
+    }
+
+    #[test]
+    fn test_floating_partition_names_match_java() {
+        // Float.toString / Double.toString on JDK 21. Include decimal / exponent
+        // boundaries and shortest-decimal ties where Rust Display differs.
+        for legacy in [false, true] {
+            for (value, expected) in [
+                (1.5_f32, "1.5"),
+                (42.0, "42.0"),
+                (0.001, "0.001"),
+                (0.0001, "1.0E-4"),
+                (1e7, "1.0E7"),
+                (f32::from_bits(3388994202), "-2096723.2"),
+                (f32::from_bits(1208999304), "147318.12"),
+                (f32::MIN_POSITIVE, "1.1754944E-38"),
+                (f32::from_bits(1), "1.4E-45"),
+                (f32::MAX, "3.4028235E38"),
+            ] {
+                assert_single_partition(
+                    "f",
+                    DataType::Float(FloatType::new()),
+                    |b| b.write_int(0, value.to_bits() as i32),
+                    &format!("f={expected}/"),
+                    legacy,
+                );
+            }
+            for (value, expected) in [
+                (2.25_f64, "2.25"),
+                (-42.0, "-42.0"),
+                (0.001, "0.001"),
+                (0.0001, "1.0E-4"),
+                (1e7, "1.0E7"),
+                (1e23, "1.0E23"),
+                (
+                    f64::from_bits(14053136104817660578),
+                    "-8.011083811354442E14",
+                ),
+                (f64::MIN_POSITIVE, "2.2250738585072014E-308"),
+                (f64::from_bits(1), "4.9E-324"),
+                (f64::MAX, "1.7976931348623157E308"),
+            ] {
+                assert_single_partition(
+                    "d",
+                    DataType::Double(DoubleType::new()),
+                    |b| b.write_long(0, value.to_bits() as i64),
+                    &format!("d={expected}/"),
+                    legacy,
+                );
+            }
+        }
     }
 
     #[test]
@@ -1616,7 +1589,7 @@ mod tests {
     #[test]
     fn test_format_time() {
         // precision=3, 12:34:56 = 45_296_000 ms
-        assert_eq!(format_time(45_296_000, 3), "12:34:56");
+        assert_eq!(format_time(45_296_000, 3), "12:34:56.0");
         // precision=3, 12:34:56.123 = 45_296_123 ms
         assert_eq!(format_time(45_296_123, 3), "12:34:56.123");
         // precision=3, 00:00:00.100 = 100 ms → trailing zero stripped to .1
@@ -1649,6 +1622,13 @@ mod tests {
             DataType::Time(TimeType::new(3).unwrap()),
             |b| b.write_int(0, 45_296_123), // 12:34:56.123
             "t=12%3A34%3A56.123/",
+            false,
+        );
+        assert_single_partition(
+            "t",
+            DataType::Time(TimeType::new(3).unwrap()),
+            |b| b.write_int(0, 0),
+            "t=00%3A00%3A00.0/",
             false,
         );
     }

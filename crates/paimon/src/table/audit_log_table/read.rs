@@ -21,7 +21,6 @@ use super::{
     audit_sequence_number_enabled, rowkind_array_from_column, PaimonTableRead, TableRead,
     TableReadKind, MAX_MERGE_INPUT_STREAMS,
 };
-use crate::arrow::build_target_arrow_schema;
 use crate::spec::{
     DataField, DataType, MergeEngine, TinyIntType, ROW_KIND_FIELD_ID, SEQUENCE_NUMBER_FIELD_ID,
     VALUE_KIND_FIELD_ID, VALUE_KIND_FIELD_NAME,
@@ -58,8 +57,16 @@ impl<'a> AuditLogRead<'a> {
     /// Reads splits planned by an audit scan, retaining winning retract rows.
     pub fn to_arrow(&self, data_splits: &[DataSplit]) -> crate::Result<ArrowRecordBatchStream> {
         // The primary-key path below builds its readers directly, so decide here.
-        self.read
-            .ensure_authorized_by_splits(&self.read.table.schema.core_options(), data_splits)?;
+        let restricted = self
+            .read
+            .ensure_authorized_by_splits(&self.read.table.schema.core_options(), data_splits)?
+            .is_some();
+        let has_primary_keys = !self.read.table.schema().primary_keys().is_empty();
+        if restricted && has_primary_keys {
+            return Err(crate::table::query_auth::unsupported(
+                "a primary-key audit log read cannot apply a row filter or column masking",
+            ));
+        }
         let output_read_type = self.read.read_type.clone();
         if output_read_type
             .iter()
@@ -71,8 +78,7 @@ impl<'a> AuditLogRead<'a> {
                 source: None,
             });
         }
-        let audit_schema = build_target_arrow_schema(&output_read_type)?;
-        let has_primary_keys = !self.read.table.schema().primary_keys().is_empty();
+        let audit_schema = crate::arrow::build_read_arrow_schema(&output_read_type)?;
         let mut read_type: Vec<_> = output_read_type
             .iter()
             .filter(|field| field.id() != ROW_KIND_FIELD_ID)

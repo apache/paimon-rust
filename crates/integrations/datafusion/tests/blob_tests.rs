@@ -21,7 +21,7 @@
 
 mod common;
 
-use arrow_array::{Array, Int32Array, LargeBinaryArray, RecordBatch};
+use arrow_array::{Array, Int32Array, LargeBinaryArray, ListArray, RecordBatch};
 use common::{assert_sql_error, create_sql_context, create_test_env, exec, string_value};
 use paimon::catalog::Identifier;
 use paimon::spec::{BlobDescriptor, BlobViewStruct};
@@ -340,37 +340,200 @@ async fn test_merge_into_updates_non_blob_on_raw_blob_table() {
     );
 }
 
-/// Reference: BlobTestBase "Blob: merge-into rejects updating raw-data BLOB column"
+/// Reference: Java Spark BlobUpdateTestBase raw-data BLOB and NULL updates.
 #[tokio::test]
-async fn test_merge_into_rejects_raw_blob_update() {
+async fn test_merge_into_updates_raw_blob_and_preserves_unmatched_rows() {
     let (_tmp, sql_context) = setup(BLOB_TABLE_DDL).await;
 
     exec(
         &sql_context,
-        "INSERT INTO paimon.test_db.t (id, name, picture) VALUES (1, 'Alice', X'4141')",
+        "INSERT INTO paimon.test_db.t (id, name, picture) VALUES \
+         (1, 'Alice', X'4141'), (2, 'Bob', X'4242'), (3, 'Carol', X'4343'), \
+         (4, 'Dave', NULL), (5, 'Eve', NULL)",
     )
     .await;
 
     exec(
         &sql_context,
-        "CREATE TEMPORARY TABLE paimon.test_db.src AS SELECT * FROM (VALUES (1, X'4242')) AS t(id, picture)",
+        "CREATE TEMPORARY TABLE paimon.test_db.src AS SELECT * FROM \
+         (VALUES (1, X'4444'), (3, CAST(NULL AS BYTEA)), (5, X'4545'), (99, X'4646')) \
+         AS t(id, picture)",
     )
     .await;
 
-    let result = sql_context
-        .sql(
+    exec(
+        &sql_context,
+        "MERGE INTO paimon.test_db.t t \
+         USING paimon.test_db.src s ON t.id = s.id \
+         WHEN MATCHED THEN UPDATE SET picture = s.picture",
+    )
+    .await;
+    assert_eq!(
+        query_id_name_picture(
+            &sql_context,
+            "SELECT id, name, picture FROM paimon.test_db.t"
+        )
+        .await,
+        vec![
+            (1, "Alice".into(), Some(b"DD".to_vec())),
+            (2, "Bob".into(), Some(b"BB".to_vec())),
+            (3, "Carol".into(), None),
+            (4, "Dave".into(), None),
+            (5, "Eve".into(), Some(b"EE".to_vec())),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn test_update_raw_blob_preserves_unmatched_rows() {
+    let (_tmp, sql_context) = setup(BLOB_TABLE_DDL).await;
+    exec(
+        &sql_context,
+        "INSERT INTO paimon.test_db.t (id, name, picture) VALUES \
+         (1, 'Alice', X'4141'), (2, 'Bob', X'4242'), (3, 'Carol', X'4343')",
+    )
+    .await;
+
+    exec(
+        &sql_context,
+        "UPDATE paimon.test_db.t SET picture = X'4444', name = 'Updated' WHERE id = 2",
+    )
+    .await;
+    exec(
+        &sql_context,
+        "UPDATE paimon.test_db.t SET picture = NULL WHERE id = 3",
+    )
+    .await;
+    exec(
+        &sql_context,
+        "UPDATE paimon.test_db.t SET picture = X'4545' WHERE id = 99",
+    )
+    .await;
+    assert_eq!(
+        query_id_name_picture(
+            &sql_context,
+            "SELECT id, name, picture FROM paimon.test_db.t"
+        )
+        .await,
+        vec![
+            (1, "Alice".into(), Some(b"AA".to_vec())),
+            (2, "Updated".into(), Some(b"DD".to_vec())),
+            (3, "Carol".into(), None),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn test_merge_into_updates_raw_blob_collections() {
+    // Java Spark BlobUpdateTestBase also covers ARRAY<BLOB> and MAP<X, BLOB>.
+    for (blob_type, original, keep, updated, empty, projection) in [
+        (
+            "ARRAY<BLOB>",
+            "[X'4141']",
+            "[X'4242']",
+            "[X'4343', CAST(NULL AS BYTEA)]",
+            "CAST([] AS BYTEA[])",
+            "picture",
+        ),
+        (
+            "MAP(STRING, BLOB)",
+            "map(['old'], [X'4141'])",
+            "map(['keep'], [X'4242'])",
+            "map(['new', 'missing'], [X'4343', CAST(NULL AS BYTEA)])",
+            "map(CAST([] AS STRING[]), CAST([] AS BYTEA[]))",
+            "map_values(picture)",
+        ),
+    ] {
+        let (_tmp, sql_context) = setup(&format!(
+            "CREATE TABLE paimon.test_db.t (id INT, picture {blob_type}) WITH (\
+                'data-evolution.enabled' = 'true', 'row-tracking.enabled' = 'true')"
+        ))
+        .await;
+        exec(
+            &sql_context,
+            &format!(
+                "INSERT INTO paimon.test_db.t (id, picture) VALUES \
+                 (1, {original}), (2, {keep}), (3, NULL), (4, {original})"
+            ),
+        )
+        .await;
+        exec(
+            &sql_context,
+            &format!(
+                "CREATE TABLE paimon.test_db.src (id INT, picture {blob_type}) WITH (\
+                    'data-evolution.enabled' = 'true', 'row-tracking.enabled' = 'true')"
+            ),
+        )
+        .await;
+        exec(
+            &sql_context,
+            &format!(
+                "INSERT INTO paimon.test_db.src (id, picture) VALUES \
+                 (1, {updated}), (3, {empty}), (4, NULL), (99, {original})"
+            ),
+        )
+        .await;
+        exec(
+            &sql_context,
             "MERGE INTO paimon.test_db.t t \
              USING paimon.test_db.src s ON t.id = s.id \
              WHEN MATCHED THEN UPDATE SET picture = s.picture",
         )
         .await;
 
-    assert!(
-        result.is_err() || {
-            let df = result.unwrap();
-            df.collect().await.is_err()
+        let batches = sql_context
+            .sql(&format!(
+                "SELECT id, {projection} FROM paimon.test_db.t ORDER BY id"
+            ))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let mut rows = Vec::new();
+        for batch in &batches {
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let lists = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .unwrap();
+            for row in 0..batch.num_rows() {
+                let values = (!lists.is_null(row)).then(|| {
+                    let values = lists.value(row);
+                    let blobs = values.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
+                    blobs
+                        .iter()
+                        .map(|value| value.map(<[u8]>::to_vec))
+                        .collect::<Vec<_>>()
+                });
+                rows.push((ids.value(row), values));
+            }
         }
-    );
+        assert_eq!(
+            rows,
+            vec![
+                (1, Some(vec![Some(b"CC".to_vec()), None])),
+                (2, Some(vec![Some(b"BB".to_vec())])),
+                (3, Some(vec![])),
+                (4, None),
+            ]
+        );
+        if blob_type.starts_with("MAP") {
+            assert_eq!(
+                query_id_name_picture(
+                    &sql_context,
+                    "SELECT id, 'map' AS name, picture['new'] FROM paimon.test_db.t WHERE id = 1"
+                )
+                .await,
+                vec![(1, "map".into(), Some(b"CC".to_vec()))]
+            );
+        }
+    }
 }
 
 /// Reference: BlobTestBase "Blob: merge-into updates non-blob column on descriptor blob table"

@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use crate::io::FileIO;
 use futures::{stream, StreamExt, TryStreamExt};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 const CONSUMER_DIR: &str = "consumer";
 const CONSUMER_PREFIX: &str = "consumer-";
@@ -53,6 +53,19 @@ impl ConsumerManager {
         )
     }
 
+    pub(super) fn validate_consumer_id(consumer_id: &str) -> crate::Result<()> {
+        if consumer_id.is_empty()
+            || matches!(consumer_id, "." | "..")
+            || consumer_id.contains(['/', '\\'])
+        {
+            return Err(crate::Error::DataInvalid {
+                message: "consumer id must be a non-empty name without path separators".into(),
+                source: None,
+            });
+        }
+        Ok(())
+    }
+
     /// Read one consumer's next snapshot id.
     pub async fn get(&self, consumer_id: &str) -> crate::Result<Option<i64>> {
         let ids = HashSet::from([consumer_id]);
@@ -62,6 +75,27 @@ impl ConsumerManager {
             .into_iter()
             .next()
             .map(|(_, next_snapshot)| next_snapshot))
+    }
+
+    /// Persist an explicitly acknowledged next snapshot, like Java resetConsumer.
+    pub async fn reset(&self, consumer_id: &str, next_snapshot: i64) -> crate::Result<()> {
+        Self::validate_consumer_id(consumer_id)?;
+        if next_snapshot < 1 {
+            return Err(crate::Error::DataInvalid {
+                message: "consumer next snapshot must be positive".into(),
+                source: None,
+            });
+        }
+        let directory = format!("{}/{}", self.table_path, CONSUMER_DIR);
+        self.file_io.mkdirs(&directory).await?;
+        let path = format!("{directory}/{CONSUMER_PREFIX}{consumer_id}");
+        let bytes = serde_json::to_vec(&Consumer { next_snapshot }).map_err(|error| {
+            crate::Error::DataInvalid {
+                message: format!("consumer JSON invalid: {error}"),
+                source: Some(Box::new(error)),
+            }
+        })?;
+        self.file_io.new_output(&path)?.write(bytes.into()).await
     }
 
     async fn read_path(&self, consumer_id: &str, path: &str) -> crate::Result<Option<i64>> {
@@ -143,7 +177,7 @@ impl ConsumerManager {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct Consumer {
     #[serde(rename = "nextSnapshot")]
     next_snapshot: i64,
@@ -155,6 +189,28 @@ mod tests {
 
     use super::*;
     use crate::io::FileIOBuilder;
+
+    #[tokio::test]
+    async fn reset_is_explicit_branch_scoped_and_rejects_path_traversal() {
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let manager = ConsumerManager::new(file_io.clone(), "memory:/consumer-reset".into());
+        let branch = manager.with_branch("dev");
+        for invalid in ["", ".", "..", "x/../../snapshot/snapshot-1", "x\\y"] {
+            assert!(manager.reset(invalid, 2).await.is_err());
+        }
+        assert!(!file_io
+            .new_input("memory:/consumer-reset/snapshot/snapshot-1")
+            .unwrap()
+            .exists()
+            .await
+            .unwrap());
+        assert!(manager.reset("job", 0).await.is_err());
+        branch.reset("job", 2).await.unwrap();
+        assert_eq!(branch.get("job").await.unwrap(), Some(2));
+        assert_eq!(manager.get("job").await.unwrap(), None);
+        branch.reset("job", 3).await.unwrap();
+        assert_eq!(branch.get("job").await.unwrap(), Some(3));
+    }
 
     #[tokio::test]
     async fn retries_a_consumer_being_overwritten() {

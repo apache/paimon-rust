@@ -110,7 +110,6 @@ pub(crate) struct KeyValueWriteConfig {
     pub sequence_field_indices: Vec<usize>,
     /// Merge engine for deduplication.
     pub merge_engine: MergeEngine,
-    pub deletion_vectors_enabled: bool,
     /// File indexes follow the sorted, merged data rows and never changelog rows.
     pub file_index_options: Option<Arc<FileIndexOptions>>,
 }
@@ -145,29 +144,11 @@ impl KeyValueFileWriter {
             partial_update.validate_write_mode(true, &config.table_name)?;
             partial_update
                 .validated_aggregate_functions(&config.value_fields, &config.primary_keys)?;
-
-            if config.deletion_vectors_enabled {
-                return Err(crate::Error::Unsupported {
-                    message: format!(
-                        "Table '{}' uses merge-engine=partial-update with deletion-vectors.enabled=true, which is not supported yet",
-                        config.table_name
-                    ),
-                });
-            }
         }
 
         if config.merge_engine == MergeEngine::Aggregation {
             AggregationConfig::new(&config.table_options)
                 .validate_runtime_mode(true, &config.table_name)?;
-
-            if config.deletion_vectors_enabled {
-                return Err(crate::Error::Unsupported {
-                    message: format!(
-                        "Table '{}' uses merge-engine=aggregation with deletion-vectors.enabled=true, which is not supported yet",
-                        config.table_name
-                    ),
-                });
-            }
         }
 
         let paths = super::data_file_path_factory::DataFilePathFactory::new(
@@ -199,6 +180,14 @@ impl KeyValueFileWriter {
             written_changelog_files: Vec::new(),
             managed_blob_writer,
         })
+    }
+
+    pub(super) fn with_blob_uri_reader_factory(
+        mut self,
+        factory: Option<Arc<dyn crate::io::UriReaderFactory>>,
+    ) -> Self {
+        self.managed_blob_writer.set_uri_reader_factory(factory);
+        self
     }
 
     /// Construct one reusable factory for this flush's data or changelog output.
@@ -1338,7 +1327,6 @@ mod tests {
             ],
             sequence_field_indices: vec![1],
             merge_engine,
-            deletion_vectors_enabled: false,
             file_index_options: None,
         }
     }
@@ -2511,22 +2499,6 @@ mod tests {
     }
 
     #[test]
-    fn test_new_rejects_partial_update_with_deletion_vectors() {
-        let mut config = test_write_config(MergeEngine::PartialUpdate);
-        config.deletion_vectors_enabled = true;
-
-        let err = KeyValueFileWriter::new(FileIOBuilder::new("memory").build().unwrap(), config, 0)
-            .err()
-            .unwrap();
-
-        assert!(matches!(
-            err,
-            crate::Error::Unsupported { message }
-            if message.contains("deletion-vectors.enabled=true")
-        ));
-    }
-
-    #[test]
     fn test_new_rejects_unsupported_partial_update_options() {
         let mut config = test_write_config(MergeEngine::PartialUpdate);
         config.table_options = HashMap::from([
@@ -2804,22 +2776,6 @@ mod tests {
         let schema = reader.schema();
         let batches = reader.map(|batch| batch.unwrap()).collect::<Vec<_>>();
         arrow_select::concat::concat_batches(&schema, &batches).unwrap()
-    }
-
-    #[test]
-    fn test_new_rejects_aggregation_with_deletion_vectors() {
-        let mut config = test_write_config(MergeEngine::Aggregation);
-        config.deletion_vectors_enabled = true;
-
-        let err = KeyValueFileWriter::new(FileIOBuilder::new("memory").build().unwrap(), config, 0)
-            .err()
-            .unwrap();
-
-        assert!(matches!(
-            err,
-            crate::Error::Unsupported { message }
-            if message.contains("deletion-vectors.enabled=true")
-        ));
     }
 
     #[test]

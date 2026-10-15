@@ -1150,6 +1150,7 @@ async fn read_pending_values(table: &Table, file: &crate::spec::DataFileMeta) ->
         &table.schema().core_options(),
         table.file_io().clone(),
         2,
+        None,
     )
     .try_collect()
     .await
@@ -1319,6 +1320,195 @@ async fn primary_key_blob_payload_limit_keeps_later_buckets() {
             id as i32
         );
     }
+}
+
+#[tokio::test]
+async fn primary_key_blob_limit_never_fetches_later_descriptors() {
+    for payload_filter in [false, true] {
+        for batch_size in [1, 8192] {
+            let io = test_file_io();
+            let path = format!("memory:/pk_blob_limit_{payload_filter}_{batch_size}");
+            setup_dirs(&io, &path).await;
+            let table = scalar_table(
+                &io,
+                &path,
+                &[
+                    ("blob-descriptor-field", "payload"),
+                    ("read.batch-size", &batch_size.to_string()),
+                ],
+            );
+            io.new_output("memory:/limit-source")
+                .unwrap()
+                .write(bytes::Bytes::from_static(b"selected"))
+                .await
+                .unwrap();
+            let selected = BlobDescriptor::new("memory:/limit-source".into(), 0, 8).serialize();
+            let missing = BlobDescriptor::new("memory:/not-selected".into(), 0, 8).serialize();
+            let mut writer = TableWrite::new(&table, "limit-test".into()).unwrap();
+            writer
+                .write_arrow_batch(&scalar_batch(&[(1, Some(&selected)), (2, Some(&missing))]))
+                .await
+                .unwrap();
+            let messages = writer.prepare_commit().await.unwrap();
+            TableCommit::new(table.clone(), "limit-test".into())
+                .commit(messages)
+                .await
+                .unwrap();
+            let mut builder = table.new_read_builder();
+            builder
+                .with_projection(&["id", "payload"])
+                .unwrap()
+                .with_limit(1);
+            if payload_filter {
+                builder.with_filter(
+                    PredicateBuilder::new(table.schema().fields())
+                        .equal("payload", Datum::Bytes(b"selected".to_vec()))
+                        .unwrap(),
+                );
+            }
+            let plan = builder.new_scan().plan().await.unwrap();
+            let batches: Vec<RecordBatch> = builder
+                .new_read()
+                .unwrap()
+                .to_arrow(plan.splits())
+                .unwrap()
+                .try_collect()
+                .await
+                .unwrap();
+            assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+            let row = batches.iter().find(|batch| batch.num_rows() != 0).unwrap();
+            assert_eq!(
+                row.column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .value(0),
+                1
+            );
+            assert_eq!(
+                row.column(1)
+                    .as_any()
+                    .downcast_ref::<LargeBinaryArray>()
+                    .unwrap()
+                    .value(0),
+                b"selected"
+            );
+            let streaming: Vec<_> = plan
+                .splits()
+                .iter()
+                .map(|split| {
+                    super::DataSplitBuilder::new()
+                        .with_snapshot(split.snapshot_id())
+                        .with_partition(split.partition().clone())
+                        .with_bucket(split.bucket())
+                        .with_bucket_path(split.bucket_path().to_string())
+                        .with_total_buckets(split.total_buckets())
+                        .with_data_files(split.data_files().to_vec())
+                        .with_streaming(true)
+                        .build()
+                        .unwrap()
+                })
+                .collect();
+            for mixed in [false, true] {
+                let mut splits = streaming.clone();
+                if mixed {
+                    splits.extend_from_slice(plan.splits());
+                }
+                let batches: Vec<RecordBatch> = builder
+                    .new_read()
+                    .unwrap()
+                    .to_arrow_with_row_kind(&splits)
+                    .unwrap()
+                    .try_collect()
+                    .await
+                    .unwrap();
+                assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+                let row = batches.iter().find(|batch| batch.num_rows() != 0).unwrap();
+                assert_eq!(
+                    row.column_by_name("payload")
+                        .unwrap()
+                        .as_any()
+                        .downcast_ref::<LargeBinaryArray>()
+                        .unwrap()
+                        .value(0),
+                    b"selected"
+                );
+                assert_eq!(
+                    row.column_by_name(crate::spec::ROW_KIND_FIELD_NAME)
+                        .unwrap()
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .unwrap()
+                        .value(0),
+                    "+I"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn primary_key_blob_sequence_predicate_does_not_alias_payload_index() {
+    let io = test_file_io();
+    let path = "memory:/pk_blob_sequence_filter";
+    setup_dirs(&io, path).await;
+    let table = scalar_table(&io, path, &[("blob-descriptor-field", "payload")]);
+    io.new_output("memory:/sequence-selected")
+        .unwrap()
+        .write(bytes::Bytes::from_static(b"selected"))
+        .await
+        .unwrap();
+    let selected = BlobDescriptor::new("memory:/sequence-selected".into(), 0, 8).serialize();
+    let missing = BlobDescriptor::new("memory:/sequence-unselected".into(), 0, 8).serialize();
+    let mut writer = TableWrite::new(&table, "sequence-test".into()).unwrap();
+    writer
+        .write_arrow_batch(&scalar_batch(&[(1, Some(&selected)), (2, Some(&missing))]))
+        .await
+        .unwrap();
+    TableCommit::new(table.clone(), "sequence-test".into())
+        .commit(writer.prepare_commit().await.unwrap())
+        .await
+        .unwrap();
+    // Metadata indices belong to the caller's read schema. Index 1 here
+    // coincides with payload in the logical table schema; the name is decisive.
+    let predicate_fields = [
+        table.schema().fields()[0].clone(),
+        DataField::new(
+            SEQUENCE_NUMBER_FIELD_ID,
+            SEQUENCE_NUMBER_FIELD_NAME.into(),
+            DataType::BigInt(BigIntType::new()),
+        ),
+    ];
+    let predicate = PredicateBuilder::new(&predicate_fields)
+        .equal(SEQUENCE_NUMBER_FIELD_NAME, Datum::Long(0))
+        .unwrap();
+    let mut builder = table.new_read_builder();
+    builder
+        .with_projection(&["payload"])
+        .unwrap()
+        .with_filter(predicate);
+    let plan = builder.new_scan().plan().await.unwrap();
+    let batches: Vec<RecordBatch> = builder
+        .new_read()
+        .unwrap()
+        .to_arrow(plan.splits())
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+    assert_eq!(
+        batches
+            .iter()
+            .find(|batch| batch.num_rows() != 0)
+            .unwrap()
+            .column(0)
+            .as_any()
+            .downcast_ref::<LargeBinaryArray>()
+            .unwrap()
+            .value(0),
+        b"selected"
+    );
 }
 
 #[tokio::test]

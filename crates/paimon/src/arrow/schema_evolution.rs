@@ -22,6 +22,20 @@
 use crate::spec::DataField;
 use std::collections::HashMap;
 
+/// Cast an Arrow column from its historical Paimon type into a requested type.
+/// Nested fields are paired by field ID; scalar conversions use Java rules.
+/// Physical Arrow layouts, NULL containers and sliced values are reconciled
+/// by the same implementation used by the table readers.
+/// Nested output fields permit runtime NULLs from casts or absent historical
+/// fields; the logical target type remains unchanged.
+pub fn cast_array_for_schema_evolution(
+    array: &arrow_array::ArrayRef,
+    source_type: &crate::spec::DataType,
+    target_type: &crate::spec::DataType,
+) -> crate::Result<arrow_array::ArrayRef> {
+    super::nested_evolution::evolve_column(array, source_type, target_type)
+}
+
 /// Sentinel value indicating a field does not exist in the data schema.
 pub const NULL_FIELD_INDEX: i32 = -1;
 

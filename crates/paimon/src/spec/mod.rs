@@ -25,6 +25,12 @@ pub use binary_row::*;
 mod blob_descriptor;
 pub use blob_descriptor::BlobDescriptor;
 
+mod blob_consumer;
+pub use blob_consumer::BlobConsumer;
+
+mod video_frame_descriptor;
+pub use video_frame_descriptor::VideoFrameDescriptor;
+
 mod blob_view_struct;
 pub use blob_view_struct::BlobViewStruct;
 
@@ -57,6 +63,12 @@ pub use schema::*;
 mod schema_change;
 pub use schema_change::*;
 
+mod read_type;
+pub use read_type::*;
+
+mod map_selected_keys;
+pub use map_selected_keys::*;
+
 mod variant_metadata;
 pub use variant_metadata::*;
 
@@ -71,6 +83,8 @@ pub use index_file_meta::*;
 
 mod pk_index_source;
 pub use pk_index_source::*;
+mod data_evolution_index_source;
+pub use data_evolution_index_source::*;
 
 mod index_manifest;
 pub use index_manifest::{IndexManifest, IndexManifestEntry};
@@ -99,16 +113,17 @@ pub(crate) use objects_file::{
 };
 pub(crate) mod avro;
 pub(crate) mod stats;
+pub use stats::BinaryTableStats;
 mod types;
 pub use types::*;
 mod partition;
 pub use partition::Partition;
 mod partition_utils;
-pub use partition_utils::is_java_whitespace_only;
 pub(crate) use partition_utils::{
     bucket_path, bucket_path_under, data_file_path, escape_path_name, relative_bucket_path,
     unescape_path_name, PartitionComputer,
 };
+pub use partition_utils::{format_java_float, is_java_whitespace_only};
 mod predicate;
 pub(crate) use predicate::datum_cmp;
 pub(crate) use predicate::eval_row;
@@ -118,8 +133,8 @@ pub(crate) use predicate::like_match;
 pub(crate) use predicate::row_id_leaf;
 pub(crate) use predicate::validate_datum_matches_type;
 pub use predicate::{
-    field_idx_to_partition_idx, Datum, Predicate, PredicateBuilder, PredicateOperator, Transform,
-    TransformInput,
+    field_idx_to_partition_idx, DatePart, Datum, PadDirection, Predicate, PredicateBuilder,
+    PredicateOperator, Transform, TransformInput, TrimFlag,
 };
 pub(crate) mod murmur_hash;
 mod partition_statistics;

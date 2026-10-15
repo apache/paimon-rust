@@ -62,3 +62,6 @@ pub use table::{
 pub use table::{
     HybridSearchBuilder, HybridSearchRanker, HybridSearchRoute, HybridSearchRouteKind,
 };
+
+#[cfg(test)]
+extern crate self as paimon;

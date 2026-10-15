@@ -17,24 +17,72 @@
 
 //! What the REST server authorized a user to read from one table.
 
-use crate::api::AuthTableQueryResponse;
+#[cfg(test)]
+mod numeric_cast_java_test;
+mod row_filter;
+mod transform;
+pub(crate) use row_filter::RowFilter;
+mod mask_output;
+mod rules;
 
-/// The server's answer for one user on one table, kept unparsed; `session`
-/// ties it to the handle that asked, as the response names no table or user.
-#[derive(Debug, PartialEq)]
+use crate::api::AuthTableQueryResponse;
+pub(crate) use rules::{filter_batch, mask_batch, mask_inputs, ColumnMask, Rules};
+
+/// The server's answer for one user on one table; `session` ties it to the
+/// handle that asked, as the response names no table or user.
+#[derive(Debug)]
 pub(crate) struct QueryAuthGrant {
-    response: AuthTableQueryResponse,
     session: u64,
+    /// The columns the request asked about; `None` asked about the whole table.
+    select: Option<Vec<String>>,
+    rules: Rules,
+    /// Original wire rules for Java QueryAuthSplit metadata transport.
+    response: Option<AuthTableQueryResponse>,
+}
+
+impl PartialEq for QueryAuthGrant {
+    fn eq(&self, other: &Self) -> bool {
+        self.session == other.session && self.select == other.select && self.rules == other.rules
+    }
 }
 
 impl QueryAuthGrant {
-    pub(crate) fn new(response: AuthTableQueryResponse, session: u64) -> Self {
-        Self { response, session }
+    /// Parses the rules against `fields`, the schema the server ruled on.
+    pub(crate) fn parse(
+        response: &AuthTableQueryResponse,
+        session: u64,
+        select: Option<Vec<String>>,
+        fields: &[crate::spec::DataField],
+    ) -> crate::Result<Self> {
+        let mut grant = Self::new(session, select, Rules::parse(response, fields)?);
+        grant.response = Some(response.clone());
+        Ok(grant)
     }
 
-    /// The only case this client can serve.
+    pub(crate) fn new(session: u64, select: Option<Vec<String>>, rules: Rules) -> Self {
+        Self {
+            session,
+            select,
+            rules,
+            response: None,
+        }
+    }
+
+    pub(crate) fn response(&self) -> Option<&AuthTableQueryResponse> {
+        self.response.as_ref()
+    }
+
+    /// No row filter and no masking.
     pub(crate) fn is_unrestricted(&self) -> bool {
-        self.response.is_unrestricted()
+        self.rules.is_empty()
+    }
+
+    pub(crate) fn rules(&self) -> &Rules {
+        &self.rules
+    }
+
+    pub(crate) fn select(&self) -> Option<&[String]> {
+        self.select.as_deref()
     }
 
     /// A view of another schema is not the one the server ruled on.
@@ -77,11 +125,10 @@ pub(crate) async fn reject_unauthorized_stats(
             }
             let older = schemas.schema(file.schema_id).await?;
             if let Some(gone) = older.fields().iter().find(|f| {
-                !current.fields().iter().any(|c| {
-                    c.id() == f.id()
-                        && c.name() == f.name()
-                        && contains(c.data_type(), f.data_type())
-                })
+                !current
+                    .fields()
+                    .iter()
+                    .any(|c| c.id() == f.id() && c.name() == f.name() && contains_field(c, f))
             }) {
                 return refuse(gone.name());
             }
@@ -90,17 +137,29 @@ pub(crate) async fn reject_unauthorized_stats(
     Ok(())
 }
 
+fn contains_field(wide: &crate::spec::DataField, narrow: &crate::spec::DataField) -> bool {
+    if let (crate::spec::DataType::Map(map), crate::spec::DataType::Row(row)) =
+        (wide.data_type(), narrow.data_type())
+    {
+        return matches!(map.key_type(), crate::spec::DataType::VarChar(_))
+            && crate::spec::map_selected_keys(narrow).is_ok_and(|keys| keys.is_some())
+            && row
+                .fields()
+                .iter()
+                .all(|child| map.value_type().equals_ignore_nullable(child.data_type()));
+    }
+    contains(wide.data_type(), narrow.data_type())
+}
+
 /// Whether `narrow` reads nothing `wide` lacks: nested children match by id
 /// and name, so a `ROW` projection passes and a re-added child does not.
 fn contains(wide: &crate::spec::DataType, narrow: &crate::spec::DataType) -> bool {
     use crate::spec::DataType;
     match (wide, narrow) {
         (DataType::Row(w), DataType::Row(n)) => n.fields().iter().all(|nf| {
-            w.fields().iter().any(|wf| {
-                wf.id() == nf.id()
-                    && wf.name() == nf.name()
-                    && contains(wf.data_type(), nf.data_type())
-            })
+            w.fields()
+                .iter()
+                .any(|wf| wf.id() == nf.id() && wf.name() == nf.name() && contains_field(wf, nf))
         }),
         (DataType::Array(w), DataType::Array(n)) => contains(w.element_type(), n.element_type()),
         (DataType::Multiset(w), DataType::Multiset(n)) => {
@@ -110,9 +169,33 @@ fn contains(wide: &crate::spec::DataType, narrow: &crate::spec::DataType) -> boo
             contains(w.key_type(), n.key_type()) && contains(w.value_type(), n.value_type())
         }
         // A `variant_get` pushdown reads a `VARIANT` column as a `ROW` of paths.
-        (DataType::Variant(_), DataType::Row(_)) => true,
+        (DataType::Variant(_), DataType::Row(_)) => {
+            crate::spec::is_variant_extraction_row_type(narrow)
+        }
         (w, n) => w == n,
     }
+}
+
+/// Every leaf's column name, system columns included.
+pub(crate) fn leaf_names(
+    predicates: &[crate::spec::Predicate],
+) -> std::collections::HashSet<String> {
+    fn collect(predicate: &crate::spec::Predicate, out: &mut std::collections::HashSet<String>) {
+        use crate::spec::Predicate;
+        match predicate {
+            Predicate::Leaf { column, .. } => {
+                out.insert(column.clone());
+            }
+            Predicate::And(children) | Predicate::Or(children) => {
+                children.iter().for_each(|child| collect(child, out));
+            }
+            Predicate::Not(inner) => collect(inner, out),
+            Predicate::AlwaysTrue | Predicate::AlwaysFalse => {}
+        }
+    }
+    let mut out = std::collections::HashSet::new();
+    predicates.iter().for_each(|p| collect(p, &mut out));
+    out
 }
 
 /// A refusal naming the option, so callers never match on prose.
@@ -151,11 +234,9 @@ pub(crate) fn reject_noncanonical_fields(
         }
         // The whole shape: an older field can keep `(id, name)` and carry an
         // extra nested child.
-        let canonical = schema_fields.iter().any(|f| {
-            f.id() == field.id()
-                && f.name() == field.name()
-                && contains(f.data_type(), field.data_type())
-        });
+        let canonical = schema_fields
+            .iter()
+            .any(|f| f.id() == field.id() && f.name() == field.name() && contains_field(f, field));
         if !canonical {
             return Err(unsupported(&format!(
                 "'{}' (field id {}) is not a column of the current schema, which is what the \
@@ -168,19 +249,120 @@ pub(crate) fn reject_noncanonical_fields(
     Ok(())
 }
 
+/// A strict `variant_get` in the read type casts every stored row, the ones the
+/// rules drop included; Java Spark keeps it above the scan.
+pub(crate) fn reject_throwing_extractions(
+    read_type: &[crate::spec::DataField],
+) -> crate::Result<()> {
+    use crate::spec::{is_variant_extraction_row, parse_variant_metadata, DataType};
+    fn throws(data_type: &DataType) -> bool {
+        match data_type {
+            DataType::Row(row) if is_variant_extraction_row(row) => {
+                row.fields().iter().any(|field| {
+                    field.description().is_none_or(|description| {
+                        parse_variant_metadata(description).map_or(true, |m| m.fail_on_error())
+                    })
+                })
+            }
+            DataType::Row(row) => row.fields().iter().any(|field| throws(field.data_type())),
+            // Nested evolution reaches through collections too.
+            DataType::Array(array) => throws(array.element_type()),
+            DataType::Multiset(multiset) => throws(multiset.element_type()),
+            DataType::Map(map) => throws(map.key_type()) || throws(map.value_type()),
+            _ => false,
+        }
+    }
+    match read_type.iter().find(|field| throws(field.data_type())) {
+        Some(field) => Err(unsupported(&format!(
+            "a Variant extraction on '{}' that can fail would run before the server's rules",
+            field.name()
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// Readers resolve a leaf by `index` or by `column`, so a scope checked by name
+/// holds only if both, and the type, name one field of `fields`.
+pub(crate) fn reject_noncanonical_leaves(
+    predicates: &[crate::spec::Predicate],
+    fields: &[crate::spec::DataField],
+) -> crate::Result<()> {
+    use crate::spec::Predicate;
+    fn check(predicate: &Predicate, fields: &[crate::spec::DataField]) -> crate::Result<()> {
+        match predicate {
+            Predicate::Leaf {
+                column,
+                index,
+                data_type,
+                ..
+            } => {
+                if fields
+                    .get(*index)
+                    .is_some_and(|f| f.name() == column && f.data_type() == data_type)
+                {
+                    Ok(())
+                } else {
+                    Err(unsupported(&format!(
+                        "the filter on '{column}' points at another field by index or type; \
+                         build filters with PredicateBuilder"
+                    )))
+                }
+            }
+            Predicate::And(children) | Predicate::Or(children) => {
+                children.iter().try_for_each(|child| check(child, fields))
+            }
+            Predicate::Not(inner) => check(inner, fields),
+            Predicate::AlwaysTrue | Predicate::AlwaysFalse => Ok(()),
+        }
+    }
+    predicates.iter().try_for_each(|p| check(p, fields))
+}
+
 #[cfg(test)]
 mod tests {
     use super::reject_system_columns;
     use crate::table::{query_auth_table, rest_query_auth_table};
 
+    #[test]
+    fn authorized_map_allows_only_valid_selected_value_types() {
+        use crate::spec::*;
+        let source = DataField::new(
+            1,
+            "attrs".into(),
+            DataType::Map(MapType::new(
+                DataType::VarChar(VarCharType::string_type()),
+                DataType::Int(IntType::new()),
+            )),
+        );
+        let selected = map_selected_keys_field(&source, &["key".into()]).unwrap();
+        super::reject_noncanonical_fields(
+            std::slice::from_ref(&selected),
+            std::slice::from_ref(&source),
+        )
+        .unwrap();
+        let forged = selected.clone().with_description(None);
+        assert!(
+            super::reject_noncanonical_fields(&[forged], std::slice::from_ref(&source)).is_err()
+        );
+        let changed = DataField::new(
+            selected.id(),
+            selected.name().into(),
+            DataType::Row(RowType::new(vec![DataField::new(
+                0,
+                "key".into(),
+                DataType::BigInt(BigIntType::new()),
+            )])),
+        )
+        .with_description(selected.description().map(str::to_string));
+        assert!(super::reject_noncanonical_fields(&[changed], &[source]).is_err());
+    }
+
     #[tokio::test]
     async fn test_a_grant_is_pinned_to_the_handle_that_obtained_it() {
         let a = crate::table::rest_query_auth_table().await;
         let b = crate::table::rest_query_auth_table().await;
-        let grant = super::QueryAuthGrant::new(
-            crate::api::AuthTableQueryResponse::default(),
-            a.query_auth_session().unwrap(),
-        );
+        let grant =
+            super::QueryAuthGrant::new(a.query_auth_session().unwrap(), None, Default::default());
         assert!(grant.matches_table(&a));
         assert!(
             !grant.matches_table(&b),
@@ -206,7 +388,7 @@ mod tests {
                         "1".to_string(),
                     )]));
             assert!(!table.is_time_traveled(), "{selector} sets no flag");
-            let err = table.authorize_read(true).await.unwrap_err();
+            let err = table.authorize_read(true, None).await.unwrap_err();
             assert!(
                 matches!(err, crate::Error::Unsupported { ref message }
                     if message.contains("time-travelled or branch read")),
@@ -240,25 +422,96 @@ mod tests {
             ("scan.snapshot-id".to_string(), "invalid".to_string()),
         ]));
         assert!(table.reads_another_schema().unwrap());
-        assert!(table.authorize_read(false).await.unwrap().is_none());
+        assert!(table.authorize_read(false, None).await.unwrap().is_none());
     }
 
     #[tokio::test]
-    async fn test_a_schema_replaced_copy_loses_its_session() {
+    async fn test_options_only_schema_replacement_keeps_its_session() {
         let table = crate::table::rest_query_auth_table().await;
         assert!(table.query_auth_session().is_some());
+        let mut json = serde_json::to_value(table.schema()).unwrap();
+        json["timeMillis"] = serde_json::json!(1);
         let copy = table
-            .copy_with_resolved_schema(table.schema().clone(), "main")
+            .copy_with_resolved_schema(serde_json::from_value(json).unwrap(), "main")
             .unwrap();
-        assert!(copy.query_auth_session().is_none());
+        assert_eq!(copy.query_auth_session(), table.query_auth_session());
+        let table = table.copy_with_options(std::collections::HashMap::from([
+            ("scan.snapshot-id".into(), "7".into()),
+            ("read.batch-size".into(), "99".into()),
+        ]));
+        let schema = table
+            .schema()
+            .copy_with_replaced_options(std::collections::HashMap::from([
+                ("query-auth.enabled".into(), "false".into()),
+                ("type".into(), "format".into()),
+                ("data-file.path-directory".into(), "/tmp/other".into()),
+            ]));
+        let copy = table.copy_with_resolved_schema(schema, "main").unwrap();
+        assert_eq!(copy.query_auth_session(), table.query_auth_session());
+        assert!(copy.schema().core_options().query_auth_enabled());
+        for key in [
+            "scan.snapshot-id",
+            "read.batch-size",
+            "type",
+            "data-file.path-directory",
+        ] {
+            assert!(!copy.schema().options().contains_key(key), "{key}");
+        }
+        assert!(!copy.reads_another_schema().unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_changed_schema_or_branch_loses_its_session() {
+        let table = crate::table::rest_query_auth_table().await;
+        let mut json = serde_json::to_value(table.schema()).unwrap();
+        json["id"] = serde_json::json!(table.schema().id() + 1);
+        let changed = serde_json::from_value(json).unwrap();
+        assert!(table
+            .copy_with_resolved_schema(changed, "main")
+            .unwrap()
+            .query_auth_session()
+            .is_none());
+        assert!(table
+            .copy_with_resolved_schema(table.schema().clone(), "test")
+            .unwrap()
+            .query_auth_session()
+            .is_none());
+        let assembled = crate::table::query_auth_table();
+        assert!(assembled
+            .copy_with_resolved_schema(assembled.schema().clone(), "main")
+            .unwrap()
+            .query_auth_session()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn test_resolved_schema_copy_cannot_reauthorize_a_historical_handle() {
+        let table = crate::table::rest_query_auth_table().await;
+        let grant = super::QueryAuthGrant::new(
+            table.query_auth_session().unwrap(),
+            None,
+            Default::default(),
+        );
+        let mut travelled = table.clone();
+        travelled.time_traveled = true;
+        let pinned = table.copy_with_pinned_snapshot(None);
+        for view in [travelled, pinned] {
+            let schema = view
+                .schema()
+                .copy_with_replaced_options(table.schema().options().clone());
+            let copy = view.copy_with_resolved_schema(schema, "main").unwrap();
+            assert!(copy.query_auth_session().is_none());
+            assert!(!grant.matches_table(&copy));
+        }
     }
 
     #[tokio::test]
     async fn test_a_grant_does_not_cross_into_a_travelled_or_branch_view() {
         let table = crate::table::rest_query_auth_table().await;
         let grant = super::QueryAuthGrant::new(
-            crate::api::AuthTableQueryResponse::default(),
             table.query_auth_session().unwrap(),
+            None,
+            Default::default(),
         );
         assert!(grant.matches_table(&table));
 
@@ -470,7 +723,12 @@ mod tests {
     fn test_a_variant_extraction_is_the_one_shape_change_allowed() {
         use crate::spec::{DataField, DataType, IntType, RowType, VariantType};
         let int = || DataType::Int(IntType::new());
-        let row = || DataType::Row(RowType::new(vec![DataField::new(0, "p".into(), int())]));
+        let row = || {
+            DataType::Row(RowType::new(vec![DataField::new(0, "p".into(), int())
+                .with_description(Some(
+                    crate::spec::build_variant_metadata("$.p", true, "UTC").unwrap(),
+                ))]))
+        };
         let schema = vec![
             DataField::new(1, "v".into(), DataType::Variant(VariantType::new())),
             DataField::new(2, "n".into(), int()),
@@ -497,7 +755,7 @@ mod tests {
     async fn test_time_travelled_or_branch_read_is_refused() {
         let mut travelled = rest_query_auth_table().await;
         travelled.time_traveled = true;
-        let err = travelled.authorize_read(true).await.unwrap_err();
+        let err = travelled.authorize_read(true, None).await.unwrap_err();
         assert!(
             matches!(err, crate::Error::Unsupported { ref message }
                 if message.contains("time-travelled or branch read")),
@@ -506,6 +764,6 @@ mod tests {
 
         let mut branch = rest_query_auth_table().await;
         branch.branch_reference = true;
-        assert!(branch.authorize_read(true).await.is_err());
+        assert!(branch.authorize_read(true, None).await.is_err());
     }
 }

@@ -18,7 +18,7 @@
 //! Shared vector-search option validation, index I/O helpers, and result ordering.
 
 use crate::lumina::is_lumina_index_type;
-use crate::spec::{CoreOptions, DataField, ROW_ID_FIELD_NAME};
+use crate::spec::{CoreOptions, DataField, Predicate, ROW_ID_FIELD_NAME};
 use crate::table::pk_vector_position_read::{PKEY_VECTOR_POSITION_COLUMN, SEARCH_SCORE_COLUMN};
 use crate::table::read_builder::resolve_projected_fields;
 use crate::table::Table;
@@ -27,6 +27,15 @@ use crate::vindex::range_reader::RangeIoStats;
 use arrow_array::{Int64Array, RecordBatch};
 use arrow_select::interleave::interleave_record_batch;
 use std::collections::HashMap;
+
+pub(super) use super::partition_filter::validate_partition_filter;
+
+pub(super) fn add_filter(current: &mut Option<Predicate>, filter: Predicate) {
+    *current = Some(match current.take() {
+        Some(previous) => Predicate::and(vec![previous, filter]),
+        None => filter,
+    });
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum VectorIndexBackend {

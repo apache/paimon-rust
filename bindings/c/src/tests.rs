@@ -3123,7 +3123,7 @@ fn test_two_commits_same_builder() {
 //   * A primary-key vector table backed by a real vindex IVF-flat ANN segment
 //     built in-process (bucket-local ANN search, residual filter supported).
 //   * A data-evolution (append) vector table whose global index is produced by
-//     the public `new_vindex_index_build_builder(...).execute()` path.
+//     the public `new_global_index_build_builder().with_index_type(...).execute()` path.
 //
 // Both fixtures live entirely on the in-memory FileIO, so no temp dirs or
 // on-disk schema files are needed: the written data file keeps `schema_id == 0`,
@@ -3482,7 +3482,7 @@ fn append_vector_batch(ids: Vec<i32>, vectors: Vec<[f32; 2]>) -> RecordBatch {
 }
 
 /// Build a data-evolution vector table: write vectors via the public write path,
-/// then build the global vindex index via `new_vindex_index_build_builder`.
+/// then build the global vindex index via `new_global_index_build_builder`.
 fn build_append_vector_table(path: &str) -> Table {
     let file_io = memory_file_io();
     setup_table_dirs(&file_io, path);
@@ -3524,7 +3524,8 @@ fn build_append_vector_table(path: &str) -> Table {
         write_builder.new_commit().commit(messages).await.unwrap();
 
         let built = table
-            .new_vindex_index_build_builder(INDEX_TYPE)
+            .new_global_index_build_builder()
+            .with_index_type(INDEX_TYPE)
             .with_index_column("embedding")
             .execute()
             .await

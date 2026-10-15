@@ -25,6 +25,7 @@ use std::collections::HashSet;
 
 use arrow_array::RecordBatch;
 
+use crate::spec::DataField;
 use crate::table::{CommitMessage, Table, TableUpdateByRowId};
 
 const ROW_ID: &str = "_ROW_ID";
@@ -43,13 +44,14 @@ fn invalid(message: impl Into<String>) -> crate::Error {
 /// [`TableCommit`](super::TableCommit).
 ///
 /// Row-ID updates infer columns from the input unless configured with
-/// [`with_update_type`](Self::with_update_type). Key-based upserts currently
-/// require complete Arrow rows and match keys within each partition.
+/// [`with_update_type`](Self::with_update_type). Key-based upserts accept a
+/// column subset including the keys and match keys within each partition.
 #[derive(Clone)]
 pub struct TableUpdate {
     table: Table,
     commit_user: String,
     update_cols: Option<Vec<String>>,
+    blob_uri_reader_factory: Option<std::sync::Arc<dyn crate::io::UriReaderFactory>>,
 }
 
 impl TableUpdate {
@@ -58,7 +60,18 @@ impl TableUpdate {
             table: table.clone(),
             commit_user,
             update_cols: None,
+            blob_uri_reader_factory: None,
         }
+    }
+
+    /// Configure readers for Blob input references. The same factory supplies
+    /// matched updates and appended rows in upsert and MERGE operations.
+    pub fn with_blob_uri_reader_factory(
+        &mut self,
+        factory: Option<std::sync::Arc<dyn crate::io::UriReaderFactory>>,
+    ) -> &mut Self {
+        self.blob_uri_reader_factory = factory;
+        self
     }
 
     /// Select columns to update when a key or row ID matches. Duplicate names
@@ -87,6 +100,33 @@ impl TableUpdate {
             .iter()
             .map(|field| field.name().to_string())
             .collect()
+    }
+
+    /// Read and replace columns over one balanced shard of whole file groups.
+    ///
+    /// `read_type` configures this operation's reader, independently of the
+    /// update columns. It preserves field IDs and nested read metadata, just
+    /// like [`ReadBuilder::with_read_type`](super::ReadBuilder::with_read_type).
+    /// `None` reads all table fields; `Some(vec![])` returns zero-column batches
+    /// with their row counts preserved. Row IDs are tracked internally.
+    pub async fn new_shard_updater(
+        &self,
+        shard: usize,
+        shard_count: usize,
+        read_type: Option<Vec<DataField>>,
+    ) -> crate::Result<super::ShardTableUpdater> {
+        let mut updater = super::ShardTableUpdater::new(
+            &self.table,
+            read_type,
+            self.update_cols
+                .clone()
+                .unwrap_or_else(|| self.all_fields()),
+            shard,
+            shard_count,
+        )
+        .await?;
+        updater.with_blob_uri_reader_factory(self.blob_uri_reader_factory.clone());
+        Ok(updater)
     }
 
     fn columns_for_batch(&self, batch: &RecordBatch) -> Vec<String> {
@@ -125,7 +165,9 @@ impl TableUpdate {
 
     /// Create a row-ID updater sharing one snapshot across per-call columns.
     pub async fn new_update_by_row_id(&self) -> crate::Result<TableUpdateByRowId> {
-        TableUpdateByRowId::new(&self.table, self.commit_user.clone()).await
+        let mut writer = TableUpdateByRowId::new(&self.table).await?;
+        writer.with_blob_uri_reader_factory(self.blob_uri_reader_factory.clone());
+        Ok(writer)
     }
 
     /// Update existing rows from chunks of one Arrow table containing `_ROW_ID`.
@@ -172,11 +214,8 @@ impl TableUpdate {
                 .map_or_else(Vec::new, |writer| writer.commit_messages().to_vec()))
         }
         .await;
-        if result.is_err() {
-            if let Some(writer) = &mut writer {
-                let _ = writer.abort().await;
-            }
-        }
+        // Preserve earlier prepared groups on failure. Never delete files
+        // based on CommitMessage.
         result
     }
 
@@ -191,18 +230,22 @@ impl TableUpdate {
     ) -> crate::Result<Vec<CommitMessage>> {
         super::table_update_predicate::update(
             &self.table,
-            &self.commit_user,
             predicate,
             assignments,
             read_columns,
+            self.blob_uri_reader_factory.clone(),
         )
         .await
     }
 
-    /// Upsert complete Arrow rows by composite key through the core upsert
+    /// Upsert Arrow rows by composite key through the core upsert
     /// writer. Keys match within each partition, including when partition
     /// columns are omitted from `upsert_keys`. Existing keys update every
-    /// matching row ID; new keys append.
+    /// matching row ID; new keys append all input columns. Omitted columns on
+    /// matched rows retain their values; on new rows they are absent from the file.
+    /// Input batches may have different non-key columns. After last-write-wins
+    /// deduplication, matched rows must supply their update columns and appended
+    /// rows in each partition must share a field set.
     pub async fn upsert_by_arrow_with_key(
         &self,
         batches: Vec<RecordBatch>,
@@ -217,10 +260,48 @@ impl TableUpdate {
                 .filter(|columns| !columns.is_empty())
                 .unwrap_or_else(|| self.all_fields()),
         )?;
+        writer.with_blob_uri_reader_factory(self.blob_uri_reader_factory.clone());
         for batch in batches {
             writer.add_batch(batch)?;
         }
         writer.prepare_commit().await
+    }
+
+    /// Prepare MERGE actions against one target snapshot. Clauses run in order,
+    /// SQL NULL keys do not match, and ambiguous source matches are rejected.
+    pub async fn merge_into(
+        &self,
+        source: super::MergeSource,
+        on: Vec<(String, String)>,
+        when_matched: Vec<super::WhenMatched>,
+        when_not_matched: Vec<super::WhenNotMatched>,
+    ) -> crate::Result<Vec<CommitMessage>> {
+        super::table_merge_into::merge_into(
+            &self.table,
+            &self.commit_user,
+            source,
+            on,
+            when_matched,
+            when_not_matched,
+            self.blob_uri_reader_factory.clone(),
+        )
+        .await
+    }
+
+    /// Delete rows matching a predicate against one captured snapshot.
+    ///
+    /// Partition-only predicates remove complete data and index metadata,
+    /// including pending files, for append and primary-key tables as well as
+    /// data-evolution tables, without requiring deletion vectors. All other
+    /// predicates (including `None`, which matches all rows) require a
+    /// data-evolution table with row tracking and deletion vectors.
+    /// Returned messages carry the snapshot baseline for conflict detection;
+    /// the caller publishes them through the matching builder's committer.
+    pub async fn delete_by_predicate(
+        &self,
+        predicate: Option<crate::spec::Predicate>,
+    ) -> crate::Result<Vec<CommitMessage>> {
+        super::table_update_delete::delete(&self.table, predicate).await
     }
 
     /// Delete rows by row ID using deletion vectors.

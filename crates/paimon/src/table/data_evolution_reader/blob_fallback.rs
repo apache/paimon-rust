@@ -19,11 +19,13 @@ use super::{
     blob_file_row_range, row_range_overlaps_any, selected_absolute_row_ranges_for_file, BlobBunch,
     DeletionVectorContext,
 };
+#[cfg(test)]
 use crate::arrow::build_target_arrow_schema;
 use crate::arrow::format::blob::{
     build_blob_array_batch, build_blob_batch, build_blob_map_batch, BlobFieldKind, BlobReadValue,
     IndexedBlobReader,
 };
+use crate::arrow::format::video::IndexedVideoReader;
 use crate::io::FileIO;
 use crate::spec::{DataField, DataType};
 use crate::table::{ArrowRecordBatchStream, RowRange};
@@ -42,7 +44,21 @@ struct LazyBlobFile {
     path: String,
     file_size: i64,
     row_count: i64,
-    reader: Option<IndexedBlobReader>,
+    reader: Option<IndexedDedicatedReader>,
+}
+
+enum IndexedDedicatedReader {
+    Blob(IndexedBlobReader),
+    Video(IndexedVideoReader),
+}
+
+impl IndexedDedicatedReader {
+    fn num_rows(&self) -> usize {
+        match self {
+            Self::Blob(reader) => reader.num_rows(),
+            Self::Video(reader) => reader.num_rows(),
+        }
+    }
 }
 
 impl LazyBlobFile {
@@ -64,14 +80,28 @@ impl LazyBlobFile {
             })?;
             let input = file_io.new_input(&self.path)?;
             let reader = input.reader().await?;
-            let reader = IndexedBlobReader::open_with_parallelism(
-                Box::new(reader),
-                file_size,
-                self.path.clone(),
-                blob_as_descriptor,
-                blob_parallelism,
-            )
-            .await?;
+            let reader = if self.file_name.to_ascii_lowercase().ends_with(".video") {
+                if !matches!(field_kind, BlobFieldKind::Scalar) {
+                    return Err(Error::DataInvalid {
+                        message: "Video files require scalar BLOB fields".into(),
+                        source: None,
+                    });
+                }
+                IndexedDedicatedReader::Video(
+                    IndexedVideoReader::open(&reader, file_size, self.path.clone()).await?,
+                )
+            } else {
+                IndexedDedicatedReader::Blob(
+                    IndexedBlobReader::open_with_parallelism(
+                        Box::new(reader),
+                        file_size,
+                        self.path.clone(),
+                        blob_as_descriptor,
+                        blob_parallelism,
+                    )
+                    .await?,
+                )
+            };
             let indexed_rows =
                 i64::try_from(reader.num_rows()).map_err(|e| Error::DataInvalid {
                     message: format!(
@@ -97,10 +127,15 @@ impl LazyBlobFile {
             .reader
             .as_ref()
             .expect("blob reader is initialized above");
-        match field_kind {
-            BlobFieldKind::Scalar => reader.read_positions(positions).await,
-            BlobFieldKind::Array => reader.read_array_positions(positions).await,
-            BlobFieldKind::Map(key_type) => reader.read_map_positions(positions, key_type).await,
+        match reader {
+            IndexedDedicatedReader::Video(reader) => reader.read_positions(positions),
+            IndexedDedicatedReader::Blob(reader) => match field_kind {
+                BlobFieldKind::Scalar => reader.read_positions(positions).await,
+                BlobFieldKind::Array => reader.read_array_positions(positions).await,
+                BlobFieldKind::Map(key_type) => {
+                    reader.read_map_positions(positions, key_type).await
+                }
+            },
         }
     }
 
@@ -130,7 +165,7 @@ pub(super) fn read(
         });
     }
 
-    let target_schema = build_target_arrow_schema(&read_fields)?;
+    let target_schema = crate::arrow::build_read_arrow_schema(&read_fields)?;
     let field_kind = match read_fields[0].data_type() {
         DataType::Blob(_) => BlobFieldKind::Scalar,
         DataType::Array(_) => BlobFieldKind::Array,
@@ -396,7 +431,7 @@ mod tests {
                 path: file_name.to_string(),
                 file_size: i64::try_from(file_size).unwrap(),
                 row_count: i64::try_from(values.len()).unwrap(),
-                reader: Some(reader),
+                reader: Some(IndexedDedicatedReader::Blob(reader)),
             },
             ranges,
         )

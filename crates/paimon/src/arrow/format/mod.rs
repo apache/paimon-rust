@@ -18,6 +18,7 @@
 mod avro;
 mod avro_write;
 pub(crate) mod blob;
+mod delta_varint;
 mod metadata_cache;
 mod mosaic;
 mod mosaic_write;
@@ -26,6 +27,8 @@ pub(crate) mod parquet;
 mod row;
 mod shredding;
 pub(crate) mod text;
+mod variant_projection;
+pub(crate) mod video;
 #[cfg(feature = "vortex")]
 mod vortex;
 
@@ -395,6 +398,8 @@ pub(crate) fn create_format_reader_with_budget(
             blob::BlobFormatReader::new(path.to_string(), blob_as_descriptor)
                 .with_blob_parallelism(blob_parallelism),
         )
+    } else if lower.ends_with(".video") {
+        Box::new(video::VideoFormatReader::new(path.to_string()))
     } else if lower.ends_with(".orc") {
         Box::new(orc::OrcFormatReader)
     } else if let Some((kind, compression)) = text::TextKind::from_path(path) {
@@ -442,6 +447,7 @@ fn supported_read_formats() -> Vec<&'static str> {
     vec![
         ".parquet",
         ".blob",
+        ".video",
         ".orc",
         ".csv",
         ".json",
@@ -468,6 +474,21 @@ fn supported_write_formats() -> Vec<&'static str> {
         #[cfg(feature = "vortex")]
         ".vortex",
     ]
+}
+
+/// Reject unavailable factories before a table writer accepts any data.
+pub(crate) fn validate_write_format(format: &str) -> crate::Result<()> {
+    let extension = format!(".{}", format.to_ascii_lowercase());
+    let supported = supported_write_formats();
+    if supported.contains(&extension.as_str()) {
+        return Ok(());
+    }
+    Err(Error::Unsupported {
+        message: format!(
+            "unsupported write format '{format}': expected {}",
+            supported.join(", ")
+        ),
+    })
 }
 
 /// Reusable factory for one rolling writer, mirroring Java FormatWriterFactory.
@@ -515,10 +536,16 @@ pub(crate) fn create_format_writer_factory(
             crate::spec::map_shredding::validate_format("file.format", file_format)?;
         }
     }
+    if file_format.eq_ignore_ascii_case("blob") {
+        return Ok(Arc::new(blob::BlobWriterFactory::new(
+            file_io,
+            write_fields.and_then(|fields| fields.first()),
+            format_options,
+        )?));
+    }
     Ok(Arc::new(PlainFormatWriterFactory {
         schema,
         zstd_level,
-        file_io,
         write_fields: write_fields.map(<[_]>::to_vec),
         format_options: format_options.cloned(),
     }))
@@ -551,7 +578,6 @@ pub(crate) async fn create_format_writer(
 struct PlainFormatWriterFactory {
     schema: SchemaRef,
     zstd_level: i32,
-    file_io: Option<FileIO>,
     write_fields: Option<Vec<DataField>>,
     format_options: Option<HashMap<String, String>>,
 }
@@ -565,16 +591,11 @@ impl FormatWriterFactory for PlainFormatWriterFactory {
     ) -> crate::Result<Box<dyn FormatFileWriter>> {
         let schema = self.schema.clone();
         let zstd_level = self.zstd_level;
-        let file_io = self.file_io.clone();
         let write_fields = self.write_fields.as_deref();
         let format_options = self.format_options.as_ref();
         let path = output.location();
         let lower = path.to_ascii_lowercase();
-        if lower.ends_with(".blob") {
-            Ok(Box::new(
-                blob::BlobFormatWriter::new(output, file_io).await?,
-            ))
-        } else if lower.ends_with(".orc") {
+        if lower.ends_with(".orc") {
             if !matches!(
                 compression.to_ascii_lowercase().as_str(),
                 "" | "none" | "uncompressed"
@@ -705,6 +726,22 @@ mod tests {
     use super::*;
     use crate::io::FileIOBuilder;
     use crate::spec::{DataType, IntType};
+
+    #[test]
+    fn write_format_validation_matches_compiled_factories() {
+        for extension in supported_write_formats() {
+            validate_write_format(extension.trim_start_matches('.')).unwrap();
+        }
+        validate_write_format("PARQUET").unwrap();
+        assert!(matches!(
+            validate_write_format("lance"),
+            Err(Error::Unsupported { .. })
+        ));
+        assert_eq!(
+            validate_write_format("vortex").is_ok(),
+            cfg!(feature = "vortex")
+        );
+    }
 
     #[test]
     fn format_selects_physical_or_projected_fields() {

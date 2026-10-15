@@ -213,11 +213,12 @@ def test_with_read_type_rejects_unsupported_variant_target():
             table.new_read_builder().with_read_type(json.dumps(read_type))
 
 
-def test_with_nested_projection_replaces_read_type():
+def test_with_read_type_replaces_variant_extraction():
     with tempfile.TemporaryDirectory() as warehouse:
         table = _make_variant_table_with_data(warehouse)
         builder = table.new_read_builder().with_read_type(_variant_read_type(
-            table, ["payload"], ["$.age"])).with_nested_projection([["id"]])
+            table, ["payload"], ["$.age"])).with_read_type(json.dumps({"type": "ROW", "fields": [{
+                "id": table.schema().fields()[0].id(), "name": "id", "type": "INT"}]}))
         plan = builder.new_scan().plan()
         result = pa.Table.from_batches(builder.new_read().read(plan.splits()))
         assert result.schema.names == ["id"]
@@ -316,8 +317,44 @@ def test_chunk_shuffle_takes_seed_and_chunk_size_before_optional_shard():
 
         with pytest.raises(ValueError, match="count must be positive"):
             builder.new_scan().with_shard(0, 0)
-        with pytest.raises(RuntimeError, match="requires chunk_shuffle"):
-            builder.new_scan().with_shard(0, 2).plan()
+
+
+@pytest.mark.parametrize("count", [1, 2, 5])
+def test_plain_worker_shards_read_each_row_once_before_limit(count):
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_table_with_data(warehouse)
+        builder = table.new_read_builder().with_projection(["id"])
+        snapshot_id = builder.new_scan().plan().snapshot_id()
+        seen = set()
+        for index in range(count):
+            scan = builder.new_scan()
+            assert scan.with_shard(index, count) is scan
+            plan = scan.plan()
+            assert plan.snapshot_id() == snapshot_id
+            rows = [
+                value
+                for split in plan.splits()
+                for value in pa.Table.from_batches(builder.new_read().read([split]))
+                .column("id").to_pylist()
+            ]
+            assert len(rows) == len(set(rows))
+            assert seen.isdisjoint(rows)
+            seen.update(rows)
+
+            limited = table.new_read_builder().with_projection(["id"]).with_limit(1)
+            limited_plan = limited.new_scan().with_shard(index, count).plan()
+            assert limited_plan.snapshot_id() == snapshot_id
+            limited_rows = [
+                value
+                for split in limited_plan.splits()
+                for value in pa.Table.from_batches(limited.new_read().read([split]))
+                .column("id").to_pylist()
+            ]
+            # with_limit is a split-planning hint; the reader can return a
+            # complete file. It must still retain this worker's owned rows.
+            assert bool(limited_rows) == bool(rows)
+            assert set(limited_rows).issubset(rows)
+        assert seen == {1, 2, 3}
 
 
 def test_chunk_shuffle_reads_split_local_ranges_across_files():
@@ -404,22 +441,60 @@ def test_row_id_filter_with_projection_and_data_predicate(data_evolution, case_s
         assert rows.to_pylist() == [{"name": "b", "_ROW_ID": 1}]
 
 
-@pytest.mark.parametrize("predicate_field", ["_row_id", "_ROW_ID"])
-def test_case_insensitive_filter_uses_real_lowercase_row_id_column(predicate_field):
+@pytest.mark.parametrize("user_field", ["_row_id", "_sequence_number"])
+@pytest.mark.parametrize("uppercase", [False, True])
+def test_case_insensitive_filter_uses_untracked_user_column(user_field, uppercase):
     with tempfile.TemporaryDirectory() as warehouse:
         ctx = SQLContext()
         ctx.register_catalog("paimon", {"warehouse": warehouse})
         ctx.sql("CREATE SCHEMA paimon.realrowid")
-        ctx.sql("CREATE TABLE paimon.realrowid.t (_row_id BIGINT, id INT)")
+        ctx.sql(f"CREATE TABLE paimon.realrowid.t ({user_field} BIGINT, id INT)")
         ctx.sql("INSERT INTO paimon.realrowid.t VALUES (11, 1), (22, 2)")
         table = PaimonCatalog({"warehouse": warehouse}).get_table("realrowid.t")
         builder = table.new_read_builder().with_case_sensitive(False)
-        builder.with_projection(["_row_id", "id"])
+        # Projection and predicate resolution must use the same available
+        # fields. Untracked append tables have no virtual tracking columns.
+        field = user_field.upper() if uppercase else user_field
+        builder.with_projection([field, "id"])
         builder.with_filter({
-            "method": "equal", "field": predicate_field, "literals": [22],
+            "method": "equal", "field": field, "literals": [22],
         })
         batches = builder.new_read().read(builder.new_scan().plan().splits())
-        assert pa.Table.from_batches(batches).to_pylist() == [{"_row_id": 22, "id": 2}]
+        assert pa.Table.from_batches(batches).to_pylist() == [{user_field: 22, "id": 2}]
+
+
+@pytest.mark.parametrize("user_field", ["_row_id", "_sequence_number"])
+@pytest.mark.parametrize("uppercase", [False, True])
+def test_case_insensitive_tracking_metadata_collision_is_ambiguous(user_field, uppercase):
+    with tempfile.TemporaryDirectory() as warehouse:
+        ctx = SQLContext()
+        ctx.register_catalog("paimon", {"warehouse": warehouse})
+        ctx.sql("CREATE SCHEMA paimon.trackingcollision")
+        ctx.sql(f"""CREATE TABLE paimon.trackingcollision.t ({user_field} BIGINT, id INT)
+            WITH ('row-tracking.enabled' = 'true')""")
+        table = PaimonCatalog({"warehouse": warehouse}).get_table("trackingcollision.t")
+        builder = table.new_read_builder().with_case_sensitive(False)
+        field = user_field.upper() if uppercase else user_field
+        with pytest.raises(ValueError, match="Ambiguous"):
+            builder.with_filter({"method": "equal", "field": field, "literals": [22]})
+        with pytest.raises(ValueError, match="Ambiguous"):
+            builder.with_projection([field]).new_read().read([])
+
+
+def test_primary_key_sequence_metadata_does_not_require_row_tracking():
+    with tempfile.TemporaryDirectory() as warehouse:
+        ctx = SQLContext()
+        ctx.register_catalog("paimon", {"warehouse": warehouse})
+        ctx.sql("CREATE SCHEMA paimon.pksequence")
+        ctx.sql("""CREATE TABLE paimon.pksequence.t (id INT, v INT, PRIMARY KEY (id))
+            WITH ('bucket' = '1', 'row-tracking.enabled' = 'false')""")
+        ctx.sql("INSERT INTO paimon.pksequence.t VALUES (1, 11), (2, 22)")
+        table = PaimonCatalog({"warehouse": warehouse}).get_table("pksequence.t")
+        builder = table.new_read_builder().with_case_sensitive(False)
+        builder.with_projection(["id", "_sequence_number"])
+        builder.with_filter({"method": "equal", "field": "_sequence_number", "literals": [1]})
+        result = pa.Table.from_batches(builder.new_read().read(builder.new_scan().plan().splits()))
+        assert result.to_pylist() == [{"id": 2, "_SEQUENCE_NUMBER": 1}]
 
 
 def test_row_tracking_append_row_ranges_keep_global_row_ids():
@@ -971,14 +1046,39 @@ def test_filter_out_of_range_raises():
                 {"method": "equal", "field": "small", "literals": [9999]})
 
 
-def test_filter_wrong_literal_count_raises():
+@pytest.mark.parametrize("literals", [[], [1, 2]])
+def test_filter_wrong_literal_count_raises(literals):
     with tempfile.TemporaryDirectory() as warehouse:
         table = _make_table_with_data(warehouse)
         b = table.new_read_builder()
         with pytest.raises(ValueError):
-            b.with_filter({"method": "equal", "field": "id", "literals": [1, 2]})
-        with pytest.raises(ValueError):
-            b.with_filter({"method": "in", "field": "id", "literals": []})
+            b.with_filter({"method": "equal", "field": "id", "literals": literals})
+
+
+@pytest.mark.parametrize("method, literals, expected_ids", [
+    ("in", [], []),
+    ("notIn", [], [2, 3]),
+    ("in", [None], []),
+    ("notIn", [None], []),
+    ("in", [None, 10], [2]),
+    ("notIn", [None, 10], []),
+    ("in", [10], [2]),
+    ("notIn", [10], [3]),
+])
+def test_filter_set_predicates_follow_java_null_semantics(method, literals, expected_ids):
+    with tempfile.TemporaryDirectory() as warehouse:
+        ctx = SQLContext()
+        ctx.register_catalog("paimon", {"warehouse": warehouse})
+        ctx.sql("CREATE SCHEMA paimon.setdb")
+        ctx.sql("CREATE TABLE paimon.setdb.t (id INT, value INT)")
+        ctx.sql("INSERT INTO paimon.setdb.t VALUES (1, NULL), (2, 10), (3, 20)")
+        table = PaimonCatalog({"warehouse": warehouse}).get_table("setdb.t")
+        builder = table.new_read_builder().with_filter({
+            "method": method, "field": "value", "literals": literals,
+        }).with_projection(["id"])
+        batches = builder.new_read().read(builder.new_scan().plan().splits())
+        actual_ids = sorted(value for batch in batches for value in batch.column(0).to_pylist())
+        assert actual_ids == expected_ids
 
 
 def test_filter_compound_with_unsupported_child_fails():
@@ -1240,11 +1340,11 @@ def test_explicit_scan_mode_without_selector_raises():
             table.new_read_builder({"scan.mode": "from-snapshot"})
 
 
-def test_unimplemented_scan_mode_raises_not_implemented():
+def test_incremental_scan_mode_requires_timestamp_window():
     with tempfile.TemporaryDirectory() as warehouse:
         _make_two_snapshot_table(warehouse)
         table = PaimonCatalog({"warehouse": warehouse}).get_table("tdb.t")
-        with pytest.raises(NotImplementedError):
+        with pytest.raises(ValueError, match="incremental-between-timestamp"):
             table.new_read_builder({"scan.mode": "incremental"})
 
 
@@ -1472,6 +1572,40 @@ def test_incremental_changelog_and_auto_plan_physical_changelog_files():
         assert empty.splits() == []
 
 
+@pytest.mark.parametrize("mode", ["changelog", "auto"])
+def test_batch_incremental_changelog_packing_sharding_and_limits(mode):
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_input_changelog_table(warehouse)
+        builder = table.new_read_builder().with_include_row_kind(True)
+        full = builder.new_incremental_scan(0, 2, mode).plan()
+        # Java packs changelogs over the whole range, rather than once per
+        # snapshot. The two commits in this bucket fit into one split.
+        assert len(full.splits()) == 1
+        assert len(_native_split_file_names(full.splits())) == 2
+        names, rows = [], []
+        for index in range(3):
+            scan = builder.new_incremental_scan(0, 2, mode).with_shard(index, 3)
+            plan = scan.plan()
+            assert plan.snapshot_id() == 2
+            assert all(split.is_streaming() for split in plan.splits())
+            names.extend(_native_split_file_names(plan.splits()))
+            batches = builder.new_read().read(plan.splits())
+            if batches:
+                rows.extend(pa.Table.from_batches(batches).to_pylist())
+            for boundary in (0, 2):
+                empty = builder.new_incremental_scan(boundary, boundary, mode).with_shard(index, 3).plan()
+                assert empty.snapshot_id() == boundary
+                assert empty.splits() == []
+        assert sorted(names) == sorted(_native_split_file_names(full.splits()))
+        assert sorted((row['rowkind'], row['id'], row['value']) for row in rows) == [
+            ('+I', 1, 'a'), ('+I', 2, 'b'), ('+I', 3, 'c')]
+        limited = (table.new_read_builder().with_limit(1).with_include_row_kind(True))
+        plan = limited.new_incremental_scan(0, 2, mode).with_shard(0, 3).plan()
+        result = pa.Table.from_batches(limited.new_read().read(plan.splits())).to_pylist()
+        assert len(result) == 1
+        assert result[0] in rows
+
+
 def test_incremental_changelog_keeps_filter_projection_and_validates_mode():
     with tempfile.TemporaryDirectory() as warehouse:
         table = _make_input_changelog_table(warehouse)
@@ -1655,3 +1789,100 @@ def test_incremental_row_positions_use_combined_delta_batch():
         builder.with_row_ranges([(1, 3)]).with_limit(2)
         plan = builder.new_incremental_scan(0, 2).with_row_position_slice(2, 5).plan()
         assert pa.Table.from_batches(builder.new_read().read(plan.splits())).column("id").to_pylist() == [2, 3]
+
+
+@pytest.mark.parametrize("window,snapshot,expected", [
+    ("0,100", 1, [dict(id=1, name="a")]),
+    ("100,200", 2, [dict(id=2, name="b"), dict(id=3, name="c")]),
+    ("100,150", 1, []),
+    ("100,100", None, []),
+])
+@pytest.mark.parametrize("mode", ["default", "incremental"])
+def test_numeric_timestamp_window_options_use_core_scan(tmp_path, window, snapshot, expected, mode):
+    from pathlib import Path
+
+    _make_two_snapshot_table(str(tmp_path))
+    table = PaimonCatalog({"warehouse": str(tmp_path)}).get_table("tdb.t")
+    for identifier, timestamp in [(1, 100), (2, 200)]:
+        path = Path(table.location()) / "snapshot" / ("snapshot-%s" % identifier)
+        data = json.loads(path.read_text())
+        data["timeMillis"] = timestamp
+        path.write_text(json.dumps(data))
+    builder = table.new_read_builder({"scan.mode": mode, "incremental-between-timestamp": window})
+    plan = builder.new_scan().plan()
+    assert plan.snapshot_id() == snapshot
+    batches = list(builder.new_read().read(plan.splits()))
+    actual = [row for batch in batches for row in batch.to_pylist()]
+    assert sorted(actual, key=lambda row: row["id"]) == expected
+
+
+def _read_partition_ids(builder, plan):
+    return sorted(row["id"] for batch in builder.new_read().read_arrow(plan.splits())
+                  for row in batch.to_pylist())
+
+
+@pytest.mark.parametrize("selector_first", [False, True])
+def test_explicit_partition_selector_is_independent_from_the_row_filter(selector_first):
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_partitioned_table(warehouse)
+        builder = table.new_read_builder().with_projection(["id"])
+        selector = {"method": "in", "field": "dt", "literals": ["p1", "p2"]}
+        row_filter = {"method": "equal", "field": "dt", "literals": ["p2"]}
+        if selector_first:
+            builder.with_partition_filter(selector).with_filter(row_filter)
+        else:
+            builder.with_filter(row_filter).with_partition_filter(selector)
+        assert _read_partition_ids(builder, builder.new_scan().plan()) == [3]
+        # A scan-only constraint must not be applied as a reader residual.
+        selector_only = table.new_read_builder().with_projection(["id"]).with_partition_filter(selector)
+        all_rows = table.new_read_builder().new_scan().plan()
+        assert _read_partition_ids(selector_only, all_rows) == [1, 2, 3, 4]
+        assert _read_partition_ids(selector_only, selector_only.new_scan().plan()) == [1, 2, 3]
+        # The normal partition predicate must also apply with independent splits.
+        normal = table.new_read_builder().with_projection(["id"]).with_filter(row_filter)
+        assert _read_partition_ids(normal, all_rows) == [3]
+
+
+def test_partition_selector_replacement_clear_validation_and_case_sensitivity():
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_partitioned_table(warehouse)
+        builder = table.new_read_builder().with_projection(["id"]).with_case_sensitive(False)
+        def selector(value):
+            return {"method": "equal", "field": "DT", "literals": [value]}
+        builder.with_partition_filter(selector("p1"))
+        scan = builder.new_scan()
+        builder.with_partition_filter(selector("p2"))
+        assert _read_partition_ids(builder, scan.plan()) == [1, 2]
+        assert _read_partition_ids(builder, builder.new_scan().plan()) == [3]
+        with pytest.raises(ValueError, match="only partition keys"):
+            builder.with_partition_filter({"method": "or", "children": [
+                selector("p3"), {"method": "equal", "field": "id", "literals": [4]}]})
+        assert _read_partition_ids(builder, builder.new_scan().plan()) == [3]
+        builder.with_partition_filter(None)
+        assert _read_partition_ids(builder, builder.new_scan().plan()) == [1, 2, 3, 4]
+        with pytest.raises(ValueError):
+            table.new_read_builder().with_partition_filter(selector("p1"))
+
+
+def test_partition_selector_survives_incremental_and_stream_scan_capture():
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_partitioned_table(warehouse)
+        builder = table.new_read_builder().with_projection(["id"]).with_partition_filter(
+            {"method": "equal", "field": "dt", "literals": ["p1"]})
+        incremental = builder.new_incremental_scan(0, 1)
+        stream = builder.new_stream_scan()
+        builder.with_partition_filter({"method": "equal", "field": "dt", "literals": ["p3"]})
+        assert _read_partition_ids(builder, incremental.plan()) == [1, 2]
+        assert _read_partition_ids(builder, stream.plan()) == [1, 2]
+        assert stream.checkpoint() == 2
+        stream.restore(1)
+        assert _read_partition_ids(builder, stream.plan()) == [1, 2]
+
+
+def test_conflicting_explicit_selector_and_ordinary_partition_filter_return_no_rows():
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_partitioned_table(warehouse)
+        builder = table.new_read_builder().with_projection(["id"]).with_limit(1)
+        builder.with_partition_filter({"method": "equal", "field": "dt", "literals": ["p1"]})
+        builder.with_filter({"method": "equal", "field": "dt", "literals": ["p3"]})
+        assert _read_partition_ids(builder, builder.new_scan().plan()) == []

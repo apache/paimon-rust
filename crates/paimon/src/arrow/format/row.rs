@@ -36,11 +36,11 @@ use arrow_array::builder::{
     TimestampMillisecondBuilder, TimestampNanosecondBuilder, TimestampSecondBuilder,
 };
 use arrow_array::{
-    Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array,
-    Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, LargeBinaryArray, ListArray,
-    MapArray, RecordBatch, RecordBatchOptions, StringArray, StructArray, Time32MillisecondArray,
-    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
-    TimestampSecondArray,
+    Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, FixedSizeListArray,
+    Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, LargeBinaryArray,
+    ListArray, MapArray, RecordBatch, RecordBatchOptions, StringArray, StructArray,
+    Time32MillisecondArray, TimestampMicrosecondArray, TimestampMillisecondArray,
+    TimestampNanosecondArray, TimestampSecondArray,
 };
 use arrow_buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::{DataType as ArrowDataType, Field, Fields, SchemaRef, TimeUnit};
@@ -167,6 +167,10 @@ impl FormatFileWriter for RowFormatWriter {
 
     fn in_progress_size(&self) -> usize {
         self.block_writer.estimated_size()
+    }
+
+    fn pending_rows(&self) -> Option<usize> {
+        Some(self.block_writer.row_count())
     }
 
     async fn flush(&mut self) -> crate::Result<()> {
@@ -441,6 +445,10 @@ fn validate_arrow_type_for_row_field(
             validate_arrow_type_for_row_field(field_name, child.data_type(), a.element_type())?;
             true
         }
+        (ArrowDataType::FixedSizeList(child, size), DataType::Vector(v)) => {
+            validate_arrow_type_for_row_field(field_name, child.data_type(), v.element_type())?;
+            *size == v.length() as i32
+        }
         (ArrowDataType::Map(entries, _), DataType::Map(m)) => {
             validate_arrow_map_entries(
                 field_name,
@@ -565,9 +573,7 @@ fn validate_supported_type(data_type: &DataType) -> crate::Result<()> {
             }
             Ok(())
         }
-        DataType::Vector(_) => Err(Error::Unsupported {
-            message: "VectorType is not supported in the .row format".to_string(),
-        }),
+        DataType::Vector(v) => validate_supported_type(v.element_type()),
     }
 }
 
@@ -738,10 +744,20 @@ fn write_field_value(
             let row = downcast::<StructArray>(array, data_type)?;
             write_struct_row(out, row, row_idx, r.fields())?;
         }
-        DataType::Vector(_) => {
-            return Err(Error::Unsupported {
-                message: "VectorType is not supported in .row field serialization".to_string(),
-            });
+        DataType::Vector(v) => {
+            let vector = downcast::<FixedSizeListArray>(array, data_type)?;
+            let values = vector.value(row_idx);
+            if values.null_count() != 0 {
+                return Err(Error::DataInvalid {
+                    message: ".row VECTOR elements must not be null".into(),
+                    source: None,
+                });
+            }
+            // Unlike ARRAY, Java writes no element null bitmap for VECTOR.
+            write_var_u32(out, v.length());
+            for index in 0..values.len() {
+                write_field_value(out, &values, index, v.element_type())?;
+            }
         }
     }
     Ok(())
@@ -1207,6 +1223,12 @@ enum ColumnBuilder {
         validities: Vec<bool>,
         values: Box<ColumnBuilder>,
     },
+    Vector {
+        field: Arc<Field>,
+        size: i32,
+        validities: Vec<bool>,
+        values: Box<ColumnBuilder>,
+    },
     Map {
         entries_field: Arc<Field>,
         offsets: Vec<i32>,
@@ -1315,11 +1337,16 @@ impl ColumnBuilder {
                 validities: Vec::with_capacity(capacity),
                 len: 0,
             },
-            DataType::Vector(_) => {
-                return Err(Error::Unsupported {
-                    message: "VectorType is not supported in .row ColumnBuilder".to_string(),
-                });
-            }
+            DataType::Vector(v) => Self::Vector {
+                field: Arc::new(Field::new(
+                    "element",
+                    paimon_type_to_arrow(v.element_type())?,
+                    v.element_type().is_nullable(),
+                )),
+                size: v.length() as i32,
+                validities: Vec::with_capacity(capacity),
+                values: Box::new(ColumnBuilder::new(v.element_type(), capacity)?),
+            },
         })
     }
 
@@ -1342,6 +1369,17 @@ impl ColumnBuilder {
             Self::TimestampUs(b) => b.append_null(),
             Self::TimestampNs(b) => b.append_null(),
             Self::Decimal(b) => b.append_null(),
+            Self::Vector {
+                size,
+                validities,
+                values,
+                ..
+            } => {
+                for _ in 0..*size {
+                    values.append_null();
+                }
+                validities.push(false);
+            }
             Self::Array {
                 offsets,
                 validities,
@@ -1428,6 +1466,29 @@ impl ColumnBuilder {
             ) => {
                 let size = read_elements_into(input, a.element_type(), values)?;
                 push_nested_offset(offsets, size)?;
+                validities.push(true);
+            }
+            (
+                Self::Vector {
+                    size,
+                    validities,
+                    values,
+                    ..
+                },
+                DataType::Vector(v),
+            ) => {
+                let stored_size = input.read_var_u32()?;
+                if stored_size != *size as u32 {
+                    return Err(Error::DataInvalid {
+                        message: format!(
+                            ".row VECTOR length {stored_size} differs from declared length {size}"
+                        ),
+                        source: None,
+                    });
+                }
+                for _ in 0..stored_size {
+                    values.read_append(input, v.element_type())?;
+                }
                 validities.push(true);
             }
             (
@@ -1547,6 +1608,23 @@ impl ColumnBuilder {
                 .map_err(|e| Error::UnexpectedError {
                     message: format!("Failed to build .row ListArray: {e}"),
                     source: Some(Box::new(e)),
+                })?,
+            ),
+            Self::Vector {
+                field,
+                size,
+                validities,
+                values,
+            } => Arc::new(
+                FixedSizeListArray::try_new(
+                    field,
+                    size,
+                    values.finish()?,
+                    Some(null_buffer(validities)),
+                )
+                .map_err(|error| Error::DataInvalid {
+                    message: format!("Failed to build .row VECTOR: {error}"),
+                    source: Some(Box::new(error)),
                 })?,
             ),
             Self::Map {
@@ -3394,6 +3472,113 @@ mod tests {
         assert_eq!(names.value(0), "seven");
         assert!(names.is_null(1));
         assert_eq!(names.value(2), "nine");
+    }
+
+    #[test]
+    fn blob_data_block_matches_java_materialized_descriptor() {
+        use crate::spec::BlobType;
+        // Java RowBlockWriter wrote Blob.fromFile(source, offset=6, length=7)
+        // where source contained "prefixpayloadsuffix".
+        let java_block = decode_hex("00077061796c6f61640000000001000000");
+        let fields = vec![DataField::new(
+            0,
+            "payload".into(),
+            DataType::Blob(BlobType::new()),
+        )];
+        let schema = build_target_arrow_schema(&fields).unwrap();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(LargeBinaryArray::from_iter([Some(
+                b"payload".as_slice(),
+            )]))],
+        )
+        .unwrap();
+        let mut writer = RowBlockWriter::new();
+        writer.write_row(&batch, 0, &fields).unwrap();
+        assert_eq!(writer.finish(), java_block);
+        let decoded = decode_row_block(&java_block, &fields, schema, &[0]).unwrap();
+        assert_eq!(
+            decoded
+                .column(0)
+                .as_any()
+                .downcast_ref::<LargeBinaryArray>()
+                .unwrap()
+                .value(0),
+            b"payload"
+        );
+    }
+
+    #[test]
+    fn vector_blocks_match_java_and_decode_parent_nulls() {
+        use crate::spec::{FloatType, VectorType};
+        // Generated by Java RowBlockWriter with VECTOR<2,FLOAT NOT NULL>:
+        // GenericRow.of([1.25f, -2.5f]), GenericRow.of(null).
+        let java_block = decode_hex("00020000a03f000020c001000000000a00000002000000");
+        let fields = vec![DataField::new(
+            0,
+            "v".into(),
+            DataType::Vector(
+                VectorType::new(2, DataType::Float(FloatType::with_nullable(false))).unwrap(),
+            ),
+        )];
+        let schema = build_target_arrow_schema(&fields).unwrap();
+        let mut vectors =
+            arrow_array::builder::FixedSizeListBuilder::new(Float32Builder::new(), 2).with_field(
+                Arc::new(Field::new("element", ArrowDataType::Float32, false)),
+            );
+        vectors.values().append_slice(&[1.25, -2.5]);
+        vectors.append(true);
+        vectors.values().append_slice(&[0.0, 0.0]);
+        vectors.append(false);
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(vectors.finish())]).unwrap();
+        let mut writer = RowBlockWriter::new();
+        writer.write_row(&batch, 0, &fields).unwrap();
+        writer.write_row(&batch, 1, &fields).unwrap();
+        assert_eq!(writer.finish(), java_block);
+        let decoded = decode_row_block(&java_block, &fields, schema, &[0, 1]).unwrap();
+        let actual = decoded
+            .column(0)
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .unwrap();
+        assert!(actual.is_null(1));
+        let first = actual.value(0);
+        assert_eq!(
+            first
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .unwrap()
+                .values()
+                .as_ref(),
+            &[1.25, -2.5]
+        );
+        // A malformed vector length cannot shift the following fields.
+        let mut malformed = java_block.clone();
+        malformed[1] = 3;
+        assert!(decode_row_block(&malformed, &fields, decoded.schema(), &[0]).is_err());
+    }
+
+    #[test]
+    fn vector_writes_reject_null_elements_and_wrong_dimensions() {
+        use crate::spec::{FloatType, VectorType};
+        let data_type =
+            DataType::Vector(VectorType::new(2, DataType::Float(FloatType::new())).unwrap());
+        let mut vectors = arrow_array::builder::FixedSizeListBuilder::new(Float32Builder::new(), 2);
+        vectors.values().append_value(1.0);
+        vectors.values().append_null();
+        vectors.append(true);
+        let array = Arc::new(vectors.finish()) as ArrayRef;
+        let error = write_field_value(&mut Vec::new(), &array, 0, &data_type).unwrap_err();
+        assert!(error.to_string().contains("elements must not be null"));
+        assert!(validate_arrow_type_for_row_field(
+            "v",
+            &ArrowDataType::FixedSizeList(
+                Arc::new(Field::new("element", ArrowDataType::Float32, true)),
+                3,
+            ),
+            &data_type
+        )
+        .is_err());
     }
 
     #[tokio::test]

@@ -271,10 +271,10 @@ openssl-sys@0.9.117											X
 orc-rust@0.8.0		X														
 ordered-float@2.10.1											X					
 ordered-multimap@0.7.3											X					
-paimon@0.4.0		X														
-paimon-datafusion@0.4.0		X														
+paimon@0.5.0		X														
+paimon-datafusion@0.5.0		X														
 paimon-mosaic-core@0.2.0		X														
-paimon-tpcds-bench@0.4.0		X														
+paimon-tpcds-bench@0.5.0		X														
 paimon-vindex-core@0.5.0		X														
 parking_lot@0.12.5		X									X					
 parking_lot_core@0.9.12		X									X					
@@ -328,7 +328,7 @@ roaring@0.11.4		X									X
 rust-ini@0.21.3											X					
 rustc_version@0.4.1		X									X					
 rustix@1.1.4		X	X								X					
-rustls@0.23.45		X							X		X					
+rustls@0.23.46		X							X		X					
 rustls-native-certs@0.8.4		X							X		X					
 rustls-pki-types@1.15.0		X									X					
 rustls-platform-verifier@0.7.0		X									X					

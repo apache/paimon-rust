@@ -30,6 +30,7 @@ use crate::spec::{
     ManifestFileMeta, ManifestList, PartitionComputer, PartitionStatistics, Predicate, Snapshot,
     EMPTY_SERIALIZED_ROW, MANIFEST_ENTRY_SCHEMA, POSTPONE_BUCKET,
 };
+use crate::table::commit_callback::{CommitCallback, CommitCallbackContext};
 use crate::table::commit_message::CommitMessage;
 use crate::table::format_table_commit::FormatTableCommit;
 use crate::table::global_index_build_common::same_extra_field_ids;
@@ -48,6 +49,7 @@ const BATCH_COMMIT_IDENTIFIER: i64 = i64::MAX;
 /// Java RollingFileWriter.CHECK_ROLLING_RECORD_CNT.
 const CHECK_ROLLING_RECORD_COUNT: usize = 1000;
 
+mod global_index_source_check;
 mod row_tracking;
 
 const DELETION_VECTORS_INDEX_TYPE: &str = "DELETION_VECTORS";
@@ -187,6 +189,7 @@ fn reject_compact_increment(messages: &[CommitMessage]) -> Result<()> {
 /// Table commit logic for Paimon write operations.
 ///
 /// Provides atomic commit functionality including append, overwrite and truncate
+#[derive(Clone)]
 pub struct TableCommit {
     table: Table,
     snapshot_manager: SnapshotManager,
@@ -205,6 +208,8 @@ pub struct TableCommit {
     row_tracking_enabled: bool,
     data_evolution_enabled: bool,
     partition_default_name: String,
+    snapshot_properties: Option<HashMap<String, String>>,
+    commit_callbacks: Vec<Arc<dyn CommitCallback>>,
 }
 
 impl TableCommit {
@@ -246,12 +251,52 @@ impl TableCommit {
             row_tracking_enabled,
             data_evolution_enabled,
             partition_default_name,
+            snapshot_properties: None,
+            commit_callbacks: Vec::new(),
         }
+    }
+
+    /// Register an idempotent notification for confirmed Paimon snapshots.
+    pub fn add_commit_callback(&mut self, callback: Arc<dyn CommitCallback>) -> Result<()> {
+        if self.table.is_format_table() {
+            return Err(crate::Error::Unsupported {
+                message: "Commit callbacks require a Paimon table snapshot".into(),
+            });
+        }
+        self.commit_callbacks.push(callback);
+        Ok(())
+    }
+
+    async fn notify_commit_callbacks(
+        &self,
+        snapshot: Snapshot,
+        commit_entries: Vec<ManifestEntry>,
+    ) -> Result<()> {
+        let context = CommitCallbackContext {
+            identifier: snapshot.commit_identifier(),
+            snapshot,
+            commit_entries,
+        };
+        for callback in &self.commit_callbacks {
+            callback.call(&context).await?;
+        }
+        Ok(())
     }
 
     /// Control empty APPEND snapshots. Java stream commits set this to false.
     pub fn with_ignore_empty_commit(mut self, ignore_empty_commit: bool) -> Self {
         self.ignore_empty_commit = ignore_empty_commit;
+        self
+    }
+
+    /// Attach caller properties to snapshots published by this committer.
+    ///
+    /// Like Java's ManifestCommittable properties, these describe the current
+    /// commit and are not inherited from the previous snapshot. Empty maps are
+    /// omitted. Clone the committer to configure metadata for a single call
+    /// while retaining its publication environment and retry configuration.
+    pub fn with_snapshot_properties(mut self, properties: HashMap<String, String>) -> Self {
+        self.snapshot_properties = (!properties.is_empty()).then_some(properties);
         self
     }
 
@@ -373,6 +418,8 @@ impl TableCommit {
         let changelog_entries = self.messages_to_changelog_entries(&commit_messages);
         let new_index_entries = self.messages_to_index_entries(&commit_messages);
         let check_from_snapshot = Self::check_from_snapshot(&commit_messages)?;
+        // Never delete CommitMessage files on failure. A previous attempt may
+        // have published them even when the caller received an exception.
         self.try_commit(
             CommitEntriesPlan::Direct {
                 entries,
@@ -421,28 +468,18 @@ impl TableCommit {
         let changelog_entries = self.messages_to_changelog_entries(&commit_messages);
         let new_index_entries = self.messages_to_index_entries(&commit_messages);
         let check_from_snapshot = Self::check_from_snapshot(&commit_messages)?;
-        let result = self
-            .try_commit(
-                CommitEntriesPlan::Direct {
-                    entries,
-                    changelog_entries,
-                    new_index_entries,
-                    check_from_snapshot,
-                },
-                Some(expected_snapshot_id),
-                commit_identifier,
-                false,
-            )
-            .await;
-        if let Err(error) = result {
-            // Storage and REST errors can be indeterminate: the snapshot may
-            // already reference these files even though the response failed.
-            if matches!(&error, crate::Error::DataInvalid { .. }) {
-                let _ = self.abort(&commit_messages).await;
-            }
-            return Err(error);
-        }
-        Ok(())
+        self.try_commit(
+            CommitEntriesPlan::Direct {
+                entries,
+                changelog_entries,
+                new_index_entries,
+                check_from_snapshot,
+            },
+            Some(expected_snapshot_id),
+            commit_identifier,
+            false,
+        )
+        .await
     }
 
     /// Overwrite partitions with new data.
@@ -882,11 +919,16 @@ impl TableCommit {
         Ok(())
     }
 
-    /// Abort a prepared commit by deleting newly written data, changelog and index files.
+    /// Delete new files for an explicitly abandoned, known-uncommitted write.
     ///
-    /// Deletion is best-effort and mirrors Python `FileStoreCommit.abort`: missing
-    /// files or storage errors are ignored so abort cleanup never masks the
-    /// original write failure.
+    /// Mirrors Java `FileStoreCommitImpl.abort`; removed inputs are preserved.
+    /// Call only when these messages will never be submitted. Never call after
+    /// a commit whose outcome is unknown: publication may have succeeded before
+    /// its response failed. File deletion is best-effort.
+    ///
+    /// Format Tables follow Java two-phase cleanup instead: discard staging,
+    /// roll back unregistered append targets and preserve overwrite replacements
+    /// or successfully registered append files.
     pub async fn abort(&self, commit_messages: &[CommitMessage]) -> Result<()> {
         if self.table.is_format_table() {
             return FormatTableCommit::new(&self.table)
@@ -1005,8 +1047,8 @@ impl TableCommit {
                     filter_committed = false;
                 }
                 if let Some(start_snapshot_id) = duplicate_check_start_snapshot_id {
-                    if self
-                        .is_duplicate_commit(
+                    if let Some(snapshot) = self
+                        .find_duplicate_commit(
                             start_snapshot_id,
                             &latest_snapshot,
                             commit_identifier,
@@ -1014,6 +1056,10 @@ impl TableCommit {
                         )
                         .await?
                     {
+                        if !self.commit_callbacks.is_empty() {
+                            let entries = self.read_delta_entries(None, &snapshot).await?;
+                            self.notify_commit_callbacks(snapshot, entries).await?;
+                        }
                         break;
                     }
                 }
@@ -1183,7 +1229,13 @@ impl TableCommit {
             )
             .await
         {
-            Ok(true) => return Ok(CommitAttemptResult::Success),
+            Ok(true) => {
+                if !self.commit_callbacks.is_empty() {
+                    self.notify_commit_callbacks(snapshot, resolved.entries)
+                        .await?;
+                }
+                return Ok(CommitAttemptResult::Success);
+            }
             Ok(false) => None,
             Err(error) => Some(error),
         };
@@ -1366,6 +1418,7 @@ impl TableCommit {
             .statistics(statistics_file)
             .next_row_id(next_row_id)
             .index_manifest(resolved.index_manifest_name.clone())
+            .properties(self.snapshot_properties.clone())
             .build();
 
         let statistics = self.generate_partition_statistics(&resolved.entries)?;
@@ -1667,13 +1720,13 @@ impl TableCommit {
     }
 
     /// Check if this commit was already completed during an in-process retry.
-    async fn is_duplicate_commit(
+    async fn find_duplicate_commit(
         &self,
         start_snapshot_id: i64,
         latest_snapshot: &Option<Snapshot>,
         commit_identifier: i64,
         commit_kind: &CommitKind,
-    ) -> Result<bool> {
+    ) -> Result<Option<Snapshot>> {
         if let Some(latest) = latest_snapshot {
             for snapshot_id in (start_snapshot_id..=latest.id()).rev() {
                 let snap = if snapshot_id == latest.id() {
@@ -1685,11 +1738,11 @@ impl TableCommit {
                     && snap.commit_identifier() == commit_identifier
                     && snap.commit_kind() == commit_kind
                 {
-                    return Ok(true);
+                    return Ok(Some(snap));
                 }
             }
         }
-        Ok(false)
+        Ok(None)
     }
 
     /// Resolve commit entries and merge index entries based on the plan type.
@@ -1746,6 +1799,8 @@ impl TableCommit {
 
                 let previous =
                     Self::read_prev_index_entries(file_io, &manifest_dir, latest_snapshot).await?;
+                self.check_global_index_sources(latest_snapshot, entries, new_index_entries)
+                    .await?;
                 let mut index_entries = new_index_entries.clone();
                 index_entries.extend(self.global_index_update_entries(
                     &previous,
@@ -1807,6 +1862,8 @@ impl TableCommit {
 
                 let previous =
                     Self::read_prev_index_entries(file_io, &manifest_dir, latest_snapshot).await?;
+                self.check_global_index_sources(latest_snapshot, &entries, &new_index_entries)
+                    .await?;
                 let mut all = previous.clone();
                 match partition_filter.as_ref() {
                     None => all.clear(),
@@ -2253,24 +2310,12 @@ impl TableCommit {
         let Some(snap) = snapshot else {
             return Ok(vec![]);
         };
-        let file_io = self.snapshot_manager.file_io();
-        let manifest_dir = self.snapshot_manager.manifest_dir();
-        let mut entries = Vec::new();
-        for manifest_list in [snap.base_manifest_list(), snap.delta_manifest_list()] {
-            let manifest_list_path = format!("{manifest_dir}/{manifest_list}");
-            for manifest_file in ManifestList::read(file_io, &manifest_list_path).await? {
-                let manifest_path = format!("{manifest_dir}/{}", manifest_file.file_name());
-                for entry in Manifest::read(file_io, &manifest_path).await? {
-                    if let Some(filter) = partition_filter {
-                        if !filter.matches_entry(entry.partition())? {
-                            continue;
-                        }
-                    }
-                    entries.push(entry);
-                }
-            }
-        }
-        Ok(merge_active_entries(entries))
+        super::snapshot_manifest::read_snapshot_entries(
+            &self.snapshot_manager,
+            snap,
+            partition_filter,
+        )
+        .await
     }
 
     async fn scan_changed_partition_entries(
@@ -3173,23 +3218,18 @@ impl TableCommit {
 
     /// Generate per-partition statistics from commit entries.
     ///
-    /// Reference: [pypaimon FileStoreCommit._generate_partition_statistics](https://github.com/apache/paimon/blob/master/paimon-python/pypaimon/write/file_store_commit.py)
+    /// Java PartitionEntry.toPartitionStatistics uses the same computer as paths.
     fn generate_partition_statistics(
         &self,
         entries: &[ManifestEntry],
     ) -> Result<Vec<PartitionStatistics>> {
-        let partition_fields = self.table.schema().partition_fields();
-        let data_types: Vec<_> = partition_fields
-            .iter()
-            .map(|f| f.data_type().clone())
-            .collect();
-        let partition_keys: Vec<_> = self
-            .table
-            .schema()
-            .partition_keys()
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let options = self.table.schema().core_options();
+        let computer = PartitionComputer::new(
+            self.table.schema().partition_keys(),
+            self.table.schema().fields(),
+            options.partition_default_name(),
+            options.legacy_partition_name(),
+        )?;
 
         let mut stats_map: HashMap<Vec<u8>, PartitionStatistics> = HashMap::new();
 
@@ -3204,20 +3244,27 @@ impl TableCommit {
                 .map(|t| t.timestamp_millis())
                 .unwrap_or_else(|| current_time_millis() as i64);
 
-            let stats = stats_map.entry(partition_bytes.clone()).or_insert_with(|| {
-                // Parse partition spec from BinaryRow
-                let spec = self
-                    .parse_partition_spec(&partition_bytes, &partition_keys, &data_types)
-                    .unwrap_or_default();
-                PartitionStatistics {
-                    spec,
-                    record_count: 0,
-                    file_size_in_bytes: 0,
-                    file_count: 0,
-                    last_file_creation_time: 0,
-                    total_buckets: entry.total_buckets(),
+            let stats = match stats_map.entry(partition_bytes) {
+                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::hash_map::Entry::Vacant(vacant) => {
+                    let spec = if self.table.schema().partition_keys().is_empty() {
+                        HashMap::new()
+                    } else {
+                        computer
+                            .generate_part_values(&BinaryRow::from_serialized_bytes(vacant.key())?)?
+                            .into_iter()
+                            .collect()
+                    };
+                    vacant.insert(PartitionStatistics {
+                        spec,
+                        record_count: 0,
+                        file_size_in_bytes: 0,
+                        file_count: 0,
+                        last_file_creation_time: 0,
+                        total_buckets: entry.total_buckets(),
+                    })
                 }
-            });
+            };
 
             stats.record_count += sign * file.row_count;
             stats.file_size_in_bytes += sign * file.file_size;
@@ -3228,28 +3275,6 @@ impl TableCommit {
         }
 
         Ok(stats_map.into_values().collect())
-    }
-
-    /// Parse partition BinaryRow bytes into a HashMap<String, String>.
-    fn parse_partition_spec(
-        &self,
-        partition_bytes: &[u8],
-        partition_keys: &[String],
-        data_types: &[crate::spec::DataType],
-    ) -> Result<HashMap<String, String>> {
-        let mut spec = HashMap::new();
-        if partition_bytes.is_empty() || partition_keys.is_empty() {
-            return Ok(spec);
-        }
-        let row = BinaryRow::from_serialized_bytes(partition_bytes)?;
-        for (i, key) in partition_keys.iter().enumerate() {
-            let value = match extract_datum(&row, i, &data_types[i])? {
-                Some(datum) => datum.to_string(),
-                None => self.partition_default_name.clone(),
-            };
-            spec.insert(key.clone(), value);
-        }
-        Ok(spec)
     }
 
     /// Check conflicts from the earliest writer snapshot, validating row-id baselines.
@@ -3477,7 +3502,7 @@ fn ranges_overlap(left_start: i64, left_end: i64, right_start: i64, right_end: i
 }
 
 fn is_blob_data_file(file: &DataFileMeta) -> bool {
-    crate::table::dedicated_format_file_writer::is_blob_file_name(&file.file_name)
+    crate::table::dedicated_format_file_writer::is_blob_or_video_file_name(&file.file_name)
 }
 
 fn is_vector_store_file(file: &DataFileMeta) -> bool {
@@ -3617,10 +3642,13 @@ mod tests {
         include!("table_commit/parity_tests.rs");
         include!("table_commit/recovery_tests.rs");
         include!("table_commit/row_tracking_tests.rs");
+        include!("table_commit/abort_tests.rs");
+        include!("table_commit/property_tests.rs");
+        include!("table_commit/callback_tests.rs");
     }
 
     #[tokio::test]
-    async fn abort_still_cleans_up_for_a_query_auth_table() {
+    async fn abort_is_allowed_for_a_query_auth_table() {
         let table = crate::table::query_auth_table();
         let commit = crate::table::WriteBuilder::new(&table).new_commit();
         commit.abort(&[]).await.unwrap();
@@ -3975,6 +4003,94 @@ mod tests {
         TableCommit::new(table, "test-user".to_string())
     }
 
+    #[test]
+    fn partition_statistics_use_java_partition_values() {
+        use crate::spec::{DateType, DecimalType, Schema, VarBinaryType, VarCharType};
+
+        for legacy in [false, true] {
+            let schema = Schema::builder()
+                .column("text", DataType::VarChar(VarCharType::string_type()))
+                .column("day", DataType::Date(DateType::new()))
+                .column("amount", DataType::Decimal(DecimalType::new(8, 2).unwrap()))
+                .partition_keys(["text", "day", "amount"])
+                .option("partition.legacy-name", legacy.to_string())
+                .build()
+                .unwrap();
+            let table = Table::new(
+                test_file_io(),
+                Identifier::new("default", "stats"),
+                "memory:/partition-stat-values".into(),
+                TableSchema::new(0, &schema),
+                None,
+            );
+            let commit = TableCommit::new(table, "user".into());
+            let mut row = BinaryRowBuilder::new(3);
+            row.write_string(0, "a/b");
+            row.write_int(1, 1);
+            row.write_long(2, 1234);
+            let entries = vec![ManifestEntry::new(
+                FileKind::Add,
+                row.build().to_serialized_bytes(),
+                0,
+                1,
+                test_data_file("data.parquet", 5),
+                2,
+            )];
+            let stats = commit.generate_partition_statistics(&entries).unwrap();
+            assert_eq!(
+                stats[0].spec,
+                HashMap::from([
+                    ("text".into(), "a/b".into()),
+                    ("day".into(), if legacy { "1" } else { "1970-01-02" }.into()),
+                    ("amount".into(), "12.34".into()),
+                ])
+            );
+            assert_eq!(stats[0].record_count, 5);
+        }
+
+        let schema = Schema::builder()
+            .column(
+                "bytes",
+                DataType::VarBinary(VarBinaryType::new(20).unwrap()),
+            )
+            .partition_keys(["bytes"])
+            .option("partition.legacy-name", "false")
+            .build()
+            .unwrap();
+        let table = Table::new(
+            test_file_io(),
+            Identifier::new("default", "binary"),
+            "memory:/binary-partition-stats".into(),
+            TableSchema::new(0, &schema),
+            None,
+        );
+        let commit = TableCommit::new(table, "user".into());
+        for (value, expected) in [
+            (Some(b"a/b".as_slice()), "a/b"),
+            (Some(b" \t".as_slice()), "__DEFAULT_PARTITION__"),
+            (None, "__DEFAULT_PARTITION__"),
+        ] {
+            let mut row = BinaryRowBuilder::new(1);
+            if let Some(value) = value {
+                row.write_binary(0, value);
+            } else {
+                row.set_null_at(0);
+            }
+            let entries = vec![ManifestEntry::new(
+                FileKind::Add,
+                row.build().to_serialized_bytes(),
+                0,
+                1,
+                test_data_file("data.parquet", 5),
+                2,
+            )];
+            assert_eq!(
+                commit.generate_partition_statistics(&entries).unwrap()[0].spec["bytes"],
+                expected
+            );
+        }
+    }
+
     fn partition_filter_for(commit: &TableCommit, partitions: Vec<Vec<u8>>) -> PartitionFilter {
         PartitionFilter::from_partition_set(
             partitions.into_iter().collect(),
@@ -4299,13 +4415,15 @@ mod tests {
         let snap_manager = SnapshotManager::new(file_io.clone(), table_path.to_string());
         let latest = snap_manager.get_latest_snapshot().await.unwrap();
         assert!(commit
-            .is_duplicate_commit(1, &latest, 7, &CommitKind::APPEND)
+            .find_duplicate_commit(1, &latest, 7, &CommitKind::APPEND)
             .await
-            .unwrap());
-        assert!(!commit
-            .is_duplicate_commit(1, &latest, 8, &CommitKind::APPEND)
+            .unwrap()
+            .is_some());
+        assert!(commit
+            .find_duplicate_commit(1, &latest, 8, &CommitKind::APPEND)
             .await
-            .unwrap());
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
@@ -4688,7 +4806,7 @@ mod tests {
         let snapshot = snap_manager.get_latest_snapshot().await.unwrap().unwrap();
         assert_eq!(snapshot.id(), 1);
         assert!(snapshot.index_manifest().is_none());
-        assert!(!file_io.exists(&index_path).await.unwrap());
+        assert!(file_io.exists(&index_path).await.unwrap());
     }
 
     #[tokio::test]

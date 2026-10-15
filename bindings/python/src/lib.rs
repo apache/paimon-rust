@@ -18,15 +18,26 @@
 use pyo3::prelude::*;
 
 mod blob;
+mod blob_uri_reader;
+mod commit_callback;
 mod context;
 mod error;
+mod evolution;
+mod full_text_search;
+mod hybrid_search;
+mod index_build;
+mod merge_into;
+mod oss_cpp;
 mod predicate;
 mod read;
 mod schema;
+mod search_result;
+mod shard_update;
 mod table;
 mod udf;
 mod update_assignment;
 mod variant;
+mod vector_search;
 mod write;
 // ---- #285: observability ----
 mod partition;
@@ -38,5 +49,6 @@ fn pypaimon_rust(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     error::register_module(py, m)?;
     context::register_module(py, m)?;
     variant::register_module(py, m)?;
+    evolution::register_module(m)?;
     Ok(())
 }

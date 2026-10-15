@@ -64,6 +64,64 @@ def test_write_commit_read_roundtrip():
         assert result == {"id": [1, 2, 3], "name": ["a", "b", "c"]}
 
 
+@pytest.mark.parametrize("streaming", [False, True])
+def test_partial_write_type_roundtrip_and_lifecycle(tmp_path, streaming):
+    ctx = _make_empty_table(str(tmp_path))
+    table = _get_table(str(tmp_path))
+    builder = table.new_stream_write_builder() if streaming else table.new_batch_write_builder()
+    writer = builder.new_write()
+    assert writer.with_write_type(["id"]) is writer
+    writer.write_arrow(pa.record_batch([pa.array([], type=pa.int32())], names=["id"]))
+    assert writer.with_write_type(["id"]) is writer
+    for columns in [[], ["missing"], ["id", "id"]]:
+        with pytest.raises(ValueError):
+            writer.with_write_type(columns)
+    writer.write_arrow(pa.record_batch([pa.array([1, 2], type=pa.int32())], names=["id"]))
+    with pytest.raises(ValueError, match="before any data"):
+        writer.with_write_type(["id", "name"])
+    messages = writer.prepare_commit(True, 7) if streaming else writer.prepare_commit()
+    commit = builder.new_commit()
+    commit.commit(7, messages) if streaming else commit.commit(messages)
+    writer.close()
+    with pytest.raises(RuntimeError, match="closed"):
+        writer.with_write_type(["id"])
+    assert pa.Table.from_batches(ctx.sql("SELECT id, name FROM paimon.wdb.t ORDER BY id")).to_pydict() == {
+        "id": [1, 2], "name": [None, None]}
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("dynamic", [False, True])
+def test_precomputed_bucket_api_roundtrip_and_closed_writer(tmp_path, streaming, dynamic):
+    ctx = SQLContext()
+    ctx.register_catalog("paimon", {"warehouse": str(tmp_path)})
+    ctx.sql("CREATE SCHEMA paimon.wdb")
+    bucket = -1 if dynamic else 4
+    ctx.sql("CREATE TABLE paimon.wdb.t (id INT, name STRING, PRIMARY KEY (id)) "
+            "WITH ('bucket' = '{}')".format(bucket))
+    table = _get_table(str(tmp_path))
+    builder = table.new_stream_write_builder() if streaming else table.new_batch_write_builder()
+    if dynamic:
+        assert builder.with_restore_snapshot(0) is builder
+    else:
+        with pytest.raises(ValueError, match="HASH_DYNAMIC"):
+            builder.with_restore_snapshot(0)
+    writer = builder.new_write()
+    try:
+        writer.write_arrow(_batch([1, 1, 2], ["old", "new", "other"]), bucket=3)
+        with pytest.raises(ValueError, match="Bucket id"):
+            writer.write_arrow(_batch([3], ["wrong"]), bucket=-1)
+        messages = writer.prepare_commit(True, 1) if streaming else writer.prepare_commit()
+        commit = builder.new_commit()
+        commit.commit(1, messages) if streaming else commit.commit(messages)
+        assert len(messages) == 1
+    finally:
+        writer.close()
+    with pytest.raises(RuntimeError, match="closed"):
+        writer.write_arrow(_batch([4], ["closed"]), bucket=3)
+    assert pa.Table.from_batches(ctx.sql("SELECT id, name FROM paimon.wdb.t ORDER BY id")).to_pydict() == {
+        "id": [1, 2], "name": ["new", "other"]}
+
+
 
 @pytest.mark.parametrize("primary_key", [False, True])
 def test_custom_data_file_prefix_matches_table_option(tmp_path, primary_key):
@@ -206,9 +264,8 @@ def test_commit_different_builder_same_table_raises():
             table.new_batch_write_builder().new_commit().commit(messages)
 
 
-def test_abort_cleans_up_written_data():
-    # Write data, prepare commit, abort — the written files should be deleted
-    # and reading back should return zero rows.
+def test_abort_cleans_up_abandoned_data():
+    # Explicitly discard prepared messages that have never been committed.
     with tempfile.TemporaryDirectory() as warehouse:
         ctx = _make_empty_table(warehouse)
         table = _get_table(warehouse)
