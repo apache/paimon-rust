@@ -990,6 +990,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_drop_table_keeps_tables_sharing_its_name_prefix() {
+        // The memory backend deletes recursively by key prefix, as S3 and OSS do.
+        let catalog = create_memory_catalog();
+        catalog
+            .create_database("db1", false, HashMap::new())
+            .await
+            .unwrap();
+        for name in ["orders", "orders_bak", "orders2024"] {
+            catalog
+                .create_table(&Identifier::new("db1", name), testing_schema(), false)
+                .await
+                .unwrap();
+        }
+
+        catalog
+            .drop_table(&Identifier::new("db1", "orders"), false)
+            .await
+            .unwrap();
+
+        let mut tables = catalog.list_tables("db1").await.unwrap();
+        tables.sort();
+        assert_eq!(tables, ["orders2024", "orders_bak"]);
+    }
+
+    #[tokio::test]
     async fn test_create_database_should_reject_path_traversal_name() {
         let (temp_dir, catalog) = create_test_catalog();
         let escaped_path = temp_dir.path().join("escaped.db");

@@ -602,4 +602,21 @@ mod tests {
         assert!(!bm.branch_exists("branch2").await.unwrap());
         assert!(bm.branch_exists("branch3").await.unwrap());
     }
+
+    #[tokio::test]
+    async fn test_rename_branch_fallback_deletes_only_the_source_directory() {
+        // The memory backend has no native rename, so this takes the copy and
+        // recursive delete fallback that S3 and OSS take.
+        let file_io = test_file_io();
+        let table_path = "memory:/test_rename_fallback_exact".to_string();
+        let schema_manager = SchemaManager::new(file_io.clone(), table_path.clone());
+        write_schema(&file_io, &schema_manager, &test_schema()).await;
+
+        let bm = BranchManager::new(file_io, table_path);
+        bm.create_branch("b1").await.unwrap();
+        bm.create_branch("b10").await.unwrap();
+        bm.rename_branch("b1", "renamed").await.unwrap();
+
+        assert_eq!(bm.list_all().await.unwrap(), vec!["b10", "renamed"]);
+    }
 }
