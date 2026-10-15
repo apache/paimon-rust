@@ -23,7 +23,7 @@ mod validation;
 mod writer;
 
 use planning::plan_vindex_shards;
-use validation::{checked_i32, find_index_field, validate_table_options, validate_vector_field};
+use validation::{checked_i32, find_index_field, validate_vector_field};
 
 use crate::spec::{CoreOptions, Predicate};
 use crate::table::{CommitMessage, RowRange, Table};
@@ -90,7 +90,7 @@ impl<'a> VindexIndexBuildBuilder<'a> {
         let mut merged_options = self.table.schema().options().clone();
         merged_options.extend(self.options.clone());
         let core_options = CoreOptions::new(&merged_options);
-        validate_table_options(self.table, &core_options)?;
+        super::global_index_build_common::validate_build_table(self.table)?;
         let rows_per_shard = core_options.global_index_row_count_per_shard()?;
         let parallelism = core_options.global_index_build_parallelism()?;
 
@@ -138,7 +138,7 @@ impl<'a> VindexIndexBuildBuilder<'a> {
             self.table.location(),
             self.table.schema().partition_keys(),
             self.table.schema().fields(),
-            &core_options,
+            &self.table.schema().core_options(),
             snapshot.id(),
             manifest_entries,
             rows_per_shard,

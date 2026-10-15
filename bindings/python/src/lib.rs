@@ -38,6 +38,7 @@ mod udf;
 mod update_assignment;
 mod variant;
 mod vector_search;
+mod vindex;
 mod write;
 // ---- #285: observability ----
 mod partition;

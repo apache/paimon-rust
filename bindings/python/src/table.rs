@@ -230,6 +230,10 @@ impl PyTable {
         crate::index_build::PyGlobalIndexBuildBuilder::new(Arc::clone(&self.inner))
     }
 
+    fn new_global_index_drop_builder(&self) -> crate::index_build::PyGlobalIndexDropBuilder {
+        crate::index_build::PyGlobalIndexDropBuilder::new(Arc::clone(&self.inner))
+    }
+
     fn new_batch_write_builder(&self) -> PyBatchWriteBuilder {
         PyBatchWriteBuilder::new(Arc::clone(&self.inner))
     }

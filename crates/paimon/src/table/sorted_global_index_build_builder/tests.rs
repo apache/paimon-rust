@@ -691,6 +691,45 @@ async fn scan_ids(table: &Table, predicate: Predicate) -> Vec<i32> {
 }
 
 #[tokio::test]
+async fn build_options_do_not_change_source_data_paths() {
+    for kind in [BTREE_GLOBAL_INDEX_TYPE, BITMAP_GLOBAL_INDEX_TYPE] {
+        let mut options = table_options("10");
+        options.insert("data-file.path-directory".into(), "actual-data".into());
+        options.insert("data-evolution.enabled".into(), "false".into());
+        let table =
+            test_table_with_path(&format!("memory:/index_build_source_path_{kind}"), options);
+        setup_dirs(&table).await;
+        let writer = table.new_write_builder();
+        let mut write = writer.new_write().unwrap();
+        write
+            .write_arrow_batch(&data_batch(vec![1, 2], vec!["a", "b"]))
+            .await
+            .unwrap();
+        writer
+            .new_commit()
+            .commit(write.prepare_commit().await.unwrap())
+            .await
+            .unwrap();
+        let count = table
+            .new_global_index_build_builder()
+            .with_index_column("name")
+            .with_index_type(kind)
+            .with_options(HashMap::from([(
+                "data-file.path-directory".into(),
+                "wrong-directory".into(),
+            )]))
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+        let predicate = PredicateBuilder::new(table.schema().fields())
+            .equal("name", Datum::String("b".into()))
+            .unwrap();
+        assert_eq!(scan_ids(&table, predicate).await, vec![2]);
+    }
+}
+
+#[tokio::test]
 async fn scalar_build_with_deletion_vectors_preserves_physical_coverage() {
     for kind in [BTREE_GLOBAL_INDEX_TYPE, BITMAP_GLOBAL_INDEX_TYPE] {
         for deleted in [vec![0, 2], vec![0, 1, 2, 3]] {

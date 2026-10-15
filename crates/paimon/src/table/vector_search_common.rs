@@ -18,7 +18,9 @@
 //! Shared vector-search option validation, index I/O helpers, and result ordering.
 
 use crate::lumina::is_lumina_index_type;
-use crate::spec::{CoreOptions, DataField, Predicate, ROW_ID_FIELD_NAME};
+use crate::spec::{
+    CoreOptions, DataField, FileKind, IndexManifestEntry, Predicate, ROW_ID_FIELD_NAME,
+};
 use crate::table::pk_vector_position_read::{PKEY_VECTOR_POSITION_COLUMN, SEARCH_SCORE_COLUMN};
 use crate::table::read_builder::resolve_projected_fields;
 use crate::table::Table;
@@ -60,6 +62,58 @@ impl VectorIndexBackend {
             Self::Vindex => "vindex",
         }
     }
+}
+
+/// A search column selects one persisted vector format, as in Java's scan.
+/// Different columns, removed entries and scalar indexes do not participate.
+pub(super) fn validate_global_vector_index_types(
+    entries: &[IndexManifestEntry],
+    field_id: i32,
+    column: &str,
+) -> crate::Result<()> {
+    let mut index_type = None;
+    for entry in entries {
+        let file = &entry.index_file;
+        if entry.kind != FileKind::Add
+            || VectorIndexBackend::from_index_type(&file.index_type).is_none()
+            || !file
+                .global_index_meta
+                .as_ref()
+                .is_some_and(|meta| meta.index_field_id == field_id)
+        {
+            continue;
+        }
+        if let Some(previous) = index_type {
+            if previous != file.index_type.as_str() {
+                return Err(crate::Error::DataInvalid {
+                    message: format!(
+                        "Vector column '{column}' has multiple index types: {previous} and {}",
+                        file.index_type
+                    ),
+                    source: None,
+                });
+            }
+        } else {
+            index_type = Some(file.index_type.as_str());
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn configured_vector_index_type(
+    table_options: &HashMap<String, String>,
+    query_options: &HashMap<String, String>,
+    column: &str,
+) -> Option<String> {
+    [
+        "index_type".to_string(),
+        "index-type".into(),
+        "vector.index-type".into(),
+        format!("fields.{column}.index-type"),
+    ]
+    .iter()
+    .find_map(|key| query_options.get(key).or_else(|| table_options.get(key)))
+    .map(|value| value.trim().to_ascii_lowercase())
 }
 
 pub(super) fn current_tokio_runtime_handle() -> crate::Result<tokio::runtime::Handle> {

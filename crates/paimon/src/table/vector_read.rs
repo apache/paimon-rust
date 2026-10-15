@@ -101,7 +101,7 @@ impl BatchVectorRead {
                 reader.read(*plan).await
             }
             (VectorReadKind::PrimaryKey(reader), VectorScanWork::PrimaryKey(plan)) => {
-                reader.read(plan).await
+                reader.read(*plan).await
             }
             _ => Err(crate::Error::DataInvalid {
                 message: "vector plan and reader use different DE/PK address spaces".to_string(),

@@ -417,70 +417,7 @@ async fn search_pk_raw_candidates_batch_with_plan(
     // them. Partition-only predicates were already applied by the scan. The
     // residual depends on the filter and plan, so its file-local ranges are
     // shared by all queries. A file with an empty range list is skipped.
-    let residual_by_split: Option<Vec<RowRangesByFile>> = match filter {
-        Some(filter) => {
-            // The whole filter is pushed into scan planning (`PkVectorScan`), where
-            // partition-only conjuncts already prune partitions/files. Re-applying
-            // them as a per-row residual would be redundant, so keep only the data
-            // conjuncts here — a partition-only filter then needs no residual at
-            // all. Mixed partition/data conjuncts stay whole in `data_predicates`
-            // and evaluate against the materialized partition column (partition
-            // columns are physically present in primary-key data files), so there
-            // is no missing-column case to reject.
-            let (_partition_predicate, data_predicates) = split_partition_and_data_predicates(
-                filter.clone(),
-                table.schema().fields(),
-                table.schema().partition_keys(),
-            );
-            if data_predicates.is_empty() {
-                None
-            } else {
-                let file_predicates = FilePredicates {
-                    predicates: data_predicates,
-                    row_filter_factory: None,
-                    file_fields: table.schema().fields().to_vec(),
-                };
-                let residual_read_type = widen_scan_fields(&[], Some(&file_predicates));
-                let residual_reader = DataFileReader::new(
-                    table.file_io().clone(),
-                    table.schema_manager().clone(),
-                    table.schema().id(),
-                    table.schema().fields().to_vec(),
-                    residual_read_type,
-                    Vec::new(),
-                )
-                .with_table_options(table.schema().options().clone());
-                let mut per_split = Vec::with_capacity(plan.splits.len());
-                for (index, split) in plan.splits.iter().enumerate() {
-                    // The plan's selection for this split, so the residual is
-                    // evaluated over the rows an engine-supplied split allows rather
-                    // than over the whole file.
-                    let allowed_rows = plan
-                        .physical_row_ranges_by_split
-                        .as_ref()
-                        .and_then(|per_split| per_split.get(index));
-                    per_split.push(
-                        residual_row_ranges_by_file(
-                            &residual_reader,
-                            &split.data_split,
-                            &split.active_files,
-                            &file_predicates,
-                            allowed_rows,
-                        )
-                        .await?,
-                    );
-                }
-                Some(per_split)
-            }
-        }
-        None => None,
-    };
-    // Preserve the external plan's ranges as well as the residual restriction.
-    let row_ranges_by_split = intersect_row_ranges_by_split(
-        plan.physical_row_ranges_by_split.as_deref(),
-        residual_by_split,
-        plan.splits.len(),
-    )?;
+    let row_ranges_by_split = filtered_row_ranges(table, filter, plan).await?;
 
     // Build the exact-fallback search on demand: the kernel calls this only for a
     // file it actually searches (uncovered by ANN, residual-allowed, and only when
@@ -632,6 +569,78 @@ async fn search_pk_candidates_batch_with_plan(
     }
 
     Ok(per_query_candidates)
+}
+
+/// Resolve the plan's residual physical selection once for any search reader.
+pub(super) async fn filtered_row_ranges(
+    table: &Table,
+    filter: Option<&Predicate>,
+    plan: &PkVectorScanPlan,
+) -> crate::Result<Option<Vec<RowRangesByFile>>> {
+    let residual_by_split: Option<Vec<RowRangesByFile>> = match filter {
+        Some(filter) => {
+            // The whole filter is pushed into scan planning (`PkVectorScan`), where
+            // partition-only conjuncts already prune partitions/files. Re-applying
+            // them as a per-row residual would be redundant, so keep only the data
+            // conjuncts here — a partition-only filter then needs no residual at
+            // all. Mixed partition/data conjuncts stay whole in `data_predicates`
+            // and evaluate against the materialized partition column (partition
+            // columns are physically present in primary-key data files), so there
+            // is no missing-column case to reject.
+            let (_partition_predicate, data_predicates) = split_partition_and_data_predicates(
+                filter.clone(),
+                table.schema().fields(),
+                table.schema().partition_keys(),
+            );
+            if data_predicates.is_empty() {
+                None
+            } else {
+                let file_predicates = FilePredicates {
+                    predicates: data_predicates,
+                    row_filter_factory: None,
+                    file_fields: table.schema().fields().to_vec(),
+                };
+                let residual_read_type = widen_scan_fields(&[], Some(&file_predicates));
+                let residual_reader = DataFileReader::new(
+                    table.file_io().clone(),
+                    table.schema_manager().clone(),
+                    table.schema().id(),
+                    table.schema().fields().to_vec(),
+                    residual_read_type,
+                    Vec::new(),
+                )
+                .with_table_options(table.schema().options().clone());
+                let mut per_split = Vec::with_capacity(plan.splits.len());
+                for (index, split) in plan.splits.iter().enumerate() {
+                    // The plan's selection for this split, so the residual is
+                    // evaluated over the rows an engine-supplied split allows rather
+                    // than over the whole file.
+                    let allowed_rows = plan
+                        .physical_row_ranges_by_split
+                        .as_ref()
+                        .and_then(|per_split| per_split.get(index));
+                    per_split.push(
+                        residual_row_ranges_by_file(
+                            &residual_reader,
+                            &split.data_split,
+                            &split.active_files,
+                            &file_predicates,
+                            allowed_rows,
+                        )
+                        .await?,
+                    );
+                }
+                Some(per_split)
+            }
+        }
+        None => None,
+    };
+    // Preserve the external plan's ranges as well as the residual restriction.
+    intersect_row_ranges_by_split(
+        plan.physical_row_ranges_by_split.as_deref(),
+        residual_by_split,
+        plan.splits.len(),
+    )
 }
 
 /// Read the plan's allowed physical rows and return merged ranges matching the

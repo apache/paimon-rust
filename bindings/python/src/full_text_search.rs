@@ -150,6 +150,17 @@ pub struct PyFullTextScanPlan {
 }
 #[pymethods]
 impl PyFullTextScanPlan {
+    fn _metadata(&self, py: Python<'_>) -> PyResult<String> {
+        let splits = py
+            .detach(|| runtime().block_on(self.inner.splits()))
+            .map_err(to_py_err)?;
+        crate::vector_search::search_plan_metadata_json(
+            self.inner.snapshot(),
+            self.inner.snapshot_id(),
+            splits,
+        )
+    }
+
     fn snapshot_id(&self) -> Option<i64> {
         self.inner.snapshot_id()
     }
