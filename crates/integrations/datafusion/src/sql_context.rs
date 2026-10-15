@@ -1262,6 +1262,17 @@ impl SQLContext {
         name: &ObjectName,
         sql_options: SQLOptions,
     ) -> DFResult<DataFrame> {
+        // Temporary objects shadow catalog tables; as in DataFusion, one without a
+        // definition shows NULL.
+        if let Some((catalog_name, database, table, temp)) = self.temp_table_for(name).await? {
+            return self.show_create_result(
+                catalog_name,
+                database,
+                table,
+                temp.get_table_definition(),
+                true,
+            );
+        }
         let (catalog, catalog_name, identifier) = self.resolve_catalog_and_table(name)?;
         let table = match catalog.get_table(&identifier).await {
             Ok(table) => table,
@@ -1272,19 +1283,76 @@ impl SQLContext {
         };
         crate::table_loader::ensure_paimon_served(&table, &identifier)?;
         let definition = crate::table::build_table_definition(&table)?;
+        self.show_create_result(
+            catalog_name,
+            identifier.database().to_string(),
+            identifier.object().to_string(),
+            Some(&definition),
+            false,
+        )
+    }
 
+    /// The temporary table or view `name` resolves to in queries.
+    async fn temp_table_for(
+        &self,
+        name: &ObjectName,
+    ) -> DFResult<Option<(String, String, String, Arc<dyn TableProvider>)>> {
+        let enable_ident_normalization = self.ctx.enable_ident_normalization();
+        let parts: Vec<String> = name
+            .0
+            .iter()
+            .filter_map(|part| part.as_ident())
+            .map(|ident| normalize_schema_identifier(ident, enable_ident_normalization))
+            .collect();
+        let table_ref = match parts.as_slice() {
+            [table] => TableReference::bare(table.as_str()),
+            [database, table] => TableReference::partial(database.as_str(), table.as_str()),
+            [catalog, database, table] => {
+                TableReference::full(catalog.as_str(), database.as_str(), table.as_str())
+            }
+            _ => return Ok(None),
+        };
+        let (catalog_name, database, table) = self.resolve_temp_table_name(table_ref)?;
+        // Queries resolve information_schema before consulting the catalog.
+        if database == datafusion::catalog::information_schema::INFORMATION_SCHEMA
+            && self.ctx.copied_config().information_schema()
+        {
+            return Ok(None);
+        }
+        let Some(catalog_provider) = self.ctx.catalog(&catalog_name) else {
+            return Ok(None);
+        };
+        let Some(provider) =
+            catalog_provider.downcast_ref::<crate::catalog::PaimonCatalogProvider>()
+        else {
+            return Ok(None);
+        };
+        Ok(provider
+            .temp_table(&database, &table)
+            .await?
+            .map(|temp| (catalog_name, database, table, temp)))
+    }
+
+    fn show_create_result(
+        &self,
+        catalog_name: String,
+        database: String,
+        table: String,
+        definition: Option<&str>,
+        nullable: bool,
+    ) -> DFResult<DataFrame> {
         let schema = Arc::new(Schema::new(vec![
             Field::new("table_catalog", ArrowDataType::Utf8, false),
             Field::new("table_schema", ArrowDataType::Utf8, false),
             Field::new("table_name", ArrowDataType::Utf8, false),
-            Field::new("definition", ArrowDataType::Utf8, false),
+            Field::new("definition", ArrowDataType::Utf8, nullable),
         ]));
         let batch = RecordBatch::try_new(
             schema,
             vec![
                 Arc::new(StringArray::from(vec![catalog_name])),
-                Arc::new(StringArray::from(vec![identifier.database().to_string()])),
-                Arc::new(StringArray::from(vec![identifier.object().to_string()])),
+                Arc::new(StringArray::from(vec![database])),
+                Arc::new(StringArray::from(vec![table])),
                 Arc::new(StringArray::from(vec![definition])),
             ],
         )?;
