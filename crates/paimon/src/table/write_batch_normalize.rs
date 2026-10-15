@@ -32,7 +32,9 @@ use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::{DataType, Field};
 use std::sync::Arc;
 
-pub(super) fn normalize_write_array(array: &ArrayRef, expected: &DataType) -> Result<ArrayRef> {
+/// Normalize equivalent Arrow layouts for writing, validating NOT NULL children
+/// only in values visible through non-NULL parents.
+pub fn normalize_write_array(array: &ArrayRef, expected: &DataType) -> Result<ArrayRef> {
     normalize_visible_array(array, expected, None)
 }
 

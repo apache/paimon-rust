@@ -68,7 +68,7 @@ pub(crate) fn datafusion_arrow_schema(
     schema_force_view_types: bool,
 ) -> DFResult<ArrowSchemaRef> {
     let paimon_schema =
-        paimon::arrow::build_target_arrow_schema(fields).map_err(to_datafusion_error)?;
+        paimon::arrow::build_read_arrow_schema(fields).map_err(to_datafusion_error)?;
     let fields = paimon_schema
         .fields()
         .iter()
@@ -900,6 +900,28 @@ mod tests {
             panic!("row field should map to an Arrow Struct");
         };
         assert_eq!(row_fields[0].data_type(), &ArrowDataType::Utf8);
+    }
+
+    #[test]
+    fn test_datafusion_read_schema_keeps_cast_nulls_visible_to_optimizers() {
+        let decimal =
+            DataType::Decimal(paimon::spec::DecimalType::with_nullable(false, 3, 2).unwrap());
+        let fields = vec![
+            DataField::new(0, "value".into(), decimal.clone()),
+            DataField::new(1, "values".into(), DataType::Array(ArrayType::new(decimal))),
+        ];
+        let schema = datafusion_arrow_schema(&fields, false).unwrap();
+        assert!(schema.field(0).is_nullable());
+        let ArrowDataType::List(child) = schema.field(1).data_type() else {
+            panic!()
+        };
+        assert!(child.is_nullable());
+        let write_schema = paimon::arrow::build_target_arrow_schema(&fields).unwrap();
+        assert!(!write_schema.field(0).is_nullable());
+        let ArrowDataType::List(child) = write_schema.field(1).data_type() else {
+            panic!()
+        };
+        assert!(!child.is_nullable());
     }
 
     fn planned_file_names(scan: &PaimonTableScan) -> Vec<String> {

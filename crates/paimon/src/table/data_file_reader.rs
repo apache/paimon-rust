@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#[cfg(test)]
 use crate::arrow::build_target_arrow_schema;
 use crate::arrow::format::blob::DEFAULT_BLOB_READ_PARALLELISM;
 use crate::arrow::format::{
@@ -617,7 +618,7 @@ impl DataFileReader {
         let mosaic_prefetch = self.mosaic_prefetch;
         let read_timing = self.read_timing.clone();
 
-        let target_schema = build_target_arrow_schema(&read_type)?;
+        let target_schema = crate::arrow::build_read_arrow_schema(&read_type)?;
         let file_fields = data_fields.clone().unwrap_or_else(|| table_fields.clone());
         let data_schema_fields = data_schema_fields_for_file(
             &file_fields,
@@ -954,7 +955,7 @@ impl DataFileReader {
         let table_options = Arc::clone(&self.table_options);
         let mosaic_prefetch = self.mosaic_prefetch;
 
-        let target_schema = build_target_arrow_schema(&read_type)?;
+        let target_schema = crate::arrow::build_read_arrow_schema(&read_type)?;
         let file_fields = data_fields.clone().unwrap_or_else(|| table_fields.clone());
         let data_schema_fields =
             data_schema_fields_for_file(&file_fields, file_meta.write_cols.as_deref(), None)?;

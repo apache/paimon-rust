@@ -1475,18 +1475,15 @@ mod tests {
             field(4, "b", DataType::VarBinary(VarBinaryType::new(10).unwrap())),
             field(5, "i", DataType::Int(IntType::new())),
         ];
-        for (target, mask) in [
-            ("ts", cast("i", "TIMESTAMP(3)")),
-            ("d", cast("b", "DOUBLE")),
-        ] {
-            let message = refusal(parse(&[], &[(target, &mask)], &fields));
-            assert!(
-                message.contains("existing Python/Java scalar"),
-                "{mask}: {message}"
-            );
-        }
+        let mask = cast("b", "DOUBLE");
+        let message = refusal(parse(&[], &[("d", &mask)], &fields));
+        assert!(
+            message.contains("existing Python/Java scalar"),
+            "{mask}: {message}"
+        );
         for (target, mask) in [
             ("n", cast("s", "BIGINT")),
+            ("ts", cast("i", "TIMESTAMP(3)")),
             ("ts", cast("n", "TIMESTAMP(3)")),
             ("s", cast("d", "VARCHAR(10)")),
             ("s", cast("b", "VARCHAR(10)")),

@@ -342,7 +342,11 @@ pub(super) fn timestamp_precision(
         value.and_then(|value| {
             let nanos = i128::from(value) * nanos_per_tick(source_unit);
             let truncated = nanos.div_euclid(quantum) * quantum;
-            i64::try_from(truncated / nanos_per_tick(target_unit)).ok()
+            // Java Timestamp keeps signed-long milliseconds. Flooring below
+            // i64::MIN wraps that millisecond value before Arrow unit scaling.
+            let millis = truncated.div_euclid(1_000_000) as i64;
+            let nanos = i128::from(millis) * 1_000_000 + truncated.rem_euclid(1_000_000);
+            i64::try_from(nanos / nanos_per_tick(target_unit)).ok()
         })
     }));
     Ok(Some(

@@ -19,6 +19,7 @@ use super::{
     blob_file_row_range, row_range_overlaps_any, selected_absolute_row_ranges_for_file, BlobBunch,
     DeletionVectorContext,
 };
+#[cfg(test)]
 use crate::arrow::build_target_arrow_schema;
 use crate::arrow::format::blob::{
     build_blob_array_batch, build_blob_batch, build_blob_map_batch, BlobFieldKind, BlobReadValue,
@@ -164,7 +165,7 @@ pub(super) fn read(
         });
     }
 
-    let target_schema = build_target_arrow_schema(&read_fields)?;
+    let target_schema = crate::arrow::build_read_arrow_schema(&read_fields)?;
     let field_kind = match read_fields[0].data_type() {
         DataType::Blob(_) => BlobFieldKind::Scalar,
         DataType::Array(_) => BlobFieldKind::Array,

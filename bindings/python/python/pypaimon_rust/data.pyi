@@ -19,6 +19,20 @@ from typing import Sequence
 
 import pyarrow
 
+def read_arrow_schema(fields: str) -> pyarrow.Schema:
+    """Build the runtime read schema from Paimon fields (JSON)."""
+    ...
+
+def normalize_array_for_write(column: pyarrow.Array, target_type: pyarrow.DataType) -> pyarrow.Array:
+    """Normalize a write layout and validate visible NOT NULL children in core."""
+    ...
+
+def cast_array_for_schema_evolution(
+    column: pyarrow.Array, source_type: str, target_type: str
+) -> pyarrow.Array:
+    """Cast historical Paimon types (JSON) using the core table-reader rules."""
+    ...
+
 def variant_get_numeric_fields(
     column: pyarrow.Array, fields: Sequence[str]
 ) -> pyarrow.FixedSizeListArray:

@@ -22,7 +22,6 @@ use super::incremental_scan::{IncrementalPlan, IncrementalScanMode, IncrementalS
 use super::kv_file_reader::{KeyValueFileReader, KeyValueReadConfig};
 use super::read_builder::split_scan_predicates;
 use super::{ArrowRecordBatchStream, Table};
-use crate::arrow::build_target_arrow_schema;
 use crate::arrow::format::blob::DEFAULT_BLOB_READ_PARALLELISM;
 use crate::arrow::format::MosaicPrefetchOptions;
 use crate::arrow::ReadBudget;
@@ -852,7 +851,7 @@ impl<'a> PaimonTableRead<'a> {
         let key_indices = primary_key_indices(self.table, &diff_read_type)?;
         ensure_diff_supported_read_type(&diff_read_type, &key_indices)?;
         let value_indices = value_indices_for_diff(self.table, &diff_read_type);
-        let output_schema = build_target_arrow_schema(&self.read_type)?;
+        let output_schema = crate::arrow::build_read_arrow_schema(&self.read_type)?;
         let output_col_indices = self
             .read_type
             .iter()
@@ -1762,7 +1761,7 @@ fn audit_schema_for_read_type(
         ));
     }
     fields.extend(read_type.iter().cloned());
-    build_target_arrow_schema(&fields)
+    crate::arrow::build_read_arrow_schema(&fields)
 }
 
 fn audit_sequence_number_enabled(table: &Table) -> bool {

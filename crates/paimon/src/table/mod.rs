@@ -175,6 +175,7 @@ pub(crate) mod vector_search_result;
 mod vector_search_test_utils;
 mod vindex_index_build_builder;
 mod write_batch_normalize;
+pub use write_batch_normalize::normalize_write_array;
 mod write_builder;
 
 use crate::Result;
