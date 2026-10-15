@@ -19,12 +19,12 @@
 
 use crate::error::to_py_err;
 use crate::predicate::dict_to_table_predicate;
+use crate::search_result::PySearchResult;
 use paimon::spec::Predicate;
 use paimon::table::{FullTextRead, FullTextScan, FullTextScanPlan, Table};
 use paimon_datafusion::runtime::runtime;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 #[derive(Default)]
@@ -123,10 +123,10 @@ impl PyFullTextSearchBuilder {
                 .map_err(to_py_err)?,
         })
     }
-    fn execute_local(&self, py: Python<'_>) -> PyResult<PyFullTextSearchResult> {
+    fn execute_local(&self, py: Python<'_>) -> PyResult<PySearchResult> {
         let builder = self.config.builder(&self.table).map_err(to_py_err)?;
         py.detach(|| runtime().block_on(builder.execute_scored()))
-            .map(|inner| PyFullTextSearchResult { inner })
+            .map(PySearchResult::new)
             .map_err(to_py_err)
     }
 }
@@ -161,32 +161,9 @@ pub struct PyFullTextRead {
 }
 #[pymethods]
 impl PyFullTextRead {
-    fn read_plan(
-        &self,
-        py: Python<'_>,
-        plan: &PyFullTextScanPlan,
-    ) -> PyResult<PyFullTextSearchResult> {
+    fn read_plan(&self, py: Python<'_>, plan: &PyFullTextScanPlan) -> PyResult<PySearchResult> {
         py.detach(|| runtime().block_on(self.inner.read(plan.inner.clone())))
-            .map(|inner| PyFullTextSearchResult { inner })
+            .map(PySearchResult::new)
             .map_err(to_py_err)
-    }
-}
-
-#[pyclass(name = "FullTextSearchResult", module = "pypaimon_rust.datafusion")]
-pub struct PyFullTextSearchResult {
-    inner: paimon::full_text::SearchResult,
-}
-#[pymethods]
-impl PyFullTextSearchResult {
-    fn __len__(&self) -> usize {
-        self.inner.len()
-    }
-    fn row_ids(&self) -> HashMap<u64, f32> {
-        self.inner
-            .row_ids
-            .iter()
-            .copied()
-            .zip(self.inner.scores.iter().copied())
-            .collect()
     }
 }

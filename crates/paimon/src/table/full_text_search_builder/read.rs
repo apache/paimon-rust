@@ -43,7 +43,32 @@ impl FullTextRead {
             .ok_or_else(|| crate::Error::ConfigInvalid {
                 message: "Query text must be set via with_query() or with_query_text()".into(),
             })?;
-        let query = if builder.query_is_dsl {
+        if context.primary_key_field_id.is_some() {
+            if builder
+                .table
+                .schema()
+                .core_options()
+                .full_text_index_search_mode()?
+                != GlobalIndexSearchMode::Fast
+            {
+                return Err(crate::Error::DataInvalid { message: "primary-key full-text search supports only the FAST global-index search mode".into(), source: None });
+            }
+            if let Some(filter) = &context.filter {
+                let (_, data) = super::super::bucket_filter::split_partition_and_data_predicates(
+                    filter.clone(),
+                    builder.table.schema().fields(),
+                    builder.table.schema().partition_keys(),
+                );
+                if !data.is_empty() {
+                    return Err(crate::Error::Unsupported {
+                        message:
+                            "Primary-key full-text search does not support non-partition filters"
+                                .into(),
+                    });
+                }
+            }
+        }
+        let query = if builder.query_is_dsl || context.primary_key_field_id.is_some() {
             query.to_string()
         } else {
             normalize_query_text(query, &context.column)?
@@ -56,7 +81,7 @@ impl FullTextRead {
         })
     }
 
-    pub async fn read(&self, plan: FullTextScanPlan) -> crate::Result<SearchResult> {
+    pub async fn read(&self, plan: FullTextScanPlan) -> crate::Result<crate::table::SearchResult> {
         CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
         CoreOptions::new(plan.table.schema().options()).ensure_read_authorized()?;
         if self.context != plan.context {
@@ -65,12 +90,44 @@ impl FullTextRead {
                 source: None,
             });
         }
-        if plan.snapshot_id.is_none() {
-            return Ok(SearchResult::empty());
+        let table = std::sync::Arc::new(plan.table.clone());
+        if self.context.primary_key_field_id.is_some() {
+            let empty = super::super::pk_full_text_scan::PrimaryKeyFullTextScanPlan {
+                snapshot_id: 0,
+                splits: Vec::new(),
+            };
+            let source = plan.primary_key_plan.as_ref().unwrap_or(&empty);
+            let materialize = DataFileReader::new(
+                plan.table.file_io().clone(),
+                plan.table.schema_manager().clone(),
+                plan.table.schema().id(),
+                plan.table.schema().fields().to_vec(),
+                plan.table.schema().fields().to_vec(),
+                Vec::new(),
+            )
+            .with_table_options(plan.table.schema().options().clone());
+            let read = PrimaryKeyFullTextRead::new(
+                plan.table.file_io().clone(),
+                materialize,
+                plan.table.location().trim_end_matches('/').to_string(),
+                plan.table
+                    .schema()
+                    .core_options()
+                    .index_file_in_data_file_dir(),
+            );
+            let result = read
+                .search_route(source, &self.search.query_text, self.search.limit)
+                .await?;
+            return crate::table::SearchResult::from_full_text_primary_key(
+                table,
+                result.snapshot_id,
+                result.candidates,
+                result.splits,
+            );
         }
         let mut search = self.search.clone();
         search.include_row_ids = self.context.include_row_ids.clone();
-        evaluate_full_text_search(
+        let hits = evaluate_full_text_search(
             FullTextSearchEvaluation {
                 table: Some(&plan.table),
                 file_io: plan.table.file_io(),
@@ -84,6 +141,10 @@ impl FullTextRead {
             &plan.entries,
             &search,
         )
-        .await
+        .await?;
+        Ok(crate::table::SearchResult::from_full_text_row_ids(
+            table,
+            crate::vector_search::ScoredRowIds::new(hits.row_ids, hits.scores),
+        ))
     }
 }

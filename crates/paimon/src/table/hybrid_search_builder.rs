@@ -1043,7 +1043,7 @@ async fn execute_full_text_route(
 ) -> crate::Result<ScoredRowIds> {
     let builder = full_text_route_builder(table, route, filter);
     let result = builder.execute_scored().await?;
-    Ok(ScoredRowIds::new(result.row_ids, result.scores))
+    result.into_row_ids()
 }
 
 #[cfg(not(feature = "fulltext"))]

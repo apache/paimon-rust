@@ -29,6 +29,7 @@ pub(super) struct PlanContext {
     pub(super) column: String,
     pub(super) filter: Option<Predicate>,
     pub(super) include_row_ids: Option<RoaringTreemap>,
+    pub(super) primary_key_field_id: Option<i32>,
 }
 
 impl PlanContext {
@@ -57,8 +58,15 @@ impl PlanContext {
                 message: format!("Full-text column '{column}' must be a character string"),
             });
         }
-        if resolves_to_pk_full_text_path(&builder.table.schema().core_options(), column) {
-            return Err(crate::Error::DataInvalid { message: "primary-key full-text search does not produce global row ids; use the materialized read (execute_read) instead".into(), source: None });
+        let primary_key_field_id =
+            resolves_to_pk_full_text_path(&builder.table.schema().core_options(), column)
+                .then_some(field.id());
+        if primary_key_field_id.is_some() && builder.include_row_ids.is_some() {
+            return Err(crate::Error::Unsupported {
+                message:
+                    "primary-key full-text search uses physical file positions, not global row IDs"
+                        .into(),
+            });
         }
         Ok(Self {
             location: builder.table.location().trim_end_matches('/').into(),
@@ -66,11 +74,12 @@ impl PlanContext {
             column: column.into(),
             filter: builder.filter.clone(),
             include_row_ids: builder.include_row_ids.clone(),
+            primary_key_field_id,
         })
     }
 }
 
-/// One selected snapshot and its partition-pruned index entries. A plan remains
+/// One selected snapshot and its partition-pruned indexes or PK buckets. A plan remains
 /// usable after its scan is dropped, and does not re-resolve the latest snapshot.
 #[derive(Clone)]
 pub struct FullTextScanPlan {
@@ -81,6 +90,8 @@ pub struct FullTextScanPlan {
     pub(super) snapshot_id: Option<i64>,
     pub(super) partition_filter: Option<Predicate>,
     pub(super) row_filter: Option<Predicate>,
+    pub(super) primary_key_plan:
+        Option<super::super::pk_full_text_scan::PrimaryKeyFullTextScanPlan>,
 }
 
 impl FullTextScanPlan {
@@ -114,6 +125,7 @@ impl FullTextScan {
             snapshot_id: None,
             partition_filter: None,
             row_filter: None,
+            primary_key_plan: None,
         };
         let mut partition_pruner = None;
         if let Some(filter) = &self.context.filter {
@@ -165,6 +177,14 @@ impl FullTextScan {
         // Pin the data without changing the schema already bound by the query.
         // A schema-only rename does not create a new data snapshot.
         plan.table = self.table.copy_with_pinned_snapshot(Some(&snapshot));
+        if let Some(field_id) = self.context.primary_key_field_id {
+            plan.primary_key_plan = Some(
+                PrimaryKeyFullTextScan::new(&plan.table, field_id, self.context.filter.clone())
+                    .plan()
+                    .await?,
+            );
+            return Ok(plan);
+        }
         if let Some(name) = snapshot.index_manifest() {
             let path = self.table.snapshot_manager().manifest_path(name);
             plan.entries = IndexManifest::read(self.table.file_io(), &path).await?;
