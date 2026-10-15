@@ -26,7 +26,7 @@ use crate::table::pk_vector_orchestrator::{
 };
 use crate::table::pk_vector_read::materialize_positions;
 use crate::table::vector_search_common::resolve_materialize_read_type;
-use crate::table::{ArrowRecordBatchStream, Table};
+use crate::table::{ArrowRecordBatchStream, DataSplit, GlobalIndexResult, Table};
 use crate::vector_search::ScoredRowIds;
 use crate::vindex::pkvector::metric::VectorSearchMetric;
 use std::sync::Arc;
@@ -200,14 +200,38 @@ impl SearchResult {
     /// Snapshot-scoped PK selections in Java SplitSerializer v1 format.
     /// The ranges are physical file positions and scores are aligned to them.
     pub fn serialize_primary_key_splits(&self) -> crate::Result<Vec<Vec<u8>>> {
+        self.primary_key_splits()?
+            .iter()
+            .map(DataSplit::serialize_split_v1)
+            .collect()
+    }
+
+    /// Reuse this selection in an ordinary batch scan. PK selections carry
+    /// the captured split metadata; DE selections use global row-ID ranges.
+    pub fn to_global_index_result(&self) -> crate::Result<GlobalIndexResult> {
+        match &self.hits {
+            SearchHits::PrimaryKey { .. } => Ok(GlobalIndexResult::Splits {
+                snapshot_id: self.snapshot_id,
+                splits: self.primary_key_splits()?,
+            }),
+            SearchHits::DataEvolution { hits, .. } => {
+                Ok(GlobalIndexResult::ScoredRowIds(hits.clone()))
+            }
+        }
+    }
+
+    fn primary_key_splits(&self) -> crate::Result<Vec<DataSplit>> {
         self.indexed_splits()?
             .iter()
             .map(|selected| {
-                selected
+                let split = selected
                     .split
                     .clone()
-                    .with_selected_row_ranges(selected.row_ranges.clone())
-                    .serialize_split_v1_with_scores(selected.scores.as_deref())
+                    .with_selected_row_ranges(selected.row_ranges.clone());
+                match &selected.scores {
+                    Some(scores) => split.with_scores(scores.clone()),
+                    None => Ok(split),
+                }
             })
             .collect()
     }

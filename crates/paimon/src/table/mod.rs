@@ -78,6 +78,7 @@ mod full_text_search_builder;
 mod global_index_build_builder;
 pub(crate) mod global_index_build_common;
 mod global_index_drop_builder;
+mod global_index_result;
 pub(crate) mod global_index_scanner;
 mod global_index_search_filter;
 mod global_index_types;
@@ -202,6 +203,7 @@ pub use full_text_search_builder::{
 use futures::stream::BoxStream;
 pub use global_index_build_builder::GlobalIndexBuildBuilder;
 pub use global_index_drop_builder::GlobalIndexDropBuilder;
+pub use global_index_result::GlobalIndexResult;
 pub use global_index_types::{normalize_global_index_type, SUPPORTED_GLOBAL_INDEX_TYPES_FOR_DROP};
 pub use hybrid_search_builder::{
     HybridSearchBuilder, HybridSearchRanker, HybridSearchRoute, HybridSearchRouteKind,

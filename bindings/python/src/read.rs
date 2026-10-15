@@ -26,7 +26,8 @@ use futures::stream::BoxStream;
 use futures::TryStreamExt;
 use paimon::spec::{is_variant_extraction_row, DataField, DataType, Predicate, RowType};
 use paimon::table::{
-    ArrowRecordBatchStream, DataSplit, IncrementalScanMode, RowRange, StreamTableScan, Table,
+    ArrowRecordBatchStream, DataSplit, GlobalIndexResult, IncrementalScanMode, RowRange,
+    StreamTableScan, Table,
 };
 use paimon_datafusion::runtime::runtime;
 use pyo3::exceptions::{PyBaseException, PyRuntimeError, PyTypeError, PyValueError};
@@ -344,6 +345,7 @@ impl PyReadBuilder {
             row_ranges: self.row_ranges.clone(),
             case_sensitive: self.case_sensitive,
             incremental_scan: None,
+            global_index_result: None,
             row_position_slice: None,
             row_position_shard: None,
             chunk_shuffle: None,
@@ -407,6 +409,7 @@ pub struct PyTableScan {
     row_ranges: Option<Vec<RowRange>>,
     case_sensitive: bool,
     incremental_scan: Option<PyIncrementalScan>,
+    global_index_result: Option<GlobalIndexResult>,
     row_position_slice: Option<(u64, u64)>,
     row_position_shard: Option<(u64, u64)>,
     chunk_shuffle: Option<PyChunkShuffle>,
@@ -443,6 +446,11 @@ fn parse_incremental_scan_mode(mode: &str) -> PyResult<IncrementalScanMode> {
 impl PyTableScan {
     fn core_scan(&self) -> PyResult<paimon::table::TableScan<'_>> {
         let mut scan = self.read_builder()?.new_scan();
+        if let Some(result) = &self.global_index_result {
+            scan = scan
+                .with_global_index_result(result.clone())
+                .map_err(to_py_err)?;
+        }
         if let Some((start, end)) = self.row_position_slice {
             scan = scan
                 .with_row_position_slice(start, end)
@@ -471,6 +479,11 @@ impl PyTableScan {
         mode: IncrementalScanMode,
     ) -> PyResult<paimon::table::IncrementalScan<'_>> {
         let mut scan = self.read_builder()?.new_incremental_scan(mode, start, end);
+        if let Some(result) = &self.global_index_result {
+            scan = scan
+                .with_global_index_result(result.clone())
+                .map_err(to_py_err)?;
+        }
         if let Some((start, end)) = self.row_position_slice {
             scan = scan
                 .with_row_position_slice(start, end)
@@ -645,6 +658,37 @@ impl PyStreamTableScan {
 
 #[pymethods]
 impl PyTableScan {
+    /// Supply an evaluated selection; validation and authorization stay in core.
+    fn with_global_index_result<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        result: &Bound<'py, PyAny>,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        let result = if let Ok(result) = result.extract::<PyRef<PyGlobalIndexResult>>() {
+            result.inner.clone()
+        } else if let Ok(result) = result.extract::<PyRef<crate::search_result::PySearchResult>>() {
+            result.inner.to_global_index_result().map_err(to_py_err)?
+        } else {
+            return Err(PyTypeError::new_err(
+                "Expected GlobalIndexResult or SearchResult",
+            ));
+        };
+        if let Some(incremental) = slf.incremental_scan {
+            slf.core_incremental_scan(
+                incremental.start_snapshot_id,
+                incremental.end_snapshot_id,
+                incremental.mode,
+            )?
+            .with_global_index_result(result.clone())
+            .map_err(to_py_err)?;
+        } else {
+            slf.core_scan()?
+                .with_global_index_result(result.clone())
+                .map_err(to_py_err)?;
+        }
+        slf.global_index_result = Some(result);
+        Ok(slf)
+    }
+
     /// Select a half-open range of append-table row positions.
     fn with_row_position_slice(
         mut slf: PyRefMut<'_, Self>,
@@ -935,6 +979,52 @@ pub struct PySplit {
     pub(crate) inner: DataSplit,
 }
 
+/// Transport an external result without interpreting physical file positions
+/// in the Python binding. SearchResult is accepted directly by TableScan too.
+#[pyclass(name = "GlobalIndexResult", module = "pypaimon_rust.datafusion")]
+pub struct PyGlobalIndexResult {
+    inner: GlobalIndexResult,
+}
+
+#[pymethods]
+impl PyGlobalIndexResult {
+    #[staticmethod]
+    fn from_splits(snapshot_id: Option<i64>, splits: &Bound<'_, PyAny>) -> PyResult<Self> {
+        Ok(Self {
+            inner: GlobalIndexResult::Splits {
+                snapshot_id,
+                splits: extract_splits(splits)?,
+            },
+        })
+    }
+
+    #[staticmethod]
+    fn from_row_ranges(ranges: Vec<(i64, i64)>) -> PyResult<Self> {
+        let ranges = ranges
+            .into_iter()
+            .map(|(from, to)| {
+                if from > to {
+                    Err(PyValueError::new_err("row range start must be <= end"))
+                } else {
+                    Ok(RowRange::new(from, to))
+                }
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        Ok(Self {
+            inner: GlobalIndexResult::RowRanges(ranges),
+        })
+    }
+
+    #[staticmethod]
+    fn from_scored_row_ids(scores: HashMap<u64, f32>) -> Self {
+        Self {
+            inner: GlobalIndexResult::ScoredRowIds(
+                paimon::vector_search::ScoredRowIds::from_scored_map(scores),
+            ),
+        }
+    }
+}
+
 impl PySplit {
     fn to_bytes(&self) -> PyResult<Vec<u8>> {
         serde_json::to_vec(&self.inner)
@@ -972,7 +1062,7 @@ impl PySplit {
     ///
     /// This is deliberately separate from the constructor used by pickle:
     /// pickle bytes are an opaque Rust JSON encoding, while this method accepts
-    /// Java/Python-compatible DataSplit and score-free IndexedSplit frames.
+    /// Java/Python-compatible DataSplit and IndexedSplit frames, including scores.
     #[staticmethod]
     fn deserialize(state: &Bound<'_, PyBytes>) -> PyResult<Self> {
         Ok(Self {

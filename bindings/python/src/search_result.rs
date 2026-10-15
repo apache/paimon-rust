@@ -26,7 +26,7 @@ use std::collections::HashMap;
 
 #[pyclass(name = "SearchResult", module = "pypaimon_rust.datafusion")]
 pub struct PySearchResult {
-    inner: SearchResult,
+    pub(crate) inner: SearchResult,
 }
 
 impl PySearchResult {

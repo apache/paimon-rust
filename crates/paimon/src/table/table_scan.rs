@@ -23,6 +23,7 @@
 use super::bucket_filter::compute_target_buckets;
 use super::chunk_shuffle::{chunk_shuffle_splits, ChunkShuffle};
 use super::format_table_scan::FormatTableScan;
+use super::global_index_result::GlobalIndexResult;
 use super::global_index_scanner::RowRangeIndex;
 use super::global_index_types::normalize_queryable_global_index_type;
 use super::kv_file_reader::retain_primary_key_conjuncts;
@@ -1269,6 +1270,25 @@ impl<'a> TableScan<'a> {
         }
     }
 
+    /// Supply an already evaluated global-index selection. PK split results
+    /// bypass snapshot resolution and further pruning, preserving their source
+    /// metadata exactly. Query-authorized scans ignore supplied selections,
+    /// since indexes describe raw values that masks may change.
+    pub fn with_global_index_result(mut self, result: GlobalIndexResult) -> crate::Result<Self> {
+        match &mut self.0 {
+            TableScanKind::Paimon(scan) => {
+                scan.split_selection
+                    .get_or_insert_with(Default::default)
+                    .global_index_result = Some(result);
+                scan.validate_global_index_result()?;
+                Ok(self)
+            }
+            TableScanKind::Format(_) => Err(crate::Error::Unsupported {
+                message: "Format tables do not support global-index results".into(),
+            }),
+        }
+    }
+
     /// Select a half-open range of logical positions in an append snapshot.
     ///
     /// Data-evolution positions are assigned before group statistics, projection
@@ -1303,10 +1323,13 @@ impl<'a> TableScan<'a> {
                         message: "chunk_shuffle cannot combine with limit".to_string(),
                     });
                 }
-                if scan.row_ranges.is_some() || scan.row_position_selection().is_some() {
+                if scan.row_ranges.is_some()
+                    || scan.row_position_selection().is_some()
+                    || scan.global_index_result().is_some()
+                {
                     return Err(crate::Error::Unsupported {
                         message:
-                            "chunk_shuffle cannot combine with row ranges or positional selection"
+                            "chunk_shuffle cannot combine with row ranges, global index results or positional selection"
                                 .to_string(),
                     });
                 }
@@ -1328,6 +1351,7 @@ impl<'a> TableScan<'a> {
                     only_real_buckets: scan.only_real_buckets(),
                     snapshot_mode: scan.snapshot_mode(),
                     snapshot_levels: scan.snapshot_levels().cloned(),
+                    global_index_result: None,
                 }));
                 Ok(Self(TableScanKind::Paimon(scan)))
             }
@@ -1371,6 +1395,7 @@ impl<'a> TableScan<'a> {
                             only_real_buckets: false,
                             snapshot_mode: None,
                             snapshot_levels: None,
+                            global_index_result: None,
                         }));
                     }
                 }
@@ -1395,6 +1420,17 @@ impl<'a> TableScan<'a> {
 
     pub(crate) fn has_shard(&self) -> bool {
         matches!(&self.0, TableScanKind::Paimon(scan) if scan.shard().is_some())
+    }
+
+    pub(super) fn has_global_index_result(&self) -> bool {
+        matches!(&self.0, TableScanKind::Paimon(scan) if scan.global_index_result().is_some())
+    }
+
+    pub(super) fn attach_global_index_scores(&self, plan: Plan) -> crate::Result<Plan> {
+        match &self.0 {
+            TableScanKind::Paimon(scan) => scan.attach_index_scores(plan),
+            TableScanKind::Format(_) => Ok(plan),
+        }
     }
 
     fn with_row_position_selection(self, selection: RowPositionSelection) -> crate::Result<Self> {
@@ -1433,6 +1469,7 @@ impl<'a> TableScan<'a> {
                     only_real_buckets: scan.only_real_buckets(),
                     snapshot_mode: scan.snapshot_mode(),
                     snapshot_levels: scan.snapshot_levels().cloned(),
+                    global_index_result: scan.global_index_result().cloned(),
                 }));
                 Ok(Self(TableScanKind::Paimon(scan)))
             }
@@ -1564,6 +1601,7 @@ struct ScanSplitSelection {
     only_real_buckets: bool,
     snapshot_mode: Option<SnapshotScanMode>,
     snapshot_levels: Option<std::ops::RangeInclusive<i32>>,
+    global_index_result: Option<GlobalIndexResult>,
 }
 
 // A stream scan owns its table so clients can retain the scan across polls.
@@ -1614,6 +1652,64 @@ struct PaimonTableScan<'a> {
 }
 
 impl<'a> PaimonTableScan<'a> {
+    fn global_index_result(&self) -> Option<&GlobalIndexResult> {
+        self.split_selection
+            .as_deref()
+            .and_then(|s| s.global_index_result.as_ref())
+    }
+
+    fn validate_global_index_result(&self) -> crate::Result<()> {
+        let Some(result) = self.global_index_result() else {
+            return Ok(());
+        };
+        let options = self.table.schema().core_options();
+        let message = if self.row_ranges.is_some() {
+            Some("with_global_index_result and with_row_ranges are mutually exclusive")
+        } else if self.chunk_shuffle().is_some() {
+            Some("chunk_shuffle cannot combine with global index results")
+        } else if self.scan_all_files || self.is_streaming() {
+            Some("Global-index results require a batch data scan")
+        } else {
+            match result {
+                GlobalIndexResult::Splits { .. }
+                    if self.table.schema().primary_keys().is_empty() =>
+                {
+                    Some("Split-based global-index results require a primary-key table")
+                }
+                GlobalIndexResult::RowRanges(_) | GlobalIndexResult::ScoredRowIds(_)
+                    if !options.data_evolution_enabled() =>
+                {
+                    Some("Row-range global-index results require a Data Evolution table")
+                }
+                _ => None,
+            }
+        };
+        match message {
+            Some(message) => Err(crate::Error::Unsupported {
+                message: message.into(),
+            }),
+            None => Ok(()),
+        }
+    }
+
+    fn supplied_split_plan(&self) -> Option<Plan> {
+        if self.table.schema().core_options().query_auth_enabled() {
+            return None;
+        }
+        match self.global_index_result()? {
+            GlobalIndexResult::Splits {
+                snapshot_id,
+                splits,
+            } => {
+                let mut plan = Plan::new(splits.clone());
+                if let Some(id) = snapshot_id {
+                    plan = plan.with_snapshot_id(*id);
+                }
+                Some(plan)
+            }
+            GlobalIndexResult::RowRanges(_) | GlobalIndexResult::ScoredRowIds(_) => None,
+        }
+    }
     fn snapshot_levels(&self) -> Option<&std::ops::RangeInclusive<i32>> {
         self.split_selection
             .as_deref()
@@ -1748,7 +1844,24 @@ impl<'a> PaimonTableScan<'a> {
     /// for `scan.version`; the strict selectors mirror Java's typed
     /// `scan.snapshot-id` / `scan.tag-name` handling.
     pub async fn plan(&self) -> crate::Result<Plan> {
+        let plan = self.plan_selection().await?;
+        self.attach_index_scores(plan)
+    }
+
+    fn attach_index_scores(&self, plan: Plan) -> crate::Result<Plan> {
+        match self.global_index_result() {
+            Some(result) if !self.table.schema().core_options().query_auth_enabled() => {
+                result.attach_scores(plan)
+            }
+            _ => Ok(plan),
+        }
+    }
+
+    async fn plan_selection(&self) -> crate::Result<Plan> {
         let scan = self.authorized_scan().await?;
+        if let Some(plan) = scan.supplied_split_plan() {
+            return Ok(plan);
+        }
         if let Some((start, end)) = scan
             .table
             .schema()
@@ -1771,11 +1884,26 @@ impl<'a> PaimonTableScan<'a> {
 
     /// Plan the full scan and return metadata-pruning trace counters.
     pub async fn plan_with_trace(&self) -> crate::Result<(Plan, ScanTrace)> {
+        let (plan, trace) = self.plan_selection_with_trace().await?;
+        Ok((self.attach_index_scores(plan)?, trace))
+    }
+
+    async fn plan_selection_with_trace(&self) -> crate::Result<(Plan, ScanTrace)> {
         let scan = self.authorized_scan().await?;
         let mut trace = ScanTrace {
             limit: scan.limit,
             ..Default::default()
         };
+        if let Some(plan) = scan.supplied_split_plan() {
+            trace.snapshot_id = plan.snapshot_id();
+            trace.planned_data_file_bytes = plan.planned_data_file_bytes();
+            trace.record_final_plan(
+                plan.splits().len(),
+                plan.splits().len(),
+                plan.splits().iter().map(|s| s.data_files().len()).sum(),
+            );
+            return Ok((plan, trace));
+        }
         if let Some((start, end)) = scan
             .table
             .schema()
@@ -1946,6 +2074,7 @@ impl<'a> PaimonTableScan<'a> {
     }
 
     async fn authorized_scan(&self) -> crate::Result<Cow<'_, Self>> {
+        self.validate_global_index_result()?;
         // Timestamp-window planning delegates to combined incremental planning
         // within the same operation. Reuse its scope, not another REST request.
         if self.query_auth_grant.is_some() {
@@ -1955,7 +2084,21 @@ impl<'a> PaimonTableScan<'a> {
         let grant = self.authorize_query().await?;
         Ok(match grant {
             Some(grant) => Cow::Owned(self.restricted_by(&grant)),
-            None => Cow::Borrowed(self),
+            None => match self
+                .global_index_result()
+                .map(GlobalIndexResult::row_ranges)
+                .transpose()?
+                .flatten()
+            {
+                Some(ranges) => {
+                    let mut scan = self.clone();
+                    scan.row_ranges = Some(ranges);
+                    // The selection is now an ordinary row-ID restriction.
+                    scan.split_selection.as_mut().unwrap().global_index_result = None;
+                    Cow::Owned(scan)
+                }
+                _ => Cow::Borrowed(self),
+            },
         })
     }
 
