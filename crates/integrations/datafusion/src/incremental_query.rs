@@ -17,7 +17,8 @@
 
 //! The `paimon_incremental_query` table function reads a snapshot-id range
 //! `(start_exclusive, end_inclusive]` as a batch. Snapshot planning stays in
-//! paimon core; this only parses arguments and streams the core plan's output.
+//! paimon core; this parses arguments, picks the core planner that matches
+//! Java's `incremental-between` for the table, and streams its output.
 //!
 //! ```sql
 //! SELECT * FROM paimon_incremental_query('db.t', 0, 5);
@@ -33,7 +34,6 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
-use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::{Session, TableFunctionImpl};
 use datafusion::common::stats::Precision;
 use datafusion::common::{internal_err, project_schema, Statistics};
@@ -49,11 +49,18 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
 };
 use datafusion::prelude::SessionContext;
-use futures::{stream, TryStreamExt};
+use futures::{stream, StreamExt, TryStreamExt};
 use paimon::catalog::Catalog;
-use paimon::table::{AuditLogTable, IncrementalScanMode, Table};
+use paimon::resource::ResourceContext;
+use paimon::spec::{CoreOptions, DataField};
+use paimon::table::{
+    ArrowRecordBatchStream, AuditLogTable, IncrementalPlan, IncrementalScanMode, IncrementalSplit,
+    Table,
+};
 
 use crate::error::to_datafusion_error;
+use crate::memory::reader_resources;
+use crate::physical_plan::scan::to_datafusion_batch;
 use crate::runtime::{await_with_runtime, block_on_with_runtime};
 use crate::table::datafusion_arrow_schema;
 use crate::table_function_args::{
@@ -156,6 +163,7 @@ struct IncrementalQueryTableProvider {
     mode: IncrementalScanMode,
     start_exclusive: i64,
     end_inclusive: i64,
+    fields: Vec<DataField>,
     schema: ArrowSchemaRef,
 }
 
@@ -185,8 +193,28 @@ impl IncrementalQueryTableProvider {
             mode,
             start_exclusive,
             end_inclusive,
+            fields,
             schema,
         })
+    }
+
+    /// Splits a projection into the table fields core reads and the column of
+    /// core's batches each output column comes from. Core's audit-log batches
+    /// lead with the same audit columns as `fields`, then the read fields.
+    fn read_projection(&self, indices: &[usize]) -> ReadProjection {
+        let audit_columns = self.fields.len() - self.table.schema().fields().len();
+        let mut read_type = Vec::new();
+        let columns = indices
+            .iter()
+            .map(|&index| {
+                if index < audit_columns {
+                    return index;
+                }
+                read_type.push(self.fields[index].clone());
+                audit_columns + read_type.len() - 1
+            })
+            .collect();
+        ReadProjection { read_type, columns }
     }
 }
 
@@ -218,11 +246,20 @@ impl TableProvider for IncrementalQueryTableProvider {
             self.mode,
             self.start_exclusive,
             self.end_inclusive,
-            projection.cloned(),
+            projection.map(|indices| self.read_projection(indices)),
             projected_schema,
         )))
     }
 }
+
+/// The table fields to read, and per output column the column of core's
+/// batches it comes from.
+#[derive(Debug, Clone)]
+struct ReadProjection {
+    read_type: Vec<DataField>,
+    columns: Vec<usize>,
+}
+
 /// Execution-time plan: builds the incremental plan in paimon core and streams
 /// its Arrow output when polled, so planning and `EXPLAIN` stay cheap.
 #[derive(Debug, Clone)]
@@ -232,7 +269,7 @@ struct IncrementalQueryExec {
     mode: IncrementalScanMode,
     start_exclusive: i64,
     end_inclusive: i64,
-    projection: Option<Vec<usize>>,
+    projection: Option<ReadProjection>,
     output_schema: ArrowSchemaRef,
     plan_properties: Arc<PlanProperties>,
 }
@@ -244,7 +281,7 @@ impl IncrementalQueryExec {
         mode: IncrementalScanMode,
         start_exclusive: i64,
         end_inclusive: i64,
-        projection: Option<Vec<usize>>,
+        projection: Option<ReadProjection>,
         output_schema: ArrowSchemaRef,
     ) -> Self {
         let plan_properties = Arc::new(PlanProperties::new(
@@ -265,39 +302,60 @@ impl IncrementalQueryExec {
         }
     }
 
-    async fn compute_batches(&self) -> DFResult<Vec<RecordBatch>> {
-        // Core owns snapshot planning; its stream is `'static`, so it outlives
-        // the transient read builder it is built from.
-        let batches = await_with_runtime(async {
-            let read_builder = self.table.new_read_builder();
-            let scan = read_builder.new_incremental_scan(
-                self.mode,
-                self.start_exclusive,
-                self.end_inclusive,
-            );
-            let plan = scan.plan().await.map_err(to_datafusion_error)?;
-            let read = read_builder.new_read().map_err(to_datafusion_error)?;
-            let mut stream = if self.audit_log {
-                read.to_audit_log_arrow(&plan)
-            } else {
-                read.to_incremental_arrow(&plan)
-            }
-            .map_err(to_datafusion_error)?;
-            let mut batches = Vec::new();
-            while let Some(batch) = stream.try_next().await.map_err(to_datafusion_error)? {
-                batches.push(batch);
-            }
-            Ok::<_, DataFusionError>(batches)
-        })
-        .await?;
-
-        match &self.projection {
-            Some(indices) => batches
-                .iter()
-                .map(|batch| batch.project(indices).map_err(DataFusionError::from))
-                .collect(),
-            None => Ok(batches),
+    /// Plans the range in paimon core and opens its batch stream. Reader memory
+    /// comes from the executing task's pool, as in the ordinary scan. The
+    /// projection is pushed into the read: Delta and Changelog decode the
+    /// projected fields, while Diff decodes full rows to compare them and
+    /// projects its output. The stream is `'static`, so it outlives the
+    /// transient read builder it is built from.
+    async fn open(&self, resources: ResourceContext) -> DFResult<ArrowRecordBatchStream> {
+        let mut read_builder = self.table.new_read_builder();
+        read_builder.with_resources(resources);
+        if let Some(projection) = &self.projection {
+            read_builder.with_read_type(projection.read_type.clone());
         }
+        let scan =
+            read_builder.new_incremental_scan(self.mode, self.start_exclusive, self.end_inclusive);
+        let plan = if self.plans_range_as_one_batch() {
+            let combined = scan
+                .plan_combined_delta()
+                .await
+                .map_err(to_datafusion_error)?;
+            IncrementalPlan::try_new(
+                IncrementalScanMode::Delta,
+                combined
+                    .into_splits()
+                    .into_iter()
+                    .map(IncrementalSplit::Data)
+                    .collect(),
+            )
+        } else {
+            scan.plan().await
+        }
+        .map_err(to_datafusion_error)?;
+        let read = read_builder.new_read().map_err(to_datafusion_error)?;
+        if self.audit_log {
+            read.to_audit_log_arrow(&plan)
+        } else {
+            read.to_incremental_arrow(&plan)
+        }
+        .map_err(to_datafusion_error)
+    }
+
+    /// Java's `incremental-between` scan plans a data-evolution Delta range as
+    /// one batch, so a column update merges into the rows it updates when they
+    /// were written in the same range; planned per commit, it would come back
+    /// as rows of its own. `Auto` is Delta here, since such a table has no
+    /// primary key and so no changelog producer. An empty range is left to
+    /// `plan`; within the available snapshots it returns no splits, as Java's
+    /// empty-range scanner does.
+    fn plans_range_as_one_batch(&self) -> bool {
+        CoreOptions::new(self.table.schema().options()).data_evolution_enabled()
+            && matches!(
+                self.mode,
+                IncrementalScanMode::Auto | IncrementalScanMode::Delta
+            )
+            && self.start_exclusive < self.end_inclusive
     }
 }
 impl DisplayAs for IncrementalQueryExec {
@@ -336,7 +394,7 @@ impl ExecutionPlan for IncrementalQueryExec {
     fn execute(
         &self,
         partition: usize,
-        _context: Arc<TaskContext>,
+        context: Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
         if partition != 0 {
             return internal_err!(
@@ -345,8 +403,20 @@ impl ExecutionPlan for IncrementalQueryExec {
         }
         let exec = self.clone();
         let stream = stream::once(async move {
-            let batches = exec.compute_batches().await?;
-            Ok::<_, DataFusionError>(stream::iter(batches.into_iter().map(Ok)))
+            let resources = reader_resources(&context, partition).map_err(to_datafusion_error)?;
+            let batches = await_with_runtime(exec.open(resources)).await?;
+            // Batches are forwarded as core emits them, projected, and rebuilt
+            // against the declared schema as the ordinary scan does.
+            let columns = exec.projection.map(|projection| projection.columns);
+            let schema = exec.output_schema;
+            Ok::<_, DataFusionError>(batches.map(move |batch| {
+                let batch = batch.map_err(to_datafusion_error)?;
+                let batch = match &columns {
+                    Some(columns) => batch.project(columns)?,
+                    None => batch,
+                };
+                to_datafusion_batch(batch, &schema)
+            }))
         })
         .try_flatten();
         Ok(Box::pin(RecordBatchStreamAdapter::new(

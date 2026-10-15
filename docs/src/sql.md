@@ -74,9 +74,9 @@ the catalog-independent `path_to_descriptor` and `descriptor_to_string` scalar
 functions pre-registered. Use `register_catalog(...).await` to add one or more
 Paimon catalogs; registering a catalog also registers the built-in scalar
 function `blob_view` (alias `sys.blob_view`) and the built-in table-valued
-functions (`vector_search`, `hybrid_search`, and `full_text_search` when the
-`fulltext` feature is enabled) against it. It also manages session-scoped
-dynamic options internally for `SET`/`RESET` support.
+functions (`vector_search`, `hybrid_search`, `paimon_incremental_query`, and
+`full_text_search` when the `fulltext` feature is enabled) against it. It also
+manages session-scoped dynamic options internally for `SET`/`RESET` support.
 
 ### REST Catalog Views and SQL Functions
 
@@ -2230,6 +2230,34 @@ This reads the earliest snapshot whose watermark is greater than or equal to the
 given value (snapshots without a watermark are skipped). It is mutually
 exclusive with the other time-travel selectors. If no matching snapshot exists,
 scan planning fails.
+
+## Incremental Query
+
+`paimon_incremental_query` reads the changes between two snapshots. The range
+excludes the start snapshot and includes the end snapshot:
+
+```sql
+SELECT * FROM paimon_incremental_query('my_db.my_table', 1, 5);
+SELECT * FROM paimon_incremental_query('my_db.my_table$audit_log', 1, 5, 'changelog');
+```
+
+The optional fourth argument selects the mode:
+
+- `delta` returns the rows each APPEND commit wrote, every version of a key included.
+  A data-evolution table's range is read as one batch, as Java's `incremental-between`
+  scan reads it, so a column update merges into the rows it updates when they were
+  written in the range. For rows written before the range it returns every row of the
+  files the update rewrote, unchanged rows included, with only the updated columns
+  set and the others NULL, NOT NULL columns included.
+- `changelog` returns the changelog rows of each commit.
+- `diff` compares the table at the two snapshots and returns the added and changed
+  rows (`$audit_log` adds `-U` and `-D` rows). It requires a primary-key table with
+  `merge-engine=deduplicate` and no BLOB or VARIANT columns.
+- `auto`, the default, is `delta` when `changelog-producer` is `none` and
+  `changelog` otherwise.
+
+A `$audit_log` suffix puts `rowkind` first, followed by `_SEQUENCE_NUMBER` when
+`table-read.sequence-number.enabled=true`.
 
 ## Dynamic Options (SET / RESET)
 
