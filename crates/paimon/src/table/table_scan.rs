@@ -54,6 +54,7 @@ use crate::table::source::{
 use crate::table::ScanTrace;
 use futures::{StreamExt, TryStreamExt};
 use indexmap::IndexMap;
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -1136,6 +1137,7 @@ impl<'a> TableScan<'a> {
             scan_all_files: scan.scan_all_files,
             incremental_split_mode: scan.incremental_split_mode,
             projected_read_field_ids: scan.projected_read_field_ids,
+            query_auth_grant: scan.query_auth_grant,
         })))
     }
 
@@ -1144,6 +1146,19 @@ impl<'a> TableScan<'a> {
             unreachable!("snapshot scans only contain Paimon tables")
         };
         &scan.table
+    }
+
+    /// One authorization scope for a single plan/poll. The long-lived stream
+    /// retains the original ungranted scan so the next poll refreshes the rules.
+    pub(super) async fn authorize_snapshot_read(&self) -> crate::Result<Self> {
+        match &self.0 {
+            TableScanKind::Paimon(scan) => Ok(Self(TableScanKind::Paimon(
+                scan.authorized_scan().await?.into_owned(),
+            ))),
+            TableScanKind::Format(_) => Err(crate::Error::Unsupported {
+                message: "Snapshot authorization requires a Paimon table".into(),
+            }),
+        }
     }
 
     pub(super) fn validate_snapshot_read(&self) -> crate::Result<()> {
@@ -1198,14 +1213,15 @@ impl<'a> TableScan<'a> {
         scan.split_selection
             .get_or_insert_with(Default::default)
             .snapshot_mode = Some(mode);
-        match mode {
+        let plan = match mode {
             SnapshotScanMode::All => {
                 let fields = scan.projected_read_field_ids()?;
                 scan.plan_snapshot(snapshot, fields.as_ref(), None).await
             }
             SnapshotScanMode::Delta => scan.plan_snapshot_delta(&snapshot).await,
             SnapshotScanMode::Changelog => scan.plan_snapshot_changelog(&snapshot, None).await,
-        }
+        }?;
+        scan.finish_plan(plan).await
     }
 
     pub(crate) fn new(
@@ -1461,8 +1477,10 @@ impl<'a> TableScan<'a> {
     ) -> crate::Result<Plan> {
         match &self.0 {
             TableScanKind::Paimon(scan) => {
-                scan.plan_incremental_lists(end_snapshot, manifest_lists, trace)
-                    .await
+                let plan = scan
+                    .plan_incremental_lists(end_snapshot, manifest_lists, trace)
+                    .await?;
+                scan.finish_plan(plan).await
             }
             TableScanKind::Format(_) => Err(crate::Error::Unsupported {
                 message: "Format tables do not support incremental batch scans".to_string(),
@@ -1590,6 +1608,9 @@ struct PaimonTableScan<'a> {
     scan_all_files: bool,
     incremental_split_mode: Option<IncrementalSplitMode>,
     projected_read_field_ids: Option<HashSet<i32>>,
+    /// Only set on an ephemeral copy after authorization. Never stored back into
+    /// StreamTableScan, and never reconstructed from serialized split metadata.
+    query_auth_grant: Option<Arc<super::query_auth::QueryAuthGrant>>,
 }
 
 impl<'a> PaimonTableScan<'a> {
@@ -1669,6 +1690,7 @@ impl<'a> PaimonTableScan<'a> {
             scan_all_files: false,
             incremental_split_mode: None,
             projected_read_field_ids: None,
+            query_auth_grant: None,
         }
     }
 
@@ -1726,9 +1748,7 @@ impl<'a> PaimonTableScan<'a> {
     /// for `scan.version`; the strict selectors mirror Java's typed
     /// `scan.snapshot-id` / `scan.tag-name` handling.
     pub async fn plan(&self) -> crate::Result<Plan> {
-        let grant = self.authorize_query().await?;
-        let restricted = grant.as_deref().map(|grant| self.restricted_by(grant));
-        let scan = restricted.as_ref().unwrap_or(self);
+        let scan = self.authorized_scan().await?;
         if let Some((start, end)) = scan
             .table
             .schema()
@@ -1736,8 +1756,7 @@ impl<'a> PaimonTableScan<'a> {
             .incremental_timestamp_window()?
         {
             let plan = scan.plan_timestamp_window(start, end, None).await?;
-            scan.check_planned_files(&plan, grant.is_some()).await?;
-            return Ok(plan.planned(grant));
+            return Ok(plan);
         }
         let data_evolution_read_field_ids = scan.projected_read_field_ids()?;
         let plan = match super::time_travel::resolve_snapshot(&scan.table).await? {
@@ -1747,15 +1766,12 @@ impl<'a> PaimonTableScan<'a> {
             }
             None => Plan::new(Vec::new()),
         };
-        scan.check_planned_files(&plan, grant.is_some()).await?;
-        Ok(plan.planned(grant))
+        scan.finish_plan(plan).await
     }
 
     /// Plan the full scan and return metadata-pruning trace counters.
     pub async fn plan_with_trace(&self) -> crate::Result<(Plan, ScanTrace)> {
-        let grant = self.authorize_query().await?;
-        let restricted = grant.as_deref().map(|grant| self.restricted_by(grant));
-        let scan = restricted.as_ref().unwrap_or(self);
+        let scan = self.authorized_scan().await?;
         let mut trace = ScanTrace {
             limit: scan.limit,
             ..Default::default()
@@ -1771,8 +1787,7 @@ impl<'a> PaimonTableScan<'a> {
                 .await?;
             trace.snapshot_id = plan.snapshot_id();
             trace.planned_data_file_bytes = plan.planned_data_file_bytes();
-            scan.check_planned_files(&plan, grant.is_some()).await?;
-            return Ok((plan.planned(grant), trace));
+            return Ok((plan, trace));
         }
         let data_evolution_read_field_ids = scan.projected_read_field_ids()?;
         let plan = match super::time_travel::resolve_snapshot(&scan.table).await? {
@@ -1790,12 +1805,11 @@ impl<'a> PaimonTableScan<'a> {
             }
             None => Plan::new(Vec::new()),
         };
-        scan.check_planned_files(&plan, grant.is_some()).await?;
-        Ok((plan.planned(grant), trace))
+        Ok((scan.finish_plan(plan).await?, trace))
     }
 
     /// Keep pruning off masked columns and apply limits after row filtering.
-    fn restricted_by(&self, grant: &super::query_auth::QueryAuthGrant) -> Self {
+    fn restricted_by(&self, grant: &Arc<super::query_auth::QueryAuthGrant>) -> Self {
         let rules = grant.rules();
         let fields = self.table.schema().fields();
         let masked: HashSet<&str> = rules
@@ -1810,6 +1824,7 @@ impl<'a> PaimonTableScan<'a> {
                 .any(|name| masked.contains(name.as_str()))
         };
         let mut scan = self.clone();
+        scan.query_auth_grant = Some(Arc::clone(grant));
         scan.data_predicates.retain(|p| !touches_masked(p));
         if scan.bucket_predicate.as_ref().is_some_and(touches_masked) {
             scan.bucket_predicate = None;
@@ -1930,6 +1945,26 @@ impl<'a> PaimonTableScan<'a> {
         .await
     }
 
+    async fn authorized_scan(&self) -> crate::Result<Cow<'_, Self>> {
+        // Timestamp-window planning delegates to combined incremental planning
+        // within the same operation. Reuse its scope, not another REST request.
+        if self.query_auth_grant.is_some() {
+            self.validate_read_options()?;
+            return Ok(Cow::Borrowed(self));
+        }
+        let grant = self.authorize_query().await?;
+        Ok(match grant {
+            Some(grant) => Cow::Owned(self.restricted_by(&grant)),
+            None => Cow::Borrowed(self),
+        })
+    }
+
+    async fn finish_plan(&self, plan: Plan) -> crate::Result<Plan> {
+        self.check_planned_files(&plan, self.query_auth_grant.is_some())
+            .await?;
+        Ok(plan.planned(self.query_auth_grant.clone()))
+    }
+
     /// Authorize this scan and return the grant for the caller to stamp.
     async fn authorize_query(
         &self,
@@ -2016,7 +2051,13 @@ impl<'a> PaimonTableScan<'a> {
     /// included.
     fn validate_read_options(&self) -> crate::Result<()> {
         let options = CoreOptions::new(self.table.schema().options());
-        options.ensure_read_authorized()?;
+        if !self
+            .query_auth_grant
+            .as_ref()
+            .is_some_and(|grant| grant.matches_table(&self.table))
+        {
+            options.ensure_read_authorized()?;
+        }
         options.validate_data_file_path_directory()
     }
 
