@@ -15,20 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::num::NonZeroI32;
-
+use crate::common::number::format_java_float;
 use crate::spec::{BinaryRow, DataField, DataType, Datum};
 use crate::{Error, Result};
 use chrono::NaiveDate;
-use lexical_write_float::{format::STANDARD, Options, ToLexicalWithOptions};
 
 const MILLIS_PER_DAY: i64 = 86_400_000;
-const JAVA_FLOAT_OPTIONS: Options = Options::builder()
-    .positive_exponent_break(NonZeroI32::new(6))
-    .negative_exponent_break(NonZeroI32::new(-3))
-    .exponent(b'E')
-    .inf_string(Some(b"Infinity"))
-    .build_strict();
 
 pub(super) fn format_row_as_java_cast_string(
     row: &BinaryRow,
@@ -150,7 +142,16 @@ fn validate_row_has_field(row: &BinaryRow, pos: usize) -> Result<()> {
     Ok(())
 }
 
-fn format_field(row: &BinaryRow, pos: usize, data_type: &DataType) -> Result<String> {
+pub(super) fn format_field(row: &BinaryRow, pos: usize, data_type: &DataType) -> Result<String> {
+    format_field_in_zone(row, pos, data_type, &jiff::tz::TimeZone::system())
+}
+
+pub(super) fn format_field_in_zone(
+    row: &BinaryRow,
+    pos: usize,
+    data_type: &DataType,
+    zone: &jiff::tz::TimeZone,
+) -> Result<String> {
     let Some(datum) = row.get_datum(pos, data_type)? else {
         return Ok("null".to_string());
     };
@@ -161,11 +162,11 @@ fn format_field(row: &BinaryRow, pos: usize, data_type: &DataType) -> Result<Str
         (Datum::SmallInt(v), DataType::SmallInt(_)) => Ok(v.to_string()),
         (Datum::Int(v), DataType::Int(_)) => Ok(v.to_string()),
         (Datum::Long(v), DataType::BigInt(_)) => Ok(v.to_string()),
-        (Datum::Float(v), DataType::Float(_)) => Ok(format_float(v)),
-        (Datum::Double(v), DataType::Double(_)) => Ok(format_double(v)),
+        (Datum::Float(v), DataType::Float(_)) => Ok(format_java_float(v)),
+        (Datum::Double(v), DataType::Double(_)) => Ok(format_java_float(v)),
         (Datum::String(v), DataType::Char(_) | DataType::VarChar(_)) => Ok(v),
         (Datum::Bytes(v), DataType::Binary(_) | DataType::VarBinary(_)) => {
-            Ok(String::from_utf8_lossy(&v).into_owned())
+            Ok(crate::spec::decode_java_utf8(&v))
         }
         (Datum::Date(v), DataType::Date(_)) => format_date(v),
         (Datum::Time(v), DataType::Time(t)) => format_time(v, t.precision()),
@@ -175,41 +176,26 @@ fn format_field(row: &BinaryRow, pos: usize, data_type: &DataType) -> Result<Str
             },
             DataType::Decimal(_),
         ) => Ok(format_decimal_plain(unscaled, scale)),
-        (Datum::Timestamp { .. } | Datum::LocalZonedTimestamp { .. }, _) => {
-            let source = row.field_to_arrow(pos, data_type)?;
-            let target = DataType::VarChar(crate::spec::VarCharType::string_type());
-            let strings =
-                crate::arrow::cast_array_for_schema_evolution(&source, data_type, &target)?;
-            let strings = strings
-                .as_any()
-                .downcast_ref::<arrow_array::StringArray>()
-                .ok_or_else(|| {
-                    data_invalid("Timestamp string cast returned a non-string array".into())
-                })?;
-            Ok(strings.value(0).to_string())
+        (Datum::Timestamp { millis, nanos }, DataType::Timestamp(typ)) => {
+            Ok(crate::common::date_time::format_timestamp_millis(
+                millis,
+                i64::from(nanos),
+                typ.precision(),
+                None,
+            ))
+        }
+        (Datum::LocalZonedTimestamp { millis, nanos }, DataType::LocalZonedTimestamp(typ)) => {
+            Ok(crate::common::date_time::format_timestamp_millis(
+                millis,
+                i64::from(nanos),
+                typ.precision(),
+                Some(zone),
+            ))
         }
         (datum, _) => Err(data_invalid(format!(
             "Decoded row string cast datum {datum:?} does not match type {data_type:?}"
         ))),
     }
-}
-
-fn format_float(value: f32) -> String {
-    const BUFFER_SIZE: usize = JAVA_FLOAT_OPTIONS.buffer_size_const::<f32, STANDARD>();
-    let mut buffer = [0u8; BUFFER_SIZE];
-    let bytes = value.to_lexical_with_options::<STANDARD>(&mut buffer, &JAVA_FLOAT_OPTIONS);
-    std::str::from_utf8(bytes)
-        .expect("lexical float output is valid UTF-8")
-        .to_string()
-}
-
-fn format_double(value: f64) -> String {
-    const BUFFER_SIZE: usize = JAVA_FLOAT_OPTIONS.buffer_size_const::<f64, STANDARD>();
-    let mut buffer = [0u8; BUFFER_SIZE];
-    let bytes = value.to_lexical_with_options::<STANDARD>(&mut buffer, &JAVA_FLOAT_OPTIONS);
-    std::str::from_utf8(bytes)
-        .expect("lexical double output is valid UTF-8")
-        .to_string()
 }
 
 fn format_date(epoch_days: i32) -> Result<String> {
@@ -433,6 +419,24 @@ mod tests {
     }
 
     #[test]
+    fn floating_partition_casts_use_java_significant_digits() {
+        assert_eq!(
+            format_value(&[
+                (
+                    Some(Datum::Float(f32::from_bits(1))),
+                    DataType::Float(FloatType::new())
+                ),
+                (
+                    Some(Datum::Double(f64::from_bits(1))),
+                    DataType::Double(DoubleType::new())
+                )
+            ])
+            .unwrap(),
+            "{1.4E-45, 4.9E-324}"
+        );
+    }
+
+    #[test]
     fn test_format_binary_invalid_utf8_uses_lossy_string() {
         let bytes = vec![0xff];
         let data_type = DataType::VarBinary(VarBinaryType::new(1).unwrap());
@@ -441,6 +445,15 @@ mod tests {
         assert_eq!(
             format_value(&[(Some(Datum::Bytes(bytes)), data_type)]).unwrap(),
             format!("{{{expected}}}")
+        );
+    }
+
+    #[test]
+    fn binary_surrogates_use_java_utf8_replacement() {
+        let typ = DataType::VarBinary(VarBinaryType::new(3).unwrap());
+        assert_eq!(
+            format_value(&[(Some(Datum::Bytes(vec![0xed, 0xa0, 0x80])), typ)]).unwrap(),
+            "{�}"
         );
     }
 
@@ -477,6 +490,54 @@ mod tests {
             format_value(&values).unwrap(),
             "{2024-01-01 12:00:00.123, 2024-01-01 12:00:00.123456}"
         );
+    }
+
+    #[test]
+    fn high_precision_timestamps_do_not_narrow_to_arrow_ticks() {
+        for precision in 7..=9 {
+            let typ = DataType::Timestamp(TimestampType::new(precision).unwrap());
+            for (millis, expected) in [
+                (16_725_225_600_123, "2500-01-01 00:00:00.123456789"),
+                (-8_520_335_999_877, "1700-01-01 00:00:00.123456789"),
+            ] {
+                let expected = &expected[..expected.len() - (9 - precision) as usize];
+                let quantum = 10_i32.pow(9 - precision);
+                let nanos = 456_789 / quantum * quantum;
+                assert_eq!(
+                    format_value(&[(Some(Datum::Timestamp { millis, nanos }), typ.clone())])
+                        .unwrap(),
+                    format!("{{{expected}}}")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn high_precision_ltz_timestamps_keep_submillisecond_values() {
+        let millis = 16_725_225_600_123;
+        let local = chrono::Local.timestamp_millis_opt(millis).single().unwrap();
+        for precision in 7..=9 {
+            let quantum = 10_i32.pow(9 - precision);
+            let nanos = 456_789 / quantum * quantum;
+            let expected = format!(
+                "{{{}.{:09}}}",
+                local.format("%Y-%m-%d %H:%M:%S"),
+                123_000_000 + nanos
+            );
+            let expected = format!(
+                "{}{}",
+                &expected[..expected.len() - 1 - (9 - precision) as usize],
+                "}"
+            );
+            assert_eq!(
+                format_value(&[(
+                    Some(Datum::LocalZonedTimestamp { millis, nanos }),
+                    DataType::LocalZonedTimestamp(LocalZonedTimestampType::new(precision).unwrap())
+                )])
+                .unwrap(),
+                expected
+            );
+        }
     }
 
     #[test]

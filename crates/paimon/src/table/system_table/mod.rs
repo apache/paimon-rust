@@ -30,6 +30,7 @@ mod consumers;
 mod files;
 mod manifests;
 mod options;
+mod partitions;
 mod row_string_cast;
 mod schemas;
 mod snapshots;
@@ -44,6 +45,7 @@ const NAMES: &[&str] = &[
     "file_key_ranges",
     "manifests",
     "options",
+    "partitions",
     "schemas",
     "snapshots",
     "table_indexes",
@@ -202,6 +204,7 @@ impl SystemRead {
             "options" => {
                 options::read(&self.table, needed.as_deref(), self.predicate.as_ref()).await?
             }
+            "partitions" => partitions::read(&self.table, needed.as_deref()).await?,
             "schemas" => {
                 schemas::read(&self.table, needed.as_deref(), self.predicate.as_ref()).await?
             }
@@ -282,6 +285,7 @@ fn schema_for_name(name: &str) -> SchemaRef {
         "file_key_ranges" => files::key_ranges_schema(),
         "manifests" => manifests::manifests_schema(),
         "options" => options::options_schema(),
+        "partitions" => partitions::partitions_schema(),
         "schemas" => schemas::schemas_schema(),
         "snapshots" => snapshots::snapshots_schema(),
         "table_indexes" => table_indexes::table_indexes_schema(),
@@ -294,10 +298,11 @@ fn record_batch(schema: SchemaRef, columns: Vec<ArrayRef>) -> Result<RecordBatch
     RecordBatch::try_new(schema, columns).map_err(arrow_error)
 }
 
-fn local_timestamp_column(values: Vec<i64>) -> Result<ArrayRef> {
+fn local_timestamp_column(
+    values: impl Into<arrow_array::TimestampMillisecondArray>,
+) -> Result<ArrayRef> {
     use crate::spec::{DataType, LocalZonedTimestampType, TimestampType};
-    use arrow_array::TimestampMillisecondArray;
-    let values: ArrayRef = Arc::new(TimestampMillisecondArray::from(values));
+    let values: ArrayRef = Arc::new(values.into());
     crate::arrow::cast_array_for_schema_evolution(
         &values,
         &DataType::LocalZonedTimestamp(LocalZonedTimestampType::new(3)?),

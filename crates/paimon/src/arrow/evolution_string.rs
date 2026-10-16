@@ -23,7 +23,7 @@ use arrow_array::{cast::AsArray, types::Int64Type, ArrayRef, StringArray, Time32
 use arrow_schema::{DataType as ArrowType, TimeUnit};
 use jiff::tz::TimeZone;
 
-use crate::common::date_time::{format_epoch_timestamp, format_time, local_offset};
+use crate::common::date_time::{format_time, format_timestamp_millis};
 use crate::spec::DataType;
 
 /// Return None when this is not a temporal-to-character conversion.
@@ -112,17 +112,7 @@ fn render_timestamp(
         TimeUnit::Nanosecond => value.rem_euclid(1_000_000),
         _ => 0,
     };
-    let millis = match zone {
-        Some(zone) => {
-            let offset = local_offset(millis.div_euclid(1000), zone);
-            // Timestamp.fromLocalDateTime uses signed long millisecond storage.
-            // Applying an offset can wrap and change the millisecond fraction.
-            millis.wrapping_add(i64::from(offset) * 1000)
-        }
-        None => millis,
-    };
-    let nanos = (millis.rem_euclid(1000) * 1_000_000 + sub_milli) as u32;
-    format_epoch_timestamp(millis.div_euclid(1000), nanos, precision)
+    format_timestamp_millis(millis, sub_milli, precision, zone)
 }
 
 fn invalid(message: impl Into<String>) -> crate::Error {

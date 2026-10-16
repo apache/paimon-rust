@@ -139,7 +139,7 @@ fn time_components(text: &str, space: bool) -> Option<[Option<i32>; 4]> {
     Some(time)
 }
 
-pub(super) fn parse_timestamp(
+pub(crate) fn parse_timestamp(
     text: &str,
     precision: u32,
     zone: Option<&jiff::tz::TimeZone>,
