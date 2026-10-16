@@ -32,20 +32,10 @@ use crate::error::to_datafusion_error;
 
 mod aggregation_fields;
 mod audit_log;
-mod branches;
-mod buckets;
-mod consumers;
-mod files;
-mod manifests;
-mod options;
+mod metadata;
 mod partitions;
 mod physical_files_size;
 mod referenced_files_size;
-mod row_string_cast;
-mod schemas;
-mod snapshots;
-mod table_indexes;
-mod tags;
 
 type Builder = fn(Table) -> DFResult<Arc<dyn TableProvider>>;
 
@@ -55,18 +45,23 @@ type Builder = fn(Table) -> DFResult<Arc<dyn TableProvider>>;
 const TABLES: &[(&str, Builder)] = &[
     ("aggregation_fields", aggregation_fields::build),
     ("audit_log", audit_log::build),
-    ("branches", branches::build),
-    ("buckets", buckets::build),
-    ("consumers", consumers::build),
-    ("files", files::build),
-    ("manifests", manifests::build),
-    ("options", options::build),
+    ("branches", |table| metadata::build(table, "branches")),
+    ("buckets", |table| metadata::build(table, "buckets")),
+    ("consumers", |table| metadata::build(table, "consumers")),
+    ("files", |table| metadata::build(table, "files")),
+    ("file_key_ranges", |table| {
+        metadata::build(table, "file_key_ranges")
+    }),
+    ("manifests", |table| metadata::build(table, "manifests")),
+    ("options", |table| metadata::build(table, "options")),
     ("physical_files_size", physical_files_size::build),
     ("referenced_files_size", referenced_files_size::build),
-    ("schemas", schemas::build),
-    ("snapshots", snapshots::build),
-    ("table_indexes", table_indexes::build),
-    ("tags", tags::build),
+    ("schemas", |table| metadata::build(table, "schemas")),
+    ("snapshots", |table| metadata::build(table, "snapshots")),
+    ("table_indexes", |table| {
+        metadata::build(table, "table_indexes")
+    }),
+    ("tags", |table| metadata::build(table, "tags")),
 ];
 
 const SYSTEM_TABLE_NAMES: &[&str] = &[
@@ -76,6 +71,7 @@ const SYSTEM_TABLE_NAMES: &[&str] = &[
     "buckets",
     "consumers",
     "files",
+    "file_key_ranges",
     "manifests",
     "options",
     "partitions",
@@ -113,20 +109,11 @@ pub(crate) fn is_registered(name: &str) -> bool {
 /// with a `$`. Keep in step with `TABLES`: one missing here goes back to
 /// having its time-travel clause silently dropped.
 pub(crate) fn is_system_table_provider(provider: &dyn TableProvider) -> bool {
-    provider.is::<aggregation_fields::AggregationFieldsTable>()
-        || provider.is::<branches::BranchesTable>()
-        || provider.is::<buckets::BucketsTable>()
-        || provider.is::<consumers::ConsumersTable>()
-        || provider.is::<files::FilesTable>()
-        || provider.is::<manifests::ManifestsTable>()
-        || provider.is::<options::OptionsTable>()
+    provider.is::<metadata::MetadataTableProvider>()
+        || provider.is::<aggregation_fields::AggregationFieldsTable>()
         || provider.is::<partitions::PartitionsTable>()
         || provider.is::<physical_files_size::PhysicalFilesSizeTable>()
         || provider.is::<referenced_files_size::ReferencedFilesSizeTable>()
-        || provider.is::<schemas::SchemasTable>()
-        || provider.is::<snapshots::SnapshotsTable>()
-        || provider.is::<table_indexes::TableIndexesTable>()
-        || provider.is::<tags::TagsTable>()
 }
 
 fn wrap_to_system_table(name: &str, base_table: Table) -> Option<DFResult<Arc<dyn TableProvider>>> {
@@ -267,20 +254,14 @@ mod tests {
             .unwrap();
 
         let ctx = SessionContext::new();
-        for (name, builder) in [
-            ("manifests", super::manifests::build as super::Builder),
-            (
-                "table_indexes",
-                super::table_indexes::build as super::Builder,
-            ),
-        ] {
+        for name in ["manifests", "table_indexes"] {
             for empty in [false, true] {
                 let view = if empty {
                     table.copy_with_pinned_snapshot(None)
                 } else {
                     table.clone()
                 };
-                let provider = builder(view).unwrap();
+                let provider = super::metadata::build(view, name).unwrap();
                 let batches = ctx.read_table(provider).unwrap().collect().await.unwrap();
                 let count: usize = batches.iter().map(RecordBatch::num_rows).sum();
                 assert_eq!(count == 0, empty, "{name}, empty={empty}");

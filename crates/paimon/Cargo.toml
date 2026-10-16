@@ -67,6 +67,7 @@ storage-jindo = ["storage-oss"]
 storage-oss-cpp = ["storage-oss"]
 
 [dependencies]
+lexical-write-float = "1.0.6"
 rand = "0.8.5"
 url = "2.5.2"
 # Already in the tree via `url`; direct dep for `RESTUtil::decode_string`.

@@ -20,32 +20,29 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, OnceLock};
 
-use async_trait::async_trait;
-use datafusion::arrow::array::{
-    Int32Array, Int64Array, ListBuilder, RecordBatch, StringArray, StringBuilder,
-    TimestampMillisecondArray,
+use crate::spec::{BinaryRow, DataField, DataFileMeta, TableSchema};
+use crate::table::{DataSplit, Table};
+use arrow_array::builder::{ListBuilder, StringBuilder};
+use arrow_array::{
+    ArrayRef, Int32Array, Int64Array, RecordBatch, StringArray, TimestampMillisecondArray,
 };
-use datafusion::arrow::datatypes::{DataType as ArrowDataType, Field, Schema, SchemaRef, TimeUnit};
-use datafusion::catalog::Session;
-use datafusion::datasource::memory::MemorySourceConfig;
-use datafusion::datasource::{TableProvider, TableType};
-use datafusion::error::Result as DFResult;
-use datafusion::logical_expr::Expr;
-use datafusion::physical_plan::ExecutionPlan;
-use paimon::spec::{BinaryRow, DataField, DataFileMeta, TableSchema};
-use paimon::table::{DataSplit, Table};
+use arrow_schema::{DataType as ArrowDataType, Field, Schema, SchemaRef, TimeUnit};
 
 use super::row_string_cast::{
     format_row_as_java_array_string, format_row_as_java_cast_string,
-    format_row_field_as_java_cast_string,
+    format_row_field_as_java_object_string,
 };
-use crate::error::to_datafusion_error;
 
-pub(super) fn build(table: Table) -> DFResult<Arc<dyn TableProvider>> {
-    Ok(Arc::new(FilesTable { table }))
+use crate::Result;
+
+pub(super) fn key_ranges_schema() -> SchemaRef {
+    let files = files_schema();
+    let mut fields = files.fields()[..10].to_vec();
+    fields.push(files.field(18).clone().into());
+    Arc::new(Schema::new(fields))
 }
 
-fn files_schema() -> SchemaRef {
+pub(super) fn files_schema() -> SchemaRef {
     static SCHEMA: OnceLock<SchemaRef> = OnceLock::new();
     SCHEMA
         .get_or_init(|| {
@@ -70,7 +67,7 @@ fn files_schema() -> SchemaRef {
                     ArrowDataType::Timestamp(TimeUnit::Millisecond, None),
                     true,
                 ),
-                Field::new("delete_row_count", ArrowDataType::Int64, true),
+                Field::new("deleteRowCount", ArrowDataType::Int64, true),
                 Field::new("file_source", ArrowDataType::Utf8, true),
                 Field::new("first_row_id", ArrowDataType::Int64, true),
                 Field::new(
@@ -83,43 +80,30 @@ fn files_schema() -> SchemaRef {
         .clone()
 }
 
-#[derive(Debug)]
-pub(super) struct FilesTable {
-    table: Table,
-}
+pub(super) async fn read(
+    table: &Table,
+    key_ranges: bool,
+    _projection: Option<&[usize]>,
+    _predicate: Option<&crate::spec::Predicate>,
+) -> Result<RecordBatch> {
+    let rows = collect_file_rows(table, !key_ranges).await?;
 
-#[async_trait]
-impl TableProvider for FilesTable {
-    fn schema(&self) -> SchemaRef {
+    let schema = if key_ranges {
+        key_ranges_schema()
+    } else {
         files_schema()
-    }
+    };
+    let batch = if key_ranges {
+        let mut columns = common_file_columns(&rows);
+        columns.push(Arc::new(Int64Array::from_iter(
+            rows.iter().map(|row| row.first_row_id),
+        )));
+        super::record_batch(schema.clone(), columns)?
+    } else {
+        file_rows_to_record_batch(&rows)?
+    };
 
-    fn table_type(&self) -> TableType {
-        TableType::View
-    }
-
-    async fn scan(
-        &self,
-        _state: &dyn Session,
-        projection: Option<&Vec<usize>>,
-        _filters: &[Expr],
-        _limit: Option<usize>,
-    ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        let table = self.table.clone();
-        let rows =
-            crate::runtime::await_with_runtime(async move { collect_file_rows(&table).await })
-                .await
-                .map_err(to_datafusion_error)?;
-
-        let schema = files_schema();
-        let batch = file_rows_to_record_batch(&rows)?;
-
-        Ok(MemorySourceConfig::try_new_exec(
-            &[vec![batch]],
-            schema,
-            projection.cloned(),
-        )?)
-    }
+    Ok(batch)
 }
 
 #[derive(Debug)]
@@ -134,9 +118,7 @@ struct FileRow {
     file_size_in_bytes: i64,
     min_key: Option<String>,
     max_key: Option<String>,
-    null_value_counts: String,
-    min_value_stats: String,
-    max_value_stats: String,
+    stats: Option<FormattedStats>,
     min_sequence_number: Option<i64>,
     max_sequence_number: Option<i64>,
     creation_time: Option<i64>,
@@ -146,7 +128,7 @@ struct FileRow {
     write_cols: Option<Vec<String>>,
 }
 
-async fn collect_file_rows(table: &Table) -> paimon::Result<Vec<FileRow>> {
+async fn collect_file_rows(table: &Table, include_stats: bool) -> crate::Result<Vec<FileRow>> {
     let scan = table
         .new_read_builder()
         .new_scan()
@@ -159,7 +141,16 @@ async fn collect_file_rows(table: &Table) -> paimon::Result<Vec<FileRow>> {
 
     let mut rows = Vec::new();
     for split in scan.splits() {
-        rows.extend(data_split_rows(table, split, &partition_fields, &mut schema_cache).await?);
+        rows.extend(
+            data_split_rows(
+                table,
+                split,
+                &partition_fields,
+                &mut schema_cache,
+                include_stats,
+            )
+            .await?,
+        );
     }
     Ok(rows)
 }
@@ -169,7 +160,8 @@ async fn data_split_rows(
     split: &DataSplit,
     partition_fields: &[DataField],
     schema_cache: &mut HashMap<i64, Arc<TableSchema>>,
-) -> paimon::Result<Vec<FileRow>> {
+    include_stats: bool,
+) -> crate::Result<Vec<FileRow>> {
     let partition = format_partition(split.partition(), partition_fields)?;
     let mut rows = Vec::with_capacity(split.data_files().len());
     for file in split.data_files() {
@@ -177,7 +169,11 @@ async fn data_split_rows(
         let key_fields = key_fields_for_schema(&file_schema);
         let min_key = format_key(&file.min_key, &key_fields)?;
         let max_key = format_key(&file.max_key, &key_fields)?;
-        let stats = format_value_stats(table, schema_cache, file).await?;
+        let stats = if include_stats {
+            Some(format_value_stats(table, schema_cache, file).await?)
+        } else {
+            None
+        };
 
         rows.push(FileRow {
             partition: partition.clone(),
@@ -185,7 +181,7 @@ async fn data_split_rows(
             file_path: file
                 .external_path
                 .clone()
-                .unwrap_or_else(|| split.data_file_path(file)),
+                .unwrap_or_else(|| java_file_path(&split.data_file_path(file))),
             file_format: data_file_format_identifier(&file.file_name)?,
             schema_id: file.schema_id,
             level: file.level,
@@ -193,9 +189,7 @@ async fn data_split_rows(
             file_size_in_bytes: file.file_size,
             min_key,
             max_key,
-            null_value_counts: stats.null_value_counts,
-            min_value_stats: stats.min_value_stats,
-            max_value_stats: stats.max_value_stats,
+            stats,
             min_sequence_number: Some(file.min_sequence_number),
             max_sequence_number: Some(file.max_sequence_number),
             creation_time: file.creation_time.map(|t| t.timestamp_millis()),
@@ -212,7 +206,7 @@ async fn schema_for_id(
     table: &Table,
     schema_cache: &mut HashMap<i64, Arc<TableSchema>>,
     schema_id: i64,
-) -> paimon::Result<Arc<TableSchema>> {
+) -> crate::Result<Arc<TableSchema>> {
     if let Some(schema) = schema_cache.get(&schema_id) {
         return Ok(schema.clone());
     }
@@ -224,7 +218,7 @@ async fn schema_for_id(
 fn format_partition(
     partition: &BinaryRow,
     partition_fields: &[DataField],
-) -> paimon::Result<Option<String>> {
+) -> crate::Result<Option<String>> {
     if partition_fields.is_empty() {
         return Ok(Some("{}".to_string()));
     }
@@ -249,7 +243,7 @@ fn key_fields_for_schema(schema: &TableSchema) -> Vec<DataField> {
         .collect()
 }
 
-fn format_key(bytes: &[u8], key_fields: &[DataField]) -> paimon::Result<Option<String>> {
+fn format_key(bytes: &[u8], key_fields: &[DataField]) -> crate::Result<Option<String>> {
     if bytes.is_empty() {
         return Ok(None);
     }
@@ -271,10 +265,18 @@ async fn format_value_stats(
     table: &Table,
     schema_cache: &mut HashMap<i64, Arc<TableSchema>>,
     file: &DataFileMeta,
-) -> paimon::Result<FormattedStats> {
-    let table_fields = table.schema().fields();
+) -> crate::Result<FormattedStats> {
     let file_schema = schema_for_id(table, schema_cache, file.schema_id).await?;
-    let data_fields = file_schema.fields();
+    format_file_value_stats(table.schema().fields(), &file_schema, file)
+}
+
+fn format_file_value_stats(
+    table_fields: &[DataField],
+    file_schema: &TableSchema,
+    file: &DataFileMeta,
+) -> crate::Result<FormattedStats> {
+    let physical_fields = file_schema.data_file_fields(file.write_cols.as_deref());
+    let data_fields = physical_fields.as_slice();
     let field_mapping = table_to_data_field_mapping(table_fields, data_fields);
     let dense_mapping = dense_stats_mapping(data_fields, file.value_stats_cols.as_deref());
     let min_row = decode_stats_row(file.value_stats.min_values())?;
@@ -302,11 +304,21 @@ async fn format_value_stats(
             .unwrap_or_else(|| table_field.data_type());
         lower_bounds.insert(
             table_field.name().to_string(),
-            format_stats_value(min_row.as_ref(), stats_index, value_type)?,
+            format_stats_value(
+                min_row.as_ref(),
+                stats_index,
+                value_type,
+                table_field.data_type(),
+            )?,
         );
         upper_bounds.insert(
             table_field.name().to_string(),
-            format_stats_value(max_row.as_ref(), stats_index, value_type)?,
+            format_stats_value(
+                max_row.as_ref(),
+                stats_index,
+                value_type,
+                table_field.data_type(),
+            )?,
         );
     }
 
@@ -377,7 +389,7 @@ fn stats_index_for_data_field(
     }
 }
 
-fn decode_stats_row(bytes: &[u8]) -> paimon::Result<Option<BinaryRow>> {
+fn decode_stats_row(bytes: &[u8]) -> crate::Result<Option<BinaryRow>> {
     if bytes.is_empty() {
         Ok(None)
     } else {
@@ -388,8 +400,9 @@ fn decode_stats_row(bytes: &[u8]) -> paimon::Result<Option<BinaryRow>> {
 fn format_stats_value(
     row: Option<&BinaryRow>,
     stats_index: Option<usize>,
-    data_type: &paimon::spec::DataType,
-) -> paimon::Result<Option<String>> {
+    data_type: &crate::spec::DataType,
+    target_type: &crate::spec::DataType,
+) -> crate::Result<Option<String>> {
     let Some(row) = row else {
         return Ok(None);
     };
@@ -399,7 +412,24 @@ fn format_stats_value(
     if stats_index >= row.arity() as usize {
         return Ok(None);
     }
-    format_row_field_as_java_cast_string(row, stats_index, data_type)
+    if data_type == target_type {
+        return format_row_field_as_java_object_string(row, stats_index, data_type);
+    }
+    let source = row.field_to_arrow(stats_index, data_type)?;
+    let target = crate::arrow::cast_array_for_schema_evolution(&source, data_type, target_type)?;
+    let fields = [DataField::new(0, "value".to_string(), target_type.clone())];
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "value",
+        target.data_type().clone(),
+        true,
+    )]));
+    let batch =
+        super::record_batch(schema, vec![target]).map_err(|error| crate::Error::DataInvalid {
+            message: format!("Invalid evolved file statistics: {error}"),
+            source: Some(Box::new(error)),
+        })?;
+    let row = BinaryRow::from_arrow(&batch, 0, &[0], &fields)?;
+    format_row_field_as_java_object_string(&row, 0, target_type)
 }
 
 fn format_java_map<T, F>(map: &BTreeMap<String, T>, value_to_string: F) -> String
@@ -419,9 +449,17 @@ where
     out
 }
 
-fn data_file_format_identifier(file_name: &str) -> paimon::Result<String> {
+fn java_file_path(path: &str) -> String {
+    if let Some((scheme, tail)) = path.split_once(":///") {
+        format!("{scheme}:/{tail}")
+    } else {
+        path.to_string()
+    }
+}
+
+fn data_file_format_identifier(file_name: &str) -> crate::Result<String> {
     let Some(dot) = file_name.rfind('.') else {
-        return Err(paimon::Error::DataInvalid {
+        return Err(crate::Error::DataInvalid {
             message: format!("{file_name} is not a legal file name."),
             source: None,
         });
@@ -430,7 +468,7 @@ fn data_file_format_identifier(file_name: &str) -> paimon::Result<String> {
     let extension = &file_name[dot + 1..];
     if is_hadoop_compression_extension(extension) {
         let Some(second_dot) = file_name[..dot].rfind('.') else {
-            return Err(paimon::Error::DataInvalid {
+            return Err(crate::Error::DataInvalid {
                 message: format!("{file_name} is not a legal file name."),
                 source: None,
             });
@@ -455,18 +493,39 @@ fn file_source_to_string(file_source: Option<i32>) -> Option<String> {
     })
 }
 
-fn file_rows_to_record_batch(rows: &[FileRow]) -> DFResult<RecordBatch> {
+fn common_file_columns(rows: &[FileRow]) -> Vec<ArrayRef> {
+    vec![
+        Arc::new(StringArray::from_iter(
+            rows.iter().map(|r| r.partition.as_deref()),
+        )),
+        Arc::new(Int32Array::from_iter_values(rows.iter().map(|r| r.bucket))),
+        Arc::new(StringArray::from_iter_values(
+            rows.iter().map(|r| r.file_path.as_str()),
+        )),
+        Arc::new(StringArray::from_iter_values(
+            rows.iter().map(|r| r.file_format.as_str()),
+        )),
+        Arc::new(Int64Array::from_iter_values(
+            rows.iter().map(|r| r.schema_id),
+        )),
+        Arc::new(Int32Array::from_iter_values(rows.iter().map(|r| r.level))),
+        Arc::new(Int64Array::from_iter_values(
+            rows.iter().map(|r| r.record_count),
+        )),
+        Arc::new(Int64Array::from_iter_values(
+            rows.iter().map(|r| r.file_size_in_bytes),
+        )),
+        Arc::new(StringArray::from_iter(
+            rows.iter().map(|r| r.min_key.as_deref()),
+        )),
+        Arc::new(StringArray::from_iter(
+            rows.iter().map(|r| r.max_key.as_deref()),
+        )),
+    ]
+}
+
+fn file_rows_to_record_batch(rows: &[FileRow]) -> Result<RecordBatch> {
     let n = rows.len();
-    let mut partitions = Vec::with_capacity(n);
-    let mut buckets = Vec::with_capacity(n);
-    let mut file_paths = Vec::with_capacity(n);
-    let mut file_formats = Vec::with_capacity(n);
-    let mut schema_ids = Vec::with_capacity(n);
-    let mut levels = Vec::with_capacity(n);
-    let mut record_counts = Vec::with_capacity(n);
-    let mut file_sizes = Vec::with_capacity(n);
-    let mut min_keys = Vec::with_capacity(n);
-    let mut max_keys = Vec::with_capacity(n);
     let mut null_value_counts = Vec::with_capacity(n);
     let mut min_value_stats = Vec::with_capacity(n);
     let mut max_value_stats = Vec::with_capacity(n);
@@ -479,19 +538,16 @@ fn file_rows_to_record_batch(rows: &[FileRow]) -> DFResult<RecordBatch> {
     let mut write_cols = ListBuilder::new(StringBuilder::new());
 
     for row in rows {
-        partitions.push(row.partition.clone());
-        buckets.push(row.bucket);
-        file_paths.push(row.file_path.clone());
-        file_formats.push(row.file_format.clone());
-        schema_ids.push(row.schema_id);
-        levels.push(row.level);
-        record_counts.push(row.record_count);
-        file_sizes.push(row.file_size_in_bytes);
-        min_keys.push(row.min_key.clone());
-        max_keys.push(row.max_key.clone());
-        null_value_counts.push(row.null_value_counts.clone());
-        min_value_stats.push(row.min_value_stats.clone());
-        max_value_stats.push(row.max_value_stats.clone());
+        let stats = row
+            .stats
+            .as_ref()
+            .ok_or_else(|| crate::Error::DataInvalid {
+                message: "Files table requires value statistics".to_string(),
+                source: None,
+            })?;
+        null_value_counts.push(stats.null_value_counts.clone());
+        min_value_stats.push(stats.min_value_stats.clone());
+        max_value_stats.push(stats.max_value_stats.clone());
         min_sequence_numbers.push(row.min_sequence_number);
         max_sequence_numbers.push(row.max_sequence_number);
         creation_times.push(row.creation_time);
@@ -509,36 +565,135 @@ fn file_rows_to_record_batch(rows: &[FileRow]) -> DFResult<RecordBatch> {
         }
     }
 
-    Ok(RecordBatch::try_new(
-        files_schema(),
-        vec![
-            Arc::new(StringArray::from(partitions)),
-            Arc::new(Int32Array::from(buckets)),
-            Arc::new(StringArray::from(file_paths)),
-            Arc::new(StringArray::from(file_formats)),
-            Arc::new(Int64Array::from(schema_ids)),
-            Arc::new(Int32Array::from(levels)),
-            Arc::new(Int64Array::from(record_counts)),
-            Arc::new(Int64Array::from(file_sizes)),
-            Arc::new(StringArray::from(min_keys)),
-            Arc::new(StringArray::from(max_keys)),
-            Arc::new(StringArray::from(null_value_counts)),
-            Arc::new(StringArray::from(min_value_stats)),
-            Arc::new(StringArray::from(max_value_stats)),
-            Arc::new(Int64Array::from(min_sequence_numbers)),
-            Arc::new(Int64Array::from(max_sequence_numbers)),
-            Arc::new(TimestampMillisecondArray::from(creation_times)),
-            Arc::new(Int64Array::from(delete_row_counts)),
-            Arc::new(StringArray::from(file_sources)),
-            Arc::new(Int64Array::from(first_row_ids)),
-            Arc::new(write_cols.finish()),
-        ],
-    )?)
+    let mut columns = common_file_columns(rows);
+    columns.extend(vec![
+        Arc::new(StringArray::from(null_value_counts)) as ArrayRef,
+        Arc::new(StringArray::from(min_value_stats)),
+        Arc::new(StringArray::from(max_value_stats)),
+        Arc::new(Int64Array::from(min_sequence_numbers)),
+        Arc::new(Int64Array::from(max_sequence_numbers)),
+        Arc::new(TimestampMillisecondArray::from(creation_times)),
+        Arc::new(Int64Array::from(delete_row_counts)),
+        Arc::new(StringArray::from(file_sources)),
+        Arc::new(Int64Array::from(first_row_ids)),
+        Arc::new(write_cols.finish()),
+    ]);
+    super::record_batch(files_schema(), columns)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn stats_file(columns: Option<Vec<String>>) -> DataFileMeta {
+        use crate::spec::{BinaryTableStats, DataType, Datum, IntType};
+        let typ = DataType::Int(IntType::new());
+        let value = Datum::Int(42);
+        let row = BinaryRow::from_datums(&[(Some(&value), &typ)]).to_serialized_bytes();
+        DataFileMeta {
+            file_name: "data.parquet".to_string(),
+            file_size: 100,
+            row_count: 2,
+            min_key: vec![],
+            max_key: vec![],
+            key_stats: BinaryTableStats::empty(),
+            value_stats: BinaryTableStats::new(row.clone(), row, vec![Some(0)]),
+            min_sequence_number: 0,
+            max_sequence_number: 1,
+            schema_id: 0,
+            level: 0,
+            extra_files: vec![],
+            creation_time: None,
+            delete_row_count: None,
+            embedded_index: None,
+            file_source: None,
+            value_stats_cols: None,
+            external_path: None,
+            first_row_id: None,
+            write_cols: columns,
+            column_max_sequence_numbers: None,
+        }
+    }
+
+    #[test]
+    fn file_stats_follow_physical_columns_and_schema_casts() {
+        use crate::spec::{DataType, DecimalType, IntType, Schema as PaimonSchema};
+        let schema = PaimonSchema::builder()
+            .column("a", DataType::Int(IntType::new()))
+            .column("b", DataType::Int(IntType::new()))
+            .build()
+            .unwrap();
+        let schema = TableSchema::new(0, &schema);
+        let mut file = stats_file(Some(vec!["b".to_string()]));
+        let result = format_file_value_stats(schema.fields(), &schema, &file).unwrap();
+        assert_eq!(result.min_value_stats, "{a=null, b=42}");
+        assert_eq!(result.null_value_counts, "{a=2, b=0}");
+        // Missing dense stats are unknown; missing physical fields are all NULL.
+        file.value_stats_cols = Some(vec![]);
+        let result = format_file_value_stats(schema.fields(), &schema, &file).unwrap();
+        assert_eq!(result.min_value_stats, "{a=null, b=null}");
+        assert_eq!(result.null_value_counts, "{a=2, b=null}");
+        file.value_stats_cols = None;
+        let target = vec![DataField::new(
+            1,
+            "renamed".to_string(),
+            DataType::Decimal(DecimalType::new(10, 2).unwrap()),
+        )];
+        let result = format_file_value_stats(&target, &schema, &file).unwrap();
+        assert_eq!(result.min_value_stats, "{renamed=42.00}");
+    }
+
+    #[test]
+    fn stats_cast_overflow_is_nullable_even_for_a_required_field() {
+        use crate::spec::{DataType, DecimalType, IntType};
+        let source_type = DataType::Int(IntType::new());
+        let value = crate::spec::Datum::Int(42);
+        let row = BinaryRow::from_datums(&[(Some(&value), &source_type)]);
+        let target = DataType::Decimal(DecimalType::with_nullable(false, 1, 0).unwrap());
+        assert_eq!(
+            format_stats_value(Some(&row), Some(0), &source_type, &target).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn key_range_batch_does_not_require_value_statistics() {
+        let row = FileRow {
+            partition: Some("{}".into()),
+            bucket: 0,
+            file_path: "s3://bucket/data.parquet".into(),
+            file_format: "parquet".into(),
+            schema_id: 0,
+            level: 0,
+            record_count: 2,
+            file_size_in_bytes: 100,
+            min_key: Some("[1, a]".into()),
+            max_key: Some("[2, b]".into()),
+            stats: None,
+            min_sequence_number: None,
+            max_sequence_number: None,
+            creation_time: None,
+            delete_row_count: None,
+            file_source: None,
+            first_row_id: Some(8),
+            write_cols: None,
+        };
+        let rows = [row];
+        let mut columns = common_file_columns(&rows);
+        columns.push(Arc::new(Int64Array::from(vec![Some(8)])));
+        let batch = RecordBatch::try_new(key_ranges_schema(), columns).unwrap();
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(batch.num_columns(), 11);
+        assert!(file_rows_to_record_batch(&rows).is_err());
+        assert_eq!(
+            java_file_path("file:///tmp/data.parquet"),
+            "file:/tmp/data.parquet"
+        );
+        assert_eq!(
+            java_file_path("s3://bucket/data.parquet"),
+            "s3://bucket/data.parquet"
+        );
+    }
 
     #[test]
     fn test_data_file_format_identifier() {

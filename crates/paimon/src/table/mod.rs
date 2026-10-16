@@ -129,6 +129,9 @@ mod postpone_fixed_bucket_write_builder;
 mod postpone_retract;
 mod prepared_files;
 mod query_auth;
+mod system_table;
+pub use system_table::SystemRead;
+
 mod read_builder;
 mod read_limit;
 pub mod referenced_files;
@@ -542,6 +545,11 @@ impl Table {
         self.rest_env.is_some()
             && options.is_format_table()
             && options.partitioned_table_in_metastore()
+    }
+
+    /// Read a small system table using this table's resolved environment.
+    pub fn new_system_read(&self, name: &str) -> Result<SystemRead> {
+        SystemRead::new(self.clone(), name)
     }
 
     /// Create a read builder for scan/read.

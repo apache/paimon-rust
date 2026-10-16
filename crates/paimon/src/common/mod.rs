@@ -18,6 +18,7 @@
 //! Common utilities for Paimon.
 
 pub(crate) mod date_time;
+pub use date_time::format_iso_timestamp;
 pub(crate) mod number;
 pub mod options;
 

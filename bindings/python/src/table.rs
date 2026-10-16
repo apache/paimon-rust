@@ -198,6 +198,13 @@ impl PyTable {
         }
     }
 
+    /// Read metadata through the core system reader.
+    fn new_system_read(&self, name: &str) -> PyResult<crate::system_table::PySystemRead> {
+        Ok(crate::system_table::PySystemRead {
+            inner: self.inner.new_system_read(name).map_err(to_py_err)?,
+        })
+    }
+
     fn new_full_text_search_builder(&self) -> crate::full_text_search::PyFullTextSearchBuilder {
         crate::full_text_search::PyFullTextSearchBuilder::new(Arc::clone(&self.inner))
     }
