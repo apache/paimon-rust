@@ -26,25 +26,24 @@ use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::Result;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
-use futures::TryStreamExt;
-use paimon::table::{SystemTable, Table};
+use paimon::table::{SystemRead, Table};
 use std::sync::Arc;
 
 pub(super) fn build(table: Table, name: &str) -> Result<Arc<dyn TableProvider>> {
     Ok(Arc::new(MetadataTableProvider {
-        table: table.system_table(name).map_err(to_datafusion_error)?,
+        read: table.new_system_read(name).map_err(to_datafusion_error)?,
     }))
 }
 
 #[derive(Debug)]
 pub(super) struct MetadataTableProvider {
-    table: SystemTable,
+    read: SystemRead,
 }
 
 #[async_trait]
 impl TableProvider for MetadataTableProvider {
     fn schema(&self) -> SchemaRef {
-        self.table.schema()
+        self.read.schema()
     }
     fn table_type(&self) -> TableType {
         TableType::View
@@ -57,44 +56,41 @@ impl TableProvider for MetadataTableProvider {
         filters: &[Expr],
         _limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let mut builder = self.table.new_read_builder();
+        let mut read = self.read.clone();
         if let Some(indices) = projection {
-            let schema = self.table.schema();
+            let schema = self.read.schema();
             let columns: Vec<_> = indices
                 .iter()
                 .map(|&index| schema.field(index).name().as_str())
                 .collect();
-            builder
-                .with_projection(&columns)
+            read.with_projection(&columns)
                 .map_err(to_datafusion_error)?;
         }
-        if let Some(predicate) =
-            crate::filter_pushdown::analyze_filters(filters, self.table.row_type().fields(), true)
-                .pushed_predicate
+        if let Some(predicate) = crate::filter_pushdown::analyze_filters(
+            filters,
+            self.read.full_row_type().fields(),
+            true,
+        )
+        .pushed_predicate
         {
-            builder
-                .with_filter(predicate)
-                .map_err(to_datafusion_error)?;
+            read.with_filter(predicate).map_err(to_datafusion_error)?;
         }
-        let schema = builder.schema();
-        let batches = crate::runtime::await_with_runtime(async move {
-            let plan = builder.new_scan().plan().await?;
-            builder
-                .new_read()
-                .read(plan.splits())?
-                .try_collect::<Vec<_>>()
-                .await
-        })
-        .await
-        .map_err(to_datafusion_error)?;
-        Ok(MemorySourceConfig::try_new_exec(&[batches], schema, None)?)
+        let schema = read.schema();
+        let batch = crate::runtime::await_with_runtime(read.read())
+            .await
+            .map_err(to_datafusion_error)?;
+        Ok(MemorySourceConfig::try_new_exec(
+            &[vec![batch]],
+            schema,
+            None,
+        )?)
     }
 
     fn supports_filters_pushdown(
         &self,
         filters: &[&Expr],
     ) -> Result<Vec<TableProviderFilterPushDown>> {
-        let fields = self.table.row_type();
+        let fields = self.read.full_row_type();
         Ok(filters
             .iter()
             .map(|filter| {

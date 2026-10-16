@@ -198,10 +198,10 @@ impl PyTable {
         }
     }
 
-    /// Resolve a core metadata table retaining this table's captured environment.
-    fn system_table(&self, name: &str) -> PyResult<crate::system_table::PySystemTable> {
-        Ok(crate::system_table::PySystemTable {
-            inner: self.inner.system_table(name).map_err(to_py_err)?,
+    /// Read metadata through the core system reader.
+    fn new_system_read(&self, name: &str) -> PyResult<crate::system_table::PySystemRead> {
+        Ok(crate::system_table::PySystemRead {
+            inner: self.inner.new_system_read(name).map_err(to_py_err)?,
         })
     }
 

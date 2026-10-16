@@ -79,9 +79,8 @@ async fn read_metadata(
     table: paimon::table::Table,
     name: &str,
 ) -> paimon::Result<paimon::table::ArrowRecordBatchStream> {
-    let builder = table.system_table(name)?.new_read_builder();
-    let plan = builder.new_scan().plan().await?;
-    builder.new_read().read(plan.splits())
+    let batch = table.new_system_read(name)?.read().await?;
+    Ok(Box::pin(futures::stream::iter([Ok(batch)])))
 }
 
 // Error text of `sql`, whether it surfaces at planning or execution.
@@ -1793,7 +1792,7 @@ async fn test_resolved_system_table_reader_preserves_guards_and_schema() {
         "table_indexes",
     ] {
         let stream = read_metadata(table.clone(), name).await.unwrap();
-        let schema = table.system_table(name).unwrap().schema();
+        let schema = table.new_system_read(name).unwrap().schema();
         let batches: Vec<_> = stream.try_collect().await.unwrap();
         assert!(!schema.fields().is_empty(), "{name}");
         assert!(
@@ -1865,46 +1864,31 @@ async fn test_options_ignore_resolved_dynamic_overrides() {
 }
 
 #[tokio::test]
-async fn test_core_system_table_read_builder_filters_before_projection() {
-    use futures::TryStreamExt;
+async fn test_core_system_read_filters_before_projection() {
     use paimon::spec::{Datum, Predicate, PredicateOperator};
     let (_ctx, catalog, _tmp) = create_context().await;
     let table = catalog
         .get_table(&Identifier::new("default", FIXTURE_TABLE))
         .await
         .unwrap();
-    let system = table.system_table("snapshots").unwrap();
-    let mut builder = system.new_read_builder();
-    builder.with_projection(&["commit_user"]).unwrap();
-    let field = system.row_type().fields()[0].clone();
-    builder
-        .with_filter(Predicate::Leaf {
-            column: field.name().to_string(),
-            index: 0,
-            data_type: field.data_type().clone(),
-            op: PredicateOperator::Gt,
-            literals: vec![Datum::Long(0)],
-        })
-        .unwrap();
-    builder.with_limit(1);
-    let plan = builder.new_scan().plan().await.unwrap();
-    let rows: Vec<_> = builder
-        .new_read()
-        .read(plan.splits())
-        .unwrap()
-        .try_collect()
-        .await
-        .unwrap();
-    assert_eq!(rows.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
-    assert_eq!(rows[0].schema().fields().len(), 1);
-    assert_eq!(rows[0].schema().field(0).name(), "commit_user");
-    builder.with_limit(0);
-    let rows: Vec<_> = builder
-        .new_read()
-        .read(plan.splits())
-        .unwrap()
-        .try_collect()
-        .await
-        .unwrap();
-    assert!(rows.iter().all(|batch| batch.num_rows() == 0));
+    let mut read = table.new_system_read("snapshots").unwrap();
+    let field = read.read_type()[0].clone();
+    read.with_projection(&["commit_user"]).unwrap();
+    read.with_filter(Predicate::Leaf {
+        column: field.name().to_string(),
+        index: 0,
+        data_type: field.data_type().clone(),
+        op: PredicateOperator::Gt,
+        literals: vec![Datum::Long(0)],
+    })
+    .unwrap();
+    read.with_limit(1);
+    let rows = read.read().await.unwrap();
+    assert_eq!(rows.num_rows(), 1);
+    assert_eq!(rows.schema().fields().len(), 1);
+    assert_eq!(rows.schema().field(0).name(), "commit_user");
+    read.with_limit(0);
+    let rows = read.read().await.unwrap();
+    assert_eq!(rows.num_rows(), 0);
+    assert_eq!(rows.schema(), read.schema());
 }

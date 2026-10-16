@@ -130,9 +130,7 @@ mod postpone_retract;
 mod prepared_files;
 mod query_auth;
 mod system_table;
-pub use system_table::{
-    SystemReadBuilder, SystemSplit, SystemTable, SystemTablePlan, SystemTableRead, SystemTableScan,
-};
+pub use system_table::SystemRead;
 
 mod read_builder;
 mod read_limit;
@@ -549,9 +547,9 @@ impl Table {
             && options.partitioned_table_in_metastore()
     }
 
-    /// Resolve a read-only metadata table while retaining this table's environment.
-    pub fn system_table(&self, name: &str) -> Result<SystemTable> {
-        SystemTable::new(self.clone(), name)
+    /// Read a small system table using this table's resolved environment.
+    pub fn new_system_read(&self, name: &str) -> Result<SystemRead> {
+        SystemRead::new(self.clone(), name)
     }
 
     /// Create a read builder for scan/read.
