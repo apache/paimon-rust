@@ -27,7 +27,9 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 
 use crate::catalog::{list_partition_entries, FileSystemPartitionEntry};
-use crate::spec::{BinaryRow, CoreOptions, DataField, FileKind, IndexManifest, IndexManifestEntry};
+use crate::spec::{
+    BinaryRow, CoreOptions, DataField, Datum, FileKind, IndexManifest, IndexManifestEntry,
+};
 use crate::table::Table;
 use crate::Result;
 
@@ -140,6 +142,47 @@ fn partition_string(row: &BinaryRow, fields: &[DataField], default_name: &str) -
         .map(|parts| parts.join("/"))
 }
 
+// Java converts catalog partition specs back to typed rows before looking up
+// deletion metadata. A default spec becomes NULL, and binary specs round-trip
+// through Java's UTF-8 decoder rather than retaining malformed source bytes.
+fn deletion_partition_key(
+    row: &BinaryRow,
+    fields: &[DataField],
+    default_name: &str,
+) -> Result<Vec<u8>> {
+    let values = fields
+        .iter()
+        .enumerate()
+        .map(|(index, field)| {
+            let value = row.get_datum(index, field.data_type())?;
+            let Some(value) = value else {
+                return Ok(None);
+            };
+            let text = format_field(row, index, field.data_type())?;
+            if text == default_name || crate::spec::is_java_whitespace_only(&text) {
+                return Ok(None);
+            }
+            Ok(Some(match value {
+                Datum::Bytes(_) => Datum::Bytes(text.into_bytes()),
+                Datum::Time(value) => {
+                    let crate::spec::DataType::Time(typ) = field.data_type() else {
+                        unreachable!()
+                    };
+                    let quantum = 10_i32.pow(3 - typ.precision().min(3));
+                    Datum::Time(value / quantum * quantum)
+                }
+                value => value,
+            }))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let refs: Vec<_> = values
+        .iter()
+        .zip(fields)
+        .map(|(value, field)| (value.as_ref(), field.data_type()))
+        .collect();
+    Ok(BinaryRow::from_datums(&refs).to_serialized_bytes())
+}
+
 fn partition_batch(
     entries: Vec<FileSystemPartitionEntry>,
     fields: &[DataField],
@@ -171,12 +214,18 @@ fn partition_batch(
         files.push(entry.file_count);
         times.push(entry.last_file_creation_time);
         buckets.push(entry.total_buckets);
-        deleted.push(
+        deleted.push(if deletions.is_empty() {
+            Some(0)
+        } else {
             deletions
-                .get(&entry.partition.to_serialized_bytes())
+                .get(&deletion_partition_key(
+                    &entry.partition,
+                    fields,
+                    default_name,
+                )?)
                 .copied()
-                .unwrap_or(Some(0)),
-        );
+                .unwrap_or(Some(0))
+        });
     }
     super::record_batch(
         partitions_schema(),
@@ -267,6 +316,30 @@ mod tests {
         assert_eq!(counts[&unknown.partition], None);
         assert!(!counts.contains_key(&absent.partition));
         assert_eq!(counts.len(), 2);
+    }
+
+    #[test]
+    fn deletion_lookup_uses_typed_partition_specs() {
+        let typ = PaimonType::VarChar(VarCharType::string_type());
+        let fields = [DataField::new(0, "p".into(), typ.clone())];
+        let null = BinaryRow::from_datums(&[(None, &typ)]).to_serialized_bytes();
+        for value in ["DEFAULT", "\u{1c}"] {
+            let datum = Datum::String(value.into());
+            let row = BinaryRow::from_datums(&[(Some(&datum), &typ)]);
+            assert_eq!(
+                deletion_partition_key(&row, &fields, "DEFAULT").unwrap(),
+                null
+            );
+        }
+        let typ = PaimonType::VarBinary(crate::spec::VarBinaryType::new(3).unwrap());
+        let fields = [DataField::new(0, "p".into(), typ.clone())];
+        let original = Datum::Bytes(vec![0xed, 0xa0, 0x80]);
+        let canonical = Datum::Bytes("�".as_bytes().to_vec());
+        let row = BinaryRow::from_datums(&[(Some(&original), &typ)]);
+        assert_eq!(
+            deletion_partition_key(&row, &fields, "DEFAULT").unwrap(),
+            BinaryRow::from_datums(&[(Some(&canonical), &typ)]).to_serialized_bytes()
+        );
     }
 
     #[test]
