@@ -1811,3 +1811,294 @@ async fn delta_keeps_physical_retractions_and_changelog_row_kinds() {
     }
     assert!(read_current_pairs(&table).await.is_empty());
 }
+
+type BlobRow = (Option<i32>, Option<Vec<u8>>);
+
+/// `(id, picture)` of every row, sorted, located by column name so a leading
+/// `rowkind` column is skipped.
+fn blob_rows(batches: &[RecordBatch]) -> Vec<BlobRow> {
+    use arrow_array::LargeBinaryArray;
+    let mut rows = Vec::new();
+    for batch in batches {
+        let ids = batch.column_by_name("id").unwrap();
+        let ids = ids.as_any().downcast_ref::<Int32Array>().unwrap();
+        let pictures = batch.column_by_name("picture").unwrap();
+        let pictures = pictures
+            .as_any()
+            .downcast_ref::<LargeBinaryArray>()
+            .unwrap();
+        for row in 0..batch.num_rows() {
+            rows.push((
+                ids.is_valid(row).then(|| ids.value(row)),
+                pictures.is_valid(row).then(|| pictures.value(row).to_vec()),
+            ));
+        }
+    }
+    rows.sort();
+    rows
+}
+
+/// Reads `(start, end]` per commit, as rows and as audit rows.
+async fn read_delta_both_ways(
+    table: &paimon::table::Table,
+    start: i64,
+    end: i64,
+) -> (Vec<RecordBatch>, Vec<RecordBatch>) {
+    let builder = table.new_read_builder();
+    let plan = builder
+        .new_incremental_scan(IncrementalScanMode::Delta, start, end)
+        .plan()
+        .await
+        .unwrap();
+    let read = builder.new_read().unwrap();
+    let rows = read
+        .to_incremental_arrow(&plan)
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    let audit = read
+        .to_audit_log_arrow(&plan)
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    (rows, audit)
+}
+
+/// A data-evolution commit writes BLOB and dedicated VECTOR columns to files of
+/// their own beside the row's other columns. Each commit must still read back
+/// as whole rows, as in an ordinary read.
+#[tokio::test]
+async fn delta_merges_data_evolution_column_files_into_rows() {
+    use arrow_array::builder::{FixedSizeListBuilder, Float32Builder};
+    use arrow_array::{ArrayRef, FixedSizeListArray, Float32Array, LargeBinaryArray, StringArray};
+    use arrow_schema::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
+    use paimon::spec::{BlobType, DataType, FloatType, IntType, Schema, TableSchema, VectorType};
+    use std::sync::Arc;
+
+    let path = "memory:/incremental_batch/data_evolution_files";
+    let vector = VectorType::try_new(true, 2, DataType::Float(FloatType::new())).unwrap();
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .column("picture", DataType::Blob(BlobType::new()))
+        .column("embedding", DataType::Vector(vector))
+        .option("row-tracking.enabled", "true")
+        .option("data-evolution.enabled", "true")
+        .option("vector.file.format", "parquet")
+        .build()
+        .unwrap();
+    let (io, table) = memory_table(path, TableSchema::new(0, &schema));
+    setup_dirs(&io, path).await;
+    persist_table_schema(&io, path, table.schema()).await;
+    let element = Arc::new(Field::new("element", ArrowDataType::Float32, true));
+    let batch = |ids: Vec<i32>, pictures: Vec<&[u8]>, embeddings: Vec<[f32; 2]>| {
+        let mut builder =
+            FixedSizeListBuilder::new(Float32Builder::new(), 2).with_field(element.clone());
+        for embedding in embeddings {
+            builder.values().append_slice(&embedding);
+            builder.append(true);
+        }
+        RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                Field::new("id", ArrowDataType::Int32, true),
+                Field::new("picture", ArrowDataType::LargeBinary, true),
+                Field::new(
+                    "embedding",
+                    ArrowDataType::FixedSizeList(element.clone(), 2),
+                    true,
+                ),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(ids)) as ArrayRef,
+                Arc::new(LargeBinaryArray::from(pictures)),
+                Arc::new(builder.finish()),
+            ],
+        )
+        .unwrap()
+    };
+    write_batch(
+        &table,
+        &batch(
+            vec![1, 2],
+            vec![b"aaa", b"bb"],
+            vec![[1.0, 0.0], [0.0, 1.0]],
+        ),
+    )
+    .await;
+    write_batch(&table, &batch(vec![3], vec![b"c"], vec![[0.5, 0.5]])).await;
+
+    let embeddings = |batches: &[RecordBatch]| {
+        let mut rows = Vec::new();
+        for batch in batches {
+            let ids = batch.column_by_name("id").unwrap();
+            let ids = ids.as_any().downcast_ref::<Int32Array>().unwrap();
+            let lists = batch.column_by_name("embedding").unwrap();
+            let lists = lists.as_any().downcast_ref::<FixedSizeListArray>().unwrap();
+            for row in 0..batch.num_rows() {
+                let values = lists.is_valid(row).then(|| {
+                    let values = lists.value(row);
+                    let values = values.as_any().downcast_ref::<Float32Array>().unwrap();
+                    values.values().to_vec()
+                });
+                rows.push((ids.is_valid(row).then(|| ids.value(row)), values));
+            }
+        }
+        rows.sort_by_key(|row| row.0);
+        rows
+    };
+    let picture = |id: i32, bytes: &[u8]| (Some(id), Some(bytes.to_vec()));
+    for (start, ids) in [(0, vec![1, 2, 3]), (1, vec![3])] {
+        let (rows, audit) = read_delta_both_ways(&table, start, 2).await;
+        let all = [picture(1, b"aaa"), picture(2, b"bb"), picture(3, b"c")];
+        let expected: Vec<BlobRow> = all
+            .into_iter()
+            .filter(|row| ids.contains(&row.0.unwrap()))
+            .collect();
+        assert_eq!(blob_rows(&rows), expected, "rows from {start}");
+        assert_eq!(blob_rows(&audit), expected, "audit rows from {start}");
+        let vectors = [
+            (Some(1), Some(vec![1.0, 0.0])),
+            (Some(2), Some(vec![0.0, 1.0])),
+            (Some(3), Some(vec![0.5, 0.5])),
+        ];
+        let expected: Vec<_> = vectors
+            .into_iter()
+            .filter(|row| ids.contains(&row.0.unwrap()))
+            .collect();
+        assert_eq!(embeddings(&rows), expected, "embeddings from {start}");
+        let kinds: Vec<_> = audit
+            .iter()
+            .flat_map(|batch| {
+                let kinds = batch.column(0).as_any().downcast_ref::<StringArray>();
+                kinds.unwrap().iter().map(|kind| kind.unwrap().to_owned())
+            })
+            .collect();
+        assert_eq!(kinds, vec!["+I"; ids.len()], "row kinds from {start}");
+    }
+}
+
+/// A primary-key table keeps managed BLOB descriptors in its data files. Each
+/// commit must read back with the payloads, as in an ordinary read.
+#[tokio::test]
+async fn delta_resolves_primary_key_blob_payloads() {
+    use arrow_array::{ArrayRef, LargeBinaryArray};
+    use arrow_schema::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
+    use paimon::spec::{BlobType, DataType, IntType, Schema, TableSchema};
+    use std::sync::Arc;
+
+    let path = "memory:/incremental_batch/primary_key_blobs";
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::with_nullable(false)))
+        .column("picture", DataType::Blob(BlobType::new()))
+        .primary_key(["id"])
+        .option("bucket", "1")
+        .build()
+        .unwrap();
+    let (io, table) = memory_table(path, TableSchema::new(0, &schema));
+    setup_dirs(&io, path).await;
+    persist_table_schema(&io, path, table.schema()).await;
+    let batch = |ids: Vec<i32>, pictures: Vec<&[u8]>| {
+        RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                Field::new("id", ArrowDataType::Int32, false),
+                Field::new("picture", ArrowDataType::LargeBinary, true),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(ids)) as ArrayRef,
+                Arc::new(LargeBinaryArray::from(pictures)),
+            ],
+        )
+        .unwrap()
+    };
+    write_batch(&table, &batch(vec![1, 2], vec![b"aaa", b"bb"])).await;
+    write_batch(&table, &batch(vec![2], vec![b"c"])).await;
+
+    let (rows, audit) = read_delta_both_ways(&table, 0, 2).await;
+    let expected = vec![
+        (Some(1), Some(b"aaa".to_vec())),
+        (Some(2), Some(b"bb".to_vec())),
+        (Some(2), Some(b"c".to_vec())),
+    ];
+    assert_eq!(blob_rows(&rows), expected);
+    assert_eq!(blob_rows(&audit), expected);
+}
+
+/// Each commit reads back as a streaming read of that snapshot does, including
+/// a data-evolution update that rewrites a column of existing rows.
+#[tokio::test]
+async fn delta_reads_each_commit_as_its_stream_follow_up() {
+    use arrow_array::{ArrayRef, Int64Array, LargeBinaryArray};
+    use paimon::spec::{BlobType, DataType, IntType, Schema, TableSchema};
+    use std::sync::Arc;
+
+    let path = "memory:/incremental_batch/stream_follow_up";
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .column("picture", DataType::Blob(BlobType::new()))
+        .option("row-tracking.enabled", "true")
+        .option("data-evolution.enabled", "true")
+        .build()
+        .unwrap();
+    let (io, table) = memory_table(path, TableSchema::new(0, &schema));
+    setup_dirs(&io, path).await;
+    persist_table_schema(&io, path, table.schema()).await;
+    let batch = |ids: Vec<i32>, pictures: Vec<&[u8]>| {
+        RecordBatch::try_from_iter([
+            ("id", Arc::new(Int32Array::from(ids)) as ArrayRef),
+            ("picture", Arc::new(LargeBinaryArray::from(pictures))),
+        ])
+        .unwrap()
+    };
+    write_batch(&table, &batch(vec![1, 2], vec![b"aaa", b"bb"])).await;
+    write_batch(&table, &batch(vec![3], vec![b"c"])).await;
+    // Snapshot 3 rewrites `picture` of row 0.
+    let builder = table.new_write_builder();
+    let mut update = builder
+        .new_data_evolution_writer(vec!["picture".into()])
+        .unwrap();
+    update
+        .add_matched_batch(
+            RecordBatch::try_from_iter([
+                ("_ROW_ID", Arc::new(Int64Array::from(vec![0])) as ArrayRef),
+                (
+                    "picture",
+                    Arc::new(LargeBinaryArray::from(vec![b"new".as_slice()])),
+                ),
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+    builder
+        .new_commit()
+        .commit(update.prepare_commit().await.unwrap())
+        .await
+        .unwrap();
+
+    let read_builder = table.new_read_builder();
+    let mut stream = read_builder.new_stream_scan().unwrap();
+    for snapshot in 1..=3 {
+        stream.restore(Some(snapshot)).unwrap();
+        let plan = stream.plan().await.unwrap().unwrap();
+        let streamed: Vec<RecordBatch> = read_builder
+            .new_read()
+            .unwrap()
+            .to_arrow(plan.splits())
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let (rows, audit) = read_delta_both_ways(&table, snapshot - 1, snapshot).await;
+        assert!(!streamed.is_empty(), "snapshot {snapshot}");
+        assert_eq!(
+            blob_rows(&rows),
+            blob_rows(&streamed),
+            "snapshot {snapshot}"
+        );
+        assert_eq!(
+            blob_rows(&audit),
+            blob_rows(&streamed),
+            "snapshot {snapshot}"
+        );
+    }
+}
