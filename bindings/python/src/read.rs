@@ -28,7 +28,7 @@ use futures::TryStreamExt;
 use paimon::spec::{is_variant_extraction_row, DataField, DataType, Predicate, RowType};
 use paimon::table::{
     ArrowRecordBatchStream, DataSplit, GlobalIndexResult, IncrementalScanMode, RowRange,
-    ScanStatsMode, StreamTableScan, Table,
+    StreamTableScan, Table,
 };
 use paimon_datafusion::runtime::runtime;
 use pyo3::exceptions::{PyBaseException, PyRuntimeError, PyTypeError, PyValueError};
@@ -351,7 +351,7 @@ impl PyReadBuilder {
             row_position_shard: None,
             chunk_shuffle: None,
             shard: None,
-            stats_mode: None,
+            collect_stats: false,
         }
     }
 
@@ -416,7 +416,7 @@ pub struct PyTableScan {
     row_position_shard: Option<(u64, u64)>,
     chunk_shuffle: Option<PyChunkShuffle>,
     shard: Option<(usize, usize)>,
-    stats_mode: Option<ScanStatsMode>,
+    collect_stats: bool,
 }
 
 #[derive(Clone)]
@@ -472,8 +472,8 @@ impl PyTableScan {
         if let Some((index, count)) = self.shard {
             scan = scan.with_shard(index, count).map_err(to_py_err)?;
         }
-        if let Some(mode) = self.stats_mode {
-            scan = scan.with_stats(mode).map_err(to_py_err)?;
+        if self.collect_stats {
+            scan = scan.with_stats();
         }
         Ok(scan)
     }
@@ -508,8 +508,8 @@ impl PyTableScan {
         if let Some((index, count)) = self.shard {
             scan = scan.with_shard(index, count).map_err(to_py_err)?;
         }
-        if let Some(mode) = self.stats_mode {
-            scan = scan.with_stats(mode).map_err(to_py_err)?;
+        if self.collect_stats {
+            scan = scan.with_stats();
         }
         Ok(scan)
     }
@@ -667,17 +667,10 @@ impl PyStreamTableScan {
 
 #[pymethods]
 impl PyTableScan {
-    /// Collect metadata statistics when plan() is called.
-    #[pyo3(signature = (complete = true))]
-    fn with_stats(mut slf: PyRefMut<'_, Self>, complete: bool) -> PyResult<PyRefMut<'_, Self>> {
-        let mode = if complete {
-            ScanStatsMode::Complete
-        } else {
-            ScanStatsMode::Lightweight
-        };
-        slf.core_scan()?.with_stats(mode).map_err(to_py_err)?;
-        slf.stats_mode = Some(mode);
-        Ok(slf)
+    /// Collect statistics from normal planning without changing pruning or LIMIT.
+    fn with_stats(mut slf: PyRefMut<'_, Self>) -> PyRefMut<'_, Self> {
+        slf.collect_stats = true;
+        slf
     }
 
     /// Supply an evaluated selection; validation and authorization stay in core.
@@ -786,11 +779,6 @@ pub struct PyScanStats {
 
 #[pymethods]
 impl PyScanStats {
-    /// Whether all partition-selected entries and pre-LIMIT candidates were counted.
-    #[getter]
-    fn complete(&self) -> bool {
-        self.inner.complete
-    }
     #[getter]
     fn base_manifest_files(&self) -> usize {
         self.inner.base_manifest_files
@@ -814,22 +802,6 @@ impl PyScanStats {
     #[getter]
     fn manifest_entries_read(&self) -> usize {
         self.inner.manifest_entries_read
-    }
-    #[getter]
-    fn entries_potential_total(&self) -> u64 {
-        self.inner.entries_potential_total
-    }
-    #[getter]
-    fn entries_after_partition(&self) -> usize {
-        self.inner.entries_after_partition
-    }
-    #[getter]
-    fn entries_after_bucket(&self) -> usize {
-        self.inner.entries_after_bucket
-    }
-    #[getter]
-    fn entries_after_stats(&self) -> usize {
-        self.inner.entries_after_stats
     }
     #[getter]
     fn manifest_entries_pruned_by_bucket(&self) -> usize {

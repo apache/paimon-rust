@@ -21,7 +21,7 @@ use super::{TableScan, TableScanKind};
 use crate::spec::MergeEngine;
 use crate::table::kv_file_reader::retain_primary_key_conjuncts;
 use crate::table::merge_tree_split_generator::{merge_tree_split_for_batch, KeyComparator};
-use crate::table::{DataSplit, Plan, ReadBuilder, ScanStatsMode};
+use crate::table::{DataSplit, Plan, ReadBuilder};
 use std::collections::HashMap;
 
 /// Plans current-state audit reads over the wrapped table's files.
@@ -50,9 +50,9 @@ impl<'a> AuditLogScan<'a> {
     }
 
     /// Collect statistics on the audit plan, accessible through [`Plan::stats`].
-    pub fn with_stats(mut self, mode: ScanStatsMode) -> crate::Result<Self> {
-        self.scan = self.scan.with_stats(mode)?;
-        Ok(self)
+    pub fn with_stats(mut self) -> Self {
+        self.scan = self.scan.with_stats();
+        self
     }
 
     pub async fn plan(&self) -> crate::Result<Plan> {
@@ -232,13 +232,7 @@ mod tests {
             let mut reader = table.new_read_builder();
             reader.with_filter(value_filter);
 
-            let ordinary_plan = reader
-                .new_scan()
-                .with_stats(crate::table::ScanStatsMode::Lightweight)
-                .unwrap()
-                .plan()
-                .await
-                .unwrap();
+            let ordinary_plan = reader.new_scan().with_stats().plan().await.unwrap();
             let ordinary_stats = ordinary_plan.stats().cloned().unwrap();
             assert!(ordinary_stats.manifest_entries_pruned_by_data_stats >= 1);
             assert_eq!(
@@ -250,13 +244,7 @@ mod tests {
                 1
             );
 
-            let audit_plan = reader
-                .new_audit_scan()
-                .with_stats(crate::table::ScanStatsMode::Lightweight)
-                .unwrap()
-                .plan()
-                .await
-                .unwrap();
+            let audit_plan = reader.new_audit_scan().with_stats().plan().await.unwrap();
             let audit_stats = audit_plan.stats().cloned().unwrap();
             assert_eq!(audit_plan.snapshot_id(), ordinary_plan.snapshot_id());
             assert_eq!(audit_stats.final_files, 2);

@@ -1099,13 +1099,7 @@ async fn test_file_index_prunes_without_opening_data_file() {
         let mut read_builder = table.new_read_builder();
         read_builder.with_filter(predicate.clone());
         let scan_stats = {
-            let statistics_plan = read_builder
-                .new_scan()
-                .with_stats(crate::table::ScanStatsMode::Lightweight)
-                .unwrap()
-                .plan()
-                .await
-                .unwrap();
+            let statistics_plan = read_builder.new_scan().with_stats().plan().await.unwrap();
             statistics_plan.stats().cloned().unwrap()
         };
         assert_eq!(scan_stats.final_files, 1, "statistics must retain the file");
@@ -1153,13 +1147,7 @@ async fn test_pk_file_index_prunes_before_sort_merge_opens_data() {
             let mut read_builder = table.new_read_builder();
             read_builder.with_filter(predicate.clone());
             let scan_stats = {
-                let statistics_plan = read_builder
-                    .new_scan()
-                    .with_stats(crate::table::ScanStatsMode::Lightweight)
-                    .unwrap()
-                    .plan()
-                    .await
-                    .unwrap();
+                let statistics_plan = read_builder.new_scan().with_stats().plan().await.unwrap();
                 statistics_plan.stats().cloned().unwrap()
             };
             assert_eq!(scan_stats.final_files, 1, "stats must retain the file");
@@ -1205,13 +1193,7 @@ async fn test_data_evolution_file_index_prunes_independent_file() {
         let mut read_builder = table.new_read_builder();
         read_builder.with_filter(predicate.clone());
         let scan_stats = {
-            let statistics_plan = read_builder
-                .new_scan()
-                .with_stats(crate::table::ScanStatsMode::Lightweight)
-                .unwrap()
-                .plan()
-                .await
-                .unwrap();
+            let statistics_plan = read_builder.new_scan().with_stats().plan().await.unwrap();
             statistics_plan.stats().cloned().unwrap()
         };
         assert_eq!(scan_stats.final_files, 1, "stats must retain the file");
@@ -1614,13 +1596,7 @@ async fn test_range_bitmap_append_range_pruning() {
             let mut scan = table.new_read_builder();
             scan.with_filter(missing.clone());
             let scan_stats = {
-                let statistics_plan = scan
-                    .new_scan()
-                    .with_stats(crate::table::ScanStatsMode::Lightweight)
-                    .unwrap()
-                    .plan()
-                    .await
-                    .unwrap();
+                let statistics_plan = scan.new_scan().with_stats().plan().await.unwrap();
                 statistics_plan.stats().cloned().unwrap()
             };
             assert_eq!(scan_stats.final_files, 1, "statistics must retain the file");

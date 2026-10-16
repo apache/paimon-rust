@@ -19,44 +19,24 @@
 
 use std::fmt;
 
-/// How much metadata a scan should collect statistics for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ScanStatsMode {
-    /// Record work performed by normal planning, retaining early pruning and LIMIT.
-    Lightweight,
-    /// Count every partition-selected manifest entry and all candidates before LIMIT.
-    Complete,
-}
-
 /// Stage counters collected while planning a table scan.
 ///
 /// The counters are intended for explain output and regression tests. They
 /// describe pruning at metadata planning time only; reader-side Parquet row
 /// group pruning and DataFusion residual filters are outside these statistics.
 /// [`super::TableScan::with_stats`] enables collection and stores
-/// this type on [`super::Plan::stats`]. Complete collection decodes all
-/// entries of partition-selected manifests and counts candidates before LIMIT.
+/// this type on [`super::Plan::stats`]. Counters describe the work performed
+/// by normal planning, retaining manifest pruning and LIMIT stopping.
 /// Snapshot metadata is available separately from [`super::Plan::snapshot_id`].
 #[non_exhaustive]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ScanStats {
-    /// True when all partition-selected entries were counted before bucket,
-    /// sidecar and LIMIT optimizations. Lightweight statistics keep false.
-    pub complete: bool,
     pub base_manifest_files: usize,
     pub delta_manifest_files: usize,
     pub manifest_files_before_partition_pruning: usize,
     pub manifest_files_after_partition_pruning: usize,
     pub manifest_files_pruned_by_row_ranges: usize,
     pub manifest_entries_read: usize,
-    /// ADD plus DELETE records in manifest metadata, before partition pruning.
-    pub entries_potential_total: u64,
-    /// Complete-funnel counters, populated only when `complete` is true.
-    pub entries_after_partition: usize,
-    pub entries_after_bucket: usize,
-    /// Selected physical file references for Data Evolution; otherwise entries
-    /// surviving schema-aware file statistics before ADD/DELETE netting.
-    pub entries_after_stats: usize,
     pub manifest_entries_pruned_by_bucket: usize,
     pub manifest_entries_pruned_by_partition: usize,
     pub manifest_entries_after_entry_pruning: usize,
@@ -70,8 +50,11 @@ pub struct ScanStats {
     pub data_evolution_groups_before_stats: usize,
     pub data_evolution_groups_pruned_by_stats: usize,
     pub data_evolution_groups_pruned_by_row_ranges: usize,
+    /// Candidates actually constructed; excludes work skipped by LIMIT stopping.
     pub split_candidates_built: usize,
+    /// Whether a LIMIT hint stopped planning before all candidates were built.
     pub limit_early_stopped: bool,
+    /// Candidates encountered before applying the LIMIT hint, not a full-scan total.
     pub splits_before_limit: usize,
     pub splits_after_limit: usize,
     pub final_splits: usize,
@@ -82,13 +65,6 @@ pub struct ScanStats {
 }
 
 impl ScanStats {
-    pub(crate) fn new(mode: ScanStatsMode) -> Self {
-        Self {
-            complete: mode == ScanStatsMode::Complete,
-            ..Default::default()
-        }
-    }
-
     pub(crate) fn record_manifest_lists(&mut self, base_count: usize, delta_count: usize) {
         self.base_manifest_files = base_count;
         self.delta_manifest_files = delta_count;

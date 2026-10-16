@@ -608,8 +608,7 @@ mod tests {
             assert!(changed
                 .new_read_builder()
                 .new_scan()
-                .with_stats(crate::table::ScanStatsMode::Lightweight)
-                .unwrap()
+                .with_stats()
                 .plan()
                 .await
                 .is_err());

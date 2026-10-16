@@ -160,8 +160,7 @@ async fn timestamp_options_select_events_and_preserve_end_snapshot() {
             let plan = selected
                 .new_read_builder()
                 .new_scan()
-                .with_stats(paimon::table::ScanStatsMode::Lightweight)
-                .unwrap()
+                .with_stats()
                 .plan()
                 .await
                 .unwrap();
@@ -189,13 +188,7 @@ async fn timestamp_auto_uses_physical_changelog_and_preserves_retracts() {
     append(&table, 300, vec![3], vec![30]).await;
     let selected = window(&table, 100, 300);
     let builder = selected.new_read_builder();
-    let plan = builder
-        .new_scan()
-        .with_stats(paimon::table::ScanStatsMode::Lightweight)
-        .unwrap()
-        .plan()
-        .await
-        .unwrap();
+    let plan = builder.new_scan().with_stats().plan().await.unwrap();
     let scan_stats = plan.stats().cloned().unwrap();
     assert_eq!(plan.snapshot_id(), Some(3));
     assert!(plan.splits().iter().all(|split| split.snapshot_id() == 3));

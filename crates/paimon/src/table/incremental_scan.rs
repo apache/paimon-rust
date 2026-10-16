@@ -15,9 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::{
-    DataSplit, GlobalIndexResult, Plan, ScanStats, ScanStatsMode, SnapshotManager, Table, TableScan,
-};
+use super::{DataSplit, GlobalIndexResult, Plan, ScanStats, SnapshotManager, Table, TableScan};
 use crate::spec::{CommitKind, CoreOptions};
 
 /// Java IncrementalDeltaStartingScanner.betweenTimestamps. Resolve both bounds
@@ -325,9 +323,9 @@ impl<'a> IncrementalScan<'a> {
     /// Collect pruning counters for [`Self::plan_combined`], available
     /// through [`Plan::stats`]. Per-snapshot and Diff planning do not
     /// represent one ordinary plan with a shared metadata funnel.
-    pub fn with_stats(mut self, mode: ScanStatsMode) -> crate::Result<Self> {
-        self.scan = self.scan.with_stats(mode)?;
-        Ok(self)
+    pub fn with_stats(mut self) -> Self {
+        self.scan = self.scan.with_stats();
+        self
     }
 
     pub async fn plan(&self) -> crate::Result<IncrementalPlan> {
@@ -350,7 +348,7 @@ impl<'a> IncrementalScan<'a> {
             || self.scan.has_chunk_shuffle()
             || self.scan.has_shard()
             || self.scan.has_global_index_result()
-            || self.scan.stats_mode().is_some()
+            || self.scan.collects_stats()
         {
             return Err(crate::Error::Unsupported {
                 message: "Incremental row-position selection and chunk_shuffle require combined Delta planning; sharding, global-index results and statistics require combined Delta or Changelog planning"
@@ -369,7 +367,7 @@ impl<'a> IncrementalScan<'a> {
     /// represented by an ordinary split list because each unit contains a
     /// before/after pair.
     pub async fn plan_combined(&self) -> crate::Result<Plan> {
-        let mut stats = self.scan.stats_mode().map(ScanStats::new);
+        let mut stats = self.scan.collects_stats().then(ScanStats::default);
         if let Some(stats) = stats.as_mut() {
             stats.limit = self.scan.limit_hint();
         }

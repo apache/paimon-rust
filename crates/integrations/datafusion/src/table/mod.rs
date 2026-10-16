@@ -479,10 +479,7 @@ impl TableProvider for PaimonTableProvider {
         if let Some(limit) = pushed_limit {
             read_builder.with_limit(limit);
         }
-        let scan = read_builder
-            .new_scan()
-            .with_stats(paimon::table::ScanStatsMode::Lightweight)
-            .map_err(to_datafusion_error)?;
+        let scan = read_builder.new_scan().with_stats();
         // DataFusion's Python FFI may poll `TableProvider::scan()` without an active
         // Tokio runtime. `scan.plan()` can reach OpenDAL/Tokio filesystem calls while
         // reading Paimon metadata, so we must provide a runtime here instead of

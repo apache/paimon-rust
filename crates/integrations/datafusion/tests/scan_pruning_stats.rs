@@ -149,8 +149,7 @@ async fn test_scan_stats_records_not_in_data_stats_pruning() {
     let _plan = table
         .new_read_builder()
         .new_scan()
-        .with_stats(paimon::table::ScanStatsMode::Lightweight)
-        .unwrap()
+        .with_stats()
         .plan()
         .await
         .unwrap();
@@ -159,13 +158,7 @@ async fn test_scan_stats_records_not_in_data_stats_pruning() {
 
     let mut reader = table.new_read_builder();
     reader.with_filter(pb.is_not_in("value", vec![Datum::Int(20)]).unwrap());
-    let _not_in_plan = reader
-        .new_scan()
-        .with_stats(paimon::table::ScanStatsMode::Lightweight)
-        .unwrap()
-        .plan()
-        .await
-        .unwrap();
+    let _not_in_plan = reader.new_scan().with_stats().plan().await.unwrap();
     let not_in_stats = _not_in_plan.stats().cloned().unwrap();
 
     assert_eq!(
@@ -191,8 +184,7 @@ async fn test_scan_stats_records_partition_pruning() {
     let _all_plan = table
         .new_read_builder()
         .new_scan()
-        .with_stats(paimon::table::ScanStatsMode::Lightweight)
-        .unwrap()
+        .with_stats()
         .plan()
         .await
         .unwrap();
@@ -209,8 +201,7 @@ async fn test_scan_stats_records_partition_pruning() {
     );
     let _partition_plan = partition_reader
         .new_scan()
-        .with_stats(paimon::table::ScanStatsMode::Lightweight)
-        .unwrap()
+        .with_stats()
         .plan()
         .await
         .unwrap();
@@ -312,13 +303,7 @@ async fn test_scan_stats_records_bucket_limit_and_time_travel() {
     let pb = PredicateBuilder::new(fields);
     let mut bucket_reader = table.new_read_builder();
     bucket_reader.with_filter(pb.equal("id", Datum::Int(1)).unwrap());
-    let _bucket_plan = bucket_reader
-        .new_scan()
-        .with_stats(paimon::table::ScanStatsMode::Lightweight)
-        .unwrap()
-        .plan()
-        .await
-        .unwrap();
+    let _bucket_plan = bucket_reader.new_scan().with_stats().plan().await.unwrap();
     let bucket_stats = _bucket_plan.stats().cloned().unwrap();
     assert!(
         bucket_stats.manifest_entries_pruned_by_bucket > 0,
@@ -328,21 +313,14 @@ async fn test_scan_stats_records_bucket_limit_and_time_travel() {
     let _full_plan = table
         .new_read_builder()
         .new_scan()
-        .with_stats(paimon::table::ScanStatsMode::Lightweight)
-        .unwrap()
+        .with_stats()
         .plan()
         .await
         .unwrap();
     let full_stats = _full_plan.stats().cloned().unwrap();
     let mut limit_reader = table.new_read_builder();
     limit_reader.with_limit(1);
-    let _limit_plan = limit_reader
-        .new_scan()
-        .with_stats(paimon::table::ScanStatsMode::Lightweight)
-        .unwrap()
-        .plan()
-        .await
-        .unwrap();
+    let _limit_plan = limit_reader.new_scan().with_stats().plan().await.unwrap();
     let limit_stats = _limit_plan.stats().cloned().unwrap();
     assert!(
         limit_stats.limit_early_stopped,
@@ -360,8 +338,7 @@ async fn test_scan_stats_records_bucket_limit_and_time_travel() {
     let _snapshot_one_plan = snapshot_one_table
         .new_read_builder()
         .new_scan()
-        .with_stats(paimon::table::ScanStatsMode::Lightweight)
-        .unwrap()
+        .with_stats()
         .plan()
         .await
         .unwrap();
@@ -371,8 +348,7 @@ async fn test_scan_stats_records_bucket_limit_and_time_travel() {
     let _latest_plan = table
         .new_read_builder()
         .new_scan()
-        .with_stats(paimon::table::ScanStatsMode::Lightweight)
-        .unwrap()
+        .with_stats()
         .plan()
         .await
         .unwrap();

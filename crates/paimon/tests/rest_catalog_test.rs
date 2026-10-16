@@ -5051,12 +5051,7 @@ async fn test_query_auth_chunk_shuffle_with_partition_filters() {
                 .expect("partition-only filters must allow chunk shuffle");
             for collect_stats in [false, true] {
                 let plan = if collect_stats {
-                    scan.clone()
-                        .with_stats(paimon::table::ScanStatsMode::Lightweight)
-                        .unwrap()
-                        .plan()
-                        .await
-                        .unwrap()
+                    scan.clone().with_stats().plan().await.unwrap()
                 } else {
                     scan.plan().await.unwrap()
                 };
@@ -5107,11 +5102,7 @@ async fn test_query_auth_chunk_shuffle_with_partition_filters() {
         let scan = read.new_scan().with_chunk_shuffle(7, 2).unwrap();
         for collect_stats in [false, true] {
             let result = if collect_stats {
-                scan.clone()
-                    .with_stats(paimon::table::ScanStatsMode::Lightweight)
-                    .unwrap()
-                    .plan()
-                    .await
+                scan.clone().with_stats().plan().await
             } else {
                 scan.plan().await
             };
@@ -5239,13 +5230,7 @@ async fn test_query_auth_filters_masked_partition_values() {
                     equals("region", "east"),
                 ]))
                 .with_limit(1);
-            let plan = limited
-                .new_scan()
-                .with_stats(paimon::table::ScanStatsMode::Lightweight)
-                .unwrap()
-                .plan()
-                .await
-                .unwrap();
+            let plan = limited.new_scan().with_stats().plan().await.unwrap();
             let scan_stats = plan.stats().cloned().unwrap();
             assert_eq!(scan_stats.limit, None);
             assert!(plan
@@ -5275,13 +5260,7 @@ async fn test_query_auth_filters_masked_partition_values() {
             .with_filter(equals("dept", "eng"));
         assert_eq!(ids(&read_all(&plain).await.unwrap()), vec![1, 3]);
         plain.with_limit(1);
-        let plan = plain
-            .new_scan()
-            .with_stats(paimon::table::ScanStatsMode::Lightweight)
-            .unwrap()
-            .plan()
-            .await
-            .unwrap();
+        let plan = plain.new_scan().with_stats().plan().await.unwrap();
         let scan_stats = plan.stats().cloned().unwrap();
         assert_eq!(scan_stats.limit, Some(1));
         assert!(!plan.splits().is_empty());

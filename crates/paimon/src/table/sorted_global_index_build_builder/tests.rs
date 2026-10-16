@@ -1395,13 +1395,7 @@ async fn test_global_index_prunes_during_manifest_read() {
             .unwrap();
         let mut read_builder = table.new_read_builder();
         read_builder.with_filter(predicate);
-        let plan = read_builder
-            .new_scan()
-            .with_stats(crate::table::ScanStatsMode::Lightweight)
-            .unwrap()
-            .plan()
-            .await
-            .unwrap();
+        let plan = read_builder.new_scan().with_stats().plan().await.unwrap();
         let scan_stats = plan.stats().cloned().unwrap();
 
         assert_eq!(
@@ -1550,13 +1544,7 @@ async fn test_empty_global_index_ranges_skip_legacy_manifests() {
         let plan = read_builder.new_scan().plan().await.unwrap();
         assert!(plan.splits().is_empty());
 
-        let stats_plan = read_builder
-            .new_scan()
-            .with_stats(crate::table::ScanStatsMode::Lightweight)
-            .unwrap()
-            .plan()
-            .await
-            .unwrap();
+        let stats_plan = read_builder.new_scan().with_stats().plan().await.unwrap();
         let scan_stats = stats_plan.stats().cloned().unwrap();
         let delta_error = read_builder
             .new_scan()
@@ -1616,13 +1604,7 @@ async fn test_detail_mode_defers_manifest_pruning_for_unindexed_ranges() {
         .unwrap();
     let mut read_builder = table.new_read_builder();
     read_builder.with_filter(predicate);
-    let plan = read_builder
-        .new_scan()
-        .with_stats(crate::table::ScanStatsMode::Lightweight)
-        .unwrap()
-        .plan()
-        .await
-        .unwrap();
+    let plan = read_builder.new_scan().with_stats().plan().await.unwrap();
     let scan_stats = plan.stats().cloned().unwrap();
     let planned_ranges = merge_row_ranges(
         plan.splits()

@@ -227,7 +227,7 @@ pub use postpone_fixed_bucket_write::{
 pub use postpone_fixed_bucket_write_builder::PostponeFixedBucketWriteBuilder;
 pub use read_builder::ReadBuilder;
 pub use rest_env::RESTEnv;
-pub use scan_stats::{ScanStats, ScanStatsMode};
+pub use scan_stats::ScanStats;
 pub use schema_manager::SchemaManager;
 pub use search_scan_split::SearchScanSplit;
 pub use shard_table_updater::ShardTableUpdater;

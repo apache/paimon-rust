@@ -52,50 +52,42 @@ def _make_variant_table_with_data(warehouse):
 
 
 @pytest.mark.parametrize("limit,split_count", [(None, 1), (0, 0), (1, 1)])
-def test_scan_statistics_include_all_candidates_before_limit(limit, split_count):
+def test_scan_statistics_preserve_normal_planning(limit, split_count):
     with tempfile.TemporaryDirectory() as warehouse:
         table = _make_table_with_data(warehouse)
         builder = table.new_read_builder()
         if limit is not None:
             builder.with_limit(limit)
         scan = builder.new_scan()
-        assert scan.plan().stats() is None
+        ordinary = scan.plan()
+        assert ordinary.stats() is None
         plan = scan.with_stats().plan()
         stats = plan.stats()
-        assert stats.complete
-        assert len(plan.splits()) == len(scan.plan().splits()) == split_count
-        assert plan.snapshot_id() == 1
-        assert stats.entries_potential_total == stats.manifest_entries_read == 1
-        assert stats.entries_after_partition == stats.entries_after_bucket == stats.entries_after_stats == 1
-        assert stats.manifest_files_before_partition_pruning == stats.manifest_files_after_partition_pruning == 1
+        assert len(plan.splits()) == split_count
+        assert plan.snapshot_id() == ordinary.snapshot_id() == 1
+        assert stats.manifest_entries_read == (0 if limit == 0 else 1)
+        assert stats.final_splits == stats.final_files == split_count
+        assert stats.limit == limit
+        assert [split.serialize() for split in plan.splits()] == [split.serialize() for split in ordinary.splits()]
+        if limit == 0:
+            assert stats.split_candidates_built == 0
+            assert stats.limit_early_stopped
         with pytest.raises(AttributeError):
             stats.manifest_entries_read = 10
-        light_plan = scan.with_stats(complete=False).plan()
-        light_stats = light_plan.stats()
-        assert not light_stats.complete
-        assert light_plan.snapshot_id() == plan.snapshot_id()
-        assert light_stats.limit == limit
-        assert light_stats.final_splits == len(light_plan.splits())
-        assert [split.serialize() for split in light_plan.splits()] == [split.serialize() for split in plan.splits()]
-        if limit == 0:
-            assert light_stats.manifest_entries_read == light_stats.split_candidates_built == 0
-            assert light_stats.limit_early_stopped
 
 
 @pytest.mark.parametrize("start,entry_count", [(0, 1), (1, 0)])
-@pytest.mark.parametrize("complete", [False, True])
-def test_combined_incremental_scan_statistics(start, entry_count, complete):
+def test_combined_incremental_scan_statistics(start, entry_count):
     with tempfile.TemporaryDirectory() as warehouse:
         table = _make_table_with_data(warehouse)
         scan = table.new_read_builder().new_incremental_scan(start, 1)
-        assert scan.plan().stats() is None
-        plan = scan.with_stats(complete=complete).plan()
+        ordinary = scan.plan()
+        assert ordinary.stats() is None
+        plan = scan.with_stats().plan()
         stats = plan.stats()
-        assert stats.complete == complete
-        assert plan.snapshot_id() == 1
-        assert stats.manifest_entries_read == entry_count
-        assert stats.entries_after_stats == (entry_count if complete else 0)
-        assert [split.serialize() for split in plan.splits()] == [split.serialize() for split in scan.plan().splits()]
+        assert plan.snapshot_id() == ordinary.snapshot_id() == 1
+        assert stats.manifest_entries_read == stats.final_files == entry_count
+        assert [split.serialize() for split in plan.splits()] == [split.serialize() for split in ordinary.splits()]
 
 
 def _variant_read_type(table, columns, paths, fail_on_error=False):

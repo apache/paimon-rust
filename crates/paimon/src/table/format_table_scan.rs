@@ -24,7 +24,7 @@ use super::format_partition::{
     FormatTablePartitionPaths,
 };
 use super::format_partition_location::FormatPartitionLocations;
-use super::{Plan, RESTEnv, ScanStats, ScanStatsMode, Table};
+use super::{Plan, RESTEnv, ScanStats, Table};
 use crate::api::RestError;
 use crate::spec::stats::BinaryTableStats;
 use crate::spec::{
@@ -42,7 +42,7 @@ pub(crate) struct FormatTableScan<'a> {
     partition_filter: Option<PartitionFilter>,
     limit: Option<usize>,
     row_ranges: Option<Vec<RowRange>>,
-    stats_mode: Option<ScanStatsMode>,
+    collect_stats: bool,
 }
 
 impl<'a> FormatTableScan<'a> {
@@ -57,7 +57,7 @@ impl<'a> FormatTableScan<'a> {
             partition_filter,
             limit,
             row_ranges,
-            stats_mode: None,
+            collect_stats: false,
         }
     }
 
@@ -68,7 +68,7 @@ impl<'a> FormatTableScan<'a> {
 
     pub(crate) async fn plan(&self) -> crate::Result<Plan> {
         self.ensure_query_auth_allowed()?;
-        let mut stats = self.stats_mode.map(ScanStats::new);
+        let mut stats = self.collect_stats.then(ScanStats::default);
         let plan = self.plan_inner(stats.as_mut()).await?;
         Ok(match stats {
             Some(mut stats) => {
@@ -79,14 +79,9 @@ impl<'a> FormatTableScan<'a> {
         })
     }
 
-    pub(crate) fn with_stats(mut self, mode: ScanStatsMode) -> crate::Result<Self> {
-        if mode == ScanStatsMode::Complete {
-            return Err(crate::Error::Unsupported {
-                message: "Complete scan statistics require a Paimon table".into(),
-            });
-        }
-        self.stats_mode = Some(mode);
-        Ok(self)
+    pub(crate) fn with_stats(mut self) -> Self {
+        self.collect_stats = true;
+        self
     }
 
     fn ensure_query_auth_allowed(&self) -> crate::Result<()> {

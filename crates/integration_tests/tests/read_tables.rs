@@ -1244,8 +1244,7 @@ async fn plan_table_with_stats(table: &paimon::Table, limit: Option<usize>) -> (
     }
     let scan = read_builder.new_scan();
     let plan = scan
-        .with_stats(paimon::table::ScanStatsMode::Lightweight)
-        .unwrap()
+        .with_stats()
         .plan()
         .await
         .expect("Failed to plan scan with statistics");
@@ -3363,8 +3362,7 @@ async fn test_limit_pushdown_disabled_with_row_ranges() {
     row_range_reader.with_row_ranges(vec![RowRange::new(0, i64::MAX)]);
     let row_range_plan = row_range_reader
         .new_scan()
-        .with_stats(paimon::table::ScanStatsMode::Lightweight)
-        .unwrap()
+        .with_stats()
         .plan()
         .await
         .expect("Failed to plan row-range scan");
@@ -3375,8 +3373,7 @@ async fn test_limit_pushdown_disabled_with_row_ranges() {
     limited_reader.with_limit(2);
     let limited_plan = limited_reader
         .new_scan()
-        .with_stats(paimon::table::ScanStatsMode::Lightweight)
-        .unwrap()
+        .with_stats()
         .plan()
         .await
         .expect("Failed to plan limited row-range scan");

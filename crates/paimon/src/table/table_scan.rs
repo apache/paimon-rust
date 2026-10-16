@@ -52,7 +52,7 @@ use crate::table::source::{
     any_range_overlaps_file, intersect_ranges_with_file, merge_row_ranges, DataSplit,
     DataSplitBuilder, DeletionFile, PartitionBucket, Plan, RowRange,
 };
-use crate::table::{ScanStats, ScanStatsMode};
+use crate::table::ScanStats;
 use futures::{StreamExt, TryStreamExt};
 use indexmap::IndexMap;
 use std::borrow::Cow;
@@ -71,8 +71,6 @@ const DELETION_VECTORS_INDEX_TYPE: &str = "DELETION_VECTORS";
 #[derive(Debug, Default)]
 struct ManifestReadCounters {
     entries_read: usize,
-    after_partition: usize,
-    after_bucket: usize,
     pruned_by_bucket: usize,
     pruned_by_partition: usize,
     after_entry_pruning: usize,
@@ -80,14 +78,11 @@ struct ManifestReadCounters {
     pruned_by_row_ranges: usize,
     pruned_by_data_stats: usize,
     after_manifest_filters: usize,
-    after_full_stats: usize,
 }
 
 impl ManifestReadCounters {
     fn merge(&mut self, other: Self) {
         self.entries_read += other.entries_read;
-        self.after_partition += other.after_partition;
-        self.after_bucket += other.after_bucket;
         self.pruned_by_bucket += other.pruned_by_bucket;
         self.pruned_by_partition += other.pruned_by_partition;
         self.after_entry_pruning += other.after_entry_pruning;
@@ -95,7 +90,6 @@ impl ManifestReadCounters {
         self.pruned_by_row_ranges += other.pruned_by_row_ranges;
         self.pruned_by_data_stats += other.pruned_by_data_stats;
         self.after_manifest_filters += other.after_manifest_filters;
-        self.after_full_stats += other.after_full_stats;
     }
 }
 
@@ -282,23 +276,10 @@ async fn read_all_manifest_entries(
         }
     };
     let mut scan_stats = scan_stats;
-    let collect_stats = scan_stats
-        .as_ref()
-        .is_some_and(|scan_stats| scan_stats.complete);
     if let Some(scan_stats) = scan_stats.as_deref_mut() {
         scan_stats.record_manifest_lists(manifest_files.len(), delta.len());
     }
     manifest_files.extend(delta);
-
-    if let Some(stats) = scan_stats
-        .as_deref_mut()
-        .filter(|scan_stats| scan_stats.complete)
-    {
-        stats.entries_potential_total += manifest_files
-            .iter()
-            .map(|meta| (meta.num_added_files() + meta.num_deleted_files()) as u64)
-            .sum::<u64>();
-    }
 
     // Manifest-file-level partition stats pruning: skip entire manifest files
     // whose partition range doesn't overlap the partition predicate.
@@ -312,17 +293,15 @@ async fn read_all_manifest_entries(
         scan_stats.manifest_files_after_partition_pruning = manifest_files.len();
     }
 
-    if !collect_stats {
-        retain_manifest_buckets(
-            &mut manifest_files,
-            has_primary_keys && !scan_all_files,
-            bucket_predicate,
-            bucket_key_fields,
-            bucket_function_type,
-        );
-    }
+    retain_manifest_buckets(
+        &mut manifest_files,
+        has_primary_keys && !scan_all_files,
+        bucket_predicate,
+        bucket_key_fields,
+        bucket_function_type,
+    );
 
-    if let Some(index) = row_range_index.filter(|_| !collect_stats) {
+    if let Some(index) = row_range_index {
         let before = manifest_files.len();
         retain_manifest_row_ranges(&mut manifest_files, index);
         if let Some(scan_stats) = scan_stats.as_deref_mut() {
@@ -344,7 +323,7 @@ async fn read_all_manifest_entries(
                     file_io,
                     &path,
                     &meta,
-                    manifest_sidecar_enabled && !collect_stats,
+                    manifest_sidecar_enabled,
                     ManifestSidecarPruning {
                         row_range_index: sidecar_row_index,
                         partition_filter,
@@ -358,27 +337,12 @@ async fn read_all_manifest_entries(
 
                 let mut bucket_selector = bucket_selector.cloned();
                 let mut counters = ManifestReadCounters::default();
-                let mut stats_schema_cache = HashMap::new();
 
                 let entries = crate::spec::avro::from_manifest_bytes_filtered_shared(
                     &content,
                     &cache,
                     &mut |_kind, partition_bytes, bucket, total_buckets| {
                         counters.entries_read += 1;
-                        // Complete statistics use Java's partition-then-bucket
-                        // funnel. Keep the ordinary early bucket path unchanged.
-                        let matches_partition = || {
-                            partition_filter.is_none_or(|filter| {
-                                filter.matches_entry(partition_bytes).unwrap_or(true)
-                            })
-                        };
-                        if collect_stats {
-                            if !matches_partition() {
-                                counters.pruned_by_partition += 1;
-                                return false;
-                            }
-                            counters.after_partition += 1;
-                        }
                         // Bucket filter (negative bucket = unassigned)
                         if has_primary_keys && !scan_all_files && bucket < 0 {
                             counters.pruned_by_bucket += 1;
@@ -392,11 +356,11 @@ async fn read_all_manifest_entries(
                         }
 
                         // Partition filter
-                        if !collect_stats && !matches_partition() {
+                        if partition_filter.is_some_and(|filter| {
+                            !filter.matches_entry(partition_bytes).unwrap_or(true)
+                        }) {
                             counters.pruned_by_partition += 1;
                             return false;
-                        } else {
-                            counters.after_bucket += 1;
                         }
 
                         true
@@ -423,22 +387,6 @@ async fn read_all_manifest_entries(
                     {
                         counters.pruned_by_data_stats += 1;
                         continue;
-                    }
-                    // Count cross-schema ADD and DELETE records before netting.
-                    // Keep ordinary planning's deferred cross-schema filtering:
-                    // changing that order could change the surviving file set.
-                    if collect_stats
-                        && (entry.file().schema_id == current_schema_id
-                            || data_file_matches_predicates_for_table(
-                                table,
-                                entry.file(),
-                                data_predicates,
-                                key_predicates,
-                                &mut stats_schema_cache,
-                            )
-                            .await)
-                    {
-                        counters.after_full_stats += 1;
                     }
                     filtered.push(entry);
                 }
@@ -472,11 +420,6 @@ async fn read_all_manifest_entries(
         counters.pruned_by_row_ranges = before - all_entries.len();
     }
     if let Some(scan_stats) = scan_stats {
-        if scan_stats.complete {
-            scan_stats.entries_after_partition += counters.after_partition;
-            scan_stats.entries_after_bucket += counters.after_bucket;
-            scan_stats.entries_after_stats += counters.after_full_stats;
-        }
         scan_stats.manifest_entries_read = counters.entries_read;
         scan_stats.manifest_entries_pruned_by_bucket = counters.pruned_by_bucket;
         scan_stats.manifest_entries_pruned_by_partition = counters.pruned_by_partition;
@@ -1181,7 +1124,7 @@ impl<'a> TableScan<'a> {
             data_predicates: scan.data_predicates,
             bucket_predicate: scan.bucket_predicate,
             limit: scan.limit,
-            stats_mode: scan.stats_mode,
+            collect_stats: scan.collect_stats,
             row_ranges: scan.row_ranges,
             split_selection: scan.split_selection,
             row_range_optimization_disabled: scan.row_range_optimization_disabled,
@@ -1557,23 +1500,21 @@ impl<'a> TableScan<'a> {
     }
 
     /// Collect statistics in [`Self::plan`], available through [`Plan::stats`].
-    /// Lightweight mode retains normal early pruning and LIMIT optimizations;
-    /// complete mode counts all partition-selected manifest entries and
-    /// candidates before LIMIT. Neither mode reads data files.
-    pub fn with_stats(self, mode: ScanStatsMode) -> crate::Result<Self> {
-        Ok(match self.0 {
+    /// Retains normal early manifest pruning and LIMIT stopping.
+    pub fn with_stats(self) -> Self {
+        match self.0 {
             TableScanKind::Paimon(mut scan) => {
-                scan.stats_mode = Some(mode);
+                scan.collect_stats = true;
                 Self(TableScanKind::Paimon(scan))
             }
-            TableScanKind::Format(scan) => Self(TableScanKind::Format(scan.with_stats(mode)?)),
-        })
+            TableScanKind::Format(scan) => Self(TableScanKind::Format(scan.with_stats())),
+        }
     }
 
-    pub(super) fn stats_mode(&self) -> Option<ScanStatsMode> {
+    pub(super) fn collects_stats(&self) -> bool {
         match &self.0 {
-            TableScanKind::Paimon(scan) => scan.stats_mode,
-            TableScanKind::Format(_) => None,
+            TableScanKind::Paimon(scan) => scan.collect_stats,
+            TableScanKind::Format(_) => false,
         }
     }
 
@@ -1704,7 +1645,7 @@ struct PaimonTableScan<'a> {
     /// When set, the scan will try to return only enough splits to satisfy the limit.
     limit: Option<usize>,
     /// Statistics collection is requested explicitly.
-    stats_mode: Option<ScanStatsMode>,
+    collect_stats: bool,
     row_ranges: Option<Vec<RowRange>>,
     /// Mutually exclusive row-position or fixed-row chunk transformation.
     /// Boxed because scans normally use neither, and keeping the cold payload
@@ -1841,7 +1782,7 @@ impl<'a> PaimonTableScan<'a> {
             data_predicates,
             bucket_predicate,
             limit,
-            stats_mode: None,
+            collect_stats: false,
             row_ranges,
             split_selection: None,
             row_range_optimization_disabled: false,
@@ -1906,7 +1847,7 @@ impl<'a> PaimonTableScan<'a> {
     /// for `scan.version`; the strict selectors mirror Java's typed
     /// `scan.snapshot-id` / `scan.tag-name` handling.
     pub async fn plan(&self) -> crate::Result<Plan> {
-        let mut stats = self.stats_mode.map(ScanStats::new);
+        let mut stats = self.collect_stats.then(ScanStats::default);
         let plan = self.plan_selection(stats.as_mut()).await?;
         let plan = self.attach_index_scores(plan)?;
         Ok(match stats {
@@ -1937,7 +1878,10 @@ impl<'a> PaimonTableScan<'a> {
                 stats.record_final_plan(
                     plan.splits().len(),
                     plan.splits().len(),
-                    plan.splits().iter().map(|s| s.data_files().len()).sum(),
+                    plan.splits()
+                        .iter()
+                        .map(|s| s.data_files().len())
+                        .sum::<usize>(),
                 );
             }
             return Ok(plan);
@@ -2322,6 +2266,7 @@ impl<'a> PaimonTableScan<'a> {
     /// committed only once the accumulated known row count reaches the limit;
     /// if it never does, the original split list is returned unchanged. The
     /// caller or query engine must still enforce the final LIMIT.
+    #[cfg(test)]
     fn apply_limit_pushdown(&self, splits: Vec<DataSplit>) -> Vec<DataSplit> {
         let limit = match self.limit {
             Some(l) => l,
@@ -2833,11 +2778,7 @@ impl<'a> PaimonTableScan<'a> {
         if let Some(scan_stats) = scan_stats.as_deref_mut() {
             scan_stats.limit = self.limit;
         }
-        if matches!(self.limit, Some(0))
-            && !scan_stats
-                .as_ref()
-                .is_some_and(|scan_stats| scan_stats.complete)
-        {
+        if matches!(self.limit, Some(0)) {
             if let Some(scan_stats) = scan_stats {
                 scan_stats.record_final_plan_with_limit(0, 0, 0, 0, true);
             }
@@ -2917,17 +2858,6 @@ impl<'a> PaimonTableScan<'a> {
         let schema_manager = self.table.schema_manager();
         let core_options = CoreOptions::new(self.table.schema().options());
         let data_evolution_enabled = core_options.data_evolution_enabled();
-        let collect_stats = scan_stats
-            .as_ref()
-            .is_some_and(|scan_stats| scan_stats.complete);
-        if data_evolution_enabled {
-            if let Some(stats) = scan_stats
-                .as_deref_mut()
-                .filter(|scan_stats| scan_stats.complete)
-            {
-                stats.entries_after_stats = 0;
-            }
-        }
         let deletion_vectors_enabled =
             core_options.deletion_vectors_enabled() && !self.is_streaming();
         let target_split_size = core_options.source_split_target_size();
@@ -3017,7 +2947,7 @@ impl<'a> PaimonTableScan<'a> {
             }
         }
 
-        if matches!(self.limit, Some(0)) && !collect_stats {
+        if matches!(self.limit, Some(0)) {
             if let Some(scan_stats) = scan_stats {
                 scan_stats.record_final_plan_with_limit(0, 0, 0, 0, true);
             }
@@ -3072,7 +3002,7 @@ impl<'a> PaimonTableScan<'a> {
         let can_push_down_limit = append_row_position_selection.is_none()
             && self.can_push_down_limit_hint(effective_row_ranges.as_deref());
         let mut limit_accumulator = match self.limit {
-            Some(limit) if limit > 0 && can_push_down_limit && !collect_stats => {
+            Some(limit) if limit > 0 && can_push_down_limit => {
                 Some(LimitPushdownAccumulator::new(limit))
             }
             _ => None,
@@ -3351,23 +3281,7 @@ impl<'a> PaimonTableScan<'a> {
         } else {
             splits
         };
-        if data_evolution_enabled {
-            if let Some(stats) = scan_stats
-                .as_deref_mut()
-                .filter(|scan_stats| scan_stats.complete)
-            {
-                stats.entries_after_stats =
-                    splits.iter().map(|split| split.data_files().len()).sum();
-            }
-        }
         let splits_before_limit = split_candidates_built;
-        let splits = if self.limit == Some(0) {
-            Vec::new()
-        } else if collect_stats && can_push_down_limit {
-            self.apply_limit_pushdown(splits)
-        } else {
-            splits
-        };
         if let Some(scan_stats) = scan_stats {
             let final_files = splits.iter().map(|split| split.data_files().len()).sum();
             scan_stats.record_final_plan_with_limit(
@@ -4100,8 +4014,7 @@ mod tests {
                     .new_scan()
                     .with_shard(index, 6)
                     .unwrap()
-                    .with_stats(crate::table::ScanStatsMode::Lightweight)
-                    .unwrap()
+                    .with_stats()
                     .plan()
                     .await
                     .unwrap();
@@ -4711,8 +4624,7 @@ mod tests {
             .new_scan()
             .with_row_position_shard(0, 2)
             .unwrap()
-            .with_stats(crate::table::ScanStatsMode::Lightweight)
-            .unwrap()
+            .with_stats()
             .plan()
             .await
             .unwrap();
@@ -4875,13 +4787,7 @@ mod tests {
 
         let mut read_builder = table.new_read_builder();
         read_builder.with_row_ranges(vec![RowRange::new(0, 0)]);
-        let plan = read_builder
-            .new_scan()
-            .with_stats(crate::table::ScanStatsMode::Lightweight)
-            .unwrap()
-            .plan()
-            .await
-            .unwrap();
+        let plan = read_builder.new_scan().with_stats().plan().await.unwrap();
         let scan_stats = plan.stats().cloned().unwrap();
         let planned_files = plan
             .splits()
@@ -5054,23 +4960,10 @@ mod tests {
         let mut reader = table.new_read_builder();
         reader.with_filter(predicate);
         let scan = reader.new_scan().with_scan_all_files();
-        let plan = scan
-            .clone()
-            .with_stats(crate::table::ScanStatsMode::Lightweight)
-            .unwrap()
-            .plan()
-            .await
-            .unwrap();
+        let plan = scan.clone().with_stats().plan().await.unwrap();
         let scan_stats = plan.stats().cloned().unwrap();
-        let statistics_plan = scan
-            .clone()
-            .with_stats(crate::table::ScanStatsMode::Complete)
-            .unwrap()
-            .plan()
-            .await
-            .unwrap();
-        let stats = statistics_plan.stats().unwrap();
-        assert_eq!(plan.splits(), statistics_plan.splits());
+        let untracked_plan = scan.plan().await.unwrap();
+        assert_eq!(plan.splits(), untracked_plan.splits());
         assert_eq!(
             plan.splits()
                 .iter()
@@ -5079,8 +4972,6 @@ mod tests {
             1000
         );
         assert!(plan.splits().iter().all(|split| split.bucket() == -2));
-        assert_eq!(stats.manifest_entries_read, 2000);
-        assert_eq!(stats.entries_after_bucket, 1000);
         assert!(scan_stats.manifest_entries_read >= 1000);
         assert!(
             scan_stats.manifest_entries_read < 2000,
@@ -5133,13 +5024,7 @@ mod tests {
 
         let mut reader = table.new_read_builder();
         reader.with_row_ranges(vec![RowRange::new(0, 0)]);
-        let plan = reader
-            .new_scan()
-            .with_stats(crate::table::ScanStatsMode::Lightweight)
-            .unwrap()
-            .plan()
-            .await
-            .unwrap();
+        let plan = reader.new_scan().with_stats().plan().await.unwrap();
         let scan_stats = plan.stats().cloned().unwrap();
         let planned = plan
             .splits()
@@ -5154,19 +5039,8 @@ mod tests {
             scan_stats.manifest_entries_read < FILE_COUNT,
             "the sidecar should avoid decoding non-overlapping Avro blocks"
         );
-        let statistics_plan = reader
-            .new_scan()
-            .with_stats(crate::table::ScanStatsMode::Complete)
-            .unwrap()
-            .plan()
-            .await
-            .unwrap();
-        let stats = statistics_plan.stats().unwrap();
-        assert_eq!(statistics_plan.splits(), plan.splits());
-        assert_eq!(stats.manifest_entries_read, FILE_COUNT);
-        assert_eq!(stats.entries_after_partition, FILE_COUNT);
-        assert_eq!(stats.entries_after_bucket, FILE_COUNT);
-        assert_eq!(stats.entries_after_stats, 1);
+        let untracked_plan = reader.new_scan().plan().await.unwrap();
+        assert_eq!(plan.splits(), untracked_plan.splits());
     }
 
     #[tokio::test]
@@ -5197,13 +5071,7 @@ mod tests {
 
         let mut read_builder = table.new_read_builder();
         read_builder.with_row_ranges(vec![RowRange::new(0, 0)]);
-        let plan = read_builder
-            .new_scan()
-            .with_stats(crate::table::ScanStatsMode::Lightweight)
-            .unwrap()
-            .plan()
-            .await
-            .unwrap();
+        let plan = read_builder.new_scan().with_stats().plan().await.unwrap();
         let scan_stats = plan.stats().cloned().unwrap();
 
         assert_eq!(
@@ -5965,13 +5833,7 @@ mod tests {
         ]);
         let mut reader = table.new_read_builder();
         reader.with_filter(between);
-        let _plan = reader
-            .new_scan()
-            .with_stats(crate::table::ScanStatsMode::Lightweight)
-            .unwrap()
-            .plan()
-            .await
-            .unwrap();
+        let _plan = reader.new_scan().with_stats().plan().await.unwrap();
         let scan_stats = _plan.stats().cloned().unwrap();
 
         assert_eq!(
@@ -5985,26 +5847,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_complete_plan_statistics_keeps_complete_funnel_before_limit() {
-        let table = scan_stats_test_table("memory:/complete_scan_statistics");
+    async fn test_plan_statistics_preserve_normal_planning_with_limit() {
+        let table = scan_stats_test_table("memory:/scan_statistics_limit");
         setup_scan_stats_dirs(&table).await;
         let empty = table.copy_with_pinned_snapshot(None);
         let statistics_plan = empty
             .new_read_builder()
             .new_scan()
-            .with_stats(crate::table::ScanStatsMode::Complete)
-            .unwrap()
+            .with_stats()
             .plan()
             .await
             .unwrap();
         let stats = statistics_plan.stats().unwrap();
-        assert_eq!(
-            stats,
-            &super::super::ScanStats {
-                complete: true,
-                ..Default::default()
-            }
-        );
+        assert_eq!(stats, &super::super::ScanStats::default());
         TableCommit::new(table.clone(), "statistics".into())
             .commit(vec![CommitMessage::new(
                 BinaryRowBuilder::new(0).build_serialized(),
@@ -6029,46 +5884,46 @@ mod tests {
             let scan = reader.new_scan();
             let expected = scan.plan().await.unwrap();
             assert!(expected.stats().is_none());
-            let scan = scan
-                .with_stats(crate::table::ScanStatsMode::Complete)
-                .unwrap();
+            let scan = scan.with_stats();
             let plan = scan.plan().await.unwrap();
             let stats = plan.stats().unwrap();
-            assert!(stats.complete);
             assert_eq!(
                 stats.planned_data_file_bytes,
                 plan.planned_data_file_bytes()
             );
             assert_eq!(plan.snapshot_id(), expected.snapshot_id());
             assert_eq!(plan.splits(), expected.splits());
-            assert_eq!(stats.entries_potential_total, 3);
-            assert_eq!(stats.manifest_entries_read, 3);
-            assert_eq!(stats.entries_after_partition, 3);
-            assert_eq!(stats.entries_after_bucket, 3);
-            assert_eq!(stats.entries_after_stats, 2);
+            assert_eq!(
+                stats.manifest_entries_read,
+                if limit == Some(0) { 0 } else { 3 }
+            );
+            assert_eq!(
+                stats.final_files,
+                plan.splits()
+                    .iter()
+                    .map(|s| s.data_files().len())
+                    .sum::<usize>()
+            );
+            if limit == Some(0) {
+                assert!(stats.limit_early_stopped);
+                assert_eq!(stats.split_candidates_built, 0);
+            }
         }
         let plan = empty
             .new_read_builder()
             .new_scan()
-            .with_stats(crate::table::ScanStatsMode::Complete)
-            .unwrap()
+            .with_stats()
             .plan()
             .await
             .unwrap();
         let stats = plan.stats().unwrap();
         assert_eq!(plan.snapshot_id(), None);
         assert!(plan.splits().is_empty());
-        assert_eq!(
-            stats,
-            &super::super::ScanStats {
-                complete: true,
-                ..Default::default()
-            }
-        );
+        assert_eq!(stats, &super::super::ScanStats::default());
     }
 
     #[tokio::test]
-    async fn test_complete_plan_statistics_counts_cross_schema_adds_and_deletes_before_netting() {
+    async fn test_plan_statistics_record_cross_schema_manifest_netting() {
         let old_table = scan_stats_test_table("memory:/cross_schema_scan_stats");
         setup_scan_stats_dirs(&old_table).await;
         write_schema_file(&old_table, old_table.schema()).await;
@@ -6105,7 +5960,7 @@ mod tests {
             .commit(vec![message])
             .await
             .unwrap();
-        for (threshold, after_stats) in [(0, 3), (50, 1), (200, 0)] {
+        for threshold in [0, 50, 200] {
             let mut reader = table.new_read_builder();
             reader.with_filter(
                 PredicateBuilder::new(table.schema().fields())
@@ -6114,23 +5969,23 @@ mod tests {
             );
             let scan = reader.new_scan();
             let expected = scan.plan().await.unwrap();
-            let plan = scan
-                .clone()
-                .with_stats(crate::table::ScanStatsMode::Complete)
-                .unwrap()
-                .plan()
-                .await
-                .unwrap();
+            let plan = scan.clone().with_stats().plan().await.unwrap();
             let stats = plan.stats().unwrap();
             assert_eq!(plan.splits(), expected.splits());
             assert_eq!(stats.manifest_entries_read, 3);
-            assert_eq!(stats.entries_after_bucket, 3);
-            assert_eq!(stats.entries_after_stats, after_stats);
+            assert_eq!(
+                stats.manifest_entries_after_merge,
+                usize::from(threshold < 200)
+            );
+            assert_eq!(
+                stats.manifest_entries_pruned_by_data_stats,
+                usize::from(threshold == 200)
+            );
         }
     }
 
     #[tokio::test]
-    async fn test_complete_plan_statistics_counts_partition_before_bucket() {
+    async fn test_plan_statistics_record_actual_bucket_then_partition_pruning() {
         let schema = PaimonSchema::builder()
             .column("pt", DataType::Int(IntType::new()))
             .column("id", DataType::Int(IntType::new()))
@@ -6172,38 +6027,26 @@ mod tests {
         ]));
         let scan = reader.new_scan();
         let expected = scan.plan().await.unwrap();
-        let plan = scan
-            .clone()
-            .with_stats(crate::table::ScanStatsMode::Complete)
-            .unwrap()
-            .plan()
-            .await
-            .unwrap();
+        let plan = scan.clone().with_stats().plan().await.unwrap();
         let stats = plan.stats().unwrap();
         assert_eq!(plan.splits(), expected.splits());
-        assert_eq!(stats.entries_potential_total, 8);
         assert_eq!(stats.manifest_entries_read, 8);
-        assert_eq!(stats.entries_after_partition, 4);
-        assert_eq!(stats.entries_after_bucket, 1);
-        assert_eq!(stats.entries_after_stats, 1);
+        // The bucket selector fails open for a nonmatching partition; the
+        // partition filter rejects those four entries after bucket evaluation.
+        assert_eq!(stats.manifest_entries_pruned_by_bucket, 3);
+        assert_eq!(stats.manifest_entries_pruned_by_partition, 4);
+        assert_eq!(stats.manifest_entries_after_entry_pruning, 1);
         let mut reader = table.new_read_builder();
         reader.with_filter(pb.equal("pt", Datum::Int(99)).unwrap());
-        let plan = reader
-            .new_scan()
-            .with_stats(crate::table::ScanStatsMode::Complete)
-            .unwrap()
-            .plan()
-            .await
-            .unwrap();
+        let plan = reader.new_scan().with_stats().plan().await.unwrap();
         let stats = plan.stats().unwrap();
         assert!(plan.splits().is_empty());
-        assert_eq!(stats.entries_potential_total, 8);
         assert_eq!(stats.manifest_files_after_partition_pruning, 0);
         assert_eq!(stats.manifest_entries_read, 0);
     }
 
     #[tokio::test]
-    async fn test_complete_plan_statistics_counts_data_evolution_projected_files_before_limit() {
+    async fn test_plan_statistics_record_data_evolution_projection_and_limit() {
         let table = data_evolution_test_table(
             "memory:/evolution_scan_stats",
             two_column_schema(0, "id", "name"),
@@ -6234,18 +6077,14 @@ mod tests {
             }
             let scan = reader.new_scan();
             let expected = scan.plan().await.unwrap();
-            let plan = scan
-                .clone()
-                .with_stats(crate::table::ScanStatsMode::Complete)
-                .unwrap()
-                .plan()
-                .await
-                .unwrap();
+            let plan = scan.clone().with_stats().plan().await.unwrap();
             let stats = plan.stats().unwrap();
             assert_eq!(plan.splits(), expected.splits());
-            assert_eq!(stats.entries_potential_total, 4);
-            assert_eq!(stats.entries_after_bucket, 4);
-            assert_eq!(stats.entries_after_stats, 2);
+            assert_eq!(
+                stats.manifest_entries_read,
+                if limit == Some(0) { 0 } else { 4 }
+            );
+            assert_eq!(stats.final_files, if limit == Some(0) { 0 } else { 2 });
         }
     }
 
@@ -6366,19 +6205,17 @@ mod tests {
         let value_filter = pb.greater_than("value", Datum::Int(90)).unwrap();
         let mut reader = table.new_read_builder();
         reader.with_filter(value_filter);
-        let plan = reader
-            .new_scan()
-            .with_stats(crate::table::ScanStatsMode::Lightweight)
-            .unwrap()
-            .plan()
-            .await
-            .unwrap();
+        let plan = reader.new_scan().with_stats().plan().await.unwrap();
         let scan_stats = plan.stats().cloned().unwrap();
         assert_eq!(
             scan_stats.manifest_entries_pruned_by_data_stats, 0,
             "non-key conjuncts must not file-prune a PK table: {scan_stats:?}"
         );
-        let planned_files: usize = plan.splits().iter().map(|s| s.data_files().len()).sum();
+        let planned_files: usize = plan
+            .splits()
+            .iter()
+            .map(|s| s.data_files().len())
+            .sum::<usize>();
         assert_eq!(
             planned_files, 2,
             "both versions must reach the merge reader"
@@ -6388,13 +6225,7 @@ mod tests {
         let key_filter = pb.equal("id", Datum::Int(9)).unwrap();
         let mut reader = table.new_read_builder();
         reader.with_filter(key_filter);
-        let _plan = reader
-            .new_scan()
-            .with_stats(crate::table::ScanStatsMode::Lightweight)
-            .unwrap()
-            .plan()
-            .await
-            .unwrap();
+        let _plan = reader.new_scan().with_stats().plan().await.unwrap();
         let scan_stats = _plan.stats().cloned().unwrap();
         assert!(
             scan_stats.manifest_entries_pruned_by_data_stats >= 2,
@@ -6440,13 +6271,7 @@ mod tests {
             .unwrap();
         let mut reader = table.new_read_builder();
         reader.with_filter(value_filter);
-        let plan = reader
-            .new_scan()
-            .with_stats(crate::table::ScanStatsMode::Lightweight)
-            .unwrap()
-            .plan()
-            .await
-            .unwrap();
+        let plan = reader.new_scan().with_stats().plan().await.unwrap();
         let scan_stats = plan.stats().cloned().unwrap();
 
         assert_eq!(scan_stats.manifest_entries_pruned_by_data_stats, 0);
@@ -6513,19 +6338,17 @@ mod tests {
         let value_filter = pb.greater_than("value", Datum::Int(90)).unwrap();
         let mut reader = table.new_read_builder();
         reader.with_filter(value_filter);
-        let plan = reader
-            .new_scan()
-            .with_stats(crate::table::ScanStatsMode::Lightweight)
-            .unwrap()
-            .plan()
-            .await
-            .unwrap();
+        let plan = reader.new_scan().with_stats().plan().await.unwrap();
         let scan_stats = plan.stats().cloned().unwrap();
         assert!(
             scan_stats.manifest_entries_pruned_by_data_stats >= 1,
             "first-row tables must keep full-predicate stats pruning: {scan_stats:?}"
         );
-        let planned_files: usize = plan.splits().iter().map(|s| s.data_files().len()).sum();
+        let planned_files: usize = plan
+            .splits()
+            .iter()
+            .map(|s| s.data_files().len())
+            .sum::<usize>();
         assert_eq!(
             planned_files, 1,
             "only the value-matching file should be planned on first-row"
@@ -6555,21 +6378,14 @@ mod tests {
         let _full_plan = table
             .new_read_builder()
             .new_scan()
-            .with_stats(crate::table::ScanStatsMode::Lightweight)
-            .unwrap()
+            .with_stats()
             .plan()
             .await
             .unwrap();
         let full_stats = _full_plan.stats().cloned().unwrap();
         let mut limited_reader = table.new_read_builder();
         limited_reader.with_limit(2);
-        let _limited_plan = limited_reader
-            .new_scan()
-            .with_stats(crate::table::ScanStatsMode::Lightweight)
-            .unwrap()
-            .plan()
-            .await
-            .unwrap();
+        let _limited_plan = limited_reader.new_scan().with_stats().plan().await.unwrap();
         let limited_stats = _limited_plan.stats().cloned().unwrap();
 
         assert_eq!(
@@ -6606,13 +6422,7 @@ mod tests {
 
         let mut reader = table.new_read_builder();
         reader.with_limit(0);
-        let plan = reader
-            .new_scan()
-            .with_stats(crate::table::ScanStatsMode::Lightweight)
-            .unwrap()
-            .plan()
-            .await
-            .unwrap();
+        let plan = reader.new_scan().with_stats().plan().await.unwrap();
         let scan_stats = plan.stats().cloned().unwrap();
 
         assert!(plan.splits().is_empty());
@@ -7856,13 +7666,7 @@ mod tests {
         let empty = limited.new_scan().plan().await.unwrap();
         assert!(empty.splits().is_empty());
         assert_eq!(empty.snapshot_id(), Some(1));
-        let empty = limited
-            .new_scan()
-            .with_stats(crate::table::ScanStatsMode::Lightweight)
-            .unwrap()
-            .plan()
-            .await
-            .unwrap();
+        let empty = limited.new_scan().with_stats().plan().await.unwrap();
         let scan_stats = empty.stats().cloned().unwrap();
         assert!(empty.splits().is_empty());
         assert_eq!(scan_stats.final_splits, 0);
@@ -7943,13 +7747,7 @@ mod tests {
         let plan = builder.new_scan().plan().await.unwrap();
         assert!(plan.splits().is_empty());
         assert_eq!(plan.snapshot_id(), Some(1));
-        let plan = builder
-            .new_scan()
-            .with_stats(crate::table::ScanStatsMode::Lightweight)
-            .unwrap()
-            .plan()
-            .await
-            .unwrap();
+        let plan = builder.new_scan().with_stats().plan().await.unwrap();
         let scan_stats = plan.stats().cloned().unwrap();
         assert!(plan.splits().is_empty());
         assert_eq!(scan_stats.final_files, 0);

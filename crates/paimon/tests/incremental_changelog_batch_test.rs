@@ -421,8 +421,7 @@ async fn timestamp_changelog_stats_describes_one_packed_batch() {
     let plan = table
         .new_read_builder()
         .new_scan()
-        .with_stats(paimon::table::ScanStatsMode::Lightweight)
-        .unwrap()
+        .with_stats()
         .plan()
         .await
         .unwrap();

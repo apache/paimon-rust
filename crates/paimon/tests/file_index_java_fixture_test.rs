@@ -231,8 +231,7 @@ async fn reads_java_written_file_indexes_and_prunes_data_files() {
         planning_builder.with_filter(missing.clone());
         let plan = planning_builder
             .new_scan()
-            .with_stats(paimon::table::ScanStatsMode::Lightweight)
-            .unwrap()
+            .with_stats()
             .plan()
             .await
             .expect("plan missing-value query");

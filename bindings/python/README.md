@@ -160,24 +160,19 @@ print(batches_tt[0])
 
 ### Scan statistics
 
-Request complete metadata pruning counters explicitly and read the `ScanStats`
-from the resulting plan:
+Request counters from ordinary metadata planning and read them from the plan:
 
 ```python
 plan = table.new_read_builder().new_scan().with_stats().plan()
 scan_stats = plan.stats()
-print(scan_stats.manifest_entries_read, scan_stats.entries_after_stats)
+print(scan_stats.manifest_entries_read, scan_stats.final_files)
 ```
 
-The counters include candidates before LIMIT. Collection can decode more
-manifest entries than ordinary planning and does not read data files. Ordinary
-`plan()` returns `None` from `stats()`. Combined incremental scans expose
-the same API for their selected Delta or Changelog window.
-
-Use `with_stats(complete=False)` to record the work performed by ordinary
-planning while preserving early manifest pruning and LIMIT stopping.
-`stats.complete` identifies which collection mode produced the counters.
-Snapshot metadata is available from `plan.snapshot_id()`.
+Collection retains early manifest/sidecar pruning and LIMIT stopping. Counters
+record the work performed; skipped entries are not decoded to reconstruct totals.
+Ordinary `plan()` returns `None` from `stats()`. Combined incremental scans expose
+the same API for their selected Delta or Changelog window. Snapshot metadata is
+available from `plan.snapshot_id()`.
 
 ### Shard column updates
 
