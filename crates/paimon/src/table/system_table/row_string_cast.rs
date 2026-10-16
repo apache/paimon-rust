@@ -143,6 +143,15 @@ fn validate_row_has_field(row: &BinaryRow, pos: usize) -> Result<()> {
 }
 
 pub(super) fn format_field(row: &BinaryRow, pos: usize, data_type: &DataType) -> Result<String> {
+    format_field_in_zone(row, pos, data_type, &jiff::tz::TimeZone::system())
+}
+
+pub(super) fn format_field_in_zone(
+    row: &BinaryRow,
+    pos: usize,
+    data_type: &DataType,
+    zone: &jiff::tz::TimeZone,
+) -> Result<String> {
     let Some(datum) = row.get_datum(pos, data_type)? else {
         return Ok("null".to_string());
     };
@@ -180,7 +189,7 @@ pub(super) fn format_field(row: &BinaryRow, pos: usize, data_type: &DataType) ->
                 millis,
                 i64::from(nanos),
                 typ.precision(),
-                Some(&jiff::tz::TimeZone::system()),
+                Some(zone),
             ))
         }
         (datum, _) => Err(data_invalid(format!(

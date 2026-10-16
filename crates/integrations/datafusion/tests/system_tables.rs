@@ -1410,6 +1410,63 @@ fn single_int_partition_stat(value: &str) -> i32 {
 }
 
 #[tokio::test]
+async fn test_partition_timestamps_match_local_file_creation_times() {
+    let (ctx, catalog, _tmp) = create_context().await;
+    let table = catalog
+        .get_table(&Identifier::new("default", FIXTURE_TABLE))
+        .await
+        .unwrap();
+    let core = table
+        .new_system_read("partitions")
+        .unwrap()
+        .read()
+        .await
+        .unwrap();
+    let sql = format!("SELECT last_update_time FROM paimon.default.{FIXTURE_TABLE}$partitions");
+    let batches = run_sql(&ctx, &sql).await;
+    let actual = batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<TimestampMillisecondArray>()
+                .unwrap()
+                .iter()
+        })
+        .collect::<Vec<_>>();
+    let expected = core
+        .column_by_name("last_update_time")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<TimestampMillisecondArray>()
+        .unwrap()
+        .iter()
+        .collect::<Vec<_>>();
+    assert!(!expected.is_empty());
+    assert_eq!(actual, expected);
+    let files = run_sql(
+        &ctx,
+        &format!("SELECT creation_time FROM paimon.default.{FIXTURE_TABLE}$files"),
+    )
+    .await;
+    let last_file = files
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<TimestampMillisecondArray>()
+                .unwrap()
+                .iter()
+                .flatten()
+        })
+        .max()
+        .unwrap();
+    assert_eq!(actual, vec![Some(last_file)]);
+}
+
+#[tokio::test]
 async fn test_partitions_system_table() {
     let (ctx, _catalog, _tmp) = create_context().await;
     let sql = format!("SELECT * FROM paimon.default.{FIXTURE_TABLE}$partitions");

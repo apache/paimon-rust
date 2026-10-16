@@ -25,6 +25,7 @@ use arrow_array::{
     TimestampMillisecondArray,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
+use jiff::tz::TimeZone;
 
 use crate::catalog::{list_partition_entries, FileSystemPartitionEntry};
 use crate::spec::{
@@ -33,7 +34,7 @@ use crate::spec::{
 use crate::table::Table;
 use crate::Result;
 
-use super::row_string_cast::format_field;
+use super::row_string_cast::{format_field_in_zone, format_row_field_as_java_object_string};
 
 const DELETED_RECORD_COUNT: usize = 11;
 
@@ -81,10 +82,14 @@ pub(super) async fn read(table: &Table, projection: Option<&[usize]>) -> Result<
         HashMap::new()
     };
     let fields = table.schema().partition_fields();
-    let default_name = CoreOptions::new(table.schema().options())
-        .partition_default_name()
-        .to_string();
-    partition_batch(entries, &fields, &default_name, &deletions)
+    let options = CoreOptions::new(table.schema().options());
+    partition_batch(
+        entries,
+        &fields,
+        options.partition_default_name(),
+        options.legacy_partition_name(),
+        &deletions,
+    )
 }
 
 async fn deleted_record_counts(table: &Table) -> Result<HashMap<Vec<u8>, Option<i64>>> {
@@ -121,7 +126,12 @@ fn accumulate_deletions(entries: Vec<IndexManifestEntry>) -> HashMap<Vec<u8>, Op
     counts
 }
 
-fn partition_string(row: &BinaryRow, fields: &[DataField], default_name: &str) -> Result<String> {
+fn partition_string(
+    row: &BinaryRow,
+    fields: &[DataField],
+    default_name: &str,
+    zone: &TimeZone,
+) -> Result<String> {
     fields
         .iter()
         .enumerate()
@@ -129,7 +139,7 @@ fn partition_string(row: &BinaryRow, fields: &[DataField], default_name: &str) -
             let value = if row.is_null_at(index) {
                 default_name.to_string()
             } else {
-                format_field(row, index, field.data_type())?
+                format_field_in_zone(row, index, field.data_type(), zone)?
             };
             let value = if crate::spec::is_java_whitespace_only(&value) {
                 default_name
@@ -142,14 +152,16 @@ fn partition_string(row: &BinaryRow, fields: &[DataField], default_name: &str) -
         .map(|parts| parts.join("/"))
 }
 
-// Java converts catalog partition specs back to typed rows before looking up
-// deletion metadata. A default spec becomes NULL, and binary specs round-trip
-// through Java's UTF-8 decoder rather than retaining malformed source bytes.
-fn deletion_partition_key(
+// Java generates a spec using partition.legacy-name, then reconstructs a typed
+// row for BOTH display and deletion lookup. Keep this conversion independent of
+// whether deletion metadata was requested (notably for LTZ and DST overlaps).
+fn normalize_partition(
     row: &BinaryRow,
     fields: &[DataField],
     default_name: &str,
-) -> Result<Vec<u8>> {
+    legacy: bool,
+    zone: &TimeZone,
+) -> Result<BinaryRow> {
     let values = fields
         .iter()
         .enumerate()
@@ -158,19 +170,42 @@ fn deletion_partition_key(
             let Some(value) = value else {
                 return Ok(None);
             };
-            let text = format_field(row, index, field.data_type())?;
+            let text = if legacy {
+                format_row_field_as_java_object_string(row, index, field.data_type())?
+                    .expect("non-null partition field")
+            } else {
+                format_field_in_zone(row, index, field.data_type(), zone)?
+            };
             if text == default_name || crate::spec::is_java_whitespace_only(&text) {
                 return Ok(None);
             }
             Ok(Some(match value {
                 Datum::Bytes(_) => Datum::Bytes(text.into_bytes()),
-                Datum::Time(value) => {
-                    let crate::spec::DataType::Time(typ) = field.data_type() else {
+                Datum::Time(_) => Datum::Time(parse_time_spec(&text)?),
+                Datum::Timestamp { .. } => {
+                    let crate::spec::DataType::Timestamp(typ) = field.data_type() else {
                         unreachable!()
                     };
-                    let quantum = 10_i32.pow(3 - typ.precision().min(3));
-                    Datum::Time(value / quantum * quantum)
+                    let (millis, nanos) =
+                        crate::arrow::parse_java_timestamp(&text, typ.precision(), None)?;
+                    Datum::Timestamp {
+                        millis,
+                        nanos: nanos as i32,
+                    }
                 }
+                Datum::LocalZonedTimestamp { .. } => {
+                    let crate::spec::DataType::LocalZonedTimestamp(typ) = field.data_type() else {
+                        unreachable!()
+                    };
+                    let (millis, nanos) =
+                        crate::arrow::parse_java_timestamp(&text, typ.precision(), Some(zone))?;
+                    Datum::LocalZonedTimestamp {
+                        millis,
+                        nanos: nanos as i32,
+                    }
+                }
+                // The remaining scalar formatters round-trip the typed value
+                // unchanged; reuse it without narrowing through Arrow storage.
                 value => value,
             }))
         })
@@ -180,20 +215,55 @@ fn deletion_partition_key(
         .zip(fields)
         .map(|(value, field)| (value.as_ref(), field.data_type()))
         .collect();
-    Ok(BinaryRow::from_datums(&refs).to_serialized_bytes())
+    Ok(BinaryRow::from_datums(&refs))
+}
+
+fn parse_time_spec(text: &str) -> Result<i32> {
+    // BinaryStringUtils.toTime preserves the integer legacy spec. Otherwise
+    // parse the formatter's HH:mm:ss[.fraction] without chrono's hour limit.
+    if let Ok(value) = text.parse::<i32>() {
+        return Ok(value);
+    }
+    let (time, fraction) = text.split_once('.').unwrap_or((text, ""));
+    let parts = time
+        .split(':')
+        .map(|part| {
+            part.parse::<i32>()
+                .map_err(|error| super::invalid(error.to_string()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let [hours, minutes, seconds] = parts.as_slice() else {
+        return Err(super::invalid(format!(
+            "Invalid TIME partition spec '{text}'"
+        )));
+    };
+    let fraction = if fraction.is_empty() {
+        0
+    } else {
+        let digits = &fraction[..fraction.len().min(3)];
+        digits
+            .parse::<i32>()
+            .map_err(|error| super::invalid(error.to_string()))?
+            * 10_i32.pow(3 - digits.len() as u32)
+    };
+    Ok((hours * 3600 + minutes * 60 + seconds) * 1000 + fraction)
 }
 
 fn partition_batch(
     entries: Vec<FileSystemPartitionEntry>,
     fields: &[DataField],
     default_name: &str,
+    legacy: bool,
     deletions: &HashMap<Vec<u8>, Option<i64>>,
 ) -> Result<RecordBatch> {
+    let zone = TimeZone::system();
     let mut rows = entries
         .into_iter()
-        .map(|entry| {
+        .map(|mut entry| {
+            entry.partition =
+                normalize_partition(&entry.partition, fields, default_name, legacy, &zone)?;
             Ok((
-                partition_string(&entry.partition, fields, default_name)?,
+                partition_string(&entry.partition, fields, default_name, &zone)?,
                 entry,
             ))
         })
@@ -218,11 +288,7 @@ fn partition_batch(
             Some(0)
         } else {
             deletions
-                .get(&deletion_partition_key(
-                    &entry.partition,
-                    fields,
-                    default_name,
-                )?)
+                .get(&entry.partition.to_serialized_bytes())
                 .copied()
                 .unwrap_or(Some(0))
         });
@@ -320,6 +386,7 @@ mod tests {
 
     #[test]
     fn deletion_lookup_uses_typed_partition_specs() {
+        let zone = TimeZone::UTC;
         let typ = PaimonType::VarChar(VarCharType::string_type());
         let fields = [DataField::new(0, "p".into(), typ.clone())];
         let null = BinaryRow::from_datums(&[(None, &typ)]).to_serialized_bytes();
@@ -327,7 +394,9 @@ mod tests {
             let datum = Datum::String(value.into());
             let row = BinaryRow::from_datums(&[(Some(&datum), &typ)]);
             assert_eq!(
-                deletion_partition_key(&row, &fields, "DEFAULT").unwrap(),
+                normalize_partition(&row, &fields, "DEFAULT", false, &zone)
+                    .unwrap()
+                    .to_serialized_bytes(),
                 null
             );
         }
@@ -337,9 +406,156 @@ mod tests {
         let canonical = Datum::Bytes("�".as_bytes().to_vec());
         let row = BinaryRow::from_datums(&[(Some(&original), &typ)]);
         assert_eq!(
-            deletion_partition_key(&row, &fields, "DEFAULT").unwrap(),
+            normalize_partition(&row, &fields, "DEFAULT", false, &zone)
+                .unwrap()
+                .to_serialized_bytes(),
             BinaryRow::from_datums(&[(Some(&canonical), &typ)]).to_serialized_bytes()
         );
+    }
+
+    #[test]
+    fn time_spec_parser_preserves_java_integer_and_clock_forms() {
+        for (spec, millis) in [
+            ("0", 0),
+            ("00:00:00", 0),
+            ("45296120", 45_296_120),
+            ("12:34:56.12", 45_296_120),
+            ("23:59:59.999", 86_399_999),
+            ("24:00:00", 86_400_000),
+        ] {
+            assert_eq!(parse_time_spec(spec).unwrap(), millis);
+        }
+    }
+
+    #[test]
+    fn time_spec_round_trip_respects_legacy_names() {
+        use crate::spec::TimeType;
+        for precision in 0..=3 {
+            let typ = PaimonType::Time(TimeType::new(precision).unwrap());
+            let fields = [DataField::new(0, "p".into(), typ.clone())];
+            let datum = Datum::Time(45_296_123);
+            let row = BinaryRow::from_datums(&[(Some(&datum), &typ)]);
+            for legacy in [true, false] {
+                let normalized =
+                    normalize_partition(&row, &fields, "DEFAULT", legacy, &TimeZone::UTC).unwrap();
+                let quantum = if legacy { 1 } else { 10_i32.pow(3 - precision) };
+                assert_eq!(
+                    normalized.get_int(0).unwrap(),
+                    45_296_123 / quantum * quantum
+                );
+                let counts = HashMap::from([(row.to_serialized_bytes(), Some(1))]);
+                let batch = partition_batch(
+                    vec![FileSystemPartitionEntry {
+                        partition: row.clone(),
+                        ..Default::default()
+                    }],
+                    &fields,
+                    "DEFAULT",
+                    legacy,
+                    &counts,
+                )
+                .unwrap();
+                let count = batch
+                    .column(DELETED_RECORD_COUNT)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .value(0);
+                assert_eq!(count, i64::from(legacy || precision == 3));
+            }
+        }
+    }
+
+    #[test]
+    fn ltz_spec_round_trip_matches_java_legacy_and_dst_rules() {
+        use crate::spec::LocalZonedTimestampType;
+        let zone = TimeZone::get("America/New_York").unwrap();
+        let typ = PaimonType::LocalZonedTimestamp(LocalZonedTimestampType::new(3).unwrap());
+        let fields = [DataField::new(0, "p".into(), typ.clone())];
+        // Expected keys and names were obtained with Java's partition computer,
+        // convertSpecToInternalRow and CastExecutors.resolveToString.
+        for (instant, legacy, key, display) in [
+            (
+                1_704_067_200_000,
+                true,
+                1_704_085_200_000,
+                "2024-01-01 00:00:00.000",
+            ),
+            (
+                1_704_067_200_000,
+                false,
+                1_704_067_200_000,
+                "2023-12-31 19:00:00.000",
+            ),
+            (
+                1_730_615_400_000,
+                true,
+                1_730_633_400_000,
+                "2024-11-03 06:30:00.000",
+            ),
+            // Parsing 01:30 during the overlap chooses the earlier EDT offset.
+            (
+                1_730_615_400_000,
+                false,
+                1_730_611_800_000,
+                "2024-11-03 01:30:00.000",
+            ),
+            // A legacy wall time inside the spring gap shifts forward an hour.
+            (
+                1_710_038_700_000,
+                true,
+                1_710_056_700_000,
+                "2024-03-10 03:45:00.000",
+            ),
+        ] {
+            let datum = Datum::LocalZonedTimestamp {
+                millis: instant,
+                nanos: 0,
+            };
+            let row = BinaryRow::from_datums(&[(Some(&datum), &typ)]);
+            let normalized = normalize_partition(&row, &fields, "DEFAULT", legacy, &zone).unwrap();
+            assert_eq!(normalized.get_timestamp_raw(0, 3).unwrap(), (key, 0));
+            assert_eq!(
+                partition_string(&normalized, &fields, "DEFAULT", &zone).unwrap(),
+                format!("p={display}")
+            );
+            let counts = HashMap::from([(row.to_serialized_bytes(), Some(1))]);
+            assert_eq!(
+                counts
+                    .get(&normalized.to_serialized_bytes())
+                    .copied()
+                    .unwrap_or(Some(0)),
+                Some(i64::from(key == instant))
+            );
+        }
+    }
+
+    #[test]
+    fn timestamp_spec_round_trip_uses_declared_precision_without_arrow_overflow() {
+        use crate::spec::TimestampType;
+        for (precision, millis, nanos) in [
+            (1, 16_725_225_600_100, 0),
+            (3, 16_725_225_600_123, 0),
+            (6, 16_725_225_600_123, 456_000),
+            (7, 16_725_225_600_123, 456_700),
+            (9, 16_725_225_600_123, 456_789),
+        ] {
+            let typ = PaimonType::Timestamp(TimestampType::new(precision).unwrap());
+            let fields = [DataField::new(0, "p".into(), typ.clone())];
+            let datum = Datum::Timestamp {
+                millis: 16_725_225_600_123,
+                nanos: 456_789,
+            };
+            let row = BinaryRow::from_datums(&[(Some(&datum), &typ)]);
+            for legacy in [true, false] {
+                let normalized =
+                    normalize_partition(&row, &fields, "DEFAULT", legacy, &TimeZone::UTC).unwrap();
+                assert_eq!(
+                    normalized.get_timestamp_raw(0, precision).unwrap(),
+                    (millis, nanos)
+                );
+            }
+        }
     }
 
     #[test]
@@ -357,7 +573,7 @@ mod tests {
             let datum = Datum::String(input.into());
             let row = BinaryRow::from_datums(&[(Some(&datum), &typ)]);
             assert_eq!(
-                partition_string(&row, &fields, "DEFAULT").unwrap(),
+                partition_string(&row, &fields, "DEFAULT", &TimeZone::UTC).unwrap(),
                 format!("p={expected}")
             );
         }
@@ -399,11 +615,11 @@ mod tests {
             .collect();
         let row = BinaryRow::from_datums(&refs);
         assert_eq!(
-            partition_string(&row, &fields, "DEFAULT").unwrap(),
+            partition_string(&row, &fields, "DEFAULT", &TimeZone::UTC).unwrap(),
             "p0=true/p1=1.20/p2=2500-01-01 00:00:00.123456789/p3=a/b=c/p4=DEFAULT"
         );
         assert_eq!(
-            partition_string(&BinaryRow::from_datums(&[]), &[], "DEFAULT").unwrap(),
+            partition_string(&BinaryRow::from_datums(&[]), &[], "DEFAULT", &TimeZone::UTC).unwrap(),
             ""
         );
     }
