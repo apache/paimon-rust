@@ -20,7 +20,7 @@
 //! Reference: [pypaimon.read.table_scan.TableScan](https://github.com/apache/paimon/blob/release-1.3/paimon-python/pypaimon/read/table_scan.py)
 //! and [FullStartingScanner](https://github.com/apache/paimon/blob/release-1.3/paimon-python/pypaimon/read/scanner/full_starting_scanner.py).
 
-use super::bucket_filter::compute_target_buckets;
+use super::bucket_filter::{compute_target_buckets, BucketSelector};
 use super::chunk_shuffle::{chunk_shuffle_splits, ChunkShuffle};
 use super::format_table_scan::FormatTableScan;
 use super::global_index_result::GlobalIndexResult;
@@ -167,6 +167,9 @@ async fn read_manifest_bytes_with_sidecar(
     };
     let mut bucket_cache: HashMap<i32, Option<HashSet<i32>>> = HashMap::new();
     let mut bucket_block_filter = |bucket: i32, total_buckets: i32| {
+        if bucket < 0 || total_buckets <= 0 {
+            return true;
+        }
         let Some(predicate) = bucket_predicate else {
             return true;
         };
@@ -244,9 +247,7 @@ async fn read_all_manifest_entries(
     current_schema_id: i64,
     schema_fields: &[DataField],
     key_fields: &[String],
-    bucket_predicate: Option<&Predicate>,
-    bucket_key_fields: &[DataField],
-    bucket_function_type: BucketFunctionType,
+    bucket_selector: Option<&BucketSelector>,
     row_range_index: Option<&RowRangeIndex>,
     manifest_sidecar_enabled: bool,
     manifest_parallelism: usize,
@@ -254,6 +255,10 @@ async fn read_all_manifest_entries(
 ) -> crate::Result<Vec<ManifestEntry>> {
     let file_io = table.file_io();
     let table_path = table.location();
+    let bucket_predicate = bucket_selector.and_then(BucketSelector::manifest_predicate);
+    let bucket_key_fields = bucket_selector.map_or(&[][..], BucketSelector::bucket_fields);
+    let bucket_function_type =
+        bucket_selector.map_or(BucketFunctionType::Default, BucketSelector::function);
     let incremental = !matches!(&source, ManifestListSource::Snapshot(_));
     let (mut manifest_files, delta) = match source {
         ManifestListSource::Snapshot(snapshot) => futures::try_join!(
@@ -354,8 +359,7 @@ async fn read_all_manifest_entries(
                 )
                 .await?;
 
-                // Per-task bucket cache (few distinct total_buckets values per manifest).
-                let mut bucket_cache: HashMap<i32, Option<HashSet<i32>>> = HashMap::new();
+                let mut bucket_selector = bucket_selector.cloned();
                 let mut counters = ManifestReadCounters::default();
                 let mut stats_schema_cache = HashMap::new();
 
@@ -383,21 +387,11 @@ async fn read_all_manifest_entries(
                             counters.pruned_by_bucket += 1;
                             return false;
                         }
-                        if let Some(pred) = bucket_predicate {
-                            let targets = bucket_cache.entry(total_buckets).or_insert_with(|| {
-                                compute_target_buckets(
-                                    pred,
-                                    bucket_key_fields,
-                                    bucket_function_type,
-                                    total_buckets,
-                                )
-                            });
-                            if let Some(targets) = targets {
-                                if !targets.contains(&bucket) {
-                                    counters.pruned_by_bucket += 1;
-                                    return false;
-                                }
-                            }
+                        if bucket_selector.as_mut().is_some_and(|selector| {
+                            !selector.test(partition_bytes, bucket, total_buckets)
+                        }) {
+                            counters.pruned_by_bucket += 1;
+                            return false;
                         }
 
                         // Partition filter
@@ -2012,7 +2006,8 @@ impl<'a> PaimonTableScan<'a> {
             .iter()
             .map(|m| fields[m.column].name())
             .collect();
-        // By name: the bucket predicate is indexed by bucket-key position.
+        // Bucket selectors retain partition and bucket-key leaves. Any masked
+        // input must disable raw-value specialization of that selector.
         let touches_masked = |predicate: &Predicate| {
             super::query_auth::leaf_names(std::slice::from_ref(predicate))
                 .iter()
@@ -2021,8 +2016,15 @@ impl<'a> PaimonTableScan<'a> {
         let mut scan = self.clone();
         scan.query_auth_grant = Some(Arc::clone(grant));
         scan.data_predicates.retain(|p| !touches_masked(p));
-        if scan.bucket_predicate.as_ref().is_some_and(touches_masked) {
-            scan.bucket_predicate = None;
+        if let Some(predicate) = scan.bucket_predicate.take() {
+            let safe = predicate
+                .split_and()
+                .into_iter()
+                .filter(|predicate| !touches_masked(predicate))
+                .collect::<Vec<_>>();
+            if !safe.is_empty() {
+                scan.bucket_predicate = Some(Predicate::and(safe));
+            }
         }
         let dropped = scan.data_predicates.len() != self.data_predicates.len();
         if !rules.filters.is_empty() || dropped {
@@ -2417,29 +2419,12 @@ impl<'a> PaimonTableScan<'a> {
         let key_fields = self.table.schema().trimmed_primary_keys();
         let pushdown_key_predicates = self.key_stats_predicates(&pushdown_data_predicates);
 
-        let bucket_key_fields: Vec<DataField> = if self.bucket_predicate.is_none() {
-            Vec::new()
-        } else {
-            let bucket_keys = core_options.bucket_key().unwrap_or_else(|| {
-                if has_primary_keys {
-                    self.table.schema().trimmed_primary_keys()
-                } else {
-                    Vec::new()
-                }
-            });
-            bucket_keys
-                .iter()
-                .filter_map(|key| {
-                    self.table
-                        .schema()
-                        .fields()
-                        .iter()
-                        .find(|f| f.name() == key)
-                        .cloned()
-                })
-                .collect::<Vec<_>>()
-        };
-        let bucket_function_type = core_options.bucket_function_type()?;
+        let bucket_selector = self
+            .bucket_predicate
+            .as_ref()
+            .map(|predicate| BucketSelector::new(&self.table, predicate))
+            .transpose()?
+            .flatten();
 
         let entries = read_all_manifest_entries(
             &self.table,
@@ -2454,9 +2439,7 @@ impl<'a> PaimonTableScan<'a> {
             self.table.schema().id(),
             self.table.schema().fields(),
             &key_fields,
-            self.bucket_predicate.as_ref(),
-            &bucket_key_fields,
-            bucket_function_type,
+            bucket_selector.as_ref(),
             row_range_index,
             core_options.manifest_sidecar_enabled(),
             core_options.scan_manifest_parallelism()?,
@@ -5039,6 +5022,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_bucket_sidecar_keeps_pending_files_when_snapshot_scan_includes_them() {
+        let schema = PaimonSchema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .primary_key(["id"])
+            .option("bucket", "-2")
+            .option("bucket-key", "id")
+            .option("manifest.sidecar.enabled", "true")
+            .build()
+            .unwrap();
+        let table = Table::new(
+            FileIOBuilder::new("memory").build().unwrap(),
+            Identifier::new("db", "pending"),
+            "memory:/pending_bucket_sidecar".into(),
+            TableSchema::new(0, &schema),
+            None,
+        );
+        setup_scan_trace_dirs(&table).await;
+        let predicate = PredicateBuilder::new(table.schema().fields())
+            .equal("id", Datum::Int(3))
+            .unwrap();
+        let target = *compute_target_buckets(
+            &predicate,
+            table.schema().fields(),
+            BucketFunctionType::Default,
+            4,
+        )
+        .unwrap()
+        .iter()
+        .next()
+        .unwrap();
+        let mut messages = Vec::new();
+        for bucket in [-2, (target + 1) % 4] {
+            let files = (0..1000)
+                .map(|index| {
+                    let mut file =
+                        stats_trace_file(&format!("{bucket}-{index:04}.parquet"), 0, 100);
+                    file.key_stats = BinaryTableStats::empty();
+                    file
+                })
+                .collect();
+            let mut message =
+                CommitMessage::new(BinaryRowBuilder::new(0).build_serialized(), bucket, files);
+            message.total_buckets = (bucket >= 0).then_some(4);
+            messages.push(message);
+        }
+        TableCommit::new(table.clone(), "pending".into())
+            .commit(messages)
+            .await
+            .unwrap();
+        let mut reader = table.new_read_builder();
+        reader.with_filter(predicate);
+        let scan = reader.new_scan().with_scan_all_files();
+        let (plan, trace) = scan.plan_with_trace().await.unwrap();
+        let (statistics_plan, stats) = scan.plan_with_stats().await.unwrap();
+        assert_eq!(plan.splits(), statistics_plan.splits());
+        assert_eq!(
+            plan.splits()
+                .iter()
+                .map(|split| split.data_files().len())
+                .sum::<usize>(),
+            1000
+        );
+        assert!(plan.splits().iter().all(|split| split.bucket() == -2));
+        assert_eq!(stats.entries_total, 2000);
+        assert_eq!(stats.entries_after_bucket, 1000);
+        assert!(trace.manifest_entries_read >= 1000);
+        assert!(
+            trace.manifest_entries_read < 2000,
+            "the sidecar should still prune assigned buckets"
+        );
+        let snapshot = table
+            .snapshot_manager()
+            .get_latest_snapshot()
+            .await
+            .unwrap()
+            .unwrap();
+        let initial = reader
+            .new_scan()
+            .plan_selected_snapshot(snapshot, super::SnapshotScanMode::All)
+            .await
+            .unwrap();
+        assert_eq!(initial.splits(), plan.splits());
+    }
+
+    #[tokio::test]
     async fn test_manifest_sidecar_prunes_avro_blocks_before_entry_decode() {
         const FILE_COUNT: usize = 1_000;
         let table_path = "memory:/manifest_sidecar_block_pruning";
@@ -7509,17 +7577,10 @@ mod tests {
         };
 
         let buckets = compute_target_buckets(&pred, &fields, BucketFunctionType::Default, 4);
-        assert!(buckets.is_some(), "IsNull should determine a target bucket");
-        let buckets = buckets.unwrap();
-        assert_eq!(buckets.len(), 1);
-        let bucket = *buckets.iter().next().unwrap();
-        assert!((0..4).contains(&bucket));
-
-        // Verify it matches the expected bucket from a null BinaryRow
-        let mut builder = BinaryRowBuilder::new(1);
-        builder.set_null_at(0);
-        let expected = (builder.build().hash_code() % 4).abs();
-        assert_eq!(bucket, expected);
+        assert!(
+            buckets.is_none(),
+            "Java BucketSelector only extracts Equal/In values"
+        );
     }
 
     #[test]
@@ -7548,13 +7609,9 @@ mod tests {
 
         let buckets = compute_target_buckets(&pred, &fields, BucketFunctionType::Default, 8);
         assert!(
-            buckets.is_some(),
-            "Composite key with IsNull should determine a target bucket"
+            buckets.is_none(),
+            "one bucket key has no Equal/In constraint"
         );
-        let buckets = buckets.unwrap();
-        assert_eq!(buckets.len(), 1);
-        let bucket = *buckets.iter().next().unwrap();
-        assert!((0..8).contains(&bucket));
     }
 
     #[tokio::test]
