@@ -691,6 +691,146 @@ async fn scan_ids(table: &Table, predicate: Predicate) -> Vec<i32> {
 }
 
 #[tokio::test]
+async fn build_options_do_not_change_source_data_paths() {
+    for kind in [BTREE_GLOBAL_INDEX_TYPE, BITMAP_GLOBAL_INDEX_TYPE] {
+        let mut options = table_options("10");
+        options.insert("data-file.path-directory".into(), "actual-data".into());
+        options.insert("data-evolution.enabled".into(), "false".into());
+        let table =
+            test_table_with_path(&format!("memory:/index_build_source_path_{kind}"), options);
+        setup_dirs(&table).await;
+        let writer = table.new_write_builder();
+        let mut write = writer.new_write().unwrap();
+        write
+            .write_arrow_batch(&data_batch(vec![1, 2], vec!["a", "b"]))
+            .await
+            .unwrap();
+        writer
+            .new_commit()
+            .commit(write.prepare_commit().await.unwrap())
+            .await
+            .unwrap();
+        let count = table
+            .new_global_index_build_builder()
+            .with_index_column("name")
+            .with_index_type(kind)
+            .with_options(HashMap::from([(
+                "data-file.path-directory".into(),
+                "wrong-directory".into(),
+            )]))
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+        let predicate = PredicateBuilder::new(table.schema().fields())
+            .equal("name", Datum::String("b".into()))
+            .unwrap();
+        assert_eq!(scan_ids(&table, predicate).await, vec![2]);
+    }
+}
+
+#[tokio::test]
+async fn scalar_build_with_deletion_vectors_preserves_physical_coverage() {
+    for kind in [BTREE_GLOBAL_INDEX_TYPE, BITMAP_GLOBAL_INDEX_TYPE] {
+        for deleted in [vec![0, 2], vec![0, 1, 2, 3]] {
+            let mut options = table_options("2");
+            options.insert("deletion-vectors.enabled".into(), "true".into());
+            options.insert("global-index.search-mode".into(), "full".into());
+            let table = test_table_with_path(
+                &format!("memory:/scalar_build_dv_{kind}_{}", deleted.len()),
+                options,
+            );
+            setup_dirs(&table).await;
+            let writer = table.new_write_builder();
+            let mut write = writer.new_write().unwrap();
+            write
+                .write_arrow_batch(&data_batch(vec![1, 2, 3, 4], vec!["a", "b", "a", "b"]))
+                .await
+                .unwrap();
+            writer
+                .new_commit()
+                .commit(write.prepare_commit().await.unwrap())
+                .await
+                .unwrap();
+            let delete = writer.new_update().unwrap();
+            writer
+                .new_commit()
+                .commit(delete.delete_by_row_id(deleted.clone()).await.unwrap())
+                .await
+                .unwrap();
+
+            let mut builder = table.new_global_index_build_builder();
+            builder.with_index_column("name").with_index_type(kind);
+            let messages = builder.build().await.unwrap();
+            let files = messages
+                .iter()
+                .flat_map(|m| &m.new_index_files)
+                .collect::<Vec<_>>();
+            // Like Java, index writers consume the physical rows, even when
+            // all rows are deleted. The query snapshot owns live-row filtering.
+            assert_eq!(files.iter().map(|f| f.row_count).sum::<i64>(), 4);
+            assert_eq!(
+                merge_row_ranges(
+                    files
+                        .iter()
+                        .map(|f| {
+                            let meta = f.global_index_meta.as_ref().unwrap();
+                            RowRange::new(meta.row_range_start, meta.row_range_end)
+                        })
+                        .collect()
+                ),
+                vec![RowRange::new(0, 3)]
+            );
+            writer.new_commit().commit(messages).await.unwrap();
+            let predicates = PredicateBuilder::new(table.schema().fields());
+            let filter = predicates.equal("name", Datum::String("b".into())).unwrap();
+            assert_eq!(
+                scan_ids(&table, filter.clone()).await,
+                if deleted.len() == 2 {
+                    vec![2, 4]
+                } else {
+                    vec![]
+                }
+            );
+            assert!(builder.build().await.unwrap().is_empty());
+
+            // A delete after preparation does not invalidate a physical index,
+            // and subsequent appends still receive their original global IDs.
+            let mut write = writer.new_write().unwrap();
+            write
+                .write_arrow_batch(&data_batch(vec![5, 6], vec!["b", "a"]))
+                .await
+                .unwrap();
+            writer
+                .new_commit()
+                .commit(write.prepare_commit().await.unwrap())
+                .await
+                .unwrap();
+            let messages = builder.build().await.unwrap();
+            assert_eq!(
+                messages
+                    .iter()
+                    .flat_map(|m| &m.new_index_files)
+                    .map(|f| f.row_count)
+                    .sum::<i64>(),
+                2
+            );
+            writer
+                .new_commit()
+                .commit(delete.delete_by_row_id(vec![1, 4]).await.unwrap())
+                .await
+                .unwrap();
+            writer.new_commit().commit(messages).await.unwrap();
+            assert_eq!(
+                scan_ids(&table, filter).await,
+                if deleted.len() == 2 { vec![4] } else { vec![] }
+            );
+            assert!(builder.build().await.unwrap().is_empty());
+        }
+    }
+}
+
+#[tokio::test]
 async fn test_execute_writes_btree_index_manifest_and_file() {
     for version in [1, 2] {
         assert_btree_build_version(version).await;

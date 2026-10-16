@@ -22,11 +22,15 @@ use std::sync::Arc;
 
 use roaring::RoaringTreemap;
 
-use crate::spec::{CoreOptions, Predicate};
+use crate::spec::{CoreOptions, Predicate, Snapshot};
 use crate::table::de_vector_scan::{DeVectorScan, DeVectorScanPlan, PreparedVectorSearchFilter};
 use crate::table::pk_vector_scan::{PkVectorScan, PkVectorScanPlan};
-use crate::table::vector_search_common::targets_primary_key_column;
+use crate::table::vector_search_common::{
+    targets_primary_key_column, validate_global_vector_index_types,
+};
+use crate::table::SearchScanSplit;
 use crate::table::{find_field_id_by_name, BucketVectorSearchSplit, Table};
+use std::collections::{HashMap, HashSet};
 
 /// Resolve one snapshot and the work a vector reader will consume.
 ///
@@ -44,15 +48,123 @@ pub(super) trait Scan: Sync {
 pub struct VectorScanPlan {
     pub(super) context: PlanContext,
     pub(super) work: VectorScanWork,
+    table: Table,
 }
 
 #[derive(Clone)]
 pub(super) enum VectorScanWork {
     DataEvolution(Box<DeVectorScanPlan>),
-    PrimaryKey(PkVectorScanPlan),
+    PrimaryKey(Box<PkVectorScanPlan>),
 }
 
 impl VectorScanPlan {
+    /// The snapshot captured by planning, including retained tag snapshots.
+    pub fn snapshot(&self) -> Option<&Snapshot> {
+        match &self.work {
+            VectorScanWork::DataEvolution(plan) => plan.table.travel_snapshot(),
+            VectorScanWork::PrimaryKey(plan) => plan.snapshot.as_ref(),
+        }
+    }
+
+    /// Inspect source work using the scan's effective search options. This does
+    /// not resolve a newer snapshot or reread its index manifest. Query readers
+    /// may still use different query vectors, limits and search options.
+    pub async fn splits(
+        &self,
+        options: &HashMap<String, String>,
+    ) -> crate::Result<Vec<SearchScanSplit>> {
+        match &self.work {
+            VectorScanWork::DataEvolution(plan) => {
+                if plan.skip_search {
+                    return Ok(vec![]);
+                }
+                super::search_scan_split::global_search_splits(
+                    &plan.table,
+                    &plan.index_entries,
+                    &self.context.column,
+                    self.context.filter.as_ref(),
+                    options,
+                    false,
+                )
+                .await
+            }
+            VectorScanWork::PrimaryKey(plan) => {
+                if plan.snapshot.is_none()
+                    && plan
+                        .splits
+                        .iter()
+                        .any(|split| !split.ann_segments.is_empty())
+                {
+                    return Err(crate::Error::Unsupported {
+                        message:
+                            "Source metadata export requires a manifest-planned primary-key search"
+                                .into(),
+                    });
+                }
+                let selected = super::pk_vector_read::filtered_row_ranges(
+                    &self.table,
+                    self.context.filter.as_ref(),
+                    plan,
+                )
+                .await?;
+                plan.splits
+                    .iter()
+                    .enumerate()
+                    .map(|(index, split)| {
+                        let payloads = plan
+                            .payloads
+                            .get(&(
+                                split.data_split.partition().to_serialized_bytes(),
+                                split.data_split.bucket(),
+                            ))
+                            .into_iter()
+                            .flatten()
+                            .filter(|payload| {
+                                split.ann_segments.iter().any(|segment| {
+                                    let location =
+                                        super::index_file_path::IndexFileLocation::BucketLocal {
+                                            table_path: &self.context.location,
+                                            bucket_path: split.data_split.bucket_path(),
+                                            index_file_in_data_file_dir: false,
+                                        };
+                                    segment.path
+                                        == location.resolve(
+                                            &payload.file_name,
+                                            payload.external_path.as_deref(),
+                                        )
+                                        || segment
+                                            .path
+                                            .ends_with(&format!("/{}", payload.file_name))
+                                })
+                            })
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        let covered = split
+                            .ann_segments
+                            .iter()
+                            .flat_map(|segment| segment.source_meta.source_files())
+                            .map(|file| file.file_name())
+                            .collect::<HashSet<_>>();
+                        Ok(SearchScanSplit::PrimaryKey {
+                            data_split: split.data_split.clone(),
+                            payloads,
+                            uncovered_data_files: split
+                                .active_files
+                                .iter()
+                                .filter(|file| !covered.contains(file.file_name.as_str()))
+                                .map(|file| file.file_name.clone())
+                                .collect(),
+                            row_ranges_by_file: selected
+                                .as_ref()
+                                .map(|ranges| ranges[index].clone())
+                                .unwrap_or_default(),
+                        })
+                    })
+                    .collect()
+            }
+        }
+    }
+
     pub fn snapshot_id(&self) -> Option<i64> {
         match &self.work {
             VectorScanWork::DataEvolution(plan) => plan.table.travel_snapshot().map(|s| s.id()),
@@ -122,6 +234,7 @@ impl PlanContext {
 
 /// Creates query-independent plans for DE or primary-key vector search.
 pub struct VectorScan {
+    table: Table,
     context: PlanContext,
     scan: VectorScanKind,
 }
@@ -164,17 +277,34 @@ impl VectorScan {
                 prepared,
             )))
         };
-        Ok(Self { context, scan })
+        Ok(Self {
+            table: table.clone(),
+            context,
+            scan,
+        })
     }
 
     pub async fn plan(&self) -> crate::Result<VectorScanPlan> {
         let work = match &self.scan {
             VectorScanKind::DataEvolution(scan) => {
-                VectorScanWork::DataEvolution(Box::new(scan.plan().await?))
+                let plan = scan.plan().await?;
+                if let Some(field_id) =
+                    find_field_id_by_name(plan.table.schema().fields(), &self.context.column)
+                {
+                    validate_global_vector_index_types(
+                        &plan.index_entries,
+                        field_id,
+                        &self.context.column,
+                    )?;
+                }
+                VectorScanWork::DataEvolution(Box::new(plan))
             }
-            VectorScanKind::PrimaryKey(scan) => VectorScanWork::PrimaryKey(scan.plan().await?),
+            VectorScanKind::PrimaryKey(scan) => {
+                VectorScanWork::PrimaryKey(Box::new(scan.plan().await?))
+            }
         };
         Ok(VectorScanPlan {
+            table: self.table.clone(),
             context: self.context.clone(),
             work,
         })
@@ -194,8 +324,9 @@ impl VectorScan {
             });
         };
         Ok(VectorScanPlan {
+            table: self.table.clone(),
             context: self.context.clone(),
-            work: VectorScanWork::PrimaryKey(scan.plan_for_bucket_vector_splits(splits)?),
+            work: VectorScanWork::PrimaryKey(Box::new(scan.plan_for_bucket_vector_splits(splits)?)),
         })
     }
 }

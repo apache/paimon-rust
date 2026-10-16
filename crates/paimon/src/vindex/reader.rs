@@ -267,15 +267,15 @@ impl VindexVectorGlobalIndexReader {
         Ok(results)
     }
 
-    #[cfg(test)]
-    pub(crate) fn load<S: SeekRead + 'static>(
+    /// Open and optimize the index without executing a query.
+    pub fn load<S: SeekRead + 'static>(
         &mut self,
         stream_fn: impl FnOnce(&str) -> crate::Result<S>,
     ) -> crate::Result<()> {
         self.ensure_loaded(stream_fn, |_| Ok(()))
     }
 
-    pub(crate) fn metadata(&self) -> crate::Result<&VectorIndexMetadata> {
+    pub fn metadata(&self) -> crate::Result<&VectorIndexMetadata> {
         self.metadata
             .as_ref()
             .ok_or_else(|| crate::Error::DataInvalid {
@@ -454,6 +454,15 @@ fn prepare_search_with_shared_filter(
     vector_search: &VectorSearch,
     shared_filter_bytes: Option<&Arc<[u8]>>,
 ) -> crate::Result<Option<PreparedSearch>> {
+    // Query options override the defaults of a reusable index reader.
+    let mut merged_options;
+    let options = if vector_search.options.is_empty() {
+        options
+    } else {
+        merged_options = options.clone();
+        merged_options.extend(vector_search.options.clone());
+        &merged_options
+    };
     if vector_search.vector.len() != metadata.dimension {
         return Err(crate::Error::DataInvalid {
             message: format!(
@@ -470,30 +479,32 @@ fn prepare_search_with_shared_filter(
     if top_k == 0 {
         return Ok(None);
     }
-    let mut params = match metadata.index_type {
-        IndexType::DiskAnn => match options.get(L_SEARCH_PARAMETER) {
-            Some(value) => {
-                let l_search = value
-                    .parse::<usize>()
-                    .ok()
-                    .filter(|value| *value > 0)
-                    .ok_or_else(|| crate::Error::DataInvalid {
-                        message: format!(
-                            "Invalid value for '{}': {}. Must be a positive integer.",
-                            L_SEARCH_PARAMETER, value
-                        ),
-                        source: None,
-                    })?;
-                VectorSearchParams::with_l_search(top_k, l_search)
+    let mut params = match (
+        options.get(NPROBE_PARAMETER),
+        options.get(L_SEARCH_PARAMETER),
+    ) {
+        (Some(_), Some(_)) => {
+            return Err(crate::Error::DataInvalid {
+                message: format!(
+                    "Cannot set both '{NPROBE_PARAMETER}' and '{L_SEARCH_PARAMETER}'."
+                ),
+                source: None,
+            });
+        }
+        (Some(value), None) => {
+            VectorSearchParams::new(top_k, parse_search_width(NPROBE_PARAMETER, value)?)
+        }
+        (None, Some(value)) => {
+            let l_search = parse_search_width(L_SEARCH_PARAMETER, value)?;
+            if l_search == 0 {
+                return Err(crate::Error::DataInvalid {
+                    message: format!("'{L_SEARCH_PARAMETER}' must be a positive integer"),
+                    source: None,
+                });
             }
-            None => VectorSearchParams::automatic(top_k),
-        },
-        _ => match options.get(NPROBE_PARAMETER) {
-            Some(value) => {
-                VectorSearchParams::new(top_k, parse_int_parameter(NPROBE_PARAMETER, value)?)
-            }
-            None => VectorSearchParams::automatic(top_k),
-        },
+            VectorSearchParams::with_l_search(top_k, l_search)
+        }
+        (None, None) => VectorSearchParams::automatic(top_k),
     };
 
     let filter_bytes = if let Some(include_ids) = vector_search.effective_include_row_ids() {
@@ -849,6 +860,30 @@ fn int_parameter(
     }
 }
 
+// Java's NativeVectorGlobalIndexReader uses Integer.parseInt, including BMP
+// decimal digits, with no whitespace/fraction coercion or values beyond i32.
+fn parse_search_width(key: &str, value: &str) -> crate::Result<usize> {
+    let text = value
+        .chars()
+        .enumerate()
+        .map(|(index, ch)| {
+            if index == 0 && matches!(ch, '+' | '-') {
+                Some(ch)
+            } else {
+                crate::common::number::java_decimal_digit(ch).map(|digit| char::from(b'0' + digit))
+            }
+        })
+        .collect::<Option<String>>();
+    text.and_then(|text| text.parse::<i32>().ok())
+        .and_then(|width| usize::try_from(width).ok())
+        .ok_or_else(|| crate::Error::DataInvalid {
+            message: format!(
+                "Invalid value for '{key}': {value}. Must be a non-negative 32-bit integer."
+            ),
+            source: None,
+        })
+}
+
 fn parse_int_parameter(key: &str, value: &str) -> crate::Result<usize> {
     value
         .parse::<usize>()
@@ -864,6 +899,28 @@ fn parse_int_parameter(key: &str, value: &str) -> crate::Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn query_widths_follow_java_integer_text_and_bounds() {
+        for key in [NPROBE_PARAMETER, L_SEARCH_PARAMETER] {
+            for (text, expected) in [
+                ("+12", 12),
+                ("１２", 12),
+                ("٢", 2),
+                ("2147483647", 2147483647),
+            ] {
+                assert_eq!(parse_search_width(key, text).unwrap(), expected);
+            }
+            for text in ["2147483648", " 2", "2 ", "2.0", "1_0", "-1", "𝟙", "+", ""] {
+                assert!(parse_search_width(key, text).is_err(), "{text}");
+            }
+        }
+        // Reader memory budgets are usize byte counts, not Java search widths.
+        assert_eq!(
+            parse_int_parameter(READER_MEMORY_BUDGET_PARAMETER, "2147483648").unwrap(),
+            2147483648
+        );
+    }
     use crate::io::FileRead;
     use crate::vindex::range_reader::VindexFileReader;
     use async_trait::async_trait;
@@ -1049,6 +1106,33 @@ mod tests {
         assert!(result.contains_key(&2));
         assert!(result.contains_key(&0));
         assert!(!result.contains_key(&3));
+    }
+
+    #[test]
+    fn reusable_reader_query_options_override_defaults_without_leaking() {
+        let metadata = VectorIndexMetadata {
+            index_type: IndexType::IvfFlat,
+            dimension: TEST_DIMENSION,
+            nlist: 16,
+            metric: MetricType::L2,
+            total_vectors: 8192,
+            pq_m: None,
+            pq_bits: None,
+            rq_bits: None,
+            diskann: None,
+        };
+        let defaults = HashMap::from([(NPROBE_PARAMETER.into(), "1".into())]);
+        let explicit = query().with_options(HashMap::from([(NPROBE_PARAMETER.into(), "7".into())]));
+        let prepared = prepare_batch_searches(&metadata, &defaults, &[explicit, query()]).unwrap();
+        assert_eq!(prepared[0].as_ref().unwrap().params.width, 7);
+        assert_eq!(prepared[1].as_ref().unwrap().params.width, 1);
+        let conflicting =
+            query().with_options(HashMap::from([(L_SEARCH_PARAMETER.into(), "32".into())]));
+        assert!(prepare_search(&metadata, &defaults, &conflicting)
+            .err()
+            .expect("conflicting query widths must be rejected")
+            .to_string()
+            .contains("Cannot set both"));
     }
 
     #[test]
@@ -1321,25 +1405,11 @@ mod tests {
             ("ivf.nprobe".to_string(), "4".to_string()),
             ("diskann.l_search".to_string(), "64".to_string()),
         ]);
-        let diskann = prepare_search(&metadata, &mixed_options, &query())
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            diskann.params.search_width,
-            paimon_vindex_core::index::SearchWidth::DiskAnnLSearch
-        );
-        assert_eq!(diskann.params.width, 64);
+        assert!(prepare_search(&metadata, &mixed_options, &query()).is_err());
 
         let mut ivf_metadata = metadata;
         ivf_metadata.index_type = IndexType::IvfFlat;
-        let ivf = prepare_search(&ivf_metadata, &mixed_options, &query())
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            ivf.params.search_width,
-            paimon_vindex_core::index::SearchWidth::IvfNProbe
-        );
-        assert_eq!(ivf.params.width, 4);
+        assert!(prepare_search(&ivf_metadata, &mixed_options, &query()).is_err());
     }
 
     #[test]

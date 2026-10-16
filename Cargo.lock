@@ -5393,7 +5393,9 @@ dependencies = [
  "futures",
  "paimon",
  "paimon-datafusion",
+ "paimon-vindex-core",
  "pyo3",
+ "roaring",
  "serde_json",
  "tokio",
 ]

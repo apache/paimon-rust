@@ -46,6 +46,11 @@ impl<'a> GlobalIndexDropBuilder<'a> {
         }
     }
 
+    /// Whether this index identity can be selected by this dropper.
+    pub fn supports_index_type(index_type: &str) -> bool {
+        normalize_global_index_type(index_type.trim()).is_some()
+    }
+
     pub fn with_index_column(&mut self, column: &str) -> &mut Self {
         self.index_column = Some(IndexColumns::Column(column.to_string()));
         self
@@ -80,19 +85,49 @@ impl<'a> GlobalIndexDropBuilder<'a> {
         self
     }
 
+    /// Prepare metadata deletions without publishing a snapshot or removing files.
+    /// The caller decides whether to commit the returned messages.
+    pub async fn build(&self) -> Result<Vec<CommitMessage>> {
+        Ok(self.prepare().await?.1)
+    }
+
     pub async fn execute(&self) -> Result<usize> {
+        let (snapshot_id, messages) = self.prepare().await?;
+        let dropped = messages
+            .iter()
+            .map(|message| message.deleted_index_files.len())
+            .sum();
+        if self.dry_run || dropped == 0 {
+            return Ok(dropped);
+        }
+        TableCommit::new(
+            self.table.clone(),
+            format!(
+                "global-index-{}-drop-{}",
+                self.index_type,
+                uuid::Uuid::new_v4()
+            ),
+        )
+        .commit_if_latest_snapshot(messages, snapshot_id.expect("nonempty drop has a snapshot"))
+        .await?;
+        // A failed commit may have been published. Never remove index files here.
+        Ok(dropped)
+    }
+
+    async fn prepare(&self) -> Result<(Option<i64>, Vec<CommitMessage>)> {
         // Dropping an index reads the index manifest.
         crate::spec::CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
 
         self.table.ensure_not_branch_reference_for_write()?;
 
-        let index_type =
-            normalize_global_index_type(&self.index_type).ok_or_else(|| Error::Unsupported {
+        let index_type = normalize_global_index_type(self.index_type.trim()).ok_or_else(|| {
+            Error::Unsupported {
                 message: format!(
                     "unsupported global index type '{}'; supported: {}",
                     self.index_type, SUPPORTED_GLOBAL_INDEX_TYPES_FOR_DROP
                 ),
-            })?;
+            }
+        })?;
         let index_column = self
             .index_column
             .as_ref()
@@ -130,10 +165,10 @@ impl<'a> GlobalIndexDropBuilder<'a> {
         // through the catalog, like reads and commit validation do.
         let snapshot_manager = self.table.snapshot_manager();
         let Some(snapshot) = snapshot_manager.get_latest_snapshot().await? else {
-            return Ok(0);
+            return Ok((None, vec![]));
         };
         let Some(index_manifest_name) = snapshot.index_manifest() else {
-            return Ok(0);
+            return Ok((Some(snapshot.id()), vec![]));
         };
 
         let index_entries = IndexManifest::read(
@@ -143,7 +178,6 @@ impl<'a> GlobalIndexDropBuilder<'a> {
         .await?;
         let mut deletions_by_partition_bucket: HashMap<(Vec<u8>, i32), Vec<IndexFileMeta>> =
             HashMap::new();
-        let mut dropped = 0;
         for entry in index_entries {
             if entry.kind != FileKind::Add {
                 continue;
@@ -176,16 +210,11 @@ impl<'a> GlobalIndexDropBuilder<'a> {
                     continue;
                 }
             }
-            dropped += 1;
             deletions_by_partition_bucket
                 .entry((entry.partition, entry.bucket))
                 .or_default()
                 .push(entry.index_file);
         }
-        if self.dry_run || dropped == 0 {
-            return Ok(dropped);
-        }
-
         let mut groups = deletions_by_partition_bucket
             .into_iter()
             .collect::<Vec<_>>();
@@ -205,14 +234,7 @@ impl<'a> GlobalIndexDropBuilder<'a> {
             })
             .collect::<Vec<_>>();
 
-        TableCommit::new(
-            self.table.clone(),
-            format!("global-index-{}-drop-{}", index_type, uuid::Uuid::new_v4()),
-        )
-        .commit_if_latest_snapshot(messages, snapshot.id())
-        .await?;
-
-        Ok(dropped)
+        Ok((Some(snapshot.id()), messages))
     }
 }
 
@@ -579,6 +601,85 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn build_prepares_only_metadata_deletions_until_explicit_commit() {
+        for dry_run in [false, true] {
+            let table = test_table(&format!("memory:/prepared_index_drop_{dry_run}"));
+            setup_dirs(&table).await;
+            let mut message = CommitMessage::new(vec![], 0, vec![data_file("data.parquet")]);
+            message.new_index_files = vec![
+                global_index_file("btree", "id.index", 0, 0, 9),
+                global_index_file("bitmap", "id-bitmap.index", 0, 0, 9),
+                global_index_file("btree", "name.index", 1, 0, 9),
+            ];
+            TableCommit::new(table.clone(), "prepare-test".into())
+                .commit(vec![message])
+                .await
+                .unwrap();
+            let snapshot_id = table
+                .snapshot_manager()
+                .get_latest_snapshot_id()
+                .await
+                .unwrap();
+            let before = table_files(&table).await;
+            let mut builder = table.new_global_index_drop_builder();
+            builder.with_index_column("id").with_dry_run(dry_run);
+            let messages = builder.build().await.unwrap();
+            assert_eq!(messages.len(), 1);
+            assert!(messages[0].new_files.is_empty());
+            assert!(messages[0].new_index_files.is_empty());
+            assert_eq!(messages[0].deleted_index_files.len(), 1);
+            assert_eq!(messages[0].deleted_index_files[0].file_name, "id.index");
+            assert_eq!(latest_index_entries(&table).await.len(), 3);
+            assert_eq!(table_files(&table).await, before);
+            assert_eq!(
+                table
+                    .snapshot_manager()
+                    .get_latest_snapshot_id()
+                    .await
+                    .unwrap(),
+                snapshot_id
+            );
+            // build() is always preparation, even on a builder configured for
+            // execute()'s dry run; only this explicit call publishes deletions.
+            TableCommit::new(table.clone(), "explicit-drop".into())
+                .commit(messages)
+                .await
+                .unwrap();
+            let mut names = latest_index_entries(&table)
+                .await
+                .into_iter()
+                .map(|entry| entry.index_file.file_name)
+                .collect::<Vec<_>>();
+            names.sort();
+            assert_eq!(names, vec!["id-bitmap.index", "name.index"]);
+            assert!(builder.build().await.unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn build_validates_empty_tables_and_authorization_without_publication() {
+        let table = test_table("memory:/prepared_index_drop_empty");
+        setup_dirs(&table).await;
+        assert!(table.new_global_index_drop_builder().build().await.is_err());
+        assert!(table
+            .new_global_index_drop_builder()
+            .with_index_column("id")
+            .build()
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(crate::table::query_auth_table()
+            .new_global_index_drop_builder()
+            .with_index_column("id")
+            .build()
+            .await
+            .is_err());
+        assert!(GlobalIndexDropBuilder::supports_index_type(" bTrEe "));
+        assert!(GlobalIndexDropBuilder::supports_index_type("FULL-TEXT"));
+        assert!(!GlobalIndexDropBuilder::supports_index_type("hash"));
     }
 
     async fn table_files(table: &Table) -> BTreeMap<String, Vec<u8>> {

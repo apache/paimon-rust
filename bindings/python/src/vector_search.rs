@@ -28,6 +28,39 @@ use crate::error::to_py_err;
 use crate::global_index_result::PyGlobalIndexResult;
 use crate::predicate::dict_to_table_predicate;
 
+pub(crate) fn search_plan_metadata_json(
+    snapshot: Option<&paimon::spec::Snapshot>,
+    snapshot_id: Option<i64>,
+    splits: Vec<paimon::table::SearchScanSplit>,
+) -> PyResult<String> {
+    use paimon::table::SearchScanSplit;
+    use serde_json::json;
+    let files = |files: &[paimon::spec::IndexFileMeta]| {
+        files
+            .iter()
+            .map(|file| file.to_serialized_row_data().map_err(to_py_err))
+            .collect::<PyResult<Vec<_>>>()
+    };
+    let splits = splits.into_iter().map(|split| Ok(match split {
+        SearchScanSplit::Index { column, row_range, index_files, scalar_index_files } => json!({
+            "kind": "index", "column": column, "row_range": row_range,
+            "index_files": files(&index_files)?, "scalar_index_files": files(&scalar_index_files)?,
+        }),
+        SearchScanSplit::Raw { row_ranges, scalar_index_files, index_type } => json!({
+            "kind": "raw", "row_ranges": row_ranges, "scalar_index_files": files(&scalar_index_files)?, "index_type": index_type,
+        }),
+        SearchScanSplit::PrimaryKey { data_split, payloads, uncovered_data_files, row_ranges_by_file } => json!({
+            "kind": "primary-key", "data_split": data_split.serialize_split_v1().map_err(to_py_err)?,
+            "payloads": files(&payloads)?, "uncovered_data_files": uncovered_data_files,
+            "row_ranges_by_file": row_ranges_by_file,
+        }),
+    })).collect::<PyResult<Vec<_>>>()?;
+    serde_json::to_string(
+        &json!({"snapshot": snapshot, "snapshot_id": snapshot_id, "splits": splits}),
+    )
+    .map_err(|error| pyo3::exceptions::PyValueError::new_err(error.to_string()))
+}
+
 #[derive(Clone, Default)]
 struct SearchConfig {
     column: Option<String>,
@@ -155,7 +188,15 @@ impl PyVectorSearchBuilder {
             .map_err(to_py_err)?
             .new_scan()
             .map_err(to_py_err)?;
-        Ok(PyVectorScan { inner })
+        Ok(PyVectorScan {
+            inner,
+            options: self
+                .config
+                .options
+                .iter()
+                .flat_map(|options| options.clone())
+                .collect(),
+        })
     }
     fn new_vector_search_read(&self) -> PyResult<PyVectorRead> {
         let mut builder = self.config.single(&self.table).map_err(to_py_err)?;
@@ -250,7 +291,15 @@ impl PyBatchVectorSearchBuilder {
             .map_err(to_py_err)?
             .new_scan()
             .map_err(to_py_err)?;
-        Ok(PyVectorScan { inner })
+        Ok(PyVectorScan {
+            inner,
+            options: self
+                .config
+                .options
+                .iter()
+                .flat_map(|options| options.clone())
+                .collect(),
+        })
     }
     fn new_batch_vector_search_read(&self) -> PyResult<PyBatchVectorRead> {
         let mut builder = self.config.batch(&self.table).map_err(to_py_err)?;
@@ -275,6 +324,7 @@ impl PyBatchVectorSearchBuilder {
 #[pyclass(name = "VectorScan", module = "pypaimon_rust.datafusion")]
 pub struct PyVectorScan {
     inner: VectorScan,
+    options: HashMap<String, String>,
 }
 
 #[pymethods]
@@ -283,17 +333,28 @@ impl PyVectorScan {
         let inner = py
             .detach(|| runtime().block_on(self.inner.plan()))
             .map_err(to_py_err)?;
-        Ok(PyVectorScanPlan { inner })
+        Ok(PyVectorScanPlan {
+            inner,
+            options: self.options.clone(),
+        })
     }
 }
 
 #[pyclass(name = "VectorScanPlan", module = "pypaimon_rust.datafusion")]
 pub struct PyVectorScanPlan {
     inner: VectorScanPlan,
+    options: HashMap<String, String>,
 }
 
 #[pymethods]
 impl PyVectorScanPlan {
+    fn _metadata(&self, py: Python<'_>) -> PyResult<String> {
+        let splits = py
+            .detach(|| runtime().block_on(self.inner.splits(&self.options)))
+            .map_err(to_py_err)?;
+        search_plan_metadata_json(self.inner.snapshot(), self.inner.snapshot_id(), splits)
+    }
+
     fn snapshot_id(&self) -> Option<i64> {
         self.inner.snapshot_id()
     }

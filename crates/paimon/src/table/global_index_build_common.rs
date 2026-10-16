@@ -38,6 +38,33 @@ pub(crate) mod vector;
 
 const COPY_BUFFER_SIZE: usize = 1024 * 1024;
 
+/// Validate the table that owns global row IDs. Procedure options only tune
+/// index generation; they cannot enable row tracking or change bucket layout.
+/// Data evolution and `global-index.enabled` govern reads, not index creation.
+pub(crate) fn validate_build_table(table: &Table) -> Result<()> {
+    let options = table.schema().core_options();
+    if !table.schema().primary_keys().is_empty() {
+        return Err(Error::Unsupported {
+            message: "Global index build does not support primary-key tables; use primary-key file indexes instead".into(),
+        });
+    }
+    if !options.row_tracking_enabled() {
+        return Err(Error::DataInvalid {
+            message: "Global index build requires 'row-tracking.enabled' = 'true'".into(),
+            source: None,
+        });
+    }
+    if options.bucket() != -1 {
+        return Err(Error::Unsupported {
+            message: format!(
+                "Global index build only supports unaware-bucket tables (bucket = -1), got {}",
+                options.bucket()
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// Stream a locally built index file to its table location. Native index
 /// builders (Lumina, full-text) serialize to a local temporary file first
 /// because their writers need synchronous I/O.
