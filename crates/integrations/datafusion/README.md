@@ -39,6 +39,12 @@ current provider. Raw `SessionContext` needs `register_catalog_table_engine` and
 dialect supporting these clauses; it preloads the current provider and propagates
 loading errors.
 
+## External engine DDL
+
+`SQLContext` answers `SHOW CREATE TABLE` on an external data table with the resolved
+provider's `get_table_definition()`, unchanged. A missing or blank definition is
+reported as unsupported.
+
 ## Reader memory
 
 Paimon Parquet scans use the memory pool from the executing DataFusion `TaskContext`.
