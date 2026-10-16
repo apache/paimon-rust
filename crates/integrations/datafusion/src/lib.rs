@@ -93,7 +93,6 @@ pub use merge_condition::compile_merge_condition;
 pub use physical_plan::PaimonTableScan;
 pub use relation_planner::PaimonRelationPlanner;
 pub use sql_context::{SQLContext, SQLContextBuilder};
-pub use system_tables::read_system_table;
 pub use table::PaimonTableProvider;
 pub use variant_functions::register_variant_functions;
 pub use vector_search::{register_vector_search, VectorSearchFunction};

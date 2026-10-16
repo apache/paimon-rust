@@ -32,36 +32,10 @@ use crate::error::to_datafusion_error;
 
 mod aggregation_fields;
 mod audit_log;
-mod branches;
-mod buckets;
-mod consumers;
-mod files;
-mod manifests;
-mod options;
+mod metadata;
 mod partitions;
 mod physical_files_size;
 mod referenced_files_size;
-mod row_string_cast;
-mod schemas;
-mod snapshots;
-mod table_indexes;
-mod tags;
-
-/// Metadata instants are exposed as Java TIMESTAMP in the system default zone.
-/// Reuse the core LTZ cast so DST, negative and extreme epochs use reader rules.
-fn local_timestamp_column(values: Vec<i64>) -> DFResult<datafusion::arrow::array::ArrayRef> {
-    use datafusion::arrow::array::{ArrayRef, TimestampMillisecondArray};
-    use paimon::spec::{DataType, LocalZonedTimestampType, TimestampType};
-    let array: ArrayRef = Arc::new(TimestampMillisecondArray::from(values));
-    paimon::arrow::cast_array_for_schema_evolution(
-        &array,
-        &DataType::LocalZonedTimestamp(
-            LocalZonedTimestampType::new(3).map_err(to_datafusion_error)?,
-        ),
-        &DataType::Timestamp(TimestampType::new(3).map_err(to_datafusion_error)?),
-    )
-    .map_err(to_datafusion_error)
-}
 
 type Builder = fn(Table) -> DFResult<Arc<dyn TableProvider>>;
 
@@ -71,19 +45,23 @@ type Builder = fn(Table) -> DFResult<Arc<dyn TableProvider>>;
 const TABLES: &[(&str, Builder)] = &[
     ("aggregation_fields", aggregation_fields::build),
     ("audit_log", audit_log::build),
-    ("branches", branches::build),
-    ("buckets", buckets::build),
-    ("consumers", consumers::build),
-    ("files", files::build),
-    ("file_key_ranges", files::build_key_ranges),
-    ("manifests", manifests::build),
-    ("options", options::build),
+    ("branches", |table| metadata::build(table, "branches")),
+    ("buckets", |table| metadata::build(table, "buckets")),
+    ("consumers", |table| metadata::build(table, "consumers")),
+    ("files", |table| metadata::build(table, "files")),
+    ("file_key_ranges", |table| {
+        metadata::build(table, "file_key_ranges")
+    }),
+    ("manifests", |table| metadata::build(table, "manifests")),
+    ("options", |table| metadata::build(table, "options")),
     ("physical_files_size", physical_files_size::build),
     ("referenced_files_size", referenced_files_size::build),
-    ("schemas", schemas::build),
-    ("snapshots", snapshots::build),
-    ("table_indexes", table_indexes::build),
-    ("tags", tags::build),
+    ("schemas", |table| metadata::build(table, "schemas")),
+    ("snapshots", |table| metadata::build(table, "snapshots")),
+    ("table_indexes", |table| {
+        metadata::build(table, "table_indexes")
+    }),
+    ("tags", |table| metadata::build(table, "tags")),
 ];
 
 const SYSTEM_TABLE_NAMES: &[&str] = &[
@@ -131,20 +109,11 @@ pub(crate) fn is_registered(name: &str) -> bool {
 /// with a `$`. Keep in step with `TABLES`: one missing here goes back to
 /// having its time-travel clause silently dropped.
 pub(crate) fn is_system_table_provider(provider: &dyn TableProvider) -> bool {
-    provider.is::<aggregation_fields::AggregationFieldsTable>()
-        || provider.is::<branches::BranchesTable>()
-        || provider.is::<buckets::BucketsTable>()
-        || provider.is::<consumers::ConsumersTable>()
-        || provider.is::<files::FilesTable>()
-        || provider.is::<manifests::ManifestsTable>()
-        || provider.is::<options::OptionsTable>()
+    provider.is::<metadata::MetadataTableProvider>()
+        || provider.is::<aggregation_fields::AggregationFieldsTable>()
         || provider.is::<partitions::PartitionsTable>()
         || provider.is::<physical_files_size::PhysicalFilesSizeTable>()
         || provider.is::<referenced_files_size::ReferencedFilesSizeTable>()
-        || provider.is::<schemas::SchemasTable>()
-        || provider.is::<snapshots::SnapshotsTable>()
-        || provider.is::<table_indexes::TableIndexesTable>()
-        || provider.is::<tags::TagsTable>()
 }
 
 fn wrap_to_system_table(name: &str, base_table: Table) -> Option<DFResult<Arc<dyn TableProvider>>> {
@@ -152,27 +121,6 @@ fn wrap_to_system_table(name: &str, base_table: Table) -> Option<DFResult<Arc<dy
         .iter()
         .find(|(n, _)| name.eq_ignore_ascii_case(n))
         .map(|(_, build)| build(base_table))
-}
-
-/// Read catalog-independent metadata using the existing system-table providers.
-/// The resolved table retains its branch, snapshot and FileIO environment.
-pub async fn read_system_table(
-    table: Table,
-    name: &str,
-) -> DFResult<datafusion::physical_plan::SendableRecordBatchStream> {
-    crate::table_loader::ensure_paimon_served(&table, table.identifier())?;
-    paimon::spec::CoreOptions::new(table.schema().options())
-        .ensure_read_authorized()
-        .map_err(to_datafusion_error)?;
-    let provider = wrap_to_system_table(name, table).ok_or_else(|| {
-        DataFusionError::Plan(format!(
-            "System table '{name}' requires a catalog or is unknown"
-        ))
-    })??;
-    datafusion::prelude::SessionContext::new()
-        .read_table(provider)?
-        .execute_stream()
-        .await
 }
 
 pub(crate) fn provider_for_table(
@@ -306,20 +254,14 @@ mod tests {
             .unwrap();
 
         let ctx = SessionContext::new();
-        for (name, builder) in [
-            ("manifests", super::manifests::build as super::Builder),
-            (
-                "table_indexes",
-                super::table_indexes::build as super::Builder,
-            ),
-        ] {
+        for name in ["manifests", "table_indexes"] {
             for empty in [false, true] {
                 let view = if empty {
                     table.copy_with_pinned_snapshot(None)
                 } else {
                     table.clone()
                 };
-                let provider = builder(view).unwrap();
+                let provider = super::metadata::build(view, name).unwrap();
                 let batches = ctx.read_table(provider).unwrap().collect().await.unwrap();
                 let count: usize = batches.iter().map(RecordBatch::num_rows).sum();
                 assert_eq!(count == 0, empty, "{name}, empty={empty}");

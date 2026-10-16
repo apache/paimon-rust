@@ -75,6 +75,15 @@ async fn run_sql(ctx: &SQLContext, sql: &str) -> Vec<RecordBatch> {
         .unwrap_or_else(|e| panic!("Failed to execute `{sql}`: {e}"))
 }
 
+async fn read_metadata(
+    table: paimon::table::Table,
+    name: &str,
+) -> paimon::Result<paimon::table::ArrowRecordBatchStream> {
+    let builder = table.system_table(name)?.new_read_builder();
+    let plan = builder.new_scan().plan().await?;
+    builder.new_read().read(plan.splits())
+}
+
 // Error text of `sql`, whether it surfaces at planning or execution.
 async fn query_error(ctx: &SQLContext, sql: &str) -> String {
     match ctx.sql(sql).await {
@@ -1740,7 +1749,7 @@ async fn test_file_key_ranges_matches_file_metadata() {
         .await
         .unwrap();
     let expected = run_sql(&ctx, &format!("SELECT partition, bucket, file_path, file_format, schema_id, level, record_count, file_size_in_bytes, min_key, max_key, first_row_id FROM paimon.default.{FIXTURE_TABLE}$files")).await;
-    let actual: Vec<_> = paimon_datafusion::read_system_table(table.clone(), "file_key_ranges")
+    let actual: Vec<_> = read_metadata(table.clone(), "file_key_ranges")
         .await
         .unwrap()
         .try_collect()
@@ -1753,7 +1762,7 @@ async fn test_file_key_ranges_matches_file_metadata() {
     assert_eq!(projected[0].num_rows(), 1);
     assert_eq!(projected[0].num_columns(), 1);
     let empty = table.copy_with_pinned_snapshot(None);
-    let batches: Vec<_> = paimon_datafusion::read_system_table(empty, "file_key_ranges")
+    let batches: Vec<_> = read_metadata(empty, "file_key_ranges")
         .await
         .unwrap()
         .try_collect()
@@ -1783,10 +1792,8 @@ async fn test_resolved_system_table_reader_preserves_guards_and_schema() {
         "file_key_ranges",
         "table_indexes",
     ] {
-        let stream = paimon_datafusion::read_system_table(table.clone(), name)
-            .await
-            .unwrap();
-        let schema = stream.schema();
+        let stream = read_metadata(table.clone(), name).await.unwrap();
+        let schema = table.system_table(name).unwrap().schema();
         let batches: Vec<_> = stream.try_collect().await.unwrap();
         assert!(!schema.fields().is_empty(), "{name}");
         assert!(
@@ -1795,7 +1802,7 @@ async fn test_resolved_system_table_reader_preserves_guards_and_schema() {
         );
     }
     for name in ["partitions", "unknown"] {
-        let error = match paimon_datafusion::read_system_table(table.clone(), name).await {
+        let error = match read_metadata(table.clone(), name).await {
             Ok(_) => panic!("{name} must require a catalog or be unknown"),
             Err(error) => error.to_string(),
         };
@@ -1805,7 +1812,7 @@ async fn test_resolved_system_table_reader_preserves_guards_and_schema() {
         "query-auth.enabled".to_string(),
         "true".to_string(),
     )]));
-    let error = match paimon_datafusion::read_system_table(denied, "options").await {
+    let error = match read_metadata(denied, "options").await {
         Ok(_) => panic!("Authorization must be checked before reading metadata"),
         Err(error) => error.to_string(),
     };
@@ -1824,7 +1831,7 @@ async fn test_options_ignore_resolved_dynamic_overrides() {
         ("file.format".to_string(), "csv".to_string()),
         ("metadata.runtime-only".to_string(), "private".to_string()),
     ]));
-    let batches: Vec<_> = paimon_datafusion::read_system_table(copy, "options")
+    let batches: Vec<_> = read_metadata(copy, "options")
         .await
         .unwrap()
         .try_collect()
@@ -1855,4 +1862,49 @@ async fn test_options_ignore_resolved_dynamic_overrides() {
         .collect();
     assert_eq!(&rows, table.schema().options());
     assert!(!rows.contains_key("metadata.runtime-only"));
+}
+
+#[tokio::test]
+async fn test_core_system_table_read_builder_filters_before_projection() {
+    use futures::TryStreamExt;
+    use paimon::spec::{Datum, Predicate, PredicateOperator};
+    let (_ctx, catalog, _tmp) = create_context().await;
+    let table = catalog
+        .get_table(&Identifier::new("default", FIXTURE_TABLE))
+        .await
+        .unwrap();
+    let system = table.system_table("snapshots").unwrap();
+    let mut builder = system.new_read_builder();
+    builder.with_projection(&["commit_user"]).unwrap();
+    let field = system.row_type().fields()[0].clone();
+    builder
+        .with_filter(Predicate::Leaf {
+            column: field.name().to_string(),
+            index: 0,
+            data_type: field.data_type().clone(),
+            op: PredicateOperator::Gt,
+            literals: vec![Datum::Long(0)],
+        })
+        .unwrap();
+    builder.with_limit(1);
+    let plan = builder.new_scan().plan().await.unwrap();
+    let rows: Vec<_> = builder
+        .new_read()
+        .read(plan.splits())
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(rows.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+    assert_eq!(rows[0].schema().fields().len(), 1);
+    assert_eq!(rows[0].schema().field(0).name(), "commit_user");
+    builder.with_limit(0);
+    let rows: Vec<_> = builder
+        .new_read()
+        .read(plan.splits())
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert!(rows.iter().all(|batch| batch.num_rows() == 0));
 }

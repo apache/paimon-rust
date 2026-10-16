@@ -33,6 +33,7 @@ mod predicate;
 mod read;
 mod schema;
 mod shard_update;
+mod system_table;
 mod table;
 mod udf;
 mod update_assignment;

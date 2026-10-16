@@ -17,10 +17,10 @@
 
 use std::num::NonZeroI32;
 
+use crate::spec::{BinaryRow, DataField, DataType, Datum};
+use crate::{Error, Result};
 use chrono::NaiveDate;
 use lexical_write_float::{format::STANDARD, Options, ToLexicalWithOptions};
-use paimon::spec::{BinaryRow, DataField, DataType, Datum};
-use paimon::{Error, Result};
 
 const MILLIS_PER_DAY: i64 = 86_400_000;
 const JAVA_FLOAT_OPTIONS: Options = Options::builder()
@@ -87,7 +87,7 @@ fn format_object_field(
         None => return Ok(None),
         Some(Datum::Date(value) | Datum::Time(value)) => value.to_string(),
         Some(Datum::Timestamp { millis, nanos } | Datum::LocalZonedTimestamp { millis, nanos }) => {
-            paimon::common::format_iso_timestamp(
+            crate::common::format_iso_timestamp(
                 millis.div_euclid(1000),
                 (millis.rem_euclid(1000) * 1_000_000 + i64::from(nanos)) as u32,
             )
@@ -177,12 +177,12 @@ fn format_field(row: &BinaryRow, pos: usize, data_type: &DataType) -> Result<Str
         ) => Ok(format_decimal_plain(unscaled, scale)),
         (Datum::Timestamp { .. } | Datum::LocalZonedTimestamp { .. }, _) => {
             let source = row.field_to_arrow(pos, data_type)?;
-            let target = DataType::VarChar(paimon::spec::VarCharType::string_type());
+            let target = DataType::VarChar(crate::spec::VarCharType::string_type());
             let strings =
-                paimon::arrow::cast_array_for_schema_evolution(&source, data_type, &target)?;
+                crate::arrow::cast_array_for_schema_evolution(&source, data_type, &target)?;
             let strings = strings
                 .as_any()
-                .downcast_ref::<datafusion::arrow::array::StringArray>()
+                .downcast_ref::<arrow_array::StringArray>()
                 .ok_or_else(|| {
                     data_invalid("Timestamp string cast returned a non-string array".into())
                 })?;
@@ -302,12 +302,12 @@ fn data_invalid(message: String) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{Local, TimeZone};
-    use paimon::spec::{
+    use crate::spec::{
         BigIntType, BinaryType, BlobType, BooleanType, CharType, DateType, DecimalType, DoubleType,
         FloatType, IntType, LocalZonedTimestampType, SmallIntType, TimeType, TimestampType,
         TinyIntType, VarBinaryType, VarCharType,
     };
+    use chrono::{Local, TimeZone};
 
     fn field(id: i32, data_type: DataType) -> DataField {
         DataField::new(id, format!("f{id}"), data_type)

@@ -19,24 +19,13 @@
 
 use std::sync::{Arc, OnceLock};
 
-use async_trait::async_trait;
-use datafusion::arrow::array::{RecordBatch, StringArray};
-use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
-use datafusion::catalog::Session;
-use datafusion::datasource::memory::MemorySourceConfig;
-use datafusion::datasource::{TableProvider, TableType};
-use datafusion::error::Result as DFResult;
-use datafusion::logical_expr::Expr;
-use datafusion::physical_plan::ExecutionPlan;
-use paimon::table::{BranchManager, Table};
+use crate::table::{BranchManager, Table};
+use arrow_array::{RecordBatch, StringArray};
+use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 
-use crate::error::to_datafusion_error;
+use crate::Result;
 
-pub(super) fn build(table: Table) -> DFResult<Arc<dyn TableProvider>> {
-    Ok(Arc::new(BranchesTable { table }))
-}
-
-fn branches_schema() -> SchemaRef {
+pub(super) fn branches_schema() -> SchemaRef {
     static SCHEMA: OnceLock<SchemaRef> = OnceLock::new();
     SCHEMA
         .get_or_init(|| {
@@ -52,52 +41,26 @@ fn branches_schema() -> SchemaRef {
         .clone()
 }
 
-#[derive(Debug)]
-pub(super) struct BranchesTable {
-    table: Table,
+pub(super) async fn read(
+    table: &Table,
+    _projection: Option<&[usize]>,
+    _predicate: Option<&crate::spec::Predicate>,
+) -> Result<RecordBatch> {
+    let (names, create_times) = collect_branches(table).await?;
+
+    let schema = branches_schema();
+    let batch = super::record_batch(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(names)),
+            super::local_timestamp_column(create_times)?,
+        ],
+    )?;
+
+    Ok(batch)
 }
 
-#[async_trait]
-impl TableProvider for BranchesTable {
-    fn schema(&self) -> SchemaRef {
-        branches_schema()
-    }
-
-    fn table_type(&self) -> TableType {
-        TableType::View
-    }
-
-    async fn scan(
-        &self,
-        _state: &dyn Session,
-        projection: Option<&Vec<usize>>,
-        _filters: &[Expr],
-        _limit: Option<usize>,
-    ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        let table = self.table.clone();
-        let (names, create_times) =
-            crate::runtime::await_with_runtime(async move { collect_branches(&table).await })
-                .await
-                .map_err(to_datafusion_error)?;
-
-        let schema = branches_schema();
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(StringArray::from(names)),
-                super::local_timestamp_column(create_times)?,
-            ],
-        )?;
-
-        Ok(MemorySourceConfig::try_new_exec(
-            &[vec![batch]],
-            schema,
-            projection.cloned(),
-        )?)
-    }
-}
-
-async fn collect_branches(table: &Table) -> paimon::Result<(Vec<String>, Vec<i64>)> {
+async fn collect_branches(table: &Table) -> crate::Result<(Vec<String>, Vec<i64>)> {
     let file_io = table.file_io();
     let bm = BranchManager::new(file_io.clone(), table.location().to_string());
     let names = bm.list_all().await?;

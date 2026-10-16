@@ -20,28 +20,16 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock};
 
-use async_trait::async_trait;
-use datafusion::arrow::array::{
-    Int32Array, Int64Array, RecordBatch, StringArray, TimestampMillisecondArray,
-};
-use datafusion::arrow::datatypes::{DataType as ArrowDataType, Field, Schema, SchemaRef, TimeUnit};
-use datafusion::catalog::Session;
-use datafusion::datasource::memory::MemorySourceConfig;
-use datafusion::datasource::{TableProvider, TableType};
-use datafusion::error::Result as DFResult;
-use datafusion::logical_expr::Expr;
-use datafusion::physical_plan::ExecutionPlan;
-use paimon::spec::{BinaryRow, DataField};
-use paimon::table::{DataSplit, Table};
+use crate::spec::{BinaryRow, DataField};
+use crate::table::{DataSplit, Table};
+use arrow_array::{Int32Array, Int64Array, RecordBatch, StringArray, TimestampMillisecondArray};
+use arrow_schema::{DataType as ArrowDataType, Field, Schema, SchemaRef, TimeUnit};
 
 use super::row_string_cast::format_row_as_java_cast_string;
-use crate::error::to_datafusion_error;
 
-pub(super) fn build(table: Table) -> DFResult<Arc<dyn TableProvider>> {
-    Ok(Arc::new(BucketsTable { table }))
-}
+use crate::Result;
 
-fn buckets_schema() -> SchemaRef {
+pub(super) fn buckets_schema() -> SchemaRef {
     static SCHEMA: OnceLock<SchemaRef> = OnceLock::new();
     SCHEMA
         .get_or_init(|| {
@@ -61,40 +49,14 @@ fn buckets_schema() -> SchemaRef {
         .clone()
 }
 
-#[derive(Debug)]
-pub(super) struct BucketsTable {
-    table: Table,
-}
-
-#[async_trait]
-impl TableProvider for BucketsTable {
-    fn schema(&self) -> SchemaRef {
-        buckets_schema()
-    }
-
-    fn table_type(&self) -> TableType {
-        TableType::View
-    }
-
-    async fn scan(
-        &self,
-        _state: &dyn Session,
-        projection: Option<&Vec<usize>>,
-        _filters: &[Expr],
-        _limit: Option<usize>,
-    ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        let table = self.table.clone();
-        let rows =
-            crate::runtime::await_with_runtime(async move { collect_bucket_rows(&table).await })
-                .await
-                .map_err(to_datafusion_error)?;
-        let batch = bucket_rows_to_record_batch(&rows)?;
-        Ok(MemorySourceConfig::try_new_exec(
-            &[vec![batch]],
-            buckets_schema(),
-            projection.cloned(),
-        )?)
-    }
+pub(super) async fn read(
+    table: &Table,
+    _projection: Option<&[usize]>,
+    _predicate: Option<&crate::spec::Predicate>,
+) -> Result<RecordBatch> {
+    let rows = collect_bucket_rows(table).await?;
+    let batch = bucket_rows_to_record_batch(&rows)?;
+    Ok(batch)
 }
 
 /// A bucket's files aggregated: mirrors Java `BucketEntry`.
@@ -112,7 +74,7 @@ struct BucketRow {
     agg: BucketAgg,
 }
 
-async fn collect_bucket_rows(table: &Table) -> paimon::Result<Vec<BucketRow>> {
+async fn collect_bucket_rows(table: &Table) -> crate::Result<Vec<BucketRow>> {
     let scan = table
         .new_read_builder()
         .new_scan()
@@ -137,7 +99,7 @@ async fn collect_bucket_rows(table: &Table) -> paimon::Result<Vec<BucketRow>> {
 fn aggregate_bucket_rows(
     splits: &[DataSplit],
     partition_fields: &[DataField],
-) -> paimon::Result<Vec<BucketRow>> {
+) -> crate::Result<Vec<BucketRow>> {
     let mut aggs: BTreeMap<(Option<String>, i32, Vec<u8>), BucketAgg> = BTreeMap::new();
     for split in splits {
         let partition = format_partition(split.partition(), partition_fields)?;
@@ -166,7 +128,7 @@ fn aggregate_bucket_rows(
         .collect())
 }
 
-fn bucket_rows_to_record_batch(rows: &[BucketRow]) -> DFResult<RecordBatch> {
+fn bucket_rows_to_record_batch(rows: &[BucketRow]) -> Result<RecordBatch> {
     let n = rows.len();
     let mut partitions = Vec::with_capacity(n);
     let mut buckets = Vec::with_capacity(n);
@@ -182,7 +144,7 @@ fn bucket_rows_to_record_batch(rows: &[BucketRow]) -> DFResult<RecordBatch> {
         file_counts.push(row.agg.file_count);
         last_update_times.push(row.agg.last_update_time);
     }
-    Ok(RecordBatch::try_new(
+    super::record_batch(
         buckets_schema(),
         vec![
             Arc::new(StringArray::from(partitions)),
@@ -192,7 +154,7 @@ fn bucket_rows_to_record_batch(rows: &[BucketRow]) -> DFResult<RecordBatch> {
             Arc::new(Int64Array::from(file_counts)),
             Arc::new(TimestampMillisecondArray::from(last_update_times)),
         ],
-    )?)
+    )
 }
 
 /// Format `partition` as Java's cast-to-string, matching `$files`; `{}` when the
@@ -200,7 +162,7 @@ fn bucket_rows_to_record_batch(rows: &[BucketRow]) -> DFResult<RecordBatch> {
 fn format_partition(
     partition: &BinaryRow,
     partition_fields: &[DataField],
-) -> paimon::Result<Option<String>> {
+) -> crate::Result<Option<String>> {
     if partition_fields.is_empty() {
         return Ok(Some("{}".to_string()));
     }
@@ -210,7 +172,7 @@ fn format_partition(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use paimon::spec::{DataType, Datum, VarCharType};
+    use crate::spec::{DataType, Datum, VarCharType};
 
     fn string_type() -> DataType {
         DataType::VarChar(VarCharType::new(64).unwrap())

@@ -129,6 +129,11 @@ mod postpone_fixed_bucket_write_builder;
 mod postpone_retract;
 mod prepared_files;
 mod query_auth;
+mod system_table;
+pub use system_table::{
+    SystemReadBuilder, SystemSplit, SystemTable, SystemTablePlan, SystemTableRead, SystemTableScan,
+};
+
 mod read_builder;
 mod read_limit;
 pub mod referenced_files;
@@ -542,6 +547,11 @@ impl Table {
         self.rest_env.is_some()
             && options.is_format_table()
             && options.partitioned_table_in_metastore()
+    }
+
+    /// Resolve a read-only metadata table while retaining this table's environment.
+    pub fn system_table(&self, name: &str) -> Result<SystemTable> {
+        SystemTable::new(self.clone(), name)
     }
 
     /// Create a read builder for scan/read.

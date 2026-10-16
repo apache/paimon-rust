@@ -19,24 +19,13 @@
 
 use std::sync::{Arc, OnceLock};
 
-use async_trait::async_trait;
-use datafusion::arrow::array::{Int64Array, RecordBatch, StringArray, TimestampMillisecondArray};
-use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
-use datafusion::catalog::Session;
-use datafusion::datasource::memory::MemorySourceConfig;
-use datafusion::datasource::{TableProvider, TableType};
-use datafusion::error::Result as DFResult;
-use datafusion::logical_expr::Expr;
-use datafusion::physical_plan::ExecutionPlan;
-use paimon::table::Table;
+use crate::table::Table;
+use arrow_array::{Int64Array, RecordBatch, StringArray, TimestampMillisecondArray};
+use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 
-use crate::error::to_datafusion_error;
+use crate::Result;
 
-pub(super) fn build(table: Table) -> DFResult<Arc<dyn TableProvider>> {
-    Ok(Arc::new(TagsTable { table }))
-}
-
-fn tags_schema() -> SchemaRef {
+pub(super) fn tags_schema() -> SchemaRef {
     static SCHEMA: OnceLock<SchemaRef> = OnceLock::new();
     SCHEMA
         .get_or_init(|| {
@@ -61,73 +50,48 @@ fn tags_schema() -> SchemaRef {
         .clone()
 }
 
-#[derive(Debug)]
-pub(super) struct TagsTable {
-    table: Table,
-}
+pub(super) async fn read(
+    table: &Table,
+    _projection: Option<&[usize]>,
+    _predicate: Option<&crate::spec::Predicate>,
+) -> Result<RecordBatch> {
+    let tm = table.tag_manager();
+    let tags = tm.list_all_with_metadata().await?;
 
-#[async_trait]
-impl TableProvider for TagsTable {
-    fn schema(&self) -> SchemaRef {
-        tags_schema()
+    let n = tags.len();
+    let mut tag_names: Vec<String> = Vec::with_capacity(n);
+    let mut snapshot_ids = Vec::with_capacity(n);
+    let mut schema_ids = Vec::with_capacity(n);
+    let mut commit_times = Vec::with_capacity(n);
+    let mut record_counts: Vec<Option<i64>> = Vec::with_capacity(n);
+    let mut create_times: Vec<Option<i64>> = Vec::with_capacity(n);
+    let mut time_retained: Vec<Option<String>> = Vec::with_capacity(n);
+
+    for (name, snap, created, retained) in tags {
+        tag_names.push(name);
+        snapshot_ids.push(snap.id());
+        schema_ids.push(snap.schema_id());
+        commit_times.push(snap.time_millis() as i64);
+        record_counts.push(snap.total_record_count());
+        create_times.push(created);
+        time_retained.push(retained.map(format_duration_iso8601));
     }
 
-    fn table_type(&self) -> TableType {
-        TableType::View
-    }
+    let schema = tags_schema();
+    let batch = super::record_batch(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(tag_names)),
+            Arc::new(Int64Array::from(snapshot_ids)),
+            Arc::new(Int64Array::from(schema_ids)),
+            super::local_timestamp_column(commit_times)?,
+            Arc::new(Int64Array::from(record_counts)),
+            Arc::new(TimestampMillisecondArray::from(create_times)),
+            Arc::new(StringArray::from(time_retained)),
+        ],
+    )?;
 
-    async fn scan(
-        &self,
-        _state: &dyn Session,
-        projection: Option<&Vec<usize>>,
-        _filters: &[Expr],
-        _limit: Option<usize>,
-    ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        let tm = self.table.tag_manager();
-        let tags =
-            crate::runtime::await_with_runtime(async move { tm.list_all_with_metadata().await })
-                .await
-                .map_err(to_datafusion_error)?;
-
-        let n = tags.len();
-        let mut tag_names: Vec<String> = Vec::with_capacity(n);
-        let mut snapshot_ids = Vec::with_capacity(n);
-        let mut schema_ids = Vec::with_capacity(n);
-        let mut commit_times = Vec::with_capacity(n);
-        let mut record_counts: Vec<Option<i64>> = Vec::with_capacity(n);
-        let mut create_times: Vec<Option<i64>> = Vec::with_capacity(n);
-        let mut time_retained: Vec<Option<String>> = Vec::with_capacity(n);
-
-        for (name, snap, created, retained) in tags {
-            tag_names.push(name);
-            snapshot_ids.push(snap.id());
-            schema_ids.push(snap.schema_id());
-            commit_times.push(snap.time_millis() as i64);
-            record_counts.push(snap.total_record_count());
-            create_times.push(created);
-            time_retained.push(retained.map(format_duration_iso8601));
-        }
-
-        let schema = tags_schema();
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(StringArray::from(tag_names)),
-                Arc::new(Int64Array::from(snapshot_ids)),
-                Arc::new(Int64Array::from(schema_ids)),
-                super::local_timestamp_column(commit_times)?,
-                Arc::new(Int64Array::from(record_counts)),
-                Arc::new(TimestampMillisecondArray::from(create_times)),
-                Arc::new(StringArray::from(time_retained)),
-            ],
-        )?;
-
-        Ok(MemorySourceConfig::try_new_exec(
-            &[vec![batch]],
-            schema,
-            projection.cloned(),
-        )?)
-    }
+    Ok(batch)
 }
 
 /// Render a retention in seconds the way Java's `Duration.toString()` does, so

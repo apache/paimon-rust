@@ -19,29 +19,19 @@
 
 use std::sync::{Arc, OnceLock};
 
-use async_trait::async_trait;
-use datafusion::arrow::array::{Int64Array, RecordBatch, StringArray};
-use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use datafusion::catalog::Session;
-use datafusion::datasource::memory::MemorySourceConfig;
-use datafusion::datasource::{TableProvider, TableType};
-use datafusion::error::Result as DFResult;
-use datafusion::logical_expr::Expr;
-use datafusion::physical_plan::ExecutionPlan;
-use paimon::spec::{BinaryRow, DataField, ManifestFileMeta, ManifestList};
-use paimon::table::Table;
+use crate::spec::{BinaryRow, DataField, ManifestFileMeta, ManifestList};
+use crate::table::Table;
+use arrow_array::{Int64Array, RecordBatch, StringArray};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 
 use super::row_string_cast::format_row_as_java_cast_string;
-use crate::error::to_datafusion_error;
 
 const MIN_PARTITION_STATS_INDEX: usize = 5;
 const MAX_PARTITION_STATS_INDEX: usize = 6;
 
-pub(super) fn build(table: Table) -> DFResult<Arc<dyn TableProvider>> {
-    Ok(Arc::new(ManifestsTable { table }))
-}
+use crate::Result;
 
-fn manifests_schema() -> SchemaRef {
+pub(super) fn manifests_schema() -> SchemaRef {
     static SCHEMA: OnceLock<SchemaRef> = OnceLock::new();
     SCHEMA
         .get_or_init(|| {
@@ -60,108 +50,76 @@ fn manifests_schema() -> SchemaRef {
         .clone()
 }
 
-#[derive(Debug)]
-pub(super) struct ManifestsTable {
-    table: Table,
+pub(super) async fn read(
+    table: &Table,
+    projection: Option<&[usize]>,
+    _predicate: Option<&crate::spec::Predicate>,
+) -> Result<RecordBatch> {
+    let metas = collect_manifests(table).await?;
+
+    let n = metas.len();
+    let mut file_names: Vec<String> = Vec::with_capacity(n);
+    let mut file_sizes = Vec::with_capacity(n);
+    let mut num_added = Vec::with_capacity(n);
+    let mut num_deleted = Vec::with_capacity(n);
+    let mut schema_ids = Vec::with_capacity(n);
+    let mut min_partition_stats: Vec<Option<String>> = Vec::with_capacity(n);
+    let mut max_partition_stats: Vec<Option<String>> = Vec::with_capacity(n);
+    let mut min_row_ids: Vec<Option<i64>> = Vec::with_capacity(n);
+    let mut max_row_ids: Vec<Option<i64>> = Vec::with_capacity(n);
+    let partition_fields = table.schema().partition_fields();
+    let projected_columns = projection;
+    let materialize_min_partition_stats =
+        should_materialize_column(projected_columns, MIN_PARTITION_STATS_INDEX);
+    let materialize_max_partition_stats =
+        should_materialize_column(projected_columns, MAX_PARTITION_STATS_INDEX);
+
+    for meta in metas {
+        let stats = meta.partition_stats();
+        file_names.push(meta.file_name().to_string());
+        file_sizes.push(meta.file_size());
+        num_added.push(meta.num_added_files());
+        num_deleted.push(meta.num_deleted_files());
+        schema_ids.push(meta.schema_id());
+        min_partition_stats.push(materialize_partition_stats_value(
+            materialize_min_partition_stats,
+            stats.min_values(),
+            stats.null_counts(),
+            &partition_fields,
+        )?);
+        max_partition_stats.push(materialize_partition_stats_value(
+            materialize_max_partition_stats,
+            stats.max_values(),
+            stats.null_counts(),
+            &partition_fields,
+        )?);
+        min_row_ids.push(meta.min_row_id());
+        max_row_ids.push(meta.max_row_id());
+    }
+
+    let schema = manifests_schema();
+    let batch = super::record_batch(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(file_names)),
+            Arc::new(Int64Array::from(file_sizes)),
+            Arc::new(Int64Array::from(num_added)),
+            Arc::new(Int64Array::from(num_deleted)),
+            Arc::new(Int64Array::from(schema_ids)),
+            Arc::new(StringArray::from(min_partition_stats)),
+            Arc::new(StringArray::from(max_partition_stats)),
+            Arc::new(Int64Array::from(min_row_ids)),
+            Arc::new(Int64Array::from(max_row_ids)),
+        ],
+    )?;
+
+    Ok(batch)
 }
 
-#[async_trait]
-impl TableProvider for ManifestsTable {
-    fn schema(&self) -> SchemaRef {
-        manifests_schema()
-    }
-
-    fn table_type(&self) -> TableType {
-        TableType::View
-    }
-
-    async fn scan(
-        &self,
-        _state: &dyn Session,
-        projection: Option<&Vec<usize>>,
-        _filters: &[Expr],
-        _limit: Option<usize>,
-    ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        let table = self.table.clone();
-        let metas =
-            crate::runtime::await_with_runtime(async move { collect_manifests(&table).await })
-                .await
-                .map_err(to_datafusion_error)?;
-
-        let n = metas.len();
-        let mut file_names: Vec<String> = Vec::with_capacity(n);
-        let mut file_sizes = Vec::with_capacity(n);
-        let mut num_added = Vec::with_capacity(n);
-        let mut num_deleted = Vec::with_capacity(n);
-        let mut schema_ids = Vec::with_capacity(n);
-        let mut min_partition_stats: Vec<Option<String>> = Vec::with_capacity(n);
-        let mut max_partition_stats: Vec<Option<String>> = Vec::with_capacity(n);
-        let mut min_row_ids: Vec<Option<i64>> = Vec::with_capacity(n);
-        let mut max_row_ids: Vec<Option<i64>> = Vec::with_capacity(n);
-        let partition_fields = self.table.schema().partition_fields();
-        let projected_columns = projection.map(Vec::as_slice);
-        let materialize_min_partition_stats =
-            should_materialize_column(projected_columns, MIN_PARTITION_STATS_INDEX);
-        let materialize_max_partition_stats =
-            should_materialize_column(projected_columns, MAX_PARTITION_STATS_INDEX);
-
-        for meta in metas {
-            let stats = meta.partition_stats();
-            file_names.push(meta.file_name().to_string());
-            file_sizes.push(meta.file_size());
-            num_added.push(meta.num_added_files());
-            num_deleted.push(meta.num_deleted_files());
-            schema_ids.push(meta.schema_id());
-            min_partition_stats.push(
-                materialize_partition_stats_value(
-                    materialize_min_partition_stats,
-                    stats.min_values(),
-                    stats.null_counts(),
-                    &partition_fields,
-                )
-                .map_err(to_datafusion_error)?,
-            );
-            max_partition_stats.push(
-                materialize_partition_stats_value(
-                    materialize_max_partition_stats,
-                    stats.max_values(),
-                    stats.null_counts(),
-                    &partition_fields,
-                )
-                .map_err(to_datafusion_error)?,
-            );
-            min_row_ids.push(meta.min_row_id());
-            max_row_ids.push(meta.max_row_id());
-        }
-
-        let schema = manifests_schema();
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(StringArray::from(file_names)),
-                Arc::new(Int64Array::from(file_sizes)),
-                Arc::new(Int64Array::from(num_added)),
-                Arc::new(Int64Array::from(num_deleted)),
-                Arc::new(Int64Array::from(schema_ids)),
-                Arc::new(StringArray::from(min_partition_stats)),
-                Arc::new(StringArray::from(max_partition_stats)),
-                Arc::new(Int64Array::from(min_row_ids)),
-                Arc::new(Int64Array::from(max_row_ids)),
-            ],
-        )?;
-
-        Ok(MemorySourceConfig::try_new_exec(
-            &[vec![batch]],
-            schema,
-            projection.cloned(),
-        )?)
-    }
-}
-
-async fn collect_manifests(table: &Table) -> paimon::Result<Vec<ManifestFileMeta>> {
+async fn collect_manifests(table: &Table) -> crate::Result<Vec<ManifestFileMeta>> {
     let file_io = table.file_io();
     let manifest_sm =
-        paimon::table::SnapshotManager::new(file_io.clone(), table.location().to_string());
+        crate::table::SnapshotManager::new(file_io.clone(), table.location().to_string());
     let Some(snapshot) = table.resolve_read_snapshot().await? else {
         return Ok(Vec::new());
     };
@@ -198,7 +156,7 @@ fn materialize_partition_stats_value(
     value_bytes: &[u8],
     null_counts: &[Option<i64>],
     partition_fields: &[DataField],
-) -> paimon::Result<Option<String>> {
+) -> crate::Result<Option<String>> {
     if materialize {
         format_partition_stats_value(value_bytes, null_counts, partition_fields)
     } else {
@@ -210,7 +168,7 @@ fn format_partition_stats_value(
     value_bytes: &[u8],
     null_counts: &[Option<i64>],
     partition_fields: &[DataField],
-) -> paimon::Result<Option<String>> {
+) -> crate::Result<Option<String>> {
     if value_bytes.is_empty() {
         return if partition_fields.is_empty() || null_counts.len() == partition_fields.len() {
             Ok(Some(format_all_null_partition_row(partition_fields.len())))
@@ -233,7 +191,7 @@ fn format_all_null_partition_row(arity: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use paimon::spec::{DataType as PaimonDataType, Datum, FloatType, IntType, VarCharType};
+    use crate::spec::{DataType as PaimonDataType, Datum, FloatType, IntType, VarCharType};
 
     fn field(name: &str, data_type: PaimonDataType) -> DataField {
         DataField::new(0, name.to_string(), data_type)
