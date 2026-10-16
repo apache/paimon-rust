@@ -252,6 +252,7 @@ impl<'a> PartialUpdateConfig<'a> {
         let groups = self.sequence_groups()?;
         let field_names: HashSet<&str> = fields.iter().map(DataField::name).collect();
         let primary_keys: HashSet<&str> = primary_keys.iter().map(String::as_str).collect();
+        let mut sequence_field_owners: HashMap<String, String> = HashMap::new();
         let mut protected_field_owners: HashMap<String, String> = HashMap::new();
 
         for group in &groups {
@@ -275,6 +276,22 @@ impl<'a> PartialUpdateConfig<'a> {
                             "The sequence-group '{option_key}' contains primary key field \
                              '{field}', which is not allowed. Primary key columns cannot be put \
                              in sequence-group."
+                        ),
+                    });
+                }
+            }
+            for field in &group.sequence_fields {
+                if let Some(previous_option) =
+                    sequence_field_owners.insert(field.clone(), option_key.clone())
+                {
+                    if previous_option == option_key {
+                        continue;
+                    }
+                    return Err(crate::Error::ConfigInvalid {
+                        message: format!(
+                            "Sequence field '{field}' is shared by sequence groups \
+                             '{previous_option}' and '{option_key}'. \
+                             Ordering fields must not overlap between sequence groups."
                         ),
                     });
                 }
@@ -818,6 +835,47 @@ mod tests {
                 if message.contains("price") && message.contains("multiple sequence groups")),
             "expected duplicate protected-field error, got {err:?}"
         );
+    }
+
+    #[test]
+    fn test_validate_sequence_groups_rejects_overlapping_ordering_fields() {
+        let fields = ["id", "seq_a", "seq_b", "seq_c", "left", "right"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, name)| {
+                DataField::new(
+                    index as i32,
+                    name.to_string(),
+                    DataType::Int(IntType::new()),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        for (first, second, shared) in [
+            ("seq_a", "seq_b,seq_a", "seq_a"),
+            ("seq_a,seq_b", "seq_b,seq_c", "seq_b"),
+            ("seq_a,seq_b", "seq_b,seq_a", "seq_b"),
+        ] {
+            let first_option = format!("fields.{first}.sequence-group");
+            let second_option = format!("fields.{second}.sequence-group");
+            let options = partial_update_options(&[
+                (first_option.as_str(), "left"),
+                (second_option.as_str(), "right"),
+            ]);
+            let config = PartialUpdateConfig::new(&options);
+            let error = config
+                .validated_sequence_groups(&fields, &["id".to_string()])
+                .unwrap_err();
+
+            assert!(
+                matches!(error, crate::Error::ConfigInvalid { ref message }
+                    if message.contains(&format!("Sequence field '{shared}'"))
+                        && message.contains(&first_option)
+                        && message.contains(&second_option)
+                        && message.contains("Ordering fields must not overlap")),
+                "expected overlapping ordering fields to be rejected, got {error:?}"
+            );
+        }
     }
 
     #[test]
