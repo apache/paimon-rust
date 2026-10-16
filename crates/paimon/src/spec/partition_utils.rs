@@ -495,7 +495,7 @@ pub fn format_java_float(value: f32) -> String {
 /// Decode as Java's UTF-8 decoder does for `BinaryString.toString()`.
 /// Rust's lossy decoder replaces each byte of a UTF-8 encoded surrogate,
 /// while Java replaces the complete malformed surrogate sequence once.
-fn decode_java_utf8(mut bytes: &[u8]) -> String {
+pub(crate) fn decode_java_utf8(mut bytes: &[u8]) -> String {
     let mut decoded = String::with_capacity(bytes.len());
     loop {
         match std::str::from_utf8(bytes) {

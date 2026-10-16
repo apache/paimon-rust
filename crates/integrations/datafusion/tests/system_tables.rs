@@ -1790,6 +1790,7 @@ async fn test_resolved_system_table_reader_preserves_guards_and_schema() {
         "consumers",
         "file_key_ranges",
         "table_indexes",
+        "partitions",
     ] {
         let stream = read_metadata(table.clone(), name).await.unwrap();
         let schema = table.new_system_read(name).unwrap().schema();
@@ -1800,13 +1801,11 @@ async fn test_resolved_system_table_reader_preserves_guards_and_schema() {
             "{name}"
         );
     }
-    for name in ["partitions", "unknown"] {
-        let error = match read_metadata(table.clone(), name).await {
-            Ok(_) => panic!("{name} must require a catalog or be unknown"),
-            Err(error) => error.to_string(),
-        };
-        assert!(error.contains("requires a catalog or is unknown"));
-    }
+    let error = match read_metadata(table.clone(), "unknown").await {
+        Ok(_) => panic!("Unknown system table must be rejected"),
+        Err(error) => error.to_string(),
+    };
+    assert!(error.contains("requires a catalog or is unknown"));
     let denied = table.copy_with_options(std::collections::HashMap::from([(
         "query-auth.enabled".to_string(),
         "true".to_string(),

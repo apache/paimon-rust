@@ -36,7 +36,10 @@ pub use database::*;
 pub use factory::*;
 pub use filesystem::*;
 pub use function::*;
+#[cfg(test)]
+pub(crate) use partition_listing::aggregate_partition_entries;
 pub use partition_listing::list_partitions_from_file_system;
+pub(crate) use partition_listing::{list_partition_entries, FileSystemPartitionEntry};
 pub use rest::*;
 use serde::{Deserialize, Serialize};
 pub use view::*;
