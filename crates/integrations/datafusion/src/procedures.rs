@@ -757,6 +757,15 @@ async fn proc_create_tag_from_watermark(
         .map_err(|_| DataFusionError::Plan(format!("Invalid watermark: '{watermark_str}'")))?;
     let time_retained = args.get("time_retained").map(String::as_str);
 
+    // REST snapshots may exist only in the catalog; storage listings cannot
+    // enumerate the authoritative history needed for watermark selection.
+    if table.rest_env().is_some() {
+        return Err(DataFusionError::NotImplemented(
+            "create_tag_from_watermark is not supported for tables managed by a REST catalog"
+                .to_string(),
+        ));
+    }
+
     let (sm, tm) = managers(&table);
     if tm.tag_exists(tag_name).await.map_err(to_datafusion_error)? {
         return Err(DataFusionError::Plan(format!(

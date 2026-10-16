@@ -680,6 +680,151 @@ async fn test_rename_branch_rejected_on_rest_catalog() {
     .await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_create_tag_from_watermark_rejects_readable_rest_catalog_table() {
+    use arrow_array::Int32Array;
+    use axum::http::{Method, StatusCode, Uri};
+    use axum::{Json, Router};
+    use paimon::catalog::Identifier;
+    use paimon::Catalog;
+    use std::sync::Mutex;
+
+    let (tmp, catalog) = common::create_test_env();
+    let writer = common::create_sql_context(catalog.clone()).await;
+    common::exec(&writer, "CREATE SCHEMA paimon.test_db").await;
+    common::exec(&writer, "CREATE TABLE paimon.test_db.t1 (id INT)").await;
+    let table_dir = tmp.path().join("test_db.db/t1");
+    for id in [1, 2] {
+        common::exec(
+            &writer,
+            &format!("INSERT INTO paimon.test_db.t1 VALUES ({id})"),
+        )
+        .await;
+        let path = table_dir.join(format!("snapshot/snapshot-{id}"));
+        let mut snapshot: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        snapshot["watermark"] = serde_json::json!(id * 1000);
+        std::fs::write(path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+    }
+    common::exec(
+        &writer,
+        "CALL sys.create_tag(table => 'test_db.t1', tag => 'keep', snapshot_id => 1, time_retained => '1d')",
+    )
+    .await;
+    let tag_path = table_dir.join("tag/tag-keep");
+    let original_tag = std::fs::read(&tag_path).unwrap();
+    let table = catalog
+        .get_table(&Identifier::new("test_db", "t1"))
+        .await
+        .unwrap();
+    assert_eq!(table.schema().core_options().file_format(), "parquet");
+    let snapshot = table.snapshot_manager().get_snapshot(2).await.unwrap();
+    let snapshot_response = serde_json::json!({"snapshot": {"snapshot": snapshot}});
+    let table_response = serde_json::json!({
+        "id": "table-uuid", "database": "test_db", "name": "t1",
+        "path": table.location(), "isExternal": false,
+        "schemaId": table.schema().id(), "schema": table.schema(),
+    });
+    // Only the catalog serves snapshot 2; the physical snapshot directory is stale.
+    std::fs::remove_file(table_dir.join("snapshot/snapshot-2")).unwrap();
+    assert_eq!(table.snapshot_manager().list_all_ids().await.unwrap(), [1]);
+
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let handler_requests = requests.clone();
+    let table_path = "/v1/test/databases/test_db/tables/t1";
+    let snapshot_path = format!("{table_path}/snapshot");
+    let app = Router::new().fallback(move |method: Method, uri: Uri| {
+        handler_requests
+            .lock()
+            .unwrap()
+            .push((method, uri.path().to_string()));
+        let (status, body) = match uri.path() {
+            "/v1/config" => (
+                StatusCode::OK,
+                serde_json::json!({"defaults": {"prefix": "test"}}),
+            ),
+            "/v1/test/databases/test_db" => (
+                StatusCode::OK,
+                serde_json::json!({"name": "test_db", "options": {}}),
+            ),
+            path if path == table_path => (StatusCode::OK, table_response.clone()),
+            path if path == snapshot_path => (StatusCode::OK, snapshot_response.clone()),
+            _ => (
+                StatusCode::NOT_FOUND,
+                serde_json::json!({"code": 404, "message": "Unexpected request"}),
+            ),
+        };
+        async move { (status, Json(body)) }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut options = Options::new();
+    options.set(
+        CatalogOptions::URI,
+        format!("http://{}", listener.local_addr().unwrap()),
+    );
+    options.set(CatalogOptions::WAREHOUSE, "test_warehouse");
+    options.set(CatalogOptions::TOKEN_PROVIDER, "bear");
+    options.set(CatalogOptions::TOKEN, "test-token");
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let catalog = Arc::new(RESTCatalog::new(options, true).await.unwrap());
+    let mut context = SQLContext::new();
+    context
+        .register_catalog_with_default_db("paimon", catalog, None)
+        .await
+        .unwrap();
+
+    let batches = context
+        .sql("SELECT id FROM paimon.test_db.t1 ORDER BY id")
+        .await
+        .unwrap_or_else(|error| panic!("{error}; requests: {:?}", requests.lock().unwrap()))
+        .collect()
+        .await
+        .unwrap();
+    let ids: Vec<_> = batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        })
+        .collect();
+    assert_eq!(ids, [1, 2]);
+    assert!(requests
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(_, path)| path.ends_with("/snapshot")));
+    requests.lock().unwrap().clear();
+
+    for (watermark, tag) in [(2000, "checkpoint"), (1000, "older"), (1000, "keep")] {
+        let error = context.sql(&format!(
+            "CALL sys.create_tag_from_watermark(table => 'test_db.t1', tag => '{tag}', watermark => {watermark})"
+        )).await.unwrap_err();
+        assert!(
+            matches!(error, datafusion::error::DataFusionError::NotImplemented(_)),
+            "{error}"
+        );
+        assert!(
+            error.to_string().contains(
+                "create_tag_from_watermark is not supported for tables managed by a REST catalog"
+            ),
+            "{error}"
+        );
+    }
+    assert_eq!(std::fs::read(tag_path).unwrap(), original_tag);
+    assert_eq!(std::fs::read_dir(table_dir.join("tag")).unwrap().count(), 1);
+    let requests = requests.lock().unwrap();
+    assert!(!requests.is_empty());
+    assert!(requests
+        .iter()
+        .all(|(method, path)| method == Method::GET && path == table_path));
+    server.abort();
+}
+
 #[tokio::test]
 async fn test_argument_validation_follows_java() {
     let (_tmp, server, context) = setup().await;

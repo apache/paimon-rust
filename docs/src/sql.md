@@ -1088,6 +1088,11 @@ CALL sys.create_tag_from_timestamp(table => 'paimon.my_db.my_table', tag => 'my_
 
 ### create_tag_from_watermark
 
+This procedure is not supported for tables managed by a REST catalog. Their
+snapshots may exist only in the catalog, while watermark selection currently
+relies on stored snapshot files. REST-managed tables are rejected before
+candidate selection or tag creation.
+
 Create a named tag from the earliest retained snapshot whose watermark is greater
 than or equal to the requested value. Candidates include live snapshots and
 historical snapshots preserved by existing tags. Equal watermarks select the
