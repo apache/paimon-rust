@@ -51,6 +51,34 @@ def _make_variant_table_with_data(warehouse):
     return PaimonCatalog({"warehouse": warehouse}).get_table("vdb.t")
 
 
+@pytest.mark.parametrize("limit,split_count", [(None, 1), (0, 0), (1, 1)])
+def test_scan_statistics_include_all_candidates_before_limit(limit, split_count):
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_table_with_data(warehouse)
+        builder = table.new_read_builder()
+        if limit is not None:
+            builder.with_limit(limit)
+        scan = builder.new_scan()
+        plan, stats = scan.plan_with_stats()
+        assert len(plan.splits()) == len(scan.plan().splits()) == split_count
+        assert plan.snapshot_id() == 1
+        assert stats.entries_potential_total == stats.entries_total == 1
+        assert stats.entries_after_partition == stats.entries_after_bucket == stats.entries_after_stats == 1
+        assert stats.manifest_files_total == stats.manifest_files_after_partition == 1
+        with pytest.raises(AttributeError):
+            stats.entries_total = 10
+
+
+def test_combined_incremental_scan_statistics():
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_table_with_data(warehouse)
+        scan = table.new_read_builder().new_incremental_scan(0, 1)
+        plan, stats = scan.plan_with_stats()
+        assert plan.snapshot_id() == 1
+        assert stats.entries_total == stats.entries_after_stats == 1
+        assert [split.serialize() for split in plan.splits()] == [split.serialize() for split in scan.plan().splits()]
+
+
 def _variant_read_type(table, columns, paths, fail_on_error=False):
     fields = []
     by_name = {field.name(): field for field in table.schema().fields()}

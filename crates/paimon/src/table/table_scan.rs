@@ -71,6 +71,8 @@ const DELETION_VECTORS_INDEX_TYPE: &str = "DELETION_VECTORS";
 #[derive(Debug, Default)]
 struct ManifestReadCounters {
     entries_read: usize,
+    after_partition: usize,
+    after_bucket: usize,
     pruned_by_bucket: usize,
     pruned_by_partition: usize,
     after_entry_pruning: usize,
@@ -78,11 +80,14 @@ struct ManifestReadCounters {
     pruned_by_row_ranges: usize,
     pruned_by_data_stats: usize,
     after_manifest_filters: usize,
+    after_full_stats: usize,
 }
 
 impl ManifestReadCounters {
     fn merge(&mut self, other: Self) {
         self.entries_read += other.entries_read;
+        self.after_partition += other.after_partition;
+        self.after_bucket += other.after_bucket;
         self.pruned_by_bucket += other.pruned_by_bucket;
         self.pruned_by_partition += other.pruned_by_partition;
         self.after_entry_pruning += other.after_entry_pruning;
@@ -90,6 +95,7 @@ impl ManifestReadCounters {
         self.pruned_by_row_ranges += other.pruned_by_row_ranges;
         self.pruned_by_data_stats += other.pruned_by_data_stats;
         self.after_manifest_filters += other.after_manifest_filters;
+        self.after_full_stats += other.after_full_stats;
     }
 }
 
@@ -226,8 +232,7 @@ enum ManifestListSource<'a> {
 /// - Data-level stats pruning per entry (current schema only, cross-schema fail-open)
 #[allow(clippy::too_many_arguments)]
 async fn read_all_manifest_entries(
-    file_io: &FileIO,
-    table_path: &str,
+    table: &Table,
     source: ManifestListSource<'_>,
     skip_level_zero: bool,
     scan_all_files: bool,
@@ -247,6 +252,8 @@ async fn read_all_manifest_entries(
     manifest_parallelism: usize,
     trace: Option<&mut ScanTrace>,
 ) -> crate::Result<Vec<ManifestEntry>> {
+    let file_io = table.file_io();
+    let table_path = table.location();
     let incremental = !matches!(&source, ManifestListSource::Snapshot(_));
     let (mut manifest_files, delta) = match source {
         ManifestListSource::Snapshot(snapshot) => futures::try_join!(
@@ -270,10 +277,24 @@ async fn read_all_manifest_entries(
         }
     };
     let mut trace = trace;
+    let collect_stats = trace
+        .as_ref()
+        .is_some_and(|trace| trace.statistics.is_some());
     if let Some(trace) = trace.as_deref_mut() {
         trace.record_manifest_lists(manifest_files.len(), delta.len());
     }
     manifest_files.extend(delta);
+
+    if let Some(stats) = trace
+        .as_deref_mut()
+        .and_then(|trace| trace.statistics.as_mut())
+    {
+        stats.manifest_files_total += manifest_files.len();
+        stats.entries_potential_total += manifest_files
+            .iter()
+            .map(|meta| (meta.num_added_files() + meta.num_deleted_files()) as u64)
+            .sum::<u64>();
+    }
 
     // Manifest-file-level partition stats pruning: skip entire manifest files
     // whose partition range doesn't overlap the partition predicate.
@@ -284,17 +305,22 @@ async fn read_all_manifest_entries(
     if let Some(trace) = trace.as_deref_mut() {
         trace.manifest_files_before_partition_pruning = manifest_files_before_partition_pruning;
         trace.manifest_files_after_partition_pruning = manifest_files.len();
+        if let Some(stats) = &mut trace.statistics {
+            stats.manifest_files_after_partition += manifest_files.len();
+        }
     }
 
-    retain_manifest_buckets(
-        &mut manifest_files,
-        has_primary_keys && !scan_all_files,
-        bucket_predicate,
-        bucket_key_fields,
-        bucket_function_type,
-    );
+    if !collect_stats {
+        retain_manifest_buckets(
+            &mut manifest_files,
+            has_primary_keys && !scan_all_files,
+            bucket_predicate,
+            bucket_key_fields,
+            bucket_function_type,
+        );
+    }
 
-    if let Some(index) = row_range_index {
+    if let Some(index) = row_range_index.filter(|_| !collect_stats) {
         let before = manifest_files.len();
         retain_manifest_row_ranges(&mut manifest_files, index);
         if let Some(trace) = trace.as_deref_mut() {
@@ -316,7 +342,7 @@ async fn read_all_manifest_entries(
                     file_io,
                     &path,
                     &meta,
-                    manifest_sidecar_enabled,
+                    manifest_sidecar_enabled && !collect_stats,
                     ManifestSidecarPruning {
                         row_range_index: sidecar_row_index,
                         partition_filter,
@@ -331,12 +357,27 @@ async fn read_all_manifest_entries(
                 // Per-task bucket cache (few distinct total_buckets values per manifest).
                 let mut bucket_cache: HashMap<i32, Option<HashSet<i32>>> = HashMap::new();
                 let mut counters = ManifestReadCounters::default();
+                let mut stats_schema_cache = HashMap::new();
 
                 let entries = crate::spec::avro::from_manifest_bytes_filtered_shared(
                     &content,
                     &cache,
                     &mut |_kind, partition_bytes, bucket, total_buckets| {
                         counters.entries_read += 1;
+                        // Complete statistics use Java's partition-then-bucket
+                        // funnel. Keep the ordinary early bucket path unchanged.
+                        let matches_partition = || {
+                            partition_filter.is_none_or(|filter| {
+                                filter.matches_entry(partition_bytes).unwrap_or(true)
+                            })
+                        };
+                        if collect_stats {
+                            if !matches_partition() {
+                                counters.pruned_by_partition += 1;
+                                return false;
+                            }
+                            counters.after_partition += 1;
+                        }
                         // Bucket filter (negative bucket = unassigned)
                         if has_primary_keys && !scan_all_files && bucket < 0 {
                             counters.pruned_by_bucket += 1;
@@ -360,15 +401,11 @@ async fn read_all_manifest_entries(
                         }
 
                         // Partition filter
-                        if let Some(pf) = partition_filter {
-                            match pf.matches_entry(partition_bytes) {
-                                Ok(false) => {
-                                    counters.pruned_by_partition += 1;
-                                    return false;
-                                }
-                                Ok(true) => {}
-                                Err(_) => {}
-                            }
+                        if !collect_stats && !matches_partition() {
+                            counters.pruned_by_partition += 1;
+                            return false;
+                        } else {
+                            counters.after_bucket += 1;
                         }
 
                         true
@@ -395,6 +432,22 @@ async fn read_all_manifest_entries(
                     {
                         counters.pruned_by_data_stats += 1;
                         continue;
+                    }
+                    // Count cross-schema ADD and DELETE records before netting.
+                    // Keep ordinary planning's deferred cross-schema filtering:
+                    // changing that order could change the surviving file set.
+                    if collect_stats
+                        && (entry.file().schema_id == current_schema_id
+                            || data_file_matches_predicates_for_table(
+                                table,
+                                entry.file(),
+                                data_predicates,
+                                key_predicates,
+                                &mut stats_schema_cache,
+                            )
+                            .await)
+                    {
+                        counters.after_full_stats += 1;
                     }
                     filtered.push(entry);
                 }
@@ -428,6 +481,12 @@ async fn read_all_manifest_entries(
         counters.pruned_by_row_ranges = before - all_entries.len();
     }
     if let Some(trace) = trace {
+        if let Some(stats) = &mut trace.statistics {
+            stats.entries_total += counters.entries_read;
+            stats.entries_after_partition += counters.after_partition;
+            stats.entries_after_bucket += counters.after_bucket;
+            stats.entries_after_stats += counters.after_full_stats;
+        }
         trace.manifest_entries_read = counters.entries_read;
         trace.manifest_entries_pruned_by_bucket = counters.pruned_by_bucket;
         trace.manifest_entries_pruned_by_partition = counters.pruned_by_partition;
@@ -1506,6 +1565,17 @@ impl<'a> TableScan<'a> {
         }
     }
 
+    /// Plan once with complete pruning counters for explain output. This reads
+    /// more manifest entries than `plan`/`plan_with_trace`, but no data files.
+    pub async fn plan_with_stats(&self) -> crate::Result<(Plan, super::ScanStats)> {
+        match &self.0 {
+            TableScanKind::Paimon(scan) => Box::pin(scan.plan_with_stats()).await,
+            TableScanKind::Format(_) => Err(crate::Error::Unsupported {
+                message: "Complete scan statistics require a Paimon table".into(),
+            }),
+        }
+    }
+
     pub(crate) async fn plan_incremental_lists_with_trace(
         &self,
         end_snapshot: &Snapshot,
@@ -1872,14 +1942,23 @@ impl<'a> PaimonTableScan<'a> {
 
     /// Plan the full scan and return metadata-pruning trace counters.
     pub async fn plan_with_trace(&self) -> crate::Result<(Plan, ScanTrace)> {
-        let (plan, trace) = self.plan_selection_with_trace().await?;
+        let (plan, trace) = self.plan_selection_with_trace(false).await?;
         Ok((self.attach_index_scores(plan)?, trace))
     }
 
-    async fn plan_selection_with_trace(&self) -> crate::Result<(Plan, ScanTrace)> {
+    async fn plan_with_stats(&self) -> crate::Result<(Plan, super::ScanStats)> {
+        let (plan, trace) = self.plan_selection_with_trace(true).await?;
+        Ok((self.attach_index_scores(plan)?, trace.statistics.unwrap()))
+    }
+
+    async fn plan_selection_with_trace(
+        &self,
+        collect_stats: bool,
+    ) -> crate::Result<(Plan, ScanTrace)> {
         let scan = self.authorized_scan().await?;
         let mut trace = ScanTrace {
             limit: scan.limit,
+            statistics: collect_stats.then(super::ScanStats::default),
             ..Default::default()
         };
         if let Some(plan) = scan.supplied_split_plan() {
@@ -2277,7 +2356,6 @@ impl<'a> PaimonTableScan<'a> {
     /// committed only once the accumulated known row count reaches the limit;
     /// if it never does, the original split list is returned unchanged. The
     /// caller or query engine must still enforce the final LIMIT.
-    #[cfg(test)]
     fn apply_limit_pushdown(&self, splits: Vec<DataSplit>) -> Vec<DataSplit> {
         let limit = match self.limit {
             Some(l) => l,
@@ -2313,8 +2391,6 @@ impl<'a> PaimonTableScan<'a> {
         row_range_index: Option<&RowRangeIndex>,
         trace: Option<&mut ScanTrace>,
     ) -> crate::Result<Vec<ManifestEntry>> {
-        let file_io = self.table.file_io();
-        let table_path = self.table.location();
         let core_options = CoreOptions::new(self.table.schema().options());
         let data_evolution_enabled = core_options.data_evolution_enabled();
 
@@ -2366,8 +2442,7 @@ impl<'a> PaimonTableScan<'a> {
         let bucket_function_type = core_options.bucket_function_type()?;
 
         let entries = read_all_manifest_entries(
-            file_io,
-            table_path,
+            &self.table,
             source,
             skip_level_zero,
             self.scan_all_files,
@@ -2808,7 +2883,11 @@ impl<'a> PaimonTableScan<'a> {
         data_evolution_read_field_ids: Option<&HashSet<i32>>,
         mut trace: Option<&mut ScanTrace>,
     ) -> crate::Result<Plan> {
-        if matches!(self.limit, Some(0)) {
+        if matches!(self.limit, Some(0))
+            && !trace
+                .as_ref()
+                .is_some_and(|trace| trace.statistics.is_some())
+        {
             if let Some(trace) = trace {
                 trace.record_final_plan_with_limit(0, 0, 0, 0, true);
             }
@@ -2888,6 +2967,17 @@ impl<'a> PaimonTableScan<'a> {
         let schema_manager = self.table.schema_manager();
         let core_options = CoreOptions::new(self.table.schema().options());
         let data_evolution_enabled = core_options.data_evolution_enabled();
+        let collect_stats = trace
+            .as_ref()
+            .is_some_and(|trace| trace.statistics.is_some());
+        if data_evolution_enabled {
+            if let Some(stats) = trace
+                .as_deref_mut()
+                .and_then(|trace| trace.statistics.as_mut())
+            {
+                stats.entries_after_stats = 0;
+            }
+        }
         let deletion_vectors_enabled =
             core_options.deletion_vectors_enabled() && !self.is_streaming();
         let target_split_size = core_options.source_split_target_size();
@@ -2977,7 +3067,7 @@ impl<'a> PaimonTableScan<'a> {
             }
         }
 
-        if matches!(self.limit, Some(0)) {
+        if matches!(self.limit, Some(0)) && !collect_stats {
             if let Some(trace) = trace {
                 trace.record_final_plan_with_limit(0, 0, 0, 0, true);
             }
@@ -3032,7 +3122,7 @@ impl<'a> PaimonTableScan<'a> {
         let can_push_down_limit = append_row_position_selection.is_none()
             && self.can_push_down_limit_hint(effective_row_ranges.as_deref());
         let mut limit_accumulator = match self.limit {
-            Some(limit) if limit > 0 && can_push_down_limit => {
+            Some(limit) if limit > 0 && can_push_down_limit && !collect_stats => {
                 Some(LimitPushdownAccumulator::new(limit))
             }
             _ => None,
@@ -3310,7 +3400,23 @@ impl<'a> PaimonTableScan<'a> {
         } else {
             splits
         };
+        if data_evolution_enabled {
+            if let Some(stats) = trace
+                .as_deref_mut()
+                .and_then(|trace| trace.statistics.as_mut())
+            {
+                stats.entries_after_stats =
+                    splits.iter().map(|split| split.data_files().len()).sum();
+            }
+        }
         let splits_before_limit = split_candidates_built;
+        let splits = if self.limit == Some(0) {
+            Vec::new()
+        } else if collect_stats && can_push_down_limit {
+            self.apply_limit_pushdown(splits)
+        } else {
+            splits
+        };
         if let Some(trace) = trace {
             let final_files = splits.iter().map(|split| split.data_files().len()).sum();
             trace.record_final_plan_with_limit(
@@ -4979,6 +5085,12 @@ mod tests {
             trace.manifest_entries_read < FILE_COUNT,
             "the sidecar should avoid decoding non-overlapping Avro blocks"
         );
+        let (statistics_plan, stats) = reader.new_scan().plan_with_stats().await.unwrap();
+        assert_eq!(statistics_plan.splits(), plan.splits());
+        assert_eq!(stats.entries_total, FILE_COUNT);
+        assert_eq!(stats.entries_after_partition, FILE_COUNT);
+        assert_eq!(stats.entries_after_bucket, FILE_COUNT);
+        assert_eq!(stats.entries_after_stats, 1);
     }
 
     #[tokio::test]
@@ -5780,6 +5892,215 @@ mod tests {
             trace.manifest_entries_pruned_by_data_stats >= 2,
             "BETWEEN should prune files outside the min/max range: {trace:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_plan_with_stats_keeps_complete_funnel_before_limit() {
+        let table = scan_trace_test_table("memory:/complete_scan_statistics");
+        setup_scan_trace_dirs(&table).await;
+        let empty = table.copy_with_pinned_snapshot(None);
+        let (_, stats) = empty
+            .new_read_builder()
+            .new_scan()
+            .plan_with_stats()
+            .await
+            .unwrap();
+        assert_eq!(stats, super::super::ScanStats::default());
+        TableCommit::new(table.clone(), "statistics".into())
+            .commit(vec![CommitMessage::new(
+                BinaryRowBuilder::new(0).build_serialized(),
+                0,
+                vec![
+                    stats_trace_file("a.parquet", 1, 2),
+                    stats_trace_file("b.parquet", 10, 20),
+                    stats_trace_file("c.parquet", 100, 101),
+                ],
+            )])
+            .await
+            .unwrap();
+        let predicate = PredicateBuilder::new(table.schema().fields())
+            .less_or_equal("id", Datum::Int(20))
+            .unwrap();
+        for limit in [None, Some(0), Some(1)] {
+            let mut reader = table.new_read_builder();
+            reader.with_filter(predicate.clone());
+            if let Some(limit) = limit {
+                reader.with_limit(limit);
+            }
+            let scan = reader.new_scan();
+            let expected = scan.plan().await.unwrap();
+            let (plan, stats) = scan.plan_with_stats().await.unwrap();
+            assert_eq!(plan.snapshot_id(), expected.snapshot_id());
+            assert_eq!(plan.splits(), expected.splits());
+            assert_eq!(stats.entries_potential_total, 3);
+            assert_eq!(stats.entries_total, 3);
+            assert_eq!(stats.entries_after_partition, 3);
+            assert_eq!(stats.entries_after_bucket, 3);
+            assert_eq!(stats.entries_after_stats, 2);
+        }
+        let (plan, stats) = empty
+            .new_read_builder()
+            .new_scan()
+            .plan_with_stats()
+            .await
+            .unwrap();
+        assert_eq!(plan.snapshot_id(), None);
+        assert!(plan.splits().is_empty());
+        assert_eq!(stats, super::super::ScanStats::default());
+    }
+
+    #[tokio::test]
+    async fn test_plan_with_stats_counts_cross_schema_adds_and_deletes_before_netting() {
+        let old_table = scan_trace_test_table("memory:/cross_schema_scan_stats");
+        setup_scan_trace_dirs(&old_table).await;
+        write_schema_file(&old_table, old_table.schema()).await;
+        let deleted = stats_trace_file("deleted.parquet", 1, 2);
+        let partition = BinaryRowBuilder::new(0).build_serialized();
+        TableCommit::new(old_table.clone(), "old".into())
+            .commit(vec![CommitMessage::new(
+                partition.clone(),
+                0,
+                vec![deleted.clone()],
+            )])
+            .await
+            .unwrap();
+        let current_schema = old_table
+            .schema()
+            .apply_changes(vec![SchemaChange::rename_column(
+                "id".into(),
+                "renamed".into(),
+            )])
+            .unwrap();
+        let table = Table::new(
+            old_table.file_io().clone(),
+            Identifier::new("test_db", "scan_trace"),
+            old_table.location().into(),
+            current_schema,
+            None,
+        );
+        write_schema_file(&table, table.schema()).await;
+        let mut retained = stats_trace_file("retained.parquet", 100, 101);
+        retained.schema_id = table.schema().id();
+        let mut message = CommitMessage::new(partition, 0, vec![retained]);
+        message.deleted_files = vec![deleted];
+        TableCommit::new(table.clone(), "new".into())
+            .commit(vec![message])
+            .await
+            .unwrap();
+        for (threshold, after_stats) in [(0, 3), (50, 1), (200, 0)] {
+            let mut reader = table.new_read_builder();
+            reader.with_filter(
+                PredicateBuilder::new(table.schema().fields())
+                    .greater_than("renamed", Datum::Int(threshold))
+                    .unwrap(),
+            );
+            let scan = reader.new_scan();
+            let expected = scan.plan().await.unwrap();
+            let (plan, stats) = scan.plan_with_stats().await.unwrap();
+            assert_eq!(plan.splits(), expected.splits());
+            assert_eq!(stats.entries_total, 3);
+            assert_eq!(stats.entries_after_bucket, 3);
+            assert_eq!(stats.entries_after_stats, after_stats);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_plan_with_stats_counts_partition_before_bucket() {
+        let schema = PaimonSchema::builder()
+            .column("pt", DataType::Int(IntType::new()))
+            .column("id", DataType::Int(IntType::new()))
+            .partition_keys(["pt"])
+            .primary_key(["pt", "id"])
+            .option("bucket", "4")
+            .build()
+            .unwrap();
+        let table = Table::new(
+            FileIOBuilder::new("memory").build().unwrap(),
+            Identifier::new("db", "stats"),
+            "memory:/partition_bucket_stats".into(),
+            TableSchema::new(0, &schema),
+            None,
+        );
+        setup_scan_trace_dirs(&table).await;
+        let mut messages = Vec::new();
+        for partition in [1, 2] {
+            for bucket in 0..4 {
+                let mut row = BinaryRowBuilder::new(1);
+                row.write_int(0, partition);
+                let file = stats_trace_file(&format!("{partition}-{bucket}.parquet"), 0, 100);
+                messages.push(CommitMessage::new(
+                    row.build_serialized(),
+                    bucket,
+                    vec![file],
+                ));
+            }
+        }
+        TableCommit::new(table.clone(), "stats".into())
+            .commit(messages)
+            .await
+            .unwrap();
+        let pb = PredicateBuilder::new(table.schema().fields());
+        let mut reader = table.new_read_builder();
+        reader.with_filter(Predicate::and(vec![
+            pb.equal("pt", Datum::Int(1)).unwrap(),
+            pb.equal("id", Datum::Int(3)).unwrap(),
+        ]));
+        let scan = reader.new_scan();
+        let expected = scan.plan().await.unwrap();
+        let (plan, stats) = scan.plan_with_stats().await.unwrap();
+        assert_eq!(plan.splits(), expected.splits());
+        assert_eq!(stats.entries_potential_total, 8);
+        assert_eq!(stats.entries_total, 8);
+        assert_eq!(stats.entries_after_partition, 4);
+        assert_eq!(stats.entries_after_bucket, 1);
+        assert_eq!(stats.entries_after_stats, 1);
+        let mut reader = table.new_read_builder();
+        reader.with_filter(pb.equal("pt", Datum::Int(99)).unwrap());
+        let (plan, stats) = reader.new_scan().plan_with_stats().await.unwrap();
+        assert!(plan.splits().is_empty());
+        assert_eq!(stats.entries_potential_total, 8);
+        assert_eq!(stats.manifest_files_after_partition, 0);
+        assert_eq!(stats.entries_total, 0);
+    }
+
+    #[tokio::test]
+    async fn test_plan_with_stats_counts_data_evolution_projected_files_before_limit() {
+        let table = data_evolution_test_table(
+            "memory:/evolution_scan_stats",
+            two_column_schema(0, "id", "name"),
+        );
+        setup_scan_trace_dirs(&table).await;
+        let files = [
+            ("id-a.parquet", 0, "id"),
+            ("name-a.parquet", 0, "name"),
+            ("id-b.parquet", 100, "id"),
+            ("name-b.parquet", 100, "name"),
+        ]
+        .into_iter()
+        .map(|(name, start, column)| make_evo_file_with_cols(name, 10, 1, start, &[column]))
+        .collect();
+        TableCommit::new(table.clone(), "stats".into())
+            .commit(vec![CommitMessage::new(
+                BinaryRowBuilder::new(0).build_serialized(),
+                0,
+                files,
+            )])
+            .await
+            .unwrap();
+        for limit in [None, Some(0), Some(1)] {
+            let mut reader = table.new_read_builder();
+            reader.with_projection(&["id"]).unwrap();
+            if let Some(limit) = limit {
+                reader.with_limit(limit);
+            }
+            let scan = reader.new_scan();
+            let expected = scan.plan().await.unwrap();
+            let (plan, stats) = scan.plan_with_stats().await.unwrap();
+            assert_eq!(plan.splits(), expected.splits());
+            assert_eq!(stats.entries_potential_total, 4);
+            assert_eq!(stats.entries_after_bucket, 4);
+            assert_eq!(stats.entries_after_stats, 2);
+        }
     }
 
     pub(super) fn pk_stats_gate_table(table_path: &str) -> Table {

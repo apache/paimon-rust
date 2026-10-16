@@ -27,6 +27,7 @@ use std::fmt;
 #[non_exhaustive]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ScanTrace {
+    pub(crate) statistics: Option<super::ScanStats>,
     pub snapshot_id: Option<i64>,
     pub base_manifest_files: usize,
     pub delta_manifest_files: usize,

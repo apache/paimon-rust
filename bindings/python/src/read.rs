@@ -756,6 +756,66 @@ impl PyTableScan {
             })
         })
     }
+
+    /// Run one planning pass with complete metadata-pruning statistics.
+    fn plan_with_stats(&self, py: Python<'_>) -> PyResult<(PyPlan, PyScanStats)> {
+        py.detach(|| {
+            runtime().block_on(async {
+                let result = match self.incremental_scan {
+                    Some(incremental) => {
+                        self.core_incremental_scan(
+                            incremental.start_snapshot_id,
+                            incremental.end_snapshot_id,
+                            incremental.mode,
+                        )?
+                        .plan_combined_with_stats()
+                        .await
+                    }
+                    None => self.core_scan()?.plan_with_stats().await,
+                };
+                result
+                    .map(|(plan, stats)| (PyPlan::from(plan), PyScanStats { inner: stats }))
+                    .map_err(to_py_err)
+            })
+        })
+    }
+}
+
+#[pyclass(name = "ScanStats", module = "pypaimon_rust.datafusion", frozen)]
+pub struct PyScanStats {
+    inner: paimon::table::ScanStats,
+}
+
+#[pymethods]
+impl PyScanStats {
+    #[getter]
+    fn manifest_files_total(&self) -> usize {
+        self.inner.manifest_files_total
+    }
+    #[getter]
+    fn manifest_files_after_partition(&self) -> usize {
+        self.inner.manifest_files_after_partition
+    }
+    #[getter]
+    fn entries_potential_total(&self) -> u64 {
+        self.inner.entries_potential_total
+    }
+    #[getter]
+    fn entries_total(&self) -> usize {
+        self.inner.entries_total
+    }
+    #[getter]
+    fn entries_after_partition(&self) -> usize {
+        self.inner.entries_after_partition
+    }
+    #[getter]
+    fn entries_after_bucket(&self) -> usize {
+        self.inner.entries_after_bucket
+    }
+    #[getter]
+    fn entries_after_stats(&self) -> usize {
+        self.inner.entries_after_stats
+    }
 }
 
 #[pyclass(name = "TableRead", module = "pypaimon_rust.datafusion")]

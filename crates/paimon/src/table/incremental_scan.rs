@@ -361,6 +361,17 @@ impl<'a> IncrementalScan<'a> {
         self.plan_combined_with_trace(None).await
     }
 
+    /// Plan the complete Delta/Changelog range once with metadata-pruning
+    /// statistics, using the same filtering and packing as `plan_combined`.
+    pub async fn plan_combined_with_stats(&self) -> crate::Result<(Plan, super::ScanStats)> {
+        let mut trace = ScanTrace {
+            statistics: Some(super::ScanStats::default()),
+            ..Default::default()
+        };
+        let plan = self.plan_combined_with_trace(Some(&mut trace)).await?;
+        Ok((plan, trace.statistics.unwrap()))
+    }
+
     pub(crate) async fn plan_combined_with_trace(
         &self,
         trace: Option<&mut ScanTrace>,
