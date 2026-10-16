@@ -1911,7 +1911,6 @@ impl<'a> PaimonTableScan<'a> {
         let plan = self.attach_index_scores(plan)?;
         Ok(match stats {
             Some(mut stats) => {
-                stats.snapshot_id = plan.snapshot_id();
                 stats.planned_data_file_bytes = plan.planned_data_file_bytes();
                 plan.with_scan_stats(stats)
             }
@@ -2832,7 +2831,6 @@ impl<'a> PaimonTableScan<'a> {
         mut scan_stats: Option<&mut ScanStats>,
     ) -> crate::Result<Plan> {
         if let Some(scan_stats) = scan_stats.as_deref_mut() {
-            scan_stats.snapshot_id = Some(snapshot.id());
             scan_stats.limit = self.limit;
         }
         if matches!(self.limit, Some(0))
@@ -6037,7 +6035,6 @@ mod tests {
             let plan = scan.plan().await.unwrap();
             let stats = plan.stats().unwrap();
             assert!(stats.complete);
-            assert_eq!(stats.snapshot_id, plan.snapshot_id());
             assert_eq!(
                 stats.planned_data_file_bytes,
                 plan.planned_data_file_bytes()
@@ -7868,7 +7865,7 @@ mod tests {
             .unwrap();
         let scan_stats = empty.stats().cloned().unwrap();
         assert!(empty.splits().is_empty());
-        assert_eq!(empty.snapshot_id(), scan_stats.snapshot_id);
+        assert_eq!(scan_stats.final_splits, 0);
         assert_eq!(empty.snapshot_id(), Some(1));
 
         let snapshot = table
@@ -7955,7 +7952,7 @@ mod tests {
             .unwrap();
         let scan_stats = plan.stats().cloned().unwrap();
         assert!(plan.splits().is_empty());
-        assert_eq!(plan.snapshot_id(), scan_stats.snapshot_id);
+        assert_eq!(scan_stats.final_files, 0);
         assert_eq!(plan.snapshot_id(), Some(1));
 
         let mut ranges = table.new_read_builder();

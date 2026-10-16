@@ -786,13 +786,10 @@ pub struct PyScanStats {
 
 #[pymethods]
 impl PyScanStats {
+    /// Whether all partition-selected entries and pre-LIMIT candidates were counted.
     #[getter]
     fn complete(&self) -> bool {
         self.inner.complete
-    }
-    #[getter]
-    fn snapshot_id(&self) -> Option<i64> {
-        self.inner.snapshot_id
     }
     #[getter]
     fn base_manifest_files(&self) -> usize {

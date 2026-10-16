@@ -64,7 +64,6 @@ async fn pk_supplied_result_preserves_snapshot_splits_and_ignores_planning_hints
             split.serialize_split_v1().unwrap()
         );
     }
-    assert_eq!(scan_stats.snapshot_id, Some(42));
     assert_eq!(scan_stats.manifest_entries_read, 0);
     assert_eq!(scan_stats.final_splits, 1);
     assert_eq!(scan_stats.final_files, split.data_files().len());
@@ -160,7 +159,7 @@ async fn de_scores_follow_final_ranges_after_distribution_and_limit() {
     assert_eq!(statistics_plan.splits(), plan.splits());
     let scan_stats = statistics_plan.stats().unwrap();
     assert!(scan_stats.complete);
-    assert_eq!(scan_stats.snapshot_id, plan.snapshot_id());
+    assert_eq!(statistics_plan.snapshot_id(), plan.snapshot_id());
     assert_eq!(
         scan_stats.planned_data_file_bytes,
         plan.planned_data_file_bytes()
@@ -366,7 +365,7 @@ async fn de_combined_incremental_results_retain_the_window_and_scores() {
     assert_eq!(statistics_plan.splits(), plan.splits());
     let scan_stats = statistics_plan.stats().unwrap();
     assert!(scan_stats.complete);
-    assert_eq!(scan_stats.snapshot_id, Some(end));
+    assert_eq!(statistics_plan.snapshot_id(), Some(end));
     assert_eq!(
         scan_stats.planned_data_file_bytes,
         plan.planned_data_file_bytes()

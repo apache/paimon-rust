@@ -36,13 +36,13 @@ pub enum ScanStatsMode {
 /// [`super::TableScan::with_stats`] enables collection and stores
 /// this type on [`super::Plan::stats`]. Complete collection decodes all
 /// entries of partition-selected manifests and counts candidates before LIMIT.
+/// Snapshot metadata is available separately from [`super::Plan::snapshot_id`].
 #[non_exhaustive]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ScanStats {
     /// True when all partition-selected entries were counted before bucket,
     /// sidecar and LIMIT optimizations. Lightweight statistics keep false.
     pub complete: bool,
-    pub snapshot_id: Option<i64>,
     pub base_manifest_files: usize,
     pub delta_manifest_files: usize,
     pub manifest_files_before_partition_pruning: usize,
@@ -131,8 +131,7 @@ impl fmt::Display for ScanStats {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "snapshot={:?}, manifests={}/{}, manifest_row_range_pruned={}, entries_read={}, bucket_pruned={}, partition_pruned={}, entry_row_range_pruned={}, data_stats_pruned={}, cross_schema_pruned={}, split_candidates_built={}, limit_early_stopped={}, splits_before_limit={}, splits_after_limit={}, files={}, data_file_bytes={}",
-            self.snapshot_id,
+            "manifests={}/{}, manifest_row_range_pruned={}, entries_read={}, bucket_pruned={}, partition_pruned={}, entry_row_range_pruned={}, data_stats_pruned={}, cross_schema_pruned={}, split_candidates_built={}, limit_early_stopped={}, splits_before_limit={}, splits_after_limit={}, files={}, data_file_bytes={}",
             self.manifest_files_after_partition_pruning,
             self.manifest_files_before_partition_pruning,
             self.manifest_files_pruned_by_row_ranges,

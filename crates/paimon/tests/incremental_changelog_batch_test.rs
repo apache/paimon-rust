@@ -428,7 +428,6 @@ async fn timestamp_changelog_stats_describes_one_packed_batch() {
         .unwrap();
     let scan_stats = plan.stats().cloned().unwrap();
     assert_eq!(plan.snapshot_id(), Some(3));
-    assert_eq!(scan_stats.snapshot_id, Some(3));
     assert_eq!(scan_stats.base_manifest_files, 0);
     assert_eq!(scan_stats.delta_manifest_files, 3);
     assert_eq!(scan_stats.manifest_entries_read, 3);

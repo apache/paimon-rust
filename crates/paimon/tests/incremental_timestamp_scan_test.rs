@@ -166,7 +166,7 @@ async fn timestamp_options_select_events_and_preserve_end_snapshot() {
                 .await
                 .unwrap();
             let scan_stats = plan.stats().cloned().unwrap();
-            assert_eq!(scan_stats.snapshot_id, snapshot);
+            assert_eq!(plan.snapshot_id(), snapshot);
             assert_eq!(scan_stats.final_splits, plan.splits().len());
             assert_eq!(
                 scan_stats.planned_data_file_bytes,

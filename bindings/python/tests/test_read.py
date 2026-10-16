@@ -73,7 +73,7 @@ def test_scan_statistics_include_all_candidates_before_limit(limit, split_count)
         light_plan = scan.with_stats(complete=False).plan()
         light_stats = light_plan.stats()
         assert not light_stats.complete
-        assert light_stats.snapshot_id == plan.snapshot_id()
+        assert light_plan.snapshot_id() == plan.snapshot_id()
         assert light_stats.limit == limit
         assert light_stats.final_splits == len(light_plan.splits())
         assert [split.serialize() for split in light_plan.splits()] == [split.serialize() for split in plan.splits()]
@@ -93,7 +93,6 @@ def test_combined_incremental_scan_statistics(start, entry_count, complete):
         stats = plan.stats()
         assert stats.complete == complete
         assert plan.snapshot_id() == 1
-        assert stats.snapshot_id == 1
         assert stats.manifest_entries_read == entry_count
         assert stats.entries_after_stats == (entry_count if complete else 0)
         assert [split.serialize() for split in plan.splits()] == [split.serialize() for split in scan.plan().splits()]

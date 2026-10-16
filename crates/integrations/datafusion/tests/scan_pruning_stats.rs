@@ -197,7 +197,7 @@ async fn test_scan_stats_records_partition_pruning() {
         .await
         .unwrap();
     let all_stats = _all_plan.stats().cloned().unwrap();
-    assert_eq!(all_stats.snapshot_id, Some(3));
+    assert_eq!(_all_plan.snapshot_id(), Some(3));
     assert_eq!(all_stats.final_files, 3);
 
     let fields = table.schema().fields();
@@ -366,7 +366,7 @@ async fn test_scan_stats_records_bucket_limit_and_time_travel() {
         .await
         .unwrap();
     let snapshot_one_stats = _snapshot_one_plan.stats().cloned().unwrap();
-    assert_eq!(snapshot_one_stats.snapshot_id, Some(1));
+    assert_eq!(_snapshot_one_plan.snapshot_id(), Some(1));
 
     let _latest_plan = table
         .new_read_builder()
@@ -377,7 +377,7 @@ async fn test_scan_stats_records_bucket_limit_and_time_travel() {
         .await
         .unwrap();
     let latest_stats = _latest_plan.stats().cloned().unwrap();
-    assert_eq!(latest_stats.snapshot_id, Some(2));
+    assert_eq!(_latest_plan.snapshot_id(), Some(2));
     assert!(
         snapshot_one_stats.final_files < latest_stats.final_files,
         "time travel should plan from the selected snapshot: snapshot1={snapshot_one_stats:?}, latest={latest_stats:?}"

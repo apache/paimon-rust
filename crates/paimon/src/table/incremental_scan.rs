@@ -376,7 +376,6 @@ impl<'a> IncrementalScan<'a> {
         let plan = self.plan_combined_inner(stats.as_mut()).await?;
         Ok(match stats {
             Some(mut stats) => {
-                stats.snapshot_id = plan.snapshot_id();
                 stats.planned_data_file_bytes = plan.planned_data_file_bytes();
                 plan.with_scan_stats(stats)
             }

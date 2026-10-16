@@ -259,7 +259,6 @@ mod tests {
                 .unwrap();
             let audit_stats = audit_plan.stats().cloned().unwrap();
             assert_eq!(audit_plan.snapshot_id(), ordinary_plan.snapshot_id());
-            assert_eq!(audit_stats.snapshot_id, audit_plan.snapshot_id());
             assert_eq!(audit_stats.final_files, 2);
             assert_eq!(
                 audit_stats.planned_data_file_bytes,

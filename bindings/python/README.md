@@ -176,6 +176,8 @@ the same API for their selected Delta or Changelog window.
 
 Use `with_stats(complete=False)` to record the work performed by ordinary
 planning while preserving early manifest pruning and LIMIT stopping.
+`stats.complete` identifies which collection mode produced the counters.
+Snapshot metadata is available from `plan.snapshot_id()`.
 
 ### Shard column updates
 
