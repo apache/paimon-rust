@@ -380,9 +380,16 @@ async fn append_mosaic_stats_prune_manifest_files() {
         .unwrap();
     let mut read = table.new_read_builder();
     read.with_filter(predicate);
-    let (plan, trace) = read.new_scan().plan_with_trace().await.unwrap();
-    assert_eq!(trace.final_files, 1, "scan trace: {trace:?}");
-    assert!(trace.manifest_entries_pruned_by_data_stats >= 1);
+    let plan = read
+        .new_scan()
+        .with_stats(crate::table::ScanStatsMode::Lightweight)
+        .unwrap()
+        .plan()
+        .await
+        .unwrap();
+    let scan_stats = plan.scan_stats().cloned().unwrap();
+    assert_eq!(scan_stats.final_files, 1, "scan scan_stats: {scan_stats:?}");
+    assert!(scan_stats.manifest_entries_pruned_by_data_stats >= 1);
     let batches: Vec<RecordBatch> = read
         .new_read()
         .unwrap()
@@ -709,9 +716,16 @@ async fn append_mosaic_without_stats_keeps_files_in_filtered_plan() {
         .unwrap();
     let mut reader = table.new_read_builder();
     reader.with_filter(predicate);
-    let (_plan, trace) = reader.new_scan().plan_with_trace().await.unwrap();
-    assert_eq!(trace.final_files, 2, "scan trace: {trace:?}");
-    assert_eq!(trace.manifest_entries_pruned_by_data_stats, 0);
+    let _plan = reader
+        .new_scan()
+        .with_stats(crate::table::ScanStatsMode::Lightweight)
+        .unwrap()
+        .plan()
+        .await
+        .unwrap();
+    let scan_stats = _plan.scan_stats().cloned().unwrap();
+    assert_eq!(scan_stats.final_files, 2, "scan scan_stats: {scan_stats:?}");
+    assert_eq!(scan_stats.manifest_entries_pruned_by_data_stats, 0);
 }
 
 #[tokio::test]
@@ -751,8 +765,15 @@ async fn append_mosaic_all_null_statistics_remain_conservative() {
         .unwrap();
     let mut reader = table.new_read_builder();
     reader.with_filter(predicate);
-    let (plan, trace) = reader.new_scan().plan_with_trace().await.unwrap();
-    assert_eq!(trace.final_files, 1);
+    let plan = reader
+        .new_scan()
+        .with_stats(crate::table::ScanStatsMode::Lightweight)
+        .unwrap()
+        .plan()
+        .await
+        .unwrap();
+    let scan_stats = plan.scan_stats().cloned().unwrap();
+    assert_eq!(scan_stats.final_files, 1);
     let batches: Vec<RecordBatch> = reader
         .new_read()
         .unwrap()
@@ -887,8 +908,15 @@ async fn append_mosaic_filters_rows_when_predicate_column_has_no_stats() {
         .unwrap();
     let mut reader = table.new_read_builder();
     reader.with_filter(predicate);
-    let (plan, trace) = reader.new_scan().plan_with_trace().await.unwrap();
-    assert_eq!(trace.final_files, 1);
+    let plan = reader
+        .new_scan()
+        .with_stats(crate::table::ScanStatsMode::Lightweight)
+        .unwrap()
+        .plan()
+        .await
+        .unwrap();
+    let scan_stats = plan.scan_stats().cloned().unwrap();
+    assert_eq!(scan_stats.final_files, 1);
     let batches: Vec<RecordBatch> = reader
         .new_read()
         .unwrap()

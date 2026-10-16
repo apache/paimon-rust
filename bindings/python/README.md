@@ -158,6 +158,25 @@ print(f"\nRead: {batches_tt[0].num_rows} rows")
 print(batches_tt[0])
 ```
 
+### Scan statistics
+
+Request complete metadata pruning counters explicitly and read the `ScanStats`
+from the resulting plan:
+
+```python
+plan = table.new_read_builder().new_scan().with_stats().plan()
+scan_stats = plan.scan_stats()
+print(scan_stats.manifest_entries_read, scan_stats.entries_after_stats)
+```
+
+The counters include candidates before LIMIT. Collection can decode more
+manifest entries than ordinary planning and does not read data files. Ordinary
+`plan()` returns `None` from `scan_stats()`. Combined incremental scans expose
+the same API for their selected Delta or Changelog window.
+
+Use `with_stats(complete=False)` to record the work performed by ordinary
+planning while preserving early manifest pruning and LIMIT stopping.
+
 ### Shard column updates
 
 The batch and stream update objects expose

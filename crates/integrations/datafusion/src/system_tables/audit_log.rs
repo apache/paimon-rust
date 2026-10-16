@@ -95,7 +95,11 @@ impl TableProvider for AuditLogTable {
         if let Some(limit) = pushed_limit {
             read_builder.with_limit(limit);
         }
-        let (plan, trace) = await_with_runtime(read_builder.new_audit_scan().plan_with_trace())
+        let scan = read_builder
+            .new_audit_scan()
+            .with_stats(paimon::table::ScanStatsMode::Lightweight)
+            .map_err(to_datafusion_error)?;
+        let plan = await_with_runtime(scan.plan())
             .await
             .map_err(to_datafusion_error)?;
 
@@ -103,7 +107,6 @@ impl TableProvider for AuditLogTable {
             table: &self.table,
             schema: &self.schema,
             plan,
-            scan_trace: Some(trace),
             projection,
             pushed_predicate: filter_analysis.pushed_predicate,
             limit: pushed_limit,

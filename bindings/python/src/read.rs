@@ -28,7 +28,7 @@ use futures::TryStreamExt;
 use paimon::spec::{is_variant_extraction_row, DataField, DataType, Predicate, RowType};
 use paimon::table::{
     ArrowRecordBatchStream, DataSplit, GlobalIndexResult, IncrementalScanMode, RowRange,
-    StreamTableScan, Table,
+    ScanStatsMode, StreamTableScan, Table,
 };
 use paimon_datafusion::runtime::runtime;
 use pyo3::exceptions::{PyBaseException, PyRuntimeError, PyTypeError, PyValueError};
@@ -351,6 +351,7 @@ impl PyReadBuilder {
             row_position_shard: None,
             chunk_shuffle: None,
             shard: None,
+            stats_mode: None,
         }
     }
 
@@ -415,6 +416,7 @@ pub struct PyTableScan {
     row_position_shard: Option<(u64, u64)>,
     chunk_shuffle: Option<PyChunkShuffle>,
     shard: Option<(usize, usize)>,
+    stats_mode: Option<ScanStatsMode>,
 }
 
 #[derive(Clone)]
@@ -470,6 +472,9 @@ impl PyTableScan {
         if let Some((index, count)) = self.shard {
             scan = scan.with_shard(index, count).map_err(to_py_err)?;
         }
+        if let Some(mode) = self.stats_mode {
+            scan = scan.with_stats(mode).map_err(to_py_err)?;
+        }
         Ok(scan)
     }
 
@@ -502,6 +507,9 @@ impl PyTableScan {
         }
         if let Some((index, count)) = self.shard {
             scan = scan.with_shard(index, count).map_err(to_py_err)?;
+        }
+        if let Some(mode) = self.stats_mode {
+            scan = scan.with_stats(mode).map_err(to_py_err)?;
         }
         Ok(scan)
     }
@@ -659,6 +667,19 @@ impl PyStreamTableScan {
 
 #[pymethods]
 impl PyTableScan {
+    /// Collect metadata statistics when plan() is called.
+    #[pyo3(signature = (complete = true))]
+    fn with_stats(mut slf: PyRefMut<'_, Self>, complete: bool) -> PyResult<PyRefMut<'_, Self>> {
+        let mode = if complete {
+            ScanStatsMode::Complete
+        } else {
+            ScanStatsMode::Lightweight
+        };
+        slf.core_scan()?.with_stats(mode).map_err(to_py_err)?;
+        slf.stats_mode = Some(mode);
+        Ok(slf)
+    }
+
     /// Supply an evaluated selection; validation and authorization stay in core.
     fn with_global_index_result<'py>(
         mut slf: PyRefMut<'py, Self>,
@@ -756,29 +777,6 @@ impl PyTableScan {
             })
         })
     }
-
-    /// Run one planning pass with complete metadata-pruning statistics.
-    fn plan_with_stats(&self, py: Python<'_>) -> PyResult<(PyPlan, PyScanStats)> {
-        py.detach(|| {
-            runtime().block_on(async {
-                let result = match self.incremental_scan {
-                    Some(incremental) => {
-                        self.core_incremental_scan(
-                            incremental.start_snapshot_id,
-                            incremental.end_snapshot_id,
-                            incremental.mode,
-                        )?
-                        .plan_combined_with_stats()
-                        .await
-                    }
-                    None => self.core_scan()?.plan_with_stats().await,
-                };
-                result
-                    .map(|(plan, stats)| (PyPlan::from(plan), PyScanStats { inner: stats }))
-                    .map_err(to_py_err)
-            })
-        })
-    }
 }
 
 #[pyclass(name = "ScanStats", module = "pypaimon_rust.datafusion", frozen)]
@@ -789,20 +787,40 @@ pub struct PyScanStats {
 #[pymethods]
 impl PyScanStats {
     #[getter]
-    fn manifest_files_total(&self) -> usize {
-        self.inner.manifest_files_total
+    fn complete(&self) -> bool {
+        self.inner.complete
     }
     #[getter]
-    fn manifest_files_after_partition(&self) -> usize {
-        self.inner.manifest_files_after_partition
+    fn snapshot_id(&self) -> Option<i64> {
+        self.inner.snapshot_id
+    }
+    #[getter]
+    fn base_manifest_files(&self) -> usize {
+        self.inner.base_manifest_files
+    }
+    #[getter]
+    fn delta_manifest_files(&self) -> usize {
+        self.inner.delta_manifest_files
+    }
+    #[getter]
+    fn manifest_files_before_partition_pruning(&self) -> usize {
+        self.inner.manifest_files_before_partition_pruning
+    }
+    #[getter]
+    fn manifest_files_after_partition_pruning(&self) -> usize {
+        self.inner.manifest_files_after_partition_pruning
+    }
+    #[getter]
+    fn manifest_files_pruned_by_row_ranges(&self) -> usize {
+        self.inner.manifest_files_pruned_by_row_ranges
+    }
+    #[getter]
+    fn manifest_entries_read(&self) -> usize {
+        self.inner.manifest_entries_read
     }
     #[getter]
     fn entries_potential_total(&self) -> u64 {
         self.inner.entries_potential_total
-    }
-    #[getter]
-    fn entries_total(&self) -> usize {
-        self.inner.entries_total
     }
     #[getter]
     fn entries_after_partition(&self) -> usize {
@@ -815,6 +833,90 @@ impl PyScanStats {
     #[getter]
     fn entries_after_stats(&self) -> usize {
         self.inner.entries_after_stats
+    }
+    #[getter]
+    fn manifest_entries_pruned_by_bucket(&self) -> usize {
+        self.inner.manifest_entries_pruned_by_bucket
+    }
+    #[getter]
+    fn manifest_entries_pruned_by_partition(&self) -> usize {
+        self.inner.manifest_entries_pruned_by_partition
+    }
+    #[getter]
+    fn manifest_entries_after_entry_pruning(&self) -> usize {
+        self.inner.manifest_entries_after_entry_pruning
+    }
+    #[getter]
+    fn manifest_entries_pruned_by_level(&self) -> usize {
+        self.inner.manifest_entries_pruned_by_level
+    }
+    #[getter]
+    fn manifest_entries_pruned_by_row_ranges(&self) -> usize {
+        self.inner.manifest_entries_pruned_by_row_ranges
+    }
+    #[getter]
+    fn manifest_entries_pruned_by_data_stats(&self) -> usize {
+        self.inner.manifest_entries_pruned_by_data_stats
+    }
+    #[getter]
+    fn manifest_entries_after_manifest_filters(&self) -> usize {
+        self.inner.manifest_entries_after_manifest_filters
+    }
+    #[getter]
+    fn manifest_entries_after_merge(&self) -> usize {
+        self.inner.manifest_entries_after_merge
+    }
+    #[getter]
+    fn manifest_entries_pruned_by_cross_schema_stats(&self) -> usize {
+        self.inner.manifest_entries_pruned_by_cross_schema_stats
+    }
+    #[getter]
+    fn manifest_entries_after_cross_schema_stats(&self) -> usize {
+        self.inner.manifest_entries_after_cross_schema_stats
+    }
+    #[getter]
+    fn data_evolution_groups_before_stats(&self) -> usize {
+        self.inner.data_evolution_groups_before_stats
+    }
+    #[getter]
+    fn data_evolution_groups_pruned_by_stats(&self) -> usize {
+        self.inner.data_evolution_groups_pruned_by_stats
+    }
+    #[getter]
+    fn data_evolution_groups_pruned_by_row_ranges(&self) -> usize {
+        self.inner.data_evolution_groups_pruned_by_row_ranges
+    }
+    #[getter]
+    fn split_candidates_built(&self) -> usize {
+        self.inner.split_candidates_built
+    }
+    #[getter]
+    fn limit_early_stopped(&self) -> bool {
+        self.inner.limit_early_stopped
+    }
+    #[getter]
+    fn splits_before_limit(&self) -> usize {
+        self.inner.splits_before_limit
+    }
+    #[getter]
+    fn splits_after_limit(&self) -> usize {
+        self.inner.splits_after_limit
+    }
+    #[getter]
+    fn final_splits(&self) -> usize {
+        self.inner.final_splits
+    }
+    #[getter]
+    fn final_files(&self) -> usize {
+        self.inner.final_files
+    }
+    #[getter]
+    fn planned_data_file_bytes(&self) -> u64 {
+        self.inner.planned_data_file_bytes
+    }
+    #[getter]
+    fn limit(&self) -> Option<usize> {
+        self.inner.limit
     }
 }
 
@@ -993,16 +1095,12 @@ impl PyRecordBatchReader {
 
 #[pyclass(name = "Plan", module = "pypaimon_rust.datafusion")]
 pub struct PyPlan {
-    splits: Vec<DataSplit>,
-    snapshot_id: Option<i64>,
+    inner: paimon::table::Plan,
 }
 
 impl From<paimon::table::Plan> for PyPlan {
     fn from(plan: paimon::table::Plan) -> Self {
-        Self {
-            splits: plan.splits().to_vec(),
-            snapshot_id: plan.snapshot_id(),
-        }
+        Self { inner: plan }
     }
 }
 
@@ -1011,11 +1109,19 @@ impl PyPlan {
     /// Snapshot selected by the scan, even when pruning produces no splits.
     /// `None` means no snapshot was selected, including snapshot-free format tables.
     fn snapshot_id(&self) -> Option<i64> {
-        self.snapshot_id
+        self.inner.snapshot_id()
+    }
+
+    fn scan_stats(&self) -> Option<PyScanStats> {
+        self.inner
+            .scan_stats()
+            .cloned()
+            .map(|inner| PyScanStats { inner })
     }
 
     fn splits(&self) -> Vec<PySplit> {
-        self.splits
+        self.inner
+            .splits()
             .iter()
             .cloned()
             .map(|inner| PySplit { inner })
@@ -1023,7 +1129,7 @@ impl PyPlan {
     }
 
     fn __len__(&self) -> usize {
-        self.splits.len()
+        self.inner.splits().len()
     }
 }
 

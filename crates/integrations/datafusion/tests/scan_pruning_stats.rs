@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Self-contained baselines for scan-pruning trace counters.
+//! Self-contained baselines for scan-pruning statistics counters.
 
 mod common;
 
@@ -27,7 +27,7 @@ use paimon::catalog::Identifier;
 use paimon::spec::{Datum, PredicateBuilder};
 use paimon::{Catalog, Table};
 
-async fn setup_trace_table() -> (tempfile::TempDir, std::sync::Arc<paimon::FileSystemCatalog>) {
+async fn setup_stats_table() -> (tempfile::TempDir, std::sync::Arc<paimon::FileSystemCatalog>) {
     let (tmp, catalog) = common::create_test_env();
     let sql_context = common::create_sql_context(catalog.clone()).await;
     sql_context
@@ -39,7 +39,7 @@ async fn setup_trace_table() -> (tempfile::TempDir, std::sync::Arc<paimon::FileS
         .unwrap();
     sql_context
         .sql(
-            "CREATE TABLE paimon.test_db.trace_append (
+            "CREATE TABLE paimon.test_db.stats_append (
                 id INT, value INT, dt STRING
              ) PARTITIONED BY (dt)",
         )
@@ -51,19 +51,19 @@ async fn setup_trace_table() -> (tempfile::TempDir, std::sync::Arc<paimon::FileS
 
     common::exec(
         &sql_context,
-        "INSERT INTO paimon.test_db.trace_append VALUES
+        "INSERT INTO paimon.test_db.stats_append VALUES
          (1, 10, '2024-01-01'), (2, 20, '2024-01-01')",
     )
     .await;
     common::exec(
         &sql_context,
-        "INSERT INTO paimon.test_db.trace_append VALUES
+        "INSERT INTO paimon.test_db.stats_append VALUES
          (100, 1000, '2024-01-02'), (101, 1010, '2024-01-02')",
     )
     .await;
     common::exec(
         &sql_context,
-        "INSERT INTO paimon.test_db.trace_append VALUES
+        "INSERT INTO paimon.test_db.stats_append VALUES
          (200, 2000, '2024-01-03'), (201, 2010, '2024-01-03')",
     )
     .await;
@@ -81,11 +81,11 @@ async fn load_table(
         .unwrap()
 }
 
-fn trace_counter(plan_text: &str, key: &str) -> usize {
+fn stats_counter(plan_text: &str, key: &str) -> usize {
     let needle = format!("{key}=");
     let start = plan_text
         .find(&needle)
-        .unwrap_or_else(|| panic!("trace counter {key} not found in plan:\n{plan_text}"))
+        .unwrap_or_else(|| panic!("statistics counter {key} not found in plan:\n{plan_text}"))
         + needle.len();
     let end = plan_text[start..]
         .find(|c: char| !c.is_ascii_digit())
@@ -94,7 +94,7 @@ fn trace_counter(plan_text: &str, key: &str) -> usize {
     plan_text[start..end].parse().unwrap()
 }
 
-fn trace_manifest_counts(plan_text: &str) -> (usize, usize) {
+fn stats_manifest_counts(plan_text: &str) -> (usize, usize) {
     let needle = "manifests=";
     let start = plan_text
         .find(needle)
@@ -117,7 +117,7 @@ fn trace_manifest_counts(plan_text: &str) -> (usize, usize) {
 /// one file holding a single distinct value, so `value NOT IN (20)` leaves the
 /// 20-only file with min == max == 20.
 #[tokio::test]
-async fn test_scan_trace_records_not_in_data_stats_pruning() {
+async fn test_scan_stats_records_not_in_data_stats_pruning() {
     let (tmp, catalog) = common::create_test_env();
     let sql_context = common::create_sql_context(catalog.clone()).await;
     sql_context
@@ -128,7 +128,7 @@ async fn test_scan_trace_records_not_in_data_stats_pruning() {
         .await
         .unwrap();
     sql_context
-        .sql("CREATE TABLE paimon.test_db.trace_not_in (id INT, value INT)")
+        .sql("CREATE TABLE paimon.test_db.stats_not_in (id INT, value INT)")
         .await
         .unwrap()
         .collect()
@@ -137,36 +137,46 @@ async fn test_scan_trace_records_not_in_data_stats_pruning() {
     for (id, value) in [(1, 10), (2, 20), (3, 30)] {
         common::exec(
             &sql_context,
-            &format!("INSERT INTO paimon.test_db.trace_not_in VALUES ({id}, {value})"),
+            &format!("INSERT INTO paimon.test_db.stats_not_in VALUES ({id}, {value})"),
         )
         .await;
     }
 
-    let table = load_table(&catalog, "trace_not_in").await;
+    let table = load_table(&catalog, "stats_not_in").await;
     let fields = table.schema().fields();
     let pb = PredicateBuilder::new(fields);
 
-    let (_plan, all_trace) = table
+    let _plan = table
         .new_read_builder()
         .new_scan()
-        .plan_with_trace()
+        .with_stats(paimon::table::ScanStatsMode::Lightweight)
+        .unwrap()
+        .plan()
         .await
         .unwrap();
-    assert_eq!(all_trace.final_files, 3);
+    let all_stats = _plan.scan_stats().cloned().unwrap();
+    assert_eq!(all_stats.final_files, 3);
 
     let mut reader = table.new_read_builder();
     reader.with_filter(pb.is_not_in("value", vec![Datum::Int(20)]).unwrap());
-    let (_not_in_plan, not_in_trace) = reader.new_scan().plan_with_trace().await.unwrap();
+    let _not_in_plan = reader
+        .new_scan()
+        .with_stats(paimon::table::ScanStatsMode::Lightweight)
+        .unwrap()
+        .plan()
+        .await
+        .unwrap();
+    let not_in_stats = _not_in_plan.scan_stats().cloned().unwrap();
 
     assert_eq!(
-        not_in_trace.manifest_entries_pruned_by_data_stats, 1,
-        "the file holding only 20 should be pruned: {not_in_trace:?}"
+        not_in_stats.manifest_entries_pruned_by_data_stats, 1,
+        "the file holding only 20 should be pruned: {not_in_stats:?}"
     );
-    assert_eq!(not_in_trace.final_files, 2);
+    assert_eq!(not_in_stats.final_files, 2);
 
     let rows = common::collect_id_value(
         &sql_context,
-        "SELECT id, value FROM paimon.test_db.trace_not_in WHERE value NOT IN (20) ORDER BY id",
+        "SELECT id, value FROM paimon.test_db.stats_not_in WHERE value NOT IN (20) ORDER BY id",
     )
     .await;
     assert_eq!(rows, vec![(1, 10), (3, 30)]);
@@ -174,18 +184,21 @@ async fn test_scan_trace_records_not_in_data_stats_pruning() {
 }
 
 #[tokio::test]
-async fn test_scan_trace_records_partition_pruning() {
-    let (_tmp, catalog) = setup_trace_table().await;
-    let table = load_table(&catalog, "trace_append").await;
+async fn test_scan_stats_records_partition_pruning() {
+    let (_tmp, catalog) = setup_stats_table().await;
+    let table = load_table(&catalog, "stats_append").await;
 
-    let (_all_plan, all_trace) = table
+    let _all_plan = table
         .new_read_builder()
         .new_scan()
-        .plan_with_trace()
+        .with_stats(paimon::table::ScanStatsMode::Lightweight)
+        .unwrap()
+        .plan()
         .await
         .unwrap();
-    assert_eq!(all_trace.snapshot_id, Some(3));
-    assert_eq!(all_trace.final_files, 3);
+    let all_stats = _all_plan.scan_stats().cloned().unwrap();
+    assert_eq!(all_stats.snapshot_id, Some(3));
+    assert_eq!(all_stats.final_files, 3);
 
     let fields = table.schema().fields();
     let pb = PredicateBuilder::new(fields);
@@ -194,25 +207,31 @@ async fn test_scan_trace_records_partition_pruning() {
         pb.equal("dt", Datum::String("2024-01-01".to_string()))
             .unwrap(),
     );
-    let (_partition_plan, partition_trace) =
-        partition_reader.new_scan().plan_with_trace().await.unwrap();
+    let _partition_plan = partition_reader
+        .new_scan()
+        .with_stats(paimon::table::ScanStatsMode::Lightweight)
+        .unwrap()
+        .plan()
+        .await
+        .unwrap();
+    let partition_stats = _partition_plan.scan_stats().cloned().unwrap();
     assert!(
-        partition_trace.manifest_files_after_partition_pruning
-            < partition_trace.manifest_files_before_partition_pruning
-            || partition_trace.manifest_entries_pruned_by_partition > 0,
-        "partition predicate should prune at manifest or entry level: {partition_trace:?}"
+        partition_stats.manifest_files_after_partition_pruning
+            < partition_stats.manifest_files_before_partition_pruning
+            || partition_stats.manifest_entries_pruned_by_partition > 0,
+        "partition predicate should prune at manifest or entry level: {partition_stats:?}"
     );
     assert!(
-        partition_trace.final_files < all_trace.final_files,
-        "partition pruning should reduce final files: all={all_trace:?}, filtered={partition_trace:?}"
+        partition_stats.final_files < all_stats.final_files,
+        "partition pruning should reduce final files: all={all_stats:?}, filtered={partition_stats:?}"
     );
 }
 
 #[tokio::test]
-async fn test_sql_between_records_partition_pruning_trace() {
-    let (_tmp, catalog) = setup_trace_table().await;
+async fn test_sql_between_records_partition_pruning_stats() {
+    let (_tmp, catalog) = setup_stats_table().await;
     let sql_context = common::create_sql_context(catalog).await;
-    let sql = "SELECT id, value FROM paimon.test_db.trace_append
+    let sql = "SELECT id, value FROM paimon.test_db.stats_append
                WHERE dt BETWEEN '2024-01-01' AND '2024-01-02'";
 
     let plan = sql_context
@@ -223,8 +242,8 @@ async fn test_sql_between_records_partition_pruning_trace() {
         .await
         .unwrap();
     let plan_text = displayable(plan.as_ref()).indent(true).to_string();
-    let (manifests_after, manifests_before) = trace_manifest_counts(&plan_text);
-    let partition_pruned = trace_counter(&plan_text, "partition_pruned");
+    let (manifests_after, manifests_before) = stats_manifest_counts(&plan_text);
+    let partition_pruned = stats_counter(&plan_text, "partition_pruned");
     assert!(
         manifests_after < manifests_before || partition_pruned > 0,
         "SQL BETWEEN over partition column should prune at manifest or entry level:\n{plan_text}"
@@ -235,10 +254,10 @@ async fn test_sql_between_records_partition_pruning_trace() {
 }
 
 #[tokio::test]
-async fn test_count_star_uses_statistics_without_scan_trace() {
-    let (_tmp, catalog) = setup_trace_table().await;
+async fn test_count_star_uses_statistics_without_scan_stats() {
+    let (_tmp, catalog) = setup_stats_table().await;
     let sql_context = common::create_sql_context(catalog).await;
-    let sql = "SELECT COUNT(*) FROM paimon.test_db.trace_append";
+    let sql = "SELECT COUNT(*) FROM paimon.test_db.stats_append";
 
     let df = sql_context.sql(sql).await.unwrap();
     let plan = df.create_physical_plan().await.unwrap();
@@ -248,8 +267,8 @@ async fn test_count_star_uses_statistics_without_scan_trace() {
         "COUNT(*) should be satisfied from exact scan statistics without data scan:\n{plan_text}"
     );
     assert!(
-        !plan_text.contains("trace="),
-        "COUNT(*) statistics rewrite should remove the scan node before trace display:\n{plan_text}"
+        !plan_text.contains("stats="),
+        "COUNT(*) statistics rewrite should remove the scan node before scan_stats display:\n{plan_text}"
     );
 
     let batches = sql_context.sql(sql).await.unwrap().collect().await.unwrap();
@@ -263,13 +282,13 @@ async fn test_count_star_uses_statistics_without_scan_trace() {
 }
 
 #[tokio::test]
-async fn test_scan_trace_records_bucket_limit_and_time_travel() {
+async fn test_scan_stats_records_bucket_limit_and_time_travel() {
     let (tmp, catalog) = common::create_test_env();
     let sql_context = common::create_sql_context(catalog.clone()).await;
     common::exec(&sql_context, "CREATE SCHEMA paimon.test_db").await;
     common::exec(
         &sql_context,
-        "CREATE TABLE paimon.test_db.trace_pk (
+        "CREATE TABLE paimon.test_db.stats_pk (
             id INT NOT NULL, value INT,
             PRIMARY KEY (id)
          ) WITH ('bucket' = '4')",
@@ -277,79 +296,102 @@ async fn test_scan_trace_records_bucket_limit_and_time_travel() {
     .await;
     common::exec(
         &sql_context,
-        "INSERT INTO paimon.test_db.trace_pk VALUES
+        "INSERT INTO paimon.test_db.stats_pk VALUES
          (1, 10), (2, 20), (3, 30), (4, 40)",
     )
     .await;
     common::exec(
         &sql_context,
-        "INSERT INTO paimon.test_db.trace_pk VALUES
+        "INSERT INTO paimon.test_db.stats_pk VALUES
          (5, 50), (6, 60), (7, 70), (8, 80)",
     )
     .await;
 
-    let table = load_table(&catalog, "trace_pk").await;
+    let table = load_table(&catalog, "stats_pk").await;
     let fields = table.schema().fields();
     let pb = PredicateBuilder::new(fields);
     let mut bucket_reader = table.new_read_builder();
     bucket_reader.with_filter(pb.equal("id", Datum::Int(1)).unwrap());
-    let (_bucket_plan, bucket_trace) = bucket_reader.new_scan().plan_with_trace().await.unwrap();
-    assert!(
-        bucket_trace.manifest_entries_pruned_by_bucket > 0,
-        "bucket-key predicate should prune manifest entries by bucket: {bucket_trace:?}"
-    );
-
-    let (_full_plan, full_trace) = table
-        .new_read_builder()
+    let _bucket_plan = bucket_reader
         .new_scan()
-        .plan_with_trace()
+        .with_stats(paimon::table::ScanStatsMode::Lightweight)
+        .unwrap()
+        .plan()
         .await
         .unwrap();
+    let bucket_stats = _bucket_plan.scan_stats().cloned().unwrap();
+    assert!(
+        bucket_stats.manifest_entries_pruned_by_bucket > 0,
+        "bucket-key predicate should prune manifest entries by bucket: {bucket_stats:?}"
+    );
+
+    let _full_plan = table
+        .new_read_builder()
+        .new_scan()
+        .with_stats(paimon::table::ScanStatsMode::Lightweight)
+        .unwrap()
+        .plan()
+        .await
+        .unwrap();
+    let full_stats = _full_plan.scan_stats().cloned().unwrap();
     let mut limit_reader = table.new_read_builder();
     limit_reader.with_limit(1);
-    let (_limit_plan, limit_trace) = limit_reader.new_scan().plan_with_trace().await.unwrap();
+    let _limit_plan = limit_reader
+        .new_scan()
+        .with_stats(paimon::table::ScanStatsMode::Lightweight)
+        .unwrap()
+        .plan()
+        .await
+        .unwrap();
+    let limit_stats = _limit_plan.scan_stats().cloned().unwrap();
     assert!(
-        limit_trace.limit_early_stopped,
-        "LIMIT should stop split construction early when no data residual exists: {limit_trace:?}"
+        limit_stats.limit_early_stopped,
+        "LIMIT should stop split construction early when no data residual exists: {limit_stats:?}"
     );
     assert!(
-        limit_trace.split_candidates_built < full_trace.split_candidates_built,
-        "LIMIT should build fewer split candidates: limited={limit_trace:?}, full={full_trace:?}"
+        limit_stats.split_candidates_built < full_stats.split_candidates_built,
+        "LIMIT should build fewer split candidates: limited={limit_stats:?}, full={full_stats:?}"
     );
 
     let snapshot_one_table = table.copy_with_options(HashMap::from([(
         "scan.version".to_string(),
         "1".to_string(),
     )]));
-    let (_snapshot_one_plan, snapshot_one_trace) = snapshot_one_table
+    let _snapshot_one_plan = snapshot_one_table
         .new_read_builder()
         .new_scan()
-        .plan_with_trace()
+        .with_stats(paimon::table::ScanStatsMode::Lightweight)
+        .unwrap()
+        .plan()
         .await
         .unwrap();
-    assert_eq!(snapshot_one_trace.snapshot_id, Some(1));
+    let snapshot_one_stats = _snapshot_one_plan.scan_stats().cloned().unwrap();
+    assert_eq!(snapshot_one_stats.snapshot_id, Some(1));
 
-    let (_latest_plan, latest_trace) = table
+    let _latest_plan = table
         .new_read_builder()
         .new_scan()
-        .plan_with_trace()
+        .with_stats(paimon::table::ScanStatsMode::Lightweight)
+        .unwrap()
+        .plan()
         .await
         .unwrap();
-    assert_eq!(latest_trace.snapshot_id, Some(2));
+    let latest_stats = _latest_plan.scan_stats().cloned().unwrap();
+    assert_eq!(latest_stats.snapshot_id, Some(2));
     assert!(
-        snapshot_one_trace.final_files < latest_trace.final_files,
-        "time travel should plan from the selected snapshot: snapshot1={snapshot_one_trace:?}, latest={latest_trace:?}"
+        snapshot_one_stats.final_files < latest_stats.final_files,
+        "time travel should plan from the selected snapshot: snapshot1={snapshot_one_stats:?}, latest={latest_stats:?}"
     );
 
     drop(tmp);
 }
 
 #[tokio::test]
-async fn test_physical_plan_displays_scan_trace_summary() {
-    let (_tmp, catalog) = setup_trace_table().await;
+async fn test_physical_plan_displays_scan_stats_summary() {
+    let (_tmp, catalog) = setup_stats_table().await;
     let sql_context = common::create_sql_context(catalog).await;
     let plan = sql_context
-        .sql("SELECT id FROM paimon.test_db.trace_append LIMIT 1")
+        .sql("SELECT id FROM paimon.test_db.stats_append LIMIT 1")
         .await
         .unwrap()
         .create_physical_plan()
@@ -358,8 +400,8 @@ async fn test_physical_plan_displays_scan_trace_summary() {
     let plan_text = displayable(plan.as_ref()).indent(true).to_string();
 
     assert!(
-        plan_text.contains("trace=") && plan_text.contains("splits_before_limit="),
-        "physical plan should include scan trace summary:\n{plan_text}"
+        plan_text.contains("stats=") && plan_text.contains("splits_before_limit="),
+        "physical plan should include scan scan_stats summary:\n{plan_text}"
     );
 }
 
@@ -383,7 +425,7 @@ async fn test_not_equal_keeps_float_files_with_nan_or_signed_zero() {
         .unwrap();
 
     sql_context
-        .sql("CREATE TABLE paimon.test_db.trace_float (id INT, d DOUBLE)")
+        .sql("CREATE TABLE paimon.test_db.stats_float (id INT, d DOUBLE)")
         .await
         .unwrap()
         .collect()
@@ -391,30 +433,30 @@ async fn test_not_equal_keeps_float_files_with_nan_or_signed_zero() {
         .unwrap();
     common::exec(
         &sql_context,
-        "INSERT INTO paimon.test_db.trace_float VALUES \
+        "INSERT INTO paimon.test_db.stats_float VALUES \
          (1, CAST(1.0 AS DOUBLE)), (2, CAST('NaN' AS DOUBLE))",
     )
     .await;
     common::exec(
         &sql_context,
-        "INSERT INTO paimon.test_db.trace_float VALUES (3, CAST(-0.0 AS DOUBLE))",
+        "INSERT INTO paimon.test_db.stats_float VALUES (3, CAST(-0.0 AS DOUBLE))",
     )
     .await;
 
     for (sql, expected) in [
         // The NaN row satisfies `<> 1.0`; pruning the file used to drop it.
         (
-            "SELECT id FROM paimon.test_db.trace_float WHERE d <> 1.0 ORDER BY id",
+            "SELECT id FROM paimon.test_db.stats_float WHERE d <> 1.0 ORDER BY id",
             vec![2, 3],
         ),
         // `-0.0` is not `0.0` to the filter, so row 3 survives; rows 1 and 2 are
         // kept as well because `1.0 <> 0.0` and NaN is not `0.0` either.
         (
-            "SELECT id FROM paimon.test_db.trace_float WHERE d <> 0.0 ORDER BY id",
+            "SELECT id FROM paimon.test_db.stats_float WHERE d <> 0.0 ORDER BY id",
             vec![1, 2, 3],
         ),
         (
-            "SELECT id FROM paimon.test_db.trace_float WHERE d NOT IN (1.0, 2.0) ORDER BY id",
+            "SELECT id FROM paimon.test_db.stats_float WHERE d NOT IN (1.0, 2.0) ORDER BY id",
             vec![2, 3],
         ),
     ] {

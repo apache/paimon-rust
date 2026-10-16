@@ -5049,9 +5049,14 @@ async fn test_query_auth_chunk_shuffle_with_partition_filters() {
                 .new_scan()
                 .with_chunk_shuffle(7, 2)
                 .expect("partition-only filters must allow chunk shuffle");
-            for traced in [false, true] {
-                let plan = if traced {
-                    scan.plan_with_trace().await.unwrap().0
+            for collect_stats in [false, true] {
+                let plan = if collect_stats {
+                    scan.clone()
+                        .with_stats(paimon::table::ScanStatsMode::Lightweight)
+                        .unwrap()
+                        .plan()
+                        .await
+                        .unwrap()
                 } else {
                     scan.plan().await.unwrap()
                 };
@@ -5071,7 +5076,7 @@ async fn test_query_auth_chunk_shuffle_with_partition_filters() {
                 assert_eq!(
                     ids(&batches),
                     expected,
-                    "evolution={evolution}, traced={traced}"
+                    "evolution={evolution}, collect_stats={collect_stats}"
                 );
             }
         }
@@ -5100,9 +5105,13 @@ async fn test_query_auth_chunk_shuffle_with_partition_filters() {
                 .unwrap(),
         );
         let scan = read.new_scan().with_chunk_shuffle(7, 2).unwrap();
-        for traced in [false, true] {
-            let result = if traced {
-                scan.plan_with_trace().await.map(|(plan, _)| plan)
+        for collect_stats in [false, true] {
+            let result = if collect_stats {
+                scan.clone()
+                    .with_stats(paimon::table::ScanStatsMode::Lightweight)
+                    .unwrap()
+                    .plan()
+                    .await
             } else {
                 scan.plan().await
             };
@@ -5230,8 +5239,15 @@ async fn test_query_auth_filters_masked_partition_values() {
                     equals("region", "east"),
                 ]))
                 .with_limit(1);
-            let (plan, trace) = limited.new_scan().plan_with_trace().await.unwrap();
-            assert_eq!(trace.limit, None);
+            let plan = limited
+                .new_scan()
+                .with_stats(paimon::table::ScanStatsMode::Lightweight)
+                .unwrap()
+                .plan()
+                .await
+                .unwrap();
+            let scan_stats = plan.scan_stats().cloned().unwrap();
+            assert_eq!(scan_stats.limit, None);
             assert!(plan
                 .splits()
                 .iter()
@@ -5259,8 +5275,15 @@ async fn test_query_auth_filters_masked_partition_values() {
             .with_filter(equals("dept", "eng"));
         assert_eq!(ids(&read_all(&plain).await.unwrap()), vec![1, 3]);
         plain.with_limit(1);
-        let (plan, trace) = plain.new_scan().plan_with_trace().await.unwrap();
-        assert_eq!(trace.limit, Some(1));
+        let plan = plain
+            .new_scan()
+            .with_stats(paimon::table::ScanStatsMode::Lightweight)
+            .unwrap()
+            .plan()
+            .await
+            .unwrap();
+        let scan_stats = plan.scan_stats().cloned().unwrap();
+        assert_eq!(scan_stats.limit, Some(1));
         assert!(!plan.splits().is_empty());
         let rows = ids(&read_all(&plain).await.unwrap());
         assert_eq!(rows.len(), 1);

@@ -15,7 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::{DataSplit, GlobalIndexResult, Plan, ScanTrace, SnapshotManager, Table, TableScan};
+use super::{
+    DataSplit, GlobalIndexResult, Plan, ScanStats, ScanStatsMode, SnapshotManager, Table, TableScan,
+};
 use crate::spec::{CommitKind, CoreOptions};
 
 /// Java IncrementalDeltaStartingScanner.betweenTimestamps. Resolve both bounds
@@ -320,6 +322,14 @@ impl<'a> IncrementalScan<'a> {
         Ok(self)
     }
 
+    /// Collect pruning counters for [`Self::plan_combined`], available
+    /// through [`Plan::scan_stats`]. Per-snapshot and Diff planning do not
+    /// represent one ordinary plan with a shared metadata funnel.
+    pub fn with_stats(mut self, mode: ScanStatsMode) -> crate::Result<Self> {
+        self.scan = self.scan.with_stats(mode)?;
+        Ok(self)
+    }
+
     pub async fn plan(&self) -> crate::Result<IncrementalPlan> {
         let mode = self.resolve_mode();
         self.validate_per_snapshot_plan(mode).await?;
@@ -340,9 +350,10 @@ impl<'a> IncrementalScan<'a> {
             || self.scan.has_chunk_shuffle()
             || self.scan.has_shard()
             || self.scan.has_global_index_result()
+            || self.scan.stats_mode().is_some()
         {
             return Err(crate::Error::Unsupported {
-                message: "Incremental row-position selection and chunk_shuffle require combined Delta planning; sharding and global-index results require combined Delta or Changelog planning"
+                message: "Incremental row-position selection and chunk_shuffle require combined Delta planning; sharding, global-index results and statistics require combined Delta or Changelog planning"
                     .into(),
             });
         }
@@ -358,28 +369,29 @@ impl<'a> IncrementalScan<'a> {
     /// represented by an ordinary split list because each unit contains a
     /// before/after pair.
     pub async fn plan_combined(&self) -> crate::Result<Plan> {
-        self.plan_combined_with_trace(None).await
+        let mut stats = self.scan.stats_mode().map(ScanStats::new);
+        if let Some(stats) = stats.as_mut() {
+            stats.limit = self.scan.limit_hint();
+        }
+        let plan = self.plan_combined_inner(stats.as_mut()).await?;
+        Ok(match stats {
+            Some(mut stats) => {
+                stats.snapshot_id = plan.snapshot_id();
+                stats.planned_data_file_bytes = plan.planned_data_file_bytes();
+                plan.with_scan_stats(stats)
+            }
+            None => plan,
+        })
     }
 
-    /// Plan the complete Delta/Changelog range once with metadata-pruning
-    /// statistics, using the same filtering and packing as `plan_combined`.
-    pub async fn plan_combined_with_stats(&self) -> crate::Result<(Plan, super::ScanStats)> {
-        let mut trace = ScanTrace {
-            statistics: Some(super::ScanStats::default()),
-            ..Default::default()
-        };
-        let plan = self.plan_combined_with_trace(Some(&mut trace)).await?;
-        Ok((plan, trace.statistics.unwrap()))
-    }
-
-    pub(crate) async fn plan_combined_with_trace(
+    pub(crate) async fn plan_combined_inner(
         &self,
-        trace: Option<&mut ScanTrace>,
+        scan_stats: Option<&mut ScanStats>,
     ) -> crate::Result<Plan> {
         let mode = self.resolve_mode();
         match mode {
             IncrementalScanMode::Delta | IncrementalScanMode::Changelog => {
-                self.plan_combined_events(mode, trace).await
+                self.plan_combined_events(mode, scan_stats).await
             }
             IncrementalScanMode::Diff => Err(crate::Error::Unsupported {
                 message: "Combined incremental planning does not support Diff mode; Diff requires before/after split pairs"
@@ -404,13 +416,13 @@ impl<'a> IncrementalScan<'a> {
                 message: "Combined incremental planning only supports Delta mode".to_string(),
             });
         }
-        self.plan_combined_events(mode, None).await
+        self.plan_combined().await
     }
 
     async fn plan_combined_events(
         &self,
         mode: IncrementalScanMode,
-        trace: Option<&mut ScanTrace>,
+        scan_stats: Option<&mut ScanStats>,
     ) -> crate::Result<Plan> {
         let scan = self.scan.authorize_snapshot_read().await?;
         // Row positions and shuffled chunks refer to one APPEND-delta row
@@ -424,8 +436,8 @@ impl<'a> IncrementalScan<'a> {
         }
         self.validate_snapshot_range(mode).await?;
         if mode == IncrementalScanMode::Changelog && self.start_exclusive == self.end_inclusive {
-            if let Some(trace) = trace {
-                trace.record_final_plan(0, 0, 0);
+            if let Some(scan_stats) = scan_stats {
+                scan_stats.record_final_plan(0, 0, 0);
             }
             // Changelog's empty range may end at earliest-1, which is a
             // valid boundary even though that snapshot need not exist.
@@ -463,7 +475,7 @@ impl<'a> IncrementalScan<'a> {
             .map(str::to_owned)
             .collect();
         let plan = scan
-            .plan_incremental_lists_with_trace(&end_snapshot, manifest_lists, trace)
+            .plan_incremental_lists(&end_snapshot, manifest_lists, scan_stats)
             .await?;
         self.scan.attach_global_index_scores(plan)
     }
@@ -545,10 +557,7 @@ impl<'a> IncrementalScan<'a> {
             if snapshot.changelog_manifest_list().is_none() {
                 continue;
             }
-            let plan = self
-                .scan
-                .plan_snapshot_changelog_with_trace(&snapshot, None)
-                .await?;
+            let plan = self.scan.plan_snapshot_changelog(&snapshot, None).await?;
             splits.extend(plan.splits().iter().cloned().map(IncrementalSplit::Data));
         }
         IncrementalPlan::try_new(mode, splits)

@@ -1098,8 +1098,17 @@ async fn test_file_index_prunes_without_opening_data_file() {
             .unwrap();
         let mut read_builder = table.new_read_builder();
         read_builder.with_filter(predicate.clone());
-        let (_, trace) = read_builder.new_scan().plan_with_trace().await.unwrap();
-        assert_eq!(trace.final_files, 1, "statistics must retain the file");
+        let scan_stats = {
+            let statistics_plan = read_builder
+                .new_scan()
+                .with_stats(crate::table::ScanStatsMode::Lightweight)
+                .unwrap()
+                .plan()
+                .await
+                .unwrap();
+            statistics_plan.scan_stats().cloned().unwrap()
+        };
+        assert_eq!(scan_stats.final_files, 1, "statistics must retain the file");
         storage.data_accesses.store(0, Ordering::SeqCst);
         assert!(query(&table, true, Some(predicate.clone()))
             .await
@@ -1143,8 +1152,17 @@ async fn test_pk_file_index_prunes_before_sort_merge_opens_data() {
                 .unwrap();
             let mut read_builder = table.new_read_builder();
             read_builder.with_filter(predicate.clone());
-            let (_, trace) = read_builder.new_scan().plan_with_trace().await.unwrap();
-            assert_eq!(trace.final_files, 1, "stats must retain the file");
+            let scan_stats = {
+                let statistics_plan = read_builder
+                    .new_scan()
+                    .with_stats(crate::table::ScanStatsMode::Lightweight)
+                    .unwrap()
+                    .plan()
+                    .await
+                    .unwrap();
+                statistics_plan.scan_stats().cloned().unwrap()
+            };
+            assert_eq!(scan_stats.final_files, 1, "stats must retain the file");
             storage.data_accesses.store(0, Ordering::SeqCst);
             assert!(pk_query(&table, true, Some(predicate.clone()))
                 .await
@@ -1186,8 +1204,17 @@ async fn test_data_evolution_file_index_prunes_independent_file() {
             .unwrap();
         let mut read_builder = table.new_read_builder();
         read_builder.with_filter(predicate.clone());
-        let (_, trace) = read_builder.new_scan().plan_with_trace().await.unwrap();
-        assert_eq!(trace.final_files, 1, "stats must retain the file");
+        let scan_stats = {
+            let statistics_plan = read_builder
+                .new_scan()
+                .with_stats(crate::table::ScanStatsMode::Lightweight)
+                .unwrap()
+                .plan()
+                .await
+                .unwrap();
+            statistics_plan.scan_stats().cloned().unwrap()
+        };
+        assert_eq!(scan_stats.final_files, 1, "stats must retain the file");
         storage.data_accesses.store(0, Ordering::SeqCst);
         assert!(query(&table, true, Some(predicate.clone()))
             .await
@@ -1586,8 +1613,17 @@ async fn test_range_bitmap_append_range_pruning() {
                 .unwrap();
             let mut scan = table.new_read_builder();
             scan.with_filter(missing.clone());
-            let (_, trace) = scan.new_scan().plan_with_trace().await.unwrap();
-            assert_eq!(trace.final_files, 1, "statistics must retain the file");
+            let scan_stats = {
+                let statistics_plan = scan
+                    .new_scan()
+                    .with_stats(crate::table::ScanStatsMode::Lightweight)
+                    .unwrap()
+                    .plan()
+                    .await
+                    .unwrap();
+                statistics_plan.scan_stats().cloned().unwrap()
+            };
+            assert_eq!(scan_stats.final_files, 1, "statistics must retain the file");
             storage.data_accesses.store(0, Ordering::SeqCst);
             assert!(query(&table, true, Some(missing.clone())).await.is_empty());
             assert_eq!(storage.data_accesses.load(Ordering::SeqCst), 0);

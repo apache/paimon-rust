@@ -59,23 +59,43 @@ def test_scan_statistics_include_all_candidates_before_limit(limit, split_count)
         if limit is not None:
             builder.with_limit(limit)
         scan = builder.new_scan()
-        plan, stats = scan.plan_with_stats()
+        assert scan.plan().scan_stats() is None
+        plan = scan.with_stats().plan()
+        stats = plan.scan_stats()
+        assert stats.complete
         assert len(plan.splits()) == len(scan.plan().splits()) == split_count
         assert plan.snapshot_id() == 1
-        assert stats.entries_potential_total == stats.entries_total == 1
+        assert stats.entries_potential_total == stats.manifest_entries_read == 1
         assert stats.entries_after_partition == stats.entries_after_bucket == stats.entries_after_stats == 1
-        assert stats.manifest_files_total == stats.manifest_files_after_partition == 1
+        assert stats.manifest_files_before_partition_pruning == stats.manifest_files_after_partition_pruning == 1
         with pytest.raises(AttributeError):
-            stats.entries_total = 10
+            stats.manifest_entries_read = 10
+        light_plan = scan.with_stats(complete=False).plan()
+        light_stats = light_plan.scan_stats()
+        assert not light_stats.complete
+        assert light_stats.snapshot_id == plan.snapshot_id()
+        assert light_stats.limit == limit
+        assert light_stats.final_splits == len(light_plan.splits())
+        assert [split.serialize() for split in light_plan.splits()] == [split.serialize() for split in plan.splits()]
+        if limit == 0:
+            assert light_stats.manifest_entries_read == light_stats.split_candidates_built == 0
+            assert light_stats.limit_early_stopped
 
 
-def test_combined_incremental_scan_statistics():
+@pytest.mark.parametrize("start,entry_count", [(0, 1), (1, 0)])
+@pytest.mark.parametrize("complete", [False, True])
+def test_combined_incremental_scan_statistics(start, entry_count, complete):
     with tempfile.TemporaryDirectory() as warehouse:
         table = _make_table_with_data(warehouse)
-        scan = table.new_read_builder().new_incremental_scan(0, 1)
-        plan, stats = scan.plan_with_stats()
+        scan = table.new_read_builder().new_incremental_scan(start, 1)
+        assert scan.plan().scan_stats() is None
+        plan = scan.with_stats(complete=complete).plan()
+        stats = plan.scan_stats()
+        assert stats.complete == complete
         assert plan.snapshot_id() == 1
-        assert stats.entries_total == stats.entries_after_stats == 1
+        assert stats.snapshot_id == 1
+        assert stats.manifest_entries_read == entry_count
+        assert stats.entries_after_stats == (entry_count if complete else 0)
         assert [split.serialize() for split in plan.splits()] == [split.serialize() for split in scan.plan().splits()]
 
 

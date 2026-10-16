@@ -359,7 +359,6 @@ pub(crate) struct PaimonScanBuilder<'a> {
     pub(crate) table: &'a Table,
     pub(crate) schema: &'a ArrowSchemaRef,
     pub(crate) plan: paimon::table::Plan,
-    pub(crate) scan_trace: Option<paimon::table::ScanTrace>,
     pub(crate) projection: Option<&'a Vec<usize>>,
     pub(crate) pushed_predicate: Option<paimon::spec::Predicate>,
     pub(crate) limit: Option<usize>,
@@ -400,6 +399,7 @@ impl PaimonScanBuilder<'_> {
             (self.schema.clone(), read_fields)
         };
 
+        let scan_stats = self.plan.scan_stats().cloned();
         let splits = self.plan.into_splits();
         let planned_partitions: Vec<Arc<[_]>> = if splits.is_empty() {
             vec![Arc::from(Vec::new())]
@@ -419,7 +419,7 @@ impl PaimonScanBuilder<'_> {
             planned_partitions,
             self.limit,
             self.filter_exact,
-            self.scan_trace,
+            scan_stats,
             None,
             self.case_sensitive,
         )
@@ -479,12 +479,15 @@ impl TableProvider for PaimonTableProvider {
         if let Some(limit) = pushed_limit {
             read_builder.with_limit(limit);
         }
-        let scan = read_builder.new_scan();
+        let scan = read_builder
+            .new_scan()
+            .with_stats(paimon::table::ScanStatsMode::Lightweight)
+            .map_err(to_datafusion_error)?;
         // DataFusion's Python FFI may poll `TableProvider::scan()` without an active
         // Tokio runtime. `scan.plan()` can reach OpenDAL/Tokio filesystem calls while
         // reading Paimon metadata, so we must provide a runtime here instead of
         // assuming the caller already entered one.
-        let (plan, scan_trace) = await_with_runtime(scan.plan_with_trace())
+        let plan = await_with_runtime(scan.plan())
             .await
             .map_err(to_datafusion_error)?;
 
@@ -498,7 +501,6 @@ impl TableProvider for PaimonTableProvider {
             table: &self.table,
             schema: &self.schema,
             plan,
-            scan_trace: Some(scan_trace),
             projection,
             pushed_predicate: filter_analysis.pushed_predicate,
             limit: pushed_limit,

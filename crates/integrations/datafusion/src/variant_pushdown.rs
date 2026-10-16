@@ -226,11 +226,15 @@ impl ExtensionPlanner for VariantExtractionExtensionPlanner {
         if let Some(limit) = pushed_limit {
             read_builder.with_limit(limit);
         }
-        let scan = read_builder.new_scan();
-        let (plan, scan_trace) = await_with_runtime(scan.plan_with_trace())
+        let scan = read_builder
+            .new_scan()
+            .with_stats(paimon::table::ScanStatsMode::Lightweight)
+            .map_err(to_datafusion_error)?;
+        let plan = await_with_runtime(scan.plan())
             .await
             .map_err(to_datafusion_error)?;
 
+        let scan_stats = plan.scan_stats().cloned();
         let splits = plan.into_splits();
         let target = session_state.config_options().execution.target_partitions;
         let planned_partitions: Vec<Arc<[_]>> = if splits.is_empty() {
@@ -256,7 +260,7 @@ impl ExtensionPlanner for VariantExtractionExtensionPlanner {
             planned_partitions,
             pushed_limit,
             filter_exact,
-            Some(scan_trace),
+            scan_stats,
             Some(node.pushed_variants.clone()),
             case_sensitive,
         )?)))

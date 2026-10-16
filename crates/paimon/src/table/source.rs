@@ -1601,6 +1601,7 @@ impl Default for DataSplitBuilder {
 pub struct Plan {
     splits: Vec<DataSplit>,
     snapshot_id: Option<i64>,
+    scan_stats: Option<Box<super::ScanStats>>,
 }
 
 impl Plan {
@@ -1608,6 +1609,7 @@ impl Plan {
         Self {
             splits,
             snapshot_id: None,
+            scan_stats: None,
         }
     }
 
@@ -1625,6 +1627,30 @@ impl Plan {
     }
     pub fn splits(&self) -> &[DataSplit] {
         &self.splits
+    }
+
+    /// Statistics collected in the same planning pass. Returns `None` unless
+    /// statistics were enabled on the scan with `with_stats`.
+    pub fn scan_stats(&self) -> Option<&super::ScanStats> {
+        self.scan_stats.as_deref()
+    }
+
+    pub(crate) fn with_scan_stats(mut self, stats: super::ScanStats) -> Self {
+        self.scan_stats = Some(Box::new(stats));
+        self
+    }
+
+    pub(crate) fn scan_stats_mut(&mut self) -> Option<&mut super::ScanStats> {
+        self.scan_stats.as_deref_mut()
+    }
+
+    /// Transform splits without dropping the snapshot or collected statistics.
+    pub(crate) fn map_splits(
+        mut self,
+        transform: impl FnOnce(Vec<DataSplit>) -> crate::Result<Vec<DataSplit>>,
+    ) -> crate::Result<Self> {
+        self.splits = transform(self.splits)?;
+        Ok(self)
     }
 
     /// Stamps the grant every split of this plan was authorized under.
