@@ -629,7 +629,8 @@ async fn test_partitions_system_table_shows_unreported_statistics_as_null() {
     sql_context
         .sql(
             "CREATE TABLE paimon.default.unknown_stats_orders \
-             (id INT, name STRING) PARTITIONED BY (id)",
+             (id INT, name STRING) PARTITIONED BY (id) \
+             WITH ('bucket' = '4', 'bucket-key' = 'name')",
         )
         .await
         .unwrap()
@@ -658,6 +659,15 @@ async fn test_partitions_system_table_shows_unreported_statistics_as_null() {
             "column {column} should carry a measurement before the switch"
         );
     }
+    assert_eq!(
+        measured
+            .column(3)
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::Int32Array>()
+            .unwrap()
+            .value(0),
+        4
+    );
 
     catalog.set_unknown_statistics(true);
 
