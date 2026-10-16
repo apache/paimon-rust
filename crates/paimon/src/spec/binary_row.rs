@@ -383,6 +383,16 @@ impl BinaryRow {
         Ok(Some(datum))
     }
 
+    /// Decode a scalar field as a single-element Arrow array.
+    /// Uses the same typed decoding as partition expansion in table reads.
+    pub fn field_to_arrow(
+        &self,
+        index: usize,
+        data_type: &DataType,
+    ) -> crate::Result<arrow_array::ArrayRef> {
+        crate::arrow::partition::partition_array(self, index, data_type, 1)
+    }
+
     /// Build a BinaryRow from selected columns of an Arrow RecordBatch at a given row.
     ///
     /// `field_indices` maps each position in the output BinaryRow to a column index

@@ -83,7 +83,7 @@ pub(crate) fn format_epoch_timestamp(seconds: i64, nanos: u32, precision: u32) -
 }
 
 /// Java Timestamp.toString uses LocalDateTime's ISO form, not a SQL CAST form.
-pub(crate) fn format_iso_timestamp(seconds: i64, nanos: u32) -> String {
+pub fn format_iso_timestamp(seconds: i64, nanos: u32) -> String {
     let (year, month, day) = epoch_day_to_date(i64::from(seconds.div_euclid(86_400) as i32));
     let year = if (0..=9999).contains(&year) {
         format!("{year:04}")

@@ -145,12 +145,7 @@ impl TableProvider for TableIndexesTable {
                 row_range_starts.push(Some(global_meta.row_range_start));
                 row_range_ends.push(Some(global_meta.row_range_end));
                 index_field_ids.push(Some(global_meta.index_field_id));
-                index_field_names.push(
-                    fields
-                        .iter()
-                        .find(|field| field.id() == global_meta.index_field_id)
-                        .map(|field| field.name().to_string()),
-                );
+                index_field_names.push(global_index_field_names(global_meta, fields));
             } else {
                 row_range_starts.push(None);
                 row_range_ends.push(None);
@@ -210,6 +205,22 @@ fn visible_index_entries(entries: Vec<IndexManifestEntry>) -> Vec<IndexManifestE
         .into_iter()
         .filter(|entry| entry.kind == FileKind::Add)
         .collect()
+}
+
+fn global_index_field_names(
+    meta: &paimon::spec::GlobalIndexMeta,
+    fields: &[DataField],
+) -> Option<String> {
+    let names: Option<Vec<_>> = std::iter::once(&meta.index_field_id)
+        .chain(meta.extra_field_ids.iter().flatten())
+        .map(|id| {
+            fields
+                .iter()
+                .find(|field| field.id() == *id)
+                .map(DataField::name)
+        })
+        .collect();
+    names.map(|names| names.join(","))
 }
 
 fn format_partition(partition: &[u8], partition_fields: &[DataField]) -> DFResult<String> {
@@ -289,6 +300,38 @@ mod tests {
             },
             version: 1,
         }
+    }
+
+    #[test]
+    fn composite_index_names_preserve_order_and_require_every_field() {
+        use paimon::spec::{GlobalIndexMeta, IntType};
+        let fields = vec![
+            DataField::new(3, "a".into(), paimon::spec::DataType::Int(IntType::new())),
+            DataField::new(
+                7,
+                "renamed".into(),
+                paimon::spec::DataType::Int(IntType::new()),
+            ),
+        ];
+        let mut meta = GlobalIndexMeta {
+            row_range_start: 0,
+            row_range_end: 1,
+            index_field_id: 7,
+            extra_field_ids: Some(vec![3]),
+            index_meta: None,
+            source_meta: None,
+        };
+        assert_eq!(
+            global_index_field_names(&meta, &fields).as_deref(),
+            Some("renamed,a")
+        );
+        meta.extra_field_ids = Some(vec![99]);
+        assert_eq!(global_index_field_names(&meta, &fields), None);
+        meta.extra_field_ids = None;
+        assert_eq!(
+            global_index_field_names(&meta, &fields).as_deref(),
+            Some("renamed")
+        );
     }
 
     #[test]

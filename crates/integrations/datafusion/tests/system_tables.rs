@@ -793,6 +793,7 @@ async fn test_snapshots_system_table() {
         ("changelog_record_count", DataType::Int64),
         ("watermark", DataType::Int64),
         ("next_row_id", DataType::Int64),
+        ("writer_version", DataType::Utf8),
     ];
     for (i, (name, dtype)) in expected_columns.iter().enumerate() {
         let field = arrow_schema.field(i);
@@ -1329,7 +1330,7 @@ async fn test_files_system_table() {
             "creation_time",
             DataType::Timestamp(TimeUnit::Millisecond, None),
         ),
-        ("delete_row_count", DataType::Int64),
+        ("deleteRowCount", DataType::Int64),
         ("file_source", DataType::Utf8),
         ("first_row_id", DataType::Int64),
         (
@@ -1728,4 +1729,130 @@ async fn test_buckets_system_table() {
         actual, expected,
         "$buckets must aggregate $files by (partition, bucket)"
     );
+}
+
+#[tokio::test]
+async fn test_file_key_ranges_matches_file_metadata() {
+    use futures::TryStreamExt;
+    let (ctx, catalog, _tmp) = create_context().await;
+    let table = catalog
+        .get_table(&Identifier::new("default", FIXTURE_TABLE))
+        .await
+        .unwrap();
+    let expected = run_sql(&ctx, &format!("SELECT partition, bucket, file_path, file_format, schema_id, level, record_count, file_size_in_bytes, min_key, max_key, first_row_id FROM paimon.default.{FIXTURE_TABLE}$files")).await;
+    let actual: Vec<_> = paimon_datafusion::read_system_table(table.clone(), "file_key_ranges")
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(actual, expected);
+    assert_eq!(actual[0].num_columns(), 11);
+    assert!(actual[0].num_rows() > 0);
+    let projected = run_sql(&ctx, &format!("SELECT file_path FROM paimon.default.{FIXTURE_TABLE}$file_key_ranges WHERE record_count > 0 LIMIT 1")).await;
+    assert_eq!(projected[0].num_rows(), 1);
+    assert_eq!(projected[0].num_columns(), 1);
+    let empty = table.copy_with_pinned_snapshot(None);
+    let batches: Vec<_> = paimon_datafusion::read_system_table(empty, "file_key_ranges")
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 0);
+}
+
+#[tokio::test]
+async fn test_resolved_system_table_reader_preserves_guards_and_schema() {
+    use futures::TryStreamExt;
+    let (_ctx, catalog, _tmp) = create_context().await;
+    let table = catalog
+        .get_table(&Identifier::new("default", FIXTURE_TABLE))
+        .await
+        .unwrap();
+    for name in [
+        "snapshots",
+        "schemas",
+        "options",
+        "manifests",
+        "files",
+        "buckets",
+        "tags",
+        "branches",
+        "consumers",
+        "file_key_ranges",
+        "table_indexes",
+    ] {
+        let stream = paimon_datafusion::read_system_table(table.clone(), name)
+            .await
+            .unwrap();
+        let schema = stream.schema();
+        let batches: Vec<_> = stream.try_collect().await.unwrap();
+        assert!(!schema.fields().is_empty(), "{name}");
+        assert!(
+            batches.iter().all(|batch| batch.schema() == schema),
+            "{name}"
+        );
+    }
+    for name in ["partitions", "unknown"] {
+        let error = match paimon_datafusion::read_system_table(table.clone(), name).await {
+            Ok(_) => panic!("{name} must require a catalog or be unknown"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("requires a catalog or is unknown"));
+    }
+    let denied = table.copy_with_options(std::collections::HashMap::from([(
+        "query-auth.enabled".to_string(),
+        "true".to_string(),
+    )]));
+    let error = match paimon_datafusion::read_system_table(denied, "options").await {
+        Ok(_) => panic!("Authorization must be checked before reading metadata"),
+        Err(error) => error.to_string(),
+    };
+    assert!(error.contains("query-auth.enabled"));
+}
+
+#[tokio::test]
+async fn test_options_ignore_resolved_dynamic_overrides() {
+    use futures::TryStreamExt;
+    let (_ctx, catalog, _tmp) = create_context().await;
+    let table = catalog
+        .get_table(&Identifier::new("default", FIXTURE_TABLE))
+        .await
+        .unwrap();
+    let copy = table.copy_with_options(std::collections::HashMap::from([
+        ("file.format".to_string(), "csv".to_string()),
+        ("metadata.runtime-only".to_string(), "private".to_string()),
+    ]));
+    let batches: Vec<_> = paimon_datafusion::read_system_table(copy, "options")
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    let rows: std::collections::HashMap<_, _> = batches
+        .iter()
+        .flat_map(|batch| {
+            let keys = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let values = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            (0..batch.num_rows())
+                .map(|index| {
+                    (
+                        keys.value(index).to_string(),
+                        values.value(index).to_string(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(&rows, table.schema().options());
+    assert!(!rows.contains_key("metadata.runtime-only"));
 }

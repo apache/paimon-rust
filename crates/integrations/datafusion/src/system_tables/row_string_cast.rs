@@ -17,7 +17,7 @@
 
 use std::num::NonZeroI32;
 
-use chrono::{Local, NaiveDate, NaiveDateTime, TimeZone, Timelike};
+use chrono::NaiveDate;
 use lexical_write_float::{format::STANDARD, Options, ToLexicalWithOptions};
 use paimon::spec::{BinaryRow, DataField, DataType, Datum};
 use paimon::{Error, Result};
@@ -58,13 +58,15 @@ pub(super) fn format_row_as_java_array_string(
         if pos > 0 {
             out.push_str(", ");
         }
-        out.push_str(&format_field(row, pos, field.data_type())?);
+        out.push_str(
+            &format_object_field(row, pos, field.data_type())?.unwrap_or_else(|| "null".into()),
+        );
     }
     out.push(']');
     Ok(out)
 }
 
-pub(super) fn format_row_field_as_java_cast_string(
+pub(super) fn format_row_field_as_java_object_string(
     row: &BinaryRow,
     pos: usize,
     data_type: &DataType,
@@ -73,7 +75,26 @@ pub(super) fn format_row_field_as_java_cast_string(
     if row.is_null_at(pos) {
         return Ok(None);
     }
-    format_field(row, pos, data_type).map(Some)
+    format_object_field(row, pos, data_type)
+}
+
+fn format_object_field(
+    row: &BinaryRow,
+    pos: usize,
+    data_type: &DataType,
+) -> Result<Option<String>> {
+    let value = match row.get_datum(pos, data_type)? {
+        None => return Ok(None),
+        Some(Datum::Date(value) | Datum::Time(value)) => value.to_string(),
+        Some(Datum::Timestamp { millis, nanos } | Datum::LocalZonedTimestamp { millis, nanos }) => {
+            paimon::common::format_iso_timestamp(
+                millis.div_euclid(1000),
+                (millis.rem_euclid(1000) * 1_000_000 + i64::from(nanos)) as u32,
+            )
+        }
+        Some(_) => format_field(row, pos, data_type)?,
+    };
+    Ok(Some(value))
 }
 
 fn validate_row(row: &BinaryRow, fields: &[DataField]) -> Result<()> {
@@ -154,11 +175,18 @@ fn format_field(row: &BinaryRow, pos: usize, data_type: &DataType) -> Result<Str
             },
             DataType::Decimal(_),
         ) => Ok(format_decimal_plain(unscaled, scale)),
-        (Datum::Timestamp { millis, nanos }, DataType::Timestamp(t)) => {
-            format_timestamp(millis, nanos, t.precision())
-        }
-        (Datum::LocalZonedTimestamp { millis, nanos }, DataType::LocalZonedTimestamp(t)) => {
-            format_local_zoned_timestamp(millis, nanos, t.precision())
+        (Datum::Timestamp { .. } | Datum::LocalZonedTimestamp { .. }, _) => {
+            let source = row.field_to_arrow(pos, data_type)?;
+            let target = DataType::VarChar(paimon::spec::VarCharType::string_type());
+            let strings =
+                paimon::arrow::cast_array_for_schema_evolution(&source, data_type, &target)?;
+            let strings = strings
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::StringArray>()
+                .ok_or_else(|| {
+                    data_invalid("Timestamp string cast returned a non-string array".into())
+                })?;
+            Ok(strings.value(0).to_string())
         }
         (datum, _) => Err(data_invalid(format!(
             "Decoded row string cast datum {datum:?} does not match type {data_type:?}"
@@ -264,76 +292,6 @@ fn format_decimal_plain(unscaled: i128, scale: u32) -> String {
     }
 }
 
-fn format_timestamp(millis: i64, nano_of_milli: i32, precision: u32) -> Result<String> {
-    format_timestamp_naive(millis_to_naive_datetime(millis, nano_of_milli)?, precision)
-}
-
-fn format_local_zoned_timestamp(millis: i64, nano_of_milli: i32, precision: u32) -> Result<String> {
-    let nanos = timestamp_nanos(millis, nano_of_milli)?;
-    let secs = millis.div_euclid(1000);
-    let local = Local
-        .timestamp_opt(secs, nanos)
-        .single()
-        .ok_or_else(|| data_invalid(format!("Invalid local zoned timestamp millis {millis}")))?;
-    format_timestamp_naive(local.naive_local(), precision)
-}
-
-fn format_timestamp_naive(dt: NaiveDateTime, precision: u32) -> Result<String> {
-    let precision = usize::try_from(precision).map_err(|e| Error::DataInvalid {
-        message: format!("Timestamp row string cast precision {precision} is invalid"),
-        source: Some(Box::new(e)),
-    })?;
-    if precision > 9 {
-        return Err(data_invalid(format!(
-            "Timestamp row string cast precision {precision} is outside 0..=9"
-        )));
-    }
-
-    let mut out = dt.format("%Y-%m-%d %H:%M:%S").to_string();
-    if precision > 0 {
-        let fraction = format!("{:09}", dt.nanosecond());
-        out.push('.');
-        out.push_str(&fraction[..precision]);
-    }
-    Ok(out)
-}
-
-fn millis_to_naive_datetime(millis: i64, nano_of_milli: i32) -> Result<NaiveDateTime> {
-    let nanos = timestamp_nanos(millis, nano_of_milli)?;
-    let days = millis.div_euclid(MILLIS_PER_DAY);
-    let millis_of_day = millis.rem_euclid(MILLIS_PER_DAY) as u64;
-    let nano_of_day = millis_of_day * 1_000_000 + u64::from(nanos % 1_000_000);
-    let ce_days = days.checked_add(719_163).ok_or_else(|| {
-        data_invalid(format!(
-            "Timestamp row string cast millis {millis} is outside supported range"
-        ))
-    })?;
-    let ce_days = i32::try_from(ce_days).map_err(|e| Error::DataInvalid {
-        message: format!("Timestamp row string cast millis {millis} is outside supported range"),
-        source: Some(Box::new(e)),
-    })?;
-    let date = NaiveDate::from_num_days_from_ce_opt(ce_days).ok_or_else(|| {
-        data_invalid(format!(
-            "Timestamp row string cast millis {millis} is outside supported range"
-        ))
-    })?;
-    let time = chrono::NaiveTime::from_num_seconds_from_midnight_opt(
-        (nano_of_day / 1_000_000_000) as u32,
-        (nano_of_day % 1_000_000_000) as u32,
-    )
-    .ok_or_else(|| data_invalid(format!("Invalid timestamp millis {millis}")))?;
-    Ok(NaiveDateTime::new(date, time))
-}
-
-fn timestamp_nanos(millis: i64, nano_of_milli: i32) -> Result<u32> {
-    if !(0..=999_999).contains(&nano_of_milli) {
-        return Err(data_invalid(format!(
-            "Timestamp nano-of-millisecond {nano_of_milli} is outside 0..=999999"
-        )));
-    }
-    Ok(millis.rem_euclid(1000) as u32 * 1_000_000 + nano_of_milli as u32)
-}
-
 fn data_invalid(message: String) -> Error {
     Error::DataInvalid {
         message,
@@ -344,6 +302,7 @@ fn data_invalid(message: String) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::{Local, TimeZone};
     use paimon::spec::{
         BigIntType, BinaryType, BlobType, BooleanType, CharType, DateType, DecimalType, DoubleType,
         FloatType, IntType, LocalZonedTimestampType, SmallIntType, TimeType, TimestampType,
@@ -537,6 +496,51 @@ mod tests {
             )])
             .unwrap(),
             format!("{{{expected}}}")
+        );
+    }
+
+    #[test]
+    fn metadata_objects_use_internal_values_and_iso_timestamps() {
+        let timestamp_type = DataType::Timestamp(TimestampType::new(3).unwrap());
+        let date_type = DataType::Date(DateType::new());
+        let time_type = DataType::Time(TimeType::new(3).unwrap());
+        let values = [
+            (Some(Datum::Date(1)), date_type),
+            (Some(Datum::Time(42)), time_type),
+            (
+                Some(Datum::Timestamp {
+                    millis: 123,
+                    nanos: 0,
+                }),
+                timestamp_type,
+            ),
+            (
+                Some(Datum::LocalZonedTimestamp {
+                    millis: 0,
+                    nanos: 0,
+                }),
+                DataType::LocalZonedTimestamp(LocalZonedTimestampType::new(3).unwrap()),
+            ),
+        ];
+        let datums: Vec<_> = values
+            .iter()
+            .map(|(value, typ)| (value.as_ref(), typ))
+            .collect();
+        let row = BinaryRow::from_datums(&datums);
+        let fields: Vec<_> = values
+            .iter()
+            .enumerate()
+            .map(|(i, (_, typ))| DataField::new(i as i32, i.to_string(), typ.clone()))
+            .collect();
+        assert_eq!(
+            format_row_as_java_array_string(&row, &fields).unwrap(),
+            "[1, 42, 1970-01-01T00:00:00.123, 1970-01-01T00:00]"
+        );
+        assert_eq!(
+            format_row_field_as_java_object_string(&row, 2, fields[2].data_type())
+                .unwrap()
+                .as_deref(),
+            Some("1970-01-01T00:00:00.123")
         );
     }
 

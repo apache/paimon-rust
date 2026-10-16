@@ -20,7 +20,7 @@
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
-use datafusion::arrow::array::{Int64Array, RecordBatch, StringArray, TimestampMillisecondArray};
+use datafusion::arrow::array::{Int64Array, RecordBatch, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use datafusion::catalog::Session;
 use datafusion::datasource::memory::MemorySourceConfig;
@@ -117,7 +117,7 @@ impl TableProvider for SchemasTable {
                 Arc::new(StringArray::from(primary_keys_json)),
                 Arc::new(StringArray::from(options_json)),
                 Arc::new(StringArray::from(comments)),
-                Arc::new(TimestampMillisecondArray::from(update_times)),
+                super::local_timestamp_column(update_times)?,
             ],
         )?;
 

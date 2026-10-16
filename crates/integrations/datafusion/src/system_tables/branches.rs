@@ -20,7 +20,7 @@
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
-use datafusion::arrow::array::{RecordBatch, StringArray, TimestampMillisecondArray};
+use datafusion::arrow::array::{RecordBatch, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use datafusion::catalog::Session;
 use datafusion::datasource::memory::MemorySourceConfig;
@@ -85,7 +85,7 @@ impl TableProvider for BranchesTable {
             schema.clone(),
             vec![
                 Arc::new(StringArray::from(names)),
-                Arc::new(TimestampMillisecondArray::from(create_times)),
+                super::local_timestamp_column(create_times)?,
             ],
         )?;
 

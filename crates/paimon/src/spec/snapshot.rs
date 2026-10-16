@@ -119,6 +119,10 @@ pub struct Snapshot {
     #[builder(default = None)]
     #[serde(skip_serializing_if = "Option::is_none")]
     next_row_id: Option<i64>,
+    /// Engine version that produced this snapshot, absent in older metadata.
+    #[builder(default = None)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    writer_version: Option<String>,
 }
 
 impl Snapshot {
@@ -238,6 +242,11 @@ impl Snapshot {
     #[inline]
     pub fn next_row_id(&self) -> Option<i64> {
         self.next_row_id
+    }
+
+    /// Get the writer version, when recorded by the producer.
+    pub fn writer_version(&self) -> Option<&str> {
+        self.writer_version.as_deref()
     }
 
     /// Get the commit kind of this snapshot.

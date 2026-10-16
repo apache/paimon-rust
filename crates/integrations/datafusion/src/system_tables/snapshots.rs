@@ -20,7 +20,7 @@
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
-use datafusion::arrow::array::{Int64Array, RecordBatch, StringArray, TimestampMillisecondArray};
+use datafusion::arrow::array::{Int64Array, RecordBatch, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use datafusion::catalog::Session;
 use datafusion::datasource::memory::MemorySourceConfig;
@@ -59,6 +59,7 @@ fn snapshots_schema() -> SchemaRef {
                 Field::new("changelog_record_count", DataType::Int64, true),
                 Field::new("watermark", DataType::Int64, true),
                 Field::new("next_row_id", DataType::Int64, true),
+                Field::new("writer_version", DataType::Utf8, true),
             ]))
         })
         .clone()
@@ -107,6 +108,7 @@ impl TableProvider for SnapshotsTable {
         let mut watermarks: Vec<Option<i64>> = Vec::with_capacity(n);
         let mut next_row_ids: Vec<Option<i64>> = Vec::with_capacity(n);
 
+        let mut writer_versions = Vec::with_capacity(n);
         for snap in &snapshots {
             snapshot_ids.push(snap.id());
             schema_ids.push(snap.schema_id());
@@ -122,6 +124,7 @@ impl TableProvider for SnapshotsTable {
             changelog_record_counts.push(snap.changelog_record_count());
             watermarks.push(snap.watermark());
             next_row_ids.push(snap.next_row_id());
+            writer_versions.push(snap.writer_version());
         }
 
         let schema = snapshots_schema();
@@ -133,7 +136,7 @@ impl TableProvider for SnapshotsTable {
                 Arc::new(StringArray::from(commit_users)),
                 Arc::new(Int64Array::from(commit_identifiers)),
                 Arc::new(StringArray::from(commit_kinds)),
-                Arc::new(TimestampMillisecondArray::from(commit_times)),
+                super::local_timestamp_column(commit_times)?,
                 Arc::new(StringArray::from(base_manifest_lists)),
                 Arc::new(StringArray::from(delta_manifest_lists)),
                 Arc::new(StringArray::from(changelog_manifest_lists)),
@@ -142,6 +145,7 @@ impl TableProvider for SnapshotsTable {
                 Arc::new(Int64Array::from(changelog_record_counts)),
                 Arc::new(Int64Array::from(watermarks)),
                 Arc::new(Int64Array::from(next_row_ids)),
+                Arc::new(StringArray::from(writer_versions)),
             ],
         )?;
 

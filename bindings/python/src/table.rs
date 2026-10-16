@@ -18,6 +18,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use futures::TryStreamExt;
 use paimon::catalog::{Identifier, RESTToken};
 use paimon::io::FileIO;
 use paimon::spec::TableSchema;
@@ -28,9 +29,9 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
 use crate::context::complete_storage_options;
-use crate::error::to_py_err;
+use crate::error::{df_to_py_err, to_py_err};
 use crate::partition::PyPartitionStat;
-use crate::read::PyReadBuilder;
+use crate::read::{PyReadBuilder, PyRecordBatchReader};
 use crate::schema::PyTableSchema;
 use crate::snapshot::PySnapshot;
 use crate::tag::PyTag;
@@ -196,6 +197,23 @@ impl PyTable {
             }
             _ => Ok(PyReadBuilder::new(Arc::clone(&self.inner))),
         }
+    }
+
+    /// Read metadata through the existing system-table providers.
+    fn _read_system_table(&self, py: Python<'_>, name: &str) -> PyResult<PyRecordBatchReader> {
+        let stream = py
+            .detach(|| {
+                runtime().block_on(paimon_datafusion::read_system_table(
+                    self.inner.as_ref().clone(),
+                    name,
+                ))
+            })
+            .map_err(df_to_py_err)?;
+        let schema = stream.schema();
+        Ok(PyRecordBatchReader::from_py_stream(
+            Some(schema),
+            Box::pin(stream.map_err(df_to_py_err)),
+        ))
     }
 
     fn new_full_text_search_builder(&self) -> crate::full_text_search::PyFullTextSearchBuilder {

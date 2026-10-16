@@ -68,8 +68,15 @@ impl TableProvider for OptionsTable {
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        let manager = self.table.schema_manager();
+        let latest = crate::runtime::await_with_runtime(async move { manager.latest().await })
+            .await
+            .map_err(crate::error::to_datafusion_error)?
+            .ok_or_else(|| {
+                datafusion::error::DataFusionError::Plan("Table does not exist".to_string())
+            })?;
         // Java uses LinkedHashMap insertion order; HashMap has none — sort for stable output.
-        let mut entries: Vec<(&String, &String)> = self.table.schema().options().iter().collect();
+        let mut entries: Vec<(&String, &String)> = latest.options().iter().collect();
         entries.sort_by(|a, b| a.0.cmp(b.0));
 
         let keys = StringArray::from_iter_values(entries.iter().map(|(k, _)| k.as_str()));

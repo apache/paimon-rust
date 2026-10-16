@@ -115,7 +115,7 @@ impl TableProvider for TagsTable {
                 Arc::new(StringArray::from(tag_names)),
                 Arc::new(Int64Array::from(snapshot_ids)),
                 Arc::new(Int64Array::from(schema_ids)),
-                Arc::new(TimestampMillisecondArray::from(commit_times)),
+                super::local_timestamp_column(commit_times)?,
                 Arc::new(Int64Array::from(record_counts)),
                 Arc::new(TimestampMillisecondArray::from(create_times)),
                 Arc::new(StringArray::from(time_retained)),

@@ -47,6 +47,22 @@ mod snapshots;
 mod table_indexes;
 mod tags;
 
+/// Metadata instants are exposed as Java TIMESTAMP in the system default zone.
+/// Reuse the core LTZ cast so DST, negative and extreme epochs use reader rules.
+fn local_timestamp_column(values: Vec<i64>) -> DFResult<datafusion::arrow::array::ArrayRef> {
+    use datafusion::arrow::array::{ArrayRef, TimestampMillisecondArray};
+    use paimon::spec::{DataType, LocalZonedTimestampType, TimestampType};
+    let array: ArrayRef = Arc::new(TimestampMillisecondArray::from(values));
+    paimon::arrow::cast_array_for_schema_evolution(
+        &array,
+        &DataType::LocalZonedTimestamp(
+            LocalZonedTimestampType::new(3).map_err(to_datafusion_error)?,
+        ),
+        &DataType::Timestamp(TimestampType::new(3).map_err(to_datafusion_error)?),
+    )
+    .map_err(to_datafusion_error)
+}
+
 type Builder = fn(Table) -> DFResult<Arc<dyn TableProvider>>;
 
 // Most system tables only need the base `Table`. `partitions` is special-cased
@@ -59,6 +75,7 @@ const TABLES: &[(&str, Builder)] = &[
     ("buckets", buckets::build),
     ("consumers", consumers::build),
     ("files", files::build),
+    ("file_key_ranges", files::build_key_ranges),
     ("manifests", manifests::build),
     ("options", options::build),
     ("physical_files_size", physical_files_size::build),
@@ -76,6 +93,7 @@ const SYSTEM_TABLE_NAMES: &[&str] = &[
     "buckets",
     "consumers",
     "files",
+    "file_key_ranges",
     "manifests",
     "options",
     "partitions",
@@ -134,6 +152,27 @@ fn wrap_to_system_table(name: &str, base_table: Table) -> Option<DFResult<Arc<dy
         .iter()
         .find(|(n, _)| name.eq_ignore_ascii_case(n))
         .map(|(_, build)| build(base_table))
+}
+
+/// Read catalog-independent metadata using the existing system-table providers.
+/// The resolved table retains its branch, snapshot and FileIO environment.
+pub async fn read_system_table(
+    table: Table,
+    name: &str,
+) -> DFResult<datafusion::physical_plan::SendableRecordBatchStream> {
+    crate::table_loader::ensure_paimon_served(&table, table.identifier())?;
+    paimon::spec::CoreOptions::new(table.schema().options())
+        .ensure_read_authorized()
+        .map_err(to_datafusion_error)?;
+    let provider = wrap_to_system_table(name, table).ok_or_else(|| {
+        DataFusionError::Plan(format!(
+            "System table '{name}' requires a catalog or is unknown"
+        ))
+    })??;
+    datafusion::prelude::SessionContext::new()
+        .read_table(provider)?
+        .execute_stream()
+        .await
 }
 
 pub(crate) fn provider_for_table(

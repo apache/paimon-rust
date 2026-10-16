@@ -99,6 +99,33 @@ impl TableSchema {
         &self.fields
     }
 
+    /// Fields physically present in a file, following Java TableSchema.dataFileSchema.
+    /// Explicit write columns retain their order and omit metadata columns.
+    pub fn data_file_fields(&self, write_cols: Option<&[String]>) -> Vec<DataField> {
+        if let Some(columns) = write_cols {
+            return columns
+                .iter()
+                .filter_map(|name| self.fields.iter().find(|f| f.name() == name).cloned())
+                .collect();
+        }
+        let options = CoreOptions::new(&self.options);
+        if !options.data_evolution_enabled()
+            || !options.data_evolution_write_cols_optimization_enabled()
+        {
+            return self.fields.clone();
+        }
+        let inline = options.blob_inline_fields();
+        self.fields
+            .iter()
+            .filter(|field| {
+                !(field.data_type().is_blob_file_field() && !inline.contains(field.name())
+                    || options.vector_file_format().is_some()
+                        && matches!(field.data_type(), DataType::Vector(_)))
+            })
+            .cloned()
+            .collect()
+    }
+
     /// Logical fields followed by the metadata available to table reads.
     /// Row tracking provides ROW_ID and SEQUENCE_NUMBER; primary-key files
     /// provide SEQUENCE_NUMBER independently of row tracking. Keeping this
