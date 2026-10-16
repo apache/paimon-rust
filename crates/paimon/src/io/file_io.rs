@@ -656,8 +656,12 @@ impl FileIO {
     /// Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/fs/FileIO.java#L139>
     pub async fn delete_dir(&self, path: &str) -> Result<()> {
         let (op, relative_path, cache_path) = self.create_with_cache_path(path).await?;
+        // Without a trailing `/`, OpenDAL trims the path's surrounding whitespace,
+        // and a recursive delete it emulates by listing removes every key with
+        // this prefix.
+        let dir_path = normalize_root(relative_path.as_ref());
 
-        op.delete_with(relative_path.as_ref())
+        op.delete_with(&dir_path)
             .recursive(true)
             .await
             .map_err(|error| {
@@ -2043,6 +2047,55 @@ mod file_action_test {
                 .unwrap();
             assert!(file_io.exists(&path).await.unwrap());
         });
+    }
+
+    #[tokio::test]
+    async fn test_delete_dir_keeps_directories_sharing_its_prefix() {
+        // The memory backend deletes recursively by key prefix, as S3 and OSS do.
+        let file_io = setup_memory_file_io();
+        let partitions = ["month=1", "month=10", "month=2"];
+        for partition in partitions {
+            file_io
+                .new_output(&format!("memory:/delete_dir_prefix/{partition}/data"))
+                .unwrap()
+                .write(Bytes::from("data"))
+                .await
+                .unwrap();
+        }
+
+        file_io
+            .delete_dir("memory:/delete_dir_prefix/month=1")
+            .await
+            .unwrap();
+
+        let mut kept = Vec::new();
+        for partition in partitions {
+            let path = format!("memory:/delete_dir_prefix/{partition}/data");
+            if file_io.exists(&path).await.unwrap() {
+                kept.push(partition);
+            }
+        }
+        assert_eq!(kept, ["month=10", "month=2"]);
+    }
+
+    // Windows drops trailing spaces from file names.
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn test_delete_dir_keeps_the_name_without_its_trailing_space() {
+        let dir = tempdir().unwrap();
+        for name in ["t1", "t1 "] {
+            fs::create_dir(dir.path().join(name)).unwrap();
+            fs::write(dir.path().join(name).join("data"), b"data").unwrap();
+        }
+        let file_io = setup_fs_file_io();
+
+        file_io
+            .delete_dir(&local_file_path(&dir.path().join("t1 ")))
+            .await
+            .unwrap();
+
+        assert!(dir.path().join("t1").exists());
+        assert!(!dir.path().join("t1 ").exists());
     }
 }
 

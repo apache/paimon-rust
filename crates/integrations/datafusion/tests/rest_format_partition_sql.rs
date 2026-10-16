@@ -564,6 +564,33 @@ async fn test_drop_partition_leaves_a_custom_location_in_place() {
 
 #[cfg(not(windows))]
 #[tokio::test]
+async fn test_drop_partition_deletes_the_directory_it_unregisters() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (server, context) =
+        setup_rest_table(&temp_dir, format_table_schema(&[("dt", varchar())])).await;
+    // The two partitions differ only by a trailing space, which the deleted path must keep.
+    common::exec(
+        &context,
+        &format!("ALTER TABLE {TABLE_NAME} ADD PARTITION (dt = 'a') PARTITION (dt = 'a ')"),
+    )
+    .await;
+    assert!(temp_dir.path().join("dt=a ").is_dir());
+
+    common::exec(
+        &context,
+        &format!("ALTER TABLE {TABLE_NAME} DROP PARTITION (dt = 'a ')"),
+    )
+    .await;
+    assert_eq!(
+        server.table_partition_specs(DATABASE, TABLE),
+        vec![spec(&[("dt", "a")])]
+    );
+    assert!(temp_dir.path().join("dt=a").is_dir());
+    assert!(!temp_dir.path().join("dt=a ").exists());
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
 async fn test_msck_repair_reconciles_registrations_with_directories() {
     let temp_dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(temp_dir.path().join("dt=2026-07-21")).unwrap();
