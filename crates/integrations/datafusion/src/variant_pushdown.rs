@@ -234,7 +234,7 @@ impl ExtensionPlanner for VariantExtractionExtensionPlanner {
             .await
             .map_err(to_datafusion_error)?;
 
-        let scan_stats = plan.scan_stats().cloned();
+        let scan_stats = plan.stats().cloned();
         let splits = plan.into_splits();
         let target = session_state.config_options().execution.target_partitions;
         let planned_partitions: Vec<Arc<[_]>> = if splits.is_empty() {

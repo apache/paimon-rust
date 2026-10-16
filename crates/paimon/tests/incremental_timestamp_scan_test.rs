@@ -165,7 +165,7 @@ async fn timestamp_options_select_events_and_preserve_end_snapshot() {
                 .plan()
                 .await
                 .unwrap();
-            let scan_stats = plan.scan_stats().cloned().unwrap();
+            let scan_stats = plan.stats().cloned().unwrap();
             assert_eq!(scan_stats.snapshot_id, snapshot);
             assert_eq!(scan_stats.final_splits, plan.splits().len());
             assert_eq!(
@@ -196,7 +196,7 @@ async fn timestamp_auto_uses_physical_changelog_and_preserves_retracts() {
         .plan()
         .await
         .unwrap();
-    let scan_stats = plan.scan_stats().cloned().unwrap();
+    let scan_stats = plan.stats().cloned().unwrap();
     assert_eq!(plan.snapshot_id(), Some(3));
     assert!(plan.splits().iter().all(|split| split.snapshot_id() == 3));
     assert!(scan_stats.manifest_entries_read >= 2);

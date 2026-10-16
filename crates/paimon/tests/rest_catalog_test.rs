@@ -5246,7 +5246,7 @@ async fn test_query_auth_filters_masked_partition_values() {
                 .plan()
                 .await
                 .unwrap();
-            let scan_stats = plan.scan_stats().cloned().unwrap();
+            let scan_stats = plan.stats().cloned().unwrap();
             assert_eq!(scan_stats.limit, None);
             assert!(plan
                 .splits()
@@ -5282,7 +5282,7 @@ async fn test_query_auth_filters_masked_partition_values() {
             .plan()
             .await
             .unwrap();
-        let scan_stats = plan.scan_stats().cloned().unwrap();
+        let scan_stats = plan.stats().cloned().unwrap();
         assert_eq!(scan_stats.limit, Some(1));
         assert!(!plan.splits().is_empty());
         let rows = ids(&read_all(&plain).await.unwrap());

@@ -154,7 +154,7 @@ async fn test_scan_stats_records_not_in_data_stats_pruning() {
         .plan()
         .await
         .unwrap();
-    let all_stats = _plan.scan_stats().cloned().unwrap();
+    let all_stats = _plan.stats().cloned().unwrap();
     assert_eq!(all_stats.final_files, 3);
 
     let mut reader = table.new_read_builder();
@@ -166,7 +166,7 @@ async fn test_scan_stats_records_not_in_data_stats_pruning() {
         .plan()
         .await
         .unwrap();
-    let not_in_stats = _not_in_plan.scan_stats().cloned().unwrap();
+    let not_in_stats = _not_in_plan.stats().cloned().unwrap();
 
     assert_eq!(
         not_in_stats.manifest_entries_pruned_by_data_stats, 1,
@@ -196,7 +196,7 @@ async fn test_scan_stats_records_partition_pruning() {
         .plan()
         .await
         .unwrap();
-    let all_stats = _all_plan.scan_stats().cloned().unwrap();
+    let all_stats = _all_plan.stats().cloned().unwrap();
     assert_eq!(all_stats.snapshot_id, Some(3));
     assert_eq!(all_stats.final_files, 3);
 
@@ -214,7 +214,7 @@ async fn test_scan_stats_records_partition_pruning() {
         .plan()
         .await
         .unwrap();
-    let partition_stats = _partition_plan.scan_stats().cloned().unwrap();
+    let partition_stats = _partition_plan.stats().cloned().unwrap();
     assert!(
         partition_stats.manifest_files_after_partition_pruning
             < partition_stats.manifest_files_before_partition_pruning
@@ -319,7 +319,7 @@ async fn test_scan_stats_records_bucket_limit_and_time_travel() {
         .plan()
         .await
         .unwrap();
-    let bucket_stats = _bucket_plan.scan_stats().cloned().unwrap();
+    let bucket_stats = _bucket_plan.stats().cloned().unwrap();
     assert!(
         bucket_stats.manifest_entries_pruned_by_bucket > 0,
         "bucket-key predicate should prune manifest entries by bucket: {bucket_stats:?}"
@@ -333,7 +333,7 @@ async fn test_scan_stats_records_bucket_limit_and_time_travel() {
         .plan()
         .await
         .unwrap();
-    let full_stats = _full_plan.scan_stats().cloned().unwrap();
+    let full_stats = _full_plan.stats().cloned().unwrap();
     let mut limit_reader = table.new_read_builder();
     limit_reader.with_limit(1);
     let _limit_plan = limit_reader
@@ -343,7 +343,7 @@ async fn test_scan_stats_records_bucket_limit_and_time_travel() {
         .plan()
         .await
         .unwrap();
-    let limit_stats = _limit_plan.scan_stats().cloned().unwrap();
+    let limit_stats = _limit_plan.stats().cloned().unwrap();
     assert!(
         limit_stats.limit_early_stopped,
         "LIMIT should stop split construction early when no data residual exists: {limit_stats:?}"
@@ -365,7 +365,7 @@ async fn test_scan_stats_records_bucket_limit_and_time_travel() {
         .plan()
         .await
         .unwrap();
-    let snapshot_one_stats = _snapshot_one_plan.scan_stats().cloned().unwrap();
+    let snapshot_one_stats = _snapshot_one_plan.stats().cloned().unwrap();
     assert_eq!(snapshot_one_stats.snapshot_id, Some(1));
 
     let _latest_plan = table
@@ -376,7 +376,7 @@ async fn test_scan_stats_records_bucket_limit_and_time_travel() {
         .plan()
         .await
         .unwrap();
-    let latest_stats = _latest_plan.scan_stats().cloned().unwrap();
+    let latest_stats = _latest_plan.stats().cloned().unwrap();
     assert_eq!(latest_stats.snapshot_id, Some(2));
     assert!(
         snapshot_one_stats.final_files < latest_stats.final_files,

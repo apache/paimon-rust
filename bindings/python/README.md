@@ -165,13 +165,13 @@ from the resulting plan:
 
 ```python
 plan = table.new_read_builder().new_scan().with_stats().plan()
-scan_stats = plan.scan_stats()
+scan_stats = plan.stats()
 print(scan_stats.manifest_entries_read, scan_stats.entries_after_stats)
 ```
 
 The counters include candidates before LIMIT. Collection can decode more
 manifest entries than ordinary planning and does not read data files. Ordinary
-`plan()` returns `None` from `scan_stats()`. Combined incremental scans expose
+`plan()` returns `None` from `stats()`. Combined incremental scans expose
 the same API for their selected Delta or Changelog window.
 
 Use `with_stats(complete=False)` to record the work performed by ordinary

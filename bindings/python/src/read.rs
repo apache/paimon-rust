@@ -1112,9 +1112,9 @@ impl PyPlan {
         self.inner.snapshot_id()
     }
 
-    fn scan_stats(&self) -> Option<PyScanStats> {
+    fn stats(&self) -> Option<PyScanStats> {
         self.inner
-            .scan_stats()
+            .stats()
             .cloned()
             .map(|inner| PyScanStats { inner })
     }

@@ -236,7 +236,7 @@ async fn reads_java_written_file_indexes_and_prunes_data_files() {
             .plan()
             .await
             .expect("plan missing-value query");
-        let scan_stats = plan.scan_stats().cloned().unwrap();
+        let scan_stats = plan.stats().cloned().unwrap();
         assert_eq!(
             scan_stats.manifest_entries_pruned_by_data_stats, 0,
             "{}",

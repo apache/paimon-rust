@@ -34,7 +34,7 @@ pub enum ScanStatsMode {
 /// describe pruning at metadata planning time only; reader-side Parquet row
 /// group pruning and DataFusion residual filters are outside these statistics.
 /// [`super::TableScan::with_stats`] enables collection and stores
-/// this type on [`super::Plan::scan_stats`]. Complete collection decodes all
+/// this type on [`super::Plan::stats`]. Complete collection decodes all
 /// entries of partition-selected manifests and counts candidates before LIMIT.
 #[non_exhaustive]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

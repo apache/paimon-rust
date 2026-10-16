@@ -49,7 +49,7 @@ impl<'a> AuditLogScan<'a> {
         Self { scan }
     }
 
-    /// Collect statistics on the audit plan, accessible through [`Plan::scan_stats`].
+    /// Collect statistics on the audit plan, accessible through [`Plan::stats`].
     pub fn with_stats(mut self, mode: ScanStatsMode) -> crate::Result<Self> {
         self.scan = self.scan.with_stats(mode)?;
         Ok(self)
@@ -239,7 +239,7 @@ mod tests {
                 .plan()
                 .await
                 .unwrap();
-            let ordinary_stats = ordinary_plan.scan_stats().cloned().unwrap();
+            let ordinary_stats = ordinary_plan.stats().cloned().unwrap();
             assert!(ordinary_stats.manifest_entries_pruned_by_data_stats >= 1);
             assert_eq!(
                 ordinary_plan
@@ -257,7 +257,7 @@ mod tests {
                 .plan()
                 .await
                 .unwrap();
-            let audit_stats = audit_plan.scan_stats().cloned().unwrap();
+            let audit_stats = audit_plan.stats().cloned().unwrap();
             assert_eq!(audit_plan.snapshot_id(), ordinary_plan.snapshot_id());
             assert_eq!(audit_stats.snapshot_id, audit_plan.snapshot_id());
             assert_eq!(audit_stats.final_files, 2);

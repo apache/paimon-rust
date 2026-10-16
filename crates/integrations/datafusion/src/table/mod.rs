@@ -399,7 +399,7 @@ impl PaimonScanBuilder<'_> {
             (self.schema.clone(), read_fields)
         };
 
-        let scan_stats = self.plan.scan_stats().cloned();
+        let scan_stats = self.plan.stats().cloned();
         let splits = self.plan.into_splits();
         let planned_partitions: Vec<Arc<[_]>> = if splits.is_empty() {
             vec![Arc::from(Vec::new())]

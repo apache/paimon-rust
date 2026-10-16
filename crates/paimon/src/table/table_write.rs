@@ -3143,7 +3143,7 @@ pub(in crate::table) mod tests {
             .plan()
             .await
             .unwrap();
-        let scan_stats = _plan.scan_stats().cloned().unwrap();
+        let scan_stats = _plan.stats().cloned().unwrap();
 
         assert_eq!(scan_stats.final_files, 1, "scan scan_stats: {scan_stats:?}");
         assert!(
@@ -3452,7 +3452,7 @@ pub(in crate::table) mod tests {
             .plan()
             .await
             .unwrap();
-        let scan_stats = _plan.scan_stats().cloned().unwrap();
+        let scan_stats = _plan.stats().cloned().unwrap();
 
         assert!(
             scan_stats.final_files > 0,

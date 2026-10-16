@@ -323,7 +323,7 @@ impl<'a> IncrementalScan<'a> {
     }
 
     /// Collect pruning counters for [`Self::plan_combined`], available
-    /// through [`Plan::scan_stats`]. Per-snapshot and Diff planning do not
+    /// through [`Plan::stats`]. Per-snapshot and Diff planning do not
     /// represent one ordinary plan with a shared metadata funnel.
     pub fn with_stats(mut self, mode: ScanStatsMode) -> crate::Result<Self> {
         self.scan = self.scan.with_stats(mode)?;

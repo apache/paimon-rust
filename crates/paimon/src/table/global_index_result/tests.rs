@@ -55,7 +55,7 @@ async fn pk_supplied_result_preserves_snapshot_splits_and_ignores_planning_hints
         .plan()
         .await
         .unwrap();
-    let scan_stats = stats_plan.scan_stats().cloned().unwrap();
+    let scan_stats = stats_plan.stats().cloned().unwrap();
     for plan in [plan, stats_plan] {
         assert_eq!(plan.snapshot_id(), Some(42));
         assert_eq!(plan.splits(), std::slice::from_ref(&split));
@@ -158,7 +158,7 @@ async fn de_scores_follow_final_ranges_after_distribution_and_limit() {
         .await
         .unwrap();
     assert_eq!(statistics_plan.splits(), plan.splits());
-    let scan_stats = statistics_plan.scan_stats().unwrap();
+    let scan_stats = statistics_plan.stats().unwrap();
     assert!(scan_stats.complete);
     assert_eq!(scan_stats.snapshot_id, plan.snapshot_id());
     assert_eq!(
@@ -364,7 +364,7 @@ async fn de_combined_incremental_results_retain_the_window_and_scores() {
         .await
         .unwrap();
     assert_eq!(statistics_plan.splits(), plan.splits());
-    let scan_stats = statistics_plan.scan_stats().unwrap();
+    let scan_stats = statistics_plan.stats().unwrap();
     assert!(scan_stats.complete);
     assert_eq!(scan_stats.snapshot_id, Some(end));
     assert_eq!(

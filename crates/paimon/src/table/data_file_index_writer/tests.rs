@@ -1106,7 +1106,7 @@ async fn test_file_index_prunes_without_opening_data_file() {
                 .plan()
                 .await
                 .unwrap();
-            statistics_plan.scan_stats().cloned().unwrap()
+            statistics_plan.stats().cloned().unwrap()
         };
         assert_eq!(scan_stats.final_files, 1, "statistics must retain the file");
         storage.data_accesses.store(0, Ordering::SeqCst);
@@ -1160,7 +1160,7 @@ async fn test_pk_file_index_prunes_before_sort_merge_opens_data() {
                     .plan()
                     .await
                     .unwrap();
-                statistics_plan.scan_stats().cloned().unwrap()
+                statistics_plan.stats().cloned().unwrap()
             };
             assert_eq!(scan_stats.final_files, 1, "stats must retain the file");
             storage.data_accesses.store(0, Ordering::SeqCst);
@@ -1212,7 +1212,7 @@ async fn test_data_evolution_file_index_prunes_independent_file() {
                 .plan()
                 .await
                 .unwrap();
-            statistics_plan.scan_stats().cloned().unwrap()
+            statistics_plan.stats().cloned().unwrap()
         };
         assert_eq!(scan_stats.final_files, 1, "stats must retain the file");
         storage.data_accesses.store(0, Ordering::SeqCst);
@@ -1621,7 +1621,7 @@ async fn test_range_bitmap_append_range_pruning() {
                     .plan()
                     .await
                     .unwrap();
-                statistics_plan.scan_stats().cloned().unwrap()
+                statistics_plan.stats().cloned().unwrap()
             };
             assert_eq!(scan_stats.final_files, 1, "statistics must retain the file");
             storage.data_accesses.store(0, Ordering::SeqCst);

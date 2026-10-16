@@ -1631,7 +1631,7 @@ impl Plan {
 
     /// Statistics collected in the same planning pass. Returns `None` unless
     /// statistics were enabled on the scan with `with_stats`.
-    pub fn scan_stats(&self) -> Option<&super::ScanStats> {
+    pub fn stats(&self) -> Option<&super::ScanStats> {
         self.scan_stats.as_deref()
     }
 

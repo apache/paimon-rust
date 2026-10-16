@@ -1556,7 +1556,7 @@ impl<'a> TableScan<'a> {
         }
     }
 
-    /// Collect statistics in [`Self::plan`], available through [`Plan::scan_stats`].
+    /// Collect statistics in [`Self::plan`], available through [`Plan::stats`].
     /// Lightweight mode retains normal early pruning and LIMIT optimizations;
     /// complete mode counts all partition-selected manifest entries and
     /// candidates before LIMIT. Neither mode reads data files.
@@ -4107,7 +4107,7 @@ mod tests {
                     .plan()
                     .await
                     .unwrap();
-                let scan_stats = plan.scan_stats().cloned().unwrap();
+                let scan_stats = plan.stats().cloned().unwrap();
                 assert_eq!(plan.snapshot_id(), Some(2));
                 assert_eq!(scan_stats.final_splits, plan.splits().len());
                 if index < 4 {
@@ -4718,7 +4718,7 @@ mod tests {
             .plan()
             .await
             .unwrap();
-        let scan_stats = empty.scan_stats().cloned().unwrap();
+        let scan_stats = empty.stats().cloned().unwrap();
         assert!(empty.splits().is_empty());
         assert_eq!(empty.snapshot_id(), Some(1));
         assert_eq!(scan_stats.data_evolution_groups_pruned_by_stats, 1);
@@ -4884,7 +4884,7 @@ mod tests {
             .plan()
             .await
             .unwrap();
-        let scan_stats = plan.scan_stats().cloned().unwrap();
+        let scan_stats = plan.stats().cloned().unwrap();
         let planned_files = plan
             .splits()
             .iter()
@@ -5063,7 +5063,7 @@ mod tests {
             .plan()
             .await
             .unwrap();
-        let scan_stats = plan.scan_stats().cloned().unwrap();
+        let scan_stats = plan.stats().cloned().unwrap();
         let statistics_plan = scan
             .clone()
             .with_stats(crate::table::ScanStatsMode::Complete)
@@ -5071,7 +5071,7 @@ mod tests {
             .plan()
             .await
             .unwrap();
-        let stats = statistics_plan.scan_stats().unwrap();
+        let stats = statistics_plan.stats().unwrap();
         assert_eq!(plan.splits(), statistics_plan.splits());
         assert_eq!(
             plan.splits()
@@ -5142,7 +5142,7 @@ mod tests {
             .plan()
             .await
             .unwrap();
-        let scan_stats = plan.scan_stats().cloned().unwrap();
+        let scan_stats = plan.stats().cloned().unwrap();
         let planned = plan
             .splits()
             .iter()
@@ -5163,7 +5163,7 @@ mod tests {
             .plan()
             .await
             .unwrap();
-        let stats = statistics_plan.scan_stats().unwrap();
+        let stats = statistics_plan.stats().unwrap();
         assert_eq!(statistics_plan.splits(), plan.splits());
         assert_eq!(stats.manifest_entries_read, FILE_COUNT);
         assert_eq!(stats.entries_after_partition, FILE_COUNT);
@@ -5206,7 +5206,7 @@ mod tests {
             .plan()
             .await
             .unwrap();
-        let scan_stats = plan.scan_stats().cloned().unwrap();
+        let scan_stats = plan.stats().cloned().unwrap();
 
         assert_eq!(
             plan.splits()[0].data_files()[0].file_name,
@@ -5974,7 +5974,7 @@ mod tests {
             .plan()
             .await
             .unwrap();
-        let scan_stats = _plan.scan_stats().cloned().unwrap();
+        let scan_stats = _plan.stats().cloned().unwrap();
 
         assert_eq!(
             scan_stats.final_files, 1,
@@ -5999,7 +5999,7 @@ mod tests {
             .plan()
             .await
             .unwrap();
-        let stats = statistics_plan.scan_stats().unwrap();
+        let stats = statistics_plan.stats().unwrap();
         assert_eq!(
             stats,
             &super::super::ScanStats {
@@ -6030,12 +6030,12 @@ mod tests {
             }
             let scan = reader.new_scan();
             let expected = scan.plan().await.unwrap();
-            assert!(expected.scan_stats().is_none());
+            assert!(expected.stats().is_none());
             let scan = scan
                 .with_stats(crate::table::ScanStatsMode::Complete)
                 .unwrap();
             let plan = scan.plan().await.unwrap();
-            let stats = plan.scan_stats().unwrap();
+            let stats = plan.stats().unwrap();
             assert!(stats.complete);
             assert_eq!(stats.snapshot_id, plan.snapshot_id());
             assert_eq!(
@@ -6058,7 +6058,7 @@ mod tests {
             .plan()
             .await
             .unwrap();
-        let stats = plan.scan_stats().unwrap();
+        let stats = plan.stats().unwrap();
         assert_eq!(plan.snapshot_id(), None);
         assert!(plan.splits().is_empty());
         assert_eq!(
@@ -6124,7 +6124,7 @@ mod tests {
                 .plan()
                 .await
                 .unwrap();
-            let stats = plan.scan_stats().unwrap();
+            let stats = plan.stats().unwrap();
             assert_eq!(plan.splits(), expected.splits());
             assert_eq!(stats.manifest_entries_read, 3);
             assert_eq!(stats.entries_after_bucket, 3);
@@ -6182,7 +6182,7 @@ mod tests {
             .plan()
             .await
             .unwrap();
-        let stats = plan.scan_stats().unwrap();
+        let stats = plan.stats().unwrap();
         assert_eq!(plan.splits(), expected.splits());
         assert_eq!(stats.entries_potential_total, 8);
         assert_eq!(stats.manifest_entries_read, 8);
@@ -6198,7 +6198,7 @@ mod tests {
             .plan()
             .await
             .unwrap();
-        let stats = plan.scan_stats().unwrap();
+        let stats = plan.stats().unwrap();
         assert!(plan.splits().is_empty());
         assert_eq!(stats.entries_potential_total, 8);
         assert_eq!(stats.manifest_files_after_partition_pruning, 0);
@@ -6244,7 +6244,7 @@ mod tests {
                 .plan()
                 .await
                 .unwrap();
-            let stats = plan.scan_stats().unwrap();
+            let stats = plan.stats().unwrap();
             assert_eq!(plan.splits(), expected.splits());
             assert_eq!(stats.entries_potential_total, 4);
             assert_eq!(stats.entries_after_bucket, 4);
@@ -6376,7 +6376,7 @@ mod tests {
             .plan()
             .await
             .unwrap();
-        let scan_stats = plan.scan_stats().cloned().unwrap();
+        let scan_stats = plan.stats().cloned().unwrap();
         assert_eq!(
             scan_stats.manifest_entries_pruned_by_data_stats, 0,
             "non-key conjuncts must not file-prune a PK table: {scan_stats:?}"
@@ -6398,7 +6398,7 @@ mod tests {
             .plan()
             .await
             .unwrap();
-        let scan_stats = _plan.scan_stats().cloned().unwrap();
+        let scan_stats = _plan.stats().cloned().unwrap();
         assert!(
             scan_stats.manifest_entries_pruned_by_data_stats >= 2,
             "key conjuncts must still prune PK-table files: {scan_stats:?}"
@@ -6450,7 +6450,7 @@ mod tests {
             .plan()
             .await
             .unwrap();
-        let scan_stats = plan.scan_stats().cloned().unwrap();
+        let scan_stats = plan.stats().cloned().unwrap();
 
         assert_eq!(scan_stats.manifest_entries_pruned_by_data_stats, 0);
         assert_eq!(
@@ -6523,7 +6523,7 @@ mod tests {
             .plan()
             .await
             .unwrap();
-        let scan_stats = plan.scan_stats().cloned().unwrap();
+        let scan_stats = plan.stats().cloned().unwrap();
         assert!(
             scan_stats.manifest_entries_pruned_by_data_stats >= 1,
             "first-row tables must keep full-predicate stats pruning: {scan_stats:?}"
@@ -6563,7 +6563,7 @@ mod tests {
             .plan()
             .await
             .unwrap();
-        let full_stats = _full_plan.scan_stats().cloned().unwrap();
+        let full_stats = _full_plan.stats().cloned().unwrap();
         let mut limited_reader = table.new_read_builder();
         limited_reader.with_limit(2);
         let _limited_plan = limited_reader
@@ -6573,7 +6573,7 @@ mod tests {
             .plan()
             .await
             .unwrap();
-        let limited_stats = _limited_plan.scan_stats().cloned().unwrap();
+        let limited_stats = _limited_plan.stats().cloned().unwrap();
 
         assert_eq!(
             full_stats.final_splits, 3,
@@ -6616,7 +6616,7 @@ mod tests {
             .plan()
             .await
             .unwrap();
-        let scan_stats = plan.scan_stats().cloned().unwrap();
+        let scan_stats = plan.stats().cloned().unwrap();
 
         assert!(plan.splits().is_empty());
         assert!(scan_stats.limit_early_stopped);
@@ -7866,7 +7866,7 @@ mod tests {
             .plan()
             .await
             .unwrap();
-        let scan_stats = empty.scan_stats().cloned().unwrap();
+        let scan_stats = empty.stats().cloned().unwrap();
         assert!(empty.splits().is_empty());
         assert_eq!(empty.snapshot_id(), scan_stats.snapshot_id);
         assert_eq!(empty.snapshot_id(), Some(1));
@@ -7953,7 +7953,7 @@ mod tests {
             .plan()
             .await
             .unwrap();
-        let scan_stats = plan.scan_stats().cloned().unwrap();
+        let scan_stats = plan.stats().cloned().unwrap();
         assert!(plan.splits().is_empty());
         assert_eq!(plan.snapshot_id(), scan_stats.snapshot_id);
         assert_eq!(plan.snapshot_id(), Some(1));

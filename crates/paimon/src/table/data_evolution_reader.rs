@@ -7122,7 +7122,7 @@ mod tests {
             .plan()
             .await
             .unwrap();
-        let scan_stats = plan.scan_stats().cloned().unwrap();
+        let scan_stats = plan.stats().cloned().unwrap();
         let mut planned_files = plan
             .splits()
             .iter()

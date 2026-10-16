@@ -59,9 +59,9 @@ def test_scan_statistics_include_all_candidates_before_limit(limit, split_count)
         if limit is not None:
             builder.with_limit(limit)
         scan = builder.new_scan()
-        assert scan.plan().scan_stats() is None
+        assert scan.plan().stats() is None
         plan = scan.with_stats().plan()
-        stats = plan.scan_stats()
+        stats = plan.stats()
         assert stats.complete
         assert len(plan.splits()) == len(scan.plan().splits()) == split_count
         assert plan.snapshot_id() == 1
@@ -71,7 +71,7 @@ def test_scan_statistics_include_all_candidates_before_limit(limit, split_count)
         with pytest.raises(AttributeError):
             stats.manifest_entries_read = 10
         light_plan = scan.with_stats(complete=False).plan()
-        light_stats = light_plan.scan_stats()
+        light_stats = light_plan.stats()
         assert not light_stats.complete
         assert light_stats.snapshot_id == plan.snapshot_id()
         assert light_stats.limit == limit
@@ -88,9 +88,9 @@ def test_combined_incremental_scan_statistics(start, entry_count, complete):
     with tempfile.TemporaryDirectory() as warehouse:
         table = _make_table_with_data(warehouse)
         scan = table.new_read_builder().new_incremental_scan(start, 1)
-        assert scan.plan().scan_stats() is None
+        assert scan.plan().stats() is None
         plan = scan.with_stats(complete=complete).plan()
-        stats = plan.scan_stats()
+        stats = plan.stats()
         assert stats.complete == complete
         assert plan.snapshot_id() == 1
         assert stats.snapshot_id == 1

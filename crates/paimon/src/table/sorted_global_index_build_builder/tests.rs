@@ -1402,7 +1402,7 @@ async fn test_global_index_prunes_during_manifest_read() {
             .plan()
             .await
             .unwrap();
-        let scan_stats = plan.scan_stats().cloned().unwrap();
+        let scan_stats = plan.stats().cloned().unwrap();
 
         assert_eq!(
             plan.splits()
@@ -1557,7 +1557,7 @@ async fn test_empty_global_index_ranges_skip_legacy_manifests() {
             .plan()
             .await
             .unwrap();
-        let scan_stats = stats_plan.scan_stats().cloned().unwrap();
+        let scan_stats = stats_plan.stats().cloned().unwrap();
         let delta_error = read_builder
             .new_scan()
             .plan_snapshot_delta(&snapshot)
@@ -1623,7 +1623,7 @@ async fn test_detail_mode_defers_manifest_pruning_for_unindexed_ranges() {
         .plan()
         .await
         .unwrap();
-    let scan_stats = plan.scan_stats().cloned().unwrap();
+    let scan_stats = plan.stats().cloned().unwrap();
     let planned_ranges = merge_row_ranges(
         plan.splits()
             .iter()
