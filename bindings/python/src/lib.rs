@@ -17,6 +17,7 @@
 
 use pyo3::prelude::*;
 
+mod arrow_input;
 mod blob;
 mod blob_uri_reader;
 mod catalog_version;
