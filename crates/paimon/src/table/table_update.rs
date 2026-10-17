@@ -245,6 +245,9 @@ impl TableUpdate {
     /// matched rows retain their values; on new rows they are absent from the file.
     /// After last-write-wins, matched values follow row-ID update conversion
     /// rules; new rows must satisfy the ordinary Arrow write type.
+    /// Numeric keys may use different Arrow types only when conversion keeps
+    /// their exact mathematical value. This matching conversion does not alter
+    /// the original key columns used as update or append payloads.
     /// Input batches may have different non-key columns. After last-write-wins
     /// deduplication, matched rows must supply their update columns and appended
     /// rows in each partition must share a field set.

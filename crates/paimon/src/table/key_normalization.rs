@@ -23,6 +23,8 @@ use arrow_schema::DataType;
 use super::update_input::{cast_update_value, decode_dictionary, CastMode};
 use super::write_batch_normalize::normalize_write_array;
 
+mod numeric;
+
 /// Unify Arrow representations without changing key identity. Dictionary
 /// indices are batch-local; numeric widths, decimal scales and temporal units
 /// may differ only when conversion is exact. Binary keys compare their bytes.
@@ -40,8 +42,8 @@ pub(super) fn normalize_match_key(
     if source == expected {
         return Ok(decoded);
     }
-    if source.is_floating() && expected.is_floating() {
-        return cast_float_key(&decoded, expected);
+    if source.is_numeric() && expected.is_numeric() {
+        return numeric::normalize(&decoded, expected);
     }
     let binary = |t: &DataType| {
         matches!(
@@ -75,49 +77,22 @@ pub(super) fn normalize_match_key(
             source: None,
         });
     }
-    let exact_family = source.is_integer() && expected.is_integer()
-        || source.is_decimal() && expected.is_decimal()
-        || matches!(
-            (source, expected),
-            (
-                DataType::Date32 | DataType::Date64,
-                DataType::Date32 | DataType::Date64
-            ) | (
-                DataType::Time32(_) | DataType::Time64(_),
-                DataType::Time32(_) | DataType::Time64(_)
-            )
+    let exact_family = matches!(
+        (source, expected),
+        (
+            DataType::Date32 | DataType::Date64,
+            DataType::Date32 | DataType::Date64
+        ) | (
+            DataType::Time32(_) | DataType::Time64(_),
+            DataType::Time32(_) | DataType::Time64(_)
         )
-        || matches!((source, expected), (DataType::Timestamp(_, from), DataType::Timestamp(_, to))
+    ) || matches!((source, expected), (DataType::Timestamp(_, from), DataType::Timestamp(_, to))
             if from.is_some() == to.is_some());
     if exact_family {
         cast_update_value(&decoded, expected, CastMode::Assignment)
     } else {
         normalize_write_array(&decoded, expected)
     }
-}
-
-fn cast_float_key(array: &ArrayRef, expected: &DataType) -> crate::Result<ArrayRef> {
-    let options = arrow_cast::CastOptions {
-        safe: false,
-        ..Default::default()
-    };
-    let cast = |array: &ArrayRef, target| {
-        arrow_cast::cast_with_options(array.as_ref(), target, &options).map_err(|error| {
-            crate::Error::DataInvalid {
-                message: error.to_string(),
-                source: None,
-            }
-        })
-    };
-    let converted = cast(array, expected)?;
-    let restored = cast(&converted, array.data_type())?;
-    if restored.to_data() != array.to_data() {
-        return Err(crate::Error::DataInvalid {
-            message: "Floating match key conversion would change key identity".into(),
-            source: None,
-        });
-    }
-    Ok(converted)
 }
 
 #[cfg(test)]
