@@ -256,35 +256,32 @@ fn cast_values(array: &ArrayRef, target: &DataType, mode: CastMode) -> crate::Re
                     .map_err(|error| invalid(error.to_string()))?,
                 ))
             }
+            DataType::Map(..) => {
+                let input = array.as_any().downcast_ref::<MapArray>().unwrap();
+                let DataType::Struct(fields) = field.data_type() else {
+                    return Err(invalid(
+                        "Map entries can only be cast to two-field ROW elements",
+                    ));
+                };
+                let (entries, offsets) = cast_map_entries(input, fields, mode)?;
+                Some(Arc::new(
+                    ListArray::try_new(
+                        field.clone(),
+                        offsets,
+                        Arc::new(entries),
+                        input.nulls().cloned(),
+                    )
+                    .map_err(|error| invalid(error.to_string()))?,
+                ))
+            }
             _ => None,
         },
         (DataType::Map(_, _), DataType::Map(field, sorted)) => {
             let input = array.as_any().downcast_ref::<MapArray>().unwrap();
-            let offsets = input.value_offsets();
-            let start = offsets[0];
-            let length = offsets[offsets.len() - 1] - start;
-            let (offsets, indices) = constructor_offsets(offsets, input.nulls(), mode);
-            let length = indices.as_ref().map_or(length as usize, |i| i.len());
             let DataType::Struct(fields) = field.data_type() else {
                 return Err(invalid("Map entries must have a struct type"));
             };
-            // Map fields may use custom names. Key/value roles are positional,
-            // unlike ROW fields, so never match these two children by name.
-            let columns = [input.keys(), input.values()]
-                .into_iter()
-                .zip(fields)
-                .map(|(values, field)| {
-                    let values = match &indices {
-                        Some(indices) => arrow_select::take::take(values.as_ref(), indices, None)
-                            .map_err(|error| invalid(error.to_string()))?,
-                        None => values.slice(start as usize, length),
-                    };
-                    cast_values(&values, field.data_type(), mode)
-                })
-                .collect::<crate::Result<Vec<_>>>()?;
-            let entries = StructArray::try_new_with_length(fields.clone(), columns, None, length)
-                .map_err(|error| invalid(error.to_string()))?;
-            let offsets = OffsetBuffer::new(offsets.into());
+            let (entries, offsets) = cast_map_entries(input, fields, mode)?;
             Some(Arc::new(
                 MapArray::try_new(
                     field.clone(),
@@ -321,6 +318,41 @@ fn cast_values(array: &ArrayRef, target: &DataType, mode: CastMode) -> crate::Re
         .map_err(|error| invalid(error.to_string()));
     }
     cast_primitive(array, target, mode)
+}
+
+/// Arrow represents a MAP as a list of key/value ROWs. Adapt these children
+/// positionally for both MAP and ARRAY<ROW> inputs, retaining recursive value
+/// conversion and the whole-column constructor's visibility rules.
+fn cast_map_entries(
+    input: &MapArray,
+    fields: &arrow_schema::Fields,
+    mode: CastMode,
+) -> crate::Result<(StructArray, OffsetBuffer<i32>)> {
+    if fields.len() != 2 {
+        return Err(invalid("Map entries require exactly two ROW fields"));
+    }
+    let offsets = input.value_offsets();
+    let start = offsets[0];
+    let length = offsets[offsets.len() - 1] - start;
+    let (offsets, indices) = constructor_offsets(offsets, input.nulls(), mode);
+    let length = indices.as_ref().map_or(length as usize, |i| i.len());
+    // MAP field names are aliases. Their key/value roles do not depend on the
+    // source names or the target ROW names, unlike a normal ROW-to-ROW cast.
+    let columns = [input.keys(), input.values()]
+        .into_iter()
+        .zip(fields)
+        .map(|(values, field)| {
+            let values = match &indices {
+                Some(indices) => arrow_select::take::take(values.as_ref(), indices, None)
+                    .map_err(|error| invalid(error.to_string()))?,
+                None => values.slice(start as usize, length),
+            };
+            cast_values(&values, field.data_type(), mode)
+        })
+        .collect::<crate::Result<Vec<_>>>()?;
+    let entries = StructArray::try_new_with_length(fields.clone(), columns, None, length)
+        .map_err(|error| invalid(error.to_string()))?;
+    Ok((entries, OffsetBuffer::new(offsets.into())))
 }
 
 // PyPaimon's row-ID fallback reconstructs Python dicts only after a whole-column
@@ -1466,6 +1498,9 @@ fn cast_primitive(array: &ArrayRef, target: &DataType, mode: CastMode) -> crate:
     }
     Ok(converted)
 }
+
+#[cfg(test)]
+mod container_tests;
 
 #[cfg(test)]
 mod tests {
