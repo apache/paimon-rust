@@ -416,7 +416,13 @@ async fn partial_update_last_non_null_reverses_over_null_delete_payload() {
     write_batch(&table, &partial_update_batch(1, Some(100), 0)).await;
     write_batch(&table, &partial_update_batch(2, None, 3)).await;
     write_batch(&table, &partial_update_batch(1, Some(5), 0)).await;
-    assert_eq!(scan_single_version_value(&table).await, (2, Some(5)));
+    let builder = table.new_read_builder();
+    let plan = builder.new_scan().plan().await.unwrap();
+    let mut stream = builder.new_read().unwrap().to_arrow(plan.splits()).unwrap();
+    assert!(stream.next().await.is_none());
+
+    write_batch(&table, &partial_update_batch(3, None, 0)).await;
+    assert_eq!(scan_single_version_value(&table).await, (3, Some(5)));
 }
 
 #[tokio::test]
