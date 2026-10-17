@@ -24,11 +24,11 @@ from urllib.parse import unquote_plus
 
 import pytest
 
-from pypaimon_rust.datafusion import PaimonCatalog
+from pypaimon_rust.datafusion import CatalogError, PaimonCatalog
 
 
 @pytest.fixture
-def catalog(monkeypatch):
+def rest_server(monkeypatch):
     requests = []
     monkeypatch.setenv("NO_PROXY", "localhost,127.0.0.1")
     monkeypatch.setenv("no_proxy", "localhost,127.0.0.1")
@@ -48,6 +48,15 @@ def catalog(monkeypatch):
                 payload, status = {"message": "denied", "code": 403}, 403
             elif "conflict" in parts:
                 payload, status = {"message": "exists", "code": 409}, 409
+            elif "nocode" in parts:
+                payload, status = {"message": "denied"}, 403
+            elif any(part.startswith("status_") for part in parts):
+                status = int(next(part for part in parts if part.startswith("status_")).split("_")[1])
+                payload = {"message": "unmapped status"}
+            elif "invalidjson" in parts:
+                payload, status = "not a branches response", 200
+            elif body and body.get("fromTag") == "missing":
+                payload, status = {"resourceType": "TAG", "message": "tag missing", "code": 404}, 404
             elif self.command == "GET":
                 payload, status = {"branches": ["dev", "release"]}, 200
             else:
@@ -70,16 +79,29 @@ def catalog(monkeypatch):
     thread = threading.Thread(target=server.serve_forever)
     thread.start()
     try:
-        native = PaimonCatalog({
+        yield {
             "metastore": "rest", "uri": "http://localhost:%d" % server.server_port,
             "warehouse": "warehouse", "token.provider": "bear", "token": "test-token",
-        })
-        requests.clear()
-        yield native, requests
+        }, requests
     finally:
         server.shutdown()
         server.server_close()
         thread.join()
+
+
+@pytest.fixture
+def catalog(rest_server):
+    options, requests = rest_server
+    native = PaimonCatalog(options)
+    requests.clear()
+    return native, requests
+
+
+def test_resolved_rest_configuration_is_not_fetched_again(rest_server):
+    options, requests = rest_server
+    native = PaimonCatalog(dict(options, prefix="resolved-prefix"), config_required=False)
+    assert native.list_branches("db.t") == ["dev", "release"]
+    assert requests == [("GET", "/v1/resolved-prefix/databases/db/tables/t/branches", None)]
 
 
 def test_rest_branch_operations_use_core_protocol(catalog):
@@ -144,6 +166,51 @@ def test_duplicate_branch_is_reported(catalog):
     with pytest.raises(ValueError, match="Branch dev of table db.conflict already exists"):
         native.create_branch("db.conflict", "dev")
     assert len(requests) == 1
+
+
+@pytest.mark.parametrize("operation,identifier,args,code,resource_type,resource_name,message", [
+    ("create_branch", "db.conflict", ("dev",), 409, "BRANCH", "dev", "already exists"),
+    ("create_branch", "db.missing", ("dev",), 404, "TABLE", "db.missing", "does not exist"),
+    ("create_branch", "db.table", ("dev", "missing"), 404, "TAG", "missing", "does not exist"),
+    ("drop_branch", "db.missing", ("dev",), 404, "BRANCH", "dev", "does not exist"),
+    ("fast_forward", "db.missing", ("dev",), 404, "BRANCH", "dev", "does not exist"),
+    ("list_branches", "db.missing", (), 404, "TABLE", "db.missing", "does not exist"),
+    ("list_branches", "db.forbidden", (), 403, None, None, "denied"),
+    ("list_branches", "db.nocode", (), 403, None, None, "denied"),
+    ("list_branches", "db.status_429", (), 429, None, None, "unmapped status"),
+    ("list_branches", "db.status_502", (), 502, None, None, "unmapped status"),
+    ("list_branches", "db.status_504", (), 504, None, None, "unmapped status"),
+    ("list_branches", "db.invalidjson", (), 0, None, None, "failed to parse json"),
+])
+def test_catalog_errors_preserve_structured_details(
+        catalog, operation, identifier, args, code, resource_type, resource_name, message):
+    native, requests = catalog
+    with pytest.raises(CatalogError) as raised:
+        getattr(native, operation)(identifier, *args)
+    error = raised.value
+    assert error.code == code
+    assert error.resource_type == resource_type
+    assert error.resource_name == resource_name
+    assert message in error.message
+    assert isinstance(error, ValueError)
+    assert len(requests) == 1
+
+
+def test_transport_failure_has_structured_catalog_error():
+    import socket
+
+    with socket.socket() as listener:
+        listener.bind(("localhost", 0))
+        native = PaimonCatalog({
+            "metastore": "rest", "uri": "http://localhost:%d" % listener.getsockname()[1],
+            "warehouse": "warehouse", "token.provider": "bear", "token": "test-token",
+        }, config_required=False)
+        with pytest.raises(CatalogError) as raised:
+            native.drop_branch("db.t", "dev")
+    assert raised.value.code == 0
+    assert raised.value.resource_type is None
+    assert raised.value.resource_name is None
+    assert "http delete failed" in raised.value.message
 
 
 @pytest.mark.parametrize("operation", ["create_branch", "drop_branch", "fast_forward", "list_branches"])

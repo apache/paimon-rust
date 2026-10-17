@@ -25,8 +25,96 @@ pyo3::create_exception!(
     "Raised when native state inherited across process fork cannot be used safely."
 );
 
+pyo3::create_exception!(
+    pypaimon_rust,
+    CatalogError,
+    PyValueError,
+    "A catalog failure with code, resource_type, resource_name and message attributes."
+);
+
 pub fn register_module(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
-    module.add("ForkSafetyError", py.get_type::<ForkSafetyError>())
+    module.add("ForkSafetyError", py.get_type::<ForkSafetyError>())?;
+    module.add("CatalogError", py.get_type::<CatalogError>())
+}
+
+/// Preserve the catalog error contract across the FFI without parsing display strings.
+pub(crate) fn to_catalog_py_err(error: paimon::Error) -> PyErr {
+    use paimon::api::RestError;
+    use paimon::Error;
+
+    if error.is_process_fork_unsupported() {
+        return to_py_err(error);
+    }
+    let (code, resource_type, resource_name, message) = match &error {
+        Error::BranchAlreadyExist { branch_name, .. } => (
+            409,
+            Some("BRANCH"),
+            Some(branch_name.as_str()),
+            error.to_string(),
+        ),
+        Error::BranchNotExist { branch_name, .. } => (
+            404,
+            Some("BRANCH"),
+            Some(branch_name.as_str()),
+            error.to_string(),
+        ),
+        Error::TableNotExist { full_name } => (
+            404,
+            Some("TABLE"),
+            Some(full_name.as_str()),
+            error.to_string(),
+        ),
+        Error::TagNotExist { tag_name } => {
+            (404, Some("TAG"), Some(tag_name.as_str()), error.to_string())
+        }
+        Error::DataInvalid { message, .. } => (400, None, None, message.clone()),
+        Error::RestApi { source } => {
+            let (code, resource_type, resource_name, message) = match source {
+                RestError::BadRequest { message } => (400, None, None, message),
+                RestError::NotAuthorized { message } => (401, None, None, message),
+                RestError::Forbidden { message } => (403, None, None, message),
+                RestError::NoSuchResource {
+                    resource_type,
+                    resource_name,
+                    message,
+                } => (
+                    404,
+                    resource_type.as_deref(),
+                    resource_name.as_deref(),
+                    message,
+                ),
+                RestError::AlreadyExists {
+                    resource_type,
+                    resource_name,
+                    message,
+                } => (
+                    409,
+                    resource_type.as_deref(),
+                    resource_name.as_deref(),
+                    message,
+                ),
+                RestError::ServiceFailure { message } => (500, None, None, message),
+                RestError::NotImplemented { message } => (501, None, None, message),
+                RestError::ServiceUnavailable { message } => (503, None, None, message),
+                RestError::Unexpected { code, message } => (*code, None, None, message),
+            };
+            (code, resource_type, resource_name, message.clone())
+        }
+        Error::UnexpectedError { .. } | Error::IoUnexpected { .. } => {
+            (0, None, None, error.to_string())
+        }
+        _ => return to_py_err(error),
+    };
+    Python::attach(|py| {
+        let exception = CatalogError::new_err(error.to_string());
+        let value = exception.value(py);
+        value.setattr("code", code)?;
+        value.setattr("resource_type", resource_type)?;
+        value.setattr("resource_name", resource_name)?;
+        value.setattr("message", message)?;
+        Ok::<_, PyErr>(exception)
+    })
+    .unwrap_or_else(|error| error)
 }
 
 pub fn to_py_err(err: paimon::Error) -> PyErr {

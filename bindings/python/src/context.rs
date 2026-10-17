@@ -41,7 +41,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyCapsule;
 
 use crate::blob::PyBlobReaderRegistry;
-use crate::error::{df_to_py_err, to_py_err};
+use crate::error::{df_to_py_err, to_catalog_py_err, to_py_err};
 use crate::read::PyRecordBatchReader;
 use crate::table::PyTable;
 use crate::udf::{build_python_scalar_udf, udf, PyPythonScalarUDFObject};
@@ -189,12 +189,26 @@ pub(crate) fn complete_storage_options(
     )
 }
 
-fn build_paimon_catalog(catalog_options: HashMap<String, String>) -> PyResult<Arc<dyn Catalog>> {
+fn build_paimon_catalog(
+    catalog_options: HashMap<String, String>,
+    config_required: bool,
+) -> PyResult<Arc<dyn Catalog>> {
     let catalog_options = complete_storage_options(catalog_options);
     let rt = runtime();
     rt.block_on(async {
         let options = Options::from_map(catalog_options);
-        let catalog = CatalogFactory::create(options).await.map_err(to_py_err)?;
+        let catalog: Arc<dyn Catalog> =
+            if !config_required && options.get("metastore").map(String::as_str) == Some("rest") {
+                Arc::new(
+                    paimon::catalog::RESTCatalog::new(options, false)
+                        .await
+                        .map_err(to_catalog_py_err)?,
+                )
+            } else {
+                CatalogFactory::create(options)
+                    .await
+                    .map_err(to_catalog_py_err)?
+            };
         Ok::<_, PyErr>(catalog)
     })
 }
@@ -312,8 +326,13 @@ fn catalog_table_identifier(identifier: &Bound<'_, PyAny>) -> PyResult<Identifie
 impl PaimonCatalog {
     /// Create a Paimon catalog that can be registered into a DataFusion session.
     #[new]
-    fn new(py: Python<'_>, catalog_options: HashMap<String, String>) -> PyResult<Self> {
-        let catalog = py.detach(|| build_paimon_catalog(catalog_options))?;
+    #[pyo3(signature = (catalog_options, *, config_required=true))]
+    fn new(
+        py: Python<'_>,
+        catalog_options: HashMap<String, String>,
+        config_required: bool,
+    ) -> PyResult<Self> {
+        let catalog = py.detach(|| build_paimon_catalog(catalog_options, config_required))?;
         let provider = Arc::new(
             PaimonCatalogProvider::new(
                 None,
@@ -399,7 +418,7 @@ impl PaimonCatalog {
                     .create_branch(&identifier, branch_name, from_tag),
             )
         })
-        .map_err(to_py_err)
+        .map_err(to_catalog_py_err)
     }
 
     /// Delete branch metadata through the REST catalog.
@@ -411,7 +430,7 @@ impl PaimonCatalog {
     ) -> PyResult<()> {
         let identifier = catalog_table_identifier(identifier)?;
         py.detach(|| runtime().block_on(self.catalog.drop_branch(&identifier, branch_name)))
-            .map_err(to_py_err)
+            .map_err(to_catalog_py_err)
     }
 
     /// Fast-forward the identifier's current branch through the REST catalog.
@@ -423,7 +442,7 @@ impl PaimonCatalog {
     ) -> PyResult<()> {
         let identifier = catalog_table_identifier(identifier)?;
         py.detach(|| runtime().block_on(self.catalog.fast_forward(&identifier, branch_name)))
-            .map_err(to_py_err)
+            .map_err(to_catalog_py_err)
     }
 
     /// List branch names in REST server order.
@@ -434,7 +453,7 @@ impl PaimonCatalog {
     ) -> PyResult<Vec<String>> {
         let identifier = catalog_table_identifier(identifier)?;
         py.detach(|| runtime().block_on(self.catalog.list_branches(&identifier)))
-            .map_err(to_py_err)
+            .map_err(to_catalog_py_err)
     }
 }
 
@@ -858,6 +877,7 @@ impl PySQLContext {
 
 pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     let this = PyModule::new(py, "datafusion")?;
+    this.add("CatalogError", py.get_type::<crate::error::CatalogError>())?;
     this.add_class::<PaimonCatalog>()?;
     this.add_class::<crate::table::PyTable>()?;
     this.add_class::<crate::system_table::PySystemRead>()?;
