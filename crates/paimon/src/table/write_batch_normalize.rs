@@ -230,6 +230,12 @@ fn normalize_visible_array(
     }
 
     match (array.data_type(), expected) {
+        // Java has one STRING value representation. Arrow offset widths do
+        // not change the logical values, including in keys and nested fields.
+        // This specific cast checks offset overflow without enabling value casts.
+        (DataType::LargeUtf8, DataType::Utf8) => {
+            arrow_cast::cast(array, expected).map_err(normalization_error)
+        }
         (DataType::FixedSizeBinary(_), DataType::Binary) => {
             let fixed = array
                 .as_any()
@@ -420,6 +426,83 @@ mod tests {
     use arrow_array::{FixedSizeListArray, Int32Array, LargeBinaryArray, StringArray};
     use arrow_buffer::{OffsetBuffer, ScalarBuffer};
     use arrow_schema::Field;
+
+    #[test]
+    fn large_strings_preserve_slices_unicode_and_nulls() {
+        let input: ArrayRef = Arc::new(
+            arrow_array::LargeStringArray::from(vec![
+                Some("outside"),
+                Some("中文"),
+                None,
+                Some(""),
+                Some("last"),
+            ])
+            .slice(1, 4),
+        );
+        let result = normalize_write_array(&input, &DataType::Utf8).unwrap();
+        assert_eq!(
+            result.to_data(),
+            StringArray::from(vec![Some("中文"), None, Some(""), Some("last")]).to_data()
+        );
+        let empty = normalize_write_array(&input.slice(0, 0), &DataType::Utf8).unwrap();
+        assert!(empty.is_empty());
+        assert_eq!(empty.data_type(), &DataType::Utf8);
+        // Layout compatibility must not become an implicit value cast.
+        assert!(normalize_write_array(&input, &DataType::Int32).is_err());
+        assert!(normalize_write_array(&input, &DataType::Binary).is_err());
+    }
+
+    #[test]
+    fn large_strings_inside_rows_and_arrays_keep_visible_nullability_checks() {
+        let text: ArrayRef = Arc::new(arrow_array::LargeStringArray::from(vec![
+            None,
+            Some("中文"),
+            None,
+        ]));
+        let input = Arc::new(StructArray::new(
+            vec![Field::new("text", DataType::LargeUtf8, true)].into(),
+            vec![text],
+            Some(NullBuffer::from(vec![false, true, true])),
+        )) as ArrayRef;
+        let target = DataType::Struct(vec![Field::new("text", DataType::Utf8, false)].into());
+        assert!(normalize_write_array(&input, &target).is_err());
+        // The first child's NULL is hidden by a NULL ROW, so it is allowed.
+        let normalized = normalize_write_array(&input.slice(0, 2), &target).unwrap();
+        let row = normalized.as_any().downcast_ref::<StructArray>().unwrap();
+        assert!(row.is_null(0));
+        assert_eq!(
+            row.column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(1),
+            "中文"
+        );
+        let list = Arc::new(
+            ListArray::new(
+                Arc::new(Field::new("item", DataType::LargeUtf8, true)),
+                OffsetBuffer::new(vec![0, 1, 3].into()),
+                Arc::new(arrow_array::LargeStringArray::from(vec![
+                    Some("outside"),
+                    Some("中文"),
+                    None,
+                ])),
+                None,
+            )
+            .slice(1, 1),
+        ) as ArrayRef;
+        let expected = DataType::List(Arc::new(Field::new("element", DataType::Utf8, true)));
+        let list = normalize_write_array(&list, &expected).unwrap();
+        assert_eq!(list.data_type(), &expected);
+        assert_eq!(
+            list.as_any()
+                .downcast_ref::<ListArray>()
+                .unwrap()
+                .value(0)
+                .to_data(),
+            StringArray::from(vec![Some("中文"), None]).to_data()
+        );
+    }
 
     #[test]
     fn vector_child_aliases_preserve_sliced_values_and_nulls() {
