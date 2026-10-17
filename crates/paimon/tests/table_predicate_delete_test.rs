@@ -571,3 +571,122 @@ async fn partition_deletes_support_append_pk_and_pending_files_without_row_track
         }
     }
 }
+
+type NegateCase = (fn(&PredicateBuilder) -> Predicate, Vec<i32>);
+
+#[tokio::test]
+async fn negated_predicates_keep_null_rows() {
+    // Seeded id 3 has p = NULL. NOT(p = 'a') is unknown for it, so it must
+    // survive, as in Java where the negation is `p <> 'a'`.
+    let cases: Vec<NegateCase> = vec![
+        (
+            |pb| Predicate::negate(pb.equal("p", Datum::String("a".into())).unwrap()),
+            vec![0, 1, 3],
+        ),
+        (
+            |pb| {
+                Predicate::negate(Predicate::and(vec![
+                    pb.equal("q", Datum::Int(2)).unwrap(),
+                    pb.equal("p", Datum::String("b".into())).unwrap(),
+                ]))
+            },
+            vec![2, 3],
+        ),
+        (
+            |pb| Predicate::negate(pb.not_equal("p", Datum::String("a".into())).unwrap()),
+            vec![2, 3],
+        ),
+    ];
+    for (predicate, expected) in cases {
+        // Partition-only predicates drop files; adding a data conjunct goes
+        // through deletion vectors.
+        for data_conjunct in [false, true] {
+            let table = table(&[]).await;
+            seed(&table).await;
+            let pb = PredicateBuilder::new(&table.schema().fields_with_read_metadata());
+            let mut predicate = predicate(&pb);
+            if data_conjunct {
+                predicate = Predicate::and(vec![
+                    predicate,
+                    pb.greater_than("v", Datum::Int(0)).unwrap(),
+                ]);
+            }
+            let update = table.new_write_builder().new_update().unwrap();
+            commit(
+                &table,
+                update
+                    .delete_by_predicate(Some(predicate.clone()))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(
+                ids(&table).await,
+                expected,
+                "{predicate} data={data_conjunct}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn negated_data_predicate_keeps_null_rows() {
+    let table = table(&[]).await;
+    write_batch(
+        &table,
+        &RecordBatch::try_from_iter([
+            (
+                "id",
+                Arc::new(Int32Array::from(vec![0, 1, 2, 3])) as ArrayRef,
+            ),
+            (
+                "p",
+                Arc::new(StringArray::from(vec![Some("a"); 4])) as ArrayRef,
+            ),
+            (
+                "v",
+                Arc::new(Int32Array::from(vec![Some(10), Some(20), Some(30), None])) as ArrayRef,
+            ),
+            ("q", Arc::new(Int32Array::from(vec![1; 4])) as ArrayRef),
+        ])
+        .unwrap(),
+    )
+    .await;
+    let pb = PredicateBuilder::new(&table.schema().fields_with_read_metadata());
+    let predicate = Predicate::negate(pb.equal("v", Datum::Int(10)).unwrap());
+
+    let mut read = table.new_read_builder();
+    read.with_projection(&["id"]).unwrap();
+    read.with_filter(predicate.clone());
+    let plan = read.new_scan().plan().await.unwrap();
+    let batches: Vec<RecordBatch> = read
+        .new_read()
+        .unwrap()
+        .to_arrow(plan.splits())
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    let mut read_ids: Vec<i32> = batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        })
+        .collect();
+    read_ids.sort_unstable();
+    assert_eq!(read_ids, vec![1, 2]);
+
+    let update = table.new_write_builder().new_update().unwrap();
+    commit(
+        &table,
+        update.delete_by_predicate(Some(predicate)).await.unwrap(),
+    )
+    .await;
+    assert_eq!(ids(&table).await, vec![0, 3]);
+}
