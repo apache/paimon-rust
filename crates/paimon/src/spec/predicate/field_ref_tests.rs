@@ -378,3 +378,38 @@ fn nested_field_resolution_uses_components_and_canonical_names() {
         .nested_field("profile", &["score"])
         .is_err());
 }
+
+#[test]
+fn negated_nested_leaves_flip_like_top_level_leaves() {
+    let builder = PredicateBuilder::new(&schema());
+    let score = builder
+        .nested_field("profile", &["detail", "score"])
+        .unwrap();
+    assert_nested(
+        Predicate::negate(builder.equal(&score, Datum::Int(7)).unwrap()),
+        PredicateOperator::NotEq,
+        &[Datum::Int(7)],
+    );
+    assert_nested(
+        Predicate::negate(builder.less_than(&score, Datum::Int(7)).unwrap()),
+        PredicateOperator::GtEq,
+        &[Datum::Int(7)],
+    );
+
+    // No negated operator: stays `Not`, guarded so a NULL label is excluded.
+    let label = builder
+        .nested_field("profile", &["detail", "label"])
+        .unwrap();
+    let starts = builder
+        .starts_with(&label, Datum::String("a".into()))
+        .unwrap();
+    assert_eq!(
+        Predicate::negate(starts.clone()),
+        Predicate::Not(Box::new(starts.clone()))
+    );
+    assert_nested(
+        starts.not_null_guard().unwrap(),
+        PredicateOperator::IsNotNull,
+        &[],
+    );
+}
