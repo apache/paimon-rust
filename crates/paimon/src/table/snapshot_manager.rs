@@ -538,6 +538,43 @@ mod tests {
             .build()
     }
 
+    #[cfg(feature = "storage-oss")]
+    #[tokio::test]
+    async fn test_snapshot_commit_and_discovery_never_use_the_io_cache() {
+        use crate::io::oss_test_server::TestOss;
+
+        let origin = TestOss::start().await;
+        let cache = TestOss::start_sharing(&origin).await;
+        let table = "oss://bkt/db.db/t";
+        let file_io = FileIOBuilder::new("oss")
+            .with_props([
+                ("fs.oss.endpoint", cache.endpoint()),
+                ("fs.oss.accessKeyId", "ak"),
+                ("fs.oss.accessKeySecret", "sk"),
+                ("fs.oss.path-style-access", "true"),
+                ("fs.oss.retry.count", "1"),
+                ("io-cache.enabled", "true"),
+                ("io-cache.endpoint", cache.endpoint()),
+                ("io-cache.target.default.path-style-access", "true"),
+                ("io-cache.origin.endpoint", origin.endpoint()),
+                ("io-cache.policy", "meta,read"),
+            ])
+            .build()
+            .unwrap();
+        let sm = SnapshotManager::new(file_io.clone(), table.to_string());
+        assert!(sm.commit_snapshot(&test_snapshot(1)).await.unwrap());
+        assert!(sm.commit_snapshot(&test_snapshot(2)).await.unwrap());
+        // A cache that probed snapshot-2 before it was written would still report it missing.
+        cache.hide("bkt/db.db/t/snapshot/snapshot-2");
+
+        assert_eq!(sm.get_latest_snapshot_id().await.unwrap(), Some(2));
+        assert_eq!(sm.get_snapshot(2).await.unwrap().id(), 2);
+        assert!(cache.take_requests().is_empty());
+        assert!(origin
+            .take_requests()
+            .contains(&"GET bkt/db.db/t/snapshot/snapshot-2".to_string()));
+    }
+
     struct RestFixture {
         table: crate::table::Table,
         response: std::sync::Arc<std::sync::Mutex<(u16, serde_json::Value)>>,

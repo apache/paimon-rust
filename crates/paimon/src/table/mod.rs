@@ -86,6 +86,8 @@ mod hybrid_search_builder;
 mod incremental_scan;
 pub(crate) mod index_file_path;
 mod inline_blob;
+#[cfg(all(test, feature = "storage-oss"))]
+mod io_cache_routing_tests;
 mod kv_file_reader;
 mod kv_file_writer;
 mod lumina_index_build_builder;
@@ -303,6 +305,16 @@ pub struct Table {
     applied_dynamic_option_keys: HashSet<String>,
 }
 
+// Format Table files may be replaced in place under the same name, so they never use io-cache;
+// other tables tell io-cache routing the prefixes their data files are named with.
+fn table_file_io(file_io: &FileIO, schema: &TableSchema) -> FileIO {
+    let options = CoreOptions::new(schema.options());
+    if options.is_format_table() {
+        return file_io.origin_only();
+    }
+    file_io.with_file_prefixes([options.data_file_prefix(), options.changelog_file_prefix()])
+}
+
 impl Table {
     /// Create a new table.
     pub fn new(
@@ -312,6 +324,7 @@ impl Table {
         schema: TableSchema,
         rest_env: Option<RESTEnv>,
     ) -> Self {
+        let file_io = table_file_io(&file_io, &schema);
         let schema_manager = SchemaManager::new(file_io.clone(), location.clone());
         let branch = DEFAULT_MAIN_BRANCH.to_string();
         Self {
@@ -349,6 +362,7 @@ impl Table {
         identifier.validate()?;
         validate_branch_name(&branch)?;
         schema.validate_resolved_structure()?;
+        let file_io = table_file_io(&file_io, &schema);
         let schema_manager = SchemaManager::new(file_io.clone(), location.clone());
         let schema_manager = if branch == DEFAULT_MAIN_BRANCH {
             schema_manager
@@ -633,11 +647,12 @@ impl Table {
                 || k == "scan.mode"
                 || k == "incremental-between-timestamp"
         });
+        let schema = self.schema.copy_with_options(extra);
         Self {
-            file_io: self.file_io.clone(),
+            file_io: table_file_io(&self.file_io, &schema),
             identifier: self.identifier.clone(),
             location: self.location.clone(),
-            schema: self.schema.copy_with_options(extra),
+            schema,
             schema_manager: self.schema_manager.clone(),
             branch: self.branch.clone(),
             branch_reference: self.branch_reference,
@@ -693,6 +708,7 @@ impl Table {
             schema_manager.with_branch(branch)
         };
         Ok(Self {
+            file_io: table_file_io(&self.file_io, &schema),
             schema,
             schema_manager,
             branch: branch.to_string(),

@@ -38,8 +38,11 @@ use tokio_util::compat::FuturesAsyncWriteCompatExt;
 use url::Url;
 
 use super::cache::{CachedFileReader, LocalCache};
+use super::cache_routing::{OpClass, RoutedOperator};
 use super::Storage;
 
+#[cfg(all(test, feature = "storage-oss"))]
+mod cache_routing_tests;
 #[cfg(all(test, feature = "storage-memory"))]
 mod provider_tests;
 
@@ -91,6 +94,18 @@ pub trait FileIOProvider: std::fmt::Debug + Send + Sync + 'static {
         let (op, relative_path) = self.create(path).await?;
         Ok((op, relative_path, None))
     }
+
+    /// Like [`Self::create`], adding the io-cache endpoint for requests that may use it;
+    /// `file_prefixes` are the data file prefixes of the table that `path` belongs to.
+    #[doc(hidden)]
+    async fn create_routed(
+        &self,
+        path: &str,
+        _file_prefixes: &[String],
+    ) -> crate::Result<(RoutedOperator, String, Option<String>)> {
+        let (op, relative_path, namespace) = self.create_with_cache_namespace(path).await?;
+        Ok((RoutedOperator::origin(op), relative_path, namespace))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -106,6 +121,9 @@ pub struct FileIO {
     cache: Option<Arc<LocalCache>>,
     file_format_metadata_cache: Arc<FileFormatMetadataCacheContext>,
     blob_index_cache: Arc<BlobIndexCacheContext>,
+    origin_only: bool,
+    /// Data file prefixes of the table this view serves, for io-cache routing.
+    file_prefixes: Arc<[String]>,
 }
 
 pub(crate) const DEFAULT_FILE_FORMAT_METADATA_CACHE_MAX_BYTES: usize = 50 * 1024 * 1024;
@@ -303,13 +321,55 @@ impl FileIO {
         }
     }
 
-    pub(crate) fn create_static(&self, path: &str) -> crate::Result<(Operator, String)> {
+    /// A view of this FileIO that sends every request to origin, as copies require.
+    pub(crate) fn origin_only(&self) -> Self {
+        let mut file_io = self.clone();
+        file_io.origin_only = true;
+        file_io
+    }
+
+    /// A view of this FileIO whose io-cache routing also knows data files named with `prefixes`.
+    pub(crate) fn with_file_prefixes<'a>(
+        &self,
+        prefixes: impl IntoIterator<Item = &'a str>,
+    ) -> Self {
+        let mut file_prefixes = self.file_prefixes.to_vec();
+        for prefix in prefixes {
+            if !prefix.trim().is_empty() && !file_prefixes.iter().any(|known| known == prefix) {
+                file_prefixes.push(prefix.to_string());
+            }
+        }
+        let mut file_io = self.clone();
+        file_io.file_prefixes = file_prefixes.into();
+        file_io
+    }
+
+    fn storage(&self) -> crate::Result<&Storage> {
         let FileIOBackend::Storage(storage) = &self.backend else {
             return Err(Error::IoUnsupported {
                 message: "A FileIOProvider requires async path resolution".to_string(),
             });
         };
-        let (op, relative_path) = storage.create(path)?;
+        Ok(storage)
+    }
+
+    /// The operator for requests that always go to origin, and the relative path.
+    pub(crate) fn create_static(&self, path: &str) -> crate::Result<(Operator, String)> {
+        let (op, relative_path) = self.storage()?.create(path)?;
+        Ok((op, relative_path.into_owned()))
+    }
+
+    pub(crate) fn create_routed_static(
+        &self,
+        path: &str,
+        file_prefixes: &[String],
+    ) -> crate::Result<(RoutedOperator, String)> {
+        let (op, relative_path) = self.storage()?.create_routed(path, file_prefixes)?;
+        let op = if self.origin_only {
+            op.without_cache()
+        } else {
+            op
+        };
         Ok((op, relative_path.into_owned()))
     }
 
@@ -344,13 +404,34 @@ impl FileIO {
         Ok((op, relative_path, cache_path))
     }
 
+    async fn create_routed(&self, path: &str) -> crate::Result<(RoutedOperator, String)> {
+        match &self.backend {
+            FileIOBackend::Provider(provider) => {
+                let (op, relative_path, _) = resolve_provider_routed(
+                    provider.as_ref(),
+                    path,
+                    self.origin_only,
+                    &self.file_prefixes,
+                )
+                .await?;
+                Ok((op, relative_path))
+            }
+            FileIOBackend::Storage(_) => self.create_routed_static(path, &self.file_prefixes),
+        }
+    }
+
     fn file_source(&self, path: &str) -> crate::Result<FileSource> {
         match &self.backend {
-            FileIOBackend::Provider(provider) => Ok(FileSource::Provider(provider.clone())),
+            FileIOBackend::Provider(provider) => Ok(FileSource::Provider {
+                provider: provider.clone(),
+                origin_only: self.origin_only,
+                file_prefixes: self.file_prefixes.clone(),
+            }),
             FileIOBackend::Storage(storage) => {
-                let (op, relative_path) = self.create_static(path)?;
+                let (op, relative_path) = self.create_routed_static(path, &self.file_prefixes)?;
                 let namespace = self.cache_namespace_for_path(path)?;
-                let cache_path = cache_object_path(&namespace, &op, &relative_path);
+                let cache_path =
+                    cache_object_path(&namespace, op.origin_operator(), &relative_path);
                 #[cfg(feature = "storage-fs")]
                 let local_fs = matches!(storage.as_ref(), Storage::LocalFs { .. });
                 #[cfg(not(feature = "storage-fs"))]
@@ -468,13 +549,17 @@ impl FileIO {
     ///
     /// Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/fs/FileIO.java#L97>
     pub async fn get_status(&self, path: &str) -> Result<FileStatus> {
-        let (op, relative_path) = self.create(path).await?;
-        let meta = op.stat(relative_path.as_ref()).await.map_err(|error| {
-            Error::from_opendal_with_context(
-                error,
-                format!("Failed to get file status for '{path}'"),
-            )
-        })?;
+        let (op, relative_path) = self.create_routed(path).await?;
+        let meta = op
+            .operator(OpClass::Meta)
+            .stat(relative_path.as_ref())
+            .await
+            .map_err(|error| {
+                Error::from_opendal_with_context(
+                    error,
+                    format!("Failed to get file status for '{path}'"),
+                )
+            })?;
 
         Ok(FileStatus {
             size: meta.content_length(),
@@ -609,14 +694,17 @@ impl FileIO {
     ///
     /// References: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/fs/FileIO.java#L128>
     pub async fn exists(&self, path: &str) -> Result<bool> {
-        let (op, relative_path) = self.create(path).await?;
+        let (op, relative_path) = self.create_routed(path).await?;
 
-        op.exists(relative_path.as_ref()).await.map_err(|error| {
-            Error::from_opendal_with_context(
-                error,
-                format!("Failed to check existence of '{path}'"),
-            )
-        })
+        op.operator(OpClass::Exists)
+            .exists(relative_path.as_ref())
+            .await
+            .map_err(|error| {
+                Error::from_opendal_with_context(
+                    error,
+                    format!("Failed to check existence of '{path}'"),
+                )
+            })
     }
 
     /// Check if a directory exists.
@@ -697,9 +785,10 @@ impl FileIO {
     ///
     /// Overwrites dst if it already exists.
     pub async fn copy_file(&self, src: &str, dst: &str) -> Result<()> {
-        let input = self.new_input(src)?;
+        let file_io = self.origin_only();
+        let input = file_io.new_input(src)?;
         let bytes = input.read().await?;
-        let output = self.new_output(dst)?;
+        let output = file_io.new_output(dst)?;
         output.write(bytes).await?;
         Ok(())
     }
@@ -709,10 +798,11 @@ impl FileIO {
     /// rename, as is common for object stores and the in-memory test backend.
     pub async fn copy_file_streaming(&self, src: &str, dst: &str) -> Result<()> {
         const CHUNK_SIZE: u64 = 8 * 1024 * 1024;
-        let input = self.new_input(src)?;
+        let file_io = self.origin_only();
+        let input = file_io.new_input(src)?;
         let size = input.metadata().await?.size;
         let reader = input.reader().await?;
-        let output = self.new_output(dst)?;
+        let output = file_io.new_output(dst)?;
         let mut writer = output.writer().await?;
         let mut position = 0;
         while position < size {
@@ -787,6 +877,22 @@ async fn resolve_provider_with_cache_namespace(
     let (op, relative_path, cache_namespace) = provider.create_with_cache_namespace(path).await?;
     validate_provider_path(path, &relative_path)?;
     Ok((op, relative_path, cache_namespace))
+}
+
+async fn resolve_provider_routed(
+    provider: &dyn FileIOProvider,
+    path: &str,
+    origin_only: bool,
+    file_prefixes: &[String],
+) -> crate::Result<(RoutedOperator, String, Option<String>)> {
+    let (op, relative_path, namespace) = if origin_only {
+        let (op, relative_path, namespace) = provider.create_with_cache_namespace(path).await?;
+        (RoutedOperator::origin(op), relative_path, namespace)
+    } else {
+        provider.create_routed(path, file_prefixes).await?
+    };
+    validate_provider_path(path, &relative_path)?;
+    Ok((op, relative_path, namespace))
 }
 
 fn validate_provider_path(path: &str, relative_path: &str) -> Result<()> {
@@ -1000,6 +1106,8 @@ impl FileIOBuilder {
             cache,
             file_format_metadata_cache,
             blob_index_cache,
+            origin_only: false,
+            file_prefixes: Arc::default(),
         })
     }
 }
@@ -1314,22 +1422,32 @@ pub struct FileStatus {
 #[derive(Clone, Debug)]
 enum FileSource {
     Static {
-        op: Operator,
+        op: RoutedOperator,
         relative_path: String,
         cache_path: String,
         local_fs: bool,
     },
-    Provider(Arc<dyn FileIOProvider>),
+    Provider {
+        provider: Arc<dyn FileIOProvider>,
+        origin_only: bool,
+        file_prefixes: Arc<[String]>,
+    },
 }
 
 impl FileSource {
-    async fn resolve(&self, path: &str) -> crate::Result<(Operator, String, Option<String>)> {
+    async fn resolve(&self, path: &str) -> crate::Result<(RoutedOperator, String, Option<String>)> {
         match self {
-            Self::Provider(provider) => {
-                let (op, relative_path, resolved_namespace) =
-                    resolve_provider_with_cache_namespace(provider.as_ref(), path).await?;
-                let cache_path = resolved_namespace
-                    .map(|namespace| cache_object_path(&namespace, &op, &relative_path));
+            Self::Provider {
+                provider,
+                origin_only,
+                file_prefixes,
+            } => {
+                let (op, relative_path, namespace) =
+                    resolve_provider_routed(provider.as_ref(), path, *origin_only, file_prefixes)
+                        .await?;
+                let cache_path = namespace.map(|namespace| {
+                    cache_object_path(&namespace, op.origin_operator(), &relative_path)
+                });
                 Ok((op, relative_path, cache_path))
             }
             Self::Static {
@@ -1358,12 +1476,12 @@ impl InputFile {
 
     pub async fn exists(&self) -> crate::Result<bool> {
         let (op, relative_path, _) = self.source.resolve(&self.path).await?;
-        Ok(op.exists(&relative_path).await?)
+        Ok(op.operator(OpClass::Exists).exists(&relative_path).await?)
     }
 
     pub async fn metadata(&self) -> crate::Result<FileStatus> {
         let (op, relative_path, _) = self.source.resolve(&self.path).await?;
-        let meta = op.stat(&relative_path).await?;
+        let meta = op.operator(OpClass::Meta).stat(&relative_path).await?;
 
         Ok(FileStatus {
             size: meta.content_length(),
@@ -1378,17 +1496,25 @@ impl InputFile {
     pub async fn read(&self) -> crate::Result<Bytes> {
         let (op, relative_path, cache_path) = self.source.resolve(&self.path).await?;
         let (Some(cache), Some(cache_path)) = (&self.cache, cache_path) else {
-            return Ok(op.read(&relative_path).await?.to_bytes());
+            return Ok(op
+                .operator(OpClass::Read)
+                .read(&relative_path)
+                .await?
+                .to_bytes());
         };
         let read_token = cache.read_token(&cache_path);
         let size = if let Some(size) = cache.file_size(&cache_path, &read_token).await {
             size
         } else {
-            let size = op.stat(&relative_path).await?.content_length();
+            let size = op
+                .operator(OpClass::Meta)
+                .stat(&relative_path)
+                .await?
+                .content_length();
             cache.put_file_size(&cache_path, size, &read_token).await;
             size
         };
-        let delegate = Arc::new(op.reader(&relative_path).await?);
+        let delegate = Arc::new(op.operator(OpClass::Read).reader(&relative_path).await?);
         CachedFileReader::new_with_token(delegate, &cache_path, size, cache.clone(), read_token)
             .read_full()
             .await
@@ -1396,7 +1522,7 @@ impl InputFile {
 
     pub async fn reader(&self) -> crate::Result<impl FileRead> {
         let (op, relative_path, cache_path) = self.source.resolve(&self.path).await?;
-        let reader = op.reader(&relative_path).await?;
+        let reader = op.operator(OpClass::Read).reader(&relative_path).await?;
         let (Some(cache), Some(cache_path)) = (&self.cache, cache_path.as_ref()) else {
             return Ok(InputFileReader::Direct {
                 reader,
@@ -1409,7 +1535,11 @@ impl InputFile {
         let size = if let Some(size) = cache.file_size(cache_path, &read_token).await {
             size
         } else {
-            let size = op.stat(&relative_path).await?.content_length();
+            let size = op
+                .operator(OpClass::Meta)
+                .stat(&relative_path)
+                .await?
+                .content_length();
             cache.put_file_size(cache_path, size, &read_token).await;
             size
         };
@@ -1444,7 +1574,7 @@ impl OutputFile {
 
     pub async fn exists(&self) -> crate::Result<bool> {
         let (op, relative_path, _) = self.source.resolve(&self.path).await?;
-        Ok(op.exists(&relative_path).await?)
+        Ok(op.origin_operator().exists(&relative_path).await?)
     }
 
     pub fn to_input_file(self) -> InputFile {
@@ -1467,7 +1597,8 @@ impl OutputFile {
     pub async fn writer(&self) -> crate::Result<Box<dyn FileWrite>> {
         let (op, relative_path, cache_path) = self.source.resolve(&self.path).await?;
         let writer: Box<dyn FileWrite> = Box::new(
-            op.writer_with(&relative_path)
+            op.operator(OpClass::Write)
+                .writer_with(&relative_path)
                 .chunk(8 * 1024 * 1024)
                 .await?,
         );
@@ -1479,9 +1610,10 @@ impl OutputFile {
     /// queue here because it cannot drain a partial chunk before close.
     pub(crate) async fn flushable_writer(&self) -> crate::Result<Box<dyn FileWrite>> {
         let (op, relative_path, cache_path) = self.source.resolve(&self.path).await?;
+        let op = op.operator(OpClass::Write);
         let writer: Box<dyn FileWrite> =
             if matches!(self.source, FileSource::Static { local_fs: true, .. }) {
-                Box::new(LocalFileWriter::new(&op, &relative_path).await?)
+                Box::new(LocalFileWriter::new(op, &relative_path).await?)
             } else {
                 Box::new(FlushableFileWriter {
                     delegate: op.writer(&relative_path).await?,
@@ -1511,7 +1643,8 @@ impl OutputFile {
     pub(crate) async fn async_writer(&self) -> crate::Result<Box<dyn AsyncFileWrite>> {
         let (op, relative_path, cache_path) = self.source.resolve(&self.path).await?;
         let writer: Box<dyn AsyncFileWrite> = Box::new(
-            op.writer_with(&relative_path)
+            op.operator(OpClass::Write)
+                .writer_with(&relative_path)
                 .chunk(8 * 1024 * 1024)
                 .concurrent(1)
                 .await?
