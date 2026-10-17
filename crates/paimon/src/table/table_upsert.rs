@@ -270,7 +270,7 @@ impl TableUpsert {
                     .fields()
                     .iter()
                     .map(|field| {
-                        super::key_normalization::normalize_upsert_key(
+                        super::key_normalization::normalize_match_key(
                             batch.column_by_name(field.name()).unwrap(),
                             field.data_type(),
                         )

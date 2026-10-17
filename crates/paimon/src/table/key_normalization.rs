@@ -23,8 +23,10 @@ use arrow_schema::DataType;
 use super::update_input::{cast_update_value, decode_dictionary, CastMode};
 use super::write_batch_normalize::normalize_write_array;
 
-/// Dictionary indices are local to each batch, never row identity. NULL keys
-/// retain their validity bitmap; the operation decides whether NULL matches.
+/// Unify Arrow representations without changing key identity. Dictionary
+/// indices are batch-local; integer widths, decimal scales and temporal units
+/// may differ only when conversion is exact. Callers validate the logical type
+/// families and decide whether NULL keys match. Payload write rules are separate.
 pub(super) fn normalize_match_key(
     array: &ArrayRef,
     expected: &DataType,
@@ -33,18 +35,6 @@ pub(super) fn normalize_match_key(
     if decoded.data_type() == &DataType::Null {
         return Ok(new_null_array(expected, decoded.len()));
     }
-    normalize_write_array(&decoded, expected)
-}
-
-/// Upsert matches logical values before deciding update versus append. Integer
-/// widths, decimal scales and units within a temporal family can differ, but
-/// conversion must be exact so distinct source keys never collapse. Payloads,
-/// including the original key columns, keep their own action's write contract.
-pub(super) fn normalize_upsert_key(
-    array: &ArrayRef,
-    expected: &DataType,
-) -> crate::Result<ArrayRef> {
-    let decoded = decode_dictionary(array)?;
     let source = decoded.data_type();
     if source.is_decimal() && matches!(expected, DataType::Decimal128(..)) {
         let source_scale = match source {
@@ -91,7 +81,7 @@ pub(super) fn normalize_upsert_key(
     if exact_family {
         cast_update_value(&decoded, expected, CastMode::Assignment)
     } else {
-        normalize_match_key(&decoded, expected)
+        normalize_write_array(&decoded, expected)
     }
 }
 
@@ -129,15 +119,15 @@ mod tests {
             None,
             Some(i32::MAX as i64),
         ]));
-        let output = normalize_upsert_key(&input, &DataType::Int32).unwrap();
+        let output = normalize_match_key(&input, &DataType::Int32).unwrap();
         assert_eq!(
             output.as_any().downcast_ref::<Int32Array>().unwrap(),
             &Int32Array::from(vec![Some(-1), None, Some(i32::MAX)])
         );
         let overflow: ArrayRef = Arc::new(Int64Array::from(vec![i32::MAX as i64 + 1]));
-        assert!(normalize_upsert_key(&overflow, &DataType::Int32).is_err());
+        assert!(normalize_match_key(&overflow, &DataType::Int32).is_err());
         let text: ArrayRef = Arc::new(StringArray::from(vec!["42"]));
-        assert!(normalize_upsert_key(&text, &DataType::Int32).is_err());
+        assert!(normalize_match_key(&text, &DataType::Int32).is_err());
     }
 
     #[test]
@@ -150,7 +140,7 @@ mod tests {
             ) as ArrayRef
         };
         let expected = DataType::Decimal128(10, 2);
-        let output = normalize_upsert_key(&array(12500), &expected).unwrap();
+        let output = normalize_match_key(&array(12500), &expected).unwrap();
         assert_eq!(
             output
                 .as_any()
@@ -159,7 +149,7 @@ mod tests {
                 .value(0),
             125
         );
-        assert!(normalize_upsert_key(&array(12501), &expected).is_err());
+        assert!(normalize_match_key(&array(12501), &expected).is_err());
     }
 
     #[test]
@@ -171,7 +161,7 @@ mod tests {
                     .unwrap(),
             );
             let expected = DataType::Decimal128(38, to);
-            let output = normalize_upsert_key(&input, &expected).unwrap();
+            let output = normalize_match_key(&input, &expected).unwrap();
             assert_eq!(output.data_type(), &expected);
             assert_eq!(
                 output.as_any().downcast_ref::<Decimal128Array>().unwrap(),
@@ -184,7 +174,7 @@ mod tests {
                     .with_precision_and_scale(38, from)
                     .unwrap(),
             );
-            assert!(normalize_upsert_key(&nonzero, &expected).is_err());
+            assert!(normalize_match_key(&nonzero, &expected).is_err());
         }
     }
 
@@ -196,8 +186,7 @@ mod tests {
             Some(2000),
         ]));
         let output =
-            normalize_upsert_key(&input, &DataType::Timestamp(TimeUnit::Millisecond, None))
-                .unwrap();
+            normalize_match_key(&input, &DataType::Timestamp(TimeUnit::Millisecond, None)).unwrap();
         assert_eq!(
             output
                 .as_any()
@@ -206,14 +195,14 @@ mod tests {
             &TimestampMillisecondArray::from(vec![Some(-1), None, Some(2)])
         );
         let fractional: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![-1001]));
-        assert!(normalize_upsert_key(
+        assert!(normalize_match_key(
             &fractional,
             &DataType::Timestamp(TimeUnit::Millisecond, None)
         )
         .is_err());
         let local: ArrayRef =
             Arc::new(TimestampMicrosecondArray::from(vec![0]).with_timezone("America/New_York"));
-        let output = normalize_upsert_key(
+        let output = normalize_match_key(
             &local,
             &DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
         )
@@ -227,8 +216,7 @@ mod tests {
             0
         );
         assert!(
-            normalize_upsert_key(&local, &DataType::Timestamp(TimeUnit::Microsecond, None))
-                .is_err()
+            normalize_match_key(&local, &DataType::Timestamp(TimeUnit::Microsecond, None)).is_err()
         );
     }
 }

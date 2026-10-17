@@ -245,7 +245,7 @@ fn normalize_blob_update_key(array: &ArrayRef, expected: &DataType) -> Result<Ar
             super::update_input::CastMode::RowUpdate,
         );
     }
-    super::key_normalization::normalize_upsert_key(&decoded, expected)
+    super::key_normalization::normalize_match_key(&decoded, expected)
 }
 
 /// Decimal.fromBigDecimal: round magnitude HALF_UP, then check precision.
