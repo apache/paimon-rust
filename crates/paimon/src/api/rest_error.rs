@@ -77,7 +77,7 @@ pub enum RestError {
 
     /// Unexpected error
     #[snafu(display("Unexpected error: {}", message))]
-    Unexpected { message: String },
+    Unexpected { code: i32, message: String },
 }
 
 use super::api_response::ErrorResponse;
@@ -89,7 +89,8 @@ impl RestError {
     /// creates an ErrorResponse with the raw response body as the message and the
     /// HTTP status code as the code.
     pub fn parse_error_response(text: &str, status_code: u16) -> ErrorResponse {
-        if let Ok(error) = serde_json::from_str::<ErrorResponse>(text) {
+        if let Ok(mut error) = serde_json::from_str::<ErrorResponse>(text) {
+            error.code = error.code.or(Some(status_code as i32));
             if error.message.is_some() {
                 return error;
             }
@@ -140,7 +141,47 @@ impl RestError {
             500 => RestError::ServiceFailure { message },
             501 => RestError::NotImplemented { message },
             503 => RestError::ServiceUnavailable { message },
-            _ => RestError::Unexpected { message },
+            _ => RestError::Unexpected { code, message },
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_json_code_uses_http_status() {
+        for code in [400, 401, 403, 404, 409, 500, 501, 503] {
+            let response = RestError::parse_error_response(
+                r#"{"resourceType":"TABLE","resourceName":"t","message":"denied"}"#,
+                code,
+            );
+            assert_eq!(response.code, Some(i32::from(code)));
+            assert_eq!(response.message.as_deref(), Some("denied"));
+            assert_eq!(response.resource_type.as_deref(), Some("TABLE"));
+            assert_eq!(response.resource_name.as_deref(), Some("t"));
+        }
+    }
+
+    #[test]
+    fn explicit_json_code_takes_precedence() {
+        let response = RestError::parse_error_response(r#"{"message":"denied","code":403}"#, 500);
+        assert!(matches!(
+            RestError::from_error_response(response),
+            RestError::Forbidden { message } if message == "denied"
+        ));
+    }
+
+    #[test]
+    fn unknown_status_preserves_code_and_raw_message() {
+        for code in [429, 502, 504] {
+            let response = RestError::parse_error_response("gateway unavailable", code);
+            assert!(matches!(
+                RestError::from_error_response(response),
+                RestError::Unexpected { code: actual, message }
+                    if actual == i32::from(code) && message == "gateway unavailable"
+            ));
         }
     }
 }

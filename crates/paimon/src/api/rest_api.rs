@@ -29,16 +29,17 @@ use crate::spec::{Partition, PartitionStatistics, Schema, SchemaChange, Snapshot
 use crate::Result;
 
 use super::api_request::{
-    AlterDatabaseRequest, AlterTableRequest, AuthTableQueryRequest, CreateDatabaseRequest,
-    CreateFunctionRequest, CreatePartitionsRequest, CreateTableRequest, CreateTagRequest,
-    CreateViewRequest, DropPartitionsRequest, DropPolicyRequest, ListPartitionsByFilterRequest,
-    ListPartitionsByNamesRequest, PolicyRequest, RenameTableRequest, RevokePermissionRequest,
+    AlterDatabaseRequest, AlterTableRequest, AuthTableQueryRequest, CreateBranchRequest,
+    CreateDatabaseRequest, CreateFunctionRequest, CreatePartitionsRequest, CreateTableRequest,
+    CreateTagRequest, CreateViewRequest, DropPartitionsRequest, DropPolicyRequest,
+    ForwardBranchRequest, ListPartitionsByFilterRequest, ListPartitionsByNamesRequest,
+    PolicyRequest, RenameTableRequest, RevokePermissionRequest,
 };
 use super::api_response::{
     AuthTableQueryResponse, ConfigResponse, ErrorResponse, GetDatabaseResponse,
-    GetFunctionResponse, GetTableResponse, GetTagResponse, GetViewResponse, ListDatabasesResponse,
-    ListFunctionsResponse, ListPartitionsResponse, ListPermissionsResponse, ListPoliciesResponse,
-    ListTablesResponse, ListViewsResponse, PagedList,
+    GetFunctionResponse, GetTableResponse, GetTagResponse, GetViewResponse, ListBranchesResponse,
+    ListDatabasesResponse, ListFunctionsResponse, ListPartitionsResponse, ListPermissionsResponse,
+    ListPoliciesResponse, ListTablesResponse, ListViewsResponse, PagedList,
 };
 use super::auth::{AuthProviderFactory, RESTAuthFunction};
 use super::management::{
@@ -76,6 +77,20 @@ fn validate_non_empty(value: &str, field_name: &str) -> Result<()> {
 fn validate_non_empty_multi(values: &[(&str, &str)]) -> Result<()> {
     for (value, field_name) in values {
         validate_non_empty(value, field_name)?;
+    }
+    Ok(())
+}
+
+/// `url` normalizes dot segments even when their dots are percent encoded.
+/// Reject them before a branch mutation can be redirected to a parent resource.
+fn validate_resource_path(values: &[(&str, &str)]) -> Result<()> {
+    validate_non_empty_multi(values)?;
+    for (value, field_name) in values {
+        if matches!(*value, "." | "..") {
+            return Err(crate::Error::ConfigInvalid {
+                message: format!("{field_name} must not be a dot path segment"),
+            });
+        }
     }
     Ok(())
 }
@@ -521,6 +536,73 @@ impl RESTApi {
         let path = self.resource_paths.view(database, view);
         let _resp: serde_json::Value = self.client.delete(&path, None::<&[(&str, &str)]>).await?;
         Ok(())
+    }
+
+    // ==================== Branch Operations ====================
+
+    /// Create an empty branch or create one from a tag, as in Java `RESTApi`.
+    pub async fn create_branch(
+        &self,
+        identifier: &Identifier,
+        branch_name: &str,
+        from_tag: Option<&str>,
+    ) -> Result<()> {
+        validate_resource_path(&[
+            (identifier.database(), "database name"),
+            (identifier.object(), "table name"),
+        ])?;
+        let path = self
+            .resource_paths
+            .branches(identifier.database(), identifier.object());
+        let request = CreateBranchRequest {
+            branch: branch_name.to_string(),
+            from_tag: from_tag.map(str::to_string),
+        };
+        self.client.post_without_response(&path, &request).await
+    }
+
+    /// Drop branch metadata through the catalog's publication protocol.
+    pub async fn drop_branch(&self, identifier: &Identifier, branch_name: &str) -> Result<()> {
+        validate_resource_path(&[
+            (identifier.database(), "database name"),
+            (identifier.object(), "table name"),
+            (branch_name, "branch name"),
+        ])?;
+        let path =
+            self.resource_paths
+                .branch(identifier.database(), identifier.object(), branch_name);
+        self.client.delete_without_response(&path).await
+    }
+
+    /// Ask the server to fast-forward from a branch. No files are changed locally.
+    pub async fn fast_forward(&self, identifier: &Identifier, branch_name: &str) -> Result<()> {
+        validate_resource_path(&[
+            (identifier.database(), "database name"),
+            (identifier.object(), "table name"),
+            (branch_name, "branch name"),
+        ])?;
+        let path = self.resource_paths.forward_branch(
+            identifier.database(),
+            identifier.object(),
+            branch_name,
+        );
+        self.client
+            .post_without_response(&path, &ForwardBranchRequest {})
+            .await
+    }
+
+    /// List the server's branches, preserving its order and null-list behavior.
+    pub async fn list_branches(&self, identifier: &Identifier) -> Result<Vec<String>> {
+        validate_resource_path(&[
+            (identifier.database(), "database name"),
+            (identifier.object(), "table name"),
+        ])?;
+        let path = self
+            .resource_paths
+            .branches(identifier.database(), identifier.object());
+        let response: ListBranchesResponse =
+            self.client.get(&path, None::<&[(&str, &str)]>).await?;
+        Ok(response.branches.unwrap_or_default())
     }
 
     // ==================== Function Operations ====================

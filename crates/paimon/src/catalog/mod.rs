@@ -570,6 +570,43 @@ pub trait Catalog: Send + Sync {
         })
     }
 
+    // ======================= branch methods =============================
+
+    /// Create an empty branch, or create one from a tag when `from_tag` is set.
+    /// Branch names and table capabilities are validated by the catalog.
+    async fn create_branch(
+        &self,
+        _identifier: &Identifier,
+        _branch_name: &str,
+        _from_tag: Option<&str>,
+    ) -> Result<()> {
+        Err(Error::Unsupported {
+            message: "branch management is not supported by this catalog".to_string(),
+        })
+    }
+
+    /// Delete a branch's metadata. Shared data files must remain intact.
+    async fn drop_branch(&self, _identifier: &Identifier, _branch_name: &str) -> Result<()> {
+        Err(Error::Unsupported {
+            message: "branch management is not supported by this catalog".to_string(),
+        })
+    }
+
+    /// Replace the identifier's current branch metadata with that of `branch_name`.
+    /// The REST catalog delegates the operation and its validation to the server.
+    async fn fast_forward(&self, _identifier: &Identifier, _branch_name: &str) -> Result<()> {
+        Err(Error::Unsupported {
+            message: "branch management is not supported by this catalog".to_string(),
+        })
+    }
+
+    /// List branches in the order supplied by the catalog, excluding no names locally.
+    async fn list_branches(&self, _identifier: &Identifier) -> Result<Vec<String>> {
+        Err(Error::Unsupported {
+            message: "branch management is not supported by this catalog".to_string(),
+        })
+    }
+
     // ======================= view methods ===============================
 
     /// Create a persistent view.

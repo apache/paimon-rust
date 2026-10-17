@@ -25,7 +25,7 @@ use chrono::Utc;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-use super::base::{AuthProvider, RESTAuthParameter, AUTHORIZATION_HEADER_KEY};
+use super::base::{merge_auth_headers, AuthProvider, RESTAuthParameter, AUTHORIZATION_HEADER_KEY};
 use super::dlf_signer::{DLFRequestSigner, DLFSignerFactory};
 use crate::api::user_agent;
 use crate::common::{CatalogOptions, Options};
@@ -334,7 +334,7 @@ const TOKEN_EXPIRATION_SAFE_TIME_MILLIS: i64 = 3_600_000;
 ///
 /// This provider implements authentication for Alibaba Cloud DLF service,
 /// supporting both VPC endpoints (DLF4-HMAC-SHA256) and public endpoints
-/// (ROA v2 HMAC-SHA1).
+/// (ROA v2 HMAC-SHA1 or explicit OpenAPI V4 ACS4-HMAC-SHA256).
 pub struct DLFAuthProvider {
     uri: String,
     token: tokio::sync::Mutex<Option<DLFToken>>,
@@ -426,7 +426,7 @@ impl DLFAuthProvider {
 impl AuthProvider for DLFAuthProvider {
     async fn merge_auth_header(
         &self,
-        mut base_header: HashMap<String, String>,
+        base_header: HashMap<String, String>,
         rest_auth_parameter: &RESTAuthParameter,
     ) -> crate::Result<HashMap<String, String>> {
         // Get token (will auto-refresh if needed via token_loader)
@@ -436,7 +436,7 @@ impl AuthProvider for DLFAuthProvider {
         let host = Self::extract_host(&self.uri);
 
         // Generate signature headers
-        let sign_headers = self.signer.sign_headers(
+        let mut sign_headers = self.signer.sign_headers(
             rest_auth_parameter.data.as_deref(),
             &now,
             token.security_token.as_deref(),
@@ -446,13 +446,11 @@ impl AuthProvider for DLFAuthProvider {
         // Generate authorization header
         let authorization =
             self.signer
-                .authorization(rest_auth_parameter, &token, &host, &sign_headers);
+                .authorization(rest_auth_parameter, &token, &host, &mut sign_headers);
 
         // Merge all headers
-        base_header.extend(sign_headers);
-        base_header.insert(AUTHORIZATION_HEADER_KEY.to_string(), authorization);
-
-        Ok(base_header)
+        sign_headers.insert(AUTHORIZATION_HEADER_KEY.to_string(), authorization);
+        Ok(merge_auth_headers(base_header, sign_headers))
     }
 }
 

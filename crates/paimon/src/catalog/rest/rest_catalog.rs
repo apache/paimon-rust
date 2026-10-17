@@ -487,6 +487,78 @@ impl Catalog for RESTCatalog {
         })
     }
 
+    async fn create_branch(
+        &self,
+        identifier: &Identifier,
+        branch_name: &str,
+        from_tag: Option<&str>,
+    ) -> Result<()> {
+        self.api
+            .create_branch(identifier, branch_name, from_tag)
+            .await
+            .map_err(|error| match error {
+                Error::RestApi {
+                    source:
+                        RestError::NoSuchResource {
+                            resource_type: Some(kind),
+                            ..
+                        },
+                } if kind == "TABLE" => Error::TableNotExist {
+                    full_name: identifier.full_name(),
+                },
+                Error::RestApi {
+                    source:
+                        RestError::NoSuchResource {
+                            resource_type: Some(kind),
+                            ..
+                        },
+                } if kind == "TAG" => Error::TagNotExist {
+                    tag_name: from_tag.unwrap_or_default().to_string(),
+                },
+                Error::RestApi {
+                    source: RestError::AlreadyExists { .. },
+                } => Error::BranchAlreadyExist {
+                    full_name: identifier.full_name(),
+                    branch_name: branch_name.to_string(),
+                },
+                Error::RestApi {
+                    source: RestError::BadRequest { message },
+                } => Error::DataInvalid {
+                    message,
+                    source: None,
+                },
+                other => other,
+            })
+    }
+
+    async fn drop_branch(&self, identifier: &Identifier, branch_name: &str) -> Result<()> {
+        self.api
+            .drop_branch(identifier, branch_name)
+            .await
+            .map_err(|error| map_rest_error_for_branch(error, identifier, branch_name))
+    }
+
+    async fn fast_forward(&self, identifier: &Identifier, branch_name: &str) -> Result<()> {
+        self.api
+            .fast_forward(identifier, branch_name)
+            .await
+            .map_err(|error| map_rest_error_for_branch(error, identifier, branch_name))
+    }
+
+    async fn list_branches(&self, identifier: &Identifier) -> Result<Vec<String>> {
+        self.api
+            .list_branches(identifier)
+            .await
+            .map_err(|error| match error {
+                Error::RestApi {
+                    source: RestError::NoSuchResource { .. },
+                } => Error::TableNotExist {
+                    full_name: identifier.full_name(),
+                },
+                other => other,
+            })
+    }
+
     async fn list_views(&self, database_name: &str) -> Result<Vec<String>> {
         self.api
             .list_views(database_name)
@@ -710,6 +782,18 @@ impl Catalog for RESTCatalog {
 // ============================================================================
 // Error mapping helpers
 // ============================================================================
+
+fn map_rest_error_for_branch(error: Error, identifier: &Identifier, branch_name: &str) -> Error {
+    match error {
+        Error::RestApi {
+            source: RestError::NoSuchResource { .. },
+        } => Error::BranchNotExist {
+            full_name: identifier.full_name(),
+            branch_name: branch_name.to_string(),
+        },
+        other => other,
+    }
+}
 
 /// Map a REST API error to a catalog-level database error.
 ///

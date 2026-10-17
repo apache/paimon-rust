@@ -148,4 +148,21 @@ ctx = SessionContext()
 ctx.register_catalog_provider("paimon", catalog)
 ```
 
+REST catalogs also support branch management through Rust core:
+
+```python
+identifier = ("db", "table")
+catalog.create_branch(identifier, "empty-branch")
+catalog.create_branch(identifier, "release-branch", from_tag="release-tag")
+branches = catalog.list_branches(identifier)
+release = catalog.get_table(("db", "table$branch_release-branch"))
+catalog.fast_forward(identifier, "release-branch")
+catalog.drop_branch(identifier, "empty-branch")
+```
+
+The server validates branch names and publishes metadata changes. Fast-forward
+updates the identifier's current branch (main by default); it does not change
+the source branch. These catalog methods currently require a REST catalog.
+Other catalog implementations raise `NotImplementedError`.
+
 Time travel queries are not supported in the Python binding at this time.

@@ -75,6 +75,18 @@ pub struct RenameTableRequest {
     pub destination: Identifier,
 }
 
+/// Request to create a table branch, optionally from a tag.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateBranchRequest {
+    pub branch: String,
+    pub from_tag: Option<String>,
+}
+
+/// Empty JSON object sent by Java's fast-forward operation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForwardBranchRequest {}
+
 /// Request to create a table tag.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

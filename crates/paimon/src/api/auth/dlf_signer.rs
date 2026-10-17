@@ -17,7 +17,7 @@
 
 //! DLF Request Signer implementations for Alibaba Cloud Data Lake Formation.
 //!
-//! This module provides two signature algorithms for authenticating requests
+//! This module provides signature algorithms for authenticating requests
 //! to Alibaba Cloud Data Lake Formation (DLF) service:
 //!
 //! # Signature Algorithms
@@ -72,6 +72,7 @@
 //! The signer is automatically selected based on the endpoint URI:
 //! - VPC endpoints → `DLFDefaultSigner` (DLF4-HMAC-SHA256)
 //! - Public endpoints with "dlfnext" or "openapi" → `DLFOpenApiSigner` (HMAC-SHA1)
+//! - Explicit `openapi-v4` → `DLFOpenApiV4Signer` (ACS4-HMAC-SHA256)
 
 use std::collections::HashMap;
 
@@ -84,11 +85,22 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::base::RESTAuthParameter;
+use super::dlf_openapi_v4_signer::DLFOpenApiV4Signer;
 use super::dlf_provider::DLFToken;
 use crate::api::rest_util::RESTUtil;
 
 type HmacSha256 = Hmac<Sha256>;
 type HmacSha1 = Hmac<Sha1>;
+
+pub(super) fn hmac_sha256(key: &[u8], data: &str) -> Vec<u8> {
+    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC can take key of any size");
+    mac.update(data.as_bytes());
+    mac.finalize().into_bytes().to_vec()
+}
+
+pub(super) fn sha256_hex(raw: &str) -> String {
+    hex::encode(Sha256::digest(raw.as_bytes()))
+}
 
 /// Trait for DLF request signers.
 ///
@@ -99,6 +111,7 @@ type HmacSha1 = Hmac<Sha1>;
 ///
 /// - [`DLFDefaultSigner`]: Uses DLF4-HMAC-SHA256 for VPC endpoints
 /// - [`DLFOpenApiSigner`]: Uses HMAC-SHA1 for public endpoints
+/// - [`DLFOpenApiV4Signer`]: Uses ACS4-HMAC-SHA256 when explicitly configured
 pub trait DLFRequestSigner: Send + Sync {
     /// Generate signature headers for the request.
     fn sign_headers(
@@ -115,7 +128,7 @@ pub trait DLFRequestSigner: Send + Sync {
         rest_auth_parameter: &RESTAuthParameter,
         token: &DLFToken,
         host: &str,
-        sign_headers: &HashMap<String, String>,
+        sign_headers: &mut HashMap<String, String>,
     ) -> String;
     #[allow(dead_code)]
     /// Get the identifier for this signer.
@@ -199,18 +212,6 @@ impl DLFDefaultSigner {
         hasher.update(raw.as_bytes());
         let hash = hasher.finalize();
         BASE64_STANDARD.encode(hash)
-    }
-
-    fn hmac_sha256(key: &[u8], data: &str) -> Vec<u8> {
-        let mut mac = HmacSha256::new_from_slice(key).expect("HMAC can take key of any size");
-        mac.update(data.as_bytes());
-        mac.finalize().into_bytes().to_vec()
-    }
-
-    fn sha256_hex(raw: &str) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(raw.as_bytes());
-        hex::encode(hasher.finalize())
     }
 
     fn hex_encode(raw: &[u8]) -> String {
@@ -340,7 +341,7 @@ impl DLFRequestSigner for DLFDefaultSigner {
         rest_auth_parameter: &RESTAuthParameter,
         token: &DLFToken,
         _host: &str,
-        sign_headers: &HashMap<String, String>,
+        sign_headers: &mut HashMap<String, String>,
     ) -> String {
         let date_time = sign_headers.get(Self::DLF_DATE_HEADER_KEY).unwrap();
         let date = &date_time[..8];
@@ -357,20 +358,20 @@ impl DLFRequestSigner for DLFDefaultSigner {
                 Self::PRODUCT,
                 Self::REQUEST_TYPE
             ),
-            Self::sha256_hex(&canonical_request),
+            sha256_hex(&canonical_request),
         ]
         .join(Self::NEW_LINE);
 
         // Derive signing key
-        let date_key = Self::hmac_sha256(
+        let date_key = hmac_sha256(
             format!("aliyun_v4{}", token.access_key_secret).as_bytes(),
             date,
         );
-        let date_region_key = Self::hmac_sha256(&date_key, &self.region);
-        let date_region_service_key = Self::hmac_sha256(&date_region_key, Self::PRODUCT);
-        let signing_key = Self::hmac_sha256(&date_region_service_key, Self::REQUEST_TYPE);
+        let date_region_key = hmac_sha256(&date_key, &self.region);
+        let date_region_service_key = hmac_sha256(&date_region_key, Self::PRODUCT);
+        let signing_key = hmac_sha256(&date_region_service_key, Self::REQUEST_TYPE);
 
-        let signature_bytes = Self::hmac_sha256(&signing_key, &string_to_sign);
+        let signature_bytes = hmac_sha256(&signing_key, &string_to_sign);
         let signature = Self::hex_encode(&signature_bytes);
 
         format!(
@@ -610,7 +611,7 @@ impl DLFRequestSigner for DLFOpenApiSigner {
         rest_auth_parameter: &RESTAuthParameter,
         token: &DLFToken,
         _host: &str,
-        sign_headers: &HashMap<String, String>,
+        sign_headers: &mut HashMap<String, String>,
     ) -> String {
         let canonicalized_headers = self.build_canonicalized_headers(sign_headers);
         let canonicalized_resource = self.build_canonicalized_resource(rest_auth_parameter);
@@ -642,7 +643,9 @@ pub struct DLFSignerFactory;
 impl DLFSignerFactory {
     /// Create a signer based on the signing algorithm.
     pub fn create_signer(signing_algorithm: &str, region: &str) -> Box<dyn DLFRequestSigner> {
-        if signing_algorithm == DLFOpenApiSigner::IDENTIFIER {
+        if signing_algorithm == DLFOpenApiV4Signer::IDENTIFIER {
+            Box::new(DLFOpenApiV4Signer::new(region))
+        } else if signing_algorithm == DLFOpenApiSigner::IDENTIFIER {
             Box::new(DLFOpenApiSigner)
         } else {
             Box::new(DLFDefaultSigner::new(region))

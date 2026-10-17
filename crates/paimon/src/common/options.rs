@@ -58,7 +58,7 @@ impl CatalogOptions {
     /// DLF security token (optional, for temporary credentials).
     pub const DLF_ACCESS_SECURITY_TOKEN: &'static str = "dlf.security-token";
 
-    /// DLF signing algorithm (default or openapi).
+    /// DLF signing algorithm (default, openapi or openapi-v4).
     pub const DLF_SIGNING_ALGORITHM: &'static str = "dlf.signing-algorithm";
 
     /// DLF token loader type ("ecs" or "local_file").
