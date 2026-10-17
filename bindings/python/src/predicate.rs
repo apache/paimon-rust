@@ -302,6 +302,64 @@ fn decimal_datum(value: &Bound<'_, PyAny>, dec: &DecimalType) -> PyResult<Datum>
     })
 }
 
+/// Predicate literals are values to compare, not values to store in the column.
+/// Java Decimal.compareTo permits a different precision and scale. Keep the
+/// strict column conversion above for partition writes and other stored values.
+fn predicate_datum(value: &Bound<'_, PyAny>, data_type: &DataType) -> PyResult<Datum> {
+    let DataType::Decimal(column) = data_type else {
+        return py_to_datum(value, data_type);
+    };
+    if let Ok(value) = decimal_datum(value, column) {
+        return Ok(value);
+    }
+    let decimal_class = value.py().import("decimal")?.getattr("Decimal")?;
+    let value = if value.is_instance_of::<PyInt>() && !value.is_instance_of::<PyBool>() {
+        decimal_class.call1((value,))?
+    } else if value.is_instance(&decimal_class)? {
+        value.clone()
+    } else {
+        return decimal_datum(value, column);
+    };
+    let tuple = value.call_method0("as_tuple")?;
+    let sign: u8 = tuple.getattr("sign")?.extract()?;
+    let mut exponent: i64 = tuple
+        .getattr("exponent")?
+        .extract()
+        .map_err(|_| PyValueError::new_err("expected a finite decimal predicate literal"))?;
+    let digits: Vec<u8> = tuple.getattr("digits")?.extract()?;
+    let start = digits.iter().position(|d| *d != 0).unwrap_or(digits.len());
+    let mut digits = &digits[start..];
+    if digits.is_empty() {
+        return Ok(Datum::Decimal {
+            unscaled: 0,
+            precision: column.precision(),
+            scale: column.scale(),
+        });
+    }
+    while digits.last() == Some(&0) {
+        digits = &digits[..digits.len() - 1];
+        exponent = exponent
+            .checked_add(1)
+            .ok_or_else(|| PyValueError::new_err("decimal exponent overflow"))?;
+    }
+    let scale = exponent.checked_neg().unwrap_or(i64::MAX).max(0);
+    let precision = (digits.len() as i64)
+        .saturating_add(exponent.max(0))
+        .max(scale);
+    if precision > 38 || scale > 38 {
+        return Err(PyValueError::new_err(
+            "decimal predicate literal exceeds Java DECIMAL precision",
+        ));
+    }
+    let magnitude = digits.iter().fold(0_i128, |v, d| v * 10 + i128::from(*d))
+        * 10_i128.pow(exponent.max(0) as u32);
+    Ok(Datum::Decimal {
+        unscaled: if sign == 1 { -magnitude } else { magnitude },
+        precision: precision as u32,
+        scale: scale as u32,
+    })
+}
+
 /// Rescale a finite `decimal.Decimal` to `scale` exactly via `as_tuple()`
 /// (sign, digits, exponent), avoiding Decimal arithmetic whose context
 /// precision could silently round.
@@ -494,7 +552,7 @@ fn leaf_to_predicate(
                     continue;
                 }
                 out.push(Some(
-                    py_to_datum(&item, &data_type)
+                    predicate_datum(&item, &data_type)
                         .map_err(|e| with_field_context(e, &field, &data_type))?,
                 ));
             }
@@ -1538,6 +1596,79 @@ value = datetime.datetime(2024, 1, 1, tzinfo=FloatingTz())",
 
     fn decimal_type(precision: u32, scale: u32) -> DataType {
         DataType::Decimal(paimon::spec::DecimalType::new(precision, scale).unwrap())
+    }
+
+    #[test]
+    fn decimal_predicate_literals_preserve_comparison_value() {
+        Python::attach(|py| {
+            for (text, unscaled, precision, scale) in [
+                ("1.235", 1235, 4, 3),
+                ("-1.23500000000000000000000000000000000000000", -1235, 4, 3),
+                ("123456789.12", 12345678912, 11, 2),
+                ("1E-38", 1, 38, 38),
+                ("1E+37", 10_i128.pow(37), 38, 0),
+                ("0E+100", 0, 10, 2),
+            ] {
+                let value = py_decimal(py, text);
+                assert_eq!(
+                    predicate_datum(&value, &decimal_type(10, 2)).unwrap(),
+                    Datum::Decimal {
+                        unscaled,
+                        precision,
+                        scale
+                    },
+                    "{text}"
+                );
+                // A comparison literal must not relax stored partition values.
+                assert!(py_to_datum(&value, &decimal_type(10, 2)).is_err(), "{text}");
+            }
+            let value = 123456789_i64.into_pyobject(py).unwrap();
+            assert_eq!(
+                predicate_datum(&value, &decimal_type(10, 2)).unwrap(),
+                Datum::Decimal {
+                    unscaled: 123456789,
+                    precision: 9,
+                    scale: 0
+                }
+            );
+            for text in ["1E-39", "1E+38"] {
+                assert!(predicate_datum(&py_decimal(py, text), &decimal_type(10, 2)).is_err());
+            }
+        });
+    }
+
+    #[test]
+    fn decimal_comparison_and_membership_use_literal_scale() {
+        Python::attach(|py| {
+            let fields = vec![DataField::new(0, "amount".into(), decimal_type(10, 2))];
+            for method in [
+                "equal",
+                "notEqual",
+                "lessThan",
+                "lessOrEqual",
+                "greaterThan",
+                "greaterOrEqual",
+                "in",
+                "notIn",
+            ] {
+                let node = leaf_dict(py, method, "amount", &[]);
+                let literals = PyList::empty(py);
+                literals.append(py_decimal(py, "1.235")).unwrap();
+                node.set_item("literals", literals).unwrap();
+                let predicate = dict_to_predicate(&node, &fields, true).unwrap();
+                let Predicate::Leaf { literals, .. } = predicate else {
+                    panic!("expected leaf")
+                };
+                assert_eq!(
+                    literals,
+                    vec![Datum::Decimal {
+                        unscaled: 1235,
+                        precision: 4,
+                        scale: 3
+                    }]
+                );
+            }
+        });
     }
 
     #[test]
