@@ -26,9 +26,9 @@
 use crate::{Error, Result};
 use arrow_array::{
     Array, ArrayRef, BinaryArray, Decimal128Array, FixedSizeBinaryArray, FixedSizeListArray,
-    LargeStringArray, ListArray, MapArray, StringArray, StructArray,
+    LargeBinaryArray, LargeStringArray, ListArray, MapArray, StringArray, StructArray,
 };
-use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
+use arrow_buffer::{Buffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::{DataType, Field};
 use std::sync::Arc;
 
@@ -435,28 +435,35 @@ fn normalize_visible_array(
 /// in its backing buffer, so casting the original absolute offsets is wrong.
 /// The value buffer remains shared and only the offset buffer is rebuilt.
 fn normalize_large_string(array: &LargeStringArray) -> Result<ArrayRef> {
-    let source = array.value_offsets();
+    let (offsets, values) = narrow_byte_range(array.value_offsets(), array.values())?;
+    StringArray::try_new(offsets, values, array.nulls().cloned())
+        .map(|array| Arc::new(array) as ArrayRef)
+        .map_err(normalization_error)
+}
+
+/// Offset adaptation for matching keys; ordinary append type validation remains
+/// separate so this does not broaden accepted write schemas.
+pub(super) fn normalize_large_binary(array: &LargeBinaryArray) -> Result<ArrayRef> {
+    let (offsets, values) = narrow_byte_range(array.value_offsets(), array.values())?;
+    BinaryArray::try_new(offsets, values, array.nulls().cloned())
+        .map(|array| Arc::new(array) as ArrayRef)
+        .map_err(normalization_error)
+}
+
+fn narrow_byte_range(source: &[i64], values: &Buffer) -> Result<(OffsetBuffer<i32>, Buffer)> {
     let start = source[0];
     let end = source[source.len() - 1];
     let offsets = source
         .iter()
         .map(|offset| {
             i32::try_from(offset - start).map_err(|_| Error::DataInvalid {
-                message: "Arrow STRING byte range exceeds 32-bit offsets".into(),
+                message: "Arrow byte range exceeds 32-bit offsets".into(),
                 source: None,
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    let values = array
-        .values()
-        .slice_with_length(start as usize, (end - start) as usize);
-    StringArray::try_new(
-        OffsetBuffer::new(offsets.into()),
-        values,
-        array.nulls().cloned(),
-    )
-    .map(|array| Arc::new(array) as ArrayRef)
-    .map_err(normalization_error)
+    let values = values.slice_with_length(start as usize, (end - start) as usize);
+    Ok((OffsetBuffer::new(offsets.into()), values))
 }
 
 /// Keep only children referenced by visible parents. Ordinary inputs and
@@ -604,6 +611,21 @@ mod tests {
         });
         let empty = normalize_write_array(&input.slice(3, 0), &DataType::Utf8).unwrap();
         assert!(empty.is_empty());
+        let text = input.as_any().downcast_ref::<LargeStringArray>().unwrap();
+        let binary: ArrayRef = Arc::new(LargeBinaryArray::new(
+            text.offsets().clone(),
+            text.values().clone(),
+            text.nulls().cloned(),
+        ));
+        let normalized =
+            crate::table::key_normalization::normalize_match_key(&binary, &DataType::Binary)
+                .unwrap();
+        assert_eq!(
+            normalized.to_data(),
+            BinaryArray::from(vec![Some("abc".as_bytes()), None, Some("中文".as_bytes())])
+                .to_data()
+        );
+        assert!(normalize_write_array(&binary, &DataType::Binary).is_err());
         // A visible range larger than i32::MAX still cannot be represented.
         // SAFETY: the mapped bytes are zeroes followed by a valid UTF-8 tail;
         // offsets and NULL bitmap are valid. Skip scanning the 2 GiB prefix.
