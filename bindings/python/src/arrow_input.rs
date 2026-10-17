@@ -79,24 +79,32 @@ pub(crate) fn batch_from_pyarrow(value: &Bound<'_, PyAny>) -> PyResult<RecordBat
     .map_err(|e| PyValueError::new_err(e.to_string()))
 }
 
-// ArrayData::slice already propagates STRUCT offsets into its children. C Data
-// has unsliced children, so preserve that representation until each parent is
-// normalized. Slicing through ArrayData::slice here would apply offsets twice.
-fn slice_imported(data: ArrayData, offset: usize, len: usize) -> Result<ArrayData, ArrowError> {
-    let nulls = data.nulls().map(|n| n.slice(offset, len));
-    let offset = data.offset() + offset;
-    data.into_builder()
-        .offset(offset)
-        .len(len)
-        .nulls(nulls)
-        .build()
-}
-
 fn normalize_sparse_unions(data: ArrayData) -> Result<ArrayData, ArrowError> {
     if !contains_sparse_union(data.data_type()) {
         return Ok(data);
     }
-    let (data_type, len, nulls, mut offset, mut buffers, children) = data.into_parts();
+    normalize_imported_data(data)
+}
+
+fn normalize_imported_data(data: ArrayData) -> Result<ArrayData, ArrowError> {
+    let len = data.len();
+    normalize_imported_slice(data, 0, len)
+}
+
+fn normalize_imported_slice(
+    data: ArrayData,
+    relative_offset: usize,
+    len: usize,
+) -> Result<ArrayData, ArrowError> {
+    // Once a parent is sliced, normalize every descendant, including ordinary
+    // STRUCT siblings and Union children. Arrow's STRUCT materializer uses
+    // ArrayData::slice, which can otherwise apply nested offsets twice.
+    let (data_type, _, nulls, offset, mut buffers, children) = data.into_parts();
+    let nulls = nulls.map(|n| n.slice(relative_offset, len));
+    let mut offset = offset + relative_offset;
+    // Defer validation until both parent and children share their coordinates.
+    // An intermediate ArrayData slice would validate a sliced parent's NULLs
+    // against unsliced non-nullable children, or propagate STRUCT offsets twice.
     let children = match &data_type {
         DataType::Struct(_) | DataType::Union(_, UnionMode::Sparse) => {
             if matches!(data_type, DataType::Union(_, UnionMode::Sparse)) {
@@ -106,7 +114,7 @@ fn normalize_sparse_unions(data: ArrayData) -> Result<ArrayData, ArrowError> {
             }
             let children = children
                 .into_iter()
-                .map(|c| slice_imported(c, offset, len))
+                .map(|c| normalize_imported_slice(c, offset, len))
                 .collect::<Result<Vec<_>, _>>()?;
             offset = 0;
             children
@@ -115,17 +123,16 @@ fn normalize_sparse_unions(data: ArrayData) -> Result<ArrayData, ArrowError> {
             let width = *width as usize;
             let children = children
                 .into_iter()
-                .map(|c| slice_imported(c, offset * width, len * width))
+                .map(|c| normalize_imported_slice(c, offset * width, len * width))
                 .collect::<Result<Vec<_>, _>>()?;
             offset = 0;
             children
         }
-        _ => children,
+        _ => children
+            .into_iter()
+            .map(normalize_imported_data)
+            .collect::<Result<Vec<_>, _>>()?,
     };
-    let children = children
-        .into_iter()
-        .map(normalize_sparse_unions)
-        .collect::<Result<Vec<_>, _>>()?;
     ArrayData::builder(data_type)
         .len(len)
         .offset(offset)
@@ -141,7 +148,7 @@ mod tests {
     use arrow::array::{
         Array, FixedSizeListArray, Int32Array, StringArray, StructArray, UnionArray,
     };
-    use arrow::buffer::ScalarBuffer;
+    use arrow::buffer::{NullBuffer, ScalarBuffer};
     use arrow::datatypes::{Field, UnionFields};
 
     fn input() -> ArrayData {
@@ -176,7 +183,7 @@ mod tests {
 
     #[test]
     fn c_data_sparse_union_slice_rebases_children_and_type_ids() {
-        let raw = slice_imported(input(), 1, 2).unwrap();
+        let raw = input().into_builder().offset(1).len(2).build().unwrap();
         assert_values(normalize_sparse_unions(raw).unwrap());
     }
 
@@ -228,5 +235,116 @@ mod tests {
         .unwrap();
         let lists = FixedSizeListArray::from(normalize_sparse_unions(lists).unwrap());
         assert_values(lists.values().to_data());
+    }
+
+    #[test]
+    fn c_data_slices_normalize_ordinary_nested_union_children_and_siblings() {
+        let leaf = Int32Array::from(vec![0, 1, 2, 3]).to_data();
+        let inner = ArrayData::builder(DataType::Struct(
+            vec![Field::new("b", DataType::Int32, true)].into(),
+        ))
+        .len(4)
+        .child_data(vec![leaf])
+        .build()
+        .unwrap();
+        let ordinary = ArrayData::builder(DataType::Struct(
+            vec![Field::new("a", inner.data_type().clone(), true)].into(),
+        ))
+        .len(4)
+        .child_data(vec![inner])
+        .build()
+        .unwrap();
+        let sibling = ArrayData::builder(DataType::Struct(
+            vec![
+                Field::new("u", input().data_type().clone(), true),
+                Field::new("ordinary", ordinary.data_type().clone(), true),
+            ]
+            .into(),
+        ))
+        .len(2)
+        .offset(1)
+        .child_data(vec![input(), ordinary.clone()])
+        .build()
+        .unwrap();
+        let sibling = StructArray::from(normalize_sparse_unions(sibling).unwrap());
+        let expected = Int32Array::from(vec![1, 2]).to_data();
+        let assert_ordinary = |data: ArrayData| {
+            let outer = StructArray::from(data);
+            let inner = outer
+                .column(0)
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .unwrap();
+            assert_eq!(inner.column(0).to_data(), expected);
+        };
+        assert_ordinary(sibling.column(1).to_data());
+        let union = ArrayData::builder(DataType::Union(
+            UnionFields::try_new(
+                [7],
+                [Field::new("ordinary", ordinary.data_type().clone(), true)],
+            )
+            .unwrap(),
+            UnionMode::Sparse,
+        ))
+        .len(2)
+        .offset(1)
+        .buffers(vec![ScalarBuffer::from(vec![7_i8; 4]).into_inner()])
+        .child_data(vec![ordinary])
+        .build()
+        .unwrap();
+        let union = UnionArray::from(normalize_sparse_unions(union).unwrap());
+        assert_ordinary(union.child(7).to_data());
+    }
+
+    #[test]
+    fn c_data_nullability_is_validated_after_parent_and_children_are_sliced() {
+        let numbers = Int32Array::from(vec![None, Some(1), Some(2), None]);
+        let parents = NullBuffer::from(vec![false, true, true, false]);
+        let rows = ArrayData::builder(DataType::Struct(
+            vec![Field::new("n", DataType::Int32, false)].into(),
+        ))
+        .len(4)
+        .nulls(Some(parents.clone()))
+        .child_data(vec![numbers.to_data()])
+        .build()
+        .unwrap();
+        let lists = ArrayData::builder(DataType::FixedSizeList(
+            Arc::new(Field::new("item", DataType::Int32, false)),
+            1,
+        ))
+        .len(4)
+        .nulls(Some(parents))
+        .child_data(vec![numbers.to_data()])
+        .build()
+        .unwrap();
+        for ordinary in [rows, lists] {
+            // Both children are initially valid in their complete C Data
+            // coordinates. The nested parent's NULL masks must move together.
+            let input = ArrayData::builder(DataType::Struct(
+                vec![
+                    Field::new("u", input().data_type().clone(), true),
+                    Field::new("ordinary", ordinary.data_type().clone(), true),
+                ]
+                .into(),
+            ))
+            .len(2)
+            .offset(1)
+            .child_data(vec![input(), ordinary])
+            .build()
+            .unwrap();
+            let result = StructArray::from(normalize_sparse_unions(input).unwrap());
+            let ordinary = result.column(1);
+            assert_eq!(ordinary.null_count(), 0);
+            let values = if let Some(row) = ordinary.as_any().downcast_ref::<StructArray>() {
+                row.column(0)
+            } else {
+                ordinary
+                    .as_any()
+                    .downcast_ref::<FixedSizeListArray>()
+                    .unwrap()
+                    .values()
+            };
+            assert_eq!(values.to_data(), Int32Array::from(vec![1, 2]).to_data());
+        }
     }
 }

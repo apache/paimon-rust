@@ -155,16 +155,20 @@ fn wide_decimal_floating_values_use_java_big_decimal_rounding() {
         None,
         Some(-1.508079088755887e35),
     ];
-    let wide: ArrayRef = Arc::new(
-        Decimal256Array::from_iter(
-            [Some(coefficient), None, Some(-coefficient)]
-                .into_iter()
-                .map(|value| value.map(arrow_buffer::i256::from_i128)),
-        )
-        .with_precision_and_scale(38, 1)
-        .unwrap(),
-    );
-    for source in [source, wide] {
+    let mut sources = vec![source];
+    for precision in [38, 39, 76] {
+        let wide: ArrayRef = Arc::new(
+            Decimal256Array::from_iter(
+                [Some(coefficient), None, Some(-coefficient)]
+                    .into_iter()
+                    .map(|value| value.map(arrow_buffer::i256::from_i128)),
+            )
+            .with_precision_and_scale(precision, 1)
+            .unwrap(),
+        );
+        sources.push(wide);
+    }
+    for source in sources {
         for mode in [CastMode::Assignment, CastMode::RowUpdate] {
             let output = cast_update_value(&source, &DataType::Float64, mode).unwrap();
             assert_eq!(

@@ -17,54 +17,89 @@
 
 //! Exact DECIMAL input rescaling shared by updates and logical match keys.
 
-use arrow_array::{cast::AsArray, ArrayRef, Decimal128Array};
+use arrow_array::{cast::AsArray, ArrayRef, Decimal128Array, Float32Array, Float64Array};
 use arrow_schema::DataType;
 use std::sync::Arc;
 
 use super::{invalid, parse_decimal_text};
 
-pub(super) fn cast_exact_decimal(array: &ArrayRef, target: &DataType) -> crate::Result<ArrayRef> {
-    let source_scale = match array.data_type() {
-        DataType::Decimal32(_, scale)
-        | DataType::Decimal64(_, scale)
-        | DataType::Decimal128(_, scale)
-        | DataType::Decimal256(_, scale) => *scale,
+fn precision_and_scale(array: &ArrayRef) -> (u8, i8) {
+    match array.data_type() {
+        DataType::Decimal32(p, s)
+        | DataType::Decimal64(p, s)
+        | DataType::Decimal128(p, s)
+        | DataType::Decimal256(p, s) => (*p, *s),
         _ => unreachable!("validated DECIMAL input"),
-    };
+    }
+}
+
+fn map_decimal<T>(
+    array: &ArrayRef,
+    parse: impl Fn(&str) -> crate::Result<T>,
+) -> crate::Result<Vec<Option<T>>> {
+    let (_, scale) = precision_and_scale(array);
+    // Preserve the full coefficient. A generic display can clip digits to the
+    // declared source precision for foreign buffers containing more digits.
+    macro_rules! values {
+        ($ty:ty) => {
+            array
+                .as_primitive::<$ty>()
+                .iter()
+                .map(|value| {
+                    value
+                        .map(|value| parse(&format!("{value}e{}", -i16::from(scale))))
+                        .transpose()
+                })
+                .collect()
+        };
+    }
+    match array.data_type() {
+        DataType::Decimal32(..) => values!(arrow_array::types::Decimal32Type),
+        DataType::Decimal64(..) => values!(arrow_array::types::Decimal64Type),
+        DataType::Decimal128(..) => values!(arrow_array::types::Decimal128Type),
+        DataType::Decimal256(..) => values!(arrow_array::types::Decimal256Type),
+        _ => unreachable!("validated DECIMAL input"),
+    }
+}
+
+pub(super) fn cast_to_floating(array: &ArrayRef, target: &DataType) -> crate::Result<ArrayRef> {
+    let (precision, scale) = precision_and_scale(array);
+    if precision <= 38 && scale >= 0 && scale as u8 <= precision {
+        let canonical = cast_exact_decimal(array, &DataType::Decimal128(precision, scale))?;
+        return crate::arrow::cast_decimal_to_floating(
+            &canonical,
+            u32::from(precision),
+            scale as u32,
+            target,
+        );
+    }
+    // External Arrow decimals can exceed Paimon's logical precision or use a
+    // negative scale. They still update FLOAT/DOUBLE columns via the exact
+    // decimal value, without first rounding an oversized coefficient to f64.
+    let values = map_decimal(array, |text| {
+        text.parse::<f64>()
+            .map_err(|_| invalid("Invalid decimal floating assignment"))
+    })?;
+    Ok(match target {
+        DataType::Float32 => Arc::new(Float32Array::from_iter(
+            values.into_iter().map(|v| v.map(|v| v as f32)),
+        )) as ArrayRef,
+        DataType::Float64 => Arc::new(Float64Array::from(values)),
+        _ => unreachable!("validated DECIMAL floating target"),
+    })
+}
+
+pub(super) fn cast_exact_decimal(array: &ArrayRef, target: &DataType) -> crate::Result<ArrayRef> {
+    let (_, source_scale) = precision_and_scale(array);
     let DataType::Decimal128(target_precision, target_scale) = target else {
         unreachable!("validated DECIMAL target")
     };
     let text_fallback = || {
         // A zero or NULL can cross scales beyond the rescaler's power table.
         // The exact text parser still rejects fractional loss and overflow.
-        // Use the full coefficient. Generic decimal display can clip digits
-        // to the source precision even for foreign buffers containing more.
-        macro_rules! values {
-            ($ty:ty) => {
-                array
-                    .as_primitive::<$ty>()
-                    .iter()
-                    .map(|value| {
-                        value
-                            .map(|value| {
-                                parse_decimal_text(
-                                    &format!("{value}e{}", -i16::from(source_scale)),
-                                    *target_precision,
-                                    *target_scale,
-                                )
-                            })
-                            .transpose()
-                    })
-                    .collect::<crate::Result<Vec<_>>>()?
-            };
-        }
-        let values = match array.data_type() {
-            DataType::Decimal32(..) => values!(arrow_array::types::Decimal32Type),
-            DataType::Decimal64(..) => values!(arrow_array::types::Decimal64Type),
-            DataType::Decimal128(..) => values!(arrow_array::types::Decimal128Type),
-            DataType::Decimal256(..) => values!(arrow_array::types::Decimal256Type),
-            _ => unreachable!("validated DECIMAL input"),
-        };
+        let values = map_decimal(array, |text| {
+            parse_decimal_text(text, *target_precision, *target_scale)
+        })?;
         Decimal128Array::from(values)
             .with_precision_and_scale(*target_precision, *target_scale)
             .map(|array| Arc::new(array) as ArrayRef)
@@ -175,6 +210,30 @@ mod tests {
                 CastMode::Assignment
             )
             .is_err());
+        }
+    }
+
+    #[test]
+    fn floating_input_keeps_coefficients_wider_than_decimal128() {
+        let coefficient = format!("1508079088755887087797858531882816082{}", "0".repeat(38))
+            .parse::<i256>()
+            .unwrap();
+        let source: ArrayRef = Arc::new(
+            Decimal256Array::from(vec![Some(coefficient), None, Some(-coefficient)])
+                .with_precision_and_scale(76, 39)
+                .unwrap(),
+        );
+        for mode in [CastMode::Assignment, CastMode::RowUpdate] {
+            let result = cast_update_value(&source, &DataType::Float64, mode).unwrap();
+            assert_eq!(
+                result.to_data(),
+                Float64Array::from(vec![
+                    Some(1.508079088755887e35),
+                    None,
+                    Some(-1.508079088755887e35),
+                ])
+                .to_data()
+            );
         }
     }
 }

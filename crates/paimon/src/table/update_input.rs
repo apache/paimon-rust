@@ -1445,25 +1445,8 @@ fn cast_primitive(array: &ArrayRef, target: &DataType, mode: CastMode) -> crate:
     if source.is_decimal() && matches!(target, DataType::Decimal128(..)) {
         return decimal::cast_exact_decimal(array, target);
     }
-    if let DataType::Decimal32(precision, scale)
-    | DataType::Decimal64(precision, scale)
-    | DataType::Decimal128(precision, scale)
-    | DataType::Decimal256(precision, scale) = source
-    {
-        if *precision <= 38
-            && *scale >= 0
-            && *scale as u8 <= *precision
-            && matches!(target, DataType::Float32 | DataType::Float64)
-        {
-            let canonical =
-                decimal::cast_exact_decimal(array, &DataType::Decimal128(*precision, *scale))?;
-            return crate::arrow::cast_decimal_to_floating(
-                &canonical,
-                u32::from(*precision),
-                *scale as u32,
-                target,
-            );
-        }
+    if source.is_decimal() && matches!(target, DataType::Float32 | DataType::Float64) {
+        return decimal::cast_to_floating(array, target);
     }
     if mode == CastMode::Constructor {
         if let Some(converted) = coerce_temporal(array, target)? {
