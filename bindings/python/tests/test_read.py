@@ -51,6 +51,39 @@ def _make_variant_table_with_data(warehouse):
     return PaimonCatalog({"warehouse": warehouse}).get_table("vdb.t")
 
 
+@pytest.mark.parametrize("limit,split_count", [(None, 1), (0, 0), (1, 1)])
+def test_scan_statistics_preserve_normal_planning(limit, split_count):
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_table_with_data(warehouse)
+        builder = table.new_read_builder()
+        if limit is not None:
+            builder.with_limit(limit)
+        scan = builder.new_scan()
+        plan = scan.plan()
+        stats = plan.stats()
+        assert len(plan.splits()) == split_count
+        assert plan.snapshot_id() == 1
+        assert stats.manifest_entries_read == (0 if limit == 0 else 1)
+        assert stats.final_splits == stats.final_files == split_count
+        assert stats.limit == limit
+        if limit == 0:
+            assert stats.split_candidates_built == 0
+            assert stats.limit_early_stopped
+        with pytest.raises(AttributeError):
+            stats.manifest_entries_read = 10
+
+
+@pytest.mark.parametrize("start,entry_count", [(0, 1), (1, 0)])
+def test_combined_incremental_scan_statistics(start, entry_count):
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_table_with_data(warehouse)
+        scan = table.new_read_builder().new_incremental_scan(start, 1)
+        plan = scan.plan()
+        stats = plan.stats()
+        assert plan.snapshot_id() == 1
+        assert stats.manifest_entries_read == stats.final_files == entry_count
+
+
 def _variant_read_type(table, columns, paths, fail_on_error=False):
     fields = []
     by_name = {field.name(): field for field in table.schema().fields()}

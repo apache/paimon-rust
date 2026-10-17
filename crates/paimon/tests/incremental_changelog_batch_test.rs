@@ -408,8 +408,8 @@ async fn combined_changelog_sharding_keeps_residual_filters_before_reader_limit(
 }
 
 #[tokio::test]
-async fn timestamp_changelog_trace_describes_one_packed_batch() {
-    let table = table("trace", "1", false, "1mb").await;
+async fn timestamp_changelog_stats_describes_one_packed_batch() {
+    let table = table("scan_stats", "1", false, "1mb").await;
     for id in 1..=3 {
         write_batch(&table, &make_batch(vec![1], vec![id])).await;
         patch_snapshot(&table, i64::from(id), "timeMillis", (id * 100).into()).await;
@@ -418,21 +418,16 @@ async fn timestamp_changelog_trace_describes_one_packed_batch() {
         ("scan.mode".into(), "incremental".into()),
         ("incremental-between-timestamp".into(), "0,300".into()),
     ]));
-    let (plan, trace) = table
-        .new_read_builder()
-        .new_scan()
-        .plan_with_trace()
-        .await
-        .unwrap();
+    let plan = table.new_read_builder().new_scan().plan().await.unwrap();
+    let scan_stats = plan.stats().clone();
     assert_eq!(plan.snapshot_id(), Some(3));
-    assert_eq!(trace.snapshot_id, Some(3));
-    assert_eq!(trace.base_manifest_files, 0);
-    assert_eq!(trace.delta_manifest_files, 3);
-    assert_eq!(trace.manifest_entries_read, 3);
-    assert_eq!(trace.final_splits, 1);
-    assert_eq!(trace.final_files, 3);
+    assert_eq!(scan_stats.base_manifest_files, 0);
+    assert_eq!(scan_stats.delta_manifest_files, 3);
+    assert_eq!(scan_stats.manifest_entries_read, 3);
+    assert_eq!(scan_stats.final_splits, 1);
+    assert_eq!(scan_stats.final_files, 3);
     assert_eq!(
-        trace.planned_data_file_bytes,
+        scan_stats.planned_data_file_bytes,
         plan.splits()
             .iter()
             .flat_map(|split| split.data_files())

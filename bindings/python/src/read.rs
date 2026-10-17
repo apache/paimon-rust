@@ -758,6 +758,123 @@ impl PyTableScan {
     }
 }
 
+#[pyclass(name = "ScanStats", module = "pypaimon_rust.datafusion", frozen)]
+pub struct PyScanStats {
+    inner: paimon::table::ScanStats,
+}
+
+#[pymethods]
+impl PyScanStats {
+    #[getter]
+    fn base_manifest_files(&self) -> usize {
+        self.inner.base_manifest_files
+    }
+    #[getter]
+    fn delta_manifest_files(&self) -> usize {
+        self.inner.delta_manifest_files
+    }
+    #[getter]
+    fn manifest_files_before_partition_pruning(&self) -> usize {
+        self.inner.manifest_files_before_partition_pruning
+    }
+    #[getter]
+    fn manifest_files_after_partition_pruning(&self) -> usize {
+        self.inner.manifest_files_after_partition_pruning
+    }
+    #[getter]
+    fn manifest_files_pruned_by_row_ranges(&self) -> usize {
+        self.inner.manifest_files_pruned_by_row_ranges
+    }
+    #[getter]
+    fn manifest_entries_read(&self) -> usize {
+        self.inner.manifest_entries_read
+    }
+    #[getter]
+    fn manifest_entries_pruned_by_bucket(&self) -> usize {
+        self.inner.manifest_entries_pruned_by_bucket
+    }
+    #[getter]
+    fn manifest_entries_pruned_by_partition(&self) -> usize {
+        self.inner.manifest_entries_pruned_by_partition
+    }
+    #[getter]
+    fn manifest_entries_after_entry_pruning(&self) -> usize {
+        self.inner.manifest_entries_after_entry_pruning
+    }
+    #[getter]
+    fn manifest_entries_pruned_by_level(&self) -> usize {
+        self.inner.manifest_entries_pruned_by_level
+    }
+    #[getter]
+    fn manifest_entries_pruned_by_row_ranges(&self) -> usize {
+        self.inner.manifest_entries_pruned_by_row_ranges
+    }
+    #[getter]
+    fn manifest_entries_pruned_by_data_stats(&self) -> usize {
+        self.inner.manifest_entries_pruned_by_data_stats
+    }
+    #[getter]
+    fn manifest_entries_after_manifest_filters(&self) -> usize {
+        self.inner.manifest_entries_after_manifest_filters
+    }
+    #[getter]
+    fn manifest_entries_after_merge(&self) -> usize {
+        self.inner.manifest_entries_after_merge
+    }
+    #[getter]
+    fn manifest_entries_pruned_by_cross_schema_stats(&self) -> usize {
+        self.inner.manifest_entries_pruned_by_cross_schema_stats
+    }
+    #[getter]
+    fn manifest_entries_after_cross_schema_stats(&self) -> usize {
+        self.inner.manifest_entries_after_cross_schema_stats
+    }
+    #[getter]
+    fn data_evolution_groups_before_stats(&self) -> usize {
+        self.inner.data_evolution_groups_before_stats
+    }
+    #[getter]
+    fn data_evolution_groups_pruned_by_stats(&self) -> usize {
+        self.inner.data_evolution_groups_pruned_by_stats
+    }
+    #[getter]
+    fn data_evolution_groups_pruned_by_row_ranges(&self) -> usize {
+        self.inner.data_evolution_groups_pruned_by_row_ranges
+    }
+    #[getter]
+    fn split_candidates_built(&self) -> usize {
+        self.inner.split_candidates_built
+    }
+    #[getter]
+    fn limit_early_stopped(&self) -> bool {
+        self.inner.limit_early_stopped
+    }
+    #[getter]
+    fn splits_before_limit(&self) -> usize {
+        self.inner.splits_before_limit
+    }
+    #[getter]
+    fn splits_after_limit(&self) -> usize {
+        self.inner.splits_after_limit
+    }
+    #[getter]
+    fn final_splits(&self) -> usize {
+        self.inner.final_splits
+    }
+    #[getter]
+    fn final_files(&self) -> usize {
+        self.inner.final_files
+    }
+    #[getter]
+    fn planned_data_file_bytes(&self) -> u64 {
+        self.inner.planned_data_file_bytes
+    }
+    #[getter]
+    fn limit(&self) -> Option<usize> {
+        self.inner.limit
+    }
+}
+
 #[pyclass(name = "TableRead", module = "pypaimon_rust.datafusion")]
 pub struct PyTableRead {
     table: Arc<Table>,
@@ -933,16 +1050,12 @@ impl PyRecordBatchReader {
 
 #[pyclass(name = "Plan", module = "pypaimon_rust.datafusion")]
 pub struct PyPlan {
-    splits: Vec<DataSplit>,
-    snapshot_id: Option<i64>,
+    inner: paimon::table::Plan,
 }
 
 impl From<paimon::table::Plan> for PyPlan {
     fn from(plan: paimon::table::Plan) -> Self {
-        Self {
-            splits: plan.splits().to_vec(),
-            snapshot_id: plan.snapshot_id(),
-        }
+        Self { inner: plan }
     }
 }
 
@@ -951,11 +1064,18 @@ impl PyPlan {
     /// Snapshot selected by the scan, even when pruning produces no splits.
     /// `None` means no snapshot was selected, including snapshot-free format tables.
     fn snapshot_id(&self) -> Option<i64> {
-        self.snapshot_id
+        self.inner.snapshot_id()
+    }
+
+    fn stats(&self) -> PyScanStats {
+        PyScanStats {
+            inner: self.inner.stats().clone(),
+        }
     }
 
     fn splits(&self) -> Vec<PySplit> {
-        self.splits
+        self.inner
+            .splits()
             .iter()
             .cloned()
             .map(|inner| PySplit { inner })
@@ -963,7 +1083,7 @@ impl PyPlan {
     }
 
     fn __len__(&self) -> usize {
-        self.splits.len()
+        self.inner.splits().len()
     }
 }
 

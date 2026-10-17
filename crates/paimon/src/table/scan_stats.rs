@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Scan planning trace counters.
+//! Scan planning statistics.
 
 use std::fmt;
 
@@ -23,11 +23,13 @@ use std::fmt;
 ///
 /// The counters are intended for explain output and regression tests. They
 /// describe pruning at metadata planning time only; reader-side Parquet row
-/// group pruning and DataFusion residual filters are outside this trace.
+/// group pruning and DataFusion residual filters are outside these statistics.
+/// Every scan stores this type on [`super::Plan::stats`]. Counters describe
+/// normal planning work, retaining manifest pruning and LIMIT stopping.
+/// Snapshot metadata is available separately from [`super::Plan::snapshot_id`].
 #[non_exhaustive]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ScanTrace {
-    pub snapshot_id: Option<i64>,
+pub struct ScanStats {
     pub base_manifest_files: usize,
     pub delta_manifest_files: usize,
     pub manifest_files_before_partition_pruning: usize,
@@ -47,8 +49,11 @@ pub struct ScanTrace {
     pub data_evolution_groups_before_stats: usize,
     pub data_evolution_groups_pruned_by_stats: usize,
     pub data_evolution_groups_pruned_by_row_ranges: usize,
+    /// Candidates actually constructed; excludes work skipped by LIMIT stopping.
     pub split_candidates_built: usize,
+    /// Whether a LIMIT hint stopped planning before all candidates were built.
     pub limit_early_stopped: bool,
+    /// Candidates encountered before applying the LIMIT hint, not a full-scan total.
     pub splits_before_limit: usize,
     pub splits_after_limit: usize,
     pub final_splits: usize,
@@ -58,51 +63,25 @@ pub struct ScanTrace {
     pub limit: Option<usize>,
 }
 
-impl ScanTrace {
+impl ScanStats {
     pub(crate) fn record_manifest_lists(&mut self, base_count: usize, delta_count: usize) {
         self.base_manifest_files = base_count;
         self.delta_manifest_files = delta_count;
         self.manifest_files_before_partition_pruning = base_count + delta_count;
     }
 
-    pub(crate) fn record_final_plan(
-        &mut self,
-        splits_before_limit: usize,
-        splits: usize,
-        files: usize,
-    ) {
-        self.record_final_plan_with_limit(
-            splits_before_limit,
-            splits_before_limit,
-            splits,
-            files,
-            false,
-        );
-    }
-
-    pub(crate) fn record_final_plan_with_limit(
-        &mut self,
-        split_candidates_built: usize,
-        splits_before_limit: usize,
-        splits: usize,
-        files: usize,
-        limit_early_stopped: bool,
-    ) {
-        self.split_candidates_built = split_candidates_built;
+    pub(crate) fn record_split_planning(&mut self, candidates: usize, limit_early_stopped: bool) {
+        self.split_candidates_built = candidates;
+        self.splits_before_limit = candidates;
         self.limit_early_stopped = limit_early_stopped;
-        self.splits_before_limit = splits_before_limit;
-        self.splits_after_limit = splits;
-        self.final_splits = splits;
-        self.final_files = files;
     }
 }
 
-impl fmt::Display for ScanTrace {
+impl fmt::Display for ScanStats {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "snapshot={:?}, manifests={}/{}, manifest_row_range_pruned={}, entries_read={}, bucket_pruned={}, partition_pruned={}, entry_row_range_pruned={}, data_stats_pruned={}, cross_schema_pruned={}, split_candidates_built={}, limit_early_stopped={}, splits_before_limit={}, splits_after_limit={}, files={}, data_file_bytes={}",
-            self.snapshot_id,
+            "manifests={}/{}, manifest_row_range_pruned={}, entries_read={}, bucket_pruned={}, partition_pruned={}, entry_row_range_pruned={}, data_stats_pruned={}, cross_schema_pruned={}, split_candidates_built={}, limit_early_stopped={}, splits_before_limit={}, splits_after_limit={}, files={}, data_file_bytes={}",
             self.manifest_files_after_partition_pruning,
             self.manifest_files_before_partition_pruning,
             self.manifest_files_pruned_by_row_ranges,

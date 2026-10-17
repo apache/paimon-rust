@@ -158,6 +158,22 @@ print(f"\nRead: {batches_tt[0].num_rows} rows")
 print(batches_tt[0])
 ```
 
+### Scan statistics
+
+Every scan collects lightweight counters during ordinary metadata planning:
+
+```python
+plan = table.new_read_builder().new_scan().plan()
+scan_stats = plan.stats()
+print(scan_stats.manifest_entries_read, scan_stats.final_files)
+```
+
+Collection retains early manifest/sidecar pruning and LIMIT stopping. Counters
+record the work performed; skipped entries are not decoded to reconstruct totals.
+Combined incremental scans expose
+the same API for their selected Delta or Changelog window. Snapshot metadata is
+available from `plan.snapshot_id()`.
+
 ### Shard column updates
 
 The batch and stream update objects expose

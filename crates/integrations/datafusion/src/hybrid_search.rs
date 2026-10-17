@@ -293,7 +293,6 @@ impl TableProvider for HybridSearchTableProvider {
             table,
             schema: &input_schema,
             plan,
-            scan_trace: None,
             projection: Some(&input_projection),
             pushed_predicate: None,
             limit: None,

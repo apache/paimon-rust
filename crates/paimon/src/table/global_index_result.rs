@@ -373,33 +373,32 @@ impl GlobalIndexResult {
         let Some(scores) = self.score_map()? else {
             return Ok(plan);
         };
-        let snapshot_id = plan.snapshot_id();
-        let splits = plan
-            .into_splits()
-            .into_iter()
-            .map(|split| {
-                let selected = split
-                    .row_ranges()
-                    .ok_or_else(|| crate::Error::DataInvalid {
-                        message: "Scored global-index splits must carry row ranges".into(),
-                        source: None,
-                    })?;
-                let mut values = Vec::new();
-                for range in selected {
-                    for id in range.from()..=range.to() {
-                        values.push(*scores.get(&id).ok_or_else(|| crate::Error::DataInvalid {
-                            message: format!("Missing score for selected global row ID {id}"),
+        plan.map_splits(|splits| {
+            splits
+                .into_iter()
+                .map(|split| {
+                    let selected = split
+                        .row_ranges()
+                        .ok_or_else(|| crate::Error::DataInvalid {
+                            message: "Scored global-index splits must carry row ranges".into(),
                             source: None,
-                        })?);
+                        })?;
+                    let mut values = Vec::new();
+                    for range in selected {
+                        for id in range.from()..=range.to() {
+                            values.push(*scores.get(&id).ok_or_else(|| {
+                                crate::Error::DataInvalid {
+                                    message: format!(
+                                        "Missing score for selected global row ID {id}"
+                                    ),
+                                    source: None,
+                                }
+                            })?);
+                        }
                     }
-                }
-                split.with_scores(values)
-            })
-            .collect::<crate::Result<Vec<_>>>()?;
-        let plan = Plan::new(splits);
-        Ok(match snapshot_id {
-            Some(id) => plan.with_snapshot_id(id),
-            None => plan,
+                    split.with_scores(values)
+                })
+                .collect::<crate::Result<Vec<_>>>()
         })
     }
 }

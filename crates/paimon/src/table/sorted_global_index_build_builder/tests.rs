@@ -1395,7 +1395,8 @@ async fn test_global_index_prunes_during_manifest_read() {
             .unwrap();
         let mut read_builder = table.new_read_builder();
         read_builder.with_filter(predicate);
-        let (plan, trace) = read_builder.new_scan().plan_with_trace().await.unwrap();
+        let plan = read_builder.new_scan().plan().await.unwrap();
+        let scan_stats = plan.stats().clone();
 
         assert_eq!(
             plan.splits()
@@ -1405,13 +1406,13 @@ async fn test_global_index_prunes_during_manifest_read() {
             1
         );
         assert_eq!(
-            trace.manifest_files_pruned_by_row_ranges,
+            scan_stats.manifest_files_pruned_by_row_ranges,
             expected_manifest_pruned
         );
-        assert_eq!(trace.manifest_entries_read, expected_entries_read);
-        assert_eq!(trace.manifest_entries_pruned_by_row_ranges, 0);
+        assert_eq!(scan_stats.manifest_entries_read, expected_entries_read);
+        assert_eq!(scan_stats.manifest_entries_pruned_by_row_ranges, 0);
         assert_eq!(
-            trace.manifest_entries_after_manifest_filters,
+            scan_stats.manifest_entries_after_manifest_filters,
             expected_entries_read
         );
     }
@@ -1543,17 +1544,18 @@ async fn test_empty_global_index_ranges_skip_legacy_manifests() {
         let plan = read_builder.new_scan().plan().await.unwrap();
         assert!(plan.splits().is_empty());
 
-        let (traced_plan, trace) = read_builder.new_scan().plan_with_trace().await.unwrap();
+        let stats_plan = read_builder.new_scan().plan().await.unwrap();
+        let scan_stats = stats_plan.stats().clone();
         let delta_error = read_builder
             .new_scan()
             .plan_snapshot_delta(&snapshot)
             .await
             .unwrap_err();
 
-        assert!(traced_plan.splits().is_empty());
-        assert_eq!(trace.manifest_entries_read, 0);
-        assert_eq!(trace.final_splits, 0);
-        assert_eq!(trace.final_files, 0);
+        assert!(stats_plan.splits().is_empty());
+        assert_eq!(scan_stats.manifest_entries_read, 0);
+        assert_eq!(scan_stats.final_splits, 0);
+        assert_eq!(scan_stats.final_files, 0);
         // A snapshot index may short-circuit a batch read, but cannot hide
         // an invalid historical event file from incremental planning.
         assert!(
@@ -1602,7 +1604,8 @@ async fn test_detail_mode_defers_manifest_pruning_for_unindexed_ranges() {
         .unwrap();
     let mut read_builder = table.new_read_builder();
     read_builder.with_filter(predicate);
-    let (plan, trace) = read_builder.new_scan().plan_with_trace().await.unwrap();
+    let plan = read_builder.new_scan().plan().await.unwrap();
+    let scan_stats = plan.stats().clone();
     let planned_ranges = merge_row_ranges(
         plan.splits()
             .iter()
@@ -1622,8 +1625,8 @@ async fn test_detail_mode_defers_manifest_pruning_for_unindexed_ranges() {
         planned_ranges,
         vec![RowRange::new(0, 0), RowRange::new(2, 3)]
     );
-    assert_eq!(trace.manifest_files_pruned_by_row_ranges, 0);
-    assert_eq!(trace.manifest_entries_read, 2);
+    assert_eq!(scan_stats.manifest_files_pruned_by_row_ranges, 0);
+    assert_eq!(scan_stats.manifest_entries_read, 2);
 }
 
 #[tokio::test]

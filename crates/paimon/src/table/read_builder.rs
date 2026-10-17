@@ -75,6 +75,9 @@ pub(super) fn split_scan_predicates(
 
 fn bucket_predicate(table: &Table, filter: &Predicate) -> Option<Predicate> {
     let core_options = CoreOptions::new(table.schema().options());
+    if core_options.bucket() < 1 && core_options.bucket() != -2 {
+        return None;
+    }
     let bucket_keys = core_options.bucket_key().unwrap_or_else(|| {
         if table.schema().trimmed_primary_keys().is_empty() {
             Vec::new()
@@ -86,18 +89,22 @@ fn bucket_predicate(table: &Table, filter: &Predicate) -> Option<Predicate> {
         return None;
     }
 
+    let mut referenced = std::collections::HashSet::new();
+    filter.collect_leaf_field_indices(&mut referenced);
     let has_all_bucket_fields = bucket_keys.iter().all(|key| {
         table
             .schema()
             .fields()
             .iter()
-            .any(|field| field.name() == key)
+            .enumerate()
+            .any(|(index, field)| field.name() == key && referenced.contains(&index))
     });
     if !has_all_bucket_fields {
         return None;
     }
 
-    extract_predicate_for_keys(filter, table.schema().fields(), &bucket_keys)
+    // Preserve partition leaves until the entry's concrete partition is known.
+    Some(filter.clone())
 }
 
 fn normalize_filter(table: &Table, filter: Predicate) -> NormalizedFilter {

@@ -140,7 +140,7 @@ pub(crate) mod row_id_predicate;
 mod row_kind_generator;
 mod row_position_selection;
 mod row_sidecar;
-mod scan_trace;
+mod scan_stats;
 pub(crate) mod schema_manager;
 mod search_scan_split;
 mod shard_table_updater;
@@ -227,7 +227,7 @@ pub use postpone_fixed_bucket_write::{
 pub use postpone_fixed_bucket_write_builder::PostponeFixedBucketWriteBuilder;
 pub use read_builder::ReadBuilder;
 pub use rest_env::RESTEnv;
-pub use scan_trace::ScanTrace;
+pub use scan_stats::ScanStats;
 pub use schema_manager::SchemaManager;
 pub use search_scan_split::SearchScanSplit;
 pub use shard_table_updater::ShardTableUpdater;

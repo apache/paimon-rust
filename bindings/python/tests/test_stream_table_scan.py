@@ -62,6 +62,10 @@ def test_cursor_restore_and_initial_vs_follow_up(table, follow_up):
     plan = scan.plan()
     expected_id = 1 if follow_up else 2
     assert plan.snapshot_id() == expected_id
+    stats = plan.stats()
+    assert stats.manifest_entries_read == stats.final_files == (4 if follow_up else 8)
+    assert stats.final_splits == len(plan.splits())
+    assert stats.planned_data_file_bytes > 0
     assert _rows(builder, plan) == [(i, (100 if follow_up else 200) + i) for i in range(32)]
     assert all(split.is_streaming() == follow_up for split in plan.splits())
     assert scan.checkpoint() == expected_id + 1

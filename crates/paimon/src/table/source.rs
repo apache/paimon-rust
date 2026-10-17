@@ -1601,14 +1601,20 @@ impl Default for DataSplitBuilder {
 pub struct Plan {
     splits: Vec<DataSplit>,
     snapshot_id: Option<i64>,
+    scan_stats: super::ScanStats,
 }
 
 impl Plan {
     pub fn new(splits: Vec<DataSplit>) -> Self {
-        Self {
+        let mut plan = Self {
             splits,
             snapshot_id: None,
-        }
+            scan_stats: super::ScanStats::default(),
+        };
+        plan.refresh_final_stats();
+        plan.scan_stats.split_candidates_built = plan.splits.len();
+        plan.scan_stats.splits_before_limit = plan.splits.len();
+        plan
     }
 
     pub(crate) fn with_snapshot_id(mut self, snapshot_id: i64) -> Self {
@@ -1625,6 +1631,46 @@ impl Plan {
     }
     pub fn splits(&self) -> &[DataSplit] {
         &self.splits
+    }
+
+    /// Lightweight statistics collected in the same planning pass.
+    pub fn stats(&self) -> &super::ScanStats {
+        &self.scan_stats
+    }
+
+    pub(crate) fn with_scan_stats(mut self, mut stats: super::ScanStats) -> Self {
+        stats.final_splits = self.scan_stats.final_splits;
+        stats.splits_after_limit = self.scan_stats.splits_after_limit;
+        stats.final_files = self.scan_stats.final_files;
+        stats.planned_data_file_bytes = self.scan_stats.planned_data_file_bytes;
+        self.scan_stats = stats;
+        self
+    }
+
+    fn refresh_final_stats(&mut self) {
+        let (files, bytes) = self.splits.iter().flat_map(DataSplit::data_files).fold(
+            (0, 0_u64),
+            |(files, bytes), file| {
+                (
+                    files + 1,
+                    bytes.saturating_add(u64::try_from(file.file_size).unwrap_or(0)),
+                )
+            },
+        );
+        self.scan_stats.final_splits = self.splits.len();
+        self.scan_stats.splits_after_limit = self.splits.len();
+        self.scan_stats.final_files = files;
+        self.scan_stats.planned_data_file_bytes = bytes;
+    }
+
+    /// Transform splits without dropping the snapshot or collected statistics.
+    pub(crate) fn map_splits(
+        mut self,
+        transform: impl FnOnce(Vec<DataSplit>) -> crate::Result<Vec<DataSplit>>,
+    ) -> crate::Result<Self> {
+        self.splits = transform(self.splits)?;
+        self.refresh_final_stats();
+        Ok(self)
     }
 
     /// Stamps the grant every split of this plan was authorized under.
@@ -1645,11 +1691,7 @@ impl Plan {
     /// file size. Totals larger than [`u64::MAX`] saturate at that value so
     /// callers cannot under-count an oversized plan due to integer overflow.
     pub fn planned_data_file_bytes(&self) -> u64 {
-        self.splits
-            .iter()
-            .flat_map(DataSplit::data_files)
-            .filter_map(|file| u64::try_from(file.file_size).ok())
-            .fold(0, u64::saturating_add)
+        self.scan_stats.planned_data_file_bytes
     }
 
     /// Consume this plan and return its splits without cloning their file metadata.
@@ -1762,6 +1804,54 @@ mod tests {
         let plan = Plan::new(vec![split(vec![first, second, overflow, unknown], true)]);
 
         assert_eq!(plan.planned_data_file_bytes(), u64::MAX);
+        assert_eq!(plan.stats().final_files, 4);
+        assert_eq!(plan.stats().planned_data_file_bytes, u64::MAX);
+    }
+
+    #[test]
+    fn transformed_plan_refreshes_totals_and_preserves_planning_work() {
+        let plan = Plan::new(vec![
+            split(
+                vec![
+                    file("a.parquet", 10, Some(0)),
+                    file("b.parquet", 10, Some(10)),
+                ],
+                true,
+            ),
+            split(vec![file("c.parquet", 10, Some(20))], true),
+        ])
+        .with_snapshot_id(7)
+        .with_scan_stats(super::super::ScanStats {
+            manifest_entries_read: 20,
+            split_candidates_built: 2,
+            splits_before_limit: 2,
+            limit_early_stopped: true,
+            limit: Some(10),
+            ..Default::default()
+        });
+        assert_eq!(plan.stats().final_files, 3);
+        assert_eq!(plan.planned_data_file_bytes(), 384);
+
+        let selected = plan
+            .map_splits(|mut splits| Ok(vec![splits.pop().unwrap()]))
+            .unwrap();
+        assert_eq!(selected.snapshot_id(), Some(7));
+        assert_eq!(selected.stats().manifest_entries_read, 20);
+        assert_eq!(selected.stats().split_candidates_built, 2);
+        assert_eq!(selected.stats().splits_before_limit, 2);
+        assert!(selected.stats().limit_early_stopped);
+        assert_eq!(selected.stats().limit, Some(10));
+        assert_eq!(selected.stats().final_splits, 1);
+        assert_eq!(selected.stats().splits_after_limit, 1);
+        assert_eq!(selected.stats().final_files, 1);
+        assert_eq!(selected.planned_data_file_bytes(), 128);
+
+        let empty = selected.map_splits(|_| Ok(Vec::new())).unwrap();
+        assert_eq!(empty.snapshot_id(), Some(7));
+        assert_eq!(empty.stats().manifest_entries_read, 20);
+        assert_eq!(empty.stats().final_splits, 0);
+        assert_eq!(empty.stats().final_files, 0);
+        assert_eq!(empty.planned_data_file_bytes(), 0);
     }
 
     #[test]

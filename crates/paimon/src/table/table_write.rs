@@ -3136,12 +3136,13 @@ pub(in crate::table) mod tests {
             .unwrap();
         let mut reader = table.new_read_builder();
         reader.with_filter(predicate);
-        let (_plan, trace) = reader.new_scan().plan_with_trace().await.unwrap();
+        let _plan = reader.new_scan().plan().await.unwrap();
+        let scan_stats = _plan.stats().clone();
 
-        assert_eq!(trace.final_files, 1, "scan trace: {trace:?}");
+        assert_eq!(scan_stats.final_files, 1, "scan scan_stats: {scan_stats:?}");
         assert!(
-            trace.manifest_entries_pruned_by_data_stats >= 1,
-            "scan trace: {trace:?}"
+            scan_stats.manifest_entries_pruned_by_data_stats >= 1,
+            "scan scan_stats: {scan_stats:?}"
         );
     }
 
@@ -3438,9 +3439,13 @@ pub(in crate::table) mod tests {
             .unwrap();
         let mut reader = table.new_read_builder();
         reader.with_filter(predicate);
-        let (_plan, trace) = reader.new_scan().plan_with_trace().await.unwrap();
+        let _plan = reader.new_scan().plan().await.unwrap();
+        let scan_stats = _plan.stats().clone();
 
-        assert!(trace.final_files > 0, "scan trace: {trace:?}");
+        assert!(
+            scan_stats.final_files > 0,
+            "scan scan_stats: {scan_stats:?}"
+        );
         assert_eq!(
             normal_write_cols,
             Some(vec!["a".to_string(), "b".to_string()])

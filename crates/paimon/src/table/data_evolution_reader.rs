@@ -7115,7 +7115,8 @@ mod tests {
 
         let mut builder = table.new_read_builder();
         builder.with_row_ranges(vec![RowRange::new(0, 0)]);
-        let (plan, trace) = builder.new_scan().plan_with_trace().await.unwrap();
+        let plan = builder.new_scan().plan().await.unwrap();
+        let scan_stats = plan.stats().clone();
         let mut planned_files = plan
             .splits()
             .iter()
@@ -7129,8 +7130,8 @@ mod tests {
             "payload-1.blob".to_string(),
         ];
         assert_eq!(planned_files, expected_planned_files);
-        assert_eq!(trace.manifest_entries_pruned_by_row_ranges, 4);
-        assert_eq!(trace.final_files, 3);
+        assert_eq!(scan_stats.manifest_entries_pruned_by_row_ranges, 4);
+        assert_eq!(scan_stats.final_files, 3);
 
         let batches = builder
             .new_read()

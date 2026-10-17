@@ -140,7 +140,6 @@ mod tests {
             table: &table,
             schema: &arrow_schema,
             plan: paimon::table::Plan::new(vec![split(1), split(2)]),
-            scan_trace: None,
             projection: None,
             pushed_predicate: None,
             limit: None,

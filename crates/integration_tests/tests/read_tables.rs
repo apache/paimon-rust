@@ -27,7 +27,7 @@ use paimon::api::ConfigResponse;
 use paimon::catalog::{Identifier, RESTCatalog};
 use paimon::common::Options;
 use paimon::spec::{DataType, IntType, Predicate, Schema, VarCharType};
-use paimon::{Catalog, CatalogOptions, Error, FileSystemCatalog, Plan, ScanTrace};
+use paimon::{Catalog, CatalogOptions, Error, FileSystemCatalog, Plan, ScanStats};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 
@@ -1237,15 +1237,18 @@ async fn plan_table(table: &paimon::Table, limit: Option<usize>) -> Plan {
     scan.plan().await.expect("Failed to plan scan")
 }
 
-async fn plan_table_with_trace(table: &paimon::Table, limit: Option<usize>) -> (Plan, ScanTrace) {
+async fn plan_table_with_stats(table: &paimon::Table, limit: Option<usize>) -> (Plan, ScanStats) {
     let mut read_builder = table.new_read_builder();
     if let Some(limit) = limit {
         read_builder.with_limit(limit);
     }
     let scan = read_builder.new_scan();
-    scan.plan_with_trace()
+    let plan = scan
+        .plan()
         .await
-        .expect("Failed to plan scan with trace")
+        .expect("Failed to plan scan with statistics");
+    let stats = plan.stats().clone();
+    (plan, stats)
 }
 
 /// Test limit pushdown: when limit is smaller than total rows, fewer data files may be generated.
@@ -1257,11 +1260,11 @@ async fn test_limit_pushdown() {
     let table = get_table_from_catalog(&catalog, "data_evolution_table").await;
 
     // Get full plan without limit
-    let (full_plan, full_trace) = plan_table_with_trace(&table, None).await;
+    let (full_plan, full_stats) = plan_table_with_stats(&table, None).await;
     let full_data_split_count: usize = full_plan.splits().iter().count();
 
     // Get the plan with limit = 2
-    let (limited_plan, limited_trace) = plan_table_with_trace(&table, Some(2)).await;
+    let (limited_plan, limited_stats) = plan_table_with_stats(&table, Some(2)).await;
     let limited_data_split_count: usize = limited_plan.splits().iter().count();
 
     // For data evolution tables, limit pushdown at split level uses merged_row_count
@@ -1271,12 +1274,12 @@ async fn test_limit_pushdown() {
         "Limit pushdown should reduce data split count for data evolution table: limited={limited_data_split_count}, full={full_data_split_count}"
     );
     assert!(
-        limited_trace.limit_early_stopped,
-        "Limit pushdown should stop split construction early: {limited_trace:?}"
+        limited_stats.limit_early_stopped,
+        "Limit pushdown should stop split construction early: {limited_stats:?}"
     );
     assert!(
-        limited_trace.split_candidates_built < full_trace.split_candidates_built,
-        "Limit pushdown should build fewer split candidates: limited={limited_trace:?}, full={full_trace:?}"
+        limited_stats.split_candidates_built < full_stats.split_candidates_built,
+        "Limit pushdown should build fewer split candidates: limited={limited_stats:?}, full={full_stats:?}"
     );
 
     // Verify data evolution splits have merged_row_count. Overlapping row-id
@@ -3356,20 +3359,22 @@ async fn test_limit_pushdown_disabled_with_row_ranges() {
 
     let mut row_range_reader = table.new_read_builder();
     row_range_reader.with_row_ranges(vec![RowRange::new(0, i64::MAX)]);
-    let (row_range_plan, row_range_trace) = row_range_reader
+    let row_range_plan = row_range_reader
         .new_scan()
-        .plan_with_trace()
+        .plan()
         .await
         .expect("Failed to plan row-range scan");
+    let row_range_stats = row_range_plan.stats().clone();
 
     let mut limited_reader = table.new_read_builder();
     limited_reader.with_row_ranges(vec![RowRange::new(0, i64::MAX)]);
     limited_reader.with_limit(2);
-    let (limited_plan, limited_trace) = limited_reader
+    let limited_plan = limited_reader
         .new_scan()
-        .plan_with_trace()
+        .plan()
         .await
         .expect("Failed to plan limited row-range scan");
+    let limited_stats = limited_plan.stats().clone();
 
     assert_eq!(
         limited_plan.splits().len(),
@@ -3377,11 +3382,11 @@ async fn test_limit_pushdown_disabled_with_row_ranges() {
         "Positive limit pushdown should be disabled when effective row_ranges exist"
     );
     assert!(
-        !limited_trace.limit_early_stopped,
-        "Row ranges should disable limit early stop: {limited_trace:?}"
+        !limited_stats.limit_early_stopped,
+        "Row ranges should disable limit early stop: {limited_stats:?}"
     );
     assert_eq!(
-        limited_trace.split_candidates_built, row_range_trace.split_candidates_built,
+        limited_stats.split_candidates_built, row_range_stats.split_candidates_built,
         "Row-range limited scan should build the same split candidates as row-range scan"
     );
 }
