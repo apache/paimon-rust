@@ -36,34 +36,6 @@ pub(super) fn normalize_match_key(
         return Ok(new_null_array(expected, decoded.len()));
     }
     let source = decoded.data_type();
-    if source.is_decimal() && matches!(expected, DataType::Decimal128(..)) {
-        let source_scale = match source {
-            DataType::Decimal32(_, scale)
-            | DataType::Decimal64(_, scale)
-            | DataType::Decimal128(_, scale)
-            | DataType::Decimal256(_, scale) => *scale,
-            _ => unreachable!(),
-        };
-        let DataType::Decimal128(_, target_scale) = expected else {
-            unreachable!()
-        };
-        let difference = i16::from(*target_scale) - i16::from(source_scale);
-        let text_fallback = || {
-            // Arrow's decimal rescaler can reject a large scale difference
-            // before inspecting values, even for zero and NULL. Reuse the
-            // exact text parser as a fallback; it still rejects nonzero values
-            // that exceed precision or lose fractional digits.
-            let text = cast_update_value(&decoded, &DataType::Utf8, CastMode::Assignment)?;
-            cast_update_value(&text, expected, CastMode::Assignment)
-        };
-        // Arrow computes scale differences in i8 and uses a Decimal128 power
-        // table. Skip that kernel before either can overflow.
-        return if !(-38..=38).contains(&difference) {
-            text_fallback()
-        } else {
-            cast_update_value(&decoded, expected, CastMode::Assignment).or_else(|_| text_fallback())
-        };
-    }
     let exact_family = source.is_integer() && expected.is_integer()
         || source.is_decimal() && expected.is_decimal()
         || matches!(

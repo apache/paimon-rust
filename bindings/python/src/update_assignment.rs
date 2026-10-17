@@ -17,8 +17,8 @@
 
 //! Python object and callback conversion for core update assignments.
 
-use arrow::array::{make_array, ArrayData, ArrayRef};
-use arrow::pyarrow::{FromPyArrow, ToPyArrow};
+use arrow::array::ArrayRef;
+use arrow::pyarrow::ToPyArrow;
 use paimon::spec::DataField;
 use paimon::table::UpdateAssignment;
 use pyo3::exceptions::PyValueError;
@@ -41,12 +41,12 @@ fn bridge_error(error: PyErr, target: &CallbackError) -> paimon::Error {
 fn arrow_arrays(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<Vec<ArrayRef>> {
     let pa = py.import("pyarrow")?;
     if value.is_instance(&pa.getattr("Array")?)? {
-        Ok(vec![make_array(ArrayData::from_pyarrow_bound(value)?)])
+        Ok(vec![crate::arrow_input::array_from_pyarrow(value)?])
     } else if value.is_instance(&pa.getattr("ChunkedArray")?)? {
         value
             .getattr("chunks")?
             .try_iter()?
-            .map(|chunk| Ok(make_array(ArrayData::from_pyarrow_bound(&chunk?)?)))
+            .map(|chunk| crate::arrow_input::array_from_pyarrow(&chunk?))
             .collect()
     } else {
         Err(PyValueError::new_err(
@@ -121,7 +121,7 @@ pub(crate) fn from_python(
                                 (PyList::new(py, [scalar])?,),
                                 Some(&kwargs),
                             )?;
-                            Ok(make_array(ArrayData::from_pyarrow_bound(&one)?))
+                            crate::arrow_input::array_from_pyarrow(&one)
                         })
                     })
                     .map_err(|cause| bridge_error(cause, &error))

@@ -540,7 +540,7 @@ fn arrow_table_batches(table: &Bound<'_, PyAny>) -> PyResult<Vec<RecordBatch>> {
     let mut batches = table
         .call_method0("to_batches")?
         .try_iter()?
-        .map(|batch| RecordBatch::from_pyarrow_bound(&batch?))
+        .map(|batch| crate::arrow_input::batch_from_pyarrow(&batch?))
         .collect::<PyResult<Vec<_>>>()?;
     // Preserve empty input schema so core validates columns even with no rows.
     if batches.is_empty() {
@@ -559,7 +559,7 @@ fn arrow_upsert_batches(input: &Bound<'_, PyAny>) -> PyResult<Vec<RecordBatch>> 
     }
     input
         .try_iter()?
-        .map(|batch| RecordBatch::from_pyarrow_bound(&batch?))
+        .map(|batch| crate::arrow_input::batch_from_pyarrow(&batch?))
         .collect()
 }
 
