@@ -756,8 +756,7 @@ class CatalogError(ValueError):
     message: str
 
 class PaimonCatalog:
-    def __init__(self, catalog_options: Dict[str, str], *, config_required: bool = True,
-                 _capture_response_cookies: bool = False) -> None:
+    def __init__(self, catalog_options: Dict[str, str], *, config_required: bool = True) -> None:
         """Set config_required=False when the REST configuration has already been resolved."""
         ...
     def __datafusion_catalog_provider__(self, session: Any) -> object: ...
@@ -773,9 +772,6 @@ class PaimonCatalog:
         """Replace the identifier's current branch metadata through the REST server."""
         ...
     def list_branches(self, identifier: Union[str, Tuple[str, str]]) -> List[str]: ...
-    def _take_response_cookies(self) -> List[Tuple[str, List[str], int]]:
-        """Drain response cookie headers, origin URLs and receipt times (Unix seconds)."""
-        ...
 
 class PythonScalarUDF:
     def __init__(

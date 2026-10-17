@@ -220,10 +220,6 @@ impl RESTApi {
         &self.options
     }
 
-    pub(crate) fn observe_response_cookies(&self) -> super::ResponseCookies {
-        self.client.observe_response_cookies()
-    }
-
     // ==================== Database Operations ====================
 
     /// List all databases.

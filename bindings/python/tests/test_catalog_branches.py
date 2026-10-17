@@ -19,7 +19,6 @@
 
 import json
 import threading
-import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import unquote_plus
 
@@ -66,10 +65,6 @@ def rest_server(monkeypatch):
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(output)))
-            if "cookies" in parts:
-                if len(requests) > 1:
-                    assert self.headers["Cookie"] == "sid=accepted"
-                self.send_header("Set-Cookie", "sid=accepted; Path=/v1/")
             self.end_headers()
             self.wfile.write(output)
 
@@ -107,26 +102,6 @@ def test_resolved_rest_configuration_is_not_fetched_again(rest_server):
     native = PaimonCatalog(dict(options, prefix="resolved-prefix"), config_required=False)
     assert native.list_branches("db.t") == ["dev", "release"]
     assert requests == [("GET", "/v1/resolved-prefix/databases/db/tables/t/branches", None)]
-
-
-@pytest.mark.parametrize("capture", [False, True])
-def test_response_cookie_capture_is_opt_in_but_jar_always_persists(rest_server, capture):
-    options, requests = rest_server
-    native = PaimonCatalog(options, config_required=False, _capture_response_cookies=capture)
-    for _ in range(2):
-        assert native.list_branches("db.cookies") == ["dev", "release"]
-        updates = native._take_response_cookies()
-        if capture:
-            assert len(updates) == 1
-            assert updates[0][:2] == (
-                options["uri"] + "/v1/databases/db/tables/cookies/branches",
-                ["sid=accepted; Path=/v1/"],
-            )
-            assert abs(time.time() - updates[0][2]) < 2
-        else:
-            assert updates == []
-        assert native._take_response_cookies() == []
-    assert len(requests) == 2
 
 
 def test_rest_branch_operations_use_core_protocol(catalog):

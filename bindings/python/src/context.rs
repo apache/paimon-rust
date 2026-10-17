@@ -192,28 +192,24 @@ pub(crate) fn complete_storage_options(
 fn build_paimon_catalog(
     catalog_options: HashMap<String, String>,
     config_required: bool,
-    capture_response_cookies: bool,
-) -> PyResult<(Arc<dyn Catalog>, Option<paimon::api::ResponseCookies>)> {
+) -> PyResult<Arc<dyn Catalog>> {
     let catalog_options = complete_storage_options(catalog_options);
     let rt = runtime();
     rt.block_on(async {
         let options = Options::from_map(catalog_options);
-        let (catalog, cookies): (Arc<dyn Catalog>, _) =
-            if options.get("metastore").map(String::as_str) == Some("rest") {
-                let catalog = paimon::catalog::RESTCatalog::new(options, config_required)
-                    .await
-                    .map_err(to_catalog_py_err)?;
-                let cookies = capture_response_cookies.then(|| catalog.observe_response_cookies());
-                (Arc::new(catalog), cookies)
-            } else {
-                (
-                    CatalogFactory::create(options)
+        let catalog: Arc<dyn Catalog> =
+            if !config_required && options.get("metastore").map(String::as_str) == Some("rest") {
+                Arc::new(
+                    paimon::catalog::RESTCatalog::new(options, false)
                         .await
                         .map_err(to_catalog_py_err)?,
-                    None,
                 )
+            } else {
+                CatalogFactory::create(options)
+                    .await
+                    .map_err(to_catalog_py_err)?
             };
-        Ok::<_, PyErr>((catalog, cookies))
+        Ok::<_, PyErr>(catalog)
     })
 }
 
@@ -294,7 +290,6 @@ fn ffi_logical_codec_from_pycapsule(obj: Bound<'_, PyAny>) -> PyResult<FFI_Logic
 pub struct PaimonCatalog {
     catalog: Arc<dyn Catalog>,
     provider: Arc<PaimonCatalogProvider>,
-    response_cookies: Option<paimon::api::ResponseCookies>,
 }
 
 fn catalog_table_identifier(identifier: &Bound<'_, PyAny>) -> PyResult<Identifier> {
@@ -331,16 +326,13 @@ fn catalog_table_identifier(identifier: &Bound<'_, PyAny>) -> PyResult<Identifie
 impl PaimonCatalog {
     /// Create a Paimon catalog that can be registered into a DataFusion session.
     #[new]
-    #[pyo3(signature = (catalog_options, *, config_required=true, _capture_response_cookies=false))]
+    #[pyo3(signature = (catalog_options, *, config_required=true))]
     fn new(
         py: Python<'_>,
         catalog_options: HashMap<String, String>,
         config_required: bool,
-        _capture_response_cookies: bool,
     ) -> PyResult<Self> {
-        let (catalog, response_cookies) = py.detach(|| {
-            build_paimon_catalog(catalog_options, config_required, _capture_response_cookies)
-        })?;
+        let catalog = py.detach(|| build_paimon_catalog(catalog_options, config_required))?;
         let provider = Arc::new(
             PaimonCatalogProvider::new(
                 None,
@@ -351,19 +343,7 @@ impl PaimonCatalog {
             )
             .with_schema_force_view_types(false),
         );
-        Ok(Self {
-            catalog,
-            provider,
-            response_cookies,
-        })
-    }
-
-    /// Return response cookie updates to the owning PyPaimon REST session.
-    fn _take_response_cookies(&self) -> Vec<(String, Vec<String>, i64)> {
-        self.response_cookies
-            .as_ref()
-            .map(|cookies| cookies.take())
-            .unwrap_or_default()
+        Ok(Self { catalog, provider })
     }
 
     /// Export this catalog as a DataFusion catalog provider PyCapsule.

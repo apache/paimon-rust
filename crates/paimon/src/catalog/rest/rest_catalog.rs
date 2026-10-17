@@ -112,13 +112,6 @@ impl RESTCatalog {
         &self.options
     }
 
-    /// Observe subsequent response cookies for integration with an owning HTTP
-    /// session. A new observer replaces the previous one; dropping it stops
-    /// collecting updates. The catalog's own cookie jar is unaffected.
-    pub fn observe_response_cookies(&self) -> crate::api::ResponseCookies {
-        self.api.observe_response_cookies()
-    }
-
     /// Whether data token is enabled.
     pub fn data_token_enabled(&self) -> bool {
         self.data_token_enabled
