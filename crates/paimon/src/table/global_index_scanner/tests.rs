@@ -4046,7 +4046,7 @@ async fn scalar_exactness_keeps_string_candidates_and_dropped_conjuncts_inexact(
         builder
             .equal("other", Datum::String("needle".to_string()))
             .unwrap(),
-        Predicate::negate(exact.clone()),
+        Predicate::Not(Box::new(exact.clone())),
     ] {
         let filter = Predicate::and(vec![exact.clone(), candidate]);
         let (ranges, is_exact) = scanner

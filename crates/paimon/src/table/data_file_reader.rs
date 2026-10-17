@@ -4059,7 +4059,9 @@ mod tests {
             .try_collect::<Vec<_>>()
             .await
             .unwrap();
-            assert_eq!(collect_ids(&batches), vec![1, 2], "enabled={enabled}");
+            // `added` is NULL in the old file, so for id 2 the predicate is
+            // NOT(true AND unknown), which is unknown. Java filters it out too.
+            assert_eq!(collect_ids(&batches), vec![1], "enabled={enabled}");
         }
     }
 

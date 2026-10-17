@@ -166,9 +166,16 @@ pub(crate) fn evaluate_predicate_mask(
             else {
                 return Ok(None);
             };
-            Ok(Some(boolean_mask_from_predicate(mask.len(), |row_index| {
-                !mask.value(row_index)
-            })))
+            let negated =
+                boolean_mask_from_predicate(mask.len(), |row_index| !mask.value(row_index));
+            if let Some(guard) = inner.not_null_guard() {
+                let Some(guard) = evaluate_predicate_mask(batch, &guard, file_fields, scan_fields)?
+                else {
+                    return Ok(None);
+                };
+                return Ok(Some(combine_filter_masks(&negated, &guard, false)));
+            }
+            Ok(Some(negated))
         }
         Predicate::Leaf {
             column,
@@ -2123,6 +2130,22 @@ mod tests {
         let fp = file_predicates(vec![pred], vec![f.clone()]);
         let out = filter_record_batch_by_predicates(b, &fp, &[f]).unwrap();
         assert_eq!(int_values(&out), vec![10, 20]);
+    }
+
+    #[test]
+    fn test_not_excludes_null_row() {
+        // NOT(age > 25) on [10, null, 30] -> [10]; NOT(unknown) is unknown.
+        let f = int_field(0, "age");
+        let b = int_batch("age", vec![Some(10), None, Some(30)]);
+        let pred = Predicate::Not(Box::new(leaf(
+            0,
+            DataType::Int(IntType::new()),
+            PredicateOperator::Gt,
+            vec![Datum::Int(25)],
+        )));
+        let fp = file_predicates(vec![pred], vec![f.clone()]);
+        let out = filter_record_batch_by_predicates(b, &fp, &[f]).unwrap();
+        assert_eq!(int_values(&out), vec![10]);
     }
 
     #[test]

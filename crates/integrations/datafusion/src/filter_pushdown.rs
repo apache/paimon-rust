@@ -1350,7 +1350,7 @@ mod tests {
                 .pushed_predicate
                 .expect("supported conjunct should still translate")
                 .to_string(),
-            "(dt = '2024-01-01' AND NOT (hr = 10))"
+            "(dt = '2024-01-01' AND hr != 10)"
         );
         assert!(analysis.requires_residual);
     }
@@ -1368,7 +1368,7 @@ mod tests {
                 .pushed_predicate
                 .expect("NOT partition predicate should translate inexactly")
                 .to_string(),
-            "NOT (dt = '2024-01-01')"
+            "dt != '2024-01-01'"
         );
         assert!(analysis.requires_residual);
     }
@@ -1530,7 +1530,7 @@ mod tests {
             build_pushed_predicate(&[filter], &fields)
                 .expect("NOT should translate as an inexact pushed predicate")
                 .to_string(),
-            "NOT (dt = '2024-01-01')"
+            "dt != '2024-01-01'"
         );
     }
 
