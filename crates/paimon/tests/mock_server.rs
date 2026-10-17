@@ -1055,11 +1055,11 @@ impl RESTServer {
 
         let key = format!("{db}.{table}.{}", request.tag_name);
         if state.tags.contains_key(&key) {
-            return resource_error(StatusCode::CONFLICT, "tag", &request.tag_name);
+            return resource_error(StatusCode::CONFLICT, "TAG", &request.tag_name);
         }
         let snapshot_id = request.snapshot_id.unwrap_or(1);
         if snapshot_id != 1 {
-            return resource_error(StatusCode::NOT_FOUND, "snapshot", &snapshot_id.to_string());
+            return resource_error(StatusCode::NOT_FOUND, "SNAPSHOT", &snapshot_id.to_string());
         }
         state.tags.insert(
             key,
@@ -1083,7 +1083,7 @@ impl RESTServer {
         }
         match state.tags.get(&format!("{db}.{table}.{tag}")) {
             Some(response) => (StatusCode::OK, Json(response.clone())).into_response(),
-            None => resource_error(StatusCode::NOT_FOUND, "tag", &tag),
+            None => resource_error(StatusCode::NOT_FOUND, "TAG", &tag),
         }
     }
 
@@ -1098,7 +1098,7 @@ impl RESTServer {
         if state.tags.remove(&format!("{db}.{table}.{tag}")).is_some() {
             (StatusCode::OK, Json(json!(""))).into_response()
         } else {
-            resource_error(StatusCode::NOT_FOUND, "tag", &tag)
+            resource_error(StatusCode::NOT_FOUND, "TAG", &tag)
         }
     }
 

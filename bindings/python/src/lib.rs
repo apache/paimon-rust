@@ -19,6 +19,7 @@ use pyo3::prelude::*;
 
 mod blob;
 mod blob_uri_reader;
+mod catalog_version;
 mod commit_callback;
 mod context;
 mod error;

@@ -62,8 +62,16 @@ pub struct Snapshot {
     schema_id: i64,
     /// a manifest list recording all changes from the previous snapshots
     base_manifest_list: String,
+    /// byte size of the base manifest list, absent in older snapshots
+    #[builder(default = None)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    base_manifest_list_size: Option<i64>,
     /// a manifest list recording all new changes occurred in this snapshot
     delta_manifest_list: String,
+    /// byte size of the delta manifest list, absent in older snapshots
+    #[builder(default = None)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    delta_manifest_list_size: Option<i64>,
     /// a manifest list recording all changelog produced in this snapshot
     #[builder(default = None)]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -154,10 +162,18 @@ impl Snapshot {
         &self.base_manifest_list
     }
 
+    pub fn base_manifest_list_size(&self) -> Option<i64> {
+        self.base_manifest_list_size
+    }
+
     /// Get the delta manifest list of this snapshot.
     #[inline]
     pub fn delta_manifest_list(&self) -> &str {
         &self.delta_manifest_list
+    }
+
+    pub fn delta_manifest_list_size(&self) -> Option<i64> {
+        self.delta_manifest_list_size
     }
 
     /// Get the changelog manifest list of this snapshot.

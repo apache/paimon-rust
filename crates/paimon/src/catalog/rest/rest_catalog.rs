@@ -408,6 +408,44 @@ impl Catalog for RESTCatalog {
         })
     }
 
+    async fn load_snapshot(
+        &self,
+        identifier: &Identifier,
+    ) -> Result<Option<crate::api::TableSnapshot>> {
+        match self.api.load_snapshot(identifier).await {
+            Err(Error::RestApi {
+                source: RestError::NoSuchResource { resource_type, .. },
+            }) if resource_type.as_deref() == Some("SNAPSHOT") => Ok(None),
+            result => result.map_err(|error| map_table_not_exist(error, identifier)),
+        }
+    }
+
+    async fn rollback_to(
+        &self,
+        identifier: &Identifier,
+        instant: &crate::table::Instant,
+        from_snapshot: Option<i64>,
+        table_uuid: Option<&str>,
+    ) -> Result<()> {
+        self.api
+            .rollback_to(identifier, instant, from_snapshot, table_uuid)
+            .await
+            .map_err(|error| map_rest_error_for_rollback(error, identifier, instant))
+    }
+
+    async fn list_tags_paged(
+        &self,
+        identifier: &Identifier,
+        max_results: Option<i32>,
+        page_token: Option<&str>,
+        tag_name_prefix: Option<&str>,
+    ) -> Result<PagedList<String>> {
+        self.api
+            .list_tags_paged(identifier, max_results, page_token, tag_name_prefix)
+            .await
+            .map_err(|error| map_table_not_exist(error, identifier))
+    }
+
     async fn create_tag(
         &self,
         identifier: &Identifier,
@@ -874,6 +912,60 @@ fn map_rest_error_for_table(err: Error, identifier: &Identifier) -> Error {
     }
 }
 
+fn map_table_not_exist(error: Error, identifier: &Identifier) -> Error {
+    match error {
+        Error::RestApi {
+            source: RestError::NoSuchResource { .. },
+        } => Error::TableNotExist {
+            full_name: identifier.full_name(),
+        },
+        other => other,
+    }
+}
+
+fn map_rest_error_for_rollback(
+    error: Error,
+    identifier: &Identifier,
+    instant: &crate::table::Instant,
+) -> Error {
+    if let Error::RestApi {
+        source:
+            RestError::NoSuchResource {
+                resource_type,
+                resource_name,
+                ..
+            },
+    } = &error
+    {
+        if resource_type.as_deref() == Some("SNAPSHOT") {
+            let snapshot_id = resource_name
+                .as_deref()
+                .and_then(|name| name.parse().ok())
+                .or(match instant {
+                    crate::table::Instant::Snapshot { snapshot_id } => Some(*snapshot_id),
+                    _ => None,
+                });
+            return snapshot_id
+                .map(|snapshot_id| Error::SnapshotNotExist { snapshot_id })
+                .unwrap_or(error);
+        }
+        if resource_type.as_deref() == Some("TAG") {
+            let tag_name = resource_name
+                .clone()
+                .or_else(|| match instant {
+                    crate::table::Instant::Tag { tag_name } => Some(tag_name.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            return Error::TagNotExist { tag_name };
+        }
+        return Error::TableNotExist {
+            full_name: identifier.full_name(),
+        };
+    }
+    error
+}
+
 fn map_rest_error_for_tag(
     error: Error,
     identifier: &Identifier,
@@ -891,32 +983,29 @@ fn map_rest_error_for_tag(
                 RestError::NoSuchResource {
                     resource_type,
                     resource_name,
-                    ..
+                    message,
                 },
-        } if resource_type
-            .as_deref()
-            .is_some_and(|kind| kind.eq_ignore_ascii_case("snapshot")) =>
-        {
-            match snapshot_id.or_else(|| resource_name.and_then(|value| value.parse().ok())) {
+        } if resource_type.as_deref() == Some("SNAPSHOT") => {
+            match snapshot_id.or_else(|| {
+                resource_name
+                    .as_deref()
+                    .and_then(|value| value.parse().ok())
+            }) {
                 Some(snapshot_id) => Error::SnapshotNotExist { snapshot_id },
-                None => Error::DataInvalid {
-                    message: format!(
-                        "Cannot create tag '{tag_name}' because the latest snapshot does not exist"
-                    ),
-                    source: None,
+                None => Error::RestApi {
+                    source: RestError::NoSuchResource {
+                        resource_type,
+                        resource_name,
+                        message,
+                    },
                 },
             }
         }
         Error::RestApi {
             source: RestError::NoSuchResource { resource_type, .. },
-        } if resource_type
-            .as_deref()
-            .is_some_and(|kind| kind.eq_ignore_ascii_case("tag")) =>
-        {
-            Error::TagNotExist {
-                tag_name: tag_name.to_string(),
-            }
-        }
+        } if resource_type.as_deref() == Some("TAG") => Error::TagNotExist {
+            tag_name: tag_name.to_string(),
+        },
         Error::RestApi {
             source: RestError::NoSuchResource { .. },
         } => Error::TableNotExist {
@@ -928,7 +1017,9 @@ fn map_rest_error_for_tag(
             message,
             source: None,
         },
-        other => map_unsupported_endpoint(other, "tag"),
+        // Preserve HTTP status and resource metadata for catalog clients. A
+        // remote 501 is not a locally unsupported operation eligible for fallback.
+        other => other,
     }
 }
 
@@ -1144,16 +1235,58 @@ mod tests {
         };
 
         assert!(matches!(
-            map_rest_error_for_tag(error("tag"), &identifier, "release", None),
+            map_rest_error_for_tag(error("TAG"), &identifier, "release", None),
             Error::TagNotExist { .. }
         ));
         assert!(matches!(
-            map_rest_error_for_tag(error("snapshot"), &identifier, "release", Some(7)),
+            map_rest_error_for_tag(error("SNAPSHOT"), &identifier, "release", Some(7)),
             Error::SnapshotNotExist { snapshot_id: 7 }
         ));
+        // Java compares resource types exactly. Other 404 resources describe
+        // a missing table, including noncanonical lowercase names.
+        for resource_type in ["TABLE", "OTHER", "tag", "snapshot"] {
+            assert!(matches!(
+                map_rest_error_for_tag(error(resource_type), &identifier, "release", None),
+                Error::TableNotExist { full_name } if full_name == "db.table"
+            ));
+        }
+    }
+
+    #[test]
+    fn test_tag_error_mapping_preserves_missing_latest_snapshot() {
+        let identifier = Identifier::new("db", "table");
+        for name in [None, Some("null"), Some("7")] {
+            let error = Error::RestApi {
+                source: RestError::NoSuchResource {
+                    resource_type: Some("SNAPSHOT".to_string()),
+                    resource_name: name.map(str::to_string),
+                    message: "missing latest snapshot".to_string(),
+                },
+            };
+            let mapped = map_rest_error_for_tag(error, &identifier, "release", None);
+            if name == Some("7") {
+                assert!(matches!(mapped, Error::SnapshotNotExist { snapshot_id: 7 }));
+            } else {
+                assert!(matches!(mapped, Error::RestApi {
+                    source: RestError::NoSuchResource { resource_type, resource_name, message }
+                } if resource_type.as_deref() == Some("SNAPSHOT")
+                    && resource_name.as_deref() == name
+                    && message == "missing latest snapshot"));
+            }
+        }
+    }
+
+    #[test]
+    fn test_tag_error_mapping_preserves_unimplemented_endpoint() {
+        let error = Error::RestApi {
+            source: RestError::NotImplemented {
+                message: "tag endpoint unavailable".to_string(),
+            },
+        };
         assert!(matches!(
-            map_rest_error_for_tag(error("table"), &identifier, "release", None),
-            Error::TableNotExist { .. }
+            map_rest_error_for_tag(error, &Identifier::new("db", "table"), "release", None),
+            Error::RestApi { source: RestError::NotImplemented { message } }
+                if message == "tag endpoint unavailable"
         ));
     }
 

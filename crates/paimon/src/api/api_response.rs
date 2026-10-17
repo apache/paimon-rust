@@ -170,6 +170,14 @@ pub struct GetTagResponse {
     pub tag_time_retained: Option<String>,
 }
 
+/// Tag names and an opaque continuation token supplied by the REST server.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListTagsResponse {
+    pub tags: Option<Vec<String>>,
+    pub next_page_token: Option<String>,
+}
+
 /// Response for getting a persistent view.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

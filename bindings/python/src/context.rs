@@ -41,6 +41,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyCapsule;
 
 use crate::blob::PyBlobReaderRegistry;
+use crate::catalog_version::{PyGetTagResponse, PyInstant, PyTableSnapshot};
 use crate::error::{df_to_py_err, to_catalog_py_err, to_py_err};
 use crate::read::PyRecordBatchReader;
 use crate::table::PyTable;
@@ -292,7 +293,7 @@ pub struct PaimonCatalog {
     provider: Arc<PaimonCatalogProvider>,
 }
 
-fn catalog_table_identifier(identifier: &Bound<'_, PyAny>) -> PyResult<Identifier> {
+fn catalog_identifier(identifier: &Bound<'_, PyAny>) -> PyResult<Identifier> {
     let (database, object_name) = if let Ok(name) = identifier.extract::<String>() {
         let (database, table) = name.split_once('.').ok_or_else(|| {
             PyValueError::new_err(format!(
@@ -308,7 +309,11 @@ fn catalog_table_identifier(identifier: &Bound<'_, PyAny>) -> PyResult<Identifie
             "database and table names must not be empty",
         ));
     }
-    let identifier = Identifier::new(&database, &object_name);
+    Ok(Identifier::new(&database, &object_name))
+}
+
+fn catalog_table_identifier(identifier: &Bound<'_, PyAny>) -> PyResult<Identifier> {
+    let identifier = catalog_identifier(identifier)?;
     if identifier
         .parsed_object_name()
         .map_err(to_py_err)?
@@ -454,6 +459,109 @@ impl PaimonCatalog {
         let identifier = catalog_table_identifier(identifier)?;
         py.detach(|| runtime().block_on(self.catalog.list_branches(&identifier)))
             .map_err(to_catalog_py_err)
+    }
+
+    /// Create a tag through core catalog handling, including optional retention.
+    #[pyo3(signature = (identifier, tag_name, snapshot_id=None, time_retained=None, ignore_if_exists=false))]
+    fn create_tag(
+        &self,
+        py: Python<'_>,
+        identifier: &Bound<'_, PyAny>,
+        tag_name: &str,
+        snapshot_id: Option<i64>,
+        time_retained: Option<&str>,
+        ignore_if_exists: bool,
+    ) -> PyResult<()> {
+        let identifier = catalog_identifier(identifier)?;
+        py.detach(|| {
+            runtime().block_on(self.catalog.create_tag_with_retention(
+                &identifier,
+                tag_name,
+                snapshot_id,
+                time_retained,
+                ignore_if_exists,
+            ))
+        })
+        .map_err(to_catalog_py_err)
+    }
+
+    fn get_tag(
+        &self,
+        py: Python<'_>,
+        identifier: &Bound<'_, PyAny>,
+        tag_name: &str,
+    ) -> PyResult<PyGetTagResponse> {
+        let identifier = catalog_identifier(identifier)?;
+        let inner = py
+            .detach(|| runtime().block_on(self.catalog.get_tag(&identifier, tag_name)))
+            .map_err(to_catalog_py_err)?;
+        Ok(PyGetTagResponse { inner })
+    }
+
+    #[pyo3(signature = (identifier, max_results=None, page_token=None, tag_name_prefix=None))]
+    fn list_tags_paged(
+        &self,
+        py: Python<'_>,
+        identifier: &Bound<'_, PyAny>,
+        max_results: Option<i32>,
+        page_token: Option<&str>,
+        tag_name_prefix: Option<&str>,
+    ) -> PyResult<(Vec<String>, Option<String>)> {
+        let identifier = catalog_identifier(identifier)?;
+        let page = py
+            .detach(|| {
+                runtime().block_on(self.catalog.list_tags_paged(
+                    &identifier,
+                    max_results,
+                    page_token,
+                    tag_name_prefix,
+                ))
+            })
+            .map_err(to_catalog_py_err)?;
+        Ok((page.elements, page.next_page_token))
+    }
+
+    fn delete_tag(
+        &self,
+        py: Python<'_>,
+        identifier: &Bound<'_, PyAny>,
+        tag_name: &str,
+    ) -> PyResult<()> {
+        let identifier = catalog_identifier(identifier)?;
+        py.detach(|| runtime().block_on(self.catalog.delete_tag(&identifier, tag_name, false)))
+            .map_err(to_catalog_py_err)
+    }
+
+    fn load_snapshot(
+        &self,
+        py: Python<'_>,
+        identifier: &Bound<'_, PyAny>,
+    ) -> PyResult<Option<PyTableSnapshot>> {
+        let identifier = catalog_identifier(identifier)?;
+        py.detach(|| runtime().block_on(self.catalog.load_snapshot(&identifier)))
+            .map(|snapshot| snapshot.map(|inner| PyTableSnapshot { inner }))
+            .map_err(to_catalog_py_err)
+    }
+
+    #[pyo3(signature = (identifier, instant, from_snapshot=None, *, table_uuid=None))]
+    fn rollback_to(
+        &self,
+        py: Python<'_>,
+        identifier: &Bound<'_, PyAny>,
+        instant: &PyInstant,
+        from_snapshot: Option<i64>,
+        table_uuid: Option<&str>,
+    ) -> PyResult<()> {
+        let identifier = catalog_identifier(identifier)?;
+        py.detach(|| {
+            runtime().block_on(self.catalog.rollback_to(
+                &identifier,
+                &instant.inner,
+                from_snapshot,
+                table_uuid,
+            ))
+        })
+        .map_err(to_catalog_py_err)
     }
 }
 
@@ -879,6 +987,9 @@ pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> 
     let this = PyModule::new(py, "datafusion")?;
     this.add("CatalogError", py.get_type::<crate::error::CatalogError>())?;
     this.add_class::<PaimonCatalog>()?;
+    this.add_class::<PyInstant>()?;
+    this.add_class::<PyGetTagResponse>()?;
+    this.add_class::<PyTableSnapshot>()?;
     this.add_class::<crate::table::PyTable>()?;
     this.add_class::<crate::system_table::PySystemRead>()?;
     this.add_class::<crate::index_build::PyGlobalIndexBuildBuilder>()?;

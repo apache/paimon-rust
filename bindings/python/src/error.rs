@@ -45,6 +45,10 @@ pub(crate) fn to_catalog_py_err(error: paimon::Error) -> PyErr {
     if error.is_process_fork_unsupported() {
         return to_py_err(error);
     }
+    let snapshot_name = match &error {
+        Error::SnapshotNotExist { snapshot_id } => Some(snapshot_id.to_string()),
+        _ => None,
+    };
     let (code, resource_type, resource_name, message) = match &error {
         Error::BranchAlreadyExist { branch_name, .. } => (
             409,
@@ -67,6 +71,15 @@ pub(crate) fn to_catalog_py_err(error: paimon::Error) -> PyErr {
         Error::TagNotExist { tag_name } => {
             (404, Some("TAG"), Some(tag_name.as_str()), error.to_string())
         }
+        Error::TagAlreadyExist { tag_name } => {
+            (409, Some("TAG"), Some(tag_name.as_str()), error.to_string())
+        }
+        Error::SnapshotNotExist { .. } => (
+            404,
+            Some("SNAPSHOT"),
+            snapshot_name.as_deref(),
+            error.to_string(),
+        ),
         Error::DataInvalid { message, .. } => (400, None, None, message.clone()),
         Error::RestApi { source } => {
             let (code, resource_type, resource_name, message) = match source {

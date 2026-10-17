@@ -570,6 +570,42 @@ pub trait Catalog: Send + Sync {
         })
     }
 
+    /// Load the catalog's current snapshot and statistics, or None for an empty table.
+    async fn load_snapshot(
+        &self,
+        _identifier: &Identifier,
+    ) -> Result<Option<crate::api::TableSnapshot>> {
+        Err(Error::Unsupported {
+            message: "catalog snapshot loading is not supported by this catalog".to_string(),
+        })
+    }
+
+    /// Roll back through the catalog, forwarding optional expected head and table identity.
+    async fn rollback_to(
+        &self,
+        _identifier: &Identifier,
+        _instant: &crate::table::Instant,
+        _from_snapshot: Option<i64>,
+        _table_uuid: Option<&str>,
+    ) -> Result<()> {
+        Err(Error::Unsupported {
+            message: "catalog rollback is not supported by this catalog".to_string(),
+        })
+    }
+
+    /// Fetch a page of tag names without scanning tag files on storage.
+    async fn list_tags_paged(
+        &self,
+        _identifier: &Identifier,
+        _max_results: Option<i32>,
+        _page_token: Option<&str>,
+        _tag_name_prefix: Option<&str>,
+    ) -> Result<PagedList<String>> {
+        Err(Error::Unsupported {
+            message: "tag pagination is not supported by this catalog".to_string(),
+        })
+    }
+
     // ======================= branch methods =============================
 
     /// Create an empty branch, or create one from a tag when `from_tag` is set.

@@ -86,6 +86,7 @@ mod hybrid_search_builder;
 mod incremental_scan;
 pub(crate) mod index_file_path;
 mod inline_blob;
+mod instant;
 mod kv_file_reader;
 mod kv_file_writer;
 mod lumina_index_build_builder;
@@ -216,6 +217,7 @@ pub use hybrid_search_builder::{
 pub use incremental_scan::{
     IncrementalPlan, IncrementalScan, IncrementalScanMode, IncrementalSplit,
 };
+pub use instant::Instant;
 pub use object_table::{ObjectEntry, ObjectTable};
 pub use partition_row_count::PartitionRowCount;
 pub use partition_stat::PartitionStat;
