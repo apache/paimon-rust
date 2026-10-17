@@ -406,6 +406,140 @@ mod tests {
     use super::*;
     use crate::spec::{DataType as PaimonType, DecimalType, TimestampType, VarCharType};
 
+    #[tokio::test]
+    async fn upsert_normalizes_string_offsets_before_matching_and_writing() {
+        use crate::catalog::Identifier;
+        use crate::io::FileIOBuilder;
+        use crate::spec::{IntType, Schema, TableSchema};
+        use crate::table::TableCommit;
+        use arrow_array::{Array, Int32Array, LargeStringArray, StringArray};
+
+        let schema = Schema::builder()
+            .column("key", PaimonType::VarChar(VarCharType::default()))
+            .column("value", PaimonType::VarChar(VarCharType::default()))
+            .column("keep", PaimonType::Int(IntType::new()))
+            .option("data-evolution.enabled", "true")
+            .option("row-tracking.enabled", "true")
+            .build()
+            .unwrap();
+        let table = Table::new(
+            FileIOBuilder::new("memory").build().unwrap(),
+            Identifier::new("db", "upsert"),
+            "memory:/upsert".into(),
+            TableSchema::new(0, &schema),
+            None,
+        );
+        let mut writer = table
+            .new_write_builder()
+            .with_commit_user("test")
+            .unwrap()
+            .new_write()
+            .unwrap();
+        let initial = RecordBatch::try_from_iter([
+            (
+                "key",
+                Arc::new(StringArray::from(vec![Some("中文"), Some("中文"), None])) as ArrayRef,
+            ),
+            (
+                "value",
+                Arc::new(StringArray::from(vec!["old"; 3])) as ArrayRef,
+            ),
+            (
+                "keep",
+                Arc::new(Int32Array::from(vec![10, 11, 12])) as ArrayRef,
+            ),
+        ])
+        .unwrap();
+        writer.write_arrow_batch(&initial).await.unwrap();
+        TableCommit::new(table.clone(), "seed".into())
+            .commit(writer.prepare_commit().await.unwrap())
+            .await
+            .unwrap();
+        writer.close().await;
+
+        let source = RecordBatch::try_from_iter([
+            (
+                "value",
+                Arc::new(LargeStringArray::from(vec![
+                    Some("discarded"),
+                    Some(""),
+                    None,
+                    Some("final"),
+                ])) as ArrayRef,
+            ),
+            (
+                "key",
+                Arc::new(LargeStringArray::from(vec![
+                    Some("中文"),
+                    Some("new"),
+                    None,
+                    Some("中文"),
+                ])) as ArrayRef,
+            ),
+        ])
+        .unwrap();
+        let mut updater = table.new_write_builder().new_update().unwrap();
+        updater.with_update_type(vec!["value".into()]).unwrap();
+        let messages = updater
+            .upsert_by_arrow_with_key(
+                vec![source.slice(0, 1), source.slice(1, 3)],
+                vec!["key".into()],
+            )
+            .await
+            .unwrap();
+        TableCommit::new(table.clone(), "upsert".into())
+            .commit(messages)
+            .await
+            .unwrap();
+        let mut reader = table.new_read_builder();
+        reader
+            .with_projection(&["key", "value", "keep", "_ROW_ID"])
+            .unwrap();
+        let plan = reader.new_scan().plan().await.unwrap();
+        let mut batches = reader.new_read().unwrap().to_arrow(plan.splits()).unwrap();
+        let mut rows = Vec::new();
+        while let Some(batch) = batches.try_next().await.unwrap() {
+            let keys = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let values = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let keep = batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let ids = batch
+                .column(3)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            rows.extend((0..batch.num_rows()).map(|row| {
+                (
+                    ids.value(row),
+                    (!keys.is_null(row)).then(|| keys.value(row).to_string()),
+                    (!values.is_null(row)).then(|| values.value(row).to_string()),
+                    (!keep.is_null(row)).then(|| keep.value(row)),
+                )
+            }));
+        }
+        rows.sort();
+        assert_eq!(
+            rows,
+            vec![
+                (0, Some("中文".into()), Some("final".into()), Some(10)),
+                (1, Some("中文".into()), Some("final".into()), Some(11)),
+                (2, None, None, Some(12)),
+                (3, Some("new".into()), Some("".into()), None),
+            ]
+        );
+    }
+
     #[test]
     fn partition_identity_ignores_java_null_variable_storage() {
         let fields = vec![

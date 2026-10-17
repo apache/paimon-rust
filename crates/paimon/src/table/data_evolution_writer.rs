@@ -1121,7 +1121,12 @@ fn apply_field_updates(
     matches: &[(usize, usize, usize)],
 ) -> Result<ArrayRef> {
     if update_columns.iter().any(|column| column == path) {
-        return interleave_updated_leaf(path, original, matched_batches, matches);
+        let updated = interleave_updated_leaf(path, original, matched_batches, matches)?;
+        // Readers allow runtime NULLs and relax nested field nullability.
+        // Restore the declared write layout, validating only visible children,
+        // before constructing a partial-column file with the table schema.
+        let target = crate::arrow::paimon_type_to_arrow(write_field.data_type())?;
+        return super::write_batch_normalize::normalize_write_array(&updated, &target);
     }
 
     let DataType::Row(row) = write_field.data_type() else {
@@ -1971,6 +1976,77 @@ mod tests {
         assert!(error
             .to_string()
             .contains("Ambiguous data-evolution write path"));
+    }
+
+    #[test]
+    fn whole_row_updates_restore_declared_child_nullability() {
+        let write_field = DataField::new(
+            0,
+            "value".into(),
+            DataType::Row(RowType::new(vec![DataField::new(
+                1,
+                "text".into(),
+                DataType::VarChar(crate::spec::VarCharType::with_nullable(false, 100).unwrap()),
+            )])),
+        );
+        let runtime_fields = vec![arrow_schema::Field::new("text", ArrowDataType::Utf8, true)];
+        let row = |values: Vec<Option<&str>>, validity: Option<Vec<bool>>| -> ArrayRef {
+            Arc::new(StructArray::new(
+                runtime_fields.clone().into(),
+                vec![Arc::new(StringArray::from(values))],
+                validity.map(NullBuffer::from),
+            ))
+        };
+        let original = row(vec![Some("old"), Some("keep")], None::<Vec<bool>>);
+        let updates = RecordBatch::try_from_iter([
+            (
+                "_ROW_ID",
+                Arc::new(Int64Array::from(vec![0, 1])) as ArrayRef,
+            ),
+            (
+                "value",
+                row(vec![None, Some("中文")], Some(vec![false, true])),
+            ),
+        ])
+        .unwrap();
+        let result = apply_field_updates(
+            &write_field,
+            "value",
+            &original,
+            &["value".into()],
+            &[updates],
+            &[(0, 0, 0), (1, 0, 1)],
+        )
+        .unwrap();
+        let expected = crate::arrow::paimon_type_to_arrow(write_field.data_type()).unwrap();
+        assert_eq!(result.data_type(), &expected);
+        let result = result.as_any().downcast_ref::<StructArray>().unwrap();
+        assert!(result.is_null(0));
+        assert_eq!(
+            result
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(1),
+            "中文"
+        );
+        // Required children are enforced for a visible ROW, including when
+        // Arrow's runtime read type had relaxed their nullability.
+        let invalid = RecordBatch::try_from_iter([
+            ("_ROW_ID", Arc::new(Int64Array::from(vec![0])) as ArrayRef),
+            ("value", row(vec![None], None::<Vec<bool>>)),
+        ])
+        .unwrap();
+        assert!(apply_field_updates(
+            &write_field,
+            "value",
+            &original,
+            &["value".into()],
+            &[invalid],
+            &[(0, 0, 0)]
+        )
+        .is_err());
     }
 
     fn nested_profile_batch(
