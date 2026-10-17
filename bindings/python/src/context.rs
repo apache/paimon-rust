@@ -278,6 +278,36 @@ pub struct PaimonCatalog {
     provider: Arc<PaimonCatalogProvider>,
 }
 
+fn catalog_table_identifier(identifier: &Bound<'_, PyAny>) -> PyResult<Identifier> {
+    let (database, object_name) = if let Ok(name) = identifier.extract::<String>() {
+        let (database, table) = name.split_once('.').ok_or_else(|| {
+            PyValueError::new_err(format!(
+                "expected identifier in 'db.table' format, got '{name}'"
+            ))
+        })?;
+        (database.to_string(), table.to_string())
+    } else {
+        identifier.extract::<(String, String)>()?
+    };
+    if database.is_empty() || object_name.is_empty() {
+        return Err(PyValueError::new_err(
+            "database and table names must not be empty",
+        ));
+    }
+    let identifier = Identifier::new(&database, &object_name);
+    if identifier
+        .parsed_object_name()
+        .map_err(to_py_err)?
+        .system_table()
+        .is_some()
+    {
+        return Err(PyValueError::new_err(
+            "Catalog table operations do not support system-table identifiers",
+        ));
+    }
+    Ok(identifier)
+}
+
 #[pymethods]
 impl PaimonCatalog {
     /// Create a Paimon catalog that can be registered into a DataFusion session.
@@ -334,29 +364,9 @@ impl PaimonCatalog {
     /// Get a table by "db.table" or a (database, table) tuple.
     /// Tuple components preserve dots; the table can include a branch suffix.
     fn get_table(&self, py: Python<'_>, identifier: &Bound<'_, PyAny>) -> PyResult<PyTable> {
-        let (database, object_name) = if let Ok(name) = identifier.extract::<String>() {
-            let (database, table) = name.split_once('.').ok_or_else(|| {
-                PyValueError::new_err(format!(
-                    "expected identifier in 'db.table' format, got '{name}'"
-                ))
-            })?;
-            (database.to_string(), table.to_string())
-        } else {
-            identifier.extract::<(String, String)>()?
-        };
-        if database.is_empty() || object_name.is_empty() {
-            return Err(PyValueError::new_err(
-                "database and table names must not be empty",
-            ));
-        }
-        let id = Identifier::new(&database, &object_name);
+        let id = catalog_table_identifier(identifier)?;
         let parsed = id.parsed_object_name().map_err(to_py_err)?;
-        if parsed.system_table().is_some() {
-            return Err(PyValueError::new_err(
-                "get_table() does not support system-table identifiers",
-            ));
-        }
-        let base_id = Identifier::new(&database, parsed.table());
+        let base_id = Identifier::new(id.database(), parsed.table());
         let branch = parsed.branch().map(str::to_string);
         let catalog = Arc::clone(&self.catalog);
         let table = py.detach(|| {
@@ -371,6 +381,60 @@ impl PaimonCatalog {
                 .map_err(to_py_err)
         })?;
         Ok(PyTable::new(Arc::new(table)))
+    }
+
+    /// Create an empty branch or one initialized from a tag through the REST catalog.
+    #[pyo3(signature = (identifier, branch_name, from_tag=None))]
+    fn create_branch(
+        &self,
+        py: Python<'_>,
+        identifier: &Bound<'_, PyAny>,
+        branch_name: &str,
+        from_tag: Option<&str>,
+    ) -> PyResult<()> {
+        let identifier = catalog_table_identifier(identifier)?;
+        py.detach(|| {
+            runtime().block_on(
+                self.catalog
+                    .create_branch(&identifier, branch_name, from_tag),
+            )
+        })
+        .map_err(to_py_err)
+    }
+
+    /// Delete branch metadata through the REST catalog.
+    fn drop_branch(
+        &self,
+        py: Python<'_>,
+        identifier: &Bound<'_, PyAny>,
+        branch_name: &str,
+    ) -> PyResult<()> {
+        let identifier = catalog_table_identifier(identifier)?;
+        py.detach(|| runtime().block_on(self.catalog.drop_branch(&identifier, branch_name)))
+            .map_err(to_py_err)
+    }
+
+    /// Fast-forward the identifier's current branch through the REST catalog.
+    fn fast_forward(
+        &self,
+        py: Python<'_>,
+        identifier: &Bound<'_, PyAny>,
+        branch_name: &str,
+    ) -> PyResult<()> {
+        let identifier = catalog_table_identifier(identifier)?;
+        py.detach(|| runtime().block_on(self.catalog.fast_forward(&identifier, branch_name)))
+            .map_err(to_py_err)
+    }
+
+    /// List branch names in REST server order.
+    fn list_branches(
+        &self,
+        py: Python<'_>,
+        identifier: &Bound<'_, PyAny>,
+    ) -> PyResult<Vec<String>> {
+        let identifier = catalog_table_identifier(identifier)?;
+        py.detach(|| runtime().block_on(self.catalog.list_branches(&identifier)))
+            .map_err(to_py_err)
     }
 }
 

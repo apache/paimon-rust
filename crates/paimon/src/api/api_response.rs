@@ -114,6 +114,12 @@ impl AuditRESTResponse {
     }
 }
 
+/// Branch names returned by a REST catalog, in server order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListBranchesResponse {
+    pub branches: Option<Vec<String>>,
+}
+
 /// Latest snapshot and table statistics returned by a REST catalog.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
