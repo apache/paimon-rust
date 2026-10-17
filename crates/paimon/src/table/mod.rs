@@ -133,6 +133,7 @@ mod query_auth;
 mod system_table;
 pub use system_table::SystemRead;
 
+mod key_normalization;
 mod read_builder;
 mod read_limit;
 pub mod referenced_files;

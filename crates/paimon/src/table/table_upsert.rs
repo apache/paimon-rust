@@ -176,8 +176,8 @@ impl TableUpsert {
     }
 
     /// Add rows containing the keys and columns to write. Column order may
-    /// differ from the table schema. Normalize match/routing keys here; keep
-    /// payloads until last-write-wins and matching have selected their action.
+    /// differ from the table schema. Keep original payloads, including keys,
+    /// until last-write-wins and matching have selected their action.
     /// Batches may carry different non-key columns, preserving absent fields.
     pub(super) fn add_batch(&mut self, batch: RecordBatch) -> crate::Result<()> {
         let target = crate::arrow::build_target_arrow_schema(self.table.schema().fields())?;
@@ -200,21 +200,8 @@ impl TableUpsert {
             let Some(column) = batch.column_by_name(field.name()) else {
                 continue;
             };
-            if self.keys.contains(field.name()) {
-                columns.push(normalize_write_array(column, field.data_type()).map_err(
-                    |error| invalid(format!("Invalid upsert key '{}': {error}", field.name())),
-                )?);
-                fields.push(field.clone());
-            } else {
-                columns.push(column.clone());
-                fields.push(
-                    input_schema
-                        .field_with_name(field.name())
-                        .unwrap()
-                        .clone()
-                        .into(),
-                );
-            }
+            columns.push(column.clone());
+            fields.push(input_schema.field_with_name(field.name()).unwrap().clone());
         }
         let ordered = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
             .map_err(|error| invalid(format!("cannot order upsert columns: {error}")))?;
@@ -262,7 +249,12 @@ impl TableUpsert {
                 || contains_binary(column.data_type())
                 || contains_binary(field.data_type())
             {
-                normalize_write_array(column, field.data_type())
+                let value = if append {
+                    column.clone()
+                } else {
+                    super::update_input::decode_dictionary(column)?
+                };
+                normalize_write_array(&value, field.data_type())
                     .map(|column| (field.as_ref().clone(), column))
             } else {
                 Ok((
@@ -287,20 +279,32 @@ impl TableUpsert {
     /// Concatenate only match keys. Padding payload columns with NULL would
     /// lose the distinction between an absent field and an explicit NULL.
     fn key_rows(&self) -> crate::Result<RecordBatch> {
+        let target = crate::arrow::build_target_arrow_schema(self.table.schema().fields())?;
+        let fields = target
+            .fields()
+            .iter()
+            .filter(|field| self.keys.contains(field.name()))
+            .cloned()
+            .collect::<Vec<_>>();
+        let key_schema = Arc::new(Schema::new(fields));
         let batches = self
             .source
             .iter()
             .map(|batch| {
-                let columns = batch
-                    .schema()
+                let columns = key_schema
                     .fields()
                     .iter()
-                    .enumerate()
-                    .filter(|(_, field)| self.keys.contains(field.name()))
-                    .map(|(index, _)| index)
-                    .collect::<Vec<_>>();
-                batch
-                    .project(&columns)
+                    .map(|field| {
+                        super::key_normalization::normalize_upsert_key(
+                            batch.column_by_name(field.name()).unwrap(),
+                            field.data_type(),
+                        )
+                        .map_err(|error| {
+                            invalid(format!("Invalid upsert key '{}': {error}", field.name()))
+                        })
+                    })
+                    .collect::<crate::Result<Vec<_>>>()?;
+                RecordBatch::try_new(key_schema.clone(), columns)
                     .map_err(|error| invalid(error.to_string()))
             })
             .collect::<crate::Result<Vec<_>>>()?;
@@ -727,6 +731,42 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("Invalid upsert column 'value'"));
+    }
+
+    #[tokio::test]
+    async fn upsert_matches_integer_key_widths_but_keeps_append_input_types() {
+        let table = numeric_table("memory:/upsert_integer_key_widths").await;
+        let source = |key, value| {
+            RecordBatch::try_from_iter([
+                ("key", Arc::new(Int64Array::from(vec![key])) as ArrayRef),
+                ("value", Arc::new(Int32Array::from(vec![value])) as ArrayRef),
+            ])
+            .unwrap()
+        };
+        let mut update = table.new_write_builder().new_update().unwrap();
+        update.with_update_type(vec!["value".into()]).unwrap();
+        let messages = update
+            .upsert_by_arrow_with_key(vec![source(1, 42)], vec!["key".into()])
+            .await
+            .unwrap();
+        TableCommit::new(table.clone(), "update".into())
+            .commit(messages)
+            .await
+            .unwrap();
+        assert_eq!(
+            numeric_rows(&table).await,
+            vec![
+                (0, 1, Some(42), Some(10)),
+                (1, 1, Some(42), Some(11)),
+                (2, 2, Some(0), Some(12))
+            ]
+        );
+        let error = update
+            .upsert_by_arrow_with_key(vec![source(3, 7)], vec!["key".into()])
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("Invalid upsert column 'key'"));
+        assert_eq!(numeric_rows(&table).await.len(), 3);
     }
 
     #[tokio::test]

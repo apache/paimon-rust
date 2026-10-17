@@ -98,7 +98,7 @@ pub(super) fn normalize_row_ids(batch: RecordBatch) -> crate::Result<RecordBatch
     RecordBatch::try_new(schema, columns).map_err(|error| invalid(error.to_string()))
 }
 
-fn decode_dictionary(array: &ArrayRef) -> crate::Result<ArrayRef> {
+pub(super) fn decode_dictionary(array: &ArrayRef) -> crate::Result<ArrayRef> {
     let mut array = array.clone();
     while let DataType::Dictionary(_, values) = array.data_type() {
         array = arrow_cast::cast_with_options(
