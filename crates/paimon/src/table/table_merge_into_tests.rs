@@ -107,6 +107,151 @@ fn update(condition: Option<MergeCondition>) -> WhenMatched {
     }
 }
 
+fn dictionary_batch(ids: Vec<Option<i32>>, values: Vec<Option<i32>>) -> RecordBatch {
+    let keys = arrow_cast::cast(
+        &Int32Array::from(ids),
+        &arrow_schema::DataType::Dictionary(
+            Box::new(arrow_schema::DataType::Int8),
+            Box::new(arrow_schema::DataType::Int32),
+        ),
+    )
+    .unwrap();
+    let schema = arrow_schema::Schema::new(vec![
+        arrow_schema::Field::new("id", keys.data_type().clone(), true),
+        arrow_schema::Field::new("value", arrow_schema::DataType::Int32, true),
+    ]);
+    RecordBatch::try_new(
+        Arc::new(schema),
+        vec![keys, Arc::new(Int32Array::from(values))],
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn dictionary_merge_keys_use_values_and_sql_null_semantics() {
+    let target = table_at("dictionary_merge");
+    seed(
+        &target,
+        &batch(
+            vec![Some(1), Some(1), Some(2), None],
+            vec![Some(10), Some(11), Some(20), Some(90)],
+        ),
+    )
+    .await;
+    // Every non-null source key has dictionary index zero in its own chunk.
+    let source = vec![
+        dictionary_batch(vec![Some(1)], vec![Some(42)]),
+        dictionary_batch(vec![Some(3)], vec![Some(30)]),
+        dictionary_batch(vec![None], vec![Some(91)]),
+    ];
+    let messages = target
+        .new_write_builder()
+        .new_update()
+        .unwrap()
+        .merge_into(
+            MergeSource::Batches(source),
+            vec![("id".into(), "id".into())],
+            vec![update(None)],
+            vec![WhenNotMatched {
+                condition: None,
+                assignments: vec![
+                    ("id".into(), MergeAssignment::SourceColumn("id".into())),
+                    (
+                        "value".into(),
+                        MergeAssignment::SourceColumn("value".into()),
+                    ),
+                ],
+            }],
+        )
+        .await
+        .unwrap();
+    TableCommit::new(target.clone(), "merge".into())
+        .commit(messages)
+        .await
+        .unwrap();
+    assert_eq!(
+        rows(&target).await,
+        vec![
+            (None, Some(90)),
+            (None, Some(91)),
+            (Some(1), Some(42)),
+            (Some(1), Some(42)),
+            (Some(2), Some(20)),
+            (Some(3), Some(30))
+        ]
+    );
+}
+
+#[tokio::test]
+async fn dictionary_merge_cardinality_is_checked_before_conditions() {
+    let target = table_at("dictionary_cardinality");
+    seed(&target, &batch(vec![Some(1)], vec![Some(10)])).await;
+    let source = vec![
+        dictionary_batch(vec![Some(1)], vec![Some(11)]),
+        dictionary_batch(vec![Some(3), Some(1)], vec![Some(30), Some(12)]),
+    ];
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed = calls.clone();
+    let condition = MergeCondition {
+        target_columns: Vec::new(),
+        source_columns: Vec::new(),
+        evaluate: Arc::new(move |batch| {
+            observed.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async move { Ok(BooleanArray::from(vec![false; batch.num_rows()])) })
+        }),
+    };
+    let error = target
+        .new_write_builder()
+        .new_update()
+        .unwrap()
+        .merge_into(
+            MergeSource::Batches(source),
+            vec![("id".into(), "id".into())],
+            vec![update(Some(condition))],
+            Vec::new(),
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("multiple source rows"));
+    assert_eq!(calls.load(Ordering::Relaxed), 0);
+    assert_eq!(rows(&target).await, vec![(Some(1), Some(10))]);
+}
+
+#[tokio::test]
+async fn dictionary_merge_duplicate_unconditional_delete_is_allowed() {
+    let target = table_at("dictionary_delete");
+    seed(
+        &target,
+        &batch(vec![Some(1), Some(2)], vec![Some(10), Some(20)]),
+    )
+    .await;
+    let source = vec![
+        dictionary_batch(vec![Some(1)], vec![Some(11)]),
+        dictionary_batch(vec![Some(3), Some(1)], vec![Some(30), Some(12)]),
+    ];
+    let messages = target
+        .new_write_builder()
+        .new_update()
+        .unwrap()
+        .merge_into(
+            MergeSource::Batches(source),
+            vec![("id".into(), "id".into())],
+            vec![WhenMatched {
+                condition: None,
+                delete: true,
+                assignments: Vec::new(),
+            }],
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    TableCommit::new(target.clone(), "merge".into())
+        .commit(messages)
+        .await
+        .unwrap();
+    assert_eq!(rows(&target).await, vec![(Some(2), Some(20))]);
+}
+
 #[tokio::test]
 async fn core_merge_preserves_row_ids_and_handles_sql_null_keys() {
     let table = table();

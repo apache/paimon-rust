@@ -243,6 +243,8 @@ impl TableUpdate {
     /// columns are omitted from `upsert_keys`. Existing keys update every
     /// matching row ID; new keys append all input columns. Omitted columns on
     /// matched rows retain their values; on new rows they are absent from the file.
+    /// After last-write-wins, matched values follow row-ID update conversion
+    /// rules; new rows must satisfy the ordinary Arrow write type.
     /// Input batches may have different non-key columns. After last-write-wins
     /// deduplication, matched rows must supply their update columns and appended
     /// rows in each partition must share a field set.

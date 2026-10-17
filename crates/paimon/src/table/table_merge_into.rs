@@ -427,14 +427,18 @@ pub(super) async fn merge_into(
                         .map_err(|error| invalid(error.to_string()))?
                         .data_type()
                 };
-                if source_type != target_type
+                let mut logical_source_type = source_type;
+                while let DataType::Dictionary(_, value) = logical_source_type {
+                    logical_source_type = value;
+                }
+                if logical_source_type != target_type
                     || !super::upsert_key_matcher::supported_key_type(target_type)
                 {
                     return Err(invalid(
                         "MERGE ON key types must match and support row encoding",
                     ));
                 }
-                Ok(SortField::new(source_type.clone()))
+                Ok(SortField::new(target_type.clone()))
             })
             .collect::<crate::Result<_>>()?;
         let key_converter =
@@ -442,8 +446,18 @@ pub(super) async fn merge_into(
         for (chunk, batch) in source.batches.iter().enumerate() {
             let keys = on
                 .iter()
-                .map(|(_, name)| batch.column_by_name(name).unwrap().clone())
-                .collect::<Vec<_>>();
+                .map(|(target, name)| {
+                    let expected = if target == ROW_ID {
+                        &DataType::Int64
+                    } else {
+                        schema.field_with_name(target).unwrap().data_type()
+                    };
+                    super::key_normalization::normalize_match_key(
+                        batch.column_by_name(name).unwrap(),
+                        expected,
+                    )
+                })
+                .collect::<crate::Result<Vec<_>>>()?;
             let rows = key_converter
                 .convert_columns(&keys)
                 .map_err(|error| invalid(error.to_string()))?;

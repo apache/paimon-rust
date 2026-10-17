@@ -98,7 +98,7 @@ pub(super) fn normalize_row_ids(batch: RecordBatch) -> crate::Result<RecordBatch
     RecordBatch::try_new(schema, columns).map_err(|error| invalid(error.to_string()))
 }
 
-fn decode_dictionary(array: &ArrayRef) -> crate::Result<ArrayRef> {
+pub(super) fn decode_dictionary(array: &ArrayRef) -> crate::Result<ArrayRef> {
     let mut array = array.clone();
     while let DataType::Dictionary(_, values) = array.data_type() {
         array = arrow_cast::cast_with_options(
@@ -2012,6 +2012,27 @@ mod tests {
         );
         let input: ArrayRef = Arc::new(arrow_array::TimestampSecondArray::from(vec![i64::MAX]));
         assert!(cast_assignment(&input, &target).is_err());
+    }
+
+    #[test]
+    fn row_update_casts_allow_text_numeric_and_null_binary_values() {
+        let text: ArrayRef = Arc::new(StringArray::from(vec![Some("42"), None]));
+        let binary = cast_update_value(&text, &DataType::Binary, CastMode::RowUpdate).unwrap();
+        let integers = cast_update_value(&binary, &DataType::Int32, CastMode::RowUpdate).unwrap();
+        assert_eq!(
+            integers.to_data(),
+            Int32Array::from(vec![Some(42), None]).to_data()
+        );
+        assert_eq!(
+            cast_update_value(
+                &new_null_array(&DataType::Null, 2),
+                &DataType::Binary,
+                CastMode::RowUpdate
+            )
+            .unwrap()
+            .null_count(),
+            2
+        );
     }
 
     #[test]
