@@ -1420,15 +1420,15 @@ fn ranges_cover_all_rows(ranges: &[RowRange], row_count: i64) -> bool {
 fn dv_to_non_deleted_ranges(dv: &DeletionVector, row_count: i64) -> Vec<RowRange> {
     let mut result = Vec::new();
     let mut cursor: i64 = 0;
-    for deleted in dv.iter() {
-        let del = deleted as i64;
-        if del >= row_count {
+    for (start, end) in dv.deleted_ranges() {
+        let (start, end) = (i64::from(start), i64::from(end));
+        if start >= row_count {
             break;
         }
-        if del > cursor {
-            result.push(RowRange::new(cursor, del - 1));
+        if start > cursor {
+            result.push(RowRange::new(cursor, start - 1));
         }
-        cursor = del + 1;
+        cursor = end + 1;
     }
     if cursor < row_count {
         result.push(RowRange::new(cursor, row_count - 1));
@@ -2353,6 +2353,30 @@ mod tests {
         assert_eq!(
             merge_row_selection(10, Some(&dv), Some(&full)),
             Some(vec![RowRange::new(0, 2), RowRange::new(4, 9)])
+        );
+    }
+
+    #[test]
+    fn dv_to_non_deleted_ranges_handles_long_runs() {
+        let dv = DeletionVector::from_bitmap;
+        // A run crossing roaring containers.
+        assert_eq!(
+            dv_to_non_deleted_ranges(&dv((70_000..140_000).collect()), 200_000),
+            vec![RowRange::new(0, 69_999), RowRange::new(140_000, 199_999)]
+        );
+        // A run that goes past the end of the file.
+        assert_eq!(
+            dv_to_non_deleted_ranges(&dv((3..100_000).collect()), 50_000),
+            vec![RowRange::new(0, 2)]
+        );
+        // Positions at or past row_count are ignored.
+        assert_eq!(
+            dv_to_non_deleted_ranges(&dv((0..10).chain(60_000..60_010).collect()), 50_000),
+            vec![RowRange::new(10, 49_999)]
+        );
+        assert_eq!(
+            dv_to_non_deleted_ranges(&dv((0..50_000).collect()), 50_000),
+            vec![]
         );
     }
 
