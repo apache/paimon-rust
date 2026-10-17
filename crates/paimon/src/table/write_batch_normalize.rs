@@ -26,7 +26,7 @@
 use crate::{Error, Result};
 use arrow_array::{
     Array, ArrayRef, BinaryArray, Decimal128Array, FixedSizeBinaryArray, FixedSizeListArray,
-    ListArray, MapArray, StringArray, StructArray,
+    LargeStringArray, ListArray, MapArray, StringArray, StructArray,
 };
 use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::{DataType, Field};
@@ -232,9 +232,8 @@ fn normalize_visible_array(
     match (array.data_type(), expected) {
         // Java has one STRING value representation. Arrow offset widths do
         // not change the logical values, including in keys and nested fields.
-        // This specific cast checks offset overflow without enabling value casts.
         (DataType::LargeUtf8, DataType::Utf8) => {
-            arrow_cast::cast(array, expected).map_err(normalization_error)
+            normalize_large_string(array.as_any().downcast_ref().unwrap())
         }
         (DataType::FixedSizeBinary(_), DataType::Binary) => {
             let fixed = array
@@ -349,6 +348,34 @@ fn normalize_visible_array(
     }
 }
 
+/// Narrow only the visible byte range. A small slice may start beyond i32::MAX
+/// in its backing buffer, so casting the original absolute offsets is wrong.
+/// The value buffer remains shared and only the offset buffer is rebuilt.
+fn normalize_large_string(array: &LargeStringArray) -> Result<ArrayRef> {
+    let source = array.value_offsets();
+    let start = source[0];
+    let end = source[source.len() - 1];
+    let offsets = source
+        .iter()
+        .map(|offset| {
+            i32::try_from(offset - start).map_err(|_| Error::DataInvalid {
+                message: "Arrow STRING byte range exceeds 32-bit offsets".into(),
+                source: None,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let values = array
+        .values()
+        .slice_with_length(start as usize, (end - start) as usize);
+    StringArray::try_new(
+        OffsetBuffer::new(offsets.into()),
+        values,
+        array.nulls().cloned(),
+    )
+    .map(|array| Arc::new(array) as ArrayRef)
+    .map_err(normalization_error)
+}
+
 /// Keep only children referenced by visible parents. Ordinary inputs and
 /// slices share their payload buffers; only disjoint ranges across NULL
 /// parents need concatenation. Hidden children must not fail NOT NULL checks
@@ -426,6 +453,105 @@ mod tests {
     use arrow_array::{FixedSizeListArray, Int32Array, LargeBinaryArray, StringArray};
     use arrow_buffer::{OffsetBuffer, ScalarBuffer};
     use arrow_schema::Field;
+
+    #[cfg(all(unix, target_pointer_width = "64"))]
+    #[test]
+    fn large_string_slices_after_two_gib_keep_only_the_visible_byte_range() {
+        use arrow_array::LargeStringArray;
+        use arrow_buffer::Buffer;
+        use std::ptr::NonNull;
+
+        struct Mapping {
+            address: usize,
+            len: usize,
+        }
+        impl Drop for Mapping {
+            fn drop(&mut self) {
+                // SAFETY: the mapping owns this mmap region until the last
+                // Arrow buffer using it is dropped.
+                unsafe { libc::munmap(self.address as *mut libc::c_void, self.len) };
+            }
+        }
+        let start = i32::MAX as usize + 17;
+        let tail = "abc中文tail".as_bytes();
+        let len = start + tail.len();
+        // Reserve virtual memory without allocating/touching a 2 GiB payload.
+        // Only the small visible tail is initialized and read by this test.
+        let address = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(address, libc::MAP_FAILED);
+        let owner = Arc::new(Mapping {
+            address: address as usize,
+            len,
+        });
+        // SAFETY: mmap returned len initialized bytes; the tail fits within
+        // the mapping and all writes finish before publishing the buffer.
+        let values = unsafe {
+            std::ptr::copy_nonoverlapping(
+                tail.as_ptr(),
+                address.cast::<u8>().add(start),
+                tail.len(),
+            );
+            Buffer::from_custom_allocation(NonNull::new(address.cast()).unwrap(), len, owner)
+        };
+        let start = start as i64;
+        let input = LargeStringArray::new(
+            OffsetBuffer::new(vec![start, start + 3, start + 3, start + 9, start + 13].into()),
+            values,
+            Some(NullBuffer::from(vec![true, false, true, true])),
+        );
+        let input: ArrayRef = Arc::new(input.slice(0, 3));
+        let result = normalize_write_array(&input, &DataType::Utf8).unwrap();
+        assert_eq!(
+            result.to_data(),
+            StringArray::from(vec![Some("abc"), None, Some("中文")]).to_data()
+        );
+        let result = result.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(result.value_offsets(), &[0, 3, 3, 9]);
+        assert_eq!(result.values().as_ptr(), unsafe {
+            address.cast::<u8>().add(start as usize)
+        });
+        let empty = normalize_write_array(&input.slice(3, 0), &DataType::Utf8).unwrap();
+        assert!(empty.is_empty());
+        // A visible range larger than i32::MAX still cannot be represented.
+        // SAFETY: the mapped bytes are zeroes followed by a valid UTF-8 tail;
+        // offsets and NULL bitmap are valid. Skip scanning the 2 GiB prefix.
+        let too_wide: ArrayRef = Arc::new(unsafe {
+            LargeStringArray::new_unchecked(
+                OffsetBuffer::new(vec![0, start + 13].into()),
+                input
+                    .as_any()
+                    .downcast_ref::<LargeStringArray>()
+                    .unwrap()
+                    .values()
+                    .clone(),
+                Some(NullBuffer::from(vec![false])),
+            )
+        });
+        assert!(normalize_write_array(&too_wide, &DataType::Utf8)
+            .unwrap_err()
+            .to_string()
+            .contains("32-bit offsets"));
+    }
+
+    #[test]
+    fn binary_offset_widths_are_not_implicitly_converted() {
+        let small: ArrayRef = Arc::new(BinaryArray::from(vec![Some(b"\xff\0".as_slice()), None]));
+        let large: ArrayRef = Arc::new(LargeBinaryArray::from(vec![
+            Some(b"\xff\0".as_slice()),
+            None,
+        ]));
+        assert!(normalize_write_array(&small, &DataType::LargeBinary).is_err());
+        assert!(normalize_write_array(&large, &DataType::Binary).is_err());
+    }
 
     #[test]
     fn large_strings_preserve_slices_unicode_and_nulls() {
