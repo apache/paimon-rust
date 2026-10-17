@@ -30,6 +30,10 @@ The XZ Utils 5.8.3 license is read from the locked `liblzma-sys` crate at
 `c62e0df1f9dcc2cc1e014711c5aa4561ae260538`. It covers `jieba-rs` 0.10.3 and
 `jieba-macros` 0.10.3.
 
+Linux Python wheels also bundle OSS C++ SDK v2 at
+`c13a82038b0696f99c32f4e86b623ffcc9e62140` and curl 8.13.0.
+Their notices and curl license are copied here from those pinned sources.
+
 Target-specific Python and Go reports are generated in their binary build jobs.
 They are intentionally not committed or included in the ASF source archive.
 
@@ -38,3 +42,5 @@ Sources:
 - <https://github.com/openssl/openssl/blob/OpenSSL_1_1_1k/LICENSE>
 - <https://github.com/openssl/openssl/blob/OpenSSL_1_1_1w/LICENSE>
 - <https://github.com/messense/jieba-rs/blob/c62e0df1f9dcc2cc1e014711c5aa4561ae260538/LICENSE>
+- <https://github.com/aliyun/alibabacloud-oss-cpp-sdk-v2/blob/c13a82038b0696f99c32f4e86b623ffcc9e62140/THIRD_PARTY_NOTICES>
+- <https://github.com/curl/curl/blob/curl-8_13_0/COPYING>

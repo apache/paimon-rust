@@ -589,6 +589,32 @@ def bundled_component_html(
     )
 
 
+def oss_cpp_wheel_licenses(root: Path, report: Report) -> str:
+    if report.component != "python" or not report.target.endswith("linux-gnu"):
+        return ""
+    sdk_notices = (root / "third-party-licenses/oss-cpp-sdk-v2.THIRD_PARTY_NOTICES").read_text(
+        encoding="utf-8"
+    )
+    curl_license = (root / "third-party-licenses/curl-8.13.0.COPYING").read_text(
+        encoding="utf-8"
+    )
+    openssl_version = "1.1.1k FIPS" if report.target.startswith("x86_64") else "1.1.1w"
+    return "\n".join(
+        [
+            "",
+            "        <h2>OSS C++ bridge dependencies</h2>",
+            '        <h3 id="bundled-oss-cpp-sdk">Alibaba Cloud OSS C++ SDK v2</h3>',
+            "        <p>Version 0.2.0, commit c13a82038b0696f99c32f4e86b623ffcc9e62140;",
+            "        Apache-2.0 (full text in LICENSE). Bundled SDK notices:</p>",
+            f'        <pre class="license-text">{html.escape(sdk_notices)}</pre>',
+            '        <h3 id="bundled-curl-8.13.0">curl 8.13.0</h3>',
+            f'        <pre class="license-text">{html.escape(curl_license)}</pre>',
+            f"        <p>OpenSSL {openssl_version} is also linked statically into the bridge;",
+            "        its license is listed above.</p>",
+        ]
+    )
+
+
 def complete_report(
     root: Path, base_report: str, report: Report, metadata: dict
 ) -> str:
@@ -628,6 +654,7 @@ def complete_report(
     result = (
         result[:closing_main]
         + bundled_component_html(root, report, result, metadata)
+        + oss_cpp_wheel_licenses(root, report)
         + "\n"
         + result[closing_main:]
     )
