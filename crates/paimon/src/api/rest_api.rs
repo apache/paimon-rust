@@ -33,13 +33,13 @@ use super::api_request::{
     CreateDatabaseRequest, CreateFunctionRequest, CreatePartitionsRequest, CreateTableRequest,
     CreateTagRequest, CreateViewRequest, DropPartitionsRequest, DropPolicyRequest,
     ForwardBranchRequest, ListPartitionsByFilterRequest, ListPartitionsByNamesRequest,
-    PolicyRequest, RenameTableRequest, RevokePermissionRequest,
+    PolicyRequest, RenameTableRequest, RevokePermissionRequest, RollbackTableRequest,
 };
 use super::api_response::{
     AuthTableQueryResponse, ConfigResponse, ErrorResponse, GetDatabaseResponse,
     GetFunctionResponse, GetTableResponse, GetTagResponse, GetViewResponse, ListBranchesResponse,
     ListDatabasesResponse, ListFunctionsResponse, ListPartitionsResponse, ListPermissionsResponse,
-    ListPoliciesResponse, ListTablesResponse, ListViewsResponse, PagedList,
+    ListPoliciesResponse, ListTablesResponse, ListTagsResponse, ListViewsResponse, PagedList,
 };
 use super::auth::{AuthProviderFactory, RESTAuthFunction};
 use super::management::{
@@ -420,16 +420,16 @@ impl RESTApi {
         &self,
         identifier: &Identifier,
     ) -> Result<Option<super::TableSnapshot>> {
-        validate_non_empty_multi(&[
+        validate_resource_path(&[
             (identifier.database(), "database name"),
             (identifier.object(), "table name"),
         ])?;
         let path = self
             .resource_paths
             .table_snapshot(identifier.database(), identifier.object());
-        let response: super::GetTableSnapshotResponse =
+        let response: Option<super::GetTableSnapshotResponse> =
             self.client.get(&path, None::<&[(&str, &str)]>).await?;
-        Ok(response.snapshot)
+        Ok(response.and_then(|response| response.snapshot))
     }
 
     /// Rename a table.
@@ -1067,22 +1067,18 @@ impl RESTApi {
     ) -> Result<()> {
         let database = identifier.database();
         let table = identifier.object();
-        validate_non_empty_multi(&[
-            (database, "database name"),
-            (table, "table name"),
-            (tag_name, "tag name"),
-        ])?;
+        validate_resource_path(&[(database, "database name"), (table, "table name")])?;
+        validate_non_empty(tag_name, "tag name")?;
         let path = self.resource_paths.tags(database, table);
         let mut request = CreateTagRequest::new(tag_name.to_string(), snapshot_id);
         request.time_retained = time_retained.map(str::to_string);
-        let _response: serde_json::Value = self.client.post(&path, &request).await?;
-        Ok(())
+        self.client.post_without_response(&path, &request).await
     }
 
     pub async fn get_tag(&self, identifier: &Identifier, tag_name: &str) -> Result<GetTagResponse> {
         let database = identifier.database();
         let table = identifier.object();
-        validate_non_empty_multi(&[
+        validate_resource_path(&[
             (database, "database name"),
             (table, "table name"),
             (tag_name, "tag name"),
@@ -1091,18 +1087,50 @@ impl RESTApi {
         self.client.get(&path, None::<&[(&str, &str)]>).await
     }
 
+    /// Fetch one tag-name page, preserving server ordering and opaque tokens.
+    pub async fn list_tags_paged(
+        &self,
+        identifier: &Identifier,
+        max_results: Option<i32>,
+        page_token: Option<&str>,
+        tag_name_prefix: Option<&str>,
+    ) -> Result<PagedList<String>> {
+        validate_resource_path(&[
+            (identifier.database(), "database name"),
+            (identifier.object(), "table name"),
+        ])?;
+        let mut params = Vec::new();
+        if let Some(max_results) = max_results.filter(|value| *value > 0) {
+            params.push((Self::MAX_RESULTS, max_results.to_string()));
+        }
+        if let Some(page_token) = page_token {
+            params.push((Self::PAGE_TOKEN, page_token.to_string()));
+        }
+        if let Some(prefix) = tag_name_prefix.filter(|value| !value.is_empty()) {
+            params.push(("tagNamePrefix", prefix.to_string()));
+        }
+        let path = self
+            .resource_paths
+            .tags(identifier.database(), identifier.object());
+        let response: ListTagsResponse = self.client.get(&path, Some(&params)).await?;
+        // Java ends pagination when the response has no tags field, including
+        // explicit null, even if a server also returned a continuation token.
+        Ok(match response.tags {
+            Some(tags) => PagedList::new(tags, response.next_page_token),
+            None => PagedList::new(Vec::new(), None),
+        })
+    }
+
     pub async fn delete_tag(&self, identifier: &Identifier, tag_name: &str) -> Result<()> {
         let database = identifier.database();
         let table = identifier.object();
-        validate_non_empty_multi(&[
+        validate_resource_path(&[
             (database, "database name"),
             (table, "table name"),
             (tag_name, "tag name"),
         ])?;
         let path = self.resource_paths.tag(database, table, tag_name);
-        let _response: serde_json::Value =
-            self.client.delete(&path, None::<&[(&str, &str)]>).await?;
-        Ok(())
+        self.client.delete_without_response(&path).await
     }
 
     // ==================== Policy Management ====================
@@ -1196,43 +1224,30 @@ impl RESTApi {
             .unwrap_or(false))
     }
 
-    /// Rollback a table to a specific snapshot.
-    pub async fn rollback_to_snapshot(
+    /// Roll back a table through the server, optionally comparing its identity
+    /// and current head. Omitted guards stay omitted on the wire, as in Java.
+    pub async fn rollback_to(
         &self,
         identifier: &Identifier,
-        snapshot_id: i64,
+        instant: &crate::table::Instant,
+        from_snapshot: Option<i64>,
+        table_uuid: Option<&str>,
     ) -> Result<()> {
-        let database = identifier.database();
-        let table = identifier.object();
-        validate_non_empty_multi(&[(database, "database name"), (table, "table name")])?;
-        let path = self.resource_paths.rollback(database, table);
-        let request = serde_json::json!({
-            "instant": {
-                "type": "snapshot",
-                "snapshotId": snapshot_id,
-            }
-        });
-        let _resp: serde_json::Value = self.client.post(&path, &request).await?;
-        Ok(())
-    }
-
-    /// Rollback a table to a specific tag.
-    pub async fn rollback_to_tag(&self, identifier: &Identifier, tag_name: &str) -> Result<()> {
-        let database = identifier.database();
-        let table = identifier.object();
-        validate_non_empty_multi(&[
-            (database, "database name"),
-            (table, "table name"),
-            (tag_name, "tag name"),
+        validate_resource_path(&[
+            (identifier.database(), "database name"),
+            (identifier.object(), "table name"),
         ])?;
-        let path = self.resource_paths.rollback(database, table);
-        let request = serde_json::json!({
-            "instant": {
-                "type": "tag",
-                "tagName": tag_name,
-            }
-        });
-        let _resp: serde_json::Value = self.client.post(&path, &request).await?;
-        Ok(())
+        if let crate::table::Instant::Tag { tag_name } = instant {
+            validate_non_empty(tag_name, "tag name")?;
+        }
+        let request = RollbackTableRequest {
+            instant: instant.clone(),
+            from_snapshot,
+            table_id: table_uuid.map(str::to_string),
+        };
+        let path = self
+            .resource_paths
+            .rollback(identifier.database(), identifier.object());
+        self.client.post_without_response(&path, &request).await
     }
 }

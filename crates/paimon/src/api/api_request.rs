@@ -87,6 +87,17 @@ pub struct CreateBranchRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ForwardBranchRequest {}
 
+/// A rollback guarded by the observed table incarnation and latest snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RollbackTableRequest {
+    pub instant: crate::table::Instant,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from_snapshot: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub table_id: Option<String>,
+}
+
 /// Request to create a table tag.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

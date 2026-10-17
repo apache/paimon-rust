@@ -408,6 +408,44 @@ impl Catalog for RESTCatalog {
         })
     }
 
+    async fn load_snapshot(
+        &self,
+        identifier: &Identifier,
+    ) -> Result<Option<crate::api::TableSnapshot>> {
+        match self.api.load_snapshot(identifier).await {
+            Err(Error::RestApi {
+                source: RestError::NoSuchResource { resource_type, .. },
+            }) if resource_type.as_deref() == Some("SNAPSHOT") => Ok(None),
+            result => result.map_err(|error| map_table_not_exist(error, identifier)),
+        }
+    }
+
+    async fn rollback_to(
+        &self,
+        identifier: &Identifier,
+        instant: &crate::table::Instant,
+        from_snapshot: Option<i64>,
+        table_uuid: Option<&str>,
+    ) -> Result<()> {
+        self.api
+            .rollback_to(identifier, instant, from_snapshot, table_uuid)
+            .await
+            .map_err(|error| map_rest_error_for_rollback(error, identifier, instant))
+    }
+
+    async fn list_tags_paged(
+        &self,
+        identifier: &Identifier,
+        max_results: Option<i32>,
+        page_token: Option<&str>,
+        tag_name_prefix: Option<&str>,
+    ) -> Result<PagedList<String>> {
+        self.api
+            .list_tags_paged(identifier, max_results, page_token, tag_name_prefix)
+            .await
+            .map_err(|error| map_table_not_exist(error, identifier))
+    }
+
     async fn create_tag(
         &self,
         identifier: &Identifier,
@@ -874,6 +912,60 @@ fn map_rest_error_for_table(err: Error, identifier: &Identifier) -> Error {
     }
 }
 
+fn map_table_not_exist(error: Error, identifier: &Identifier) -> Error {
+    match error {
+        Error::RestApi {
+            source: RestError::NoSuchResource { .. },
+        } => Error::TableNotExist {
+            full_name: identifier.full_name(),
+        },
+        other => other,
+    }
+}
+
+fn map_rest_error_for_rollback(
+    error: Error,
+    identifier: &Identifier,
+    instant: &crate::table::Instant,
+) -> Error {
+    if let Error::RestApi {
+        source:
+            RestError::NoSuchResource {
+                resource_type,
+                resource_name,
+                ..
+            },
+    } = &error
+    {
+        if resource_type.as_deref() == Some("SNAPSHOT") {
+            let snapshot_id = resource_name
+                .as_deref()
+                .and_then(|name| name.parse().ok())
+                .or(match instant {
+                    crate::table::Instant::Snapshot { snapshot_id } => Some(*snapshot_id),
+                    _ => None,
+                });
+            return snapshot_id
+                .map(|snapshot_id| Error::SnapshotNotExist { snapshot_id })
+                .unwrap_or(error);
+        }
+        if resource_type.as_deref() == Some("TAG") {
+            let tag_name = resource_name
+                .clone()
+                .or_else(|| match instant {
+                    crate::table::Instant::Tag { tag_name } => Some(tag_name.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            return Error::TagNotExist { tag_name };
+        }
+        return Error::TableNotExist {
+            full_name: identifier.full_name(),
+        };
+    }
+    error
+}
+
 fn map_rest_error_for_tag(
     error: Error,
     identifier: &Identifier,
@@ -891,32 +983,29 @@ fn map_rest_error_for_tag(
                 RestError::NoSuchResource {
                     resource_type,
                     resource_name,
-                    ..
+                    message,
                 },
-        } if resource_type
-            .as_deref()
-            .is_some_and(|kind| kind.eq_ignore_ascii_case("snapshot")) =>
-        {
-            match snapshot_id.or_else(|| resource_name.and_then(|value| value.parse().ok())) {
+        } if resource_type.as_deref() == Some("SNAPSHOT") => {
+            match snapshot_id.or_else(|| {
+                resource_name
+                    .as_deref()
+                    .and_then(|value| value.parse().ok())
+            }) {
                 Some(snapshot_id) => Error::SnapshotNotExist { snapshot_id },
-                None => Error::DataInvalid {
-                    message: format!(
-                        "Cannot create tag '{tag_name}' because the latest snapshot does not exist"
-                    ),
-                    source: None,
+                None => Error::RestApi {
+                    source: RestError::NoSuchResource {
+                        resource_type,
+                        resource_name,
+                        message,
+                    },
                 },
             }
         }
         Error::RestApi {
             source: RestError::NoSuchResource { resource_type, .. },
-        } if resource_type
-            .as_deref()
-            .is_some_and(|kind| kind.eq_ignore_ascii_case("tag")) =>
-        {
-            Error::TagNotExist {
-                tag_name: tag_name.to_string(),
-            }
-        }
+        } if resource_type.as_deref() == Some("TAG") => Error::TagNotExist {
+            tag_name: tag_name.to_string(),
+        },
         Error::RestApi {
             source: RestError::NoSuchResource { .. },
         } => Error::TableNotExist {
@@ -928,7 +1017,9 @@ fn map_rest_error_for_tag(
             message,
             source: None,
         },
-        other => map_unsupported_endpoint(other, "tag"),
+        // Preserve HTTP status and resource metadata for catalog clients. A
+        // remote 501 is not a locally unsupported operation eligible for fallback.
+        other => other,
     }
 }
 

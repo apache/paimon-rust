@@ -37,7 +37,7 @@ pub use api_request::{
     CreateDatabaseRequest, CreateFunctionRequest, CreatePartitionsRequest, CreateTableRequest,
     CreateTagRequest, CreateViewRequest, DropPartitionsRequest, DropPolicyRequest,
     ForwardBranchRequest, ListPartitionsByFilterRequest, ListPartitionsByNamesRequest,
-    PolicyRequest, RenameTableRequest, RevokePermissionRequest,
+    PolicyRequest, RenameTableRequest, RevokePermissionRequest, RollbackTableRequest,
 };
 
 // Re-export response types
@@ -46,7 +46,7 @@ pub use api_response::{
     GetFunctionResponse, GetTableResponse, GetTableSnapshotResponse, GetTableTokenResponse,
     GetTagResponse, GetViewResponse, ListBranchesResponse, ListDatabasesResponse,
     ListFunctionsResponse, ListPartitionsResponse, ListPermissionsResponse, ListPoliciesResponse,
-    ListTablesResponse, ListViewsResponse, PagedList, TableSnapshot,
+    ListTablesResponse, ListTagsResponse, ListViewsResponse, PagedList, TableSnapshot,
 };
 
 // Re-export management types

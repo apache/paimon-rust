@@ -635,13 +635,23 @@ async fn proc_rollback_to(
                 .map_err(|_| DataFusionError::Plan(format!("Invalid snapshot_id: '{id_str}'")))?;
             rest_env
                 .api()
-                .rollback_to_snapshot(rest_env.identifier(), id)
+                .rollback_to(
+                    rest_env.identifier(),
+                    &paimon::table::Instant::snapshot(id),
+                    None,
+                    Some(rest_env.uuid()),
+                )
                 .await
                 .map_err(to_datafusion_error)?;
         } else if let Some(tag_name) = args.get("tag") {
             rest_env
                 .api()
-                .rollback_to_tag(rest_env.identifier(), tag_name)
+                .rollback_to(
+                    rest_env.identifier(),
+                    &paimon::table::Instant::tag(tag_name),
+                    None,
+                    Some(rest_env.uuid()),
+                )
                 .await
                 .map_err(to_datafusion_error)?;
         } else {
@@ -723,7 +733,12 @@ async fn proc_rollback_to_timestamp(
     if let Some(rest_env) = table.rest_env() {
         rest_env
             .api()
-            .rollback_to_snapshot(rest_env.identifier(), snapshot.id())
+            .rollback_to(
+                rest_env.identifier(),
+                &paimon::table::Instant::snapshot(snapshot.id()),
+                None,
+                Some(rest_env.uuid()),
+            )
             .await
             .map_err(to_datafusion_error)?;
     } else {
