@@ -1235,16 +1235,58 @@ mod tests {
         };
 
         assert!(matches!(
-            map_rest_error_for_tag(error("tag"), &identifier, "release", None),
+            map_rest_error_for_tag(error("TAG"), &identifier, "release", None),
             Error::TagNotExist { .. }
         ));
         assert!(matches!(
-            map_rest_error_for_tag(error("snapshot"), &identifier, "release", Some(7)),
+            map_rest_error_for_tag(error("SNAPSHOT"), &identifier, "release", Some(7)),
             Error::SnapshotNotExist { snapshot_id: 7 }
         ));
+        // Java compares resource types exactly. Other 404 resources describe
+        // a missing table, including noncanonical lowercase names.
+        for resource_type in ["TABLE", "OTHER", "tag", "snapshot"] {
+            assert!(matches!(
+                map_rest_error_for_tag(error(resource_type), &identifier, "release", None),
+                Error::TableNotExist { full_name } if full_name == "db.table"
+            ));
+        }
+    }
+
+    #[test]
+    fn test_tag_error_mapping_preserves_missing_latest_snapshot() {
+        let identifier = Identifier::new("db", "table");
+        for name in [None, Some("null"), Some("7")] {
+            let error = Error::RestApi {
+                source: RestError::NoSuchResource {
+                    resource_type: Some("SNAPSHOT".to_string()),
+                    resource_name: name.map(str::to_string),
+                    message: "missing latest snapshot".to_string(),
+                },
+            };
+            let mapped = map_rest_error_for_tag(error, &identifier, "release", None);
+            if name == Some("7") {
+                assert!(matches!(mapped, Error::SnapshotNotExist { snapshot_id: 7 }));
+            } else {
+                assert!(matches!(mapped, Error::RestApi {
+                    source: RestError::NoSuchResource { resource_type, resource_name, message }
+                } if resource_type.as_deref() == Some("SNAPSHOT")
+                    && resource_name.as_deref() == name
+                    && message == "missing latest snapshot"));
+            }
+        }
+    }
+
+    #[test]
+    fn test_tag_error_mapping_preserves_unimplemented_endpoint() {
+        let error = Error::RestApi {
+            source: RestError::NotImplemented {
+                message: "tag endpoint unavailable".to_string(),
+            },
+        };
         assert!(matches!(
-            map_rest_error_for_tag(error("table"), &identifier, "release", None),
-            Error::TableNotExist { .. }
+            map_rest_error_for_tag(error, &Identifier::new("db", "table"), "release", None),
+            Error::RestApi { source: RestError::NotImplemented { message } }
+                if message == "tag endpoint unavailable"
         ));
     }
 
