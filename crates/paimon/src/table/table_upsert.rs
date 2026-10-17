@@ -421,7 +421,6 @@ impl TableUpsert {
                     &self.table,
                     self.update_columns.clone(),
                 )?;
-                update.preserve_binary_layout();
                 update.with_blob_uri_reader_factory(self.blob_uri_reader_factory.clone());
                 if let Some(snapshot_id) = plan.snapshot_id() {
                     update.pin_read_snapshot(snapshot_id);
@@ -667,7 +666,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upsert_update_casts_keep_binary_write_layouts() {
+    async fn upsert_matched_binary_values_use_existing_row_id_casts() {
         use arrow_array::{BinaryArray, LargeBinaryArray};
         let schema = PaimonSchema::builder()
             .column("key", PaimonType::Int(IntType::new()))
@@ -700,15 +699,34 @@ mod tests {
         let update = table.new_write_builder().new_update().unwrap();
         let input = numeric_source(
             vec![1],
-            Arc::new(LargeBinaryArray::from(vec![b"new".as_slice()])),
+            Arc::new(LargeBinaryArray::from(vec![b"\xff\0new".as_slice()])),
         );
-        let error = update
+        let messages = update
             .upsert_by_arrow_with_key(vec![input], vec!["key".into()])
             .await
-            .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("incompatible with table type Binary"));
+            .unwrap();
+        TableCommit::new(table.clone(), "update".into())
+            .commit(messages)
+            .await
+            .unwrap();
+        let mut builder = table.new_read_builder();
+        builder.with_projection(&["value"]).unwrap();
+        let plan = builder.new_scan().plan().await.unwrap();
+        let batches: Vec<_> = builder
+            .new_read()
+            .unwrap()
+            .to_arrow(plan.splits())
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+        let values = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+        assert_eq!(values.value(0), b"\xff\0new");
     }
 
     #[tokio::test]

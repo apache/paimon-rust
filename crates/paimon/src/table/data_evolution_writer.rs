@@ -85,7 +85,6 @@ pub struct DataEvolutionWriter {
     matched_batch_groups: Vec<usize>,
     next_group_id: usize,
     blob_uri_reader_factory: Option<Arc<dyn crate::io::UriReaderFactory>>,
-    preserve_binary_layout: bool,
 }
 
 impl DataEvolutionWriter {
@@ -177,7 +176,6 @@ impl DataEvolutionWriter {
             matched_batch_groups: Vec::new(),
             next_group_id: 1,
             blob_uri_reader_factory: None,
-            preserve_binary_layout: false,
         })
     }
 
@@ -186,10 +184,6 @@ impl DataEvolutionWriter {
         factory: Option<Arc<dyn crate::io::UriReaderFactory>>,
     ) {
         self.blob_uri_reader_factory = factory;
-    }
-
-    pub(super) fn preserve_binary_layout(&mut self) {
-        self.preserve_binary_layout = true;
     }
 
     fn validate_partition_values(
@@ -206,10 +200,10 @@ impl DataEvolutionWriter {
                 .matched_batches
                 .iter()
                 .map(|batch| {
-                    super::update_input::cast_row_update_value(
+                    super::update_input::cast_update_value(
                         &matched_column(batch, name)?,
                         &target_type,
-                        self.preserve_binary_layout,
+                        super::update_input::CastMode::RowUpdate,
                     )
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -392,7 +386,6 @@ impl DataEvolutionWriter {
                     &self.matched_batches,
                     &sorted_matches,
                     file_range,
-                    self.preserve_binary_layout,
                 )
                 .await?;
                 if normal_fields.is_empty() {
@@ -475,7 +468,6 @@ impl DataEvolutionWriter {
                             &self.update_columns,
                             &self.matched_batches,
                             &sorted_matches,
-                            self.preserve_binary_layout,
                         )
                     })
                     .collect::<Result<Vec<_>>>()?;
@@ -1127,16 +1119,9 @@ fn apply_field_updates(
     update_columns: &[String],
     matched_batches: &[RecordBatch],
     matches: &[(usize, usize, usize)],
-    preserve_binary_layout: bool,
 ) -> Result<ArrayRef> {
     if update_columns.iter().any(|column| column == path) {
-        let updated = interleave_updated_leaf(
-            path,
-            original,
-            matched_batches,
-            matches,
-            preserve_binary_layout,
-        )?;
+        let updated = interleave_updated_leaf(path, original, matched_batches, matches)?;
         // Readers allow runtime NULLs and relax nested field nullability.
         // Restore the declared write layout, validating only visible children,
         // before constructing a partial-column file with the table schema.
@@ -1175,7 +1160,6 @@ fn apply_field_updates(
                     update_columns,
                     matched_batches,
                     matches,
-                    preserve_binary_layout,
                 )
             })
             .collect::<Result<Vec<_>>>()?;
@@ -1206,7 +1190,6 @@ fn interleave_updated_leaf(
     original: &ArrayRef,
     matched_batches: &[RecordBatch],
     matches: &[(usize, usize, usize)],
-    preserve_binary_layout: bool,
 ) -> Result<ArrayRef> {
     let mut batch_arrays = Vec::<ArrayRef>::new();
     let mut batch_id_map = HashMap::<usize, usize>::new();
@@ -1216,10 +1199,10 @@ fn interleave_updated_leaf(
             *index
         } else {
             let value = matched_column(&matched_batches[batch_idx], path)?;
-            let value = super::update_input::cast_row_update_value(
+            let value = super::update_input::cast_update_value(
                 &value,
                 original.data_type(),
-                preserve_binary_layout,
+                super::update_input::CastMode::RowUpdate,
             )?;
             let index = batch_arrays.len();
             batch_arrays.push(value);
@@ -2033,7 +2016,6 @@ mod tests {
             &["value".into()],
             &[updates],
             &[(0, 0, 0), (1, 0, 1)],
-            false,
         )
         .unwrap();
         let expected = crate::arrow::paimon_type_to_arrow(write_field.data_type()).unwrap();
@@ -2062,8 +2044,7 @@ mod tests {
             &original,
             &["value".into()],
             &[invalid],
-            &[(0, 0, 0)],
-            false,
+            &[(0, 0, 0)]
         )
         .is_err());
     }

@@ -48,7 +48,6 @@ pub(super) async fn file_updates(
     batches: &[RecordBatch],
     matches: &[(usize, usize, usize)],
     file: &FileRowRange,
-    preserve_binary_layout: bool,
 ) -> Result<Vec<BlobUpdateBatch>> {
     let inline = CoreOptions::new(table.schema().options()).blob_inline_fields();
     let fields = fields
@@ -68,7 +67,6 @@ pub(super) async fn file_updates(
                 matches,
                 file.row_count as usize,
                 baseline.contains(&field.id()),
-                preserve_binary_layout,
             )?;
             Ok(BlobUpdateBatch {
                 field: field.clone(),
@@ -142,7 +140,6 @@ pub(super) fn delta_batch(
     matches: &[(usize, usize, usize)],
     row_count: usize,
     has_baseline: bool,
-    preserve_binary_layout: bool,
 ) -> Result<(RecordBatch, Option<Vec<usize>>)> {
     let length = if has_baseline {
         matches.last().map_or(0, |(offset, _, _)| offset + 1)
@@ -152,10 +149,10 @@ pub(super) fn delta_batch(
     let target = update_arrow_type(field, batches)?;
     let mut arrays = vec![arrow_array::new_null_array(&target, 1)];
     for batch in batches {
-        arrays.push(super::super::update_input::cast_row_update_value(
+        arrays.push(super::super::update_input::cast_update_value(
             &matched_column(batch, field.name())?,
             &target,
-            preserve_binary_layout,
+            super::super::update_input::CastMode::RowUpdate,
         )?);
     }
     let mut indices = vec![(0, 0); length];

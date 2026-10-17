@@ -239,7 +239,11 @@ fn normalize_blob_update_key(array: &ArrayRef, expected: &DataType) -> Result<Ar
     ) {
         // Java/Python serialize TIME Blob keys in milliseconds. This is a
         // value normalization step, unlike lossless table-key matching.
-        return super::update_input::cast_row_update_value(&decoded, expected, true);
+        return super::update_input::cast_update_value(
+            &decoded,
+            expected,
+            super::update_input::CastMode::RowUpdate,
+        );
     }
     super::key_normalization::normalize_upsert_key(&decoded, expected)
 }
