@@ -2930,9 +2930,9 @@ pub(in crate::table) mod tests {
     }
 
     #[tokio::test]
-    async fn test_append_write_applies_configured_metadata_collect_statss() {
+    async fn test_append_write_applies_configured_metadata_stats_modes() {
         let file_io = test_file_io();
-        let table_path = "memory:/test_table_write_configured_metadata_collect_statss";
+        let table_path = "memory:/test_table_write_configured_metadata_stats_modes";
         setup_dirs(&file_io, table_path).await;
 
         let schema = Schema::builder()
@@ -2948,7 +2948,7 @@ pub(in crate::table) mod tests {
             .unwrap();
         let table = Table::new(
             file_io.clone(),
-            Identifier::new("default", "test_configured_collect_statss_table"),
+            Identifier::new("default", "test_configured_stats_modes_table"),
             table_path.to_string(),
             TableSchema::new(0, &schema),
             None,
@@ -3136,8 +3136,8 @@ pub(in crate::table) mod tests {
             .unwrap();
         let mut reader = table.new_read_builder();
         reader.with_filter(predicate);
-        let _plan = reader.new_scan().with_stats().plan().await.unwrap();
-        let scan_stats = _plan.stats().cloned().unwrap();
+        let _plan = reader.new_scan().plan().await.unwrap();
+        let scan_stats = _plan.stats().clone();
 
         assert_eq!(scan_stats.final_files, 1, "scan scan_stats: {scan_stats:?}");
         assert!(
@@ -3439,8 +3439,8 @@ pub(in crate::table) mod tests {
             .unwrap();
         let mut reader = table.new_read_builder();
         reader.with_filter(predicate);
-        let _plan = reader.new_scan().with_stats().plan().await.unwrap();
-        let scan_stats = _plan.stats().cloned().unwrap();
+        let _plan = reader.new_scan().plan().await.unwrap();
+        let scan_stats = _plan.stats().clone();
 
         assert!(
             scan_stats.final_files > 0,

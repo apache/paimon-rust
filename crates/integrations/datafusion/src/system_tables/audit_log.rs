@@ -95,7 +95,7 @@ impl TableProvider for AuditLogTable {
         if let Some(limit) = pushed_limit {
             read_builder.with_limit(limit);
         }
-        let scan = read_builder.new_audit_scan().with_stats();
+        let scan = read_builder.new_audit_scan();
         let plan = await_with_runtime(scan.plan())
             .await
             .map_err(to_datafusion_error)?;

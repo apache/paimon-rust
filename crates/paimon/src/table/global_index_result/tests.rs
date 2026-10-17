@@ -48,8 +48,8 @@ async fn pk_supplied_result_preserves_snapshot_splits_and_ignores_planning_hints
         .with_shard(1, 2)
         .unwrap();
     let plan = scan.plan().await.unwrap();
-    let stats_plan = scan.clone().with_stats().plan().await.unwrap();
-    let scan_stats = stats_plan.stats().cloned().unwrap();
+    let stats_plan = scan.clone().plan().await.unwrap();
+    let scan_stats = stats_plan.stats().clone();
     for plan in [plan, stats_plan] {
         assert_eq!(plan.snapshot_id(), Some(42));
         assert_eq!(plan.splits(), std::slice::from_ref(&split));
@@ -143,9 +143,9 @@ async fn de_scores_follow_final_ranges_after_distribution_and_limit() {
         .with_global_index_result(hits.clone())
         .unwrap();
     let plan = scan.plan().await.unwrap();
-    let statistics_plan = scan.clone().with_stats().plan().await.unwrap();
+    let statistics_plan = scan.clone().plan().await.unwrap();
     assert_eq!(statistics_plan.splits(), plan.splits());
-    let scan_stats = statistics_plan.stats().unwrap();
+    let scan_stats = statistics_plan.stats();
     assert_eq!(statistics_plan.snapshot_id(), plan.snapshot_id());
     assert_eq!(
         scan_stats.planned_data_file_bytes,
@@ -285,7 +285,7 @@ async fn supplied_pk_result_cannot_bypass_required_authorization() {
         ))
         .unwrap();
     assert!(scan.plan().await.is_err());
-    assert!(scan.clone().with_stats().plan().await.is_err());
+    assert!(scan.clone().plan().await.is_err());
 }
 
 #[tokio::test]
@@ -337,9 +337,9 @@ async fn de_combined_incremental_results_retain_the_window_and_scores() {
         .unwrap();
     assert!(scan.plan().await.is_err());
     let plan = scan.plan_combined().await.unwrap();
-    let statistics_plan = scan.with_stats().plan_combined().await.unwrap();
+    let statistics_plan = scan.plan_combined().await.unwrap();
     assert_eq!(statistics_plan.splits(), plan.splits());
-    let scan_stats = statistics_plan.stats().unwrap();
+    let scan_stats = statistics_plan.stats();
     assert_eq!(statistics_plan.snapshot_id(), Some(end));
     assert_eq!(
         scan_stats.planned_data_file_bytes,

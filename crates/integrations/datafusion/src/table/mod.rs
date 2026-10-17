@@ -399,7 +399,7 @@ impl PaimonScanBuilder<'_> {
             (self.schema.clone(), read_fields)
         };
 
-        let scan_stats = self.plan.stats().cloned();
+        let scan_stats = Some(self.plan.stats().clone());
         let splits = self.plan.into_splits();
         let planned_partitions: Vec<Arc<[_]>> = if splits.is_empty() {
             vec![Arc::from(Vec::new())]
@@ -479,7 +479,7 @@ impl TableProvider for PaimonTableProvider {
         if let Some(limit) = pushed_limit {
             read_builder.with_limit(limit);
         }
-        let scan = read_builder.new_scan().with_stats();
+        let scan = read_builder.new_scan();
         // DataFusion's Python FFI may poll `TableProvider::scan()` without an active
         // Tokio runtime. `scan.plan()` can reach OpenDAL/Tokio filesystem calls while
         // reading Paimon metadata, so we must provide a runtime here instead of

@@ -351,7 +351,6 @@ impl PyReadBuilder {
             row_position_shard: None,
             chunk_shuffle: None,
             shard: None,
-            collect_stats: false,
         }
     }
 
@@ -416,7 +415,6 @@ pub struct PyTableScan {
     row_position_shard: Option<(u64, u64)>,
     chunk_shuffle: Option<PyChunkShuffle>,
     shard: Option<(usize, usize)>,
-    collect_stats: bool,
 }
 
 #[derive(Clone)]
@@ -472,9 +470,6 @@ impl PyTableScan {
         if let Some((index, count)) = self.shard {
             scan = scan.with_shard(index, count).map_err(to_py_err)?;
         }
-        if self.collect_stats {
-            scan = scan.with_stats();
-        }
         Ok(scan)
     }
 
@@ -507,9 +502,6 @@ impl PyTableScan {
         }
         if let Some((index, count)) = self.shard {
             scan = scan.with_shard(index, count).map_err(to_py_err)?;
-        }
-        if self.collect_stats {
-            scan = scan.with_stats();
         }
         Ok(scan)
     }
@@ -667,12 +659,6 @@ impl PyStreamTableScan {
 
 #[pymethods]
 impl PyTableScan {
-    /// Collect statistics from normal planning without changing pruning or LIMIT.
-    fn with_stats(mut slf: PyRefMut<'_, Self>) -> PyRefMut<'_, Self> {
-        slf.collect_stats = true;
-        slf
-    }
-
     /// Supply an evaluated selection; validation and authorization stay in core.
     fn with_global_index_result<'py>(
         mut slf: PyRefMut<'py, Self>,
@@ -1081,11 +1067,10 @@ impl PyPlan {
         self.inner.snapshot_id()
     }
 
-    fn stats(&self) -> Option<PyScanStats> {
-        self.inner
-            .stats()
-            .cloned()
-            .map(|inner| PyScanStats { inner })
+    fn stats(&self) -> PyScanStats {
+        PyScanStats {
+            inner: self.inner.stats().clone(),
+        }
     }
 
     fn splits(&self) -> Vec<PySplit> {

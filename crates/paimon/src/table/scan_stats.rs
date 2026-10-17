@@ -24,9 +24,8 @@ use std::fmt;
 /// The counters are intended for explain output and regression tests. They
 /// describe pruning at metadata planning time only; reader-side Parquet row
 /// group pruning and DataFusion residual filters are outside these statistics.
-/// [`super::TableScan::with_stats`] enables collection and stores
-/// this type on [`super::Plan::stats`]. Counters describe the work performed
-/// by normal planning, retaining manifest pruning and LIMIT stopping.
+/// Every scan stores this type on [`super::Plan::stats`]. Counters describe
+/// normal planning work, retaining manifest pruning and LIMIT stopping.
 /// Snapshot metadata is available separately from [`super::Plan::snapshot_id`].
 #[non_exhaustive]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -71,35 +70,10 @@ impl ScanStats {
         self.manifest_files_before_partition_pruning = base_count + delta_count;
     }
 
-    pub(crate) fn record_final_plan(
-        &mut self,
-        splits_before_limit: usize,
-        splits: usize,
-        files: usize,
-    ) {
-        self.record_final_plan_with_limit(
-            splits_before_limit,
-            splits_before_limit,
-            splits,
-            files,
-            false,
-        );
-    }
-
-    pub(crate) fn record_final_plan_with_limit(
-        &mut self,
-        split_candidates_built: usize,
-        splits_before_limit: usize,
-        splits: usize,
-        files: usize,
-        limit_early_stopped: bool,
-    ) {
-        self.split_candidates_built = split_candidates_built;
+    pub(crate) fn record_split_planning(&mut self, candidates: usize, limit_early_stopped: bool) {
+        self.split_candidates_built = candidates;
+        self.splits_before_limit = candidates;
         self.limit_early_stopped = limit_early_stopped;
-        self.splits_before_limit = splits_before_limit;
-        self.splits_after_limit = splits;
-        self.final_splits = splits;
-        self.final_files = files;
     }
 }
 

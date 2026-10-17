@@ -160,17 +160,17 @@ print(batches_tt[0])
 
 ### Scan statistics
 
-Request counters from ordinary metadata planning and read them from the plan:
+Every scan collects lightweight counters during ordinary metadata planning:
 
 ```python
-plan = table.new_read_builder().new_scan().with_stats().plan()
+plan = table.new_read_builder().new_scan().plan()
 scan_stats = plan.stats()
 print(scan_stats.manifest_entries_read, scan_stats.final_files)
 ```
 
 Collection retains early manifest/sidecar pruning and LIMIT stopping. Counters
 record the work performed; skipped entries are not decoded to reconstruct totals.
-Ordinary `plan()` returns `None` from `stats()`. Combined incremental scans expose
+Combined incremental scans expose
 the same API for their selected Delta or Changelog window. Snapshot metadata is
 available from `plan.snapshot_id()`.
 

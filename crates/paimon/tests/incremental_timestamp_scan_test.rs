@@ -157,14 +157,8 @@ async fn timestamp_options_select_events_and_preserve_end_snapshot() {
                 assert_eq!(actual_snapshot, snapshot, "{mode}: ({start},{end}]");
                 assert_eq!(rows, expected, "{mode}: ({start},{end}]");
             }
-            let plan = selected
-                .new_read_builder()
-                .new_scan()
-                .with_stats()
-                .plan()
-                .await
-                .unwrap();
-            let scan_stats = plan.stats().cloned().unwrap();
+            let plan = selected.new_read_builder().new_scan().plan().await.unwrap();
+            let scan_stats = plan.stats().clone();
             assert_eq!(plan.snapshot_id(), snapshot);
             assert_eq!(scan_stats.final_splits, plan.splits().len());
             assert_eq!(
@@ -188,8 +182,8 @@ async fn timestamp_auto_uses_physical_changelog_and_preserves_retracts() {
     append(&table, 300, vec![3], vec![30]).await;
     let selected = window(&table, 100, 300);
     let builder = selected.new_read_builder();
-    let plan = builder.new_scan().with_stats().plan().await.unwrap();
-    let scan_stats = plan.stats().cloned().unwrap();
+    let plan = builder.new_scan().plan().await.unwrap();
+    let scan_stats = plan.stats().clone();
     assert_eq!(plan.snapshot_id(), Some(3));
     assert!(plan.splits().iter().all(|split| split.snapshot_id() == 3));
     assert!(scan_stats.manifest_entries_read >= 2);

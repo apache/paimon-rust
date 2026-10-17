@@ -42,7 +42,6 @@ pub(crate) struct FormatTableScan<'a> {
     partition_filter: Option<PartitionFilter>,
     limit: Option<usize>,
     row_ranges: Option<Vec<RowRange>>,
-    collect_stats: bool,
 }
 
 impl<'a> FormatTableScan<'a> {
@@ -57,7 +56,6 @@ impl<'a> FormatTableScan<'a> {
             partition_filter,
             limit,
             row_ranges,
-            collect_stats: false,
         }
     }
 
@@ -68,20 +66,9 @@ impl<'a> FormatTableScan<'a> {
 
     pub(crate) async fn plan(&self) -> crate::Result<Plan> {
         self.ensure_query_auth_allowed()?;
-        let mut stats = self.collect_stats.then(ScanStats::default);
-        let plan = self.plan_inner(stats.as_mut()).await?;
-        Ok(match stats {
-            Some(mut stats) => {
-                stats.planned_data_file_bytes = plan.planned_data_file_bytes();
-                plan.with_scan_stats(stats)
-            }
-            None => plan,
-        })
-    }
-
-    pub(crate) fn with_stats(mut self) -> Self {
-        self.collect_stats = true;
-        self
+        let mut stats = ScanStats::default();
+        let plan = self.plan_inner(&mut stats).await?;
+        Ok(plan.with_scan_stats(stats))
     }
 
     fn ensure_query_auth_allowed(&self) -> crate::Result<()> {
@@ -89,7 +76,7 @@ impl<'a> FormatTableScan<'a> {
         CoreOptions::new(self.table.schema().options()).ensure_read_authorized()
     }
 
-    async fn plan_inner(&self, scan_stats: Option<&mut ScanStats>) -> crate::Result<Plan> {
+    async fn plan_inner(&self, scan_stats: &mut ScanStats) -> crate::Result<Plan> {
         if self.row_ranges.is_some() {
             return Err(crate::Error::Unsupported {
                 message: "Row ranges are not supported for format tables".to_string(),
@@ -162,9 +149,7 @@ impl<'a> FormatTableScan<'a> {
         });
         splits = self.apply_limit_pushdown(splits);
 
-        if let Some(scan_stats) = scan_stats {
-            scan_stats.record_final_plan(splits.len(), splits.len(), splits.len());
-        }
+        scan_stats.record_split_planning(splits.len(), false);
         Ok(Plan::new(splits))
     }
 

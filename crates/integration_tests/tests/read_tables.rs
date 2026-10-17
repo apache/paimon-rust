@@ -1244,11 +1244,10 @@ async fn plan_table_with_stats(table: &paimon::Table, limit: Option<usize>) -> (
     }
     let scan = read_builder.new_scan();
     let plan = scan
-        .with_stats()
         .plan()
         .await
         .expect("Failed to plan scan with statistics");
-    let stats = plan.stats().cloned().unwrap();
+    let stats = plan.stats().clone();
     (plan, stats)
 }
 
@@ -3362,22 +3361,20 @@ async fn test_limit_pushdown_disabled_with_row_ranges() {
     row_range_reader.with_row_ranges(vec![RowRange::new(0, i64::MAX)]);
     let row_range_plan = row_range_reader
         .new_scan()
-        .with_stats()
         .plan()
         .await
         .expect("Failed to plan row-range scan");
-    let row_range_stats = row_range_plan.stats().cloned().unwrap();
+    let row_range_stats = row_range_plan.stats().clone();
 
     let mut limited_reader = table.new_read_builder();
     limited_reader.with_row_ranges(vec![RowRange::new(0, i64::MAX)]);
     limited_reader.with_limit(2);
     let limited_plan = limited_reader
         .new_scan()
-        .with_stats()
         .plan()
         .await
         .expect("Failed to plan limited row-range scan");
-    let limited_stats = limited_plan.stats().cloned().unwrap();
+    let limited_stats = limited_plan.stats().clone();
 
     assert_eq!(
         limited_plan.splits().len(),

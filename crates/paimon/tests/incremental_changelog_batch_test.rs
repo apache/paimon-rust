@@ -418,14 +418,8 @@ async fn timestamp_changelog_stats_describes_one_packed_batch() {
         ("scan.mode".into(), "incremental".into()),
         ("incremental-between-timestamp".into(), "0,300".into()),
     ]));
-    let plan = table
-        .new_read_builder()
-        .new_scan()
-        .with_stats()
-        .plan()
-        .await
-        .unwrap();
-    let scan_stats = plan.stats().cloned().unwrap();
+    let plan = table.new_read_builder().new_scan().plan().await.unwrap();
+    let scan_stats = plan.stats().clone();
     assert_eq!(plan.snapshot_id(), Some(3));
     assert_eq!(scan_stats.base_manifest_files, 0);
     assert_eq!(scan_stats.delta_manifest_files, 3);

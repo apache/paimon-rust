@@ -7115,8 +7115,8 @@ mod tests {
 
         let mut builder = table.new_read_builder();
         builder.with_row_ranges(vec![RowRange::new(0, 0)]);
-        let plan = builder.new_scan().with_stats().plan().await.unwrap();
-        let scan_stats = plan.stats().cloned().unwrap();
+        let plan = builder.new_scan().plan().await.unwrap();
+        let scan_stats = plan.stats().clone();
         let mut planned_files = plan
             .splits()
             .iter()

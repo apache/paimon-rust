@@ -380,8 +380,8 @@ async fn append_mosaic_stats_prune_manifest_files() {
         .unwrap();
     let mut read = table.new_read_builder();
     read.with_filter(predicate);
-    let plan = read.new_scan().with_stats().plan().await.unwrap();
-    let scan_stats = plan.stats().cloned().unwrap();
+    let plan = read.new_scan().plan().await.unwrap();
+    let scan_stats = plan.stats().clone();
     assert_eq!(scan_stats.final_files, 1, "scan scan_stats: {scan_stats:?}");
     assert!(scan_stats.manifest_entries_pruned_by_data_stats >= 1);
     let batches: Vec<RecordBatch> = read
@@ -710,8 +710,8 @@ async fn append_mosaic_without_stats_keeps_files_in_filtered_plan() {
         .unwrap();
     let mut reader = table.new_read_builder();
     reader.with_filter(predicate);
-    let _plan = reader.new_scan().with_stats().plan().await.unwrap();
-    let scan_stats = _plan.stats().cloned().unwrap();
+    let _plan = reader.new_scan().plan().await.unwrap();
+    let scan_stats = _plan.stats().clone();
     assert_eq!(scan_stats.final_files, 2, "scan scan_stats: {scan_stats:?}");
     assert_eq!(scan_stats.manifest_entries_pruned_by_data_stats, 0);
 }
@@ -753,8 +753,8 @@ async fn append_mosaic_all_null_statistics_remain_conservative() {
         .unwrap();
     let mut reader = table.new_read_builder();
     reader.with_filter(predicate);
-    let plan = reader.new_scan().with_stats().plan().await.unwrap();
-    let scan_stats = plan.stats().cloned().unwrap();
+    let plan = reader.new_scan().plan().await.unwrap();
+    let scan_stats = plan.stats().clone();
     assert_eq!(scan_stats.final_files, 1);
     let batches: Vec<RecordBatch> = reader
         .new_read()
@@ -890,8 +890,8 @@ async fn append_mosaic_filters_rows_when_predicate_column_has_no_stats() {
         .unwrap();
     let mut reader = table.new_read_builder();
     reader.with_filter(predicate);
-    let plan = reader.new_scan().with_stats().plan().await.unwrap();
-    let scan_stats = plan.stats().cloned().unwrap();
+    let plan = reader.new_scan().plan().await.unwrap();
+    let scan_stats = plan.stats().clone();
     assert_eq!(scan_stats.final_files, 1);
     let batches: Vec<RecordBatch> = reader
         .new_read()

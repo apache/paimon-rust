@@ -59,16 +59,13 @@ def test_scan_statistics_preserve_normal_planning(limit, split_count):
         if limit is not None:
             builder.with_limit(limit)
         scan = builder.new_scan()
-        ordinary = scan.plan()
-        assert ordinary.stats() is None
-        plan = scan.with_stats().plan()
+        plan = scan.plan()
         stats = plan.stats()
         assert len(plan.splits()) == split_count
-        assert plan.snapshot_id() == ordinary.snapshot_id() == 1
+        assert plan.snapshot_id() == 1
         assert stats.manifest_entries_read == (0 if limit == 0 else 1)
         assert stats.final_splits == stats.final_files == split_count
         assert stats.limit == limit
-        assert [split.serialize() for split in plan.splits()] == [split.serialize() for split in ordinary.splits()]
         if limit == 0:
             assert stats.split_candidates_built == 0
             assert stats.limit_early_stopped
@@ -81,13 +78,10 @@ def test_combined_incremental_scan_statistics(start, entry_count):
     with tempfile.TemporaryDirectory() as warehouse:
         table = _make_table_with_data(warehouse)
         scan = table.new_read_builder().new_incremental_scan(start, 1)
-        ordinary = scan.plan()
-        assert ordinary.stats() is None
-        plan = scan.with_stats().plan()
+        plan = scan.plan()
         stats = plan.stats()
-        assert plan.snapshot_id() == ordinary.snapshot_id() == 1
+        assert plan.snapshot_id() == 1
         assert stats.manifest_entries_read == stats.final_files == entry_count
-        assert [split.serialize() for split in plan.splits()] == [split.serialize() for split in ordinary.splits()]
 
 
 def _variant_read_type(table, columns, paths, fail_on_error=False):

@@ -231,11 +231,10 @@ async fn reads_java_written_file_indexes_and_prunes_data_files() {
         planning_builder.with_filter(missing.clone());
         let plan = planning_builder
             .new_scan()
-            .with_stats()
             .plan()
             .await
             .expect("plan missing-value query");
-        let scan_stats = plan.stats().cloned().unwrap();
+        let scan_stats = plan.stats().clone();
         assert_eq!(
             scan_stats.manifest_entries_pruned_by_data_stats, 0,
             "{}",

@@ -146,20 +146,14 @@ async fn test_scan_stats_records_not_in_data_stats_pruning() {
     let fields = table.schema().fields();
     let pb = PredicateBuilder::new(fields);
 
-    let _plan = table
-        .new_read_builder()
-        .new_scan()
-        .with_stats()
-        .plan()
-        .await
-        .unwrap();
-    let all_stats = _plan.stats().cloned().unwrap();
+    let _plan = table.new_read_builder().new_scan().plan().await.unwrap();
+    let all_stats = _plan.stats().clone();
     assert_eq!(all_stats.final_files, 3);
 
     let mut reader = table.new_read_builder();
     reader.with_filter(pb.is_not_in("value", vec![Datum::Int(20)]).unwrap());
-    let _not_in_plan = reader.new_scan().with_stats().plan().await.unwrap();
-    let not_in_stats = _not_in_plan.stats().cloned().unwrap();
+    let _not_in_plan = reader.new_scan().plan().await.unwrap();
+    let not_in_stats = _not_in_plan.stats().clone();
 
     assert_eq!(
         not_in_stats.manifest_entries_pruned_by_data_stats, 1,
@@ -181,14 +175,8 @@ async fn test_scan_stats_records_partition_pruning() {
     let (_tmp, catalog) = setup_stats_table().await;
     let table = load_table(&catalog, "stats_append").await;
 
-    let _all_plan = table
-        .new_read_builder()
-        .new_scan()
-        .with_stats()
-        .plan()
-        .await
-        .unwrap();
-    let all_stats = _all_plan.stats().cloned().unwrap();
+    let _all_plan = table.new_read_builder().new_scan().plan().await.unwrap();
+    let all_stats = _all_plan.stats().clone();
     assert_eq!(_all_plan.snapshot_id(), Some(3));
     assert_eq!(all_stats.final_files, 3);
 
@@ -199,13 +187,8 @@ async fn test_scan_stats_records_partition_pruning() {
         pb.equal("dt", Datum::String("2024-01-01".to_string()))
             .unwrap(),
     );
-    let _partition_plan = partition_reader
-        .new_scan()
-        .with_stats()
-        .plan()
-        .await
-        .unwrap();
-    let partition_stats = _partition_plan.stats().cloned().unwrap();
+    let _partition_plan = partition_reader.new_scan().plan().await.unwrap();
+    let partition_stats = _partition_plan.stats().clone();
     assert!(
         partition_stats.manifest_files_after_partition_pruning
             < partition_stats.manifest_files_before_partition_pruning
@@ -303,25 +286,19 @@ async fn test_scan_stats_records_bucket_limit_and_time_travel() {
     let pb = PredicateBuilder::new(fields);
     let mut bucket_reader = table.new_read_builder();
     bucket_reader.with_filter(pb.equal("id", Datum::Int(1)).unwrap());
-    let _bucket_plan = bucket_reader.new_scan().with_stats().plan().await.unwrap();
-    let bucket_stats = _bucket_plan.stats().cloned().unwrap();
+    let _bucket_plan = bucket_reader.new_scan().plan().await.unwrap();
+    let bucket_stats = _bucket_plan.stats().clone();
     assert!(
         bucket_stats.manifest_entries_pruned_by_bucket > 0,
         "bucket-key predicate should prune manifest entries by bucket: {bucket_stats:?}"
     );
 
-    let _full_plan = table
-        .new_read_builder()
-        .new_scan()
-        .with_stats()
-        .plan()
-        .await
-        .unwrap();
-    let full_stats = _full_plan.stats().cloned().unwrap();
+    let _full_plan = table.new_read_builder().new_scan().plan().await.unwrap();
+    let full_stats = _full_plan.stats().clone();
     let mut limit_reader = table.new_read_builder();
     limit_reader.with_limit(1);
-    let _limit_plan = limit_reader.new_scan().with_stats().plan().await.unwrap();
-    let limit_stats = _limit_plan.stats().cloned().unwrap();
+    let _limit_plan = limit_reader.new_scan().plan().await.unwrap();
+    let limit_stats = _limit_plan.stats().clone();
     assert!(
         limit_stats.limit_early_stopped,
         "LIMIT should stop split construction early when no data residual exists: {limit_stats:?}"
@@ -338,21 +315,14 @@ async fn test_scan_stats_records_bucket_limit_and_time_travel() {
     let _snapshot_one_plan = snapshot_one_table
         .new_read_builder()
         .new_scan()
-        .with_stats()
         .plan()
         .await
         .unwrap();
-    let snapshot_one_stats = _snapshot_one_plan.stats().cloned().unwrap();
+    let snapshot_one_stats = _snapshot_one_plan.stats().clone();
     assert_eq!(_snapshot_one_plan.snapshot_id(), Some(1));
 
-    let _latest_plan = table
-        .new_read_builder()
-        .new_scan()
-        .with_stats()
-        .plan()
-        .await
-        .unwrap();
-    let latest_stats = _latest_plan.stats().cloned().unwrap();
+    let _latest_plan = table.new_read_builder().new_scan().plan().await.unwrap();
+    let latest_stats = _latest_plan.stats().clone();
     assert_eq!(_latest_plan.snapshot_id(), Some(2));
     assert!(
         snapshot_one_stats.final_files < latest_stats.final_files,

@@ -605,13 +605,6 @@ mod tests {
             let changed = pinned.copy_with_options(extra);
             assert!(changed.resolve_read_snapshot().await.is_err());
             assert!(changed.new_read_builder().new_scan().plan().await.is_err());
-            assert!(changed
-                .new_read_builder()
-                .new_scan()
-                .with_stats()
-                .plan()
-                .await
-                .is_err());
         }
         // Changing the selector must not silently reuse the empty view or the
         // schema captured by that view. Explicitly re-resolve the pair.

@@ -49,12 +49,6 @@ impl<'a> AuditLogScan<'a> {
         Self { scan }
     }
 
-    /// Collect statistics on the audit plan, accessible through [`Plan::stats`].
-    pub fn with_stats(mut self) -> Self {
-        self.scan = self.scan.with_stats();
-        self
-    }
-
     pub async fn plan(&self) -> crate::Result<Plan> {
         let TableScanKind::Paimon(inner) = &self.scan.0 else {
             return Err(crate::Error::Unsupported {
@@ -124,17 +118,6 @@ impl<'a> AuditLogScan<'a> {
                     Ok(splits)
                 })?;
             }
-        }
-        let splits = plan.splits().len();
-        let files = plan
-            .splits()
-            .iter()
-            .map(|split| split.data_files().len())
-            .sum();
-        let bytes = plan.planned_data_file_bytes();
-        if let Some(stats) = plan.scan_stats_mut() {
-            stats.record_final_plan(splits, splits, files);
-            stats.planned_data_file_bytes = bytes;
         }
         Ok(plan)
     }
@@ -232,8 +215,8 @@ mod tests {
             let mut reader = table.new_read_builder();
             reader.with_filter(value_filter);
 
-            let ordinary_plan = reader.new_scan().with_stats().plan().await.unwrap();
-            let ordinary_stats = ordinary_plan.stats().cloned().unwrap();
+            let ordinary_plan = reader.new_scan().plan().await.unwrap();
+            let ordinary_stats = ordinary_plan.stats().clone();
             assert!(ordinary_stats.manifest_entries_pruned_by_data_stats >= 1);
             assert_eq!(
                 ordinary_plan
@@ -244,8 +227,8 @@ mod tests {
                 1
             );
 
-            let audit_plan = reader.new_audit_scan().with_stats().plan().await.unwrap();
-            let audit_stats = audit_plan.stats().cloned().unwrap();
+            let audit_plan = reader.new_audit_scan().plan().await.unwrap();
+            let audit_stats = audit_plan.stats().clone();
             assert_eq!(audit_plan.snapshot_id(), ordinary_plan.snapshot_id());
             assert_eq!(audit_stats.final_files, 2);
             assert_eq!(
