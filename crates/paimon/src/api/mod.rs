@@ -29,7 +29,10 @@ pub mod rest_error;
 pub mod rest_util;
 
 mod api_response;
+mod rest_cookies;
 mod user_agent;
+
+pub use rest_cookies::ResponseCookies;
 
 // Re-export request types
 pub use api_request::{

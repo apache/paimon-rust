@@ -18,13 +18,16 @@
 //! Asynchronous HTTP client for REST API calls.
 
 use super::auth::{RESTAuthFunction, RESTAuthParameter};
+use super::rest_cookies::CookieStore;
 use super::rest_error::RestError;
 use super::user_agent;
+use super::ResponseCookies;
 use crate::Error;
 use crate::Result;
 use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
 use serde::de::DeserializeOwned;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Asynchronous HTTP client for REST API calls.
@@ -32,6 +35,7 @@ pub struct HttpClient {
     client: reqwest::Client,
     base_url: String,
     auth_function: Option<RESTAuthFunction>,
+    cookies: Arc<CookieStore>,
 }
 
 impl HttpClient {
@@ -57,27 +61,37 @@ impl HttpClient {
         auth_function: Option<RESTAuthFunction>,
         agent: &str,
     ) -> Result<Self> {
+        let cookies = Arc::new(CookieStore::default());
         Ok(HttpClient {
-            client: Self::build_client(agent)?,
+            client: Self::build_client(agent, Arc::clone(&cookies))?,
             base_url: Self::normalize_uri(base_url)?,
             auth_function,
+            cookies,
         })
     }
 
     /// Replace the default User-Agent, e.g. after options are merged with the server config.
     pub(crate) fn set_user_agent(&mut self, agent: &str) -> Result<()> {
-        self.client = Self::build_client(agent)?;
+        self.client = Self::build_client(agent, Arc::clone(&self.cookies))?;
         Ok(())
     }
 
-    fn build_client(agent: &str) -> Result<reqwest::Client> {
+    pub(crate) fn observe_response_cookies(&self) -> ResponseCookies {
+        self.cookies.observe()
+    }
+
+    fn build_client(agent: &str, cookies: Arc<CookieStore>) -> Result<reqwest::Client> {
         let agent = HeaderValue::from_str(agent).unwrap_or_else(|_| {
             log::warn!("Invalid REST User-Agent {agent:?}, using the default");
             HeaderValue::from_str(&user_agent::default_rest_user_agent())
                 .expect("the default User-Agent is visible ASCII")
         });
         reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
+            // Java and PyPaimon allow three minutes for connection and response
+            // reads. A short total deadline aborts otherwise valid REST calls.
+            .connect_timeout(Duration::from_secs(180))
+            .read_timeout(Duration::from_secs(180))
+            .cookie_provider(cookies)
             .user_agent(agent)
             .build()
             .map_err(|e| Error::ConfigInvalid {
@@ -553,6 +567,41 @@ mod tests {
                 env!("CARGO_PKG_VERSION")
             )]
         );
+    }
+
+    #[tokio::test]
+    async fn config_cookies_survive_user_agent_reconfiguration() {
+        let app = Router::new()
+            .route(
+                "/v1/config",
+                get(|| async {
+                    (
+                        [(header::SET_COOKIE, "sid=accepted; Path=/v1/")],
+                        Json(serde_json::json!({})),
+                    )
+                }),
+            )
+            .route(
+                "/v1/databases",
+                get(|headers: HeaderMap| async move {
+                    assert_eq!(headers.get(header::COOKIE).unwrap(), "sid=accepted");
+                    Json(serde_json::json!({"databases": ["db"]}))
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let options = crate::common::Options::from_map(HashMap::from([
+            ("uri".to_string(), format!("http://{address}")),
+            ("warehouse".to_string(), "warehouse".to_string()),
+            ("token.provider".to_string(), "bear".to_string()),
+            ("token".to_string(), "token".to_string()),
+        ]));
+        let api = crate::api::rest_api::RESTApi::new(options, true)
+            .await
+            .unwrap();
+        assert_eq!(api.list_databases().await.unwrap(), vec!["db"]);
+        server.abort();
     }
 
     #[tokio::test]
