@@ -46,6 +46,34 @@ pub(super) fn normalize_upsert_key(
 ) -> crate::Result<ArrayRef> {
     let decoded = decode_dictionary(array)?;
     let source = decoded.data_type();
+    if source.is_decimal() && matches!(expected, DataType::Decimal128(..)) {
+        let source_scale = match source {
+            DataType::Decimal32(_, scale)
+            | DataType::Decimal64(_, scale)
+            | DataType::Decimal128(_, scale)
+            | DataType::Decimal256(_, scale) => *scale,
+            _ => unreachable!(),
+        };
+        let DataType::Decimal128(_, target_scale) = expected else {
+            unreachable!()
+        };
+        let difference = i16::from(*target_scale) - i16::from(source_scale);
+        let text_fallback = || {
+            // Arrow's decimal rescaler can reject a large scale difference
+            // before inspecting values, even for zero and NULL. Reuse the
+            // exact text parser as a fallback; it still rejects nonzero values
+            // that exceed precision or lose fractional digits.
+            let text = cast_update_value(&decoded, &DataType::Utf8, CastMode::Assignment)?;
+            cast_update_value(&text, expected, CastMode::Assignment)
+        };
+        // Arrow computes scale differences in i8 and uses a Decimal128 power
+        // table. Skip that kernel before either can overflow.
+        return if !(-38..=38).contains(&difference) {
+            text_fallback()
+        } else {
+            cast_update_value(&decoded, expected, CastMode::Assignment).or_else(|_| text_fallback())
+        };
+    }
     let exact_family = source.is_integer() && expected.is_integer()
         || source.is_decimal() && expected.is_decimal()
         || matches!(
@@ -132,6 +160,32 @@ mod tests {
             125
         );
         assert!(normalize_upsert_key(&array(12501), &expected).is_err());
+    }
+
+    #[test]
+    fn decimal_zero_and_null_keys_rescale_across_large_scale_differences() {
+        for (from, to) in [(-2, 38), (38, -2), (-90, 38), (-128, 38), (38, -128)] {
+            let input: ArrayRef = Arc::new(
+                Decimal128Array::from(vec![Some(0), None])
+                    .with_precision_and_scale(38, from)
+                    .unwrap(),
+            );
+            let expected = DataType::Decimal128(38, to);
+            let output = normalize_upsert_key(&input, &expected).unwrap();
+            assert_eq!(output.data_type(), &expected);
+            assert_eq!(
+                output.as_any().downcast_ref::<Decimal128Array>().unwrap(),
+                &Decimal128Array::from(vec![Some(0), None])
+                    .with_precision_and_scale(38, to)
+                    .unwrap()
+            );
+            let nonzero: ArrayRef = Arc::new(
+                Decimal128Array::from(vec![1])
+                    .with_precision_and_scale(38, from)
+                    .unwrap(),
+            );
+            assert!(normalize_upsert_key(&nonzero, &expected).is_err());
+        }
     }
 
     #[test]

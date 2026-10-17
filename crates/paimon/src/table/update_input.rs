@@ -131,32 +131,66 @@ pub(super) fn cast_update_value(
     mode: CastMode,
 ) -> crate::Result<ArrayRef> {
     if mode == CastMode::RowUpdate {
-        cast_values(array, target, CastMode::Assignment).or_else(|_| {
-            validate_map_constructor_input(array, target)?;
-            let decoded = decode_dictionary(array)?;
-            // Python converts lists of pairs to tuples only for a top-level MAP.
-            if let DataType::Map(field, sorted) = target {
-                if matches!(
-                    decoded.data_type(),
-                    DataType::List(_)
-                        | DataType::LargeList(_)
-                        | DataType::ListView(_)
-                        | DataType::LargeListView(_)
-                        | DataType::FixedSizeList(..)
-                ) {
-                    return constructor_map(&decoded, field, *sorted);
-                }
-            }
-            cast_values(array, target, CastMode::Constructor)
-        })
+        cast_row_update_value(array, target, false)
     } else {
-        cast_values(array, target, mode)
+        cast_values(array, target, mode, false)
     }
+}
+
+/// Upserts preserve binary write layouts without disabling other row-ID casts.
+/// Keep this policy through the whole-column constructor fallback and all
+/// recursive conversions, including MAP/ROW constructor paths.
+pub(super) fn cast_row_update_value(
+    array: &ArrayRef,
+    target: &DataType,
+    preserve_binary_layout: bool,
+) -> crate::Result<ArrayRef> {
+    cast_values(array, target, CastMode::Assignment, preserve_binary_layout).or_else(|_| {
+        validate_map_constructor_input(array, target)?;
+        let decoded = decode_dictionary(array)?;
+        // Python converts lists of pairs to tuples only for a top-level MAP.
+        if let DataType::Map(field, sorted) = target {
+            if matches!(
+                decoded.data_type(),
+                DataType::List(_)
+                    | DataType::LargeList(_)
+                    | DataType::ListView(_)
+                    | DataType::LargeListView(_)
+                    | DataType::FixedSizeList(..)
+            ) {
+                return constructor_map(&decoded, field, *sorted, preserve_binary_layout);
+            }
+        }
+        cast_values(array, target, CastMode::Constructor, preserve_binary_layout)
+    })
 }
 
 /// Cast logical values recursively, so dictionary encoding and nesting cannot
 /// bypass primitive validation. The final outer cast only converts the layout.
-fn cast_values(array: &ArrayRef, target: &DataType, mode: CastMode) -> crate::Result<ArrayRef> {
+fn cast_values(
+    array: &ArrayRef,
+    target: &DataType,
+    mode: CastMode,
+    preserve_binary_layout: bool,
+) -> crate::Result<ArrayRef> {
+    if preserve_binary_layout && matches!(array.data_type(), DataType::Dictionary(..)) {
+        return cast_values(
+            &decode_dictionary(array)?,
+            target,
+            mode,
+            preserve_binary_layout,
+        );
+    }
+    if preserve_binary_layout
+        && matches!(
+            (array.data_type(), target),
+            (DataType::Binary, DataType::LargeBinary) | (DataType::LargeBinary, DataType::Binary)
+        )
+    {
+        // Check before the constructor's all-NULL shortcut. A failed safe
+        // cast must not retry a prohibited width conversion via NULL values.
+        return super::write_batch_normalize::normalize_write_array(array, target);
+    }
     if mode == CastMode::Constructor && array.null_count() == array.len() {
         return Ok(new_null_array(target, array.len()));
     }
@@ -164,7 +198,12 @@ fn cast_values(array: &ArrayRef, target: &DataType, mode: CastMode) -> crate::Re
         return Ok(array.clone());
     }
     if matches!(array.data_type(), DataType::Dictionary(..)) {
-        return cast_values(&decode_dictionary(array)?, target, mode);
+        return cast_values(
+            &decode_dictionary(array)?,
+            target,
+            mode,
+            preserve_binary_layout,
+        );
     }
     if let DataType::ListView(field) | DataType::LargeListView(field) = array.data_type() {
         // Convert only the offsets/layout first. Casting children here would
@@ -179,7 +218,7 @@ fn cast_values(array: &ArrayRef, target: &DataType, mode: CastMode) -> crate::Re
             },
         )
         .map_err(|error| invalid(error.to_string()))?;
-        return cast_values(&materialized, target, mode);
+        return cast_values(&materialized, target, mode, preserve_binary_layout);
     }
     if matches!(array.data_type(), DataType::RunEndEncoded(..)) {
         return Err(invalid(
@@ -189,12 +228,13 @@ fn cast_values(array: &ArrayRef, target: &DataType, mode: CastMode) -> crate::Re
     if mode == CastMode::Constructor {
         match (array.data_type(), target) {
             (DataType::Struct(_), DataType::Map(field, sorted)) => {
-                return constructor_map(array, field, *sorted);
+                return constructor_map(array, field, *sorted, preserve_binary_layout);
             }
             (DataType::Map(..), DataType::Struct(fields)) => {
                 return constructor_struct_from_map(
                     array.as_any().downcast_ref::<MapArray>().unwrap(),
                     fields,
+                    preserve_binary_layout,
                 );
             }
             _ => {}
@@ -211,7 +251,7 @@ fn cast_values(array: &ArrayRef, target: &DataType, mode: CastMode) -> crate::Re
                 .map(|field| match input.column_by_name(field.name()) {
                     Some(column) => {
                         let column = constructor_child(column, input.nulls(), 1, mode)?;
-                        cast_values(&column, field.data_type(), mode)
+                        cast_values(&column, field.data_type(), mode, preserve_binary_layout)
                     }
                     None => Ok(new_null_array(field.data_type(), input.len())),
                 })
@@ -234,17 +274,19 @@ fn cast_values(array: &ArrayRef, target: &DataType, mode: CastMode) -> crate::Re
                 array.as_any().downcast_ref::<ListArray>().unwrap(),
                 field,
                 mode,
+                preserve_binary_layout,
             )?),
             DataType::LargeList(_) => Some(cast_list(
                 array.as_any().downcast_ref::<LargeListArray>().unwrap(),
                 field,
                 mode,
+                preserve_binary_layout,
             )?),
             DataType::FixedSizeList(_, size) => {
                 let input = array.as_any().downcast_ref::<FixedSizeListArray>().unwrap();
                 let values =
                     constructor_child(input.values(), input.nulls(), *size as usize, mode)?;
-                let values = cast_values(&values, field.data_type(), mode)?;
+                let values = cast_values(&values, field.data_type(), mode, preserve_binary_layout)?;
                 Some(Arc::new(
                     FixedSizeListArray::try_new_with_length(
                         field.clone(),
@@ -279,7 +321,7 @@ fn cast_values(array: &ArrayRef, target: &DataType, mode: CastMode) -> crate::Re
                             .map_err(|error| invalid(error.to_string()))?,
                         None => values.slice(start as usize, length),
                     };
-                    cast_values(&values, field.data_type(), mode)
+                    cast_values(&values, field.data_type(), mode, preserve_binary_layout)
                 })
                 .collect::<crate::Result<Vec<_>>>()?;
             let entries = StructArray::try_new_with_length(fields.clone(), columns, None, length)
@@ -368,6 +410,7 @@ fn validate_struct_cast_fields(
 fn constructor_struct_from_map(
     input: &MapArray,
     fields: &arrow_schema::Fields,
+    preserve_binary_layout: bool,
 ) -> crate::Result<ArrayRef> {
     let keys = decode_dictionary(input.keys())?;
     let columns = fields
@@ -412,7 +455,12 @@ fn constructor_struct_from_map(
                 None,
             )
             .map_err(|error| invalid(error.to_string()))?;
-            cast_values(&values, field.data_type(), CastMode::Constructor)
+            cast_values(
+                &values,
+                field.data_type(),
+                CastMode::Constructor,
+                preserve_binary_layout,
+            )
         })
         .collect::<crate::Result<Vec<_>>>()?;
     Ok(Arc::new(
@@ -430,6 +478,7 @@ fn constructor_map(
     input: &ArrayRef,
     entries_field: &arrow_schema::FieldRef,
     sorted: bool,
+    preserve_binary_layout: bool,
 ) -> crate::Result<ArrayRef> {
     let DataType::Struct(fields) = entries_field.data_type() else {
         return Err(invalid("Map entries must have a struct type"));
@@ -452,7 +501,12 @@ fn constructor_map(
             .iter()
             .map(|column| {
                 let visible = constructor_child(column, input.nulls(), 1, CastMode::Constructor)?;
-                cast_values(&visible, fields[1].data_type(), CastMode::Constructor)
+                cast_values(
+                    &visible,
+                    fields[1].data_type(),
+                    CastMode::Constructor,
+                    preserve_binary_layout,
+                )
             })
             .collect::<crate::Result<Vec<_>>>()?;
         let values = if columns.is_empty() {
@@ -489,11 +543,16 @@ fn constructor_map(
             offsets.push(i32::try_from(keys.len()).map_err(|_| invalid("Map offset overflow"))?);
         }
         (
-            concat_constructor_values(&keys, fields[0].data_type())?,
-            concat_constructor_values(&values, fields[1].data_type())?,
+            concat_constructor_values(&keys, fields[0].data_type(), preserve_binary_layout)?,
+            concat_constructor_values(&values, fields[1].data_type(), preserve_binary_layout)?,
         )
     };
-    let keys = cast_values(&keys, fields[0].data_type(), CastMode::Constructor)?;
+    let keys = cast_values(
+        &keys,
+        fields[0].data_type(),
+        CastMode::Constructor,
+        preserve_binary_layout,
+    )?;
     let entries = StructArray::try_new(fields.clone(), vec![keys, values], None)
         .map_err(|error| invalid(error.to_string()))?;
     Ok(Arc::new(
@@ -539,7 +598,11 @@ fn constructor_list_value(input: &ArrayRef, index: usize) -> crate::Result<Array
     }
 }
 
-fn concat_constructor_values(values: &[ArrayRef], target: &DataType) -> crate::Result<ArrayRef> {
+fn concat_constructor_values(
+    values: &[ArrayRef],
+    target: &DataType,
+    preserve_binary_layout: bool,
+) -> crate::Result<ArrayRef> {
     if values.is_empty() {
         return Ok(arrow_array::new_empty_array(target));
     }
@@ -549,13 +612,19 @@ fn concat_constructor_values(values: &[ArrayRef], target: &DataType) -> crate::R
         .collect::<Vec<_>>();
     let combined =
         arrow_select::concat::concat(&values).map_err(|error| invalid(error.to_string()))?;
-    cast_values(&combined, target, CastMode::Constructor)
+    cast_values(
+        &combined,
+        target,
+        CastMode::Constructor,
+        preserve_binary_layout,
+    )
 }
 
 fn cast_list<O: OffsetSizeTrait>(
     input: &GenericListArray<O>,
     field: &arrow_schema::FieldRef,
     mode: CastMode,
+    preserve_binary_layout: bool,
 ) -> crate::Result<ArrayRef> {
     let offsets = input.value_offsets();
     let start = offsets[0];
@@ -570,7 +639,7 @@ fn cast_list<O: OffsetSizeTrait>(
             .values()
             .slice(start.as_usize(), (end - start).as_usize()),
     };
-    let values = cast_values(&values, field.data_type(), mode)?;
+    let values = cast_values(&values, field.data_type(), mode, preserve_binary_layout)?;
     let offsets = OffsetBuffer::new(offsets.into());
     Ok(Arc::new(
         GenericListArray::<O>::try_new(field.clone(), offsets, values, input.nulls().cloned())
@@ -2012,6 +2081,61 @@ mod tests {
         );
         let input: ArrayRef = Arc::new(arrow_array::TimestampSecondArray::from(vec![i64::MAX]));
         assert!(cast_assignment(&input, &target).is_err());
+    }
+
+    #[test]
+    fn preserved_binary_layouts_allow_text_numeric_and_null_update_casts() {
+        let text: ArrayRef = Arc::new(StringArray::from(vec![Some("42"), None]));
+        let binary = cast_row_update_value(&text, &DataType::Binary, true).unwrap();
+        let integers = cast_row_update_value(&binary, &DataType::Int32, true).unwrap();
+        assert_eq!(
+            integers.to_data(),
+            Int32Array::from(vec![Some(42), None]).to_data()
+        );
+        assert_eq!(
+            cast_row_update_value(&new_null_array(&DataType::Null, 2), &DataType::Binary, true)
+                .unwrap()
+                .null_count(),
+            2
+        );
+    }
+
+    #[test]
+    fn preserved_binary_layouts_reject_width_changes_before_null_fallbacks() {
+        use arrow_array::{types::Int8Type, DictionaryArray, Int8Array};
+        for (source, target) in [
+            (DataType::Binary, DataType::LargeBinary),
+            (DataType::LargeBinary, DataType::Binary),
+        ] {
+            let array = new_null_array(&source, 1);
+            assert!(cast_row_update_value(&array, &target, true).is_err());
+            // Other row-ID/MERGE callers keep their established cast contract.
+            assert!(cast_update_value(&array, &target, CastMode::RowUpdate).is_ok());
+            let dictionary: ArrayRef = Arc::new(
+                DictionaryArray::<Int8Type>::try_new(Int8Array::from(vec![Some(0)]), array.clone())
+                    .unwrap(),
+            );
+            assert!(cast_row_update_value(&dictionary, &target, true).is_err());
+            let field = Arc::new(arrow_schema::Field::new("data", source, true));
+            let nested: ArrayRef = Arc::new(
+                StructArray::try_new(
+                    vec![field].into(),
+                    vec![array],
+                    Some(arrow_buffer::NullBuffer::from(vec![false])),
+                )
+                .unwrap(),
+            );
+            let expected =
+                DataType::Struct(vec![arrow_schema::Field::new("data", target, true)].into());
+            // A NULL container reconstructs no child payload and follows the
+            // existing whole-value constructor behavior.
+            assert_eq!(
+                cast_row_update_value(&nested, &expected, true)
+                    .unwrap()
+                    .null_count(),
+                1
+            );
+        }
     }
 
     #[test]

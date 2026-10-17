@@ -46,32 +46,6 @@ fn invalid(message: impl Into<String>) -> crate::Error {
     }
 }
 
-// BYTES and BLOB keep their declared Arrow representation. Reusing row-ID
-// conversions for matched values must not introduce Binary/LargeBinary casts.
-fn contains_binary(data_type: &DataType) -> bool {
-    match data_type {
-        DataType::Binary
-        | DataType::LargeBinary
-        | DataType::FixedSizeBinary(_)
-        | DataType::BinaryView => true,
-        DataType::Dictionary(_, value) => contains_binary(value),
-        DataType::Struct(fields) => fields
-            .iter()
-            .any(|field| contains_binary(field.data_type())),
-        DataType::List(field)
-        | DataType::LargeList(field)
-        | DataType::ListView(field)
-        | DataType::LargeListView(field)
-        | DataType::FixedSizeList(field, _)
-        | DataType::Map(field, _)
-        | DataType::RunEndEncoded(_, field) => contains_binary(field.data_type()),
-        DataType::Union(fields, _) => fields
-            .iter()
-            .any(|(_, field)| contains_binary(field.data_type())),
-        _ => false,
-    }
-}
-
 fn selected_rows(batch: &RecordBatch, rows: &[usize]) -> crate::Result<RecordBatch> {
     let indices = rows
         .iter()
@@ -243,18 +217,19 @@ impl TableUpsert {
                         .clone(),
                     column.clone(),
                 ))
-            } else if logical.data_type().is_blob_file_field() && !inline.contains(logical.name()) {
-                normalize_blob_write_field(column, field)
-            } else if append
-                || contains_binary(column.data_type())
-                || contains_binary(field.data_type())
+            } else if logical.data_type().is_blob_file_field()
+                && !inline.contains(logical.name())
+                && (append || matches!(logical.data_type(), crate::spec::DataType::Map(_)))
             {
-                let value = if append {
-                    column.clone()
+                // Named-row Blob maps carry nullable keys and decimal text in
+                // their dedicated physical layout. Keep that transport intact.
+                if append {
+                    normalize_blob_write_field(column, field)
                 } else {
-                    super::update_input::decode_dictionary(column)?
-                };
-                normalize_write_array(&value, field.data_type())
+                    super::write_batch_normalize::normalize_blob_update_field(column, field)
+                }
+            } else if append {
+                normalize_write_array(column, field.data_type())
                     .map(|column| (field.as_ref().clone(), column))
             } else {
                 Ok((
@@ -446,6 +421,7 @@ impl TableUpsert {
                     &self.table,
                     self.update_columns.clone(),
                 )?;
+                update.preserve_binary_layout();
                 update.with_blob_uri_reader_factory(self.blob_uri_reader_factory.clone());
                 if let Some(snapshot_id) = plan.snapshot_id() {
                     update.pin_read_snapshot(snapshot_id);
@@ -730,7 +706,9 @@ mod tests {
             .upsert_by_arrow_with_key(vec![input], vec!["key".into()])
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("Invalid upsert column 'value'"));
+        assert!(error
+            .to_string()
+            .contains("incompatible with table type Binary"));
     }
 
     #[tokio::test]

@@ -66,6 +66,33 @@ pub(super) fn normalize_blob_write_field(
     array: &ArrayRef,
     expected: &Field,
 ) -> Result<(Field, ArrayRef)> {
+    normalize_blob_field(array, expected, true)
+}
+
+/// Normalize Blob map keys and their physical transport, retaining the value
+/// input type for the row-ID updater's conversion at the existing read layout.
+pub(super) fn normalize_blob_update_field(
+    array: &ArrayRef,
+    expected: &Field,
+) -> Result<(Field, ArrayRef)> {
+    let array = super::update_input::decode_dictionary(array)?;
+    if matches!(array.data_type(), DataType::Map(..) | DataType::List(_)) {
+        normalize_blob_field(&array, expected, false)
+    } else {
+        // NULLs and other row-ID constructor inputs retain their conversion
+        // at the existing DE writer position, rather than the declared schema.
+        Ok((
+            expected.clone().with_data_type(array.data_type().clone()),
+            array,
+        ))
+    }
+}
+
+fn normalize_blob_field(
+    array: &ArrayRef,
+    expected: &Field,
+    normalize_values: bool,
+) -> Result<(Field, ArrayRef)> {
     let Some(target) = blob_map_row_type(expected.data_type()) else {
         return Ok((
             expected.clone(),
@@ -121,17 +148,39 @@ pub(super) fn normalize_blob_write_field(
         .enumerate()
         .map(|(index, (column, field))| {
             if index == 0 {
-                normalize_blob_map_key(column, field.data_type())
-            } else {
+                if normalize_values {
+                    normalize_blob_map_key(column, field.data_type())
+                } else {
+                    normalize_blob_update_key(column, field.data_type())
+                }
+            } else if normalize_values {
                 normalize_write_array(column, field.data_type())
+            } else {
+                Ok(column.clone())
             }
         })
         .collect::<Result<Vec<_>>>()?;
-    let entries =
-        StructArray::try_new(fields.clone(), columns, None).map_err(normalization_error)?;
-    let list = ListArray::try_new(child.clone(), offsets, Arc::new(entries), nulls.cloned())
+    let mut fields = fields.to_vec();
+    fields[1] = Arc::new(
+        fields[1]
+            .as_ref()
+            .clone()
+            .with_data_type(columns[1].data_type().clone()),
+    );
+    let fields = fields.into();
+    let entries = StructArray::try_new(fields, columns, None).map_err(normalization_error)?;
+    let child = Arc::new(
+        child
+            .as_ref()
+            .clone()
+            .with_data_type(entries.data_type().clone()),
+    );
+    let list = ListArray::try_new(child, offsets, Arc::new(entries), nulls.cloned())
         .map_err(normalization_error)?;
-    Ok((expected.clone().with_data_type(target), Arc::new(list)))
+    Ok((
+        expected.clone().with_data_type(list.data_type().clone()),
+        Arc::new(list),
+    ))
 }
 
 fn normalize_blob_map_key(array: &ArrayRef, expected: &DataType) -> Result<ArrayRef> {
@@ -163,6 +212,36 @@ fn normalize_blob_map_key(array: &ArrayRef, expected: &DataType) -> Result<Array
         ));
     }
     normalize_write_array(array, expected)
+}
+
+fn normalize_blob_update_key(array: &ArrayRef, expected: &DataType) -> Result<ArrayRef> {
+    let decoded = super::update_input::decode_dictionary(array)?;
+    if matches!(expected, DataType::Decimal128(..)) && decoded.data_type() != &DataType::Null {
+        // Blob map keys follow Java Decimal.fromBigDecimal (HALF_UP), rather
+        // than the exact decimal conversion used to match table upsert keys.
+        let text = if decoded.data_type().is_decimal() {
+            super::update_input::cast_update_value(
+                &decoded,
+                &DataType::Utf8,
+                super::update_input::CastMode::Assignment,
+            )?
+        } else {
+            decoded
+        };
+        return normalize_blob_map_key(&text, expected);
+    }
+    if matches!(
+        (decoded.data_type(), expected),
+        (
+            DataType::Time32(_) | DataType::Time64(_),
+            DataType::Time32(_) | DataType::Time64(_)
+        )
+    ) {
+        // Java/Python serialize TIME Blob keys in milliseconds. This is a
+        // value normalization step, unlike lossless table-key matching.
+        return super::update_input::cast_row_update_value(&decoded, expected, true);
+    }
+    super::key_normalization::normalize_upsert_key(&decoded, expected)
 }
 
 /// Decimal.fromBigDecimal: round magnitude HALF_UP, then check precision.
@@ -970,6 +1049,84 @@ mod tests {
             None,
         );
         assert!(normalize_blob_write_field(&visible_overflow, &expected).is_err());
+    }
+
+    #[test]
+    fn blob_map_updates_normalize_keys_and_transport_before_value_casts() {
+        let entries = StructArray::new(
+            vec![
+                Field::new("k", DataType::Utf8, false),
+                Field::new("v", DataType::Utf8, true),
+            ]
+            .into(),
+            vec![
+                Arc::new(StringArray::from(vec!["1.235"])),
+                Arc::new(StringArray::from(vec!["new"])),
+            ],
+            None,
+        );
+        let entry_field = Arc::new(Field::new("input", entries.data_type().clone(), false));
+        let offsets = OffsetBuffer::new(vec![0_i32, 1].into());
+        let map: ArrayRef = Arc::new(MapArray::new(
+            entry_field.clone(),
+            offsets.clone(),
+            entries.clone(),
+            None,
+            false,
+        ));
+        let list: ArrayRef = Arc::new(ListArray::new(
+            entry_field,
+            offsets,
+            Arc::new(entries),
+            None,
+        ));
+        let expected = Field::new(
+            "payload",
+            DataType::Map(
+                Arc::new(Field::new(
+                    "entries",
+                    DataType::Struct(
+                        vec![
+                            Field::new("key", DataType::Decimal128(10, 2), false),
+                            Field::new("value", DataType::LargeBinary, true),
+                        ]
+                        .into(),
+                    ),
+                    false,
+                )),
+                false,
+            ),
+            true,
+        );
+        let normalized = [map, list]
+            .iter()
+            .map(|array| normalize_blob_update_field(array, &expected).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(normalized[0].0, normalized[1].0);
+        assert_eq!(normalized[0].1.to_data(), normalized[1].1.to_data());
+        let list = normalized[0]
+            .1
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        let entries = list
+            .values()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        assert_eq!(
+            entries
+                .column(0)
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .unwrap()
+                .value(0),
+            124
+        );
+        // Preserve the original input value type until the row-ID updater
+        // casts against the actual read layout, including its nullability.
+        assert_eq!(entries.column(1).data_type(), &DataType::Utf8);
+        assert!(normalize_blob_write_field(&normalized[0].1, &expected).is_err());
     }
 
     #[test]

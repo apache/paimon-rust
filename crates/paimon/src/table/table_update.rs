@@ -245,7 +245,8 @@ impl TableUpdate {
     /// matched rows retain their values; on new rows they are absent from the file.
     /// After last-write-wins, matched values follow row-ID update conversion
     /// rules; new rows must satisfy the ordinary Arrow write type.
-    /// Binary values, including nested ones, retain ordinary write layout rules.
+    /// Binary and LargeBinary are not implicitly converted to each other,
+    /// including inside nested values.
     /// Input batches may have different non-key columns. After last-write-wins
     /// deduplication, matched rows must supply their update columns and appended
     /// rows in each partition must share a field set.
