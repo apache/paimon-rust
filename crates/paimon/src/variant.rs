@@ -2774,7 +2774,20 @@ pub(crate) fn cast_variant_to_shredded_value(
             message: format!("Unsupported Variant extraction target type: {data_type:?}"),
         });
     };
-    match cast_variant_to_extraction_value(variant, &scalar) {
+    let value = cast_variant_to_extraction_value(variant, &scalar).filter(|value| {
+        let precision = match data_type {
+            DataType::Timestamp(ts) => ts.precision(),
+            DataType::LocalZonedTimestamp(ts) => ts.precision(),
+            _ => return true,
+        };
+        match value {
+            ShreddedValue::Timestamp(micros) if precision > 6 => {
+                micros.checked_mul(1_000).is_some()
+            }
+            _ => true,
+        }
+    });
+    match value {
         Some(value) => Ok(Some(value)),
         None if fail_on_error => Err(Error::DataInvalid {
             message: format!("Cannot cast Variant value to {data_type:?}"),
@@ -2827,6 +2840,7 @@ fn cast_variant_to_bool(variant: VariantRef<'_>) -> Option<bool> {
 
 fn cast_variant_to_i64(variant: VariantRef<'_>) -> Option<i64> {
     match variant.kind().ok()? {
+        VariantKind::Boolean => Some(i64::from(variant.get_boolean().ok()?)),
         VariantKind::Long
         | VariantKind::Date
         | VariantKind::Timestamp
@@ -2873,6 +2887,7 @@ fn f64_to_i64_truncating(value: f64) -> Option<i64> {
 
 fn cast_variant_to_f64(variant: VariantRef<'_>) -> Option<f64> {
     match variant.kind().ok()? {
+        VariantKind::Boolean => Some(u8::from(variant.get_boolean().ok()?) as f64),
         VariantKind::Long
         | VariantKind::Date
         | VariantKind::Timestamp
@@ -2931,6 +2946,9 @@ fn cast_variant_to_string(variant: VariantRef<'_>) -> Option<String> {
 
 fn cast_variant_to_decimal(variant: VariantRef<'_>, precision: u8, scale: i8) -> Option<i128> {
     let unscaled = match variant.kind().ok()? {
+        VariantKind::Boolean => {
+            rescale_decimal_exact(i128::from(variant.get_boolean().ok()?), 0, scale)?
+        }
         VariantKind::Long
         | VariantKind::Date
         | VariantKind::Timestamp
@@ -3153,12 +3171,10 @@ fn try_typed_shred(
             Some(ShreddedValue::Int64(variant.get_long()?))
         }
         (VariantKind::Long, VariantScalarSchema::Decimal { precision, scale }) => {
-            let unscaled = rescale_decimal(variant.get_long()? as i128, 0, *scale)?;
-            if decimal_precision(unscaled) <= *precision {
-                Some(ShreddedValue::Decimal128(unscaled))
-            } else {
-                None
-            }
+            rescale_decimal_exact(variant.get_long()? as i128, 0, *scale).and_then(|unscaled| {
+                (decimal_precision(unscaled) <= *precision)
+                    .then_some(ShreddedValue::Decimal128(unscaled))
+            })
         }
         (VariantKind::Decimal, VariantScalarSchema::Decimal { precision, scale }) => {
             let decimal = variant.get_decimal()?;
