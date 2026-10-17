@@ -177,7 +177,7 @@ def test_duplicate_branch_is_reported(catalog):
     ("list_branches", "db.missing", (), 404, "TABLE", "db.missing", "does not exist"),
     ("list_branches", "db.forbidden", (), 403, None, None, "denied"),
     ("list_branches", "db.nocode", (), 403, None, None, "denied"),
-    ("list_branches", "db.status_429", (), 429, None, None, "unmapped status"),
+    ("create_branch", "db.status_429", ("dev",), 429, None, None, "unmapped status"),
     ("list_branches", "db.status_502", (), 502, None, None, "unmapped status"),
     ("list_branches", "db.status_504", (), 504, None, None, "unmapped status"),
     ("list_branches", "db.invalidjson", (), 0, None, None, "failed to parse json"),

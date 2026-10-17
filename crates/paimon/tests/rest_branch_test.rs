@@ -22,9 +22,9 @@ use std::sync::{Arc, Mutex};
 
 use axum::body::Bytes;
 use axum::extract::State;
-use axum::http::{HeaderMap, Method, StatusCode, Uri};
+use axum::http::{header, HeaderMap, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
-use axum::{Json, Router};
+use axum::Router;
 use paimon::api::RestError;
 use paimon::catalog::{Catalog, Identifier, RESTCatalog};
 use paimon::common::Options;
@@ -40,7 +40,7 @@ struct Request {
 
 #[derive(Default)]
 struct ServerState {
-    responses: VecDeque<(StatusCode, Value)>,
+    responses: VecDeque<(StatusCode, String)>,
     requests: Vec<Request>,
 }
 
@@ -58,6 +58,16 @@ impl Drop for TestCatalog {
 
 impl TestCatalog {
     async fn new(responses: Vec<(StatusCode, Value)>) -> Self {
+        Self::new_raw(
+            responses
+                .into_iter()
+                .map(|(status, body)| (status, body.to_string()))
+                .collect(),
+        )
+        .await
+    }
+
+    async fn new_raw(responses: Vec<(StatusCode, String)>) -> Self {
         async fn handle(
             State(state): State<Arc<Mutex<ServerState>>>,
             method: Method,
@@ -75,8 +85,10 @@ impl TestCatalog {
             let (status, value) = state.responses.pop_front().expect("unexpected request");
             if status == StatusCode::NO_CONTENT {
                 status.into_response()
+            } else if matches!(status.as_u16(), 429 | 503) {
+                (status, [(header::RETRY_AFTER, "1")], value).into_response()
             } else {
-                (status, Json(value)).into_response()
+                (status, value).into_response()
             }
         }
         let state = Arc::new(Mutex::new(ServerState {
@@ -109,6 +121,103 @@ impl TestCatalog {
         );
         std::mem::take(&mut state.requests)
     }
+}
+
+#[tokio::test]
+async fn branch_mutations_ignore_success_response_bodies() {
+    let bodies = ["OK", "", "not JSON", "{}"];
+    let ctx = TestCatalog::new_raw(
+        bodies
+            .into_iter()
+            .flat_map(|body| vec![(StatusCode::OK, body.to_string()); 3])
+            .collect(),
+    )
+    .await;
+    let id = Identifier::new("db", "t");
+    for _ in bodies {
+        ctx.catalog.create_branch(&id, "dev", None).await.unwrap();
+        ctx.catalog.drop_branch(&id, "dev").await.unwrap();
+        ctx.catalog.fast_forward(&id, "dev").await.unwrap();
+    }
+    assert_eq!(ctx.requests().len(), bodies.len() * 3);
+}
+
+#[tokio::test]
+async fn branch_listing_retries_only_retryable_statuses() {
+    for status in [
+        StatusCode::TOO_MANY_REQUESTS,
+        StatusCode::SERVICE_UNAVAILABLE,
+    ] {
+        let ctx = TestCatalog::new(vec![
+            (
+                status,
+                json!({"code": status.as_u16(), "message": "try again"}),
+            ),
+            (StatusCode::OK, json!({"branches": ["dev"]})),
+        ])
+        .await;
+        assert_eq!(
+            ctx.catalog
+                .list_branches(&Identifier::new("db", "t"))
+                .await
+                .unwrap(),
+            ["dev"]
+        );
+        assert_eq!(ctx.requests().len(), 2);
+    }
+    let ctx = TestCatalog::new(vec![(
+        StatusCode::BAD_GATEWAY,
+        json!({"code": 502, "message": "gateway failed"}),
+    )])
+    .await;
+    assert!(matches!(
+        ctx.catalog.list_branches(&Identifier::new("db", "t")).await,
+        Err(Error::RestApi {
+            source: RestError::Unexpected { code: 502, .. }
+        })
+    ));
+    assert_eq!(ctx.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn branch_mutations_do_not_retry_temporary_failures() {
+    let id = Identifier::new("db", "t");
+    for status in [
+        StatusCode::TOO_MANY_REQUESTS,
+        StatusCode::SERVICE_UNAVAILABLE,
+    ] {
+        let ctx = TestCatalog::new(vec![
+            (
+                status,
+                json!({"code": status.as_u16(), "message": "uncertain result"})
+            );
+            3
+        ])
+        .await;
+        assert!(ctx.catalog.create_branch(&id, "dev", None).await.is_err());
+        assert!(ctx.catalog.drop_branch(&id, "dev").await.is_err());
+        assert!(ctx.catalog.fast_forward(&id, "dev").await.is_err());
+        assert_eq!(ctx.requests().len(), 3);
+    }
+}
+
+#[tokio::test]
+async fn branch_listing_stops_after_five_retries() {
+    let ctx = TestCatalog::new(vec![
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({"code": 503, "message": "unavailable"})
+        );
+        6
+    ])
+    .await;
+    assert!(matches!(
+        ctx.catalog.list_branches(&Identifier::new("db", "t")).await,
+        Err(Error::RestApi {
+            source: RestError::ServiceUnavailable { .. }
+        })
+    ));
+    assert_eq!(ctx.requests().len(), 6);
 }
 
 #[tokio::test]

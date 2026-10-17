@@ -558,8 +558,7 @@ impl RESTApi {
             branch: branch_name.to_string(),
             from_tag: from_tag.map(str::to_string),
         };
-        let _: serde_json::Value = self.client.post(&path, &request).await?;
-        Ok(())
+        self.client.post_without_response(&path, &request).await
     }
 
     /// Drop branch metadata through the catalog's publication protocol.
@@ -572,8 +571,7 @@ impl RESTApi {
         let path =
             self.resource_paths
                 .branch(identifier.database(), identifier.object(), branch_name);
-        let _: serde_json::Value = self.client.delete(&path, None::<&[(&str, &str)]>).await?;
-        Ok(())
+        self.client.delete_without_response(&path).await
     }
 
     /// Ask the server to fast-forward from a branch. No files are changed locally.
@@ -588,8 +586,9 @@ impl RESTApi {
             identifier.object(),
             branch_name,
         );
-        let _: serde_json::Value = self.client.post(&path, &ForwardBranchRequest {}).await?;
-        Ok(())
+        self.client
+            .post_without_response(&path, &ForwardBranchRequest {})
+            .await
     }
 
     /// List the server's branches, preserving its order and null-list behavior.

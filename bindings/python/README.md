@@ -365,6 +365,12 @@ REST catalogs also expose `create_branch(identifier, branch, from_tag=None)`,
 release the GIL while waiting for requests. Creation without a tag creates an
 empty branch, as in Java. REST branch rename is unsupported.
 
+REST authentication also supports explicit `dlf.signing-algorithm=openapi-v4`.
+Rust core signs ACS4-HMAC-SHA256 requests with the same canonical request,
+credential scope and action headers as Java. GET requests retry HTTP 429/503 up
+to five times and honor Retry-After; branch mutations are sent once and ignore
+successful response payloads.
+
 `PaimonCatalog(options, config_required=False)` reuses already resolved REST
 options without fetching `/config` again. Branch operation failures raise
 `CatalogError`, a `ValueError` subclass with `code`, `resource_type`,

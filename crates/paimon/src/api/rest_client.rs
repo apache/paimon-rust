@@ -22,7 +22,7 @@ use super::rest_error::RestError;
 use super::user_agent;
 use crate::Error;
 use crate::Result;
-use reqwest::header::HeaderValue;
+use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
 use serde::de::DeserializeOwned;
 use std::collections::HashMap;
 use std::time::Duration;
@@ -146,12 +146,61 @@ impl HttpClient {
             }
         }
 
-        let request = Self::apply_headers(request, &headers);
-        let resp = request.send().await.map_err(|e| Error::UnexpectedError {
-            message: "http get failed".to_string(),
-            source: Some(Box::new(e)),
-        })?;
-        self.parse_response(resp).await
+        let request = Self::apply_headers(request, &headers)?
+            .build()
+            .map_err(|e| Error::UnexpectedError {
+                message: "http get failed".to_string(),
+                source: Some(Box::new(e)),
+            })?;
+        // Retry only idempotent reads and only on Java's retryable HTTP statuses.
+        // A mutation may have been published before an intermediary returned an
+        // error, so POST/DELETE must never enter this loop.
+        for attempt in 0..=5 {
+            let pending = request
+                .try_clone()
+                .expect("GET requests have no streaming body");
+            let response =
+                self.client
+                    .execute(pending)
+                    .await
+                    .map_err(|e| Error::UnexpectedError {
+                        message: "http get failed".to_string(),
+                        source: Some(Box::new(e)),
+                    })?;
+            if attempt == 5 || !matches!(response.status().as_u16(), 429 | 503) {
+                return self.parse_response(response).await;
+            }
+            let retry_after = response
+                .headers()
+                .get(RETRY_AFTER)
+                .and_then(|value| value.to_str().ok());
+            let delay = Self::retry_delay(retry_after, attempt, chrono::Utc::now());
+            drop(response);
+            tokio::time::sleep(delay).await;
+        }
+        unreachable!("the final attempt returns its response")
+    }
+
+    fn retry_delay(
+        retry_after: Option<&str>,
+        attempt: u32,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Duration {
+        if let Some(value) = retry_after {
+            let delay = value
+                .parse::<u64>()
+                .ok()
+                .map(Duration::from_secs)
+                .or_else(|| {
+                    chrono::DateTime::parse_from_rfc2822(value)
+                        .ok()
+                        .and_then(|date| date.signed_duration_since(now).to_std().ok())
+                });
+            if let Some(delay) = delay.filter(|delay| !delay.is_zero()) {
+                return delay;
+            }
+        }
+        Duration::from_secs(1 << attempt.min(6))
     }
 
     /// Perform a POST request with a JSON body.
@@ -167,18 +216,35 @@ impl HttpClient {
         path: &str,
         body: &B,
     ) -> Result<T> {
+        self.parse_response(self.send_post(path, body).await?).await
+    }
+
+    /// Send a mutation whose successful response has no defined payload.
+    pub(crate) async fn post_without_response<B: serde::Serialize>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<()> {
+        Self::response_text(self.send_post(path, body).await?).await?;
+        Ok(())
+    }
+
+    async fn send_post<B: serde::Serialize>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<reqwest::Response> {
         let url = self.request_url(path);
         let body_str = serde_json::to_string(body).ok();
         let headers = self
             .build_auth_headers("POST", path, body_str.as_deref(), HashMap::new())
             .await?;
         let request = self.client.post(&url).json(body);
-        let request = Self::apply_headers(request, &headers);
-        let resp = request.send().await.map_err(|e| Error::UnexpectedError {
+        let request = Self::apply_headers(request, &headers)?;
+        request.send().await.map_err(|e| Error::UnexpectedError {
             message: "http post failed".to_string(),
             source: Some(Box::new(e)),
-        })?;
-        self.parse_response(resp).await
+        })
     }
 
     /// Perform a DELETE request with optional query parameters.
@@ -194,6 +260,21 @@ impl HttpClient {
         path: &str,
         params: Option<&[(impl AsRef<str>, impl AsRef<str>)]>,
     ) -> Result<T> {
+        self.parse_response(self.send_delete(path, params).await?)
+            .await
+    }
+
+    /// Delete metadata, ignoring the successful payload as Java does.
+    pub(crate) async fn delete_without_response(&self, path: &str) -> Result<()> {
+        Self::response_text(self.send_delete(path, None::<&[(&str, &str)]>).await?).await?;
+        Ok(())
+    }
+
+    async fn send_delete(
+        &self,
+        path: &str,
+        params: Option<&[(impl AsRef<str>, impl AsRef<str>)]>,
+    ) -> Result<reqwest::Response> {
         let url = self.request_url(path);
 
         let params_map: HashMap<String, String> = match params {
@@ -215,12 +296,11 @@ impl HttpClient {
             }
         }
 
-        let request = Self::apply_headers(request, &headers);
-        let resp = request.send().await.map_err(|e| Error::UnexpectedError {
+        let request = Self::apply_headers(request, &headers)?;
+        request.send().await.map_err(|e| Error::UnexpectedError {
             message: "http delete failed".to_string(),
             source: Some(Box::new(e)),
-        })?;
-        self.parse_response(resp).await
+        })
     }
 
     /// Set the authentication function for this client.
@@ -249,12 +329,13 @@ impl HttpClient {
     fn apply_headers(
         request: reqwest::RequestBuilder,
         headers: &HashMap<String, String>,
-    ) -> reqwest::RequestBuilder {
-        let mut request = request;
-        for (key, value) in headers {
-            request = request.header(key, value);
-        }
-        request
+    ) -> Result<reqwest::RequestBuilder> {
+        let headers = HeaderMap::try_from(headers).map_err(|error| Error::UnexpectedError {
+            message: "Invalid REST request headers".to_string(),
+            source: Some(Box::new(error)),
+        })?;
+        // Replace JSON's default Content-Type rather than append a second value.
+        Ok(request.headers(headers))
     }
 
     fn request_url(&self, path: &str) -> String {
@@ -267,27 +348,24 @@ impl HttpClient {
         }
     }
 
-    async fn parse_response<T: DeserializeOwned>(&self, resp: reqwest::Response) -> Result<T> {
+    async fn response_text(resp: reqwest::Response) -> Result<String> {
         let status = resp.status();
-
+        let text = resp.text().await.map_err(|e| Error::UnexpectedError {
+            message: "failed to read response".to_string(),
+            source: Some(Box::new(e)),
+        })?;
         if !status.is_success() {
-            let text = resp.text().await.map_err(|e| Error::UnexpectedError {
-                message: "failed to read response".to_string(),
-                source: Some(Box::new(e)),
-            })?;
-
             // Parse error response as ErrorResponse and map code to corresponding error
             let error_response: super::ErrorResponse =
                 RestError::parse_error_response(&text, status.as_u16());
             let rest_error: RestError = RestError::from_error_response(error_response);
             return Err(Error::from(rest_error));
         }
+        Ok(text)
+    }
 
-        // Parse successful response
-        let text = resp.text().await.map_err(|e| Error::UnexpectedError {
-            message: "failed to read response".to_string(),
-            source: Some(Box::new(e)),
-        })?;
+    async fn parse_response<T: DeserializeOwned>(&self, resp: reqwest::Response) -> Result<T> {
+        let text = Self::response_text(resp).await?;
 
         // Handle empty response body - return null as default for types like serde_json::Value
         if text.trim().is_empty() {
@@ -316,6 +394,39 @@ mod tests {
 
     use super::*;
     use crate::api::auth::AuthProvider;
+
+    #[test]
+    fn retry_after_or_exponential_backoff_matches_java() {
+        let now = chrono::DateTime::parse_from_rfc3339("2025-04-16T03:44:46Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        for (header, attempt, seconds) in [
+            (Some("5"), 0, 5),
+            (Some("Wed, 16 Apr 2025 03:44:49 GMT"), 0, 3),
+            (Some("Wed, 16 Apr 2025 03:44:45 GMT"), 2, 4),
+            (None, 0, 1),
+            (Some("invalid"), 3, 8),
+            (Some("0"), 1, 2),
+        ] {
+            assert_eq!(
+                HttpClient::retry_delay(header, attempt, now),
+                Duration::from_secs(seconds)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_get_headers_fail_before_sending() {
+        let auth = RESTAuthFunction::new(
+            HashMap::from([("X-Invalid".to_string(), "line\nbreak".to_string())]),
+            Box::new(RecordingProvider(Arc::new(Mutex::new(None)))),
+        );
+        let client = HttpClient::new("http://localhost:0", Some(auth)).unwrap();
+        assert!(
+            matches!(client.get::<serde_json::Value>("/", None::<&[(&str, &str)]>).await,
+            Err(Error::UnexpectedError { message, .. }) if message == "Invalid REST request headers")
+        );
+    }
 
     struct RecordingProvider(Arc<Mutex<Option<HashMap<String, String>>>>);
 
