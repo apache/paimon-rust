@@ -178,11 +178,18 @@ pub(crate) fn data_leaf_may_match<T: StatsAccessor>(
         PredicateOperator::LtEq => {
             !matches!(min_value.partial_cmp(literal), Some(Ordering::Greater))
         }
-        PredicateOperator::Gt => !matches!(
-            max_value.partial_cmp(literal),
-            Some(Ordering::Less | Ordering::Equal)
-        ),
-        PredicateOperator::GtEq => !matches!(max_value.partial_cmp(literal), Some(Ordering::Less)),
+        // A NaN row missing from `max` satisfies both (see `bounds_may_hide_nan`).
+        PredicateOperator::Gt => {
+            bounds_may_hide_nan(&max_value)
+                || !matches!(
+                    max_value.partial_cmp(literal),
+                    Some(Ordering::Less | Ordering::Equal)
+                )
+        }
+        PredicateOperator::GtEq => {
+            bounds_may_hide_nan(&max_value)
+                || !matches!(max_value.partial_cmp(literal), Some(Ordering::Less))
+        }
         PredicateOperator::StartsWith => {
             // pat lives in [min, max] iff max >= pat AND min < pat_next, where
             // pat_next is pat with its last codepoint incremented. If we can't
@@ -263,6 +270,16 @@ fn equality_exclusion_is_sound(bound: &Datum) -> bool {
     !matches!(bound, Datum::Float(_) | Datum::Double(_))
 }
 
+/// Whether a NaN row may be missing from these FLOAT/DOUBLE bounds.
+///
+/// The writer leaves NaN out of min/max without counting it null, and Java's
+/// `Float.compare` / `Double.compare` order every NaN above every number. So a file
+/// holding `[0.0, NaN]` reports `max == 0.0`, yet its NaN row satisfies `> 1.0`
+/// and fails `< 1.0`. Pruning by `max` would drop that row.
+fn bounds_may_hide_nan(bound: &Datum) -> bool {
+    matches!(bound, Datum::Float(_) | Datum::Double(_))
+}
+
 pub(crate) fn data_leaf_must_match<T: StatsAccessor>(
     index: usize,
     stats_data_type: &DataType,
@@ -329,15 +346,23 @@ pub(crate) fn data_leaf_must_match<T: StatsAccessor>(
             matches!(literal.partial_cmp(&min_value), Some(Ordering::Less))
                 || matches!(literal.partial_cmp(&max_value), Some(Ordering::Greater))
         }),
-        PredicateOperator::Lt => literals
-            .first()
-            .is_some_and(|literal| matches!(max_value.partial_cmp(literal), Some(Ordering::Less))),
-        PredicateOperator::LtEq => literals.first().is_some_and(|literal| {
-            matches!(
-                max_value.partial_cmp(literal),
-                Some(Ordering::Less | Ordering::Equal)
-            )
-        }),
+        // A NaN row missing from `max` fails `<`, `<=` and BETWEEN (see
+        // `bounds_may_hide_nan`), so `NOT(v < 1.0)` must not prune its file.
+        PredicateOperator::Lt => {
+            !bounds_may_hide_nan(&max_value)
+                && literals.first().is_some_and(|literal| {
+                    matches!(max_value.partial_cmp(literal), Some(Ordering::Less))
+                })
+        }
+        PredicateOperator::LtEq => {
+            !bounds_may_hide_nan(&max_value)
+                && literals.first().is_some_and(|literal| {
+                    matches!(
+                        max_value.partial_cmp(literal),
+                        Some(Ordering::Less | Ordering::Equal)
+                    )
+                })
+        }
         PredicateOperator::Gt => literals.first().is_some_and(|literal| {
             matches!(min_value.partial_cmp(literal), Some(Ordering::Greater))
         }),
@@ -353,6 +378,9 @@ pub(crate) fn data_leaf_must_match<T: StatsAccessor>(
                 && literals.contains(&min_value)
         }
         PredicateOperator::Between => {
+            if bounds_may_hide_nan(&max_value) {
+                return false;
+            }
             let (Some(low), Some(high)) = (literals.first(), literals.get(1)) else {
                 return false;
             };
@@ -475,6 +503,10 @@ fn between_may_match<T: StatsAccessor>(
     match op {
         PredicateOperator::Between => overlaps,
         PredicateOperator::NotBetween => {
+            // A NaN row missing from `max` is above `high`.
+            if bounds_may_hide_nan(&max_value) {
+                return true;
+            }
             // Prune only when [min, max] is entirely inside [low, high].
             let min_ge_low = !matches!(min_value.partial_cmp(low), Some(Ordering::Less));
             let max_le_high = !matches!(max_value.partial_cmp(high), Some(Ordering::Greater));
@@ -1050,6 +1082,72 @@ mod tests {
     }
 
     #[test]
+    fn range_predicates_on_float_keep_files_that_may_hold_nan() {
+        // A Rust-written `[0.0, NaN]` column reports `min == max == 0.0` with
+        // `null_count == 0`. Its NaN row satisfies `> 1.0`, `>= 1.0`,
+        // `NOT BETWEEN 0.5 AND 1.0` and the negation of `< 1.0`, `<= 1.0` and
+        // `BETWEEN -1.0 AND 1.0`, so none of them may prune the file.
+        let dt = DataType::Double(DoubleType::new());
+        let fields = vec![DataField::new(0, "v".to_string(), dt.clone())];
+        let mapping = vec![Some(0)];
+        let stats = MockStats {
+            row_count: 2,
+            null_count: Some(0),
+            min: Some(Datum::Double(0.0)),
+            max: Some(Datum::Double(0.0)),
+        };
+        let leaf = |op, literals: Vec<f64>| Predicate::Leaf {
+            column: "v".to_string(),
+            index: 0,
+            data_type: dt.clone(),
+            op,
+            literals: literals.into_iter().map(Datum::Double).collect(),
+        };
+        let predicates = [
+            leaf(PredicateOperator::Gt, vec![1.0]),
+            leaf(PredicateOperator::GtEq, vec![1.0]),
+            leaf(PredicateOperator::NotBetween, vec![-1.0, 1.0]),
+            Predicate::Not(Box::new(leaf(PredicateOperator::Lt, vec![1.0]))),
+            Predicate::Not(Box::new(leaf(PredicateOperator::LtEq, vec![1.0]))),
+            Predicate::Not(Box::new(leaf(PredicateOperator::Between, vec![-1.0, 1.0]))),
+        ];
+        for predicate in predicates {
+            assert!(
+                predicates_may_match_with_schema(
+                    std::slice::from_ref(&predicate),
+                    &stats,
+                    &mapping,
+                    &fields
+                ),
+                "{predicate:?} must keep a float file whose max == 0.0 (may hold NaN)"
+            );
+        }
+
+        // Integer bounds cover every row, so the same predicates still prune.
+        let it = DataType::Int(IntType::new());
+        let int_fields = vec![DataField::new(0, "v".to_string(), it.clone())];
+        let int_stats = MockStats {
+            row_count: 2,
+            null_count: Some(0),
+            min: Some(Datum::Int(0)),
+            max: Some(Datum::Int(0)),
+        };
+        let gt = Predicate::Leaf {
+            column: "v".to_string(),
+            index: 0,
+            data_type: it,
+            op: PredicateOperator::Gt,
+            literals: vec![Datum::Int(1)],
+        };
+        assert!(!predicates_may_match_with_schema(
+            &[gt],
+            &int_stats,
+            &mapping,
+            &int_fields
+        ));
+    }
+
+    #[test]
     fn not_predicate_fails_open_when_nulls_or_stats_make_inner_uncertain() {
         let dt = DataType::Int(IntType::new());
         let fields = vec![DataField::new(0, "id".to_string(), dt.clone())];
@@ -1321,8 +1419,9 @@ mod tests {
             &signed_zero_file
         ));
 
-        // Ordering-based rules are unaffected and must keep pruning.
-        assert!(!run_double(PredicateOperator::Gt, &[5.0], &nan_file));
+        // A NaN row hidden from `max` satisfies `>` (see `bounds_may_hide_nan`),
+        // but under Java's ordering no NaN satisfies `<`, so that one keeps pruning.
+        assert!(run_double(PredicateOperator::Gt, &[5.0], &nan_file));
         assert!(!run_double(PredicateOperator::Lt, &[0.5], &nan_file));
         // So is `Eq`, whose direction of error is to keep files.
         assert!(run_double(PredicateOperator::Eq, &[1.0], &nan_file));
