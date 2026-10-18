@@ -353,6 +353,8 @@ impl TableSchema {
     /// Column errors ([`crate::Error::ColumnNotExist`] /
     /// [`crate::Error::ColumnAlreadyExist`]) are returned with an empty table
     /// name; the calling catalog fills in the table's full name.
+    /// The catalog also checks snapshot-dependent immutable options before
+    /// applying changes; this schema transformation has no snapshot context.
     pub fn apply_changes(&self, changes: Vec<crate::spec::SchemaChange>) -> crate::Result<Self> {
         use crate::spec::SchemaChange;
 
@@ -397,28 +399,9 @@ impl TableSchema {
         for change in changes {
             match change {
                 SchemaChange::SetOption { key, value } => {
-                    if key == PRIMARY_KEY_NULLABLE_OPTION
-                        && value.eq_ignore_ascii_case("true")
-                            != new_schema.core_options().primary_key_nullable()
-                    {
-                        return Err(crate::Error::Unsupported {
-                            message: format!(
-                                "Change '{PRIMARY_KEY_NULLABLE_OPTION}' is not supported yet."
-                            ),
-                        });
-                    }
                     new_schema.options.insert(key, value);
                 }
                 SchemaChange::RemoveOption { key } => {
-                    if key == PRIMARY_KEY_NULLABLE_OPTION
-                        && new_schema.core_options().primary_key_nullable()
-                    {
-                        return Err(crate::Error::Unsupported {
-                            message: format!(
-                                "Change '{PRIMARY_KEY_NULLABLE_OPTION}' is not supported yet."
-                            ),
-                        });
-                    }
                     new_schema.options.remove(&key);
                 }
                 SchemaChange::UpdateComment { comment } => {
@@ -721,8 +704,9 @@ impl TableSchema {
                         disable_null_to_not_null,
                     )?;
                     let nt = old.data_type().copy_with_nullable(new_nullability)?;
-                    fields[idx] = DataField::new(old.id(), old.name().to_string(), nt)
-                        .with_description(old.description().map(|s| s.to_string()));
+                    let mut field = old.clone();
+                    field.typ = nt;
+                    fields[idx] = field;
                 }
                 SchemaChange::UpdateColumnComment {
                     field_names,
@@ -742,6 +726,13 @@ impl TableSchema {
             }
         }
 
+        // Java rebuilds Schema after ALTER, reapplying the key option even if
+        // an individual column change requested a different nullability.
+        Schema::normalize_primary_key_nullability(
+            &mut fields,
+            &new_schema.primary_keys,
+            new_schema.core_options().primary_key_nullable(),
+        )?;
         new_schema.fields = fields;
         new_schema.highest_field_id =
             highest_field_id.max(Self::current_highest_field_id(&new_schema.fields));
@@ -1565,7 +1556,6 @@ impl Schema {
 
         let core_options = CoreOptions::new(options);
         let blob_field_names = core_options.blob_fields();
-        let primary_key_nullable = core_options.primary_key_nullable();
         for name in &blob_field_names {
             if !field_names.iter().any(|field| field == name) {
                 return Err(crate::Error::ConfigInvalid {
@@ -1578,22 +1568,40 @@ impl Schema {
             return Ok(fields.to_vec());
         }
 
-        let pk_set: HashSet<&str> = primary_keys.iter().map(String::as_str).collect();
         let mut new_fields = Vec::with_capacity(fields.len());
         for f in fields {
-            let mut data_type = if blob_field_names.contains(f.name()) {
+            let data_type = if blob_field_names.contains(f.name()) {
                 normalize_blob_field_type(f.name(), f.data_type().clone())?
             } else {
                 f.data_type().clone()
             };
-            if pk_set.contains(f.name()) && data_type.is_nullable() != primary_key_nullable {
-                data_type = data_type.copy_with_nullable(primary_key_nullable)?;
-            }
             let mut field = f.clone();
             field.typ = data_type;
             new_fields.push(field);
         }
+        Self::normalize_primary_key_nullability(
+            &mut new_fields,
+            primary_keys,
+            core_options.primary_key_nullable(),
+        )?;
         Ok(new_fields)
+    }
+
+    fn normalize_primary_key_nullability(
+        fields: &mut [DataField],
+        primary_keys: &[String],
+        nullable: bool,
+    ) -> crate::Result<()> {
+        if primary_keys.is_empty() {
+            return Ok(());
+        }
+        let primary_keys: HashSet<&str> = primary_keys.iter().map(String::as_str).collect();
+        for field in fields {
+            if primary_keys.contains(field.name()) && field.typ.is_nullable() != nullable {
+                field.typ = field.typ.copy_with_nullable(nullable)?;
+            }
+        }
+        Ok(())
     }
 
     /// Table columns must not contain duplicate field names.
@@ -2928,6 +2936,17 @@ mod tests {
             let mut expected = fields;
             expected[0].typ = DataType::Int(IntType::with_nullable(nullable));
             assert_eq!(schema.fields(), expected.as_slice());
+            let stored = TableSchema::new(0, &schema).copy_with_options(HashMap::from([(
+                "alter-column-null-to-not-null.disabled".into(),
+                "false".into(),
+            )]));
+            let changed = stored
+                .apply_changes(vec![crate::spec::SchemaChange::UpdateColumnNullability {
+                    field_names: vec!["id".into()],
+                    new_nullability: false,
+                }])
+                .unwrap();
+            assert_eq!(changed.fields(), expected.as_slice());
         }
     }
 
@@ -2981,7 +3000,29 @@ mod tests {
     }
 
     #[test]
-    fn alter_cannot_change_primary_key_nullability_option() {
+    fn nullable_key_option_wins_over_alter_column_not_null() {
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("value", DataType::Int(IntType::new()))
+            .primary_key(["id"])
+            .option(PRIMARY_KEY_NULLABLE_OPTION, "true")
+            .option("alter-column-null-to-not-null.disabled", "false")
+            .build()
+            .unwrap();
+        let stored = TableSchema::new(0, &schema);
+        let changed = stored
+            .apply_changes(vec![crate::spec::SchemaChange::UpdateColumnNullability {
+                field_names: vec!["id".into()],
+                new_nullability: false,
+            }])
+            .unwrap();
+        // Java reconstructs Schema after ALTER and reapplies the key option.
+        assert!(changed.fields()[0].data_type().is_nullable());
+        assert!(changed.core_options().primary_key_nullable());
+    }
+
+    #[test]
+    fn schema_changes_normalize_primary_key_nullability_option() {
         use crate::spec::SchemaChange;
 
         for nullable in [false, true] {
@@ -2992,32 +3033,22 @@ mod tests {
                 .build()
                 .unwrap();
             let stored = TableSchema::new(0, &schema);
-            let error = stored
+            let changed = stored
                 .apply_changes(vec![SchemaChange::SetOption {
                     key: PRIMARY_KEY_NULLABLE_OPTION.into(),
                     value: (!nullable).to_string(),
                 }])
-                .unwrap_err();
-            assert!(error.to_string().contains("Change 'primary-key.nullable'"));
+                .unwrap();
+            assert_eq!(changed.core_options().primary_key_nullable(), !nullable);
+            assert_eq!(changed.fields()[0].data_type().is_nullable(), !nullable);
             assert_eq!(stored.fields()[0].data_type().is_nullable(), nullable);
-            let unchanged = stored
-                .apply_changes(vec![SchemaChange::SetOption {
+            let removed = stored
+                .apply_changes(vec![SchemaChange::RemoveOption {
                     key: PRIMARY_KEY_NULLABLE_OPTION.into(),
-                    value: nullable.to_string(),
                 }])
                 .unwrap();
-            assert_eq!(unchanged.fields(), stored.fields());
-            let removed = stored.apply_changes(vec![SchemaChange::RemoveOption {
-                key: PRIMARY_KEY_NULLABLE_OPTION.into(),
-            }]);
-            if nullable {
-                assert!(removed
-                    .unwrap_err()
-                    .to_string()
-                    .contains("Change 'primary-key.nullable'"));
-            } else {
-                assert!(!removed.unwrap().core_options().primary_key_nullable());
-            }
+            assert!(!removed.core_options().primary_key_nullable());
+            assert!(!removed.fields()[0].data_type().is_nullable());
         }
     }
 
