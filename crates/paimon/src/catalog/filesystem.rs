@@ -29,7 +29,7 @@ use crate::io::cache::{create_local_cache, LocalCache};
 use crate::io::FileIO;
 use crate::spec::{
     CoreOptions, Schema, Snapshot, TableSchema, TableType, INDEX_FILE_IN_DATA_FILE_DIR_OPTION,
-    TABLE_TYPE_OPTION,
+    PRIMARY_KEY_NULLABLE_OPTION, TABLE_TYPE_OPTION,
 };
 use crate::table::{ObjectTable, SchemaManager, Table};
 use async_trait::async_trait;
@@ -554,6 +554,26 @@ impl Catalog for FileSystemCatalog {
             })?;
 
         reject_immutable_option_changes(current.options(), &changes)?;
+        // Java permits changing the key policy before the first snapshot and
+        // normalizes the fields again. Once data exists the option is immutable.
+        // Avoid snapshot IO for unrelated schema changes or exact SET no-ops.
+        let changes_key_nullability = changes.iter().any(|change| match change {
+            crate::spec::SchemaChange::SetOption { key, value } => {
+                key == PRIMARY_KEY_NULLABLE_OPTION && current.options().get(key) != Some(value)
+            }
+            crate::spec::SchemaChange::RemoveOption { key } => key == PRIMARY_KEY_NULLABLE_OPTION,
+            _ => false,
+        });
+        if changes_key_nullability
+            && crate::table::SnapshotManager::new(self.file_io.clone(), table_path.clone())
+                .get_latest_snapshot()
+                .await?
+                .is_some()
+        {
+            return Err(Error::Unsupported {
+                message: format!("Change '{PRIMARY_KEY_NULLABLE_OPTION}' is not supported yet."),
+            });
+        }
 
         let new_schema = current
             .apply_changes(changes)
@@ -1084,6 +1104,114 @@ mod tests {
             .await
             .is_ok());
         catalog.get_table(&identifier).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn nullable_key_policy_changes_only_before_first_snapshot() {
+        use crate::spec::{DataType, IntType, SchemaChange};
+
+        let catalog = create_memory_catalog();
+        catalog
+            .create_database("db", false, HashMap::new())
+            .await
+            .unwrap();
+        for initial in [None, Some("false"), Some("true")] {
+            let identifier = Identifier::new("db", initial.unwrap_or("default"));
+            let mut schema = Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .primary_key(["id"])
+                .option("bucket", "1");
+            if let Some(initial) = initial {
+                schema = schema.option("primary-key.nullable", initial);
+            }
+            catalog
+                .create_table(&identifier, schema.build().unwrap(), false)
+                .await
+                .unwrap();
+            // As in Java, an empty table can change and reset this option.
+            for value in ["true", "false", "true"] {
+                catalog
+                    .alter_table(
+                        &identifier,
+                        vec![SchemaChange::set_option(
+                            "primary-key.nullable".into(),
+                            value.into(),
+                        )],
+                        false,
+                    )
+                    .await
+                    .unwrap();
+                let table = catalog.get_table(&identifier).await.unwrap();
+                assert_eq!(
+                    table.schema().fields()[0].data_type().is_nullable(),
+                    value == "true"
+                );
+            }
+            catalog
+                .alter_table(
+                    &identifier,
+                    vec![SchemaChange::remove_option("primary-key.nullable".into())],
+                    false,
+                )
+                .await
+                .unwrap();
+            let table = catalog.get_table(&identifier).await.unwrap();
+            assert!(!table.schema().fields()[0].data_type().is_nullable());
+            if let Some(initial) = initial {
+                catalog
+                    .alter_table(
+                        &identifier,
+                        vec![SchemaChange::set_option(
+                            "primary-key.nullable".into(),
+                            initial.into(),
+                        )],
+                        false,
+                    )
+                    .await
+                    .unwrap();
+            }
+            give_the_table_a_snapshot(&catalog, &identifier).await;
+            let before = catalog
+                .get_table(&identifier)
+                .await
+                .unwrap()
+                .schema()
+                .clone();
+            for value in ["false", "true", "TRUE"] {
+                let result = catalog
+                    .alter_table(
+                        &identifier,
+                        vec![SchemaChange::set_option(
+                            "primary-key.nullable".into(),
+                            value.into(),
+                        )],
+                        false,
+                    )
+                    .await;
+                if Some(value) == initial {
+                    result.unwrap();
+                } else {
+                    assert!(
+                        matches!(result, Err(Error::Unsupported { .. })),
+                        "{initial:?}/{value}: {result:?}"
+                    );
+                }
+            }
+            let result = catalog
+                .alter_table(
+                    &identifier,
+                    vec![SchemaChange::remove_option("primary-key.nullable".into())],
+                    false,
+                )
+                .await;
+            assert!(
+                matches!(result, Err(Error::Unsupported { .. })),
+                "{initial:?}: {result:?}"
+            );
+            let after = catalog.get_table(&identifier).await.unwrap();
+            assert_eq!(after.schema().options(), before.options());
+            assert_eq!(after.schema().fields(), before.fields());
+        }
     }
 
     /// Give the table a first snapshot, so a test can assert that a rejection does

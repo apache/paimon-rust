@@ -44,6 +44,25 @@ impl StreamTableScan {
     pub(super) fn new(scan: TableScan<'_>) -> Result<Self> {
         let mut scan = scan.into_owned_paimon_scan()?;
         let options = CoreOptions::new(scan.snapshot_table().schema().options());
+        // These aliases are supported by the batch starting scanner. A
+        // continuous reader needs a different starting position: latest must
+        // skip the initial state, and from-snapshot-full must start at that
+        // snapshot. Keep rejecting them until those stream policies exist.
+        if scan
+            .snapshot_table()
+            .schema()
+            .options()
+            .get("scan.mode")
+            .is_some_and(|mode| {
+                mode.eq_ignore_ascii_case("latest")
+                    || mode.eq_ignore_ascii_case("from-snapshot-full")
+            })
+        {
+            return Err(Error::Unsupported {
+                message: "Stream scans do not yet support scan.mode=latest or from-snapshot-full"
+                    .into(),
+            });
+        }
         let producer = options.try_changelog_producer()?;
         let follow_up_mode = if producer == ChangelogProducer::None {
             SnapshotScanMode::Delta

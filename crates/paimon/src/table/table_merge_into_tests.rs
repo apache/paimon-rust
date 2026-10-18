@@ -704,6 +704,56 @@ async fn core_merge_empty_table_source_keeps_no_match_assignments_lazy() {
 }
 
 #[tokio::test]
+async fn core_merge_full_startup_modes_select_source_snapshot() {
+    for mode in ["latest", "latest-full", "from-snapshot-full"] {
+        let target = table_at(&format!("target_full_{mode}"));
+        seed(&target, &batch(vec![Some(1)], vec![Some(10)])).await;
+        let source = table_at(&format!("source_full_{mode}"));
+        seed(&source, &batch(vec![Some(1)], vec![Some(11)])).await;
+        seed(&source, &batch(vec![Some(2)], vec![Some(22)])).await;
+        let mut options = std::collections::HashMap::from([("scan.mode".into(), mode.into())]);
+        if mode == "from-snapshot-full" {
+            options.insert("scan.snapshot-id".into(), "1".into());
+        }
+        let selected = source.copy_with_options(options);
+        let messages = target
+            .new_write_builder()
+            .new_update()
+            .unwrap()
+            .merge_into(
+                MergeSource::Table(Arc::new(selected)),
+                vec![("id".into(), "id".into())],
+                vec![update(None)],
+                vec![WhenNotMatched {
+                    condition: None,
+                    assignments: vec![
+                        ("id".into(), MergeAssignment::SourceColumn("id".into())),
+                        (
+                            "value".into(),
+                            MergeAssignment::SourceColumn("value".into()),
+                        ),
+                    ],
+                }],
+            )
+            .await
+            .unwrap();
+        TableCommit::new(target.clone(), "merge".into())
+            .commit(messages)
+            .await
+            .unwrap();
+        let mut expected = vec![(Some(1), Some(11))];
+        if mode != "from-snapshot-full" {
+            expected.push((Some(2), Some(22)));
+        }
+        assert_eq!(rows(&target).await, expected, "{mode}");
+        assert_eq!(
+            rows(&source).await,
+            vec![(Some(1), Some(11)), (Some(2), Some(22))]
+        );
+    }
+}
+
+#[tokio::test]
 async fn core_merge_empty_table_source_obeys_reader_authorization() {
     let target = table();
     seed(&target, &batch(vec![Some(1)], vec![Some(10)])).await;

@@ -1187,7 +1187,7 @@ mod tests {
         async fn plan_validates_original_scan_mode_and_rejects_nonempty_incremental_search() {
             let (_tmp, table) = build_pruning_test_table(false).await;
             for extra in [
-                HashMap::from([("scan.mode".to_string(), "latest-full".to_string())]),
+                HashMap::from([("scan.mode".to_string(), "compacted-full".to_string())]),
                 HashMap::from([(
                     "incremental-between-timestamp".to_string(),
                     "0,9999999999999".to_string(),
@@ -1219,6 +1219,30 @@ mod tests {
             .unwrap()
             .splits
             .is_empty());
+        }
+
+        #[tokio::test]
+        async fn full_startup_modes_preserve_vector_scan_snapshot() {
+            let (_tmp, table) = build_pruning_test_table(false).await;
+            let snapshot = table.resolve_read_snapshot().await.unwrap().unwrap();
+            for mode in ["latest", "latest-full", "from-snapshot-full"] {
+                let mut options = HashMap::from([("scan.mode".into(), mode.into())]);
+                if mode == "from-snapshot-full" {
+                    options.insert("scan.snapshot-id".into(), snapshot.id().to_string());
+                }
+                let view = table.copy_with_options(options);
+                let plan = PkVectorScan::new(
+                    &view,
+                    prune_vector_field_id(&view),
+                    PRUNE_INDEX_TYPE.to_string(),
+                    None,
+                )
+                .plan()
+                .await
+                .unwrap();
+                assert_eq!(plan.snapshot_id, snapshot.id());
+                assert!(!plan.splits.is_empty());
+            }
         }
 
         #[tokio::test]

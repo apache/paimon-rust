@@ -175,6 +175,107 @@ async fn explicit_snapshot_overrides_startup_options_without_mutating_table() {
 }
 
 #[tokio::test]
+async fn full_startup_modes_read_complete_batch_snapshots() {
+    for engine in [
+        "append",
+        "evolution",
+        "deduplicate",
+        "first-row",
+        "partial-update",
+        "aggregation",
+    ] {
+        let table = table(&format!("startup_modes_{engine}"), engine, "none", 1).await;
+        write_batch(&table, &make_batch(vec![1, 2], vec![10, 20])).await;
+        write_batch(&table, &make_batch(vec![1, 3], vec![11, 30])).await;
+        let expected = match engine {
+            "append" | "evolution" => vec![(1, 10), (1, 11), (2, 20), (3, 30)],
+            // Ordinary first-row scans skip uncompacted L0 files.
+            "first-row" => vec![],
+            "aggregation" => vec![(1, 21), (2, 20), (3, 30)],
+            _ => vec![(1, 11), (2, 20), (3, 30)],
+        };
+        for mode in ["latest", "latest-full", "from-snapshot-full"] {
+            let mut options = HashMap::from([("scan.mode".into(), mode.into())]);
+            if mode == "from-snapshot-full" {
+                options.insert("scan.snapshot-id".into(), "1".into());
+            }
+            let selected = table.copy_with_options(options.clone());
+            let plan = selected.new_read_builder().new_scan().plan().await.unwrap();
+            assert_eq!(
+                plan.snapshot_id(),
+                Some(if mode == "from-snapshot-full" { 1 } else { 2 })
+            );
+            assert!(plan.splits().iter().all(|split| !split.is_streaming()));
+            let want = if engine == "first-row" {
+                vec![]
+            } else if mode == "from-snapshot-full" {
+                vec![(1, 10), (2, 20)]
+            } else {
+                expected.clone()
+            };
+            assert_eq!(rows(&selected, &plan).await, want, "{engine}/{mode}");
+            assert_eq!(
+                selected.schema().options().get("scan.mode"),
+                options.get("scan.mode")
+            );
+            let mut builder = selected.new_read_builder();
+            builder.with_projection(&["value"]).unwrap();
+            builder.with_filter(
+                crate::spec::PredicateBuilder::new(selected.schema().fields())
+                    .equal("id", crate::spec::Datum::Int(2))
+                    .unwrap(),
+            );
+            builder.with_limit(1);
+            let plan = builder.new_scan().plan().await.unwrap();
+            let batches: Vec<RecordBatch> = builder
+                .new_read()
+                .unwrap()
+                .to_arrow(plan.splits())
+                .unwrap()
+                .try_collect()
+                .await
+                .unwrap();
+            assert_eq!(
+                batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+                usize::from(engine != "first-row")
+            );
+            assert!(batches.iter().all(|batch| batch.num_columns() == 1));
+        }
+    }
+}
+
+#[tokio::test]
+async fn full_startup_modes_empty_tables_and_stream_boundaries() {
+    let table = table("startup_modes_empty", "append", "none", 1).await;
+    for mode in ["latest", "latest-full"] {
+        let selected = table.copy_with_options(HashMap::from([("scan.mode".into(), mode.into())]));
+        let plan = selected.new_read_builder().new_scan().plan().await.unwrap();
+        assert_eq!(plan.snapshot_id(), None);
+        assert!(plan.splits().is_empty());
+    }
+    for mode in ["latest", "from-snapshot-full"] {
+        let selected = table.copy_with_options(HashMap::from([("scan.mode".into(), mode.into())]));
+        assert!(matches!(
+            selected.new_read_builder().new_stream_scan(),
+            Err(paimon::Error::Unsupported { .. })
+        ));
+    }
+    let selected = table.copy_with_options(HashMap::from([
+        ("scan.mode".into(), "from-snapshot-full".into()),
+        ("scan.snapshot-id".into(), "1".into()),
+    ]));
+    assert!(selected.new_read_builder().new_scan().plan().await.is_err());
+    let selected =
+        table.copy_with_options(HashMap::from([("scan.mode".into(), "latest-full".into())]));
+    let mut stream = selected.new_read_builder().new_stream_scan().unwrap();
+    assert!(stream.plan().await.unwrap().is_none());
+    write_batch(&table, &make_batch(vec![1], vec![10])).await;
+    let plan = stream.plan().await.unwrap().unwrap();
+    assert_eq!(rows(&selected, &plan).await, vec![(1, 10)]);
+    assert_eq!(stream.checkpoint(), Some(2));
+}
+
+#[tokio::test]
 async fn changelog_reads_overwrite_while_batch_range_still_skips_it() {
     let table = table("overwrite", "deduplicate", "input", 1).await;
     write_batch(&table, &make_batch(vec![1], vec![10])).await;
