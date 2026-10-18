@@ -24,6 +24,7 @@
 //! - `CALL sys.rollback_to(table => '...', snapshot_id => ... | tag => '...')`
 //! - `CALL sys.rollback_to_timestamp(table => '...', timestamp => ...)`
 //! - `CALL sys.create_tag_from_timestamp(table => '...', tag => '...', timestamp => ...)`
+//! - `CALL sys.create_tag_from_watermark(table => '...', tag => '...', watermark => ..., time_retained => '...')`
 //! - `CALL sys.create_global_index(table => '...', index_column => '...', index_type => 'btree')`
 //! - `CALL sys.create_global_index(table => '...', index_column => '...', index_type => 'bitmap')`
 //! - `CALL sys.create_global_index(table => '...', index_column => '...', index_type => 'ivf-pq')`
@@ -134,6 +135,35 @@ async fn later_or_equal_from_all(
     }
 }
 
+/// Find a snapshot with watermark >= the requested value, including tag-retained
+/// snapshots. Matches Java's Spark procedure: compare the first eligible live and
+/// tagged snapshots by watermark, then by snapshot ID when watermarks are equal.
+async fn later_or_equal_watermark_from_all(
+    sm: &SnapshotManager,
+    tm: &TagManager,
+    watermark: i64,
+) -> DFResult<Option<Snapshot>> {
+    let live = sm
+        .later_or_equal_watermark(watermark)
+        .await
+        .map_err(to_datafusion_error)?;
+    let tags = tm.list_all().await.map_err(to_datafusion_error)?;
+    let tag_candidate = tags
+        .into_iter()
+        .map(|(_, snapshot)| snapshot)
+        .filter(|snapshot| {
+            snapshot
+                .watermark()
+                .is_some_and(|value| value != i64::MIN && value >= watermark)
+        })
+        // Rust lists tags by name; Java's tag candidates are ordered by snapshot ID.
+        .min_by_key(Snapshot::id);
+    Ok(live
+        .into_iter()
+        .chain(tag_candidate)
+        .min_by_key(|snapshot| (snapshot.watermark(), snapshot.id())))
+}
+
 /// Find the latest snapshot with commit time <= timestamp_millis,
 /// considering both live snapshots and tag-retained snapshots.
 async fn earlier_or_equal_from_all(
@@ -177,6 +207,7 @@ fn declared_parameters(proc_name: &str) -> Option<&'static [&'static str]> {
         "rollback_to" => &["table", "snapshot_id", "tag"],
         "rollback_to_timestamp" => &["table", "timestamp"],
         "create_tag_from_timestamp" => &["table", "tag", "timestamp"],
+        "create_tag_from_watermark" => &["table", "tag", "watermark", "time_retained"],
         "rename_branch" => &["table", "from_branch", "to_branch"],
         "delete_branch" => &["table", "branch"],
         "create_global_index" => &["table", "index_column", "index_type", "options"],
@@ -290,6 +321,9 @@ pub async fn execute_call(
         }
         "create_tag_from_timestamp" => {
             proc_create_tag_from_timestamp(ctx, catalog, catalog_name, &args).await
+        }
+        "create_tag_from_watermark" => {
+            proc_create_tag_from_watermark(ctx, catalog, catalog_name, &args).await
         }
         "rename_branch" => proc_rename_branch(ctx, catalog, catalog_name, &args).await,
         "delete_branch" => proc_delete_branch(ctx, catalog, catalog_name, &args).await,
@@ -773,6 +807,46 @@ async fn proc_create_tag_from_timestamp(
         )));
     }
     tm.create(tag_name, &snapshot)
+        .await
+        .map_err(to_datafusion_error)?;
+    ok_result(ctx)
+}
+
+async fn proc_create_tag_from_watermark(
+    ctx: &SessionContext,
+    catalog: &Arc<dyn Catalog>,
+    catalog_name: &str,
+    args: &HashMap<String, String>,
+) -> DFResult<DataFrame> {
+    let table = get_table(catalog, catalog_name, args).await?;
+    let tag_name = require_arg(args, "tag")?;
+    let watermark_str = require_arg(args, "watermark")?;
+    let watermark: i64 = watermark_str
+        .parse()
+        .map_err(|_| DataFusionError::Plan(format!("Invalid watermark: '{watermark_str}'")))?;
+    let time_retained = args.get("time_retained").map(String::as_str);
+
+    // REST snapshots may exist only in the catalog; storage listings cannot
+    // enumerate the authoritative history needed for watermark selection.
+    if table.rest_env().is_some() {
+        return Err(DataFusionError::NotImplemented(
+            "create_tag_from_watermark is not supported for tables managed by a REST catalog"
+                .to_string(),
+        ));
+    }
+
+    let (sm, tm) = managers(&table);
+    if tm.tag_exists(tag_name).await.map_err(to_datafusion_error)? {
+        return Err(DataFusionError::Plan(format!(
+            "Tag '{tag_name}' already exists"
+        )));
+    }
+    let snapshot = later_or_equal_watermark_from_all(&sm, &tm, watermark)
+        .await?
+        .ok_or_else(|| {
+            DataFusionError::Plan(format!("No snapshot found with watermark >= {watermark}"))
+        })?;
+    tm.create_with_retention(tag_name, &snapshot, time_retained)
         .await
         .map_err(to_datafusion_error)?;
     ok_result(ctx)
