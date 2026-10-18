@@ -238,3 +238,69 @@ fn map_entries_require_two_fields_and_actual_child_nullability() {
     );
     assert!(cast_update_value(&null_value, &target, CastMode::Assignment).is_err());
 }
+
+#[test]
+fn map_pairs_construct_array_elements_without_converting_hidden_entries() {
+    let input = map(
+        Arc::new(Int64Array::from(vec![i64::MAX, 1, 3, i64::MAX, 5])),
+        Arc::new(Float64Array::from(vec![
+            Some(f64::MAX),
+            Some(2.75),
+            None,
+            Some(f64::MAX),
+            Some(-6.75),
+        ])),
+        &[1, 2, 1, 0, 1],
+        &[true, true, false, true, true],
+    )
+    .slice(1, 4);
+    let element = Arc::new(Field::new("element", DataType::Int32, true));
+    for pair_type in [
+        DataType::List(element.clone()),
+        DataType::LargeList(element.clone()),
+        DataType::FixedSizeList(element.clone(), 2),
+    ] {
+        let target = DataType::List(Arc::new(Field::new("pair", pair_type, false)));
+        assert!(cast_update_value(&input, &target, CastMode::Assignment).is_err());
+        let result = cast_update_value(&input, &target, CastMode::RowUpdate).unwrap();
+        let outer = result.as_list::<i32>();
+        assert_eq!(outer.value_offsets(), &[0, 2, 2, 2, 3]);
+        assert!(outer.is_null(1));
+        let pairs = arrow_cast::cast(
+            outer.values().as_ref(),
+            &DataType::FixedSizeList(element.clone(), 2),
+        )
+        .unwrap();
+        assert_eq!(
+            pairs.as_fixed_size_list().values().to_data(),
+            Int32Array::from(vec![Some(1), Some(2), Some(3), None, Some(5), Some(-6)]).to_data()
+        );
+    }
+}
+
+#[test]
+fn empty_map_pairs_do_not_require_a_particular_vector_width() {
+    let input = map(
+        Arc::new(Int32Array::from(vec![1])),
+        Arc::new(Int32Array::from(vec![2])),
+        &[0, 1],
+        &[true, false],
+    );
+    for size in [0, 1, 3] {
+        let target = DataType::List(Arc::new(Field::new(
+            "pair",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Int32, true)), size),
+            false,
+        )));
+        let result = cast_update_value(&input, &target, CastMode::RowUpdate).unwrap();
+        assert_eq!(result.as_list::<i32>().value_offsets(), &[0, 0, 0]);
+        assert!(result.is_null(1));
+        let visible = map(
+            Arc::new(Int32Array::from(vec![1])),
+            Arc::new(Int32Array::from(vec![2])),
+            &[1],
+            &[true],
+        );
+        assert!(cast_update_value(&visible, &target, CastMode::RowUpdate).is_err());
+    }
+}
