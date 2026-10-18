@@ -43,6 +43,9 @@ use super::Storage;
 #[cfg(all(test, feature = "storage-memory"))]
 mod provider_tests;
 
+#[cfg(feature = "storage-fs")]
+mod path_mapping;
+
 /// An externally managed block cache used by [`FileIO`].
 ///
 /// Implementations store immutable file ranges. Cache failures must be handled

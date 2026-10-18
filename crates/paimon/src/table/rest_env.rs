@@ -50,6 +50,29 @@ impl Table {
         rest_options: Options,
         initial_token: Option<RESTToken>,
     ) -> Result<Self> {
+        Self::from_rest_response_inner(identifier, response, rest_options, initial_token, None)
+            .await
+    }
+
+    /// Reuse a resolved application FileIO (for example a validated FUSE mount)
+    /// without requesting cloud credentials that the provider does not use.
+    pub async fn from_rest_response_with_file_io(
+        identifier: Identifier,
+        response: crate::api::GetTableResponse,
+        rest_options: Options,
+        file_io: FileIO,
+    ) -> Result<Self> {
+        Self::from_rest_response_inner(identifier, response, rest_options, None, Some(file_io))
+            .await
+    }
+
+    async fn from_rest_response_inner(
+        identifier: Identifier,
+        response: crate::api::GetTableResponse,
+        rest_options: Options,
+        initial_token: Option<RESTToken>,
+        file_io: Option<FileIO>,
+    ) -> Result<Self> {
         identifier.validate()?;
         // Reject a stale or misrouted response before initializing auth or local-cache resources.
         response_identifier(&identifier, &response)?;
@@ -75,6 +98,7 @@ impl Table {
             local_cache,
             file_io_cache,
             initial_token,
+            file_io,
         )
         .await
     }
@@ -134,18 +158,36 @@ impl RESTEnv {
         &self.api
     }
 
-    /// Bracketed by a freshness check: the response names no table, so a
-    /// re-create in between would serve a replacement's grant.
+    /// Bind the response to a stable catalog entity and latest rule schema.
+    /// Historical views use their own schema only when executing these rules.
     pub(crate) async fn table_query_auth(
         &self,
         schema_id: i64,
         fields: &[crate::spec::DataField],
         select: Option<Vec<String>>,
-    ) -> Result<crate::api::AuthTableQueryResponse> {
-        self.current_table_checked(schema_id, fields).await?;
+    ) -> Result<(crate::api::AuthTableQueryResponse, TableSchema)> {
+        let current = self.current_table_identity_checked().await?;
+        // A catalog-loaded handle can predate a normal schema evolution, just
+        // as a historical view does. Reusing an id for different fields is not
+        // a legitimate evolution and must still fail closed.
+        if current.schema_id == Some(schema_id) {
+            self.check_schema(&current, schema_id, fields)?;
+        }
+        let schema = current.schema.as_ref().ok_or_else(|| Error::DataInvalid {
+            message: "REST query authorization requires the current schema".into(),
+            source: None,
+        })?;
+        let schema = TableSchema::new(
+            current.schema_id.ok_or_else(|| Error::DataInvalid {
+                message: "REST query authorization requires the current schema id".into(),
+                source: None,
+            })?,
+            schema,
+        );
         let response = self.api.auth_table_query(&self.identifier, select).await?;
-        self.current_table_checked(schema_id, fields).await?;
-        Ok(response)
+        self.current_table_checked(schema.id(), schema.fields())
+            .await?;
+        Ok((response, schema))
     }
 
     /// Refused unless the name still resolves to the loaded table, a missing
@@ -156,6 +198,16 @@ impl RESTEnv {
         fields: &[crate::spec::DataField],
     ) -> Result<GetTableResponse> {
         let response = self.current_table_identity_checked().await?;
+        self.check_schema(&response, schema_id, fields)?;
+        Ok(response)
+    }
+
+    fn check_schema(
+        &self,
+        response: &GetTableResponse,
+        schema_id: i64,
+        fields: &[crate::spec::DataField],
+    ) -> Result<()> {
         let name = self.identifier.full_name();
         let same = |what: &str, loaded: String, now: Option<String>| match now {
             Some(now) if now == loaded => Ok(()),
@@ -190,7 +242,7 @@ impl RESTEnv {
                 source: None,
             });
         }
-        Ok(response)
+        Ok(())
     }
 
     /// Refused unless the identifier still resolves to this catalog entity.
@@ -312,6 +364,7 @@ impl RESTEnv {
             local_cache,
             file_io_cache,
             None,
+            None,
         )
         .await
     }
@@ -327,6 +380,7 @@ impl RESTEnv {
         local_cache: Option<Arc<LocalCache>>,
         file_io_cache: FileIOCacheContext,
         initial_token: Option<RESTToken>,
+        file_io: Option<FileIO>,
     ) -> Result<Table> {
         let identifier = response_identifier(identifier, &response)?;
         let schema = response.schema.ok_or_else(|| Error::DataInvalid {
@@ -385,17 +439,22 @@ impl RESTEnv {
             source: None,
         })?;
 
-        let file_io = Self::build_file_io_with_token(
-            &identifier,
-            &table_path,
-            api.clone(),
-            &options,
-            data_token_enabled && !is_external,
-            local_cache.clone(),
-            file_io_cache.clone(),
-            initial_token,
-        )
-        .await?;
+        let file_io = match file_io {
+            Some(file_io) => file_io,
+            None => {
+                Self::build_file_io_with_token(
+                    &identifier,
+                    &table_path,
+                    api.clone(),
+                    &options,
+                    data_token_enabled && !is_external,
+                    local_cache.clone(),
+                    file_io_cache.clone(),
+                    initial_token,
+                )
+                .await?
+            }
+        };
 
         let rest_env = RESTEnv::new(
             identifier.clone(),

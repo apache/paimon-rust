@@ -500,10 +500,16 @@ impl Table {
         if !query_auth {
             return Ok(None);
         }
-        if self.reads_another_schema()? {
+        if self.identifier.system_table_name()?.is_some()
+            || rest_env
+                .identifier()
+                .branch_name()?
+                .as_deref()
+                .unwrap_or(DEFAULT_MAIN_BRANCH)
+                != self.branch
+        {
             return Err(query_auth::unsupported(
-                "a time-travelled or branch read authorizes against the table's current schema, \
-                 which is not the one it reads",
+                "the REST authorization identifier does not address this data table and branch",
             ));
         }
 
@@ -513,11 +519,17 @@ impl Table {
             query_auth::unsupported("this table handle was assembled rather than loaded")
         })?;
 
-        let response = rest_env
+        let (response, current) = rest_env
             .table_query_auth(self.schema.id(), self.schema.fields(), select.clone())
             .await?;
+        let fields =
+            query_auth::historical_rule_fields(&response, current.fields(), self.schema.fields())?;
         Ok(Some(std::sync::Arc::new(
-            query_auth::QueryAuthGrant::parse(&response, session, select, self.schema.fields())?,
+            query_auth::QueryAuthGrant::parse(&response, session, select, &fields)?.bind(
+                self,
+                fields,
+                (current.id(), current.fields()),
+            ),
         )))
     }
 
@@ -656,6 +668,21 @@ impl Table {
         }
     }
 
+    /// Copy this resolved table with an application-provided FileIO. Table
+    /// identity, branch, REST authorization and the captured read view persist.
+    pub fn copy_with_file_io(&self, file_io: FileIO) -> Self {
+        let manager = SchemaManager::new(file_io.clone(), self.location.clone());
+        Self {
+            schema_manager: if self.is_main_branch() {
+                manager
+            } else {
+                manager.with_branch(&self.branch)
+            },
+            file_io,
+            ..self.clone()
+        }
+    }
+
     /// Replace the complete schema with one already resolved by an external caller.
     ///
     /// Like `from_resolved_schema`, this preserves field IDs and options exactly
@@ -664,8 +691,8 @@ impl Table {
     /// selects its metadata namespace without loading a different schema.
     /// An options-only replacement of the catalog-loaded schema keeps its REST
     /// authorization session and the stored immutable options.
-    /// Any cached time-travel resolution is discarded: subsequent scans resolve
-    /// the supplied options without replacing the supplied fields.
+    /// Changing a snapshot selector discards its cached resolution. Unchanged
+    /// selectors retain a verified historical snapshot and its schema.
     pub fn copy_with_resolved_schema(&self, schema: TableSchema, branch: &str) -> Result<Self> {
         schema.validate_resolved_structure()?;
         validate_branch_name(branch)?;
@@ -674,17 +701,31 @@ impl Table {
         // path; supplied fields, IDs, keys, comments and branch must all match.
         // REST synthesizes creation times independently in different clients.
         if self.query_auth_session.is_some()
-            && !self.time_traveled
-            && self.travel_snapshot.is_none()
             && branch == self.branch
             && schema.has_same_definition(&self.schema)
         {
+            let schema = self
+                .schema
+                .copy_with_replaced_dynamic_options(schema.options().clone());
+            let changed = [
+                SCAN_VERSION_OPTION,
+                SCAN_TIMESTAMP_MILLIS_OPTION,
+                SCAN_TIMESTAMP_OPTION,
+                SCAN_WATERMARK_OPTION,
+                SCAN_SNAPSHOT_ID_OPTION,
+                SCAN_TAG_NAME_OPTION,
+                "scan.mode",
+                "incremental-between-timestamp",
+            ]
+            .iter()
+            .any(|key| schema.options().get(*key) != self.schema.options().get(*key));
             return Ok(Self {
-                schema: self
-                    .schema
-                    .copy_with_replaced_dynamic_options(schema.options().clone()),
-                time_traveled: false,
-                travel_snapshot: None,
+                schema,
+                travel_snapshot: if changed {
+                    None
+                } else {
+                    self.travel_snapshot.clone()
+                },
                 applied_dynamic_option_keys: HashSet::new(),
                 ..self.clone()
             });
@@ -715,7 +756,7 @@ impl Table {
     /// explicit `scan.snapshot-id`, so every subsequent scan stage observes the
     /// same snapshot. The snapshot's schema is loaded when it differs from the
     /// current table schema.
-    pub(crate) async fn copy_with_resolved_snapshot(&self, snapshot: &Snapshot) -> Result<Self> {
+    pub async fn copy_with_resolved_snapshot(&self, snapshot: &Snapshot) -> Result<Self> {
         let mut table = self.copy_with_pinned_snapshot(Some(snapshot));
         if snapshot.schema_id() != self.schema.id() {
             let schema = self.schema_manager.schema(snapshot.schema_id()).await?;

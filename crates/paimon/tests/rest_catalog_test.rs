@@ -3990,7 +3990,7 @@ async fn test_query_auth_empty_table_defers_mask_output_class_checks() {
 }
 
 #[tokio::test]
-async fn test_query_auth_refuses_a_stale_handle() {
+async fn test_query_auth_validates_a_long_lived_handle_against_current_rules() {
     let g = guarded("drifting", &["id"]).await;
     g.ctx.server.set_table_schema_id(
         "default",
@@ -3999,10 +3999,8 @@ async fn test_query_auth_refuses_a_stale_handle() {
         7,
     );
 
-    assert_drifted(
-        plan_err(&g.table, "a handle whose schema drifted must be refused").await,
-        "now resolves to schema",
-    );
+    g.table.new_read_builder().new_scan().plan().await.unwrap();
+    assert_eq!(g.ctx.server.auth_selects("default", "drifting"), [None]);
 }
 
 #[tokio::test]
@@ -4200,7 +4198,7 @@ async fn test_a_decorated_name_loads_and_only_query_auth_refuses_it() {
         .await
         .expect("an ordinary table's name is the server's business");
     // The view such a name addresses is not what the server rules on.
-    for name in ["guarded$branch_dev", "guarded$files"] {
+    for name in ["guarded$files"] {
         let table = ctx
             .catalog
             .get_table(&Identifier::new("default", name))
@@ -4863,10 +4861,53 @@ async fn test_query_auth_keeps_a_mask_source_in_another_partial_file() {
             .sum::<usize>(),
         1
     );
+    let write_plan = projected.new_scan().plan_for_write().await.unwrap();
+    assert_eq!(
+        write_plan
+            .splits()
+            .iter()
+            .map(|split| split.data_files().len())
+            .sum::<usize>(),
+        2
+    );
+
+    // A projected DE plan need not carry unrelated column slices. Restore
+    // against the projection's required files, while validating every supplied
+    // file against the full snapshot inventory.
+    let mut projected = g.table.new_read_builder();
+    projected.with_projection(&["visible"]).unwrap();
+    let projected_plan = projected.new_scan().plan().await.unwrap();
+    let transported = read_path_completion::transport(&projected_plan);
+    let reader = projected.new_read().unwrap();
+    let restored = reader.authorize_splits(&transported).await.unwrap();
+    let rows = reader
+        .to_arrow(&restored)
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    assert_eq!(rows.iter().map(|batch| batch.num_rows()).sum::<usize>(), 2);
+
     g.set_rules(
         &[],
         &[("visible", field_ref_mask(2, "source", "VARCHAR(255)"))],
     );
+    let mut protected = g.table.new_read_builder();
+    protected.with_projection(&["visible"]).unwrap();
+    let mut transported =
+        read_path_completion::transport(&protected.new_scan().plan().await.unwrap());
+    assert_eq!(transported.len(), 1);
+    let mut value = serde_json::to_value(&transported[0]).unwrap();
+    let files = value["data_files"].as_array_mut().unwrap();
+    files.retain(|file| file["_WRITE_COLS"] != serde_json::json!(["source"]));
+    transported[0] = serde_json::from_value(value).unwrap();
+    assert!(protected
+        .new_read()
+        .unwrap()
+        .authorize_splits(&transported)
+        .await
+        .is_err());
+
     for filtered in [false, true] {
         let mut builder = g.table.new_read_builder();
         builder.with_projection(&["visible"]).unwrap();
@@ -5824,3 +5865,6 @@ mod authorized_snapshot_scans;
 #[cfg(not(windows))]
 #[path = "rest_catalog/merge_sources.rs"]
 mod merge_sources;
+
+#[path = "rest_catalog/read_path_completion.rs"]
+mod read_path_completion;

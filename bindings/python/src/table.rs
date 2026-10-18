@@ -90,7 +90,7 @@ impl PyTable {
     /// Reuse the matching REST table response and merged catalog options.
     /// Skips config/get-table requests, preserving REST snapshots and token refresh.
     #[staticmethod]
-    #[pyo3(signature = (response_json, *, database, table, rest_options, initial_data_token=None))]
+    #[pyo3(signature = (response_json, *, database, table, rest_options, initial_data_token=None, path_mapping=None))]
     fn from_rest_response(
         py: Python<'_>,
         response_json: &str,
@@ -98,6 +98,7 @@ impl PyTable {
         table: &str,
         rest_options: HashMap<String, String>,
         initial_data_token: Option<(HashMap<String, String>, i64)>,
+        path_mapping: Option<(String, String)>,
     ) -> PyResult<Self> {
         let response: paimon::api::GetTableResponse =
             serde_json::from_str(response_json).map_err(|err| {
@@ -109,12 +110,28 @@ impl PyTable {
             initial_data_token.map(|(token, expires_at)| RESTToken::new(token, expires_at));
         let table = py
             .detach(|| {
-                runtime().block_on(paimon::table::Table::from_rest_response_with_token(
-                    identifier,
-                    response,
-                    Options::from_map(rest_options),
-                    initial_token,
-                ))
+                runtime().block_on(async {
+                    if let Some((original, local)) = path_mapping {
+                        let file_io = FileIO::from_path(&local)?
+                            .build()?
+                            .with_path_mapping(&original, &local)?;
+                        paimon::table::Table::from_rest_response_with_file_io(
+                            identifier,
+                            response,
+                            Options::from_map(rest_options),
+                            file_io,
+                        )
+                        .await
+                    } else {
+                        paimon::table::Table::from_rest_response_with_token(
+                            identifier,
+                            response,
+                            Options::from_map(rest_options),
+                            initial_token,
+                        )
+                        .await
+                    }
+                })
             })
             .map_err(to_py_err)?;
         Ok(Self::new(Arc::new(table)))
@@ -140,6 +157,7 @@ impl PyTable {
             table,
             rest_options,
             Some((data_token, expires_at_millis)),
+            None,
         )
     }
 
@@ -152,6 +170,31 @@ impl PyTable {
         let table = self
             .inner
             .copy_with_resolved_schema(schema, branch.unwrap_or(self.inner.branch()))
+            .map_err(to_py_err)?;
+        Ok(Self::new(Arc::new(table)))
+    }
+
+    /// Java Table.copy: apply dynamic options and resolve the selected schema.
+    #[pyo3(signature = (options, *, path_mapping=None))]
+    fn copy(
+        &self,
+        py: Python<'_>,
+        options: HashMap<String, String>,
+        path_mapping: Option<(String, String)>,
+    ) -> PyResult<Self> {
+        let table = if let Some((original, local)) = path_mapping {
+            let io = self
+                .inner
+                .file_io()
+                .clone()
+                .with_path_mapping(&original, &local)
+                .map_err(to_py_err)?;
+            self.inner.copy_with_file_io(io)
+        } else {
+            self.inner.as_ref().clone()
+        };
+        let table = py
+            .detach(|| runtime().block_on(table.copy_with_time_travel_strict(options)))
             .map_err(to_py_err)?;
         Ok(Self::new(Arc::new(table)))
     }
@@ -214,15 +257,24 @@ impl PyTable {
     }
 
     /// Forward one captured Java-format snapshot, or an explicitly empty view.
-    #[pyo3(signature = (snapshot_json))]
-    fn copy_with_pinned_snapshot(&self, snapshot_json: Option<&str>) -> PyResult<Self> {
+    #[pyo3(signature = (snapshot_json, *, with_schema=false))]
+    fn copy_with_pinned_snapshot(
+        &self,
+        py: Python<'_>,
+        snapshot_json: Option<&str>,
+        with_schema: bool,
+    ) -> PyResult<Self> {
         let snapshot = snapshot_json
             .map(serde_json::from_str::<paimon::spec::Snapshot>)
             .transpose()
             .map_err(|error| PyValueError::new_err(format!("Invalid snapshot JSON: {error}")))?;
-        Ok(Self {
-            inner: Arc::new(self.inner.copy_with_pinned_snapshot(snapshot.as_ref())),
-        })
+        let table = match snapshot.as_ref().filter(|_| with_schema) {
+            Some(snapshot) => py
+                .detach(|| runtime().block_on(self.inner.copy_with_resolved_snapshot(snapshot)))
+                .map_err(to_py_err)?,
+            None => self.inner.copy_with_pinned_snapshot(snapshot.as_ref()),
+        };
+        Ok(Self::new(Arc::new(table)))
     }
 
     fn new_vector_search_builder(&self) -> crate::vector_search::PyVectorSearchBuilder {

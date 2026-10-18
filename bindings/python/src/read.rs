@@ -737,6 +737,18 @@ impl PyTableScan {
         Ok(slf)
     }
 
+    fn plan_for_write(&self, py: Python<'_>) -> PyResult<PyPlan> {
+        py.detach(|| {
+            runtime().block_on(async {
+                self.core_scan()?
+                    .plan_for_write()
+                    .await
+                    .map(PyPlan::from)
+                    .map_err(to_py_err)
+            })
+        })
+    }
+
     fn plan(&self, py: Python<'_>) -> PyResult<PyPlan> {
         py.detach(|| {
             runtime().block_on(async {
@@ -915,6 +927,9 @@ impl PyTableRead {
             // path so an invalid projection fails consistently regardless of
             // how many splits are passed.
             let read = builder.new_read().map_err(to_py_err)?;
+            let splits = runtime()
+                .block_on(read.authorize_splits(&splits))
+                .map_err(to_py_err)?;
             if self.include_row_kind {
                 read.to_arrow_with_row_kind(&splits).map_err(to_py_err)
             } else {
