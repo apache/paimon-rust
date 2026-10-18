@@ -41,6 +41,11 @@ const S3_ACCESS_KEY: &str = "s3.access-key";
 /// Compatible with paimon-java's `s3.secret-key` / `fs.s3a.secret.key`.
 const S3_SECRET_KEY: &str = "s3.secret-key";
 
+/// Configuration key for S3 session token.
+///
+/// Compatible with paimon-java's `s3.session-token` / `fs.s3a.session.token`.
+const S3_SESSION_TOKEN: &str = "s3.session-token";
+
 /// Configuration key for S3 path-style access.
 ///
 /// When set to `true`, uses path-style URLs (`https://s3.endpoint/bucket`)
@@ -69,6 +74,7 @@ const JAVA_CONFIG_PREFIXES: &[&str] = &["fs.s3a.", "s3a.", "s3."];
 const KEY_ALIASES: &[(&str, &str)] = &[
     ("s3.access.key", "s3.access-key"),
     ("s3.secret.key", "s3.secret-key"),
+    ("s3.session.token", "s3.session-token"),
     ("s3.path.style.access", "s3.path-style-access"),
 ];
 
@@ -100,7 +106,7 @@ pub(crate) fn s3_config_parse(props: HashMap<String, String>) -> Result<S3Config
     cfg.region = normalized.get(S3_REGION).cloned();
 
     // Session / assume-role credentials.
-    cfg.session_token = normalized.get("s3.session.token").cloned();
+    cfg.session_token = normalized.get(S3_SESSION_TOKEN).cloned();
     cfg.role_arn = normalized.get("s3.assumed.role.arn").cloned();
     cfg.external_id = normalized.get("s3.assumed.role.externalId").cloned();
     cfg.role_session_name = normalized.get("s3.assumed.role.session.name").cloned();
@@ -278,6 +284,31 @@ mod tests {
             Some("arn:aws:iam::123456:role/test")
         );
         assert_eq!(cfg.external_id.as_deref(), Some("ext-id"));
+    }
+
+    #[test]
+    fn test_s3_config_parse_session_token_follows_access_key_precedence() {
+        let props = make_props(&[
+            ("s3.access-key", "AK_A"),
+            ("s3.secret-key", "SK_A"),
+            ("s3.session-token", "TOKEN_A"),
+            ("fs.s3a.access.key", "AK_B"),
+            ("fs.s3a.secret.key", "SK_B"),
+            ("fs.s3a.session.token", "TOKEN_B"),
+        ]);
+
+        let cfg = s3_config_parse(props).unwrap();
+        assert_eq!(cfg.access_key_id.as_deref(), Some("AK_A"));
+        assert_eq!(cfg.secret_access_key.as_deref(), Some("SK_A"));
+        assert_eq!(cfg.session_token.as_deref(), Some("TOKEN_A"));
+    }
+
+    #[test]
+    fn test_s3_config_parse_hadoop_session_token() {
+        let props = make_props(&[("fs.s3a.session.token", "TOKEN")]);
+
+        let cfg = s3_config_parse(props).unwrap();
+        assert_eq!(cfg.session_token.as_deref(), Some("TOKEN"));
     }
 
     #[test]
