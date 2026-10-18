@@ -69,6 +69,7 @@ const JAVA_CONFIG_PREFIXES: &[&str] = &["fs.s3a.", "s3a.", "s3."];
 const KEY_ALIASES: &[(&str, &str)] = &[
     ("s3.access.key", "s3.access-key"),
     ("s3.secret.key", "s3.secret-key"),
+    ("s3.session.token", "s3.session-token"),
     ("s3.path.style.access", "s3.path-style-access"),
 ];
 
@@ -100,7 +101,7 @@ pub(crate) fn s3_config_parse(props: HashMap<String, String>) -> Result<S3Config
     cfg.region = normalized.get(S3_REGION).cloned();
 
     // Session / assume-role credentials.
-    cfg.session_token = normalized.get("s3.session.token").cloned();
+    cfg.session_token = normalized.get("s3.session-token").cloned();
     cfg.role_arn = normalized.get("s3.assumed.role.arn").cloned();
     cfg.external_id = normalized.get("s3.assumed.role.externalId").cloned();
     cfg.role_session_name = normalized.get("s3.assumed.role.session.name").cloned();
@@ -365,5 +366,32 @@ mod tests {
 
         let cfg = s3_config_parse(props).unwrap();
         assert_eq!(cfg.endpoint.as_deref(), Some("https://new.endpoint.com"));
+    }
+
+    #[test]
+    fn test_s3_config_parse_session_token_alias_precedence() {
+        let props = make_props(&[
+            ("s3.access-key", "AK_A"),
+            ("s3.secret-key", "SK_A"),
+            ("s3.session-token", "TOKEN_A"),
+            ("fs.s3a.access.key", "AK_B"),
+            ("fs.s3a.secret.key", "SK_B"),
+            ("fs.s3a.session.token", "TOKEN_B"),
+        ]);
+
+        let cfg = s3_config_parse(props).unwrap();
+        assert_eq!(cfg.access_key_id.as_deref(), Some("AK_A"));
+        assert_eq!(cfg.secret_access_key.as_deref(), Some("SK_A"));
+        // Expected: TOKEN_A. Actual in v0.4.0: TOKEN_B.
+        assert_eq!(cfg.session_token.as_deref(), Some("TOKEN_A"));
+    }
+
+    #[test]
+    fn test_s3_config_parse_session_token_hadoop_alias() {
+        // `fs.s3a.session.token` alone must keep working (dotted fallback).
+        let props = make_props(&[("fs.s3a.session.token", "TOKEN")]);
+
+        let cfg = s3_config_parse(props).unwrap();
+        assert_eq!(cfg.session_token.as_deref(), Some("TOKEN"));
     }
 }
