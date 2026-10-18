@@ -28,6 +28,7 @@ use arrow_array::{
 use arrow_buffer::OffsetBuffer;
 use arrow_schema::{DataType, Schema, TimeUnit};
 
+mod binary;
 mod decimal;
 mod encoded;
 
@@ -282,6 +283,14 @@ fn cast_values(array: &ArrayRef, target: &DataType, mode: CastMode) -> crate::Re
             }
             DataType::Map(..) => {
                 let input = array.as_any().downcast_ref::<MapArray>().unwrap();
+                if mode == CastMode::Constructor
+                    && matches!(
+                        field.data_type(),
+                        DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(..)
+                    )
+                {
+                    return constructor_array_pairs(input, field, target);
+                }
                 let DataType::Struct(fields) = field.data_type() else {
                     return Err(invalid(
                         "Map entries can only be cast to two-field ROW elements",
@@ -355,28 +364,83 @@ fn cast_map_entries(
     if fields.len() != 2 {
         return Err(invalid("Map entries require exactly two ROW fields"));
     }
+    let (columns, offsets) =
+        cast_map_columns(input, [fields[0].data_type(), fields[1].data_type()], mode)?;
+    let length = *offsets.last().unwrap() as usize;
+    let entries = StructArray::try_new_with_length(fields.clone(), columns.into(), None, length)
+        .map_err(|error| invalid(error.to_string()))?;
+    Ok((entries, offsets))
+}
+
+/// Select the visible MAP entries before rebuilding Python constructor values.
+/// Both ROW pairs and ARRAY pairs share the same key/value selection rules.
+fn cast_map_columns(
+    input: &MapArray,
+    types: [&DataType; 2],
+    mode: CastMode,
+) -> crate::Result<([ArrayRef; 2], OffsetBuffer<i32>)> {
     let offsets = input.value_offsets();
     let start = offsets[0];
     let length = offsets[offsets.len() - 1] - start;
     let (offsets, indices) = constructor_offsets(offsets, input.nulls(), mode);
-    let length = indices.as_ref().map_or(length as usize, |i| i.len());
     // MAP field names are aliases. Their key/value roles do not depend on the
     // source names or the target ROW names, unlike a normal ROW-to-ROW cast.
-    let columns = [input.keys(), input.values()]
-        .into_iter()
-        .zip(fields)
-        .map(|(values, field)| {
-            let values = match &indices {
-                Some(indices) => arrow_select::take::take(values.as_ref(), indices, None)
-                    .map_err(|error| invalid(error.to_string()))?,
-                None => values.slice(start as usize, length),
-            };
-            cast_values(&values, field.data_type(), mode)
-        })
-        .collect::<crate::Result<Vec<_>>>()?;
-    let entries = StructArray::try_new_with_length(fields.clone(), columns, None, length)
+    let cast = |values: &ArrayRef, target: &DataType| {
+        let values = match &indices {
+            Some(indices) => arrow_select::take::take(values.as_ref(), indices, None)
+                .map_err(|error| invalid(error.to_string()))?,
+            None => values.slice(start as usize, length as usize),
+        };
+        cast_values(&values, target, mode)
+    };
+    Ok((
+        [
+            cast(input.keys(), types[0])?,
+            cast(input.values(), types[1])?,
+        ],
+        OffsetBuffer::new(offsets.into()),
+    ))
+}
+
+/// A Python MAP value is a sequence of key/value tuples. Rebuilding it as
+/// ARRAY<ARRAY<T>> turns each tuple into a two-element ARRAY; this is input
+/// construction, not a MAP-to-ARRAY schema-evolution cast.
+fn constructor_array_pairs(
+    input: &MapArray,
+    pair_field: &arrow_schema::FieldRef,
+    target: &DataType,
+) -> crate::Result<ArrayRef> {
+    let element = match pair_field.data_type() {
+        DataType::List(element)
+        | DataType::LargeList(element)
+        | DataType::FixedSizeList(element, _) => element,
+        _ => return Err(invalid("Map pairs require two-element ARRAY values")),
+    };
+    let ([keys, values], offsets) =
+        cast_map_columns(input, [element.data_type(); 2], CastMode::Constructor)?;
+    let positions = (0..keys.len())
+        .flat_map(|row| [(0, row), (1, row)])
+        .collect::<Vec<_>>();
+    let values =
+        arrow_select::interleave::interleave(&[keys.as_ref(), values.as_ref()], &positions)
+            .map_err(|error| invalid(error.to_string()))?;
+    let options = arrow_cast::CastOptions {
+        safe: false,
+        ..Default::default()
+    };
+    let pairs = if keys.is_empty() {
+        arrow_array::new_empty_array(pair_field.data_type())
+    } else {
+        let pairs =
+            FixedSizeListArray::try_new_with_length(element.clone(), 2, values, None, keys.len())
+                .map_err(|error| invalid(error.to_string()))?;
+        arrow_cast::cast_with_options(&pairs, pair_field.data_type(), &options)
+            .map_err(|error| invalid(error.to_string()))?
+    };
+    let output = ListArray::try_new(pair_field.clone(), offsets, pairs, input.nulls().cloned())
         .map_err(|error| invalid(error.to_string()))?;
-    Ok((entries, OffsetBuffer::new(offsets.into())))
+    arrow_cast::cast_with_options(&output, target, &options)
+        .map_err(|error| invalid(error.to_string()))
 }
 
 // PyPaimon's row-ID fallback reconstructs Python dicts only after a whole-column
@@ -773,6 +837,12 @@ fn cast_to_string(array: &ArrayRef, target: &DataType) -> crate::Result<ArrayRef
         // Arrow Rust lacks the direct fixed-binary to STRING kernel.
         let binary = super::write_batch_normalize::normalize_write_array(array, &DataType::Binary)?;
         return cast_to_string(&binary, target);
+    }
+    if matches!(
+        array.data_type(),
+        DataType::Binary | DataType::LargeBinary | DataType::BinaryView
+    ) {
+        return binary::cast_to_string(array, target);
     }
     let floats: Option<StringArray> = match array.data_type() {
         DataType::Float16 => Some(
@@ -1343,8 +1413,7 @@ fn cast_primitive(array: &ArrayRef, target: &DataType, mode: CastMode) -> crate:
     ) && (target.is_numeric() || *target == DataType::Boolean)
     {
         // Binary numeric inputs contain text, never native-endian numeric bytes.
-        let text = arrow_cast::cast_with_options(array.as_ref(), &DataType::Utf8, &options)
-            .map_err(|error| invalid(error.to_string()))?;
+        let text = binary::cast_to_string(array, &DataType::Utf8)?;
         return cast_primitive(&text, target, mode);
     }
     if matches!(source, DataType::Timestamp(..)) && matches!(target, DataType::Timestamp(..)) {
@@ -1444,6 +1513,9 @@ fn cast_primitive(array: &ArrayRef, target: &DataType, mode: CastMode) -> crate:
     }
     if source.is_decimal() && matches!(target, DataType::Decimal128(..)) {
         return decimal::cast_exact_decimal(array, target);
+    }
+    if source.is_decimal() && target.is_integer() {
+        return decimal::cast_to_integer(array, target, mode == CastMode::Constructor);
     }
     if source.is_decimal() && matches!(target, DataType::Float32 | DataType::Float64) {
         return decimal::cast_to_floating(array, target);

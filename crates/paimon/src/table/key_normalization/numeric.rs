@@ -69,11 +69,7 @@ pub(super) fn normalize(array: &ArrayRef, target: &DataType) -> crate::Result<Ar
             return decimal_to_float(array, target);
         }
         if target.is_integer() {
-            // Canonicalize first to avoid scale arithmetic overflow in generic
-            // Arrow integer casts, including external Decimal256 zero values.
-            let integral =
-                cast_update_value(array, &DataType::Decimal128(38, 0), CastMode::Assignment)?;
-            return cast_update_value(&integral, target, CastMode::Assignment);
+            return cast_update_value(array, target, CastMode::Assignment);
         }
     }
     if source.is_floating() || target.is_floating() {
