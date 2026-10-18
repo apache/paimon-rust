@@ -328,6 +328,22 @@ refreshes those credentials before expiration, so callers do not need to load
 the table again. Static `dlf.access-key-id`, `dlf.access-key-secret`, and
 `dlf.security-token` values are not rotated.
 
+With `storage-fs`, internal REST tables can access an existing FUSE mount:
+
+```rust
+options.set("fuse.enabled", "true");
+options.set("fuse.root", "/mnt/warehouse");
+options.set("fuse.mode", "pvfs");
+options.set("fuse.validation-mode", "strict");
+```
+
+The default `pvfs` layout uses `<root>/<database>/<table>`; `raw` uses the URI
+path beneath the root, excluding the scheme and authority. Original table URIs
+remain in metadata and REST requests. The default `strict` validation checks the
+default database's mount once per catalog; `warn` falls back to ordinary FileIO
+when that mount is missing, and `none` skips validation. Mounted tables do not
+request cloud data credentials. External tables keep their ordinary FileIO.
+
 To read credentials managed by another process, use a local token file:
 
 ```rust

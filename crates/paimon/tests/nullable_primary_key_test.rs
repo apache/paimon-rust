@@ -82,7 +82,7 @@ async fn read(table: &Table, predicate: Option<Predicate>) -> Vec<Row> {
     if let Some(predicate) = predicate {
         builder.with_filter(predicate);
     }
-    // First-row source reads include L0, as Python plan_for_write does.
+    // First-row source reads include L0, as Python plan_all_files does.
     let plan = builder
         .new_scan()
         .with_scan_all_files()

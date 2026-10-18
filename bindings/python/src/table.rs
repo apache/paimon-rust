@@ -156,6 +156,15 @@ impl PyTable {
         Ok(Self::new(Arc::new(table)))
     }
 
+    /// Java Table.copy: apply dynamic options and resolve the selected schema.
+    #[pyo3(signature = (options))]
+    fn copy(&self, py: Python<'_>, options: HashMap<String, String>) -> PyResult<Self> {
+        let table = py
+            .detach(|| runtime().block_on(self.inner.copy_with_time_travel_strict(options)))
+            .map_err(to_py_err)?;
+        Ok(Self::new(Arc::new(table)))
+    }
+
     fn identifier(&self) -> String {
         let id = self.inner.identifier();
         format!("{}.{}", id.database(), id.object())
@@ -214,15 +223,24 @@ impl PyTable {
     }
 
     /// Forward one captured Java-format snapshot, or an explicitly empty view.
-    #[pyo3(signature = (snapshot_json))]
-    fn copy_with_pinned_snapshot(&self, snapshot_json: Option<&str>) -> PyResult<Self> {
+    #[pyo3(signature = (snapshot_json, *, with_schema=false))]
+    fn copy_with_pinned_snapshot(
+        &self,
+        py: Python<'_>,
+        snapshot_json: Option<&str>,
+        with_schema: bool,
+    ) -> PyResult<Self> {
         let snapshot = snapshot_json
             .map(serde_json::from_str::<paimon::spec::Snapshot>)
             .transpose()
             .map_err(|error| PyValueError::new_err(format!("Invalid snapshot JSON: {error}")))?;
-        Ok(Self {
-            inner: Arc::new(self.inner.copy_with_pinned_snapshot(snapshot.as_ref())),
-        })
+        let table = match snapshot.as_ref().filter(|_| with_schema) {
+            Some(snapshot) => py
+                .detach(|| runtime().block_on(self.inner.copy_with_resolved_snapshot(snapshot)))
+                .map_err(to_py_err)?,
+            None => self.inner.copy_with_pinned_snapshot(snapshot.as_ref()),
+        };
+        Ok(Self::new(Arc::new(table)))
     }
 
     fn new_vector_search_builder(&self) -> crate::vector_search::PyVectorSearchBuilder {

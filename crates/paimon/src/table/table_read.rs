@@ -235,6 +235,113 @@ impl<'a> TableRead<'a> {
         }
     }
 
+    /// Restore catalog authorization for transported or externally planned splits.
+    /// Bytes never grant access: obtain a fresh grant for this reader's columns.
+    /// Captured rules must match it, or be retained under a current unrestricted
+    /// whole-table grant (e.g. the policy was relaxed after planning).
+    pub async fn authorize_splits(&self, splits: &[DataSplit]) -> crate::Result<Vec<DataSplit>> {
+        use super::query_auth::{historical_rule_fields, leaf_names, unsupported, QueryAuthGrant};
+        let required = self.table().schema().core_options().query_auth_enabled()
+            || splits.iter().any(DataSplit::query_auth_required);
+        if !required
+            || splits
+                .iter()
+                .all(|split| split.query_auth_grant().is_some())
+        {
+            return Ok(splits.to_vec());
+        }
+        let mut select: Vec<String> = self
+            .read_type()
+            .iter()
+            .map(|field| field.name().into())
+            .collect();
+        select.extend(leaf_names(self.data_predicates()));
+        if let TableReadKind::Paimon(read) = &self.0 {
+            if let Some(predicate) = &read.partition_predicate {
+                select.extend(leaf_names(std::slice::from_ref(predicate)));
+            }
+        }
+        select.sort();
+        select.dedup();
+        let fresh = self
+            .table()
+            .authorize_read(true, Some(select))
+            .await?
+            .ok_or_else(|| unsupported("transported splits require REST authorization"))?;
+        let (id, current) = fresh
+            .current_schema()
+            .ok_or_else(|| unsupported("authorization has no current schema"))?;
+        let mut whole_table = None;
+        let mut restored = Vec::with_capacity(splits.len());
+        for split in splits {
+            if split.query_auth_grant().is_some() {
+                restored.push(split.clone());
+                continue;
+            }
+            let grant = if let Some(response) = split.query_auth_response() {
+                let fields =
+                    historical_rule_fields(response, current, self.table().schema().fields())?;
+                let captured = QueryAuthGrant::parse(
+                    response,
+                    self.table().query_auth_session().unwrap(),
+                    fresh.select().map(<[String]>::to_vec),
+                    &fields,
+                )?
+                .bind(self.table(), fields, (id, current));
+                if !captured.rules().same_policy(fresh.rules()) {
+                    if !fresh.is_unrestricted() {
+                        return Err(unsupported(
+                            "transported rules differ from the current policy; re-plan the scan",
+                        ));
+                    }
+                    if whole_table.is_none() {
+                        whole_table = self.table().authorize_read(true, None).await?;
+                    }
+                    if !whole_table.as_ref().is_some_and(|grant| {
+                        grant.is_unrestricted() && grant.current_schema() == fresh.current_schema()
+                    }) {
+                        return Err(unsupported(
+                            "captured rules require an unrestricted whole-table grant",
+                        ));
+                    }
+                }
+                Arc::new(captured)
+            } else {
+                Arc::clone(&fresh)
+            };
+            restored.push(split.clone().planned(Some(grant)));
+        }
+        let TableReadKind::Paimon(read) = &self.0 else {
+            return Err(unsupported(
+                "only Paimon data splits carry query authorization",
+            ));
+        };
+        read.ensure_authorized_by_splits(&self.table().schema().core_options(), &restored)?;
+        let mut fields = self.read_type().to_vec();
+        let operands = leaf_names(self.data_predicates());
+        fields.extend(
+            self.table()
+                .schema()
+                .fields()
+                .iter()
+                .filter(|field| {
+                    operands.contains(field.name())
+                        && !self.read_type().iter().any(|f| f.id() == field.id())
+                })
+                .cloned(),
+        );
+        let mut builder = self.table().new_read_builder();
+        builder.with_read_type(fields);
+        let grant = restored
+            .iter()
+            .find_map(DataSplit::query_auth_grant)
+            .unwrap_or(&fresh);
+        builder
+            .new_scan()
+            .validate_transported_splits(&restored, grant)
+            .await
+    }
+
     /// Returns an [`ArrowRecordBatchStream`].
     ///
     /// A `query-auth.enabled` table reads only splits from this handle's plan;
@@ -1059,7 +1166,16 @@ impl<'a> PaimonTableRead<'a> {
             ));
         }
         // The read's own scope: a caller can plan clean, then read differently.
-        let filter_columns = super::query_auth::leaf_names(&self.data_predicates);
+        let mut filter_columns = super::query_auth::leaf_names(&self.data_predicates);
+        if let Some(predicate) = &self.partition_predicate {
+            super::query_auth::reject_noncanonical_leaves(
+                std::slice::from_ref(predicate),
+                &self.table.schema().partition_fields(),
+            )?;
+            filter_columns.extend(super::query_auth::leaf_names(std::slice::from_ref(
+                predicate,
+            )));
+        }
         super::query_auth::reject_system_columns(
             self.read_type
                 .iter()
@@ -1091,6 +1207,19 @@ impl<'a> PaimonTableRead<'a> {
                     "the grant was issued for a different table, schema or session; re-plan the \
                      scan",
                 ));
+            }
+            if let Some(predicate) = &self.partition_predicate {
+                let names = super::query_auth::leaf_names(std::slice::from_ref(predicate));
+                if grant
+                    .rules()
+                    .masks
+                    .iter()
+                    .any(|mask| names.contains(grant.fields(self.table)[mask.column].name()))
+                {
+                    return Err(super::query_auth::unsupported(
+                        "a partition selector cannot test raw values of a masked column",
+                    ));
+                }
             }
             // The server ruled on these columns only, whether or not it set rules.
             if let Some(select) = grant.select() {
@@ -1147,7 +1276,7 @@ impl<'a> PaimonTableRead<'a> {
         use crate::arrow::residual::{filter_record_batch_by_predicates, widen_scan_fields};
         use std::collections::HashSet;
 
-        let schema_fields = self.table.schema().fields().to_vec();
+        let schema_fields = grant.fields(self.table).to_vec();
         let rules = grant.rules();
         super::query_auth::reject_throwing_extractions(&self.read_type)?;
 
@@ -1265,7 +1394,7 @@ impl<'a> PaimonTableRead<'a> {
             row_filter_factory: None,
             file_fields: schema_fields.clone(),
         };
-        let blob_options = has_blobs.then(|| self.masked_blob_options(&masks));
+        let blob_options = has_blobs.then(|| self.masked_blob_options(&masks, &schema_fields));
         let stream = stream.map(move |batch| {
             let batch = batch?;
             let names_match = batch.num_columns() == physical.len()
@@ -1306,10 +1435,10 @@ impl<'a> PaimonTableRead<'a> {
     fn masked_blob_options(
         &self,
         masks: &[super::query_auth::ColumnMask],
+        fields: &[DataField],
     ) -> std::collections::HashMap<String, String> {
         use crate::spec::Transform;
 
-        let fields = self.table.schema().fields();
         let copies: Vec<_> = masks
             .iter()
             .filter_map(|mask| {

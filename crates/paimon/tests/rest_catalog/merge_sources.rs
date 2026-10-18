@@ -98,7 +98,7 @@ async fn unrestricted_source_supports_merge_and_keeps_metadata_scans_closed() {
 }
 
 #[tokio::test]
-async fn unrestricted_source_authorizes_empty_tables_and_keeps_historical_guard() {
+async fn unrestricted_source_authorizes_empty_and_historical_tables() {
     let g = written(
         "merge_history",
         people,
@@ -107,17 +107,20 @@ async fn unrestricted_source_authorizes_empty_tables_and_keeps_historical_guard(
     .await;
     g.set_rules(&[], &[]);
     let snapshot = g.table.snapshot_manager().get_snapshot(1).await.unwrap();
-    for view in [
+    for (index, view) in [
         g.table.copy_with_pinned_snapshot(None),
         g.table.copy_with_pinned_snapshot(Some(&snapshot)),
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let target = target();
         write_batch(&target, people_batch(&[(1, "old")]), "seed").await;
-        let error = merge(&target, &view, false).await.unwrap_err();
-        assert!(error.to_string().contains("time-travelled"), "{error}");
+        merge(&target, &view, false).await.unwrap();
+        let rows = id_names(&read_all(&target.new_read_builder()).await.unwrap());
         assert_eq!(
-            id_names(&read_all(&target.new_read_builder()).await.unwrap()),
-            [(1, Some("old".into()))]
+            rows,
+            [(1, Some(if index == 0 { "old" } else { "alice" }.into()))]
         );
     }
     let empty = written("merge_empty", people, vec![]).await;
@@ -154,7 +157,7 @@ async fn merge_rejects_restricted_sources_even_for_unused_fields_or_empty_views(
                 source.set_rules(&[int_leaf(0, "id", "GREATER_THAN", 1)], &[]);
             }
             // DELETE matches only `id`: an unused column's mask still makes the
-            // source unsuitable for Python's existing plan_for_write contract.
+            // source unsuitable for Python's existing plan_all_files contract.
             let error = merge(&target, &source.table, true).await.unwrap_err();
             assert!(error.to_string().contains("unrestricted"), "{error}");
             assert_eq!(

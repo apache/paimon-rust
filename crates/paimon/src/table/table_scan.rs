@@ -63,6 +63,9 @@ use std::sync::Arc;
 mod audit;
 pub use audit::AuditLogScan;
 
+#[path = "table_scan/restore_splits.rs"]
+mod restore_splits;
+
 /// Path segment for manifest directory under table.
 const MANIFEST_DIR: &str = "manifest";
 /// Path segment for index directory under table.
@@ -1144,7 +1147,7 @@ impl<'a> TableScan<'a> {
         }
     }
 
-    /// MERGE table sources follow plan_for_write: authorize the whole table,
+    /// MERGE table sources follow plan_all_files: authorize the whole table,
     /// then include L0 only when no row filter or column mask was returned.
     /// Keep this scope internal; public metadata scans must still fail closed.
     pub(super) async fn authorize_merge_source(&self) -> crate::Result<Self> {
@@ -1504,6 +1507,31 @@ impl<'a> TableScan<'a> {
         }
     }
 
+    /// Plan matching files including L0 and all data-evolution column files.
+    /// Existing scan filters and limits still apply. Query authorization must
+    /// be unrestricted, as required by writer restore, overwrite and indexing.
+    pub async fn plan_all_files(&self) -> crate::Result<Plan> {
+        let mut source = self.clone();
+        if let TableScanKind::Paimon(scan) = &mut source.0 {
+            scan.projected_read_field_ids = None;
+        }
+        source
+            .authorize_merge_source()
+            .await?
+            .with_scan_all_files()
+            .plan()
+            .await
+    }
+
+    /// Validate transported metadata and restore canonical snapshot paths.
+    pub(super) async fn validate_transported_splits(
+        &self,
+        splits: &[DataSplit],
+        grant: &Arc<super::query_auth::QueryAuthGrant>,
+    ) -> crate::Result<Vec<DataSplit>> {
+        restore_splits::validate(self, splits, grant).await
+    }
+
     pub(super) fn limit_hint(&self) -> Option<usize> {
         match &self.0 {
             TableScanKind::Paimon(scan) => scan.limit,
@@ -1788,7 +1816,7 @@ impl<'a> PaimonTableScan<'a> {
         }
     }
 
-    /// Disable level-0 filtering so all files are visible.
+    /// Disable level-0 filtering and column-file projection pruning.
     ///
     /// Used by non-read paths (overwrite, truncate, writer restore) that need
     /// the complete file set regardless of merge engine or DV settings.
@@ -1886,7 +1914,7 @@ impl<'a> PaimonTableScan<'a> {
     /// Keep pruning off masked columns and apply limits after row filtering.
     fn restricted_by(&self, grant: &Arc<super::query_auth::QueryAuthGrant>) -> Self {
         let rules = grant.rules();
-        let fields = self.table.schema().fields();
+        let fields = grant.fields(&self.table);
         let masked: HashSet<&str> = rules
             .masks
             .iter()
@@ -1934,9 +1962,18 @@ impl<'a> PaimonTableScan<'a> {
         // Keep files for every column used by the rules.
         if let Some(ids) = scan.projected_read_field_ids.as_mut() {
             let mut columns = rules.filter_columns();
+            let mut visible = super::query_auth::leaf_names(&self.data_predicates);
+            visible.extend(
+                fields
+                    .iter()
+                    .filter(|field| ids.contains(&field.id()))
+                    .map(|field| field.name().to_string()),
+            );
             for mask in &rules.masks {
-                columns.insert(mask.column);
-                columns.extend(super::query_auth::mask_inputs(mask));
+                if visible.contains(fields[mask.column].name()) {
+                    columns.insert(mask.column);
+                    columns.extend(super::query_auth::mask_inputs(mask));
+                }
             }
             ids.extend(
                 columns
@@ -2009,23 +2046,24 @@ impl<'a> PaimonTableScan<'a> {
         .await
     }
 
-    /// The grant predates the manifest read, so the table can have been
-    /// re-created in between. Also refuses stats the schema no longer covers.
-    async fn check_planned_files(&self, plan: &Plan, query_auth: bool) -> crate::Result<()> {
-        if !query_auth {
-            return Ok(());
+    /// The grant predates the manifest read, so reject a concurrent replacement
+    /// or rule-schema change. File metadata, including old column statistics,
+    /// is carried unchanged by Java QueryAuthSplit as well.
+    async fn check_planned_files(&self, _plan: &Plan, query_auth: bool) -> crate::Result<()> {
+        if query_auth {
+            if let Some(rest_env) = self.table.rest_env() {
+                if let Some((id, fields)) = self
+                    .query_auth_grant
+                    .as_ref()
+                    .and_then(|grant| grant.current_schema())
+                {
+                    rest_env.current_table_checked(id, fields).await?;
+                } else {
+                    rest_env.current_table_identity_checked().await?;
+                }
+            }
         }
-        if let Some(rest_env) = self.table.rest_env() {
-            rest_env
-                .current_table_checked(self.table.schema().id(), self.table.schema().fields())
-                .await?;
-        }
-        super::query_auth::reject_unauthorized_stats(
-            plan,
-            self.table.schema(),
-            self.table.schema_manager(),
-        )
-        .await
+        Ok(())
     }
 
     async fn authorized_scan(&self) -> crate::Result<Cow<'_, Self>> {
@@ -2114,7 +2152,7 @@ impl<'a> PaimonTableScan<'a> {
             .authorize_read(query_auth, self.query_auth_select())
             .await?;
         if let Some(grant) = &grant {
-            let fields = self.table.schema().fields();
+            let fields = grant.fields(&self.table);
             let masked: Vec<&str> = grant
                 .rules()
                 .masks

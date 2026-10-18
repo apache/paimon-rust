@@ -270,14 +270,14 @@ use std::sync::Arc;
 #[derive(Debug, Clone)]
 enum ReadSnapshot {
     Empty,
-    Snapshot(Arc<Snapshot>),
+    Snapshot(Arc<Snapshot>, Arc<tokio::sync::OnceCell<()>>),
 }
 
 impl ReadSnapshot {
     fn snapshot(&self) -> Option<&Snapshot> {
         match self {
             Self::Empty => None,
-            Self::Snapshot(snapshot) => Some(snapshot),
+            Self::Snapshot(snapshot, _) => Some(snapshot),
         }
     }
 }
@@ -500,10 +500,16 @@ impl Table {
         if !query_auth {
             return Ok(None);
         }
-        if self.reads_another_schema()? {
+        if self.identifier.system_table_name()?.is_some()
+            || rest_env
+                .identifier()
+                .branch_name()?
+                .as_deref()
+                .unwrap_or(DEFAULT_MAIN_BRANCH)
+                != self.branch
+        {
             return Err(query_auth::unsupported(
-                "a time-travelled or branch read authorizes against the table's current schema, \
-                 which is not the one it reads",
+                "the REST authorization identifier does not address this data table and branch",
             ));
         }
 
@@ -513,12 +519,62 @@ impl Table {
             query_auth::unsupported("this table handle was assembled rather than loaded")
         })?;
 
-        let response = rest_env
+        let (response, current) = rest_env
             .table_query_auth(self.schema.id(), self.schema.fields(), select.clone())
             .await?;
+        self.validate_authorized_snapshot(rest_env).await?;
+        let fields =
+            query_auth::historical_rule_fields(&response, current.fields(), self.schema.fields())?;
         Ok(Some(std::sync::Arc::new(
-            query_auth::QueryAuthGrant::parse(&response, session, select, self.schema.fields())?,
+            query_auth::QueryAuthGrant::parse(&response, session, select, &fields)?.bind(
+                self,
+                fields,
+                (current.id(), current.fields()),
+            ),
         )))
+    }
+
+    /// A captured snapshot supplied across the API boundary is metadata, not
+    /// proof that its manifest lists belong to this table and branch. Verify
+    /// it once while the authoritative snapshot is available, then retain the
+    /// verified view even if the snapshot file expires during the query.
+    async fn validate_authorized_snapshot(&self, rest_env: &RESTEnv) -> Result<()> {
+        let Some(ReadSnapshot::Snapshot(snapshot, verified)) = &self.travel_snapshot else {
+            return Ok(());
+        };
+        verified
+            .get_or_try_init(|| async {
+                match self.snapshot_manager().get_snapshot(snapshot.id()).await {
+                    Ok(stored) if snapshot.has_same_read_metadata(&stored) => return Ok(()),
+                    Ok(_) | Err(crate::Error::SnapshotNotExist { .. }) => (),
+                    Err(error) => return Err(error),
+                }
+                // A tag can retain a view after expiration or after rollback
+                // reuses its snapshot id for a different commit.
+                let retained = self.tag_manager().list_all().await;
+                if retained.as_ref().is_ok_and(|tags| {
+                    tags.iter()
+                        .any(|(_, stored)| snapshot.has_same_read_metadata(stored))
+                }) {
+                    return Ok(());
+                }
+                if rest_env
+                    .load_snapshot(&self.branch)
+                    .await?
+                    .as_ref()
+                    .is_some_and(|stored| snapshot.has_same_read_metadata(stored))
+                {
+                    return Ok(());
+                }
+                // Failure of one optional source must not block a matching
+                // authoritative source. Preserve its error if none can verify.
+                retained?;
+                Err(query_auth::unsupported(
+                    "cannot verify the pinned snapshot against this table and branch",
+                ))
+            })
+            .await?;
+        Ok(())
     }
 
     /// Handed out once per catalog-loaded table; wraps only after 2^64 loads.
@@ -664,8 +720,8 @@ impl Table {
     /// selects its metadata namespace without loading a different schema.
     /// An options-only replacement of the catalog-loaded schema keeps its REST
     /// authorization session and the stored immutable options.
-    /// Any cached time-travel resolution is discarded: subsequent scans resolve
-    /// the supplied options without replacing the supplied fields.
+    /// Changing a snapshot selector discards its cached resolution. Unchanged
+    /// selectors retain a verified historical snapshot and its schema.
     pub fn copy_with_resolved_schema(&self, schema: TableSchema, branch: &str) -> Result<Self> {
         schema.validate_resolved_structure()?;
         validate_branch_name(branch)?;
@@ -674,17 +730,31 @@ impl Table {
         // path; supplied fields, IDs, keys, comments and branch must all match.
         // REST synthesizes creation times independently in different clients.
         if self.query_auth_session.is_some()
-            && !self.time_traveled
-            && self.travel_snapshot.is_none()
             && branch == self.branch
             && schema.has_same_definition(&self.schema)
         {
+            let schema = self
+                .schema
+                .copy_with_replaced_dynamic_options(schema.options().clone());
+            let changed = [
+                SCAN_VERSION_OPTION,
+                SCAN_TIMESTAMP_MILLIS_OPTION,
+                SCAN_TIMESTAMP_OPTION,
+                SCAN_WATERMARK_OPTION,
+                SCAN_SNAPSHOT_ID_OPTION,
+                SCAN_TAG_NAME_OPTION,
+                "scan.mode",
+                "incremental-between-timestamp",
+            ]
+            .iter()
+            .any(|key| schema.options().get(*key) != self.schema.options().get(*key));
             return Ok(Self {
-                schema: self
-                    .schema
-                    .copy_with_replaced_dynamic_options(schema.options().clone()),
-                time_traveled: false,
-                travel_snapshot: None,
+                schema,
+                travel_snapshot: if changed {
+                    None
+                } else {
+                    self.travel_snapshot.clone()
+                },
                 applied_dynamic_option_keys: HashSet::new(),
                 ..self.clone()
             });
@@ -715,7 +785,7 @@ impl Table {
     /// explicit `scan.snapshot-id`, so every subsequent scan stage observes the
     /// same snapshot. The snapshot's schema is loaded when it differs from the
     /// current table schema.
-    pub(crate) async fn copy_with_resolved_snapshot(&self, snapshot: &Snapshot) -> Result<Self> {
+    pub async fn copy_with_resolved_snapshot(&self, snapshot: &Snapshot) -> Result<Self> {
         let mut table = self.copy_with_pinned_snapshot(Some(snapshot));
         if snapshot.schema_id() != self.schema.id() {
             let schema = self.schema_manager.schema(snapshot.schema_id()).await?;
@@ -729,7 +799,8 @@ impl Table {
     /// preserving the current read schema and options other than scan selectors.
     ///
     /// Unlike time travel, pinning must not change the fields used by an already
-    /// planned query. The resolved snapshot is cached without additional I/O.
+    /// planned query. The resolved snapshot is cached; query authorization
+    /// verifies its origin on first use before trusting its manifest lists.
     /// `None` captures an empty view, which remains empty after later commits.
     pub fn copy_with_pinned_snapshot(&self, snapshot: Option<&Snapshot>) -> Self {
         let mut options = self.schema.options().clone();
@@ -766,7 +837,19 @@ impl Table {
             schema: self.schema.copy_with_replaced_options(options),
             time_traveled: true,
             travel_snapshot: Some(match snapshot {
-                Some(snapshot) => ReadSnapshot::Snapshot(Arc::new(snapshot.clone())),
+                Some(snapshot) => match &self.travel_snapshot {
+                    Some(view)
+                        if view
+                            .snapshot()
+                            .is_some_and(|known| known.has_same_read_metadata(snapshot)) =>
+                    {
+                        view.clone()
+                    }
+                    _ => ReadSnapshot::Snapshot(
+                        Arc::new(snapshot.clone()),
+                        Arc::new(tokio::sync::OnceCell::new()),
+                    ),
+                },
                 None => ReadSnapshot::Empty,
             }),
             ..self.clone()
@@ -888,7 +971,12 @@ impl Table {
                 table.schema = snapshot_schema.copy_with_replaced_options(options);
                 table.time_traveled = true;
             }
-            table.travel_snapshot = Some(ReadSnapshot::Snapshot(Arc::new(snapshot)));
+            // Resolved by this table's snapshot/tag manager rather than supplied
+            // by a caller; its origin is already known.
+            table.travel_snapshot = Some(ReadSnapshot::Snapshot(
+                Arc::new(snapshot),
+                Arc::new(tokio::sync::OnceCell::new_with(Some(()))),
+            ));
         }
         Ok(table)
     }

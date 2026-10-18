@@ -513,14 +513,17 @@ pub struct DataSplit {
     raw_convertible: bool,
     #[serde(default)]
     is_streaming: bool,
-    /// Mirrors Java `QueryAuthSplit`, but is dropped by serialization, so a
-    /// plan must be read where it was made.
+    /// Live grants are local to a catalog session. Serialized rules remain
+    /// metadata until TableRead::authorize_splits validates them and their files.
     #[serde(skip)]
     query_auth_grant: Option<Arc<QueryAuthGrant>>,
     /// That this split came from a `query-auth.enabled` table. Unlike the grant
     /// it survives serialization, so a round-tripped split fails closed.
     #[serde(default)]
     query_auth_required: bool,
+    /// Transported rules are metadata, never a live catalog grant.
+    #[serde(default)]
+    query_auth_response: Option<crate::api::AuthTableQueryResponse>,
 }
 
 impl DataSplit {
@@ -533,6 +536,7 @@ impl DataSplit {
     /// still refuses at the read.
     pub(crate) fn planned(mut self, grant: Option<Arc<QueryAuthGrant>>) -> Self {
         self.query_auth_required = true;
+        self.query_auth_response = grant.as_ref().and_then(|g| g.response()).cloned();
         self.query_auth_grant = grant;
         self
     }
@@ -545,13 +549,22 @@ impl DataSplit {
         self.query_auth_grant.as_ref()
     }
 
+    pub(crate) fn query_auth_response(&self) -> Option<&crate::api::AuthTableQueryResponse> {
+        self.query_auth_response.as_ref()
+    }
+
     /// Whether the server attached rules to this split's read: its row counts
     /// and column statistics then describe rows the read will not return as
     /// they are.
     pub fn has_query_auth_rules(&self) -> bool {
         self.query_auth_grant
             .as_ref()
-            .is_some_and(|grant| !grant.is_unrestricted())
+            .map(|grant| !grant.is_unrestricted())
+            .unwrap_or_else(|| {
+                self.query_auth_response
+                    .as_ref()
+                    .is_some_and(|response| !response.is_unrestricted())
+            })
     }
 
     pub fn snapshot_id(&self) -> i64 {
@@ -569,6 +582,16 @@ impl DataSplit {
     }
     pub fn total_buckets(&self) -> i32 {
         self.total_buckets.unwrap_or(1)
+    }
+
+    pub(crate) fn declared_total_buckets(&self) -> Option<i32> {
+        self.total_buckets
+    }
+
+    pub(crate) fn restore_bucket_layout(mut self, source: &Self) -> Self {
+        self.bucket_path = source.bucket_path.clone();
+        self.total_buckets = source.total_buckets;
+        self
     }
 
     pub fn data_files(&self) -> &[DataFileMeta] {
@@ -711,7 +734,15 @@ impl DataSplit {
         if self
             .query_auth_grant
             .as_ref()
-            .is_some_and(|grant| !grant.rules().filters.is_empty())
+            .map(|grant| !grant.rules().filters.is_empty())
+            .unwrap_or_else(|| {
+                self.query_auth_response.as_ref().is_some_and(|response| {
+                    response
+                        .filter
+                        .as_ref()
+                        .is_some_and(|filters| !filters.is_empty())
+                })
+            })
         {
             return None;
         }
@@ -980,6 +1011,7 @@ impl DataSplit {
                 .query_auth_grant
                 .as_ref()
                 .and_then(|grant| grant.response())
+                .or(self.query_auth_response.as_ref())
                 .ok_or_else(|| {
                     crate::table::query_auth::unsupported(
                         "the split has no live wire authorization",
@@ -1077,10 +1109,10 @@ impl DataSplit {
         let split = match type_id {
             SPLIT_SER_TYPE_QUERY_AUTH_SPLIT => {
                 let split = Self::read_split_v1(cur, depth + 1)?;
-                read_auth_response(cur)?;
-                // Rules transported in a frame are not a grant minted by this
-                // catalog session. Reading it still requires the original split.
-                split.planned(None)
+                let response = read_auth_response(cur)?;
+                let mut split = split.planned(None);
+                split.query_auth_response = Some(response);
+                split
             }
             SPLIT_SER_TYPE_DATA_SPLIT => Self::read_body(cur)?,
             SPLIT_SER_TYPE_INDEXED_SPLIT => {
@@ -1218,9 +1250,9 @@ fn write_auth_response(
     Ok(())
 }
 
-/// Consume wire rules without creating a trusted grant from untrusted bytes.
-fn read_auth_response(cur: &mut &[u8]) -> crate::Result<()> {
-    fn string(cur: &mut &[u8]) -> crate::Result<()> {
+/// Decode captured rules as metadata. A reader must still obtain a live grant.
+fn read_auth_response(cur: &mut &[u8]) -> crate::Result<crate::api::AuthTableQueryResponse> {
+    fn string(cur: &mut &[u8]) -> crate::Result<String> {
         let length = read_i32(cur)?;
         if length < 0 {
             return Err(crate::Error::DataInvalid {
@@ -1229,32 +1261,45 @@ fn read_auth_response(cur: &mut &[u8]) -> crate::Result<()> {
             });
         }
         let bytes = take(cur, length as usize)?;
-        std::str::from_utf8(bytes).map_err(|e| crate::Error::DataInvalid {
-            message: e.to_string(),
-            source: None,
-        })?;
-        Ok(())
+        std::str::from_utf8(bytes)
+            .map(str::to_string)
+            .map_err(|e| crate::Error::DataInvalid {
+                message: e.to_string(),
+                source: None,
+            })
     }
-    if read_u8(cur)? == 0 {
-        return Ok(());
-    }
-    for multiplier in [1, 2] {
-        if read_u8(cur)? != 0 {
-            let count = read_i32(cur)?;
-            if count < 0 || count as usize > cur.len() / (4 * multiplier) {
-                return Err(crate::Error::DataInvalid {
-                    message: "invalid QueryAuthSplit rule count".into(),
-                    source: None,
-                });
-            }
-            for _ in 0..count {
-                for _ in 0..multiplier {
-                    string(cur)?;
-                }
-            }
+    fn count(cur: &mut &[u8], multiplier: usize) -> crate::Result<usize> {
+        let count = read_i32(cur)?;
+        if count < 0 || count as usize > cur.len() / (4 * multiplier) {
+            return Err(crate::Error::DataInvalid {
+                message: "invalid QueryAuthSplit rule count".into(),
+                source: None,
+            });
         }
+        Ok(count as usize)
     }
-    Ok(())
+    let mut response = crate::api::AuthTableQueryResponse {
+        filter: None,
+        column_masking: None,
+    };
+    if read_u8(cur)? == 0 {
+        return Ok(response);
+    }
+    if read_u8(cur)? != 0 {
+        let mut filters = Vec::new();
+        for _ in 0..count(cur, 1)? {
+            filters.push(string(cur)?);
+        }
+        response.filter = Some(filters);
+    }
+    if read_u8(cur)? != 0 {
+        let mut masks = std::collections::HashMap::new();
+        for _ in 0..count(cur, 2)? {
+            masks.insert(string(cur)?, string(cur)?);
+        }
+        response.column_masking = Some(masks);
+    }
+    Ok(response)
 }
 
 /// Java `IndexedSplit#MAGIC` / `VERSION`.
@@ -1571,6 +1616,7 @@ impl DataSplitBuilder {
         Ok(DataSplit {
             query_auth_grant: None,
             query_auth_required: false,
+            query_auth_response: None,
             snapshot_id: self.snapshot_id,
             partition: Arc::new(partition),
             bucket: self.bucket,
@@ -2485,7 +2531,7 @@ mod tests {
         assert!(copy.query_auth_grant().is_none());
         assert_eq!(copy.data_files(), ordinary.data_files());
         assert!(copy.serialize().is_err());
-        assert!(copy.serialize_split_v1().is_err());
+        assert_eq!(copy.serialize_split_v1().unwrap(), frame);
     }
 
     #[test]
@@ -2499,7 +2545,10 @@ mod tests {
         assert_eq!(split.data_files().len(), 2);
         assert!(split.query_auth_required());
         assert!(split.query_auth_grant().is_none());
-        assert!(split.serialize_split_v1().is_err());
+        assert_eq!(
+            split.serialize_split_v1().unwrap(),
+            include_bytes!("goldens/split_v1_query_auth.bin")
+        );
     }
 
     #[test]

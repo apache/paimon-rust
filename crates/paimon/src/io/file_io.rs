@@ -43,6 +43,9 @@ use super::Storage;
 #[cfg(all(test, feature = "storage-memory"))]
 mod provider_tests;
 
+#[cfg(feature = "storage-fs")]
+mod fuse;
+
 /// An externally managed block cache used by [`FileIO`].
 ///
 /// Implementations store immutable file ranges. Cache failures must be handled
@@ -320,25 +323,32 @@ impl FileIO {
         }
     }
 
+    async fn create_with_cache_namespace(
+        &self,
+        path: &str,
+    ) -> crate::Result<(Operator, String, Option<String>)> {
+        match &self.backend {
+            FileIOBackend::Provider(provider) => {
+                let (op, relative_path, namespace) =
+                    resolve_provider_with_cache_namespace(provider.as_ref(), path).await?;
+                Ok((op, relative_path, namespace))
+            }
+            FileIOBackend::Storage(_) => {
+                let (op, relative_path) = self.create_static(path)?;
+                Ok((
+                    op,
+                    relative_path,
+                    Some(self.cache_namespace_for_path(path)?),
+                ))
+            }
+        }
+    }
+
     async fn create_with_cache_path(
         &self,
         path: &str,
     ) -> crate::Result<(Operator, String, Option<String>)> {
-        let (op, relative_path, namespace) = match &self.backend {
-            FileIOBackend::Provider(provider) => {
-                let (op, relative_path, namespace) =
-                    resolve_provider_with_cache_namespace(provider.as_ref(), path).await?;
-                (op, relative_path, namespace)
-            }
-            FileIOBackend::Storage(_) => {
-                let (op, relative_path) = self.create_static(path)?;
-                (
-                    op,
-                    relative_path,
-                    Some(self.cache_namespace_for_path(path)?),
-                )
-            }
-        };
+        let (op, relative_path, namespace) = self.create_with_cache_namespace(path).await?;
         let cache_path =
             namespace.map(|namespace| cache_object_path(&namespace, &op, &relative_path));
         Ok((op, relative_path, cache_path))
@@ -2020,6 +2030,39 @@ mod file_action_test {
             "file:/tmp/new_test_file_fs_o",
         )
         .await;
+    }
+
+    #[cfg(all(windows, feature = "storage-fs"))]
+    #[tokio::test]
+    async fn windows_drive_paths_and_file_uris_can_list_the_same_files() {
+        let directory = tempdir().unwrap();
+        let native = directory.path().to_string_lossy().into_owned();
+        let forward = native.replace('\\', "/");
+        let uri = url::Url::from_directory_path(directory.path()).unwrap();
+        let file_io = FileIO::from_path(&native).unwrap().build().unwrap();
+        file_io
+            .new_output(&format!("{forward}/data"))
+            .unwrap()
+            .write(Bytes::from_static(b"value"))
+            .await
+            .unwrap();
+
+        for root in [
+            native,
+            forward.clone(),
+            uri.to_string(),
+            format!("file:/{forward}"),
+        ] {
+            let entries = file_io.list_status(&root).await.unwrap();
+            assert_eq!(entries.len(), 1, "{root}");
+            let contents = file_io
+                .new_input(&entries[0].path)
+                .unwrap()
+                .read()
+                .await
+                .unwrap();
+            assert_eq!(contents, Bytes::from_static(b"value"), "{root}");
+        }
     }
 
     #[tokio::test]

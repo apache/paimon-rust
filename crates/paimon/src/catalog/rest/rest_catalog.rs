@@ -51,6 +51,7 @@ const PARTITION_BATCH_SIZE: usize = 1000;
 ///
 /// Corresponds to Python `RESTCatalog` in `pypaimon/catalog/rest/rest_catalog.py`.
 pub struct RESTCatalog {
+    fuse_resolver: Arc<super::FusePathResolver>,
     /// The REST API client (shared with RESTEnv).
     api: Arc<RESTApi>,
     /// Catalog configuration options.
@@ -92,7 +93,9 @@ impl RESTCatalog {
         let local_cache = create_local_cache_with_namespace(&options, &api_options)?;
         let file_io_cache = FileIOCacheContext::from_props(api_options.to_map())?;
 
+        let fuse_resolver = Arc::new(super::FusePathResolver::new(&api_options));
         Ok(Self {
+            fuse_resolver,
             api,
             options: api_options,
             warehouse,
@@ -285,6 +288,7 @@ impl Catalog for RESTCatalog {
             self.data_token_enabled,
             self.local_cache.clone(),
             self.file_io_cache.clone(),
+            self.fuse_resolver.clone(),
         )
         .await
     }
@@ -303,6 +307,7 @@ impl Catalog for RESTCatalog {
                     self.data_token_enabled,
                     self.local_cache.clone(),
                     self.file_io_cache.clone(),
+                    self.fuse_resolver.clone(),
                 )
                 .await
                 .map(crate::catalog::LoadedTable::Object);
@@ -324,6 +329,7 @@ impl Catalog for RESTCatalog {
             self.data_token_enabled,
             self.local_cache.clone(),
             self.file_io_cache.clone(),
+            self.fuse_resolver.clone(),
         )
         .await
         .map(|table| crate::catalog::LoadedTable::Paimon(Box::new(table)))

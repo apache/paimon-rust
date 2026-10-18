@@ -20,6 +20,7 @@
 //! This module provides a REST-based catalog that communicates with
 //! a Paimon REST catalog server for metadata operations.
 
+mod fuse_support;
 mod rest_catalog;
 mod rest_token;
 mod rest_token_file_io;
@@ -27,3 +28,5 @@ mod rest_token_file_io;
 pub use rest_catalog::*;
 pub use rest_token::*;
 pub use rest_token_file_io::*;
+
+pub(crate) use fuse_support::FusePathResolver;

@@ -138,6 +138,15 @@ impl Snapshot {
         self.uuid.as_deref()
     }
 
+    /// Compare a captured read view with authoritative snapshot metadata.
+    /// Log offsets are not used by file reads and are absent from the Python
+    /// snapshot transport; all file references and other metadata must match.
+    pub(crate) fn has_same_read_metadata(&self, other: &Self) -> bool {
+        let mut comparable = self.clone();
+        comparable.log_offsets.clone_from(&other.log_offsets);
+        comparable == *other
+    }
+
     /// Get the version of this snapshot.
     #[inline]
     pub fn version(&self) -> i32 {
@@ -278,6 +287,16 @@ mod tests {
     use pretty_assertions::assert_eq;
     use serde_json;
     use std::env::current_dir;
+
+    #[test]
+    fn captured_read_metadata_ignores_log_offsets_but_not_file_references() {
+        let original: Snapshot = serde_json::from_str(&load_fixture("snapshot-v3")).unwrap();
+        let mut transported = original.clone();
+        transported.log_offsets = Some(HashMap::from([(0, 42)]));
+        assert!(transported.has_same_read_metadata(&original));
+        transported.delta_manifest_list.push_str("-different");
+        assert!(!transported.has_same_read_metadata(&original));
+    }
 
     fn load_fixture(name: &str) -> String {
         let path = current_dir()

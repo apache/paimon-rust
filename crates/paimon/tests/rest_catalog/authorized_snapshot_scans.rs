@@ -383,7 +383,7 @@ async fn stream_authorizes_empty_tables_and_filtered_frames_before_advancing() {
 }
 
 #[tokio::test]
-async fn stream_rejects_schema_or_identity_drift_without_consuming_the_frame() {
+async fn stream_accepts_schema_evolution_but_rejects_identity_replacement() {
     for recreate in [false, true] {
         let g = written("stream_drift", people, vec![people_rows(1..=2)]).await;
         let mut stream = g.table.new_stream_scan().unwrap();
@@ -396,14 +396,16 @@ async fn stream_rejects_schema_or_identity_drift_without_consuming_the_frame() {
                 .server
                 .set_table_schema_id("default", "stream_drift", people(GUARDED), 7);
         }
-        assert_drifted(
-            stream.plan().await.unwrap_err(),
-            if recreate {
-                "now resolves to uuid"
-            } else {
-                "now resolves to schema"
-            },
-        );
-        assert_eq!(stream.checkpoint(), None);
+        if recreate {
+            assert_drifted(stream.plan().await.unwrap_err(), "now resolves to uuid");
+            assert_eq!(stream.checkpoint(), None);
+        } else {
+            let plan = stream.plan().await.unwrap().unwrap();
+            let batches = read_frame(&g.table.new_read_builder(), &plan, false)
+                .await
+                .unwrap();
+            assert_eq!(ids(&batches), [1, 2]);
+            assert_eq!(stream.checkpoint(), Some(2));
+        }
     }
 }

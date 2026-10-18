@@ -1803,6 +1803,17 @@ impl RESTServer {
             )
         });
     }
+    /// Override the database location used to validate FUSE mounts.
+    pub fn set_database_location(&self, name: &str, location: Option<&str>) {
+        self.inner
+            .lock()
+            .unwrap()
+            .databases
+            .get_mut(name)
+            .unwrap()
+            .location = location.map(str::to_string);
+    }
+
     /// Add a no-permission database to the server state.
     pub fn add_no_permission_database(&self, name: &str) {
         let mut s = self.inner.lock().unwrap();
