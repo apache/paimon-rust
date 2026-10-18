@@ -1032,17 +1032,38 @@ def test_filter_decimal_literal_prunes_and_reads():
         assert t.column("id").to_pylist() == [1]
 
 
-def test_filter_decimal_rejects_float_and_rounding():
-    from decimal import Decimal
-
+def test_filter_decimal_rejects_float():
     with tempfile.TemporaryDirectory() as warehouse:
         table = _make_temporal_table(warehouse)
         b = table.new_read_builder()
         with pytest.raises(ValueError):
             b.with_filter({"method": "equal", "field": "dec", "literals": [12.34]})
-        with pytest.raises(ValueError):
-            b.with_filter(
-                {"method": "equal", "field": "dec", "literals": [Decimal("0.005")]})
+
+
+@pytest.mark.parametrize("method,literal,expected_ids", [
+    ("equal", "0.005", []),
+    ("equal", "12.345", []),
+    ("equal", "12.340", [1]),
+    ("lessThan", "12.345", [1]),
+    ("greaterThan", "56.775", [2]),
+    ("lessThan", "100000000.00", [1, 2]),
+    ("greaterThan", "-100000000.00", [1, 2]),
+])
+def test_filter_decimal_preserves_literal_precision_and_scale(
+        method, literal, expected_ids):
+    from decimal import Decimal
+
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_temporal_table(warehouse)
+        builder = table.new_read_builder().with_filter(
+            {"method": method, "field": "dec", "literals": [Decimal(literal)]})
+        filtered_splits = builder.new_scan().plan().splits()
+        all_splits = table.new_read_builder().new_scan().plan().splits()
+        # Check both file-stat pruning and row filtering without file pruning.
+        for splits in (filtered_splits, all_splits):
+            ids = [row["id"] for batch in builder.new_read().read(splits)
+                   for row in batch.to_pylist()]
+            assert sorted(ids) == expected_ids
 
 
 def test_filter_unknown_field_raises():
