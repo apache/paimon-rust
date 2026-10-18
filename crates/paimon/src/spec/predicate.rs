@@ -322,7 +322,13 @@ impl PredicateOperator {
 
 /// The operator [`Predicate::negate`] flips `op` to on a field of `data_type`.
 fn negated_op(op: PredicateOperator, data_type: &DataType) -> Option<PredicateOperator> {
-    let _ = data_type;
+    // `NaN < 1.0` and `NaN >= 1.0` are both false, so a flipped comparison
+    // would drop NaN. `Not` keeps it, as Java's NaN-last ordering does.
+    if matches!(data_type, DataType::Float(_) | DataType::Double(_))
+        && !matches!(op, PredicateOperator::IsNull | PredicateOperator::IsNotNull)
+    {
+        return None;
+    }
     op.negate()
 }
 
@@ -512,7 +518,8 @@ impl Predicate {
     /// - `NOT(NOT(p))` → `p` (double negation elimination)
     /// - `NOT(AlwaysTrue)` → `AlwaysFalse`
     /// - `NOT(AlwaysFalse)` → `AlwaysTrue`
-    /// - Leaves without a negated operator stay wrapped in `Not`.
+    /// - Leaves without a negated operator stay wrapped in `Not`, and so do
+    ///   FLOAT/DOUBLE comparisons, which NaN makes non-complementary.
     pub fn negate(predicate: Predicate) -> Predicate {
         match predicate {
             Predicate::Not(inner) => *inner,
