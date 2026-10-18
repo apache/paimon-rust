@@ -737,11 +737,11 @@ impl PyTableScan {
         Ok(slf)
     }
 
-    fn plan_for_write(&self, py: Python<'_>) -> PyResult<PyPlan> {
+    fn plan_all_files(&self, py: Python<'_>) -> PyResult<PyPlan> {
         py.detach(|| {
             runtime().block_on(async {
                 self.core_scan()?
-                    .plan_for_write()
+                    .plan_all_files()
                     .await
                     .map(PyPlan::from)
                     .map_err(to_py_err)

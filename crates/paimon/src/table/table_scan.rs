@@ -1147,7 +1147,7 @@ impl<'a> TableScan<'a> {
         }
     }
 
-    /// MERGE table sources follow plan_for_write: authorize the whole table,
+    /// MERGE table sources follow plan_all_files: authorize the whole table,
     /// then include L0 only when no row filter or column mask was returned.
     /// Keep this scope internal; public metadata scans must still fail closed.
     pub(super) async fn authorize_merge_source(&self) -> crate::Result<Self> {
@@ -1507,9 +1507,10 @@ impl<'a> TableScan<'a> {
         }
     }
 
-    /// Plan all live files for writer restore/overwrite, including L0.
-    /// A restricted query grant cannot authorize a write-side file inventory.
-    pub async fn plan_for_write(&self) -> crate::Result<Plan> {
+    /// Plan matching files including L0 and all data-evolution column files.
+    /// Existing scan filters and limits still apply. Query authorization must
+    /// be unrestricted, as required by writer restore, overwrite and indexing.
+    pub async fn plan_all_files(&self) -> crate::Result<Plan> {
         let mut source = self.clone();
         if let TableScanKind::Paimon(scan) = &mut source.0 {
             scan.projected_read_field_ids = None;
@@ -1815,7 +1816,7 @@ impl<'a> PaimonTableScan<'a> {
         }
     }
 
-    /// Disable level-0 filtering so all files are visible.
+    /// Disable level-0 filtering and column-file projection pruning.
     ///
     /// Used by non-read paths (overwrite, truncate, writer restore) that need
     /// the complete file set regardless of merge engine or DV settings.

@@ -4861,7 +4861,7 @@ async fn test_query_auth_keeps_a_mask_source_in_another_partial_file() {
             .sum::<usize>(),
         1
     );
-    let write_plan = projected.new_scan().plan_for_write().await.unwrap();
+    let write_plan = projected.new_scan().plan_all_files().await.unwrap();
     assert_eq!(
         write_plan
             .splits()

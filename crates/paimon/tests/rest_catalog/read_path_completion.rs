@@ -176,7 +176,7 @@ async fn write_planning_rejects_rules_and_keeps_all_file_scan_guard() {
         .table
         .new_read_builder()
         .new_scan()
-        .plan_for_write()
+        .plan_all_files()
         .await
         .unwrap()
         .splits()
@@ -186,7 +186,7 @@ async fn write_planning_rejects_rules_and_keeps_all_file_scan_guard() {
         .set_column_auth("default", "write_plan", vec!["id".into()]);
     let mut projected = g.table.new_read_builder();
     projected.with_projection(&["id"]).unwrap();
-    assert_forbidden(projected.new_scan().plan_for_write().await.unwrap_err());
+    assert_forbidden(projected.new_scan().plan_all_files().await.unwrap_err());
     g.ctx
         .server
         .set_column_auth("default", "write_plan", vec!["id".into(), "name".into()]);
@@ -195,7 +195,7 @@ async fn write_planning_rejects_rules_and_keeps_all_file_scan_guard() {
         .table
         .new_read_builder()
         .new_scan()
-        .plan_for_write()
+        .plan_all_files()
         .await
         .is_err());
     assert!(g
