@@ -45,6 +45,11 @@ pub(super) fn normalize_match_key(
     if source.is_numeric() && expected.is_numeric() {
         return numeric::normalize(&decoded, expected);
     }
+    if source == &DataType::LargeUtf8 && expected == &DataType::Utf8 {
+        return super::write_batch_normalize::normalize_large_string_key(
+            decoded.as_any().downcast_ref().unwrap(),
+        );
+    }
     let binary = |t: &DataType| {
         matches!(
             t,

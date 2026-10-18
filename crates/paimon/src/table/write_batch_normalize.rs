@@ -444,27 +444,59 @@ fn normalize_large_string(array: &LargeStringArray) -> Result<ArrayRef> {
 /// Offset adaptation for matching keys; ordinary append type validation remains
 /// separate so this does not broaden accepted write schemas.
 pub(super) fn normalize_large_binary(array: &LargeBinaryArray) -> Result<ArrayRef> {
-    let source = array.value_offsets();
-    if array.null_count() != 0 && source[source.len() - 1] - source[0] > i64::from(i32::MAX) {
+    let (offsets, values) =
+        normalize_large_key_bytes(array.value_offsets(), array.values(), array.nulls())?;
+    BinaryArray::try_new(offsets, values, array.nulls().cloned())
+        .map(|array| Arc::new(array) as ArrayRef)
+        .map_err(normalization_error)
+}
+
+/// Matching reads logical string values, including NULLs with hidden storage.
+/// Ordinary write normalization keeps its existing offset-limit validation.
+pub(super) fn normalize_large_string_key(array: &LargeStringArray) -> Result<ArrayRef> {
+    let (offsets, values) =
+        normalize_large_key_bytes(array.value_offsets(), array.values(), array.nulls())?;
+    StringArray::try_new(offsets, values, array.nulls().cloned())
+        .map(|array| Arc::new(array) as ArrayRef)
+        .map_err(normalization_error)
+}
+
+fn normalize_large_key_bytes(
+    source: &[i64],
+    values: &Buffer,
+    nulls: Option<&NullBuffer>,
+) -> Result<(OffsetBuffer<i32>, Buffer)> {
+    if let Some(nulls) = nulls.filter(|nulls| {
+        nulls.null_count() != 0 && source[source.len() - 1] - source[0] > i64::from(i32::MAX)
+    }) {
         // NULL slots can retain arbitrarily large, unobservable byte ranges.
         // Compact only when they prevent narrowing; ordinary arrays continue
         // to share the visible value buffer below.
-        let visible_len = array
-            .iter()
-            .flatten()
-            .try_fold(0_usize, |len, value| len.checked_add(value.len()));
-        if visible_len.is_none_or(|len| len > i32::MAX as usize) {
+        let visible_len = source
+            .windows(2)
+            .enumerate()
+            .filter(|(row, _)| nulls.is_valid(*row))
+            .try_fold(0_i64, |len, (_, range)| {
+                len.checked_add(range[1] - range[0])
+            });
+        if visible_len.is_none_or(|len| len > i64::from(i32::MAX)) {
             return Err(Error::DataInvalid {
                 message: "Arrow byte range exceeds 32-bit offsets".into(),
                 source: None,
             });
         }
-        return Ok(Arc::new(BinaryArray::from_iter(array.iter())));
+        let mut compacted = Vec::with_capacity(visible_len.unwrap() as usize);
+        let mut offsets = Vec::with_capacity(source.len());
+        offsets.push(0);
+        for (row, range) in source.windows(2).enumerate() {
+            if nulls.is_valid(row) {
+                compacted.extend_from_slice(&values[range[0] as usize..range[1] as usize]);
+            }
+            offsets.push(compacted.len() as i32);
+        }
+        return Ok((OffsetBuffer::new(offsets.into()), Buffer::from(compacted)));
     }
-    let (offsets, values) = narrow_byte_range(array.value_offsets(), array.values())?;
-    BinaryArray::try_new(offsets, values, array.nulls().cloned())
-        .map(|array| Arc::new(array) as ArrayRef)
-        .map_err(normalization_error)
+    narrow_byte_range(source, values)
 }
 
 fn narrow_byte_range(source: &[i64], values: &Buffer) -> Result<(OffsetBuffer<i32>, Buffer)> {
@@ -652,11 +684,8 @@ mod tests {
             let input: ArrayRef = Arc::new(LargeBinaryArray::new(
                 OffsetBuffer::new(offsets.into()),
                 text.values().clone(),
-                Some(NullBuffer::from(if mixed {
-                    vec![false, true]
-                } else {
-                    vec![false]
-                })),
+                // Retain a nonzero validity-bit offset through compaction.
+                Some(NullBuffer::from(vec![true, false, true]).slice(1, if mixed { 2 } else { 1 })),
             ));
             let output =
                 crate::table::key_normalization::normalize_match_key(&input, &DataType::Binary)
@@ -667,6 +696,29 @@ mod tests {
                 vec![None]
             };
             assert_eq!(output.to_data(), BinaryArray::from(expected).to_data());
+            let bytes = input.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
+            // SAFETY: the shared mapping contains valid UTF-8. Avoid scanning
+            // the hidden 2 GiB NULL range merely to construct the test input.
+            let strings: ArrayRef = Arc::new(unsafe {
+                LargeStringArray::new_unchecked(
+                    bytes.offsets().clone(),
+                    bytes.values().clone(),
+                    bytes.nulls().cloned(),
+                )
+            });
+            let output =
+                crate::table::key_normalization::normalize_match_key(&strings, &DataType::Utf8)
+                    .unwrap();
+            assert_eq!(
+                output.to_data(),
+                StringArray::from(if mixed {
+                    vec![None, Some("abc")]
+                } else {
+                    vec![None]
+                })
+                .to_data(),
+            );
+            assert!(normalize_write_array(&strings, &DataType::Utf8).is_err());
         }
         let visible_overflow: ArrayRef = Arc::new(LargeBinaryArray::new(
             OffsetBuffer::new(vec![0, start + 3, start + 3].into()),
@@ -676,6 +728,23 @@ mod tests {
         assert!(crate::table::key_normalization::normalize_match_key(
             &visible_overflow,
             &DataType::Binary,
+        )
+        .is_err());
+        let bytes = visible_overflow
+            .as_any()
+            .downcast_ref::<LargeBinaryArray>()
+            .unwrap();
+        // SAFETY: as above, both the zero-filled prefix and tail are UTF-8.
+        let visible_string_overflow: ArrayRef = Arc::new(unsafe {
+            LargeStringArray::new_unchecked(
+                bytes.offsets().clone(),
+                bytes.values().clone(),
+                bytes.nulls().cloned(),
+            )
+        });
+        assert!(crate::table::key_normalization::normalize_match_key(
+            &visible_string_overflow,
+            &DataType::Utf8,
         )
         .is_err());
         // A visible range larger than i32::MAX still cannot be represented.

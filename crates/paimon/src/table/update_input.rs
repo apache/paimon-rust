@@ -1445,6 +1445,9 @@ fn cast_primitive(array: &ArrayRef, target: &DataType, mode: CastMode) -> crate:
     if source.is_decimal() && matches!(target, DataType::Decimal128(..)) {
         return decimal::cast_exact_decimal(array, target);
     }
+    if source.is_decimal() && target.is_integer() {
+        return decimal::cast_to_integer(array, target, mode == CastMode::Constructor);
+    }
     if source.is_decimal() && matches!(target, DataType::Float32 | DataType::Float64) {
         return decimal::cast_to_floating(array, target);
     }
