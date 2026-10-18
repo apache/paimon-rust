@@ -4282,7 +4282,7 @@ async fn written(
     let mut fs_options = Options::new();
     fs_options.set(
         CatalogOptions::WAREHOUSE,
-        format!("file://{}", tmp.path().display()),
+        tmp.path().to_string_lossy().replace('\\', "/"),
     );
     let fs_catalog = FileSystemCatalog::new(fs_options).unwrap();
     fs_catalog

@@ -255,10 +255,7 @@ async fn fuse_file_io_keeps_rest_identity_and_original_metadata_paths() {
     for mode in ["pvfs", "raw"] {
         let g = written("mount_read", people, vec![people_rows(1..=3)]).await;
         let snapshot = g.table.snapshot_manager().get_snapshot(1).await.unwrap();
-        let local = url::Url::parse(g.table.location())
-            .unwrap()
-            .to_file_path()
-            .unwrap();
+        let local = std::path::PathBuf::from(g.table.location());
         let root = g._tmp.path().join("fuse mount%");
         let mounted = match mode {
             "pvfs" => root.join("default/mount_read"),
@@ -538,10 +535,7 @@ async fn authorized_pinned_latest_can_use_rest_when_tag_metadata_is_unavailable(
         .server
         .set_table_external("default", "pinned_rest", false);
     let snapshot = g.table.snapshot_manager().get_snapshot(1).await.unwrap();
-    let source = url::Url::parse(g.table.location())
-        .unwrap()
-        .to_file_path()
-        .unwrap();
+    let source = std::path::PathBuf::from(g.table.location());
     let root = tempfile::tempdir().unwrap();
     let mounted = root.path().join("default/pinned_rest");
     for directory in ["manifest", "bucket-0"] {
@@ -849,15 +843,17 @@ async fn transported_optional_bucket_layout_uses_canonical_snapshot_paths() {
     for split in &mut splits {
         let mut json = serde_json::to_value(&split).unwrap();
         json["total_buckets"] = serde_json::Value::Null;
-        json["bucket_path"] =
-            serde_json::json!(split.bucket_path().strip_prefix("file://").unwrap());
+        if split.bucket_path().starts_with('/') {
+            json["bucket_path"] = serde_json::json!(format!("file://{}", split.bucket_path()));
+        }
         *split = serde_json::from_value(json).unwrap();
     }
     let reader = builder.new_read().unwrap();
     let restored = reader.authorize_splits(&splits).await.unwrap();
     assert!(restored
         .iter()
-        .all(|split| split.bucket_path().starts_with("file://")));
+        .zip(plan.splits())
+        .all(|(restored, original)| { restored.bucket_path() == original.bucket_path() }));
     assert_eq!(
         ids(&reader
             .to_arrow(&restored)
