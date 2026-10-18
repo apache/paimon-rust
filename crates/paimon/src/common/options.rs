@@ -99,6 +99,20 @@ impl CatalogOptions {
     pub const BLOB_INDEX_CACHE_MAX_SIZE: &'static str = "cache.blob-index.max-size";
 }
 
+/// FUSE mount options shared with PyPaimon's REST catalog.
+pub struct FuseOptions;
+
+impl FuseOptions {
+    /// Enable reads and writes through a local FUSE mount (default: false).
+    pub const ENABLED: &'static str = "fuse.enabled";
+    /// Mounted local root directory.
+    pub const ROOT: &'static str = "fuse.root";
+    /// Path layout: pvfs (database/table names, default) or raw (URI path).
+    pub const MODE: &'static str = "fuse.mode";
+    /// Mount validation: strict (default), warn (fallback), or none.
+    pub const VALIDATION_MODE: &'static str = "fuse.validation-mode";
+}
+
 /// Configuration options container.
 ///
 /// This is a simple key-value store for catalog configuration.

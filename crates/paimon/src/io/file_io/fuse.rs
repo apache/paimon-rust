@@ -15,19 +15,19 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Route an original URI prefix through an already resolved local mount.
+//! Access original table URIs through a resolved FUSE mount.
 
 use super::*;
 
 #[derive(Debug)]
-struct PathMapping {
+struct FuseFileIO {
     original: String,
     mounted: Operator,
     fallback: FileIO,
 }
 
 #[async_trait::async_trait]
-impl FileIOProvider for PathMapping {
+impl FileIOProvider for FuseFileIO {
     async fn create(&self, path: &str) -> crate::Result<(Operator, String)> {
         if path == self.original {
             return Ok((self.mounted.clone(), String::new()));
@@ -47,15 +47,18 @@ impl FileIO {
     /// metadata, listings and REST requests. Only component-boundary matches
     /// are translated; unrelated paths retain their existing storage provider.
     /// The caller resolves and validates the mount before supplying this map.
-    pub fn with_path_mapping(self, original: &str, local: &str) -> crate::Result<Self> {
+    pub(crate) fn with_fuse(self, original: &str, local: &str) -> crate::Result<Self> {
         let original = original.trim_end_matches('/');
         if original.is_empty() || !std::path::Path::new(local).is_absolute() {
-            return Err(Error::ConfigInvalid { message: "Path mapping requires a nonempty original prefix and an absolute local directory".into() });
+            return Err(Error::ConfigInvalid {
+                message: "FUSE requires a nonempty original prefix and an absolute local directory"
+                    .into(),
+            });
         }
         let mut cfg = opendal_service_fs::FsConfig::default();
         cfg.root = Some(local.into());
         let mounted = Operator::from_config(cfg)?;
-        let provider = Arc::new(PathMapping {
+        let provider = Arc::new(FuseFileIO {
             original: original.into(),
             mounted,
             fallback: self.clone(),
@@ -78,7 +81,7 @@ mod tests {
             .await
             .unwrap();
         let io = base
-            .with_path_mapping("memory:/table/", root.path().to_str().unwrap())
+            .with_fuse("memory:/table/", root.path().to_str().unwrap())
             .unwrap();
         io.new_output("memory:/table/data/a")
             .unwrap()

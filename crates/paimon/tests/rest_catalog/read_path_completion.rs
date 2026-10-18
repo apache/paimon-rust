@@ -251,35 +251,189 @@ async fn historical_schema_rules_use_null_for_new_columns_and_reject_renames() {
 }
 
 #[tokio::test]
-async fn mounted_file_io_keeps_rest_identity_and_original_metadata_paths() {
-    let g = written("mount_read", people, vec![people_rows(1..=3)]).await;
-    let local = url::Url::parse(g.table.location())
-        .unwrap()
-        .to_file_path()
-        .unwrap();
-    let remote = "memory:/mounted/table";
+async fn fuse_file_io_keeps_rest_identity_and_original_metadata_paths() {
+    for mode in ["pvfs", "raw"] {
+        let g = written("mount_read", people, vec![people_rows(1..=3)]).await;
+        let snapshot = g.table.snapshot_manager().get_snapshot(1).await.unwrap();
+        let local = url::Url::parse(g.table.location())
+            .unwrap()
+            .to_file_path()
+            .unwrap();
+        let root = g._tmp.path().join("fuse mount%");
+        let mounted = match mode {
+            "pvfs" => root.join("default/mount_read"),
+            _ => root.join("warehouse/default/mount_read"),
+        };
+        std::fs::create_dir_all(mounted.parent().unwrap()).unwrap();
+        std::fs::rename(local, &mounted).unwrap();
+        let remote = "memory:/warehouse/default/mount_read";
+        g.ctx
+            .server
+            .add_table_with_schema("default", "mount_read", people(GUARDED), remote);
+        g.ctx
+            .server
+            .set_table_external("default", "mount_read", false);
+        let mut options = g.ctx.catalog.options().clone();
+        options.set("fuse.enabled", "true");
+        let root_option = if mode == "raw" {
+            url::Url::from_file_path(&root).unwrap().to_string()
+        } else {
+            root.to_str().unwrap().to_string()
+        };
+        options.set("fuse.root", root_option);
+        options.set("fuse.mode", mode);
+        options.set("fuse.validation-mode", "none");
+        // There is no token endpoint: any accidental token request fails.
+        options.set("data-token.enabled", "true");
+        let catalog = RESTCatalog::new(options.clone(), false).await.unwrap();
+        let response = catalog
+            .get_table(&g.identifier)
+            .await
+            .unwrap()
+            .rest_env()
+            .unwrap()
+            .api()
+            .get_table(&g.identifier)
+            .await
+            .unwrap();
+        let tables = [
+            catalog.get_table(&g.identifier).await.unwrap(),
+            Table::from_rest_response(g.identifier.clone(), response, options)
+                .await
+                .unwrap(),
+        ];
+        g.set_rules(&[int_leaf(0, "id", "GREATER_THAN", 1)], &[]);
+        for table in tables {
+            // A Python-resolved snapshot must still read all files through FUSE.
+            let table = table.copy_with_pinned_snapshot(Some(&snapshot));
+            assert_eq!(table.location(), remote);
+            assert_eq!(table.rest_env().unwrap().identifier(), &g.identifier);
+            assert_eq!(
+                ids(&read_all(&table.new_read_builder()).await.unwrap()),
+                [2, 3]
+            );
+            table
+                .file_io()
+                .new_output(&format!("{remote}/sidecar"))
+                .unwrap()
+                .write(bytes::Bytes::from_static(b"mounted write"))
+                .await
+                .unwrap();
+            assert_eq!(
+                std::fs::read(mounted.join("sidecar")).unwrap(),
+                b"mounted write"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn fuse_validation_modes_control_mount_fallback() {
+    for mode in ["strict", "warn", "none"] {
+        let g = written("fuse_validation", people, vec![people_rows(1..=2)]).await;
+        g.ctx
+            .server
+            .set_table_external("default", "fuse_validation", false);
+        g.ctx
+            .server
+            .set_database_location("default", Some("memory:/warehouse/default"));
+        let mut options = g.ctx.catalog.options().clone();
+        options.set("fuse.enabled", "true");
+        options.set("fuse.root", g._tmp.path().join("missing").to_str().unwrap());
+        options.set("fuse.validation-mode", mode);
+        let catalog = RESTCatalog::new(options, false).await.unwrap();
+        match mode {
+            "strict" => assert!(catalog
+                .get_table(&g.identifier)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("FUSE local path validation failed")),
+            "warn" => {
+                let table = catalog.get_table(&g.identifier).await.unwrap();
+                assert_eq!(
+                    ids(&read_all(&table.new_read_builder()).await.unwrap()),
+                    [1, 2]
+                );
+                // A failed validation is cached; do not retry it on every table.
+                g.ctx.server.add_no_permission_database("default");
+                catalog.get_table(&g.identifier).await.unwrap();
+                table
+                    .rest_env()
+                    .unwrap()
+                    .get_table(&g.identifier)
+                    .await
+                    .unwrap();
+            }
+            _ => {
+                g.ctx.server.add_no_permission_database("default");
+                catalog.get_table(&g.identifier).await.unwrap();
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn fuse_validation_caches_success_but_never_swallows_rest_errors() {
+    let g = written("fuse_validation", people, vec![]).await;
     g.ctx
         .server
-        .add_table_with_schema("default", "mount_read", people(GUARDED), remote);
-    let table = g.ctx.catalog.get_table(&g.identifier).await.unwrap();
-    let table = table.copy_with_file_io(
-        table
-            .file_io()
-            .clone()
-            .with_path_mapping(remote, local.to_str().unwrap())
-            .unwrap(),
+        .set_table_external("default", "fuse_validation", false);
+    g.ctx
+        .server
+        .set_database_location("default", Some("memory:/warehouse/default"));
+    let root = g._tmp.path().join("fuse mount%");
+    std::fs::create_dir_all(root.join("default")).unwrap();
+    let mut options = g.ctx.catalog.options().clone();
+    options.set("fuse.enabled", "true");
+    options.set(
+        "fuse.root",
+        url::Url::from_file_path(&root).unwrap().to_string(),
     );
-    g.set_rules(&[int_leaf(0, "id", "GREATER_THAN", 1)], &[]);
-    // REST snapshot lookup has no mounted filesystem; use the captured snapshot
-    // from the same table's mount, just as a Python-resolved read view does.
-    let snapshot = g.table.snapshot_manager().get_snapshot(1).await.unwrap();
-    let table = table.copy_with_pinned_snapshot(Some(&snapshot));
-    assert_eq!(table.location(), remote);
-    assert_eq!(table.rest_env().unwrap().identifier(), &g.identifier);
-    assert_eq!(
-        ids(&read_all(&table.new_read_builder()).await.unwrap()),
-        [2, 3]
-    );
+    let catalog = RESTCatalog::new(options.clone(), false).await.unwrap();
+    let table = catalog.get_table(&g.identifier).await.unwrap();
+    g.ctx.server.add_no_permission_database("default");
+    catalog.get_table(&g.identifier).await.unwrap();
+    table
+        .rest_env()
+        .unwrap()
+        .get_table(&g.identifier)
+        .await
+        .unwrap();
+    for mode in ["strict", "warn"] {
+        options.set("fuse.validation-mode", mode);
+        let fresh = RESTCatalog::new(options.clone(), false).await.unwrap();
+        let error = fresh.get_table(&g.identifier).await.unwrap_err();
+        assert!(matches!(error, paimon::Error::RestApi { .. }));
+    }
+}
+
+#[tokio::test]
+async fn external_tables_ignore_fuse_and_invalid_fuse_options_fail_for_internal_tables() {
+    let g = written("external_fuse", people, vec![]).await;
+    let mut options = g.ctx.catalog.options().clone();
+    options.set("fuse.enabled", "true");
+    let catalog = RESTCatalog::new(options.clone(), false).await.unwrap();
+    // The fixture is external. Its normal FileIO never resolves a FUSE mount.
+    catalog.get_table(&g.identifier).await.unwrap();
+    g.ctx
+        .server
+        .set_table_external("default", "external_fuse", false);
+    assert!(catalog
+        .get_table(&g.identifier)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("fuse.root"));
+    options.set("fuse.root", g._tmp.path().to_str().unwrap());
+    options.set("fuse.validation-mode", "invalid");
+    let catalog = RESTCatalog::new(options, false).await.unwrap();
+    assert!(catalog
+        .get_table(&g.identifier)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("fuse.validation-mode"));
 }
 
 pub(super) fn transport(plan: &paimon::table::Plan) -> Vec<DataSplit> {

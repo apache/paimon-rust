@@ -90,7 +90,7 @@ impl PyTable {
     /// Reuse the matching REST table response and merged catalog options.
     /// Skips config/get-table requests, preserving REST snapshots and token refresh.
     #[staticmethod]
-    #[pyo3(signature = (response_json, *, database, table, rest_options, initial_data_token=None, path_mapping=None))]
+    #[pyo3(signature = (response_json, *, database, table, rest_options, initial_data_token=None))]
     fn from_rest_response(
         py: Python<'_>,
         response_json: &str,
@@ -98,7 +98,6 @@ impl PyTable {
         table: &str,
         rest_options: HashMap<String, String>,
         initial_data_token: Option<(HashMap<String, String>, i64)>,
-        path_mapping: Option<(String, String)>,
     ) -> PyResult<Self> {
         let response: paimon::api::GetTableResponse =
             serde_json::from_str(response_json).map_err(|err| {
@@ -110,28 +109,12 @@ impl PyTable {
             initial_data_token.map(|(token, expires_at)| RESTToken::new(token, expires_at));
         let table = py
             .detach(|| {
-                runtime().block_on(async {
-                    if let Some((original, local)) = path_mapping {
-                        let file_io = FileIO::from_path(&local)?
-                            .build()?
-                            .with_path_mapping(&original, &local)?;
-                        paimon::table::Table::from_rest_response_with_file_io(
-                            identifier,
-                            response,
-                            Options::from_map(rest_options),
-                            file_io,
-                        )
-                        .await
-                    } else {
-                        paimon::table::Table::from_rest_response_with_token(
-                            identifier,
-                            response,
-                            Options::from_map(rest_options),
-                            initial_token,
-                        )
-                        .await
-                    }
-                })
+                runtime().block_on(paimon::table::Table::from_rest_response_with_token(
+                    identifier,
+                    response,
+                    Options::from_map(rest_options),
+                    initial_token,
+                ))
             })
             .map_err(to_py_err)?;
         Ok(Self::new(Arc::new(table)))
@@ -157,7 +140,6 @@ impl PyTable {
             table,
             rest_options,
             Some((data_token, expires_at_millis)),
-            None,
         )
     }
 
@@ -175,26 +157,10 @@ impl PyTable {
     }
 
     /// Java Table.copy: apply dynamic options and resolve the selected schema.
-    #[pyo3(signature = (options, *, path_mapping=None))]
-    fn copy(
-        &self,
-        py: Python<'_>,
-        options: HashMap<String, String>,
-        path_mapping: Option<(String, String)>,
-    ) -> PyResult<Self> {
-        let table = if let Some((original, local)) = path_mapping {
-            let io = self
-                .inner
-                .file_io()
-                .clone()
-                .with_path_mapping(&original, &local)
-                .map_err(to_py_err)?;
-            self.inner.copy_with_file_io(io)
-        } else {
-            self.inner.as_ref().clone()
-        };
+    #[pyo3(signature = (options))]
+    fn copy(&self, py: Python<'_>, options: HashMap<String, String>) -> PyResult<Self> {
         let table = py
-            .detach(|| runtime().block_on(table.copy_with_time_travel_strict(options)))
+            .detach(|| runtime().block_on(self.inner.copy_with_time_travel_strict(options)))
             .map_err(to_py_err)?;
         Ok(Self::new(Arc::new(table)))
     }

@@ -668,21 +668,6 @@ impl Table {
         }
     }
 
-    /// Copy this resolved table with an application-provided FileIO. Table
-    /// identity, branch, REST authorization and the captured read view persist.
-    pub fn copy_with_file_io(&self, file_io: FileIO) -> Self {
-        let manager = SchemaManager::new(file_io.clone(), self.location.clone());
-        Self {
-            schema_manager: if self.is_main_branch() {
-                manager
-            } else {
-                manager.with_branch(&self.branch)
-            },
-            file_io,
-            ..self.clone()
-        }
-    }
-
     /// Replace the complete schema with one already resolved by an external caller.
     ///
     /// Like `from_resolved_schema`, this preserves field IDs and options exactly

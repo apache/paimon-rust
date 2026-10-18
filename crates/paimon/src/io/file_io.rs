@@ -44,7 +44,7 @@ use super::Storage;
 mod provider_tests;
 
 #[cfg(feature = "storage-fs")]
-mod path_mapping;
+mod fuse;
 
 /// An externally managed block cache used by [`FileIO`].
 ///
