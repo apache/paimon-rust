@@ -527,9 +527,10 @@ impl<'a> CoreOptions<'a> {
     /// they surface as `Error::Unsupported` (mapped to `NotImplementedError` at
     /// the Python boundary). Explicit `scan.mode=from-snapshot` /
     /// `from-timestamp` are the modes Java's `CoreOptions.setDefaultValues()`
-    /// writes next to the corresponding selector, so they are accepted when
-    /// that selector is present (the batch-read semantics are identical to
-    /// leaving the mode at `default`); an explicit mode without its selector
+    /// writes next to the corresponding selector. `latest` / `latest-full`
+    /// read the latest full state in batch mode; `from-snapshot-full` reads
+    /// the selected full snapshot, as Java's batch starting scanners do.
+    /// An explicit point-in-time mode without its selector
     /// is malformed input (`Error::DataInvalid`), mirroring Java's
     /// `SchemaValidation`. Incremental timestamp windows reuse the batch
     /// Delta/Changelog scanner; snapshot/tag ranges remain unimplemented here.
@@ -564,6 +565,15 @@ impl<'a> CoreOptions<'a> {
             }
         }
         if let Some(mode) = self.options.get(SCAN_MODE_OPTION) {
+            if self.is_format_table()
+                && ["latest", "latest-full", "from-snapshot-full"]
+                    .iter()
+                    .any(|value| mode.eq_ignore_ascii_case(value))
+            {
+                return Err(crate::Error::Unsupported {
+                    message: "Full-snapshot startup modes require a Paimon table".into(),
+                });
+            }
             if incremental
                 && !mode.eq_ignore_ascii_case("default")
                 && !mode.eq_ignore_ascii_case("incremental")
@@ -577,6 +587,10 @@ impl<'a> CoreOptions<'a> {
             }
             let selector_keys: &[&str] = if mode.eq_ignore_ascii_case("default") {
                 return Ok(());
+            } else if mode.eq_ignore_ascii_case("latest")
+                || mode.eq_ignore_ascii_case("latest-full")
+            {
+                &[]
             } else if mode.eq_ignore_ascii_case("incremental") {
                 if incremental {
                     return Ok(());
@@ -594,6 +608,8 @@ impl<'a> CoreOptions<'a> {
                 ]
             } else if mode.eq_ignore_ascii_case("from-timestamp") {
                 &[SCAN_TIMESTAMP_MILLIS_OPTION, SCAN_TIMESTAMP_OPTION]
+            } else if mode.eq_ignore_ascii_case("from-snapshot-full") {
+                &[SCAN_SNAPSHOT_ID_OPTION]
             } else {
                 return Err(crate::Error::Unsupported {
                     message: format!(
@@ -601,15 +617,28 @@ impl<'a> CoreOptions<'a> {
                     ),
                 });
             };
-            if !selector_keys
-                .iter()
-                .any(|key| self.options.contains_key(*key))
+            if !selector_keys.is_empty()
+                && !selector_keys
+                    .iter()
+                    .any(|key| self.options.contains_key(*key))
             {
                 return Err(crate::Error::DataInvalid {
                     message: format!(
                         "Scan option 'scan.mode={mode}' requires one of {} to be set",
                         selector_keys.join(", ")
                     ),
+                    source: None,
+                });
+            }
+            if self
+                .configured_time_travel_selectors()
+                .iter()
+                .any(|key| !selector_keys.contains(key))
+                || self.options.contains_key("scan.file-creation-time-millis")
+                || self.options.contains_key("scan.creation-time-millis")
+            {
+                return Err(crate::Error::DataInvalid {
+                    message: format!("scan.mode={mode} cannot be used with the configured point-in-time scan options"),
                     source: None,
                 });
             }
@@ -3947,13 +3976,89 @@ mod tests {
         let ok = HashMap::from([("scan.mode".to_string(), "default".to_string())]);
         assert!(CoreOptions::new(&ok).validate_scan_options().is_ok());
         // unimplemented modes Unsupported
-        for mode in ["compacted-full", "latest", "latest-full"] {
+        for mode in ["compacted-full", "latest-delta", "unknown"] {
             let bad = HashMap::from([("scan.mode".to_string(), mode.to_string())]);
             let err = CoreOptions::new(&bad).validate_scan_options().unwrap_err();
             assert!(
                 matches!(err, crate::Error::Unsupported { message } if message.contains("scan.mode")),
                 "scan.mode={mode} should be Unsupported"
             );
+        }
+    }
+
+    #[test]
+    fn test_full_startup_modes_validate_batch_options() {
+        for mode in ["latest", "latest-full", "LATEST-FULL"] {
+            let options = HashMap::from([("scan.mode".into(), mode.into())]);
+            assert!(
+                CoreOptions::new(&options).validate_scan_options().is_ok(),
+                "{mode}"
+            );
+        }
+        let options = HashMap::from([
+            ("scan.mode".into(), "from-snapshot-full".into()),
+            ("scan.snapshot-id".into(), "1".into()),
+        ]);
+        assert!(CoreOptions::new(&options).validate_scan_options().is_ok());
+    }
+
+    #[test]
+    fn test_full_startup_modes_reject_conflicting_selectors() {
+        for mode in ["latest", "latest-full", "from-snapshot-full"] {
+            for key in [
+                "scan.version",
+                "scan.snapshot-id",
+                "scan.tag-name",
+                "scan.watermark",
+                "scan.timestamp",
+                "scan.timestamp-millis",
+                "scan.file-creation-time-millis",
+                "scan.creation-time-millis",
+                "incremental-between-timestamp",
+            ] {
+                if mode == "from-snapshot-full" && key == "scan.snapshot-id" {
+                    continue;
+                }
+                let mut options =
+                    HashMap::from([("scan.mode".into(), mode.into()), (key.into(), "1".into())]);
+                if mode == "from-snapshot-full" {
+                    options.insert("scan.snapshot-id".into(), "1".into());
+                }
+                assert!(
+                    matches!(
+                        CoreOptions::new(&options).validate_scan_options(),
+                        Err(crate::Error::DataInvalid { .. })
+                    ),
+                    "{mode} / {key}"
+                );
+            }
+        }
+        for selector in [None, Some("scan.tag-name"), Some("scan.version")] {
+            let mut options = HashMap::from([("scan.mode".into(), "from-snapshot-full".into())]);
+            if let Some(selector) = selector {
+                options.insert(selector.into(), "1".into());
+            }
+            assert!(matches!(
+                CoreOptions::new(&options).validate_scan_options(),
+                Err(crate::Error::DataInvalid { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn test_full_startup_modes_do_not_enable_format_table_snapshots() {
+        for mode in ["latest", "latest-full", "from-snapshot-full"] {
+            let mut options = HashMap::from([
+                ("type".into(), "format-table".into()),
+                ("scan.mode".into(), mode.into()),
+            ]);
+            if mode == "from-snapshot-full" {
+                options.insert("scan.snapshot-id".into(), "1".into());
+            }
+            assert!(matches!(
+                CoreOptions::new(&options).validate_scan_options(),
+                Err(crate::Error::Unsupported { .. })
+            ));
         }
     }
 
