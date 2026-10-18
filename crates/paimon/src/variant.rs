@@ -3812,11 +3812,10 @@ mod tests {
             for path in ["$.object.a", "$.object.extra", "$.items[0]", "$.items[1]"] {
                 let expected = extract_shredded_path(&shredded, &schema, path)
                     .unwrap()
-                    .map(|selected| {
+                    .and_then(|selected| {
                         cast_variant_to_shredded_value(selected.as_ref().unwrap(), &target, false)
                             .unwrap()
-                    })
-                    .flatten();
+                    });
                 let actual = extract_shredded_path_cast(
                     &shredded,
                     &schema,
@@ -3906,7 +3905,7 @@ mod tests {
         let schema = build_variant_schema(&physical).unwrap();
         let fields = (0..5_342)
             .map(|i| {
-                if i < 27 || i >= 200 {
+                if !(27..200).contains(&i) {
                     format!(r#""f{i}":0"#)
                 } else {
                     format!(r#""f{i}":{i}.5"#)
@@ -3933,10 +3932,9 @@ mod tests {
         for path in &paths {
             let old = extract_shredded_path(&shredded, &schema, path)
                 .unwrap()
-                .map(|value| {
+                .and_then(|value| {
                     cast_variant_to_shredded_value(value.as_ref().unwrap(), &target, false).unwrap()
-                })
-                .flatten();
+                });
             let mut metadata = VariantMetadataValidation::new(variant.metadata(), false);
             let new =
                 extract_shredded_path_cast(&shredded, &schema, &mut metadata, path, &target, false)
@@ -3965,7 +3963,7 @@ mod tests {
                         } else {
                             extract_shredded_path(&shredded, &schema, path)
                                 .unwrap()
-                                .map(|value| {
+                                .and_then(|value| {
                                     cast_variant_to_shredded_value(
                                         value.as_ref().unwrap(),
                                         &target,
@@ -3973,7 +3971,6 @@ mod tests {
                                     )
                                     .unwrap()
                                 })
-                                .flatten()
                         };
                         black_box(value);
                     }

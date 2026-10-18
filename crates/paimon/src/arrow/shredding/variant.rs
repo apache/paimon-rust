@@ -941,6 +941,15 @@ fn assemble_mixed_shredded_projection(
     if fallback_indices.is_empty() || fallback_indices.len() == fields.len() {
         return Ok(None);
     }
+    // The row-wise path must validate metadata for strict typed fields even
+    // when every residual field uses try casts.
+    if metadata.iter().any(|field| field.fail_on_error())
+        && fallback_indices
+            .iter()
+            .all(|&index| !metadata[index].fail_on_error())
+    {
+        return Ok(None);
+    }
 
     let fallback_fields = fallback_indices
         .iter()
@@ -2844,6 +2853,61 @@ mod tests {
             assemble_variant_extraction_array(&with_dictionary_metadata(&input), &row_type)
                 .unwrap();
         assert_eq!(actual.as_ref(), expected.as_ref());
+    }
+
+    #[test]
+    fn mixed_shredded_projection_keeps_strict_metadata_error() {
+        let input = shredded_for_test(
+            &[Some(r#"{"a":0,"b":2}"#)],
+            r#"[{"name":"a","type":"DOUBLE"},{"name":"b","type":"BIGINT"}]"#,
+        );
+        let metadata_index = input
+            .fields()
+            .iter()
+            .position(|field| field.name() == VARIANT_METADATA_FIELD_NAME)
+            .unwrap();
+        let mut columns = input.columns().to_vec();
+        columns[metadata_index] = Arc::new(BinaryArray::from(vec![None::<&[u8]>]));
+        let mut fields = input
+            .fields()
+            .iter()
+            .map(|field| field.as_ref().clone())
+            .collect::<Vec<_>>();
+        fields[metadata_index] = fields[metadata_index].clone().with_nullable(true);
+        let missing_metadata =
+            StructArray::try_new(fields.into(), columns, input.nulls().cloned()).unwrap();
+        let row_type = variant_extraction_row(
+            true,
+            vec![
+                (
+                    DataType::Float(FloatType::new()),
+                    "$.b".to_string(),
+                    true,
+                    "UTC".to_string(),
+                ),
+                (
+                    DataType::Float(FloatType::new()),
+                    "$.a".to_string(),
+                    false,
+                    "UTC".to_string(),
+                ),
+            ],
+        )
+        .unwrap();
+        let metadata = row_type
+            .fields()
+            .iter()
+            .map(|field| parse_variant_metadata(field.description().unwrap()).unwrap())
+            .collect::<Vec<_>>();
+        assert!(typed_shredded_leaf(&missing_metadata, "$.b").is_some());
+        assert!(assemble_mixed_shredded_projection(
+            &missing_metadata,
+            row_type.fields(),
+            &metadata
+        )
+        .unwrap()
+        .is_none());
+        assert!(assemble_variant_extraction_array(&missing_metadata, &row_type).is_err());
     }
 
     #[test]
