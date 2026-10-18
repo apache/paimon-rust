@@ -29,7 +29,9 @@ import (
 )
 
 // PostponeFixedBucketWriteBuilder creates fixed-bucket writers for bucket=-2
-// tables. A resolved bucket plan must be supplied before NewWrite.
+// tables. Without an explicit plan, core reuses known layouts and applies the
+// configured default or infers counts for new partitions across this writer's
+// input batches. Distributed writers should share one resolved bucket plan.
 type PostponeFixedBucketWriteBuilder struct {
 	ctx       context.Context
 	lib       *libRef
@@ -151,7 +153,7 @@ func (wb *PostponeFixedBucketWriteBuilder) NewCommit() (*PostponeFixedBucketTabl
 	return &PostponeFixedBucketTableCommit{ctx: wb.ctx, lib: wb.lib, inner: inner}, nil
 }
 
-// PostponeFixedBucketTableWrite writes rows according to a resolved bucket plan.
+// PostponeFixedBucketTableWrite writes rows using explicit or inferred bucket counts.
 type PostponeFixedBucketTableWrite struct {
 	ctx       context.Context
 	lib       *libRef

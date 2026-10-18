@@ -688,9 +688,11 @@ func TestMultiplePostponeFixedBucketWritersSharePlan(t *testing.T) {
 		defer builder.Close()
 	}
 
-	if _, err := builders[0].NewWrite(); err == nil || !strings.Contains(err.Error(), "bucket plan is required") {
-		t.Fatalf("Expected missing bucket plan error, got: %v", err)
+	automatic, err := builders[0].NewWrite()
+	if err != nil {
+		t.Fatalf("Failed to create automatically planned writer: %v", err)
 	}
+	automatic.Close()
 	plan := makePartitionedBucketPlan(t, []string{"2026-08-14", "2026-08-15"}, 1)
 	for index, builder := range builders {
 		if err := builder.WithBucketPlan(plan); err != nil {

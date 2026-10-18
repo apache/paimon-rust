@@ -404,6 +404,29 @@ def test_partition_truncation_matches_java_lifecycle(tmp_path):
     assert _rows(table) == []
 
 
+@pytest.mark.parametrize("overwrite", [False, True])
+def test_decimal_partition_precision_overflow_matches_java_null_spec(tmp_path, overwrite):
+    ctx = SQLContext()
+    ctx.register_catalog("paimon", {"warehouse": str(tmp_path)})
+    ctx.sql("CREATE SCHEMA paimon.db")
+    ctx.sql("""CREATE TABLE paimon.db.t (id INT, pt DECIMAL(3, 0)) PARTITIONED BY (pt)
+        WITH ('dynamic-partition-overwrite' = 'false')""")
+    ctx.sql("INSERT INTO paimon.db.t (id, pt) VALUES (1, NULL), (2, 12)")
+    table = PaimonCatalog({"warehouse": str(tmp_path)}).get_table("db.t")
+    if overwrite:
+        table.new_batch_write_builder().with_overwrite({"pt": "1000"}).new_commit().commit([])
+    else:
+        table.new_batch_write_builder().new_commit().truncate_partitions([{"pt": "1000"}])
+    assert _rows(table) == [2]
+
+
+def test_integer_partition_spec_accepts_java_unicode_digits(tmp_path):
+    table = _table(tmp_path, partitioned=True)
+    _append(table, [1, 2], [12, 13])
+    table.new_batch_write_builder().new_commit().truncate_partitions([{"pt": "１２"}])
+    assert _rows(table) == [2]
+
+
 @pytest.mark.parametrize("spec", [{"id": 1}, {"pt": "bad"}, {"pt": True}])
 def test_partition_spec_validation_precedes_mutation(tmp_path, spec):
     table = _table(tmp_path, partitioned=True)

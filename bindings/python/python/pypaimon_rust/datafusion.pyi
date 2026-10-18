@@ -739,7 +739,8 @@ class PostponeFixedBucketWriteBuilder:
     Inference uses target rows, otherwise estimated BinaryRow bytes, rounds up
     to a power of two and caps at the configured maximum parallelism.
     The default applies exactly to new partitions; append reuses existing
-    layouts from the writer's baseline snapshot. Overwrite uses the new default.
+    layouts from the writer's baseline snapshot. Overwrite plans replaced
+    partitions from the new input or configured default.
     Unknown partitions buffer until preparation; known layouts write directly.
     Rescaling and compaction are not performed.
     """

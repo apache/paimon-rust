@@ -22,17 +22,42 @@ use arrow_array::{ArrayRef, RecordBatch, StringArray};
 use arrow_schema::{Field, Schema};
 use std::sync::Arc;
 
-pub fn parse_partition_spec_value(text: &str, data_type: &DataType) -> crate::Result<Datum> {
+/// Convert a Java partition spec, retaining DECIMAL precision overflow as NULL.
+pub fn parse_partition_spec_value(
+    text: &str,
+    data_type: &DataType,
+) -> crate::Result<Option<Datum>> {
     let invalid = || crate::Error::DataInvalid {
         message: format!("Invalid partition value '{text}' for {data_type:?}"),
         source: None,
     };
     match data_type {
         // TypeUtils uses valueOf, not the decimal-truncating SQL cast rules.
-        DataType::TinyInt(_) => return text.parse().map(Datum::TinyInt).map_err(|_| invalid()),
-        DataType::SmallInt(_) => return text.parse().map(Datum::SmallInt).map_err(|_| invalid()),
-        DataType::Int(_) => return text.parse().map(Datum::Int).map_err(|_| invalid()),
-        DataType::BigInt(_) => return text.parse().map(Datum::Long).map_err(|_| invalid()),
+        DataType::TinyInt(_) | DataType::SmallInt(_) | DataType::Int(_) | DataType::BigInt(_) => {
+            let text = if text.is_ascii() {
+                std::borrow::Cow::Borrowed(text)
+            } else {
+                // Integer.valueOf scans Character.digit, unlike SQL's
+                // BinaryStringUtils integer cast with its fractional grammar.
+                std::borrow::Cow::Owned(
+                    text.chars()
+                        .map(|ch| {
+                            crate::common::number::java_decimal_digit(ch)
+                                .map_or(ch, |digit| char::from(b'0' + digit))
+                        })
+                        .collect::<String>(),
+                )
+            };
+            return match data_type {
+                DataType::TinyInt(_) => text.parse().map(Datum::TinyInt),
+                DataType::SmallInt(_) => text.parse().map(Datum::SmallInt),
+                DataType::Int(_) => text.parse().map(Datum::Int),
+                DataType::BigInt(_) => text.parse().map(Datum::Long),
+                _ => unreachable!(),
+            }
+            .map(Some)
+            .map_err(|_| invalid());
+        }
         DataType::Float(_) => {
             use crate::common::number::{format_java_float, parse_java_float};
             let double = parse_java_float(text, false)?;
@@ -40,24 +65,26 @@ pub fn parse_partition_spec_value(text: &str, data_type: &DataType) -> crate::Re
             return if double == f64::from(single)
                 || format_java_float(single) == format_java_float(double)
             {
-                Ok(Datum::Float(single))
+                Ok(Some(Datum::Float(single)))
             } else {
                 Err(invalid())
             };
         }
         DataType::Double(_) => {
-            return crate::common::number::parse_java_float(text, false).map(Datum::Double)
+            return crate::common::number::parse_java_float(text, false)
+                .map(Datum::Double)
+                .map(Some)
         }
-        DataType::Time(_) => return parse_time_spec(text).map(Datum::Time),
+        DataType::Time(_) => return parse_time_spec(text).map(Datum::Time).map(Some),
         DataType::Char(ty) if text.chars().count() > ty.length() => return Err(invalid()),
         DataType::VarChar(ty) if text.chars().count() > ty.length() as usize => {
             return Err(invalid())
         }
-        DataType::Char(_) | DataType::VarChar(_) => return Ok(Datum::String(text.into())),
-        DataType::Binary(_) => return Ok(Datum::Bytes(text.as_bytes().to_vec())),
+        DataType::Char(_) | DataType::VarChar(_) => return Ok(Some(Datum::String(text.into()))),
+        DataType::Binary(_) => return Ok(Some(Datum::Bytes(text.as_bytes().to_vec()))),
         DataType::VarBinary(ty) => {
             return if text.len() <= ty.length() as usize {
-                Ok(Datum::Bytes(text.as_bytes().to_vec()))
+                Ok(Some(Datum::Bytes(text.as_bytes().to_vec())))
             } else {
                 Err(invalid())
             };
@@ -84,7 +111,7 @@ pub fn parse_partition_spec_value(text: &str, data_type: &DataType) -> crate::Re
         vec![array],
     )
     .map_err(|_| invalid())?;
-    crate::spec::extract_datum_from_arrow(&batch, 0, 0, data_type)?.ok_or_else(invalid)
+    crate::spec::extract_datum_from_arrow(&batch, 0, 0, data_type)
 }
 
 fn parse_time_spec(text: &str) -> crate::Result<i32> {
@@ -121,7 +148,10 @@ fn parse_time_spec(text: &str) -> crate::Result<i32> {
         None => (text, 0),
     };
     let parts = clock.split(':').collect::<Vec<_>>();
-    if parts.len() > 3 {
+    if parts.len() > 3 || parts.len() < 3 && zone_at.is_some_and(|at| text[at + 1..].contains(':'))
+    {
+        // Java searches for the clock's colons in the complete string. With
+        // missing seconds a colon in the offset is not a valid second colon.
         return Err(invalid());
     }
     let hours = component(parts[0])?;
@@ -159,17 +189,41 @@ mod tests {
     };
 
     #[test]
+    fn partition_specs_accept_java_unicode_and_decimal_null() {
+        let integer = DataType::Int(IntType::new());
+        for (value, expected) in [("１２", 12), ("١٢", 12), ("-１２", -12), ("+١٢", 12)] {
+            assert_eq!(
+                parse_partition_spec_value(value, &integer).unwrap(),
+                Some(Datum::Int(expected))
+            );
+        }
+        let decimal = DataType::Decimal(DecimalType::new(3, 0).unwrap());
+        assert_eq!(parse_partition_spec_value("1000", &decimal).unwrap(), None);
+        assert_eq!(parse_partition_spec_value("999.5", &decimal).unwrap(), None);
+        assert!(parse_partition_spec_value("not a decimal", &decimal).is_err());
+        let time = DataType::Time(TimeType::new(3).unwrap());
+        for value in ["12:34+02:30", "12+02:30"] {
+            assert!(parse_partition_spec_value(value, &time).is_err());
+        }
+    }
+
+    #[test]
     fn partition_specs_use_java_typed_text_conversion() {
         assert_eq!(
-            parse_partition_spec_value("TRUE", &DataType::Boolean(BooleanType::new())).unwrap(),
+            parse_partition_spec_value("TRUE", &DataType::Boolean(BooleanType::new()))
+                .unwrap()
+                .unwrap(),
             Datum::Bool(true)
         );
         assert_eq!(
-            parse_partition_spec_value("1970-01-02", &DataType::Date(DateType::new())).unwrap(),
+            parse_partition_spec_value("1970-01-02", &DataType::Date(DateType::new()))
+                .unwrap()
+                .unwrap(),
             Datum::Date(1)
         );
         assert_eq!(
             parse_partition_spec_value("12:34:56.789", &DataType::Time(TimeType::new(3).unwrap()))
+                .unwrap()
                 .unwrap(),
             Datum::Time(45_296_789)
         );
@@ -178,6 +232,7 @@ mod tests {
                 "1970-01-01 00:00:00.123456",
                 &DataType::Timestamp(TimestampType::new(1).unwrap())
             )
+            .unwrap()
             .unwrap(),
             Datum::Timestamp {
                 millis: 100,
@@ -189,6 +244,7 @@ mod tests {
                 "12.345",
                 &DataType::Decimal(DecimalType::new(6, 2).unwrap())
             )
+            .unwrap()
             .unwrap(),
             Datum::Decimal { unscaled: 1235, .. }
         ));
@@ -197,11 +253,13 @@ mod tests {
         }
         let float = DataType::Float(FloatType::new());
         assert_eq!(
-            parse_partition_spec_value("1.2", &float).unwrap(),
+            parse_partition_spec_value("1.2", &float).unwrap().unwrap(),
             Datum::Float(1.2)
         );
         assert_eq!(
-            parse_partition_spec_value("0x1p2", &float).unwrap(),
+            parse_partition_spec_value("0x1p2", &float)
+                .unwrap()
+                .unwrap(),
             Datum::Float(4.0)
         );
         assert!(parse_partition_spec_value("1.23456789", &float).is_err());
@@ -215,7 +273,7 @@ mod tests {
             ("24:00:00", 86_400_000),
         ] {
             assert_eq!(
-                parse_partition_spec_value(text, &time).unwrap(),
+                parse_partition_spec_value(text, &time).unwrap().unwrap(),
                 Datum::Time(millis)
             );
         }
