@@ -338,6 +338,7 @@ class Table:
     def copy_with_resolved_schema(self, schema_json: str, *, branch: Optional[str] = None) -> "Table":
         """Replace all fields/options, preserving FileIO, REST context and branch."""
         ...
+    def _copy_with_fuse_file_io(self, local_path: str) -> "Table": ...
     def copy_with_pinned_snapshot(self, snapshot_json: Optional[str], *, with_schema: bool = False) -> "Table":
         """Pin Java Snapshot JSON, optionally loading its schema; None pins an empty view."""
         ...
@@ -462,8 +463,10 @@ class BatchTableUpdate:
         A Table source reads its selected snapshot or numeric timestamp window
         in core, independently of the target. Arrow input preserves batches and source row order.
 
-        Clauses carry assignments as (column, source/target/literal, value)
-        tuples, a delete flag, and optional SQL condition metadata.
+        Clauses carry assignments as (column, source/target/literal/callable, value)
+        tuples, a delete flag, and optional SQL condition metadata. Callables
+        consume the complete clause's qualified t./s. Arrow columns and return
+        an Array or ChunkedArray with the same row count; empty clauses are lazy.
         Commit returned messages through the matching builder's committer.
         """
         ...
@@ -520,8 +523,10 @@ class StreamTableUpdate:
         A Table source reads its selected snapshot or numeric timestamp window
         in core, independently of the target. Arrow input preserves batches and source row order.
 
-        Clauses carry assignments as (column, source/target/literal, value)
-        tuples, a delete flag, and optional SQL condition metadata.
+        Clauses carry assignments as (column, source/target/literal/callable, value)
+        tuples, a delete flag, and optional SQL condition metadata. Callables
+        consume the complete clause's qualified t./s. Arrow columns and return
+        an Array or ChunkedArray with the same row count; empty clauses are lazy.
         Commit returned messages through the matching builder's committer.
         """
         ...
@@ -717,7 +722,8 @@ class BatchWriteBuilder:
         replace touched partitions, irrespective of the static spec; empty input
         removes nothing. With the option false, match the spec ({} means all).
         An unpartitioned empty overwrite truncates the table. Partition values
-        use the schema's Python types; None or the default partition name is null.
+        use the schema's Python types or Java textual specs; None or the default
+        partition name is null.
         """
         ...
     def with_restore_snapshot(self, snapshot_id: int) -> "BatchWriteBuilder": ...
@@ -728,10 +734,14 @@ class BatchWriteBuilder:
 class PostponeFixedBucketWriteBuilder:
     """Real-bucket batch writes for a bucket=-2 primary-key table.
 
-    Supply a shared Arrow plan or configure postpone.default-bucket-num.
+    Supply a shared Arrow plan, configure postpone.default-bucket-num, or let
+    core infer new partition counts across all input batches at prepare_commit.
+    Inference uses target rows, otherwise estimated BinaryRow bytes, rounds up
+    to a power of two and caps at the configured maximum parallelism.
     The default applies exactly to new partitions; append reuses existing
     layouts from the writer's baseline snapshot. Overwrite uses the new default.
-    Automatic staging, rescaling and compaction are not performed.
+    Unknown partitions buffer until preparation; known layouts write directly.
+    Rescaling and compaction are not performed.
     """
     def _with_commit_user(self, commit_user: str) -> "PostponeFixedBucketWriteBuilder": ...
     def with_bucket_plan(self, plan: pyarrow.RecordBatch) -> "PostponeFixedBucketWriteBuilder":

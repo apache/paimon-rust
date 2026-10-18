@@ -64,7 +64,7 @@ impl FileIO {
     /// metadata, listings and REST requests. Only component-boundary matches
     /// are translated; unrelated paths retain their existing storage provider.
     /// The caller resolves and validates the mount before supplying this map.
-    pub(crate) fn with_fuse(self, original: &str, local: &str) -> crate::Result<Self> {
+    pub fn with_fuse(self, original: &str, local: &str) -> crate::Result<Self> {
         let original = original.trim_end_matches('/');
         if original.is_empty() || !std::path::Path::new(local).is_absolute() {
             return Err(Error::ConfigInvalid {
@@ -94,6 +94,106 @@ mod tests {
         let mut base = crate::io::FileIOBuilder::new("memory").build().unwrap();
         base.cache = crate::io::cache::create_local_cache(&options).unwrap();
         base
+    }
+
+    #[tokio::test]
+    async fn bound_mount_supports_table_write_commit_and_truncate() {
+        use crate::catalog::Identifier;
+        use crate::spec::{DataType, IntType, Schema, TableSchema};
+        use crate::table::{Table, TableCommit};
+        use arrow_array::{Int32Array, RecordBatch};
+        use futures::TryStreamExt;
+
+        let mount = tempfile::tempdir().unwrap();
+        let root = "oss://bucket/warehouse/table";
+        let base = FileIOBuilder::new("memory").build().unwrap();
+        let io = base
+            .clone()
+            .with_fuse(root, mount.path().to_str().unwrap())
+            .unwrap();
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .build()
+            .unwrap();
+        let table = Table::new(
+            base,
+            Identifier::new("db", "table"),
+            root.into(),
+            TableSchema::new(0, &schema),
+            None,
+        )
+        .copy_with_file_io(io.clone());
+        // SchemaManager must follow the replacement FileIO as well as data I/O.
+        let schema_path = format!("{root}/schema/schema-0");
+        io.new_output(&schema_path)
+            .unwrap()
+            .write(bytes::Bytes::from(
+                serde_json::to_vec(table.schema()).unwrap(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(table.schema_manager().schema(0).await.unwrap().id(), 0);
+        let builder = table.new_write_builder();
+        let mut writer = builder.new_write().unwrap();
+        let batch = RecordBatch::try_from_iter(vec![(
+            "id",
+            Arc::new(Int32Array::from(vec![1, 2])) as arrow_array::ArrayRef,
+        )])
+        .unwrap();
+        writer.write_arrow_batch(&batch).await.unwrap();
+        let messages = writer.prepare_commit().await.unwrap();
+        let files = messages
+            .iter()
+            .flat_map(|m| {
+                m.new_files
+                    .iter()
+                    .map(move |f| format!("{root}/bucket-{}/{}", m.bucket, f.file_name))
+            })
+            .collect::<Vec<_>>();
+        let committer = TableCommit::new(table.clone(), builder.commit_user().into());
+        committer.commit_with_identifier(messages, 1).await.unwrap();
+        writer.close().await;
+        assert!(mount.path().join("snapshot/snapshot-1").exists());
+        for file in &files {
+            assert!(io.exists(file).await.unwrap());
+        }
+        let reader = table.new_read_builder();
+        let plan = reader.new_scan().plan().await.unwrap();
+        let mut batches = reader.new_read().unwrap().to_arrow(plan.splits()).unwrap();
+        let mut count = 0;
+        while let Some(batch) = batches.try_next().await.unwrap() {
+            count += batch.num_rows();
+        }
+        assert_eq!(count, 2);
+        committer.truncate_table_with_identifier(17).await.unwrap();
+        assert!(table
+            .new_read_builder()
+            .new_scan()
+            .plan()
+            .await
+            .unwrap()
+            .splits()
+            .is_empty());
+        // Logical truncation must retain files referenced by older snapshots.
+        for file in &files {
+            assert!(io.exists(file).await.unwrap());
+        }
+        let mut writer = builder.new_write().unwrap();
+        writer.write_arrow_batch(&batch).await.unwrap();
+        committer
+            .commit_with_identifier(writer.prepare_commit().await.unwrap(), 18)
+            .await
+            .unwrap();
+        // Retrying an uncertain truncate cannot remove the later append.
+        committer.truncate_table_with_identifier(17).await.unwrap();
+        assert!(!table
+            .new_read_builder()
+            .new_scan()
+            .plan()
+            .await
+            .unwrap()
+            .splits()
+            .is_empty());
     }
 
     #[tokio::test]

@@ -103,27 +103,12 @@ fn boolean_option(table: &Table, key: &str, default: bool) -> PyResult<bool> {
     }
 }
 
-/// Java partition specs may encode numeric values as strings. Other Python
+/// Java partition specs encode schema-typed values as strings. Other Python
 /// literals use the same schema-driven conversion as the predicate API.
 fn partition_value(value: &Bound<'_, PyAny>, data_type: &DataType) -> PyResult<Datum> {
     if let Ok(text) = value.cast::<PyString>() {
         let text = text.to_str()?;
-        let invalid = || {
-            PyValueError::new_err(format!(
-                "Invalid partition value '{text}' for {data_type:?}"
-            ))
-        };
-        match data_type {
-            DataType::TinyInt(_) => return text.parse().map(Datum::TinyInt).map_err(|_| invalid()),
-            DataType::SmallInt(_) => {
-                return text.parse().map(Datum::SmallInt).map_err(|_| invalid())
-            }
-            DataType::Int(_) => return text.parse().map(Datum::Int).map_err(|_| invalid()),
-            DataType::BigInt(_) => return text.parse().map(Datum::Long).map_err(|_| invalid()),
-            DataType::Float(_) => return text.parse().map(Datum::Float).map_err(|_| invalid()),
-            DataType::Double(_) => return text.parse().map(Datum::Double).map_err(|_| invalid()),
-            _ => {}
-        }
+        return paimon::table::parse_partition_spec_value(text, data_type).map_err(to_py_err);
     }
     py_to_datum(value, data_type)
 }

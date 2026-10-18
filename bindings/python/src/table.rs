@@ -156,6 +156,17 @@ impl PyTable {
         Ok(Self::new(Arc::new(table)))
     }
 
+    /// Retain the FileIO already bound to a PyPaimon REST table view.
+    fn _copy_with_fuse_file_io(&self, local_path: &str) -> PyResult<Self> {
+        let io = self
+            .inner
+            .file_io()
+            .clone()
+            .with_fuse(self.inner.location(), local_path)
+            .map_err(to_py_err)?;
+        Ok(Self::new(Arc::new(self.inner.copy_with_file_io(io))))
+    }
+
     /// Java Table.copy: apply dynamic options and resolve the selected schema.
     #[pyo3(signature = (options))]
     fn copy(&self, py: Python<'_>, options: HashMap<String, String>) -> PyResult<Self> {

@@ -508,3 +508,50 @@ def test_prepared_merge_accepts_native_table_sources(tmp_path, stream, historica
     actual = pa.Table.from_batches(context.sql(
         'SELECT id, value FROM paimon.table_merge.target ORDER BY id')).to_pylist()
     assert actual == [dict(id=1, value=11), dict(id=2, value=20 if historical else 22), dict(id=3, value=33)]
+
+
+@pytest.mark.parametrize('stream', [False, True])
+def test_prepared_merge_callable_uses_complete_clause_and_preserves_exception(tmp_path, stream):
+    context = SQLContext()
+    context.register_catalog('paimon', {'warehouse': str(tmp_path)})
+    context.sql('CREATE SCHEMA paimon.callable_merge')
+    context.sql("""CREATE TABLE paimon.callable_merge.t (id INT, value INT) WITH (
+        'row-tracking.enabled' = 'true', 'data-evolution.enabled' = 'true')""")
+    for values in ['(1, 10)', '(2, 20)']:
+        context.sql('INSERT INTO paimon.callable_merge.t (id, value) VALUES ' + values)
+    table = PaimonCatalog({'warehouse': str(tmp_path)}).get_table('callable_merge.t')
+    builder = (table.new_stream_write_builder().with_commit_user('callable-merge')
+               if stream else table.new_batch_write_builder())
+    kwargs = dict(commit_identifier=42) if stream else {}
+    update = builder.new_update()
+    source = pa.table({'id': pa.array([1, 2, 3], pa.int32()), 'delta': pa.array([4, 5, 6], pa.int32())})
+    calls = []
+
+    def values(batch):
+        calls.append(batch.num_rows)
+        assert {'t.id', 't.value', 's.id', 's.delta'} <= set(batch.column_names)
+        return pa.chunked_array([[100], [200]], type=pa.int32())
+
+    messages = update.merge_into(source, on=[('id', 'id')], when_matched=[
+        dict(delete=False, assignments=[('value', 'callable', values)])], when_not_matched=[
+        dict(assignments=[('id', 'source', 'id'), ('value', 'callable', lambda batch: batch['s.delta'])])],
+        **kwargs)
+    assert calls == [2]
+    commit = builder.new_commit()
+    commit.commit(42, messages) if stream else commit.commit(messages)
+    actual = pa.Table.from_batches(context.sql(
+        'SELECT id, value FROM paimon.callable_merge.t ORDER BY id')).to_pylist()
+    assert actual == [dict(id=1, value=100), dict(id=2, value=200), dict(id=3, value=6)]
+    error = RuntimeError('callback error')
+
+    def fail(batch):
+        raise error
+
+    clause = [dict(delete=False, assignments=[('value', 'callable', fail)])]
+    update = builder.new_update()
+    assert update.merge_into(pa.table({'id': pa.array([99], pa.int32())}), on=[('id', 'id')],
+                             when_matched=clause, when_not_matched=[], **kwargs) == []
+    with pytest.raises(RuntimeError) as caught:
+        update.merge_into(source, on=[('id', 'id')], when_matched=clause,
+                          when_not_matched=[], **kwargs)
+    assert caught.value is error

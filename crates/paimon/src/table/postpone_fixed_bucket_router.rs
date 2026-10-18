@@ -43,6 +43,10 @@ pub(crate) struct PostponeFixedBucketRouter {
 }
 
 impl PostponeFixedBucketRouter {
+    pub(super) fn set_plan(&mut self, plan: PostponeBucketPlan) {
+        self.plan = plan;
+    }
+
     pub(crate) fn new(table: &Table, plan: PostponeBucketPlan) -> Result<Self> {
         validate_postpone_fixed_bucket_table(table)?;
         let schema = table.schema();

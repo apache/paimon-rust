@@ -1618,6 +1618,49 @@ impl<'a> CoreOptions<'a> {
             .unwrap_or(DEFAULT_TARGET_FILE_SIZE)
     }
 
+    /// Maximum automatically inferred postpone bucket count (Java default: 2048).
+    pub fn postpone_batch_write_fixed_bucket_max_parallelism(&self) -> crate::Result<i32> {
+        let key = "postpone.batch-write-fixed-bucket.max-parallelism";
+        let Some(raw) = self.options.get(key) else {
+            return Ok(2048);
+        };
+        raw.parse::<i32>()
+            .ok()
+            .filter(|n| *n > 0)
+            .ok_or_else(|| crate::Error::ConfigInvalid {
+                message: format!("{key} must be a positive 32-bit integer, got '{raw}'"),
+            })
+    }
+
+    pub fn postpone_target_row_num_per_bucket(&self) -> crate::Result<Option<i64>> {
+        self.options
+            .get("postpone.target-row-num-per-bucket")
+            .map(|raw| {
+                raw.parse::<i64>().ok().filter(|n| *n > 0).ok_or_else(|| {
+                    crate::Error::ConfigInvalid {
+                        message: format!(
+                            "postpone.target-row-num-per-bucket must be positive, got '{raw}'"
+                        ),
+                    }
+                })
+            })
+            .transpose()
+    }
+
+    pub fn postpone_target_size_per_bucket(&self) -> crate::Result<i64> {
+        self.options
+            .get("postpone.target-size-per-bucket")
+            .map_or(Ok(1024 * 1024 * 1024), |raw| {
+                parse_memory_size(raw).filter(|n| *n > 0).ok_or_else(|| {
+                    crate::Error::ConfigInvalid {
+                        message: format!(
+                            "postpone.target-size-per-bucket must be positive, got '{raw}'"
+                        ),
+                    }
+                })
+            })
+    }
+
     /// Maximum rows in a newly written data file. Java defaults to `Long.MAX_VALUE`.
     pub fn target_file_row_num(&self) -> crate::Result<i64> {
         let Some(raw) = self.options.get("target-file-row-num") else {

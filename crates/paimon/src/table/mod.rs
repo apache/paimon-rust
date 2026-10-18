@@ -103,6 +103,7 @@ mod mosaic_table_write_tests;
 mod object_table;
 mod partition_filter;
 mod partition_row_count;
+mod partition_spec;
 mod partition_stat;
 #[cfg(feature = "fulltext")]
 mod pk_full_text_bucket_search;
@@ -123,6 +124,7 @@ mod pk_vector_read;
 mod pk_vector_scan;
 mod pk_vector_search_params;
 mod postpone_bucket_plan;
+mod postpone_bucket_planner;
 mod postpone_file_writer;
 mod postpone_fixed_bucket_router;
 mod postpone_fixed_bucket_write;
@@ -221,6 +223,7 @@ pub use incremental_scan::{
 pub use instant::Instant;
 pub use object_table::{ObjectEntry, ObjectTable};
 pub use partition_row_count::PartitionRowCount;
+pub use partition_spec::parse_partition_spec_value;
 pub use partition_stat::PartitionStat;
 pub use pk_vector_bucket_split::{BucketVectorPayload, BucketVectorSearchSplit};
 pub use postpone_bucket_plan::{PostponeBucketPlan, POSTPONE_BUCKET_PLAN_TOTAL_BUCKETS_FIELD};
@@ -307,6 +310,18 @@ pub struct Table {
 }
 
 impl Table {
+    /// Copy a resolved table with a caller-owned FileIO, retaining its catalog
+    /// publication identity and read view. All schema I/O uses the new FileIO.
+    pub fn copy_with_file_io(&self, file_io: FileIO) -> Self {
+        let mut table = self.clone();
+        table.schema_manager = SchemaManager::new(file_io.clone(), self.location.clone());
+        if !self.is_main_branch() {
+            table.schema_manager = table.schema_manager.with_branch(&self.branch);
+        }
+        table.file_io = file_io;
+        table
+    }
+
     /// Create a new table.
     pub fn new(
         file_io: FileIO,
