@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::error::to_py_err;
 use paimon::spec::{
     DataField, DataType, Datum, DecimalType, Predicate, PredicateBuilder, TableSchema,
 };
@@ -422,6 +423,8 @@ const METHOD_NOT_SUPPORTED: &[&str] = &["not"];
 /// The dict shape mirrors the Python predicate tree:
 /// - Leaf: `{"method": <op>, "field": <name>, "literals": [..]}`
 /// - Compound: `{"method": "and"|"or", "children": [<dict>, ..]}`
+/// - Nested ROW leaf: the same leaf dict with `field` naming the root and
+///   `nested_path` containing separate descendant names (not a dotted string).
 ///
 /// Field types are resolved authoritatively from `fields` (the table schema); any
 /// `index`/`data_type` present in the dict is ignored. Literal conversion is
@@ -488,37 +491,6 @@ pub(crate) fn dict_to_table_predicate(
     dict_to_predicate(node, &schema.fields_with_read_metadata(), case_sensitive)
 }
 
-/// Resolve a leaf's field name to its schema [`DataType`] under the given case
-/// sensitivity.
-///
-/// Case-sensitive: exact match. Case-insensitive: ASCII-fold and require a
-/// unique match. Absent → `ValueError("Column '{field}' not found in schema")`;
-/// ambiguous (2+ fields collide under folding) → `ValueError` naming the clash.
-fn resolve_leaf_field_type(
-    fields: &[DataField],
-    field: &str,
-    case_sensitive: bool,
-) -> PyResult<DataType> {
-    let not_found = || PyValueError::new_err(format!("Column '{field}' not found in schema"));
-    if case_sensitive {
-        return fields
-            .iter()
-            .find(|f| f.name() == field)
-            .map(|f| f.data_type().clone())
-            .ok_or_else(not_found);
-    }
-    let mut matches = fields
-        .iter()
-        .filter(|f| f.name().eq_ignore_ascii_case(field));
-    let first = matches.next().ok_or_else(not_found)?;
-    if matches.next().is_some() {
-        return Err(PyValueError::new_err(format!(
-            "Ambiguous column '{field}': multiple schema fields match case-insensitively"
-        )));
-    }
-    Ok(first.data_type().clone())
-}
-
 /// Convert a single leaf dict (already known not to be `and`/`or`) into a
 /// [`Predicate`], resolving the field type from the schema.
 fn leaf_to_predicate(
@@ -527,16 +499,21 @@ fn leaf_to_predicate(
     fields: &[DataField],
     case_sensitive: bool,
 ) -> PyResult<Predicate> {
-    let field: String = node
+    let field_name: String = node
         .get_item("field")?
         .ok_or_else(|| PyValueError::new_err(format!("'{method}' leaf requires 'field'")))?
         .extract()?;
-
-    // Resolve field DataType from schema (authoritative) for literal conversion.
-    let data_type = resolve_leaf_field_type(fields, &field, case_sensitive)?;
-
-    let literals_obj = node.get_item("literals")?;
     let pb = PredicateBuilder::new_with_case_sensitive(fields, case_sensitive);
+    let field = if let Some(path) = node.get_item("nested_path")? {
+        let path = path.extract::<Vec<String>>()?;
+        let names = path.iter().map(String::as_str).collect::<Vec<_>>();
+        pb.nested_field(&field_name, &names)
+    } else {
+        pb.field(&field_name)
+    }
+    .map_err(to_py_err)?;
+    let data_type = field.data_type().clone();
+    let literals_obj = node.get_item("literals")?;
 
     // Convert literals (DataType-driven), wrapping NotImplemented type messages
     // with field context.
@@ -553,7 +530,7 @@ fn leaf_to_predicate(
                 }
                 out.push(Some(
                     predicate_datum(&item, &data_type)
-                        .map_err(|e| with_field_context(e, &field, &data_type))?,
+                        .map_err(|e| with_field_context(e, &field_name, &data_type))?,
                 ));
             }
         }

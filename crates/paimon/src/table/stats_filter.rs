@@ -575,6 +575,7 @@ fn data_evolution_predicate_may_match(
     row_count: i64,
 ) -> bool {
     match predicate {
+        Predicate::NestedLeaf { .. } => true,
         Predicate::AlwaysTrue => true,
         Predicate::AlwaysFalse => false,
         Predicate::And(children) => children.iter().all(|child| {
@@ -640,6 +641,7 @@ fn data_evolution_predicate_must_match(
     row_count: i64,
 ) -> bool {
     match predicate {
+        Predicate::NestedLeaf { .. } => false,
         Predicate::AlwaysTrue => row_count > 0,
         Predicate::AlwaysFalse => false,
         Predicate::And(children) => children.iter().all(|child| {

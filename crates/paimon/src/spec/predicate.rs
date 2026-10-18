@@ -27,7 +27,15 @@ use crate::error::*;
 use crate::spec::binary_row::BinaryRow;
 use crate::spec::types::DataType;
 use crate::spec::{is_row_tracking_column, DataField};
+use std::borrow::Cow;
 use std::cmp::Ordering;
+
+mod field_ref;
+pub use field_ref::{FieldRef, PredicateField};
+
+#[cfg(test)]
+#[path = "predicate/field_ref_tests.rs"]
+mod field_ref_tests;
 use std::fmt;
 
 // ---------------------------------------------------------------------------
@@ -336,6 +344,21 @@ pub enum Predicate {
         /// multiple for In/NotIn).
         literals: Vec<Datum>,
     },
+    /// A comparison on a field inside a ROW. Like Java's NestedFieldTransform,
+    /// this is distinct from a top-level leaf: root-column statistics and file
+    /// indexes cannot be used to prune it. Paths retain stable field identities.
+    NestedLeaf {
+        /// Enclosing top-level ROW field in the predicate schema.
+        root: Box<DataField>,
+        /// Index of the root in the current evaluation schema.
+        index: usize,
+        /// Nonempty sequence of descendant fields, excluding the root.
+        path: Vec<DataField>,
+        /// Comparison applied to the final descendant.
+        op: PredicateOperator,
+        /// Literals typed against the final descendant.
+        literals: Vec<Datum>,
+    },
     /// N-ary conjunction. Invariant: always flattened (no nested And).
     And(Vec<Predicate>),
     /// N-ary disjunction. Invariant: always flattened (no nested Or).
@@ -349,6 +372,29 @@ pub enum Predicate {
 }
 
 impl Predicate {
+    /// Validate a nested reference against its original schema. Keeping the root,
+    /// every field id and each type together prevents a remap from substituting
+    /// a same-named but unrelated field.
+    pub(crate) fn validate_nested_fields(&self, fields: &[DataField]) -> Result<()> {
+        let Self::NestedLeaf {
+            root,
+            index,
+            path,
+            op,
+            literals,
+        } = self
+        else {
+            return Ok(());
+        };
+        let names = path.iter().map(DataField::name).collect::<Vec<_>>();
+        let builder = PredicateBuilder::new(fields);
+        let field = builder.nested_field(root.name(), &names)?;
+        let canonical = builder.leaf(&field, *op, literals.clone())?;
+        if fields.get(*index) != Some(root.as_ref()) || &canonical != self {
+            return Err(Error::DataInvalid { message: "Nested predicate does not match the table schema; build filters with PredicateBuilder".into(), source: None });
+        }
+        Ok(())
+    }
     /// Combine predicates with AND, with recursive flattening and constant absorption.
     ///
     /// - `AND(p, AlwaysTrue)` → `p` (identity element filtered out)
@@ -432,6 +478,27 @@ impl Predicate {
             Predicate::Not(inner) => *inner,
             Predicate::AlwaysTrue => Predicate::AlwaysFalse,
             Predicate::AlwaysFalse => Predicate::AlwaysTrue,
+            Predicate::NestedLeaf {
+                root,
+                index,
+                path,
+                op,
+                literals,
+            } if literals.is_empty()
+                && matches!(op, PredicateOperator::In | PredicateOperator::NotIn) =>
+            {
+                Predicate::NestedLeaf {
+                    root,
+                    index,
+                    path,
+                    op: if op == PredicateOperator::In {
+                        PredicateOperator::NotIn
+                    } else {
+                        PredicateOperator::In
+                    },
+                    literals,
+                }
+            }
             Predicate::Leaf {
                 column,
                 index,
@@ -483,6 +550,7 @@ impl Predicate {
     /// `mapping` is the output of `field_idx_to_partition_idx`.
     pub(crate) fn remap_field_index(&self, mapping: &[Option<usize>]) -> Option<Predicate> {
         match self {
+            Predicate::NestedLeaf { .. } => None,
             Predicate::Leaf {
                 column,
                 index,
@@ -531,6 +599,7 @@ impl Predicate {
     /// retained as a residual data predicate after partition projection.
     pub(crate) fn references_only_mapped_fields(&self, mapping: &[Option<usize>]) -> bool {
         match self {
+            Predicate::NestedLeaf { .. } => false,
             Predicate::Leaf { column, index, .. } => {
                 !is_row_tracking_column(column) && mapping.get(*index).is_some_and(Option::is_some)
             }
@@ -557,6 +626,7 @@ impl Predicate {
         mapping: &[Option<usize>],
     ) -> Option<Predicate> {
         match self {
+            Predicate::NestedLeaf { .. } => None,
             Predicate::Leaf {
                 column,
                 index,
@@ -607,6 +677,26 @@ impl Predicate {
 impl fmt::Display for Predicate {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::NestedLeaf {
+                root,
+                path,
+                op,
+                literals,
+                ..
+            } => {
+                let name = std::iter::once(root.name())
+                    .chain(path.iter().map(DataField::name))
+                    .collect::<Vec<_>>()
+                    .join(".");
+                Self::Leaf {
+                    column: name,
+                    index: 0,
+                    data_type: path.last().unwrap().data_type().clone(),
+                    op: *op,
+                    literals: literals.clone(),
+                }
+                .fmt(f)
+            }
             Self::Leaf {
                 column,
                 op,
@@ -682,6 +772,9 @@ impl Predicate {
     /// predicate.
     pub fn collect_leaf_field_indices(&self, out: &mut std::collections::HashSet<usize>) {
         match self {
+            Predicate::NestedLeaf { index, .. } => {
+                out.insert(*index);
+            }
             Predicate::Leaf { index, .. } => {
                 out.insert(*index);
             }
@@ -704,6 +797,7 @@ impl Predicate {
     /// indexed by partition field.
     pub fn to_rest_json(&self) -> Option<serde_json::Value> {
         match self {
+            Predicate::NestedLeaf { .. } => None,
             Predicate::AlwaysTrue => Some(rest_constant_leaf("TRUE")),
             Predicate::AlwaysFalse => Some(rest_constant_leaf("FALSE")),
             Predicate::And(children) | Predicate::Or(children) => {
@@ -1645,7 +1739,8 @@ fn check_input_type(input: &serde_json::Value, integer: bool) -> Result<()> {
 // PredicateBuilder
 // ---------------------------------------------------------------------------
 
-/// Builds `Predicate` nodes from field names and typed literals.
+/// Builds `Predicate` nodes from field names or resolved field references and
+/// typed literals. Field selection is independent of the comparison operator.
 ///
 /// Stores schema field metadata and validates column references in builder
 /// methods. Unknown column names cause immediate errors (fail-fast).
@@ -1653,8 +1748,7 @@ fn check_input_type(input: &serde_json::Value, integer: bool) -> Result<()> {
 /// Reference: Java `PredicateBuilder` — but uses field names instead of indices
 /// for a more ergonomic Rust API.
 pub struct PredicateBuilder {
-    field_names: Vec<String>,
-    field_types: Vec<DataType>,
+    fields: Vec<DataField>,
     case_sensitive: bool,
 }
 
@@ -1670,45 +1764,135 @@ impl PredicateBuilder {
     /// ambiguous (case-colliding) schema errors. Infallible.
     pub fn new_with_case_sensitive(fields: &[DataField], case_sensitive: bool) -> Self {
         Self {
-            field_names: fields.iter().map(|f| f.name().to_string()).collect(),
-            field_types: fields.iter().map(|f| f.data_type().clone()).collect(),
+            fields: fields.to_vec(),
             case_sensitive,
         }
     }
 
     // -- comparison operators --
 
-    pub fn equal(&self, field: &str, literal: Datum) -> Result<Predicate> {
+    pub fn equal<'a>(
+        &self,
+        field: impl Into<PredicateField<'a>>,
+        literal: Datum,
+    ) -> Result<Predicate> {
         self.leaf(field, PredicateOperator::Eq, vec![literal])
     }
 
-    pub fn not_equal(&self, field: &str, literal: Datum) -> Result<Predicate> {
+    /// Resolve a top-level field for reuse with ordinary predicate operators.
+    pub fn field(&self, name: &str) -> Result<FieldRef> {
+        let index = self.resolve_field(name)?;
+        Ok(FieldRef {
+            root: Box::new(self.fields[index].clone()),
+            index,
+            path: vec![],
+        })
+    }
+
+    /// Resolve a nested ROW input independently of a predicate operator.
+    /// Path components are separate names, so dots in real column names remain
+    /// unambiguous. NULL at any parent yields NULL during evaluation.
+    ///
+    /// ```
+    /// # use paimon::spec::{DataField, DataType, Datum, IntType, RowType, PredicateBuilder};
+    /// let fields = vec![DataField::new(0, "profile".into(), DataType::Row(
+    ///     RowType::new(vec![DataField::new(1, "score".into(), DataType::Int(IntType::new()))])
+    /// ))];
+    /// let builder = PredicateBuilder::new(&fields);
+    /// let score: paimon::spec::FieldRef = builder.nested_field("profile", &["score"])?;
+    /// let equals = builder.equal(&score, Datum::Int(7))?;
+    /// let present = builder.is_not_null(&score)?;
+    /// # Ok::<(), paimon::Error>(())
+    /// ```
+    pub fn nested_field(&self, root: &str, path: &[&str]) -> Result<FieldRef> {
+        let index = self.resolve_field(root)?;
+        if path.is_empty() {
+            return Err(Error::ConfigInvalid {
+                message: "Nested field path must not be empty".into(),
+            });
+        }
+        let root = self.fields[index].clone();
+        let mut current = root.data_type();
+        let mut resolved = Vec::with_capacity(path.len());
+        for name in path {
+            let DataType::Row(row) = current else {
+                return Err(Error::ConfigInvalid {
+                    message: format!("Nested field path descends into non-ROW type {current:?}"),
+                });
+            };
+            let field = row
+                .fields()
+                .iter()
+                .filter(|f| {
+                    if self.case_sensitive {
+                        f.name() == *name
+                    } else {
+                        f.name().eq_ignore_ascii_case(name)
+                    }
+                })
+                .collect::<Vec<_>>();
+            if field.len() != 1 {
+                return Err(Error::ConfigInvalid {
+                    message: format!("Nested field '{name}' is missing or ambiguous"),
+                });
+            }
+            resolved.push(field[0].clone());
+            current = field[0].data_type();
+        }
+        Ok(FieldRef {
+            root: Box::new(root),
+            index,
+            path: resolved,
+        })
+    }
+
+    pub fn not_equal<'a>(
+        &self,
+        field: impl Into<PredicateField<'a>>,
+        literal: Datum,
+    ) -> Result<Predicate> {
         self.leaf(field, PredicateOperator::NotEq, vec![literal])
     }
 
-    pub fn less_than(&self, field: &str, literal: Datum) -> Result<Predicate> {
+    pub fn less_than<'a>(
+        &self,
+        field: impl Into<PredicateField<'a>>,
+        literal: Datum,
+    ) -> Result<Predicate> {
         self.leaf(field, PredicateOperator::Lt, vec![literal])
     }
 
-    pub fn less_or_equal(&self, field: &str, literal: Datum) -> Result<Predicate> {
+    pub fn less_or_equal<'a>(
+        &self,
+        field: impl Into<PredicateField<'a>>,
+        literal: Datum,
+    ) -> Result<Predicate> {
         self.leaf(field, PredicateOperator::LtEq, vec![literal])
     }
 
-    pub fn greater_than(&self, field: &str, literal: Datum) -> Result<Predicate> {
+    pub fn greater_than<'a>(
+        &self,
+        field: impl Into<PredicateField<'a>>,
+        literal: Datum,
+    ) -> Result<Predicate> {
         self.leaf(field, PredicateOperator::Gt, vec![literal])
     }
 
-    pub fn greater_or_equal(&self, field: &str, literal: Datum) -> Result<Predicate> {
+    pub fn greater_or_equal<'a>(
+        &self,
+        field: impl Into<PredicateField<'a>>,
+        literal: Datum,
+    ) -> Result<Predicate> {
         self.leaf(field, PredicateOperator::GtEq, vec![literal])
     }
 
     // -- null operators --
 
-    pub fn is_null(&self, field: &str) -> Result<Predicate> {
+    pub fn is_null<'a>(&self, field: impl Into<PredicateField<'a>>) -> Result<Predicate> {
         self.leaf(field, PredicateOperator::IsNull, vec![])
     }
 
-    pub fn is_not_null(&self, field: &str) -> Result<Predicate> {
+    pub fn is_not_null<'a>(&self, field: impl Into<PredicateField<'a>>) -> Result<Predicate> {
         self.leaf(field, PredicateOperator::IsNotNull, vec![])
     }
 
@@ -1717,8 +1901,8 @@ impl PredicateBuilder {
         let predicates: Vec<Predicate> = fields
             .iter()
             .map(|(name, value)| match value {
-                Some(v) => self.equal(name, v.clone()),
-                None => self.is_null(name),
+                Some(v) => self.equal(*name, v.clone()),
+                None => self.is_null(*name),
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(Predicate::and(predicates))
@@ -1726,58 +1910,92 @@ impl PredicateBuilder {
 
     // -- set operators --
 
-    pub fn is_in(&self, field: &str, literals: Vec<Datum>) -> Result<Predicate> {
+    pub fn is_in<'a>(
+        &self,
+        field: impl Into<PredicateField<'a>>,
+        literals: Vec<Datum>,
+    ) -> Result<Predicate> {
         self.leaf(field, PredicateOperator::In, literals)
     }
 
-    pub fn is_not_in(&self, field: &str, literals: Vec<Datum>) -> Result<Predicate> {
+    pub fn is_not_in<'a>(
+        &self,
+        field: impl Into<PredicateField<'a>>,
+        literals: Vec<Datum>,
+    ) -> Result<Predicate> {
         self.leaf(field, PredicateOperator::NotIn, literals)
     }
 
     /// Java IN ignores NULL literals; an empty/all-NULL list matches nothing.
-    pub fn is_in_with_nulls(&self, field: &str, literals: Vec<Option<Datum>>) -> Result<Predicate> {
+    pub fn is_in_with_nulls<'a>(
+        &self,
+        field: impl Into<PredicateField<'a>>,
+        literals: Vec<Option<Datum>>,
+    ) -> Result<Predicate> {
         self.is_in(field, literals.into_iter().flatten().collect())
     }
 
     /// Java NOT IN fails every row if any literal is NULL.
-    pub fn is_not_in_with_nulls(
+    pub fn is_not_in_with_nulls<'a>(
         &self,
-        field: &str,
+        field: impl Into<PredicateField<'a>>,
         literals: Vec<Option<Datum>>,
     ) -> Result<Predicate> {
-        if literals.iter().any(Option::is_none) {
-            self.resolve_field(field)?;
-            return Ok(Predicate::AlwaysFalse);
-        }
-        self.is_not_in(field, literals.into_iter().flatten().collect())
+        let contains_null = literals.iter().any(Option::is_none);
+        let predicate = self.is_not_in(field, literals.into_iter().flatten().collect())?;
+        Ok(if contains_null {
+            Predicate::AlwaysFalse
+        } else {
+            predicate
+        })
     }
 
     // -- string operators --
 
     /// `field LIKE 'pat%'` shape. Retains an empty pattern as a string leaf,
     /// matching Java. Non-string `pattern` → [`Error::ConfigInvalid`].
-    pub fn starts_with(&self, field: &str, pattern: Datum) -> Result<Predicate> {
+    pub fn starts_with<'a>(
+        &self,
+        field: impl Into<PredicateField<'a>>,
+        pattern: Datum,
+    ) -> Result<Predicate> {
         self.string_leaf(field, PredicateOperator::StartsWith, pattern)
     }
 
     /// `field LIKE '%pat'` shape, including an empty pattern.
-    pub fn ends_with(&self, field: &str, pattern: Datum) -> Result<Predicate> {
+    pub fn ends_with<'a>(
+        &self,
+        field: impl Into<PredicateField<'a>>,
+        pattern: Datum,
+    ) -> Result<Predicate> {
         self.string_leaf(field, PredicateOperator::EndsWith, pattern)
     }
 
     /// `field LIKE '%pat%'` shape, including an empty pattern.
-    pub fn contains(&self, field: &str, pattern: Datum) -> Result<Predicate> {
+    pub fn contains<'a>(
+        &self,
+        field: impl Into<PredicateField<'a>>,
+        pattern: Datum,
+    ) -> Result<Predicate> {
         self.string_leaf(field, PredicateOperator::Contains, pattern)
     }
 
     /// Build an element-membership predicate over an ARRAY column.
-    pub fn array_contains(&self, field: &str, element: Datum) -> Result<Predicate> {
-        self.array_leaf(field, PredicateOperator::ArrayContains, vec![element])
+    pub fn array_contains<'a>(
+        &self,
+        field: impl Into<PredicateField<'a>>,
+        element: Datum,
+    ) -> Result<Predicate> {
+        self.leaf(field, PredicateOperator::ArrayContains, vec![element])
     }
 
     /// Build an any-element membership predicate over an ARRAY column.
-    pub fn arrays_overlap(&self, field: &str, elements: Vec<Datum>) -> Result<Predicate> {
-        self.array_leaf(field, PredicateOperator::ArraysOverlap, elements)
+    pub fn arrays_overlap<'a>(
+        &self,
+        field: impl Into<PredicateField<'a>>,
+        elements: Vec<Datum>,
+    ) -> Result<Predicate> {
+        self.leaf(field, PredicateOperator::ArraysOverlap, elements)
     }
 
     /// Build an all-elements membership predicate over an ARRAY column.
@@ -1785,8 +2003,12 @@ impl PredicateBuilder {
     /// An empty literal list is retained as a leaf: it matches non-null arrays,
     /// while the multivalue index must fall back because it cannot distinguish
     /// null arrays from empty arrays.
-    pub fn array_contains_all(&self, field: &str, elements: Vec<Datum>) -> Result<Predicate> {
-        self.array_leaf(field, PredicateOperator::ArrayContainsAll, elements)
+    pub fn array_contains_all<'a>(
+        &self,
+        field: impl Into<PredicateField<'a>>,
+        elements: Vec<Datum>,
+    ) -> Result<Predicate> {
+        self.leaf(field, PredicateOperator::ArrayContainsAll, elements)
     }
 
     /// `field LIKE '<pattern>'` with optional `escape` character (default `\`).
@@ -1801,7 +2023,12 @@ impl PredicateBuilder {
     /// `escape == None` defaults to `\`. Any other ESCAPE character is
     /// rejected with [`Error::ConfigInvalid`] (the DataFusion translator turns
     /// that into a fall-open).
-    pub fn like(&self, field: &str, pattern: Datum, escape: Option<char>) -> Result<Predicate> {
+    pub fn like<'a>(
+        &self,
+        field: impl Into<PredicateField<'a>>,
+        pattern: Datum,
+        escape: Option<char>,
+    ) -> Result<Predicate> {
         let pattern_str = match &pattern {
             Datum::String(s) => s.clone(),
             other => {
@@ -1833,22 +2060,26 @@ impl PredicateBuilder {
     /// `field BETWEEN low AND high`. SQL semantics: inclusive on both ends.
     /// `low > high` short-circuits to [`Predicate::AlwaysFalse`] (no value can
     /// be between an empty range).
-    pub fn between(&self, field: &str, low: Datum, high: Datum) -> Result<Predicate> {
-        if Self::low_strictly_above_high(&low, &high) {
-            return Ok(Predicate::AlwaysFalse);
-        }
-        self.leaf(field, PredicateOperator::Between, vec![low, high])
+    pub fn between<'a>(
+        &self,
+        field: impl Into<PredicateField<'a>>,
+        low: Datum,
+        high: Datum,
+    ) -> Result<Predicate> {
+        self.range_leaf(field, PredicateOperator::Between, low, high)
     }
 
     /// `field NOT BETWEEN low AND high`. SQL three-valued logic: NULL value
     /// → NULL → treated as false, matching the existing `NotEq` evaluator.
     /// `low > high` short-circuits to `IsNotNull(field)` (every non-null value
     /// is "not between" an empty range).
-    pub fn not_between(&self, field: &str, low: Datum, high: Datum) -> Result<Predicate> {
-        if Self::low_strictly_above_high(&low, &high) {
-            return self.is_not_null(field);
-        }
-        self.leaf(field, PredicateOperator::NotBetween, vec![low, high])
+    pub fn not_between<'a>(
+        &self,
+        field: impl Into<PredicateField<'a>>,
+        low: Datum,
+        high: Datum,
+    ) -> Result<Predicate> {
+        self.range_leaf(field, PredicateOperator::NotBetween, low, high)
     }
 
     fn low_strictly_above_high(low: &Datum, high: &Datum) -> bool {
@@ -1858,7 +2089,12 @@ impl PredicateBuilder {
     /// Shared literal-type guard for the three string operators. Preserve
     /// empty string leaves: search refinement depends on the original operator,
     /// even when row evaluation is equivalent to `IsNotNull`.
-    fn string_leaf(&self, field: &str, op: PredicateOperator, pattern: Datum) -> Result<Predicate> {
+    fn string_leaf<'a>(
+        &self,
+        field: impl Into<PredicateField<'a>>,
+        op: PredicateOperator,
+        pattern: Datum,
+    ) -> Result<Predicate> {
         match &pattern {
             Datum::String(_) => {}
             other => {
@@ -1870,91 +2106,118 @@ impl PredicateBuilder {
         self.leaf(field, op, vec![pattern])
     }
 
-    fn array_leaf(
+    fn range_leaf<'a>(
         &self,
-        field: &str,
+        field: impl Into<PredicateField<'a>>,
         op: PredicateOperator,
-        literals: Vec<Datum>,
+        low: Datum,
+        high: Datum,
     ) -> Result<Predicate> {
-        let (index, canonical, data_type) = self.resolve_field(field)?;
-        let DataType::Array(array_type) = &data_type else {
-            return Err(Error::ConfigInvalid {
-                message: format!("{op} requires an ARRAY field, got {data_type:?}"),
-            });
-        };
-        Self::validate_literal_count(op, &literals)?;
-        for literal in &literals {
-            validate_datum_matches_type(literal, array_type.element_type())?;
-        }
-        Ok(Predicate::Leaf {
-            column: canonical,
-            index,
-            data_type,
-            op,
-            literals,
+        let field = self.resolve_input(field)?;
+        let reversed = Self::low_strictly_above_high(&low, &high);
+        let predicate = Self::resolved_leaf(&field, op, vec![low, high])?;
+        Ok(if reversed {
+            if op == PredicateOperator::Between {
+                Predicate::AlwaysFalse
+            } else {
+                field.predicate(PredicateOperator::IsNotNull, vec![])
+            }
+        } else {
+            predicate
         })
     }
 
     // -- internal --
 
-    /// Resolve field name to index + type, validate literals, and build a leaf predicate.
-    fn leaf(&self, field: &str, op: PredicateOperator, literals: Vec<Datum>) -> Result<Predicate> {
-        let (index, canonical, data_type) = self.resolve_field(field)?;
-        Self::validate_literal_count(op, &literals)?;
-        for lit in &literals {
-            validate_datum_matches_type(lit, &data_type)?;
-        }
-        Ok(Predicate::Leaf {
-            column: canonical,
-            index,
-            data_type,
-            op,
-            literals,
-        })
+    fn leaf<'a>(
+        &self,
+        field: impl Into<PredicateField<'a>>,
+        op: PredicateOperator,
+        literals: Vec<Datum>,
+    ) -> Result<Predicate> {
+        let field = self.resolve_input(field)?;
+        Self::resolved_leaf(&field, op, literals)
     }
 
-    /// Look up a field name, returning its (index, DataType) or an error.
-    /// Resolve a column name to `(index, canonical_name, data_type)`.
+    fn resolved_leaf(
+        field: &FieldRef,
+        op: PredicateOperator,
+        literals: Vec<Datum>,
+    ) -> Result<Predicate> {
+        let data_type = field.data_type();
+        let literal_type = if matches!(
+            op,
+            PredicateOperator::ArrayContains
+                | PredicateOperator::ArraysOverlap
+                | PredicateOperator::ArrayContainsAll
+        ) {
+            let DataType::Array(array_type) = data_type else {
+                return Err(Error::ConfigInvalid {
+                    message: format!("{op} requires an ARRAY field, got {data_type:?}"),
+                });
+            };
+            array_type.element_type()
+        } else {
+            data_type
+        };
+        Self::validate_literal_count(op, &literals)?;
+        for literal in &literals {
+            validate_datum_matches_type(literal, literal_type)?;
+        }
+        Ok(field.predicate(op, literals))
+    }
+
+    fn resolve_input<'a>(&self, input: impl Into<PredicateField<'a>>) -> Result<Cow<'a, FieldRef>> {
+        match input.into().0 {
+            field_ref::FieldInput::Name(name) => self.field(&name).map(Cow::Owned),
+            field_ref::FieldInput::Reference(field) => {
+                // A resolved operand may be reused only with the same root
+                // identity, position and schema. Validate before any operator
+                // optimization can turn the predicate into a constant.
+                if self.fields.get(field.index) != Some(field.root.as_ref()) {
+                    return Err(Error::ConfigInvalid {
+                        message: "Predicate field reference does not match the builder schema"
+                            .into(),
+                    });
+                }
+                Ok(field)
+            }
+        }
+    }
+
+    /// Resolve a column name to its canonical schema position.
     ///
     /// The canonical name is the schema's stored field name for the matched
     /// index. It is stored in the resulting [`Predicate::Leaf`] so downstream
     /// name-based lookups (e.g. global-index pruning) match the schema even
     /// when the caller passed a different casing. Case-insensitive matching
     /// errors on an ambiguous (case-colliding) schema.
-    fn resolve_field(&self, field: &str) -> Result<(usize, String, DataType)> {
+    fn resolve_field(&self, field: &str) -> Result<usize> {
         let index = if self.case_sensitive {
-            self.field_names.iter().position(|n| n == field)
+            self.fields.iter().position(|f| f.name() == field)
         } else {
             let mut hits = self
-                .field_names
+                .fields
                 .iter()
                 .enumerate()
-                .filter(|(_, n)| n.eq_ignore_ascii_case(field));
+                .filter(|(_, f)| f.name().eq_ignore_ascii_case(field));
             let first = hits.next();
             if first.is_some() && hits.next().is_some() {
                 return Err(Error::ConfigInvalid {
                     message: format!(
                         "Ambiguous column '{field}' matches multiple schema fields case-insensitively: {:?}",
-                        self.field_names
+                        self.fields
                     ),
                 });
             }
             first.map(|(i, _)| i)
         };
-        index
-            .map(|idx| {
-                (
-                    idx,
-                    self.field_names[idx].clone(),
-                    self.field_types[idx].clone(),
-                )
-            })
-            .ok_or_else(|| Error::ConfigInvalid {
-                message: format!(
-                    "Column '{}' not found in schema fields {:?}",
-                    field, self.field_names
-                ),
-            })
+        index.ok_or_else(|| Error::ConfigInvalid {
+            message: format!(
+                "Column '{}' not found in schema fields {:?}",
+                field, self.fields
+            ),
+        })
     }
 
     /// Validate that the number of literals matches the operator's expectation.
@@ -2135,6 +2398,43 @@ pub(crate) fn extract_datum(
 /// SQL null semantics: null compared to any value yields `false`.
 pub(crate) fn eval_row(predicate: &Predicate, row: &BinaryRow) -> Result<bool> {
     match predicate {
+        Predicate::NestedLeaf {
+            root,
+            index,
+            path,
+            op,
+            literals,
+        } => {
+            let mut current = row.clone();
+            let mut position = *index;
+            let mut data_type = root.data_type();
+            for field in path {
+                if current.is_null_at(position) {
+                    return Ok(eval_leaf(*op, None, literals));
+                }
+                let DataType::Row(row_type) = data_type else {
+                    return Err(Error::DataInvalid {
+                        message: "Nested predicate requires ROW input".into(),
+                        source: None,
+                    });
+                };
+                current = BinaryRow::from_bytes(
+                    row_type.fields().len() as i32,
+                    current.get_binary(position)?.to_vec(),
+                );
+                position = row_type
+                    .fields()
+                    .iter()
+                    .position(|f| f.id() == field.id())
+                    .ok_or_else(|| Error::DataInvalid {
+                        message: format!("Nested field '{}' changed identity", field.name()),
+                        source: None,
+                    })?;
+                data_type = field.data_type();
+            }
+            let value = extract_datum(&current, position, data_type)?;
+            Ok(eval_leaf(*op, value.as_ref(), literals))
+        }
         Predicate::AlwaysTrue => Ok(true),
         Predicate::AlwaysFalse => Ok(false),
         Predicate::And(children) => {

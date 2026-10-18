@@ -1753,6 +1753,7 @@ fn parquet_predicate_row_filter_accepted(
     file_fields: &[DataField],
 ) -> crate::Result<bool> {
     match predicate {
+        Predicate::NestedLeaf { .. } => Ok(false),
         Predicate::AlwaysTrue | Predicate::AlwaysFalse => Ok(true),
         Predicate::Leaf {
             column,
@@ -2601,6 +2602,7 @@ fn build_predicate_page_selection(
 /// through compound nodes). Indices are already file-level (see caller).
 fn collect_leaf_field_indices(predicate: &Predicate, out: &mut Vec<usize>) {
     match predicate {
+        Predicate::NestedLeaf { index, .. } => out.push(*index),
         Predicate::Leaf { index, .. } => out.push(*index),
         Predicate::And(children) | Predicate::Or(children) => {
             for child in children {

@@ -67,6 +67,9 @@ fn ranges(ids: &RoaringTreemap) -> crate::Result<Vec<RowRange>> {
 
 fn field_ids(predicate: &Predicate, fields: &[DataField], ids: &mut HashSet<i32>) {
     match predicate {
+        Predicate::NestedLeaf { root, .. } => {
+            ids.insert(root.id());
+        }
         Predicate::Leaf { column, .. } => {
             if let Some(id) = find_field_id_by_name(fields, column) {
                 ids.insert(id);

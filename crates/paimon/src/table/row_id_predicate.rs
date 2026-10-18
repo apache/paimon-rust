@@ -116,6 +116,7 @@ pub(crate) fn reject_row_id_filter(predicates: &[Predicate], read: &str) -> crat
 /// Whether any leaf of `predicate` references `_ROW_ID`.
 pub(crate) fn references_row_id(predicate: &Predicate) -> bool {
     match predicate {
+        Predicate::NestedLeaf { .. } => false,
         Predicate::Leaf { column, .. } => is_row_id_column(column),
         Predicate::And(children) | Predicate::Or(children) => {
             children.iter().any(references_row_id)

@@ -387,6 +387,7 @@ impl GlobalIndexScanner {
     ) -> bool {
         use crate::spec::PredicateOperator;
         match predicate {
+            Predicate::NestedLeaf { .. } => false,
             Predicate::Leaf { column, op, .. } => {
                 predicates::is_sorted_global_index_supported_op(*op)
                     && !matches!(

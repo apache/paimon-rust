@@ -192,6 +192,13 @@ pub(super) fn rule_mask(
     batch_fields: &[DataField],
 ) -> Result<BooleanArray> {
     match predicate {
+        Predicate::NestedLeaf { .. } => crate::arrow::residual::evaluate_predicate_mask(
+            batch,
+            predicate,
+            schema_fields,
+            batch_fields,
+        )?
+        .ok_or_else(|| unsupported("nested row filter cannot be evaluated")),
         Predicate::AlwaysTrue => Ok(BooleanArray::from(vec![true; batch.num_rows()])),
         Predicate::AlwaysFalse => Ok(BooleanArray::from(vec![false; batch.num_rows()])),
         Predicate::And(children) | Predicate::Or(children) => {

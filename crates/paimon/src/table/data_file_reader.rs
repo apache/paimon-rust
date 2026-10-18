@@ -527,8 +527,9 @@ impl DataFileReader {
             return Ok(futures::stream::empty().boxed());
         }
 
-        let mut read_type = self.read_type.clone();
-        let output_field_count = read_type.len();
+        let output_read_type = self.read_type.clone();
+        let output_schema = crate::arrow::build_read_arrow_schema(&output_read_type)?;
+        let mut read_type = output_read_type.clone();
         let table_fields = self.table_fields.clone();
         let predicates = self.predicates.clone();
         let projects_row_id = read_type
@@ -600,6 +601,13 @@ impl DataFileReader {
             row_filter_factory: None,
             file_fields: table_fields.clone(),
         });
+        if post_read_filter {
+            // Nested residuals need the complete ROW even when the caller only
+            // projects a sibling. Widen before reconciliation; restoring only
+            // the top-level column count would leak the extra nested children.
+            read_type =
+                crate::arrow::residual::widen_scan_fields(&read_type, residual_predicates.as_ref());
+        }
         // The first version of the engine hook is deliberately limited to a
         // schema-identical raw read. Schema-evolution readers retain their exact
         // post-filter until expression adaptation is proven for that path.
@@ -861,16 +869,8 @@ impl DataFileReader {
                         residual,
                         &read_type,
                     )?;
-                    if read_type.len() > output_field_count {
-                        filtered.project(&(0..output_field_count).collect::<Vec<_>>()).map_err(|e| {
-                            Error::UnexpectedError {
-                                message: format!("Failed to project filtered RecordBatch: {e}"),
-                                source: Some(Box::new(e)),
-                            }
-                        })?
-                    } else {
-                        filtered
-                    }
+                    let output_schema = super::row_sidecar::propagate_blob_data(&output_schema, &filtered);
+                    project_residual_output(filtered, &read_type, &output_read_type, output_schema)?
                 } else {
                     result
                 };
@@ -1057,6 +1057,44 @@ impl DataFileReader {
         }
         .boxed())
     }
+}
+
+/// Restore an output projection after reading complete predicate ROW inputs.
+/// Columns retain their prefix order; ROW children are paired by Paimon field
+/// identity rather than Arrow position, including reordered nested projections.
+pub(super) fn project_residual_output(
+    batch: RecordBatch,
+    source_fields: &[DataField],
+    output_fields: &[DataField],
+    output_schema: Arc<arrow_schema::Schema>,
+) -> crate::Result<RecordBatch> {
+    if batch.schema() == output_schema {
+        return Ok(batch);
+    }
+    let columns = output_fields
+        .iter()
+        .enumerate()
+        .map(|(index, target)| {
+            let source = source_fields
+                .iter()
+                .find(|field| field.id() == target.id())
+                .unwrap_or(target);
+            if source == target {
+                Ok(batch.column(index).clone())
+            } else {
+                crate::arrow::nested_evolution::evolve_field(batch.column(index), source, target)
+            }
+        })
+        .collect::<crate::Result<Vec<_>>>()?;
+    RecordBatch::try_new_with_options(
+        output_schema,
+        columns,
+        &arrow_array::RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
+    )
+    .map_err(|error| Error::UnexpectedError {
+        message: format!("Failed to restore residual output projection: {error}"),
+        source: Some(Box::new(error)),
+    })
 }
 
 /// Reconcile one decoded column with the read schema's type for it.
@@ -2238,6 +2276,158 @@ mod row_tests {
             .await
             .unwrap();
         assert_eq!(row_ids(&selected), vec![101]);
+    }
+
+    #[tokio::test]
+    async fn nested_residual_reads_unprojected_sibling_before_restoring_output() {
+        use arrow_array::StructArray;
+        use arrow_buffer::NullBuffer;
+        use arrow_schema::DataType as ArrowDataType;
+
+        for (evolved, row_id) in [(true, false), (false, true), (true, true)] {
+            let score = field(1, "score", DataType::Int(IntType::new()));
+            let label = field(2, "label", DataType::VarChar(VarCharType::string_type()));
+            let physical = vec![field(
+                0,
+                "profile",
+                DataType::Row(RowType::new(vec![score.clone(), label.clone()])),
+            )];
+            let mut current = physical.clone();
+            if evolved {
+                current[0] = field(
+                    0,
+                    "profile",
+                    DataType::Row(RowType::new(vec![
+                        field(1, "score", DataType::BigInt(BigIntType::new())),
+                        label.clone(),
+                    ])),
+                );
+            }
+            let schema = build_target_arrow_schema(&physical).unwrap();
+            let ArrowDataType::Struct(children) = schema.field(0).data_type() else {
+                unreachable!()
+            };
+            let values = StructArray::new(
+                children.clone(),
+                vec![
+                    Arc::new(Int32Array::from(vec![7, 9, 7])),
+                    Arc::new(StringArray::from(vec!["match", "other", "hidden"])),
+                ],
+                Some(NullBuffer::from(vec![true, true, false])),
+            );
+            let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(values)]).unwrap();
+            let file_io = FileIOBuilder::new("memory").build().unwrap();
+            let table_path = format!("memory:/nested_residual_{evolved}_{row_id}");
+            let bucket_path = format!("{table_path}/bucket-0");
+            let output = file_io
+                .new_output(&format!("{bucket_path}/part.parquet"))
+                .unwrap();
+            let mut writer = create_format_writer(&output, schema, "zstd", 1, None, None, None)
+                .await
+                .unwrap();
+            writer.write(&batch).await.unwrap();
+            let file_size = writer.close().await.unwrap().file_size as i64;
+            let mut file_meta = data_file("part.parquet", file_size, 3, 1);
+            file_meta.first_row_id = Some(100);
+            let split = DataSplitBuilder::new()
+                .with_snapshot(1)
+                .with_partition(BinaryRow::new(0))
+                .with_bucket(0)
+                .with_bucket_path(bucket_path)
+                .with_total_buckets(1)
+                .with_data_files(vec![file_meta.clone()])
+                .build()
+                .unwrap();
+            let mut projected = vec![field(
+                0,
+                "profile",
+                DataType::Row(RowType::new(vec![label])),
+            )];
+            if row_id {
+                projected.insert(0, crate::spec::row_id_data_field());
+            }
+            let builder = PredicateBuilder::new(&current);
+            for op in [
+                crate::spec::PredicateOperator::Eq,
+                crate::spec::PredicateOperator::IsNull,
+            ] {
+                let literals = if op == crate::spec::PredicateOperator::IsNull {
+                    vec![]
+                } else if evolved {
+                    vec![Datum::Long(7)]
+                } else {
+                    vec![Datum::Int(7)]
+                };
+                let score = builder.nested_field("profile", &["score"]).unwrap();
+                let predicate = if op == crate::spec::PredicateOperator::IsNull {
+                    builder.is_null(&score)
+                } else {
+                    builder.equal(&score, literals[0].clone())
+                }
+                .unwrap();
+                let reader = DataFileReader::new(
+                    file_io.clone(),
+                    SchemaManager::new(file_io.clone(), table_path.clone()),
+                    2,
+                    current.clone(),
+                    projected.clone(),
+                    vec![predicate],
+                );
+                let batches = reader
+                    .read_single_file_stream(
+                        &split,
+                        file_meta.clone(),
+                        evolved.then(|| physical.clone()),
+                        None,
+                        None,
+                    )
+                    .unwrap()
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .unwrap();
+                assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+                for batch in batches {
+                    assert_eq!(
+                        batch.schema(),
+                        crate::arrow::build_read_arrow_schema(&projected).unwrap()
+                    );
+                    let profile = batch
+                        .column(usize::from(row_id))
+                        .as_any()
+                        .downcast_ref::<StructArray>()
+                        .unwrap();
+                    assert_eq!(profile.num_columns(), 1);
+                    if op == crate::spec::PredicateOperator::IsNull {
+                        assert!(profile.is_null(0));
+                    } else {
+                        assert_eq!(
+                            profile
+                                .column(0)
+                                .as_any()
+                                .downcast_ref::<StringArray>()
+                                .unwrap()
+                                .value(0),
+                            "match"
+                        );
+                    }
+                    if row_id {
+                        assert_eq!(
+                            batch
+                                .column(0)
+                                .as_any()
+                                .downcast_ref::<Int64Array>()
+                                .unwrap()
+                                .value(0),
+                            if op == crate::spec::PredicateOperator::IsNull {
+                                102
+                            } else {
+                                100
+                            }
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[tokio::test]

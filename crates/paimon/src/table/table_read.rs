@@ -1295,7 +1295,7 @@ impl<'a> PaimonTableRead<'a> {
         if let Some(options) = blob_options {
             return self.finish_authorized_blobs(stream, &batch_fields, &pending, options);
         }
-        let stream = project_authorized_stream(stream, self.read_type.len());
+        let stream = project_authorized_stream(stream, &batch_fields, &self.read_type)?;
         Ok(match self.limit {
             None => Box::pin(stream),
             Some(limit) => limit_rows(Box::pin(stream), limit),
@@ -1409,7 +1409,23 @@ impl<'a> PaimonTableRead<'a> {
                 // The payload filter owns its widened schema. Drop authorization
                 // columns before it resolves columns by position.
                 let fields = plan.scan_fields().to_vec();
-                Box::pin(stream.map(move |batch| {
+                let sources = fields
+                    .iter()
+                    .map(|field| {
+                        batch_fields
+                            .iter()
+                            .find(|source| source.id() == field.id())
+                            .cloned()
+                            .ok_or_else(|| crate::Error::DataInvalid {
+                                message: format!(
+                                    "authorized BLOB filter is missing field '{}'",
+                                    field.name()
+                                ),
+                                source: None,
+                            })
+                    })
+                    .collect::<crate::Result<Vec<_>>>()?;
+                let stream = Box::pin(stream.map(move |batch| {
                     let batch = batch?;
                     let indices = fields
                         .iter()
@@ -1425,7 +1441,11 @@ impl<'a> PaimonTableRead<'a> {
                             message: format!("failed to project the authorized batch: {e}"),
                             source: Some(Box::new(e)),
                         })
-                })) as ArrowRecordBatchStream
+                })) as ArrowRecordBatchStream;
+                // An ordinary predicate may have read extra ROW children that
+                // the remaining BLOB predicates do not need. Restore the plan's
+                // nested inputs using their actual, pre-projection types.
+                project_authorized_stream(stream, &sources, plan.scan_fields())?
             }
             None => {
                 let predicates = crate::arrow::format::FilePredicates {
@@ -1441,7 +1461,8 @@ impl<'a> PaimonTableRead<'a> {
                         &fields,
                     )
                 });
-                let stream = project_authorized_stream(Box::pin(stream), self.read_type.len());
+                let stream =
+                    project_authorized_stream(Box::pin(stream), batch_fields, &self.read_type)?;
                 let stream = match self.limit {
                     Some(limit) => limit_rows(stream, limit),
                     None => stream,
@@ -1715,17 +1736,24 @@ impl<'a> PaimonTableRead<'a> {
 
 fn project_authorized_stream(
     stream: ArrowRecordBatchStream,
-    columns: usize,
-) -> ArrowRecordBatchStream {
-    let projection: Vec<usize> = (0..columns).collect();
-    Box::pin(stream.map(move |batch| {
-        batch?
-            .project(&projection)
-            .map_err(|e| crate::Error::DataInvalid {
-                message: format!("failed to project the authorized batch: {e}"),
-                source: Some(Box::new(e)),
-            })
-    }))
+    source_fields: &[DataField],
+    output_fields: &[DataField],
+) -> crate::Result<ArrowRecordBatchStream> {
+    let source_fields = source_fields.to_vec();
+    let output_fields = output_fields.to_vec();
+    let output_schema = crate::arrow::build_read_arrow_schema(&output_fields)?;
+    Ok(Box::pin(stream.map(move |batch| {
+        let batch = batch?;
+        let schema = super::row_sidecar::propagate_blob_data(&output_schema, &batch);
+        // Predicates may widen a partially projected ROW to include a sibling.
+        // Restore its children as well as dropping authorization-only columns.
+        super::data_file_reader::project_residual_output(
+            batch,
+            &source_fields,
+            &output_fields,
+            schema,
+        )
+    })))
 }
 
 /// Cuts batches to at most `quota` rows; stages up to `spend_quota` must not
@@ -2981,6 +3009,326 @@ mod tests {
                 masks: Vec::new(),
             },
         )
+    }
+
+    #[tokio::test]
+    async fn test_authorized_nested_predicate_restores_projected_row_children() {
+        use crate::arrow::format::create_format_writer;
+        use crate::spec::{BlobDescriptor, BlobType, RowType, VarCharType};
+        use arrow_array::{Int32Array, LargeBinaryArray};
+
+        for (mode, blob, payload_filter, project_payload, mask_id) in [
+            ("ordinary", false, false, false, false),
+            ("descriptor", true, false, true, false),
+            ("payload", true, true, true, false),
+            ("hidden_payload", true, true, false, false),
+            ("masked_ordinary", false, false, false, true),
+            ("masked_descriptor", true, false, true, true),
+            ("masked_payload", true, true, true, true),
+        ] {
+            let mut schema = Schema::builder()
+                .column("id", DataType::Int(IntType::with_nullable(false)))
+                .column(
+                    "profile",
+                    DataType::Row(RowType::new(vec![
+                        DataField::new(2, "score".into(), DataType::Int(IntType::new())),
+                        DataField::new(
+                            3,
+                            "label".into(),
+                            DataType::VarChar(VarCharType::string_type()),
+                        ),
+                    ])),
+                )
+                .option("query-auth.enabled", "true")
+                .option(
+                    "blob-as-descriptor",
+                    if payload_filter { "false" } else { "true" },
+                );
+            if blob {
+                schema = schema
+                    .column("payload", DataType::Blob(BlobType::new()))
+                    .option("data-evolution.enabled", "true")
+                    .option("row-tracking.enabled", "true");
+            }
+            let schema = schema.build().unwrap();
+            let table_schema = TableSchema::new(0, &schema);
+            let fields = table_schema.fields().to_vec();
+            let DataType::Row(profile_type) = fields[1].data_type() else {
+                unreachable!()
+            };
+            let profile_arrow = crate::arrow::paimon_type_to_arrow(fields[1].data_type()).unwrap();
+            let arrow_schema::DataType::Struct(children) = profile_arrow else {
+                unreachable!()
+            };
+            let profiles = StructArray::new(
+                children,
+                vec![
+                    Arc::new(Int32Array::from(vec![7, 9, 7])),
+                    Arc::new(StringArray::from(vec!["selected", "other", "denied"])),
+                ],
+                None,
+            );
+            let descriptor = BlobDescriptor::new("memory:/payload".into(), 0, 3).serialize();
+            let mut columns: Vec<ArrayRef> = vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(profiles),
+            ];
+            if blob {
+                columns.push(Arc::new(LargeBinaryArray::from(vec![
+                    descriptor.as_slice();
+                    3
+                ])));
+            }
+            let batch = RecordBatch::try_new(
+                crate::arrow::build_read_arrow_schema(&fields).unwrap(),
+                columns,
+            )
+            .unwrap();
+            let file_io = FileIOBuilder::new("memory").build().unwrap();
+            file_io
+                .new_output("memory:/payload")
+                .unwrap()
+                .write(bytes::Bytes::from_static(b"abc"))
+                .await
+                .unwrap();
+            let location = format!("memory:/authorized_nested_{mode}");
+            let bucket_path = format!("{location}/bucket-0");
+            let output = file_io
+                .new_output(&format!("{bucket_path}/data.parquet"))
+                .unwrap();
+            let mut writer =
+                create_format_writer(&output, batch.schema(), "zstd", 1, None, None, None)
+                    .await
+                    .unwrap();
+            writer.write(&batch).await.unwrap();
+            let mut data_file = file("data.parquet", 0, Some(0));
+            data_file.row_count = 3;
+            data_file.first_row_id = Some(100);
+            data_file.file_size = writer.close().await.unwrap().file_size as i64;
+            let table = Table {
+                schema: table_schema,
+                schema_manager: crate::table::schema_manager::SchemaManager::new(
+                    file_io.clone(),
+                    location.clone(),
+                ),
+                file_io,
+                location,
+                ..crate::table::rest_query_auth_table().await
+            };
+            let builder = PredicateBuilder::new(&fields);
+            let score = builder.nested_field("profile", &["score"]).unwrap();
+            let predicate = builder.equal(&score, Datum::Int(7)).unwrap();
+            let mut predicates = vec![predicate];
+            if payload_filter {
+                predicates.push(
+                    builder
+                        .equal("payload", Datum::Bytes(b"abc".to_vec()))
+                        .unwrap(),
+                );
+            }
+            let grant = crate::table::query_auth::QueryAuthGrant::new(
+                table.query_auth_session().unwrap(),
+                None,
+                crate::table::query_auth::Rules {
+                    filters: vec![builder.less_than("id", Datum::Int(3)).unwrap().into()],
+                    masks: if mask_id {
+                        crate::table::query_auth::Rules::parse(
+                            &crate::api::AuthTableQueryResponse {
+                                filter: None,
+                                column_masking: Some(std::collections::HashMap::from([(
+                                    "id".to_string(),
+                                    r#"{"name":"NULL"}"#.to_string(),
+                                )])),
+                            },
+                            &fields,
+                        )
+                        .unwrap()
+                        .masks
+                    } else {
+                        Vec::new()
+                    },
+                },
+            );
+            let split = DataSplitBuilder::new()
+                .with_snapshot(1)
+                .with_partition(BinaryRow::new(0))
+                .with_bucket(0)
+                .with_bucket_path(bucket_path)
+                .with_total_buckets(1)
+                .with_data_files(vec![data_file])
+                .build()
+                .unwrap()
+                .planned(Some(Arc::new(grant)));
+            let mut projected = vec![DataField::new(
+                fields[1].id(),
+                "profile".into(),
+                DataType::Row(RowType::new(vec![profile_type.fields()[1].clone()])),
+            )];
+            if mask_id {
+                projected.push(fields[0].clone());
+            }
+            if project_payload {
+                projected.push(fields[2].clone());
+            }
+            for row_kind in [false, true] {
+                let read = TableRead::new(&table, projected.clone(), predicates.clone())
+                    .with_limit(Some(1));
+                let stream = if row_kind {
+                    read.to_arrow_with_row_kind(std::slice::from_ref(&split))
+                } else {
+                    read.to_arrow(std::slice::from_ref(&split))
+                }
+                .unwrap();
+                let batches: Vec<_> = stream.try_collect().await.unwrap();
+                assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+                let mut expected = projected.clone();
+                if row_kind {
+                    expected.insert(0, row_kind_field());
+                }
+                for batch in batches {
+                    assert_eq!(
+                        batch.schema(),
+                        crate::arrow::build_read_arrow_schema(&expected).unwrap()
+                    );
+                    let profile = batch
+                        .column(usize::from(row_kind))
+                        .as_any()
+                        .downcast_ref::<StructArray>()
+                        .unwrap();
+                    assert_eq!(profile.num_columns(), 1);
+                    let label = profile
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .unwrap();
+                    assert_eq!(label.value(0), "selected");
+                    if row_kind {
+                        assert_eq!(
+                            batch
+                                .column(0)
+                                .as_any()
+                                .downcast_ref::<StringArray>()
+                                .unwrap()
+                                .value(0),
+                            "+I"
+                        );
+                    }
+                    if project_payload {
+                        let payload = batch
+                            .column(usize::from(row_kind) + 1 + usize::from(mask_id))
+                            .as_any()
+                            .downcast_ref::<LargeBinaryArray>()
+                            .unwrap();
+                        assert_eq!(
+                            payload.value(0),
+                            if payload_filter {
+                                b"abc".as_slice()
+                            } else {
+                                descriptor.as_slice()
+                            },
+                        );
+                    }
+                    if mask_id {
+                        let id = batch.column(usize::from(row_kind) + 1);
+                        assert_eq!(id.null_count(), batch.num_rows());
+                        assert!(batch
+                            .schema()
+                            .field(usize::from(row_kind) + 1)
+                            .is_nullable());
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_authorized_projection_preserves_null_parents_and_blob_markers() {
+        use crate::spec::{BlobType, RowType, VarCharType};
+        use arrow_array::{Int32Array, LargeBinaryArray};
+        use arrow_buffer::NullBuffer;
+
+        let score = DataField::new(11, "score".into(), DataType::Int(IntType::new()));
+        let label = DataField::new(
+            12,
+            "label".into(),
+            DataType::VarChar(VarCharType::string_type()),
+        );
+        let hidden = DataField::new(13, "hidden".into(), DataType::Int(IntType::new()));
+        let source = vec![
+            DataField::new(
+                10,
+                "profile".into(),
+                DataType::Row(RowType::new(vec![score.clone(), label.clone(), hidden])),
+            ),
+            DataField::new(20, "payload".into(), DataType::Blob(BlobType::new())),
+            DataField::new(30, "auth_only".into(), DataType::Int(IntType::new())),
+        ];
+        let output = vec![
+            DataField::new(
+                10,
+                "profile".into(),
+                DataType::Row(RowType::new(vec![label, score])),
+            ),
+            source[1].clone(),
+        ];
+        let schema = crate::arrow::build_read_arrow_schema(&source).unwrap();
+        let arrow_schema::DataType::Struct(children) = schema.field(0).data_type() else {
+            unreachable!()
+        };
+        let profile = StructArray::new(
+            children.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![7, 99])),
+                Arc::new(StringArray::from(vec!["visible", "under-null-parent"])),
+                Arc::new(Int32Array::from(vec![100, 200])),
+            ],
+            Some(NullBuffer::from(vec![true, false])),
+        );
+        let schema = super::super::row_sidecar::mark_blob_data(
+            &schema,
+            &std::collections::HashSet::from(["payload".to_string()]),
+        );
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(profile),
+                Arc::new(LargeBinaryArray::from(vec![b"raw".as_slice(); 2])),
+                Arc::new(Int32Array::from(vec![1, 2])),
+            ],
+        )
+        .unwrap();
+        let stream = Box::pin(stream::iter([Ok(batch)]));
+        let batches: Vec<_> = project_authorized_stream(stream, &source, &output)
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let batch = &batches[0];
+        assert_eq!(batch.num_columns(), 2);
+        assert!(super::super::row_sidecar::is_blob_data(
+            batch.schema().field(1)
+        ));
+        let profile = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        assert_eq!(profile.column_names(), ["label", "score"]);
+        assert!(profile.is_null(1));
+        let labels = profile
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(labels.value(0), "visible");
+        assert!(labels.is_null(1));
+        let scores = profile
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(scores.value(0), 7);
+        assert!(scores.is_null(1));
     }
 
     #[tokio::test]

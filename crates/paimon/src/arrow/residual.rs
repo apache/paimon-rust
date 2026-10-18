@@ -67,6 +67,8 @@ use arrow_string::like::{
 };
 use std::sync::Arc;
 
+mod nested;
+
 /// Filter a [`RecordBatch`] to exactly the rows satisfying `predicates`.
 ///
 /// `scan_fields` describes the columns actually present in `batch` (in order);
@@ -118,13 +120,20 @@ pub(crate) fn evaluate_predicates_mask(
     Ok(combined)
 }
 
-fn evaluate_predicate_mask(
+pub(crate) fn evaluate_predicate_mask(
     batch: &RecordBatch,
     predicate: &Predicate,
     file_fields: &[DataField],
     scan_fields: &[DataField],
 ) -> crate::Result<Option<BooleanArray>> {
     match predicate {
+        Predicate::NestedLeaf {
+            root,
+            path,
+            op,
+            literals,
+            ..
+        } => nested::evaluate(batch, root, path, *op, literals, file_fields, scan_fields).map(Some),
         Predicate::AlwaysTrue => Ok(Some(BooleanArray::from(vec![true; batch.num_rows()]))),
         Predicate::AlwaysFalse => Ok(Some(BooleanArray::from(vec![false; batch.num_rows()]))),
         Predicate::And(children) => {
@@ -284,9 +293,37 @@ pub(crate) fn widen_scan_fields(
                 push_unique_scan_field(&mut fields, field);
             }
         }
+        for predicate in &fp.predicates {
+            widen_nested_fields(predicate, &fp.file_fields, &mut fields);
+        }
     }
 
     fields
+}
+
+fn widen_nested_fields(
+    predicate: &Predicate,
+    file_fields: &[DataField],
+    fields: &mut Vec<DataField>,
+) {
+    match predicate {
+        Predicate::NestedLeaf { root, .. } => {
+            if let Some(source) = file_fields.iter().find(|f| f.id() == root.id()) {
+                if let Some(index) = fields.iter().position(|f| f.id() == root.id()) {
+                    fields[index] = source.clone();
+                } else {
+                    fields.push(source.clone());
+                }
+            }
+        }
+        Predicate::And(children) | Predicate::Or(children) => {
+            for child in children {
+                widen_nested_fields(child, file_fields, fields);
+            }
+        }
+        Predicate::Not(child) => widen_nested_fields(child, file_fields, fields),
+        _ => {}
+    }
 }
 
 /// Collect every leaf as `(column name, leaf index)`.
@@ -298,6 +335,7 @@ pub(crate) fn collect_predicate_leaf_refs<'a>(
     refs: &mut Vec<(&'a str, usize)>,
 ) {
     match predicate {
+        Predicate::NestedLeaf { root, index, .. } => refs.push((root.name(), *index)),
         Predicate::Leaf { column, index, .. } => refs.push((column.as_str(), *index)),
         Predicate::And(children) | Predicate::Or(children) => {
             for child in children {
