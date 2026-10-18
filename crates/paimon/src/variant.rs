@@ -17,7 +17,8 @@
 
 //! Java-compatible helpers for Paimon Variant values.
 
-use std::collections::{HashMap, HashSet};
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::spec::{
     ArrayType, BigIntType, BooleanType, DataField, DataType, DateType, DecimalType, DoubleType,
@@ -36,6 +37,15 @@ const BASIC_TYPE_BITS: u8 = 2;
 const BASIC_TYPE_MASK: u8 = 0x3;
 const TYPE_INFO_MASK: u8 = 0x3f;
 const MAX_SHORT_STR_SIZE: usize = 0x3f;
+const MAX_CACHED_VARIANT_METADATA_BYTES: usize = 512 * 1024;
+const MAX_CACHED_VARIANT_METADATA_TOTAL_BYTES: usize = 1024 * 1024;
+const MAX_CACHED_VARIANT_METADATA_ENTRIES: usize = 4;
+
+thread_local! {
+    /// Exact-byte cache: metadata dictionaries are often repeated across rows and
+    /// independent projected expressions, but must never be trusted by hash alone.
+    static VALIDATED_METADATA: RefCell<VecDeque<Vec<u8>>> = const { RefCell::new(VecDeque::new()) };
+}
 
 const PRIMITIVE: u8 = 0;
 const SHORT_STR: u8 = 1;
@@ -128,10 +138,51 @@ pub struct VariantRef<'a> {
     pos: usize,
 }
 
+/// Validation state is tied to these exact metadata bytes, not just to a row or a
+/// dictionary key that may have a different meaning in another batch.
+pub(crate) struct VariantMetadataValidation<'a> {
+    bytes: &'a [u8],
+    validated: bool,
+}
+
+impl<'a> VariantMetadataValidation<'a> {
+    pub(crate) fn new(bytes: &'a [u8], validated: bool) -> Self {
+        Self { bytes, validated }
+    }
+
+    pub(crate) fn is_validated(&self) -> bool {
+        self.validated
+    }
+}
+
 impl<'a> VariantRef<'a> {
     pub fn new(value: &'a [u8], metadata: &'a [u8], pos: usize) -> Result<Self> {
         validate_payload(value, metadata)?;
         Self::new_at(value, metadata, pos)
+    }
+
+    /// Validate the shared metadata once per shredded row, while still validating every
+    /// residual value before exposing a borrowed view of it.
+    fn new_with_cached_metadata(
+        value: &'a [u8],
+        pos: usize,
+        metadata: &mut VariantMetadataValidation<'a>,
+    ) -> Result<Self> {
+        if metadata.bytes.is_empty() || (metadata.bytes[0] & VERSION_MASK) != VERSION {
+            return data_invalid("Malformed Variant metadata version");
+        }
+        if value.len() > SIZE_LIMIT || metadata.bytes.len() > SIZE_LIMIT {
+            return data_invalid("Variant value or metadata exceeds constructor size limit");
+        }
+        if !metadata.validated {
+            validate_metadata(metadata.bytes)?;
+            metadata.validated = true;
+        }
+        let root_size = validate_value(value, metadata.bytes, 0, 0)?;
+        if root_size != value.len() {
+            return data_invalid("Malformed Variant root size");
+        }
+        Self::new_at(value, metadata.bytes, pos)
     }
 
     fn new_at(value: &'a [u8], metadata: &'a [u8], pos: usize) -> Result<Self> {
@@ -442,6 +493,11 @@ pub fn validate_payload(value: &[u8], metadata: &[u8]) -> Result<()> {
 }
 
 fn validate_metadata(metadata: &[u8]) -> Result<()> {
+    if metadata.len() <= MAX_CACHED_VARIANT_METADATA_BYTES
+        && VALIDATED_METADATA.with(|cached| cached.borrow().iter().any(|entry| entry == metadata))
+    {
+        return Ok(());
+    }
     let offset_size = metadata_offset_size(metadata)?;
     let dict_size = read_unsigned(metadata, 1, offset_size)?;
     let offset_start = 1 + offset_size;
@@ -474,6 +530,20 @@ fn validate_metadata(metadata: &[u8]) -> Result<()> {
         if !seen.insert(key) {
             return data_invalid("Malformed Variant metadata duplicate key");
         }
+    }
+    if metadata.len() <= MAX_CACHED_VARIANT_METADATA_BYTES {
+        VALIDATED_METADATA.with(|cached| {
+            let mut cached = cached.borrow_mut();
+            let mut total_bytes = cached.iter().map(Vec::len).sum::<usize>();
+            while cached.len() >= MAX_CACHED_VARIANT_METADATA_ENTRIES
+                || total_bytes + metadata.len() > MAX_CACHED_VARIANT_METADATA_TOTAL_BYTES
+            {
+                if let Some(evicted) = cached.pop_front() {
+                    total_bytes -= evicted.len();
+                }
+            }
+            cached.push_back(metadata.to_vec());
+        });
     }
     Ok(())
 }
@@ -2689,6 +2759,7 @@ pub(crate) fn rebuild_shredded(
 /// Resolve a path directly against a clipped shredded schema. Unrequested
 /// physical siblings and a pruned parent `value` are not needed to rebuild
 /// the selected subtree. Whole-value rebuilding remains strict.
+#[cfg(test)]
 pub(crate) fn extract_shredded_path(
     row: &ShreddedRow,
     schema: &VariantSchema,
@@ -2699,6 +2770,110 @@ pub(crate) fn extract_shredded_path(
         return data_invalid("Malformed shredded Variant: missing value");
     }
     extract_shredded_segments(row, schema, metadata, &parse_path(path)?)
+}
+
+/// Cast a selected shredded path without copying the shared metadata for each
+/// residual field. The validation state is bound to one row's metadata bytes.
+pub(crate) fn extract_shredded_path_cast<'a>(
+    row: &'a ShreddedRow,
+    schema: &VariantSchema,
+    metadata: &mut VariantMetadataValidation<'a>,
+    path: &str,
+    data_type: &DataType,
+    fail_on_error: bool,
+) -> Result<Option<ShreddedValue>> {
+    if !shredded_row_has_value(row, schema) && schema.variant_idx.is_some() {
+        return data_invalid("Malformed shredded Variant: missing value");
+    }
+    extract_shredded_segments_cast(
+        row,
+        schema,
+        metadata,
+        &parse_path(path)?,
+        data_type,
+        fail_on_error,
+    )
+}
+
+fn extract_shredded_segments_cast<'a>(
+    row: &'a ShreddedRow,
+    schema: &VariantSchema,
+    metadata: &mut VariantMetadataValidation<'a>,
+    segments: &[PathSegment],
+    data_type: &DataType,
+    fail_on_error: bool,
+) -> Result<Option<ShreddedValue>> {
+    let Some((segment, remaining)) = segments.split_first() else {
+        // A selected scalar leaf can be read without rebuilding the whole
+        // Variant (and copying its shared metadata) for every field.
+        if schema.scalar_schema.is_some() {
+            let typed = schema.typed_idx.and_then(|index| row.field(index));
+            let residual = optional_binary_field(row, schema.variant_idx)?;
+            match (typed, residual) {
+                (None, Some(value)) => {
+                    let variant = VariantRef::new_with_cached_metadata(value, 0, metadata)?;
+                    return cast_variant_to_shredded_value(variant, data_type, fail_on_error);
+                }
+                (None, None) => return Ok(None),
+                _ => {}
+            }
+        }
+        let extracted = extract_shredded_segments(row, schema, metadata.bytes, segments)?;
+        return extracted
+            .map(|variant| {
+                cast_variant_to_shredded_value(variant.as_ref()?, data_type, fail_on_error)
+            })
+            .transpose()
+            .map(Option::flatten);
+    };
+    if let Some(typed) = schema.typed_idx.and_then(|index| row.field(index)) {
+        match (segment, typed) {
+            (PathSegment::Key(key), ShreddedValue::Row(object))
+                if schema.object_schema.is_some() =>
+            {
+                if let Some(index) = schema.object_field_index(key) {
+                    let Some(ShreddedValue::Row(child)) = object.field(index) else {
+                        return data_invalid("Malformed shredded Variant object field");
+                    };
+                    return extract_shredded_segments_cast(
+                        child,
+                        &schema.object_schema.as_ref().unwrap()[index].schema,
+                        metadata,
+                        remaining,
+                        data_type,
+                        fail_on_error,
+                    );
+                }
+            }
+            (PathSegment::Index(index), ShreddedValue::List(elements))
+                if schema.array_schema.is_some() =>
+            {
+                return match elements.get(*index) {
+                    Some(element) => extract_shredded_segments_cast(
+                        element,
+                        schema.array_schema.as_ref().unwrap(),
+                        metadata,
+                        remaining,
+                        data_type,
+                        fail_on_error,
+                    ),
+                    None => Ok(None),
+                };
+            }
+            _ => {}
+        }
+    }
+    match optional_binary_field(row, schema.variant_idx)? {
+        Some(value) => {
+            let variant = VariantRef::new_with_cached_metadata(value, 0, metadata)?;
+            variant
+                .get_path_segments(segments)?
+                .map(|selected| cast_variant_to_shredded_value(selected, data_type, fail_on_error))
+                .transpose()
+                .map(Option::flatten)
+        }
+        None => Ok(None),
+    }
 }
 
 fn extract_shredded_segments(
@@ -3382,6 +3557,114 @@ mod tests {
         vec![VERSION, 0, 0]
     }
 
+    #[test]
+    fn metadata_cache_requires_exact_valid_bytes() {
+        let make_large = |suffix: char| {
+            let fields = (0..5342)
+                .map(|i| format!("\"field_{i:04}_{suffix}_{i:032}_abcdefghijklmnop\":0"))
+                .collect::<Vec<_>>()
+                .join(",");
+            GenericVariant::parse_json(&format!("{{{fields}}}"))
+                .unwrap()
+                .metadata()
+                .to_vec()
+        };
+        let first = make_large('a');
+        let second = make_large('b');
+        let third = GenericVariant::parse_json("42").unwrap();
+        assert_ne!(first, second);
+        assert!(first.len() > 256 * 1024);
+        VALIDATED_METADATA.with(|cached| cached.borrow_mut().clear());
+        validate_metadata(&first).unwrap();
+        validate_metadata(&second).unwrap();
+        validate_metadata(third.metadata()).unwrap();
+        let cached_pointers = VALIDATED_METADATA.with(|cached| {
+            cached
+                .borrow()
+                .iter()
+                .map(|metadata| metadata.as_ptr())
+                .collect::<Vec<_>>()
+        });
+        for _ in 0..100 {
+            validate_metadata(&first).unwrap();
+            validate_metadata(third.metadata()).unwrap();
+            validate_metadata(&second).unwrap();
+        }
+        VALIDATED_METADATA.with(|cached| {
+            assert_eq!(
+                cached
+                    .borrow()
+                    .iter()
+                    .map(|metadata| metadata.as_ptr())
+                    .collect::<Vec<_>>(),
+                cached_pointers,
+                "repeated dictionaries must remain cached instead of being rebuilt"
+            );
+        });
+
+        let mut malformed = first.clone();
+        *malformed.last_mut().unwrap() = 0xff;
+        assert_eq!(malformed.len(), first.len());
+        assert!(validate_metadata(&malformed).is_err());
+        validate_metadata(&first).unwrap();
+    }
+
+    #[test]
+    fn metadata_cache_respects_entry_and_byte_limits() {
+        VALIDATED_METADATA.with(|cached| cached.borrow_mut().clear());
+        for i in 0..5 {
+            let variant = GenericVariant::parse_json(&format!(r#"{{"field_{i}":0}}"#)).unwrap();
+            validate_metadata(variant.metadata()).unwrap();
+        }
+        VALIDATED_METADATA.with(|cached| {
+            let cached = cached.borrow();
+            assert_eq!(cached.len(), MAX_CACHED_VARIANT_METADATA_ENTRIES);
+            assert!(
+                cached.iter().map(Vec::len).sum::<usize>()
+                    <= MAX_CACHED_VARIANT_METADATA_TOTAL_BYTES
+            );
+        });
+
+        let wide = |suffix: usize, count: usize| {
+            let fields = (0..count)
+                .map(|i| format!(r#""field_{i:04}_{suffix}_{i:032}_abcdefghijklmnop":0"#))
+                .collect::<Vec<_>>()
+                .join(",");
+            GenericVariant::parse_json(&format!("{{{fields}}}"))
+                .unwrap()
+                .metadata()
+                .to_vec()
+        };
+        let large = wide(0, 5_342);
+        let oversize = wide(1, 9_000);
+        assert!(large.len() > MAX_CACHED_VARIANT_METADATA_TOTAL_BYTES / 4);
+        assert!(large.len() <= MAX_CACHED_VARIANT_METADATA_BYTES);
+        assert!(oversize.len() > MAX_CACHED_VARIANT_METADATA_BYTES);
+        VALIDATED_METADATA.with(|cached| cached.borrow_mut().clear());
+        for suffix in 0..4 {
+            let metadata = wide(suffix, 5_342);
+            validate_metadata(&metadata).unwrap();
+            VALIDATED_METADATA.with(|cached| {
+                let cached = cached.borrow();
+                assert!(cached.len() <= MAX_CACHED_VARIANT_METADATA_ENTRIES);
+                assert!(
+                    cached.iter().map(Vec::len).sum::<usize>()
+                        <= MAX_CACHED_VARIANT_METADATA_TOTAL_BYTES
+                );
+            });
+        }
+        VALIDATED_METADATA.with(|cached| {
+            assert!(!cached.borrow().iter().any(|entry| entry == &large));
+        });
+        let before = VALIDATED_METADATA.with(|cached| cached.borrow().len());
+        validate_metadata(&oversize).unwrap();
+        VALIDATED_METADATA.with(|cached| {
+            let cached = cached.borrow();
+            assert_eq!(cached.len(), before);
+            assert!(!cached.iter().any(|entry| entry == &oversize));
+        });
+    }
+
     fn simple_object_shredding_schema() -> VariantSchema {
         let configured = DataType::Row(RowType::new(vec![
             DataField::new(7, "age".to_string(), DataType::BigInt(BigIntType::new())),
@@ -3431,6 +3714,285 @@ mod tests {
             rebuild_shredded(&row, &clipped).is_err(),
             "whole values still require the pruned fallback"
         );
+    }
+
+    #[test]
+    fn cached_shredded_residual_cast_matches_existing_extraction() {
+        let configured = DataType::Row(RowType::new(vec![
+            DataField::new(7, "a".to_string(), DataType::Double(DoubleType::new())),
+            DataField::new(8, "b".to_string(), DataType::Double(DoubleType::new())),
+        ]));
+        let DataType::Row(physical) = variant_shredding_type(&configured).unwrap() else {
+            panic!("expected row shredding type");
+        };
+        let schema = build_variant_schema(&physical).unwrap();
+        let target = DataType::Float(FloatType::new());
+        for json in [
+            r#"{"a":0,"b":1}"#,
+            r#"{"a":2.5,"b":0}"#,
+            r#"{"a":"bad","b":1}"#,
+            r#"{"a":null,"b":1}"#,
+            r#"{"b":1}"#,
+            r#"{"c":0}"#,
+            r#"{"d":0}"#,
+            "42",
+            "null",
+        ] {
+            let variant = GenericVariant::parse_json(json).unwrap();
+            let shredded = cast_shredded(&variant, &schema).unwrap();
+            for fail_on_error in [false, true] {
+                let mut metadata_validation =
+                    VariantMetadataValidation::new(variant.metadata(), false);
+                for path in ["$.a", "$.b"] {
+                    let expected =
+                        extract_shredded_path(&shredded, &schema, path).and_then(|selected| {
+                            selected
+                                .map(|value| {
+                                    cast_variant_to_shredded_value(
+                                        value.as_ref()?,
+                                        &target,
+                                        fail_on_error,
+                                    )
+                                })
+                                .transpose()
+                                .map(Option::flatten)
+                        });
+                    let actual = extract_shredded_path_cast(
+                        &shredded,
+                        &schema,
+                        &mut metadata_validation,
+                        path,
+                        &target,
+                        fail_on_error,
+                    );
+                    assert_eq!(
+                        actual.is_err(),
+                        expected.is_err(),
+                        "{json} {path} {fail_on_error}"
+                    );
+                    if let (Ok(actual), Ok(expected)) = (actual, expected) {
+                        assert_eq!(actual, expected, "{json} {path} {fail_on_error}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cached_shredded_nested_object_and_array_paths_match_existing_extraction() {
+        let configured = DataType::Row(RowType::new(vec![
+            DataField::new(
+                7,
+                "object".to_string(),
+                DataType::Row(RowType::new(vec![DataField::new(
+                    8,
+                    "a".to_string(),
+                    DataType::Double(DoubleType::new()),
+                )])),
+            ),
+            DataField::new(
+                9,
+                "items".to_string(),
+                DataType::Array(ArrayType::new(DataType::Double(DoubleType::new()))),
+            ),
+        ]));
+        let DataType::Row(physical) = variant_shredding_type(&configured).unwrap() else {
+            panic!("expected row shredding type");
+        };
+        let schema = build_variant_schema(&physical).unwrap();
+        let target = DataType::Float(FloatType::new());
+        for json in [
+            r#"{"object":{"a":0,"extra":1},"items":[0,2.5]}"#,
+            r#"{"object":{"a":2.5},"items":[3.5,0]}"#,
+            r#"{"object":null,"items":[]}"#,
+        ] {
+            let variant = GenericVariant::parse_json(json).unwrap();
+            let shredded = cast_shredded(&variant, &schema).unwrap();
+            let mut metadata = VariantMetadataValidation::new(variant.metadata(), false);
+            for path in ["$.object.a", "$.object.extra", "$.items[0]", "$.items[1]"] {
+                let expected = extract_shredded_path(&shredded, &schema, path)
+                    .unwrap()
+                    .map(|selected| {
+                        cast_variant_to_shredded_value(selected.as_ref().unwrap(), &target, false)
+                            .unwrap()
+                    })
+                    .flatten();
+                let actual = extract_shredded_path_cast(
+                    &shredded,
+                    &schema,
+                    &mut metadata,
+                    path,
+                    &target,
+                    false,
+                )
+                .unwrap();
+                assert_eq!(actual, expected, "{json} {path}");
+            }
+        }
+    }
+
+    #[test]
+    fn cached_shredded_residual_preserves_malformed_and_conflicting_values() {
+        let DataType::Row(physical) =
+            variant_shredding_type(&DataType::Double(DoubleType::new())).unwrap()
+        else {
+            panic!("expected row shredding type");
+        };
+        let schema = build_variant_schema(&physical).unwrap();
+        let variant = GenericVariant::parse_json("0").unwrap();
+        let residual = cast_shredded(&variant, &schema).unwrap();
+        let target = DataType::Float(FloatType::new());
+        let compare = |row: &ShreddedRow, metadata_bytes: &[u8]| {
+            let expected = extract_shredded_path(row, &schema, "$").and_then(|selected| {
+                selected
+                    .map(|value| cast_variant_to_shredded_value(value.as_ref()?, &target, false))
+                    .transpose()
+                    .map(Option::flatten)
+            });
+            let mut metadata = VariantMetadataValidation::new(metadata_bytes, false);
+            let actual =
+                extract_shredded_path_cast(row, &schema, &mut metadata, "$", &target, false);
+            assert_eq!(actual.is_err(), expected.is_err());
+            if let (Ok(actual), Ok(expected)) = (actual, expected) {
+                assert_eq!(actual, expected);
+            }
+        };
+        compare(&residual, variant.metadata());
+
+        let mut bad_value = residual.clone();
+        bad_value
+            .set(
+                schema.variant_idx.unwrap(),
+                ShreddedValue::Binary(vec![0xff]),
+            )
+            .unwrap();
+        compare(&bad_value, variant.metadata());
+
+        let mut bad_metadata = residual.clone();
+        let mut bytes = variant.metadata().to_vec();
+        bytes.pop();
+        bad_metadata
+            .set(
+                schema.top_level_metadata_idx.unwrap(),
+                ShreddedValue::Binary(bytes.clone()),
+            )
+            .unwrap();
+        compare(&bad_metadata, &bytes);
+
+        let mut both = residual.clone();
+        both.set(schema.typed_idx.unwrap(), ShreddedValue::Float64(1.5))
+            .unwrap();
+        compare(&both, variant.metadata());
+    }
+
+    /// Decode-only comparison, deliberately excluding Parquet I/O and DataLoader work.
+    /// Run with `cargo test --release -p paimon --lib benchmark_wide_shredded_residual_cast -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "local synthetic performance comparison"]
+    fn benchmark_wide_shredded_residual_cast() {
+        use std::hint::black_box;
+        use std::time::{Duration, Instant};
+
+        let configured = DataType::Row(RowType::new(
+            (0..200)
+                .map(|i| {
+                    DataField::new(i + 1, format!("f{i}"), DataType::Double(DoubleType::new()))
+                })
+                .collect(),
+        ));
+        let DataType::Row(physical) = variant_shredding_type(&configured).unwrap() else {
+            panic!("expected row shredding type");
+        };
+        let schema = build_variant_schema(&physical).unwrap();
+        let fields = (0..5_342)
+            .map(|i| {
+                if i < 27 || i >= 200 {
+                    format!(r#""f{i}":0"#)
+                } else {
+                    format!(r#""f{i}":{i}.5"#)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let variant = GenericVariant::parse_json(&format!("{{{fields}}}")).unwrap();
+        let shredded = cast_shredded(&variant, &schema).unwrap();
+        let Some(ShreddedValue::Row(object)) =
+            schema.typed_idx.and_then(|index| shredded.field(index))
+        else {
+            panic!("expected shredded object");
+        };
+        for field in schema.object_schema.as_ref().unwrap().iter().take(27) {
+            let index = schema.object_field_index(&field.field_name).unwrap();
+            let Some(ShreddedValue::Row(child)) = object.field(index) else {
+                panic!("expected shredded child");
+            };
+            assert!(child.field(field.schema.variant_idx.unwrap()).is_some());
+        }
+        let paths = (0..27).map(|i| format!("$.f{i}")).collect::<Vec<_>>();
+        let target = DataType::Float(FloatType::new());
+        for path in &paths {
+            let old = extract_shredded_path(&shredded, &schema, path)
+                .unwrap()
+                .map(|value| {
+                    cast_variant_to_shredded_value(value.as_ref().unwrap(), &target, false).unwrap()
+                })
+                .flatten();
+            let mut metadata = VariantMetadataValidation::new(variant.metadata(), false);
+            let new =
+                extract_shredded_path_cast(&shredded, &schema, &mut metadata, path, &target, false)
+                    .unwrap();
+            assert_eq!(new, old);
+        }
+
+        let mut old_times = Vec::new();
+        let mut new_times = Vec::new();
+        for round in 0..5 {
+            let measure = |optimized: bool| {
+                let start = Instant::now();
+                for _ in 0..512 {
+                    let mut metadata = VariantMetadataValidation::new(variant.metadata(), false);
+                    for path in &paths {
+                        let value = if optimized {
+                            extract_shredded_path_cast(
+                                &shredded,
+                                &schema,
+                                &mut metadata,
+                                path,
+                                &target,
+                                false,
+                            )
+                            .unwrap()
+                        } else {
+                            extract_shredded_path(&shredded, &schema, path)
+                                .unwrap()
+                                .map(|value| {
+                                    cast_variant_to_shredded_value(
+                                        value.as_ref().unwrap(),
+                                        &target,
+                                        false,
+                                    )
+                                    .unwrap()
+                                })
+                                .flatten()
+                        };
+                        black_box(value);
+                    }
+                }
+                start.elapsed()
+            };
+            if round % 2 == 0 {
+                old_times.push(measure(false));
+                new_times.push(measure(true));
+            } else {
+                new_times.push(measure(true));
+                old_times.push(measure(false));
+            }
+        }
+        old_times.sort();
+        new_times.sort();
+        let old: Duration = old_times[old_times.len() / 2];
+        let new: Duration = new_times[new_times.len() / 2];
+        println!("512 synthetic rows, 5342 metadata keys, 27 residual fields of 200 projected: legacy={old:?}, direct={new:?}");
     }
 
     #[test]
