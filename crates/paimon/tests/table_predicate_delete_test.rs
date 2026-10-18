@@ -20,12 +20,12 @@ mod common;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow_array::{ArrayRef, Int32Array, Int64Array, RecordBatch, StringArray};
+use arrow_array::{ArrayRef, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray};
 use common::incremental_helpers::{memory_table, persist_table_schema, setup_dirs, write_batch};
 use futures::TryStreamExt;
 use paimon::spec::{
-    DataType, Datum, IndexManifest, IntType, Predicate, PredicateBuilder, Schema, TableSchema,
-    VarCharType,
+    DataType, Datum, DoubleType, IndexManifest, IntType, Predicate, PredicateBuilder, Schema,
+    TableSchema, VarCharType,
 };
 use paimon::table::{CommitMessage, Table};
 
@@ -114,6 +114,35 @@ async fn ids(table: &Table) -> Vec<i32> {
         .await
         .unwrap();
     let mut ids: Vec<_> = batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        })
+        .collect();
+    ids.sort_unstable();
+    ids
+}
+
+async fn read_ids(table: &Table, filter: Predicate) -> Vec<i32> {
+    let mut read = table.new_read_builder();
+    read.with_projection(&["id"]).unwrap();
+    read.with_filter(filter);
+    let plan = read.new_scan().plan().await.unwrap();
+    let batches: Vec<RecordBatch> = read
+        .new_read()
+        .unwrap()
+        .to_arrow(plan.splits())
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    let mut ids: Vec<i32> = batches
         .iter()
         .flat_map(|batch| {
             batch
@@ -674,32 +703,7 @@ async fn negated_data_predicate_keeps_null_rows() {
     let pb = PredicateBuilder::new(&table.schema().fields_with_read_metadata());
     let predicate = Predicate::negate(pb.equal("v", Datum::Int(10)).unwrap());
 
-    let mut read = table.new_read_builder();
-    read.with_projection(&["id"]).unwrap();
-    read.with_filter(predicate.clone());
-    let plan = read.new_scan().plan().await.unwrap();
-    let batches: Vec<RecordBatch> = read
-        .new_read()
-        .unwrap()
-        .to_arrow(plan.splits())
-        .unwrap()
-        .try_collect()
-        .await
-        .unwrap();
-    let mut read_ids: Vec<i32> = batches
-        .iter()
-        .flat_map(|batch| {
-            batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<Int32Array>()
-                .unwrap()
-                .values()
-                .to_vec()
-        })
-        .collect();
-    read_ids.sort_unstable();
-    assert_eq!(read_ids, vec![1, 2]);
+    assert_eq!(read_ids(&table, predicate.clone()).await, vec![1, 2]);
 
     let update = table.new_write_builder().new_update().unwrap();
     commit(
@@ -708,4 +712,52 @@ async fn negated_data_predicate_keeps_null_rows() {
     )
     .await;
     assert_eq!(ids(&table).await, vec![0, 3]);
+}
+
+#[tokio::test]
+async fn negated_float_comparison_keeps_nan_rows() {
+    // `NaN < 1.0` and `NaN >= 1.0` are both false. Java orders NaN above
+    // every number, so NOT(f < 1.0) selects it, partitioned by `f` or not.
+    for partitioned in [false, true] {
+        let mut schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("f", DataType::Double(DoubleType::new()))
+            .option("data-evolution.enabled", "true")
+            .option("row-tracking.enabled", "true")
+            .option("deletion-vectors.enabled", "true");
+        if partitioned {
+            schema = schema.partition_keys(["f"]);
+        }
+        let path = "memory:/negated_float";
+        let (io, table) = memory_table(path, TableSchema::new(0, &schema.build().unwrap()));
+        setup_dirs(&io, path).await;
+        persist_table_schema(&io, path, table.schema()).await;
+        write_batch(
+            &table,
+            &RecordBatch::try_from_iter([
+                ("id", Arc::new(Int32Array::from(vec![0, 1, 2])) as ArrayRef),
+                (
+                    "f",
+                    Arc::new(Float64Array::from(vec![0.0, f64::NAN, 2.0])) as ArrayRef,
+                ),
+            ])
+            .unwrap(),
+        )
+        .await;
+        let pb = PredicateBuilder::new(&table.schema().fields_with_read_metadata());
+        let predicate = Predicate::negate(pb.less_than("f", Datum::Double(1.0)).unwrap());
+
+        assert_eq!(
+            read_ids(&table, predicate.clone()).await,
+            vec![1, 2],
+            "partitioned={partitioned}"
+        );
+        let update = table.new_write_builder().new_update().unwrap();
+        commit(
+            &table,
+            update.delete_by_predicate(Some(predicate)).await.unwrap(),
+        )
+        .await;
+        assert_eq!(ids(&table).await, vec![0], "partitioned={partitioned}");
+    }
 }
