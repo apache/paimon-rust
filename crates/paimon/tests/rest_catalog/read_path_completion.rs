@@ -475,6 +475,140 @@ async fn restored_splits_cannot_substitute_paths_metadata_vectors_or_raw_mode() 
 }
 
 #[tokio::test]
+async fn authorized_pinned_snapshots_must_match_the_tables_snapshot() {
+    let g = written(
+        "pinned_metadata",
+        people,
+        vec![people_rows(1..=1), people_rows(2..=2)],
+    )
+    .await;
+    let first = g.table.snapshot_manager().get_snapshot(1).await.unwrap();
+    let second = g.table.snapshot_manager().get_snapshot(2).await.unwrap();
+    let mut metadata = serde_json::to_value(&first).unwrap();
+    // A captured snapshot id must not accidentally be paired with another
+    // snapshot's manifest list when crossing the JSON boundary.
+    metadata["deltaManifestList"] = serde_json::json!(second.delta_manifest_list());
+    metadata["deltaManifestListSize"] = serde_json::json!(second.delta_manifest_list_size());
+    let mixed: paimon::spec::Snapshot = serde_json::from_value(metadata).unwrap();
+    let view = g.table.copy_with_pinned_snapshot(Some(&mixed));
+    let error = view.new_read_builder().new_scan().plan().await.unwrap_err();
+    assert!(error.to_string().contains("pinned snapshot"), "{error}");
+}
+
+#[tokio::test]
+async fn authorized_pinned_snapshot_can_verify_a_retained_tag_after_expiry_or_id_reuse() {
+    for replaced in [false, true] {
+        let g = written(
+            "pinned_tag",
+            people,
+            vec![people_rows(1..=1), people_rows(2..=2)],
+        )
+        .await;
+        let snapshot = g.table.snapshot_manager().get_snapshot(1).await.unwrap();
+        g.table
+            .tag_manager()
+            .create("before", &snapshot)
+            .await
+            .unwrap();
+        let path = g.table.snapshot_manager().snapshot_path(1);
+        if replaced {
+            let later = g.table.snapshot_manager().get_snapshot(2).await.unwrap();
+            let mut json = serde_json::to_value(later).unwrap();
+            json["id"] = serde_json::json!(1);
+            g.table
+                .file_io()
+                .new_output(&path)
+                .unwrap()
+                .write(bytes::Bytes::from(serde_json::to_vec(&json).unwrap()))
+                .await
+                .unwrap();
+        } else {
+            g.table.file_io().delete_file(&path).await.unwrap();
+        }
+        let view = g.table.copy_with_pinned_snapshot(Some(&snapshot));
+        let rows = read_all(&view.new_read_builder()).await.unwrap();
+        assert_eq!(ids(&rows), [1]);
+    }
+}
+
+#[tokio::test]
+async fn authorized_pinned_latest_can_use_rest_when_tag_metadata_is_unavailable() {
+    let g = written("pinned_rest", people, vec![people_rows(1..=1)]).await;
+    g.ctx
+        .server
+        .set_table_external("default", "pinned_rest", false);
+    let snapshot = g.table.snapshot_manager().get_snapshot(1).await.unwrap();
+    let source = url::Url::parse(g.table.location())
+        .unwrap()
+        .to_file_path()
+        .unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let mounted = root.path().join("default/pinned_rest");
+    for directory in ["manifest", "bucket-0"] {
+        let destination = mounted.join(directory);
+        std::fs::create_dir_all(&destination).unwrap();
+        for file in std::fs::read_dir(source.join(directory)).unwrap() {
+            let file = file.unwrap();
+            std::fs::copy(file.path(), destination.join(file.file_name())).unwrap();
+        }
+    }
+    // The mount exposes data/manifests but no snapshot directory. An unrelated
+    // malformed tag must not block validation through the REST snapshot source.
+    std::fs::create_dir_all(mounted.join("tag")).unwrap();
+    std::fs::write(mounted.join("tag/tag-broken"), "not snapshot JSON").unwrap();
+    let mut options = g.ctx.catalog.options().clone();
+    options.set("fuse.enabled", "true");
+    options.set("fuse.root", root.path().to_str().unwrap());
+    options.set("fuse.validation-mode", "none");
+    let table = RESTCatalog::new(options, false)
+        .await
+        .unwrap()
+        .get_table(&g.identifier)
+        .await
+        .unwrap();
+    assert!(table.tag_manager().list_all().await.is_err());
+    let view = table.copy_with_pinned_snapshot(Some(&snapshot));
+    let rows = read_all(&view.new_read_builder()).await.unwrap();
+    assert_eq!(ids(&rows), [1]);
+}
+
+#[tokio::test]
+async fn authorized_repin_ignores_log_offsets_absent_from_the_python_transport() {
+    let g = written(
+        "pinned_offsets",
+        people,
+        vec![people_rows(1..=1), people_rows(2..=2)],
+    )
+    .await;
+    let snapshot = g.table.snapshot_manager().get_snapshot(1).await.unwrap();
+    let mut json = serde_json::to_value(&snapshot).unwrap();
+    json["logOffsets"] = serde_json::json!({"0": 42});
+    g.table
+        .file_io()
+        .new_output(&g.table.snapshot_manager().snapshot_path(1))
+        .unwrap()
+        .write(bytes::Bytes::from(serde_json::to_vec(&json).unwrap()))
+        .await
+        .unwrap();
+    let view = g
+        .table
+        .copy_with_time_travel_strict(HashMap::from([("scan.snapshot-id".into(), "1".into())]))
+        .await
+        .unwrap();
+    let rows = read_all(&view.new_read_builder()).await.unwrap();
+    assert_eq!(ids(&rows), [1]);
+    g.table
+        .file_io()
+        .delete_file(&g.table.snapshot_manager().snapshot_path(1))
+        .await
+        .unwrap();
+    // Snapshot is the equivalent Python read view, without logOffsets.
+    let view = view.copy_with_pinned_snapshot(Some(&snapshot));
+    let rows = read_all(&view.new_read_builder()).await.unwrap();
+    assert_eq!(ids(&rows), [1]);
+}
+
+#[tokio::test]
 async fn retained_snapshot_authorization_and_selector_replacement() {
     let g = written(
         "retained",
@@ -510,6 +644,9 @@ async fn retained_snapshot_authorization_and_selector_replacement() {
         .delete_file(&g.table.snapshot_manager().snapshot_path(1))
         .await
         .unwrap();
+    let recopied = view.copy_with_pinned_snapshot(Some(&snapshot));
+    let rows = read_all(&recopied.new_read_builder()).await.unwrap();
+    assert_eq!(ids(&rows), [1]);
     let restored = read.authorize_splits(&splits).await.unwrap();
     let rows = read
         .to_arrow(&restored)

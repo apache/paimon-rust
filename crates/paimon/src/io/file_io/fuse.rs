@@ -29,16 +29,33 @@ struct FuseFileIO {
 #[async_trait::async_trait]
 impl FileIOProvider for FuseFileIO {
     async fn create(&self, path: &str) -> crate::Result<(Operator, String)> {
-        if path == self.original {
-            return Ok((self.mounted.clone(), String::new()));
-        }
-        if let Some(relative) = path
-            .strip_prefix(&self.original)
-            .and_then(|p| p.strip_prefix('/'))
-        {
+        if let Some(relative) = self.relative_path(path) {
             return Ok((self.mounted.clone(), relative.into()));
         }
         self.fallback.create(path).await
+    }
+
+    async fn create_with_cache_namespace(
+        &self,
+        path: &str,
+    ) -> crate::Result<(Operator, String, Option<String>)> {
+        if let Some(relative) = self.relative_path(path) {
+            // FileIO combines this namespace with the operator's actual mount
+            // root and relative path, keeping different mounts isolated.
+            return Ok((self.mounted.clone(), relative.into(), Some("fuse".into())));
+        }
+        self.fallback.create_with_cache_namespace(path).await
+    }
+}
+
+impl FuseFileIO {
+    fn relative_path<'a>(&self, path: &'a str) -> Option<&'a str> {
+        if path == self.original {
+            Some("")
+        } else {
+            path.strip_prefix(&self.original)
+                .and_then(|p| p.strip_prefix('/'))
+        }
     }
 }
 
@@ -70,6 +87,121 @@ impl FileIO {
 #[cfg(all(test, feature = "storage-memory"))]
 mod tests {
     use super::*;
+
+    fn cached_base() -> FileIO {
+        let mut options = crate::common::Options::new();
+        options.set(CatalogOptions::LOCAL_CACHE_ENABLED, "true");
+        options.set(CatalogOptions::LOCAL_CACHE_WHITELIST, "*");
+        options.set(CatalogOptions::LOCAL_CACHE_BLOCK_SIZE, "4");
+        let mut base = crate::io::FileIOBuilder::new("memory").build().unwrap();
+        base.cache = crate::io::cache::create_local_cache(&options).unwrap();
+        base
+    }
+
+    #[tokio::test]
+    async fn mounted_cache_reuses_files_isolates_mounts_and_invalidates_writes() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let base = cached_base();
+        let uri = "memory:/table/data.parquet";
+        let io = base
+            .clone()
+            .with_fuse("memory:/table", first.path().to_str().unwrap())
+            .unwrap();
+        let other = base
+            .clone()
+            .with_fuse("memory:/table", second.path().to_str().unwrap())
+            .unwrap();
+        std::fs::write(first.path().join("data.parquet"), "first").unwrap();
+        std::fs::write(second.path().join("data.parquet"), "second").unwrap();
+        let input = io.new_input(uri).unwrap();
+        let reader = input.reader().await.unwrap();
+        assert!(
+            reader.cache_key().is_some(),
+            "mounted readers must have stable file identities"
+        );
+        let reloaded = base
+            .with_fuse("memory:/table", first.path().to_str().unwrap())
+            .unwrap();
+        assert_eq!(
+            reader.cache_key(),
+            reloaded
+                .new_input(uri)
+                .unwrap()
+                .reader()
+                .await
+                .unwrap()
+                .cache_key()
+        );
+        assert_eq!(input.read().await.unwrap(), "first");
+        assert_eq!(
+            other.new_input(uri).unwrap().read().await.unwrap(),
+            "second"
+        );
+        // Without any source left to read, the second read must use cached blocks.
+        std::fs::remove_file(first.path().join("data.parquet")).unwrap();
+        assert_eq!(input.read().await.unwrap(), "first");
+        io.new_output(uri)
+            .unwrap()
+            .write(Bytes::from_static(b"new"))
+            .await
+            .unwrap();
+        assert_eq!(input.read().await.unwrap(), "new");
+        let destination = "memory:/table/renamed.parquet";
+        io.new_output(destination)
+            .unwrap()
+            .write(Bytes::from_static(b"old destination"))
+            .await
+            .unwrap();
+        assert_eq!(
+            io.new_input(destination).unwrap().read().await.unwrap(),
+            "old destination"
+        );
+        io.rename(uri, destination).await.unwrap();
+        assert!(input.read().await.is_err());
+        assert_eq!(
+            io.new_input(destination).unwrap().read().await.unwrap(),
+            "new"
+        );
+    }
+
+    #[tokio::test]
+    async fn unmapped_files_keep_the_fallback_cache_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let base = cached_base();
+        let io = base
+            .clone()
+            .with_fuse("memory:/table", root.path().to_str().unwrap())
+            .unwrap();
+        let uri = "memory:/outside/data.parquet";
+        base.new_output(uri)
+            .unwrap()
+            .write(Bytes::from_static(b"fallback"))
+            .await
+            .unwrap();
+        let input = base.new_input(uri).unwrap();
+        let key = input
+            .reader()
+            .await
+            .unwrap()
+            .cache_key()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            io.new_input(uri)
+                .unwrap()
+                .reader()
+                .await
+                .unwrap()
+                .cache_key(),
+            Some(key.as_str())
+        );
+        assert_eq!(input.read().await.unwrap(), "fallback");
+        // Bypass invalidation at the backing service to demonstrate shared caching.
+        let (op, path) = base.create_static(uri).unwrap();
+        op.delete(&path).await.unwrap();
+        assert_eq!(io.new_input(uri).unwrap().read().await.unwrap(), "fallback");
+    }
 
     #[tokio::test]
     async fn mounted_reads_writes_and_lists_keep_the_original_uri() {

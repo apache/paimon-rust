@@ -323,25 +323,32 @@ impl FileIO {
         }
     }
 
+    async fn create_with_cache_namespace(
+        &self,
+        path: &str,
+    ) -> crate::Result<(Operator, String, Option<String>)> {
+        match &self.backend {
+            FileIOBackend::Provider(provider) => {
+                let (op, relative_path, namespace) =
+                    resolve_provider_with_cache_namespace(provider.as_ref(), path).await?;
+                Ok((op, relative_path, namespace))
+            }
+            FileIOBackend::Storage(_) => {
+                let (op, relative_path) = self.create_static(path)?;
+                Ok((
+                    op,
+                    relative_path,
+                    Some(self.cache_namespace_for_path(path)?),
+                ))
+            }
+        }
+    }
+
     async fn create_with_cache_path(
         &self,
         path: &str,
     ) -> crate::Result<(Operator, String, Option<String>)> {
-        let (op, relative_path, namespace) = match &self.backend {
-            FileIOBackend::Provider(provider) => {
-                let (op, relative_path, namespace) =
-                    resolve_provider_with_cache_namespace(provider.as_ref(), path).await?;
-                (op, relative_path, namespace)
-            }
-            FileIOBackend::Storage(_) => {
-                let (op, relative_path) = self.create_static(path)?;
-                (
-                    op,
-                    relative_path,
-                    Some(self.cache_namespace_for_path(path)?),
-                )
-            }
-        };
+        let (op, relative_path, namespace) = self.create_with_cache_namespace(path).await?;
         let cache_path =
             namespace.map(|namespace| cache_object_path(&namespace, &op, &relative_path));
         Ok((op, relative_path, cache_path))

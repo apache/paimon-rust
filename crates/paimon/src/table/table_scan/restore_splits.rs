@@ -43,7 +43,9 @@ pub(super) async fn validate(
     if let Some(view) = &base.table.travel_snapshot {
         if splits.iter().any(|split| match view {
             super::super::ReadSnapshot::Empty => !split.data_files().is_empty(),
-            super::super::ReadSnapshot::Snapshot(snapshot) => snapshot.id() != split.snapshot_id(),
+            super::super::ReadSnapshot::Snapshot(snapshot, _) => {
+                snapshot.id() != split.snapshot_id()
+            }
         }) {
             return Err(super::super::query_auth::unsupported(
                 "transported splits address another captured snapshot",
@@ -54,7 +56,7 @@ pub(super) async fn validate(
         let key = (split.snapshot_id(), split.is_streaming());
         if let std::collections::hash_map::Entry::Vacant(entry) = plans.entry(key) {
             let snapshot = match &base.table.travel_snapshot {
-                Some(super::super::ReadSnapshot::Snapshot(snapshot))
+                Some(super::super::ReadSnapshot::Snapshot(snapshot, _))
                     if snapshot.id() == split.snapshot_id() =>
                 {
                     snapshot.as_ref().clone()
