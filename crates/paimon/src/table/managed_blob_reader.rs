@@ -804,15 +804,9 @@ mod tests {
         )
         .unwrap();
         let builder = PredicateBuilder::new(&fields);
+        let score = builder.nested_field("profile", &["score"]).unwrap();
         let predicate = Predicate::and(vec![
-            builder
-                .nested(
-                    "profile",
-                    &["score"],
-                    PredicateOperator::Eq,
-                    vec![Datum::Int(7)],
-                )
-                .unwrap(),
+            builder.equal(&score, Datum::Int(7)).unwrap(),
             builder
                 .equal("payload", Datum::Bytes(b"yes".to_vec()))
                 .unwrap(),

@@ -175,9 +175,16 @@ mod tests {
     }
 
     fn predicate(fields: &[DataField], op: PredicateOperator, literals: Vec<Datum>) -> Predicate {
-        PredicateBuilder::new(fields)
-            .nested("root", &["detail", "value"], op, literals)
-            .unwrap()
+        let builder = PredicateBuilder::new(fields);
+        let field = builder.nested_field("root", &["detail", "value"]).unwrap();
+        match op {
+            PredicateOperator::Eq => builder.equal(&field, literals[0].clone()),
+            PredicateOperator::IsNull => builder.is_null(&field),
+            PredicateOperator::In => builder.is_in(&field, literals),
+            PredicateOperator::NotIn => builder.is_not_in(&field, literals),
+            _ => unreachable!("test fixture operator"),
+        }
+        .unwrap()
     }
 
     fn batch(fields: &[DataField], values: Vec<ArrayRef>) -> RecordBatch {
@@ -273,22 +280,14 @@ mod tests {
             None,
         );
         let batch = batch(&old, vec![Arc::new(root)]);
-        let pred = PredicateBuilder::new(&new)
-            .nested(
-                "renamed_root",
-                &["renamed_detail", "renamed_value"],
-                PredicateOperator::Eq,
-                vec![Datum::Long(7)],
-            )
+        let builder = PredicateBuilder::new(&new);
+        let field = builder
+            .nested_field("renamed_root", &["renamed_detail", "renamed_value"])
             .unwrap();
+        let pred = builder.equal(&field, Datum::Long(7)).unwrap();
         assert_eq!(mask(&batch, &pred, &old), [true, false, false]);
-        let pred = PredicateBuilder::new(&new)
-            .nested(
-                "renamed_root",
-                &["renamed_detail", "renamed_value"],
-                PredicateOperator::Gt,
-                vec![Datum::Long(i32::MAX as i64 + 1)],
-            )
+        let pred = builder
+            .greater_than(&field, Datum::Long(i32::MAX as i64 + 1))
             .unwrap();
         assert_eq!(mask(&batch, &pred, &old), [false, false, false]);
     }
@@ -441,38 +440,21 @@ mod tests {
             vec![int(30, "a.b"), int(31, "Value"), int(32, "value")],
         )];
         let builder = PredicateBuilder::new(&fields);
-        assert!(builder
-            .nested("Root", &[], PredicateOperator::IsNull, vec![])
-            .is_err());
-        let pred = builder
-            .nested("Root", &["a.b"], PredicateOperator::Eq, vec![Datum::Int(7)])
-            .unwrap();
+        assert!(builder.nested_field("Root", &[]).is_err());
+        let field = builder.nested_field("Root", &["a.b"]).unwrap();
+        let pred = builder.equal(&field, Datum::Int(7)).unwrap();
         pred.validate_nested_fields(&fields).unwrap();
-        assert!(builder
-            .nested("Root", &["a", "b"], PredicateOperator::IsNull, vec![])
-            .is_err());
-        assert!(builder
-            .nested("Root", &["a.b", "child"], PredicateOperator::IsNull, vec![])
-            .is_err());
-        assert!(builder
-            .nested(
-                "Root",
-                &["a.b"],
-                PredicateOperator::Eq,
-                vec![Datum::Long(7)]
-            )
-            .is_err());
-        assert!(builder
-            .nested("Root", &["a.b"], PredicateOperator::Eq, vec![])
-            .is_err());
+        assert!(builder.nested_field("Root", &["a", "b"]).is_err());
+        assert!(builder.nested_field("Root", &["a.b", "child"]).is_err());
+        assert!(builder.equal(&field, Datum::Long(7)).is_err());
         let insensitive = PredicateBuilder::new_with_case_sensitive(&fields, false);
-        assert!(insensitive
-            .nested("root", &["VALUE"], PredicateOperator::IsNull, vec![])
-            .is_err());
-        let renamed = insensitive
-            .nested("root", &["A.B"], PredicateOperator::IsNull, vec![])
+        assert!(insensitive.nested_field("root", &["VALUE"]).is_err());
+        let renamed = insensitive.nested_field("root", &["A.B"]).unwrap();
+        insensitive
+            .is_null(&renamed)
+            .unwrap()
+            .validate_nested_fields(&fields)
             .unwrap();
-        renamed.validate_nested_fields(&fields).unwrap();
         let changed = vec![row(
             10,
             "Root",

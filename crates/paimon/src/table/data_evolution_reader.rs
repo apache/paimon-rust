@@ -3284,14 +3284,9 @@ mod tests {
             file.file_size = writer.close().await.unwrap().file_size as i64;
             files.push(file);
         }
-        let predicate = PredicateBuilder::new(&fields)
-            .nested(
-                "profile",
-                &["score"],
-                crate::spec::PredicateOperator::Eq,
-                vec![Datum::Int(7)],
-            )
-            .unwrap();
+        let builder = PredicateBuilder::new(&fields);
+        let score_ref = builder.nested_field("profile", &["score"]).unwrap();
+        let predicate = builder.equal(&score_ref, Datum::Int(7)).unwrap();
         for merged in [false, true] {
             let split = DataSplitBuilder::new()
                 .with_snapshot(1)

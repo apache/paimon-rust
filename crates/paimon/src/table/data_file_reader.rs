@@ -2358,7 +2358,13 @@ mod row_tests {
                 } else {
                     vec![Datum::Int(7)]
                 };
-                let predicate = builder.nested("profile", &["score"], op, literals).unwrap();
+                let score = builder.nested_field("profile", &["score"]).unwrap();
+                let predicate = if op == crate::spec::PredicateOperator::IsNull {
+                    builder.is_null(&score)
+                } else {
+                    builder.equal(&score, literals[0].clone())
+                }
+                .unwrap();
                 let reader = DataFileReader::new(
                     file_io.clone(),
                     SchemaManager::new(file_io.clone(), table_path.clone()),

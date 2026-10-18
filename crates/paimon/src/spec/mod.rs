@@ -134,8 +134,8 @@ pub(crate) use predicate::like_match;
 pub(crate) use predicate::row_id_leaf;
 pub(crate) use predicate::validate_datum_matches_type;
 pub use predicate::{
-    field_idx_to_partition_idx, DatePart, Datum, PadDirection, Predicate, PredicateBuilder,
-    PredicateOperator, Transform, TransformInput, TrimFlag,
+    field_idx_to_partition_idx, DatePart, Datum, FieldRef, PadDirection, Predicate,
+    PredicateBuilder, PredicateField, PredicateOperator, Transform, TransformInput, TrimFlag,
 };
 pub(crate) mod murmur_hash;
 mod partition_statistics;
