@@ -1052,6 +1052,47 @@ anything is deleted.
 
 Use `CALL` to invoke built-in procedures. All procedures are under the `sys` namespace.
 
+### reset_consumer
+
+Create or overwrite a consumer's next snapshot to consume:
+
+```sql
+CALL sys.reset_consumer(
+    table => 'paimon.test_db.events',
+    consumer_id => 'pipeline_a',
+    next_snapshot_id => 12
+);
+```
+
+`next_snapshot_id` must be a positive BIGINT identifying an existing live snapshot.
+Missing, expired, or invalid snapshots are rejected before changing consumer progress;
+tag-retained metadata alone is not sufficient. The ID is the next snapshot to process
+using the existing incremental or changelog scan rules, rather than a full-state read.
+
+Omit `next_snapshot_id` to delete the consumer record. Deleting a missing consumer succeeds:
+
+```sql
+CALL sys.reset_consumer(
+    table => 'paimon.test_db.events',
+    consumer_id => 'pipeline_a'
+);
+```
+
+Only filesystem-managed FileStore tables are supported. REST-managed tables and
+format tables are not supported. Consumer IDs must be non-empty names without path
+separators or trailing whitespace; IDs are never trimmed. Arguments use the existing
+named `=>` syntax; explicit `NULL` and positional arguments are not supported.
+Successful calls return `OK`.
+These operations change only consumer metadata, without publishing snapshots or
+changing table data, snapshot files, or manifests.
+
+A new scan with the same consumer ID resumes the stored progress unless the caller
+explicitly restores a checkpoint, which takes precedence. After deletion, a new scan
+without an explicit checkpoint follows its existing initial scan behavior. Scans that
+have already loaded their progress do not switch positions when the record changes.
+A running consumer's checkpoint completion can overwrite or recreate the record,
+so stop the consumer before adjusting its progress manually.
+
 ### create_tag
 
 Create a named tag from a snapshot:

@@ -21,6 +21,7 @@
 //! - `CALL sys.create_tag(table => '...', tag => '...', snapshot_id => ..., time_retained => '...')`
 //! - `CALL sys.delete_tag(table => '...', tag => '...')`
 //! - `CALL sys.rename_tag(table => '...', tag => '...', target_tag => '...')`
+//! - `CALL sys.reset_consumer(table => '...', consumer_id => '...'[, next_snapshot_id => ...])`
 //! - `CALL sys.rollback_to(table => '...', snapshot_id => ... | tag => '...')`
 //! - `CALL sys.rollback_to_timestamp(table => '...', timestamp => ...)`
 //! - `CALL sys.create_tag_from_timestamp(table => '...', tag => '...', timestamp => ...)`
@@ -74,8 +75,8 @@ use paimon::catalog::{Catalog, Identifier, RESTCatalog};
 use paimon::lumina::{is_lumina_index_type, LUMINA_IDENTIFIER};
 use paimon::spec::{CoreOptions, DataType, Datum, Predicate, PredicateBuilder, Snapshot};
 use paimon::table::{
-    normalize_global_index_type, BranchManager, SnapshotManager, Table, TagManager,
-    SUPPORTED_GLOBAL_INDEX_TYPES_FOR_DROP,
+    normalize_global_index_type, BranchManager, ConsumerManager, SnapshotManager, Table,
+    TagManager, SUPPORTED_GLOBAL_INDEX_TYPES_FOR_DROP,
 };
 
 use crate::error::to_datafusion_error;
@@ -204,6 +205,7 @@ fn declared_parameters(proc_name: &str) -> Option<&'static [&'static str]> {
         "create_tag" => &["table", "tag", "snapshot_id", "time_retained"],
         "delete_tag" => &["table", "tag"],
         "rename_tag" => &["table", "tag", "target_tag"],
+        "reset_consumer" => &["table", "consumer_id", "next_snapshot_id"],
         "rollback_to" => &["table", "snapshot_id", "tag"],
         "rollback_to_timestamp" => &["table", "timestamp"],
         "create_tag_from_timestamp" => &["table", "tag", "timestamp"],
@@ -315,6 +317,7 @@ pub async fn execute_call(
         "create_tag" => proc_create_tag(ctx, catalog, catalog_name, &args).await,
         "delete_tag" => proc_delete_tag(ctx, catalog, catalog_name, &args).await,
         "rename_tag" => proc_rename_tag(ctx, catalog, catalog_name, &args).await,
+        "reset_consumer" => proc_reset_consumer(ctx, catalog, catalog_name, &args).await,
         "rollback_to" => proc_rollback_to(ctx, catalog, catalog_name, &args).await,
         "rollback_to_timestamp" => {
             proc_rollback_to_timestamp(ctx, catalog, catalog_name, &args).await
@@ -459,6 +462,60 @@ fn managers(table: &Table) -> (SnapshotManager, TagManager) {
     let sm = SnapshotManager::new(table.file_io().clone(), table.location().to_string());
     let tm = TagManager::new(table.file_io().clone(), table.location().to_string());
     (sm, tm)
+}
+
+async fn proc_reset_consumer(
+    ctx: &SessionContext,
+    catalog: &Arc<dyn Catalog>,
+    catalog_name: &str,
+    args: &HashMap<String, String>,
+) -> DFResult<DataFrame> {
+    let consumer_id = require_arg(args, "consumer_id")?;
+    ConsumerManager::validate_consumer_id(consumer_id).map_err(to_datafusion_error)?;
+    let next_snapshot_id = args
+        .get("next_snapshot_id")
+        .map(|value| {
+            value
+                .parse::<i64>()
+                .ok()
+                .filter(|id| *id > 0)
+                .ok_or_else(|| {
+                    DataFusionError::Plan(format!(
+                        "Invalid next_snapshot_id: '{value}'. Expected a positive BIGINT"
+                    ))
+                })
+        })
+        .transpose()?;
+    let table = get_table(catalog, catalog_name, args).await?;
+    if table.rest_env().is_some() {
+        return Err(DataFusionError::NotImplemented(
+            "reset_consumer is not supported for tables managed by a REST catalog".to_string(),
+        ));
+    }
+    if table.schema().core_options().is_format_table() {
+        return Err(DataFusionError::NotImplemented(
+            "reset_consumer requires a FileStoreTable; format-table is not supported".to_string(),
+        ));
+    }
+    let manager = table.consumer_manager();
+    if let Some(id) = next_snapshot_id {
+        // Stream recovery reads live snapshot files, not tag-retained metadata.
+        table
+            .snapshot_manager()
+            .get_snapshot(id)
+            .await
+            .map_err(to_datafusion_error)?;
+        manager
+            .reset(consumer_id, id)
+            .await
+            .map_err(to_datafusion_error)?;
+    } else {
+        manager
+            .delete(consumer_id)
+            .await
+            .map_err(to_datafusion_error)?;
+    }
+    ok_result(ctx)
 }
 
 async fn proc_create_tag(
