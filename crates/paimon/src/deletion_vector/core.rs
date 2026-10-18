@@ -36,6 +36,9 @@ const MAGIC_NUMBER: u32 = 1581511376;
 /// unlike the v1 magic, so the two are told apart by byte order as well as value.
 const MAGIC_NUMBER_64: u32 = 1681511377;
 const MAGIC_NUMBER_SIZE_BYTES: u64 = 4;
+/// Adjacent deleted positions walked one by one before switching to
+/// `next_range` in [`DeletionVector::deleted_ranges`].
+const RUN_PROBE_LEN: u32 = 4;
 /// Size of the `bitmapLength` prefix and of the trailing CRC. Mirrors Java
 /// `Bitmap64DeletionVector.LENGTH_SIZE_BYTES` / `CRC_SIZE_BYTES`; a v2 entry
 /// counts both in `DeletionFile.length()` while a v1 entry counts neither.
@@ -91,6 +94,50 @@ impl DeletionVector {
     /// Check if the deletion vector is empty (no deleted rows)
     pub fn is_empty(&self) -> bool {
         self.bitmap.is_empty()
+    }
+
+    /// Deleted positions as ascending inclusive `(start, end)` runs.
+    ///
+    /// Short runs are walked with `next`; once a run is longer than
+    /// [`RUN_PROBE_LEN`], the rest of it is taken with `next_range`, one roaring
+    /// container at a time. `next_range` alone is slower than `next` on
+    /// scattered deletes.
+    pub(crate) fn deleted_ranges(&self) -> impl Iterator<Item = (u32, u32)> + '_ {
+        let mut iter = self.bitmap.iter();
+        let mut pending: Option<(u32, u32)> = None;
+        std::iter::from_fn(move || {
+            let (start, mut end) = match pending.take() {
+                Some(run) => run,
+                None => {
+                    let pos = iter.next()?;
+                    (pos, pos)
+                }
+            };
+            let mut walked = end - start;
+            while walked < RUN_PROBE_LEN {
+                match iter.next() {
+                    Some(pos) if end.checked_add(1) == Some(pos) => {
+                        end = pos;
+                        walked += 1;
+                    }
+                    Some(pos) => {
+                        pending = Some((pos, pos));
+                        return Some((start, end));
+                    }
+                    None => return Some((start, end)),
+                }
+            }
+            // A run split at a container boundary comes back in pieces; join them.
+            while let Some(run) = iter.next_range() {
+                if end.checked_add(1) == Some(*run.start()) {
+                    end = *run.end();
+                } else {
+                    pending = Some((*run.start(), *run.end()));
+                    break;
+                }
+            }
+            Some((start, end))
+        })
     }
 
     /// Serialize using Java `BitmapDeletionVector` format:
@@ -587,5 +634,62 @@ mod tests {
         assert!(!dv.is_deleted(0), "position 0 was not deleted");
         // Positions above u32::MAX cannot exist in a roaring32 bitmap -> not deleted.
         assert!(!dv.is_deleted(u64::from(u32::MAX) + 1));
+    }
+
+    /// Runs of `bitmap.iter()`, the obvious way.
+    fn model_ranges(bitmap: &RoaringBitmap) -> Vec<(u32, u32)> {
+        let mut ranges: Vec<(u32, u32)> = Vec::new();
+        for pos in bitmap {
+            match ranges.last_mut() {
+                Some((_, end)) if end.checked_add(1) == Some(pos) => *end = pos,
+                _ => ranges.push((pos, pos)),
+            }
+        }
+        ranges
+    }
+
+    fn assert_ranges(bitmap: RoaringBitmap) {
+        let expected = model_ranges(&bitmap);
+        let dv = DeletionVector::from_bitmap(bitmap);
+        assert_eq!(dv.deleted_ranges().collect::<Vec<_>>(), expected);
+    }
+
+    #[test]
+    fn test_deleted_ranges_edges() {
+        assert_ranges(RoaringBitmap::new());
+        assert_ranges(RoaringBitmap::from([7]));
+        // Runs right at the probe length, and one past it.
+        assert_ranges((10..14).chain(20..25).chain(30..31).collect());
+        // One run across several roaring containers, then a short one.
+        assert_ranges((65_530..200_000).chain([200_002]).collect());
+        // A long run followed by an adjacent-container run that does not touch it.
+        assert_ranges((0..65_535).chain(65_537..70_000).collect());
+        // Runs ending at u32::MAX.
+        assert_ranges([u32::MAX].into_iter().collect());
+        assert_ranges((u32::MAX - 70_000..=u32::MAX).collect());
+    }
+
+    #[test]
+    fn test_deleted_ranges_match_model_on_random_bitmaps() {
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for round in 0..128 {
+            let max_gap = [2u64, 30, 3_000, 100_000][round % 4];
+            let max_len = [3u64, 50, 3_000, 70_000][(round / 4) % 4];
+            let mut bitmap = RoaringBitmap::new();
+            let mut pos = (next() % 200_000) as u32;
+            for _ in 0..40 {
+                let len = 1 + (next() % max_len) as u32;
+                let end = pos.saturating_add(len);
+                bitmap.insert_range(pos..end);
+                pos = end.saturating_add(1 + (next() % max_gap) as u32);
+            }
+            assert_ranges(bitmap);
+        }
     }
 }

@@ -2149,15 +2149,15 @@ fn prefix_row_ranges(
 fn non_deleted_local_ranges(row_count: i64, deletion_vector: &DeletionVector) -> Vec<RowRange> {
     let mut ranges = Vec::new();
     let mut cursor = 0i64;
-    for deleted in deletion_vector.iter() {
-        let deleted = deleted as i64;
-        if deleted >= row_count {
+    for (start, end) in deletion_vector.deleted_ranges() {
+        let (start, end) = (i64::from(start), i64::from(end));
+        if start >= row_count {
             break;
         }
-        if deleted > cursor {
-            ranges.push(RowRange::new(cursor, deleted - 1));
+        if start > cursor {
+            ranges.push(RowRange::new(cursor, start - 1));
         }
-        cursor = deleted + 1;
+        cursor = end + 1;
     }
     if cursor < row_count {
         ranges.push(RowRange::new(cursor, row_count - 1));
