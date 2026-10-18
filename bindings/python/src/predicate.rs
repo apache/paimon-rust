@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::error::to_py_err;
 use paimon::spec::{
     DataField, DataType, Datum, DecimalType, Predicate, PredicateBuilder, TableSchema,
 };
@@ -422,6 +423,8 @@ const METHOD_NOT_SUPPORTED: &[&str] = &["not"];
 /// The dict shape mirrors the Python predicate tree:
 /// - Leaf: `{"method": <op>, "field": <name>, "literals": [..]}`
 /// - Compound: `{"method": "and"|"or", "children": [<dict>, ..]}`
+/// - Nested ROW leaf: the same leaf dict with `field` naming the root and
+///   `nested_path` containing separate descendant names (not a dotted string).
 ///
 /// Field types are resolved authoritatively from `fields` (the table schema); any
 /// `index`/`data_type` present in the dict is ignored. Literal conversion is
@@ -532,6 +535,36 @@ fn leaf_to_predicate(
         .ok_or_else(|| PyValueError::new_err(format!("'{method}' leaf requires 'field'")))?
         .extract()?;
 
+    if let Some(path) = node.get_item("nested_path")? {
+        let path = path.extract::<Vec<String>>()?;
+        if path.is_empty() {
+            return Err(PyValueError::new_err("nested_path must not be empty"));
+        }
+        let names = path.iter().map(String::as_str).collect::<Vec<_>>();
+        let builder = PredicateBuilder::new_with_case_sensitive(fields, case_sensitive);
+        let resolved = builder
+            .nested(
+                &field,
+                &names,
+                paimon::spec::PredicateOperator::IsNull,
+                vec![],
+            )
+            .map_err(to_py_err)?;
+        let Predicate::NestedLeaf { path: resolved, .. } = resolved else {
+            unreachable!()
+        };
+        let output = [DataField::new(
+            0,
+            "value".into(),
+            resolved.last().unwrap().data_type().clone(),
+        )];
+        let leaf = node.copy()?;
+        leaf.del_item("nested_path")?;
+        leaf.set_item("field", "value")?;
+        let predicate = leaf_to_predicate(method, &leaf, &output, true)?;
+        return bind_nested_predicate(predicate, &builder, &field, &names).map_err(to_py_err);
+    }
+
     // Resolve field DataType from schema (authoritative) for literal conversion.
     let data_type = resolve_leaf_field_type(fields, &field, case_sensitive)?;
 
@@ -639,6 +672,31 @@ fn leaf_to_predicate(
         }
     };
     result.map_err(|e| PyValueError::new_err(e.to_string()))
+}
+
+fn bind_nested_predicate(
+    predicate: Predicate,
+    builder: &PredicateBuilder,
+    root: &str,
+    path: &[&str],
+) -> paimon::Result<Predicate> {
+    match predicate {
+        Predicate::Leaf { op, literals, .. } => builder.nested(root, path, op, literals),
+        Predicate::And(children) => children
+            .into_iter()
+            .map(|p| bind_nested_predicate(p, builder, root, path))
+            .collect::<paimon::Result<Vec<_>>>()
+            .map(Predicate::and),
+        Predicate::Or(children) => children
+            .into_iter()
+            .map(|p| bind_nested_predicate(p, builder, root, path))
+            .collect::<paimon::Result<Vec<_>>>()
+            .map(Predicate::or),
+        Predicate::Not(child) => {
+            bind_nested_predicate(*child, builder, root, path).map(Predicate::negate)
+        }
+        other => Ok(other),
+    }
 }
 
 /// Extract exactly one literal for comparison/equality operators.

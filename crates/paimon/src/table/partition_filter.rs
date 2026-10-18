@@ -213,6 +213,7 @@ fn predicate_may_match(
     partition_fields: &[DataField],
 ) -> bool {
     match predicate {
+        Predicate::NestedLeaf { .. } => true,
         Predicate::AlwaysTrue => true,
         Predicate::AlwaysFalse => false,
         Predicate::And(children) => children

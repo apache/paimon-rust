@@ -37,6 +37,23 @@ pub(crate) fn remap_predicates_to_file(
 
 fn remap_predicate(predicate: &Predicate, mapping: &[Option<usize>]) -> Predicate {
     match predicate {
+        Predicate::NestedLeaf {
+            root,
+            index,
+            path,
+            op,
+            literals,
+        } => match mapping.get(*index).copied().flatten() {
+            Some(index) => Predicate::NestedLeaf {
+                root: root.clone(),
+                index,
+                path: path.clone(),
+                op: *op,
+                literals: literals.clone(),
+            },
+            None if *op == PredicateOperator::IsNull => Predicate::AlwaysTrue,
+            None => Predicate::AlwaysFalse,
+        },
         Predicate::Leaf {
             column,
             index,

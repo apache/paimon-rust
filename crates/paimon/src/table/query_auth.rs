@@ -183,6 +183,9 @@ pub(crate) fn leaf_names(
     fn collect(predicate: &crate::spec::Predicate, out: &mut std::collections::HashSet<String>) {
         use crate::spec::Predicate;
         match predicate {
+            Predicate::NestedLeaf { root, .. } => {
+                out.insert(root.name().to_string());
+            }
             Predicate::Leaf { column, .. } => {
                 out.insert(column.clone());
             }
@@ -290,6 +293,7 @@ pub(crate) fn reject_noncanonical_leaves(
     use crate::spec::Predicate;
     fn check(predicate: &Predicate, fields: &[crate::spec::DataField]) -> crate::Result<()> {
         match predicate {
+            Predicate::NestedLeaf { .. } => predicate.validate_nested_fields(fields),
             Predicate::Leaf {
                 column,
                 index,

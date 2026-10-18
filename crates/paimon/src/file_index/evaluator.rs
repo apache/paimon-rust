@@ -106,6 +106,7 @@ fn remap_predicate(
     predicate: &Predicate,
 ) -> Option<Predicate> {
     match predicate {
+        Predicate::NestedLeaf { .. } => None,
         Predicate::Leaf {
             column,
             index,
@@ -159,6 +160,7 @@ fn remap_predicate_exact(
     predicate: &Predicate,
 ) -> Option<Predicate> {
     match predicate {
+        Predicate::NestedLeaf { .. } => None,
         Predicate::And(children) => children
             .iter()
             .map(|child| remap_predicate_exact(table_fields, data_fields, child))
@@ -242,6 +244,7 @@ fn integer_datum(data_type: &DataType, value: i64) -> Option<Datum> {
 
 fn collect_required_columns(predicate: &Predicate, columns: &mut HashSet<String>) {
     match predicate {
+        Predicate::NestedLeaf { .. } => {}
         Predicate::Leaf { column, .. } => {
             columns.insert(column.clone());
         }

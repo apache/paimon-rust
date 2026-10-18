@@ -86,6 +86,7 @@ fn validate_predicate(
     fields: &[crate::spec::DataField],
 ) -> crate::Result<()> {
     match predicate {
+        Predicate::NestedLeaf { .. } => predicate.validate_nested_fields(fields)?,
         Predicate::Leaf {
             column,
             index,
