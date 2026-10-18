@@ -292,39 +292,6 @@ struct RuntimeSequenceGroup {
 }
 
 impl PartialUpdateMergeFunction {
-    fn materialize_source_row(
-        batch_idx: usize,
-        row_idx: usize,
-        batch_buffer: &[BufferedBatch],
-        source_output_col_indices: &[usize],
-        output_schema: &SchemaRef,
-    ) -> crate::Result<RecordBatch> {
-        let columns: Vec<ArrayRef> = output_schema
-            .fields()
-            .iter()
-            .enumerate()
-            .map(|(index, field)| {
-                let column = batch_buffer[batch_idx]
-                    .column_for_output(index, source_output_col_indices)
-                    .slice(row_idx, 1);
-                if !field.is_nullable() && column.is_null(0) {
-                    return Err(Error::DataInvalid {
-                        message: format!(
-                            "Partial-update delete row has NULL for non-nullable field '{}'",
-                            field.name()
-                        ),
-                        source: None,
-                    });
-                }
-                Ok(column)
-            })
-            .collect::<crate::Result<_>>()?;
-        RecordBatch::try_new(output_schema.clone(), columns).map_err(|error| Error::DataInvalid {
-            message: format!("Failed to materialize partial-update delete row: {error}"),
-            source: Some(Box::new(error)),
-        })
-    }
-
     /// Java replaces the current row with the DELETE value. Later inserts may
     /// leave some columns null, so their merge must start from that value.
     fn replace_with_source(
@@ -535,7 +502,7 @@ impl PartialUpdateMergeFunction {
         }
         let mut saw_add = false;
         let mut current_delete_row = false;
-        let mut last_retract_source = None;
+        let mut saw_retract = false;
         let mut latest_row = None;
 
         for row_idx in ordered_row_indices {
@@ -546,7 +513,7 @@ impl PartialUpdateMergeFunction {
                     continue;
                 }
                 latest_row = Some(row);
-                if !saw_add && last_retract_source.is_none() {
+                if !saw_add && !saw_retract {
                     // Java initializes the row from the first retract before
                     // applying sequence-group retractions. That row also
                     // becomes the DELETE payload when no insert follows.
@@ -560,8 +527,7 @@ impl PartialUpdateMergeFunction {
                     )?;
                     group_sequence_rows.fill(Some((row.batch_idx, row.row_idx)));
                 }
-                last_retract_source = Some((row.batch_idx, row.row_idx));
-                current_delete_row = false;
+                saw_retract = true;
                 if self.sequence_group_enabled {
                     let mut full_delete = false;
                     for (group_idx, group) in self.sequence_groups.iter().enumerate() {
@@ -649,7 +615,9 @@ impl PartialUpdateMergeFunction {
                 });
             }
             saw_add = true;
-            current_delete_row = false;
+            if !self.sequence_group_enabled {
+                current_delete_row = false;
+            }
             latest_row = Some(row);
 
             for (output_col_idx, selected) in selected_by_col.iter_mut().enumerate() {
@@ -715,6 +683,13 @@ impl PartialUpdateMergeFunction {
                     continue;
                 }
 
+                if group
+                    .sequence_indices
+                    .iter()
+                    .any(|index| self.sequence_group_partial_delete.contains(index))
+                {
+                    current_delete_row = false;
+                }
                 group_sequence_rows[group_idx] = Some((row.batch_idx, row.row_idx));
                 for &output_col_idx in &group.sequence_indices {
                     selected_by_col[output_col_idx] = Some((row.batch_idx, row.row_idx));
@@ -722,30 +697,17 @@ impl PartialUpdateMergeFunction {
             }
         }
 
-        if current_delete_row {
-            return match last_retract_source {
-                Some((batch_idx, row_idx)) => Ok(MergeResult::MaterializedDeleteRow(
-                    Self::materialize_source_row(
-                        batch_idx,
-                        row_idx,
-                        batch_buffer,
-                        source_output_col_indices,
-                        output_schema,
-                    )?,
-                )),
-                None => Ok(MergeResult::Omit),
-            };
-        }
-        if !saw_add && last_retract_source.is_none() {
+        if !saw_add && !saw_retract {
             return Ok(MergeResult::Omit);
         }
+        let deleted = current_delete_row || !saw_add;
 
         let output_columns: Vec<ArrayRef> = output_schema
             .fields()
             .iter()
             .enumerate()
             .map(|(output_col_idx, field)| {
-                if let Some(column) = merged_metadata_column(field, latest_row.unwrap(), !saw_add) {
+                if let Some(column) = merged_metadata_column(field, latest_row.unwrap(), deleted) {
                     return Ok(column);
                 }
                 let column = match aggregators
@@ -761,7 +723,7 @@ impl PartialUpdateMergeFunction {
                         None => new_null_array(field.data_type(), 1),
                     },
                 };
-                if saw_add && !field.is_nullable() && column.is_null(0) {
+                if (saw_add || current_delete_row) && !field.is_nullable() && column.is_null(0) {
                     return Err(Error::DataInvalid {
                         message: format!(
                             "merge-engine=partial-update produced NULL for non-nullable field '{}'",
@@ -781,10 +743,10 @@ impl PartialUpdateMergeFunction {
             }
         })?;
 
-        if saw_add {
-            Ok(MergeResult::MaterializedRow(batch))
-        } else {
+        if deleted {
             Ok(MergeResult::MaterializedDeleteRow(batch))
+        } else {
+            Ok(MergeResult::MaterializedRow(batch))
         }
     }
 }
@@ -3445,6 +3407,75 @@ mod tests {
                 .unwrap()
                 .value(0),
             "new"
+        );
+    }
+
+    #[test]
+    fn test_partial_update_delete_preserves_payload_and_latest_metadata() {
+        let schema = make_schema();
+        let batch = make_batch_with_kind(
+            &schema,
+            vec![1, 1, 1],
+            vec![10, 11, 12],
+            vec![0, 3, 1],
+            vec![Some("initial"), Some("deleted"), Some("before")],
+        );
+        let rows = [0, 3, 1]
+            .into_iter()
+            .enumerate()
+            .map(|(row_idx, value_kind)| MergeRow {
+                batch_idx: 0,
+                row_idx,
+                sequence_number: 10 + row_idx as i64,
+                value_kind,
+                user_sequence: None,
+            })
+            .collect::<Vec<_>>();
+        let options = HashMap::from([
+            ("merge-engine".into(), "partial-update".into()),
+            (
+                "partial-update.remove-record-on-delete".into(),
+                "true".into(),
+            ),
+        ]);
+        let merge = PartialUpdateMergeFunction::new(&options, "test_table").unwrap();
+        let result = merge
+            .merge(
+                &rows,
+                &[BufferedBatch::Source(batch)],
+                &[0, 1, 2, 3],
+                &schema,
+            )
+            .unwrap();
+        let MergeResult::MaterializedDeleteRow(deleted) = result else {
+            panic!("expected a materialized delete row");
+        };
+        assert_eq!(
+            deleted
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            12
+        );
+        assert_eq!(
+            deleted
+                .column(2)
+                .as_any()
+                .downcast_ref::<Int8Array>()
+                .unwrap()
+                .value(0),
+            RowKind::Delete.to_value()
+        );
+        assert_eq!(
+            deleted
+                .column(3)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(0),
+            "deleted"
         );
     }
 
