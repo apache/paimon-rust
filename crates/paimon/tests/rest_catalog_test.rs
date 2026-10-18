@@ -5820,3 +5820,7 @@ async fn test_query_auth_explicit_partition_selector() {
 #[cfg(not(windows))]
 #[path = "rest_catalog/authorized_snapshot_scans.rs"]
 mod authorized_snapshot_scans;
+
+#[cfg(not(windows))]
+#[path = "rest_catalog/merge_sources.rs"]
+mod merge_sources;

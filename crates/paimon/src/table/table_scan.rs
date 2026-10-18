@@ -1144,6 +1144,25 @@ impl<'a> TableScan<'a> {
         }
     }
 
+    /// MERGE table sources follow plan_for_write: authorize the whole table,
+    /// then include L0 only when no row filter or column mask was returned.
+    /// Keep this scope internal; public metadata scans must still fail closed.
+    pub(super) async fn authorize_merge_source(&self) -> crate::Result<Self> {
+        let scan = self.authorize_snapshot_read().await?;
+        if let TableScanKind::Paimon(source) = &scan.0 {
+            if source
+                .query_auth_grant
+                .as_ref()
+                .is_some_and(|grant| !grant.is_unrestricted())
+            {
+                return Err(super::query_auth::unsupported(
+                    "MERGE table sources require unrestricted query authorization",
+                ));
+            }
+        }
+        Ok(scan)
+    }
+
     pub(super) fn validate_snapshot_read(&self) -> crate::Result<()> {
         let TableScanKind::Paimon(scan) = &self.0 else {
             unreachable!("snapshot scans only contain Paimon tables")
