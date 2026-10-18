@@ -1546,7 +1546,12 @@ fn timestamp_array(
     let values = values
         .iter()
         .map(|value| match value {
-            Some(ShreddedValue::Timestamp(v)) => Some(*v),
+            Some(ShreddedValue::Timestamp(v)) => match precision {
+                0 => Some(v.div_euclid(1_000_000)),
+                1..=3 => Some(v.div_euclid(1_000)),
+                4..=6 => Some(*v),
+                _ => v.checked_mul(1_000),
+            },
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -2756,5 +2761,169 @@ mod tests {
                 .field(0)
                 .data_type()
         );
+    }
+    fn parquet_roundtrip(array: ArrayRef) -> ArrayRef {
+        use parquet::arrow::{arrow_reader::ParquetRecordBatchReaderBuilder, ArrowWriter};
+        let schema = Arc::new(arrow_schema::Schema::new(vec![ArrowField::new(
+            "v",
+            array.data_type().clone(),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![array]).unwrap();
+        let mut output = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut output, schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(output))
+            .unwrap()
+            .build()
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .column(0)
+            .clone()
+    }
+
+    fn extract_root(array: &dyn Array, data_type: DataType, strict: bool) -> Result<ArrayRef> {
+        let field = DataField::new(0, "result".into(), data_type).with_description(Some(
+            crate::spec::build_variant_metadata("$", strict, "UTC").unwrap(),
+        ));
+        let result = assemble_variant_extraction_array(array, &RowType::new(vec![field]))?;
+        Ok(result
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap()
+            .column(0)
+            .clone())
+    }
+
+    #[test]
+    fn variant_timestamp_projection_units_and_overflow() {
+        use crate::spec::{LocalZonedTimestampType, TimestampType};
+        let micros = [1_234_567_890_123_i64, -1, -1_234_567, 0, i64::MAX, i64::MIN];
+        for zoned in [false, true] {
+            let dtype = |precision| {
+                if zoned {
+                    DataType::LocalZonedTimestamp(LocalZonedTimestampType::new(precision).unwrap())
+                } else {
+                    DataType::Timestamp(TimestampType::new(precision).unwrap())
+                }
+            };
+            let values = micros
+                .iter()
+                .map(|value| {
+                    let mut raw = vec![if zoned { 12 << 2 } else { 13 << 2 }];
+                    raw.extend_from_slice(&value.to_le_bytes());
+                    Some(GenericVariant::from_parts(raw, vec![1, 0, 0]).unwrap())
+                })
+                .chain([Some(GenericVariant::parse_json("null").unwrap()), None])
+                .collect();
+            let plain = variant_array(values).unwrap();
+            let physical = variant_shredding_type(&dtype(3)).unwrap();
+            let shredded = shred_variant_array(plain.as_ref(), &physical).unwrap();
+            for input in [plain, shredded] {
+                let input = parquet_roundtrip(input);
+                for precision in [0, 3, 6, 9] {
+                    let result = extract_root(input.as_ref(), dtype(precision), false).unwrap();
+                    assert_eq!(
+                        result.data_type(),
+                        &paimon_type_to_arrow(&dtype(precision)).unwrap()
+                    );
+                    for (row, value) in micros.iter().enumerate() {
+                        let expected = match precision {
+                            0 => Some(value.div_euclid(1_000_000)),
+                            3 => Some(value.div_euclid(1_000)),
+                            6 => Some(*value),
+                            _ => value.checked_mul(1_000),
+                        };
+                        match expected {
+                            Some(value) => {
+                                assert!(!result.is_null(row));
+                                assert_eq!(
+                                    timestamp_value_at(result.as_ref(), row).unwrap(),
+                                    value
+                                );
+                            }
+                            None => assert!(result.is_null(row)),
+                        }
+                    }
+                    assert!(result.is_null(micros.len()));
+                    assert!(result.is_null(micros.len() + 1));
+                    let strict = extract_root(input.as_ref(), dtype(precision), true);
+                    assert_eq!(strict.is_err(), precision == 9);
+                    let valid = input.slice(0, 4);
+                    assert!(extract_root(valid.as_ref(), dtype(precision), true).is_ok());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn variant_boolean_numeric_projection() {
+        use crate::spec::{
+            BigIntType, BooleanType, DecimalType, DoubleType, SmallIntType, TinyIntType,
+        };
+        let values = ["true", "false", "null"]
+            .iter()
+            .map(|value| Some(GenericVariant::parse_json(value).unwrap()))
+            .chain([None])
+            .collect();
+        let plain = variant_array(values).unwrap();
+        let physical = variant_shredding_type(&DataType::Boolean(BooleanType::new())).unwrap();
+        let shredded = shred_variant_array(plain.as_ref(), &physical).unwrap();
+        for input in [plain, shredded] {
+            let input = parquet_roundtrip(input);
+            for dtype in [
+                DataType::TinyInt(TinyIntType::new()),
+                DataType::SmallInt(SmallIntType::new()),
+                DataType::Int(IntType::new()),
+                DataType::BigInt(BigIntType::new()),
+                DataType::Float(FloatType::new()),
+                DataType::Double(DoubleType::new()),
+                DataType::Decimal(DecimalType::new(10, 2).unwrap()),
+            ] {
+                for strict in [false, true] {
+                    let output = extract_root(input.as_ref(), dtype.clone(), strict).unwrap();
+                    assert_eq!(output.null_count(), 2);
+                    assert!(output.is_null(2));
+                    assert!(output.is_null(3));
+                    let numeric =
+                        arrow_cast::cast(output.as_ref(), &ArrowDataType::Float64).unwrap();
+                    let numeric = numeric.as_any().downcast_ref::<Float64Array>().unwrap();
+                    assert_eq!(numeric.value(0), 1.0);
+                    assert_eq!(numeric.value(1), 0.0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn variant_decimal_overflow_preserves_residual() {
+        use crate::spec::DecimalType;
+        let values = ["10", "-10", "9223372036854775807", "-9223372036854775808"];
+        let input = variant_array(
+            values
+                .iter()
+                .map(|v| Some(GenericVariant::parse_json(v).unwrap()))
+                .collect(),
+        )
+        .unwrap();
+        let physical =
+            variant_shredding_type(&DataType::Decimal(DecimalType::new(38, 38).unwrap())).unwrap();
+        let output = shred_variant_array(input.as_ref(), &physical).unwrap();
+        let output = parquet_roundtrip(output);
+        let storage = output.as_any().downcast_ref::<StructArray>().unwrap();
+        assert_eq!(
+            storage.column_by_name("typed_value").unwrap().null_count(),
+            values.len()
+        );
+        assert_eq!(storage.column_by_name("value").unwrap().null_count(), 0);
+        let restored = assemble_shredded_variant_array(output.as_ref()).unwrap();
+        for row in 0..values.len() {
+            let expected = variant_from_array(input.as_ref(), row).unwrap().unwrap();
+            let actual = variant_from_array(restored.as_ref(), row).unwrap().unwrap();
+            assert_eq!(actual, expected);
+        }
     }
 }
