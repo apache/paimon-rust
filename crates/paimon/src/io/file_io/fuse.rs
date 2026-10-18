@@ -72,9 +72,7 @@ impl FileIO {
                     .into(),
             });
         }
-        let mut cfg = opendal_service_fs::FsConfig::default();
-        cfg.root = Some(local.into());
-        let mounted = Operator::from_config(cfg)?;
+        let mounted = super::super::fs_config_build_with_root(local)?;
         let provider = Arc::new(FuseFileIO {
             original: original.into(),
             mounted,

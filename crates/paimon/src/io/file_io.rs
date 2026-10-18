@@ -2032,6 +2032,39 @@ mod file_action_test {
         .await;
     }
 
+    #[cfg(all(windows, feature = "storage-fs"))]
+    #[tokio::test]
+    async fn windows_drive_paths_and_file_uris_can_list_the_same_files() {
+        let directory = tempdir().unwrap();
+        let native = directory.path().to_string_lossy().into_owned();
+        let forward = native.replace('\\', "/");
+        let uri = url::Url::from_directory_path(directory.path()).unwrap();
+        let file_io = FileIO::from_path(&native).unwrap().build().unwrap();
+        file_io
+            .new_output(&format!("{forward}/data"))
+            .unwrap()
+            .write(Bytes::from_static(b"value"))
+            .await
+            .unwrap();
+
+        for root in [
+            native,
+            forward.clone(),
+            uri.to_string(),
+            format!("file:/{forward}"),
+        ] {
+            let entries = file_io.list_status(&root).await.unwrap();
+            assert_eq!(entries.len(), 1, "{root}");
+            let contents = file_io
+                .new_input(&entries[0].path)
+                .unwrap()
+                .read()
+                .await
+                .unwrap();
+            assert_eq!(contents, Bytes::from_static(b"value"), "{root}");
+        }
+    }
+
     #[tokio::test]
     async fn test_list_status_fs_should_return_entry_paths() {
         let file_io = setup_fs_file_io();
