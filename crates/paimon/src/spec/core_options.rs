@@ -58,6 +58,7 @@ const MAX_FORMAT_TABLE_SCAN_LIST_PARALLELISM: i64 = 1000;
 pub(crate) const BUCKET_KEY_OPTION: &str = "bucket-key";
 const BUCKET_FUNCTION_TYPE_OPTION: &str = "bucket-function.type";
 const BUCKET_OPTION: &str = "bucket";
+pub(crate) const PRIMARY_KEY_NULLABLE_OPTION: &str = "primary-key.nullable";
 const DEFAULT_BUCKET: i32 = -1;
 /// Postpone bucket mode: data is written to `bucket-postpone` directory
 /// and is invisible to readers until compaction assigns real bucket numbers.
@@ -809,6 +810,14 @@ impl<'a> CoreOptions<'a> {
     /// The `rowkind.field` option: a user column whose value encodes the row kind.
     pub fn rowkind_field(&self) -> Option<&str> {
         self.options.get(ROWKIND_FIELD_OPTION).map(String::as_str)
+    }
+
+    /// Whether primary keys allow null values. Null keys use null-safe equality
+    /// when records are merged. Disabled by default, as in Java.
+    pub fn primary_key_nullable(&self) -> bool {
+        self.options
+            .get(PRIMARY_KEY_NULLABLE_OPTION)
+            .is_some_and(|v| v.eq_ignore_ascii_case("true"))
     }
 
     /// Whether to ignore delete records (and all retracts when used by `RowKindFilter`).
