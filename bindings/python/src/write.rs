@@ -532,6 +532,34 @@ fn arrow_table_batches(table: &Bound<'_, PyAny>) -> PyResult<Vec<RecordBatch>> {
         batches.push(RecordBatch::new_empty(Arc::new(
             ArrowSchema::from_pyarrow_bound(&table.getattr("schema")?)?,
         )));
+    } else if batches.len() > 1 {
+        // One Arrow Table has one schema, even when NULLs occur in only some
+        // chunks. The write importer relaxes transport fields per batch; union
+        // those flags so core can still require a uniform MERGE source schema.
+        let first = batches[0].schema();
+        let mut fields = first.fields().to_vec();
+        for batch in batches.iter().skip(1) {
+            for (field, actual) in fields.iter_mut().zip(batch.schema().fields()) {
+                if actual.is_nullable() && !field.is_nullable() {
+                    *field = Arc::new(field.as_ref().clone().with_nullable(true));
+                }
+            }
+        }
+        let schema = Arc::new(ArrowSchema::new_with_metadata(
+            fields,
+            first.metadata().clone(),
+        ));
+        for batch in &mut batches {
+            if batch.schema() != schema {
+                *batch = RecordBatch::try_new_with_options(
+                    schema.clone(),
+                    batch.columns().to_vec(),
+                    &arrow::array::RecordBatchOptions::default()
+                        .with_row_count(Some(batch.num_rows())),
+                )
+                .map_err(|error| PyValueError::new_err(error.to_string()))?;
+            }
+        }
     }
     Ok(batches)
 }
@@ -1770,6 +1798,119 @@ invalid = source.slice(0, 1)
                 .expect("a surviving NULL must still fail the declared target schema")
                 .to_string();
             assert!(error.contains("null"), "{error}");
+        });
+    }
+
+    #[test]
+    fn merge_binding_preserves_one_schema_across_source_chunks() {
+        use arrow::array::Int32Array;
+
+        Python::attach(|py| {
+            for reverse in [false, true] {
+                let schema = Schema::builder()
+                    .column("id", DataType::Int(IntType::with_nullable(false)))
+                    .column("value", DataType::Int(IntType::with_nullable(false)))
+                    .column("keep", DataType::Int(IntType::with_nullable(false)))
+                    .option("row-tracking.enabled", "true")
+                    .option("data-evolution.enabled", "true")
+                    .build()
+                    .unwrap();
+                let table = Arc::new(Table::new(
+                    FileIOBuilder::new("memory").build().unwrap(),
+                    Identifier::new("default", "merge_chunk_nullability"),
+                    "memory:/merge-chunk-nullability".into(),
+                    TableSchema::new(0, &schema),
+                    None,
+                ));
+                let seed = RecordBatch::try_new(
+                    paimon::arrow::build_target_arrow_schema(table.schema().fields()).unwrap(),
+                    vec![
+                        Arc::new(Int32Array::from(vec![1])),
+                        Arc::new(Int32Array::from(vec![10])),
+                        Arc::new(Int32Array::from(vec![100])),
+                    ],
+                )
+                .unwrap();
+                py.detach(|| {
+                    runtime().block_on(async {
+                        let builder = table.new_write_builder();
+                        let mut writer = builder.new_write().unwrap();
+                        writer.write_arrow_batch(&seed).await.unwrap();
+                        builder
+                            .new_commit()
+                            .commit(writer.prepare_commit().await.unwrap())
+                            .await
+                            .unwrap();
+                        writer.close().await;
+                    })
+                });
+                let context = UpdateContext::new(&WriteContext::new(table)).unwrap();
+                let locals = PyDict::new(py);
+                locals.set_item("reverse", reverse).unwrap();
+                py.run(
+                    c_str!(
+                        r#"
+import pyarrow as pa
+schema = pa.schema([
+    pa.field('id', pa.int32(), nullable=False),
+    pa.field('value', pa.int32(), nullable=False),
+    pa.field('keep', pa.int32(), nullable=False, metadata={'role': 'unselected'}),
+], metadata={'origin': 'chunked-merge'})
+def chunk(row):
+    return pa.RecordBatch.from_pylist([
+        {'id': 0, 'value': 0, 'keep': 0}, row], schema=schema).slice(1)
+chunks = [chunk({'id': 1, 'value': 42, 'keep': 100}),
+          chunk({'id': 2, 'value': None, 'keep': None}),
+          chunk({'id': None, 'value': 30, 'keep': 100})]
+source = pa.Table.from_batches(chunks[::-1] if reverse else chunks)
+encoded = pa.chunked_array([pa.DictionaryArray.from_arrays(
+    pa.array([0], type=pa.int8()), pa.array([None], type=pa.int32())) for _ in chunks])
+source = source.append_column(pa.field('encoded_unused', encoded.type, nullable=False), encoded)
+assert source.column('encoded_unused').null_count == 0
+assert source.column('encoded_unused').to_pylist() == [None, None, None]
+matched = [dict(assignments=[('value', 'source', 'value')], condition=None, delete=False)]
+not_matched = []
+"#
+                    ),
+                    Some(&locals),
+                    Some(&locals),
+                )
+                .unwrap();
+                let source = locals.get_item("source").unwrap().unwrap();
+                let matched = locals.get_item("matched").unwrap().unwrap();
+                let not_matched = locals.get_item("not_matched").unwrap().unwrap();
+                let messages = context
+                    .merge_into(
+                        py,
+                        Some(&source),
+                        vec![("id".into(), "id".into())],
+                        &matched,
+                        &not_matched,
+                    )
+                    .unwrap();
+                assert_eq!(messages.len(), 1);
+                assert_eq!(messages[0].inner.new_files.len(), 1);
+                let imported = arrow_table_batches(&source).unwrap();
+                assert_eq!(imported.len(), 3);
+                for batch in &imported {
+                    assert_eq!(batch.schema(), imported[0].schema());
+                    assert!(batch.schema().fields()[..3]
+                        .iter()
+                        .all(|field| field.is_nullable()));
+                    assert!(!batch.schema().field(3).is_nullable());
+                    assert_eq!(
+                        batch.schema().metadata().get("origin").unwrap(),
+                        "chunked-merge"
+                    );
+                    assert_eq!(
+                        batch.schema().field(2).metadata().get("role").unwrap(),
+                        "unselected"
+                    );
+                }
+                let original =
+                    ArrowSchema::from_pyarrow_bound(&source.getattr("schema").unwrap()).unwrap();
+                assert!(original.fields().iter().all(|field| !field.is_nullable()));
+            }
         });
     }
 
