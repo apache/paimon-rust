@@ -385,19 +385,11 @@ impl GlobalIndexScanner {
         predicate: &Predicate,
         evaluated_fields: &std::collections::HashSet<i32>,
     ) -> bool {
-        use crate::spec::{DataType, PredicateOperator};
+        use crate::spec::PredicateOperator;
         match predicate {
             Predicate::NestedLeaf { .. } => false,
-            Predicate::Leaf {
-                column,
-                op,
-                data_type,
-                ..
-            } => {
+            Predicate::Leaf { column, op, .. } => {
                 predicates::is_sorted_global_index_supported_op(*op)
-                    // Bitmap answers these with every non-null row.
-                    && !(matches!(data_type, DataType::Float(_) | DataType::Double(_))
-                        && super::bitmap_global_index_format::is_bitmap_floating_residual_sensitive_op(*op))
                     && !matches!(
                         op,
                         PredicateOperator::Contains

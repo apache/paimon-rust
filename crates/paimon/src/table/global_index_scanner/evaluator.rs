@@ -19,8 +19,8 @@
 
 use super::all_match::all_matching_entries;
 use super::entry::{
-    bitmap_meta_may_match, bitmap_meta_may_match_between, multivalue_meta_may_match,
-    sorted_entry_meta, GlobalIndexEntry, GlobalIndexFileKind,
+    bitmap_meta_may_match, bitmap_meta_may_match_between, is_floating_point,
+    multivalue_meta_may_match, sorted_entry_meta, GlobalIndexEntry, GlobalIndexFileKind,
 };
 use super::predicates::{
     entries_support_predicate, is_multivalue_predicate, is_sorted_global_index_supported_op,
@@ -39,6 +39,7 @@ use crate::btree::{make_key_comparator, serialize_datum};
 #[cfg(test)]
 use crate::spec::GlobalIndexSearchMode;
 use crate::spec::{DataType, Datum, Predicate, PredicateOperator};
+use crate::table::bitmap_global_index_format::is_bitmap_floating_residual_sensitive_op;
 use crate::table::bitmap_global_index_format::{
     make_bitmap_key_comparator, serialize_bitmap_datum,
 };
@@ -383,6 +384,27 @@ impl GlobalIndexScanner {
     /// Opens each file once and evaluates all predicates, intersecting results.
     /// Detects between patterns (GtEq/Gt + LtEq/Lt) and merges them into a single range query.
     async fn evaluate_leaf(
+        &self,
+        entries: &[&GlobalIndexEntry],
+        predicates: &[(PredicateOperator, &[Datum], &DataType)],
+    ) -> Result<Option<(Vec<RowRange>, Vec<RowRange>, bool)>> {
+        // A bitmap answers floating ranges and negations with every non-null
+        // row (see `bitmap_meta_may_match`), so those results are candidates
+        // only. Sorted indexes answer them exactly.
+        let bitmap_superset = entries
+            .iter()
+            .any(|entry| matches!(entry.index_type, GlobalIndexFileKind::Bitmap))
+            && predicates.iter().any(|(op, _, data_type)| {
+                is_floating_point(data_type) && is_bitmap_floating_residual_sensitive_op(*op)
+            });
+        Ok(self.evaluate_leaf_entries(entries, predicates).await?.map(
+            |(row_ranges, coverage, fully_evaluated)| {
+                (row_ranges, coverage, fully_evaluated && !bitmap_superset)
+            },
+        ))
+    }
+
+    async fn evaluate_leaf_entries(
         &self,
         entries: &[&GlobalIndexEntry],
         predicates: &[(PredicateOperator, &[Datum], &DataType)],
