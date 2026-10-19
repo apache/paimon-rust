@@ -1940,41 +1940,43 @@ async fn test_bitmap_floating_candidates_preserve_residual_results() {
         None,
     );
 
+    // Java's Float.compare / Double.compare treat every NaN as one value above
+    // +Inf and order -0.0 below 0.0.
     let predicates = PredicateBuilder::new(table.schema().fields());
     let cases = [
         (
             "Float < 0",
             predicates.less_than("f", Datum::Float(0.0)).unwrap(),
-            vec![0, 1, 4, 5],
+            vec![4, 5],
         ),
         (
             "Double < 0",
             predicates.less_than("d", Datum::Double(0.0)).unwrap(),
-            vec![0, 1, 4, 5],
+            vec![4, 5],
         ),
         (
             "Float = canonical NaN",
             predicates.equal("f", Datum::Float(f32::NAN)).unwrap(),
-            vec![2],
+            vec![0, 1, 2, 3],
         ),
         (
             "Double = canonical NaN",
             predicates.equal("d", Datum::Double(f64::NAN)).unwrap(),
-            vec![2],
+            vec![0, 1, 2, 3],
         ),
         (
             "Float = negative NaN",
             predicates
                 .equal("f", Datum::Float(float_negative_nan))
                 .unwrap(),
-            vec![0],
+            vec![0, 1, 2, 3],
         ),
         (
             "Double = negative NaN",
             predicates
                 .equal("d", Datum::Double(double_negative_nan))
                 .unwrap(),
-            vec![0],
+            vec![0, 1, 2, 3],
         ),
         (
             "Float IN NaNs",
@@ -1984,7 +1986,7 @@ async fn test_bitmap_floating_candidates_preserve_residual_results() {
                     vec![Datum::Float(float_negative_nan), Datum::Float(f32::NAN)],
                 )
                 .unwrap(),
-            vec![0, 2],
+            vec![0, 1, 2, 3],
         ),
         (
             "Double IN NaNs",
@@ -1994,31 +1996,31 @@ async fn test_bitmap_floating_candidates_preserve_residual_results() {
                     vec![Datum::Double(double_negative_nan), Datum::Double(f64::NAN)],
                 )
                 .unwrap(),
-            vec![0, 2],
+            vec![0, 1, 2, 3],
         ),
         (
             "Float != canonical NaN",
             predicates.not_equal("f", Datum::Float(f32::NAN)).unwrap(),
-            vec![0, 1, 3, 4, 5, 6, 7],
+            vec![4, 5, 6, 7],
         ),
         (
             "Double != canonical NaN",
             predicates.not_equal("d", Datum::Double(f64::NAN)).unwrap(),
-            vec![0, 1, 3, 4, 5, 6, 7],
+            vec![4, 5, 6, 7],
         ),
         (
             "Float NOT IN",
             predicates
                 .is_not_in("f", vec![Datum::Float(f32::NAN), Datum::Float(0.0)])
                 .unwrap(),
-            vec![0, 1, 3, 4, 5, 7],
+            vec![4, 5, 7],
         ),
         (
             "Double NOT IN",
             predicates
                 .is_not_in("d", vec![Datum::Double(f64::NAN), Datum::Double(0.0)])
                 .unwrap(),
-            vec![0, 1, 3, 4, 5, 7],
+            vec![4, 5, 7],
         ),
         (
             "Float combined range",
@@ -2028,7 +2030,7 @@ async fn test_bitmap_floating_candidates_preserve_residual_results() {
                     .unwrap(),
                 predicates.less_or_equal("f", Datum::Float(0.0)).unwrap(),
             ]),
-            vec![0, 4, 5, 6],
+            Vec::<i32>::new(),
         ),
         (
             "Double combined range",
@@ -2038,7 +2040,7 @@ async fn test_bitmap_floating_candidates_preserve_residual_results() {
                     .unwrap(),
                 predicates.less_or_equal("d", Datum::Double(0.0)).unwrap(),
             ]),
-            vec![0, 4, 5, 6],
+            Vec::<i32>::new(),
         ),
     ];
 

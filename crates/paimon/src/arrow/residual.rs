@@ -1138,6 +1138,8 @@ fn evaluate_column_predicate(
     op: PredicateOperator,
 ) -> Result<BooleanArray, ArrowError> {
     let scalar = string_scalar_for_column(scalar, column.data_type())?;
+    let canonical = canonical_nan_column(column);
+    let column = canonical.as_ref().unwrap_or(column);
 
     match op {
         PredicateOperator::Eq => arrow_eq(column, &scalar),
@@ -1409,6 +1411,7 @@ fn float32_literal(literal: &Datum) -> Option<f32> {
         }
         _ => None,
     }
+    .map(|value| if value.is_nan() { f32::NAN } else { value })
 }
 
 fn float64_literal(literal: &Datum) -> Option<f64> {
@@ -1416,6 +1419,48 @@ fn float64_literal(literal: &Datum) -> Option<f64> {
         Datum::Float(value) => Some(f64::from(*value)),
         Datum::Double(value) => Some(*value),
         _ => None,
+    }
+    .map(|value| if value.is_nan() { f64::NAN } else { value })
+}
+
+/// Java's `Float.compare` / `Double.compare` treat every NaN as one value above
+/// `+Inf`. Arrow's total order keeps the NaN bits, so a NaN with the sign bit
+/// set (what x86 yields for `0.0 / 0.0`) sorts below `-Inf` and differs from
+/// `NaN`. Returns the column with such NaNs rewritten to `NaN`, or `None` when
+/// it has none.
+fn canonical_nan_column(column: &ArrayRef) -> Option<ArrayRef> {
+    if let Some(values) = column.as_any().downcast_ref::<Float32Array>() {
+        let canonical = f32::NAN.to_bits();
+        values
+            .values()
+            .iter()
+            .any(|value| value.is_nan() && value.to_bits() != canonical)
+            .then(|| -> ArrayRef {
+                Arc::new(values.unary::<_, arrow_array::types::Float32Type>(|value| {
+                    if value.is_nan() {
+                        f32::NAN
+                    } else {
+                        value
+                    }
+                }))
+            })
+    } else if let Some(values) = column.as_any().downcast_ref::<Float64Array>() {
+        let canonical = f64::NAN.to_bits();
+        values
+            .values()
+            .iter()
+            .any(|value| value.is_nan() && value.to_bits() != canonical)
+            .then(|| -> ArrayRef {
+                Arc::new(values.unary::<_, arrow_array::types::Float64Type>(|value| {
+                    if value.is_nan() {
+                        f64::NAN
+                    } else {
+                        value
+                    }
+                }))
+            })
+    } else {
+        None
     }
 }
 
