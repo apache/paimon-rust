@@ -19,7 +19,7 @@
 //!
 //! Reference: Java `org.apache.paimon.table.sink.RowKindGenerator`.
 
-use arrow_array::{Array, RecordBatch, StringArray};
+use arrow_array::{Array, LargeStringArray, RecordBatch, StringArray};
 
 use crate::spec::{RowKind, TableSchema};
 
@@ -51,13 +51,17 @@ impl RowKindGenerator {
                 source: None,
             });
         }
-        let strings = col.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
-            crate::Error::DataInvalid {
+        let value = if let Some(strings) = col.as_any().downcast_ref::<StringArray>() {
+            strings.value(row)
+        } else if let Some(strings) = col.as_any().downcast_ref::<LargeStringArray>() {
+            strings.value(row)
+        } else {
+            return Err(crate::Error::DataInvalid {
                 message: "rowkind.field column must be Utf8/String".to_string(),
                 source: None,
-            }
-        })?;
-        RowKind::from_short_string(strings.value(row))
+            });
+        };
+        RowKind::from_short_string(value)
     }
 }
 

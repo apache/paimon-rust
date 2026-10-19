@@ -806,15 +806,11 @@ impl TableWrite {
     }
 
     pub(super) fn normalize_write_batch(&self, batch: &RecordBatch) -> Result<Option<RecordBatch>> {
-        let batch = self.validate_write_batch_schema(batch)?;
-        // Java filters row kinds before extracting Blob values. Ignored rows
-        // need neither valid descriptor bytes nor physical files.
+        let filtered = self.filter_write_input(batch)?;
+        let batch = self.validate_write_batch_schema(filtered.as_ref().unwrap_or(batch))?;
+        // Filtering already precedes value normalization. Generate the system
+        // column now so every surviving PK batch has the same buffer schema.
         let batch = self.generate_rowkind_batch(&batch)?;
-        let selection = self.rowkind_selection(&batch)?;
-        let batch = match &selection {
-            Some(rows) => take_rows(&batch, rows)?,
-            None => batch,
-        };
         if batch.num_rows() == 0 {
             return Ok(None);
         }
@@ -868,6 +864,75 @@ impl TableWrite {
             batch
         };
         Ok(Some(batch))
+    }
+
+    /// Java resolves the event and checks top-level nullability before its
+    /// RowKindFilter. Ignored rows never reach value extraction or nested
+    /// writers, so their child values must not be normalized or validated.
+    fn filter_write_input(&self, batch: &RecordBatch) -> Result<Option<RecordBatch>> {
+        let Some(filter) = &self.row_kind_filter else {
+            return Ok(None);
+        };
+        if self.primary_key_indices.is_empty() {
+            return Ok(None);
+        }
+        // Reject malformed schemas even when every event would be ignored.
+        // Empty arrays check equivalent layouts without examining row values.
+        self.validate_write_batch_schema(&RecordBatch::new_empty(batch.schema()))?;
+        let kinds = if let Some(generator) = &self.row_kind_generator {
+            (0..batch.num_rows())
+                .map(|row| generator.generate(batch, row))
+                .collect::<Result<Vec<_>>>()?
+        } else if let Some(column) = batch.column_by_name(VALUE_KIND_FIELD_NAME) {
+            column
+                .as_any()
+                .downcast_ref::<Int8Array>()
+                .unwrap()
+                .iter()
+                .map(|kind| RowKind::from_value(kind.unwrap_or(RowKind::Insert.to_value())))
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            vec![RowKind::Insert; batch.num_rows()]
+        };
+
+        let schema = self.table.schema();
+        let options = CoreOptions::new(schema.options());
+        // Java's deduplicate DELETE can omit non-key values. Sequence fields
+        // still identify the event; other engines and partition migrations
+        // require every declared top-level NOT NULL field.
+        let partial_delete = self.merge_engine == MergeEngine::Deduplicate
+            && schema
+                .partition_keys()
+                .iter()
+                .all(|field| schema.primary_keys().contains(field));
+        let sequence_fields = options.sequence_fields();
+        for (index, field) in self.write_schema.fields().iter().enumerate() {
+            if field.is_nullable() || batch.column(index).null_count() == 0 {
+                continue;
+            }
+            let delete_required = !partial_delete
+                || schema.primary_keys().contains(field.name())
+                || sequence_fields.contains(&field.name().as_str());
+            for (row, kind) in kinds.iter().enumerate() {
+                if batch.column(index).is_null(row) && (*kind != RowKind::Delete || delete_required)
+                {
+                    return Err(crate::Error::DataInvalid {
+                        message: format!("Cannot write null to non-null column({})", field.name()),
+                        source: None,
+                    });
+                }
+            }
+        }
+        let rows = kinds
+            .into_iter()
+            .enumerate()
+            .filter_map(|(row, kind)| filter.test(kind).then_some(row))
+            .collect::<Vec<_>>();
+        if rows.len() == batch.num_rows() {
+            Ok(None)
+        } else {
+            take_rows(batch, &rows).map(Some)
+        }
     }
 
     pub(super) async fn write_partition_bucket_batch(
@@ -1195,32 +1260,6 @@ impl TableWrite {
             .map(|row| generator.generate(batch, row).map(|kind| kind.to_value()))
             .collect::<Result<Vec<_>>>()?;
         Self::add_per_row_value_kind_column(batch, kinds)
-    }
-
-    /// Both generated row kinds and explicit caller-provided kinds use the
-    /// same Java RowKindFilter before bucket assignment and changelog writing.
-    fn rowkind_selection(&self, batch: &RecordBatch) -> Result<Option<Vec<usize>>> {
-        let Some(filter) = &self.row_kind_filter else {
-            return Ok(None);
-        };
-        let Some(column) = batch.column_by_name(VALUE_KIND_FIELD_NAME) else {
-            return Ok(None);
-        };
-        let kinds = column
-            .as_any()
-            .downcast_ref::<arrow_array::Int8Array>()
-            .ok_or_else(|| crate::Error::DataInvalid {
-                message: "_VALUE_KIND column must be Int8".to_string(),
-                source: None,
-            })?;
-        let mut keep_rows = Vec::new();
-        for (row, kind) in kinds.iter().enumerate() {
-            let kind = RowKind::from_value(kind.unwrap_or(RowKind::Insert as i8))?;
-            if filter.test(kind) {
-                keep_rows.push(row);
-            }
-        }
-        Ok((keep_rows.len() != batch.num_rows()).then_some(keep_rows))
     }
 
     fn add_per_row_value_kind_column(

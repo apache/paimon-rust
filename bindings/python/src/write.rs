@@ -863,7 +863,7 @@ impl WriteState {
         batch: &Bound<'_, PyAny>,
         bucket: Option<i32>,
     ) -> PyResult<()> {
-        let batch = RecordBatch::from_pyarrow_bound(batch)?;
+        let batch = crate::arrow_input::write_batch_from_pyarrow(batch)?;
         let inner = self
             .inner
             .as_mut()
@@ -1648,6 +1648,85 @@ impl PyCommitMessage {
             inner,
             origin: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use paimon::catalog::Identifier;
+    use paimon::io::FileIOBuilder;
+    use paimon::spec::{IntType, Schema, TableSchema, VarCharType};
+    use pyo3::ffi::c_str;
+
+    #[test]
+    fn ignored_delete_null_payload_reaches_core_nullability_checks() {
+        Python::attach(|py| {
+            let schema = Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("op", DataType::VarChar(VarCharType::string_type()))
+                .column("payload", DataType::Int(IntType::with_nullable(false)))
+                .primary_key(["id"])
+                .option("bucket", "1")
+                .option("rowkind.field", "op")
+                .option("ignore-delete", "true")
+                .build()
+                .unwrap();
+            let table = Arc::new(Table::new(
+                FileIOBuilder::new("memory").build().unwrap(),
+                Identifier::new("default", "nullable_transport"),
+                "memory:/nullable-transport".into(),
+                TableSchema::new(0, &schema),
+                None,
+            ));
+            let locals = PyDict::new(py);
+            for large_string in [false, true] {
+                locals.set_item("large_string", large_string).unwrap();
+                for (kind, id, payload, error_column) in [
+                    ("-D", Some(1), None, None),
+                    ("-U", Some(1), None, Some("payload")),
+                    ("+I", Some(1), None, Some("payload")),
+                    ("-D", None, Some(42), Some("id")),
+                ] {
+                    locals.set_item("kind", kind).unwrap();
+                    locals.set_item("row_id", id).unwrap();
+                    locals.set_item("payload", payload).unwrap();
+                    py.run(
+                        c_str!(
+                            r#"
+import pyarrow as pa
+schema = pa.schema([
+    pa.field('id', pa.int32(), nullable=False),
+    pa.field('op', pa.large_string() if large_string else pa.string()),
+    pa.field('payload', pa.int32(), nullable=False),
+])
+batch = pa.RecordBatch.from_pylist([
+    {'id': row_id, 'op': kind, 'payload': payload},
+], schema=schema)
+"#
+                        ),
+                        None,
+                        Some(&locals),
+                    )
+                    .unwrap();
+                    let batch = locals.get_item("batch").unwrap().unwrap();
+                    let mut state = WriteContext::new(table.clone()).new_write(false).unwrap();
+                    let result = state.write_arrow(py, &batch, None);
+                    if let Some(column) = error_column {
+                        let error = result.unwrap_err().to_string();
+                        assert!(
+                            error.contains(&format!(
+                                "Cannot write null to non-null column({column})"
+                            )),
+                            "{error}"
+                        );
+                    } else {
+                        result.unwrap();
+                    }
+                    assert!(state.prepare_commit(py).unwrap().is_empty());
+                }
+            }
+        });
     }
 }
 

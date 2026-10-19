@@ -79,6 +79,44 @@ pub(crate) fn batch_from_pyarrow(value: &Bound<'_, PyAny>) -> PyResult<RecordBat
     .map_err(|e| PyValueError::new_err(e.to_string()))
 }
 
+pub(crate) fn write_batch_from_pyarrow(value: &Bound<'_, PyAny>) -> PyResult<RecordBatch> {
+    let schema = Schema::from_pyarrow_bound(&value.getattr("schema")?)?;
+    let mut fields = schema.fields().to_vec();
+    let mut nullable_transport = false;
+    for (index, field) in schema.fields().iter().enumerate() {
+        if !field.is_nullable()
+            && value
+                .call_method1("column", (index,))?
+                .getattr("null_count")?
+                .extract::<usize>()?
+                > 0
+        {
+            fields[index] = Arc::new(field.as_ref().clone().with_nullable(true));
+            nullable_transport = true;
+        }
+    }
+    if !nullable_transport {
+        return batch_from_pyarrow(value);
+    }
+
+    // PyArrow permits NULLs under a top-level NOT NULL transport field. A
+    // DELETE may legitimately omit non-key values, so retain those NULLs for
+    // core's declared-schema and per-event checks instead of rejecting them
+    // in Arrow's RecordBatch constructor. Nested fields stay unchanged.
+    let columns = value
+        .getattr("columns")?
+        .try_iter()?
+        .map(|column| array_from_pyarrow(&column?))
+        .collect::<PyResult<Vec<_>>>()?;
+    let rows = value.getattr("num_rows")?.extract::<usize>()?;
+    RecordBatch::try_new_with_options(
+        Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone())),
+        columns,
+        &RecordBatchOptions::default().with_row_count(Some(rows)),
+    )
+    .map_err(|e| PyValueError::new_err(e.to_string()))
+}
+
 fn normalize_sparse_unions(data: ArrayData) -> Result<ArrayData, ArrowError> {
     if !contains_sparse_union(data.data_type()) {
         return Ok(data);
@@ -150,6 +188,138 @@ mod tests {
     };
     use arrow::buffer::{NullBuffer, ScalarBuffer};
     use arrow::datatypes::{Field, UnionFields};
+    use pyo3::{ffi::c_str, types::PyDict};
+
+    #[test]
+    fn write_batch_import_preserves_nullable_transport_for_core() {
+        Python::attach(|py| {
+            let locals = PyDict::new(py);
+            py.run(
+                c_str!(
+                    r#"
+import pyarrow as pa
+schema = pa.schema([
+    pa.field('id', pa.int32(), nullable=False),
+    pa.field('payload', pa.int32(), nullable=False, metadata={'field': 'value'}),
+    pa.field('nested', pa.struct([pa.field('child', pa.int32(), nullable=False)])),
+], metadata={'scope': 'write'})
+batch = pa.RecordBatch.from_pylist([
+    {'id': 0, 'payload': 9, 'nested': {'child': 9}},
+    {'id': 1, 'payload': None, 'nested': {'child': 10}},
+    {'id': 2, 'payload': 42, 'nested': {'child': 11}},
+], schema=schema).slice(1, 2)
+"#
+                ),
+                None,
+                Some(&locals),
+            )
+            .unwrap();
+            let source = locals.get_item("batch").unwrap().unwrap();
+            let imported = write_batch_from_pyarrow(&source).unwrap();
+            assert_eq!(imported.num_rows(), 2);
+            let schema = imported.schema();
+            assert!(!schema.field(0).is_nullable());
+            assert!(schema.field(1).is_nullable());
+            assert_eq!(schema.metadata().get("scope").unwrap(), "write");
+            assert_eq!(schema.field(1).metadata().get("field").unwrap(), "value");
+            let values = imported
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            assert!(values.is_null(0));
+            assert_eq!(values.value(1), 42);
+            let nested = imported
+                .column(2)
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .unwrap();
+            assert!(!nested.fields()[0].is_nullable());
+            let children = nested
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            assert_eq!(children.values().as_ref(), &[10, 11]);
+            // The input's declared schema stays untouched; the table declaration
+            // remains the authority for the core's per-event nullability checks.
+            let original = Schema::from_pyarrow_bound(&source.getattr("schema").unwrap()).unwrap();
+            assert!(!original.field(1).is_nullable());
+        });
+    }
+
+    #[test]
+    fn write_batch_import_leaves_nested_value_validation_to_core() {
+        use arrow::array::{ListArray, MapArray};
+
+        Python::attach(|py| {
+            let locals = PyDict::new(py);
+            py.run(
+                c_str!(
+                    r#"
+import pyarrow as pa
+child = pa.field('value', pa.int32(), nullable=False)
+schema = pa.schema([
+    pa.field('id', pa.int32(), nullable=False),
+    pa.field('items', pa.list_(child)),
+    pa.field('row', pa.struct([child])),
+    pa.field('map', pa.map_(pa.string(), child)),
+])
+batch = pa.RecordBatch.from_pylist([
+    {'id': 0, 'items': [0], 'row': {'value': 0}, 'map': [('key', 0)]},
+    {'id': 1, 'items': [None], 'row': {'value': None}, 'map': [('key', None)]},
+    {'id': 2, 'items': [42], 'row': {'value': 42}, 'map': [('key', 42)]},
+], schema=schema).slice(1, 2)
+"#
+                ),
+                None,
+                Some(&locals),
+            )
+            .unwrap();
+            let source = locals.get_item("batch").unwrap().unwrap();
+            let imported = write_batch_from_pyarrow(&source).unwrap();
+            let original = Schema::from_pyarrow_bound(&source.getattr("schema").unwrap()).unwrap();
+            assert_eq!(imported.schema().as_ref(), &original);
+            assert_eq!(imported.num_rows(), 2);
+            let items = imported
+                .column(1)
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .unwrap();
+            assert!(!items.value_type().is_nested());
+            assert!(items.value(0).is_null(0));
+            assert_eq!(
+                items
+                    .value(1)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .value(0),
+                42
+            );
+            let row = imported
+                .column(2)
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .unwrap();
+            assert!(row.column(0).is_null(0));
+            let map = imported
+                .column(3)
+                .as_any()
+                .downcast_ref::<MapArray>()
+                .unwrap();
+            assert!(map.value(0).column(1).is_null(0));
+            assert_eq!(
+                map.value(1)
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .value(0),
+                42
+            );
+        });
+    }
 
     fn input() -> ArrayData {
         UnionArray::try_new(

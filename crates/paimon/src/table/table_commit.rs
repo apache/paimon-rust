@@ -3268,8 +3268,7 @@ impl TableCommit {
 
             let file = entry.file();
             let file_creation_time = file
-                .creation_time
-                .map(|t| t.timestamp_millis())
+                .creation_time_epoch_millis()?
                 .unwrap_or_else(|| current_time_millis() as i64);
 
             let stats = match stats_map.entry(partition_bytes) {
@@ -3288,7 +3287,9 @@ impl TableCommit {
                         record_count: 0,
                         file_size_in_bytes: 0,
                         file_count: 0,
-                        last_file_creation_time: 0,
+                        // Java starts with the first PartitionEntry, so
+                        // pre-epoch creation times must remain negative.
+                        last_file_creation_time: file_creation_time,
                         total_buckets: entry.total_buckets(),
                     })
                 }
@@ -4030,6 +4031,73 @@ mod tests {
     fn setup_partitioned_commit(file_io: &FileIO, table_path: &str) -> TableCommit {
         let table = test_partitioned_table(file_io, table_path);
         TableCommit::new(table, "test-user".to_string())
+    }
+
+    #[test]
+    fn partition_creation_time_uses_java_local_zone_and_keeps_millis() {
+        const CHILD: &str = "PAIMON_CREATION_TIME_ZONE_CHILD";
+        if let Ok(zone) = std::env::var(CHILD) {
+            let commit = TableCommit::new(
+                test_table(&test_file_io(), "memory:/creation-time"),
+                "user".into(),
+            );
+            let cases: &[(&str, &str)] = match zone.as_str() {
+                "UTC" => &[
+                    ("2024-01-02T12:34:56.789Z", "2024-01-02T12:34:56.789Z"),
+                    ("1970-01-01T00:00:00.000Z", "1970-01-01T00:00:00.000Z"),
+                    ("1969-12-31T23:59:59.999Z", "1969-12-31T23:59:59.999Z"),
+                ],
+                "Asia/Shanghai" => &[
+                    ("2024-01-02T12:34:56.789Z", "2024-01-02T04:34:56.789Z"),
+                    ("1970-01-01T07:59:59.999Z", "1969-12-31T23:59:59.999Z"),
+                ],
+                "America/New_York" => &[
+                    ("2024-01-02T12:34:56.789Z", "2024-01-02T17:34:56.789Z"),
+                    ("2024-03-10T02:30:00.123Z", "2024-03-10T07:30:00.123Z"),
+                    ("2024-11-03T01:30:00.456Z", "2024-11-03T05:30:00.456Z"),
+                ],
+                _ => unreachable!(),
+            };
+            for (wall, expected) in cases {
+                let mut file = test_data_file("data.parquet", 1);
+                file.creation_time = Some(wall.parse::<DateTime<Utc>>().unwrap());
+                let mut earlier = file.clone();
+                earlier.file_name = "earlier.parquet".into();
+                earlier.creation_time = file
+                    .creation_time
+                    .map(|wall| wall - chrono::Duration::milliseconds(1));
+                let mut entries = [
+                    ManifestEntry::new(FileKind::Add, vec![], 0, 1, file, 2),
+                    ManifestEntry::new(FileKind::Add, vec![], 0, 1, earlier, 2),
+                ];
+                for _ in 0..2 {
+                    let stats = commit.generate_partition_statistics(&entries).unwrap();
+                    assert_eq!(stats[0].file_count, 2);
+                    assert_eq!(stats[0].record_count, 2);
+                    assert_eq!(
+                        stats[0].last_file_creation_time,
+                        expected
+                            .parse::<DateTime<Utc>>()
+                            .unwrap()
+                            .timestamp_millis(),
+                        "{zone} {wall}"
+                    );
+                    entries.reverse();
+                }
+            }
+            return;
+        }
+        for zone in ["UTC", "Asia/Shanghai", "America/New_York"] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "table::table_commit::tests::partition_creation_time_uses_java_local_zone_and_keeps_millis", "--nocapture"])
+                .env(CHILD, zone).env("TZ", zone).output().unwrap();
+            assert!(
+                output.status.success(),
+                "{zone}: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 
     #[test]

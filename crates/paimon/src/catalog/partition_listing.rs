@@ -129,12 +129,7 @@ fn aggregate_partition_entries_in_zone(
         agg.file_size_in_bytes = agg.file_size_in_bytes.wrapping_add(file.file_size);
         agg.file_count += 1;
         agg.total_buckets = entry.total_buckets();
-        if let Some(time) = file.creation_time {
-            let millis = time.timestamp_millis();
-            let time =
-                crate::common::date_time::local_to_utc_seconds(millis.div_euclid(1000), zone)?
-                    * 1000
-                    + millis.rem_euclid(1000);
+        if let Some(time) = file.creation_time_epoch_millis_in_zone(zone)? {
             agg.last_file_creation_time = Some(
                 agg.last_file_creation_time
                     .map_or(time, |old| old.max(time)),
