@@ -181,6 +181,8 @@ lexical-write-integer@1.0.6		X									X
 libbz2-rs-sys@0.2.5																X
 libc@0.2.186		X									X					
 libloading@0.9.0									X							
+liblzma@0.4.7		X									X					
+liblzma-sys@0.4.7		X									X					
 libm@0.2.16											X					
 linux-raw-sys@0.12.1		X	X								X					
 litemap@0.8.2													X			

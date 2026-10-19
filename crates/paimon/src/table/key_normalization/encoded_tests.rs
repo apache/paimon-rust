@@ -231,6 +231,61 @@ fn typed_null_string_keys_match_without_casting_unselected_dictionary_values() {
 }
 
 #[test]
+fn all_null_union_keys_need_no_type_compatible_child() {
+    for dense in [true, false] {
+        let fields = UnionFields::try_new(
+            [7, 42],
+            [
+                Field::new("text", DataType::Utf8, true),
+                Field::new("bytes", DataType::Binary, true),
+            ],
+        )
+        .unwrap();
+        let input: ArrayRef = Arc::new(
+            UnionArray::try_new(
+                fields,
+                ScalarBuffer::from(vec![7, 42, 7]),
+                dense.then(|| ScalarBuffer::from(vec![0, 1, 1])),
+                if dense {
+                    vec![
+                        Arc::new(StringArray::from(vec![Some("not an integer"), None])) as ArrayRef,
+                        Arc::new(BinaryArray::from(vec![Some(b"inactive".as_slice()), None])),
+                    ]
+                } else {
+                    vec![
+                        Arc::new(StringArray::from(vec![
+                            Some("not an integer"),
+                            Some("inactive"),
+                            None,
+                        ])) as ArrayRef,
+                        Arc::new(BinaryArray::from(vec![
+                            Some(b"inactive".as_slice()),
+                            None,
+                            Some(b"inactive".as_slice()),
+                        ])),
+                    ]
+                },
+            )
+            .unwrap(),
+        );
+        assert!(normalize_match_key(&input, &DataType::Int32).is_err());
+        let selected = input.slice(1, 2);
+        let dictionary: ArrayRef = Arc::new(
+            DictionaryArray::<Int8Type>::try_new(
+                Int8Array::from(vec![Some(1), None, Some(0)]),
+                selected.clone(),
+            )
+            .unwrap(),
+        );
+        for keys in [selected, dictionary] {
+            let normalized = normalize_match_key(&keys, &DataType::Int32).unwrap();
+            assert_eq!(normalized.data_type(), &DataType::Int32);
+            assert_eq!(normalized.null_count(), keys.len());
+        }
+    }
+}
+
+#[test]
 fn typed_null_union_children_match_null_keys_without_casting_their_type() {
     for dense in [true, false] {
         let fields = UnionFields::try_new(
