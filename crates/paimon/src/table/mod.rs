@@ -19,6 +19,8 @@
 
 pub(crate) mod aggregator;
 mod audit_log_table;
+#[cfg(test)]
+mod authorized_write_tests;
 mod batch_vector_search_builder;
 pub(crate) mod bin_pack;
 mod bitmap_global_index_format;
