@@ -126,6 +126,8 @@ impl FileRead for TimedFileRead {
     }
 }
 
+type DataFieldsExtractor = dyn Fn(&[DataField]) -> crate::Result<Vec<DataField>> + Send + Sync;
+
 /// Reads data files through their format-specific readers.
 #[derive(Clone)]
 pub(crate) struct DataFileReader {
@@ -133,6 +135,7 @@ pub(crate) struct DataFileReader {
     schema_manager: SchemaManager,
     table_schema_id: i64,
     table_fields: Vec<DataField>,
+    fields_extractor: Arc<DataFieldsExtractor>,
     partition_fields: Vec<DataField>,
     read_type: Vec<DataField>,
     predicates: Vec<Predicate>,
@@ -154,6 +157,7 @@ impl DataFileReader {
         schema_manager: SchemaManager,
         table_schema_id: i64,
         table_fields: Vec<DataField>,
+        fields_extractor: impl Fn(&[DataField]) -> crate::Result<Vec<DataField>> + Send + Sync + 'static,
         read_type: Vec<DataField>,
         predicates: Vec<Predicate>,
     ) -> Self {
@@ -162,6 +166,7 @@ impl DataFileReader {
             schema_manager,
             table_schema_id,
             table_fields,
+            fields_extractor: Arc::new(fields_extractor),
             partition_fields: Vec::new(),
             read_type,
             predicates,
@@ -186,6 +191,20 @@ impl DataFileReader {
     pub(crate) fn with_partition_fields(mut self, fields: Vec<DataField>) -> Self {
         self.partition_fields = fields;
         self
+    }
+
+    fn physical_data_fields(
+        &self,
+        file_meta: &DataFileMeta,
+        file_fields: &[DataField],
+        supplied_fields: Option<&[DataField]>,
+    ) -> crate::Result<Vec<DataField>> {
+        data_schema_fields_for_file(
+            file_fields,
+            file_meta.write_cols.as_deref(),
+            supplied_fields,
+            self.fields_extractor.as_ref(),
+        )
     }
 
     pub(crate) fn with_blob_parallelism(mut self, blob_parallelism: usize) -> Self {
@@ -545,11 +564,8 @@ impl DataFileReader {
         let partition_fields = self.partition_fields.clone();
         let predicates = self.predicates.clone();
         let file_fields = data_fields.clone().unwrap_or_else(|| table_fields.clone());
-        let data_schema_fields = data_schema_fields_for_file(
-            &file_fields,
-            file_meta.write_cols.as_deref(),
-            data_schema_fields.as_deref(),
-        )?;
+        let data_schema_fields =
+            self.physical_data_fields(&file_meta, &file_fields, data_schema_fields.as_deref())?;
         let projects_row_id = read_type
             .iter()
             .any(|field| field.name() == ROW_ID_FIELD_NAME);
@@ -991,8 +1007,7 @@ impl DataFileReader {
 
         let target_schema = crate::arrow::build_read_arrow_schema(&read_type)?;
         let file_fields = data_fields.clone().unwrap_or_else(|| table_fields.clone());
-        let data_schema_fields =
-            data_schema_fields_for_file(&file_fields, file_meta.write_cols.as_deref(), None)?;
+        let data_schema_fields = self.physical_data_fields(&file_meta, &file_fields, None)?;
         // What the reader is asked for.
         let projected_read_fields: Vec<DataField> = if data_fields.is_some()
             || file_meta.write_cols.is_some()
@@ -1385,11 +1400,15 @@ fn data_schema_fields_for_file(
     file_fields: &[DataField],
     write_cols: Option<&[String]>,
     data_schema_fields: Option<&[DataField]>,
+    fields_extractor: &DataFieldsExtractor,
 ) -> crate::Result<Vec<DataField>> {
     if let Some(write_cols) = write_cols {
         return super::data_evolution_fields::project_by_paths(file_fields, write_cols);
     }
-    Ok(data_schema_fields.unwrap_or(file_fields).to_vec())
+    match data_schema_fields {
+        Some(fields) => Ok(fields.to_vec()),
+        None => fields_extractor(file_fields),
+    }
 }
 
 /// Convert ranges from their read-path coordinate system to file-local ranges.
@@ -1728,19 +1747,29 @@ mod row_tests {
             field(1, "id", DataType::Int(IntType::new())),
             field(2, "value", DataType::Int(IntType::new())),
         ];
-        let physical = vec![field(1_000_001, "_KEY_id", DataType::Int(IntType::new()))];
+        let physical = vec![field(
+            1 + crate::spec::KEY_FIELD_ID_START,
+            "_KEY_id",
+            DataType::Int(IntType::new()),
+        )];
+        let extractor = |fields: &[DataField]| Ok(fields.iter().rev().cloned().collect());
         assert_eq!(
-            data_schema_fields_for_file(&fields, None, None).unwrap(),
-            fields
+            data_schema_fields_for_file(&fields, None, None, &extractor).unwrap(),
+            fields.iter().rev().cloned().collect::<Vec<_>>()
         );
-        let selected = data_schema_fields_for_file(&fields, None, Some(&physical)).unwrap();
+        let selected =
+            data_schema_fields_for_file(&fields, None, Some(&physical), &extractor).unwrap();
         assert_eq!(
             selected.iter().map(DataField::name).collect::<Vec<_>>(),
             vec!["_KEY_id"]
         );
-        let partial =
-            data_schema_fields_for_file(&fields, Some(&["value".to_string()]), Some(&physical))
-                .unwrap();
+        let partial = data_schema_fields_for_file(
+            &fields,
+            Some(&["value".to_string()]),
+            Some(&physical),
+            &extractor,
+        )
+        .unwrap();
         assert_eq!(
             partial.iter().map(DataField::name).collect::<Vec<_>>(),
             vec!["value"]
@@ -2065,6 +2094,7 @@ mod row_tests {
             SchemaManager::new(file_io, table_path.to_string()),
             schema_id,
             fields,
+            |fields| Ok(fields.to_vec()),
             read_type,
             Vec::new(),
         );
@@ -2140,6 +2170,7 @@ mod row_tests {
             SchemaManager::new(file_io, table_path.to_string()),
             schema_id,
             fields,
+            |fields| Ok(fields.to_vec()),
             read_type,
             vec![predicate],
         );
@@ -2208,6 +2239,7 @@ mod row_tests {
                 SchemaManager::new(file_io.clone(), table_path.to_string()),
                 1,
                 fields.clone(),
+                |fields| Ok(fields.to_vec()),
                 vec![fields[0].clone()],
                 vec![predicate],
             );
@@ -2222,6 +2254,171 @@ mod row_tests {
                 expected_rows
             );
         }
+    }
+
+    #[tokio::test]
+    async fn row_variant_extraction_after_schema_evolution_uses_local_positions() {
+        use crate::spec::VariantType;
+        use crate::variant::GenericVariant;
+        use arrow_array::{BinaryArray, StructArray};
+        use arrow_buffer::NullBuffer;
+
+        let physical_fields = vec![
+            field(7, "old_id", DataType::Int(IntType::new())),
+            field(41, "old_payload", DataType::Variant(VariantType::new())),
+        ];
+        let schema = build_target_arrow_schema(&physical_fields).unwrap();
+        let variants = [
+            Some(r#"{"x":7,"items":[1,9]}"#),
+            Some(r#"{"x":99}"#),
+            Some("null"),
+            None,
+            Some(r#"{"x":88}"#),
+            Some(r#"{"x":"invalid","items":[]}"#),
+        ]
+        .into_iter()
+        .map(|json| json.map(|json| GenericVariant::parse_json(json).unwrap()))
+        .collect::<Vec<_>>();
+        let arrow_schema::DataType::Struct(children) = schema.field(1).data_type() else {
+            unreachable!()
+        };
+        let payload = StructArray::new(
+            children.clone(),
+            vec![
+                Arc::new(BinaryArray::from_iter_values(variants.iter().map(
+                    |value| value.as_ref().map_or(&[][..], GenericVariant::value),
+                ))),
+                Arc::new(BinaryArray::from_iter_values(variants.iter().map(
+                    |value| value.as_ref().map_or(&[][..], GenericVariant::metadata),
+                ))),
+            ],
+            Some(NullBuffer::from(
+                variants.iter().map(Option::is_some).collect::<Vec<_>>(),
+            )),
+        );
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5, 6])),
+                Arc::new(payload),
+            ],
+        )
+        .unwrap();
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let table_path = "memory:/row_variant_local_evolution";
+        let bucket_path = format!("{table_path}/bucket-0");
+        let file_name = "part.row";
+        let output = file_io
+            .new_output(&format!("{bucket_path}/{file_name}"))
+            .unwrap();
+        let mut writer = create_format_writer(&output, schema, "zstd", 1, None, None, None)
+            .await
+            .unwrap();
+        writer.write(&batch).await.unwrap();
+        let file_size = writer.close().await.unwrap().file_size as i64;
+        let mut file = data_file(file_name, file_size, 6, 1);
+        file.first_row_id = Some(1_000);
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(bucket_path)
+            .with_total_buckets(1)
+            .with_data_files(vec![file.clone()])
+            .build()
+            .unwrap();
+
+        let current_fields = vec![
+            field(7, "id", DataType::BigInt(BigIntType::new())),
+            field(41, "payload", DataType::Variant(VariantType::new())),
+        ];
+        let extraction = variant_extraction_row(
+            true,
+            vec![
+                (
+                    DataType::Int(IntType::new()),
+                    "$.x".into(),
+                    false,
+                    "UTC".into(),
+                ),
+                (
+                    DataType::Int(IntType::new()),
+                    "$.items[1]".into(),
+                    false,
+                    "UTC".into(),
+                ),
+                (
+                    DataType::Int(IntType::new()),
+                    "$.missing.deep".into(),
+                    false,
+                    "UTC".into(),
+                ),
+            ],
+        )
+        .unwrap();
+        let reader = DataFileReader::new(
+            file_io.clone(),
+            SchemaManager::new(file_io, table_path.to_string()),
+            2,
+            current_fields.clone(),
+            |fields| Ok(fields.to_vec()),
+            vec![
+                field(41, "payload", DataType::Row(extraction)),
+                current_fields[0].clone(),
+            ],
+            vec![],
+        );
+        let batches = reader
+            .read_single_file_stream_local(
+                &split,
+                file,
+                Some(physical_fields),
+                None,
+                vec![0, 2, 3, 5],
+            )
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(batches.len(), 1);
+        let result = &batches[0];
+        assert_eq!(result.num_rows(), 4);
+        assert_eq!(result.schema().field(0).name(), "payload");
+        assert_eq!(
+            result
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap(),
+            &Int64Array::from(vec![1, 3, 4, 6]),
+        );
+        let extracted = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        assert_eq!(
+            extracted
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap(),
+            &Int32Array::from(vec![Some(7), None, None, None]),
+        );
+        assert_eq!(
+            extracted
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap(),
+            &Int32Array::from(vec![Some(9), None, None, None]),
+        );
+        assert_eq!(extracted.column(2).null_count(), 4);
+        assert!(
+            extracted.is_valid(1),
+            "Variant null retains its parent value"
+        );
+        assert!(extracted.is_null(2), "SQL null has no parent Variant value");
     }
 
     /// The predicate must not renumber a projected `_ROW_ID`: the surviving row
@@ -2283,6 +2480,7 @@ mod row_tests {
             SchemaManager::new(file_io, table_path),
             1,
             fields,
+            |fields| Ok(fields.to_vec()),
             read_type,
             vec![predicate],
         );
@@ -2435,6 +2633,7 @@ mod row_tests {
                     SchemaManager::new(file_io.clone(), table_path.clone()),
                     2,
                     current.clone(),
+                    |fields| Ok(fields.to_vec()),
                     projected.clone(),
                     vec![predicate],
                 );
@@ -2714,6 +2913,7 @@ mod tests {
             schema_manager.clone(),
             1,
             fields.clone(),
+            |fields| Ok(fields.to_vec()),
             fields.clone(),
             vec![],
         );
@@ -2725,6 +2925,7 @@ mod tests {
             schema_manager.clone(),
             1,
             fields.clone(),
+            |fields| Ok(fields.to_vec()),
             fields.clone(),
             vec![crate::spec::Predicate::AlwaysTrue],
         );
@@ -2741,6 +2942,7 @@ mod tests {
             schema_manager.clone(),
             1,
             fields.clone(),
+            |fields| Ok(fields.to_vec()),
             fields.clone(),
             vec![filtering],
         );
@@ -2754,6 +2956,7 @@ mod tests {
             schema_manager.clone(),
             1,
             fields.clone(),
+            |fields| Ok(fields.to_vec()),
             fields.clone(),
             vec![],
         )
@@ -3026,6 +3229,7 @@ mod tests {
                     SchemaManager::new(file_io.clone(), table_path.to_string()),
                     1,
                     read_fields.clone(),
+                    |fields| Ok(fields.to_vec()),
                     read_fields.clone(),
                     predicates.clone(),
                 )
@@ -3123,6 +3327,7 @@ mod tests {
             schema_manager,
             table_schema_id,
             read_fields.clone(),
+            |fields| Ok(fields.to_vec()),
             read_fields.clone(),
             Vec::new(),
         );
@@ -3294,6 +3499,7 @@ mod tests {
             schema_manager.clone(),
             0,
             fields.clone(),
+            |fields| Ok(fields.to_vec()),
             fields.clone(),
             vec![predicate.clone()],
         )
@@ -3310,6 +3516,7 @@ mod tests {
             schema_manager,
             0,
             fields.clone(),
+            |fields| Ok(fields.to_vec()),
             fields,
             vec![predicate],
         )
@@ -3397,6 +3604,7 @@ mod tests {
                 schema_manager.clone(),
                 0,
                 fields.clone(),
+                |fields| Ok(fields.to_vec()),
                 fields.clone(),
                 vec![predicate.clone()],
             )
@@ -3485,6 +3693,7 @@ mod tests {
             schema_manager,
             0,
             fields.clone(),
+            |fields| Ok(fields.to_vec()),
             fields,
             vec![predicate],
         )
@@ -3557,6 +3766,7 @@ mod tests {
             schema_manager,
             current_schema.id(),
             current_schema.fields().to_vec(),
+            |fields| Ok(fields.to_vec()),
             current_schema.fields().to_vec(),
             vec![predicate],
         )
@@ -3829,6 +4039,7 @@ mod tests {
                 schema_manager.clone(),
                 current_schema.id(),
                 current_schema.fields().to_vec(),
+                |fields| Ok(fields.to_vec()),
                 vec![current_schema.fields()[0].clone()],
                 vec![predicate.clone()],
             )
@@ -3884,6 +4095,7 @@ mod tests {
             schema_manager,
             table_schema_id,
             fields.clone(),
+            |fields| Ok(fields.to_vec()),
             fields.clone(),
             Vec::new(),
         );
@@ -3962,6 +4174,7 @@ mod tests {
             schema_manager,
             table_schema_id,
             fields.clone(),
+            |fields| Ok(fields.to_vec()),
             fields.clone(),
             Vec::new(),
         );
@@ -4031,6 +4244,7 @@ mod tests {
             schema_manager,
             table_schema_id,
             fields.clone(),
+            |fields| Ok(fields.to_vec()),
             read_type,
             vec![predicate],
         );
@@ -4178,6 +4392,7 @@ mod vector_parquet_tests {
             schema_manager,
             table_schema_id,
             read_fields.clone(),
+            |fields| Ok(fields.to_vec()),
             read_fields.clone(),
             Vec::new(),
         );
@@ -4301,6 +4516,7 @@ mod vector_parquet_tests {
             SchemaManager::new(file_io, table_path.to_string()),
             schema_id,
             read_fields.clone(),
+            |fields| Ok(fields.to_vec()),
             read_fields,
             predicates,
         );

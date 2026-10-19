@@ -756,6 +756,7 @@ mod read_tests {
             schema_manager,
             1,
             id_fields(),
+            |fields| Ok(fields.to_vec()),
             id_fields(),
             Vec::new(),
         );

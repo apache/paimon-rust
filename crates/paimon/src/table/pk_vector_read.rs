@@ -298,6 +298,7 @@ async fn search_pk_raw_candidates_batch_with_plan(
         table.schema_manager().clone(),
         table.schema().id(),
         table.schema().fields().to_vec(),
+        table.data_fields_extractor(),
         vec![vector_field.clone()],
         Vec::new(),
     )
@@ -548,6 +549,7 @@ async fn search_pk_candidates_batch_with_plan(
                 table.schema_manager().clone(),
                 table.schema().id(),
                 table.schema().fields().to_vec(),
+                table.data_fields_extractor(),
                 vec![vector_field.clone()],
                 Vec::new(),
             )
@@ -606,6 +608,7 @@ pub(super) async fn filtered_row_ranges(
                     table.schema_manager().clone(),
                     table.schema().id(),
                     table.schema().fields().to_vec(),
+                    table.data_fields_extractor(),
                     residual_read_type,
                     Vec::new(),
                 )

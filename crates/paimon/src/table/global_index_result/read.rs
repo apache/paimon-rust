@@ -86,6 +86,7 @@ impl<'a> GlobalIndexResultReadBuilder<'a> {
                     table.schema_manager().clone(),
                     table.schema().id(),
                     table.schema().fields().to_vec(),
+                    table.data_fields_extractor(),
                     read_type,
                     Vec::new(),
                 )

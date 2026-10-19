@@ -814,6 +814,7 @@ impl<'a> PaimonTableRead<'a> {
             self.table.schema_manager().clone(),
             self.table.schema().id(),
             self.table.schema.fields().to_vec(),
+            self.table.data_fields_extractor(),
             scan_type,
             predicates,
         )
@@ -1880,6 +1881,7 @@ impl<'a> PaimonTableRead<'a> {
             self.table.schema_manager().clone(),
             self.table.schema().id(),
             self.table.schema.fields().to_vec(),
+            self.table.data_fields_extractor(),
             self.read_type().to_vec(),
             self.data_predicates.clone(),
         )

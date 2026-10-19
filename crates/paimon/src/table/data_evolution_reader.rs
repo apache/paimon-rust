@@ -488,6 +488,7 @@ impl DataEvolutionReader {
                 self.schema_manager.clone(),
                 self.table_schema_id,
                 self.table_fields.clone(),
+                |fields| Ok(fields.to_vec()),
                 self.wide_file_read_type.clone(),
                 if push_down_raw_predicates {
                     self.predicates.clone()
@@ -1781,6 +1782,7 @@ fn open_source_stream(
         schema_manager,
         table_schema_id,
         table_fields,
+        |fields| Ok(fields.to_vec()),
         source.read_fields().to_vec(),
         Vec::new(),
     )

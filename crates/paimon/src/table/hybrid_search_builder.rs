@@ -596,6 +596,7 @@ impl<'a> HybridSearchBuilder<'a> {
             self.table.schema_manager().clone(),
             self.table.schema().id(),
             self.table.schema().fields().to_vec(),
+            self.table.data_fields_extractor(),
             self.table.schema().fields().to_vec(),
             Vec::new(),
         )
@@ -762,6 +763,7 @@ impl<'a> HybridSearchBuilder<'a> {
             table.schema_manager().clone(),
             table.schema().id(),
             table.schema().fields().to_vec(),
+            table.data_fields_extractor(),
             table.schema().fields().to_vec(),
             Vec::new(),
         )

@@ -495,6 +495,7 @@ mod tests {
             schema_manager,
             schema_id,
             id_fields(),
+            |fields| Ok(fields.to_vec()),
             read_type,
             predicates,
         );
@@ -938,6 +939,7 @@ mod tests {
             schema_manager,
             1,
             id_fields(),
+            |fields| Ok(fields.to_vec()),
             id_fields(),
             vec![predicate],
         );
@@ -984,6 +986,7 @@ mod tests {
             schema_manager,
             1,
             id_fields(),
+            |fields| Ok(fields.to_vec()),
             vec![reserved],
             Vec::new(),
         );
@@ -1031,6 +1034,7 @@ mod tests {
             schema_manager,
             1,
             id_fields(),
+            |fields| Ok(fields.to_vec()),
             vec![id_field(), requested_row_id],
             Vec::new(),
         );

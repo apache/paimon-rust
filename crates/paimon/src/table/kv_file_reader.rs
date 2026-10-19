@@ -40,7 +40,7 @@ use crate::io::FileIO;
 use crate::spec::{
     is_variant_extraction_row, BigIntType, CoreOptions, DataField, DataFileMeta,
     DataType as PaimonDataType, MergeEngine, PartialUpdateConfig, Predicate, TinyIntType,
-    SEQUENCE_NUMBER_FIELD_ID, SEQUENCE_NUMBER_FIELD_NAME, VALUE_KIND_FIELD_ID,
+    KEY_FIELD_ID_START, SEQUENCE_NUMBER_FIELD_ID, SEQUENCE_NUMBER_FIELD_NAME, VALUE_KIND_FIELD_ID,
     VALUE_KIND_FIELD_NAME,
 };
 use crate::table::schema_manager::SchemaManager;
@@ -186,7 +186,42 @@ fn ensure_merge_input_limit(input_stream_count: usize, limit: Option<usize>) -> 
 
 /// Java's `KeyValueFieldsExtractor` builds the physical file layout from the
 /// schema that wrote the file, including its historical key names and types.
-fn key_value_data_schema_fields(
+pub(super) fn key_value_fields_extractor(
+    table_fields: &[DataField],
+    primary_keys: &[String],
+) -> impl Fn(&[DataField]) -> crate::Result<Vec<DataField>> + Send + Sync + 'static {
+    let key_ids = primary_keys
+        .iter()
+        .map(|name| {
+            table_fields
+                .iter()
+                .find(|field| field.name() == name)
+                .map(DataField::id)
+        })
+        .collect::<Option<Vec<_>>>();
+    move |file_fields| {
+        let key_ids = key_ids.as_ref().ok_or_else(|| Error::DataInvalid {
+            message: "KV key field is absent from the table schema".to_string(),
+            source: None,
+        })?;
+        let names = key_ids
+            .iter()
+            .map(|id| {
+                file_fields
+                    .iter()
+                    .find(|field| field.id() == *id)
+                    .map(|field| field.name().to_string())
+                    .ok_or_else(|| Error::DataInvalid {
+                        message: format!("KV key field id {id} is absent from the file schema"),
+                        source: None,
+                    })
+            })
+            .collect::<crate::Result<Vec<_>>>()?;
+        key_value_data_schema_fields(file_fields, &names)
+    }
+}
+
+pub(super) fn key_value_data_schema_fields(
     file_fields: &[DataField],
     trimmed_primary_keys: &[String],
 ) -> crate::Result<Vec<DataField>> {
@@ -203,7 +238,7 @@ fn key_value_data_schema_fields(
             field
                 .clone()
                 .with_name(format!("_KEY_{name}"))
-                .with_id(field.id() + 1_000_000),
+                .with_id(field.id() + KEY_FIELD_ID_START),
         );
     }
     physical.push(DataField::new(
@@ -683,6 +718,7 @@ impl KeyValueFileReader {
                             config.schema_manager.clone(),
                             table_schema_id,
                             config.table_fields.clone(),
+                            key_value_fields_extractor(&config.table_fields, &config.primary_keys),
                             internal_read_type.clone(),
                             pushdown_predicates.clone(),
                         )
@@ -1119,7 +1155,7 @@ mod tests {
                 "value"
             ]
         );
-        assert_eq!(physical[0].id(), 1_000_000);
+        assert_eq!(physical[0].id(), i32::MAX / 2);
         assert_eq!(physical[0].description(), Some("sort key"));
         assert_eq!(&physical[3..], fields);
         assert!(key_value_data_schema_fields(&fields, &["id".to_string()]).is_err());
@@ -1189,27 +1225,134 @@ mod tests {
         file.file_size = file_size;
         file.min_key = int_key(7);
         file.max_key = int_key(7);
-        let split = DataSplitBuilder::new()
-            .with_snapshot(1)
-            .with_partition(BinaryRow::new(0))
-            .with_bucket(0)
-            .with_bucket_path(bucket_path)
-            .with_total_buckets(1)
-            .with_data_files(vec![file])
-            .with_raw_convertible(false)
-            .build()
-            .unwrap();
-        let batches = table
-            .new_read_builder()
-            .new_read()
-            .unwrap()
-            .to_arrow(&[split])
+        file.delete_row_count = Some(0);
+        for raw_convertible in [false, true] {
+            let split = DataSplitBuilder::new()
+                .with_snapshot(1)
+                .with_partition(BinaryRow::new(0))
+                .with_bucket(0)
+                .with_bucket_path(bucket_path.clone())
+                .with_total_buckets(1)
+                .with_data_files(vec![file.clone()])
+                .with_raw_convertible(raw_convertible)
+                .build()
+                .unwrap();
+            let batches = table
+                .new_read_builder()
+                .new_read()
+                .unwrap()
+                .to_arrow(std::slice::from_ref(&split))
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            assert_eq!(int_column(&batches, "id"), vec![7]);
+            assert_eq!(int_column(&batches, "value"), vec![42]);
+
+            let selected = DataFileReader::new(
+                file_io.clone(),
+                table.schema_manager().clone(),
+                table.schema().id(),
+                table.schema().fields().to_vec(),
+                table.data_fields_extractor(),
+                table.schema().fields().to_vec(),
+                Vec::new(),
+            )
+            .read_single_file_stream_local(
+                &split,
+                file.clone(),
+                Some(old_schema.fields().to_vec()),
+                None,
+                vec![0],
+            )
             .unwrap()
             .try_collect::<Vec<_>>()
             .await
             .unwrap();
-        assert_eq!(int_column(&batches, "id"), vec![7]);
-        assert_eq!(int_column(&batches, "value"), vec![42]);
+            assert_eq!(int_column(&selected, "id"), vec![7]);
+            assert_eq!(int_column(&selected, "value"), vec![42]);
+        }
+    }
+
+    #[tokio::test]
+    async fn kv_row_nested_predicate_preserves_high_user_field_ids() {
+        let file_io = test_file_io();
+        let table_path = "memory:/kv_row_high_user_field_ids";
+        setup_dirs(&file_io, table_path).await;
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column(
+                "profile",
+                DataType::Row(crate::spec::RowType::new(vec![
+                    DataField::new(0, "score".into(), DataType::Int(IntType::new())),
+                    DataField::new(1, "payload".into(), DataType::Variant(VariantType::new())),
+                ])),
+            )
+            .primary_key(["id"])
+            .option("bucket", "1")
+            .option("file.format", "row")
+            .build()
+            .unwrap();
+        // A resolved historical schema can have sparse field IDs after many
+        // schema changes. This ID is valid user space, below Java's reserved
+        // key/system range, and must not alias the duplicated key column.
+        let mut json = serde_json::to_value(TableSchema::new(0, &schema)).unwrap();
+        json["fields"][1]["id"] = serde_json::json!(1_000_000);
+        json["highestFieldId"] = serde_json::json!(1_000_000);
+        let schema: TableSchema = serde_json::from_value(json).unwrap();
+        schema.validate_resolved_structure().unwrap();
+        let table = Table::new(
+            file_io,
+            Identifier::new("default", "kv_row_high_user_field_ids"),
+            table_path.to_string(),
+            schema,
+            None,
+        );
+        write_schema_file(&table, table.schema()).await;
+        let variant = crate::variant::GenericVariant::parse_json(r#"{"x":7}"#).unwrap();
+        let ArrowDataType::Struct(variant_fields) = variant_arrow_type() else {
+            unreachable!()
+        };
+        let payload = StructArray::new(
+            variant_fields,
+            vec![
+                Arc::new(BinaryArray::from(vec![variant.value(); 2])),
+                Arc::new(BinaryArray::from(vec![variant.metadata(); 2])),
+            ],
+            None,
+        );
+        let arrow_schema = build_target_arrow_schema(table.schema().fields()).unwrap();
+        let ArrowDataType::Struct(profile_fields) = arrow_schema.field(1).data_type() else {
+            unreachable!()
+        };
+        let profile = StructArray::new(
+            profile_fields.clone(),
+            vec![Arc::new(Int32Array::from(vec![-5, 42])), Arc::new(payload)],
+            None,
+        );
+        let batch = RecordBatch::try_new(
+            arrow_schema,
+            vec![Arc::new(Int32Array::from(vec![7, 8])), Arc::new(profile)],
+        )
+        .unwrap();
+        write_commit(&table, &batch).await;
+
+        let predicates = PredicateBuilder::new(table.schema().fields());
+        let score = predicates.nested_field("profile", &["score"]).unwrap();
+        let mut builder = table.new_read_builder();
+        builder.with_filter(predicates.greater_than(&score, Datum::Int(0)).unwrap());
+        let plan = builder.new_scan().plan().await.unwrap();
+        assert!(!plan.splits().is_empty());
+        assert!(plan.splits().iter().all(|split| split.raw_convertible()));
+        let batches = builder
+            .new_read()
+            .unwrap()
+            .to_arrow(plan.splits())
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(int_column(&batches, "id"), vec![8]);
     }
 
     #[tokio::test]

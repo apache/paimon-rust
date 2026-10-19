@@ -109,6 +109,7 @@ impl<'a> AuditLogRead<'a> {
                 self.read.table.schema_manager().clone(),
                 self.read.table.schema().id(),
                 self.read.table.schema.fields().to_vec(),
+                self.read.table.data_fields_extractor(),
                 read_type.clone(),
                 self.read.data_predicates.clone(),
             )

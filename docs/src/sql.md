@@ -386,6 +386,11 @@ bytes.
 
 `VARIANT` stores semi-structured data using the same logical value + metadata binary shape as Paimon Java. Use it for JSON-like fields whose schema may differ row by row.
 
+Parquet and ROW files support ordinary `VARIANT` reads and writes. Set
+`'file.format' = 'row'` to use ROW storage. ROW preserves the value and metadata
+buffers in the Java-compatible v1 layout; extracting a path still reads the
+containing compressed row block. The shredding options below apply to Parquet.
+
 Create `VARIANT` columns like ordinary table columns:
 
 ```sql
