@@ -20,10 +20,13 @@
 use arrow_array::{new_null_array, ArrayRef};
 use arrow_schema::DataType;
 
-use super::update_input::{cast_update_value, decode_dictionary, CastMode};
+use super::update_input::{cast_update_value, encoded, CastMode};
 use super::write_batch_normalize::normalize_write_array;
 
 mod numeric;
+
+#[cfg(test)]
+mod encoded_tests;
 
 /// Unify Arrow representations without changing key identity. Dictionary
 /// indices are batch-local; numeric widths, decimal scales and temporal units
@@ -34,8 +37,49 @@ pub(super) fn normalize_match_key(
     array: &ArrayRef,
     expected: &DataType,
 ) -> crate::Result<ArrayRef> {
-    let decoded = decode_dictionary(array)?;
-    if decoded.data_type() == &DataType::Null {
+    // Decode only selected dictionary entries and active Union children. An
+    // inactive child may contain an overflowing or unrelated typed value;
+    // applying assignment casts here would also change key identity.
+    match array.data_type() {
+        DataType::Dictionary(..) => {
+            return encoded::construct_dictionary(array, expected, normalize_match_key);
+        }
+        DataType::Union(..) => {
+            return encoded::construct_union(array, expected, normalize_match_key);
+        }
+        DataType::RunEndEncoded(_, values) => {
+            // Materialize the encoding without casting its logical values.
+            // This also preserves the logical offset of sliced run arrays.
+            let decoded =
+                arrow_cast::cast(array.as_ref(), values.data_type()).map_err(|error| {
+                    crate::Error::DataInvalid {
+                        message: error.to_string(),
+                        source: None,
+                    }
+                })?;
+            return normalize_match_key(&decoded, expected);
+        }
+        _ => {}
+    }
+    let materialized = match array.data_type() {
+        DataType::Utf8View => Some(DataType::Utf8),
+        DataType::BinaryView => Some(DataType::Binary),
+        _ => None,
+    };
+    let decoded = if let Some(layout) = materialized {
+        // View buffers are transport layouts; matching still uses the exact
+        // logical STRING or byte sequence, including dictionary NULL values.
+        arrow_cast::cast(array.as_ref(), &layout).map_err(|error| crate::Error::DataInvalid {
+            message: error.to_string(),
+            source: None,
+        })?
+    } else {
+        array.clone()
+    };
+    // Python matches None independently of the declared type of an active
+    // Union child. Only selected logical values reach here, so an all-NULL
+    // child needs no cast from its unrelated physical type.
+    if decoded.null_count() == decoded.len() {
         return Ok(new_null_array(expected, decoded.len()));
     }
     let source = decoded.data_type();

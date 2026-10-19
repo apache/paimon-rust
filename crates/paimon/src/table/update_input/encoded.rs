@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Rebuild selected encoded values after the whole-column safe cast has failed.
+//! Select logical encoded values before applying the caller's conversion rules.
 
 use arrow_array::cast::AsArray;
 use arrow_array::{Array, ArrayRef, UInt64Array, UnionArray};
@@ -24,10 +24,10 @@ use indexmap::IndexMap;
 
 use super::invalid;
 
-/// Decode references before constructor conversion, then restore NULL keys.
+/// Decode selected references before conversion, then restore NULL indices.
 /// Unlike taking a nullable index directly from a Union, taking from the typed
 /// output can represent NULL without assigning it an unrelated active type.
-pub(super) fn construct_dictionary(
+pub(in crate::table) fn construct_dictionary(
     array: &ArrayRef,
     target: &DataType,
     convert: fn(&ArrayRef, &DataType) -> crate::Result<ArrayRef>,
@@ -80,10 +80,10 @@ pub(super) fn construct_selected(
         .map_err(|error| invalid(error.to_string()))
 }
 
-/// Only active children participate in the Python-value constructor. A sparse
+/// Only active children participate in the caller's conversion. A sparse
 /// Union can contain invalid values at inactive positions; a dense Union can
 /// select any child offset repeatedly or in a different order.
-pub(super) fn construct_union(
+pub(in crate::table) fn construct_union(
     array: &ArrayRef,
     target: &DataType,
     convert: fn(&ArrayRef, &DataType) -> crate::Result<ArrayRef>,

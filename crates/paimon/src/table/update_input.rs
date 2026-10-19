@@ -30,7 +30,7 @@ use arrow_schema::{DataType, Schema, TimeUnit};
 
 mod binary;
 mod decimal;
-mod encoded;
+pub(super) mod encoded;
 
 /// PyPaimon distinguishes evaluated assignments (safe casts) from row-ID
 /// input (numeric coercion). Both use the same encodings, strings and nested

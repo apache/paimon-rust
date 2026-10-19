@@ -158,7 +158,6 @@ async fn invalid_write_type_does_not_replace_previous_configuration() {
         vec!["pt", "id", "id"],
         vec!["pt", "missing"],
         vec!["id"],
-        vec!["pt"],
     ] {
         assert!(writer
             .with_write_type(columns.into_iter().map(str::to_string).collect())

@@ -638,6 +638,8 @@ impl TableWrite {
     /// Select the top-level columns written by an append table, as Java
     /// `BaseAppendFileStoreWrite.withWriteType` does. Input follows this order;
     /// omitted columns are recorded in file metadata rather than filled with NULL.
+    /// Partition columns are required. Hash columns may be omitted when every
+    /// nonempty input supplies its bucket through [`Self::write_arrow`].
     /// Configure this before writing any nonempty batch.
     pub fn with_write_type(&mut self, write_columns: Vec<String>) -> Result<&mut Self> {
         self.ensure_active()?;
@@ -697,12 +699,18 @@ impl TableWrite {
         let partition_indices = indices(&self.partition_keys)?;
         let options = CoreOptions::new(schema.options());
         let total_buckets = options.bucket();
-        let bucket_indices = if total_buckets > 1 {
-            indices(&schema.bucket_keys())?
-        } else {
-            Vec::new()
-        };
-        let assigner = if total_buckets <= 1 || bucket_indices.is_empty() {
+        // Explicit-bucket inputs do not need the columns used to hash rows.
+        // Validate those columns only for automatic routing, while keeping
+        // partition extraction available for both forms of write.
+        let bucket_keys = schema.bucket_keys();
+        let bucket_indices = bucket_keys
+            .iter()
+            .filter_map(|name| fields.iter().position(|field| field.name() == name))
+            .collect::<Vec<_>>();
+        let assigner = if total_buckets <= 1
+            || bucket_indices.is_empty()
+            || bucket_indices.len() != bucket_keys.len()
+        {
             BucketAssignerEnum::Constant(ConstantBucketAssigner::new(
                 partition_indices,
                 if total_buckets == POSTPONE_BUCKET {
@@ -783,6 +791,7 @@ impl TableWrite {
         let Some(batch) = self.normalize_write_batch(batch)? else {
             return Ok(());
         };
+        self.ensure_automatic_bucket_columns()?;
         self.written = true;
 
         let grouped = match self.divide_by_partition_bucket(&batch).await {
@@ -795,6 +804,22 @@ impl TableWrite {
         for ((partition_bytes, bucket), sub_batch) in grouped {
             self.write_bucket(partition_bytes, bucket, sub_batch)
                 .await?;
+        }
+        Ok(())
+    }
+
+    fn ensure_automatic_bucket_columns(&self) -> Result<()> {
+        if matches!(self.bucket_assigner, BucketAssignerEnum::Constant(_))
+            && CoreOptions::new(self.table.schema().options()).bucket() > 1
+        {
+            for name in self.table.schema().bucket_keys() {
+                if !self.write_fields.iter().any(|field| field.name() == name) {
+                    return Err(crate::Error::DataInvalid {
+                        message: format!("Write type must include routing column '{name}' for automatic bucket assignment"),
+                        source: None,
+                    });
+                }
+            }
         }
         Ok(())
     }
