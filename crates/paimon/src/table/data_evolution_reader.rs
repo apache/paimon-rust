@@ -546,6 +546,7 @@ impl DataEvolutionReader {
                             let has_row_id = file_meta.first_row_id.is_some();
                             let requested_row_ranges = if has_row_id { row_ranges.clone() } else { None };
                             let mut effective_row_ranges = requested_row_ranges.clone();
+                            let mut has_bitmap_selection = false;
                             if read_file_index {
                                 match evaluate_file_index(
                                     &self.file_io,
@@ -562,6 +563,7 @@ impl DataEvolutionReader {
                                                 &selection,
                                                 file_meta.row_count,
                                             )? {
+                                            has_bitmap_selection = selection.len() < file_meta.row_count as u64;
                                             let base = file_meta.first_row_id.unwrap_or(0);
                                             let index_ranges = local_ranges
                                                 .into_iter()
@@ -580,9 +582,18 @@ impl DataEvolutionReader {
                                     FileIndexResult::Remain => {}
                                 }
                             }
-                            // Match Java's sidecar choice using the bitmap
-                            // intersection, before a DV or LIMIT narrows rows.
-                            let sidecar_row_ranges = effective_row_ranges.clone();
+                            // Java applies DV to a selective bitmap before
+                            // choosing ROW. DV alone and LIMIT cannot trigger it.
+                            let sidecar_row_ranges = if has_bitmap_selection {
+                                selected_absolute_row_ranges_for_file(
+                                    file_meta.first_row_id.unwrap_or(0),
+                                    file_meta.row_count,
+                                    effective_row_ranges.as_deref(),
+                                    deletion_vector.as_deref(),
+                                )?
+                            } else {
+                                effective_row_ranges.clone()
+                            };
                             if self.predicates.is_empty() {
                                 if let Some(left) = remaining {
                                     let selected = selected_absolute_row_ranges_for_file(
@@ -665,6 +676,7 @@ impl DataEvolutionReader {
                     } else {
                         let prepared_group = PreparedMergeGroup::new(&files)?;
                         let mut indexed_row_ranges = row_ranges.clone();
+                        let mut has_bitmap_selection = false;
                         if read_file_index {
                             match self.evaluate_group_file_indexes(&split, &prepared_group).await? {
                                 FileIndexResult::Skip => continue,
@@ -673,6 +685,7 @@ impl DataEvolutionReader {
                                         &selection,
                                         prepared_group.logical_row_count,
                                     )? {
+                                        has_bitmap_selection = selection.len() < prepared_group.logical_row_count as u64;
                                         let index_ranges = local_ranges.into_iter().map(|range| {
                                             RowRange::new(
                                                 prepared_group.first_row_id + range.from(),
@@ -691,9 +704,6 @@ impl DataEvolutionReader {
                         if indexed_row_ranges.as_ref().is_some_and(Vec::is_empty) {
                             continue;
                         }
-                        // Every provider must read the same physical selection.
-                        // Freeze sidecar eligibility before DV/LIMIT narrowing.
-                        let sidecar_row_ranges = indexed_row_ranges.clone();
                         let anchor_deletion_vector = read_anchor_deletion_vector(
                             &self.file_io,
                             &split,
@@ -708,6 +718,14 @@ impl DataEvolutionReader {
                                 .as_ref()
                                 .map(|ctx| ctx.deletion_vector.as_ref()),
                         )?;
+                        // Every provider shares the DV-aware bitmap. Without
+                        // a selective bitmap, only caller ranges choose ROW.
+                        // LIMIT never changes sidecar eligibility.
+                        let sidecar_row_ranges = if has_bitmap_selection {
+                            selected_ranges.clone()
+                        } else {
+                            indexed_row_ranges.clone()
+                        };
                         let effective_row_ranges = if self.predicates.is_empty() {
                             if let Some(left) = remaining {
                                 selected_ranges = Some(prefix_row_ranges(

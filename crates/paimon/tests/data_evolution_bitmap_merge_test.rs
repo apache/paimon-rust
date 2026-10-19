@@ -439,7 +439,11 @@ async fn missing_latest_bitmap_keeps_primary_and_does_not_reuse_stale_index() {
 async fn bitmap_requested_ranges_deletions_and_limit_keep_merged_providers_aligned() {
     use std::collections::HashMap;
 
-    for (name, max_rows, sidecar) in [("aligned", "4", true), ("before_dv_limit", "3", false)] {
+    for (name, max_rows, sidecar) in [
+        ("aligned", "4", true),
+        ("after_dv", "3", true),
+        ("before_limit", "2", false),
+    ] {
         let table = table(name).await.copy_with_options(HashMap::from([(
             "data-evolution.row-sidecar.max-selected-rows".into(),
             max_rows.into(),
@@ -497,9 +501,77 @@ async fn bitmap_requested_ranges_deletions_and_limit_keep_merged_providers_align
         // Four index hits remain after requested-range intersection. Deleting
         // global row 27 must remove local selected position 1 from every
         // provider, then LIMIT returns rows 26/28, including a SQL-null Variant.
-        // The max_rows=3 case has no sidecars: DV/LIMIT must not reduce the
-        // four-candidate threshold and accidentally trigger a ROW read.
+        // DV reduces the bitmap's four candidates to three before choosing
+        // ROW. LIMIT must not reduce that threshold further to two.
         let batch = concat_batches(&batches[0].schema(), &batches).unwrap();
         assert_payload(&batch, &[6, 8], true);
+    }
+}
+
+#[tokio::test]
+async fn deletions_narrow_sidecar_candidates_only_for_a_selective_bitmap() {
+    use std::collections::HashMap;
+
+    for merged in [false, true] {
+        for selective in [false, true] {
+            let table = table(&format!("bitmap_dv_{merged}_{selective}"))
+                .await
+                .copy_with_options(HashMap::from([(
+                    "data-evolution.row-sidecar.max-selected-rows".into(),
+                    "3".into(),
+                )]));
+            append(&table, -20, 20).await;
+            let mut messages = append(&table, 0, 100).await;
+            if merged {
+                messages.extend(
+                    patch(&table, "payload", Arc::new(variants(&values(0, 100, true)))).await,
+                );
+            }
+            let deleted = if selective {
+                vec![25, 27]
+            } else {
+                (20..119).collect()
+            };
+            let deletions = table
+                .new_write_builder()
+                .new_update()
+                .unwrap()
+                .delete_by_row_id(deleted)
+                .await
+                .unwrap();
+            table
+                .new_write_builder()
+                .new_commit()
+                .commit(deletions)
+                .await
+                .unwrap();
+            if selective {
+                remove_primaries(&table, &messages).await;
+            } else {
+                // Java normalizes a full-coverage bitmap to REMAIN. Even
+                // though DV leaves one live row, it cannot choose ROW alone.
+                for file in messages.iter().flat_map(|m| &m.new_files) {
+                    table
+                        .file_io()
+                        .delete_file(&file.aligned_file_path(
+                            &format!("{}/bucket-0", table.location()),
+                            &file.extra_files[0],
+                        ))
+                        .await
+                        .unwrap();
+                }
+            }
+            let predicates = PredicateBuilder::new(table.schema().fields());
+            let predicate = if selective {
+                predicates
+                    .is_in("id", (5..10).map(Datum::Int).collect())
+                    .unwrap()
+            } else {
+                predicates.greater_or_equal("id", Datum::Int(0)).unwrap()
+            };
+            let batch = query(&table, predicate, &["payload", "_ROW_ID"]).await;
+            let expected = if selective { vec![6, 8, 9] } else { vec![99] };
+            assert_payload(&batch, &expected, merged);
+        }
     }
 }
