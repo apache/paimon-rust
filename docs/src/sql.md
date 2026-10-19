@@ -2238,9 +2238,20 @@ unfiltered corpus for BM25 scores; Boolean and boosted queries collect leaf
 candidates before applying the final limit. Index shard searches use
 `global-index.thread-num` workers.
 
+Non-Data-Evolution tables also support row filters when they are append tables
+without primary keys, use Parquet, enable row tracking, and use full-text `fast`
+mode. Scalar `fast`, `full`, and `detail` retain their coverage rules, with data
+reads restricted to the full-text index coverage. Candidate refinement keeps
+the Rust default of `global-index.filter.refine-from-data=true`. Matching rows
+are checked against the pinned snapshot's live data and deletion vectors before
+full-text Top-K; filtering preserves the original index corpus and BM25 scores.
+Full-text `full`/`detail` row filtering on these tables remains unsupported.
+
 The existing `with_text_column()` / `with_query_text()` API continues to
-accept plain text for the SQL table function. Full-text row filters require
-Data Evolution; primary-key materialized reads use `execute_read()`.
+accept plain text for the SQL table function. These pre-filters are configured
+through the Rust core builder's `with_filter()`; the SQL table function does not
+push an outer `WHERE` into full-text search. Primary-key materialized reads use
+`execute_read()`.
 
 
 ## Time Travel
