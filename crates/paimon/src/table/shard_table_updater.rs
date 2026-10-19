@@ -92,7 +92,6 @@ impl ShardTableUpdater {
             return Err(invalid("Shard update columns must not be empty"));
         }
         let writer = DataEvolutionWriter::new(table, write_columns.clone())?;
-        table.schema().core_options().ensure_read_authorized()?;
         let snapshot = super::time_travel::resolve_snapshot(table).await?;
         let table = table
             .copy_with_options(HashMap::from([(
@@ -100,12 +99,7 @@ impl ShardTableUpdater {
                 "FULL".into(),
             )]))
             .copy_with_pinned_snapshot(snapshot.as_ref());
-        let plan = table
-            .new_read_builder()
-            .new_scan()
-            .with_scan_all_files()
-            .plan()
-            .await?;
+        let plan = table.new_read_builder().new_scan().plan_all_files().await?;
         let splits = select_shard(plan.splits(), shard, shard_count)?;
         let index = RowIdFileIndex::from_splits(table.clone(), &splits)?;
         let read_type = read_type.unwrap_or_else(|| table.schema().fields().to_vec());
@@ -175,7 +169,7 @@ impl ShardTableUpdater {
         }
         let mut builder = self.table.new_read_builder();
         builder.with_read_type(with_row_id(&self.read_type)?);
-        let mut input = builder.new_read()?.to_arrow(&self.splits)?;
+        let mut input = builder.new_read()?.for_update().to_arrow(&self.splits)?;
         let state = self.state.clone();
         let output_columns = self.read_type.len();
         self.reader_started = true;

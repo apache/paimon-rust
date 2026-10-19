@@ -80,6 +80,16 @@ pub(crate) fn configured_mosaic_prefetch(table: &Table) -> crate::Result<MosaicP
 }
 
 impl<'a> TableRead<'a> {
+    /// Internal mutation readers need stable row IDs to match and preserve
+    /// original rows. This does not authorize a read: every split must still
+    /// carry a whole-table unrestricted grant issued to this exact handle.
+    pub(super) fn for_update(mut self) -> Self {
+        if let TableReadKind::Paimon(read) = &mut self.0 {
+            read.update_read = true;
+        }
+        self
+    }
+
     /// Create a new TableRead with a specific read type (projected fields).
     pub fn new(
         table: &'a Table,
@@ -443,6 +453,7 @@ struct PaimonTableRead<'a> {
     data_file_read_timing: Option<Arc<DataFileReadTiming>>,
     blob_parallelism: usize,
     limit: Option<usize>,
+    update_read: bool,
 }
 
 impl<'a> PaimonTableRead<'a> {
@@ -463,6 +474,7 @@ impl<'a> PaimonTableRead<'a> {
             data_file_read_timing: None,
             blob_parallelism: DEFAULT_BLOB_READ_PARALLELISM,
             limit: None,
+            update_read: false,
         }
     }
 
@@ -705,6 +717,7 @@ impl<'a> PaimonTableRead<'a> {
         let data_file_read_timing = self.data_file_read_timing.clone();
         let blob_parallelism = self.blob_parallelism;
         let limit = self.limit;
+        let update_read = self.update_read;
         Ok(Box::pin(async_stream::try_stream! {
             let mut remaining = limit;
             for group in [materialized, streaming] {
@@ -720,6 +733,7 @@ impl<'a> PaimonTableRead<'a> {
                     data_file_read_timing: data_file_read_timing.clone(),
                     blob_parallelism,
                     limit: remaining,
+                    update_read,
                 };
                 let mut stream = read.to_arrow_with_row_kind(&group)?;
                 while remaining != Some(0) {
@@ -1176,11 +1190,18 @@ impl<'a> PaimonTableRead<'a> {
                 predicate,
             )));
         }
+        let unrestricted_update = self.update_read
+            && data_splits.iter().all(|split| {
+                split.query_auth_grant().is_some_and(|grant| {
+                    grant.matches_table(self.table) && grant.is_unrestricted_whole_table()
+                })
+            });
         super::query_auth::reject_system_columns(
             self.read_type
                 .iter()
                 .map(|f| f.name())
-                .chain(filter_columns.iter().map(String::as_str)),
+                .chain(filter_columns.iter().map(String::as_str))
+                .filter(|name| !unrestricted_update || *name != "_ROW_ID"),
         )?;
         // By id and name: older files resolve by id, so a dropped field passed
         // to `with_read_type` would read an uncovered column.

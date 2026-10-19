@@ -92,6 +92,18 @@ impl QueryAuthGrant {
         self.rules.is_empty()
     }
 
+    /// Physical file-group operations need a grant over every table column,
+    /// without any wire restriction. A mask ignored by an ordinary projection
+    /// (for example a reserved system field) is still not a mutation grant.
+    pub(super) fn is_unrestricted_whole_table(&self) -> bool {
+        self.select.is_none()
+            && self.is_unrestricted()
+            && self
+                .response
+                .as_ref()
+                .is_none_or(AuthTableQueryResponse::is_unrestricted)
+    }
+
     pub(crate) fn rules(&self) -> &Rules {
         &self.rules
     }

@@ -302,11 +302,9 @@ pub(super) async fn merge_into(
     let projection = projection.into_iter().collect::<Vec<_>>();
     let mut builder = scan_table.new_read_builder();
     builder.with_projection(&projection.iter().map(String::as_str).collect::<Vec<_>>())?;
-    let plan = if snapshot.is_some() {
-        builder.new_scan().with_scan_all_files().plan().await?
-    } else {
-        super::source::Plan::new(Vec::new())
-    };
+    // The target may be empty, but its whole-table authorization must still
+    // precede source callbacks and insert-only MERGE actions.
+    let plan = builder.new_scan().plan_all_files().await?;
     let index = RowIdFileIndex::from_splits(scan_table.clone(), plan.splits())?;
     let source = match source {
         MergeSource::Batches(batches) => Some(MergeInput::new(batches)?),
@@ -477,7 +475,7 @@ pub(super) async fn merge_into(
     let check_cardinality = !matched.is_empty()
         && !(matched.len() == 1 && matched[0].delete && matched[0].condition.is_none());
     let mut joined = Vec::new();
-    let mut stream = builder.new_read()?.to_arrow(plan.splits())?;
+    let mut stream = builder.new_read()?.for_update().to_arrow(plan.splits())?;
     while let Some(target) = stream.try_next().await? {
         if let Some(source) = &source {
             let keys = on

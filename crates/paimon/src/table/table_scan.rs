@@ -1147,19 +1147,19 @@ impl<'a> TableScan<'a> {
         }
     }
 
-    /// MERGE table sources follow plan_all_files: authorize the whole table,
+    /// Mutation targets and MERGE table sources authorize the whole table,
     /// then include L0 only when no row filter or column mask was returned.
     /// Keep this scope internal; public metadata scans must still fail closed.
-    pub(super) async fn authorize_merge_source(&self) -> crate::Result<Self> {
+    pub(super) async fn authorize_all_files(&self) -> crate::Result<Self> {
         let scan = self.authorize_snapshot_read().await?;
         if let TableScanKind::Paimon(source) = &scan.0 {
             if source
                 .query_auth_grant
                 .as_ref()
-                .is_some_and(|grant| !grant.is_unrestricted())
+                .is_some_and(|grant| !grant.is_unrestricted_whole_table())
             {
                 return Err(super::query_auth::unsupported(
-                    "MERGE table sources require unrestricted query authorization",
+                    "file-group operations require unrestricted whole-table query authorization",
                 ));
             }
         }
@@ -1516,7 +1516,7 @@ impl<'a> TableScan<'a> {
             scan.projected_read_field_ids = None;
         }
         source
-            .authorize_merge_source()
+            .authorize_all_files()
             .await?
             .with_scan_all_files()
             .plan()

@@ -629,6 +629,35 @@ impl DataSplit {
         self
     }
 
+    /// Select one data-evolution file group from a live plan. Retain its
+    /// authorization and the deletion vector associated with each selected
+    /// file; rebuilding a split from metadata would discard the live grant.
+    pub(super) fn for_data_evolution_files(&self, files: Vec<DataFileMeta>) -> Self {
+        let mut split = self.clone();
+        split.data_deletion_files = self.data_deletion_files.as_ref().map(|_| {
+            files
+                .iter()
+                .map(|file| self.deletion_file_for_data_file(file).cloned())
+                .collect::<Vec<_>>()
+                .into()
+        });
+        split.raw_convertible = files.len() == 1;
+        split.data_files = files.into();
+        split.scores = None;
+        split
+    }
+
+    /// A partial-column rewrite preserves the physical row-ID slots, including
+    /// rows already hidden by a deletion vector. The vector stays attached to
+    /// the original normal file at commit time, rather than filtering the
+    /// ordinary-column input and shifting the replacement column's positions.
+    pub(super) fn for_data_evolution_rewrite(&self, files: Vec<DataFileMeta>) -> Self {
+        let mut split = self.for_data_evolution_files(files);
+        split.data_deletion_files = None;
+        split.row_ranges = None;
+        split
+    }
+
     /// Java PrimaryKeySortedIndexResult preserves each non-raw split whole,
     /// and turns raw splits into single-file merge-reader inputs. Its ranges
     /// address physical positions, including when the file tracks row IDs.
