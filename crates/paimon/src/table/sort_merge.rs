@@ -1410,6 +1410,9 @@ fn sort_merge_stream(
 
         // Output indices: (batch_buffer_idx, row_idx) for interleave.
         let mut output_indices: Vec<(usize, usize)> = Vec::with_capacity(batch_size);
+        // Reused for every key, so grouping allocates nothing per key.
+        let mut winner_key: Vec<u8> = Vec::new();
+        let mut same_key_rows: Vec<MergeRow> = Vec::new();
 
         loop {
             let winner_idx = tree.winner();
@@ -1418,20 +1421,20 @@ fn sort_merge_stream(
                 break;
             }
 
-            // Capture the winner's key for grouping same-key rows.
-            let winner_key = {
-                let cursor = cursors[winner_idx].as_ref().unwrap();
-                cursor.current_row().owned()
-            };
+            // Capture the winner's key for grouping same-key rows. Encoded
+            // rows compare by their bytes, so byte equality is key equality.
+            let winner = cursors[winner_idx].as_ref().unwrap();
+            winner_key.clear();
+            winner_key.extend_from_slice(winner.current_row().as_ref());
 
             // Collect all rows with the same key across all streams.
-            let mut same_key_rows: Vec<MergeRow> = Vec::new();
+            same_key_rows.clear();
 
             loop {
                 let current_winner = tree.winner();
                 let matches = match &cursors[current_winner] {
                     None => false,
-                    Some(c) => c.current_row().cmp(&winner_key.row()) == Ordering::Equal,
+                    Some(c) => c.current_row().as_ref() == winner_key.as_slice(),
                 };
                 if !matches {
                     break;
