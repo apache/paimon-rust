@@ -525,7 +525,7 @@ fn arrow_table_batches(table: &Bound<'_, PyAny>) -> PyResult<Vec<RecordBatch>> {
     let mut batches = table
         .call_method0("to_batches")?
         .try_iter()?
-        .map(|batch| crate::arrow_input::batch_from_pyarrow(&batch?))
+        .map(|batch| crate::arrow_input::write_batch_from_pyarrow(&batch?))
         .collect::<PyResult<Vec<_>>>()?;
     // Preserve empty input schema so core validates columns even with no rows.
     if batches.is_empty() {
@@ -544,7 +544,7 @@ fn arrow_upsert_batches(input: &Bound<'_, PyAny>) -> PyResult<Vec<RecordBatch>> 
     }
     input
         .try_iter()?
-        .map(|batch| crate::arrow_input::batch_from_pyarrow(&batch?))
+        .map(|batch| crate::arrow_input::write_batch_from_pyarrow(&batch?))
         .collect()
 }
 
@@ -1658,6 +1658,120 @@ mod tests {
     use paimon::io::FileIOBuilder;
     use paimon::spec::{IntType, Schema, TableSchema, VarCharType};
     use pyo3::ffi::c_str;
+
+    #[test]
+    fn update_inputs_preserve_source_nulls_until_core_selects_payloads() {
+        use arrow::array::{Array, Int32Array};
+
+        Python::attach(|py| {
+            let locals = PyDict::new(py);
+            py.run(
+                c_str!(
+                    r#"
+import pyarrow as pa
+schema = pa.schema([
+    pa.field('id', pa.int32(), nullable=False),
+    pa.field('value', pa.int32(), nullable=False),
+    pa.field('unused', pa.int32(), nullable=False, metadata={'role': 'unselected'}),
+], metadata={'origin': 'update'})
+source = pa.Table.from_pylist([
+    {'id': 0, 'value': 0, 'unused': 0},
+    {'id': 1, 'value': None, 'unused': None},
+    {'id': 1, 'value': 42, 'unused': None},
+], schema=schema).slice(1, 2)
+source.validate(full=True)
+batches = source.to_batches()
+"#
+                ),
+                None,
+                Some(&locals),
+            )
+            .unwrap();
+            let table = locals.get_item("source").unwrap().unwrap();
+            let batches = locals.get_item("batches").unwrap().unwrap();
+            for imported in [
+                arrow_table_batches(&table).unwrap(),
+                arrow_upsert_batches(&batches).unwrap(),
+            ] {
+                assert_eq!(imported.len(), 1);
+                let batch = &imported[0];
+                assert_eq!(batch.num_rows(), 2);
+                assert!(!batch.schema().field(0).is_nullable());
+                assert!(batch.schema().field(1).is_nullable());
+                assert!(batch.schema().field(2).is_nullable());
+                assert_eq!(batch.schema().metadata().get("origin").unwrap(), "update");
+                assert_eq!(
+                    batch.schema().field(2).metadata().get("role").unwrap(),
+                    "unselected"
+                );
+                let values = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap();
+                assert!(values.is_null(0));
+                assert_eq!(values.value(1), 42);
+                assert_eq!(batch.column(2).null_count(), 2);
+            }
+            let original =
+                ArrowSchema::from_pyarrow_bound(&table.getattr("schema").unwrap()).unwrap();
+            assert!(original.fields().iter().all(|field| !field.is_nullable()));
+        });
+    }
+
+    #[test]
+    fn upsert_binding_validates_only_surviving_target_values() {
+        Python::attach(|py| {
+            let schema = Schema::builder()
+                .column("id", DataType::Int(IntType::with_nullable(false)))
+                .column("value", DataType::Int(IntType::with_nullable(false)))
+                .column("keep", DataType::Int(IntType::with_nullable(false)))
+                .option("row-tracking.enabled", "true")
+                .option("data-evolution.enabled", "true")
+                .build()
+                .unwrap();
+            let table = Arc::new(Table::new(
+                FileIOBuilder::new("memory").build().unwrap(),
+                Identifier::new("default", "upsert_source_nullability"),
+                "memory:/upsert-source-nullability".into(),
+                TableSchema::new(0, &schema),
+                None,
+            ));
+            let context = UpdateContext::new(&WriteContext::new(table)).unwrap();
+            let locals = PyDict::new(py);
+            py.run(
+                c_str!(
+                    r#"
+import pyarrow as pa
+schema = pa.schema([pa.field(name, pa.int32(), nullable=False)
+                    for name in ('id', 'value', 'keep')])
+source = pa.Table.from_pylist([
+    {'id': 1, 'value': None, 'keep': None},
+    {'id': 1, 'value': 42, 'keep': 100},
+], schema=schema)
+invalid = source.slice(0, 1)
+"#
+                ),
+                None,
+                Some(&locals),
+            )
+            .unwrap();
+            let source = locals.get_item("source").unwrap().unwrap();
+            let messages = context
+                .upsert_by_arrow_with_key(py, &source, vec!["id".into()])
+                .unwrap();
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0].inner.new_files.len(), 1);
+            assert_eq!(messages[0].inner.new_files[0].row_count, 1);
+            let invalid = locals.get_item("invalid").unwrap().unwrap();
+            let error = context
+                .upsert_by_arrow_with_key(py, &invalid, vec!["id".into()])
+                .err()
+                .expect("a surviving NULL must still fail the declared target schema")
+                .to_string();
+            assert!(error.contains("null"), "{error}");
+        });
+    }
 
     #[test]
     fn ignored_delete_null_payload_reaches_core_nullability_checks() {

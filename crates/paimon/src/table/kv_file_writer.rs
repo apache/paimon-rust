@@ -1357,12 +1357,24 @@ fn build_physical_fields(
             name => value_fields
                 .iter()
                 .find(|field| field.name() == name)
-                .cloned()
                 .ok_or_else(|| crate::Error::DataInvalid {
                     message: format!(
                         "Physical file column '{name}' is missing from the table schema"
                     ),
                     source: None,
+                })
+                .and_then(|field| {
+                    // The table remains logically NOT NULL, but Java's KV
+                    // value type makes non-key DELETE payloads nullable.
+                    Ok(DataField::new(
+                        field.id(),
+                        field.name().into(),
+                        field
+                            .data_type()
+                            .copy_with_nullable(arrow_field.is_nullable())?,
+                    )
+                    .with_description(field.description().map(str::to_owned))
+                    .with_default_value(field.default_value().map(str::to_owned)))
                 }),
         })
         .collect()
