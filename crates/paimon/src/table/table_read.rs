@@ -817,6 +817,7 @@ impl<'a> PaimonTableRead<'a> {
             scan_type,
             predicates,
         )
+        .with_partition_fields(self.table.schema().partition_fields())
         .with_blob_as_descriptor(primary_key)
         .with_file_index_read_enabled(core_options.file_index_read_enabled())
         .with_batch_size(Some(core_options.read_batch_size()?))
@@ -1839,6 +1840,7 @@ impl<'a> PaimonTableRead<'a> {
             core_options.blob_view_resolve_enabled(),
             self.table.rest_env().cloned(),
         )?
+        .with_partition_fields(self.table.schema().partition_fields())
         .with_batch_size(Some(core_options.read_batch_size()?))
         .with_limit(self.limit)
         .with_blob_parallelism(self.blob_parallelism)
@@ -1864,6 +1866,7 @@ impl<'a> PaimonTableRead<'a> {
             self.read_type().to_vec(),
             self.data_predicates.clone(),
         )
+        .with_partition_fields(self.table.schema().partition_fields())
         .with_blob_as_descriptor(core_options.blob_as_descriptor())
         .with_file_index_read_enabled(core_options.file_index_read_enabled())
         .with_batch_size(Some(core_options.read_batch_size()?))

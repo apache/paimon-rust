@@ -281,3 +281,276 @@ async fn empty_partial_input_does_not_require_automatic_bucket_keys() {
         .unwrap();
     assert_eq!(rows(&table).await, vec![(None, None, 42)]);
 }
+
+#[tokio::test]
+async fn full_input_routes_unwritten_columns_without_storing_them() {
+    for supplied_bucket in [None, Some(2)] {
+        for columns in [vec!["value", "pt"], vec!["value"]] {
+            let table = table(true, "id").await;
+            let builder = table.new_write_builder();
+            let mut writer = builder.new_write().unwrap();
+            writer
+                .with_write_type(columns.iter().map(|name| name.to_string()).collect())
+                .unwrap();
+            let input = RecordBatch::try_from_iter([
+                ("id", Arc::new(Int32Array::from(vec![1])) as ArrayRef),
+                ("pt", Arc::new(Int32Array::from(vec![7])) as ArrayRef),
+                ("value", Arc::new(Int32Array::from(vec![42])) as ArrayRef),
+            ])
+            .unwrap();
+            writer
+                .write_arrow(std::slice::from_ref(&input), supplied_bucket)
+                .await
+                .unwrap();
+            let messages = writer.prepare_commit().await.unwrap();
+            let expected_bucket = supplied_bucket.unwrap_or_else(|| {
+                (paimon::spec::batch_hash_codes(&input, &[0], table.schema().fields()).unwrap()[0]
+                    % 4)
+                .abs()
+            });
+            assert_eq!(messages[0].bucket, expected_bucket);
+            assert_eq!(
+                messages[0].new_files[0].write_cols,
+                Some(columns.iter().map(|name| name.to_string()).collect())
+            );
+            builder.new_commit().commit(messages).await.unwrap();
+            assert_eq!(rows(&table).await, vec![(None, Some(7), 42)]);
+        }
+    }
+}
+
+#[tokio::test]
+async fn full_and_selected_inputs_keep_reordered_columns_across_writes() {
+    let table = table(true, "id").await;
+    let builder = table.new_write_builder();
+    let mut writer = builder.new_write().unwrap();
+    let columns = vec!["value".into(), "pt".into(), "id".into()];
+    writer.with_write_type(columns.clone()).unwrap();
+    let full = RecordBatch::try_from_iter([
+        ("id", Arc::new(Int32Array::from(vec![1])) as ArrayRef),
+        ("pt", Arc::new(Int32Array::from(vec![7])) as ArrayRef),
+        ("value", Arc::new(Int32Array::from(vec![42])) as ArrayRef),
+    ])
+    .unwrap();
+    let selected = RecordBatch::try_from_iter([
+        ("value", Arc::new(Int32Array::from(vec![43])) as ArrayRef),
+        ("pt", Arc::new(Int32Array::from(vec![8])) as ArrayRef),
+        ("id", Arc::new(Int32Array::from(vec![2])) as ArrayRef),
+    ])
+    .unwrap();
+    writer.write_arrow(&[full, selected], None).await.unwrap();
+    let messages = writer.prepare_commit().await.unwrap();
+    assert!(messages
+        .iter()
+        .flat_map(|message| &message.new_files)
+        .all(|file| file.write_cols == Some(columns.clone())));
+    builder.new_commit().commit(messages).await.unwrap();
+    assert_eq!(
+        rows(&table).await,
+        vec![(Some(1), Some(7), 42), (Some(2), Some(8), 43)]
+    );
+}
+
+#[tokio::test]
+async fn full_input_layout_errors_and_missing_routing_fields_do_not_stage_files() {
+    use arrow_array::StringArray;
+    let table = table(true, "id").await;
+    let mut writer = table.new_write_builder().new_write().unwrap();
+    writer.with_write_type(vec!["value".into()]).unwrap();
+    let before = table
+        .file_io()
+        .list_status_recursive(table.location())
+        .await
+        .unwrap()
+        .len();
+    for input in [
+        RecordBatch::try_from_iter([
+            ("id", Arc::new(Int32Array::from(vec![1])) as ArrayRef),
+            ("unknown", Arc::new(Int32Array::from(vec![7])) as ArrayRef),
+            ("value", Arc::new(Int32Array::from(vec![42])) as ArrayRef),
+        ])
+        .unwrap(),
+        RecordBatch::try_from_iter([
+            ("id", Arc::new(Int32Array::from(vec![1])) as ArrayRef),
+            ("id", Arc::new(Int32Array::from(vec![7])) as ArrayRef),
+            ("value", Arc::new(Int32Array::from(vec![42])) as ArrayRef),
+        ])
+        .unwrap(),
+        RecordBatch::try_from_iter([
+            (
+                "id",
+                Arc::new(StringArray::from(vec!["bad type"])) as ArrayRef,
+            ),
+            ("pt", Arc::new(Int32Array::from(vec![7])) as ArrayRef),
+            ("value", Arc::new(Int32Array::from(vec![42])) as ArrayRef),
+        ])
+        .unwrap(),
+    ] {
+        assert!(writer.write_arrow_batch(&input).await.is_err());
+        assert!(writer
+            .write_arrow(std::slice::from_ref(&input), Some(2))
+            .await
+            .is_err());
+    }
+    let selected = batch(&["value"], 7, 42);
+    for bucket in [None, Some(2)] {
+        assert!(writer
+            .write_arrow(std::slice::from_ref(&selected), bucket)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("routing column 'pt'"));
+    }
+    assert_eq!(
+        table
+            .file_io()
+            .list_status_recursive(table.location())
+            .await
+            .unwrap()
+            .len(),
+        before
+    );
+    assert!(writer.prepare_commit().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn full_input_does_not_validate_or_consume_unwritten_blob_payloads() {
+    use paimon::spec::{BlobDescriptor, BlobType};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .column("pt", DataType::Int(IntType::new()))
+        .column("value", DataType::Int(IntType::new()))
+        .column("payload", DataType::Blob(BlobType::with_nullable(false)))
+        .partition_keys(["pt"])
+        .option("data-evolution.enabled", "true")
+        .option("row-tracking.enabled", "true")
+        .build()
+        .unwrap();
+    let (io, table) = memory_table("memory:/unwritten_blob_input", TableSchema::new(0, &schema));
+    setup_dirs(&io, table.location()).await;
+    persist_table_schema(&io, table.location(), table.schema()).await;
+    let mut writer = table.new_write_builder().new_write().unwrap();
+    writer.with_write_type(vec!["value".into()]).unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let received = calls.clone();
+    writer
+        .with_blob_consumer(Some(Arc::new(
+            move |_: &str, _: Option<&BlobDescriptor>| {
+                received.fetch_add(1, Ordering::SeqCst);
+                Ok(false)
+            },
+        )))
+        .unwrap();
+    let input = RecordBatch::try_from_iter([
+        (
+            "id",
+            Arc::new(Int32Array::from(vec![Some(1), None])) as ArrayRef,
+        ),
+        (
+            "pt",
+            Arc::new(Int32Array::from(vec![Some(7), None])) as ArrayRef,
+        ),
+        (
+            "value",
+            Arc::new(Int32Array::from(vec![Some(42), None])) as ArrayRef,
+        ),
+        (
+            "payload",
+            Arc::new(arrow_array::LargeBinaryArray::from(vec![
+                Some(b"unwritten".as_slice()),
+                None,
+            ])) as ArrayRef,
+        ),
+    ])
+    .unwrap();
+    writer.write_arrow_batch(&input.slice(0, 0)).await.unwrap();
+    assert!(writer.prepare_commit().await.unwrap().is_empty());
+    writer.write_arrow_batch(&input).await.unwrap();
+    let messages = writer.prepare_commit().await.unwrap();
+    assert!(messages
+        .iter()
+        .flat_map(|message| &message.new_files)
+        .all(|file| file.file_name.ends_with(".parquet")));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(table
+        .file_io()
+        .list_status_recursive(table.location())
+        .await
+        .unwrap()
+        .iter()
+        .all(|file| !file.path.ends_with(".blob")));
+    table
+        .new_write_builder()
+        .new_commit()
+        .commit(messages)
+        .await
+        .unwrap();
+    let mut reader = table.new_read_builder();
+    reader.with_projection(&["value"]).unwrap();
+    let plan = reader.new_scan().plan().await.unwrap();
+    let batches: Vec<RecordBatch> = reader
+        .new_read()
+        .unwrap()
+        .to_arrow(plan.splits())
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+        2
+    );
+    assert_eq!(
+        batches
+            .iter()
+            .map(|batch| batch.column(0).null_count())
+            .sum::<usize>(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn unwritten_routing_columns_do_not_enforce_physical_not_null_constraints() {
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::with_nullable(false)))
+        .column("pt", DataType::Int(IntType::with_nullable(false)))
+        .column("value", DataType::Int(IntType::new()))
+        .partition_keys(["pt"])
+        .option("bucket", "4")
+        .option("bucket-key", "id")
+        .build()
+        .unwrap();
+    let (io, table) = memory_table(
+        "memory:/null_unwritten_routing",
+        TableSchema::new(0, &schema),
+    );
+    setup_dirs(&io, table.location()).await;
+    persist_table_schema(&io, table.location(), table.schema()).await;
+    let input = RecordBatch::try_from_iter([
+        (
+            "id",
+            Arc::new(Int32Array::from(vec![None::<i32>])) as ArrayRef,
+        ),
+        (
+            "pt",
+            Arc::new(Int32Array::from(vec![None::<i32>])) as ArrayRef,
+        ),
+        ("value", Arc::new(Int32Array::from(vec![42])) as ArrayRef),
+    ])
+    .unwrap();
+    for bucket in [None, Some(2)] {
+        let mut writer = table.new_write_builder().new_write().unwrap();
+        writer.with_write_type(vec!["value".into()]).unwrap();
+        writer
+            .write_arrow(std::slice::from_ref(&input), bucket)
+            .await
+            .unwrap();
+        let messages = writer.prepare_commit().await.unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            messages[0].new_files[0].write_cols,
+            Some(vec!["value".into()])
+        );
+    }
+}

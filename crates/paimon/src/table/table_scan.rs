@@ -371,6 +371,12 @@ async fn read_all_manifest_entries(
                         continue;
                     }
                     if (!data_predicates.is_empty() || !key_predicates.is_empty())
+                        && !super::stats_filter::predicates_reference_unwritten_partitions(
+                            data_predicates,
+                            schema_fields,
+                            partition_fields,
+                            [(entry.file(), schema_fields)],
+                        )
                         && !data_file_matches_predicates_with_key_stats(
                             entry.file(),
                             data_predicates,

@@ -52,6 +52,8 @@ use arrow_array::{Array, ArrayRef, Int8Array, RecordBatch};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+#[path = "table_write_input.rs"]
+mod input;
 #[path = "table_write_precomputed.rs"]
 mod precomputed;
 
@@ -638,8 +640,9 @@ impl TableWrite {
     /// Select the top-level columns written by an append table, as Java
     /// `BaseAppendFileStoreWrite.withWriteType` does. Input follows this order;
     /// omitted columns are recorded in file metadata rather than filled with NULL.
-    /// Partition columns are required. Hash columns may be omitted when every
-    /// nonempty input supplies its bucket through [`Self::write_arrow`].
+    /// Full-table inputs may provide routing columns which are not written.
+    /// Selected inputs must include partition columns and, unless a bucket is
+    /// supplied through [`Self::write_arrow`], the columns used for hashing.
     /// Configure this before writing any nonempty batch.
     pub fn with_write_type(&mut self, write_columns: Vec<String>) -> Result<&mut Self> {
         self.ensure_active()?;
@@ -685,18 +688,10 @@ impl TableWrite {
         let indices = |names: &[String]| {
             names
                 .iter()
-                .map(|name| {
-                    fields
-                        .iter()
-                        .position(|field| field.name() == name)
-                        .ok_or_else(|| crate::Error::DataInvalid {
-                            message: format!("Write type must include routing column '{name}'"),
-                            source: None,
-                        })
-                })
-                .collect::<Result<Vec<_>>>()
+                .filter_map(|name| fields.iter().position(|field| field.name() == name))
+                .collect::<Vec<_>>()
         };
-        let partition_indices = indices(&self.partition_keys)?;
+        let partition_indices = indices(&self.partition_keys);
         let options = CoreOptions::new(schema.options());
         let total_buckets = options.bucket();
         // Explicit-bucket inputs do not need the columns used to hash rows.
@@ -710,6 +705,7 @@ impl TableWrite {
         let assigner = if total_buckets <= 1
             || bucket_indices.is_empty()
             || bucket_indices.len() != bucket_keys.len()
+            || partition_indices.len() != self.partition_keys.len()
         {
             BucketAssignerEnum::Constant(ConstantBucketAssigner::new(
                 partition_indices,
@@ -788,13 +784,14 @@ impl TableWrite {
             return writer.write(batch).await;
         }
         self.ensure_active()?;
-        let Some(batch) = self.normalize_write_batch(batch)? else {
+        let input = batch;
+        let Some(batch) = self.normalize_write_batch(input)? else {
             return Ok(());
         };
-        self.ensure_automatic_bucket_columns()?;
+        let routing = self.normalize_automatic_routing_input(input)?;
         self.written = true;
 
-        let grouped = match self.divide_by_partition_bucket(&batch).await {
+        let grouped = match self.divide_write_input(&batch, routing).await {
             Ok(grouped) => grouped,
             Err(error) => {
                 self.fail_write().await;
@@ -804,22 +801,6 @@ impl TableWrite {
         for ((partition_bytes, bucket), sub_batch) in grouped {
             self.write_bucket(partition_bytes, bucket, sub_batch)
                 .await?;
-        }
-        Ok(())
-    }
-
-    fn ensure_automatic_bucket_columns(&self) -> Result<()> {
-        if matches!(self.bucket_assigner, BucketAssignerEnum::Constant(_))
-            && CoreOptions::new(self.table.schema().options()).bucket() > 1
-        {
-            for name in self.table.schema().bucket_keys() {
-                if !self.write_fields.iter().any(|field| field.name() == name) {
-                    return Err(crate::Error::DataInvalid {
-                        message: format!("Write type must include routing column '{name}' for automatic bucket assignment"),
-                        source: None,
-                    });
-                }
-            }
         }
         Ok(())
     }
@@ -904,7 +885,15 @@ impl TableWrite {
     }
 
     fn validate_write_batch_schema(&self, batch: &RecordBatch) -> Result<RecordBatch> {
-        let expected_schema = &self.write_schema;
+        let projected = self.project_full_write_input(batch)?;
+        self.normalize_batch_schema(projected.as_ref().unwrap_or(batch), &self.write_schema)
+    }
+
+    fn normalize_batch_schema(
+        &self,
+        batch: &RecordBatch,
+        expected_schema: &arrow_schema::Schema,
+    ) -> Result<RecordBatch> {
         let actual_schema = batch.schema();
         let table_field_count = expected_schema.fields().len();
         let actual_field_count = actual_schema.fields().len();
@@ -1052,6 +1041,13 @@ impl TableWrite {
         if matches!(self.bucket_assigner, BucketAssignerEnum::CrossPartition(_)) {
             return self.divide_cross_partition_batch(batch, output);
         }
+        Self::group_assigned_rows(batch, output)
+    }
+
+    fn group_assigned_rows(
+        batch: &RecordBatch,
+        output: BatchAssignOutput,
+    ) -> Result<Vec<(PartitionBucketKey, RecordBatch)>> {
         let mut groups: HashMap<PartitionBucketKey, Vec<usize>> = HashMap::new();
         for row_idx in 0..batch.num_rows() {
             groups
