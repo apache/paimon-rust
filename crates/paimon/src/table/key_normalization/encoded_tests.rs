@@ -210,6 +210,27 @@ fn union_key_conversion_never_uses_lossy_assignment_or_text_parsing() {
 }
 
 #[test]
+fn typed_null_string_keys_match_without_casting_unselected_dictionary_values() {
+    let plain: ArrayRef = Arc::new(StringArray::from(vec![None::<&str>; 3]));
+    let dictionary: ArrayRef = Arc::new(
+        DictionaryArray::<Int8Type>::try_new(
+            Int8Array::from(vec![Some(0), Some(1), None, Some(1), Some(0)]),
+            Arc::new(StringArray::from(vec![Some("not an integer"), None])),
+        )
+        .unwrap(),
+    );
+    for input in [plain, dictionary.slice(1, 3)] {
+        let normalized = normalize_match_key(&input, &DataType::Int32).unwrap();
+        assert_eq!(normalized.data_type(), &DataType::Int32);
+        assert_eq!(normalized.len(), 3);
+        assert_eq!(normalized.null_count(), 3);
+    }
+    assert!(normalize_match_key(&dictionary, &DataType::Int32).is_err());
+    let non_null: ArrayRef = Arc::new(StringArray::from(vec![None, Some("1")]));
+    assert!(normalize_match_key(&non_null, &DataType::Int32).is_err());
+}
+
+#[test]
 fn typed_null_union_children_match_null_keys_without_casting_their_type() {
     for dense in [true, false] {
         let fields = UnionFields::try_new(

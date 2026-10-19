@@ -96,6 +96,23 @@ pub fn parse_partition_spec_value(
         | DataType::Decimal(_) => {}
         _ => return Err(invalid()),
     }
+    if matches!(data_type, DataType::Timestamp(ty) if ty.precision() == 0) {
+        let digits = text.strip_prefix('-').unwrap_or(text);
+        if !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()) {
+            // Java converts numeric seconds with long multiplication. Overflow
+            // can leave subsecond milliseconds, which a partition Datum can
+            // retain even though an Arrow second-precision array cannot.
+            return text
+                .parse::<i64>()
+                .map(|seconds| {
+                    Some(Datum::Timestamp {
+                        millis: seconds.wrapping_mul(1_000),
+                        nanos: 0,
+                    })
+                })
+                .map_err(|_| invalid());
+        }
+    }
     let input: ArrayRef = Arc::new(StringArray::from(vec![text]));
     let array = crate::arrow::cast_array_for_schema_evolution(
         &input,
@@ -204,6 +221,26 @@ mod tests {
         let time = DataType::Time(TimeType::new(3).unwrap());
         for value in ["12:34+02:30", "12+02:30"] {
             assert!(parse_partition_spec_value(value, &time).is_err());
+        }
+    }
+
+    #[test]
+    fn numeric_second_precision_partition_specs_keep_java_wrapped_milliseconds() {
+        let data_type = DataType::Timestamp(TimestampType::new(0).unwrap());
+        for (text, millis) in [
+            ("18446744073709552", 384),
+            ("-18446744073709552", -384),
+            ("9223372036854775807", -1000),
+            ("1", 1000),
+        ] {
+            assert_eq!(
+                parse_partition_spec_value(text, &data_type).unwrap(),
+                Some(Datum::Timestamp { millis, nanos: 0 }),
+                "{text}"
+            );
+        }
+        for text in ["9223372036854775808", "+1", "1.5"] {
+            assert!(parse_partition_spec_value(text, &data_type).is_err());
         }
     }
 
