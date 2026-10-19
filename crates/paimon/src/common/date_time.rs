@@ -19,6 +19,24 @@
 
 use chrono::{Datelike, NaiveDateTime, Timelike};
 
+/// Java Timestamp.now stores system-local wall fields, without a time zone.
+/// The UTC label is only the carrier used by manifest timestamp-millis fields.
+pub(crate) fn current_local_timestamp() -> chrono::DateTime<chrono::Utc> {
+    // DataFileMeta persists TIMESTAMP(3), as Java now().toMillisTimestamp().
+    let now = chrono::Utc::now();
+    let now = now
+        .with_nanosecond(now.timestamp_subsec_millis() * 1_000_000)
+        .unwrap();
+    local_timestamp(now, &jiff::tz::TimeZone::system())
+}
+
+pub(crate) fn local_timestamp(
+    instant: chrono::DateTime<chrono::Utc>,
+    zone: &jiff::tz::TimeZone,
+) -> chrono::DateTime<chrono::Utc> {
+    instant + chrono::Duration::seconds(i64::from(local_offset(instant.timestamp(), zone)))
+}
+
 /// Format millis-since-midnight to `HH:mm:ss[.f...]` using Java `DateTimeUtils` semantics.
 ///
 /// Matches Java `DateTimeUtils.formatTimestampMillis(time, precision)`:

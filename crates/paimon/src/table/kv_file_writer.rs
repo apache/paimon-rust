@@ -52,7 +52,6 @@ use arrow_array::{Array, BooleanArray, Int64Array, Int8Array, RecordBatch, UInt3
 use arrow_ord::sort::{lexsort_to_indices, SortColumn, SortOptions};
 use arrow_row::{RowConverter, SortField};
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
-use chrono::Utc;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -774,7 +773,7 @@ impl KeyValueFileWriter {
             schema_id: self.config.schema_id,
             level: 0,
             extra_files: vec![],
-            creation_time: Some(Utc::now()),
+            creation_time: Some(crate::common::date_time::current_local_timestamp()),
             delete_row_count: Some(write.delete_row_count),
             embedded_index: None,
             file_source: Some(0), // FileSource.APPEND

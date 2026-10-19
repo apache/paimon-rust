@@ -36,7 +36,6 @@ use crate::spec::stats::BinaryTableStats;
 use crate::spec::{CoreOptions, DataField, DataFileMeta, EMPTY_SERIALIZED_ROW};
 use crate::Result;
 use arrow_array::RecordBatch;
-use chrono::Utc;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::task::JoinSet;
@@ -600,7 +599,7 @@ impl DataFileWriter {
             schema_id,
             level: 0,
             extra_files: vec![],
-            creation_time: Some(Utc::now()),
+            creation_time: Some(crate::common::date_time::current_local_timestamp()),
             delete_row_count: Some(0),
             embedded_index: None,
             file_source,

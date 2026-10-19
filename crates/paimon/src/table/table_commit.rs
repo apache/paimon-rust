@@ -3268,8 +3268,7 @@ impl TableCommit {
 
             let file = entry.file();
             let file_creation_time = file
-                .creation_time
-                .map(|t| t.timestamp_millis())
+                .creation_time_epoch_millis()?
                 .unwrap_or_else(|| current_time_millis() as i64);
 
             let stats = match stats_map.entry(partition_bytes) {
@@ -4030,6 +4029,53 @@ mod tests {
     fn setup_partitioned_commit(file_io: &FileIO, table_path: &str) -> TableCommit {
         let table = test_partitioned_table(file_io, table_path);
         TableCommit::new(table, "test-user".to_string())
+    }
+
+    #[test]
+    fn partition_creation_time_uses_java_local_zone_and_keeps_millis() {
+        const CHILD: &str = "PAIMON_CREATION_TIME_ZONE_CHILD";
+        if let Ok(zone) = std::env::var(CHILD) {
+            let commit = TableCommit::new(
+                test_table(&test_file_io(), "memory:/creation-time"),
+                "user".into(),
+            );
+            let cases: &[(&str, &str)] = match zone.as_str() {
+                "UTC" => &[("2024-01-02T12:34:56.789Z", "2024-01-02T12:34:56.789Z")],
+                "Asia/Shanghai" => &[("2024-01-02T12:34:56.789Z", "2024-01-02T04:34:56.789Z")],
+                "America/New_York" => &[
+                    ("2024-01-02T12:34:56.789Z", "2024-01-02T17:34:56.789Z"),
+                    ("2024-03-10T02:30:00.123Z", "2024-03-10T07:30:00.123Z"),
+                    ("2024-11-03T01:30:00.456Z", "2024-11-03T05:30:00.456Z"),
+                ],
+                _ => unreachable!(),
+            };
+            for (wall, expected) in cases {
+                let mut file = test_data_file("data.parquet", 1);
+                file.creation_time = Some(wall.parse::<DateTime<Utc>>().unwrap());
+                let entry = ManifestEntry::new(FileKind::Add, vec![], 0, 1, file, 2);
+                let stats = commit.generate_partition_statistics(&[entry]).unwrap();
+                assert_eq!(
+                    stats[0].last_file_creation_time,
+                    expected
+                        .parse::<DateTime<Utc>>()
+                        .unwrap()
+                        .timestamp_millis(),
+                    "{zone} {wall}"
+                );
+            }
+            return;
+        }
+        for zone in ["UTC", "Asia/Shanghai", "America/New_York"] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "table::table_commit::tests::partition_creation_time_uses_java_local_zone_and_keeps_millis", "--nocapture"])
+                .env(CHILD, zone).env("TZ", zone).output().unwrap();
+            assert!(
+                output.status.success(),
+                "{zone}: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 
     #[test]
