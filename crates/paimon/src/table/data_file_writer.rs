@@ -451,6 +451,8 @@ impl DataFileWriter {
             if let Some(name) = sidecar_name {
                 meta.extra_files.push(name);
             }
+            // Java constructs the result after all auxiliary outputs finish.
+            meta.creation_time = Some(crate::common::date_time::current_local_timestamp());
             Ok(meta)
         })
     }
@@ -599,7 +601,7 @@ impl DataFileWriter {
             schema_id,
             level: 0,
             extra_files: vec![],
-            creation_time: Some(crate::common::date_time::current_local_timestamp()),
+            creation_time: None,
             delete_row_count: Some(0),
             embedded_index: None,
             file_source,

@@ -773,7 +773,7 @@ impl KeyValueFileWriter {
             schema_id: self.config.schema_id,
             level: 0,
             extra_files: vec![],
-            creation_time: Some(crate::common::date_time::current_local_timestamp()),
+            creation_time: None,
             delete_row_count: Some(write.delete_row_count),
             embedded_index: None,
             file_source: Some(0), // FileSource.APPEND
@@ -828,6 +828,8 @@ impl KeyValueFileWriter {
         )
         .await?;
 
+        // Java creates file metadata after the index and Blob references finish.
+        meta.creation_time = Some(crate::common::date_time::current_local_timestamp());
         Ok(meta)
     }
 

@@ -3287,7 +3287,9 @@ impl TableCommit {
                         record_count: 0,
                         file_size_in_bytes: 0,
                         file_count: 0,
-                        last_file_creation_time: 0,
+                        // Java starts with the first PartitionEntry, so
+                        // pre-epoch creation times must remain negative.
+                        last_file_creation_time: file_creation_time,
                         total_buckets: entry.total_buckets(),
                     })
                 }
@@ -4040,8 +4042,15 @@ mod tests {
                 "user".into(),
             );
             let cases: &[(&str, &str)] = match zone.as_str() {
-                "UTC" => &[("2024-01-02T12:34:56.789Z", "2024-01-02T12:34:56.789Z")],
-                "Asia/Shanghai" => &[("2024-01-02T12:34:56.789Z", "2024-01-02T04:34:56.789Z")],
+                "UTC" => &[
+                    ("2024-01-02T12:34:56.789Z", "2024-01-02T12:34:56.789Z"),
+                    ("1970-01-01T00:00:00.000Z", "1970-01-01T00:00:00.000Z"),
+                    ("1969-12-31T23:59:59.999Z", "1969-12-31T23:59:59.999Z"),
+                ],
+                "Asia/Shanghai" => &[
+                    ("2024-01-02T12:34:56.789Z", "2024-01-02T04:34:56.789Z"),
+                    ("1970-01-01T07:59:59.999Z", "1969-12-31T23:59:59.999Z"),
+                ],
                 "America/New_York" => &[
                     ("2024-01-02T12:34:56.789Z", "2024-01-02T17:34:56.789Z"),
                     ("2024-03-10T02:30:00.123Z", "2024-03-10T07:30:00.123Z"),
@@ -4052,16 +4061,29 @@ mod tests {
             for (wall, expected) in cases {
                 let mut file = test_data_file("data.parquet", 1);
                 file.creation_time = Some(wall.parse::<DateTime<Utc>>().unwrap());
-                let entry = ManifestEntry::new(FileKind::Add, vec![], 0, 1, file, 2);
-                let stats = commit.generate_partition_statistics(&[entry]).unwrap();
-                assert_eq!(
-                    stats[0].last_file_creation_time,
-                    expected
-                        .parse::<DateTime<Utc>>()
-                        .unwrap()
-                        .timestamp_millis(),
-                    "{zone} {wall}"
-                );
+                let mut earlier = file.clone();
+                earlier.file_name = "earlier.parquet".into();
+                earlier.creation_time = file
+                    .creation_time
+                    .map(|wall| wall - chrono::Duration::milliseconds(1));
+                let mut entries = [
+                    ManifestEntry::new(FileKind::Add, vec![], 0, 1, file, 2),
+                    ManifestEntry::new(FileKind::Add, vec![], 0, 1, earlier, 2),
+                ];
+                for _ in 0..2 {
+                    let stats = commit.generate_partition_statistics(&entries).unwrap();
+                    assert_eq!(stats[0].file_count, 2);
+                    assert_eq!(stats[0].record_count, 2);
+                    assert_eq!(
+                        stats[0].last_file_creation_time,
+                        expected
+                            .parse::<DateTime<Utc>>()
+                            .unwrap()
+                            .timestamp_millis(),
+                        "{zone} {wall}"
+                    );
+                    entries.reverse();
+                }
             }
             return;
         }

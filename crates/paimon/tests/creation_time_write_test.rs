@@ -20,8 +20,14 @@ mod common;
 use arrow_array::{ArrayRef, Int32Array, LargeBinaryArray, RecordBatch};
 use common::incremental_helpers::{memory_table, persist_table_schema, setup_dirs};
 use futures::TryStreamExt;
+use opendal::Operator;
 use paimon::spec::{BlobType, DataType, IntType, Manifest, ManifestList, Schema, TableSchema};
-use std::sync::Arc;
+use paimon::{
+    catalog::Identifier,
+    io::{FileIOBuilder, FileIOProvider},
+    table::Table,
+};
+use std::sync::{Arc, Mutex};
 
 fn local_wall_millis() -> i64 {
     // Chrono Local ignores TZ on Windows. Resolve the explicit test zone
@@ -37,6 +43,98 @@ fn local_wall_millis() -> i64 {
         .unwrap()
         .timestamp()
         .as_millisecond()
+}
+
+#[derive(Debug)]
+struct IndexOutputProvider {
+    operator: Operator,
+    index_output_times: Mutex<Vec<i64>>,
+}
+
+#[async_trait::async_trait]
+impl FileIOProvider for IndexOutputProvider {
+    async fn create(&self, path: &str) -> paimon::Result<(Operator, String)> {
+        let relative = path.strip_prefix("s3://bucket/").unwrap().to_string();
+        if relative.ends_with(".index") {
+            // Force a distinct millisecond at the actual auxiliary output,
+            // without relying on a storage delay or scheduling a sleep.
+            let before = local_wall_millis();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let completed = loop {
+                let now = local_wall_millis();
+                if now > before {
+                    break now;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "wall clock did not advance"
+                );
+                tokio::task::yield_now().await;
+            };
+            self.index_output_times.lock().unwrap().push(completed);
+        }
+        Ok((self.operator.clone(), relative))
+    }
+}
+
+async fn check_creation_time_after_index_output(primary_key: bool) {
+    let provider = Arc::new(IndexOutputProvider {
+        operator: Operator::from_config(opendal::services::MemoryConfig::default()).unwrap(),
+        index_output_times: Mutex::new(Vec::new()),
+    });
+    let io = FileIOBuilder::new("unused")
+        .with_provider(provider.clone())
+        .build()
+        .unwrap();
+    let mut schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .option("file-index.bitmap.columns", "id")
+        .option("file-index.in-manifest-threshold", "0b");
+    if primary_key {
+        schema = schema.primary_key(["id"]).option("bucket", "1");
+    }
+    let path = "s3://bucket/creation-time-index";
+    let table = Table::new(
+        io.clone(),
+        Identifier::new("default", "creation_time_index"),
+        path.into(),
+        TableSchema::new(0, &schema.build().unwrap()),
+        None,
+    );
+    setup_dirs(&io, path).await;
+    persist_table_schema(&io, path, table.schema()).await;
+    let builder = table.new_write_builder();
+    let mut writer = builder.new_write().unwrap();
+    let batch =
+        RecordBatch::try_from_iter([("id", Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef)])
+            .unwrap();
+    writer.write_arrow_batch(&batch).await.unwrap();
+    let messages = writer.prepare_commit().await.unwrap();
+    let file = &messages[0].new_files[0];
+    let index_output_time = {
+        let index_times = provider.index_output_times.lock().unwrap();
+        assert_eq!(index_times.len(), 1);
+        index_times[0]
+    };
+    assert!(
+        file.creation_time.unwrap().timestamp_millis() >= index_output_time,
+        "creation time must be assigned after the auxiliary index output: {:?} vs {}",
+        file.creation_time,
+        index_output_time,
+    );
+    assert_eq!(file.extra_files, vec![format!("{}.index", file.file_name)]);
+    let index = format!("{path}/bucket-0/{}", file.extra_files[0]);
+    assert!(io.new_input(&index).unwrap().metadata().await.unwrap().size > 0);
+}
+
+#[tokio::test]
+async fn append_creation_time_is_assigned_after_index_output() {
+    check_creation_time_after_index_output(false).await;
+}
+
+#[tokio::test]
+async fn pk_creation_time_is_assigned_after_index_output() {
+    check_creation_time_after_index_output(true).await;
 }
 
 #[test]
