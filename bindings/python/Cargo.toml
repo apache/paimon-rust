@@ -36,7 +36,6 @@ chrono = "0.4.38"
 datafusion = { workspace = true }
 datafusion-ffi = { workspace = true }
 futures = "0.3"
-opendal = { package = "opendal-core", version = "0.58.0" }
 paimon = { path = "../../crates/paimon", features = ["storage-all"] }
 paimon-datafusion = { path = "../../crates/integrations/datafusion", features = ["fulltext"] }
 paimon-vindex-core = "0.5.0"

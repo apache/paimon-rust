@@ -53,12 +53,10 @@ impl PyTable {
     ///
     /// Preserves the caller's resolved schema and complete table options without
     /// loading catalog metadata or resolving a different schema for time travel.
-    /// `options` configures the built-in FileIO, not table reads. `file_io` reuses
-    /// a resolved PyPaimon FileIO with its routing and credential refresh instead.
-    /// `branch` selects the metadata namespace. REST snapshots and authorization
-    /// require a REST-backed table.
+    /// `options` configures FileIO, not table reads. `branch` selects the metadata
+    /// namespace. REST authorization and credential refresh require a catalog.
     #[staticmethod]
-    #[pyo3(signature = (location, schema_json, *, database="default", table="table", branch="main", options=None, file_io=None))]
+    #[pyo3(signature = (location, schema_json, *, database="default", table="table", branch="main", options=None))]
     fn from_resolved_schema(
         location: String,
         schema_json: &str,
@@ -66,7 +64,6 @@ impl PyTable {
         table: &str,
         branch: &str,
         options: Option<&Bound<'_, PyDict>>,
-        file_io: Option<Py<PyAny>>,
     ) -> PyResult<Self> {
         let schema: TableSchema = serde_json::from_str(schema_json)
             .map_err(|err| PyValueError::new_err(format!("Invalid table schema JSON: {err}")))?;
@@ -76,12 +73,9 @@ impl PyTable {
                 .transpose()?
                 .unwrap_or_default(),
         );
-        let file_io = match file_io {
-            Some(file_io) => crate::file_io::python_file_io(file_io),
-            None => FileIO::from_path(&location)
-                .and_then(|builder| builder.with_props(properties).build()),
-        }
-        .map_err(to_py_err)?;
+        let file_io = FileIO::from_path(&location)
+            .and_then(|builder| builder.with_props(properties).build())
+            .map_err(to_py_err)?;
         let table = paimon::table::Table::from_resolved_schema(
             file_io,
             Identifier::new(database, table),
@@ -95,10 +89,8 @@ impl PyTable {
 
     /// Reuse the matching REST table response and merged catalog options.
     /// Skips config/get-table requests, preserving REST snapshots and token refresh.
-    /// An optional resolved `file_io` owns storage routing and credential refresh;
-    /// it cannot be combined with `initial_data_token`.
     #[staticmethod]
-    #[pyo3(signature = (response_json, *, database, table, rest_options, initial_data_token=None, file_io=None))]
+    #[pyo3(signature = (response_json, *, database, table, rest_options, initial_data_token=None))]
     fn from_rest_response(
         py: Python<'_>,
         response_json: &str,
@@ -106,7 +98,6 @@ impl PyTable {
         table: &str,
         rest_options: HashMap<String, String>,
         initial_data_token: Option<(HashMap<String, String>, i64)>,
-        file_io: Option<Py<PyAny>>,
     ) -> PyResult<Self> {
         let response: paimon::api::GetTableResponse =
             serde_json::from_str(response_json).map_err(|err| {
@@ -116,39 +107,14 @@ impl PyTable {
         let rest_options = complete_storage_options(rest_options);
         let initial_token =
             initial_data_token.map(|(token, expires_at)| RESTToken::new(token, expires_at));
-        if file_io.is_some() && initial_token.is_some() {
-            return Err(PyValueError::new_err(
-                "file_io owns credential refresh and cannot be combined with initial_data_token",
-            ));
-        }
-        let file_io = file_io
-            .map(crate::file_io::python_file_io)
-            .transpose()
-            .map_err(to_py_err)?;
         let table = py
             .detach(|| {
-                runtime().block_on(async {
-                    match file_io {
-                        Some(file_io) => {
-                            paimon::table::Table::from_rest_response_with_file_io(
-                                identifier,
-                                response,
-                                Options::from_map(rest_options),
-                                file_io,
-                            )
-                            .await
-                        }
-                        None => {
-                            paimon::table::Table::from_rest_response_with_token(
-                                identifier,
-                                response,
-                                Options::from_map(rest_options),
-                                initial_token,
-                            )
-                            .await
-                        }
-                    }
-                })
+                runtime().block_on(paimon::table::Table::from_rest_response_with_token(
+                    identifier,
+                    response,
+                    Options::from_map(rest_options),
+                    initial_token,
+                ))
             })
             .map_err(to_py_err)?;
         Ok(Self::new(Arc::new(table)))
@@ -174,7 +140,6 @@ impl PyTable {
             table,
             rest_options,
             Some((data_token, expires_at_millis)),
-            None,
         )
     }
 

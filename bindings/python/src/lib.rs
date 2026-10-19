@@ -25,7 +25,6 @@ mod commit_callback;
 mod context;
 mod error;
 mod evolution;
-mod file_io;
 mod full_text_search;
 mod global_index_result;
 mod hybrid_search;

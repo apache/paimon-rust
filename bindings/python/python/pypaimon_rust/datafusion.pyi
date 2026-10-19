@@ -311,27 +311,21 @@ class Table:
     def from_resolved_schema(
         location: str, schema_json: str, *, database: str = "default",
         table: str = "table", branch: str = "main",
-        options: Optional[Dict[str, str]] = None, file_io: Optional[Any] = None,
+        options: Optional[Dict[str, str]] = None,
     ) -> "Table":
-        """Preserve a resolved Java-format TableSchema and optional PyPaimon FileIO.
+        """Preserve a resolved Java-format TableSchema; options configures FileIO.
 
         No catalog lookup or schema time-travel resolution is performed. Snapshot
-        selection still uses the supplied schema's options. options configures
-        built-in storage only when file_io is omitted. REST snapshots and
-        authorization require a REST-backed table.
+        selection still uses the supplied schema's options. Use a catalog when
+        REST authorization or credential refresh is required.
         """
         ...
     @staticmethod
     def from_rest_response(
         response_json: str, *, database: str, table: str, rest_options: Dict[str, str],
         initial_data_token: Optional[Tuple[Dict[str, str], int]] = None,
-        file_io: Optional[Any] = None,
     ) -> "Table":
-        """Reuse REST metadata with a token or a resolved PyPaimon FileIO.
-
-        file_io retains its routing and credential refresh, so it cannot be
-        combined with initial_data_token. REST still owns snapshot publication.
-        """
+        """Reuse REST metadata and optionally an already fetched table data token."""
         ...
     @staticmethod
     def from_rest_response_with_token(

@@ -272,29 +272,26 @@ mod tests {
         });
     }
     #[test]
-    fn callback_errors_survive_io_catalog_and_datafusion_wrapping() {
+    fn callback_errors_survive_catalog_and_datafusion_wrapping() {
         use pyo3::exceptions::PyPermissionError;
         fn error() -> paimon::Error {
-            let original = PyPermissionError::new_err("custom FileIO denied access");
+            let original = PyPermissionError::new_err("custom authorization denied access");
             let inner = crate::blob_uri_reader::callback_error(original);
-            let storage =
-                opendal::Error::new(opendal::ErrorKind::PermissionDenied, "Python FileIO failed")
-                    .set_source(inner);
-            paimon::Error::IoUnexpected {
-                message: "reading a page".to_string(),
-                source: Box::new(storage),
+            paimon::Error::UnexpectedError {
+                message: "query authorization failed".to_string(),
+                source: Some(Box::new(inner)),
             }
         }
         Python::attach(|py| {
             assert!(to_py_err(error()).is_instance_of::<PyPermissionError>(py));
             assert!(to_catalog_py_err(error()).is_instance_of::<PyPermissionError>(py));
             let wrapped = datafusion::error::DataFusionError::External(Box::new(error()))
-                .context("reading parquet");
+                .context("query authorization");
             let recovered = df_to_py_err(wrapped);
             assert!(recovered.is_instance_of::<PyPermissionError>(py));
             assert_eq!(
                 recovered.value(py).to_string(),
-                "custom FileIO denied access"
+                "custom authorization denied access"
             );
         });
     }
@@ -314,15 +311,15 @@ mod tests {
         Python::attach(|py| assert!(df_to_py_err(error).is_instance_of::<ForkSafetyError>(py)));
     }
     #[test]
-    fn io_callback_error_preserves_exception_identity() {
+    fn wrapped_callback_error_preserves_exception_identity() {
         Python::attach(|py| {
-            let original = pyo3::exceptions::PyOSError::new_err("private custom IO failure");
+            let original = pyo3::exceptions::PyOSError::new_err("private callback failure");
             original.value(py).setattr("storage_code", 17).unwrap();
             let expected = original.clone_ref(py);
             let wrapped = crate::blob_uri_reader::callback_error(original);
             let io_error = std::io::Error::other(wrapped);
             let wrapped = paimon::Error::DataInvalid {
-                message: "parquet read failed".to_string(),
+                message: "callback failed".to_string(),
                 source: Some(Box::new(io_error)),
             };
             let recovered = to_py_err(wrapped);
