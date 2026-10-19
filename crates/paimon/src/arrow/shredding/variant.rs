@@ -35,14 +35,15 @@ use crate::variant::{
 };
 use crate::{Error, Result};
 use arrow_array::{
-    new_null_array, Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array,
-    Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, LargeBinaryArray,
-    ListArray, RecordBatch, StringArray, StructArray, TimestampMicrosecondArray,
-    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray,
+    new_null_array, types::Int32Type, Array, ArrayRef, BinaryArray, BooleanArray, Date32Array,
+    Decimal128Array, DictionaryArray, Float32Array, Float64Array, Int16Array, Int32Array,
+    Int64Array, Int8Array, LargeBinaryArray, ListArray, RecordBatch, StringArray, StructArray,
+    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+    TimestampSecondArray,
 };
 use arrow_buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Fields, TimeUnit};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 const VARIANT_SHREDDING_SCHEMA_OPTION: &str = "variant.shreddingSchema";
@@ -909,7 +910,84 @@ pub(crate) fn assemble_variant_extraction_array(
     if let Some(projected) = assemble_typed_shredded_projection(input, fields, &metadata)? {
         return Ok(projected);
     }
+    if let Some(projected) = assemble_mixed_shredded_projection(input, fields, &metadata)? {
+        return Ok(projected);
+    }
     assemble_row_wise_variant_extraction(input, fields, &metadata)
+}
+
+/// Keep fully typed fields column-wise even when another requested field needs the
+/// residual path. A single residual must not force unrelated fields through the
+/// row-wise Variant decoder.
+fn assemble_mixed_shredded_projection(
+    input: &StructArray,
+    fields: &[DataField],
+    metadata: &[crate::spec::VariantFieldMetadata],
+) -> Result<Option<ArrayRef>> {
+    if !is_shredded_variant_array(input) {
+        return Ok(None);
+    }
+
+    let mut columns = Vec::with_capacity(fields.len());
+    let mut fallback_indices = Vec::new();
+    for (index, (field, field_metadata)) in fields.iter().zip(metadata).enumerate() {
+        let typed = typed_shredded_leaf(input, field_metadata.path())
+            .and_then(|leaf| cast_typed_leaf(leaf.as_ref(), field.data_type(), input.nulls()));
+        if typed.is_none() {
+            fallback_indices.push(index);
+        }
+        columns.push(typed);
+    }
+    if fallback_indices.is_empty() || fallback_indices.len() == fields.len() {
+        return Ok(None);
+    }
+    // The row-wise path must validate metadata for strict typed fields even
+    // when every residual field uses try casts.
+    if metadata.iter().any(|field| field.fail_on_error())
+        && fallback_indices
+            .iter()
+            .all(|&index| !metadata[index].fail_on_error())
+    {
+        return Ok(None);
+    }
+
+    let fallback_fields = fallback_indices
+        .iter()
+        .map(|&index| fields[index].clone())
+        .collect::<Vec<_>>();
+    let fallback_metadata = fallback_indices
+        .iter()
+        .map(|&index| metadata[index].clone())
+        .collect::<Vec<_>>();
+    let fallback =
+        assemble_row_wise_variant_extraction(input, &fallback_fields, &fallback_metadata)?;
+    let fallback = fallback.as_any().downcast_ref::<StructArray>().unwrap();
+    for (fallback_index, &field_index) in fallback_indices.iter().enumerate() {
+        columns[field_index] = Some(fallback.column(fallback_index).clone());
+    }
+
+    let arrow_fields: Fields = fields
+        .iter()
+        .map(|field| {
+            Ok(ArrowField::new(
+                field.name(),
+                paimon_type_to_arrow(field.data_type())?,
+                field.data_type().is_nullable(),
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?
+        .into();
+    let validities = (0..input.len()).map(|row| input.is_valid(row)).collect();
+    let array = StructArray::try_new(
+        arrow_fields,
+        columns.into_iter().map(Option::unwrap).collect(),
+        Some(null_buffer(validities)),
+    )
+    .map_err(|e| Error::UnexpectedError {
+        message: format!("Failed to build mixed Variant extraction StructArray: {e}"),
+        source: Some(Box::new(e)),
+    })?;
+    Ok(Some(Arc::new(array)))
 }
 
 fn assemble_row_wise_variant_extraction(
@@ -917,10 +995,15 @@ fn assemble_row_wise_variant_extraction(
     fields: &[DataField],
     metadata: &[crate::spec::VariantFieldMetadata],
 ) -> Result<ArrayRef> {
-    let materialized = materialize_variant_metadata(input)?;
-    let input = &materialized;
+    let shredded = is_shredded_variant_array(input);
+    let materialized = if shredded {
+        None
+    } else {
+        Some(materialize_variant_metadata(input)?)
+    };
+    let input = materialized.as_ref().unwrap_or(input);
 
-    let shredded_type = if is_shredded_variant_array(input) {
+    let shredded_type = if shredded {
         let DataType::Row(row) = arrow_to_paimon_type(input.data_type(), true)? else {
             unreachable!()
         };
@@ -931,6 +1014,10 @@ fn assemble_row_wise_variant_extraction(
     };
     let mut values_by_field = vec![Vec::with_capacity(input.len()); fields.len()];
     let mut validities = Vec::with_capacity(input.len());
+    // Arrow dictionary keys identify immutable metadata values within this batch.
+    // Once a residual value validates one key, other rows using that key do not
+    // need to compare and revalidate the same large dictionary bytes.
+    let mut validated_dictionary_keys = HashSet::new();
     for row in 0..input.len() {
         if input.is_null(row) {
             validities.push(false);
@@ -943,7 +1030,9 @@ fn assemble_row_wise_variant_extraction(
         validities.push(true);
         let shredded = shredded_type
             .as_ref()
-            .map(|(row_type, _)| struct_row_at(input, row, row_type))
+            .map(|(row_type, schema)| {
+                struct_row_at_skipping(input, row, row_type, schema.top_level_metadata_idx)
+            })
             .transpose()?
             .flatten();
         let variant = if shredded_type.is_none() {
@@ -951,32 +1040,78 @@ fn assemble_row_wise_variant_extraction(
         } else {
             None
         };
+        let (shredded_metadata, dictionary_key) = if shredded.is_some() {
+            match variant_metadata_at(input, row) {
+                Ok((bytes, key)) => (Some(bytes), key),
+                Err(error) => {
+                    if metadata.iter().any(|field| field.fail_on_error()) {
+                        return Err(error);
+                    }
+                    (None, None)
+                }
+            }
+        } else {
+            (None, None)
+        };
+        let mut metadata_validation = shredded_metadata.map(|bytes| {
+            crate::variant::VariantMetadataValidation::new(
+                bytes,
+                dictionary_key.is_some_and(|key| validated_dictionary_keys.contains(&key)),
+            )
+        });
         for (field_idx, field) in fields.iter().enumerate() {
             let field_metadata = &metadata[field_idx];
-            let extracted = match (&shredded, &shredded_type) {
+            let value = match (&shredded, &shredded_type) {
                 (Some(shredded), Some((_, schema))) => {
-                    crate::variant::extract_shredded_path(shredded, schema, field_metadata.path())
+                    let extracted = match &mut metadata_validation {
+                        Some(validation) => crate::variant::extract_shredded_path_cast(
+                            shredded,
+                            schema,
+                            validation,
+                            field_metadata.path(),
+                            field.data_type(),
+                            field_metadata.fail_on_error(),
+                        ),
+                        None => Ok(None),
+                    };
+                    match extracted {
+                        Ok(value) => value,
+                        Err(_) if !field_metadata.fail_on_error() => None,
+                        Err(error) => return Err(error),
+                    }
                 }
-                _ => match &variant {
-                    Some(variant) => variant
-                        .get_path(field_metadata.path())
-                        .and_then(|selected| {
-                            selected.map(|value| value.to_owned_variant()).transpose()
-                        }),
-                    None => Ok(None),
-                },
-            };
-            let value = match extracted {
-                Ok(Some(extracted)) => cast_variant_to_shredded_value(
-                    extracted.as_ref()?,
-                    field.data_type(),
-                    field_metadata.fail_on_error(),
-                )?,
-                Ok(None) => None,
-                Err(_) if !field_metadata.fail_on_error() => None,
-                Err(error) => return Err(error),
+                _ => {
+                    let extracted = match &variant {
+                        Some(variant) => {
+                            variant
+                                .get_path(field_metadata.path())
+                                .and_then(|selected| {
+                                    selected.map(|value| value.to_owned_variant()).transpose()
+                                })
+                        }
+                        None => Ok(None),
+                    };
+                    match extracted {
+                        Ok(Some(extracted)) => cast_variant_to_shredded_value(
+                            extracted.as_ref()?,
+                            field.data_type(),
+                            field_metadata.fail_on_error(),
+                        )?,
+                        Ok(None) => None,
+                        Err(_) if !field_metadata.fail_on_error() => None,
+                        Err(error) => return Err(error),
+                    }
+                }
             };
             values_by_field[field_idx].push(value);
+        }
+        if metadata_validation
+            .as_ref()
+            .is_some_and(|validation| validation.is_validated())
+        {
+            if let Some(key) = dictionary_key {
+                validated_dictionary_keys.insert(key);
+            }
         }
     }
 
@@ -1675,6 +1810,65 @@ fn struct_row_at(
         }
     }
     Ok(Some(shredded))
+}
+
+fn struct_row_at_skipping(
+    array: &StructArray,
+    row: usize,
+    row_type: &RowType,
+    skip_field: Option<usize>,
+) -> Result<Option<ShreddedRow>> {
+    if array.is_null(row) {
+        return Ok(None);
+    }
+    let mut shredded = ShreddedRow::new(row_type.fields().len());
+    for (field_idx, field) in row_type.fields().iter().enumerate() {
+        if Some(field_idx) == skip_field {
+            continue;
+        }
+        if let Some(value) = value_at(array.column(field_idx).as_ref(), row, field.data_type())? {
+            shredded.set(field_idx, value)?;
+        }
+    }
+    Ok(Some(shredded))
+}
+
+fn variant_metadata_at(input: &StructArray, row: usize) -> Result<(&[u8], Option<i32>)> {
+    let column = input
+        .column_by_name(VARIANT_METADATA_FIELD_NAME)
+        .ok_or_else(|| Error::DataInvalid {
+            message: "Shredded Variant metadata is missing".to_string(),
+            source: None,
+        })?;
+    if column.is_null(row) {
+        return Err(Error::DataInvalid {
+            message: "Shredded Variant metadata is null".to_string(),
+            source: None,
+        });
+    }
+    if let Some(binary) = column.as_any().downcast_ref::<BinaryArray>() {
+        return Ok((binary.value(row), None));
+    }
+    if let Some(dictionary) = column.as_any().downcast_ref::<DictionaryArray<Int32Type>>() {
+        let values = downcast_array::<BinaryArray>(dictionary.values().as_ref(), "Binary")?;
+        let key = dictionary.keys().value(row);
+        let index = usize::try_from(key).map_err(|_| Error::DataInvalid {
+            message: "Shredded Variant metadata dictionary key is negative".to_string(),
+            source: None,
+        })?;
+        if index >= values.len() || values.is_null(index) {
+            return Err(Error::DataInvalid {
+                message: "Shredded Variant metadata dictionary key is invalid".to_string(),
+                source: None,
+            });
+        }
+        return Ok((values.value(index), Some(key)));
+    }
+    Err(Error::DataInvalid {
+        message: "Shredded Variant metadata must be Binary or Dictionary(Int32, Binary)"
+            .to_string(),
+        source: None,
+    })
 }
 
 fn value_at(array: &dyn Array, row: usize, data_type: &DataType) -> Result<Option<ShreddedValue>> {
@@ -2630,6 +2824,90 @@ mod tests {
                     .unwrap();
             assert_eq!(actual.as_ref(), expected.as_ref());
         }
+    }
+
+    #[test]
+    fn mixed_shredded_projection_keeps_typed_fields_column_wise() {
+        let input = shredded_for_test(
+            &[
+                Some(r#"{"a":0,"b":1}"#),
+                Some(r#"{"a":2.5e0,"b":2}"#),
+                Some(r#"{"b":3}"#),
+                None,
+            ],
+            r#"[{"name":"a","type":"DOUBLE"},{"name":"b","type":"BIGINT"}]"#,
+        );
+        let float = || DataType::Float(FloatType::new());
+        let (row_type, metadata) =
+            extraction_for_test(&[(float(), "$.b"), (float(), "$.a"), (float(), "$.b")]);
+        assert!(
+            assemble_typed_shredded_projection(&input, row_type.fields(), &metadata)
+                .unwrap()
+                .is_none()
+        );
+        assert!(typed_shredded_leaf(&input, "$.b").is_some());
+        assert!(typed_shredded_leaf(&input, "$.a").is_none());
+        let expected =
+            assemble_row_wise_variant_extraction(&input, row_type.fields(), &metadata).unwrap();
+        let actual =
+            assemble_variant_extraction_array(&with_dictionary_metadata(&input), &row_type)
+                .unwrap();
+        assert_eq!(actual.as_ref(), expected.as_ref());
+    }
+
+    #[test]
+    fn mixed_shredded_projection_keeps_strict_metadata_error() {
+        let input = shredded_for_test(
+            &[Some(r#"{"a":0,"b":2}"#)],
+            r#"[{"name":"a","type":"DOUBLE"},{"name":"b","type":"BIGINT"}]"#,
+        );
+        let metadata_index = input
+            .fields()
+            .iter()
+            .position(|field| field.name() == VARIANT_METADATA_FIELD_NAME)
+            .unwrap();
+        let mut columns = input.columns().to_vec();
+        columns[metadata_index] = Arc::new(BinaryArray::from(vec![None::<&[u8]>]));
+        let mut fields = input
+            .fields()
+            .iter()
+            .map(|field| field.as_ref().clone())
+            .collect::<Vec<_>>();
+        fields[metadata_index] = fields[metadata_index].clone().with_nullable(true);
+        let missing_metadata =
+            StructArray::try_new(fields.into(), columns, input.nulls().cloned()).unwrap();
+        let row_type = variant_extraction_row(
+            true,
+            vec![
+                (
+                    DataType::Float(FloatType::new()),
+                    "$.b".to_string(),
+                    true,
+                    "UTC".to_string(),
+                ),
+                (
+                    DataType::Float(FloatType::new()),
+                    "$.a".to_string(),
+                    false,
+                    "UTC".to_string(),
+                ),
+            ],
+        )
+        .unwrap();
+        let metadata = row_type
+            .fields()
+            .iter()
+            .map(|field| parse_variant_metadata(field.description().unwrap()).unwrap())
+            .collect::<Vec<_>>();
+        assert!(typed_shredded_leaf(&missing_metadata, "$.b").is_some());
+        assert!(assemble_mixed_shredded_projection(
+            &missing_metadata,
+            row_type.fields(),
+            &metadata
+        )
+        .unwrap()
+        .is_none());
+        assert!(assemble_variant_extraction_array(&missing_metadata, &row_type).is_err());
     }
 
     #[test]
