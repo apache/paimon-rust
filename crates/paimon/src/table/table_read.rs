@@ -80,6 +80,16 @@ pub(crate) fn configured_mosaic_prefetch(table: &Table) -> crate::Result<MosaicP
 }
 
 impl<'a> TableRead<'a> {
+    /// Internal mutation readers need stable row IDs to match and preserve
+    /// original rows. This does not authorize a read: every split must still
+    /// carry a whole-table unrestricted grant issued to this exact handle.
+    pub(super) fn for_update(mut self) -> Self {
+        if let TableReadKind::Paimon(read) = &mut self.0 {
+            read.update_read = true;
+        }
+        self
+    }
+
     /// Create a new TableRead with a specific read type (projected fields).
     pub fn new(
         table: &'a Table,
@@ -443,6 +453,7 @@ struct PaimonTableRead<'a> {
     data_file_read_timing: Option<Arc<DataFileReadTiming>>,
     blob_parallelism: usize,
     limit: Option<usize>,
+    update_read: bool,
 }
 
 impl<'a> PaimonTableRead<'a> {
@@ -463,6 +474,7 @@ impl<'a> PaimonTableRead<'a> {
             data_file_read_timing: None,
             blob_parallelism: DEFAULT_BLOB_READ_PARALLELISM,
             limit: None,
+            update_read: false,
         }
     }
 
@@ -705,6 +717,7 @@ impl<'a> PaimonTableRead<'a> {
         let data_file_read_timing = self.data_file_read_timing.clone();
         let blob_parallelism = self.blob_parallelism;
         let limit = self.limit;
+        let update_read = self.update_read;
         Ok(Box::pin(async_stream::try_stream! {
             let mut remaining = limit;
             for group in [materialized, streaming] {
@@ -720,6 +733,7 @@ impl<'a> PaimonTableRead<'a> {
                     data_file_read_timing: data_file_read_timing.clone(),
                     blob_parallelism,
                     limit: remaining,
+                    update_read,
                 };
                 let mut stream = read.to_arrow_with_row_kind(&group)?;
                 while remaining != Some(0) {
@@ -803,6 +817,7 @@ impl<'a> PaimonTableRead<'a> {
             scan_type,
             predicates,
         )
+        .with_partition_fields(self.table.schema().partition_fields())
         .with_blob_as_descriptor(primary_key)
         .with_file_index_read_enabled(core_options.file_index_read_enabled())
         .with_batch_size(Some(core_options.read_batch_size()?))
@@ -1176,21 +1191,45 @@ impl<'a> PaimonTableRead<'a> {
                 predicate,
             )));
         }
+        let unrestricted_update = self.update_read
+            && data_splits.iter().all(|split| {
+                split.query_auth_grant().is_some_and(|grant| {
+                    grant.matches_table(self.table) && grant.is_unrestricted_whole_table()
+                })
+            });
         super::query_auth::reject_system_columns(
             self.read_type
                 .iter()
                 .map(|f| f.name())
-                .chain(filter_columns.iter().map(String::as_str)),
+                .filter(|name| !unrestricted_update || *name != "_ROW_ID"),
         )?;
+        super::query_auth::reject_system_columns(
+            filter_columns.iter().map(String::as_str).filter(|name| {
+                !unrestricted_update || !matches!(*name, "_ROW_ID" | "_SEQUENCE_NUMBER")
+            }),
+        )?;
+        if unrestricted_update
+            && self.read_type.iter().any(|field| {
+                field.name() == "_ROW_ID" && field != &crate::spec::row_id_data_field()
+            })
+        {
+            return Err(super::query_auth::unsupported(
+                "the mutation read requires the canonical _ROW_ID field",
+            ));
+        }
         // By id and name: older files resolve by id, so a dropped field passed
         // to `with_read_type` would read an uncovered column.
         super::query_auth::reject_noncanonical_fields(
             &self.read_type,
             self.table.schema().fields(),
         )?;
+        let mutation_fields =
+            unrestricted_update.then(|| self.table.schema().fields_with_read_metadata());
         super::query_auth::reject_noncanonical_leaves(
             &self.data_predicates,
-            self.table.schema().fields(),
+            mutation_fields
+                .as_deref()
+                .unwrap_or(self.table.schema().fields()),
         )?;
         // Per split, as Java binds one `QueryAuthSplit` each; one read applies one
         // rule set, so a restricted split's grant must cover them all.
@@ -1818,6 +1857,7 @@ impl<'a> PaimonTableRead<'a> {
             core_options.blob_view_resolve_enabled(),
             self.table.rest_env().cloned(),
         )?
+        .with_partition_fields(self.table.schema().partition_fields())
         .with_batch_size(Some(core_options.read_batch_size()?))
         .with_limit(self.limit)
         .with_blob_parallelism(self.blob_parallelism)
@@ -1843,6 +1883,7 @@ impl<'a> PaimonTableRead<'a> {
             self.read_type().to_vec(),
             self.data_predicates.clone(),
         )
+        .with_partition_fields(self.table.schema().partition_fields())
         .with_blob_as_descriptor(core_options.blob_as_descriptor())
         .with_file_index_read_enabled(core_options.file_index_read_enabled())
         .with_batch_size(Some(core_options.read_batch_size()?))

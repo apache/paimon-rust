@@ -390,7 +390,6 @@ impl TableUpsert {
     /// new rows, then return both sets of commit messages as one operation.
     #[must_use = "commit messages must be passed to TableCommit"]
     pub(super) async fn prepare_commit(self) -> crate::Result<Vec<CommitMessage>> {
-        CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
         let source = self.key_rows()?;
         if source.num_rows() == 0 {
             return Err(invalid("Input data is empty"));
@@ -401,8 +400,8 @@ impl TableUpsert {
         let mut projection = self.keys.iter().map(String::as_str).collect::<Vec<_>>();
         projection.push(ROW_ID);
         read_builder.with_projection(&projection)?;
-        let plan = read_builder.new_scan().plan().await?;
-        let read = read_builder.new_read()?;
+        let plan = read_builder.new_scan().plan_all_files().await?;
+        let read = read_builder.new_read()?.for_update();
         let splits = self.matching_splits(&source, &plan)?;
         let mut stream = read.to_arrow(splits.as_ref())?;
         while let Some(batch) = stream.try_next().await? {

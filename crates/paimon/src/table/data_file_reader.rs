@@ -45,6 +45,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+#[cfg(test)]
+#[path = "data_file_reader_partition_tests.rs"]
+mod partition_tests;
+
 #[derive(Debug, Default)]
 pub(crate) struct DataFileReadTiming {
     file_read_nanos: AtomicU64,
@@ -129,6 +133,7 @@ pub(crate) struct DataFileReader {
     schema_manager: SchemaManager,
     table_schema_id: i64,
     table_fields: Vec<DataField>,
+    partition_fields: Vec<DataField>,
     read_type: Vec<DataField>,
     predicates: Vec<Predicate>,
     file_index_read_enabled: bool,
@@ -157,6 +162,7 @@ impl DataFileReader {
             schema_manager,
             table_schema_id,
             table_fields,
+            partition_fields: Vec::new(),
             read_type,
             predicates,
             file_index_read_enabled: false,
@@ -174,6 +180,11 @@ impl DataFileReader {
 
     pub(crate) fn with_blob_as_descriptor(mut self, blob_as_descriptor: bool) -> Self {
         self.blob_as_descriptor = blob_as_descriptor;
+        self
+    }
+
+    pub(crate) fn with_partition_fields(mut self, fields: Vec<DataField>) -> Self {
+        self.partition_fields = fields;
         self
     }
 
@@ -531,7 +542,14 @@ impl DataFileReader {
         let output_schema = crate::arrow::build_read_arrow_schema(&output_read_type)?;
         let mut read_type = output_read_type.clone();
         let table_fields = self.table_fields.clone();
+        let partition_fields = self.partition_fields.clone();
         let predicates = self.predicates.clone();
+        let file_fields = data_fields.clone().unwrap_or_else(|| table_fields.clone());
+        let data_schema_fields = data_schema_fields_for_file(
+            &file_fields,
+            file_meta.write_cols.as_deref(),
+            data_schema_fields.as_deref(),
+        )?;
         let projects_row_id = read_type
             .iter()
             .any(|field| field.name() == ROW_ID_FIELD_NAME);
@@ -563,7 +581,18 @@ impl DataFileReader {
                 })
             })
         });
+        let partition_predicate = refs.iter().any(|(_, index)| {
+            table_fields.get(*index).is_some_and(|target| {
+                partition_fields
+                    .iter()
+                    .any(|field| field.id() == target.id())
+                    && !data_schema_fields
+                        .iter()
+                        .any(|field| field.id() == target.id())
+            })
+        });
         let post_read_filter = evolved_predicate
+            || partition_predicate
             || (projects_row_id
                 && predicates
                     .iter()
@@ -613,7 +642,15 @@ impl DataFileReader {
         // post-filter until expression adaptation is proven for that path.
         // Positional `_ROW_ID` materialization must see the unfiltered row
         // stream, so the engine hook stays disabled for this projection.
-        let row_filter_factory = (data_fields.is_none() && !projects_row_id && !post_read_filter)
+        let missing_partition_fields = partition_fields.iter().any(|target| {
+            !data_schema_fields
+                .iter()
+                .any(|field| field.id() == target.id())
+        });
+        let row_filter_factory = (data_fields.is_none()
+            && !projects_row_id
+            && !post_read_filter
+            && !missing_partition_fields)
             .then(|| self.row_filter_factory.clone())
             .flatten();
         let file_io = self.file_io.clone();
@@ -627,12 +664,6 @@ impl DataFileReader {
         let read_timing = self.read_timing.clone();
 
         let target_schema = crate::arrow::build_read_arrow_schema(&read_type)?;
-        let file_fields = data_fields.clone().unwrap_or_else(|| table_fields.clone());
-        let data_schema_fields = data_schema_fields_for_file(
-            &file_fields,
-            file_meta.write_cols.as_deref(),
-            data_schema_fields.as_deref(),
-        )?;
         // What the reader is asked for.
         let projected_read_fields: Vec<DataField> = if data_fields.is_some()
             || file_meta.write_cols.is_some()
@@ -842,8 +873,10 @@ impl DataFileReader {
                             columns.push(reconcile_column(col, source_field, &read_type[i])?);
                         }
                         _ => {
-                            let null_array = arrow_array::new_null_array(target_field.data_type(), num_rows);
-                            columns.push(null_array);
+                            columns.push(missing_file_column(
+                                &read_type[i], target_field.data_type(),
+                                split.partition(), &partition_fields, num_rows,
+                            )?);
                         }
                     }
                 }
@@ -946,6 +979,7 @@ impl DataFileReader {
 
         let read_type = self.read_type.clone();
         let table_fields = self.table_fields.clone();
+        let partition_fields = self.partition_fields.clone();
         let predicates = self.predicates.clone();
         let file_io = self.file_io.clone();
         let split = split.clone();
@@ -1051,6 +1085,7 @@ impl DataFileReader {
                     &table_fields,
                     index_mapping.as_deref(),
                     source_fields.as_deref(),
+                    (split.partition(), &partition_fields),
                 )?;
                 yield result;
             }
@@ -1120,6 +1155,32 @@ fn reconcile_column(
     })
 }
 
+/// Restore only absent physical partition columns. Present columns, including
+/// explicit NULLs, retain the file's value and ordinary schema reconciliation.
+pub(super) fn missing_file_column(
+    target: &DataField,
+    arrow_type: &arrow_schema::DataType,
+    partition: &crate::spec::BinaryRow,
+    partition_fields: &[DataField],
+    num_rows: usize,
+) -> crate::Result<Arc<dyn Array>> {
+    if let Some((index, source)) = partition_fields
+        .iter()
+        .enumerate()
+        .find(|(_, field)| field.id() == target.id())
+    {
+        let column = crate::arrow::partition::partition_array(
+            partition,
+            index,
+            source.data_type(),
+            num_rows,
+        )?;
+        reconcile_column(&column, source, target)
+    } else {
+        Ok(arrow_array::new_null_array(arrow_type, num_rows))
+    }
+}
+
 /// Project one decoded file `batch` onto `target_schema`, resolving each target
 /// column through the field-ID `index_mapping` (or by name when the file schema
 /// matches the table schema), casting on type mismatch and null-filling absent
@@ -1133,6 +1194,7 @@ fn project_file_batch(
     table_fields: &[DataField],
     index_mapping: Option<&[i32]>,
     source_fields: Option<&[DataField]>,
+    partition: (&crate::spec::BinaryRow, &[DataField]),
 ) -> crate::Result<RecordBatch> {
     let num_rows = batch.num_rows();
     let batch_schema = batch.schema();
@@ -1167,10 +1229,13 @@ fn project_file_batch(
                 columns.push(reconcile_column(col, source_field, &read_type[i])?);
             }
             _ => {
-                columns.push(arrow_array::new_null_array(
+                columns.push(missing_file_column(
+                    &read_type[i],
                     target_field.data_type(),
+                    partition.0,
+                    partition.1,
                     num_rows,
-                ));
+                )?);
             }
         }
     }

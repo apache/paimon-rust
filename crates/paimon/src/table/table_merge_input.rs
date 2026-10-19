@@ -136,7 +136,7 @@ impl MergeInput {
             table
                 .new_read_builder()
                 .new_scan()
-                .authorize_merge_source()
+                .authorize_all_files()
                 .await?
         } else {
             builder.new_scan()
@@ -155,7 +155,7 @@ impl MergeInput {
             // do not observe files from a commit arriving after resolution.
             super::source::Plan::new(Vec::new())
         };
-        let read = builder.new_read()?;
+        let read = builder.new_read()?.for_update();
         if query_auth && plan.splits().is_empty() {
             // Empty input carries no splits on which to stamp the live grant.
             // Authorization above still runs for empty tables/windows.

@@ -112,6 +112,7 @@ pub(crate) struct DataEvolutionReader {
     schema_manager: SchemaManager,
     table_schema_id: i64,
     table_fields: Vec<DataField>,
+    partition_fields: Vec<DataField>,
     /// read_type with _ROW_ID filtered out, widened with complete predicate
     /// ROW inputs and extra top-level columns — used for file reads and the
     /// column-merge plan.
@@ -207,6 +208,7 @@ impl DataEvolutionReader {
             schema_manager,
             table_schema_id,
             table_fields,
+            partition_fields: Vec::new(),
             wide_file_read_type,
             row_id_index,
             output_schema,
@@ -231,6 +233,11 @@ impl DataEvolutionReader {
 
     pub(crate) fn with_batch_size(mut self, batch_size: Option<usize>) -> Self {
         self.batch_size = batch_size;
+        self
+    }
+
+    pub(crate) fn with_partition_fields(mut self, fields: Vec<DataField>) -> Self {
+        self.partition_fields = fields;
         self
     }
 
@@ -488,6 +495,7 @@ impl DataEvolutionReader {
                     Vec::new()
                 },
             )
+            .with_partition_fields(self.partition_fields.clone())
             .with_batch_size(batch_size)
             .with_blob_parallelism(self.blob_parallelism)
             .with_parquet_read_budget(self.parquet_read_budget.clone())
@@ -893,6 +901,7 @@ impl DataEvolutionReader {
             false,
             None,
         )?
+        .with_partition_fields(self.partition_fields.clone())
         .with_batch_size(self.batch_size)
         .with_parquet_read_budget(self.parquet_read_budget.clone())
         .with_table_options(Arc::clone(&self.table_options))
@@ -964,6 +973,7 @@ impl DataEvolutionReader {
         // whose values would be transformed by resolution.
         let read_type = self.wide_file_read_type.clone();
         let table_fields = self.table_fields.clone();
+        let partition_fields = self.partition_fields.clone();
         let mut blob_inline_fields = self.blob_descriptor_fields.clone();
         blob_inline_fields.extend(self.blob_view_fields.iter().cloned());
         let blob_as_descriptor = self.blob_as_descriptor;
@@ -1015,8 +1025,12 @@ impl DataEvolutionReader {
                     let columns: Vec<Arc<dyn arrow_array::Array>> = target_schema
                         .fields()
                         .iter()
-                        .map(|f| arrow_array::new_null_array(f.data_type(), rows_to_emit))
-                        .collect();
+                        .zip(&read_type)
+                        .map(|(arrow_field, field)| super::data_file_reader::missing_file_column(
+                            field, arrow_field.data_type(), split.partition(),
+                            &partition_fields, rows_to_emit,
+                        ))
+                        .collect::<crate::Result<_>>()?;
                     let batch = if columns.is_empty() {
                         RecordBatch::try_new_with_options(
                             target_schema.clone(),
@@ -1165,10 +1179,14 @@ impl DataEvolutionReader {
                             source_cursors[source_idx].as_ref().map(|(batch, offset)| {
                                 batch.column(field_offset).slice(*offset, rows_to_emit)
                             })
-                        })
-                        .unwrap_or_else(|| {
-                            arrow_array::new_null_array(target_field.data_type(), rows_to_emit)
                         });
+                    let array = match array {
+                        Some(array) => array,
+                        None => super::data_file_reader::missing_file_column(
+                            &read_type[idx], target_field.data_type(), split.partition(),
+                            &partition_fields, rows_to_emit,
+                        )?,
+                    };
                     let array = if let Some((source_idx, field_offset)) = provider {
                         crate::arrow::nested_evolution::evolve_field(
                             &array,

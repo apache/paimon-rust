@@ -371,6 +371,12 @@ async fn read_all_manifest_entries(
                         continue;
                     }
                     if (!data_predicates.is_empty() || !key_predicates.is_empty())
+                        && !super::stats_filter::predicates_reference_unwritten_partitions(
+                            data_predicates,
+                            schema_fields,
+                            partition_fields,
+                            [(entry.file(), schema_fields)],
+                        )
                         && !data_file_matches_predicates_with_key_stats(
                             entry.file(),
                             data_predicates,
@@ -1147,19 +1153,19 @@ impl<'a> TableScan<'a> {
         }
     }
 
-    /// MERGE table sources follow plan_all_files: authorize the whole table,
+    /// Mutation targets and MERGE table sources authorize the whole table,
     /// then include L0 only when no row filter or column mask was returned.
     /// Keep this scope internal; public metadata scans must still fail closed.
-    pub(super) async fn authorize_merge_source(&self) -> crate::Result<Self> {
+    pub(super) async fn authorize_all_files(&self) -> crate::Result<Self> {
         let scan = self.authorize_snapshot_read().await?;
         if let TableScanKind::Paimon(source) = &scan.0 {
             if source
                 .query_auth_grant
                 .as_ref()
-                .is_some_and(|grant| !grant.is_unrestricted())
+                .is_some_and(|grant| !grant.is_unrestricted_whole_table())
             {
                 return Err(super::query_auth::unsupported(
-                    "MERGE table sources require unrestricted query authorization",
+                    "file-group operations require unrestricted whole-table query authorization",
                 ));
             }
         }
@@ -1516,11 +1522,52 @@ impl<'a> TableScan<'a> {
             scan.projected_read_field_ids = None;
         }
         source
-            .authorize_merge_source()
+            .authorize_all_files()
             .await?
             .with_scan_all_files()
             .plan()
             .await
+    }
+
+    /// Mutation predicates can refer to canonical row-tracking metadata only
+    /// after the REST server authorizes the entire table without restrictions.
+    /// Keep public scans' system-column and row-range refusals unchanged.
+    pub(super) async fn plan_for_update(&self) -> crate::Result<Plan> {
+        let mut requested = self.clone();
+        if let TableScanKind::Paimon(scan) = &mut requested.0 {
+            if scan.table.schema().core_options().query_auth_enabled() {
+                super::query_auth::reject_noncanonical_leaves(
+                    &scan.data_predicates,
+                    &scan.table.schema().fields_with_read_metadata(),
+                )?;
+                super::query_auth::reject_system_columns(
+                    super::query_auth::leaf_names(&scan.data_predicates)
+                        .iter()
+                        .map(String::as_str)
+                        .filter(|name| {
+                            !matches!(
+                                *name,
+                                ROW_ID_FIELD_NAME | crate::spec::SEQUENCE_NUMBER_FIELD_NAME
+                            )
+                        }),
+                )?;
+            }
+            scan.projected_read_field_ids = None;
+        }
+        let mut authorization = requested.clone();
+        if let TableScanKind::Paimon(scan) = &mut authorization.0 {
+            // Predicate-derived row ranges do not narrow the permission scope.
+            // The requested scan retains both the ranges and exact residuals.
+            scan.row_ranges = None;
+            scan.data_predicates.clear();
+        }
+        let authorization = authorization.authorize_all_files().await?;
+        if let (TableScanKind::Paimon(scan), TableScanKind::Paimon(authorized)) =
+            (&mut requested.0, authorization.0)
+        {
+            scan.query_auth_grant = authorized.query_auth_grant;
+        }
+        requested.with_scan_all_files().plan().await
     }
 
     /// Validate transported metadata and restore canonical snapshot paths.

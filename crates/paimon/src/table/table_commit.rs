@@ -1917,11 +1917,45 @@ impl TableCommit {
             .filter(|entry| entry.kind == FileKind::Delete)
             .collect::<Vec<_>>();
         for deletion in deletions {
-            let position = all
-                .iter()
-                .position(|entry| same_index_file_entry(entry, deletion));
+            let global_index = !matches!(
+                deletion.index_file.index_type.as_str(),
+                "HASH" | DELETION_VECTORS_INDEX_TYPE
+            );
+            // Java combines global indexes by type and file name, then checks
+            // the complete current metadata before removing an entry. A stale
+            // removal must not discard metadata-only row-id reassignment.
+            let position = all.iter().position(|entry| {
+                if global_index {
+                    entry.index_file.index_type == deletion.index_file.index_type
+                        && entry.index_file.file_name == deletion.index_file.file_name
+                } else {
+                    same_index_file_entry(entry, deletion)
+                }
+            });
             if let Some(position) = position {
+                let previous = &all[position];
+                if global_index
+                    && (!same_index_partition(&previous.partition, &deletion.partition)
+                        || previous.bucket != deletion.bucket
+                        || previous.index_file != deletion.index_file)
+                {
+                    return Err(crate::Error::DataInvalid {
+                        message: format!(
+                            "Index file {} metadata does not match the current entry.",
+                            deletion.index_file.file_name
+                        ),
+                        source: None,
+                    });
+                }
                 all.remove(position);
+            } else if global_index {
+                return Err(crate::Error::DataInvalid {
+                    message: format!(
+                        "Trying to delete global index file {} which does not exist.",
+                        deletion.index_file.file_name
+                    ),
+                    source: None,
+                });
             } else if deletion.index_file.index_type == DELETION_VECTORS_INDEX_TYPE {
                 return Err(crate::Error::DataInvalid {
                     message: format!("Cannot replace missing deletion vector index '{}'; prepare the DELETE again from the latest snapshot", deletion.index_file.file_name),
@@ -3639,6 +3673,7 @@ mod tests {
         include!("table_commit/abort_tests.rs");
         include!("table_commit/property_tests.rs");
         include!("table_commit/callback_tests.rs");
+        include!("table_commit/index_delete_tests.rs");
     }
 
     #[tokio::test]

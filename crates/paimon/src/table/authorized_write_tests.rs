@@ -33,6 +33,8 @@ struct CatalogState {
     query_requests: AtomicUsize,
     commit_requests: AtomicUsize,
     deny_commit: AtomicBool,
+    deny_query: AtomicBool,
+    query_response: Mutex<serde_json::Value>,
 }
 
 struct RestTable {
@@ -72,6 +74,8 @@ impl RestTable {
             query_requests: AtomicUsize::new(0),
             commit_requests: AtomicUsize::new(0),
             deny_commit: AtomicBool::new(false),
+            deny_query: AtomicBool::new(true),
+            query_response: Mutex::new(serde_json::json!({})),
         });
         let app = Router::new()
             .route(
@@ -94,13 +98,27 @@ impl RestTable {
             .route("/v1/databases/db/tables/t/commit", post(commit_snapshot))
             .route(
                 "/v1/databases/db/tables/t/auth",
-                post(|State(state): State<Arc<CatalogState>>| async move {
-                    state.query_requests.fetch_add(1, Ordering::SeqCst);
-                    (
-                        StatusCode::FORBIDDEN,
-                        Json(serde_json::json!({"message": "SELECT denied"})),
-                    )
-                }),
+                post(
+                    |State(state): State<Arc<CatalogState>>,
+                     Json(body): Json<serde_json::Value>| async move {
+                        state.query_requests.fetch_add(1, Ordering::SeqCst);
+                        assert!(
+                            body.get("select").is_none_or(serde_json::Value::is_null),
+                            "mutation authorization must cover the entire table: {body}"
+                        );
+                        if state.deny_query.load(Ordering::SeqCst) {
+                            (
+                                StatusCode::FORBIDDEN,
+                                Json(serde_json::json!({"message": "SELECT denied"})),
+                            )
+                        } else {
+                            (
+                                StatusCode::OK,
+                                Json(state.query_response.lock().await.clone()),
+                            )
+                        }
+                    },
+                ),
             )
             .with_state(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -218,6 +236,9 @@ impl RestTable {
         rows
     }
 }
+
+#[path = "authorized_update_tests.rs"]
+mod updates;
 
 async fn commit_snapshot(
     State(state): State<Arc<CatalogState>>,

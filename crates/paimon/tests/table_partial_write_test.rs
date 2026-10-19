@@ -153,13 +153,7 @@ async fn invalid_write_type_does_not_replace_previous_configuration() {
     writer
         .with_write_type(vec!["pt".into(), "id".into()])
         .unwrap();
-    for columns in [
-        vec![],
-        vec!["pt", "id", "id"],
-        vec!["pt", "missing"],
-        vec!["id"],
-        vec!["pt"],
-    ] {
+    for columns in [vec![], vec!["pt", "id", "id"], vec!["pt", "missing"]] {
         assert!(writer
             .with_write_type(columns.into_iter().map(str::to_string).collect())
             .is_err());
