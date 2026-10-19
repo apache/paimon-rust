@@ -302,7 +302,8 @@ pub struct Table {
     query_auth_session: Option<u64>,
     rest_env: Option<RESTEnv>,
     /// True when this table copy was switched to a historical schema by
-    /// [`Table::copy_with_time_travel`]. Such a copy is read-only.
+    /// [`Table::copy_with_time_travel`]. Ordinary writes and publication reject
+    /// this copy; row-level updates may use it as their read snapshot.
     time_traveled: bool,
     /// Captured snapshot or empty view, so scans don't resolve latest again.
     /// Cleared when [`Table::copy_with_options`] changes the selector.
@@ -801,7 +802,7 @@ impl Table {
         })
     }
 
-    /// Create a read-only copy pinned to an already resolved snapshot.
+    /// Create a read view pinned to an already resolved snapshot.
     ///
     /// Replaces any selector that originally resolved the snapshot with an
     /// explicit `scan.snapshot-id`, so every subsequent scan stage observes the
@@ -817,7 +818,7 @@ impl Table {
         Ok(table)
     }
 
-    /// Create a read-only copy pinned to a snapshot from this table and branch,
+    /// Create a read view pinned to a snapshot from this table and branch,
     /// preserving the current read schema and options other than scan selectors.
     ///
     /// Unlike time travel, pinning must not change the fields used by an already
@@ -1133,8 +1134,9 @@ impl Table {
         })
     }
 
-    /// Whether this copy is read-only because its schema was time-traveled or
-    /// its read view was explicitly pinned (including an empty view).
+    /// Whether this copy has a time-traveled schema or an explicitly pinned
+    /// read view (including an empty view). Ordinary writes and commits reject
+    /// it; row-level updates retain its snapshot as their conflict baseline.
     pub fn is_time_traveled(&self) -> bool {
         self.time_traveled
     }

@@ -30,7 +30,7 @@ pub(super) async fn delete(
     table: &Table,
     predicate: Option<Predicate>,
 ) -> crate::Result<Vec<CommitMessage>> {
-    super::write_builder::ensure_table_write_allowed(table)?;
+    super::write_builder::ensure_paimon_table(table)?;
     // Partition-only deletes use manifest metadata directly, but still need
     // the same unrestricted whole-table grant as row-level deletes. Authorize
     // before the empty-target and partition-optimization branches.

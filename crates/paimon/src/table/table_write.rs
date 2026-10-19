@@ -424,9 +424,7 @@ impl TableWrite {
         }
 
         let row_kind_generator = match core_options.rowkind_field() {
-            Some(field_name) if has_primary_keys => {
-                Some(RowKindGenerator::create(schema, field_name)?)
-            }
+            Some(field_name) => Some(RowKindGenerator::create(schema, field_name)?),
             _ => None,
         };
         let row_kind_filter = RowKindFilter::of(core_options);
@@ -784,8 +782,9 @@ impl TableWrite {
             return writer.write(batch).await;
         }
         self.ensure_active()?;
-        let input = batch;
-        let Some(batch) = self.normalize_write_batch(input)? else {
+        let filtered = self.filter_write_input(batch)?;
+        let input = filtered.as_ref().unwrap_or(batch);
+        let Some(batch) = self.normalize_filtered_write_batch(input)? else {
             return Ok(());
         };
         let routing = self.normalize_automatic_routing_input(input)?;
@@ -807,7 +806,11 @@ impl TableWrite {
 
     pub(super) fn normalize_write_batch(&self, batch: &RecordBatch) -> Result<Option<RecordBatch>> {
         let filtered = self.filter_write_input(batch)?;
-        let batch = self.validate_write_batch_schema(filtered.as_ref().unwrap_or(batch))?;
+        self.normalize_filtered_write_batch(filtered.as_ref().unwrap_or(batch))
+    }
+
+    fn normalize_filtered_write_batch(&self, batch: &RecordBatch) -> Result<Option<RecordBatch>> {
+        let batch = self.validate_write_batch_schema(batch)?;
         // Filtering already precedes value normalization. Generate the system
         // column now so every surviving PK batch has the same buffer schema.
         let batch = self.generate_rowkind_batch(&batch)?;
@@ -870,16 +873,16 @@ impl TableWrite {
     /// its optional RowKindFilter, independently of physical KV nullability.
     /// Ignored rows never reach value extraction or nested writers.
     fn filter_write_input(&self, batch: &RecordBatch) -> Result<Option<RecordBatch>> {
-        if self.primary_key_indices.is_empty() {
+        // Ordinary Arrow append input has no event header. It represents
+        // INSERTs and needs no kind allocation or pre-routing filter.
+        if self.primary_key_indices.is_empty() && self.row_kind_generator.is_none() {
             return Ok(None);
         }
         // Reject malformed schemas even when every event would be ignored.
         // Empty arrays check equivalent layouts without examining row values.
         self.validate_write_batch_schema(&RecordBatch::new_empty(batch.schema()))?;
         let kinds = if let Some(generator) = &self.row_kind_generator {
-            (0..batch.num_rows())
-                .map(|row| generator.generate(batch, row))
-                .collect::<Result<Vec<_>>>()?
+            generator.generate_batch(batch)?
         } else if let Some(column) = batch.column_by_name(VALUE_KIND_FIELD_NAME) {
             column
                 .as_any()
@@ -896,15 +899,18 @@ impl TableWrite {
         // still identify the event; other engines and partition migrations
         // require every declared top-level NOT NULL field.
         let delete_required_fields = self.delete_not_null_fields();
+        let projected = self.project_full_write_input(batch)?;
+        let physical = projected.as_ref().unwrap_or(batch);
         for (index, field) in self.write_schema.fields().iter().enumerate() {
-            if field.is_nullable() || batch.column(index).null_count() == 0 {
+            if field.is_nullable() || physical.column(index).null_count() == 0 {
                 continue;
             }
             let delete_required = delete_required_fields
                 .as_ref()
                 .is_none_or(|fields| fields.contains(field.name()));
             for (row, kind) in kinds.iter().enumerate() {
-                if batch.column(index).is_null(row) && (*kind != RowKind::Delete || delete_required)
+                if physical.column(index).is_null(row)
+                    && (*kind != RowKind::Delete || delete_required)
                 {
                     return Err(crate::Error::DataInvalid {
                         message: format!("Cannot write null to non-null column({})", field.name()),
@@ -913,14 +919,25 @@ impl TableWrite {
                 }
             }
         }
-        let Some(filter) = &self.row_kind_filter else {
-            return Ok(None);
-        };
-        let rows = kinds
-            .into_iter()
-            .enumerate()
-            .filter_map(|(row, kind)| filter.test(kind).then_some(row))
-            .collect::<Vec<_>>();
+        let mut rows = Vec::with_capacity(batch.num_rows());
+        for (row, kind) in kinds.into_iter().enumerate() {
+            if self
+                .row_kind_filter
+                .as_ref()
+                .is_some_and(|filter| !filter.test(kind))
+            {
+                continue;
+            }
+            if self.primary_key_indices.is_empty()
+                && !matches!(kind, RowKind::Insert | RowKind::UpdateAfter)
+            {
+                return Err(crate::Error::DataInvalid {
+                    message: format!("Append only writer cannot accept row with RowKind {kind:?}"),
+                    source: None,
+                });
+            }
+            rows.push(row);
+        }
         if rows.len() == batch.num_rows() {
             Ok(None)
         } else {
@@ -1265,6 +1282,11 @@ impl TableWrite {
     }
 
     fn generate_rowkind_batch(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+        // Append rows have already been filtered and checked. Their events do
+        // not become a physical KV system column.
+        if self.primary_key_indices.is_empty() {
+            return Ok(batch.clone());
+        }
         let Some(generator) = &self.row_kind_generator else {
             // Every PK batch sent to a buffered writer uses the same schema.
             // Mixing default INSERT batches with explicit kinds must neither
@@ -1291,9 +1313,11 @@ impl TableWrite {
             });
         }
 
-        let kinds = (0..batch.num_rows())
-            .map(|row| generator.generate(batch, row).map(|kind| kind.to_value()))
-            .collect::<Result<Vec<_>>>()?;
+        let kinds = generator
+            .generate_batch(batch)?
+            .into_iter()
+            .map(|kind| kind.to_value())
+            .collect();
         Self::add_per_row_value_kind_column(batch, kinds)
     }
 
