@@ -866,13 +866,10 @@ impl TableWrite {
         Ok(Some(batch))
     }
 
-    /// Java resolves the event and checks top-level nullability before its
-    /// RowKindFilter. Ignored rows never reach value extraction or nested
-    /// writers, so their child values must not be normalized or validated.
+    /// Java resolves the event and checks logical top-level nullability before
+    /// its optional RowKindFilter, independently of physical KV nullability.
+    /// Ignored rows never reach value extraction or nested writers.
     fn filter_write_input(&self, batch: &RecordBatch) -> Result<Option<RecordBatch>> {
-        let Some(filter) = &self.row_kind_filter else {
-            return Ok(None);
-        };
         if self.primary_key_indices.is_empty() {
             return Ok(None);
         }
@@ -895,24 +892,17 @@ impl TableWrite {
             vec![RowKind::Insert; batch.num_rows()]
         };
 
-        let schema = self.table.schema();
-        let options = CoreOptions::new(schema.options());
         // Java's deduplicate DELETE can omit non-key values. Sequence fields
         // still identify the event; other engines and partition migrations
         // require every declared top-level NOT NULL field.
-        let partial_delete = self.merge_engine == MergeEngine::Deduplicate
-            && schema
-                .partition_keys()
-                .iter()
-                .all(|field| schema.primary_keys().contains(field));
-        let sequence_fields = options.sequence_fields();
+        let delete_required_fields = self.delete_not_null_fields();
         for (index, field) in self.write_schema.fields().iter().enumerate() {
             if field.is_nullable() || batch.column(index).null_count() == 0 {
                 continue;
             }
-            let delete_required = !partial_delete
-                || schema.primary_keys().contains(field.name())
-                || sequence_fields.contains(&field.name().as_str());
+            let delete_required = delete_required_fields
+                .as_ref()
+                .is_none_or(|fields| fields.contains(field.name()));
             for (row, kind) in kinds.iter().enumerate() {
                 if batch.column(index).is_null(row) && (*kind != RowKind::Delete || delete_required)
                 {
@@ -923,6 +913,9 @@ impl TableWrite {
                 }
             }
         }
+        let Some(filter) = &self.row_kind_filter else {
+            return Ok(None);
+        };
         let rows = kinds
             .into_iter()
             .enumerate()
@@ -933,6 +926,29 @@ impl TableWrite {
         } else {
             take_rows(batch, &rows).map(Some)
         }
+    }
+
+    /// PrimaryKeyFileStoreTable uses nullable non-key value fields for ordinary
+    /// deduplication, while retaining the declared schema for event validation.
+    fn delete_not_null_fields(&self) -> Option<HashSet<String>> {
+        let schema = self.table.schema();
+        if self.primary_key_indices.is_empty()
+            || self.merge_engine != MergeEngine::Deduplicate
+            || schema
+                .partition_keys()
+                .iter()
+                .any(|field| !schema.primary_keys().contains(field))
+        {
+            return None;
+        }
+        let mut fields: HashSet<_> = schema.primary_keys().iter().cloned().collect();
+        fields.extend(
+            CoreOptions::new(schema.options())
+                .sequence_fields()
+                .into_iter()
+                .map(str::to_owned),
+        );
+        Some(fields)
     }
 
     pub(super) async fn write_partition_bucket_batch(
@@ -951,7 +967,26 @@ impl TableWrite {
 
     fn validate_write_batch_schema(&self, batch: &RecordBatch) -> Result<RecordBatch> {
         let projected = self.project_full_write_input(batch)?;
-        self.normalize_batch_schema(projected.as_ref().unwrap_or(batch), &self.write_schema)
+        let value_schema = self.delete_not_null_fields().map(|required| {
+            arrow_schema::Schema::new_with_metadata(
+                self.write_schema
+                    .fields()
+                    .iter()
+                    .map(|field| {
+                        if required.contains(field.name()) {
+                            field.clone()
+                        } else {
+                            Arc::new(field.as_ref().clone().with_nullable(true))
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+                self.write_schema.metadata().clone(),
+            )
+        });
+        self.normalize_batch_schema(
+            projected.as_ref().unwrap_or(batch),
+            value_schema.as_ref().unwrap_or(&self.write_schema),
+        )
     }
 
     fn normalize_batch_schema(
@@ -4795,15 +4830,14 @@ pub(in crate::table) mod tests {
         );
 
         let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
-        table_write
+        let err = table_write
             .write_arrow_batch(&make_batch_with_value_kind(vec![1], vec![10], vec![4]))
             .await
-            .unwrap();
-
-        let err = table_write.prepare_commit().await.unwrap_err();
+            .unwrap_err();
         assert!(
             matches!(err, crate::Error::DataInvalid { message, .. } if message.contains("Invalid RowKind value"))
         );
+        assert!(table_write.prepare_commit().await.unwrap().is_empty());
     }
 
     #[tokio::test]
