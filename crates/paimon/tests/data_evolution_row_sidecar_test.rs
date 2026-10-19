@@ -22,7 +22,7 @@ use common::incremental_helpers::{memory_table, persist_table_schema, setup_dirs
 use futures::TryStreamExt;
 use paimon::io::FileIO;
 use paimon::spec::{DataType, IntType, Schema, TableSchema, VarCharType};
-use paimon::table::{CommitMessage, RowRange, Table};
+use paimon::table::{CommitMessage, DataSplitBuilder, RowRange, Table};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -371,8 +371,113 @@ async fn explicit_abort_deletes_sidecar_while_writer_close_keeps_prepared_files(
 }
 
 #[tokio::test]
-async fn file_index_and_limit_do_not_turn_full_reads_into_sidecar_reads() {
+async fn bitmap_index_selection_reads_sidecar_without_primary_file() {
     use paimon::spec::{Datum, PredicateBuilder};
+    let table = table(&[
+        ("file-index.bitmap.columns", "id"),
+        ("file-index.in-manifest-threshold", "1mb"),
+    ])
+    .await;
+    append(&table, -20, 20).await;
+    let messages = append(&table, 0, 100).await;
+    assert!(messages
+        .iter()
+        .flat_map(|message| &message.new_files)
+        .all(|file| file.embedded_index.is_some()));
+    remove_primary(table.file_io(), &table, &messages).await;
+
+    for project_row_id in [false, true] {
+        for (requested_ranges, expected) in [
+            (None, vec![5]),
+            (Some(vec![RowRange::new(20, 119)]), vec![5]),
+            (Some(vec![RowRange::new(25, 27)]), vec![5]),
+            (Some(vec![RowRange::new(26, 30)]), vec![]),
+        ] {
+            let mut builder = table.new_read_builder();
+            if project_row_id {
+                builder
+                    .with_projection(&["id", "value", "_ROW_ID"])
+                    .unwrap();
+            }
+            builder.with_filter(
+                PredicateBuilder::new(table.schema().fields())
+                    .equal("id", Datum::Int(5))
+                    .unwrap(),
+            );
+            if let Some(ranges) = requested_ranges {
+                builder.with_row_ranges(ranges);
+            }
+            let plan = builder.new_scan().plan().await.unwrap();
+            let actual: Vec<RecordBatch> = builder
+                .new_read()
+                .unwrap()
+                .to_arrow(plan.splits())
+                .unwrap()
+                .try_collect()
+                .await
+                .unwrap();
+            let ids = actual
+                .iter()
+                .flat_map(|batch| {
+                    batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .unwrap()
+                        .values()
+                        .iter()
+                        .copied()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(ids, expected);
+            if project_row_id && !actual.is_empty() {
+                assert_eq!(rows(&actual), vec![(5, "v5".into(), 25)]);
+            }
+        }
+    }
+
+    // Direct split callers need not pass through ReadBuilder's range
+    // normalization. A later range must not hide an earlier bitmap hit.
+    let mut builder = table.new_read_builder();
+    builder
+        .with_projection(&["id", "value", "_ROW_ID"])
+        .unwrap();
+    builder.with_filter(
+        PredicateBuilder::new(table.schema().fields())
+            .equal("id", Datum::Int(5))
+            .unwrap(),
+    );
+    let plan = builder.new_scan().plan().await.unwrap();
+    let direct_splits = plan
+        .splits()
+        .iter()
+        .map(|split| {
+            DataSplitBuilder::new()
+                .with_snapshot(split.snapshot_id())
+                .with_partition(split.partition().clone())
+                .with_bucket(split.bucket())
+                .with_bucket_path(split.bucket_path().to_string())
+                .with_total_buckets(split.total_buckets())
+                .with_data_files(split.data_files().to_vec())
+                .with_raw_convertible(split.raw_convertible())
+                .with_row_ranges(vec![RowRange::new(80, 90), RowRange::new(25, 27)])
+                .build()
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let actual: Vec<RecordBatch> = builder
+        .new_read()
+        .unwrap()
+        .to_arrow(&direct_splits)
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(rows(&actual), vec![(5, "v5".into(), 25)]);
+}
+
+#[tokio::test]
+async fn limit_and_deletion_vectors_do_not_trigger_sidecar_reads() {
     let table = table(&[("file-index.bitmap.columns", "id")]).await;
     let messages = append(&table, 0, 100).await;
     for file in messages.iter().flat_map(|m| &m.new_files) {
@@ -388,28 +493,6 @@ async fn file_index_and_limit_do_not_turn_full_reads_into_sidecar_reads() {
             )
             .await
             .unwrap();
-    }
-    // A one-row bitmap selection must still decode the existing primary file.
-    for requested_ranges in [None, Some(vec![RowRange::new(0, 99)])] {
-        let mut builder = table.new_read_builder();
-        builder.with_filter(
-            PredicateBuilder::new(table.schema().fields())
-                .equal("id", Datum::Int(5))
-                .unwrap(),
-        );
-        if let Some(ranges) = requested_ranges {
-            builder.with_row_ranges(ranges);
-        }
-        let plan = builder.new_scan().plan().await.unwrap();
-        let actual: Vec<RecordBatch> = builder
-            .new_read()
-            .unwrap()
-            .to_arrow(plan.splits())
-            .unwrap()
-            .try_collect()
-            .await
-            .unwrap();
-        assert_eq!(actual.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
     }
     let mut builder = table.new_read_builder();
     builder.with_limit(1);
@@ -474,6 +557,20 @@ async fn file_index_and_limit_do_not_turn_full_reads_into_sidecar_reads() {
             .unwrap()
             .value(0),
         "changed"
+    );
+
+    // Keeping only one live row must not make an otherwise full read use a
+    // sidecar either. All the sidecars above are absent, but primaries remain.
+    let deletions = update.delete_by_row_id((1..100).collect()).await.unwrap();
+    table
+        .new_write_builder()
+        .new_commit()
+        .commit(deletions)
+        .await
+        .unwrap();
+    assert_eq!(
+        rows(&read(&table, None).await.unwrap()),
+        vec![(0, "changed".into(), 0)]
     );
 }
 

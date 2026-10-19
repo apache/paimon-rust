@@ -361,7 +361,7 @@ impl DataFileReader {
                         )
                     });
                     split_file_offset += file_meta.row_count;
-                    let sidecar_ranges = split_ranges.clone();
+                    let mut has_bitmap_selection = false;
                     let selected_ranges = match file_index_result {
                         FileIndexResult::Remain => split_ranges,
                         FileIndexResult::Skip => Some(Vec::new()),
@@ -370,12 +370,15 @@ impl DataFileReader {
                                 &selection,
                                 file_meta.row_count,
                             )? {
-                                Some(index_ranges) => Some(match split_ranges {
-                                    Some(split_ranges) => {
-                                        intersect_sorted_ranges(&index_ranges, &split_ranges)
-                                    }
-                                    None => index_ranges,
-                                }),
+                                Some(index_ranges) => {
+                                    has_bitmap_selection = selection.len() < file_meta.row_count as u64;
+                                    Some(match split_ranges {
+                                        Some(split_ranges) => {
+                                            intersect_sorted_ranges(&index_ranges, &split_ranges)
+                                        }
+                                        None => index_ranges,
+                                    })
+                                }
                                 None => split_ranges,
                             }
                         }
@@ -385,6 +388,13 @@ impl DataFileReader {
                         dv.as_deref(),
                         selected_ranges.as_deref(),
                     );
+                    // Like Java, only a selective bitmap allows DV to narrow
+                    // sidecar eligibility. DV alone cannot trigger a ROW read.
+                    let sidecar_ranges = if has_bitmap_selection {
+                        row_selection.clone()
+                    } else {
+                        selected_ranges
+                    };
 
                     let mut stream = reader.read_single_file_stream_with_selection(
                         &split,
@@ -480,8 +490,8 @@ impl DataFileReader {
         )
     }
 
-    /// Physical selection may be narrowed by file indexes or a LIMIT, while
-    /// Java selects the ROW sidecar from the caller's original row ranges.
+    /// The caller supplies sidecar candidates separately from physical ranges:
+    /// a selective bitmap includes DV filtering, while LIMIT never affects it.
     pub(super) fn read_single_file_stream_with_requested_ranges(
         &self,
         split: &DataSplit,

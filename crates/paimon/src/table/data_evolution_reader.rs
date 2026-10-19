@@ -477,7 +477,10 @@ impl DataEvolutionReader {
             let push_down_raw_predicates = !self.predicates.is_empty()
                 && self.row_id_index.is_none()
                 && filter_before_blob_resolution;
-            let read_raw_file_index = push_down_raw_predicates
+            // A bitmap selection preserves physical positions, including when
+            // `_ROW_ID` needs attaching before the residual predicate runs.
+            let read_file_index = !self.predicates.is_empty()
+                && filter_before_blob_resolution
                 && CoreOptions::new(&self.table_options).file_index_read_enabled();
             // A managed BLOB file fetches payloads as its batch is decoded.
             // Keep batches small and restrict predicate-free file selections
@@ -508,7 +511,9 @@ impl DataEvolutionReader {
                 if remaining == Some(0) {
                     break;
                 }
-                let row_ranges = split.row_ranges().map(|r| r.to_vec());
+                let row_ranges = split
+                    .row_ranges()
+                    .map(|ranges| crate::table::merge_row_ranges(ranges.to_vec()));
                 // A chunk may span several disjoint row-id groups while one
                 // group still needs column-wise merging. Process each aligned
                 // group independently; treating the whole chunk as one merge
@@ -541,10 +546,8 @@ impl DataEvolutionReader {
                             let has_row_id = file_meta.first_row_id.is_some();
                             let requested_row_ranges = if has_row_id { row_ranges.clone() } else { None };
                             let mut effective_row_ranges = requested_row_ranges.clone();
-                            if read_raw_file_index {
-                                // Independent files can apply a physical row selection
-                                // before decoding. Column-merge groups cannot: an older
-                                // file may hold values still needed by a newer file.
+                            let mut has_bitmap_selection = false;
+                            if read_file_index {
                                 match evaluate_file_index(
                                     &self.file_io,
                                     split.bucket_path(),
@@ -560,6 +563,7 @@ impl DataEvolutionReader {
                                                 &selection,
                                                 file_meta.row_count,
                                             )? {
+                                            has_bitmap_selection = selection.len() < file_meta.row_count as u64;
                                             let base = file_meta.first_row_id.unwrap_or(0);
                                             let index_ranges = local_ranges
                                                 .into_iter()
@@ -578,6 +582,18 @@ impl DataEvolutionReader {
                                     FileIndexResult::Remain => {}
                                 }
                             }
+                            // Java applies DV to a selective bitmap before
+                            // choosing ROW. DV alone and LIMIT cannot trigger it.
+                            let sidecar_row_ranges = if has_bitmap_selection {
+                                selected_absolute_row_ranges_for_file(
+                                    file_meta.first_row_id.unwrap_or(0),
+                                    file_meta.row_count,
+                                    effective_row_ranges.as_deref(),
+                                    deletion_vector.as_deref(),
+                                )?
+                            } else {
+                                effective_row_ranges.clone()
+                            };
                             if self.predicates.is_empty() {
                                 if let Some(left) = remaining {
                                     let selected = selected_absolute_row_ranges_for_file(
@@ -628,7 +644,7 @@ impl DataEvolutionReader {
                                 data_fields,
                                 deletion_vector,
                                 effective_row_ranges,
-                                requested_row_ranges,
+                                sidecar_row_ranges,
                             )?;
                             while remaining != Some(0) {
                                 let Some(batch) = stream.next().await else { break };
@@ -659,6 +675,35 @@ impl DataEvolutionReader {
                         }
                     } else {
                         let prepared_group = PreparedMergeGroup::new(&files)?;
+                        let mut indexed_row_ranges = row_ranges.clone();
+                        let mut has_bitmap_selection = false;
+                        if read_file_index {
+                            match self.evaluate_group_file_indexes(&split, &prepared_group).await? {
+                                FileIndexResult::Skip => continue,
+                                FileIndexResult::Selection(selection) => {
+                                    if let Some(local_ranges) = file_index_selection_to_local_ranges(
+                                        &selection,
+                                        prepared_group.logical_row_count,
+                                    )? {
+                                        has_bitmap_selection = selection.len() < prepared_group.logical_row_count as u64;
+                                        let index_ranges = local_ranges.into_iter().map(|range| {
+                                            RowRange::new(
+                                                prepared_group.first_row_id + range.from(),
+                                                prepared_group.first_row_id + range.to(),
+                                            )
+                                        }).collect::<Vec<_>>();
+                                        indexed_row_ranges = Some(match indexed_row_ranges {
+                                            Some(ref ranges) => intersect_local_ranges(ranges, &index_ranges),
+                                            None => index_ranges,
+                                        });
+                                    }
+                                }
+                                FileIndexResult::Remain => {}
+                            }
+                        }
+                        if indexed_row_ranges.as_ref().is_some_and(Vec::is_empty) {
+                            continue;
+                        }
                         let anchor_deletion_vector = read_anchor_deletion_vector(
                             &self.file_io,
                             &split,
@@ -668,11 +713,19 @@ impl DataEvolutionReader {
                         let mut selected_ranges = selected_absolute_row_ranges_for_file(
                             prepared_group.first_row_id,
                             prepared_group.logical_row_count,
-                            row_ranges.as_deref(),
+                            indexed_row_ranges.as_deref(),
                             anchor_deletion_vector
                                 .as_ref()
                                 .map(|ctx| ctx.deletion_vector.as_ref()),
                         )?;
+                        // Every provider shares the DV-aware bitmap. Without
+                        // a selective bitmap, only caller ranges choose ROW.
+                        // LIMIT never changes sidecar eligibility.
+                        let sidecar_row_ranges = if has_bitmap_selection {
+                            selected_ranges.clone()
+                        } else {
+                            indexed_row_ranges.clone()
+                        };
                         let effective_row_ranges = if self.predicates.is_empty() {
                             if let Some(left) = remaining {
                                 selected_ranges = Some(prefix_row_ranges(
@@ -683,10 +736,10 @@ impl DataEvolutionReader {
                                 ));
                                 selected_ranges.clone()
                             } else {
-                                row_ranges.clone()
+                                indexed_row_ranges.clone()
                             }
                         } else {
-                            row_ranges.clone()
+                            indexed_row_ranges
                         };
                         let expected_output_rows = match selected_ranges.as_ref() {
                             Some(ranges) => ranges.iter().map(|r| r.count() as usize).sum(),
@@ -711,7 +764,7 @@ impl DataEvolutionReader {
                             &split,
                             &prepared_group,
                             effective_row_ranges,
-                            row_ranges.clone(),
+                            sidecar_row_ranges,
                             expected_output_rows,
                             anchor_deletion_vector,
                         )?;
@@ -942,6 +995,83 @@ impl DataEvolutionReader {
             &self.blob_read_limiter,
         )
         .await
+    }
+
+    /// Evaluate only the fields each normal file wins in the merged row.
+    ///
+    /// The group is newest first. A newer writer claims its fields even when
+    /// it has no index, so an obsolete value can never reject a live row.
+    async fn evaluate_group_file_indexes(
+        &self,
+        split: &DataSplit,
+        group: &PreparedMergeGroup,
+    ) -> crate::Result<FileIndexResult> {
+        // Dedicated sources may cover only part of the normal files' range.
+        // Like Java, they prevent a shared positional bitmap selection.
+        let can_select = group.files.iter().all(|file| {
+            !is_blob_or_video_file_name(&file.file_name)
+                && !is_vector_store_file_name(&file.file_name)
+        });
+        let mut claimed = HashSet::new();
+        let mut result = FileIndexResult::Remain;
+        for file in &group.files {
+            if is_blob_or_video_file_name(&file.file_name)
+                || is_vector_store_file_name(&file.file_name)
+            {
+                continue;
+            }
+            let (data_fields, _) = raw_file_physical_fields(
+                &self.schema_manager,
+                self.table_schema_id,
+                &self.table_fields,
+                file,
+            )
+            .await?;
+            let data_fields = data_fields.as_deref().unwrap_or(&self.table_fields);
+            let winning_ids = data_fields
+                .iter()
+                .filter_map(|field| claimed.insert(field.id()).then_some(field.id()))
+                .collect::<HashSet<_>>();
+            let mapping = self
+                .table_fields
+                .iter()
+                .enumerate()
+                .map(|(index, field)| {
+                    // Partition values come from the split. A partially written
+                    // ROW can have several providers for its parent nullness.
+                    (winning_ids.contains(&field.id())
+                        && !matches!(field.data_type(), DataType::Row(_))
+                        && !self.partition_fields.iter().any(|p| p.id() == field.id()))
+                    .then_some(index)
+                })
+                .collect::<Vec<_>>();
+            let predicates = self
+                .predicates
+                .iter()
+                .filter_map(|predicate| predicate.project_field_index_inclusive(&mapping))
+                .collect::<Vec<_>>();
+            let file_result = evaluate_file_index(
+                &self.file_io,
+                split.bucket_path(),
+                file,
+                &self.table_fields,
+                data_fields,
+                &predicates,
+            )
+            .await?;
+            if !file_result.remain() {
+                return Ok(FileIndexResult::Skip);
+            }
+            if can_select {
+                // Each file contributes a necessary condition, so intersect
+                // candidates rather than independently filtering its stream.
+                result = result.and(file_result);
+                if !result.remain() {
+                    return Ok(FileIndexResult::Skip);
+                }
+            }
+        }
+        Ok(result)
     }
 
     /// Merge multiple logical sources column-wise for data evolution.
