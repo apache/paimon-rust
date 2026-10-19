@@ -280,6 +280,7 @@ async fn vector_rerank_fixture(
         schema_manager,
         schema_id,
         read_fields.clone(),
+        |fields| Ok(fields.to_vec()),
         read_fields,
         Vec::new(),
     );
@@ -593,6 +594,7 @@ async fn rerank_aligns_recomputed_distance_by_position_column() {
         schema_manager,
         schema_id,
         read_fields.clone(),
+        |fields| Ok(fields.to_vec()),
         read_fields.clone(),
         Vec::new(),
     );

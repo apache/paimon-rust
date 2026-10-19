@@ -86,10 +86,10 @@ impl<'a> GlobalIndexResultReadBuilder<'a> {
                     table.schema_manager().clone(),
                     table.schema().id(),
                     table.schema().fields().to_vec(),
+                    table.data_fields_extractor(),
                     read_type,
                     Vec::new(),
                 )
-                .with_primary_key_schema(table.schema())
                 .with_table_options(table.schema().options().clone());
                 materialize_positions(positions, &splits, &reader).await
             }

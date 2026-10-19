@@ -105,10 +105,10 @@ impl FullTextRead {
                 plan.table.schema_manager().clone(),
                 plan.table.schema().id(),
                 plan.table.schema().fields().to_vec(),
+                plan.table.data_fields_extractor(),
                 plan.table.schema().fields().to_vec(),
                 Vec::new(),
             )
-            .with_primary_key_schema(plan.table.schema())
             .with_table_options(plan.table.schema().options().clone());
             let read = PrimaryKeyFullTextRead::new(
                 plan.table.file_io().clone(),

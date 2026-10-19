@@ -404,6 +404,23 @@ impl Table {
         &self.schema
     }
 
+    pub(crate) fn data_fields_extractor(
+        &self,
+    ) -> impl Fn(&[DataField]) -> Result<Vec<DataField>> + Send + Sync + 'static {
+        let primary_key = !self.schema.primary_keys().is_empty();
+        let key_value_fields = kv_file_reader::key_value_fields_extractor(
+            self.schema.fields(),
+            &self.schema.trimmed_primary_keys(),
+        );
+        move |fields| {
+            if primary_key {
+                key_value_fields(fields)
+            } else {
+                Ok(fields.to_vec())
+            }
+        }
+    }
+
     /// Get the FileIO instance for this table.
     pub fn file_io(&self) -> &FileIO {
         &self.file_io

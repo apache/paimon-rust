@@ -186,6 +186,41 @@ fn ensure_merge_input_limit(input_stream_count: usize, limit: Option<usize>) -> 
 
 /// Java's `KeyValueFieldsExtractor` builds the physical file layout from the
 /// schema that wrote the file, including its historical key names and types.
+pub(super) fn key_value_fields_extractor(
+    table_fields: &[DataField],
+    primary_keys: &[String],
+) -> impl Fn(&[DataField]) -> crate::Result<Vec<DataField>> + Send + Sync + 'static {
+    let key_ids = primary_keys
+        .iter()
+        .map(|name| {
+            table_fields
+                .iter()
+                .find(|field| field.name() == name)
+                .map(DataField::id)
+        })
+        .collect::<Option<Vec<_>>>();
+    move |file_fields| {
+        let key_ids = key_ids.as_ref().ok_or_else(|| Error::DataInvalid {
+            message: "KV key field is absent from the table schema".to_string(),
+            source: None,
+        })?;
+        let names = key_ids
+            .iter()
+            .map(|id| {
+                file_fields
+                    .iter()
+                    .find(|field| field.id() == *id)
+                    .map(|field| field.name().to_string())
+                    .ok_or_else(|| Error::DataInvalid {
+                        message: format!("KV key field id {id} is absent from the file schema"),
+                        source: None,
+                    })
+            })
+            .collect::<crate::Result<Vec<_>>>()?;
+        key_value_data_schema_fields(file_fields, &names)
+    }
+}
+
 pub(super) fn key_value_data_schema_fields(
     file_fields: &[DataField],
     trimmed_primary_keys: &[String],
@@ -683,6 +718,7 @@ impl KeyValueFileReader {
                             config.schema_manager.clone(),
                             table_schema_id,
                             config.table_fields.clone(),
+                            key_value_fields_extractor(&config.table_fields, &config.primary_keys),
                             internal_read_type.clone(),
                             pushdown_predicates.clone(),
                         )
@@ -1218,10 +1254,10 @@ mod tests {
                 table.schema_manager().clone(),
                 table.schema().id(),
                 table.schema().fields().to_vec(),
+                table.data_fields_extractor(),
                 table.schema().fields().to_vec(),
                 Vec::new(),
             )
-            .with_primary_key_schema(table.schema())
             .read_single_file_stream_local(
                 &split,
                 file.clone(),

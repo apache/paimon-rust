@@ -298,10 +298,10 @@ async fn search_pk_raw_candidates_batch_with_plan(
         table.schema_manager().clone(),
         table.schema().id(),
         table.schema().fields().to_vec(),
+        table.data_fields_extractor(),
         vec![vector_field.clone()],
         Vec::new(),
     )
-    .with_primary_key_schema(table.schema())
     .with_table_options(table.schema().options().clone());
 
     // Real ANN scorer + loader. Each segment source is opened lazily inside its
@@ -549,10 +549,10 @@ async fn search_pk_candidates_batch_with_plan(
                 table.schema_manager().clone(),
                 table.schema().id(),
                 table.schema().fields().to_vec(),
+                table.data_fields_extractor(),
                 vec![vector_field.clone()],
                 Vec::new(),
             )
-            .with_primary_key_schema(table.schema())
             .with_table_options(table.schema().options().clone());
             rerank_indexed_positional(
                 &rerank_reader,
@@ -608,10 +608,10 @@ pub(super) async fn filtered_row_ranges(
                     table.schema_manager().clone(),
                     table.schema().id(),
                     table.schema().fields().to_vec(),
+                    table.data_fields_extractor(),
                     residual_read_type,
                     Vec::new(),
                 )
-                .with_primary_key_schema(table.schema())
                 .with_table_options(table.schema().options().clone());
                 let mut per_split = Vec::with_capacity(plan.splits.len());
                 for (index, split) in plan.splits.iter().enumerate() {
