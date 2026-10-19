@@ -1680,46 +1680,51 @@ mod tests {
                 None,
             ));
             let locals = PyDict::new(py);
-            for (kind, id, payload, error_column) in [
-                ("-D", Some(1), None, None),
-                ("-U", Some(1), None, Some("payload")),
-                ("+I", Some(1), None, Some("payload")),
-                ("-D", None, Some(42), Some("id")),
-            ] {
-                locals.set_item("kind", kind).unwrap();
-                locals.set_item("row_id", id).unwrap();
-                locals.set_item("payload", payload).unwrap();
-                py.run(
-                    c_str!(
-                        r#"
+            for large_string in [false, true] {
+                locals.set_item("large_string", large_string).unwrap();
+                for (kind, id, payload, error_column) in [
+                    ("-D", Some(1), None, None),
+                    ("-U", Some(1), None, Some("payload")),
+                    ("+I", Some(1), None, Some("payload")),
+                    ("-D", None, Some(42), Some("id")),
+                ] {
+                    locals.set_item("kind", kind).unwrap();
+                    locals.set_item("row_id", id).unwrap();
+                    locals.set_item("payload", payload).unwrap();
+                    py.run(
+                        c_str!(
+                            r#"
 import pyarrow as pa
 schema = pa.schema([
     pa.field('id', pa.int32(), nullable=False),
-    pa.field('op', pa.string()),
+    pa.field('op', pa.large_string() if large_string else pa.string()),
     pa.field('payload', pa.int32(), nullable=False),
 ])
 batch = pa.RecordBatch.from_pylist([
     {'id': row_id, 'op': kind, 'payload': payload},
 ], schema=schema)
 "#
-                    ),
-                    None,
-                    Some(&locals),
-                )
-                .unwrap();
-                let batch = locals.get_item("batch").unwrap().unwrap();
-                let mut state = WriteContext::new(table.clone()).new_write(false).unwrap();
-                let result = state.write_arrow(py, &batch, None);
-                if let Some(column) = error_column {
-                    let error = result.unwrap_err().to_string();
-                    assert!(
-                        error.contains(&format!("Cannot write null to non-null column({column})")),
-                        "{error}"
-                    );
-                } else {
-                    result.unwrap();
+                        ),
+                        None,
+                        Some(&locals),
+                    )
+                    .unwrap();
+                    let batch = locals.get_item("batch").unwrap().unwrap();
+                    let mut state = WriteContext::new(table.clone()).new_write(false).unwrap();
+                    let result = state.write_arrow(py, &batch, None);
+                    if let Some(column) = error_column {
+                        let error = result.unwrap_err().to_string();
+                        assert!(
+                            error.contains(&format!(
+                                "Cannot write null to non-null column({column})"
+                            )),
+                            "{error}"
+                        );
+                    } else {
+                        result.unwrap();
+                    }
+                    assert!(state.prepare_commit(py).unwrap().is_empty());
                 }
-                assert!(state.prepare_commit(py).unwrap().is_empty());
             }
         });
     }
