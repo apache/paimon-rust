@@ -153,8 +153,10 @@ checksum = "36fa98bc79671c7981272d91a8753a928ff6a1cd8e4f20a44c45bd5d313840bf"
 dependencies = [
  "bigdecimal",
  "bon",
+ "bzip2",
  "crc32fast",
  "digest 0.10.7",
+ "liblzma",
  "log",
  "miniz_oxide",
  "num-bigint",
@@ -4680,6 +4682,7 @@ dependencies = [
  "lexical-write-float",
  "libc",
  "libloading 0.9.0",
+ "liblzma",
  "log",
  "lru 0.18.2",
  "lz4_flex 0.13.1",

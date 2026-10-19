@@ -39,6 +39,8 @@ pub enum OcfCodec {
     Deflate,
     Snappy,
     Zstandard,
+    Bzip2,
+    Xz,
 }
 
 /// A single data block from the OCF.
@@ -117,16 +119,8 @@ impl<'a> OcfBlockIter<'a> {
             OcfCodec::Deflate => {
                 // The Avro `deflate` codec is raw DEFLATE (RFC 1951), with no
                 // zlib or gzip wrapper.
-                use std::io::Read;
-                let mut decoder = flate2::read::DeflateDecoder::new(data);
-                let mut decompressed = Vec::new();
-                decoder
-                    .read_to_end(&mut decompressed)
-                    .map_err(|e| Error::UnexpectedError {
-                        message: format!("avro ocf: deflate decompression failed: {e}"),
-                        source: None,
-                    })?;
-                Ok(Cow::Owned(decompressed))
+                read_decompressed("deflate", flate2::read::DeflateDecoder::new(data))
+                    .map(Cow::Owned)
             }
             OcfCodec::Snappy => {
                 if data.len() < 4 {
@@ -163,8 +157,28 @@ impl<'a> OcfBlockIter<'a> {
                     })?;
                 Ok(Cow::Owned(decompressed))
             }
+            // The apache-avro decoders unwrap I/O errors for these two codecs.
+            // Read them directly so corrupt manifests return an error instead
+            // of panicking during a scan or commit.
+            OcfCodec::Bzip2 => {
+                read_decompressed("bzip2", bzip2::read::BzDecoder::new(data)).map(Cow::Owned)
+            }
+            OcfCodec::Xz => {
+                read_decompressed("xz", liblzma::read::XzDecoder::new(data)).map(Cow::Owned)
+            }
         }
     }
+}
+
+fn read_decompressed(codec: &str, mut decoder: impl std::io::Read) -> crate::Result<Vec<u8>> {
+    let mut decompressed = Vec::new();
+    decoder
+        .read_to_end(&mut decompressed)
+        .map_err(|e| Error::UnexpectedError {
+            message: format!("avro ocf: {codec} decompression failed: {e}"),
+            source: None,
+        })?;
+    Ok(decompressed)
 }
 
 /// Parse an Avro OCF header and return a streaming block iterator.
@@ -194,6 +208,8 @@ pub fn parse_ocf_streaming(bytes: &[u8]) -> crate::Result<(OcfHeader, OcfBlockIt
         Some("deflate") => OcfCodec::Deflate,
         Some("snappy") => OcfCodec::Snappy,
         Some("zstandard") => OcfCodec::Zstandard,
+        Some("bzip2") => OcfCodec::Bzip2,
+        Some("xz") => OcfCodec::Xz,
         Some(other) => {
             return Err(Error::UnexpectedError {
                 message: format!("avro ocf: unsupported codec: {other}"),

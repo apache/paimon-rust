@@ -96,6 +96,23 @@ pub fn parse_partition_spec_value(
         | DataType::Decimal(_) => {}
         _ => return Err(invalid()),
     }
+    if matches!(data_type, DataType::Timestamp(ty) if ty.precision() == 0) {
+        let digits = text.strip_prefix('-').unwrap_or(text);
+        if !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()) {
+            // Java converts numeric seconds with long multiplication. Overflow
+            // can leave subsecond milliseconds, which a partition Datum can
+            // retain even though an Arrow second-precision array cannot.
+            return text
+                .parse::<i64>()
+                .map(|seconds| {
+                    Some(Datum::Timestamp {
+                        millis: seconds.wrapping_mul(1_000),
+                        nanos: 0,
+                    })
+                })
+                .map_err(|_| invalid());
+        }
+    }
     let input: ArrayRef = Arc::new(StringArray::from(vec![text]));
     let array = crate::arrow::cast_array_for_schema_evolution(
         &input,
@@ -163,14 +180,19 @@ fn parse_time_spec(text: &str) -> crate::Result<i32> {
         }
         None => (0, ""),
     };
-    // Java's fraction parser rounds using the fourth character.
+    // Java's fraction parser counts UTF-16 code units, including the fourth
+    // unit used for rounding. Supplementary characters occupy two positions.
     let mut millis = 0;
-    let mut chars = fraction.chars();
+    let mut chars = fraction.encode_utf16();
     for multiplier in [100, 10, 1] {
         let Some(ch) = chars.next() else { break };
-        millis += ch.to_digit(10).filter(|_| ch.is_ascii()).unwrap_or(0) as i32 * multiplier;
+        let digit = ch
+            .checked_sub(u16::from(b'0'))
+            .filter(|digit| *digit < 10)
+            .unwrap_or(0);
+        millis += i32::from(digit) * multiplier;
     }
-    if chars.next().is_some_and(|ch| ch >= '5') {
+    if chars.next().is_some_and(|ch| ch >= u16::from(b'5')) {
         millis += 1;
     }
     Ok(hours
@@ -204,6 +226,43 @@ mod tests {
         let time = DataType::Time(TimeType::new(3).unwrap());
         for value in ["12:34+02:30", "12+02:30"] {
             assert!(parse_partition_spec_value(value, &time).is_err());
+        }
+    }
+
+    #[test]
+    fn time_partition_fractions_use_java_utf16_character_positions() {
+        let time = DataType::Time(TimeType::new(3).unwrap());
+        for (text, millis) in [
+            ("12:34:56.😀123", 45_296_001),
+            ("12:34:56.1😀23", 45_296_100),
+            ("12:34:56.12😀3", 45_296_121),
+            ("12:34:56.123😀", 45_296_124),
+        ] {
+            assert_eq!(
+                parse_partition_spec_value(text, &time).unwrap(),
+                Some(Datum::Time(millis)),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn numeric_second_precision_partition_specs_keep_java_wrapped_milliseconds() {
+        let data_type = DataType::Timestamp(TimestampType::new(0).unwrap());
+        for (text, millis) in [
+            ("18446744073709552", 384),
+            ("-18446744073709552", -384),
+            ("9223372036854775807", -1000),
+            ("1", 1000),
+        ] {
+            assert_eq!(
+                parse_partition_spec_value(text, &data_type).unwrap(),
+                Some(Datum::Timestamp { millis, nanos: 0 }),
+                "{text}"
+            );
+        }
+        for text in ["9223372036854775808", "+1", "1.5"] {
+            assert!(parse_partition_spec_value(text, &data_type).is_err());
         }
     }
 

@@ -24,6 +24,9 @@ mod manifest_file_meta_decode;
 pub mod ocf;
 pub mod schema;
 
+#[cfg(test)]
+mod codec_tests;
+
 use cursor::AvroCursor;
 use decode::AvroRecordDecode;
 use ocf::parse_ocf_streaming;
