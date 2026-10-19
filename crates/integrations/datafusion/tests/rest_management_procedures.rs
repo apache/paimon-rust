@@ -652,6 +652,32 @@ async fn test_non_rest_catalog_is_rejected_by_every_procedure() {
 }
 
 #[tokio::test]
+async fn test_reset_consumer_rejected_on_rest_catalog_without_changing_progress() {
+    let (tmp, server, context) = setup().await;
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .build()
+        .unwrap();
+    let path = format!("file://{}/{DATABASE}.db/{TABLE}", tmp.path().display());
+    server.add_table_with_schema(DATABASE, TABLE, schema, &path);
+    let consumer_path = tmp
+        .path()
+        .join(format!("{DATABASE}.db/{TABLE}/consumer/consumer-job"));
+    std::fs::create_dir_all(consumer_path.parent().unwrap()).unwrap();
+    let original = br#"{"nextSnapshot":2}"#;
+    std::fs::write(&consumer_path, original).unwrap();
+
+    for snapshot in ["", ", next_snapshot_id => 1"] {
+        common::assert_sql_error(
+            &context,
+            &format!("CALL sys.reset_consumer(table => '{DATABASE}.{TABLE}', consumer_id => 'job'{snapshot})"),
+            "reset_consumer is not supported for tables managed by a REST catalog",
+        ).await;
+        assert_eq!(std::fs::read(&consumer_path).unwrap(), original);
+    }
+}
+
+#[tokio::test]
 async fn test_rename_branch_rejected_on_rest_catalog() {
     // A REST catalog is authoritative for branch metadata and has no rename
     // endpoint, so `rename_branch` must refuse rather than move the physical
