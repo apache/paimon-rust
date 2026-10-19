@@ -3305,7 +3305,7 @@ pub(in crate::table) mod tests {
             ];
             if format == "row" {
                 let key = table.schema().fields()[0].clone();
-                let key_id = key.id() + 1_000_000;
+                let key_id = key.id() + crate::spec::KEY_FIELD_ID_START;
                 physical_fields.insert(0, key.with_name("_KEY_id".into()).with_id(key_id));
             }
             let format_reader = create_format_reader(&file_path, false, &physical_fields).unwrap();

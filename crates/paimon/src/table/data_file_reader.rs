@@ -1786,7 +1786,11 @@ mod row_tests {
             field(1, "id", DataType::Int(IntType::new())),
             field(2, "value", DataType::Int(IntType::new())),
         ];
-        let physical = vec![field(1_000_001, "_KEY_id", DataType::Int(IntType::new()))];
+        let physical = vec![field(
+            1 + crate::spec::KEY_FIELD_ID_START,
+            "_KEY_id",
+            DataType::Int(IntType::new()),
+        )];
         assert_eq!(
             data_schema_fields_for_file(&fields, None, None).unwrap(),
             fields

@@ -1,0 +1,71 @@
+{
+  "version": 3,
+  "id": 0,
+  "fields": [
+    {
+      "id": 0,
+      "name": "id",
+      "type": "INT NOT NULL"
+    },
+    {
+      "id": 1,
+      "name": "payload",
+      "type": "VARIANT"
+    },
+    {
+      "id": 2,
+      "name": "nested",
+      "type": {
+        "type": "ROW",
+        "fields": [
+          {
+            "id": 10,
+            "name": "payload",
+            "type": "VARIANT"
+          },
+          {
+            "id": 11,
+            "name": "note",
+            "type": "STRING"
+          }
+        ],
+        "nullable": true
+      }
+    },
+    {
+      "id": 3,
+      "name": "items",
+      "type": {
+        "type": "ARRAY",
+        "element": "VARIANT",
+        "nullable": true
+      }
+    },
+    {
+      "id": 4,
+      "name": "attrs",
+      "type": {
+        "type": "MAP",
+        "key": "STRING",
+        "value": "VARIANT",
+        "nullable": true
+      }
+    },
+    {
+      "id": 5,
+      "name": "extra",
+      "type": "VARIANT"
+    }
+  ],
+  "highestFieldId": 11,
+  "partitionKeys": [],
+  "primaryKeys": [
+    "id"
+  ],
+  "options": {
+    "file.format": "row",
+    "bucket": "1"
+  },
+  "comment": null,
+  "timeMillis": 1
+}

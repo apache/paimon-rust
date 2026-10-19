@@ -1208,6 +1208,10 @@ fn move_reference(mv: &ColumnMove) -> crate::Result<&str> {
         })
 }
 
+/// Must match Java Paimon's `SpecialFields.KEY_FIELD_ID_START`. Duplicated
+/// primary-key fields belong to reserved ID space, outside all user fields.
+pub(crate) const KEY_FIELD_ID_START: i32 = i32::MAX / 2;
+
 pub const ROW_ID_FIELD_NAME: &str = "_ROW_ID";
 
 pub const ROW_ID_FIELD_ID: i32 = i32::MAX - 5;

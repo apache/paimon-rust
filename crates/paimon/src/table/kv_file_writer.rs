@@ -36,7 +36,7 @@ use crate::spec::stats::{compute_column_stats, BinaryTableStats};
 use crate::spec::{
     data_file_to_file_index_file_name, extract_datum_from_arrow, AggregationConfig, BigIntType,
     BinaryRowBuilder, CoreOptions, DataField, DataFileMeta, DataType, MergeEngine,
-    PartialUpdateConfig, RowKind, TinyIntType, SEQUENCE_NUMBER_FIELD_ID,
+    PartialUpdateConfig, RowKind, TinyIntType, KEY_FIELD_ID_START, SEQUENCE_NUMBER_FIELD_ID,
     SEQUENCE_NUMBER_FIELD_NAME, VALUE_KIND_FIELD_ID, VALUE_KIND_FIELD_NAME,
 };
 use crate::table::data_file_index_writer::FileIndexOptions;
@@ -239,7 +239,7 @@ impl KeyValueFileWriter {
                 .map(|(index, &source)| {
                     let field = physical_fields[source].clone();
                     if index < key_count {
-                        let id = field.id() + 1_000_000;
+                        let id = field.id() + KEY_FIELD_ID_START;
                         field
                             .with_id(id)
                             .with_name(projection.schema.field(index).name().clone())
@@ -1557,7 +1557,7 @@ mod tests {
                         value_fields[0]
                             .clone()
                             .with_name("_KEY_id".into())
-                            .with_id(1_000_000),
+                            .with_id(KEY_FIELD_ID_START),
                     );
                     let bytes = io.new_input(&path).unwrap().read().await.unwrap();
                     assert_eq!(bytes[bytes.len() - 8], 1);
