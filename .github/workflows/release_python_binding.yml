@@ -136,6 +136,14 @@ jobs:
           cargo fetch --locked
           python3 scripts/release_licenses.py --stage-python ${{ matrix.rust_target }}
 
+      - name: Checkout OSS C++ SDK
+        if: runner.os == 'Linux'
+        uses: actions/checkout@v7
+        with:
+          repository: aliyun/alibabacloud-oss-cpp-sdk-v2
+          ref: c13a82038b0696f99c32f4e86b623ffcc9e62140
+          path: .oss-cpp-sdk
+
       - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
           maturin-version: v1.14.1
@@ -147,7 +155,7 @@ jobs:
           before-script-linux: |
             # Install OpenSSL for x86_64 (manylinux2014 with OpenSSL 1.1)
             if [ "${{ matrix.rust_target }}" = "x86_64-unknown-linux-gnu" ]; then
-              yum install -y openssl11-devel
+              yum install -y openssl11-devel openssl11-static
               # Create symlinks so pkg-config finds openssl11 as openssl
               ln -sf /usr/lib64/pkgconfig/openssl11.pc /usr/lib64/pkgconfig/openssl.pc
               ln -sf /usr/lib64/pkgconfig/libssl11.pc /usr/lib64/pkgconfig/libssl.pc
@@ -206,8 +214,28 @@ jobs:
               export CFLAGS_aarch64_unknown_linux_gnu="-D__ARM_ARCH=8"
             fi
 
+            bash ../../scripts/build_python_oss_cpp_bridge.sh \
+              "${{ matrix.rust_target }}"
+
       - name: Verify wheel
         run: python scripts/verify_python_wheels.py --allow-partial bindings/python/dist
+
+      - name: Load bundled OSS C++ bridge
+        if: matrix.rust_target == 'x86_64-unknown-linux-gnu'
+        run: |
+          python3 - <<'PY'
+          import ctypes
+          import glob
+          import tempfile
+          import zipfile
+          from pathlib import Path
+
+          wheel, = glob.glob('bindings/python/dist/*.whl')
+          with zipfile.ZipFile(wheel) as archive, tempfile.TemporaryDirectory() as temp:
+              bridge = Path(temp) / 'liboss_cpp_bridge.so'
+              bridge.write_bytes(archive.read('pypaimon_rust/liboss_cpp_bridge.so'))
+              assert ctypes.CDLL(str(bridge)).oss_cpp_bridge_abi_version() == 2
+          PY
 
       - name: Upload wheels
         uses: actions/upload-artifact@v7

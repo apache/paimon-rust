@@ -199,6 +199,9 @@ def verify_license_report(content: bytes, target: str, description: str) -> None
     )
     for marker in markers:
         require(marker in content, f"{description} is missing {marker!r}")
+    if target.endswith("linux-gnu"):
+        for marker in (b'id="bundled-oss-cpp-sdk"', b'id="bundled-curl-8.13.0"'):
+            require(marker in content, f"{description} is missing {marker!r}")
 
 
 def parse_metadata(content: bytes, description: str) -> Message:
@@ -466,6 +469,16 @@ def verify_wheel(path: Path) -> tuple[str, str]:
             name for name in names if name != native_member and is_native_library(name)
         ]
         if target.endswith("linux-gnu"):
+            bridge = "pypaimon_rust/liboss_cpp_bridge.so"
+            require(
+                bridge in extra_native_members,
+                f"wheel is missing OSS C++ bridge: {path.name}",
+            )
+            with archive.open(bridge) as bridge_file:
+                verify_native_header(
+                    bridge_file.read(65536), target, f"{path.name}:{bridge}"
+                )
+            extra_native_members.remove(bridge)
             openssl_version = (
                 b"OpenSSL 1.1.1k  FIPS"
                 if target.startswith("x86_64")

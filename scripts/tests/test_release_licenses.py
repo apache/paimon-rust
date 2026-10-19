@@ -22,8 +22,10 @@ from pathlib import Path
 from scripts.release_licenses import (
     LicenseCorrection,
     PYTHON_MIT_CORRECTIONS,
+    Report,
     binary_notice,
     correction_html,
+    oss_cpp_wheel_licenses,
     resolved_packages,
 )
 
@@ -215,6 +217,20 @@ class ResolvedPackagesTest(unittest.TestCase):
             notice = binary_notice(root, [metadata])
             self.assertIn("Required dependency notice", notice)
             self.assertNotIn("Optional dependency notice", notice)
+
+
+class OssCppWheelLicensesTest(unittest.TestCase):
+    def test_only_linux_python_wheels_include_sdk_and_curl(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        for target, expected in (
+            ("x86_64-unknown-linux-gnu", True),
+            ("aarch64-unknown-linux-gnu", True),
+            ("aarch64-apple-darwin", False),
+        ):
+            report = Report("python", "bindings/python/Cargo.toml", target, "unused")
+            text = oss_cpp_wheel_licenses(root, report)
+            self.assertEqual('id="bundled-oss-cpp-sdk"' in text, expected)
+            self.assertEqual('id="bundled-curl-8.13.0"' in text, expected)
 
 
 if __name__ == "__main__":

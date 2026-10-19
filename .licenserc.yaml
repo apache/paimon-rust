@@ -31,6 +31,8 @@ header:
     - "bindings/go/tests/testdata/**"
     - "third-party-licenses/jieba-rs-0.10.3.LICENSE"
     - "third-party-licenses/openssl-1.1.1.LICENSE"
+    - "third-party-licenses/oss-cpp-sdk-v2.THIRD_PARTY_NOTICES"
+    - "third-party-licenses/curl-8.13.0.COPYING"
     - "**/go.sum"
     - "**/DEPENDENCIES.*.tsv"
     - ".devcontainer/devcontainer.json"
