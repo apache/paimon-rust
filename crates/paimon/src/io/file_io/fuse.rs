@@ -64,7 +64,7 @@ impl FileIO {
     /// metadata, listings and REST requests. Only component-boundary matches
     /// are translated; unrelated paths retain their existing storage provider.
     /// The caller resolves and validates the mount before supplying this map.
-    pub fn with_fuse(self, original: &str, local: &str) -> crate::Result<Self> {
+    pub(crate) fn with_fuse(self, original: &str, local: &str) -> crate::Result<Self> {
         let original = original.trim_end_matches('/');
         if original.is_empty() || !std::path::Path::new(local).is_absolute() {
             return Err(Error::ConfigInvalid {
@@ -106,9 +106,9 @@ mod tests {
 
         let mount = tempfile::tempdir().unwrap();
         let root = "oss://bucket/warehouse/table";
-        let base = FileIOBuilder::new("memory").build().unwrap();
-        let io = base
-            .clone()
+        let io = FileIOBuilder::new("memory")
+            .build()
+            .unwrap()
             .with_fuse(root, mount.path().to_str().unwrap())
             .unwrap();
         let schema = Schema::builder()
@@ -116,14 +116,13 @@ mod tests {
             .build()
             .unwrap();
         let table = Table::new(
-            base,
+            io.clone(),
             Identifier::new("db", "table"),
             root.into(),
             TableSchema::new(0, &schema),
             None,
-        )
-        .copy_with_file_io(io.clone());
-        // SchemaManager must follow the replacement FileIO as well as data I/O.
+        );
+        // Construction binds schema and data I/O to the same provider.
         let schema_path = format!("{root}/schema/schema-0");
         io.new_output(&schema_path)
             .unwrap()

@@ -310,18 +310,6 @@ pub struct Table {
 }
 
 impl Table {
-    /// Copy a resolved table with a caller-owned FileIO, retaining its catalog
-    /// publication identity and read view. All schema I/O uses the new FileIO.
-    pub fn copy_with_file_io(&self, file_io: FileIO) -> Self {
-        let mut table = self.clone();
-        table.schema_manager = SchemaManager::new(file_io.clone(), self.location.clone());
-        if !self.is_main_branch() {
-            table.schema_manager = table.schema_manager.with_branch(&self.branch);
-        }
-        table.file_io = file_io;
-        table
-    }
-
     /// Create a new table.
     pub fn new(
         file_io: FileIO,
@@ -882,6 +870,8 @@ impl Table {
     /// table's fields and keys come from that snapshot's schema while the
     /// runtime options stay merged. Column declarations follow the historical
     /// schema unless explicitly overridden, as in Java.
+    /// A different `branch` option first loads that branch's schema and catalog
+    /// identity, retaining the bound FileIO and preceding dynamic overrides.
     /// Like Java, resolution failures fall back silently to the current
     /// schema (the `if let Ok` below swallows them); an invalid selector
     /// still fails later at scan planning.
@@ -962,7 +952,28 @@ impl Table {
         CoreOptions::new(self.schema.options())
             .ensure_type_paimon_served(&self.identifier.full_name())?;
         self.ensure_format_table_partition_options_unchanged(&extra)?;
-        let mut table = self.copy_with_options(extra);
+        // Resolve a different branch before applying dynamic read options so
+        // its schema, REST identity and metadata namespace stay consistent.
+        let mut table = match extra.get("branch") {
+            Some(branch) if branch != self.branch() => {
+                let target = self.copy_with_branch(branch).await?;
+                // Earlier copy() overrides remain in effect on the new branch;
+                // other defaults come from its own schema.
+                let mut dynamic: HashMap<_, _> = self
+                    .applied_dynamic_option_keys
+                    .iter()
+                    .filter_map(|key| {
+                        self.schema
+                            .options()
+                            .get(key)
+                            .map(|value| (key.clone(), value.clone()))
+                    })
+                    .collect();
+                dynamic.extend(extra);
+                target.copy_with_options(dynamic)
+            }
+            _ => self.copy_with_options(extra),
+        };
         // Reject unimplemented scan options on the merged view before any IO, so
         // both table-level and per-read options are covered.
         CoreOptions::new(table.schema().options()).validate_scan_options()?;
@@ -1043,7 +1054,8 @@ impl Table {
         };
         if let Some(env) = &self.rest_env {
             // Catalog branches may have no schema directory in the data store.
-            // Load their schema, identity and FileIO through the same catalog.
+            // Load their schema and identity through the same catalog. A table
+            // copy retains the original FileIO, including its bound FUSE mount.
             let identifier = env.identifier().with_branch(&branch)?;
             let (current, mut table) = tokio::try_join!(
                 env.current_table_identity_checked(),
@@ -1060,6 +1072,13 @@ impl Table {
                     source: None,
                 });
             }
+            table.file_io = self.file_io.clone();
+            let schema_manager = SchemaManager::new(table.file_io.clone(), table.location.clone());
+            table.schema_manager = if branch == DEFAULT_MAIN_BRANCH {
+                schema_manager
+            } else {
+                schema_manager.with_branch(&branch)
+            };
             let mut options = table.schema.options().clone();
             options.insert("branch".to_string(), branch);
             table.schema = table.schema.copy_with_replaced_options(options);
