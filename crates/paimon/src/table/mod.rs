@@ -103,6 +103,7 @@ mod mosaic_table_write_tests;
 mod object_table;
 mod partition_filter;
 mod partition_row_count;
+mod partition_spec;
 mod partition_stat;
 #[cfg(feature = "fulltext")]
 mod pk_full_text_bucket_search;
@@ -123,6 +124,7 @@ mod pk_vector_read;
 mod pk_vector_scan;
 mod pk_vector_search_params;
 mod postpone_bucket_plan;
+mod postpone_bucket_planner;
 mod postpone_file_writer;
 mod postpone_fixed_bucket_router;
 mod postpone_fixed_bucket_write;
@@ -221,6 +223,7 @@ pub use incremental_scan::{
 pub use instant::Instant;
 pub use object_table::{ObjectEntry, ObjectTable};
 pub use partition_row_count::PartitionRowCount;
+pub use partition_spec::parse_partition_spec_value;
 pub use partition_stat::PartitionStat;
 pub use pk_vector_bucket_split::{BucketVectorPayload, BucketVectorSearchSplit};
 pub use postpone_bucket_plan::{PostponeBucketPlan, POSTPONE_BUCKET_PLAN_TOTAL_BUCKETS_FIELD};
@@ -867,6 +870,8 @@ impl Table {
     /// table's fields and keys come from that snapshot's schema while the
     /// runtime options stay merged. Column declarations follow the historical
     /// schema unless explicitly overridden, as in Java.
+    /// A different `branch` option first loads that branch's schema and catalog
+    /// identity, retaining the bound FileIO and preceding dynamic overrides.
     /// Like Java, resolution failures fall back silently to the current
     /// schema (the `if let Ok` below swallows them); an invalid selector
     /// still fails later at scan planning.
@@ -947,7 +952,28 @@ impl Table {
         CoreOptions::new(self.schema.options())
             .ensure_type_paimon_served(&self.identifier.full_name())?;
         self.ensure_format_table_partition_options_unchanged(&extra)?;
-        let mut table = self.copy_with_options(extra);
+        // Resolve a different branch before applying dynamic read options so
+        // its schema, REST identity and metadata namespace stay consistent.
+        let mut table = match extra.get("branch") {
+            Some(branch) if branch != self.branch() => {
+                let target = self.copy_with_branch(branch).await?;
+                // Earlier copy() overrides remain in effect on the new branch;
+                // other defaults come from its own schema.
+                let mut dynamic: HashMap<_, _> = self
+                    .applied_dynamic_option_keys
+                    .iter()
+                    .filter_map(|key| {
+                        self.schema
+                            .options()
+                            .get(key)
+                            .map(|value| (key.clone(), value.clone()))
+                    })
+                    .collect();
+                dynamic.extend(extra);
+                target.copy_with_options(dynamic)
+            }
+            _ => self.copy_with_options(extra),
+        };
         // Reject unimplemented scan options on the merged view before any IO, so
         // both table-level and per-read options are covered.
         CoreOptions::new(table.schema().options()).validate_scan_options()?;
@@ -1028,7 +1054,8 @@ impl Table {
         };
         if let Some(env) = &self.rest_env {
             // Catalog branches may have no schema directory in the data store.
-            // Load their schema, identity and FileIO through the same catalog.
+            // Load their schema and identity through the same catalog. A table
+            // copy retains the original FileIO, including its bound FUSE mount.
             let identifier = env.identifier().with_branch(&branch)?;
             let (current, mut table) = tokio::try_join!(
                 env.current_table_identity_checked(),
@@ -1045,6 +1072,13 @@ impl Table {
                     source: None,
                 });
             }
+            table.file_io = self.file_io.clone();
+            let schema_manager = SchemaManager::new(table.file_io.clone(), table.location.clone());
+            table.schema_manager = if branch == DEFAULT_MAIN_BRANCH {
+                schema_manager
+            } else {
+                schema_manager.with_branch(&branch)
+            };
             let mut options = table.schema.options().clone();
             options.insert("branch".to_string(), branch);
             table.schema = table.schema.copy_with_replaced_options(options);

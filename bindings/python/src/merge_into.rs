@@ -67,7 +67,12 @@ fn assignments(
             let assignment = match kind.as_str() {
                 "source" => MergeAssignment::SourceColumn(value.bind(py).extract()?),
                 "target" => MergeAssignment::TargetColumn(value.bind(py).extract()?),
-                "literal" => {
+                "literal" | "callable" => {
+                    if kind == "callable" && !value.bind(py).is_callable() {
+                        return Err(PyValueError::new_err(
+                            "MERGE callable assignment must be callable",
+                        ));
+                    }
                     let values = PyDict::new(py);
                     values.set_item(&name, value)?;
                     let assignment =

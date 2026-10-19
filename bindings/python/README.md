@@ -294,11 +294,16 @@ for a partition and bucket must have a single writer owner. Both duplicate
 owners in a commit and stale overlapping writers are rejected. Pending files
 (`bucket=-2`) can coexist with real buckets; they remain pending until assigned.
 
-Without an explicit plan, set `postpone.default-bucket-num` to a positive integer.
-The count is used exactly for new partitions, and append reuses existing layouts
-from the same snapshot used to initialize sequence numbers. Overwrite uses the
-configured default for replaced partitions. No staging, automatic rescaling or
-compaction is performed. Deletion-vector tables are rejected by this writer.
+Without an explicit plan, `postpone.default-bucket-num` can provide an exact count
+for new partitions. Otherwise core buffers unknown partitions until preparation
+and infers their counts from this writer's input: the target row count takes
+precedence over estimated BinaryRow bytes. Counts round up to a power of two,
+then cap at the configured maximum parallelism. Append reuses existing layouts
+from the same snapshot used to initialize sequence numbers and writes known
+partitions directly. Overwrite plans replaced partitions from the new input.
+Distributed writers should share one resolved plan. This does not implement
+Spark's temporary-file measurement, automatic rescaling or compaction.
+Deletion-vector tables are rejected by this writer.
 A failed write cannot be prepared, and close deletes only unprepared output.
 
 Configure overwrite on the batch builder:
