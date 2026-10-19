@@ -817,6 +817,7 @@ impl<'a> PaimonTableRead<'a> {
             scan_type,
             predicates,
         )
+        .with_primary_key_schema(self.table.schema())
         .with_partition_fields(self.table.schema().partition_fields())
         .with_blob_as_descriptor(primary_key)
         .with_file_index_read_enabled(core_options.file_index_read_enabled())
@@ -1883,6 +1884,7 @@ impl<'a> PaimonTableRead<'a> {
             self.read_type().to_vec(),
             self.data_predicates.clone(),
         )
+        .with_primary_key_schema(self.table.schema())
         .with_partition_fields(self.table.schema().partition_fields())
         .with_blob_as_descriptor(core_options.blob_as_descriptor())
         .with_file_index_read_enabled(core_options.file_index_read_enabled())

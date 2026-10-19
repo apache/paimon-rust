@@ -599,6 +599,7 @@ impl<'a> HybridSearchBuilder<'a> {
             self.table.schema().fields().to_vec(),
             Vec::new(),
         )
+        .with_primary_key_schema(self.table.schema())
         .with_table_options(self.table.schema().options().clone());
 
         let mut batches: Vec<RecordBatch> = Vec::new();
@@ -765,6 +766,7 @@ impl<'a> HybridSearchBuilder<'a> {
             table.schema().fields().to_vec(),
             Vec::new(),
         )
+        .with_primary_key_schema(table.schema())
         .with_table_options(table.schema().options().clone());
         let read = PrimaryKeyFullTextRead::new(
             table.file_io().clone(),

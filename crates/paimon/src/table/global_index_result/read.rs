@@ -89,6 +89,7 @@ impl<'a> GlobalIndexResultReadBuilder<'a> {
                     read_type,
                     Vec::new(),
                 )
+                .with_primary_key_schema(table.schema())
                 .with_table_options(table.schema().options().clone());
                 materialize_positions(positions, &splits, &reader).await
             }

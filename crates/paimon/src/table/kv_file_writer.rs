@@ -20,9 +20,9 @@
 //! Buffers data in memory, sorts by primary key on flush, and prepends
 //! `_SEQUENCE_NUMBER` and `_VALUE_KIND` columns.
 //!
-//! Uses thin-mode (`data-file.thin-mode`): the physical file schema is
-//! `[_SEQUENCE_NUMBER, _VALUE_KIND, all_user_cols...]` — primary key columns
-//! are NOT duplicated. The read path extracts keys from the value portion.
+//! Columnar files use thin-mode: `[_SEQUENCE_NUMBER, _VALUE_KIND, all_user_cols...]`.
+//! Positional ROW files prepend duplicated `_KEY_*` columns, matching Java's
+//! key-value file schema. Internal merge, index and statistics batches stay thin.
 //!
 //! Reference: [org.apache.paimon.io.KeyValueDataFileWriterImpl](https://github.com/apache/paimon/blob/release-1.3/paimon-core/src/main/java/org/apache/paimon/io/KeyValueDataFileWriterImpl.java)
 
@@ -126,6 +126,27 @@ struct IndexedFileWrite<'a> {
     delete_row_count: i64,
 }
 
+struct RowKeyProjection {
+    schema: Arc<ArrowSchema>,
+    column_indices: Vec<usize>,
+}
+
+impl RowKeyProjection {
+    fn project(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+        let columns = self
+            .column_indices
+            .iter()
+            .map(|&index| Arc::clone(batch.column(index)))
+            .collect();
+        RecordBatch::try_new(Arc::clone(&self.schema), columns).map_err(|error| {
+            crate::Error::DataInvalid {
+                message: format!("Failed to prepend ROW key columns: {error}"),
+                source: None,
+            }
+        })
+    }
+}
+
 impl KeyValueFileWriter {
     pub(crate) fn new(
         file_io: FileIO,
@@ -194,10 +215,10 @@ impl KeyValueFileWriter {
     /// Statistics retain logical value fields independently of the physical KV schema.
     fn new_format_writer_factory(
         &self,
-        schema: arrow_schema::SchemaRef,
+        mut schema: arrow_schema::SchemaRef,
         is_changelog: bool,
     ) -> Result<Arc<dyn FormatWriterFactory>> {
-        let physical_fields = build_physical_fields(&schema, &self.config.value_fields)?;
+        let mut physical_fields = build_physical_fields(&schema, &self.config.value_fields)?;
         let mut options = self.config.table_options.clone();
         let mode = CoreOptions::new(&options)
             .pk_file_metadata_stats_mode(0, is_changelog)?
@@ -208,6 +229,27 @@ impl KeyValueFileWriter {
         } else {
             &self.config.file_format
         };
+        if file_format.eq_ignore_ascii_case("row") {
+            let projection = self.row_key_projection(&schema)?;
+            let key_count = self.config.primary_key_indices.len();
+            physical_fields = projection
+                .column_indices
+                .iter()
+                .enumerate()
+                .map(|(index, &source)| {
+                    let field = physical_fields[source].clone();
+                    if index < key_count {
+                        let id = field.id() + 1_000_000;
+                        field
+                            .with_id(id)
+                            .with_name(projection.schema.field(index).name().clone())
+                    } else {
+                        field
+                    }
+                })
+                .collect();
+            schema = projection.schema;
+        }
         create_format_writer_factory(
             file_format,
             schema,
@@ -217,6 +259,42 @@ impl KeyValueFileWriter {
             Some(&options),
             Some(&self.config.value_fields),
         )
+    }
+
+    fn row_key_projection(&self, schema: &Arc<ArrowSchema>) -> Result<RowKeyProjection> {
+        let mut fields = Vec::new();
+        let mut column_indices = Vec::new();
+        // These indices contain only trimmed keys; partition key columns are
+        // stored in the value portion but do not belong in the key prefix.
+        for &index in &self.config.primary_key_indices {
+            let key = &self.config.value_fields[index];
+            let source =
+                schema
+                    .index_of(key.name())
+                    .map_err(|error| crate::Error::DataInvalid {
+                        message: format!(
+                            "ROW key '{}' is absent from the physical schema: {error}",
+                            key.name()
+                        ),
+                        source: None,
+                    })?;
+            let arrow_field = schema.field(source);
+            fields.push(Arc::new(ArrowField::new(
+                format!("_KEY_{}", key.name()),
+                arrow_field.data_type().clone(),
+                arrow_field.is_nullable(),
+            )));
+            column_indices.push(source);
+        }
+        fields.extend(schema.fields().iter().cloned());
+        column_indices.extend(0..schema.fields().len());
+        Ok(RowKeyProjection {
+            schema: Arc::new(ArrowSchema::new_with_metadata(
+                fields,
+                schema.metadata().clone(),
+            )),
+            column_indices,
+        })
     }
 
     pub(crate) fn with_resources(mut self, resources: Option<ResourceContext>) -> Self {
@@ -516,6 +594,11 @@ impl KeyValueFileWriter {
                 .transpose()?
         };
         let physical_schema = build_physical_schema(&user_schema);
+        let row_projection = write
+            .file_format
+            .eq_ignore_ascii_case("row")
+            .then(|| self.row_key_projection(&physical_schema))
+            .transpose()?;
         let mut blob_references = ManagedBlobReferences::new(
             &self.config.value_fields,
             &CoreOptions::new(&self.config.table_options),
@@ -604,7 +687,14 @@ impl KeyValueFileWriter {
                 let _ = self.file_io.delete_file(&file_path).await;
                 return Err(error);
             }
-            if let Err(error) = writer.write(&chunk_batch).await {
+            let row_batch = row_projection
+                .as_ref()
+                .map(|projection| projection.project(&chunk_batch))
+                .transpose()?;
+            if let Err(error) = writer
+                .write(row_batch.as_ref().unwrap_or(&chunk_batch))
+                .await
+            {
                 let _ = writer.close().await;
                 let _ = self.file_io.delete_file(&file_path).await;
                 return Err(error);
@@ -1380,6 +1470,161 @@ mod tests {
                     .collect::<Vec<_>>(),
                 vec![(1, 3), (2, 4), (0, 0)]
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn row_key_prefix_is_applied_independently_to_data_and_changelog() {
+        use crate::arrow::format::create_format_reader;
+        use crate::arrow::{build_target_arrow_schema, variant_arrow_type};
+        use crate::spec::{BinaryRow, VariantType};
+        use crate::variant::GenericVariant;
+        use arrow_array::{BinaryArray, StructArray};
+        use arrow_buffer::NullBuffer;
+        use futures::TryStreamExt;
+
+        for (data_format, changelog_format) in
+            [("row", "row"), ("row", "parquet"), ("parquet", "row")]
+        {
+            let io = FileIOBuilder::new("memory").build().unwrap();
+            let mut config = test_write_config(MergeEngine::Deduplicate);
+            config.file_format = data_format.into();
+            config.changelog_file_format = changelog_format.into();
+            config.input_changelog = true;
+            config.write_buffer_size = i64::MAX;
+            // The full PK includes the partition column, but only the trimmed
+            // `id` key belongs in the physical key prefix.
+            config.primary_keys.push("seq".into());
+            config.value_fields[2] =
+                DataField::new(2, "value".into(), DataType::Variant(VariantType::new()));
+            let value_fields = config.value_fields.clone();
+            let variants = [Some("[1,2]"), Some("null"), Some(r#"{"x":7}"#), None]
+                .into_iter()
+                .map(|json| json.map(|json| GenericVariant::parse_json(json).unwrap()))
+                .collect::<Vec<_>>();
+            let ArrowDataType::Struct(children) = variant_arrow_type() else {
+                unreachable!()
+            };
+            let values = StructArray::new(
+                children,
+                vec![
+                    Arc::new(BinaryArray::from_iter_values(variants.iter().map(
+                        |value| value.as_ref().map_or(&[][..], GenericVariant::value),
+                    ))),
+                    Arc::new(BinaryArray::from_iter_values(variants.iter().map(
+                        |value| value.as_ref().map_or(&[][..], GenericVariant::metadata),
+                    ))),
+                ],
+                Some(NullBuffer::from(
+                    variants.iter().map(Option::is_some).collect::<Vec<_>>(),
+                )),
+            );
+            let batch = RecordBatch::try_new(
+                build_target_arrow_schema(&value_fields).unwrap(),
+                vec![
+                    Arc::new(Int32Array::from(vec![3, 2, 1, 4])),
+                    Arc::new(Int64Array::from(vec![7; 4])),
+                    Arc::new(values),
+                ],
+            )
+            .unwrap();
+            let mut writer = KeyValueFileWriter::new(io.clone(), config, 0).unwrap();
+            writer.write(&batch).await.unwrap();
+            let prepared = writer.prepare_commit().await.unwrap();
+            for (files, format) in [
+                (&prepared.data_files, data_format),
+                (&prepared.changelog_files, changelog_format),
+            ] {
+                assert_eq!(files.len(), 1);
+                let file = &files[0];
+                let path = file.data_file_path(writer.paths.bucket_path());
+                let mut physical = vec![
+                    DataField::new(
+                        SEQUENCE_NUMBER_FIELD_ID,
+                        SEQUENCE_NUMBER_FIELD_NAME.into(),
+                        DataType::BigInt(BigIntType::new()),
+                    ),
+                    DataField::new(
+                        VALUE_KIND_FIELD_ID,
+                        VALUE_KIND_FIELD_NAME.into(),
+                        DataType::TinyInt(TinyIntType::new()),
+                    ),
+                ];
+                physical.extend(value_fields.clone());
+                if format == "row" {
+                    physical.insert(
+                        0,
+                        value_fields[0]
+                            .clone()
+                            .with_name("_KEY_id".into())
+                            .with_id(1_000_000),
+                    );
+                    let bytes = io.new_input(&path).unwrap().read().await.unwrap();
+                    assert_eq!(bytes[bytes.len() - 8], 1);
+                } else {
+                    // Dense Parquet stats omit Variant values and identify the
+                    // remaining logical columns, independently of KV metadata.
+                    assert_eq!(file.value_stats_cols, Some(vec!["id".into(), "seq".into()]));
+                    assert_eq!(file.value_stats.null_counts(), &vec![Some(0), Some(0)]);
+                }
+                assert_eq!(file.key_stats.null_counts().len(), 1);
+                let min = BinaryRow::from_serialized_bytes(&file.min_key).unwrap();
+                let max = BinaryRow::from_serialized_bytes(&file.max_key).unwrap();
+                assert_eq!(min.get_int(0).unwrap(), 1);
+                assert_eq!(max.get_int(0).unwrap(), 4);
+
+                let input = io.new_input(&path).unwrap();
+                let batches = create_format_reader(&path, false, &physical)
+                    .unwrap()
+                    .read_batch_stream(
+                        Box::new(input.reader().await.unwrap()),
+                        file.file_size as u64,
+                        &physical,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                    .unwrap()
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .unwrap();
+                assert_eq!(batches.len(), 1);
+                let stored = &batches[0];
+                assert_eq!(stored.num_columns(), if format == "row" { 6 } else { 5 });
+                if format == "row" {
+                    assert_eq!(
+                        stored.column_by_name("_KEY_id").unwrap().to_data(),
+                        stored.column_by_name("id").unwrap().to_data(),
+                    );
+                    assert!(stored.column_by_name("_KEY_seq").is_none());
+                }
+                let values = stored
+                    .column_by_name("value")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<StructArray>()
+                    .unwrap();
+                let value_bytes = values
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<BinaryArray>()
+                    .unwrap();
+                let metadata = values
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<BinaryArray>()
+                    .unwrap();
+                for (row, original) in [2, 1, 0, 3].into_iter().enumerate() {
+                    if let Some(expected) = &variants[original] {
+                        assert!(values.is_valid(row));
+                        assert_eq!(value_bytes.value(row), expected.value());
+                        assert_eq!(metadata.value(row), expected.metadata());
+                    } else {
+                        assert!(values.is_null(row));
+                    }
+                }
+            }
         }
     }
 

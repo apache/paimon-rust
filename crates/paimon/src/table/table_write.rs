@@ -3289,7 +3289,7 @@ pub(in crate::table) mod tests {
                 bucket_dir_name(messages[0].bucket),
                 file.file_name
             );
-            let physical_fields = vec![
+            let mut physical_fields = vec![
                 DataField::new(
                     SEQUENCE_NUMBER_FIELD_ID,
                     SEQUENCE_NUMBER_FIELD_NAME.into(),
@@ -3303,6 +3303,11 @@ pub(in crate::table) mod tests {
                 table.schema().fields()[0].clone(),
                 table.schema().fields()[1].clone(),
             ];
+            if format == "row" {
+                let key = table.schema().fields()[0].clone();
+                let key_id = key.id() + 1_000_000;
+                physical_fields.insert(0, key.with_name("_KEY_id".into()).with_id(key_id));
+            }
             let format_reader = create_format_reader(&file_path, false, &physical_fields).unwrap();
             let input = table.file_io().new_input(&file_path).unwrap();
             let stream = format_reader
@@ -3318,8 +3323,14 @@ pub(in crate::table) mod tests {
                 .unwrap();
             let batches: Vec<RecordBatch> =
                 futures::TryStreamExt::try_collect(stream).await.unwrap();
-            assert_eq!(collect_i32(&batches, 2), vec![1, 2], "{format}");
-            assert_eq!(collect_i32(&batches, 3), vec![10, 20], "{format}");
+            let id_index = batches[0].schema().index_of("id").unwrap();
+            let value_index = batches[0].schema().index_of("value").unwrap();
+            assert_eq!(collect_i32(&batches, id_index), vec![1, 2], "{format}");
+            assert_eq!(collect_i32(&batches, value_index), vec![10, 20], "{format}");
+            if format == "row" {
+                let key_index = batches[0].schema().index_of("_KEY_id").unwrap();
+                assert_eq!(collect_i32(&batches, key_index), vec![1, 2]);
+            }
             TableCommit::new(table.clone(), "test-user".into())
                 .commit(messages)
                 .await

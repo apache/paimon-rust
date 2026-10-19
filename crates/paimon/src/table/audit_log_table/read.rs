@@ -112,6 +112,7 @@ impl<'a> AuditLogRead<'a> {
                 read_type.clone(),
                 self.read.data_predicates.clone(),
             )
+            .with_primary_key_schema(self.read.table.schema())
             .with_file_index_read_enabled(core_options.file_index_read_enabled())
             .with_batch_size(Some(core_options.read_batch_size()?))
             .with_parquet_read_budget(Some(Arc::clone(&parquet_read_budget)))

@@ -186,7 +186,7 @@ fn ensure_merge_input_limit(input_stream_count: usize, limit: Option<usize>) -> 
 
 /// Java's `KeyValueFieldsExtractor` builds the physical file layout from the
 /// schema that wrote the file, including its historical key names and types.
-fn key_value_data_schema_fields(
+pub(super) fn key_value_data_schema_fields(
     file_fields: &[DataField],
     trimmed_primary_keys: &[String],
 ) -> crate::Result<Vec<DataField>> {
@@ -1189,27 +1189,53 @@ mod tests {
         file.file_size = file_size;
         file.min_key = int_key(7);
         file.max_key = int_key(7);
-        let split = DataSplitBuilder::new()
-            .with_snapshot(1)
-            .with_partition(BinaryRow::new(0))
-            .with_bucket(0)
-            .with_bucket_path(bucket_path)
-            .with_total_buckets(1)
-            .with_data_files(vec![file])
-            .with_raw_convertible(false)
-            .build()
-            .unwrap();
-        let batches = table
-            .new_read_builder()
-            .new_read()
-            .unwrap()
-            .to_arrow(&[split])
+        file.delete_row_count = Some(0);
+        for raw_convertible in [false, true] {
+            let split = DataSplitBuilder::new()
+                .with_snapshot(1)
+                .with_partition(BinaryRow::new(0))
+                .with_bucket(0)
+                .with_bucket_path(bucket_path.clone())
+                .with_total_buckets(1)
+                .with_data_files(vec![file.clone()])
+                .with_raw_convertible(raw_convertible)
+                .build()
+                .unwrap();
+            let batches = table
+                .new_read_builder()
+                .new_read()
+                .unwrap()
+                .to_arrow(std::slice::from_ref(&split))
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            assert_eq!(int_column(&batches, "id"), vec![7]);
+            assert_eq!(int_column(&batches, "value"), vec![42]);
+
+            let selected = DataFileReader::new(
+                file_io.clone(),
+                table.schema_manager().clone(),
+                table.schema().id(),
+                table.schema().fields().to_vec(),
+                table.schema().fields().to_vec(),
+                Vec::new(),
+            )
+            .with_primary_key_schema(table.schema())
+            .read_single_file_stream_local(
+                &split,
+                file.clone(),
+                Some(old_schema.fields().to_vec()),
+                None,
+                vec![0],
+            )
             .unwrap()
             .try_collect::<Vec<_>>()
             .await
             .unwrap();
-        assert_eq!(int_column(&batches, "id"), vec![7]);
-        assert_eq!(int_column(&batches, "value"), vec![42]);
+            assert_eq!(int_column(&selected, "id"), vec![7]);
+            assert_eq!(int_column(&selected, "value"), vec![42]);
+        }
     }
 
     #[tokio::test]
