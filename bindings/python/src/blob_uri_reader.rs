@@ -15,8 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Python URI objects and exception transport; source reuse and copy semantics
-//! are implemented by Rust core.
+//! Python URI object adaptation; source reuse and copy semantics are implemented
+//! by Rust core.
 
 use bytes::Bytes;
 use paimon::io::{UriInputStream, UriReader, UriReaderFactory};
@@ -25,66 +25,7 @@ use pyo3::prelude::*;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, Weak};
 
-struct PythonCallbackError(PyErr);
-
-impl std::fmt::Debug for PythonCallbackError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("PythonCallbackError")
-    }
-}
-
-impl std::fmt::Display for PythonCallbackError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("Python callback failed")
-    }
-}
-impl std::error::Error for PythonCallbackError {}
-
-pub(crate) fn callback_error(error: PyErr) -> paimon::Error {
-    paimon::Error::UnexpectedError {
-        message: "Python callback failed".into(),
-        source: Some(Box::new(PythonCallbackError(error))),
-    }
-}
-
-pub(crate) fn to_callback_error(error: paimon::Error) -> PyErr {
-    crate::error::to_py_err(error)
-}
-
-/// Recover the original exception without formatting callback errors or URIs.
-pub(crate) fn original_callback_error(error: &paimon::Error) -> Option<PyErr> {
-    let mut cause: &(dyn std::error::Error + 'static) = error;
-    loop {
-        if let Some(original) = cause.downcast_ref::<PythonCallbackError>() {
-            return Some(Python::attach(|py| original.0.clone_ref(py)));
-        }
-        // Paimon UnexpectedError deliberately omits its source from the
-        // standard chain. Inspect that explicit source without stringifying
-        // Python errors (which can contain URI credentials).
-        let next = match cause.downcast_ref::<paimon::Error>() {
-            Some(
-                paimon::Error::UnexpectedError { source, .. }
-                | paimon::Error::DataInvalid { source, .. },
-            ) => source
-                .as_deref()
-                .map(|source| source as &(dyn std::error::Error + 'static)),
-            // std::io::Error::source skips its custom error itself. Inspect
-            // that value too, since positional index I/O wraps Paimon errors.
-            _ => match cause.downcast_ref::<std::io::Error>() {
-                Some(error) => error
-                    .get_ref()
-                    .map(|error| error as &(dyn std::error::Error + 'static))
-                    .or_else(|| cause.source()),
-                None => cause.source(),
-            },
-        };
-        match next {
-            Some(source) => cause = source,
-            None => break,
-        }
-    }
-    None
-}
+pub(crate) use crate::error::{callback_error, to_py_err as to_callback_error};
 
 pub(crate) struct PythonUriReaderFactory {
     factory: Py<PyAny>,

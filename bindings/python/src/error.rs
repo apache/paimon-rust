@@ -18,6 +18,63 @@
 use pyo3::exceptions::{PyNotImplementedError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 
+struct PythonCallbackError(PyErr);
+
+impl std::fmt::Debug for PythonCallbackError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PythonCallbackError")
+    }
+}
+
+impl std::fmt::Display for PythonCallbackError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Python callback failed")
+    }
+}
+impl std::error::Error for PythonCallbackError {}
+
+pub(crate) fn callback_error(error: PyErr) -> paimon::Error {
+    paimon::Error::UnexpectedError {
+        message: "Python callback failed".into(),
+        source: Some(Box::new(PythonCallbackError(error))),
+    }
+}
+
+/// Recover the original exception without formatting callback errors or URIs.
+fn original_callback_error(error: &paimon::Error) -> Option<PyErr> {
+    let mut cause: &(dyn std::error::Error + 'static) = error;
+    loop {
+        if let Some(original) = cause.downcast_ref::<PythonCallbackError>() {
+            return Some(Python::attach(|py| original.0.clone_ref(py)));
+        }
+        // Paimon UnexpectedError deliberately omits its source from the
+        // standard chain. Inspect that explicit source without stringifying
+        // Python errors (which can contain URI credentials).
+        let next = match cause.downcast_ref::<paimon::Error>() {
+            Some(
+                paimon::Error::UnexpectedError { source, .. }
+                | paimon::Error::DataInvalid { source, .. },
+            ) => source
+                .as_deref()
+                .map(|source| source as &(dyn std::error::Error + 'static)),
+            // std::io::Error::source skips its custom error itself. Inspect
+            // that value too, since positional index I/O wraps Paimon errors.
+            _ => match cause.downcast_ref::<std::io::Error>() {
+                Some(error) => error
+                    .get_ref()
+                    .map(|error| error as &(dyn std::error::Error + 'static))
+                    .or_else(|| cause.source()),
+                None => cause.source(),
+            },
+        };
+        match next {
+            Some(source) => cause = source,
+            None => break,
+        }
+    }
+    None
+}
+
 pyo3::create_exception!(
     pypaimon_rust,
     ForkSafetyError,
@@ -45,7 +102,7 @@ pub(crate) fn to_catalog_py_err(error: paimon::Error) -> PyErr {
     if error.is_process_fork_unsupported() {
         return to_py_err(error);
     }
-    if let Some(original) = crate::blob_uri_reader::original_callback_error(&error) {
+    if let Some(original) = original_callback_error(&error) {
         return original;
     }
     let snapshot_name = match &error {
@@ -137,7 +194,7 @@ pub fn to_py_err(err: paimon::Error) -> PyErr {
     if err.is_process_fork_unsupported() {
         return ForkSafetyError::new_err(err.to_string());
     }
-    if let Some(original) = crate::blob_uri_reader::original_callback_error(&err) {
+    if let Some(original) = original_callback_error(&err) {
         return original;
     }
     match err {
@@ -160,7 +217,7 @@ pub fn df_to_py_err(err: datafusion::error::DataFusionError) -> PyErr {
         }
         if callback_error.is_none() {
             if let Some(core_error) = cause.downcast_ref::<paimon::Error>() {
-                callback_error = crate::blob_uri_reader::original_callback_error(core_error);
+                callback_error = original_callback_error(core_error);
             }
         }
         if let Some(datafusion::error::DataFusionError::Collection(errors)) =
@@ -276,7 +333,7 @@ mod tests {
         use pyo3::exceptions::PyPermissionError;
         fn error() -> paimon::Error {
             let original = PyPermissionError::new_err("custom authorization denied access");
-            let inner = crate::blob_uri_reader::callback_error(original);
+            let inner = callback_error(original);
             paimon::Error::UnexpectedError {
                 message: "query authorization failed".to_string(),
                 source: Some(Box::new(inner)),
@@ -298,9 +355,9 @@ mod tests {
 
     #[test]
     fn fork_error_keeps_priority_over_callback_error_in_collection() {
-        let callback = crate::blob_uri_reader::callback_error(
-            pyo3::exceptions::PyPermissionError::new_err("Python callback denied"),
-        );
+        let callback = callback_error(pyo3::exceptions::PyPermissionError::new_err(
+            "Python callback denied",
+        ));
         let fork = paimon::Error::ProcessForkUnsupported {
             message: "fork is unsupported".to_string(),
         };
@@ -316,7 +373,7 @@ mod tests {
             let original = pyo3::exceptions::PyOSError::new_err("private callback failure");
             original.value(py).setattr("storage_code", 17).unwrap();
             let expected = original.clone_ref(py);
-            let wrapped = crate::blob_uri_reader::callback_error(original);
+            let wrapped = callback_error(original);
             let io_error = std::io::Error::other(wrapped);
             let wrapped = paimon::Error::DataInvalid {
                 message: "callback failed".to_string(),

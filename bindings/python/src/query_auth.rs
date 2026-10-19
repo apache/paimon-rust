@@ -23,6 +23,8 @@ use paimon::table::TableQueryAuth;
 use pyo3::exceptions::PyTypeError;
 use pyo3::prelude::*;
 
+use crate::error::callback_error;
+
 pub(crate) struct PythonTableQueryAuth {
     callback: Py<PyAny>,
 }
@@ -62,13 +64,14 @@ impl TableQueryAuth for PythonTableQueryAuth {
                 }))
             })
         })
-        .map_err(crate::blob_uri_reader::callback_error)
+        .map_err(callback_error)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::to_py_err;
     use std::ffi::CString;
 
     fn authorizer(source: &str) -> PythonTableQueryAuth {
@@ -97,7 +100,7 @@ mod tests {
     async fn python_authorizer_preserves_original_callback_exception() {
         let auth =
             authorizer("lambda select: (_ for _ in ()).throw(PermissionError('query denied'))");
-        let error = crate::blob_uri_reader::to_callback_error(auth.auth(None).await.unwrap_err());
+        let error = to_py_err(auth.auth(None).await.unwrap_err());
         Python::attach(|py| {
             assert!(error.is_instance_of::<pyo3::exceptions::PyPermissionError>(py));
             assert_eq!(
