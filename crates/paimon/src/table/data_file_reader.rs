@@ -361,7 +361,6 @@ impl DataFileReader {
                         )
                     });
                     split_file_offset += file_meta.row_count;
-                    let sidecar_ranges = split_ranges.clone();
                     let selected_ranges = match file_index_result {
                         FileIndexResult::Remain => split_ranges,
                         FileIndexResult::Skip => Some(Vec::new()),
@@ -380,6 +379,9 @@ impl DataFileReader {
                             }
                         }
                     };
+                    // Bitmap indexes and requested ranges determine whether
+                    // the sidecar saves I/O. Deletions must not trigger it.
+                    let sidecar_ranges = selected_ranges.clone();
                     let row_selection = merge_row_selection(
                         file_meta.row_count,
                         dv.as_deref(),
@@ -480,8 +482,8 @@ impl DataFileReader {
         )
     }
 
-    /// Physical selection may be narrowed by file indexes or a LIMIT, while
-    /// Java selects the ROW sidecar from the caller's original row ranges.
+    /// Sidecar eligibility uses requested ranges intersected with bitmap
+    /// indexes, before deletion vectors or a LIMIT narrow physical selection.
     pub(super) fn read_single_file_stream_with_requested_ranges(
         &self,
         split: &DataSplit,

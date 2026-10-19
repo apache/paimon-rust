@@ -477,7 +477,10 @@ impl DataEvolutionReader {
             let push_down_raw_predicates = !self.predicates.is_empty()
                 && self.row_id_index.is_none()
                 && filter_before_blob_resolution;
-            let read_raw_file_index = push_down_raw_predicates
+            // A bitmap selection preserves physical positions, including when
+            // `_ROW_ID` needs attaching before the residual predicate runs.
+            let read_raw_file_index = !self.predicates.is_empty()
+                && filter_before_blob_resolution
                 && CoreOptions::new(&self.table_options).file_index_read_enabled();
             // A managed BLOB file fetches payloads as its batch is decoded.
             // Keep batches small and restrict predicate-free file selections
@@ -508,7 +511,9 @@ impl DataEvolutionReader {
                 if remaining == Some(0) {
                     break;
                 }
-                let row_ranges = split.row_ranges().map(|r| r.to_vec());
+                let row_ranges = split
+                    .row_ranges()
+                    .map(|ranges| crate::table::merge_row_ranges(ranges.to_vec()));
                 // A chunk may span several disjoint row-id groups while one
                 // group still needs column-wise merging. Process each aligned
                 // group independently; treating the whole chunk as one merge
@@ -578,6 +583,9 @@ impl DataEvolutionReader {
                                     FileIndexResult::Remain => {}
                                 }
                             }
+                            // Match Java's sidecar choice using the bitmap
+                            // intersection, before a DV or LIMIT narrows rows.
+                            let sidecar_row_ranges = effective_row_ranges.clone();
                             if self.predicates.is_empty() {
                                 if let Some(left) = remaining {
                                     let selected = selected_absolute_row_ranges_for_file(
@@ -628,7 +636,7 @@ impl DataEvolutionReader {
                                 data_fields,
                                 deletion_vector,
                                 effective_row_ranges,
-                                requested_row_ranges,
+                                sidecar_row_ranges,
                             )?;
                             while remaining != Some(0) {
                                 let Some(batch) = stream.next().await else { break };
