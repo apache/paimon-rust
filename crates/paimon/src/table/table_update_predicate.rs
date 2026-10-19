@@ -106,6 +106,16 @@ pub(super) async fn update(
     blob_uri_reader_factory: Option<Arc<dyn crate::io::UriReaderFactory>>,
 ) -> crate::Result<Vec<CommitMessage>> {
     let combine_all = validate(table, &assignments, &read_columns)?;
+    if table.schema().core_options().query_auth_enabled() {
+        if let Some(predicate) = &predicate {
+            // Row-ID range extraction can remove exact leaves from the scan;
+            // validate their original index/type before deriving those ranges.
+            super::query_auth::reject_noncanonical_leaves(
+                std::slice::from_ref(predicate),
+                &table.schema().fields_with_read_metadata(),
+            )?;
+        }
+    }
     let snapshot = super::time_travel::resolve_snapshot(table).await?;
     // Updates must include unindexed rows even when normal reads request the
     // partial/detail scalar-index search mode.
@@ -129,7 +139,7 @@ pub(super) async fn update(
     }
     // Rewrites need all existing column versions, including columns outside
     // the callback/predicate projection, to preserve values of unmatched rows.
-    let plan = read_builder.new_scan().plan_all_files().await?;
+    let plan = read_builder.new_scan().plan_for_update().await?;
     let index = RowIdFileIndex::from_splits(scan_table.clone(), plan.splits())?;
     let groups = ordered_file_groups(plan.splits())?;
     let mut updater = TableUpdateByRowId::with_index(table, index)?;

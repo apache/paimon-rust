@@ -1529,6 +1529,47 @@ impl<'a> TableScan<'a> {
             .await
     }
 
+    /// Mutation predicates can refer to canonical row-tracking metadata only
+    /// after the REST server authorizes the entire table without restrictions.
+    /// Keep public scans' system-column and row-range refusals unchanged.
+    pub(super) async fn plan_for_update(&self) -> crate::Result<Plan> {
+        let mut requested = self.clone();
+        if let TableScanKind::Paimon(scan) = &mut requested.0 {
+            if scan.table.schema().core_options().query_auth_enabled() {
+                super::query_auth::reject_noncanonical_leaves(
+                    &scan.data_predicates,
+                    &scan.table.schema().fields_with_read_metadata(),
+                )?;
+                super::query_auth::reject_system_columns(
+                    super::query_auth::leaf_names(&scan.data_predicates)
+                        .iter()
+                        .map(String::as_str)
+                        .filter(|name| {
+                            !matches!(
+                                *name,
+                                ROW_ID_FIELD_NAME | crate::spec::SEQUENCE_NUMBER_FIELD_NAME
+                            )
+                        }),
+                )?;
+            }
+            scan.projected_read_field_ids = None;
+        }
+        let mut authorization = requested.clone();
+        if let TableScanKind::Paimon(scan) = &mut authorization.0 {
+            // Predicate-derived row ranges do not narrow the permission scope.
+            // The requested scan retains both the ranges and exact residuals.
+            scan.row_ranges = None;
+            scan.data_predicates.clear();
+        }
+        let authorization = authorization.authorize_all_files().await?;
+        if let (TableScanKind::Paimon(scan), TableScanKind::Paimon(authorized)) =
+            (&mut requested.0, authorization.0)
+        {
+            scan.query_auth_grant = authorized.query_auth_grant;
+        }
+        requested.with_scan_all_files().plan().await
+    }
+
     /// Validate transported metadata and restore canonical snapshot paths.
     pub(super) async fn validate_transported_splits(
         &self,

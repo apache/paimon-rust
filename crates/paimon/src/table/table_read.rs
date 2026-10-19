@@ -1201,18 +1201,35 @@ impl<'a> PaimonTableRead<'a> {
             self.read_type
                 .iter()
                 .map(|f| f.name())
-                .chain(filter_columns.iter().map(String::as_str))
                 .filter(|name| !unrestricted_update || *name != "_ROW_ID"),
         )?;
+        super::query_auth::reject_system_columns(
+            filter_columns.iter().map(String::as_str).filter(|name| {
+                !unrestricted_update || !matches!(*name, "_ROW_ID" | "_SEQUENCE_NUMBER")
+            }),
+        )?;
+        if unrestricted_update
+            && self.read_type.iter().any(|field| {
+                field.name() == "_ROW_ID" && field != &crate::spec::row_id_data_field()
+            })
+        {
+            return Err(super::query_auth::unsupported(
+                "the mutation read requires the canonical _ROW_ID field",
+            ));
+        }
         // By id and name: older files resolve by id, so a dropped field passed
         // to `with_read_type` would read an uncovered column.
         super::query_auth::reject_noncanonical_fields(
             &self.read_type,
             self.table.schema().fields(),
         )?;
+        let mutation_fields =
+            unrestricted_update.then(|| self.table.schema().fields_with_read_metadata());
         super::query_auth::reject_noncanonical_leaves(
             &self.data_predicates,
-            self.table.schema().fields(),
+            mutation_fields
+                .as_deref()
+                .unwrap_or(self.table.schema().fields()),
         )?;
         // Per split, as Java binds one `QueryAuthSplit` each; one read applies one
         // rule set, so a restricted split's grant must cover them all.

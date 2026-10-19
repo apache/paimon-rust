@@ -76,7 +76,7 @@ pub(super) async fn delete(
         builder.with_filter(predicate);
     }
     let reader = builder.new_read()?.for_update();
-    let plan = builder.new_scan().plan_all_files().await?;
+    let plan = builder.new_scan().plan_for_update().await?;
     let mut writer = DataEvolutionDeleteWriter::new(&scan_table)?;
     let mut batches = reader.to_arrow(plan.splits())?;
     while let Some(batch) = batches.try_next().await? {

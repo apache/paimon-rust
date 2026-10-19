@@ -469,3 +469,296 @@ async fn authorized_empty_targets_allow_insert_only_upsert_and_merge() {
         assert!(fixture.state.query_requests.load(Ordering::SeqCst) > 0);
     }
 }
+
+#[tokio::test]
+async fn mutation_metadata_predicates_match_unguarded_and_authorized_rows() {
+    for guarded in [false, true] {
+        for column in ["_ROW_ID", "_SEQUENCE_NUMBER"] {
+            for delete in [false, true] {
+                let mut options = EVOLUTION_OPTIONS.to_vec();
+                options.push(("query-auth.enabled", if guarded { "true" } else { "false" }));
+                let fixture = RestTable::new(false, &options).await;
+                fixture
+                    .append("seed-one", &[(1, "a", 10), (2, "a", 20)], false)
+                    .await;
+                fixture.append("seed-two", &[(3, "a", 30)], false).await;
+                fixture.state.deny_query.store(false, Ordering::SeqCst);
+                if column == "_SEQUENCE_NUMBER" {
+                    // A partial-column rewrite changes the logical group's
+                    // sequence metadata, including its unchanged rows.
+                    let messages = fixture
+                        .table
+                        .new_write_builder()
+                        .new_update()
+                        .unwrap()
+                        .update_by_arrow_with_row_id(vec![row_update(0, 88)])
+                        .await
+                        .unwrap();
+                    TableCommit::new(fixture.table.clone(), "seed-partial".into())
+                        .commit(messages)
+                        .await
+                        .unwrap();
+                }
+                let plan = fixture
+                    .table
+                    .new_read_builder()
+                    .new_scan()
+                    .plan_all_files()
+                    .await
+                    .unwrap();
+                let first = plan
+                    .splits()
+                    .iter()
+                    .flat_map(DataSplit::data_files)
+                    .filter(|file| file.first_row_id == Some(0))
+                    .max_by_key(|file| file.max_sequence_number)
+                    .unwrap();
+                let literal = if column == "_ROW_ID" {
+                    0
+                } else {
+                    first.max_sequence_number
+                };
+                let fields = fixture.table.schema().fields_with_read_metadata();
+                let predicate = crate::spec::PredicateBuilder::new(&fields)
+                    .equal(column, Datum::Long(literal))
+                    .unwrap();
+                let calls = Arc::new(AtomicUsize::new(0));
+                let update = fixture.table.new_write_builder().new_update().unwrap();
+                let messages = if delete {
+                    update.delete_by_predicate(Some(predicate)).await
+                } else {
+                    update
+                        .update_by_predicate(
+                            Some(predicate),
+                            vec![("value".into(), callback(calls.clone()))],
+                            vec!["value".into()],
+                        )
+                        .await
+                }
+                .unwrap_or_else(|error| {
+                    panic!("guarded={guarded}, column={column}, delete={delete}: {error}")
+                });
+                TableCommit::new(fixture.table.clone(), "metadata-predicate".into())
+                    .commit(messages)
+                    .await
+                    .unwrap();
+                let expected = match (delete, column) {
+                    (true, "_SEQUENCE_NUMBER") => vec![(3, "a".into(), 30)],
+                    (false, "_SEQUENCE_NUMBER") => vec![
+                        (1, "a".into(), 99),
+                        (2, "a".into(), 99),
+                        (3, "a".into(), 30),
+                    ],
+                    (true, _) => vec![(2, "a".into(), 20), (3, "a".into(), 30)],
+                    (false, _) => vec![
+                        (1, "a".into(), 99),
+                        (2, "a".into(), 20),
+                        (3, "a".into(), 30),
+                    ],
+                };
+                assert_eq!(fixture.stored_rows().await, expected);
+                assert_eq!(calls.load(Ordering::SeqCst), usize::from(!delete));
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn mutation_metadata_predicates_preserve_restricted_and_public_read_guards() {
+    for column in ["_ROW_ID", "_SEQUENCE_NUMBER"] {
+        for response in [None]
+            .into_iter()
+            .chain(restricted_responses().into_iter().map(Some))
+        {
+            let fixture = RestTable::new(false, EVOLUTION_OPTIONS).await;
+            fixture.append("seed", &[(1, "a", 10)], false).await;
+            if let Some(response) = response {
+                fixture.state.deny_query.store(false, Ordering::SeqCst);
+                *fixture.state.query_response.lock().await = response;
+            }
+            let predicate = crate::spec::PredicateBuilder::new(
+                &fixture.table.schema().fields_with_read_metadata(),
+            )
+            .equal(column, Datum::Long(0))
+            .unwrap();
+            let before = fixture
+                .table
+                .file_io()
+                .list_status_recursive(fixture.table.location())
+                .await
+                .unwrap()
+                .len();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let update = fixture.table.new_write_builder().new_update().unwrap();
+            assert!(update
+                .update_by_predicate(
+                    Some(predicate.clone()),
+                    vec![("value".into(), callback(calls.clone()))],
+                    vec!["value".into()]
+                )
+                .await
+                .is_err());
+            assert!(update.delete_by_predicate(Some(predicate)).await.is_err());
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                fixture
+                    .table
+                    .file_io()
+                    .list_status_recursive(fixture.table.location())
+                    .await
+                    .unwrap()
+                    .len(),
+                before
+            );
+            assert!(fixture.state.query_requests.load(Ordering::SeqCst) > 0);
+        }
+    }
+    let fixture = RestTable::new(false, EVOLUTION_OPTIONS).await;
+    fixture.append("seed", &[(1, "a", 10)], false).await;
+    fixture.state.deny_query.store(false, Ordering::SeqCst);
+    for column in ["_ROW_ID", "_SEQUENCE_NUMBER"] {
+        let mut builder = fixture.table.new_read_builder();
+        builder.with_filter(
+            crate::spec::PredicateBuilder::new(&fixture.table.schema().fields_with_read_metadata())
+                .equal(column, Datum::Long(0))
+                .unwrap(),
+        );
+        assert!(builder.new_scan().plan().await.is_err());
+        assert!(builder.new_scan().plan_all_files().await.is_err());
+    }
+    assert!(fixture
+        .table
+        .new_read_builder()
+        .new_scan()
+        .with_row_ranges(vec![super::super::RowRange::new(0, 0)])
+        .plan_all_files()
+        .await
+        .is_err());
+    assert_eq!(fixture.state.query_requests.load(Ordering::SeqCst), 0);
+    let plan = fixture
+        .table
+        .new_read_builder()
+        .new_scan()
+        .plan_all_files()
+        .await
+        .unwrap();
+    // The internal marker allows canonical _ROW_ID output only. A forged
+    // field identity or other metadata output cannot reuse the grant.
+    for field in [
+        crate::spec::row_id_data_field(),
+        crate::spec::sequence_number_data_field(),
+        crate::spec::DataField::new(
+            0,
+            "_ROW_ID".into(),
+            crate::spec::row_id_data_field().data_type().clone(),
+        ),
+    ] {
+        let read = super::super::TableRead::new(&fixture.table, vec![field.clone()], Vec::new());
+        assert!(read.clone().to_arrow(plan.splits()).is_err());
+        if field != crate::spec::row_id_data_field() {
+            assert!(read.for_update().to_arrow(plan.splits()).is_err());
+        }
+    }
+}
+
+#[tokio::test]
+async fn mutation_metadata_predicates_reject_forged_field_indices_and_types() {
+    let fixture = RestTable::new(false, EVOLUTION_OPTIONS).await;
+    fixture.append("seed", &[(1, "a", 10)], false).await;
+    fixture.state.deny_query.store(false, Ordering::SeqCst);
+    let fields = fixture.table.schema().fields_with_read_metadata();
+    let before = fixture
+        .table
+        .file_io()
+        .list_status_recursive(fixture.table.location())
+        .await
+        .unwrap()
+        .len();
+    for column in ["_ROW_ID", "_SEQUENCE_NUMBER"] {
+        for invalid_type in [false, true] {
+            let mut predicate = crate::spec::PredicateBuilder::new(&fields)
+                .equal(column, Datum::Long(0))
+                .unwrap();
+            if let crate::spec::Predicate::Leaf {
+                index, data_type, ..
+            } = &mut predicate
+            {
+                if invalid_type {
+                    *data_type = DataType::Int(IntType::new());
+                } else {
+                    *index = 0;
+                }
+            } else {
+                unreachable!()
+            }
+            let calls = Arc::new(AtomicUsize::new(0));
+            let update = fixture.table.new_write_builder().new_update().unwrap();
+            assert!(update
+                .update_by_predicate(
+                    Some(predicate.clone()),
+                    vec![("value".into(), callback(calls.clone()))],
+                    vec!["value".into()]
+                )
+                .await
+                .is_err());
+            assert!(update.delete_by_predicate(Some(predicate)).await.is_err());
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+        }
+    }
+    assert_eq!(
+        fixture
+            .table
+            .file_io()
+            .list_status_recursive(fixture.table.location())
+            .await
+            .unwrap()
+            .len(),
+        before
+    );
+}
+
+#[tokio::test]
+async fn mutation_metadata_predicates_preserve_mixed_row_id_residuals() {
+    for delete in [false, true] {
+        let fixture = RestTable::new(false, EVOLUTION_OPTIONS).await;
+        fixture
+            .append("seed", &[(1, "a", 10), (2, "a", 20)], false)
+            .await;
+        fixture.state.deny_query.store(false, Ordering::SeqCst);
+        let fields = fixture.table.schema().fields_with_read_metadata();
+        let pb = crate::spec::PredicateBuilder::new(&fields);
+        // This OR cannot become a row-range-only selection. The metadata
+        // operand must survive whole-table authorization and exact filtering.
+        let predicate = crate::spec::Predicate::or(vec![
+            pb.equal("_ROW_ID", Datum::Long(0)).unwrap(),
+            pb.equal("id", Datum::Int(999)).unwrap(),
+        ]);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let update = fixture.table.new_write_builder().new_update().unwrap();
+        let messages = if delete {
+            update.delete_by_predicate(Some(predicate)).await
+        } else {
+            update
+                .update_by_predicate(
+                    Some(predicate),
+                    vec![("value".into(), callback(calls.clone()))],
+                    vec!["value".into()],
+                )
+                .await
+        }
+        .unwrap();
+        TableCommit::new(fixture.table.clone(), "mixed-metadata-predicate".into())
+            .commit(messages)
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture.stored_rows().await,
+            if delete {
+                vec![(2, "a".into(), 20)]
+            } else {
+                vec![(1, "a".into(), 99), (2, "a".into(), 20)]
+            }
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), usize::from(!delete));
+    }
+}
