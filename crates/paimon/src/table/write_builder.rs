@@ -234,7 +234,7 @@ impl<'a> PaimonWriteBuilder<'a> {
 
     /// Try to create a new TableCommit for committing write results.
     pub fn try_new_commit(&self) -> crate::Result<TableCommit> {
-        ensure_table_write_allowed(self.table)?;
+        ensure_table_write_authorized(self.table)?;
         Ok(TableCommit::new(
             self.table.clone(),
             self.commit_user.clone(),
@@ -287,6 +287,22 @@ impl<'a> PaimonWriteBuilder<'a> {
     }
 }
 
+pub(super) fn ensure_table_write_authorized(table: &Table) -> crate::Result<()> {
+    let options = crate::spec::CoreOptions::new(table.schema().options());
+    // Query authorization protects reads, not INSERT/OVERWRITE/TRUNCATE.
+    // A catalog-loaded REST table retains its publication identity and uses
+    // the server's commit authorization. Supplied schemas without that binding
+    // must not turn a guarded table into a filesystem write.
+    if options.query_auth_enabled()
+        && (table.rest_env().is_none() || table.query_auth_session().is_none())
+    {
+        return Err(crate::Error::Unsupported {
+            message: "Writing a table with 'query-auth.enabled' = true requires a catalog-loaded REST table with its resolved schema".into(),
+        });
+    }
+    ensure_table_write_allowed(table)
+}
+
 pub(super) fn ensure_table_write_allowed(table: &Table) -> crate::Result<()> {
     let options = crate::spec::CoreOptions::new(table.schema().options());
     let declared = options.table_type()?;
@@ -332,6 +348,26 @@ pub(super) fn validate_commit_user(commit_user: &str) -> crate::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn rest_query_auth_write_does_not_require_a_query_grant() {
+        let table = crate::table::rest_query_auth_table().await;
+        assert!(table.new_write_builder().new_write().is_ok());
+        assert!(table.new_write_builder().try_new_commit().is_ok());
+    }
+
+    #[tokio::test]
+    async fn rest_query_auth_write_refuses_an_unbound_schema() {
+        let table = crate::table::rest_query_auth_table().await;
+        let mut schema = serde_json::to_value(table.schema()).unwrap();
+        schema["fields"][0]["name"] = serde_json::json!("another_field");
+        let table = table
+            .copy_with_resolved_schema(serde_json::from_value(schema).unwrap(), "main")
+            .unwrap();
+        assert!(table.query_auth_session().is_none());
+        assert!(table.new_write_builder().new_write().is_err());
+        assert!(table.new_write_builder().try_new_commit().is_err());
+    }
     use crate::catalog::Identifier;
     use crate::io::{FileIO, FileIOBuilder};
     use crate::spec::{

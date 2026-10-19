@@ -262,9 +262,7 @@ impl TableWrite {
     }
 
     pub(crate) fn new(table: &Table, commit_user: String) -> crate::Result<Self> {
-        // A dynamic-bucket write reads the persisted PK hash index; the rest are
-        // refused too, since their commit is blocked anyway.
-        CoreOptions::new(table.schema().options()).ensure_read_authorized()?;
+        super::write_builder::ensure_table_write_authorized(table)?;
         CoreOptions::new(table.schema().options()).validate_data_file_path_directory()?;
         let is_overwrite = false;
         let schema = table.schema();
@@ -331,6 +329,12 @@ impl TableWrite {
                     .iter()
                     .any(|p| !pk_set.contains(p.as_str()))
             };
+
+        if is_dynamic_cross_partition && core_options.query_auth_enabled() {
+            return Err(super::query_auth::unsupported(
+                "cross-partition index bootstrap requires an unrestricted primary-key scan",
+            ));
+        }
 
         if has_primary_keys
             && !is_dynamic_bucket

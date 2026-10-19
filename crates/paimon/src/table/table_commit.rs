@@ -306,8 +306,7 @@ impl TableCommit {
         &self,
         mut commits: Vec<(i64, Vec<CommitMessage>)>,
     ) -> Result<usize> {
-        CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
-        super::write_builder::ensure_table_write_allowed(&self.table)?;
+        super::write_builder::ensure_table_write_authorized(&self.table)?;
         commits.sort_by_key(|(id, _)| *id);
         for pair in commits.windows(2) {
             if pair[0].0 == pair[1].0 {
@@ -404,8 +403,7 @@ impl TableCommit {
         // A commit validates against the existing snapshot.
         // A refusal here must not clean up: a retry with an identifier that
         // already committed names files a snapshot references.
-        CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
-        super::write_builder::ensure_table_write_allowed(&self.table)?;
+        super::write_builder::ensure_table_write_authorized(&self.table)?;
         reject_compact_increment(&commit_messages)?;
         validate_fixed_bucket_commit_mode(&commit_messages, false)?;
         validate_bucket_ownership(&commit_messages)?;
@@ -454,8 +452,7 @@ impl TableCommit {
         commit_identifier: i64,
     ) -> Result<()> {
         // A commit validates against the existing snapshot.
-        CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
-        super::write_builder::ensure_table_write_allowed(&self.table)?;
+        super::write_builder::ensure_table_write_authorized(&self.table)?;
         reject_compact_increment(&commit_messages)?;
         validate_fixed_bucket_commit_mode(&commit_messages, false)?;
         validate_bucket_ownership(&commit_messages)?;
@@ -540,8 +537,7 @@ impl TableCommit {
         filter_committed: bool,
     ) -> Result<()> {
         // A commit validates against the existing snapshot.
-        CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
-        super::write_builder::ensure_table_write_allowed(&self.table)?;
+        super::write_builder::ensure_table_write_authorized(&self.table)?;
         reject_compact_increment(&commit_messages)?;
         validate_fixed_bucket_commit_mode(&commit_messages, true)?;
         validate_bucket_ownership(&commit_messages)?;
@@ -800,9 +796,8 @@ impl TableCommit {
         filter_committed: bool,
     ) -> Result<()> {
         // A commit validates against the existing snapshot.
-        CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
         self.ensure_not_format_table()?;
-        super::write_builder::ensure_table_write_allowed(&self.table)?;
+        super::write_builder::ensure_table_write_authorized(&self.table)?;
 
         if partitions.is_empty() {
             return Ok(());
@@ -850,7 +845,7 @@ impl TableCommit {
         partitions: Vec<HashMap<String, Option<Datum>>>,
         commit_identifier: i64,
     ) -> Result<()> {
-        super::write_builder::ensure_table_write_allowed(&self.table)?;
+        super::write_builder::ensure_table_write_authorized(&self.table)?;
 
         if partitions.is_empty() {
             return Err(crate::Error::DataInvalid {
@@ -882,9 +877,8 @@ impl TableCommit {
         filter_committed: bool,
     ) -> Result<()> {
         // A commit validates against the existing snapshot.
-        CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
         self.ensure_not_format_table()?;
-        super::write_builder::ensure_table_write_allowed(&self.table)?;
+        super::write_builder::ensure_table_write_authorized(&self.table)?;
 
         self.try_commit(
             CommitEntriesPlan::Overwrite {
