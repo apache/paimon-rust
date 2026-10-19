@@ -23,6 +23,22 @@ use futures::TryStreamExt;
 use paimon::spec::{BlobType, DataType, IntType, Manifest, ManifestList, Schema, TableSchema};
 use std::sync::Arc;
 
+fn local_wall_millis() -> i64 {
+    // Chrono Local ignores TZ on Windows. Resolve the explicit test zone
+    // independently, so the same wall-time expectations cover every platform.
+    let zone = std::env::var("TZ")
+        .ok()
+        .and_then(|name| jiff::tz::TimeZone::get(&name).ok())
+        .unwrap_or_else(jiff::tz::TimeZone::system);
+    jiff::Timestamp::now()
+        .to_zoned(zone)
+        .datetime()
+        .to_zoned(jiff::tz::TimeZone::UTC)
+        .unwrap()
+        .timestamp()
+        .as_millisecond()
+}
+
 #[test]
 fn writers_persist_local_creation_times_in_all_data_and_changelog_files() {
     const CHILD: &str = "PAIMON_WRITER_CREATION_TIME_ZONE_CHILD";
@@ -99,18 +115,12 @@ async fn check_writers() {
             ("payload", payload),
         ])
         .unwrap();
-        let before = chrono::Local::now()
-            .naive_local()
-            .and_utc()
-            .timestamp_millis();
+        let before = local_wall_millis();
         let builder = table.new_write_builder();
         let mut writer = builder.new_write().unwrap();
         writer.write_arrow_batch(&batch).await.unwrap();
         let messages = writer.prepare_commit().await.unwrap();
-        let after = chrono::Local::now()
-            .naive_local()
-            .and_utc()
-            .timestamp_millis();
+        let after = local_wall_millis();
         let files = messages
             .iter()
             .flat_map(|message| message.new_files.iter().chain(&message.new_changelog_files))
@@ -220,18 +230,12 @@ async fn postpone_creation_time_is_assigned_when_file_result_is_finished() {
     ])
     .unwrap();
     writer.write_arrow_batch(&batch).await.unwrap();
-    let opened = chrono::Local::now()
-        .naive_local()
-        .and_utc()
-        .timestamp_millis();
+    let opened = local_wall_millis();
     // Advance one wall-clock millisecond after opening the file, without a
     // sleep or any process-global time-zone change.
     let started = Instant::now();
     let before_finish = loop {
-        let current = chrono::Local::now()
-            .naive_local()
-            .and_utc()
-            .timestamp_millis();
+        let current = local_wall_millis();
         if current > opened {
             break current;
         }
@@ -242,10 +246,7 @@ async fn postpone_creation_time_is_assigned_when_file_result_is_finished() {
         tokio::task::yield_now().await;
     };
     let messages = writer.prepare_commit().await.unwrap();
-    let finished = chrono::Local::now()
-        .naive_local()
-        .and_utc()
-        .timestamp_millis();
+    let finished = local_wall_millis();
     let file = &messages[0].new_files[0];
     assert!(
         (before_finish..=finished).contains(&file.creation_time.unwrap().timestamp_millis()),
@@ -279,15 +280,9 @@ async fn postpone_rolling_results_keep_arrival_order_and_creation_times() {
             ),
         ])
         .unwrap();
-        let before = chrono::Local::now()
-            .naive_local()
-            .and_utc()
-            .timestamp_millis();
+        let before = local_wall_millis();
         writer.write_arrow_batch(&batch).await.unwrap();
-        let after = chrono::Local::now()
-            .naive_local()
-            .and_utc()
-            .timestamp_millis();
+        let after = local_wall_millis();
         windows.push(before..=after);
     }
     let messages = writer.prepare_commit().await.unwrap();
