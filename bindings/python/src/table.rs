@@ -143,13 +143,6 @@ impl PyTable {
         )
     }
 
-    /// Install catalog query authorization; core validates and enforces the policy.
-    fn with_query_auth(&self, query_auth: Py<PyAny>) -> PyResult<Self> {
-        let query_auth = Arc::new(crate::query_auth::PythonTableQueryAuth::new(query_auth)?);
-        let table = self.inner.with_query_auth(query_auth).map_err(to_py_err)?;
-        Ok(Self::new(Arc::new(table)))
-    }
-
     /// Replace the complete schema while retaining FileIO, REST credentials and branch.
     /// The caller has already resolved fields and options; no schema is reloaded.
     #[pyo3(signature = (schema_json, *, branch=None))]

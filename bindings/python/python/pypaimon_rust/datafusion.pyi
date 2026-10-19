@@ -335,10 +335,6 @@ class Table:
         """Reuse REST metadata and a matching table token; Rust refreshes it on expiry."""
         ...
 
-    def with_query_auth(self, query_auth: Callable[[Optional[List[str]]], Any]) -> "Table":
-        """Use a catalog callback returning a query policy or None for unrestricted access."""
-        ...
-
     def copy_with_resolved_schema(self, schema_json: str, *, branch: Optional[str] = None) -> "Table":
         """Replace all fields/options, preserving FileIO, REST context and branch."""
         ...

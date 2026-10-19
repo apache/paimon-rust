@@ -146,7 +146,6 @@ impl RESTEnv {
         schema_id: i64,
         fields: &[crate::spec::DataField],
         select: Option<Vec<String>>,
-        query_auth: Option<&dyn super::TableQueryAuth>,
     ) -> Result<(crate::api::AuthTableQueryResponse, TableSchema)> {
         let current = self.current_table_identity_checked().await?;
         // A catalog-loaded handle can predate a normal schema evolution, just
@@ -166,10 +165,7 @@ impl RESTEnv {
             })?,
             schema,
         );
-        let response = match query_auth {
-            Some(query_auth) => query_auth.auth(select).await?.unwrap_or_default(),
-            None => self.api.auth_table_query(&self.identifier, select).await?,
-        };
+        let response = self.api.auth_table_query(&self.identifier, select).await?;
         self.current_table_checked(schema.id(), schema.fields())
             .await?;
         Ok((response, schema))

@@ -32,7 +32,6 @@ mod index_build;
 mod merge_into;
 mod oss_cpp;
 mod predicate;
-mod query_auth;
 mod read;
 mod schema;
 mod shard_update;

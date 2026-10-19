@@ -237,9 +237,6 @@ impl RestTable {
     }
 }
 
-#[path = "custom_query_auth_tests.rs"]
-mod custom_query_auth;
-
 #[path = "authorized_update_tests.rs"]
 mod updates;
 
