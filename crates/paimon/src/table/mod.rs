@@ -135,7 +135,9 @@ mod postpone_retract;
 mod prepared_files;
 mod query_auth;
 mod system_table;
+mod table_query_auth;
 pub use system_table::SystemRead;
+pub use table_query_auth::TableQueryAuth;
 
 mod key_normalization;
 mod read_builder;
@@ -300,6 +302,8 @@ pub struct Table {
     /// Minted only by [`RESTEnv::build_table`]; a [`Table::new`] handle cannot
     /// replay a grant.
     query_auth_session: Option<u64>,
+    /// Optional catalog-provided query authorization, independent of REST transport.
+    query_auth: Option<Arc<dyn TableQueryAuth>>,
     rest_env: Option<RESTEnv>,
     /// True when this table copy was switched to a historical schema by
     /// [`Table::copy_with_time_travel`]. Such a copy is read-only.
@@ -331,6 +335,7 @@ impl Table {
             branch,
             branch_reference: false,
             query_auth_session: None,
+            query_auth: None,
             rest_env,
             time_traveled: false,
             travel_snapshot: None,
@@ -374,6 +379,7 @@ impl Table {
             branch,
             branch_reference,
             query_auth_session: None,
+            query_auth: None,
             rest_env: None,
             time_traveled: false,
             travel_snapshot: None,
@@ -542,7 +548,12 @@ impl Table {
         })?;
 
         let (response, current) = rest_env
-            .table_query_auth(self.schema.id(), self.schema.fields(), select.clone())
+            .table_query_auth(
+                self.schema.id(),
+                self.schema.fields(),
+                select.clone(),
+                self.query_auth.as_deref(),
+            )
             .await?;
         self.validate_authorized_snapshot(rest_env).await?;
         let fields =
@@ -604,6 +615,32 @@ impl Table {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         self.query_auth_session = Some(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
         self
+    }
+
+    /// Use a catalog-provided authorizer for this table, as Java's
+    /// `TableQueryAuth.auth(select)` does. The callback is refreshed on every
+    /// operation; policy parsing, schema checks and grant binding stay in core.
+    /// Installing an explicit hook enables query authorization for this copy.
+    /// The hook is scoped to the loaded table identifier: resolve a different
+    /// branch before installing an authorizer for that branch.
+    /// REST publication identity and current schema validation are preserved.
+    pub fn with_query_auth(&self, query_auth: Arc<dyn TableQueryAuth>) -> Result<Self> {
+        if self.rest_env.is_none() || self.query_auth_session.is_none() {
+            return Err(query_auth::unsupported(
+                "a custom query authorizer requires a catalog-loaded REST table",
+            ));
+        }
+        // An explicit callback is authoritative even when the default catalog
+        // factory was disabled. All read guards must observe it, including
+        // readers which intentionally reject query authorization altogether.
+        let mut table = self
+            .copy_with_options(HashMap::from([(
+                "query-auth.enabled".to_string(),
+                "true".into(),
+            )]))
+            .with_query_auth_session();
+        table.query_auth = Some(query_auth);
+        Ok(table)
     }
 
     pub(crate) fn query_auth_session(&self) -> Option<u64> {
@@ -723,6 +760,7 @@ impl Table {
             branch: self.branch.clone(),
             branch_reference: self.branch_reference,
             query_auth_session: self.query_auth_session,
+            query_auth: self.query_auth.clone(),
             rest_env: self.rest_env.clone(),
             time_traveled: self.time_traveled,
             applied_dynamic_option_keys,
@@ -1071,6 +1109,15 @@ impl Table {
             validate_branch_name(branch_name)?;
             branch_name.to_string()
         };
+        if self.query_auth.is_some() {
+            if branch != self.branch {
+                return Err(query_auth::unsupported(
+                    "a custom query authorizer is scoped to the loaded table identifier; \
+                     resolve the target branch before installing its authorizer",
+                ));
+            }
+            return Ok(self.clone());
+        }
         if let Some(env) = &self.rest_env {
             // Catalog branches may have no schema directory in the data store.
             // Load their schema and identity through the same catalog. A table
@@ -1126,6 +1173,7 @@ impl Table {
             branch,
             branch_reference: true,
             query_auth_session: self.query_auth_session,
+            query_auth: self.query_auth.clone(),
             rest_env: self.rest_env.clone(),
             time_traveled: false,
             travel_snapshot: None,

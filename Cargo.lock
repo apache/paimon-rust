@@ -5394,6 +5394,7 @@ dependencies = [
  "datafusion",
  "datafusion-ffi",
  "futures",
+ "opendal-core",
  "paimon",
  "paimon-datafusion",
  "paimon-vindex-core",

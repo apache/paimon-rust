@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! What the REST server authorized a user to read from one table.
+//! What the catalog authorizer permits a user to read from one table.
 
 #[cfg(test)]
 mod numeric_cast_java_test;
@@ -28,7 +28,7 @@ mod rules;
 use crate::api::AuthTableQueryResponse;
 pub(crate) use rules::{filter_batch, mask_batch, mask_inputs, ColumnMask, Rules};
 
-/// The server's answer for one user on one table; `session` ties it to the
+/// The authorizer's answer for one user on one table; `session` ties it to the
 /// handle that asked, as the response names no table or user.
 #[derive(Debug)]
 pub(crate) struct QueryAuthGrant {

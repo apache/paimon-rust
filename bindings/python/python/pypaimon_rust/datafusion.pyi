@@ -311,21 +311,27 @@ class Table:
     def from_resolved_schema(
         location: str, schema_json: str, *, database: str = "default",
         table: str = "table", branch: str = "main",
-        options: Optional[Dict[str, str]] = None,
+        options: Optional[Dict[str, str]] = None, file_io: Optional[Any] = None,
     ) -> "Table":
-        """Preserve a resolved Java-format TableSchema; options configures FileIO.
+        """Preserve a resolved Java-format TableSchema and optional PyPaimon FileIO.
 
         No catalog lookup or schema time-travel resolution is performed. Snapshot
-        selection still uses the supplied schema's options. Use a catalog when
-        REST authorization or credential refresh is required.
+        selection still uses the supplied schema's options. options configures
+        built-in storage only when file_io is omitted. REST snapshots and
+        authorization require a REST-backed table.
         """
         ...
     @staticmethod
     def from_rest_response(
         response_json: str, *, database: str, table: str, rest_options: Dict[str, str],
         initial_data_token: Optional[Tuple[Dict[str, str], int]] = None,
+        file_io: Optional[Any] = None,
     ) -> "Table":
-        """Reuse REST metadata and optionally an already fetched table data token."""
+        """Reuse REST metadata with a token or a resolved PyPaimon FileIO.
+
+        file_io retains its routing and credential refresh, so it cannot be
+        combined with initial_data_token. REST still owns snapshot publication.
+        """
         ...
     @staticmethod
     def from_rest_response_with_token(
@@ -333,6 +339,10 @@ class Table:
         data_token: Dict[str, str], expires_at_millis: int,
     ) -> "Table":
         """Reuse REST metadata and a matching table token; Rust refreshes it on expiry."""
+        ...
+
+    def with_query_auth(self, query_auth: Callable[[Optional[List[str]]], Any]) -> "Table":
+        """Use a catalog callback returning a query policy or None for unrestricted access."""
         ...
 
     def copy_with_resolved_schema(self, schema_json: str, *, branch: Optional[str] = None) -> "Table":

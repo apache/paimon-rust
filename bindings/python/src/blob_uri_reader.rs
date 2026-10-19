@@ -48,10 +48,15 @@ pub(crate) fn callback_error(error: PyErr) -> paimon::Error {
 }
 
 pub(crate) fn to_callback_error(error: paimon::Error) -> PyErr {
-    let mut cause: &(dyn std::error::Error + 'static) = &error;
+    crate::error::to_py_err(error)
+}
+
+/// Recover the original exception without formatting callback errors or URIs.
+pub(crate) fn original_callback_error(error: &paimon::Error) -> Option<PyErr> {
+    let mut cause: &(dyn std::error::Error + 'static) = error;
     loop {
         if let Some(original) = cause.downcast_ref::<PythonCallbackError>() {
-            return Python::attach(|py| original.0.clone_ref(py));
+            return Some(Python::attach(|py| original.0.clone_ref(py)));
         }
         // Paimon UnexpectedError deliberately omits its source from the
         // standard chain. Inspect that explicit source without stringifying
@@ -78,7 +83,7 @@ pub(crate) fn to_callback_error(error: paimon::Error) -> PyErr {
             None => break,
         }
     }
-    crate::error::to_py_err(error)
+    None
 }
 
 pub(crate) struct PythonUriReaderFactory {

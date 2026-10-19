@@ -50,6 +50,30 @@ impl Table {
         rest_options: Options,
         initial_token: Option<RESTToken>,
     ) -> Result<Self> {
+        Self::from_rest_response_with_io(identifier, response, rest_options, initial_token, None)
+            .await
+    }
+
+    /// Reuse REST publication and authorization with an already resolved FileIO.
+    /// The caller owns storage routing and credential refresh. No built-in
+    /// storage backend or table data token is initialized for this FileIO.
+    pub async fn from_rest_response_with_file_io(
+        identifier: Identifier,
+        response: crate::api::GetTableResponse,
+        rest_options: Options,
+        file_io: FileIO,
+    ) -> Result<Self> {
+        Self::from_rest_response_with_io(identifier, response, rest_options, None, Some(file_io))
+            .await
+    }
+
+    async fn from_rest_response_with_io(
+        identifier: Identifier,
+        response: crate::api::GetTableResponse,
+        rest_options: Options,
+        initial_token: Option<RESTToken>,
+        file_io: Option<FileIO>,
+    ) -> Result<Self> {
         identifier.validate()?;
         // Reject a stale or misrouted response before initializing auth or local-cache resources.
         response_identifier(&identifier, &response)?;
@@ -77,6 +101,7 @@ impl Table {
             file_io_cache,
             initial_token,
             fuse_resolver,
+            file_io,
         )
         .await
     }
@@ -94,6 +119,7 @@ pub struct RESTEnv {
     local_cache: Option<Arc<LocalCache>>,
     file_io_cache: FileIOCacheContext,
     fuse_resolver: Arc<FusePathResolver>,
+    file_io_override: Option<FileIO>,
 }
 
 impl std::fmt::Debug for RESTEnv {
@@ -126,6 +152,7 @@ impl RESTEnv {
             local_cache,
             file_io_cache,
             fuse_resolver,
+            file_io_override: None,
         }
     }
 
@@ -146,6 +173,7 @@ impl RESTEnv {
         schema_id: i64,
         fields: &[crate::spec::DataField],
         select: Option<Vec<String>>,
+        query_auth: Option<&dyn super::TableQueryAuth>,
     ) -> Result<(crate::api::AuthTableQueryResponse, TableSchema)> {
         let current = self.current_table_identity_checked().await?;
         // A catalog-loaded handle can predate a normal schema evolution, just
@@ -165,7 +193,10 @@ impl RESTEnv {
             })?,
             schema,
         );
-        let response = self.api.auth_table_query(&self.identifier, select).await?;
+        let response = match query_auth {
+            Some(query_auth) => query_auth.auth(select).await?.unwrap_or_default(),
+            None => self.api.auth_table_query(&self.identifier, select).await?,
+        };
         self.current_table_checked(schema.id(), schema.fields())
             .await?;
         Ok((response, schema))
@@ -284,6 +315,36 @@ impl RESTEnv {
 
     /// Load a table through the same REST catalog environment.
     pub async fn get_table(&self, identifier: &Identifier) -> Result<Table> {
+        // A resolved FileIO belongs to this table, including its branches.
+        // Dependency tables must resolve their own routing and credentials.
+        if self.file_io_override.is_some()
+            && identifier.database() == self.identifier.database()
+            && identifier.table_name()? == self.identifier.table_name()?
+        {
+            let response = Self::fetch_table_response(identifier, &self.api).await?;
+            if response.id.as_deref() != Some(self.uuid.as_str()) {
+                return Err(Error::DataInvalid {
+                    message: format!(
+                        "Table {} identity changed; reload it before reusing its FileIO",
+                        identifier.full_name()
+                    ),
+                    source: None,
+                });
+            }
+            return Self::build_table_with_token(
+                identifier,
+                response,
+                self.api.clone(),
+                self.options.clone(),
+                self.data_token_enabled,
+                self.local_cache.clone(),
+                self.file_io_cache.clone(),
+                None,
+                self.fuse_resolver.clone(),
+                self.file_io_override.clone(),
+            )
+            .await;
+        }
         Self::load_table(
             identifier,
             self.api.clone(),
@@ -351,6 +412,7 @@ impl RESTEnv {
             file_io_cache,
             None,
             fuse_resolver,
+            None,
         )
         .await
     }
@@ -367,6 +429,7 @@ impl RESTEnv {
         file_io_cache: FileIOCacheContext,
         initial_token: Option<RESTToken>,
         fuse_resolver: Arc<FusePathResolver>,
+        file_io_override: Option<FileIO>,
     ) -> Result<Table> {
         let identifier = response_identifier(identifier, &response)?;
         let schema = response.schema.ok_or_else(|| Error::DataInvalid {
@@ -425,18 +488,23 @@ impl RESTEnv {
             source: None,
         })?;
 
-        let file_io = Self::build_file_io_with_token(
-            &identifier,
-            &table_path,
-            api.clone(),
-            &options,
-            data_token_enabled && !is_external,
-            local_cache.clone(),
-            file_io_cache.clone(),
-            initial_token,
-            (!is_external).then_some(fuse_resolver.as_ref()),
-        )
-        .await?;
+        let file_io = match file_io_override.clone() {
+            Some(file_io) => file_io,
+            None => {
+                Self::build_file_io_with_token(
+                    &identifier,
+                    &table_path,
+                    api.clone(),
+                    &options,
+                    data_token_enabled && !is_external,
+                    local_cache.clone(),
+                    file_io_cache.clone(),
+                    initial_token,
+                    (!is_external).then_some(fuse_resolver.as_ref()),
+                )
+                .await?
+            }
+        };
 
         let mut rest_env = RESTEnv::new(
             identifier.clone(),
@@ -448,6 +516,7 @@ impl RESTEnv {
             file_io_cache,
         );
         rest_env.fuse_resolver = fuse_resolver;
+        rest_env.file_io_override = file_io_override;
         let parsed_identifier = identifier.parsed_object_name()?;
         let branch = parsed_identifier.branch_or_default().to_string();
         let branch_reference = parsed_identifier.branch().is_some();
@@ -880,3 +949,7 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+#[path = "rest_env_file_io_tests.rs"]
+mod file_io_tests;

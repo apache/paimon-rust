@@ -45,6 +45,9 @@ pub(crate) fn to_catalog_py_err(error: paimon::Error) -> PyErr {
     if error.is_process_fork_unsupported() {
         return to_py_err(error);
     }
+    if let Some(original) = crate::blob_uri_reader::original_callback_error(&error) {
+        return original;
+    }
     let snapshot_name = match &error {
         Error::SnapshotNotExist { snapshot_id } => Some(snapshot_id.to_string()),
         _ => None,
@@ -134,6 +137,9 @@ pub fn to_py_err(err: paimon::Error) -> PyErr {
     if err.is_process_fork_unsupported() {
         return ForkSafetyError::new_err(err.to_string());
     }
+    if let Some(original) = crate::blob_uri_reader::original_callback_error(&err) {
+        return original;
+    }
     match err {
         // Unimplemented scan semantics: distinct from malformed input so upper
         // layers can catch NotImplementedError and decide on a fallback.
@@ -144,12 +150,18 @@ pub fn to_py_err(err: paimon::Error) -> PyErr {
 
 pub fn df_to_py_err(err: datafusion::error::DataFusionError) -> PyErr {
     let mut causes: Vec<&(dyn std::error::Error + 'static)> = vec![&err];
+    let mut callback_error = None;
     while let Some(cause) = causes.pop() {
         if cause
             .downcast_ref::<paimon::Error>()
             .is_some_and(paimon::Error::is_process_fork_unsupported)
         {
             return ForkSafetyError::new_err(err.to_string());
+        }
+        if callback_error.is_none() {
+            if let Some(core_error) = cause.downcast_ref::<paimon::Error>() {
+                callback_error = crate::blob_uri_reader::original_callback_error(core_error);
+            }
         }
         if let Some(datafusion::error::DataFusionError::Collection(errors)) =
             cause.downcast_ref::<datafusion::error::DataFusionError>()
@@ -163,7 +175,7 @@ pub fn df_to_py_err(err: datafusion::error::DataFusionError) -> PyErr {
             causes.push(source);
         }
     }
-    PyValueError::new_err(err.to_string())
+    callback_error.unwrap_or_else(|| PyValueError::new_err(err.to_string()))
 }
 
 #[cfg(test)]
@@ -257,6 +269,73 @@ mod tests {
         Python::attach(|py| {
             let error = datafusion::error::DataFusionError::Plan("invalid SQL".to_string());
             assert!(df_to_py_err(error).is_instance_of::<PyValueError>(py));
+        });
+    }
+    #[test]
+    fn callback_errors_survive_io_catalog_and_datafusion_wrapping() {
+        use pyo3::exceptions::PyPermissionError;
+        fn error() -> paimon::Error {
+            let original = PyPermissionError::new_err("custom FileIO denied access");
+            let inner = crate::blob_uri_reader::callback_error(original);
+            let storage =
+                opendal::Error::new(opendal::ErrorKind::PermissionDenied, "Python FileIO failed")
+                    .set_source(inner);
+            paimon::Error::IoUnexpected {
+                message: "reading a page".to_string(),
+                source: Box::new(storage),
+            }
+        }
+        Python::attach(|py| {
+            assert!(to_py_err(error()).is_instance_of::<PyPermissionError>(py));
+            assert!(to_catalog_py_err(error()).is_instance_of::<PyPermissionError>(py));
+            let wrapped = datafusion::error::DataFusionError::External(Box::new(error()))
+                .context("reading parquet");
+            let recovered = df_to_py_err(wrapped);
+            assert!(recovered.is_instance_of::<PyPermissionError>(py));
+            assert_eq!(
+                recovered.value(py).to_string(),
+                "custom FileIO denied access"
+            );
+        });
+    }
+
+    #[test]
+    fn fork_error_keeps_priority_over_callback_error_in_collection() {
+        let callback = crate::blob_uri_reader::callback_error(
+            pyo3::exceptions::PyPermissionError::new_err("Python callback denied"),
+        );
+        let fork = paimon::Error::ProcessForkUnsupported {
+            message: "fork is unsupported".to_string(),
+        };
+        let error = datafusion::error::DataFusionError::Collection(vec![
+            datafusion::error::DataFusionError::External(Box::new(fork)),
+            datafusion::error::DataFusionError::External(Box::new(callback)),
+        ]);
+        Python::attach(|py| assert!(df_to_py_err(error).is_instance_of::<ForkSafetyError>(py)));
+    }
+    #[test]
+    fn io_callback_error_preserves_exception_identity() {
+        Python::attach(|py| {
+            let original = pyo3::exceptions::PyOSError::new_err("private custom IO failure");
+            original.value(py).setattr("storage_code", 17).unwrap();
+            let expected = original.clone_ref(py);
+            let wrapped = crate::blob_uri_reader::callback_error(original);
+            let io_error = std::io::Error::other(wrapped);
+            let wrapped = paimon::Error::DataInvalid {
+                message: "parquet read failed".to_string(),
+                source: Some(Box::new(io_error)),
+            };
+            let recovered = to_py_err(wrapped);
+            assert!(recovered.value(py).is(expected.value(py)));
+            assert_eq!(
+                recovered
+                    .value(py)
+                    .getattr("storage_code")
+                    .unwrap()
+                    .extract::<i32>()
+                    .unwrap(),
+                17
+            );
         });
     }
 }
