@@ -306,7 +306,6 @@ impl LocalCacheConfig {
             .get(CatalogOptions::LOCAL_CACHE_WHITELIST)
             .map(String::as_str)
             .unwrap_or("meta,global-index");
-
         Ok(Some(Self {
             dir,
             namespace: catalog_namespace(namespace_options),
@@ -409,7 +408,11 @@ mod tests {
         assert_eq!(config.block_size, 64 * 1024);
         assert_eq!(
             config.whitelist,
-            std::collections::HashSet::from([FileType::Meta, FileType::Data])
+            std::collections::HashSet::from([
+                FileType::Meta,
+                FileType::DedicatedData,
+                FileType::StructuredData
+            ])
         );
     }
 
@@ -483,6 +486,28 @@ mod tests {
         assert_eq!(cache.file_size(path, &token).await, Some(42));
         cache.invalidate_path(path).await;
         assert_eq!(cache.file_size(path, &token).await, None);
+    }
+
+    #[test]
+    fn test_structured_data_excludes_dedicated_and_mutable_files() {
+        let mut options = Options::new();
+        options.set(CatalogOptions::LOCAL_CACHE_ENABLED, "true");
+        options.set(CatalogOptions::LOCAL_CACHE_WHITELIST, "structured-data");
+        let cache = create_local_cache(&options).unwrap().unwrap();
+        assert!(cache.is_cacheable("s3://bucket/data.parquet"));
+        assert!(cache.is_cacheable("s3://bucket/data.unknown"));
+        for path in [
+            "s3://bucket/data.parquet.tmp",
+            "s3://bucket/.data.parquet.123e4567-e89b-12d3-a456-426614174000.tmp",
+            "s3://bucket/data.tmp.parquet",
+            "s3://bucket/manifest-1.avro",
+            "s3://bucket/data.parquet.index",
+            "s3://bucket/data.blob",
+            "s3://bucket/data.video",
+            "s3://bucket/data.vector.vortex",
+        ] {
+            assert!(!cache.is_cacheable(path), "{path}");
+        }
     }
 
     #[tokio::test]
