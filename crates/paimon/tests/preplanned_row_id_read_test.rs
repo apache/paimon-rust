@@ -23,7 +23,7 @@ use common::incremental_helpers::{
 };
 use futures::TryStreamExt;
 use paimon::spec::{DataType, Datum, IntType, Predicate, PredicateBuilder, Schema, TableSchema};
-use paimon::table::{DataSplit, ReadBuilder, RowRange};
+use paimon::table::{DataSplit, DataSplitBuilder, ReadBuilder, RowRange};
 
 async fn ids(builder: &ReadBuilder<'_>, splits: &[DataSplit]) -> Vec<i32> {
     let batches: Vec<RecordBatch> = builder
@@ -158,5 +158,93 @@ async fn a_reader_applies_its_row_id_filter_to_an_existing_plan() {
         // A new filter replaces its old derived range as well as the residual.
         reader.with_filter(pb.equal("id", Datum::Int(13)).unwrap());
         assert_eq!(ids(&reader, plan.splits()).await, vec![13]);
+    }
+}
+
+#[tokio::test]
+async fn physical_slices_use_the_readers_coordinate_system_before_filtering() {
+    for tracked in [false, true] {
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("value", DataType::Int(IntType::new()))
+            .option("row-tracking.enabled", tracked.to_string())
+            .option("read.batch-size", "2")
+            .build()
+            .unwrap();
+        let (io, table) = memory_table("memory:/physical_slices", TableSchema::new(0, &schema));
+        setup_dirs(&io, table.location()).await;
+        persist_table_schema(&io, table.location(), table.schema()).await;
+        let mut seen = std::collections::HashSet::new();
+        let mut files = Vec::new();
+        let mut bucket_path = String::new();
+        for start in [10, 20, 30] {
+            let values = (start..start + 4).collect::<Vec<_>>();
+            write_batch(&table, &make_batch(values.clone(), values)).await;
+            let plan = table.new_read_builder().new_scan().plan().await.unwrap();
+            for split in plan.splits() {
+                bucket_path = split.bucket_path().to_string();
+                for file in split.data_files() {
+                    if seen.insert(file.file_name.clone()) {
+                        files.push(file.clone());
+                    }
+                }
+            }
+        }
+        assert_eq!(files.len(), 3);
+        // Drop the middle file and reverse the others. Stable row IDs retain
+        // their gaps; raw offsets restart at zero in this supplied split.
+        let selected = vec![files[2].clone(), files[0].clone()];
+        let mut offset = 0;
+        let ranges = selected
+            .iter()
+            .zip([(2, 4), (1, 3)])
+            .map(|(file, (start, end))| {
+                let base = if tracked {
+                    file.first_row_id.unwrap()
+                } else {
+                    offset
+                };
+                offset += file.row_count;
+                RowRange::new(base + start, base + end - 1)
+            })
+            .collect();
+        let split = DataSplitBuilder::new()
+            .with_snapshot(3)
+            .with_partition(paimon::spec::BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(bucket_path)
+            .with_data_files(selected)
+            .with_raw_convertible(true)
+            .with_row_ranges(ranges)
+            .build()
+            .unwrap();
+        let mut reader = table.new_read_builder();
+        reader.with_projection(&["id"]).unwrap();
+        assert_eq!(
+            ids(&reader, std::slice::from_ref(&split)).await,
+            vec![11, 12, 32, 33],
+            "tracked={tracked}"
+        );
+        reader.with_filter(
+            PredicateBuilder::new(table.schema().fields())
+                .greater_or_equal("id", Datum::Int(12))
+                .unwrap(),
+        );
+        assert_eq!(
+            ids(&reader, std::slice::from_ref(&split)).await,
+            vec![12, 32, 33],
+            "tracked={tracked}"
+        );
+        reader.with_projection(&[]).unwrap();
+        let counted = reader
+            .new_read()
+            .unwrap()
+            .to_arrow(&[split])
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert!(counted.iter().all(|batch| batch.num_columns() == 0));
+        assert_eq!(counted.iter().map(RecordBatch::num_rows).sum::<usize>(), 3);
     }
 }

@@ -316,6 +316,40 @@ mod tests {
     }
 
     #[test]
+    fn mod_bucket_preserves_integer_boundaries_and_null_slots() {
+        let int_type = DataType::Int(IntType::new());
+        let long_type = DataType::BigInt(crate::spec::BigIntType::new());
+        for (value, expected) in [(i32::MIN, 2), (-17, 3), (-1, 4), (0, 0), (i32::MAX, 2)] {
+            assert_eq!(
+                bucket_for_datums(
+                    &[(Some(&Datum::Int(value)), &int_type)],
+                    BucketFunctionType::Mod,
+                    5,
+                )
+                .unwrap(),
+                expected
+            );
+        }
+        for (value, expected) in [(i64::MIN, 2), (-17, 3), (-1, 4), (0, 0), (i64::MAX, 2)] {
+            assert_eq!(
+                bucket_for_datums(
+                    &[(Some(&Datum::Long(value)), &long_type)],
+                    BucketFunctionType::Mod,
+                    5,
+                )
+                .unwrap(),
+                expected
+            );
+        }
+        for data_type in [&int_type, &long_type] {
+            assert_eq!(
+                bucket_for_datums(&[(None, data_type)], BucketFunctionType::Mod, 5).unwrap(),
+                0
+            );
+        }
+    }
+
+    #[test]
     fn hive_bucket_matches_java_reference_case() {
         let bool_type = DataType::Boolean(BooleanType::new());
         let int_type = DataType::Int(IntType::new());
