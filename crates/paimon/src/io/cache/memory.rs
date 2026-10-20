@@ -18,7 +18,9 @@
 use bytes::Bytes;
 use std::sync::Mutex;
 
-use super::priority_lru::{protected_limit, PriorityLru, DEFAULT_HIGH_PRIORITY_POOL_RATIO};
+#[cfg(test)]
+use super::priority_lru::DEFAULT_HIGH_PRIORITY_POOL_RATIO;
+use super::priority_lru::{protected_limit, PriorityLru};
 use super::state::BlockKey;
 
 #[derive(Debug)]

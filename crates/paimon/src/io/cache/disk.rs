@@ -23,7 +23,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use tokio::io::AsyncWriteExt;
 
-use super::priority_lru::{protected_limit, PriorityLru, DEFAULT_HIGH_PRIORITY_POOL_RATIO};
+#[cfg(test)]
+use super::priority_lru::DEFAULT_HIGH_PRIORITY_POOL_RATIO;
+use super::priority_lru::{protected_limit, PriorityLru};
 use super::state::{BlockKey, CacheCoordinator, LogicalPath};
 
 const CACHE_MAGIC: &[u8; 8] = b"PAIMONLC";
