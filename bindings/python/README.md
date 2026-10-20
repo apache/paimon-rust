@@ -132,6 +132,17 @@ scan = read_builder.new_scan()
 plan = scan.plan()
 batches = read_builder.new_read().read(plan.splits())
 
+# Core schedules a bounded set of split readers and owns their global limit.
+# Set ordered=True to retain the supplied split order. The default emits
+# whichever split group is ready first. Ordered parallel reads disable background
+# Parquet row-group prefetch; split workers still read concurrently.
+reader = read_builder.new_read().read_arrow(plan.splits(), parallelism=4, ordered=False)
+try:
+    for batch in reader:
+        print(batch)
+finally:
+    reader.close()
+
 print(f"\nRead: {batches[0].num_rows} rows")
 print(batches[0])
 
