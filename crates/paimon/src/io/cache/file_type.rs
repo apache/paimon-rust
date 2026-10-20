@@ -25,7 +25,7 @@ const TEMP_FILE_SUFFIX_LEN: usize = 41;
 pub(super) enum FileType {
     Meta,
     Data,
-    DedicatedData,
+    StructuredData,
     BucketIndex,
     GlobalIndex,
     FileIndex,
@@ -35,7 +35,7 @@ impl FileType {
     const ALL: [Self; 6] = [
         Self::Meta,
         Self::Data,
-        Self::DedicatedData,
+        Self::StructuredData,
         Self::BucketIndex,
         Self::GlobalIndex,
         Self::FileIndex,
@@ -81,9 +81,9 @@ impl FileType {
         }
 
         if Self::is_dedicated_file(name) {
-            Self::DedicatedData
-        } else {
             Self::Data
+        } else {
+            Self::StructuredData
         }
     }
 
@@ -120,8 +120,8 @@ impl FileType {
                     "global-index" => &[Self::GlobalIndex],
                     "bucket-index" => &[Self::BucketIndex],
                     // Preserve the existing broad data selector.
-                    "data" => &[Self::Data, Self::DedicatedData],
-                    "structured-data" => &[Self::Data],
+                    "data" => &[Self::Data, Self::StructuredData],
+                    "structured-data" => &[Self::StructuredData],
                     "file-index" => &[Self::FileIndex],
                     "" => &[],
                     unknown => {
@@ -182,7 +182,7 @@ mod tests {
             ),
             (
                 "s3://bucket/table/bucket-0/data-abc.parquet",
-                FileType::Data,
+                FileType::StructuredData,
             ),
             (
                 "s3://bucket/table/manifest/manifest-123e4567-e89b-12d3-a456-426614174000-0.avro.sidecar",
@@ -196,7 +196,7 @@ mod tests {
             ("s3://bucket/table/changelog/changelog-5", FileType::Meta),
             (
                 "s3://bucket/table/bucket-0/changelog-123e4567-e89b-12d3-a456-426614174000-0.parquet",
-                FileType::Data,
+                FileType::StructuredData,
             ),
             (
                 "s3://bucket/table/snapshot/.snapshot-13.123e4567-e89b-12d3-a456-426614174000.tmp",
@@ -208,7 +208,7 @@ mod tests {
             ),
             (
                 "s3://bucket/table/bucket-0/.data-abc.parquet.123e4567-e89b-12d3-a456-426614174000.tmp",
-                FileType::Data,
+                FileType::StructuredData,
             ),
         ];
 
@@ -280,7 +280,7 @@ mod tests {
             "data.unknown",
             "dir.parquet/data",
         ] {
-            assert_eq!(FileType::classify(name), FileType::Data);
+            assert_eq!(FileType::classify(name), FileType::StructuredData);
         }
         for name in [
             "data.blob",
@@ -291,7 +291,7 @@ mod tests {
             "data.vector.vortex",
             "data.VECTOR.index-data",
         ] {
-            assert_eq!(FileType::classify(name), FileType::DedicatedData);
+            assert_eq!(FileType::classify(name), FileType::Data);
         }
         assert_eq!(FileType::classify("manifest-1.avro"), FileType::Meta);
         assert_eq!(FileType::classify("snapshot-1.parquet"), FileType::Meta);
@@ -301,11 +301,11 @@ mod tests {
         );
         assert_eq!(
             FileType::parse_whitelist("data"),
-            HashSet::from([FileType::Data, FileType::DedicatedData])
+            HashSet::from([FileType::Data, FileType::StructuredData])
         );
         assert_eq!(
             FileType::parse_whitelist("structured-data"),
-            HashSet::from([FileType::Data])
+            HashSet::from([FileType::StructuredData])
         );
     }
 
@@ -316,7 +316,7 @@ mod tests {
             FileType::GlobalIndex,
             FileType::BucketIndex,
             FileType::Data,
-            FileType::DedicatedData,
+            FileType::StructuredData,
             FileType::FileIndex,
         ]);
 

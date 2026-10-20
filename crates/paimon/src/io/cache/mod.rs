@@ -411,7 +411,7 @@ mod tests {
             std::collections::HashSet::from([
                 FileType::Meta,
                 FileType::Data,
-                FileType::DedicatedData
+                FileType::StructuredData
             ])
         );
     }
