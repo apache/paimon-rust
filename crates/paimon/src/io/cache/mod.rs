@@ -18,11 +18,13 @@
 mod disk;
 mod file_type;
 mod memory;
+mod priority_lru;
 mod reader;
 mod state;
 
 use self::file_type::FileType;
 use self::memory::MemoryCache;
+use self::priority_lru::DEFAULT_HIGH_PRIORITY_POOL_RATIO;
 use self::state::{BlockKey, CacheCoordinator, CacheReadToken};
 use crate::common::{CatalogOptions, Options};
 use crate::io::FileBlockCache;
@@ -75,7 +77,12 @@ impl LocalCache {
         })
     }
 
+    #[cfg(test)]
     pub(super) fn new(config: LocalCacheConfig) -> crate::Result<Self> {
+        Self::new_with_ratio(config, DEFAULT_HIGH_PRIORITY_POOL_RATIO)
+    }
+
+    fn new_with_ratio(config: LocalCacheConfig, ratio: f64) -> crate::Result<Self> {
         let file_size_capacity = config
             .max_size
             .map(|max_size| max_size / config.block_size)
@@ -83,12 +90,12 @@ impl LocalCache {
             .unwrap_or(DEFAULT_FILE_SIZE_CAPACITY)
             .clamp(1, DEFAULT_FILE_SIZE_CAPACITY);
         let (backend, coordinator) = if let Some(dir) = config.dir {
-            let disk = DiskCache::shared(dir.join(CACHE_DIRECTORY_NAME), config.max_size)?;
+            let disk = DiskCache::shared(dir.join(CACHE_DIRECTORY_NAME), config.max_size, ratio)?;
             let coordinator = disk.coordinator();
             (CacheBackend::Disk(disk), coordinator)
         } else {
             (
-                CacheBackend::Memory(MemoryCache::new(config.max_size)),
+                CacheBackend::Memory(MemoryCache::with_ratio(config.max_size, ratio)),
                 Arc::new(CacheCoordinator::default()),
             )
         };
@@ -234,10 +241,34 @@ pub(crate) fn create_local_cache_with_namespace(
     cache_options: &Options,
     namespace_options: &Options,
 ) -> crate::Result<Option<Arc<LocalCache>>> {
-    LocalCacheConfig::from_options_with_namespace(cache_options, namespace_options)?
-        .map(LocalCache::new)
-        .transpose()
-        .map(|cache| cache.map(Arc::new))
+    let Some(config) =
+        LocalCacheConfig::from_options_with_namespace(cache_options, namespace_options)?
+    else {
+        return Ok(None);
+    };
+    let ratio = parse_high_priority_ratio(cache_options)?;
+    LocalCache::new_with_ratio(config, ratio)
+        .map(Arc::new)
+        .map(Some)
+}
+
+fn parse_high_priority_ratio(options: &Options) -> crate::Result<f64> {
+    let key = CatalogOptions::LOCAL_CACHE_HIGH_PRIORITY_POOL_RATIO;
+    let Some(value) = options.get(key) else {
+        return Ok(DEFAULT_HIGH_PRIORITY_POOL_RATIO);
+    };
+    let ratio = value
+        .trim()
+        .parse::<f64>()
+        .map_err(|_| crate::Error::ConfigInvalid {
+            message: format!("{key} must be a number in [0, 1)"),
+        })?;
+    if !(0.0..1.0).contains(&ratio) {
+        return Err(crate::Error::ConfigInvalid {
+            message: format!("{key} must be in [0, 1)"),
+        });
+    }
+    Ok(ratio)
 }
 
 #[derive(Debug)]
@@ -369,6 +400,7 @@ mod tests {
         assert_eq!(config.dir, None);
         assert_eq!(config.max_size, None);
         assert_eq!(config.block_size, 1024 * 1024);
+        assert_eq!(parse_high_priority_ratio(&options).unwrap(), 0.25);
         assert_eq!(
             config.whitelist,
             HashSet::from([FileType::Meta, FileType::GlobalIndex])
@@ -465,6 +497,24 @@ mod tests {
         let error = LocalCacheConfig::from_options(&options).unwrap_err();
         assert!(matches!(error, crate::Error::ConfigInvalid { .. }));
         assert!(error.to_string().contains("local-cache.enabled"));
+    }
+
+    #[test]
+    fn test_local_cache_high_priority_ratio_validation() {
+        let mut options = Options::new();
+        options.set(CatalogOptions::LOCAL_CACHE_ENABLED, "true");
+        for (value, expected) in [("0", 0.0), ("0.75", 0.75)] {
+            options.set(CatalogOptions::LOCAL_CACHE_HIGH_PRIORITY_POOL_RATIO, value);
+            assert_eq!(parse_high_priority_ratio(&options).unwrap(), expected);
+        }
+        for value in ["-0.1", "1", "NaN", "inf", "garbage"] {
+            options.set(CatalogOptions::LOCAL_CACHE_HIGH_PRIORITY_POOL_RATIO, value);
+            let error = create_local_cache(&options).unwrap_err();
+            assert!(matches!(error, crate::Error::ConfigInvalid { .. }));
+            assert!(error
+                .to_string()
+                .contains(CatalogOptions::LOCAL_CACHE_HIGH_PRIORITY_POOL_RATIO));
+        }
     }
 
     #[tokio::test]

@@ -402,12 +402,16 @@ let catalog = CatalogFactory::create(options).await?;
 | `local-cache.enabled` | `false` | Enable catalog-scoped local block caching. |
 | `local-cache.dir` | none | Optional base directory. When set, Paimon uses a persistent disk cache in a private versioned child directory; otherwise it uses memory. |
 | `local-cache.max-size` | unlimited | Maximum cache size. Memory caches count payload bytes; disk caches count encoded bytes. Values accept byte units such as `512 MiB` or `20 GiB`. |
+| `local-cache.high-priority-pool-ratio` | `0.25` | Fraction of a finite cache budget protected for `meta` and `global-index` blocks. Use `0` for a single LRU. |
 | `local-cache.block-size` | `1 MiB` | Block size used for cached range reads. |
 | `local-cache.whitelist` | `meta,global-index` | Comma-separated eligible types: `meta`, `global-index`, `bucket-index`, `data`, `structured-data`, and `file-index`, or `*` for all of them. |
 
 Use `local-cache.whitelist=meta,global-index,structured-data` to cache data
 blocks without dedicated BLOB, video, or vector-store files. `data` and `*`
 retain their broader behavior.
+
+The protected and regular LRUs share one total budget; either can use idle
+capacity. Catalogs sharing a disk cache within one process must use the same ratio.
 
 Each catalog owns its in-memory cache for the catalog's lifetime. Disk caches
 are reused after process restarts. Cache keys include a catalog-configuration
