@@ -93,7 +93,7 @@ impl LocalCache {
             .clamp(1, DEFAULT_FILE_SIZE_CAPACITY);
         let (backend, coordinator) = if config.shared {
             (
-                CacheBackend::SharedDisk(SharedDiskCache::new(
+                CacheBackend::SharedDisk(SharedDiskCache::new_with_ratio(
                     config
                         .dir
                         .ok_or_else(|| crate::Error::ConfigInvalid {
@@ -103,6 +103,7 @@ impl LocalCache {
                     config.max_size.ok_or_else(|| crate::Error::ConfigInvalid {
                         message: "Shared local cache requires local-cache.max-size".into(),
                     })?,
+                    ratio,
                 )?),
                 Arc::new(CacheCoordinator::default()),
             )

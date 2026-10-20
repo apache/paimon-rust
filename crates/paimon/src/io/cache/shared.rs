@@ -30,6 +30,7 @@ const MUTATION_MARKER: &str = "mutation-pending";
 pub(crate) struct SharedDiskCache {
     root: PathBuf,
     max_size: u64,
+    high_priority_ratio: f64,
 }
 
 fn open_lock(path: &Path) -> io::Result<File> {
@@ -143,7 +144,16 @@ impl SharedInvalidationGuard {
 }
 
 impl SharedDiskCache {
+    #[cfg(test)]
     pub(crate) fn new(root: PathBuf, max_size: u64) -> crate::Result<Self> {
+        Self::new_with_ratio(root, max_size, DEFAULT_HIGH_PRIORITY_POOL_RATIO)
+    }
+
+    pub(crate) fn new_with_ratio(
+        root: PathBuf,
+        max_size: u64,
+        high_priority_ratio: f64,
+    ) -> crate::Result<Self> {
         let root = prepare_cache_root(&root)?;
         let initialize = || -> io::Result<()> {
             let gate = open_lock(&root.join("directory.lock"))?;
@@ -161,11 +171,25 @@ impl SharedDiskCache {
                 }
                 Err(e) => return Err(e),
             }
+            let ratio_path = root.join("high-priority-pool-ratio");
+            let ratio_bits = high_priority_ratio.to_bits().to_string();
+            match std::fs::read_to_string(&ratio_path) {
+                Ok(value) if value == ratio_bits => (),
+                Ok(_) => {
+                    return Err(io::Error::other(
+                        "Shared cache participants must use the same local-cache.high-priority-pool-ratio",
+                    ))
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    std::fs::write(ratio_path, ratio_bits)?;
+                }
+                Err(e) => return Err(e),
+            }
             if read_generation(&root).is_none() {
                 // No block can be trusted without the epoch used to encode its
                 // key. Clear unknown blocks before publishing a fresh epoch.
                 std::fs::write(root.join("dirty"), b"")?;
-                let used = recover_usage(&root, 0)?;
+                let used = recover_usage(&root, 0, high_priority_ratio)?;
                 rotate_generation(&root)?;
                 finish_usage(&root, used)?;
             }
@@ -173,7 +197,7 @@ impl SharedDiskCache {
             // block whenever another worker starts.
             if clean_usage(&root, max_size).is_none() {
                 std::fs::write(root.join("dirty"), b"")?;
-                let used = recover_usage(&root, max_size)?;
+                let used = recover_usage(&root, max_size, high_priority_ratio)?;
                 finish_usage(&root, used)?;
             }
             Ok(())
@@ -181,7 +205,11 @@ impl SharedDiskCache {
         initialize().map_err(|e| crate::Error::ConfigInvalid {
             message: e.to_string(),
         })?;
-        Ok(Self { root, max_size })
+        Ok(Self {
+            root,
+            max_size,
+            high_priority_ratio,
+        })
     }
 
     pub(crate) fn generation(&self) -> Option<String> {
@@ -240,6 +268,7 @@ impl SharedDiskCache {
         let key = generation_key(key, generation.as_ref().unwrap());
         let generation = generation.clone();
         let max_size = self.max_size;
+        let high_priority_ratio = self.high_priority_ratio;
         let result = tokio::task::spawn_blocking(move || -> io::Result<()> {
             let _gate = gate;
             if !mutation_cleared(&root)
@@ -253,14 +282,14 @@ impl SharedDiskCache {
             }
             let path = root.join(key.cache_relative_path());
             let mut used = if root.join("dirty").exists() {
-                recover_usage(&root, max_size)?
+                recover_usage(&root, max_size, high_priority_ratio)?
             } else {
                 match std::fs::read_to_string(root.join("usage"))
                     .ok()
                     .and_then(|s| s.parse::<u64>().ok())
                 {
                     Some(used) => used,
-                    None => recover_usage(&root, max_size)?,
+                    None => recover_usage(&root, max_size, high_priority_ratio)?,
                 }
             };
             // Keep the marker until publication and accounting both complete.
@@ -276,6 +305,7 @@ impl SharedDiskCache {
                 used = recover_usage(
                     &root,
                     (max_size - encoded.len() as u64).min(max_size - max_size / 10),
+                    high_priority_ratio,
                 )?;
                 previous = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
             }
@@ -388,12 +418,19 @@ fn start_invalidation(root: &Path) -> io::Result<()> {
 
 fn finish_invalidation(root: &Path) -> io::Result<()> {
     // This intentionally invalidates the whole shared directory.
-    let state = scan_existing_blocks(root);
-    for key in state.entries.keys() {
+    for (key, _) in scan_existing_blocks(root) {
         let _ = std::fs::remove_file(root.join(key.cache_relative_path()));
     }
     cleanup_temporary_files(root)?;
-    finish_usage(root, scan_existing_blocks(root).current_size)
+    finish_usage(root, existing_usage(root))
+}
+
+fn existing_usage(root: &Path) -> u64 {
+    scan_existing_blocks(root)
+        .iter()
+        .fold(0u64, |used, (_, encoded_size)| {
+            used.saturating_add(*encoded_size)
+        })
 }
 
 fn clean_usage(root: &Path, max_size: u64) -> Option<u64> {
@@ -407,14 +444,16 @@ fn clean_usage(root: &Path, max_size: u64) -> Option<u64> {
     (used <= max_size).then_some(used)
 }
 
-fn recover_usage(root: &Path, limit: u64) -> io::Result<u64> {
+fn recover_usage(root: &Path, limit: u64, high_priority_ratio: f64) -> io::Result<u64> {
     // Publication holds the directory lock, so every temporary block found
     // here belongs to an interrupted publisher. Remove it before clearing dirty.
     cleanup_temporary_files(root)?;
     #[cfg(test)]
     RECOVERY_SCANS.with(|count| count.set(count.get() + 1));
-    let mut state = scan_existing_blocks(root);
-    state.max_size = Some(limit);
+    let mut state = CacheState::new(Some(limit), high_priority_ratio);
+    for (key, encoded_size) in scan_existing_blocks(root) {
+        insert_state_entry(&mut state, key, encoded_size);
+    }
     for key in collect_evictions(&mut state) {
         std::fs::remove_file(root.join(key.cache_relative_path()))?;
     }
@@ -675,14 +714,36 @@ mod tests {
             key.block_index = index;
             cache.put(&key, Bytes::from(vec![42; 64]), &token).await;
         }
-        let state = scan_existing_blocks(directory.path());
-        assert!(state.current_size <= 512);
+        assert!(existing_usage(directory.path()) <= 512);
         let newest = BlockKey::with_namespace("catalog", "data.parquet", 64, 9);
         let file = directory
             .path()
             .join(generation_key(&newest, token.as_ref().unwrap()).cache_relative_path());
         std::fs::write(file, b"corrupt").unwrap();
         assert!(cache.get(&newest, &token).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn shared_cache_preserves_metadata_priority() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache =
+            SharedDiskCache::new_with_ratio(directory.path().to_path_buf(), 2048, 0.25).unwrap();
+        assert!(
+            SharedDiskCache::new_with_ratio(directory.path().to_path_buf(), 2048, 0.5).is_err()
+        );
+        let token = cache.generation();
+        let metadata = BlockKey::with_namespace("catalog", "snapshot-1", 64, 0);
+        cache.put(&metadata, Bytes::from(vec![1; 64]), &token).await;
+        for index in 0..20 {
+            let mut data = key();
+            data.block_index = index;
+            cache.put(&data, Bytes::from(vec![2; 64]), &token).await;
+        }
+        assert_eq!(
+            cache.get(&metadata, &token).await,
+            Some(Bytes::from(vec![1; 64]))
+        );
+        assert!(existing_usage(directory.path()) <= 2048);
     }
 
     #[tokio::test]
@@ -702,7 +763,7 @@ mod tests {
             .unwrap()
             .parse()
             .unwrap();
-        assert_eq!(used, scan_existing_blocks(directory.path()).current_size);
+        assert_eq!(used, existing_usage(directory.path()));
         assert!(used <= 512);
     }
 

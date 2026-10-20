@@ -412,7 +412,7 @@ blocks without dedicated BLOB, video, or vector-store files. `data` and `*`
 retain their broader behavior.
 
 The protected and regular LRUs share one total budget; either can use idle
-capacity. Catalogs sharing a disk cache within one process must use the same ratio.
+capacity. Catalogs or processes sharing a disk cache must use the same ratio.
 
 Each catalog owns its in-memory cache for the catalog's lifetime. Disk caches
 are reused after process restarts. Cache keys include a catalog-configuration

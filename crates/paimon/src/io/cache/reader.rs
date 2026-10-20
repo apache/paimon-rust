@@ -308,6 +308,7 @@ mod tests {
         });
         let cache = Arc::new(
             LocalCache::new(LocalCacheConfig {
+                shared: false,
                 dir: None,
                 namespace: "test".to_string(),
                 max_size: Some(16),
