@@ -409,7 +409,11 @@ mod tests {
         assert_eq!(config.block_size, 64 * 1024);
         assert_eq!(
             config.whitelist,
-            std::collections::HashSet::from([FileType::Meta, FileType::Data])
+            std::collections::HashSet::from([
+                FileType::Meta,
+                FileType::Data,
+                FileType::StructuredData
+            ])
         );
     }
 
@@ -483,6 +487,25 @@ mod tests {
         assert_eq!(cache.file_size(path, &token).await, Some(42));
         cache.invalidate_path(path).await;
         assert_eq!(cache.file_size(path, &token).await, None);
+    }
+
+    #[test]
+    fn test_structured_data_selection_excludes_mutable_files() {
+        let mut options = Options::new();
+        options.set(CatalogOptions::LOCAL_CACHE_ENABLED, "true");
+        options.set(CatalogOptions::LOCAL_CACHE_WHITELIST, "structured-data");
+        let cache = create_local_cache(&options).unwrap().unwrap();
+        assert!(cache.is_cacheable("s3://bucket/data.parquet"));
+        for path in [
+            "s3://bucket/data.parquet.tmp",
+            "s3://bucket/.data.parquet.123e4567-e89b-12d3-a456-426614174000.tmp",
+            "s3://bucket/data.tmp.parquet",
+            "s3://bucket/manifest-1.avro",
+            "s3://bucket/data.parquet.index",
+            "s3://bucket/data.blob",
+        ] {
+            assert!(!cache.is_cacheable(path), "{path}");
+        }
     }
 
     #[tokio::test]

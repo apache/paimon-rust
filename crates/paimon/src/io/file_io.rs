@@ -268,7 +268,7 @@ impl FileIO {
     /// `block_size` controls the aligned ranges presented to the cache.
     /// `whitelist` uses the same comma-separated values as
     /// `local-cache.whitelist`: `meta`, `global-index`, `bucket-index`, `data`,
-    /// and `file-index`, or `*` for all of them.
+    /// `structured-data`, and `file-index`, or `*` for all of them.
     pub fn with_file_block_cache(
         mut self,
         cache: Arc<dyn FileBlockCache>,
@@ -2422,6 +2422,101 @@ mod input_output_test {
                 assert_eq!(&cache_path, expected_key, "{scheme}");
             } else {
                 expected_key = Some(cache_path);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_structured_data_cache_preserves_existing_selectors() {
+        for disk in [false, true] {
+            for whitelist in [
+                "meta,global-index",
+                "data",
+                "structured-data",
+                "meta,global-index,structured-data",
+                "*",
+            ] {
+                let directory = tempfile::tempdir().unwrap();
+                let mut options = Options::new();
+                options.set(CatalogOptions::LOCAL_CACHE_ENABLED, "true");
+                options.set(CatalogOptions::LOCAL_CACHE_WHITELIST, whitelist);
+                options.set(CatalogOptions::LOCAL_CACHE_BLOCK_SIZE, "4");
+                if disk {
+                    options.set(
+                        CatalogOptions::LOCAL_CACHE_DIR,
+                        directory.path().to_string_lossy(),
+                    );
+                }
+                let cache = Arc::new(
+                    LocalCache::new(LocalCacheConfig::from_options(&options).unwrap().unwrap())
+                        .unwrap(),
+                );
+                let file_io = FileIOBuilder::new("memory")
+                    .with_local_cache(cache)
+                    .build()
+                    .unwrap();
+                for name in [
+                    "data.parquet",
+                    "data.blob",
+                    "data.orc",
+                    "data.avro",
+                    "data.row",
+                    "data.mosaic",
+                    "data.vortex",
+                    "data.csv",
+                    "data.json.zst",
+                    "data.text.snappy",
+                    "data.video",
+                    "data.PARQUET",
+                    "data.unknown",
+                    "data.parquet.index",
+                    "snapshot-1",
+                    "snapshot-1.blob",
+                ] {
+                    let path = format!("memory:/{name}");
+                    file_io
+                        .new_output(&path)
+                        .unwrap()
+                        .write(Bytes::from_static(b"abcdefgh"))
+                        .await
+                        .unwrap();
+                    let input = file_io.new_input(&path).unwrap();
+                    let reader = input.reader().await.unwrap();
+                    assert_eq!(reader.read(1..7).await.unwrap(), b"bcdefg"[..]);
+                    drop(reader);
+                    let (op, relative_path, _) = input.source.resolve(&path).await.unwrap();
+                    op.delete(&relative_path).await.unwrap();
+                    let cached = match whitelist {
+                        "*" => true,
+                        "data" => name.starts_with("data.") && !name.ends_with(".index"),
+                        "structured-data" => matches!(
+                            name,
+                            "data.parquet"
+                                | "data.orc"
+                                | "data.avro"
+                                | "data.row"
+                                | "data.mosaic"
+                                | "data.vortex"
+                                | "data.csv"
+                                | "data.json.zst"
+                                | "data.text.snappy"
+                                | "data.PARQUET"
+                        ),
+                        "meta,global-index,structured-data" => !matches!(
+                            name,
+                            "data.blob" | "data.video" | "data.unknown" | "data.parquet.index"
+                        ),
+                        _ => name.starts_with("snapshot-"),
+                    };
+                    let result = input.read().await;
+                    if cached {
+                        assert_eq!(result.unwrap(), b"abcdefgh"[..], "{whitelist}: {name}");
+                        let reader = input.reader().await.unwrap();
+                        assert_eq!(reader.read(1..7).await.unwrap(), b"bcdefg"[..]);
+                    } else {
+                        assert!(result.is_err(), "{whitelist}: {name}");
+                    }
+                }
             }
         }
     }

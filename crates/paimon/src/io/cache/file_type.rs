@@ -21,25 +21,60 @@ use std::collections::HashSet;
 // Suffix `.{uuid}.tmp` appended by Java `Path.createTempPath()`: 1 dot + 36-char UUID + `.tmp`.
 const TEMP_FILE_SUFFIX_LEN: usize = 41;
 
+// Keep this list aligned with the non-BLOB/non-video formats accepted by
+// `arrow::format::create_format_reader_with_budget`. Text formats also support
+// an optional compression suffix.
+const STRUCTURED_DATA_SUFFIXES: [&str; 27] = [
+    ".parquet",
+    ".orc",
+    ".avro",
+    ".row",
+    ".mosaic",
+    ".vortex",
+    ".csv",
+    ".json",
+    ".text",
+    ".csv.gz",
+    ".csv.bz2",
+    ".csv.deflate",
+    ".csv.snappy",
+    ".csv.lz4",
+    ".csv.zst",
+    ".json.gz",
+    ".json.bz2",
+    ".json.deflate",
+    ".json.snappy",
+    ".json.lz4",
+    ".json.zst",
+    ".text.gz",
+    ".text.bz2",
+    ".text.deflate",
+    ".text.snappy",
+    ".text.lz4",
+    ".text.zst",
+];
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(super) enum FileType {
     Meta,
     Data,
+    StructuredData,
     BucketIndex,
     GlobalIndex,
     FileIndex,
 }
 
 impl FileType {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 6] = [
         Self::Meta,
         Self::Data,
+        Self::StructuredData,
         Self::BucketIndex,
         Self::GlobalIndex,
         Self::FileIndex,
     ];
 
-    /// Mirrors Java `org.apache.paimon.utils.FileType#classify`, including its check order.
+    /// Keeps metadata/index classification ahead of structured data detection.
     pub(super) fn classify(path: &str) -> Self {
         let mut segments = path.rsplit('/');
         let name = unwrap_temp_file_name(segments.next().unwrap_or(path));
@@ -78,7 +113,15 @@ impl FileType {
             return Self::Meta;
         }
 
-        Self::Data
+        let lower_name = name.to_ascii_lowercase();
+        if STRUCTURED_DATA_SUFFIXES
+            .iter()
+            .any(|suffix| lower_name.len() > suffix.len() && lower_name.ends_with(suffix))
+        {
+            Self::StructuredData
+        } else {
+            Self::Data
+        }
     }
 
     pub(super) fn is_mutable(path: &str) -> bool {
@@ -107,13 +150,15 @@ impl FileType {
                     "meta" => &[Self::Meta],
                     "global-index" => &[Self::GlobalIndex],
                     "bucket-index" => &[Self::BucketIndex],
-                    "data" => &[Self::Data],
+                    // Preserve the existing broad data selector.
+                    "data" => &[Self::Data, Self::StructuredData],
+                    "structured-data" => &[Self::StructuredData],
                     "file-index" => &[Self::FileIndex],
                     "" => &[],
                     unknown => {
                         log::warn!(
                             "Unknown local-cache.whitelist value '{}'; supported values are \
-                             meta, global-index, bucket-index, data, file-index, \
+                             meta, global-index, bucket-index, data, structured-data, file-index, \
                              or * for all of them",
                             unknown
                         );
@@ -168,7 +213,7 @@ mod tests {
             ),
             (
                 "s3://bucket/table/bucket-0/data-abc.parquet",
-                FileType::Data,
+                FileType::StructuredData,
             ),
             (
                 "s3://bucket/table/manifest/manifest-123e4567-e89b-12d3-a456-426614174000-0.avro.sidecar",
@@ -182,7 +227,7 @@ mod tests {
             ("s3://bucket/table/changelog/changelog-5", FileType::Meta),
             (
                 "s3://bucket/table/bucket-0/changelog-123e4567-e89b-12d3-a456-426614174000-0.parquet",
-                FileType::Data,
+                FileType::StructuredData,
             ),
             (
                 "s3://bucket/table/snapshot/.snapshot-13.123e4567-e89b-12d3-a456-426614174000.tmp",
@@ -194,7 +239,7 @@ mod tests {
             ),
             (
                 "s3://bucket/table/bucket-0/.data-abc.parquet.123e4567-e89b-12d3-a456-426614174000.tmp",
-                FileType::Data,
+                FileType::StructuredData,
             ),
         ];
 
@@ -249,12 +294,59 @@ mod tests {
     }
 
     #[test]
+    fn test_structured_data_classification_keeps_metadata_and_indexes_separate() {
+        for name in [
+            "data.parquet",
+            "data.ORC",
+            "data.avro",
+            "data.row",
+            "data.mosaic",
+            "data.vortex",
+            "data.csv",
+            "data.json",
+            "data.text",
+            "data.csv.gz",
+            "data.JSON.ZST",
+            "data.text.snappy",
+        ] {
+            assert_eq!(FileType::classify(name), FileType::StructuredData);
+        }
+        for name in [
+            "data.blob",
+            "data.BLOB",
+            "data.unknown",
+            "dir.parquet/data",
+            "data.parquet.blob",
+            "data.video",
+            ".parquet",
+            ".csv.gz",
+        ] {
+            assert_eq!(FileType::classify(name), FileType::Data);
+        }
+        assert_eq!(FileType::classify("manifest-1.avro"), FileType::Meta);
+        assert_eq!(FileType::classify("snapshot-1.parquet"), FileType::Meta);
+        assert_eq!(
+            FileType::classify("data.parquet.index"),
+            FileType::FileIndex
+        );
+        assert_eq!(
+            FileType::parse_whitelist("structured-data"),
+            HashSet::from([FileType::StructuredData])
+        );
+        assert_eq!(
+            FileType::parse_whitelist("data"),
+            HashSet::from([FileType::Data, FileType::StructuredData])
+        );
+    }
+
+    #[test]
     fn test_file_type_parses_whitelist() {
         let all = HashSet::from([
             FileType::Meta,
             FileType::GlobalIndex,
             FileType::BucketIndex,
             FileType::Data,
+            FileType::StructuredData,
             FileType::FileIndex,
         ]);
 
