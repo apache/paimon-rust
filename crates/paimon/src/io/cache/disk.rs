@@ -28,6 +28,9 @@ use super::priority_lru::DEFAULT_HIGH_PRIORITY_POOL_RATIO;
 use super::priority_lru::{protected_limit, PriorityLru};
 use super::state::{BlockKey, CacheCoordinator, LogicalPath};
 
+#[path = "shared.rs"]
+pub(super) mod shared;
+
 const CACHE_MAGIC: &[u8; 8] = b"PAIMONLC";
 const CACHE_FORMAT_VERSION: u8 = 2;
 const FIXED_HEADER_LEN: usize = CACHE_MAGIC.len() + 1 + 4 + 4 + 8 + 8 + 8;

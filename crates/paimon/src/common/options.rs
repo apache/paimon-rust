@@ -81,6 +81,8 @@ impl CatalogOptions {
 
     /// Directory for the local disk block cache. If unset, an in-memory cache is used.
     pub const LOCAL_CACHE_DIR: &'static str = "local-cache.dir";
+    /// Share a node-local disk cache between cooperating processes.
+    pub const LOCAL_CACHE_SHARED: &'static str = "local-cache.shared";
 
     /// Maximum total size of the local block cache.
     pub const LOCAL_CACHE_MAX_SIZE: &'static str = "local-cache.max-size";

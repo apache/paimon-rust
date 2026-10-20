@@ -36,7 +36,7 @@ use crate::catalog::{
 };
 use crate::common::{CatalogOptions, Options};
 use crate::error::Error;
-use crate::io::cache::{create_local_cache_with_namespace, LocalCache};
+use crate::io::cache::{create_local_cache_with_namespace_async, LocalCache};
 use crate::io::FileIOCacheContext;
 use crate::spec::{Partition, PartitionStatistics, Schema, SchemaChange};
 use crate::table::{RESTEnv, Table};
@@ -90,7 +90,7 @@ impl RESTCatalog {
             .unwrap_or(false);
 
         let api_options = api.options().clone();
-        let local_cache = create_local_cache_with_namespace(&options, &api_options)?;
+        let local_cache = create_local_cache_with_namespace_async(&options, &api_options).await?;
         let file_io_cache = FileIOCacheContext::from_props(api_options.to_map())?;
 
         let fuse_resolver = Arc::new(super::FusePathResolver::new(&api_options));
@@ -1227,6 +1227,57 @@ mod tests {
         let catalog = RESTCatalog::new(options, false).await.unwrap();
 
         assert!(catalog.has_local_cache());
+    }
+
+    #[test]
+    fn test_shared_cache_catalog_init_does_not_block_current_thread_runtime() {
+        use std::fs::File;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut options = Options::new();
+        options.set(CatalogOptions::URI, "http://localhost:1");
+        options.set(CatalogOptions::WAREHOUSE, "test-warehouse");
+        options.set("token.provider", "bear");
+        options.set("token", "test-token");
+        options.set(CatalogOptions::LOCAL_CACHE_ENABLED, "true");
+        options.set(CatalogOptions::LOCAL_CACHE_SHARED, "true");
+        options.set(CatalogOptions::LOCAL_CACHE_MAX_SIZE, "1 MiB");
+        options.set(
+            CatalogOptions::LOCAL_CACHE_DIR,
+            directory.path().to_str().unwrap(),
+        );
+        drop(crate::io::cache::create_local_cache_with_namespace(&options, &options).unwrap());
+        let gate = File::open(
+            directory
+                .path()
+                .join("paimon-shared-local-cache-v1/directory.lock"),
+        )
+        .unwrap();
+        gate.lock().unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        let catalog_thread = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    tx.send(()).unwrap();
+                });
+                RESTCatalog::new(options, false).await.unwrap();
+            });
+        });
+        let runtime_progressed = rx.recv_timeout(Duration::from_secs(2)).is_ok();
+        drop(gate);
+        catalog_thread.join().unwrap();
+        assert!(
+            runtime_progressed,
+            "catalog initialization blocked the runtime"
+        );
     }
 
     #[test]
