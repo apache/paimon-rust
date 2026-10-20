@@ -3808,6 +3808,109 @@ async fn test_query_auth_blob_view_predicate_limit_groups_lookups() {
     }
 }
 
+#[cfg(not(windows))]
+#[tokio::test]
+async fn test_query_auth_blob_view_limit_skips_rejected_split() {
+    let payload = b"admitted-payload".to_vec();
+    let source = written(
+        "rejected_split_source",
+        blob_schema,
+        vec![blob_batch(vec![1], vec!["Source"], vec![payload.clone()])],
+    )
+    .await;
+    let picture_id = source.table.schema().fields()[2].id();
+    let reference = |row_id| {
+        BlobViewStruct::new(source.identifier.clone(), picture_id, row_id)
+            .serialize()
+            .unwrap()
+    };
+    let target = written(
+        "rejected_split_target",
+        |options| {
+            blob_schema(
+                &[
+                    options,
+                    &[
+                        ("blob-view-field", "picture"),
+                        ("source.split.target-size", "1b"),
+                    ],
+                ]
+                .concat(),
+            )
+        },
+        vec![
+            blob_batch(vec![0], vec!["Rejected"], vec![reference(99)]),
+            blob_batch(vec![1], vec!["Admitted"], vec![reference(0)]),
+        ],
+    )
+    .await;
+    let server = &target.ctx.server;
+    server.add_table_with_schema(
+        "default",
+        "rejected_split_source",
+        blob_schema(&[]),
+        source.table.location(),
+    );
+    target.set_rules(&[int_leaf(0, "id", "GREATER_THAN", 0)], &[]);
+    let mut builder = target.table.new_read_builder();
+    builder.with_limit(1);
+    let plan = builder.new_scan().plan().await.unwrap();
+    assert_eq!(plan.splits().len(), 2);
+
+    // Probe only ids so locating the rejected split cannot resolve its bad view.
+    let mut projected = target.table.new_read_builder();
+    projected.with_projection(&["id"]).unwrap();
+    let probe = projected.new_read().unwrap();
+    let mut rejected = None;
+    let mut admitted = None;
+    for split in plan.splits() {
+        let batches = probe
+            .to_arrow(std::slice::from_ref(split))
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let returned = ids(&batches);
+        if returned.is_empty() {
+            rejected = Some(split.clone());
+        } else {
+            assert_eq!(returned, vec![1]);
+            admitted = Some(split.clone());
+        }
+    }
+    let splits = vec![rejected.unwrap(), admitted.unwrap()];
+
+    for (include_row_kind, ordered) in [(false, false), (true, true)] {
+        let label = format!("row_kind={include_row_kind}, ordered={ordered}");
+        let read = builder.new_read().unwrap().with_ordered(ordered);
+        let stream = if include_row_kind {
+            read.to_arrow_with_row_kind(&splits)
+        } else {
+            read.to_arrow(&splits)
+        }
+        .unwrap();
+        let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+        let payload_batches: Vec<_> = batches
+            .iter()
+            .map(|batch| {
+                if include_row_kind {
+                    let kinds = column::<StringArray>(batch, "rowkind");
+                    assert_eq!(kinds.null_count(), 0, "{label}");
+                    assert!(kinds.iter().all(|kind| kind == Some("+I")), "{label}");
+                    batch.project(&[1, 2, 3]).unwrap()
+                } else {
+                    batch.clone()
+                }
+            })
+            .collect();
+        assert_eq!(
+            collect_blob_rows(&payload_batches),
+            vec![(1, "Admitted".to_string(), Some(payload.clone()))],
+            "{label}"
+        );
+    }
+}
+
 fn schema_of(columns: &[&str], options: &[(&str, &str)]) -> Schema {
     let mut builder = Schema::builder();
     for name in columns {

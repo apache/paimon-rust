@@ -216,6 +216,7 @@ class TableRead:
         parallelism must be positive and bounds concurrent split groups.
         ordered=True emits groups in the supplied split order; the default
         emits ready groups first. The row limit applies across the whole read.
+        Ordered parallel reads disable background Parquet row-group prefetch.
         close() cancels all pending groups.
         """
         ...

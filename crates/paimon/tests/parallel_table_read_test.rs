@@ -219,6 +219,119 @@ async fn parallel_reads_preserve_requested_order_and_enforce_one_global_limit() 
 }
 
 #[tokio::test]
+async fn data_evolution_streaming_splits_preserve_order_and_limit() {
+    let table = table("de").await;
+    let mut planned = table
+        .new_read_builder()
+        .new_scan()
+        .plan()
+        .await
+        .unwrap()
+        .splits()
+        .to_vec();
+    assert_eq!(planned.len(), 4);
+    planned.reverse();
+
+    for mixed in [false, true] {
+        let splits = planned
+            .iter()
+            .enumerate()
+            .map(|(index, split)| {
+                let mut builder = DataSplitBuilder::new()
+                    .with_snapshot(split.snapshot_id())
+                    .with_partition(split.partition().clone())
+                    .with_bucket(split.bucket())
+                    .with_bucket_path(split.bucket_path().to_string())
+                    .with_total_buckets(split.total_buckets())
+                    .with_data_files(split.data_files().to_vec())
+                    .with_raw_convertible(split.raw_convertible())
+                    // Alternating flags keep any group of two splits mixed.
+                    .with_streaming(!mixed || index % 2 == 0);
+                if let Some(files) = split.data_deletion_files() {
+                    builder = builder.with_data_deletion_files(files.to_vec());
+                }
+                if let Some(ranges) = split.row_ranges() {
+                    builder = builder.with_row_ranges(ranges.to_vec());
+                }
+                builder.build().unwrap()
+            })
+            .collect::<Vec<_>>();
+        let mut expected = Vec::new();
+        for split in &splits {
+            let batches = table
+                .new_read_builder()
+                .new_read()
+                .unwrap()
+                .to_arrow(std::slice::from_ref(split))
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            expected.extend(rows(&batches));
+        }
+        assert_eq!(expected.len(), 12);
+
+        for include_row_kind in [false, true] {
+            for parallelism in [1, 2] {
+                for ordered in [false, true] {
+                    for limit in [None, Some(0), Some(1), Some(4), Some(7)] {
+                        let label = format!(
+                            "mixed={mixed}, row_kind={include_row_kind}, p={parallelism}, ordered={ordered}, limit={limit:?}"
+                        );
+                        let mut builder = table.new_read_builder();
+                        if let Some(limit) = limit {
+                            builder.with_limit(limit);
+                        }
+                        let read = builder
+                            .new_read()
+                            .unwrap()
+                            .with_parallelism(parallelism)
+                            .unwrap()
+                            .with_ordered(ordered);
+                        let stream = if include_row_kind {
+                            read.to_arrow_with_row_kind(&splits)
+                        } else {
+                            read.to_arrow(&splits)
+                        }
+                        .unwrap();
+                        let batches = tokio::time::timeout(
+                            std::time::Duration::from_secs(15),
+                            stream.try_collect::<Vec<_>>(),
+                        )
+                        .await
+                        .expect("data-evolution split read stalled")
+                        .unwrap();
+                        let result = rows(&batches);
+                        assert_eq!(result.len(), limit.unwrap_or(12).min(12), "{label}");
+                        if ordered || parallelism == 1 {
+                            assert_eq!(result, expected[..result.len()], "{label}");
+                        } else {
+                            assert!(result.iter().all(|row| expected.contains(row)), "{label}");
+                            let mut unique = result.clone();
+                            unique.sort_unstable();
+                            unique.dedup();
+                            assert_eq!(unique.len(), result.len(), "{label}");
+                        }
+                        if include_row_kind {
+                            assert!(
+                                batches.iter().all(|batch| batch
+                                    .column(0)
+                                    .as_any()
+                                    .downcast_ref::<StringArray>()
+                                    .unwrap()
+                                    .iter()
+                                    .all(|kind| kind == Some("+I"))),
+                                "{label}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn zero_parallelism_fails_before_any_splits_are_read() {
     let table = table("append").await;
     assert!(table

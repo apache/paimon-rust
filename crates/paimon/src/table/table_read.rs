@@ -194,6 +194,9 @@ impl<'a> TableRead<'a> {
     /// When true, batches follow the supplied split order while reads remain
     /// concurrent. When false (the default), ready split groups can emit first.
     /// Rows within a split keep that split reader's existing order in both modes.
+    /// Ordered parallel reads disable background Parquet row-group prefetch so
+    /// a later group cannot retain scheduling permits needed by an earlier one.
+    /// Foreground reads still share memory admission from [`Self::with_resources`].
     pub fn with_ordered(mut self, ordered: bool) -> Self {
         self.ordered = ordered;
         self
