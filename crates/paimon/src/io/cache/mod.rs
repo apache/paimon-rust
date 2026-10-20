@@ -306,28 +306,12 @@ impl LocalCacheConfig {
             .get(CatalogOptions::LOCAL_CACHE_WHITELIST)
             .map(String::as_str)
             .unwrap_or("meta,global-index");
-        let mut whitelist = FileType::parse_whitelist(whitelist);
-        if let Some(value) = options.get(CatalogOptions::LOCAL_CACHE_EXCLUDE_DEDICATED_FILES) {
-            let value = value.trim();
-            if value.eq_ignore_ascii_case("true") {
-                whitelist.remove(&FileType::DedicatedData);
-            } else if !value.eq_ignore_ascii_case("false") {
-                return Err(crate::Error::ConfigInvalid {
-                    message: format!(
-                        "Invalid boolean for {}: '{}'",
-                        CatalogOptions::LOCAL_CACHE_EXCLUDE_DEDICATED_FILES,
-                        value
-                    ),
-                });
-            }
-        }
-
         Ok(Some(Self {
             dir,
             namespace: catalog_namespace(namespace_options),
             max_size,
             block_size,
-            whitelist,
+            whitelist: FileType::parse_whitelist(whitelist),
         }))
     }
 }
@@ -505,11 +489,10 @@ mod tests {
     }
 
     #[test]
-    fn test_dedicated_data_exclusion_preserves_mutable_bypass() {
+    fn test_structured_data_excludes_dedicated_and_mutable_files() {
         let mut options = Options::new();
         options.set(CatalogOptions::LOCAL_CACHE_ENABLED, "true");
-        options.set(CatalogOptions::LOCAL_CACHE_WHITELIST, "data");
-        options.set(CatalogOptions::LOCAL_CACHE_EXCLUDE_DEDICATED_FILES, "true");
+        options.set(CatalogOptions::LOCAL_CACHE_WHITELIST, "structured-data");
         let cache = create_local_cache(&options).unwrap().unwrap();
         assert!(cache.is_cacheable("s3://bucket/data.parquet"));
         assert!(cache.is_cacheable("s3://bucket/data.unknown"));
@@ -525,34 +508,6 @@ mod tests {
         ] {
             assert!(!cache.is_cacheable(path), "{path}");
         }
-    }
-
-    #[test]
-    fn test_dedicated_data_exclusion_option() {
-        let mut options = Options::new();
-        options.set(CatalogOptions::LOCAL_CACHE_ENABLED, "true");
-        options.set(CatalogOptions::LOCAL_CACHE_WHITELIST, "data");
-        assert!(LocalCacheConfig::from_options(&options)
-            .unwrap()
-            .unwrap()
-            .whitelist
-            .contains(&FileType::DedicatedData));
-
-        options.set(CatalogOptions::LOCAL_CACHE_EXCLUDE_DEDICATED_FILES, "TrUe");
-        assert!(!LocalCacheConfig::from_options(&options)
-            .unwrap()
-            .unwrap()
-            .whitelist
-            .contains(&FileType::DedicatedData));
-
-        options.set(
-            CatalogOptions::LOCAL_CACHE_EXCLUDE_DEDICATED_FILES,
-            "invalid",
-        );
-        let error = LocalCacheConfig::from_options(&options).unwrap_err();
-        assert!(error
-            .to_string()
-            .contains(CatalogOptions::LOCAL_CACHE_EXCLUDE_DEDICATED_FILES));
     }
 
     #[tokio::test]

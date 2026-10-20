@@ -121,12 +121,13 @@ impl FileType {
                     "bucket-index" => &[Self::BucketIndex],
                     // Preserve the existing broad data selector.
                     "data" => &[Self::Data, Self::DedicatedData],
+                    "structured-data" => &[Self::Data],
                     "file-index" => &[Self::FileIndex],
                     "" => &[],
                     unknown => {
                         log::warn!(
                             "Unknown local-cache.whitelist value '{}'; supported values are \
-                             meta, global-index, bucket-index, data, file-index, \
+                             meta, global-index, bucket-index, data, structured-data, file-index, \
                              or * for all of them",
                             unknown
                         );
@@ -301,6 +302,10 @@ mod tests {
         assert_eq!(
             FileType::parse_whitelist("data"),
             HashSet::from([FileType::Data, FileType::DedicatedData])
+        );
+        assert_eq!(
+            FileType::parse_whitelist("structured-data"),
+            HashSet::from([FileType::Data])
         );
     }
 
