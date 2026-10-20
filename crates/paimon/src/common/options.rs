@@ -91,6 +91,10 @@ impl CatalogOptions {
     /// Comma-separated file types eligible for local caching.
     pub const LOCAL_CACHE_WHITELIST: &'static str = "local-cache.whitelist";
 
+    /// Exclude dedicated BLOB, video, and vector-store files from the local cache.
+    pub const LOCAL_CACHE_EXCLUDE_DEDICATED_FILES: &'static str =
+        "local-cache.exclude-dedicated-files";
+
     /// Maximum process-local cache size for parsed file-format metadata.
     pub const FILE_FORMAT_METADATA_CACHE_MAX_SIZE: &'static str =
         "file-format.metadata-cache.max-size";
@@ -300,6 +304,10 @@ mod tests {
         assert_eq!(
             CatalogOptions::LOCAL_CACHE_WHITELIST,
             "local-cache.whitelist"
+        );
+        assert_eq!(
+            CatalogOptions::LOCAL_CACHE_EXCLUDE_DEDICATED_FILES,
+            "local-cache.exclude-dedicated-files"
         );
         assert_eq!(
             CatalogOptions::FILE_FORMAT_METADATA_CACHE_MAX_SIZE,
