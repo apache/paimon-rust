@@ -350,6 +350,47 @@ mod tests {
     }
 
     #[test]
+    fn timestamp_nanoseconds_use_java_default_bucket_ids() {
+        for (ticks, expected) in [
+            (i64::MIN + 1, 4),
+            (i64::MIN + 807, 0),
+            (-1_000_001_i64, 3),
+            (-1, 0),
+            (0, 4),
+            (1, 2),
+            (2, 3),
+            (999_999, 2),
+            (1_000_001, 0),
+            (i64::MAX, 4),
+        ] {
+            let millis = ticks.div_euclid(1_000_000);
+            let nanos = ticks.rem_euclid(1_000_000) as i32;
+            for (data_type, datum) in [
+                (
+                    DataType::Timestamp(crate::spec::TimestampType::new(9).unwrap()),
+                    Datum::Timestamp { millis, nanos },
+                ),
+                (
+                    DataType::LocalZonedTimestamp(
+                        crate::spec::LocalZonedTimestampType::new(9).unwrap(),
+                    ),
+                    Datum::LocalZonedTimestamp { millis, nanos },
+                ),
+            ] {
+                assert_eq!(
+                    bucket_for_datums(
+                        &[(Some(&datum), &data_type)],
+                        BucketFunctionType::Default,
+                        5
+                    )
+                    .unwrap(),
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
     fn hive_bucket_matches_java_reference_case() {
         let bool_type = DataType::Boolean(BooleanType::new());
         let int_type = DataType::Int(IntType::new());

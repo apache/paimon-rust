@@ -335,6 +335,7 @@ impl DataEvolutionReader {
                 false,
                 None,
             )?
+            .with_partition_fields(self.partition_fields.clone())
             .with_batch_size(self.batch_size)
             .with_limit(Some(remaining))
             .with_parquet_read_budget(self.parquet_read_budget.clone())
@@ -1135,10 +1136,13 @@ impl DataEvolutionReader {
                 &prepared_group,
                 &file_infos,
                 &read_type,
-                &table_fields,
                 &blob_inline_fields,
-                row_ranges.is_some(),
-                nested_enabled,
+                SourcePlanReadContext {
+                    table_fields: &table_fields,
+                    partition_fields: &partition_fields,
+                    row_id_pushdown: row_ranges.is_some(),
+                    nested_enabled,
+                },
             )?;
 
             let active_source_indices: Vec<usize> = source_plan
@@ -2506,6 +2510,16 @@ struct SourcePlan {
     nested_plan: Vec<Option<super::data_evolution_nested::NestedFieldPlan>>,
 }
 
+/// Logical inputs needed while selecting physical column providers.
+/// Partition columns may have no provider: the merge restores them from the
+/// split, including when the declared partition type is NOT NULL.
+struct SourcePlanReadContext<'a> {
+    table_fields: &'a [DataField],
+    partition_fields: &'a [DataField],
+    row_id_pushdown: bool,
+    nested_enabled: bool,
+}
+
 #[cfg(test)]
 fn build_source_plan(
     prepared_group: &PreparedMergeGroup,
@@ -2517,10 +2531,13 @@ fn build_source_plan(
         prepared_group,
         file_infos,
         read_type,
-        read_type,
         blob_descriptor_fields,
-        false,
-        false,
+        SourcePlanReadContext {
+            table_fields: read_type,
+            partition_fields: &[],
+            row_id_pushdown: false,
+            nested_enabled: false,
+        },
     )
 }
 
@@ -2528,11 +2545,15 @@ fn build_source_plan_with_row_id_pushdown(
     prepared_group: &PreparedMergeGroup,
     file_infos: &[ResolvedFileInfo],
     read_type: &[DataField],
-    table_fields: &[DataField],
     blob_descriptor_fields: &HashSet<String>,
-    row_id_pushdown: bool,
-    nested_enabled: bool,
+    context: SourcePlanReadContext<'_>,
 ) -> crate::Result<SourcePlan> {
+    let SourcePlanReadContext {
+        table_fields,
+        partition_fields,
+        row_id_pushdown,
+        nested_enabled,
+    } = context;
     let mut sources = Vec::new();
     let mut normal_providers: HashMap<i32, usize> = HashMap::new(); // field_id -> source_idx
     let mut vector_field_providers: HashMap<i32, usize> = HashMap::new(); // field_id -> source_idx
@@ -2749,7 +2770,11 @@ fn build_source_plan_with_row_id_pushdown(
             let field_offset = sources[source_idx].add_read_field(source_field.clone());
             column_plan.push(Some((source_idx, field_offset)));
             nested_plan.push(None);
-        } else if !field.data_type().is_nullable() {
+        } else if !field.data_type().is_nullable()
+            && !partition_fields
+                .iter()
+                .any(|partition| partition.id() == field.id())
+        {
             return Err(Error::DataInvalid {
                 message: format!(
                     "Cannot read non-nullable field '{}' without a provider",
@@ -4571,10 +4596,13 @@ mod tests {
             &prepared_group,
             &file_infos,
             &read_type,
-            &read_type,
             &HashSet::new(),
-            true,
-            false,
+            SourcePlanReadContext {
+                table_fields: &read_type,
+                partition_fields: &[],
+                row_id_pushdown: true,
+                nested_enabled: false,
+            },
         )
         .unwrap_err();
 
@@ -4660,10 +4688,13 @@ mod tests {
             &group,
             &[resolved_info(vec![1]), resolved_info(vec![2])],
             &[selected],
-            std::slice::from_ref(&map),
             &HashSet::new(),
-            false,
-            false,
+            SourcePlanReadContext {
+                table_fields: std::slice::from_ref(&map),
+                partition_fields: &[],
+                row_id_pushdown: false,
+                nested_enabled: false,
+            },
         )
         .unwrap();
         assert_eq!(plan.column_plan, vec![Some((1, 0))]);

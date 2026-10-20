@@ -611,6 +611,21 @@ impl UpdateContext {
         })
     }
 
+    fn merge_source_schema(
+        &self,
+        source: &paimon::table::MergeSource,
+    ) -> PyResult<Arc<ArrowSchema>> {
+        let table = match source {
+            paimon::table::MergeSource::Batches(batches) => return Ok(batches[0].schema()),
+            paimon::table::MergeSource::Table(table) => table,
+            paimon::table::MergeSource::SelfTable => &self.table,
+        };
+        // Compile conditions against the same metadata schema that core uses
+        // when projecting a table source, including independently pinned views.
+        paimon::arrow::build_target_arrow_schema(&table.schema().fields_with_read_metadata())
+            .map_err(to_py_err)
+    }
+
     fn merge_into(
         &self,
         py: Python<'_>,
@@ -626,24 +641,7 @@ impl UpdateContext {
             },
             None => paimon::table::MergeSource::SelfTable,
         };
-        let source_schema = match &source {
-            paimon::table::MergeSource::Batches(batches) => batches[0].schema(),
-            paimon::table::MergeSource::Table(table) => {
-                paimon::arrow::build_target_arrow_schema(table.schema().fields())
-                    .map_err(to_py_err)?
-            }
-            paimon::table::MergeSource::SelfTable => {
-                let schema = paimon::arrow::build_target_arrow_schema(self.table.schema().fields())
-                    .map_err(to_py_err)?;
-                let mut fields = schema.fields().to_vec();
-                fields.push(Arc::new(arrow::datatypes::Field::new(
-                    "_ROW_ID",
-                    arrow::datatypes::DataType::Int64,
-                    false,
-                )));
-                Arc::new(ArrowSchema::new(fields))
-            }
-        };
+        let source_schema = self.merge_source_schema(&source)?;
         let errors = Arc::new(Mutex::new(None));
         let (matched, not_matched) = crate::merge_into::from_python(
             py,
@@ -1686,8 +1684,238 @@ mod tests {
     use super::*;
     use paimon::catalog::Identifier;
     use paimon::io::FileIOBuilder;
-    use paimon::spec::{IntType, Schema, TableSchema, VarCharType};
+    use paimon::spec::{BigIntType, IntType, Schema, TableSchema, VarCharType};
     use pyo3::ffi::c_str;
+
+    #[test]
+    fn merge_table_source_conditions_resolve_read_metadata() {
+        Python::attach(|py| {
+            for metadata in ["_ROW_ID", "_SEQUENCE_NUMBER"] {
+                let schema = Schema::builder()
+                    .column("id", DataType::BigInt(BigIntType::new()))
+                    .column("value", DataType::Int(IntType::new()))
+                    .option("row-tracking.enabled", "true")
+                    .option("data-evolution.enabled", "true")
+                    .build()
+                    .unwrap();
+                let file_io = FileIOBuilder::new("memory").build().unwrap();
+                let table = Arc::new(Table::new(
+                    file_io.clone(),
+                    Identifier::new("default", "metadata_merge_target"),
+                    "memory:/metadata-merge-target".into(),
+                    TableSchema::new(0, &schema),
+                    None,
+                ));
+                let source = Arc::new(Table::new(
+                    file_io,
+                    Identifier::new("default", "metadata_merge_source"),
+                    "memory:/metadata-merge-source".into(),
+                    TableSchema::new(0, &schema),
+                    None,
+                ));
+                let source = Py::new(py, crate::table::PyTable::new(source)).unwrap();
+                let context = UpdateContext::new(&WriteContext::new(table)).unwrap();
+                let locals = PyDict::new(py);
+                locals.set_item("metadata", metadata).unwrap();
+                py.run(
+                    c_str!(
+                        r#"
+condition = dict(sql='"s.' + metadata + '" >= 0')
+matched = [dict(assignments=[('value', 'source', 'value')], condition=condition, delete=False)]
+not_matched = [dict(assignments=[('id', 'source', metadata), ('value', 'source', 'value')],
+                    condition=condition)]
+"#
+                    ),
+                    Some(&locals),
+                    Some(&locals),
+                )
+                .unwrap();
+                let messages = context
+                    .merge_into(
+                        py,
+                        Some(source.bind(py).as_any()),
+                        vec![("id".into(), metadata.into())],
+                        &locals.get_item("matched").unwrap().unwrap(),
+                        &locals.get_item("not_matched").unwrap().unwrap(),
+                    )
+                    .unwrap();
+                // Conditions must compile even when both snapshots are empty;
+                // empty input prepares no mutation files or synthetic rows.
+                assert!(messages.is_empty());
+            }
+        });
+    }
+
+    #[test]
+    fn merge_table_source_metadata_conditions_update_and_insert() {
+        use arrow::array::{Array, Int32Array, Int64Array};
+        use futures::TryStreamExt;
+
+        async fn seed(table: &Table, ids: Vec<i64>, values: Vec<i32>) {
+            let batch = RecordBatch::try_new(
+                paimon::arrow::build_target_arrow_schema(table.schema().fields()).unwrap(),
+                vec![
+                    Arc::new(Int64Array::from(ids)),
+                    Arc::new(Int32Array::from(values)),
+                ],
+            )
+            .unwrap();
+            let builder = table.new_write_builder();
+            let mut writer = builder.new_write().unwrap();
+            writer.write_arrow_batch(&batch).await.unwrap();
+            builder
+                .new_commit()
+                .commit(writer.prepare_commit().await.unwrap())
+                .await
+                .unwrap();
+            writer.close().await;
+        }
+
+        async fn read(table: &Table, projection: &[&str]) -> Vec<RecordBatch> {
+            let mut builder = table.new_read_builder();
+            builder.with_projection(projection).unwrap();
+            let plan = builder.new_scan().plan().await.unwrap();
+            builder
+                .new_read()
+                .unwrap()
+                .to_arrow(plan.splits())
+                .unwrap()
+                .try_collect()
+                .await
+                .unwrap()
+        }
+
+        Python::attach(|py| {
+            for metadata in ["_ROW_ID", "_SEQUENCE_NUMBER"] {
+                let schema = Schema::builder()
+                    .column("id", DataType::BigInt(BigIntType::new()))
+                    .column("value", DataType::Int(IntType::new()))
+                    .option("row-tracking.enabled", "true")
+                    .option("data-evolution.enabled", "true")
+                    .build()
+                    .unwrap();
+                let file_io = FileIOBuilder::new("memory").build().unwrap();
+                let target = Arc::new(Table::new(
+                    file_io.clone(),
+                    Identifier::new("default", "metadata_data_target"),
+                    "memory:/metadata-data-target".into(),
+                    TableSchema::new(0, &schema),
+                    None,
+                ));
+                let source = Arc::new(Table::new(
+                    file_io,
+                    Identifier::new("default", "metadata_data_source"),
+                    "memory:/metadata-data-source".into(),
+                    TableSchema::new(0, &schema),
+                    None,
+                ));
+                let (first, second) = py.detach(|| {
+                    runtime().block_on(async {
+                        seed(&source, vec![9], vec![91]).await;
+                        seed(&source, vec![8], vec![82]).await;
+                        let mut identities = HashMap::new();
+                        for batch in read(&source, &[metadata, "value"]).await {
+                            let keys = batch
+                                .column(0)
+                                .as_any()
+                                .downcast_ref::<Int64Array>()
+                                .unwrap();
+                            let values = batch
+                                .column(1)
+                                .as_any()
+                                .downcast_ref::<Int32Array>()
+                                .unwrap();
+                            assert_eq!(keys.null_count(), 0);
+                            for row in 0..batch.num_rows() {
+                                identities.insert(values.value(row), keys.value(row));
+                            }
+                        }
+                        let first = identities[&91];
+                        let second = identities[&82];
+                        assert_ne!(first, second);
+                        seed(&target, vec![first, first + 100], vec![10, 20]).await;
+                        (first, second)
+                    })
+                });
+                let source = Py::new(py, crate::table::PyTable::new(source)).unwrap();
+                let context = UpdateContext::new(&WriteContext::new(target.clone())).unwrap();
+                let locals = PyDict::new(py);
+                locals.set_item("metadata", metadata).unwrap();
+                locals.set_item("first", first).unwrap();
+                locals.set_item("second", second).unwrap();
+                py.run(
+                    c_str!(
+                        r#"
+matched = [dict(assignments=[('value', 'source', 'value')],
+                condition=dict(sql='"s.' + metadata + '" = ' + str(first)), delete=False)]
+not_matched = [dict(assignments=[('id', 'source', metadata), ('value', 'source', 'value')],
+                    condition=dict(sql='"s.' + metadata + '" = ' + str(second)))]
+"#
+                    ),
+                    Some(&locals),
+                    Some(&locals),
+                )
+                .unwrap();
+                let messages = context
+                    .merge_into(
+                        py,
+                        Some(source.bind(py).as_any()),
+                        vec![("id".into(), metadata.into())],
+                        &locals.get_item("matched").unwrap().unwrap(),
+                        &locals.get_item("not_matched").unwrap().unwrap(),
+                    )
+                    .unwrap();
+                assert!(messages
+                    .iter()
+                    .any(|message| message.inner.check_from_snapshot == Some(1)));
+                assert!(messages.iter().any(|message| {
+                    message.inner.check_from_snapshot.is_none()
+                        && message
+                            .inner
+                            .new_files
+                            .iter()
+                            .all(|file| file.first_row_id.is_none())
+                }));
+                let rows = py.detach(|| {
+                    runtime().block_on(async {
+                        target
+                            .new_write_builder()
+                            .new_commit()
+                            .commit(messages.into_iter().map(|message| message.inner).collect())
+                            .await
+                            .unwrap();
+                        let mut rows = Vec::new();
+                        for batch in read(&target, &["id", "value", "_ROW_ID"]).await {
+                            let ids = batch
+                                .column(0)
+                                .as_any()
+                                .downcast_ref::<Int64Array>()
+                                .unwrap();
+                            let values = batch
+                                .column(1)
+                                .as_any()
+                                .downcast_ref::<Int32Array>()
+                                .unwrap();
+                            let row_ids = batch
+                                .column(2)
+                                .as_any()
+                                .downcast_ref::<Int64Array>()
+                                .unwrap();
+                            for row in 0..batch.num_rows() {
+                                rows.push((ids.value(row), values.value(row), row_ids.value(row)));
+                            }
+                        }
+                        rows.sort_by_key(|row| row.2);
+                        rows
+                    })
+                });
+                assert_eq!(
+                    rows,
+                    [(first, 91, 0), (first + 100, 20, 1), (second, 82, 2)]
+                );
+            }
+        });
+    }
 
     #[test]
     fn update_inputs_preserve_source_nulls_until_core_selects_payloads() {

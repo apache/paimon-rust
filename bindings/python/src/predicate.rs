@@ -19,7 +19,7 @@ use crate::error::to_py_err;
 use paimon::spec::{
     DataField, DataType, Datum, DecimalType, Predicate, PredicateBuilder, TableSchema,
 };
-use pyo3::exceptions::{PyNotImplementedError, PyValueError};
+use pyo3::exceptions::{PyAttributeError, PyNotImplementedError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyTzInfoAccess;
 use pyo3::types::{
@@ -200,6 +200,22 @@ fn micros_to_millis_nanos(micros: i64) -> (i64, i32) {
     )
 }
 
+fn submicrosecond_nanos(value: &Bound<'_, PyAny>) -> PyResult<i32> {
+    // datetime itself has no nanosecond attribute. Arrow's pandas.Timestamp
+    // subclass carries the remaining three digits outside its microseconds.
+    let nanos = match value.getattr("nanosecond") {
+        Ok(nanos) => nanos.extract::<i32>()?,
+        Err(error) if error.is_instance_of::<PyAttributeError>(value.py()) => 0,
+        Err(error) => return Err(error),
+    };
+    if !(0..1_000).contains(&nanos) {
+        return Err(PyValueError::new_err(
+            "datetime nanosecond remainder must be between 0 and 999",
+        ));
+    }
+    Ok(nanos)
+}
+
 /// Convert a naive `datetime.datetime` into `Datum::Timestamp`.
 ///
 /// TIMESTAMP (without time zone) is timezone-less, so timezone-aware datetimes
@@ -219,7 +235,8 @@ fn timestamp_datum(value: &Bound<'_, PyAny>) -> PyResult<Datum> {
     let naive: chrono::NaiveDateTime = value.extract().map_err(|_| {
         PyValueError::new_err("expected a datetime.datetime literal for Timestamp field")
     })?;
-    let (millis, nanos) = micros_to_millis_nanos(naive.and_utc().timestamp_micros());
+    let (millis, micros_nanos) = micros_to_millis_nanos(naive.and_utc().timestamp_micros());
+    let nanos = micros_nanos + submicrosecond_nanos(value)?;
     Ok(Datum::Timestamp { millis, nanos })
 }
 
@@ -254,7 +271,8 @@ fn local_zoned_timestamp_datum(value: &Bound<'_, PyAny>) -> PyResult<Datum> {
     let utc = PyTzInfo::utc(py)?;
     let as_utc = dt.call_method1(pyo3::intern!(py, "astimezone"), (utc,))?;
     let instant: chrono::DateTime<chrono::Utc> = as_utc.extract()?;
-    let (millis, nanos) = micros_to_millis_nanos(instant.timestamp_micros());
+    let (millis, micros_nanos) = micros_to_millis_nanos(instant.timestamp_micros());
+    let nanos = micros_nanos + submicrosecond_nanos(value)?;
     Ok(Datum::LocalZonedTimestamp { millis, nanos })
 }
 
@@ -1465,6 +1483,67 @@ mod tests {
                     nanos: 999_000,
                 }
             );
+        });
+    }
+
+    #[test]
+    fn timestamp_literals_preserve_nanosecond_tails() {
+        Python::attach(|py| {
+            // Arrow's pandas.Timestamp is a datetime subclass with a
+            // nanosecond remainder. Keep this unit independent of pandas.
+            let module = pyo3::types::PyModule::from_code(
+                py,
+                c"import datetime
+def stamp(ticks, hours):
+    class NanosecondDateTime(datetime.datetime):
+        @property
+        def nanosecond(self):
+            return ticks % 1000
+    base = datetime.datetime(1970, 1, 1) + datetime.timedelta(microseconds=ticks // 1000)
+    value = NanosecondDateTime(base.year, base.month, base.day, base.hour, base.minute, base.second, base.microsecond)
+    if hours is not None:
+        value = value.replace(tzinfo=datetime.timezone.utc).astimezone(datetime.timezone(datetime.timedelta(hours=hours)))
+    return value
+",
+                c"ns_literal.py",
+                c"ns_literal",
+            )
+            .unwrap();
+            for ticks in [
+                i64::MIN + 1,
+                i64::MIN + 807,
+                1,
+                2,
+                -1,
+                -1_000_001,
+                999_999,
+                1_000_001,
+                i64::MAX,
+            ] {
+                for hours in [None, Some(0), Some(-5), Some(8)] {
+                    let value = module
+                        .getattr("stamp")
+                        .unwrap()
+                        .call1((ticks, hours))
+                        .unwrap();
+                    let millis = ticks.div_euclid(1_000_000);
+                    let nanos = ticks.rem_euclid(1_000_000) as i32;
+                    let (data_type, expected) = if hours.is_some() {
+                        (
+                            DataType::LocalZonedTimestamp(
+                                paimon::spec::LocalZonedTimestampType::new(9).unwrap(),
+                            ),
+                            Datum::LocalZonedTimestamp { millis, nanos },
+                        )
+                    } else {
+                        (
+                            DataType::Timestamp(paimon::spec::TimestampType::new(9).unwrap()),
+                            Datum::Timestamp { millis, nanos },
+                        )
+                    };
+                    assert_eq!(py_to_datum(&value, &data_type).unwrap(), expected);
+                }
+            }
         });
     }
 
