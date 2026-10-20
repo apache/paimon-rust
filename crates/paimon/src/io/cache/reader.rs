@@ -297,6 +297,46 @@ mod tests {
         assert_eq!(delegate.reads.load(Ordering::SeqCst), 3);
     }
 
+    #[tokio::test]
+    async fn test_data_reads_do_not_evict_cached_snapshot_block() {
+        let delegate = Arc::new(CountingReader {
+            data: Bytes::from_static(b"data"),
+            reads: AtomicUsize::new(0),
+        });
+        let cache = Arc::new(
+            LocalCache::new(LocalCacheConfig {
+                dir: None,
+                namespace: "test".to_string(),
+                max_size: Some(16),
+                block_size: 4,
+                whitelist: std::collections::HashSet::from([
+                    FileType::Meta,
+                    FileType::StructuredData,
+                ]),
+            })
+            .unwrap(),
+        );
+        let snapshot = CachedFileReader::new(
+            delegate.clone(),
+            "s3://bucket/table/snapshot/snapshot-1",
+            4,
+            cache.clone(),
+        );
+        snapshot.read(0..4).await.unwrap();
+        for index in 1..=4 {
+            let reader = CachedFileReader::new(
+                delegate.clone(),
+                format!("s3://bucket/table/data/data-{index}.parquet"),
+                4,
+                cache.clone(),
+            );
+            reader.read(0..4).await.unwrap();
+        }
+        snapshot.read(0..4).await.unwrap();
+
+        assert_eq!(delegate.reads.load(Ordering::SeqCst), 5);
+    }
+
     #[derive(Debug)]
     struct SlowCountingReader {
         data: Bytes,

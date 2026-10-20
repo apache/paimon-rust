@@ -16,7 +16,6 @@
 // under the License.
 
 use bytes::Bytes;
-use indexmap::IndexMap;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
@@ -24,6 +23,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use tokio::io::AsyncWriteExt;
 
+use super::priority_lru::{protected_limit, PriorityLru, DEFAULT_HIGH_PRIORITY_POOL_RATIO};
 use super::state::{BlockKey, CacheCoordinator, LogicalPath};
 
 const CACHE_MAGIC: &[u8; 8] = b"PAIMONLC";
@@ -64,24 +64,47 @@ pub(super) struct DiskCache {
     coordinator: Arc<CacheCoordinator>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct CacheState {
-    entries: IndexMap<BlockKey, u64>,
+    entries: PriorityLru<u64>,
     paths: HashMap<LogicalPath, HashSet<BlockKey>>,
     current_size: u64,
     max_size: Option<u64>,
+    high_priority_ratio: f64,
+}
+
+impl CacheState {
+    fn new(max_size: Option<u64>, high_priority_ratio: f64) -> Self {
+        Self {
+            entries: PriorityLru::new(protected_limit(max_size, high_priority_ratio)),
+            paths: HashMap::new(),
+            current_size: 0,
+            max_size,
+            high_priority_ratio,
+        }
+    }
 }
 
 impl DiskCache {
     #[cfg(test)]
     pub(super) fn new(root: impl AsRef<Path>, max_size: Option<u64>) -> crate::Result<Self> {
+        Self::new_with_ratio(root, max_size, DEFAULT_HIGH_PRIORITY_POOL_RATIO)
+    }
+
+    #[cfg(test)]
+    pub(super) fn new_with_ratio(
+        root: impl AsRef<Path>,
+        max_size: Option<u64>,
+        ratio: f64,
+    ) -> crate::Result<Self> {
         let root = prepare_cache_root(root.as_ref())?;
-        Ok(Self::new_resolved(root, max_size))
+        Ok(Self::new_resolved(root, max_size, ratio))
     }
 
     pub(super) fn shared(
         root: impl AsRef<Path>,
         max_size: Option<u64>,
+        ratio: f64,
     ) -> crate::Result<Arc<Self>> {
         let root = prepare_cache_root(root.as_ref())?;
         let mut registry = disk_cache_registry()
@@ -91,34 +114,39 @@ impl DiskCache {
             registry.retain(|_, cache| cache.strong_count() > 0);
         }
         if let Some(cache) = registry.get(&root).and_then(Weak::upgrade) {
-            cache.tighten_max_size(max_size);
+            cache.tighten_max_size(max_size, ratio)?;
             return Ok(cache);
         }
 
-        let cache = Arc::new(Self::new_resolved(root.clone(), max_size));
+        let cache = Arc::new(Self::new_resolved(root.clone(), max_size, ratio));
         registry.insert(root, Arc::downgrade(&cache));
         Ok(cache)
     }
 
-    fn new_resolved(root: PathBuf, max_size: Option<u64>) -> Self {
+    fn new_resolved(root: PathBuf, max_size: Option<u64>, ratio: f64) -> Self {
         Self {
             root,
-            state: Mutex::new(CacheState {
-                max_size,
-                ..CacheState::default()
-            }),
+            state: Mutex::new(CacheState::new(max_size, ratio)),
             recovered: tokio::sync::OnceCell::new(),
             coordinator: Arc::new(CacheCoordinator::default()),
         }
     }
 
-    fn tighten_max_size(&self, requested: Option<u64>) {
+    fn tighten_max_size(&self, requested: Option<u64>, ratio: f64) -> crate::Result<()> {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if state.high_priority_ratio != ratio {
+            return Err(crate::Error::ConfigInvalid {
+                message: "Local caches using the same directory must use the same local-cache.high-priority-pool-ratio".into(),
+            });
+        }
         state.max_size = match (state.max_size, requested) {
             (None, requested) => requested,
             (current, None) => current,
             (Some(current), Some(requested)) => Some(current.min(requested)),
         };
+        let limit = protected_limit(state.max_size, ratio);
+        state.entries.set_protected_limit(limit);
+        Ok(())
     }
 
     pub(super) async fn ensure_recovered(&self) {
@@ -141,7 +169,7 @@ impl DiskCache {
                             .state
                             .lock()
                             .unwrap_or_else(|error| error.into_inner());
-                        for (key, encoded_size) in recovered.entries {
+                        for (key, encoded_size) in recovered {
                             insert_state_entry(&mut state, key, encoded_size);
                         }
                     }
@@ -368,11 +396,7 @@ impl DiskCache {
 
     fn touch_entry(&self, key: &BlockKey) -> bool {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        let Some(encoded_size) = state.entries.shift_remove(key) else {
-            return false;
-        };
-        state.entries.insert(key.clone(), encoded_size);
-        true
+        state.entries.touch(key).is_some()
     }
 
     fn forget_entry(&self, key: &BlockKey) {
@@ -400,7 +424,7 @@ fn collect_evictions(state: &mut CacheState) -> Vec<BlockKey> {
     let mut to_evict = Vec::new();
     if let Some(max_size) = state.max_size {
         while state.current_size > max_size {
-            let Some((eldest, size)) = state.entries.shift_remove_index(0) else {
+            let Some((eldest, _, size)) = state.entries.pop_lru() else {
                 break;
             };
             state.current_size = state.current_size.saturating_sub(size);
@@ -425,7 +449,10 @@ fn logical_path_matches_prefix(path: &LogicalPath, namespace: &str, prefix: &str
 }
 
 fn insert_state_entry(state: &mut CacheState, key: BlockKey, encoded_size: u64) {
-    if let Some(previous_size) = state.entries.shift_remove(&key) {
+    if let Some((_, previous_size)) = state
+        .entries
+        .insert(key.clone(), encoded_size, encoded_size)
+    {
         state.current_size = state.current_size.saturating_sub(previous_size);
     }
     state
@@ -433,12 +460,11 @@ fn insert_state_entry(state: &mut CacheState, key: BlockKey, encoded_size: u64) 
         .entry(logical_path(&key))
         .or_default()
         .insert(key.clone());
-    state.entries.insert(key, encoded_size);
     state.current_size = state.current_size.saturating_add(encoded_size);
 }
 
 fn remove_state_entry(state: &mut CacheState, key: &BlockKey) {
-    if let Some(encoded_size) = state.entries.shift_remove(key) {
+    if let Some((_, encoded_size)) = state.entries.remove(key) {
         state.current_size = state.current_size.saturating_sub(encoded_size);
         remove_path_index_entry(state, key);
     }
@@ -516,21 +542,21 @@ fn cleanup_temporary_files(directory: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-fn scan_existing_blocks(root: &Path) -> CacheState {
+fn scan_existing_blocks(root: &Path) -> Vec<(BlockKey, u64)> {
     let mut discovered = Vec::new();
     collect_cache_files(root, &mut discovered);
     discovered.sort_by_key(|(modified, _, _, _)| *modified);
 
-    let mut state = CacheState::default();
+    let mut entries = Vec::with_capacity(discovered.len());
     for (_, path, key, encoded_size) in discovered {
         if root.join(key.cache_relative_path()) != path {
             let _ = std::fs::remove_file(path);
             continue;
         }
-        insert_state_entry(&mut state, key, encoded_size);
+        entries.push((key, encoded_size));
     }
 
-    state
+    entries
 }
 
 fn collect_cache_files(
@@ -872,8 +898,14 @@ mod tests {
         let payload = Bytes::from_static(b"data");
         let one_block_size = encode_block(&first_key, &payload).len() as u64;
 
-        let first = DiskCache::shared(directory.path(), None).unwrap();
-        let second = DiskCache::shared(directory.path().join("."), Some(one_block_size)).unwrap();
+        let first =
+            DiskCache::shared(directory.path(), None, DEFAULT_HIGH_PRIORITY_POOL_RATIO).unwrap();
+        let second = DiskCache::shared(
+            directory.path().join("."),
+            Some(one_block_size),
+            DEFAULT_HIGH_PRIORITY_POOL_RATIO,
+        )
+        .unwrap();
 
         assert!(Arc::ptr_eq(&first, &second));
         first.put_block(&first_key, payload.clone()).await;
@@ -990,6 +1022,69 @@ mod tests {
 
         assert_eq!(cache.get_block(&first).await, None);
         assert_eq!(cache.get_block(&second).await, Some(payload));
+    }
+
+    #[tokio::test]
+    async fn test_disk_cache_protects_global_index_from_data_scan() {
+        let directory = tempfile::tempdir().unwrap();
+        let high = BlockKey::new("global-index-1.index", 4, 0);
+        let payload = Bytes::from_static(b"data");
+        let one_block_size = encode_block(&high, &payload).len() as u64;
+        let cache = DiskCache::new(directory.path(), Some(4 * one_block_size)).unwrap();
+        cache.put_block(&high, payload.clone()).await;
+        for index in 1..=4 {
+            cache
+                .put_block(
+                    &BlockKey::new(format!("data-{index}"), 4, 0),
+                    payload.clone(),
+                )
+                .await;
+        }
+
+        assert_eq!(cache.get_block(&high).await, Some(payload));
+        assert_eq!(cache.get_block(&BlockKey::new("data-1", 4, 0)).await, None);
+    }
+
+    #[tokio::test]
+    async fn test_disk_cache_recovery_preserves_priority() {
+        let directory = tempfile::tempdir().unwrap();
+        let high = BlockKey::new("global-index-1.index", 4, 0);
+        let payload = Bytes::from_static(b"data");
+        let one_high_block = encode_block(&high, &payload).len() as u64;
+        let initial = DiskCache::new(directory.path(), None).unwrap();
+        initial.put_block(&high, payload.clone()).await;
+        for index in 1..=4 {
+            initial
+                .put_block(
+                    &BlockKey::new(format!("data-{index}"), 4, 0),
+                    payload.clone(),
+                )
+                .await;
+        }
+        drop(initial);
+
+        let recovered = DiskCache::new(directory.path(), Some(4 * one_high_block)).unwrap();
+        recovered.ensure_recovered().await;
+        assert_eq!(recovered.get_block(&high).await, Some(payload));
+        let mut data_misses = 0;
+        for index in 1..=4 {
+            if recovered
+                .get_block(&BlockKey::new(format!("data-{index}"), 4, 0))
+                .await
+                .is_none()
+            {
+                data_misses += 1;
+            }
+        }
+        assert!(data_misses >= 1);
+    }
+
+    #[test]
+    fn test_disk_cache_shared_directory_rejects_different_priority_ratio() {
+        let directory = tempfile::tempdir().unwrap();
+        let _first = DiskCache::shared(directory.path(), Some(1024), 0.25).unwrap();
+        let error = DiskCache::shared(directory.path(), Some(1024), 0.5).unwrap_err();
+        assert!(matches!(error, crate::Error::ConfigInvalid { .. }));
     }
 
     #[tokio::test]

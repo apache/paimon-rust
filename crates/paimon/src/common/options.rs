@@ -85,6 +85,10 @@ impl CatalogOptions {
     /// Maximum total size of the local block cache.
     pub const LOCAL_CACHE_MAX_SIZE: &'static str = "local-cache.max-size";
 
+    /// Fraction of the local cache protected for metadata and global indexes.
+    pub const LOCAL_CACHE_HIGH_PRIORITY_POOL_RATIO: &'static str =
+        "local-cache.high-priority-pool-ratio";
+
     /// Block size used by the local cache.
     pub const LOCAL_CACHE_BLOCK_SIZE: &'static str = "local-cache.block-size";
 
@@ -293,6 +297,10 @@ mod tests {
         assert_eq!(CatalogOptions::LOCAL_CACHE_ENABLED, "local-cache.enabled");
         assert_eq!(CatalogOptions::LOCAL_CACHE_DIR, "local-cache.dir");
         assert_eq!(CatalogOptions::LOCAL_CACHE_MAX_SIZE, "local-cache.max-size");
+        assert_eq!(
+            CatalogOptions::LOCAL_CACHE_HIGH_PRIORITY_POOL_RATIO,
+            "local-cache.high-priority-pool-ratio"
+        );
         assert_eq!(
             CatalogOptions::LOCAL_CACHE_BLOCK_SIZE,
             "local-cache.block-size"
