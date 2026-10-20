@@ -904,6 +904,8 @@ impl PyTableRead {
         &self,
         py: Python<'_>,
         splits: &Bound<'_, PyAny>,
+        parallelism: usize,
+        preserve_split_order: bool,
     ) -> PyResult<ArrowRecordBatchStream> {
         let splits = extract_splits(splits)?;
         py.detach(|| {
@@ -926,7 +928,12 @@ impl PyTableRead {
             // Validate config (e.g. projection) before the empty-splits fast
             // path so an invalid projection fails consistently regardless of
             // how many splits are passed.
-            let read = builder.new_read().map_err(to_py_err)?;
+            let read = builder
+                .new_read()
+                .map_err(to_py_err)?
+                .with_parallelism(parallelism)
+                .map_err(to_py_err)?
+                .with_preserve_split_order(preserve_split_order);
             let splits = runtime()
                 .block_on(read.authorize_splits(&splits))
                 .map_err(to_py_err)?;
@@ -942,19 +949,33 @@ impl PyTableRead {
 #[pymethods]
 impl PyTableRead {
     /// Lazily read the given splits as an iterator of PyArrow RecordBatches.
+    /// Core owns split scheduling, the global row limit and cancellation.
+    #[pyo3(signature = (splits, *, parallelism = 1, preserve_split_order = false))]
     fn read_arrow(
         &self,
         py: Python<'_>,
         splits: &Bound<'_, PyAny>,
+        parallelism: usize,
+        preserve_split_order: bool,
     ) -> PyResult<PyRecordBatchReader> {
-        Ok(PyRecordBatchReader::from_stream(
-            self.read_stream(py, splits)?,
-        ))
+        Ok(PyRecordBatchReader::from_stream(self.read_stream(
+            py,
+            splits,
+            parallelism,
+            preserve_split_order,
+        )?))
     }
 
     /// Read the given splits into a list of PyArrow RecordBatches.
-    fn read(&self, py: Python<'_>, splits: &Bound<'_, PyAny>) -> PyResult<Vec<Py<PyAny>>> {
-        let stream = self.read_stream(py, splits)?;
+    #[pyo3(signature = (splits, *, parallelism = 1, preserve_split_order = false))]
+    fn read(
+        &self,
+        py: Python<'_>,
+        splits: &Bound<'_, PyAny>,
+        parallelism: usize,
+        preserve_split_order: bool,
+    ) -> PyResult<Vec<Py<PyAny>>> {
+        let stream = self.read_stream(py, splits, parallelism, preserve_split_order)?;
         let rt = runtime();
         let batches = py.detach(|| {
             rt.block_on(stream.try_collect::<Vec<_>>())
@@ -1181,7 +1202,70 @@ mod tests {
     use std::task::Poll;
     use std::time::Duration;
 
+    use paimon::catalog::Identifier;
+    use paimon::io::FileIOBuilder;
+    use paimon::spec::{IntType, Schema, TableSchema};
+    use pyo3::types::PyList;
+
     use super::*;
+
+    #[test]
+    fn table_read_execution_keywords_validate_before_empty_splits() {
+        Python::attach(|py| {
+            let schema = Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .build()
+                .unwrap();
+            let table = Arc::new(Table::new(
+                FileIOBuilder::new("memory").build().unwrap(),
+                Identifier::new("default", "read_execution_keywords"),
+                "memory:/read-execution-keywords".into(),
+                TableSchema::new(0, &schema),
+                None,
+            ));
+            let read = Py::new(py, PyReadBuilder::new(table).new_read()).unwrap();
+            for method in ["read", "read_arrow"] {
+                for preserve_order in [false, true] {
+                    let kwargs = PyDict::new(py);
+                    kwargs.set_item("parallelism", 3).unwrap();
+                    kwargs
+                        .set_item("preserve_split_order", preserve_order)
+                        .unwrap();
+                    let result = read
+                        .bind(py)
+                        .call_method(method, (PyList::empty(py),), Some(&kwargs))
+                        .unwrap();
+                    if method == "read" {
+                        assert_eq!(result.len().unwrap(), 0);
+                    } else {
+                        let reader: PyRef<PyRecordBatchReader> = result.extract().unwrap();
+                        assert!(reader.next_record_batch().unwrap().is_none());
+                        reader.close_reader();
+                        reader.close_reader();
+                    }
+
+                    kwargs.set_item("parallelism", 0).unwrap();
+                    let error = read
+                        .bind(py)
+                        .call_method(method, (PyList::empty(py),), Some(&kwargs))
+                        .unwrap_err();
+                    assert!(error.is_instance_of::<PyValueError>(py));
+                    assert!(error.to_string().contains("parallelism"));
+                }
+
+                // Keep the existing no-keyword entry point and reject positional
+                // execution options, which would be ambiguous in future APIs.
+                read.bind(py)
+                    .call_method1(method, (PyList::empty(py),))
+                    .unwrap();
+                let error = read
+                    .bind(py)
+                    .call_method1(method, (PyList::empty(py), 3))
+                    .unwrap_err();
+                assert!(error.is_instance_of::<PyTypeError>(py));
+            }
+        });
+    }
 
     #[test]
     fn record_batch_reader_releases_stream_on_completion_or_error() {

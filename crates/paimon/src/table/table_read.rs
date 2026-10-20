@@ -50,12 +50,17 @@ mod audit;
 pub use audit::AuditLogRead;
 
 const MAX_MERGE_INPUT_STREAMS: usize = 256;
+const MAX_TOTAL_BLOB_READS: usize = 64;
 
 /// Table read: reads data from splits (e.g. produced by [TableScan::plan]).
 ///
 /// Reference: [pypaimon.read.table_read.TableRead](https://github.com/apache/paimon/blob/master/paimon-python/pypaimon/read/table_read.py)
 #[derive(Debug, Clone)]
-pub struct TableRead<'a>(TableReadKind<'a>);
+pub struct TableRead<'a> {
+    kind: TableReadKind<'a>,
+    parallelism: usize,
+    preserve_split_order: bool,
+}
 
 #[derive(Debug, Clone)]
 enum TableReadKind<'a> {
@@ -84,7 +89,7 @@ impl<'a> TableRead<'a> {
     /// original rows. This does not authorize a read: every split must still
     /// carry a whole-table unrestricted grant issued to this exact handle.
     pub(super) fn for_update(mut self) -> Self {
-        if let TableReadKind::Paimon(read) = &mut self.0 {
+        if let TableReadKind::Paimon(read) = &mut self.kind {
             read.update_read = true;
         }
         self
@@ -99,11 +104,15 @@ impl<'a> TableRead<'a> {
         if table.is_format_table() {
             Self::new_format(table, read_type, data_predicates, None)
         } else {
-            Self(TableReadKind::Paimon(PaimonTableRead::new(
-                table,
-                read_type,
-                data_predicates,
-            )))
+            Self {
+                kind: TableReadKind::Paimon(PaimonTableRead::new(
+                    table,
+                    read_type,
+                    data_predicates,
+                )),
+                parallelism: 1,
+                preserve_split_order: false,
+            }
         }
     }
 
@@ -113,17 +122,21 @@ impl<'a> TableRead<'a> {
         data_predicates: Vec<Predicate>,
         limit: Option<usize>,
     ) -> Self {
-        Self(TableReadKind::Format(FormatTableRead::new(
-            table,
-            read_type,
-            data_predicates,
-            limit,
-        )))
+        Self {
+            kind: TableReadKind::Format(FormatTableRead::new(
+                table,
+                read_type,
+                data_predicates,
+                limit,
+            )),
+            parallelism: 1,
+            preserve_split_order: false,
+        }
     }
 
     /// Schema (fields) that this read will produce.
     pub fn read_type(&self) -> &[DataField] {
-        match &self.0 {
+        match &self.kind {
             TableReadKind::Paimon(read) => read.read_type(),
             TableReadKind::Format(read) => read.read_type(),
         }
@@ -131,7 +144,7 @@ impl<'a> TableRead<'a> {
 
     /// Data predicates for read-side pruning.
     pub fn data_predicates(&self) -> &[Predicate] {
-        match &self.0 {
+        match &self.kind {
             TableReadKind::Paimon(read) => read.data_predicates(),
             TableReadKind::Format(read) => read.data_predicates(),
         }
@@ -139,7 +152,7 @@ impl<'a> TableRead<'a> {
 
     /// Table for this read.
     pub fn table(&self) -> &Table {
-        match &self.0 {
+        match &self.kind {
             TableReadKind::Paimon(read) => read.table(),
             TableReadKind::Format(read) => read.table(),
         }
@@ -150,31 +163,64 @@ impl<'a> TableRead<'a> {
     /// Callers account for output batches they retain. Budget exhaustion is a
     /// terminal stream error. See [`ResourceContext`] for the accounting scope.
     pub fn with_resources(mut self, resources: ResourceContext) -> Self {
-        match &mut self.0 {
+        match &mut self.kind {
             TableReadKind::Paimon(read) => read.resources = Some(resources),
             TableReadKind::Format(read) => read.with_resources(resources),
         }
         self
     }
 
+    /// Read independent splits concurrently, with at most one ready batch per worker.
+    ///
+    /// Applies to [`Self::to_arrow`] and [`Self::to_arrow_with_row_kind`] on
+    /// Paimon tables. Incremental diff and audit readers keep their own execution.
+    /// Multiple groups run on Tokio workers; poll parallel reads in a Tokio runtime.
+    /// The default is one worker. All workers share the same Parquet resource
+    /// budget. Reads that resolve BLOB values before a finite limit remain
+    /// sequential so unused payloads are never fetched speculatively.
+    pub fn with_parallelism(mut self, parallelism: usize) -> crate::Result<Self> {
+        if parallelism == 0 {
+            return Err(crate::Error::DataInvalid {
+                message: "Read parallelism must be greater than zero".into(),
+                source: None,
+            });
+        }
+        self.parallelism = parallelism;
+        Ok(self)
+    }
+
+    /// Emit splits in their supplied order while retaining bounded parallel reads.
+    ///
+    /// Rows within a split keep that split reader's existing order. The default
+    /// allows batches from whichever split group becomes ready first.
+    pub fn with_preserve_split_order(mut self, preserve: bool) -> Self {
+        self.preserve_split_order = preserve;
+        self
+    }
+
+    fn map_kind(mut self, map: impl FnOnce(TableReadKind<'a>) -> TableReadKind<'a>) -> Self {
+        self.kind = map(self.kind);
+        self
+    }
+
     /// Set a filter predicate.
     pub fn with_filter(self, filter: Predicate) -> Self {
-        match self.0 {
-            TableReadKind::Paimon(read) => Self(TableReadKind::Paimon(read.with_filter(filter))),
-            TableReadKind::Format(read) => Self(TableReadKind::Format(read.with_filter(filter))),
-        }
+        self.map_kind(|kind| match kind {
+            TableReadKind::Paimon(read) => TableReadKind::Paimon(read.with_filter(filter)),
+            TableReadKind::Format(read) => TableReadKind::Format(read.with_filter(filter)),
+        })
     }
 
     /// Ordinary partition conjuncts are evaluated against split metadata,
     /// since partition columns may be absent from physical data files. The
     /// predicate uses partition-row indices, not table-field indices.
     pub(crate) fn with_partition_predicate(self, predicate: Option<Predicate>) -> Self {
-        match self.0 {
-            TableReadKind::Paimon(read) => Self(TableReadKind::Paimon(
-                read.with_partition_predicate(predicate),
-            )),
-            TableReadKind::Format(_) => self,
-        }
+        self.map_kind(|kind| match kind {
+            TableReadKind::Paimon(read) => {
+                TableReadKind::Paimon(read.with_partition_predicate(predicate))
+            }
+            other => other,
+        })
     }
 
     /// Set the maximum number of concurrent BLOB range reads for this read.
@@ -185,26 +231,26 @@ impl<'a> TableRead<'a> {
                 source: None,
             });
         }
-        Ok(match self.0 {
-            TableReadKind::Paimon(read) => Self(TableReadKind::Paimon(
-                read.with_blob_parallelism(blob_parallelism),
-            )),
-            TableReadKind::Format(read) => Self(TableReadKind::Format(
-                read.with_blob_parallelism(blob_parallelism),
-            )),
-        })
+        Ok(self.map_kind(|kind| match kind {
+            TableReadKind::Paimon(read) => {
+                TableReadKind::Paimon(read.with_blob_parallelism(blob_parallelism))
+            }
+            TableReadKind::Format(read) => {
+                TableReadKind::Format(read.with_blob_parallelism(blob_parallelism))
+            }
+        }))
     }
 
     /// Pass the limit to Data Evolution and primary-key readers. These paths
     /// apply it after merging/filtering and before output BLOB resolution.
     pub(crate) fn with_limit(self, limit: Option<usize>) -> Self {
-        match self.0 {
+        self.map_kind(|kind| match kind {
             TableReadKind::Paimon(mut read) => {
                 read.limit = limit;
-                Self(TableReadKind::Paimon(read))
+                TableReadKind::Paimon(read)
             }
-            TableReadKind::Format(read) => Self(TableReadKind::Format(read)),
-        }
+            other => other,
+        })
     }
 
     /// Attach an engine-specific Parquet decoder-filter factory.
@@ -213,36 +259,36 @@ impl<'a> TableRead<'a> {
     /// enforce the expression after the scan because an individual file may not
     /// be able to build a decoder filter. A `query-auth.enabled` read refuses it.
     pub fn with_row_filter_factory(self, factory: Arc<dyn crate::arrow::RowFilterFactory>) -> Self {
-        match self.0 {
+        self.map_kind(|kind| match kind {
             TableReadKind::Paimon(read) => {
-                Self(TableReadKind::Paimon(read.with_row_filter_factory(factory)))
+                TableReadKind::Paimon(read.with_row_filter_factory(factory))
             }
             TableReadKind::Format(read) => {
-                Self(TableReadKind::Format(read.with_row_filter_factory(factory)))
+                TableReadKind::Format(read.with_row_filter_factory(factory))
             }
-        }
+        })
     }
 
     /// Override the Parquet resource budget shared by this read.
     #[doc(hidden)]
     pub fn with_parquet_read_budget(self, budget: Arc<ReadBudget>) -> Self {
-        match self.0 {
+        self.map_kind(|kind| match kind {
             TableReadKind::Paimon(read) => {
-                Self(TableReadKind::Paimon(read.with_parquet_read_budget(budget)))
+                TableReadKind::Paimon(read.with_parquet_read_budget(budget))
             }
             TableReadKind::Format(read) => {
-                Self(TableReadKind::Format(read.with_parquet_read_budget(budget)))
+                TableReadKind::Format(read.with_parquet_read_budget(budget))
             }
-        }
+        })
     }
 
     pub(crate) fn with_data_file_read_timing(self, timing: Arc<DataFileReadTiming>) -> Self {
-        match self.0 {
-            TableReadKind::Paimon(read) => Self(TableReadKind::Paimon(
-                read.with_data_file_read_timing(timing),
-            )),
-            TableReadKind::Format(read) => Self(TableReadKind::Format(read)),
-        }
+        self.map_kind(|kind| match kind {
+            TableReadKind::Paimon(read) => {
+                TableReadKind::Paimon(read.with_data_file_read_timing(timing))
+            }
+            other => other,
+        })
     }
 
     /// Restore catalog authorization for transported or externally planned splits.
@@ -266,7 +312,7 @@ impl<'a> TableRead<'a> {
             .map(|field| field.name().into())
             .collect();
         select.extend(leaf_names(self.data_predicates()));
-        if let TableReadKind::Paimon(read) = &self.0 {
+        if let TableReadKind::Paimon(read) = &self.kind {
             if let Some(predicate) = &read.partition_predicate {
                 select.extend(leaf_names(std::slice::from_ref(predicate)));
             }
@@ -321,7 +367,7 @@ impl<'a> TableRead<'a> {
             };
             restored.push(split.clone().planned(Some(grant)));
         }
-        let TableReadKind::Paimon(read) = &self.0 else {
+        let TableReadKind::Paimon(read) = &self.kind else {
             return Err(unsupported(
                 "only Paimon data splits carry query authorization",
             ));
@@ -357,8 +403,13 @@ impl<'a> TableRead<'a> {
     /// A `query-auth.enabled` table reads only splits from this handle's plan;
     /// re-plan after a permission change.
     pub fn to_arrow(&self, data_splits: &[DataSplit]) -> crate::Result<ArrowRecordBatchStream> {
-        match &self.0 {
-            TableReadKind::Paimon(read) => read.to_arrow(data_splits),
+        match &self.kind {
+            TableReadKind::Paimon(read) => read.execute_splits(
+                data_splits,
+                self.parallelism,
+                self.preserve_split_order,
+                false,
+            ),
             TableReadKind::Format(read) => read.to_arrow(data_splits),
         }
     }
@@ -373,8 +424,13 @@ impl<'a> TableRead<'a> {
         data_splits: &[DataSplit],
     ) -> crate::Result<ArrowRecordBatchStream> {
         // Decided from the splits by the `to_arrow` each branch ends in.
-        match &self.0 {
-            TableReadKind::Paimon(read) => read.to_arrow_with_row_kind(data_splits),
+        match &self.kind {
+            TableReadKind::Paimon(read) => read.execute_splits(
+                data_splits,
+                self.parallelism,
+                self.preserve_split_order,
+                true,
+            ),
             TableReadKind::Format(read) => {
                 let schema = audit_schema_for_read_type(read.read_type(), false)?;
                 prepend_insert_row_kind_stream(read.to_arrow(data_splits)?, schema)
@@ -392,7 +448,7 @@ impl<'a> TableRead<'a> {
     ) -> crate::Result<ArrowRecordBatchStream> {
         self.ensure_query_auth_allowed(plan)?;
         plan.validate()?;
-        match &self.0 {
+        match &self.kind {
             TableReadKind::Paimon(read) => read.to_incremental_arrow(plan),
             TableReadKind::Format(_) => Err(crate::Error::Unsupported {
                 message: "Format tables do not support incremental batch read".to_string(),
@@ -412,7 +468,7 @@ impl<'a> TableRead<'a> {
     ) -> crate::Result<ArrowRecordBatchStream> {
         self.ensure_query_auth_allowed(plan)?;
         plan.validate()?;
-        match &self.0 {
+        match &self.kind {
             TableReadKind::Paimon(read) => read.to_audit_log_arrow(plan),
             TableReadKind::Format(_) => Err(crate::Error::Unsupported {
                 message: "Format tables do not support audit log batch read".to_string(),
@@ -456,6 +512,24 @@ struct PaimonTableRead<'a> {
     update_read: bool,
 }
 
+fn execution_parallelism(
+    parallelism: usize,
+    limit: Option<usize>,
+    unfiltered: bool,
+    resolves_blob: bool,
+) -> usize {
+    let parallelism = if resolves_blob {
+        parallelism.min(MAX_TOTAL_BLOB_READS)
+    } else {
+        parallelism
+    };
+    match limit {
+        Some(_) if resolves_blob => 1,
+        Some(limit) if unfiltered => parallelism.min(limit.max(1)),
+        _ => parallelism,
+    }
+}
+
 impl<'a> PaimonTableRead<'a> {
     /// Create a new TableRead with a specific read type (projected fields).
     pub fn new(
@@ -476,6 +550,125 @@ impl<'a> PaimonTableRead<'a> {
             limit: None,
             update_read: false,
         }
+    }
+
+    fn execute_splits(
+        &self,
+        splits: &[DataSplit],
+        parallelism: usize,
+        preserve_split_order: bool,
+        include_row_kind: bool,
+    ) -> crate::Result<ArrowRecordBatchStream> {
+        let options = self.table.schema().core_options();
+        // Validate the complete grant set before splitting the work. Per-worker
+        // validation alone could accept incompatible restricted policies.
+        let grant = self.ensure_authorized_by_splits(&options, splits)?;
+        let splits = self.matching_splits(splits)?;
+        let budget = self.parquet_read_budget()?;
+        // Preserve eager schema/configuration errors (including restricted
+        // extraction validation). Constructing the streams performs no file I/O.
+        // Reuse the existing readers' checks instead of duplicating their rules.
+        let mut validation = self.clone();
+        validation.parquet_read_budget = Some(Arc::clone(&budget));
+        validation.resources = None;
+        if include_row_kind {
+            drop(validation.to_arrow_with_row_kind(&splits)?);
+        } else {
+            drop(validation.to_arrow(&splits)?);
+        }
+        let mut blob_fields = options.blob_fields();
+        blob_fields.extend(
+            self.table
+                .schema()
+                .fields()
+                .iter()
+                .filter(|field| {
+                    super::managed_blob_writer::managed_blob_kind(field.data_type()).is_some()
+                })
+                .map(|field| field.name().to_string()),
+        );
+        let views = options.blob_view_fields();
+        blob_fields.retain(|name| !views.contains(name));
+        let operands = super::query_auth::leaf_names(&self.data_predicates);
+        let uses = |fields: &std::collections::HashSet<String>| {
+            (grant.is_some() && !fields.is_empty())
+                || self
+                    .read_type
+                    .iter()
+                    .any(|field| fields.contains(field.name()))
+                || !fields.is_disjoint(&operands)
+        };
+        // Captured masks and row policies may introduce hidden BLOB operands.
+        // View descriptors still require REST resolution in descriptor mode.
+        let resolves_blob = (!options.blob_as_descriptor() && uses(&blob_fields))
+            || (self.table.rest_env().is_some()
+                && options.blob_view_resolve_enabled()
+                && uses(&views));
+        let parallelism = execution_parallelism(
+            parallelism,
+            self.limit,
+            self.data_predicates.is_empty() && self.partition_predicate.is_none(),
+            resolves_blob,
+        );
+        let workers = parallelism.min(splits.len()).max(1);
+        // A later ordered group may retain its ready batch while the current
+        // group is still reading. Background prefetch must not keep a shared
+        // scheduling permit in that retained decoder and block the current
+        // group forever. Foreground reads retain shared memory admission.
+        let budget = if preserve_split_order && workers > 1 {
+            Arc::new(budget.without_prefetch())
+        } else {
+            budget
+        };
+        let blob_parallelism = self
+            .blob_parallelism
+            .min((MAX_TOTAL_BLOB_READS / workers).max(1));
+        let factory = self.execution_factory(include_row_kind, budget, blob_parallelism);
+        Ok(super::read_execution::execute(
+            splits.into_owned(),
+            parallelism,
+            preserve_split_order,
+            self.limit,
+            factory,
+        ))
+    }
+
+    fn execution_factory(
+        &self,
+        include_row_kind: bool,
+        budget: Arc<ReadBudget>,
+        blob_parallelism: usize,
+    ) -> super::read_execution::SplitReader {
+        // The returned streams own their table/configuration; neither this
+        // TableRead nor its caller needs to outlive asynchronous execution.
+        let table = self.table.clone();
+        let read_type = self.read_type.clone();
+        let data_predicates = self.data_predicates.clone();
+        let partition_predicate = self.partition_predicate.clone();
+        let row_filter_factory = self.row_filter_factory.clone();
+        let data_file_read_timing = self.data_file_read_timing.clone();
+        let update_read = self.update_read;
+        Arc::new(move |splits, limit| {
+            let read = PaimonTableRead {
+                table: &table,
+                read_type: read_type.clone(),
+                data_predicates: data_predicates.clone(),
+                partition_predicate: partition_predicate.clone(),
+                row_filter_factory: row_filter_factory.clone(),
+                parquet_read_budget: Some(Arc::clone(&budget)),
+                // The shared budget already carries this read's resources.
+                resources: None,
+                data_file_read_timing: data_file_read_timing.clone(),
+                blob_parallelism,
+                limit,
+                update_read,
+            };
+            if include_row_kind {
+                read.to_arrow_with_row_kind(splits)
+            } else {
+                read.to_arrow(splits)
+            }
+        })
     }
 
     /// Schema (fields) that this read will produce.
@@ -2762,6 +2955,21 @@ fn pk_split_needs_merge(split: &DataSplit, dv_enabled: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn split_execution_worker_policy_limits_speculation() {
+        assert_eq!(execution_parallelism(8, None, true, false), 8);
+        assert_eq!(execution_parallelism(8, Some(0), true, false), 1);
+        assert_eq!(execution_parallelism(8, Some(2), true, false), 2);
+        assert_eq!(execution_parallelism(8, Some(2), false, false), 8);
+        assert_eq!(execution_parallelism(8, Some(100), false, true), 1);
+        assert_eq!(execution_parallelism(8, None, false, true), 8);
+        assert_eq!(execution_parallelism(64, None, false, true), 64);
+        assert_eq!(execution_parallelism(128, None, false, true), 64);
+        assert_eq!(execution_parallelism(128, None, false, false), 128);
+        assert_eq!(execution_parallelism(128, Some(100), false, true), 1);
+    }
+
     use crate::catalog::Identifier;
     use crate::common::Options;
     use crate::file_index::file_indexer_factory::{FileIndexerFactory, BITMAP_INDEX};

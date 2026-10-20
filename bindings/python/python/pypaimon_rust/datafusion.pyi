@@ -209,10 +209,20 @@ class RecordBatchReader:
         ...
 
 class TableRead:
-    def read_arrow(self, splits: Sequence[Split]) -> RecordBatchReader:
-        """Lazily read splits as PyArrow RecordBatches."""
+    def read_arrow(self, splits: Sequence[Split], *, parallelism: int = 1,
+                   preserve_split_order: bool = False) -> RecordBatchReader:
+        """Lazily read splits as PyArrow RecordBatches.
+
+        parallelism must be positive and bounds concurrent split groups.
+        preserve_split_order emits groups in the supplied split order;
+        otherwise ready groups can be emitted first. The row limit applies
+        across the whole read. close() cancels all pending groups.
+        """
         ...
-    def read(self, splits: Sequence[Split]) -> List[pyarrow.RecordBatch]: ...
+    def read(self, splits: Sequence[Split], *, parallelism: int = 1,
+             preserve_split_order: bool = False) -> List[pyarrow.RecordBatch]:
+        """Collect the same stream returned by read_arrow()."""
+        ...
 
 class ReadBuilder:
     def with_read_type(self, read_type_json: str) -> "ReadBuilder":

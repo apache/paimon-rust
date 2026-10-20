@@ -1202,6 +1202,82 @@ def test_read_arrow_close_is_idempotent_and_stops_iteration():
         reader.close()
 
 
+@pytest.mark.parametrize("method", ["read", "read_arrow"])
+@pytest.mark.parametrize("preserve_order", [False, True])
+def test_parallel_read_preserves_rows_and_requested_split_order(method, preserve_order):
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_partitioned_table(warehouse)
+        builder = table.new_read_builder().with_projection(["id", "dt"])
+        splits = list(reversed(builder.new_scan().plan().splits()))
+        assert len(splits) >= 3
+        read = builder.new_read()
+        expected = [row for split in splits for batch in read.read([split])
+                    for row in batch.to_pylist()]
+        # Generators follow the same iterable contract as the original reader.
+        batches = getattr(read, method)(
+            (split for split in splits), parallelism=3,
+            preserve_split_order=preserve_order)
+        actual = [row for batch in batches for row in batch.to_pylist()]
+        assert sorted(actual, key=lambda row: row["id"]) == sorted(expected, key=lambda row: row["id"])
+        if preserve_order:
+            assert actual == expected
+
+
+@pytest.mark.parametrize("method", ["read", "read_arrow"])
+@pytest.mark.parametrize("preserve_order", [False, True])
+@pytest.mark.parametrize("limit", [0, 1, 3])
+def test_parallel_read_shares_filter_and_limit_across_splits(method, preserve_order, limit):
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_partitioned_table(warehouse)
+        splits = table.new_read_builder().new_scan().plan().splits()
+        builder = (table.new_read_builder().with_projection(["id"])
+                   .with_filter({"method": "greaterThan", "field": "id", "literals": [1]}))
+        read = builder.new_read()
+        expected = [row for split in splits for batch in read.read([split])
+                    for row in batch.to_pylist()]
+        limited = builder.with_limit(limit).new_read()
+        batches = getattr(limited, method)(
+            splits, parallelism=3, preserve_split_order=preserve_order)
+        actual = [row for batch in batches for row in batch.to_pylist()]
+        assert len(actual) == min(limit, len(expected))
+        assert all(row in expected for row in actual)
+        assert len({row["id"] for row in actual}) == len(actual)
+        if preserve_order:
+            assert actual == expected[:limit]
+
+
+@pytest.mark.parametrize("method", ["read", "read_arrow"])
+def test_parallel_read_keeps_zero_column_row_counts(method):
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_partitioned_table(warehouse)
+        splits = table.new_read_builder().new_scan().plan().splits()
+        read = table.new_read_builder().with_projection([]).with_limit(3).new_read()
+        batches = list(getattr(read, method)(splits, parallelism=3, preserve_split_order=True))
+        assert sum(batch.num_rows for batch in batches) == 3
+        assert all(batch.num_columns == 0 for batch in batches)
+
+
+@pytest.mark.parametrize("method", ["read", "read_arrow"])
+def test_parallel_read_rejects_zero_parallelism_before_empty_splits(method):
+    with tempfile.TemporaryDirectory() as warehouse:
+        read = _make_table_with_data(warehouse).new_read_builder().new_read()
+        with pytest.raises(ValueError, match="parallelism"):
+            getattr(read, method)([], parallelism=0)
+
+
+def test_parallel_read_arrow_close_after_first_batch_stops_iteration():
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_partitioned_table(warehouse)
+        builder = table.new_read_builder()
+        splits = builder.new_scan().plan().splits()
+        reader = builder.new_read().read_arrow(splits, parallelism=3)
+        assert next(reader).num_rows > 0
+        reader.close()
+        assert reader.read_next_batch() is None
+        assert list(reader) == []
+        reader.close()
+
+
 def test_read_empty_splits():
     with tempfile.TemporaryDirectory() as warehouse:
         table = _make_table_with_data(warehouse)
@@ -1624,6 +1700,34 @@ def test_incremental_changelog_and_auto_plan_physical_changelog_files():
         empty = builder.new_incremental_scan(2, 2, "changelog").plan()
         assert empty.snapshot_id() == 2
         assert empty.splits() == []
+
+
+@pytest.mark.parametrize("method", ["read", "read_arrow"])
+@pytest.mark.parametrize("preserve_order", [False, True])
+def test_parallel_read_keeps_streaming_row_kinds(method, preserve_order):
+    with tempfile.TemporaryDirectory() as warehouse:
+        ctx = SQLContext()
+        ctx.register_catalog("paimon", {"warehouse": warehouse})
+        ctx.sql("CREATE SCHEMA paimon.parallel_changes")
+        ctx.sql("""CREATE TABLE paimon.parallel_changes.t (
+            dt STRING, id INT, value STRING, PRIMARY KEY (dt, id)
+        ) PARTITIONED BY (dt) WITH ('bucket' = '1', 'changelog-producer' = 'input')""")
+        ctx.sql("INSERT INTO paimon.parallel_changes.t VALUES ('p1', 1, 'a'), ('p2', 2, 'b')")
+        ctx.sql("INSERT INTO paimon.parallel_changes.t VALUES ('p3', 3, 'c')")
+        table = PaimonCatalog({"warehouse": warehouse}).get_table("parallel_changes.t")
+        builder = table.new_read_builder().with_projection(["id"]).with_include_row_kind(True)
+        splits = list(reversed(builder.new_incremental_scan(0, 2, "changelog").plan().splits()))
+        assert len(splits) == 3
+        assert all(split.is_streaming() for split in splits)
+        read = builder.new_read()
+        expected = [row for split in splits for batch in read.read([split])
+                    for row in batch.to_pylist()]
+        batches = getattr(read, method)(splits, parallelism=3, preserve_split_order=preserve_order)
+        actual = [row for batch in batches for row in batch.to_pylist()]
+        assert sorted(actual, key=lambda row: row["id"]) == [
+            {"rowkind": "+I", "id": 1}, {"rowkind": "+I", "id": 2}, {"rowkind": "+I", "id": 3}]
+        if preserve_order:
+            assert actual == expected
 
 
 @pytest.mark.parametrize("mode", ["changelog", "auto"])
