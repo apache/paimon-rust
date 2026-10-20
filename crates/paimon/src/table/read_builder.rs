@@ -535,11 +535,6 @@ impl<'a> PaimonReadBuilder<'a> {
         let combined = Predicate::and(self.filter.data_predicates.clone());
         if let Some(ranges) = super::row_id_predicate::extract_row_id_ranges(&combined) {
             self.derived_row_ranges = Some(ranges);
-            // Ranges are a superset, so a conjunct leaves the residual only when
-            // they represent it exactly.
-            self.filter
-                .data_predicates
-                .retain(|conjunct| !super::row_id_predicate::ranges_represent_conjunct(conjunct));
         }
     }
 
@@ -652,7 +647,18 @@ impl<'a> PaimonReadBuilder<'a> {
     /// ordinary partition conjuncts for safe stats/LIMIT decisions, rebound from
     /// the partition row to the table layout (partition order may differ).
     fn scan_data_predicates(&self) -> Vec<Predicate> {
-        let mut predicates = self.filter.data_predicates.clone();
+        // Range extraction replaces exact scan conjuncts only. A reader can
+        // consume splits from another plan, so retain its complete predicate.
+        let mut predicates = self
+            .filter
+            .data_predicates
+            .iter()
+            .filter(|conjunct| {
+                self.derived_row_ranges.is_none()
+                    || !super::row_id_predicate::ranges_represent_conjunct(conjunct)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
         if self.partition_filter.is_none() {
             return predicates;
         }
@@ -1307,7 +1313,7 @@ mod tests {
             Some(vec![RowRange::new(1, 1)])
         );
         assert_eq!(
-            builder.filter.data_predicates,
+            builder.scan_data_predicates(),
             vec![row_id_leaf(PredicateOperator::NotEq, 1)]
         );
 
@@ -1317,7 +1323,8 @@ mod tests {
             exact.effective_row_ranges(),
             Some(vec![RowRange::new(10, i64::MAX)])
         );
-        assert!(exact.filter.data_predicates.is_empty());
+        assert!(exact.scan_data_predicates().is_empty());
+        assert_eq!(exact.new_read().unwrap().data_predicates().len(), 1);
     }
 
     #[test]
@@ -1342,7 +1349,7 @@ mod tests {
             builder.effective_row_ranges(),
             Some(vec![RowRange::new(10, i64::MAX)])
         );
-        assert_eq!(builder.filter.data_predicates, vec![disjunction]);
+        assert_eq!(builder.scan_data_predicates(), vec![disjunction]);
     }
 
     #[test]
@@ -1363,7 +1370,8 @@ mod tests {
             builder.effective_row_ranges(),
             Some(vec![RowRange::new(7, 7)])
         );
-        assert!(builder.filter.data_predicates.is_empty());
+        assert!(builder.scan_data_predicates().is_empty());
+        assert_eq!(builder.new_read().unwrap().data_predicates().len(), 1);
     }
 
     #[test]
@@ -1413,7 +1421,7 @@ mod tests {
         ]));
 
         assert_eq!(builder.effective_row_ranges(), Some(Vec::new()));
-        assert_eq!(builder.filter.data_predicates, vec![unsatisfiable]);
+        assert_eq!(builder.scan_data_predicates(), vec![unsatisfiable]);
     }
 
     #[test]
@@ -1442,7 +1450,8 @@ mod tests {
                 Some(vec![RowRange::new(102, i64::MAX)]),
                 "row_tracking={row_tracking} data_evolution={data_evolution}"
             );
-            assert!(builder.filter.data_predicates.is_empty());
+            assert!(builder.scan_data_predicates().is_empty());
+            assert_eq!(builder.new_read().unwrap().data_predicates().len(), 1);
         }
     }
 
@@ -1456,7 +1465,7 @@ mod tests {
             row_id_leaf(PredicateOperator::Eq, 8),
         ]));
         assert!(
-            builder.filter.data_predicates.is_empty(),
+            builder.scan_data_predicates().is_empty(),
             "handed to ranges"
         );
 
@@ -2289,9 +2298,16 @@ mod tests {
         assert_eq!(ranges[0].from(), 10);
         assert_eq!(ranges[0].to(), 20);
 
-        // _ROW_ID predicates should be removed from data_predicates
-        assert!(!inner.filter.data_predicates.is_empty());
-        for p in &inner.filter.data_predicates {
+        // Only scan predicates omit exact ranges. Independent readers retain
+        // the full filter even when their supplied splits were not filtered.
+        assert!(inner
+            .filter
+            .data_predicates
+            .iter()
+            .any(super::super::row_id_predicate::references_row_id));
+        let scan_predicates = inner.scan_data_predicates();
+        assert!(!scan_predicates.is_empty());
+        for p in &scan_predicates {
             if let Predicate::Leaf { column, .. } = p {
                 assert_ne!(column, crate::spec::ROW_ID_FIELD_NAME);
             }

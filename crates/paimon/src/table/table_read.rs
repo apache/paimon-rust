@@ -3611,7 +3611,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_a_row_id_filter_configured_on_the_read_is_refused() {
-        let table = crate::table::rest_query_auth_table().await;
+        let table = crate::table::rest_query_auth_table()
+            .await
+            .copy_with_options(std::collections::HashMap::from([(
+                "row-tracking.enabled".into(),
+                "true".into(),
+            )]));
         let row_id = Predicate::Leaf {
             index: 0,
             column: crate::spec::ROW_ID_FIELD_NAME.to_string(),
@@ -3619,17 +3624,21 @@ mod tests {
             op: crate::spec::PredicateOperator::GtEq,
             literals: vec![crate::spec::Datum::Long(1)],
         };
+        let mut builder = table.new_read_builder();
+        builder.with_filter(row_id.clone());
         let read = TableRead::new(&table, table.schema.fields().to_vec(), vec![row_id]);
-        let split = split_with_grant(Some(grant_for(&table, false)));
-        let err = match read.to_arrow(&[split]) {
-            Ok(_) => panic!("a system-column filter must be refused"),
-            Err(err) => err,
-        };
-        assert!(
-            matches!(err, crate::Error::Unsupported { ref message }
-                if message.contains("system column '_ROW_ID'")),
-            "got {err:?}"
-        );
+        for read in [read, builder.new_read().unwrap()] {
+            let split = split_with_grant(Some(grant_for(&table, false)));
+            let err = match read.to_arrow(&[split]) {
+                Ok(_) => panic!("a system-column filter must be refused"),
+                Err(err) => err,
+            };
+            assert!(
+                matches!(err, crate::Error::Unsupported { ref message }
+                    if message.contains("system column '_ROW_ID'")),
+                "got {err:?}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -626,7 +626,7 @@ impl DataFileReader {
             || (row_tracking_enabled
                 && refs
                     .iter()
-                    .any(|(name, _)| *name == crate::spec::SEQUENCE_NUMBER_FIELD_NAME));
+                    .any(|(name, _)| crate::spec::is_row_tracking_column(name)));
         if post_read_filter {
             // Read predicate-only columns without decoder filtering. Reconcile
             // old-file types and attach original row IDs before exact filtering.
