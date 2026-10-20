@@ -1607,15 +1607,13 @@ impl SQLContext {
         ok_result(&self.ctx)
     }
 
-    /// Reject write statements while a session-level time-travel selector is
-    /// active.
+    /// Reject latest-table statement executors while a session-level
+    /// time-travel selector is active.
     ///
-    /// Writes always operate on the latest table state, but in the same
-    /// session reads resolve through the time-travelled snapshot schema (and
-    /// INSERT through the provider is rejected by the write builder), so
-    /// silently ignoring the selector here would be inconsistent. Failing
-    /// with a clear message is safer than writing against a different schema
-    /// than concurrent reads observe.
+    /// These executors load the latest catalog table, while session reads
+    /// resolve the selected snapshot schema. Silently ignoring the selector
+    /// here would be inconsistent. Ordinary INSERT uses the resolved provider
+    /// and its selected schema, so it does not need this guard.
     fn ensure_no_time_travel_for_write(&self, operation: &str) -> DFResult<()> {
         use paimon::spec::{
             SCAN_SNAPSHOT_ID_OPTION, SCAN_TAG_NAME_OPTION, SCAN_TIMESTAMP_MILLIS_OPTION,

@@ -335,3 +335,65 @@ async fn empty_and_filtered_rowkind_inputs_preserve_transport_validation() {
         assert!(writer.prepare_commit().await.unwrap().is_empty());
     }
 }
+
+#[tokio::test]
+async fn completely_filtered_batches_do_not_lock_writer_configuration() {
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .column("op", DataType::VarChar(VarCharType::string_type()))
+        .option("rowkind.field", "op")
+        .option("ignore-delete", "true")
+        .build()
+        .unwrap();
+    let (io, table) = memory_table(
+        "memory:/filtered-configuration",
+        TableSchema::new(0, &schema),
+    );
+    setup_dirs(&io, table.location()).await;
+    persist_table_schema(&io, table.location(), table.schema()).await;
+    let batch = |kind| {
+        RecordBatch::try_from_iter([
+            ("id", Arc::new(Int32Array::from(vec![2])) as ArrayRef),
+            ("op", Arc::new(StringArray::from(vec![kind])) as ArrayRef),
+        ])
+        .unwrap()
+    };
+    let mut writer = table.new_write_builder().new_write().unwrap();
+    writer.write_arrow_batch(&batch("-D")).await.unwrap();
+    writer.with_write_type(vec!["id".into()]).unwrap();
+    writer.with_blob_consumer(None).unwrap();
+    writer.with_blob_uri_reader_factory(None).unwrap();
+    writer.write_arrow_batch(&batch("+I")).await.unwrap();
+    assert!(writer.with_write_type(vec!["id".into()]).is_err());
+    assert!(writer.with_blob_consumer(None).is_err());
+    assert!(writer.with_blob_uri_reader_factory(None).is_err());
+    let messages = writer.prepare_commit().await.unwrap();
+    assert_eq!(
+        messages
+            .iter()
+            .flat_map(|message| &message.new_files)
+            .map(|file| file.row_count)
+            .sum::<i64>(),
+        1
+    );
+    table
+        .new_write_builder()
+        .new_commit()
+        .commit(messages)
+        .await
+        .unwrap();
+    let reader = table.new_read_builder();
+    let plan = reader.new_scan().plan().await.unwrap();
+    let batches: Vec<_> = reader
+        .new_read()
+        .unwrap()
+        .to_arrow(plan.splits())
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+    assert!(batches
+        .iter()
+        .all(|batch| batch.column_by_name("op").unwrap().is_null(0)));
+}

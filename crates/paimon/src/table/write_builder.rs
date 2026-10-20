@@ -264,8 +264,9 @@ impl<'a> PaimonWriteBuilder<'a> {
     pub fn new_update(&self) -> crate::Result<TableUpdate> {
         // Row-level updates can select an older read snapshot. Their partial
         // files retain that schema and their messages carry the snapshot used
-        // for conflict detection. Appending and publishing still require a
-        // current table, including append-capable operations on TableUpdate.
+        // for conflict detection. Upsert and MERGE append unmatched rows using
+        // the same read schema. As with ordinary writers, publication uses the
+        // latest state of the selected table and branch.
         ensure_paimon_table(self.table)?;
         if self.overwrite {
             return Err(crate::Error::Unsupported {
@@ -292,6 +293,7 @@ impl<'a> PaimonWriteBuilder<'a> {
 }
 
 pub(super) fn ensure_table_write_authorized(table: &Table) -> crate::Result<()> {
+    ensure_table_write_allowed(table)?;
     let options = crate::spec::CoreOptions::new(table.schema().options());
     // Query authorization protects reads, not INSERT/OVERWRITE/TRUNCATE.
     // A catalog-loaded REST table retains its publication identity and uses
@@ -304,22 +306,13 @@ pub(super) fn ensure_table_write_authorized(table: &Table) -> crate::Result<()> 
             message: "Writing a table with 'query-auth.enabled' = true requires a catalog-loaded REST table with its resolved schema".into(),
         });
     }
-    ensure_table_write_allowed(table)
+    Ok(())
 }
 
 pub(super) fn ensure_table_write_allowed(table: &Table) -> crate::Result<()> {
-    ensure_paimon_table(table)?;
-    // A time-travel table may carry a historical schema.
-    let selector =
-        crate::spec::CoreOptions::new(table.schema().options()).try_time_travel_selector();
-    if table.is_time_traveled() || !matches!(selector, Ok(None)) {
-        return Err(crate::Error::Unsupported {
-            message: "Cannot write to a table with a time-travel option set \
-                  (scan.version / scan.timestamp-millis / scan.timestamp / scan.watermark / scan.snapshot-id / scan.tag-name)"
-                .to_string(),
-        });
-    }
-    Ok(())
+    // Read selectors choose the read view and its schema. Java writers retain
+    // that schema but restore sequence/index state and publish against latest.
+    ensure_paimon_table(table)
 }
 
 pub(super) fn ensure_paimon_table(table: &Table) -> crate::Result<()> {

@@ -301,9 +301,9 @@ pub struct Table {
     /// replay a grant.
     query_auth_session: Option<u64>,
     rest_env: Option<RESTEnv>,
-    /// True when this table copy was switched to a historical schema by
-    /// [`Table::copy_with_time_travel`]. Ordinary writes and publication reject
-    /// this copy; row-level updates may use it as their read snapshot.
+    /// True for a time-traveled or captured read view. Scans and row matching
+    /// use its selected snapshot. Writers retain its schema; commits publish
+    /// against latest state.
     time_traveled: bool,
     /// Captured snapshot or empty view, so scans don't resolve latest again.
     /// Cleared when [`Table::copy_with_options`] changes the selector.

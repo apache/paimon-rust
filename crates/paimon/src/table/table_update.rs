@@ -46,10 +46,11 @@ fn invalid(message: impl Into<String>) -> crate::Error {
 /// Row-ID updates infer columns from the input unless configured with
 /// [`with_update_type`](Self::with_update_type). Key-based upserts accept a
 /// column subset including the keys and match keys within each partition.
-/// Row updates, deletes and shard updates may select a historical read view;
-/// their messages retain its snapshot as the conflict baseline. Publish those
-/// messages using a current table. Upsert and MERGE with INSERT clauses
-/// require a current table as ordinary writes do.
+/// Operations may select a historical read view. Matched updates retain its
+/// snapshot as the conflict baseline; upsert and MERGE append unmatched rows
+/// using that view's schema and assign fresh row IDs at publication. Publication
+/// resolves the latest snapshot and current table schema independently of the
+/// selected read view.
 #[derive(Clone)]
 pub struct TableUpdate {
     table: Table,
@@ -260,8 +261,6 @@ impl TableUpdate {
         batches: Vec<RecordBatch>,
         upsert_keys: Vec<String>,
     ) -> crate::Result<Vec<CommitMessage>> {
-        // Unlike partial row updates, an upsert may append complete rows.
-        super::write_builder::ensure_table_write_allowed(&self.table)?;
         let mut writer = super::table_upsert::TableUpsert::new(
             &self.table,
             self.commit_user.clone(),
@@ -287,9 +286,6 @@ impl TableUpdate {
         when_matched: Vec<super::WhenMatched>,
         when_not_matched: Vec<super::WhenNotMatched>,
     ) -> crate::Result<Vec<CommitMessage>> {
-        if !when_not_matched.is_empty() {
-            super::write_builder::ensure_table_write_allowed(&self.table)?;
-        }
         super::table_merge_into::merge_into(
             &self.table,
             &self.commit_user,

@@ -225,21 +225,24 @@ async fn test_session_scan_version_uses_snapshot_schema() {
     assert_eq!(column_names(&batches), vec!["id", "name"]);
     assert_eq!(total_rows(&batches), 3);
 
-    // Writing through a time-travelled table is rejected.
-    let result = sql_context
+    // Ordinary INSERT retains the selected schema, while its commit publishes
+    // to the latest table state. The session's historical reader stays fixed.
+    sql_context
         .sql("INSERT INTO paimon.default.t VALUES (6, 'f')")
-        .await;
-    let err = match result {
-        Err(e) => e.to_string(),
-        Ok(df) => match df.collect().await {
-            Err(e) => e.to_string(),
-            Ok(_) => panic!("INSERT into a time-travelled table should fail"),
-        },
-    };
-    assert!(
-        err.contains("time-travel option"),
-        "error should mention time travel: {err}"
-    );
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let historical = sql_context
+        .sql("SELECT * FROM paimon.default.t")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(column_names(&historical), vec!["id", "name"]);
+    assert_eq!(total_rows(&historical), 3);
 
     // Other write statements are rejected up front instead of silently
     // ignoring the active selector and writing to the latest state.
@@ -261,8 +264,8 @@ async fn test_session_scan_version_uses_snapshot_schema() {
         );
     }
 
-    // A selector resolving to a snapshot with the current schema id pins the
-    // read just the same, so INSERT stays rejected.
+    // A selector resolving to the current schema also permits INSERT without
+    // making newly published rows visible through the pinned read.
     sql_context
         .sql("SET 'paimon.scan.version' = '2'")
         .await
@@ -270,20 +273,22 @@ async fn test_session_scan_version_uses_snapshot_schema() {
         .collect()
         .await
         .unwrap();
-    let result = sql_context
-        .sql("INSERT INTO paimon.default.t VALUES (6, 'f', 16)")
-        .await;
-    let err = match result {
-        Err(e) => e.to_string(),
-        Ok(df) => match df.collect().await {
-            Err(e) => e.to_string(),
-            Ok(_) => panic!("INSERT should fail while scan.version pins a same-schema snapshot"),
-        },
-    };
-    assert!(
-        err.contains("time-travel option"),
-        "error should mention time travel: {err}"
-    );
+    sql_context
+        .sql("INSERT INTO paimon.default.t VALUES (7, 'g', 17)")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let pinned = sql_context
+        .sql("SELECT * FROM paimon.default.t")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(column_names(&pinned), vec!["id", "name", "age"]);
+    assert_eq!(total_rows(&pinned), 5);
 
     sql_context
         .sql("RESET 'paimon.scan.version'")
@@ -300,6 +305,26 @@ async fn test_session_scan_version_uses_snapshot_schema() {
         .await
         .unwrap();
     assert_eq!(column_names(&batches), vec!["id", "name", "age"]);
+    assert_eq!(total_rows(&batches), 7);
+    let appended = sql_context
+        .sql("SELECT id, age FROM paimon.default.t WHERE id >= 6 ORDER BY id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let ids = appended[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::Int32Array>()
+        .unwrap();
+    let ages = appended[0]
+        .column(1)
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::Int32Array>()
+        .unwrap();
+    assert_eq!(ids.iter().collect::<Vec<_>>(), vec![Some(6), Some(7)]);
+    assert_eq!(ages.iter().collect::<Vec<_>>(), vec![None, Some(17)]);
 }
 
 #[tokio::test]

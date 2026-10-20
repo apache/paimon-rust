@@ -5329,6 +5329,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_explicit_index_deletes_only_exempt_the_deleted_indexes() {
+        for action in ["THROW_ERROR", "DROP_PARTITION_INDEX", "IGNORE"] {
+            for deleted in ["affected", "other", "both"] {
+                let file_io = test_file_io();
+                let path = format!("memory:/explicit_index_delete_{action}_{deleted}");
+                let table = test_table_with_options(
+                    &file_io,
+                    &path,
+                    HashMap::from([("global-index.column-update-action".into(), action.into())]),
+                );
+                let commit = TableCommit::new(table, "test-user".into());
+                let previous: Vec<_> = [("affected.index", 0), ("other.index", 1)]
+                    .into_iter()
+                    .map(|(name, id)| IndexManifestEntry {
+                        kind: FileKind::Add,
+                        partition: vec![],
+                        bucket: 0,
+                        index_file: test_global_index_file(name, id, 0, 9),
+                        version: 1,
+                    })
+                    .collect();
+                let deletions: Vec<_> = previous
+                    .iter()
+                    .filter(|entry| {
+                        deleted == "both"
+                            || entry.index_file.file_name == format!("{deleted}.index")
+                    })
+                    .cloned()
+                    .map(|mut entry| {
+                        entry.kind = FileKind::Delete;
+                        entry
+                    })
+                    .collect();
+                let mut update = test_data_file("update.parquet", 10);
+                update.first_row_id = Some(0);
+                update.write_cols = Some(vec!["id".into()]);
+                let entries =
+                    commit.messages_to_entries(&[CommitMessage::new(vec![], 0, vec![update])]);
+                let result = commit
+                    .global_index_update_entries(&previous, &entries, &deletions)
+                    .await;
+                if action == "THROW_ERROR" && deleted == "other" {
+                    assert!(
+                        result
+                            .unwrap_err()
+                            .to_string()
+                            .contains("globally indexed columns"),
+                        "{action}/{deleted}"
+                    );
+                } else {
+                    let automatic = result.unwrap();
+                    if action == "DROP_PARTITION_INDEX" && deleted == "other" {
+                        assert_eq!(automatic.len(), 1);
+                        assert_eq!(automatic[0].kind, FileKind::Delete);
+                        assert_eq!(automatic[0].index_file, previous[0].index_file);
+                    } else {
+                        assert!(automatic.is_empty(), "{action}/{deleted}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn test_partial_update_indexed_column_rejects_by_default() {
         let file_io = test_file_io();
         let table_path = "memory:/test_partial_update_indexed_column_rejects";

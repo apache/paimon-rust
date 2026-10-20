@@ -17,6 +17,272 @@
 
 use super::*;
 use paimon::table::{MergeAssignment, MergeSource, TableCommit, WhenMatched, WhenNotMatched};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+#[tokio::test]
+async fn historical_append_writers_do_not_require_query_read_grants() {
+    for empty in [false, true] {
+        for policy in ["denied", "filter", "mask"] {
+            let g = written(
+                "historical_append_target",
+                |options| {
+                    people(
+                        &[
+                            options,
+                            &[
+                                ("data-evolution.enabled", "true"),
+                                ("row-tracking.enabled", "true"),
+                            ],
+                        ]
+                        .concat(),
+                    )
+                },
+                vec![people_rows(1..=2), people_rows(3..=3)],
+            )
+            .await;
+            let snapshot = g.table.snapshot_manager().get_snapshot(1).await.unwrap();
+            let target = g
+                .table
+                .copy_with_pinned_snapshot((!empty).then_some(&snapshot));
+            match policy {
+                "denied" => g.ctx.server.set_column_auth(
+                    "default",
+                    "historical_append_target",
+                    vec!["id".into()],
+                ),
+                "filter" => g.set_rules(&[int_leaf(0, "id", "GREATER_THAN", 1)], &[]),
+                "mask" => g.set_rules(&[], &[("name", upper(1, "name"))]),
+                _ => unreachable!(),
+            }
+            let builder = target.new_write_builder();
+            let mut writer = builder.new_write().unwrap();
+            writer
+                .write_arrow_batch(&people_batch(&[(4, "new")]))
+                .await
+                .unwrap();
+            let messages = writer.prepare_commit().await.unwrap();
+            assert!(!messages.is_empty());
+            assert!(messages
+                .iter()
+                .flat_map(|message| &message.new_files)
+                .all(|file| file.schema_id == target.schema().id() && file.first_row_id.is_none()));
+            builder.try_new_commit().unwrap();
+            assert!(g
+                .ctx
+                .server
+                .auth_selects("default", "historical_append_target")
+                .is_empty());
+
+            // The mock REST endpoint serves SELECT authorization, not commit
+            // publication. Publish through its backing filesystem fixture.
+            let mut options = Options::new();
+            options.set(
+                CatalogOptions::WAREHOUSE,
+                g._tmp.path().to_string_lossy().replace('\\', "/"),
+            );
+            let publisher = FileSystemCatalog::new(options)
+                .unwrap()
+                .get_table(&g.identifier)
+                .await
+                .unwrap();
+            TableCommit::new(publisher.clone(), "historical-append".into())
+                .commit(messages)
+                .await
+                .unwrap();
+            assert_eq!(
+                ids(&read_all(&publisher.new_read_builder()).await.unwrap()),
+                [1, 2, 3, 4]
+            );
+
+            // A supplied schema cannot obtain publication authority merely by
+            // selecting a historical view of the same physical table.
+            let assembled = Table::new(
+                target.file_io().clone(),
+                target.identifier().clone(),
+                target.location().into(),
+                target.schema().clone(),
+                None,
+            )
+            .copy_with_pinned_snapshot((!empty).then_some(&snapshot));
+            assert_refused(assembled.new_write_builder().new_write().err().unwrap());
+            assert_refused(
+                assembled
+                    .new_write_builder()
+                    .try_new_commit()
+                    .err()
+                    .unwrap(),
+            );
+            assert_refused(
+                TableCommit::new(assembled, "assembled".into())
+                    .commit(Vec::new())
+                    .await
+                    .unwrap_err(),
+            );
+            assert!(g
+                .ctx
+                .server
+                .auth_selects("default", "historical_append_target")
+                .is_empty());
+        }
+    }
+}
+
+#[tokio::test]
+async fn historical_insert_mutations_require_whole_target_grants_before_staging() {
+    for operation in ["upsert", "merge"] {
+        for empty in [false, true] {
+            for policy in ["whole", "denied", "filter", "mask"] {
+                let g = written(
+                    "historical_insert_target",
+                    |options| {
+                        people(
+                            &[
+                                options,
+                                &[
+                                    ("data-evolution.enabled", "true"),
+                                    ("row-tracking.enabled", "true"),
+                                    ("deletion-vectors.enabled", "true"),
+                                ],
+                            ]
+                            .concat(),
+                        )
+                    },
+                    vec![people_rows(1..=2), people_rows(3..=3)],
+                )
+                .await;
+                let snapshot = g.table.snapshot_manager().get_snapshot(1).await.unwrap();
+                let target = g
+                    .table
+                    .copy_with_pinned_snapshot((!empty).then_some(&snapshot));
+                match policy {
+                    "denied" => g.ctx.server.set_column_auth(
+                        "default",
+                        "historical_insert_target",
+                        vec!["id".into()],
+                    ),
+                    "filter" => g.set_rules(&[int_leaf(0, "id", "GREATER_THAN", 1)], &[]),
+                    "mask" => g.set_rules(&[], &[("name", upper(1, "name"))]),
+                    _ => g.set_rules(&[], &[]),
+                }
+                let before = target
+                    .file_io()
+                    .list_status_recursive(target.location())
+                    .await
+                    .unwrap()
+                    .len();
+                let calls = Arc::new(AtomicUsize::new(0));
+                let called = calls.clone();
+                let assignment = MergeAssignment::Value(paimon::table::UpdateAssignment::Function(
+                    Arc::new(move |batches| {
+                        called.fetch_add(1, Ordering::SeqCst);
+                        Ok(batches
+                            .iter()
+                            .map(|batch| batch.column_by_name("s.name").unwrap().clone())
+                            .collect())
+                    }),
+                ));
+                let mut update = target.new_write_builder().new_update().unwrap();
+                update.with_update_type(vec!["name".into()]).unwrap();
+                let source = people_batch(&[(1, "changed"), (4, "new")]);
+                let result = if operation == "upsert" {
+                    update
+                        .upsert_by_arrow_with_key(vec![source], vec!["id".into()])
+                        .await
+                } else {
+                    update
+                        .merge_into(
+                            MergeSource::Batches(vec![source]),
+                            vec![("id".into(), "id".into())],
+                            vec![WhenMatched {
+                                condition: None,
+                                delete: false,
+                                assignments: vec![("name".into(), assignment.clone())],
+                            }],
+                            vec![WhenNotMatched {
+                                condition: None,
+                                assignments: vec![
+                                    ("id".into(), MergeAssignment::SourceColumn("id".into())),
+                                    ("name".into(), assignment),
+                                ],
+                            }],
+                        )
+                        .await
+                };
+                if policy == "whole" {
+                    let messages = result.unwrap();
+                    assert!(!messages.is_empty());
+                    if operation == "merge" {
+                        assert!(calls.load(Ordering::SeqCst) > 0);
+                    }
+                    assert!(messages
+                        .iter()
+                        .any(|message| message.check_from_snapshot.is_none()));
+                    // This fixture's REST server supplies grants, while its
+                    // filesystem catalog owns snapshot publication.
+                    let mut options = Options::new();
+                    options.set(
+                        CatalogOptions::WAREHOUSE,
+                        g._tmp.path().to_string_lossy().replace('\\', "/"),
+                    );
+                    let publisher = FileSystemCatalog::new(options)
+                        .unwrap()
+                        .get_table(&g.identifier)
+                        .await
+                        .unwrap();
+                    TableCommit::new(publisher, "historical-inserts".into())
+                        .commit(messages)
+                        .await
+                        .unwrap();
+                    let mut expected = vec![
+                        (1, Some("changed".into())),
+                        (2, Some("bob".into())),
+                        (3, Some("carol".into())),
+                        (4, Some("new".into())),
+                    ];
+                    if empty {
+                        expected.push((1, Some("alice".into())));
+                        expected.sort();
+                    }
+                    assert_eq!(
+                        id_names(&read_all(&g.table.new_read_builder()).await.unwrap()),
+                        expected
+                    );
+                } else {
+                    let error = result.unwrap_err();
+                    if policy == "denied" {
+                        assert_forbidden(error);
+                    } else {
+                        assert!(error.to_string().contains("unrestricted"), "{error}");
+                    }
+                    assert_eq!(calls.load(Ordering::SeqCst), 0);
+                    assert_eq!(
+                        target
+                            .file_io()
+                            .list_status_recursive(target.location())
+                            .await
+                            .unwrap()
+                            .len(),
+                        before
+                    );
+                    assert_eq!(
+                        target
+                            .snapshot_manager()
+                            .get_latest_snapshot_id()
+                            .await
+                            .unwrap(),
+                        Some(2)
+                    );
+                }
+                let selects = g
+                    .ctx
+                    .server
+                    .auth_selects("default", "historical_insert_target");
+                assert!(!selects.is_empty());
+                assert!(selects.iter().all(Option::is_none));
+            }
+        }
+    }
+}
 
 fn target() -> Table {
     Table::new(
