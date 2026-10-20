@@ -1858,7 +1858,20 @@ async fn test_execute_multivalue_index_and_array_queries_end_to_end() {
 
 #[tokio::test]
 async fn test_bitmap_floating_candidates_preserve_residual_results() {
-    let table_path = "memory:/test_bitmap_floating_residual_candidates";
+    check_floating_candidates_preserve_residual_results(BITMAP_GLOBAL_INDEX_TYPE).await;
+}
+
+/// BTree keys keep `total_cmp` order, so sign-bit NaNs sort below `-Inf`.
+#[tokio::test]
+async fn test_btree_floating_candidates_preserve_residual_results() {
+    check_floating_candidates_preserve_residual_results(
+        crate::table::global_index_types::BTREE_GLOBAL_INDEX_TYPE,
+    )
+    .await;
+}
+
+async fn check_floating_candidates_preserve_residual_results(index_type: &str) {
+    let table_path = format!("memory:/test_{index_type}_floating_residual_candidates");
     let schema = Schema::builder()
         .column("id", DataType::Int(IntType::new()))
         .column("f", DataType::Float(FloatType::new()))
@@ -1869,7 +1882,7 @@ async fn test_bitmap_floating_candidates_preserve_residual_results() {
     let table = Table::new(
         FileIOBuilder::new("memory").build().unwrap(),
         Identifier::new("default", "test_bitmap_floating_residual_candidates"),
-        table_path.to_string(),
+        table_path,
         TableSchema::new(0, &schema),
         None,
     );
@@ -1923,7 +1936,7 @@ async fn test_bitmap_floating_candidates_preserve_residual_results() {
         let shard_count = table
             .new_global_index_build_builder()
             .with_index_column(column)
-            .with_index_type(BITMAP_GLOBAL_INDEX_TYPE)
+            .with_index_type(index_type)
             .execute()
             .await
             .unwrap();
@@ -1944,6 +1957,18 @@ async fn test_bitmap_floating_candidates_preserve_residual_results() {
     // +Inf and order -0.0 below 0.0.
     let predicates = PredicateBuilder::new(table.schema().fields());
     let cases = [
+        (
+            "Float > 0",
+            predicates.greater_than("f", Datum::Float(0.0)).unwrap(),
+            vec![0, 1, 2, 3, 7],
+        ),
+        (
+            "Double >= -1",
+            predicates
+                .greater_or_equal("d", Datum::Double(-1.0))
+                .unwrap(),
+            vec![0, 1, 2, 3, 4, 5, 6, 7],
+        ),
         (
             "Float < 0",
             predicates.less_than("f", Datum::Float(0.0)).unwrap(),
@@ -2046,11 +2071,14 @@ async fn test_bitmap_floating_candidates_preserve_residual_results() {
 
     for (name, predicate, expected) in cases {
         let without_index = scan_ids(&table_without_index, predicate.clone()).await;
-        assert_eq!(without_index, expected, "{name}: residual baseline");
+        assert_eq!(
+            without_index, expected,
+            "{index_type} {name}: residual baseline"
+        );
         let with_index = scan_ids(&table, predicate).await;
         assert_eq!(
             with_index, without_index,
-            "{name}: global index changed rows"
+            "{index_type} {name}: global index changed rows"
         );
     }
 }

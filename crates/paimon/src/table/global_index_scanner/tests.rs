@@ -2368,14 +2368,9 @@ async fn test_bitmap_floating_bound_fusion_preserves_candidates_and_fallback() {
                     )
                     .await
                     .unwrap();
-                    assert_eq!(
-                        actual,
-                        if budget == 0 {
-                            None
-                        } else {
-                            Some(vec![RowRange::new(100, 100)])
-                        }
-                    );
+                    // Java orders every NaN above every number, so no row is
+                    // greater than the sign-bit NaN bound.
+                    assert_eq!(actual, Some(vec![]));
                 }
             }
         }
@@ -2442,17 +2437,15 @@ async fn assert_legacy_floating_btree(
         &write_result.meta,
     )];
     let fields = vec![DataField::new(1, "id".to_string(), data_type.clone())];
+    // Java has a single NaN, but these files keep each NaN payload as its own
+    // key. A NaN literal is left to the row filter; other keys stay exact.
     let cases = [
         (
             PredicateOperator::Eq,
             vec![zero_literal.clone()],
-            vec![RowRange::new(103, 103)],
+            Some(vec![RowRange::new(103, 103)]),
         ),
-        (
-            PredicateOperator::Eq,
-            vec![nan_literals[0].clone()],
-            vec![RowRange::new(100, 100)],
-        ),
+        (PredicateOperator::Eq, vec![nan_literals[0].clone()], None),
         (
             PredicateOperator::In,
             vec![
@@ -2460,7 +2453,7 @@ async fn assert_legacy_floating_btree(
                 nan_literals[1].clone(),
                 zero_literal,
             ],
-            vec![RowRange::new(100, 101), RowRange::new(103, 103)],
+            None,
         ),
     ];
 
@@ -2475,7 +2468,6 @@ async fn assert_legacy_floating_btree(
         let result =
             evaluate_global_index_fast(&file_io, &table_path, &entries, &predicates, &fields)
                 .await
-                .unwrap()
                 .unwrap();
         assert_eq!(result, expected, "{file_name}: {op}");
     }

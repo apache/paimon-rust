@@ -18,7 +18,8 @@
 //! Type-specific index readers and shard I/O execution.
 
 use super::entry::{
-    sorted_entry_meta, GlobalIndexEntry, GlobalIndexEntryMeta, GlobalIndexFileKind,
+    btree_nan_order_sensitive, sorted_entry_meta, GlobalIndexEntry, GlobalIndexEntryMeta,
+    GlobalIndexFileKind,
 };
 use super::query_plan::{add_file_size, EntryQueryPlan, EntryQueryResult, FallbackScanPlan};
 use super::{BoxedCmp, GlobalIndexScanner};
@@ -104,6 +105,31 @@ impl GlobalIndexScanner {
         plan: &EntryQueryPlan,
         effective_predicates: &[(PredicateOperator, &[Datum], &DataType)],
     ) -> Result<EntryQueryResult> {
+        // Leave predicates this file cannot answer like Java to the read
+        // pipeline; see `btree_nan_order_sensitive`.
+        if entry.index_type == GlobalIndexFileKind::BTree {
+            let meta = sorted_entry_meta(entry);
+            let between_sensitive = plan.between_matches
+                && plan.between_evaluated
+                && between.is_some_and(|between| {
+                    btree_nan_order_sensitive(
+                        meta,
+                        PredicateOperator::Between,
+                        &[between.from.clone(), between.to.clone()],
+                        between.data_type,
+                    )
+                });
+            let predicate_sensitive = plan.matching_predicates.iter().any(|&idx| {
+                let (op, literals, data_type) = &effective_predicates[idx];
+                btree_nan_order_sensitive(meta, *op, literals, data_type)
+            });
+            if between_sensitive || predicate_sensitive {
+                return Ok(EntryQueryResult {
+                    bitmap: None,
+                    declined: true,
+                });
+            }
+        }
         let mut reader = if (plan.between_matches && plan.between_evaluated)
             || !plan.matching_predicates.is_empty()
         {

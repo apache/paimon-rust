@@ -19,7 +19,7 @@
 
 use crate::btree::key_serde::DynKeyComparator;
 use crate::btree::BTreeIndexMeta;
-use crate::spec::{DataType, PredicateOperator};
+use crate::spec::{DataType, Datum, PredicateOperator};
 use crate::table::bitmap_global_index_format::is_bitmap_floating_residual_sensitive_op;
 use crate::table::index_file_path::IndexFileLocation;
 use crate::{Error, Result};
@@ -160,6 +160,46 @@ pub(super) enum GlobalIndexFileKind {
 
 pub(super) fn is_floating_point(data_type: &DataType) -> bool {
     matches!(data_type, DataType::Float(_) | DataType::Double(_))
+}
+
+/// Java orders every NaN as one value above `+Inf`. BTree keys keep `total_cmp`
+/// order, where a NaN with the sign bit set sorts below `-Inf` and each NaN
+/// payload is its own key. Literals are canonicalized before querying, so only
+/// a file holding NaN keys can disagree with Java: on ranges when its first key
+/// is a NaN, and on NaN literals when either end is a NaN.
+pub(super) fn btree_nan_order_sensitive(
+    meta: &BTreeIndexMeta,
+    op: PredicateOperator,
+    literals: &[Datum],
+    data_type: &DataType,
+) -> bool {
+    let is_nan = |key: &Option<Vec<u8>>| match (data_type, key.as_deref()) {
+        (DataType::Float(_), Some(key)) => {
+            <[u8; 4]>::try_from(key).is_ok_and(|bytes| f32::from_le_bytes(bytes).is_nan())
+        }
+        (DataType::Double(_), Some(key)) => {
+            <[u8; 8]>::try_from(key).is_ok_and(|bytes| f64::from_le_bytes(bytes).is_nan())
+        }
+        _ => false,
+    };
+    let first_is_nan = is_nan(&meta.first_key);
+    let range = matches!(
+        op,
+        PredicateOperator::Lt
+            | PredicateOperator::LtEq
+            | PredicateOperator::Gt
+            | PredicateOperator::GtEq
+    );
+    (range && first_is_nan)
+        || (literals.iter().any(is_nan_literal) && (first_is_nan || is_nan(&meta.last_key)))
+}
+
+pub(super) fn is_nan_literal(literal: &Datum) -> bool {
+    match literal {
+        Datum::Float(value) => value.is_nan(),
+        Datum::Double(value) => value.is_nan(),
+        _ => false,
+    }
 }
 
 pub(super) fn bitmap_meta_may_match(

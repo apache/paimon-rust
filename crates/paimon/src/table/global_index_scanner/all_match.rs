@@ -17,7 +17,9 @@
 
 //! Prove complete scalar BTree domains match without opening index files.
 
-use super::entry::{sorted_entry_meta, GlobalIndexEntry, GlobalIndexFileKind};
+use super::entry::{
+    btree_nan_order_sensitive, sorted_entry_meta, GlobalIndexEntry, GlobalIndexFileKind,
+};
 use crate::btree::key_serde::KeyComparator;
 use crate::btree::{make_key_comparator, serialize_datum, BTreeIndexMeta};
 use crate::spec::{DataType, Datum, PredicateOperator};
@@ -47,6 +49,8 @@ pub(super) fn all_matching_entries(
                     .map(|literal| serialize_datum(literal, ty))
                     .collect::<Vec<_>>(),
                 make_key_comparator(ty),
+                *literals,
+                *ty,
             )
         })
         .collect();
@@ -68,14 +72,17 @@ pub(super) fn all_matching_entries(
         if count != Some(expected_count) {
             continue;
         }
-        for (predicate_index, (op, values, cmp)) in comparisons.iter().enumerate() {
+        for (predicate_index, (op, values, cmp, literals, ty)) in comparisons.iter().enumerate() {
             let all_match = files.iter().all(|&index| {
+                let meta = sorted_entry_meta(entries[index]);
+                if btree_nan_order_sensitive(meta, *op, literals, ty) {
+                    return false;
+                }
                 // Degradation: pure optimisation. This only proves that a file's whole
                 // row range matches so the posting list need not be decoded. Without an
                 // ordering nothing is proven, so the entry is simply not an all-match
                 // and the ordinary query path handles it.
-                entry_all_matches(sorted_entry_meta(entries[index]), *op, values, cmp)
-                    .unwrap_or(false)
+                entry_all_matches(meta, *op, values, cmp).unwrap_or(false)
             });
             if all_match {
                 for &index in &files {

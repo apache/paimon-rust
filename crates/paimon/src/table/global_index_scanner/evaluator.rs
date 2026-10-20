@@ -19,8 +19,9 @@
 
 use super::all_match::all_matching_entries;
 use super::entry::{
-    bitmap_meta_may_match, bitmap_meta_may_match_between, multivalue_meta_may_match,
-    sorted_entry_meta, GlobalIndexEntry, GlobalIndexFileKind,
+    bitmap_meta_may_match, bitmap_meta_may_match_between, btree_nan_order_sensitive,
+    is_nan_literal, multivalue_meta_may_match, sorted_entry_meta, GlobalIndexEntry,
+    GlobalIndexFileKind,
 };
 use super::predicates::{
     entries_support_predicate, is_multivalue_predicate, is_sorted_global_index_supported_op,
@@ -416,6 +417,18 @@ impl GlobalIndexScanner {
                         }
                     }
                 }
+                // Java has one NaN; see `btree_nan_order_sensitive`.
+                if matches!(key_type, DataType::Float(_) | DataType::Double(_))
+                    && literals.iter().any(is_nan_literal)
+                {
+                    for literal in literals.to_mut() {
+                        match literal {
+                            Datum::Float(value) if value.is_nan() => *value = f32::NAN,
+                            Datum::Double(value) if value.is_nan() => *value = f64::NAN,
+                            _ => {}
+                        }
+                    }
+                }
                 Ok(Some((*op, literals, key_type)))
             })
             .collect::<Result<Option<Vec<_>>>>()?
@@ -498,6 +511,7 @@ impl GlobalIndexScanner {
                     .collect::<Vec<_>>();
                 (
                     *op,
+                    *literals,
                     *data_type,
                     btree_cmp,
                     btree_serialized,
@@ -510,12 +524,22 @@ impl GlobalIndexScanner {
         let predicate_matches: Vec<Vec<bool>> = pruning_info
             .iter()
             .map(
-                |(op, data_type, btree_cmp, btree_serialized, bitmap_cmp, bitmap_serialized)| {
+                |(
+                    op,
+                    literals,
+                    data_type,
+                    btree_cmp,
+                    btree_serialized,
+                    bitmap_cmp,
+                    bitmap_serialized,
+                )| {
                     entries
                         .iter()
                         .map(|entry| match entry.index_type {
                             GlobalIndexFileKind::BTree => {
-                                sorted_entry_meta(entry).may_match(*op, btree_serialized, btree_cmp)
+                                let meta = sorted_entry_meta(entry);
+                                btree_nan_order_sensitive(meta, *op, literals, data_type)
+                                    || meta.may_match(*op, btree_serialized, btree_cmp)
                             }
                             GlobalIndexFileKind::Bitmap => bitmap_meta_may_match(
                                 sorted_entry_meta(entry),
@@ -553,33 +577,39 @@ impl GlobalIndexScanner {
             })
             .collect();
 
-        let between_matches_by_entry: Vec<bool> =
-            match between.as_ref() {
-                Some(b) => {
-                    let btree_cmp = make_key_comparator(b.data_type);
-                    let btree_from = serialize_datum(b.from, b.data_type);
-                    let btree_to = serialize_datum(b.to, b.data_type);
-                    let bitmap_cmp = make_bitmap_key_comparator(b.data_type);
-                    let bitmap_from = serialize_bitmap_datum(b.from, b.data_type);
-                    let bitmap_to = serialize_bitmap_datum(b.to, b.data_type);
-                    entries
-                        .iter()
-                        .map(|entry| match entry.index_type {
-                            GlobalIndexFileKind::BTree => sorted_entry_meta(entry)
-                                .may_match_between(&btree_from, &btree_to, &btree_cmp),
-                            GlobalIndexFileKind::Bitmap => bitmap_meta_may_match_between(
-                                sorted_entry_meta(entry),
+        let between_matches_by_entry: Vec<bool> = match between.as_ref() {
+            Some(b) => {
+                let btree_cmp = make_key_comparator(b.data_type);
+                let btree_from = serialize_datum(b.from, b.data_type);
+                let btree_to = serialize_datum(b.to, b.data_type);
+                let bitmap_cmp = make_bitmap_key_comparator(b.data_type);
+                let bitmap_from = serialize_bitmap_datum(b.from, b.data_type);
+                let bitmap_to = serialize_bitmap_datum(b.to, b.data_type);
+                entries
+                    .iter()
+                    .map(|entry| match entry.index_type {
+                        GlobalIndexFileKind::BTree => {
+                            let meta = sorted_entry_meta(entry);
+                            btree_nan_order_sensitive(
+                                meta,
+                                PredicateOperator::Between,
+                                &[b.from.clone(), b.to.clone()],
                                 b.data_type,
-                                &bitmap_from,
-                                &bitmap_to,
-                                bitmap_cmp.as_ref(),
-                            ),
-                            GlobalIndexFileKind::Multivalue | GlobalIndexFileKind::FM => false,
-                        })
-                        .collect()
-                }
-                None => Vec::new(),
-            };
+                            ) || meta.may_match_between(&btree_from, &btree_to, &btree_cmp)
+                        }
+                        GlobalIndexFileKind::Bitmap => bitmap_meta_may_match_between(
+                            sorted_entry_meta(entry),
+                            b.data_type,
+                            &bitmap_from,
+                            &bitmap_to,
+                            bitmap_cmp.as_ref(),
+                        ),
+                        GlobalIndexFileKind::Multivalue | GlobalIndexFileKind::FM => false,
+                    })
+                    .collect()
+            }
+            None => Vec::new(),
+        };
         let between_fallback_plan = between.as_ref().map(|_| {
             self.fallback_scan_plan(
                 entries,
