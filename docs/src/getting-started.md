@@ -401,6 +401,7 @@ let catalog = CatalogFactory::create(options).await?;
 |--------|---------|-------------|
 | `local-cache.enabled` | `false` | Enable catalog-scoped local block caching. |
 | `local-cache.dir` | none | Optional base directory. When set, Paimon uses a persistent disk cache in a private versioned child directory; otherwise it uses memory. |
+| `local-cache.shared` | `false` | Share disk blocks across processes on one node; requires `local-cache.dir` and `local-cache.max-size`. |
 | `local-cache.max-size` | unlimited | Maximum cache size. Memory caches count payload bytes; disk caches count encoded bytes. Values accept byte units such as `512 MiB` or `20 GiB`. |
 | `local-cache.high-priority-pool-ratio` | `0.25` | Fraction of a finite cache budget protected for `meta` and `global-index` blocks. Use `0` for a single LRU. |
 | `local-cache.block-size` | `1 MiB` | Block size used for cached range reads. |
@@ -411,7 +412,7 @@ blocks without dedicated BLOB, video, or vector-store files. `data` and `*`
 retain their broader behavior.
 
 The protected and regular LRUs share one total budget; either can use idle
-capacity. Catalogs sharing a disk cache within one process must use the same ratio.
+capacity. Catalogs or processes sharing a disk cache must use the same ratio.
 
 Each catalog owns its in-memory cache for the catalog's lifetime. Disk caches
 are reused after process restarts. Cache keys include a catalog-configuration
@@ -424,8 +425,16 @@ convention. Cache managers using the same canonical directory in one process
 share LRU, size accounting, and invalidation state; if their configured limits
 differ, the smallest `local-cache.max-size` is used. Restart recovery runs on a
 blocking worker, reads only block headers and file metadata, and validates
-payload CRC lazily on the first hit. Use a separate `local-cache.dir` for each
-worker or process because processes do not share exact LRU or size accounting.
+payload CRC lazily on the first hit. Without shared mode, use a separate
+`local-cache.dir` per worker or process.
+
+For sharing, set `local-cache.enabled=true` and `local-cache.shared=true` in
+same-UID workers with the same node-local directory and capacity. NFS,
+cross-node sharing, and catalogs inherited across `fork` are unsupported.
+Invalidation clears the shared cache; if it fails after a storage mutation,
+do not reuse the affected path until invalidation succeeds.
+A canceled or failed rename bypasses this cache; after confirming storage state,
+use a new cache directory to resume sharing.
 
 ### BLOB Index Cache
 

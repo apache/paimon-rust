@@ -23,7 +23,7 @@ use crate::api::GetTableResponse;
 use crate::catalog::{FusePathResolver, Identifier, RESTToken, RESTTokenFileIO};
 use crate::common::{CatalogOptions, Options};
 use crate::error::Error;
-use crate::io::cache::{create_local_cache_with_namespace, LocalCache};
+use crate::io::cache::{create_local_cache_with_namespace_async, LocalCache};
 use crate::io::{FileIO, FileIOCacheContext};
 use crate::spec::{CoreOptions, TableSchema, PATH_OPTION};
 use crate::table::snapshot_commit::{RESTSnapshotCommit, SnapshotCommit};
@@ -64,7 +64,8 @@ impl Table {
             .get(CatalogOptions::DATA_TOKEN_ENABLED)
             .map(|v| v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
-        let local_cache = create_local_cache_with_namespace(&rest_options, api.options())?;
+        let local_cache =
+            create_local_cache_with_namespace_async(&rest_options, api.options()).await?;
         let file_io_cache = FileIOCacheContext::from_props(api.options().to_map())?;
         let fuse_resolver = Arc::new(FusePathResolver::new(api.options()));
         RESTEnv::build_table_with_token(

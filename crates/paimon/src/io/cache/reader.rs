@@ -83,6 +83,7 @@ impl CachedFileReader {
 
         let load_lock = self.cache.block_load_lock(&key).await;
         let load_guard = load_lock.lock().await;
+        let _shared_guard = self.cache.shared_load_lock(&key).await;
         let result = if let Some(payload) = self
             .cache
             .get_block(&key, expected_len, &self.read_token)
@@ -140,6 +141,7 @@ impl CachedFileReader {
         let first_key = self.cache.block_key(&self.path, 0);
         let load_lock = self.cache.block_load_lock(&first_key).await;
         let load_guard = load_lock.lock().await;
+        let _shared_guard = self.cache.shared_load_lock(&first_key).await;
         let result = if let Some(payload) = self.read_cached_full().await {
             Ok(payload)
         } else {
@@ -270,6 +272,7 @@ mod tests {
         });
         let cache = Arc::new(
             LocalCache::new(LocalCacheConfig {
+                shared: false,
                 dir: None,
                 namespace: "test".to_string(),
                 max_size: None,
@@ -305,6 +308,7 @@ mod tests {
         });
         let cache = Arc::new(
             LocalCache::new(LocalCacheConfig {
+                shared: false,
                 dir: None,
                 namespace: "test".to_string(),
                 max_size: Some(16),
@@ -360,6 +364,7 @@ mod tests {
         });
         let cache = Arc::new(
             LocalCache::new(LocalCacheConfig {
+                shared: false,
                 dir: None,
                 namespace: "test".to_string(),
                 max_size: None,
@@ -390,6 +395,7 @@ mod tests {
             reads: AtomicUsize::new(0),
         });
         let config = || LocalCacheConfig {
+            shared: false,
             dir: Some(directory.path().to_path_buf()),
             namespace: "test".to_string(),
             max_size: None,
@@ -437,6 +443,7 @@ mod tests {
         let path = "s3://bucket/table/snapshot/snapshot-1";
         let cache = Arc::new(
             LocalCache::new(LocalCacheConfig {
+                shared: false,
                 dir: None,
                 namespace: "test".to_string(),
                 max_size: None,
@@ -460,7 +467,7 @@ mod tests {
         let old_load = tokio::spawn(async move { old_reader.read(0..4).await });
 
         started.notified().await;
-        cache.invalidate_path(path).await;
+        cache.invalidate_path(path).await.unwrap();
         release.notify_one();
         assert_eq!(
             old_load.await.unwrap().unwrap(),
@@ -486,6 +493,7 @@ mod tests {
         let path = "s3://bucket/table/snapshot/snapshot-1";
         let cache_a = Arc::new(
             LocalCache::new(LocalCacheConfig {
+                shared: false,
                 dir: Some(directory.path().to_path_buf()),
                 namespace: "test".to_string(),
                 max_size: None,
@@ -496,6 +504,7 @@ mod tests {
         );
         let cache_b = Arc::new(
             LocalCache::new(LocalCacheConfig {
+                shared: false,
                 dir: Some(directory.path().to_path_buf()),
                 namespace: "test".to_string(),
                 max_size: None,
@@ -519,7 +528,7 @@ mod tests {
         let old_load = tokio::spawn(async move { old_reader.read(0..4).await });
 
         started.notified().await;
-        cache_b.invalidate_path(path).await;
+        cache_b.invalidate_path(path).await.unwrap();
         release.notify_one();
         assert_eq!(
             old_load.await.unwrap().unwrap(),
@@ -547,6 +556,7 @@ mod tests {
         let observed_path = "s3://bucket/table/snapshot/snapshot-2";
         let blocked_path = "s3://bucket/table/snapshot/snapshot-3";
         let config = || LocalCacheConfig {
+            shared: false,
             dir: Some(directory.path().to_path_buf()),
             namespace: "test".to_string(),
             max_size: None,
@@ -613,7 +623,7 @@ mod tests {
             "file-size lookup completed before prefix invalidation removed the old entry"
         );
         drop(blocked_guard);
-        invalidation.await.unwrap();
+        invalidation.await.unwrap().unwrap();
         assert_eq!(
             current_load.await.unwrap().unwrap(),
             Bytes::from_static(b"new!")
@@ -693,6 +703,7 @@ mod tests {
         });
         let cache = Arc::new(
             LocalCache::new(LocalCacheConfig {
+                shared: false,
                 dir: Some(directory.path().to_path_buf()),
                 namespace: "test".to_string(),
                 max_size: None,
@@ -727,6 +738,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let cache = Arc::new(
             LocalCache::new(LocalCacheConfig {
+                shared: false,
                 dir: Some(directory.path().to_path_buf()),
                 namespace: "test".to_string(),
                 max_size: None,
@@ -748,6 +760,7 @@ mod tests {
         });
         let cache = Arc::new(
             LocalCache::new(LocalCacheConfig {
+                shared: false,
                 dir: None,
                 namespace: "test".to_string(),
                 max_size: None,
