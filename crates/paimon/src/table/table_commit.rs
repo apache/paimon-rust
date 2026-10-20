@@ -24,7 +24,7 @@ use crate::io::FileIO;
 use crate::spec::stats::BinaryTableStats;
 use crate::spec::FileKind;
 use crate::spec::{
-    bucket_path, bucket_path_under, extract_datum, merge_active_entries, BinaryRow,
+    bucket_path, bucket_path_under, extract_datum, java_cmp, merge_active_entries, BinaryRow,
     BinaryRowBuilder, CommitKind, CoreOptions, DataFileMeta, DataType, Datum,
     GlobalIndexColumnUpdateAction, IndexManifest, IndexManifestEntry, Manifest, ManifestEntry,
     ManifestFileMeta, ManifestList, PartitionComputer, PartitionStatistics, Predicate, Snapshot,
@@ -3252,14 +3252,16 @@ impl TableCommit {
             let row = BinaryRow::from_serialized_bytes(partition_bytes)?;
             for i in 0..num_fields {
                 match extract_datum(&row, i, &data_types[i])? {
+                    // Java order keeps NaN and -0.0 from making these depend on
+                    // the entry order.
                     Some(datum) => {
                         mins[i] = Some(match mins[i].take() {
-                            Some(cur) if cur <= datum => cur,
+                            Some(cur) if java_cmp(&cur, &datum).is_some_and(|o| o.is_le()) => cur,
                             Some(_) => datum.clone(),
                             None => datum.clone(),
                         });
                         maxs[i] = Some(match maxs[i].take() {
-                            Some(cur) if cur >= datum => cur,
+                            Some(cur) if java_cmp(&cur, &datum).is_some_and(|o| o.is_ge()) => cur,
                             Some(_) => datum,
                             None => datum,
                         });
@@ -7031,6 +7033,59 @@ mod tests {
         assert!(min_row.is_null_at(0));
         assert!(max_row.is_null_at(0));
         assert_eq!(stats.null_counts(), &vec![Some(1)]);
+    }
+
+    /// Java's `Double.compare` orders `-0.0` below `0.0` and NaN above all, so
+    /// the bounds must not depend on the order of the entries.
+    #[test]
+    fn compute_partition_stats_orders_floats_like_java() {
+        use crate::spec::{DataType, DoubleType, IntType, Schema};
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("p", DataType::Double(DoubleType::new()))
+            .partition_keys(["p"])
+            .build()
+            .unwrap();
+        let table = Table::new(
+            test_file_io(),
+            Identifier::new("default", "test_table"),
+            "memory:/test_float_partition_stats".to_string(),
+            TableSchema::new(0, &schema),
+            None,
+        );
+        let commit = TableCommit::new(table, "test-user".to_string());
+        let partition_type = DataType::Double(DoubleType::new());
+        let entry = |value: f64| {
+            let mut builder = BinaryRowBuilder::new(1);
+            builder.write_datum(0, &Datum::Double(value), &partition_type);
+            ManifestEntry::new(
+                FileKind::Add,
+                builder.build_serialized(),
+                0,
+                1,
+                test_data_file("data.parquet", 1),
+                2,
+            )
+        };
+        let bounds = |values: &[f64]| {
+            let entries: Vec<_> = values.iter().map(|value| entry(*value)).collect();
+            let stats = commit.compute_partition_stats(&entries).unwrap();
+            let min = BinaryRow::from_serialized_bytes(stats.min_values()).unwrap();
+            let max = BinaryRow::from_serialized_bytes(stats.max_values()).unwrap();
+            (
+                min.get_double(0).unwrap().to_bits(),
+                max.get_double(0).unwrap().to_bits(),
+            )
+        };
+        let expected = ((-0.0f64).to_bits(), f64::NAN.to_bits());
+        for values in [
+            [0.0, -0.0, f64::NAN, 1.0],
+            [1.0, f64::NAN, 0.0, -0.0],
+            [f64::NAN, 1.0, -0.0, 0.0],
+            [-0.0, 0.0, 1.0, f64::NAN],
+        ] {
+            assert_eq!(bounds(&values), expected, "{values:?}");
+        }
     }
 
     #[tokio::test]
