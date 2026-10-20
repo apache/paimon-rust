@@ -1796,11 +1796,10 @@ impl TableCommit {
                 self.check_global_index_sources(latest_snapshot, entries, new_index_entries)
                     .await?;
                 let mut index_entries = new_index_entries.clone();
-                index_entries.extend(self.global_index_update_entries(
-                    &previous,
-                    entries,
-                    new_index_entries,
-                )?);
+                index_entries.extend(
+                    self.global_index_update_entries(&previous, entries, new_index_entries)
+                        .await?,
+                );
                 let all = Self::merge_index_entries(&previous, &index_entries, false)?;
                 self.check_deletion_vector_references(
                     latest_snapshot,
@@ -2019,34 +2018,69 @@ impl TableCommit {
         Ok(all)
     }
 
-    fn global_index_update_entries(
+    async fn global_index_update_entries(
         &self,
         previous_entries: &[IndexManifestEntry],
         commit_entries: &[ManifestEntry],
         new_index_entries: &[IndexManifestEntry],
     ) -> Result<Vec<IndexManifestEntry>> {
+        if !previous_entries
+            .iter()
+            .any(|entry| entry.index_file.global_index_meta.is_some())
+        {
+            return Ok(vec![]);
+        }
+        let action =
+            CoreOptions::new(self.table.schema().options()).global_index_column_update_action()?;
+        if action == GlobalIndexColumnUpdateAction::Ignore {
+            return Ok(vec![]);
+        }
         let mut updated_cols = HashSet::new();
+        let mut updated_field_ids = HashSet::new();
         let mut written_partitions: Vec<Vec<u8>> = Vec::new();
         for entry in commit_entries
             .iter()
             .filter(|entry| *entry.kind() == FileKind::Add)
         {
-            let Some(write_cols) = entry.file().write_cols.as_ref() else {
-                continue;
-            };
+            let file = entry.file();
             // Dedicated normal/vector/blob INSERT files also carry write_cols.
             // Only files targeting existing row IDs can invalidate an existing index.
-            if entry.file().first_row_id.is_none()
-                && !write_cols
-                    .iter()
-                    .any(|col| col == crate::spec::ROW_ID_FIELD_NAME)
+            if file.first_row_id.is_none()
+                && !file.write_cols.as_ref().is_some_and(|columns| {
+                    columns
+                        .iter()
+                        .any(|col| col == crate::spec::ROW_ID_FIELD_NAME)
+                })
             {
                 continue;
             }
-            for col in write_cols {
-                if !is_system_field(col) {
-                    updated_cols.insert(col.clone());
-                }
+            // Partial files retain their writer's schema, including historical
+            // names. Index metadata identifies fields by ID; comparing against
+            // today's names would miss renames and confuse dropped/readded names.
+            let historical_schema = if file.schema_id == self.table.schema().id() {
+                None
+            } else {
+                Some(self.table.schema_manager().schema(file.schema_id).await?)
+            };
+            let schema = historical_schema
+                .as_deref()
+                .unwrap_or_else(|| self.table.schema());
+            let fields = match &file.write_cols {
+                Some(columns) => super::data_evolution_fields::project_by_paths(
+                    schema.fields(),
+                    &columns
+                        .iter()
+                        .filter(|name| !is_system_field(name))
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                )?,
+                // A complete-row update can omit write_cols, as can a compact
+                // normal file which excludes dedicated Blob/vector columns.
+                None => schema.data_file_fields(None),
+            };
+            for field in fields {
+                updated_field_ids.insert(field.id());
+                updated_cols.insert(field.name().to_string());
             }
             if !written_partitions
                 .iter()
@@ -2089,8 +2123,8 @@ impl TableCommit {
             }
             let matched = indexed_field_ids
                 .iter()
+                .filter(|field_id| updated_field_ids.contains(field_id))
                 .filter_map(|field_id| field_by_id.get(field_id))
-                .filter(|field_name| updated_cols.contains(*field_name))
                 .cloned()
                 .collect::<Vec<_>>();
             if !matched.is_empty() {
@@ -2102,7 +2136,7 @@ impl TableCommit {
             return Ok(vec![]);
         }
 
-        match CoreOptions::new(self.table.schema().options()).global_index_column_update_action()? {
+        match action {
             GlobalIndexColumnUpdateAction::Ignore => Ok(vec![]),
             GlobalIndexColumnUpdateAction::DropPartitionIndex => Ok(affected
                 .into_iter()
@@ -5204,6 +5238,94 @@ mod tests {
                 .unwrap();
         assert_eq!(index_entries.len(), 1);
         assert_eq!(index_entries[0].index_file.file_name, "lumina-0.index");
+    }
+
+    #[tokio::test]
+    async fn test_index_update_policy_uses_file_schema_identity() {
+        for mode in ["rename", "drop_readd", "complete_row"] {
+            for action in ["THROW_ERROR", "DROP_PARTITION_INDEX", "IGNORE"] {
+                for extra_field in [false, true] {
+                    let file_io = test_file_io();
+                    let path = format!("memory:/index_identity_{mode}_{action}_{extra_field}");
+                    setup_dirs(&file_io, &path).await;
+                    let old = test_schema();
+                    let mut encoded = serde_json::to_value(&old).unwrap();
+                    encoded["id"] = serde_json::json!(1);
+                    if mode == "rename" {
+                        encoded["fields"][0]["name"] = serde_json::json!("renamed_id");
+                    } else if mode == "drop_readd" {
+                        encoded["fields"][0]["id"] = serde_json::json!(2);
+                        encoded["highestFieldId"] = serde_json::json!(2);
+                    }
+                    let current: TableSchema = serde_json::from_value(encoded).unwrap();
+                    let current = current.copy_with_options(HashMap::from([(
+                        "global-index.column-update-action".into(),
+                        action.into(),
+                    )]));
+                    let index_id = current.fields()[0].id();
+                    let table = Table::new(
+                        file_io.clone(),
+                        Identifier::new("default", "t"),
+                        path.clone(),
+                        current,
+                        None,
+                    );
+                    file_io.mkdirs(&format!("{path}/schema/")).await.unwrap();
+                    file_io
+                        .new_output(&format!("{path}/schema/schema-0"))
+                        .unwrap()
+                        .write(serde_json::to_vec(&old).unwrap().into())
+                        .await
+                        .unwrap();
+                    let commit = TableCommit::new(table, "test-user".into());
+                    let index_file = if extra_field {
+                        test_global_index_file_with_extra_fields(
+                            "id.index",
+                            1,
+                            vec![index_id],
+                            0,
+                            9,
+                        )
+                    } else {
+                        test_global_index_file("id.index", index_id, 0, 9)
+                    };
+                    let previous = vec![IndexManifestEntry {
+                        kind: FileKind::Add,
+                        partition: vec![],
+                        bucket: 0,
+                        index_file,
+                        version: 1,
+                    }];
+                    let mut file = test_data_file("update.parquet", 10);
+                    file.first_row_id = Some(0);
+                    if mode == "complete_row" {
+                        file.schema_id = 1;
+                        file.write_cols = None;
+                    } else {
+                        file.write_cols = Some(vec!["id".into()]);
+                    }
+                    let entries =
+                        commit.messages_to_entries(&[CommitMessage::new(vec![], 0, vec![file])]);
+                    let result = commit
+                        .global_index_update_entries(&previous, &entries, &[])
+                        .await;
+                    if mode == "drop_readd" || action == "IGNORE" {
+                        assert!(result.unwrap().is_empty(), "{mode}/{action}/{extra_field}");
+                    } else if action == "THROW_ERROR" {
+                        let error = result.unwrap_err().to_string();
+                        assert!(error.contains("globally indexed columns"), "{error}");
+                        if mode == "rename" {
+                            assert!(error.contains("renamed_id"), "{error}");
+                        }
+                    } else {
+                        let deleted = result.unwrap();
+                        assert_eq!(deleted.len(), 1, "{mode}/{action}/{extra_field}");
+                        assert_eq!(deleted[0].kind, FileKind::Delete);
+                        assert_eq!(deleted[0].index_file, previous[0].index_file);
+                    }
+                }
+            }
+        }
     }
 
     #[tokio::test]

@@ -84,7 +84,8 @@ impl MergeInput {
             });
         }
         crate::spec::CoreOptions::new(table.schema().options()).validate_scan_options()?;
-        let schema = crate::arrow::build_target_arrow_schema(table.schema().fields())?;
+        let schema =
+            crate::arrow::build_target_arrow_schema(&table.schema().fields_with_read_metadata())?;
         for column in columns {
             schema
                 .field_with_name(column)

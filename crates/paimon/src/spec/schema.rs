@@ -23,7 +23,7 @@ use crate::spec::core_options::{
     QUERY_AUTH_ENABLED_OPTION, SEQUENCE_FIELD_OPTION, TABLE_READ_SEQUENCE_NUMBER_ENABLED_OPTION,
     TABLE_TYPE_OPTION,
 };
-use crate::spec::types::{ArrayType, DataType, MapType, MultisetType, RowType, VarCharType};
+use crate::spec::types::{ArrayType, DataType, MapType, MultisetType, RowType};
 use crate::spec::{
     remove_field_scoped_options, rename_field_scoped_options,
     validate_no_aggregation_on_sequence_field, AggregationConfig, BlobType, ColumnMove,
@@ -1416,7 +1416,7 @@ impl Schema {
         Self::validate_first_row_changelog_producer(options)?;
         Self::validate_changelog_producer_requires_primary_keys(options, primary_keys)?;
         Self::validate_read_sequence_number_requires_primary_keys(options, primary_keys)?;
-        Self::validate_rowkind_field(options, primary_keys, fields)?;
+        Self::validate_rowkind_field(options, fields)?;
         Self::validate_deletion_vectors(options)?;
         Self::validate_bucket_keys(options, fields, partition_keys, primary_keys)?;
         Self::validate_sequence_field(options, fields, partition_keys, primary_keys)?;
@@ -2120,28 +2120,14 @@ impl Schema {
 
     fn validate_rowkind_field(
         options: &HashMap<String, String>,
-        primary_keys: &[String],
         fields: &[DataField],
     ) -> crate::Result<()> {
         let core = CoreOptions::new(options);
         let Some(field_name) = core.rowkind_field() else {
             return Ok(());
         };
-
-        if primary_keys.is_empty() {
-            return Err(crate::Error::ConfigInvalid {
-                message: "rowkind.field requires a primary-key table".to_string(),
-            });
-        }
-
-        let producer = core
-            .try_changelog_producer()
+        core.try_changelog_producer()
             .map_err(Self::options_error_to_config_invalid)?;
-        if producer == ChangelogProducer::Input {
-            return Err(crate::Error::ConfigInvalid {
-                message: "rowkind.field cannot be used with changelog-producer=input".to_string(),
-            });
-        }
 
         let Some(field) = fields.iter().find(|f| f.name() == field_name) else {
             return Err(crate::Error::ConfigInvalid {
@@ -2149,13 +2135,10 @@ impl Schema {
             });
         };
 
-        if !matches!(
-            field.data_type(),
-            DataType::VarChar(v) if v.length() == VarCharType::MAX_LENGTH
-        ) {
+        if !matches!(field.data_type(), DataType::Char(_) | DataType::VarChar(_)) {
             return Err(crate::Error::ConfigInvalid {
                 message: format!(
-                    "rowkind.field '{field_name}' must be STRING (unbounded VARCHAR) type"
+                    "rowkind.field '{field_name}' must be CHARACTER_STRING (CHAR or VARCHAR) type"
                 ),
             });
         }
@@ -6591,17 +6574,13 @@ mod tests {
     }
 
     #[test]
-    fn rowkind_field_requires_primary_key_table() {
-        let err = Schema::builder()
+    fn rowkind_field_accepts_append_tables() {
+        Schema::builder()
             .column("id", DataType::Int(IntType::new()))
             .column("op", DataType::VarChar(VarCharType::string_type()))
             .option("rowkind.field", "op")
             .build()
-            .unwrap_err();
-        assert!(
-            matches!(err, crate::Error::ConfigInvalid { ref message } if message.contains("rowkind.field")),
-            "got {err:?}"
-        );
+            .unwrap();
     }
 
     #[test]
@@ -6690,20 +6669,15 @@ mod tests {
     }
 
     #[test]
-    fn rowkind_field_rejects_changelog_producer_input() {
-        let err = Schema::builder()
+    fn rowkind_field_accepts_changelog_producer_input() {
+        Schema::builder()
             .column("id", DataType::Int(IntType::new()))
             .column("op", DataType::VarChar(VarCharType::string_type()))
             .primary_key(["id"])
             .option("changelog-producer", "input")
             .option("rowkind.field", "op")
             .build()
-            .unwrap_err();
-        assert!(
-            matches!(err, crate::Error::ConfigInvalid { ref message }
-                if message.contains("changelog-producer=input")),
-            "got {err:?}"
-        );
+            .unwrap();
     }
 
     #[test]

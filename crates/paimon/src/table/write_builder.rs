@@ -262,7 +262,11 @@ impl<'a> PaimonWriteBuilder<'a> {
 
     /// Create a configured table update object.
     pub fn new_update(&self) -> crate::Result<TableUpdate> {
-        ensure_table_write_allowed(self.table)?;
+        // Row-level updates can select an older read snapshot. Their partial
+        // files retain that schema and their messages carry the snapshot used
+        // for conflict detection. Appending and publishing still require a
+        // current table, including append-capable operations on TableUpdate.
+        ensure_paimon_table(self.table)?;
         if self.overwrite {
             return Err(crate::Error::Unsupported {
                 message: "TableUpdate does not support overwrite".to_string(),
@@ -304,16 +308,7 @@ pub(super) fn ensure_table_write_authorized(table: &Table) -> crate::Result<()> 
 }
 
 pub(super) fn ensure_table_write_allowed(table: &Table) -> crate::Result<()> {
-    let options = crate::spec::CoreOptions::new(table.schema().options());
-    let declared = options.table_type()?;
-    if declared.requires_table_engine() {
-        return Err(crate::Error::Unsupported {
-            message: format!(
-                "table '{}' is declared '{declared}' and cannot be written as a Paimon table",
-                table.identifier().full_name()
-            ),
-        });
-    }
+    ensure_paimon_table(table)?;
     // A time-travel table may carry a historical schema.
     let selector =
         crate::spec::CoreOptions::new(table.schema().options()).try_time_travel_selector();
@@ -322,6 +317,20 @@ pub(super) fn ensure_table_write_allowed(table: &Table) -> crate::Result<()> {
             message: "Cannot write to a table with a time-travel option set \
                   (scan.version / scan.timestamp-millis / scan.timestamp / scan.watermark / scan.snapshot-id / scan.tag-name)"
                 .to_string(),
+        });
+    }
+    Ok(())
+}
+
+pub(super) fn ensure_paimon_table(table: &Table) -> crate::Result<()> {
+    let options = crate::spec::CoreOptions::new(table.schema().options());
+    let declared = options.table_type()?;
+    if declared.requires_table_engine() {
+        return Err(crate::Error::Unsupported {
+            message: format!(
+                "table '{}' is declared '{declared}' and cannot be written as a Paimon table",
+                table.identifier().full_name()
+            ),
         });
     }
     Ok(())

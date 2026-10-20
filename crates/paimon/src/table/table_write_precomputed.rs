@@ -63,8 +63,9 @@ impl TableWrite {
                 upper_bound - 1,
             )));
         }
-        let input = batch;
-        let Some(batch) = self.normalize_write_batch(input)? else {
+        let filtered = self.filter_write_input(batch)?;
+        let input = filtered.as_ref().unwrap_or(batch);
+        let Some(batch) = self.normalize_filtered_write_batch(input)? else {
             return Ok(());
         };
         let partitions = self.precomputed_partition_bytes(input, &batch)?;
