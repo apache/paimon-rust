@@ -495,7 +495,7 @@ async fn row_delete_rejects_concurrent_dv_replacement() {
 }
 
 #[tokio::test]
-async fn predicate_delete_rejects_time_travel_auth_and_inconsistent_field_indices() {
+async fn historical_predicate_delete_keeps_auth_and_field_index_validation() {
     let table = table(&[]).await;
     seed(&table).await;
     let pb = PredicateBuilder::new(table.schema().fields());
@@ -516,7 +516,18 @@ async fn predicate_delete_rejects_time_travel_auth_and_inconsistent_field_indice
         .contains("does not match the table schema"));
     let historical =
         table.copy_with_options(HashMap::from([("scan.snapshot-id".into(), "1".into())]));
-    assert!(historical.new_write_builder().new_update().is_err());
+    let messages = historical
+        .new_write_builder()
+        .new_update()
+        .unwrap()
+        .delete_by_predicate(Some(predicate.clone()))
+        .await
+        .unwrap();
+    assert!(!messages.is_empty());
+    assert!(messages
+        .iter()
+        .all(|message| message.check_from_snapshot == Some(1)));
+    assert!(historical.new_write_builder().new_write().is_err());
     let auth = table.copy_with_options(HashMap::from([(
         "query-auth.enabled".into(),
         "true".into(),
@@ -530,6 +541,9 @@ async fn predicate_delete_rejects_time_travel_auth_and_inconsistent_field_indice
         .unwrap_err();
     assert!(error.to_string().contains("query-auth.enabled"));
     assert_eq!(ids(&table).await, vec![0, 1, 2, 3]);
+    write_batch(&table, &batch(vec![4], vec![Some("a")], vec![50], vec![1])).await;
+    commit(&table, messages).await;
+    assert_eq!(ids(&table).await, vec![2, 3, 4]);
 }
 
 #[tokio::test]

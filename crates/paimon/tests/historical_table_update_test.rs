@@ -504,3 +504,78 @@ async fn captured_empty_update_views_do_not_observe_later_rows() {
     );
     assert_eq!(rows(&latest).await.len(), 3);
 }
+
+#[tokio::test]
+async fn row_id_merge_reads_the_independently_selected_source_view() {
+    for source_view in ["current", "snapshot", "empty"] {
+        let (latest, historical) =
+            evolved_table(&format!("memory:/merge_source_view_{source_view}")).await;
+        let changed = RecordBatch::try_from_iter([
+            ("_ROW_ID", Arc::new(Int64Array::from(vec![0])) as ArrayRef),
+            ("value", Arc::new(Int32Array::from(vec![99])) as ArrayRef),
+        ])
+        .unwrap();
+        commit(
+            &latest,
+            latest
+                .new_write_builder()
+                .new_update()
+                .unwrap()
+                .update_by_arrow_with_row_id(vec![changed])
+                .await
+                .unwrap(),
+        )
+        .await;
+        let source = match source_view {
+            "snapshot" => latest
+                .copy_with_time_travel(HashMap::from([("scan.snapshot-id".into(), "3".into())]))
+                .await
+                .unwrap(),
+            "empty" => latest.copy_with_pinned_snapshot(None),
+            _ => latest.clone(),
+        };
+        let assignment = if source_view == "empty" {
+            MergeAssignment::Value(UpdateAssignment::Function(Arc::new(|_| {
+                panic!("an empty MERGE source evaluated an assignment")
+            })))
+        } else {
+            MergeAssignment::SourceColumn("value".into())
+        };
+        let messages = historical
+            .new_write_builder()
+            .new_update()
+            .unwrap()
+            .merge_into(
+                MergeSource::Table(Arc::new(source)),
+                vec![("_ROW_ID".into(), "_ROW_ID".into())],
+                vec![WhenMatched {
+                    condition: None,
+                    delete: false,
+                    assignments: vec![("keep".into(), assignment)],
+                }],
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        let kept = if source_view == "empty" {
+            assert!(messages.is_empty());
+            [100, 200]
+        } else {
+            assert!(!messages.is_empty());
+            assert!(messages
+                .iter()
+                .all(|message| message.check_from_snapshot == Some(1)));
+            commit(&latest, messages).await;
+            [99, 20]
+        };
+        assert_eq!(
+            rows(&latest).await,
+            vec![
+                vec![Some(1), Some(99), Some(kept[0]), None],
+                vec![Some(2), Some(20), Some(kept[1]), None],
+                vec![Some(3), Some(30), Some(300), Some(999)],
+            ],
+            "{source_view}"
+        );
+    }
+}
