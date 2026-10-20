@@ -109,7 +109,7 @@ fn group_ranges(weights: &[u64], parallelism: usize) -> Vec<(usize, usize)> {
 pub(super) fn execute(
     splits: Vec<DataSplit>,
     parallelism: usize,
-    preserve_split_order: bool,
+    ordered: bool,
     limit: Option<usize>,
     read: SplitReader,
 ) -> ArrowRecordBatchStream {
@@ -133,7 +133,7 @@ pub(super) fn execute(
             }) as ArrowRecordBatchStream
         })
         .collect();
-    merge_streams(streams, preserve_split_order, limit)
+    merge_streams(streams, ordered, limit)
 }
 
 fn next_batch(index: usize, mut stream: ArrowRecordBatchStream) -> BoxFuture<'static, NextBatch> {
@@ -149,7 +149,7 @@ fn next_batch(index: usize, mut stream: ArrowRecordBatchStream) -> BoxFuture<'st
 /// Dropping the output aborts every task through JoinSet's drop implementation.
 fn merge_streams(
     mut streams: Vec<ArrowRecordBatchStream>,
-    preserve_order: bool,
+    ordered: bool,
     limit: Option<usize>,
 ) -> ArrowRecordBatchStream {
     if limit == Some(0) {
@@ -186,7 +186,7 @@ fn merge_streams(
         let mut current = 0;
         let mut remaining = limit;
         while remaining != Some(0) && current < count {
-            let next = if preserve_order {
+            let next = if ordered {
                 loop {
                     if let Some(next) = ready.remove(&current) { break Ok(Some(next)); }
                     let next = match pending.join_next().await {
@@ -241,7 +241,7 @@ fn merge_streams(
                     // Schedule another decode only after the caller resumes.
                     pending.spawn_on(next_batch(index, stream), &handle);
                 }
-                None if preserve_order => current += 1,
+                None if ordered => current += 1,
                 None => {},
             }
         }
@@ -571,7 +571,7 @@ mod tests {
             peak: usize,
             threads: std::collections::HashSet<std::thread::ThreadId>,
         }
-        for preserve_order in [false, true] {
+        for ordered in [false, true] {
             let shared = Arc::new((
                 std::sync::Mutex::new(State::default()),
                 std::sync::Condvar::new(),
@@ -606,7 +606,7 @@ mod tests {
                     })) as ArrowRecordBatchStream
                 })
                 .collect();
-            let batches = merge_streams(streams, preserve_order, None)
+            let batches = merge_streams(streams, ordered, None)
                 .try_collect::<Vec<_>>()
                 .await
                 .unwrap();

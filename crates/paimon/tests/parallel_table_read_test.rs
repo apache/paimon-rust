@@ -141,7 +141,7 @@ async fn parallel_reads_preserve_requested_order_and_enforce_one_global_limit() 
             assert!(expected.iter().all(|row| row.2 >= 100));
         }
         for parallelism in [1, 2, 8] {
-            for preserve in [false, true] {
+            for ordered in [false, true] {
                 for limit in [None, Some(0), Some(3), Some(100)] {
                     let mut limited = builder.clone();
                     if let Some(limit) = limit {
@@ -152,7 +152,7 @@ async fn parallel_reads_preserve_requested_order_and_enforce_one_global_limit() 
                         .unwrap()
                         .with_parallelism(parallelism)
                         .unwrap()
-                        .with_preserve_split_order(preserve)
+                        .with_ordered(ordered)
                         // One shared slot must not deadlock while workers wait.
                         .with_parquet_read_budget(Arc::new(
                             ReadBudget::new(1, 1024 * 1024).unwrap(),
@@ -170,7 +170,7 @@ async fn parallel_reads_preserve_requested_order_and_enforce_one_global_limit() 
                         limit.unwrap_or(8).min(8),
                         "{mode}, p={parallelism}, limit={limit:?}"
                     );
-                    if preserve || parallelism == 1 {
+                    if ordered || parallelism == 1 {
                         assert_eq!(result, expected[..result.len()]);
                     } else {
                         assert!(result.iter().all(|row| expected.contains(row)));
@@ -187,7 +187,7 @@ async fn parallel_reads_preserve_requested_order_and_enforce_one_global_limit() 
             .unwrap()
             .with_parallelism(3)
             .unwrap()
-            .with_preserve_split_order(true)
+            .with_ordered(true)
             .to_arrow_with_row_kind(&splits)
             .unwrap()
             .try_collect::<Vec<_>>()
@@ -292,13 +292,13 @@ async fn finite_blob_reads_do_not_open_payloads_in_later_splits() {
                 .greater_than("id", Datum::Int(0))
                 .unwrap(),
         );
-        for preserve in [false, true] {
+        for ordered in [false, true] {
             let batches = limited
                 .new_read()
                 .unwrap()
                 .with_parallelism(8)
                 .unwrap()
-                .with_preserve_split_order(preserve)
+                .with_ordered(ordered)
                 .to_arrow(splits)
                 .unwrap()
                 .try_collect::<Vec<_>>()
@@ -445,7 +445,7 @@ async fn ordered_split_reads_do_not_wait_on_a_later_row_groups_budget_permit() {
         .unwrap()
         .with_parallelism(2)
         .unwrap()
-        .with_preserve_split_order(true)
+        .with_ordered(true)
         // Two row-group workers enable Parquet prefetch; the 1 MiB byte
         // window admits only one projected 600 KiB row group at a time.
         .with_parquet_read_budget(Arc::new(ReadBudget::new(2, 1024 * 1024).unwrap()))

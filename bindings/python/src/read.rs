@@ -905,7 +905,7 @@ impl PyTableRead {
         py: Python<'_>,
         splits: &Bound<'_, PyAny>,
         parallelism: usize,
-        preserve_split_order: bool,
+        ordered: bool,
     ) -> PyResult<ArrowRecordBatchStream> {
         let splits = extract_splits(splits)?;
         py.detach(|| {
@@ -933,7 +933,7 @@ impl PyTableRead {
                 .map_err(to_py_err)?
                 .with_parallelism(parallelism)
                 .map_err(to_py_err)?
-                .with_preserve_split_order(preserve_split_order);
+                .with_ordered(ordered);
             let splits = runtime()
                 .block_on(read.authorize_splits(&splits))
                 .map_err(to_py_err)?;
@@ -948,34 +948,35 @@ impl PyTableRead {
 
 #[pymethods]
 impl PyTableRead {
-    /// Lazily read the given splits as an iterator of PyArrow RecordBatches.
+    /// Lazily read the given splits as PyArrow RecordBatches.
     /// Core owns split scheduling, the global row limit and cancellation.
-    #[pyo3(signature = (splits, *, parallelism = 1, preserve_split_order = false))]
+    /// ordered=True retains the supplied split order; the default emits ready groups first.
+    #[pyo3(signature = (splits, *, parallelism = 1, ordered = false))]
     fn read_arrow(
         &self,
         py: Python<'_>,
         splits: &Bound<'_, PyAny>,
         parallelism: usize,
-        preserve_split_order: bool,
+        ordered: bool,
     ) -> PyResult<PyRecordBatchReader> {
         Ok(PyRecordBatchReader::from_stream(self.read_stream(
             py,
             splits,
             parallelism,
-            preserve_split_order,
+            ordered,
         )?))
     }
 
     /// Read the given splits into a list of PyArrow RecordBatches.
-    #[pyo3(signature = (splits, *, parallelism = 1, preserve_split_order = false))]
+    #[pyo3(signature = (splits, *, parallelism = 1, ordered = false))]
     fn read(
         &self,
         py: Python<'_>,
         splits: &Bound<'_, PyAny>,
         parallelism: usize,
-        preserve_split_order: bool,
+        ordered: bool,
     ) -> PyResult<Vec<Py<PyAny>>> {
-        let stream = self.read_stream(py, splits, parallelism, preserve_split_order)?;
+        let stream = self.read_stream(py, splits, parallelism, ordered)?;
         let rt = runtime();
         let batches = py.detach(|| {
             rt.block_on(stream.try_collect::<Vec<_>>())
@@ -1225,12 +1226,10 @@ mod tests {
             ));
             let read = Py::new(py, PyReadBuilder::new(table).new_read()).unwrap();
             for method in ["read", "read_arrow"] {
-                for preserve_order in [false, true] {
+                for ordered in [false, true] {
                     let kwargs = PyDict::new(py);
                     kwargs.set_item("parallelism", 3).unwrap();
-                    kwargs
-                        .set_item("preserve_split_order", preserve_order)
-                        .unwrap();
+                    kwargs.set_item("ordered", ordered).unwrap();
                     let result = read
                         .bind(py)
                         .call_method(method, (PyList::empty(py),), Some(&kwargs))
@@ -1252,6 +1251,34 @@ mod tests {
                     assert!(error.is_instance_of::<PyValueError>(py));
                     assert!(error.to_string().contains("parallelism"));
                 }
+
+                let signature = py
+                    .import("inspect")
+                    .unwrap()
+                    .getattr("signature")
+                    .unwrap()
+                    .call1((read.bind(py).getattr(method).unwrap(),))
+                    .unwrap();
+                let ordered = signature
+                    .getattr("parameters")
+                    .unwrap()
+                    .get_item("ordered")
+                    .unwrap();
+                assert!(!ordered
+                    .getattr("default")
+                    .unwrap()
+                    .extract::<bool>()
+                    .unwrap());
+                assert_eq!(
+                    ordered
+                        .getattr("kind")
+                        .unwrap()
+                        .getattr("name")
+                        .unwrap()
+                        .extract::<String>()
+                        .unwrap(),
+                    "KEYWORD_ONLY"
+                );
 
                 // Keep the existing no-keyword entry point and reject positional
                 // execution options, which would be ambiguous in future APIs.

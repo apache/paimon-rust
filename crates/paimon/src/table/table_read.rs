@@ -59,7 +59,7 @@ const MAX_TOTAL_BLOB_READS: usize = 64;
 pub struct TableRead<'a> {
     kind: TableReadKind<'a>,
     parallelism: usize,
-    preserve_split_order: bool,
+    ordered: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -111,7 +111,7 @@ impl<'a> TableRead<'a> {
                     data_predicates,
                 )),
                 parallelism: 1,
-                preserve_split_order: false,
+                ordered: false,
             }
         }
     }
@@ -130,7 +130,7 @@ impl<'a> TableRead<'a> {
                 limit,
             )),
             parallelism: 1,
-            preserve_split_order: false,
+            ordered: false,
         }
     }
 
@@ -189,12 +189,13 @@ impl<'a> TableRead<'a> {
         Ok(self)
     }
 
-    /// Emit splits in their supplied order while retaining bounded parallel reads.
+    /// Control whether output follows the supplied split order.
     ///
-    /// Rows within a split keep that split reader's existing order. The default
-    /// allows batches from whichever split group becomes ready first.
-    pub fn with_preserve_split_order(mut self, preserve: bool) -> Self {
-        self.preserve_split_order = preserve;
+    /// When true, batches follow the supplied split order while reads remain
+    /// concurrent. When false (the default), ready split groups can emit first.
+    /// Rows within a split keep that split reader's existing order in both modes.
+    pub fn with_ordered(mut self, ordered: bool) -> Self {
+        self.ordered = ordered;
         self
     }
 
@@ -404,12 +405,9 @@ impl<'a> TableRead<'a> {
     /// re-plan after a permission change.
     pub fn to_arrow(&self, data_splits: &[DataSplit]) -> crate::Result<ArrowRecordBatchStream> {
         match &self.kind {
-            TableReadKind::Paimon(read) => read.execute_splits(
-                data_splits,
-                self.parallelism,
-                self.preserve_split_order,
-                false,
-            ),
+            TableReadKind::Paimon(read) => {
+                read.execute_splits(data_splits, self.parallelism, self.ordered, false)
+            }
             TableReadKind::Format(read) => read.to_arrow(data_splits),
         }
     }
@@ -425,12 +423,9 @@ impl<'a> TableRead<'a> {
     ) -> crate::Result<ArrowRecordBatchStream> {
         // Decided from the splits by the `to_arrow` each branch ends in.
         match &self.kind {
-            TableReadKind::Paimon(read) => read.execute_splits(
-                data_splits,
-                self.parallelism,
-                self.preserve_split_order,
-                true,
-            ),
+            TableReadKind::Paimon(read) => {
+                read.execute_splits(data_splits, self.parallelism, self.ordered, true)
+            }
             TableReadKind::Format(read) => {
                 let schema = audit_schema_for_read_type(read.read_type(), false)?;
                 prepend_insert_row_kind_stream(read.to_arrow(data_splits)?, schema)
@@ -556,7 +551,7 @@ impl<'a> PaimonTableRead<'a> {
         &self,
         splits: &[DataSplit],
         parallelism: usize,
-        preserve_split_order: bool,
+        ordered: bool,
         include_row_kind: bool,
     ) -> crate::Result<ArrowRecordBatchStream> {
         let options = self.table.schema().core_options();
@@ -615,7 +610,7 @@ impl<'a> PaimonTableRead<'a> {
         // group is still reading. Background prefetch must not keep a shared
         // scheduling permit in that retained decoder and block the current
         // group forever. Foreground reads retain shared memory admission.
-        let budget = if preserve_split_order && workers > 1 {
+        let budget = if ordered && workers > 1 {
             Arc::new(budget.without_prefetch())
         } else {
             budget
@@ -627,7 +622,7 @@ impl<'a> PaimonTableRead<'a> {
         Ok(super::read_execution::execute(
             splits.into_owned(),
             parallelism,
-            preserve_split_order,
+            ordered,
             self.limit,
             factory,
         ))

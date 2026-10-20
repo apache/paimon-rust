@@ -133,10 +133,9 @@ plan = scan.plan()
 batches = read_builder.new_read().read(plan.splits())
 
 # Core schedules a bounded set of split readers and owns their global limit.
-# Set preserve_split_order=True for ordered materialization; streaming can
-# emit whichever split group is ready first.
-reader = read_builder.new_read().read_arrow(
-    plan.splits(), parallelism=4, preserve_split_order=False)
+# Set ordered=True to retain the supplied split order. The default emits
+# whichever split group is ready first.
+reader = read_builder.new_read().read_arrow(plan.splits(), parallelism=4, ordered=False)
 try:
     for batch in reader:
         print(batch)
