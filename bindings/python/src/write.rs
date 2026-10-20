@@ -327,8 +327,10 @@ impl WriteTarget {
                 writer.with_blob_consumer(consumer)?;
                 Ok(())
             }
-            // Like Java AbstractFileStoreWrite, PK-only writers ignore it.
-            Self::PostponeFixed(_) => Ok(()),
+            Self::PostponeFixed(writer) => {
+                writer.with_blob_consumer(consumer)?;
+                Ok(())
+            }
         }
     }
 

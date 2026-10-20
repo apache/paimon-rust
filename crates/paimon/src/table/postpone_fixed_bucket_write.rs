@@ -39,18 +39,35 @@ pub struct PostponeFixedBucketTableWrite {
 }
 
 impl PostponeFixedBucketTableWrite {
+    /// Configure the Blob consumer before accepting input, including input
+    /// buffered for automatic bucket planning. Primary-key writers do not call
+    /// this consumer, just as for ordinary TableWrite.
+    pub fn with_blob_consumer(
+        &mut self,
+        consumer: Option<std::sync::Arc<dyn crate::spec::BlobConsumer>>,
+    ) -> Result<&mut Self> {
+        self.ensure_configurable("with_blob_consumer")?;
+        self.inner.with_blob_consumer(consumer)?;
+        Ok(self)
+    }
+
     pub fn with_blob_uri_reader_factory(
         &mut self,
         factory: Option<std::sync::Arc<dyn crate::io::UriReaderFactory>>,
     ) -> Result<&mut Self> {
-        self.ensure_writable()?;
-        if self.check_from_snapshot.is_some() {
-            return Err(data_invalid(
-                "with_blob_uri_reader_factory must be called before any write operation",
-            ));
-        }
+        self.ensure_configurable("with_blob_uri_reader_factory")?;
         self.inner.with_blob_uri_reader_factory(factory)?;
         Ok(self)
+    }
+
+    fn ensure_configurable(&self, method: &str) -> Result<()> {
+        self.ensure_writable()?;
+        if self.check_from_snapshot.is_some() {
+            return Err(data_invalid(format!(
+                "{method} must be called before any write operation"
+            )));
+        }
+        Ok(())
     }
 
     pub(crate) fn new(

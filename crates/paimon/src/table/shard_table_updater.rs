@@ -91,7 +91,7 @@ impl ShardTableUpdater {
         if write_columns.is_empty() {
             return Err(invalid("Shard update columns must not be empty"));
         }
-        let writer = DataEvolutionWriter::new(table, write_columns.clone())?;
+        let writer = DataEvolutionWriter::for_row_id(table, write_columns.clone())?;
         let snapshot = super::time_travel::resolve_snapshot(table).await?;
         let table = table
             .copy_with_options(HashMap::from([(
@@ -282,7 +282,8 @@ impl ShardTableUpdater {
                 ));
             }
             if self.writer.is_none() {
-                let mut writer = DataEvolutionWriter::new(&self.table, self.write_columns.clone())?;
+                let mut writer =
+                    DataEvolutionWriter::for_row_id(&self.table, self.write_columns.clone())?;
                 writer.with_blob_uri_reader_factory(self.blob_uri_reader_factory.clone());
                 self.writer = Some(writer);
             }
