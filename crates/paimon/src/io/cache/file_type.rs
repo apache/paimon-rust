@@ -24,7 +24,7 @@ const TEMP_FILE_SUFFIX_LEN: usize = 41;
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(super) enum FileType {
     Meta,
-    Data,
+    DedicatedData,
     StructuredData,
     BucketIndex,
     GlobalIndex,
@@ -34,7 +34,7 @@ pub(super) enum FileType {
 impl FileType {
     const ALL: [Self; 6] = [
         Self::Meta,
-        Self::Data,
+        Self::DedicatedData,
         Self::StructuredData,
         Self::BucketIndex,
         Self::GlobalIndex,
@@ -81,7 +81,7 @@ impl FileType {
         }
 
         if Self::is_dedicated_file(name) {
-            Self::Data
+            Self::DedicatedData
         } else {
             Self::StructuredData
         }
@@ -120,7 +120,7 @@ impl FileType {
                     "global-index" => &[Self::GlobalIndex],
                     "bucket-index" => &[Self::BucketIndex],
                     // Preserve the existing broad data selector.
-                    "data" => &[Self::Data, Self::StructuredData],
+                    "data" => &[Self::DedicatedData, Self::StructuredData],
                     "structured-data" => &[Self::StructuredData],
                     "file-index" => &[Self::FileIndex],
                     "" => &[],
@@ -291,7 +291,7 @@ mod tests {
             "data.vector.vortex",
             "data.VECTOR.index-data",
         ] {
-            assert_eq!(FileType::classify(name), FileType::Data);
+            assert_eq!(FileType::classify(name), FileType::DedicatedData);
         }
         assert_eq!(FileType::classify("manifest-1.avro"), FileType::Meta);
         assert_eq!(FileType::classify("snapshot-1.parquet"), FileType::Meta);
@@ -301,7 +301,7 @@ mod tests {
         );
         assert_eq!(
             FileType::parse_whitelist("data"),
-            HashSet::from([FileType::Data, FileType::StructuredData])
+            HashSet::from([FileType::DedicatedData, FileType::StructuredData])
         );
         assert_eq!(
             FileType::parse_whitelist("structured-data"),
@@ -315,7 +315,7 @@ mod tests {
             FileType::Meta,
             FileType::GlobalIndex,
             FileType::BucketIndex,
-            FileType::Data,
+            FileType::DedicatedData,
             FileType::StructuredData,
             FileType::FileIndex,
         ]);

@@ -410,7 +410,7 @@ mod tests {
             config.whitelist,
             std::collections::HashSet::from([
                 FileType::Meta,
-                FileType::Data,
+                FileType::DedicatedData,
                 FileType::StructuredData
             ])
         );
