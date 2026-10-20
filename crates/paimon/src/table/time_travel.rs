@@ -167,7 +167,7 @@ mod tests {
     use crate::catalog::Identifier;
     use crate::io::{FileIO, FileIOBuilder};
     use crate::spec::{CommitKind, DataType, IntType, Schema, Snapshot, TableSchema};
-    use crate::table::{SnapshotManager, Table, TableCommit, TableWrite, TagManager};
+    use crate::table::{SnapshotManager, Table, TagManager};
     use arrow_array::{Int32Array, RecordBatch};
     use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
     use std::collections::HashMap;
@@ -250,11 +250,49 @@ mod tests {
     }
 
     async fn write_and_commit(table: &Table, batch: &RecordBatch) {
-        let mut write = TableWrite::new(table, "test-user".to_string()).unwrap();
+        let builder = table
+            .new_write_builder()
+            .with_commit_user("test-user")
+            .unwrap();
+        let mut write = builder.new_write().unwrap();
         write.write_arrow_batch(batch).await.unwrap();
         let messages = write.prepare_commit().await.unwrap();
-        let commit = TableCommit::new(table.clone(), "test-user".to_string());
-        commit.commit(messages).await.unwrap();
+        builder
+            .try_new_commit()
+            .unwrap()
+            .commit(messages)
+            .await
+            .unwrap();
+    }
+
+    async fn read_ids(table: &Table) -> Vec<i32> {
+        use futures::TryStreamExt;
+
+        let builder = table.new_read_builder();
+        let plan = builder.new_scan().plan().await.unwrap();
+        let batches: Vec<RecordBatch> = builder
+            .new_read()
+            .unwrap()
+            .to_arrow(plan.splits())
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let mut ids = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column_by_name("id")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids
     }
 
     /// Table with two schema versions and one snapshot per version:
@@ -402,12 +440,6 @@ mod tests {
                 .unwrap();
             assert_eq!(traveled.schema().id(), 0);
             assert_eq!(traveled.travel_snapshot().unwrap().id(), 1);
-            assert!(traveled.new_write_builder().new_write().is_err());
-            assert!(table
-                .copy_with_options(opts)
-                .new_write_builder()
-                .new_write()
-                .is_err());
             let builder = traveled.new_read_builder();
             let plan = builder.new_scan().plan().await.unwrap();
             let batches: Vec<RecordBatch> = builder
@@ -519,7 +551,6 @@ mod tests {
             super::resolve_snapshot(&pinned).await.unwrap().unwrap(),
             snapshot
         );
-        assert!(pinned.new_write_builder().new_write().is_err());
         assert!(table.travel_snapshot().is_none());
     }
 
@@ -589,7 +620,6 @@ mod tests {
                 .unwrap()
                 .splits()
                 .is_empty());
-            assert!(view.new_write_builder().new_write().is_err());
             assert!(view.is_time_traveled());
             assert!(!view.has_resolved_travel_snapshot());
             assert!(crate::catalog::list_partitions_from_file_system(&view)
@@ -631,13 +661,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_copy_with_time_travel_same_schema_still_rejects_write() {
+    async fn test_copy_with_time_travel_same_schema_can_append_and_commit() {
         let (file_io, table_path) = setup_evolved_table().await;
         let table = latest_table(&file_io, &table_path);
 
         // Snapshot 2 carries the current schema, so the schema is not
-        // switched — but the copy still reads a pinned snapshot, so writing
-        // through it is rejected like any other time-travelled copy.
+        // switched. Its read snapshot does not limit append publication.
         let traveled = table
             .copy_with_time_travel(options(&[("scan.version", "2")]))
             .await
@@ -645,7 +674,19 @@ mod tests {
 
         assert_eq!(traveled.schema().id(), 1);
         assert!(!traveled.is_time_traveled());
-        assert!(traveled.new_write_builder().new_write().is_err());
+        write_and_commit(&traveled, &batch_v1(vec![6], vec![60], vec![16])).await;
+        assert_eq!(read_ids(&table).await, vec![1, 2, 3, 4, 5, 6]);
+        assert_eq!(read_ids(&traveled).await, vec![1, 2, 3, 4, 5]);
+        assert_eq!(
+            table
+                .snapshot_manager()
+                .get_latest_snapshot()
+                .await
+                .unwrap()
+                .unwrap()
+                .schema_id(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -712,7 +753,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_time_traveled_table_rejects_write() {
+    async fn test_time_traveled_table_appends_with_its_schema_and_publishes_latest() {
         let (file_io, table_path) = setup_evolved_table().await;
         let table = latest_table(&file_io, &table_path);
 
@@ -721,17 +762,17 @@ mod tests {
             .await
             .unwrap();
 
-        let err = match traveled.new_write_builder().new_write() {
-            Err(e) => e,
-            Ok(_) => panic!("expected write rejection on time-travelled table"),
-        };
-        assert!(
-            matches!(err, crate::Error::Unsupported { ref message }
-                if message.contains("time-travel option")),
-            "expected write rejection on time-travelled table, got {err:?}"
-        );
-        // The latest table is unaffected.
-        assert!(table.new_write_builder().new_write().is_ok());
+        write_and_commit(&traveled, &batch_v0(vec![6], vec![60])).await;
+        let latest_snapshot = table
+            .snapshot_manager()
+            .get_latest_snapshot()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(latest_snapshot.id(), 3);
+        assert_eq!(latest_snapshot.schema_id(), 1);
+        assert_eq!(read_ids(&table).await, vec![1, 2, 3, 4, 5, 6]);
+        assert_eq!(read_ids(&traveled).await, vec![1, 2, 3]);
     }
 
     #[tokio::test]

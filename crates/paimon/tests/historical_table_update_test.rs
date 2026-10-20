@@ -302,48 +302,254 @@ async fn historical_deletes_preserve_newer_rows() {
 }
 
 #[tokio::test]
-async fn historical_updater_cannot_append_or_publish() {
-    let (latest, historical) = evolved_table("memory:/historical_write_guards").await;
-    assert!(historical.new_write_builder().new_write().is_err());
-    assert!(historical.new_write_builder().try_new_commit().is_err());
-    assert!(historical.new_write_builder().new_delete().is_err());
-    assert!(historical
-        .new_write_builder()
-        .new_data_evolution_writer(vec!["value".into()])
-        .is_err());
-    let update = historical.new_write_builder().new_update().unwrap();
-    let upsert = update
-        .upsert_by_arrow_with_key(
-            vec![batch(
-                &["id", "value", "keep"],
-                &[vec![1], vec![11], vec![100]],
-            )],
-            vec!["id".into()],
-        )
+async fn historical_table_can_publish_ordinary_append_with_old_schema() {
+    let (latest, historical) = evolved_table("memory:/historical_ordinary_append").await;
+    let builder = historical.new_write_builder();
+    let mut write = builder.new_write().unwrap();
+    write
+        .write_arrow_batch(&batch(
+            &["id", "value", "keep"],
+            &[vec![4], vec![40], vec![400]],
+        ))
         .await
-        .unwrap_err();
-    assert!(upsert.to_string().contains("time-travel option"));
-    let merge = update
-        .merge_into(
-            MergeSource::Batches(Vec::new()),
-            Vec::new(),
-            Vec::new(),
-            vec![WhenNotMatched {
-                condition: None,
-                assignments: Vec::new(),
-            }],
-        )
+        .unwrap();
+    let messages = write.prepare_commit().await.unwrap();
+    assert!(messages
+        .iter()
+        .flat_map(|message| &message.new_files)
+        .all(|file| file.schema_id == historical.schema().id()));
+    builder
+        .try_new_commit()
+        .unwrap()
+        .commit(messages)
         .await
-        .unwrap_err();
-    assert!(merge.to_string().contains("time-travel option"));
+        .unwrap();
+    assert_eq!(
+        latest
+            .snapshot_manager()
+            .get_latest_snapshot()
+            .await
+            .unwrap()
+            .unwrap()
+            .schema_id(),
+        latest.schema().id()
+    );
     assert_eq!(
         rows(&latest).await,
         vec![
             vec![Some(1), Some(10), Some(100), None],
             vec![Some(2), Some(20), Some(200), None],
             vec![Some(3), Some(30), Some(300), Some(999)],
+            vec![Some(4), Some(40), Some(400), None],
         ]
     );
+    assert_eq!(
+        rows(&historical).await,
+        vec![
+            vec![Some(1), Some(10), Some(100)],
+            vec![Some(2), Some(20), Some(200)],
+        ]
+    );
+}
+
+async fn append_mutation(table: &Table, operation: &str, input: RecordBatch) -> Vec<CommitMessage> {
+    let mut update = table.new_write_builder().new_update().unwrap();
+    update.with_update_type(vec!["value".into()]).unwrap();
+    if operation == "upsert" {
+        update
+            .upsert_by_arrow_with_key(vec![input], vec!["id".into()])
+            .await
+            .unwrap()
+    } else {
+        update
+            .merge_into(
+                MergeSource::Batches(vec![input]),
+                vec![("id".into(), "id".into())],
+                vec![WhenMatched {
+                    condition: None,
+                    delete: false,
+                    assignments: vec![(
+                        "value".into(),
+                        MergeAssignment::SourceColumn("value".into()),
+                    )],
+                }],
+                vec![WhenNotMatched {
+                    condition: None,
+                    assignments: ["id", "value", "keep"]
+                        .into_iter()
+                        .map(|name| (name.into(), MergeAssignment::SourceColumn(name.into())))
+                        .collect(),
+                }],
+            )
+            .await
+            .unwrap()
+    }
+}
+
+#[tokio::test]
+async fn historical_upsert_and_merge_append_with_the_read_schema() {
+    for operation in ["upsert", "merge"] {
+        for only_matched in [false, true] {
+            let (latest, historical) = evolved_table(&format!(
+                "memory:/historical_append_{operation}_{only_matched}"
+            ))
+            .await;
+            let input = || {
+                if only_matched {
+                    batch(&["id", "value", "keep"], &[vec![1], vec![11], vec![101]])
+                } else {
+                    batch(
+                        &["id", "value", "keep"],
+                        &[vec![1, 4], vec![11, 40], vec![101, 400]],
+                    )
+                }
+            };
+            let messages = append_mutation(&historical, operation, input()).await;
+            assert_eq!(messages.len(), if only_matched { 1 } else { 2 });
+            for message in &messages {
+                for file in &message.new_files {
+                    assert_eq!(file.schema_id, 0);
+                    if message.check_from_snapshot.is_some() {
+                        assert_eq!(message.check_from_snapshot, Some(1));
+                        assert_eq!(file.first_row_id, Some(0));
+                        assert_eq!(file.write_cols, Some(vec!["value".into()]));
+                    } else {
+                        // Only publication assigns an appended row's new identity.
+                        assert_eq!(file.first_row_id, None);
+                    }
+                }
+            }
+            commit(&latest, messages).await;
+            let mut expected = vec![
+                vec![Some(1), Some(11), Some(100), None],
+                vec![Some(2), Some(20), Some(200), None],
+                vec![Some(3), Some(30), Some(300), Some(999)],
+            ];
+            if !only_matched {
+                expected.push(vec![Some(4), Some(40), Some(400), None]);
+            }
+            assert_eq!(rows(&latest).await, expected);
+            let stale = append_mutation(&historical, operation, input()).await;
+            let error = latest
+                .new_write_builder()
+                .new_commit()
+                .commit(stale)
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().to_lowercase().contains("conflict"),
+                "{error}"
+            );
+            assert_eq!(rows(&latest).await, expected);
+        }
+    }
+}
+
+#[tokio::test]
+async fn captured_empty_upsert_and_merge_only_append() {
+    for operation in ["upsert", "merge"] {
+        let (latest, historical) =
+            evolved_table(&format!("memory:/captured_empty_append_{operation}")).await;
+        let empty = historical.copy_with_pinned_snapshot(None);
+        let messages = append_mutation(
+            &empty,
+            operation,
+            batch(&["id", "value", "keep"], &[vec![4], vec![40], vec![400]]),
+        )
+        .await;
+        assert!(!messages.is_empty());
+        assert!(messages
+            .iter()
+            .all(|message| message.check_from_snapshot.is_none()));
+        assert!(messages
+            .iter()
+            .flat_map(|message| &message.new_files)
+            .all(|file| file.schema_id == 0 && file.first_row_id.is_none()));
+        commit(&latest, messages).await;
+        assert_eq!(
+            rows(&latest).await,
+            vec![
+                vec![Some(1), Some(10), Some(100), None],
+                vec![Some(2), Some(20), Some(200), None],
+                vec![Some(3), Some(30), Some(300), Some(999)],
+                vec![Some(4), Some(40), Some(400), None],
+            ]
+        );
+    }
+}
+
+#[tokio::test]
+async fn historical_append_mutations_keep_original_field_ids() {
+    for operation in ["upsert", "merge"] {
+        for change in ["rename", "drop_readd", "widen"] {
+            let (table, historical) = evolved_table(&format!(
+                "memory:/historical_append_fields_{operation}_{change}"
+            ))
+            .await;
+            let mut schema = serde_json::to_value(table.schema()).unwrap();
+            schema["id"] = 2.into();
+            match change {
+                "rename" => schema["fields"][1]["name"] = "renamed".into(),
+                "drop_readd" => {
+                    schema["fields"][1]["id"] = 4.into();
+                    schema["highestFieldId"] = 4.into();
+                }
+                "widen" => schema["fields"][1]["type"] = "BIGINT".into(),
+                _ => unreachable!(),
+            }
+            let schema: TableSchema = serde_json::from_value(schema).unwrap();
+            persist_table_schema(table.file_io(), table.location(), &schema).await;
+            let latest = table.copy_with_resolved_schema(schema, "main").unwrap();
+            let messages = append_mutation(
+                &historical,
+                operation,
+                batch(
+                    &["id", "value", "keep"],
+                    &[vec![1, 4], vec![11, 40], vec![101, 400]],
+                ),
+            )
+            .await;
+            assert!(messages
+                .iter()
+                .flat_map(|message| &message.new_files)
+                .all(|file| file.schema_id == 0));
+            // The committer's historical read schema must not replace the
+            // latest schema used for publication or conflict validation.
+            commit(&historical, messages).await;
+            let values = if change == "drop_readd" {
+                [None; 4]
+            } else {
+                [Some(11), Some(20), Some(30), Some(40)]
+            };
+            let expected = vec![
+                vec![Some(1), values[0], Some(100), None],
+                vec![Some(2), values[1], Some(200), None],
+                vec![Some(3), values[2], Some(300), Some(999)],
+                vec![Some(4), values[3], Some(400), None],
+            ];
+            assert_eq!(rows(&latest).await, expected, "{operation} {change}");
+            let stale = append_mutation(
+                &historical,
+                operation,
+                batch(
+                    &["id", "value", "keep"],
+                    &[vec![1, 4], vec![12, 41], vec![101, 400]],
+                ),
+            )
+            .await;
+            let error = historical
+                .new_write_builder()
+                .new_commit()
+                .commit(stale)
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().to_lowercase().contains("conflict"),
+                "{operation} {change}: {error}"
+            );
+            assert_eq!(rows(&latest).await, expected);
+        }
+    }
 }
 
 #[tokio::test]
@@ -396,7 +602,7 @@ async fn historical_partial_files_follow_field_ids_after_schema_changes() {
             .iter()
             .flat_map(|message| &message.new_files)
             .all(|file| file.schema_id == 0 && file.write_cols == Some(vec!["value".into()])));
-        commit(&latest, messages).await;
+        commit(&historical, messages).await;
         let expected = if change == "drop_readd" {
             [None, None, None]
         } else {

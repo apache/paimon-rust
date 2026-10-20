@@ -462,25 +462,31 @@ async fn branch_write_missing_schema_never_creates_a_branch() {
 }
 
 #[tokio::test]
-async fn branch_write_historical_handles_remain_read_only() {
+async fn branch_write_historical_handles_retain_their_read_view() {
     let (_dir, main) = table(false, &[]).await;
     append(&main, "seed", batch(vec![1], vec![10])).await;
     let branch = tagged_branch(&main).await;
     let snapshot = latest(&branch).await;
     let mut historical = branch.copy_with_pinned_snapshot(Some(&snapshot));
-    // The pinned snapshot remains read-only even with no selector in its options.
+    // A captured view is independent of the writer's publication state, even
+    // when the corresponding selector is absent from its options.
     historical.schema = historical
         .schema
         .copy_with_replaced_options(branch.schema().options().clone());
-    assert!(historical.new_write_builder().new_write().is_err());
-    assert!(historical.new_write_builder().try_new_commit().is_err());
-    assert!(historical
-        .new_write_builder()
-        .new_commit()
-        .commit(vec![])
-        .await
-        .is_err());
-    assert_eq!(latest(&branch).await, snapshot);
+    append(&historical, "historical", batch(vec![2], vec![20])).await;
+    assert_eq!(latest(&branch).await.id(), snapshot.id() + 1);
+    assert_eq!(
+        table_write::tests::read_id_value_rows(&historical).await,
+        vec![(1, 10)]
+    );
+    assert_eq!(
+        table_write::tests::read_id_value_rows(&branch).await,
+        vec![(1, 10), (2, 20)]
+    );
+    assert_eq!(
+        table_write::tests::read_id_value_rows(&main).await,
+        vec![(1, 10)]
+    );
 }
 
 #[tokio::test]

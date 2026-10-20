@@ -527,7 +527,6 @@ async fn historical_predicate_delete_keeps_auth_and_field_index_validation() {
     assert!(messages
         .iter()
         .all(|message| message.check_from_snapshot == Some(1)));
-    assert!(historical.new_write_builder().new_write().is_err());
     let auth = table.copy_with_options(HashMap::from([(
         "query-auth.enabled".into(),
         "true".into(),
@@ -541,8 +540,14 @@ async fn historical_predicate_delete_keeps_auth_and_field_index_validation() {
         .unwrap_err();
     assert!(error.to_string().contains("query-auth.enabled"));
     assert_eq!(ids(&table).await, vec![0, 1, 2, 3]);
-    write_batch(&table, &batch(vec![4], vec![Some("a")], vec![50], vec![1])).await;
-    commit(&table, messages).await;
+    // A historical handle can append a later row and publish the earlier
+    // predicate deletion; the read snapshot still limits deletion selection.
+    write_batch(
+        &historical,
+        &batch(vec![4], vec![Some("a")], vec![50], vec![1]),
+    )
+    .await;
+    commit(&historical, messages).await;
     assert_eq!(ids(&table).await, vec![2, 3, 4]);
 }
 

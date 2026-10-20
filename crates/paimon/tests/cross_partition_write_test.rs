@@ -244,6 +244,59 @@ async fn merge_engines_route_updates_like_java_after_restart() {
     }
 }
 
+#[tokio::test]
+async fn historical_read_views_restore_the_latest_global_key_locations() {
+    for engine in ["deduplicate", "first-row", "partial-update", "aggregation"] {
+        for captured_empty in [false, true] {
+            let mut options = vec![("merge-engine", engine)];
+            if engine == "aggregation" {
+                options.push(("fields.v.aggregate-function", "sum"));
+            }
+            let table = table(true, &options).await;
+            let empty = table.copy_with_pinned_snapshot(None);
+            write_batch(&table, &batch(&[("x", "a", 1, 10)])).await;
+            let first = table
+                .snapshot_manager()
+                .get_latest_snapshot()
+                .await
+                .unwrap()
+                .unwrap();
+            let historical = table.copy_with_pinned_snapshot(Some(&first));
+            // This key is absent from either historical view. Its location must
+            // still be restored before the next write, as in IndexBootstrap's
+            // forced latest scan rather than the writer table's read selector.
+            write_batch(&table, &batch(&[("x", "b", 2, 20)])).await;
+            let view = if captured_empty { &empty } else { &historical };
+            write_batch(view, &batch(&[("x", "c", 2, 30)])).await;
+
+            let (partition, value) = match engine {
+                "deduplicate" => ("c", 30),
+                "first-row" => ("b", 20),
+                "partial-update" => ("b", 30),
+                "aggregation" => ("b", 50),
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                rows(&table).await,
+                vec![
+                    ("x".into(), "a".into(), 1, 10),
+                    ("x".into(), partition.into(), 2, value)
+                ],
+                "engine={engine}, captured_empty={captured_empty}"
+            );
+            // Restoring the writer must not mutate either public read view.
+            assert_eq!(
+                rows(view).await,
+                if captured_empty {
+                    vec![]
+                } else {
+                    vec![("x".into(), "a".into(), 1, 10)]
+                }
+            );
+        }
+    }
+}
+
 fn with_kinds(rows: &[(&str, &str, i32, i32)], kinds: &[&str]) -> RecordBatch {
     let data = batch(rows);
     let mut fields = data.schema().fields().to_vec();
