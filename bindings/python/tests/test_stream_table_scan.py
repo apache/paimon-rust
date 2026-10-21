@@ -17,6 +17,7 @@
 
 """Stateful core streaming through the Python wrapper."""
 
+import copy
 import gc
 import weakref
 
@@ -228,3 +229,86 @@ def test_snapshot_reader_is_an_internal_component():
     assert not hasattr(datafusion, 'SnapshotReader')
     assert not hasattr(datafusion.Table, 'new_snapshot_reader')
     assert not hasattr(datafusion.ReadBuilder, 'new_snapshot_reader')
+
+
+@pytest.mark.parametrize('follow_up', [False, True])
+def test_copy_has_independent_progress_and_bucket_callback(table, follow_up):
+    builder = table.new_read_builder()
+    original = builder.new_stream_scan().with_bucket_filter(lambda bucket: bucket % 2 == 0)
+    original.restore(1 if follow_up else None)
+    copied = copy.copy(original)
+    assert copied is not original
+    assert copied.checkpoint() == original.checkpoint()
+    copied.with_bucket_filter(lambda bucket: bucket % 2 == 1)
+    first = original.plan()
+    assert copied.checkpoint() == (1 if follow_up else None)
+    second = copied.plan()
+    expected = 100 if follow_up else 200
+    assert sorted(_rows(builder, first) + _rows(builder, second)) == [
+        (i, expected + i) for i in range(32)]
+    original.restore(1)
+    assert copied.checkpoint() == (2 if follow_up else 3)
+    assert original.checkpoint() == 1
+
+
+@pytest.mark.parametrize('bound_method', [False, True])
+def test_copy_owns_independent_callback_references_and_collects_cycles(table, bound_method):
+    class Owner:
+        def __init__(self):
+            self.scan = table.new_stream_scan().with_bucket_filter(self.select if bound_method else self)
+            self.copied = copy.copy(self.scan)
+
+        def select(self, bucket):
+            gc.collect()
+            return True
+
+        def __call__(self, bucket):
+            return self.select(bucket)
+
+    owner = Owner()
+    reference = weakref.ref(owner)
+    gc.collect()
+    assert owner.scan.plan().snapshot_id() == 2
+    assert owner.copied.plan().snapshot_id() == 2
+    del owner
+    gc.collect()
+    assert reference() is None
+
+
+def test_replacing_original_callback_does_not_clear_the_copy(table):
+    class Owner:
+        def select(self, bucket):
+            return True
+
+    owner = Owner()
+    reference = weakref.ref(owner)
+    original = table.new_stream_scan().with_bucket_filter(owner.select)
+    copied = copy.copy(original)
+    del owner
+    original.with_bucket_filter(None)
+    gc.collect()
+    assert reference() is not None
+    assert copied.plan().snapshot_id() == 2
+    copied.with_bucket_filter(None)
+    gc.collect()
+    assert reference() is None
+
+
+def test_copy_preserves_callback_error_identity_without_sharing_configuration(table):
+    failure = LookupError('copied bucket callback failure')
+
+    def select(bucket):
+        raise failure
+
+    original = table.new_stream_scan().with_bucket_filter(select)
+    copied = copy.copy(original)
+    with pytest.raises(LookupError) as caught:
+        copied.plan()
+    assert caught.value is failure
+    assert copied.checkpoint() is None
+    copied.with_bucket_filter(None)
+    assert copied.plan().snapshot_id() == 2
+    with pytest.raises(LookupError) as caught:
+        original.plan()
+    assert caught.value is failure
+    assert original.checkpoint() is None

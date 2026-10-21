@@ -1880,20 +1880,26 @@ def test_append_row_position_slices_and_shards_are_native_readable(row_tracking)
         assert shards == list(range(9))
 
 
-def test_append_row_positions_follow_stats_pruned_file_order_before_limit():
+@pytest.mark.parametrize("row_tracking", [False, True])
+@pytest.mark.parametrize("limit,expected", [(None, [4, 5, 6, 7]), (2, [4, 5])])
+def test_append_row_positions_follow_stats_pruned_file_order_before_limit(row_tracking, limit, expected):
     with tempfile.TemporaryDirectory() as warehouse:
-        table = _make_append_position_table(warehouse)
+        table = _make_append_position_table(warehouse, row_tracking)
         builder = (
             table.new_read_builder()
             .with_projection(["id"])
             .with_filter({"method": "greaterOrEqual", "field": "id", "literals": [3]})
-            .with_limit(2)
         )
+        if limit is not None:
+            builder.with_limit(limit)
         plan = builder.new_scan().with_row_position_slice(1, 5).plan()
+        # Stats remove the first file before positions are assigned. LIMIT
+        # must not truncate the candidate files before applying the slice.
+        full_selection = table.new_read_builder().with_projection(["id"]).new_read().read(plan.splits())
+        assert pa.Table.from_batches(full_selection).column("id").to_pylist() == [4, 5, 6, 7]
         actual = pa.Table.from_batches(builder.new_read().read(plan.splits()))
-        # with_limit is a planning hint in the Rust API. The complete selected
-        # range must survive planning; PyPaimon enforces the final two-row limit.
-        assert actual.column("id").to_pylist() == [4, 5, 6, 7]
+        # The configured reader enforces the final LIMIT after selection.
+        assert actual.column("id").to_pylist() == expected
 
 
 def test_append_incremental_row_positions_use_combined_delta_order():

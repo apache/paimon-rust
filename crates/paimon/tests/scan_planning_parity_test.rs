@@ -167,6 +167,55 @@ async fn read_column(builder: &ReadBuilder<'_>, plan: &Plan, column: usize) -> V
         .collect()
 }
 
+#[tokio::test]
+async fn append_stats_pruning_then_positions_then_reader_limit() {
+    for row_tracking in [false, true] {
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("value", DataType::Int(IntType::new()))
+            .option("row-tracking.enabled", row_tracking.to_string())
+            .option("source.split.target-size", "1b")
+            .build()
+            .unwrap();
+        let path = "memory:/planning_parity/append_position_limit";
+        let (io, table) = memory_table(path, TableSchema::new(0, &schema));
+        setup_dirs(&io, path).await;
+        persist_table_schema(&io, path, table.schema()).await;
+        for start in [0, 3, 6] {
+            append_ids(&table, start, start + 3).await;
+        }
+        let predicate = PredicateBuilder::new(table.schema().fields())
+            .greater_or_equal("id", Datum::Int(3))
+            .unwrap();
+        for limit in [None, Some(2)] {
+            let mut builder = table.new_read_builder();
+            builder.with_filter(predicate.clone());
+            if let Some(limit) = limit {
+                builder.with_limit(limit);
+            }
+            let plan = builder
+                .new_scan()
+                .with_row_position_slice(1, 5)
+                .unwrap()
+                .plan()
+                .await
+                .unwrap();
+            assert_eq!(plan.snapshot_id(), Some(3));
+            // An unlimited reader proves that scan planning kept the complete
+            // slice after stats pruned the first three-row file.
+            assert_eq!(read_ids(&table, &plan).await, vec![4, 5, 6, 7]);
+            assert_eq!(
+                read_column(&builder, &plan, 0).await,
+                if limit.is_some() {
+                    vec![4, 5]
+                } else {
+                    vec![4, 5, 6, 7]
+                }
+            );
+        }
+    }
+}
+
 async fn delete_ids(table: &Table, ids: &[i64]) {
     let builder = table.new_write_builder();
     let mut delete = builder.new_delete().unwrap();
