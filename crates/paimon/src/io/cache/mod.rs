@@ -48,6 +48,8 @@ pub(crate) struct LocalCache {
     block_size: u64,
     whitelist: HashSet<FileType>,
     file_size_capacity: usize,
+    // Bound queued + active background fills, including their payload buffers.
+    fill_slots: Arc<tokio::sync::Semaphore>,
 }
 
 #[derive(Debug)]
@@ -76,6 +78,7 @@ impl LocalCache {
             block_size,
             whitelist: FileType::parse_whitelist(whitelist),
             file_size_capacity: DEFAULT_FILE_SIZE_CAPACITY,
+            fill_slots: Arc::new(tokio::sync::Semaphore::new(8)),
         })
     }
 
@@ -124,11 +127,21 @@ impl LocalCache {
             block_size: config.block_size,
             whitelist: config.whitelist,
             file_size_capacity,
+            fill_slots: Arc::new(tokio::sync::Semaphore::new(8)),
         })
     }
 
     fn block_size(&self) -> u64 {
         self.block_size
+    }
+
+    fn background_fill_slot(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        // At most 8 MiB of payloads per cache. Oversized blocks and a full
+        // queue retain synchronous backpressure; never spawn unbounded work.
+        if !matches!(self.backend, CacheBackend::SharedDisk(_)) || self.block_size > 1024 * 1024 {
+            return None;
+        }
+        self.fill_slots.clone().try_acquire_owned().ok()
     }
 
     fn block_key(&self, path: &str, block_index: u64) -> BlockKey {

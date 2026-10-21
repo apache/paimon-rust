@@ -82,8 +82,8 @@ impl CachedFileReader {
         }
 
         let load_lock = self.cache.block_load_lock(&key).await;
-        let load_guard = load_lock.lock().await;
-        let _shared_guard = self.cache.shared_load_lock(&key).await;
+        let load_guard = load_lock.clone().lock_owned().await;
+        let shared_guard = self.cache.shared_load_lock(&key).await;
         let result = if let Some(payload) = self
             .cache
             .get_block(&key, expected_len, &self.read_token)
@@ -107,6 +107,21 @@ impl CachedFileReader {
         } else {
             match self.delegate.read(start..end).await {
                 Ok(payload) if payload.len() == expected_len => {
+                    if let Some(slot) = self.cache.background_fill_slot() {
+                        let cache = self.cache.clone();
+                        let token = self.read_token.clone();
+                        let fill_payload = payload.clone();
+                        // Transfer single-flight ownership until publication
+                        // finishes. Same-key waiters recheck the cache afterward.
+                        tokio::spawn(async move {
+                            let _slot = slot;
+                            let _shared_guard = shared_guard;
+                            cache.put_block(&key, fill_payload, &token).await;
+                            drop(load_guard);
+                            cache.release_block_load_lock(&key, &load_lock).await;
+                        });
+                        return Ok(payload);
+                    }
                     self.cache
                         .put_block(&key, payload.clone(), &self.read_token)
                         .await;
@@ -125,6 +140,7 @@ impl CachedFileReader {
                 Err(error) => Err(error),
             }
         };
+        drop(shared_guard);
         drop(load_guard);
         self.cache.release_block_load_lock(&key, &load_lock).await;
         result
@@ -354,6 +370,62 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             Ok(self.data.slice(range.start as usize..range.end as usize))
         }
+    }
+
+    #[tokio::test]
+    async fn shared_fill_returns_before_publication_and_preserves_single_flight() {
+        let directory = tempfile::tempdir().unwrap();
+        let delegate = Arc::new(CountingReader {
+            data: Bytes::from_static(b"abcdefgh"),
+            reads: AtomicUsize::new(0),
+        });
+        let cache = Arc::new(
+            LocalCache::new(LocalCacheConfig {
+                shared: true,
+                dir: Some(directory.path().to_path_buf()),
+                namespace: "test".into(),
+                max_size: Some(4096),
+                block_size: 4,
+                whitelist: std::collections::HashSet::from([FileType::Meta]),
+            })
+            .unwrap(),
+        );
+        let reader = CachedFileReader::new(delegate.clone(), "data.parquet", 8, cache.clone());
+        let gate = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(
+                directory
+                    .path()
+                    .join("paimon-shared-local-cache-v1/directory.lock"),
+            )
+            .unwrap();
+        gate.lock().unwrap();
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_millis(500), reader.read(0..4))
+                .await
+                .unwrap()
+                .unwrap(),
+            "abcd"
+        );
+        assert_eq!(cache.fill_slots.available_permits(), 7);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), reader.read(0..4))
+                .await
+                .is_err()
+        );
+        assert_eq!(delegate.reads.load(Ordering::SeqCst), 1);
+        drop(gate);
+        assert_eq!(reader.read(0..4).await.unwrap(), "abcd");
+        assert_eq!(delegate.reads.load(Ordering::SeqCst), 1);
+        let permits = cache
+            .fill_slots
+            .clone()
+            .acquire_many_owned(8)
+            .await
+            .unwrap();
+        assert!(cache.background_fill_slot().is_none());
+        drop(permits);
     }
 
     #[tokio::test]

@@ -436,6 +436,23 @@ do not reuse the affected path until invalidation succeeds.
 A canceled or failed rename bypasses this cache; after confirming storage state,
 use a new cache directory to resume sharing.
 
+Shared-cache hits validate the generation before and after reading immutable
+blocks without acquiring the directory lock. Recency updates are approximate
+(at most once per ten seconds per block in the absence of concurrent hits).
+Range reads may return before cache publication: each cache instance allows up
+to eight background fills for blocks no larger than 1 MiB. Saturation or larger
+blocks use synchronous publication; whole-file reads remain synchronous.
+Download locks are block-striped, so simultaneous whole-file and range reads
+can download overlapping data. These locks are best-effort, not a correctness
+requirement.
+
+Encoding and temporary-file writes occur outside the directory lock. Publication,
+capacity accounting, eviction, and invalidation remain serialized. Each shared
+cache instance permits up to eight staged writes; temporary staging bytes are
+additional to `local-cache.max-size` and are not a node-wide fixed-size budget.
+Startup and recovery skip live staged files and reclaim files left by exited
+processes. Leave disk headroom for staging when configuring the cache capacity.
+
 ### BLOB Index Cache
 
 Decoded `.blob` indexes are cached per catalog. Set

@@ -16,12 +16,12 @@
 // under the License.
 
 //! Opt-in node-local cache. Block files, not a process-local index, are authoritative.
-//! A shared directory lock protects cache hits, while an exclusive lock serializes
-//! publication, eviction, and invalidation. File-striped locks coalesce downloads.
+//! Epoch validation protects immutable hits; an exclusive directory lock serializes
+//! publication, eviction, and invalidation. Block-striped locks coalesce downloads.
 
 use super::*;
 use std::fs::{File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::time::Duration;
 
 const MUTATION_MARKER: &str = "mutation-pending";
@@ -31,6 +31,92 @@ pub(crate) struct SharedDiskCache {
     root: PathBuf,
     max_size: u64,
     high_priority_ratio: f64,
+    staging_slots: Arc<tokio::sync::Semaphore>,
+}
+
+/// A private, locked inode, not yet visible to cache readers or usage accounting.
+/// Keep this in a separate directory so older cache cleanup ignores live staging.
+struct StagedBlock {
+    path: PathBuf,
+    _file: File,
+    len: u64,
+}
+
+impl StagedBlock {
+    fn create(root: &Path, encoded: &[u8]) -> io::Result<Self> {
+        let directory = root.join("staging");
+        std::fs::create_dir_all(&directory)?;
+        let path = directory.join(uuid::Uuid::new_v4().to_string());
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options.open(&path)?;
+        let mut staged = Self {
+            path,
+            _file: file,
+            len: encoded.len() as u64,
+        };
+        // Cleanup may win the create-to-lock race. In that case this fill is
+        // best-effort: fail rather than publish or account a missing inode.
+        staged._file.try_lock().map_err(io::Error::other)?;
+        if !staged.path.try_exists()? {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "staging inode was reclaimed",
+            ));
+        }
+        staged._file.write_all(encoded)?;
+        Ok(staged)
+    }
+}
+
+impl Drop for StagedBlock {
+    fn drop(&mut self) {
+        // After publication this unique staging path no longer exists. On any
+        // error/cancellation, unlink while the live-file lock is still held.
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn cleanup_staging(root: &Path) -> io::Result<()> {
+    let entries = match std::fs::read_dir(root.join("staging")) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    for entry in entries {
+        let entry = entry?;
+        if uuid::Uuid::parse_str(&entry.file_name().to_string_lossy()).is_err() {
+            continue;
+        }
+        match entry.file_type() {
+            Ok(kind) if kind.is_file() => (),
+            Ok(_) => continue,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        }
+        let file = match OpenOptions::new().read(true).write(true).open(entry.path()) {
+            Ok(file) => file,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
+        // Never wait here: a live publisher may itself be waiting for our
+        // directory gate. Process death releases this lock automatically.
+        match file.try_lock() {
+            Ok(()) => match std::fs::remove_file(entry.path()) {
+                Ok(()) => (),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => (),
+                Err(e) => return Err(e),
+            },
+            Err(std::fs::TryLockError::WouldBlock) => (),
+            Err(std::fs::TryLockError::Error(e)) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 fn open_lock(path: &Path) -> io::Result<File> {
@@ -69,6 +155,7 @@ async fn lock(path: PathBuf) -> Option<File> {
     }
 }
 
+#[cfg(test)]
 async fn read_lock(path: PathBuf) -> Option<File> {
     let file = tokio::task::spawn_blocking(move || open_lock(&path))
         .await
@@ -200,6 +287,7 @@ impl SharedDiskCache {
                 let used = recover_usage(&root, max_size, high_priority_ratio)?;
                 finish_usage(&root, used)?;
             }
+            cleanup_staging(&root)?;
             Ok(())
         };
         initialize().map_err(|e| crate::Error::ConfigInvalid {
@@ -209,6 +297,7 @@ impl SharedDiskCache {
             root,
             max_size,
             high_priority_ratio,
+            staging_slots: Arc::new(tokio::sync::Semaphore::new(8)),
         })
     }
 
@@ -218,9 +307,12 @@ impl SharedDiskCache {
     }
 
     pub(crate) async fn load_lock(&self, key: &BlockKey) -> Option<File> {
-        // All blocks of one file use the same stripe, also coordinating read_full.
-        let stripe =
-            BlockKey::with_namespace(&key.namespace, &key.path, 0, 0).cache_relative_path();
+        // Coalesce the same block without serializing every range of a large file.
+        // Keep a bounded number of stripes. read_full uses the first block's lock;
+        // other blocks can be fetched concurrently (and occasionally redundantly).
+        // Publication and invalidation remain protected by the directory gate and
+        // generation checks, not by these best-effort download locks.
+        let stripe = key.cache_relative_path();
         lock(self.root.join(format!(
             "load-{}.lock",
             stripe.components().next()?.as_os_str().to_string_lossy()
@@ -232,23 +324,36 @@ impl SharedDiskCache {
         if generation.is_none() {
             return None;
         }
-        let gate = read_lock(self.root.join("directory.lock")).await?;
         let root = self.root.clone();
         let key = generation_key(key, generation.as_ref()?);
         let generation = generation.clone();
         tokio::task::spawn_blocking(move || {
-            let _gate = gate;
             if !mutation_cleared(&root)
                 || std::fs::read_to_string(root.join("generation")).ok() != generation
             {
                 return None;
             }
             let path = root.join(key.cache_relative_path());
-            let data = std::fs::read(&path).ok()?;
-            let payload = decode_block(&key, &data).ok()?;
-            // Persist recency so eviction observes hits from every process.
-            if let Ok(file) = File::open(path) {
+            // Published inodes are immutable. Unlink/rename cannot alter this
+            // descriptor. Validate the epoch again after reading: invalidation
+            // rotates a unique epoch before changing remote storage, preventing
+            // ABA and rejecting reads that overlap a completed mutation.
+            let mut file = File::open(path).ok()?;
+            let metadata = file.metadata().ok()?;
+            // Approximate cross-process LRU: avoid a metadata write for every hit.
+            if metadata
+                .modified()
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age >= Duration::from_secs(10))
+            {
                 let _ = file.set_modified(std::time::SystemTime::now());
+            }
+            let mut data = Vec::with_capacity(usize::try_from(metadata.len()).ok()?);
+            file.read_to_end(&mut data).ok()?;
+            let payload = decode_block_owned(&key, data).ok()?;
+            if !mutation_cleared(&root) || read_generation(&root) != generation {
+                return None;
             }
             Some(payload)
         })
@@ -261,23 +366,39 @@ impl SharedDiskCache {
         if generation.is_none() {
             return;
         }
-        let Some(gate) = lock(self.root.join("directory.lock")).await else {
-            return;
-        };
         let root = self.root.clone();
         let key = generation_key(key, generation.as_ref().unwrap());
         let generation = generation.clone();
         let max_size = self.max_size;
         let high_priority_ratio = self.high_priority_ratio;
+        // Encoding touches only owned data. Keep its allocation, copy and CRC
+        // outside the exclusive directory gate. Recheck the generation under
+        // the gate below, since invalidation may run during encoding.
+        let Ok(slot) = self.staging_slots.clone().acquire_owned().await else {
+            return;
+        };
+        let staging_root = root.clone();
+        let Ok(Ok((key, staged, slot))) = tokio::task::spawn_blocking(move || -> io::Result<_> {
+            let encoded = encode_block(&key, &payload);
+            if encoded.len() as u64 > max_size {
+                return Err(io::Error::other("cache block exceeds capacity"));
+            }
+            let staged = StagedBlock::create(&staging_root, &encoded)?;
+            Ok((key, staged, slot))
+        })
+        .await
+        else {
+            return;
+        };
+        let Some(gate) = lock(self.root.join("directory.lock")).await else {
+            return;
+        };
         let result = tokio::task::spawn_blocking(move || -> io::Result<()> {
             let _gate = gate;
+            let _slot = slot;
             if !mutation_cleared(&root)
                 || std::fs::read_to_string(root.join("generation")).ok() != generation
             {
-                return Ok(());
-            }
-            let encoded = encode_block(&key, &payload);
-            if encoded.len() as u64 > max_size {
                 return Ok(());
             }
             let path = root.join(key.cache_relative_path());
@@ -296,47 +417,23 @@ impl SharedDiskCache {
             // A killed process leaves it for the next writer to recover.
             std::fs::write(root.join("dirty"), b"")?;
             let mut previous = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-            if used
-                .saturating_sub(previous)
-                .saturating_add(encoded.len() as u64)
-                > max_size
-            {
+            if used.saturating_sub(previous).saturating_add(staged.len) > max_size {
                 // Evict in batches, not one full directory scan per new block.
                 used = recover_usage(
                     &root,
-                    (max_size - encoded.len() as u64).min(max_size - max_size / 10),
+                    (max_size - staged.len).min(max_size - max_size / 10),
                     high_priority_ratio,
                 )?;
                 previous = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
             }
             let parent = path.parent().expect("cache shard");
             std::fs::create_dir_all(parent)?;
-            let temporary = parent.join(format!(
-                ".{}.tmp.{}",
-                path.file_name().unwrap().to_string_lossy(),
-                uuid::Uuid::new_v4()
-            ));
-            let mut options = OpenOptions::new();
-            options.write(true).create_new(true);
-            #[cfg(unix)]
             {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.mode(0o600);
+                std::fs::rename(&staged.path, &path)?;
             }
-            let publish = (|| {
-                let mut file = options.open(&temporary)?;
-                file.write_all(&encoded)?;
-                drop(file);
-                std::fs::rename(&temporary, &path)
-            })();
-            if publish.is_err() {
-                let _ = std::fs::remove_file(&temporary);
-            }
-            publish?;
             finish_usage(
                 &root,
-                used.saturating_sub(previous)
-                    .saturating_add(encoded.len() as u64),
+                used.saturating_sub(previous).saturating_add(staged.len),
             )
         })
         .await;
@@ -422,6 +519,7 @@ fn finish_invalidation(root: &Path) -> io::Result<()> {
         let _ = std::fs::remove_file(root.join(key.cache_relative_path()));
     }
     cleanup_temporary_files(root)?;
+    cleanup_staging(root)?;
     finish_usage(root, existing_usage(root))
 }
 
@@ -445,13 +543,15 @@ fn clean_usage(root: &Path, max_size: u64) -> Option<u64> {
 }
 
 fn recover_usage(root: &Path, limit: u64, high_priority_ratio: f64) -> io::Result<u64> {
-    // Publication holds the directory lock, so every temporary block found
-    // here belongs to an interrupted publisher. Remove it before clearing dirty.
+    // Legacy temporaries were written under the gate. New staged files may be
+    // live outside it; cleanup_staging skips their per-inode locks.
     cleanup_temporary_files(root)?;
+    cleanup_staging(root)?;
     #[cfg(test)]
     RECOVERY_SCANS.with(|count| count.set(count.get() + 1));
     let mut state = CacheState::new(Some(limit), high_priority_ratio);
-    for (key, encoded_size) in scan_existing_blocks(root) {
+    let blocks = scan_existing_blocks(root);
+    for (key, encoded_size) in blocks {
         insert_state_entry(&mut state, key, encoded_size);
     }
     for key in collect_evictions(&mut state) {
@@ -539,6 +639,11 @@ mod tests {
         let cache = SharedDiskCache::new(root.clone(), 4096).unwrap();
         let token = cache.generation();
         match std::env::var("PAIMON_SHARED_TEST_MODE").unwrap().as_str() {
+            "stage-hold" => {
+                let _staged = StagedBlock::create(&root, b"staged").unwrap();
+                std::fs::write(root.join("locked"), b"ready").unwrap();
+                std::future::pending::<()>().await;
+            }
             "populate" => {
                 let _guard = cache.load_lock(&key()).await.unwrap();
                 if cache.get(&key(), &token).await.is_none() {
@@ -667,6 +772,120 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn staged_file_survives_recovery_and_publishes_after_gate_release() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = Arc::new(SharedDiskCache::new(directory.path().to_path_buf(), 4096).unwrap());
+        let generation = cache.generation();
+        let gate = open_lock(&directory.path().join("directory.lock")).unwrap();
+        gate.lock().unwrap();
+        let writer = {
+            let cache = cache.clone();
+            let generation = generation.clone();
+            tokio::spawn(async move {
+                cache
+                    .put(&key(), Bytes::from_static(b"value"), &generation)
+                    .await;
+            })
+        };
+        let staged_path = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Ok(entries) = std::fs::read_dir(directory.path().join("staging")) {
+                    for entry in entries.flatten() {
+                        if entry.metadata().unwrap().len() > 0 {
+                            return entry.path();
+                        }
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!writer.is_finished());
+        assert_eq!(
+            recover_usage(directory.path(), 4096, DEFAULT_HIGH_PRIORITY_POOL_RATIO).unwrap(),
+            0
+        );
+        assert!(staged_path.exists());
+        drop(gate);
+        writer.await.unwrap();
+        assert!(!staged_path.exists());
+        assert_eq!(cache.get(&key(), &generation).await.unwrap(), "value");
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("usage"))
+                .unwrap()
+                .parse::<u64>()
+                .unwrap(),
+            existing_usage(directory.path())
+        );
+    }
+
+    #[test]
+    fn process_exit_releases_staging_for_cleanup() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut process = child(directory.path(), "stage-hold").spawn().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !directory.path().join("locked").exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let ready = directory.path().join("locked").exists();
+        cleanup_staging(directory.path()).unwrap();
+        let live = std::fs::read_dir(directory.path().join("staging"))
+            .unwrap()
+            .count();
+        process.kill().unwrap();
+        process.wait().unwrap();
+        assert!(ready);
+        assert_eq!(live, 1);
+        SharedDiskCache::new(directory.path().to_path_buf(), 4096).unwrap();
+        assert_eq!(
+            std::fs::read_dir(directory.path().join("staging"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn dropping_unpublished_stage_removes_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let staged = StagedBlock::create(directory.path(), b"value").unwrap();
+        let path = staged.path.clone();
+        assert!(path.exists());
+        drop(staged);
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn encoded_publication_cannot_cross_invalidation() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = std::sync::Arc::new(
+            SharedDiskCache::new(directory.path().to_path_buf(), 4 * 1024 * 1024).unwrap(),
+        );
+        let old = cache.generation();
+        let mutation = cache.begin_invalidation().await.unwrap();
+        let writer = {
+            let cache = cache.clone();
+            tokio::spawn(async move {
+                cache
+                    .put(&key(), Bytes::from(vec![42; 1024 * 1024]), &old)
+                    .await;
+            })
+        };
+        // Encoding may finish while publication waits for the mutation gate.
+        // Either scheduling order must reject the old generation.
+        tokio::task::yield_now().await;
+        mutation.finish().await;
+        writer.await.unwrap();
+        let current = cache.generation();
+        assert!(cache.get(&key(), &current).await.is_none());
+        cache
+            .put(&key(), Bytes::from_static(b"current"), &current)
+            .await;
+        assert_eq!(cache.get(&key(), &current).await.unwrap(), "current");
+    }
+
+    #[tokio::test]
     async fn cache_hits_can_share_the_directory_read_lock() {
         let directory = tempfile::tempdir().unwrap();
         let cache = SharedDiskCache::new(directory.path().to_path_buf(), 4096).unwrap();
@@ -701,6 +920,75 @@ mod tests {
             .await
             .unwrap();
         assert!(guard.is_some());
+    }
+
+    #[tokio::test]
+    async fn hit_does_not_wait_for_directory_writer() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = SharedDiskCache::new(directory.path().to_path_buf(), 4096).unwrap();
+        let token = cache.generation();
+        cache
+            .put(&key(), Bytes::from_static(b"value"), &token)
+            .await;
+        let gate = open_lock(&directory.path().join("directory.lock")).unwrap();
+        gate.lock().unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(500), cache.get(&key(), &token))
+                .await
+                .unwrap()
+                .unwrap(),
+            "value"
+        );
+        // A marker alone must fail closed, even before generation rotation.
+        std::fs::write(directory.path().join(MUTATION_MARKER), b"").unwrap();
+        assert!(cache.get(&key(), &token).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn opened_block_survives_invalidation_but_new_reads_reject_old_epoch() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = SharedDiskCache::new(directory.path().to_path_buf(), 4096).unwrap();
+        let token = cache.generation();
+        cache.put(&key(), Bytes::from_static(b"old"), &token).await;
+        let encoded_key = generation_key(&key(), token.as_ref().unwrap());
+        let gate = read_lock(directory.path().join("directory.lock"))
+            .await
+            .unwrap();
+        let mut opened =
+            File::open(directory.path().join(encoded_key.cache_relative_path())).unwrap();
+        drop(gate);
+        cache.invalidate().await.unwrap();
+        assert!(cache.get(&key(), &token).await.is_none());
+        let current = cache.generation();
+        cache
+            .put(&key(), Bytes::from_static(b"new"), &current)
+            .await;
+        let mut bytes = Vec::new();
+        opened.read_to_end(&mut bytes).unwrap();
+        assert_eq!(decode_block_owned(&encoded_key, bytes).unwrap(), "old");
+        assert_eq!(cache.get(&key(), &current).await.unwrap(), "new");
+    }
+
+    #[tokio::test]
+    async fn hits_refresh_stale_recency_but_do_not_touch_recent_blocks() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = SharedDiskCache::new(directory.path().to_path_buf(), 4096).unwrap();
+        let token = cache.generation();
+        cache
+            .put(&key(), Bytes::from_static(b"value"), &token)
+            .await;
+        let path = directory
+            .path()
+            .join(generation_key(&key(), token.as_ref().unwrap()).cache_relative_path());
+        let file = File::open(path).unwrap();
+        let recent = std::time::SystemTime::now() - Duration::from_secs(1);
+        file.set_modified(recent).unwrap();
+        let before = file.metadata().unwrap().modified().unwrap();
+        assert!(cache.get(&key(), &token).await.is_some());
+        assert_eq!(file.metadata().unwrap().modified().unwrap(), before);
+        file.set_modified(recent - Duration::from_secs(60)).unwrap();
+        assert!(cache.get(&key(), &token).await.is_some());
+        assert!(file.metadata().unwrap().modified().unwrap() > before);
     }
 
     #[tokio::test]
@@ -765,6 +1053,41 @@ mod tests {
             .unwrap();
         assert_eq!(used, existing_usage(directory.path()));
         assert!(used <= 512);
+    }
+
+    #[tokio::test]
+    async fn download_locks_allow_different_blocks_of_the_same_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = SharedDiskCache::new(directory.path().to_path_buf(), 1024 * 1024).unwrap();
+        let first = key();
+        let mut second = first.clone();
+        // Select a different stripe; collisions remain intentionally bounded.
+        loop {
+            second.block_index += 1;
+            if first.cache_relative_path().components().next()
+                != second.cache_relative_path().components().next()
+            {
+                break;
+            }
+        }
+        let guard = cache.load_lock(&first).await.unwrap();
+        let other = tokio::time::timeout(Duration::from_secs(1), cache.load_lock(&second))
+            .await
+            .expect("another block must not wait for this file's download")
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), cache.load_lock(&first))
+                .await
+                .is_err()
+        );
+        drop(guard);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), cache.load_lock(&first))
+                .await
+                .unwrap()
+                .is_some()
+        );
+        drop(other);
     }
 
     #[tokio::test]
