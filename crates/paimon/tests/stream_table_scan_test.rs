@@ -134,6 +134,73 @@ async fn stream_scan_owns_table_and_read_configuration() {
 }
 
 #[tokio::test]
+async fn cloned_scan_keeps_independent_progress_watermarks_and_configuration() {
+    let table = table("memory:/stream-cloned-state", "none").await;
+    write_batch(&table, &make_batch(vec![1], vec![10])).await;
+    patch_snapshot(&table, 1, "watermark", 100.into()).await;
+    write_batch(&table, &make_batch(vec![1], vec![20])).await;
+    patch_snapshot(&table, 2, "watermark", 200.into()).await;
+    let mut original = table.new_stream_scan().unwrap();
+    original.with_consumer_id("original").unwrap();
+    original.restore(Some(1)).unwrap();
+    assert_eq!(
+        values(&table, original.plan().await.unwrap().unwrap()).await,
+        vec![(1, 10)]
+    );
+    let mut copy = original.clone();
+    assert_eq!(copy.checkpoint(), Some(2));
+    assert_eq!(copy.watermark(), Some(100));
+
+    copy.with_consumer_id("copy").unwrap();
+    copy.with_bucket_filter(|_| Ok(false));
+    assert!(copy.plan().await.unwrap().is_none());
+    assert_eq!(copy.checkpoint(), Some(3));
+    assert_eq!(copy.watermark(), Some(200));
+    assert_eq!(original.checkpoint(), Some(2));
+    assert_eq!(original.watermark(), Some(100));
+    assert_eq!(
+        values(&table, original.plan().await.unwrap().unwrap()).await,
+        vec![(1, 20)]
+    );
+
+    original.restore(Some(1)).unwrap();
+    assert_eq!(copy.checkpoint(), Some(3));
+    assert_eq!(copy.watermark(), Some(200));
+    copy.with_bucket_filter(|_| Ok(true));
+    copy.restore(Some(1)).unwrap();
+    assert_eq!(
+        values(&table, copy.plan().await.unwrap().unwrap()).await,
+        vec![(1, 10)]
+    );
+    assert_eq!(copy.watermark(), Some(100));
+    assert_eq!(original.checkpoint(), Some(1));
+    assert_eq!(original.watermark(), Some(200));
+
+    original.with_bucket_filter(|_| Ok(false));
+    assert!(original.plan().await.unwrap().is_none());
+    assert_eq!(original.checkpoint(), Some(3));
+    assert_eq!(copy.checkpoint(), Some(2));
+    original
+        .notify_checkpoint_complete(original.checkpoint())
+        .await
+        .unwrap();
+    copy.notify_checkpoint_complete(copy.checkpoint())
+        .await
+        .unwrap();
+    let consumers = table.consumer_manager();
+    assert_eq!(consumers.get("original").await.unwrap(), Some(3));
+    assert_eq!(consumers.get("copy").await.unwrap(), Some(2));
+
+    // Resetting one copy restores its own acknowledged consumer checkpoint.
+    copy.restore(None).unwrap();
+    assert_eq!(copy.plan().await.unwrap().unwrap().snapshot_id(), Some(2));
+    assert_eq!(copy.checkpoint(), Some(3));
+    assert_eq!(copy.watermark(), Some(200));
+    assert_eq!(original.checkpoint(), Some(3));
+    assert_eq!(consumers.get("original").await.unwrap(), Some(3));
+}
+
+#[tokio::test]
 async fn initial_shards_merge_all_key_versions_and_follow_up_shards_keep_events() {
     for (engine, dv, bucket, producer, expected) in [
         ("first-row", false, "1", "none", 10),

@@ -29,7 +29,9 @@ use crate::{Error, Result};
 /// otherwise. Empty follow-up plans and irrelevant commits are skipped, as in
 /// Java. `None` means there is no available next snapshot; clients can poll.
 /// Progress is persisted only by an explicit `notify_checkpoint_complete`.
-#[derive(Debug)]
+/// Clones retain the current progress and read configuration; subsequent
+/// planning, restoration and configuration changes are independent.
+#[derive(Debug, Clone)]
 pub struct StreamTableScan {
     scan: TableScan<'static>,
     next_snapshot_id: Option<i64>,

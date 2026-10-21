@@ -545,40 +545,14 @@ struct PyBucketFilterState {
     error: Option<Py<PyBaseException>>,
 }
 
-#[pymethods]
 impl PyStreamTableScan {
-    fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
-        let state = self.bucket_filter.lock().unwrap();
-        visit.call(&state.filter)?;
-        visit.call(&state.error)
-    }
-
-    fn __clear__(&mut self) {
-        let references = {
-            let mut state = self.bucket_filter.lock().unwrap();
-            (state.filter.take(), state.error.take())
-        };
-        // Drop Python references outside the lock: destructors may re-enter
-        // Python. The core closure sees an empty filter and retains no cycle.
-        drop(references);
-    }
-
-    #[pyo3(signature = (filter = None))]
-    fn with_bucket_filter(
-        mut slf: PyRefMut<'_, Self>,
-        filter: Option<Py<PyAny>>,
-    ) -> PyResult<PyRefMut<'_, Self>> {
-        if filter
-            .as_ref()
-            .is_some_and(|filter| !filter.bind(slf.py()).is_callable())
-        {
-            return Err(PyTypeError::new_err("bucket filter must be callable"));
+    fn install_bucket_filter(&mut self) {
+        if self.bucket_filter.lock().unwrap().filter.is_none() {
+            self.scan.with_bucket_filter(|_| Ok(true));
+            return;
         }
-        let previous_filter =
-            std::mem::replace(&mut slf.bucket_filter.lock().unwrap().filter, filter);
-        drop(previous_filter);
-        let state = Arc::clone(&slf.bucket_filter);
-        slf.scan.with_bucket_filter(move |bucket| {
+        let state = Arc::clone(&self.bucket_filter);
+        self.scan.with_bucket_filter(move |bucket| {
             Python::attach(|py| {
                 // Release the lock before invoking Python: callbacks may run
                 // GC, which traverses this same state.
@@ -605,6 +579,64 @@ impl PyStreamTableScan {
                     })
             })
         });
+    }
+}
+
+#[pymethods]
+impl PyStreamTableScan {
+    fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
+        let state = self.bucket_filter.lock().unwrap();
+        visit.call(&state.filter)?;
+        visit.call(&state.error)
+    }
+
+    fn __clear__(&mut self) {
+        let references = {
+            let mut state = self.bucket_filter.lock().unwrap();
+            (state.filter.take(), state.error.take())
+        };
+        // Drop Python references outside the lock: destructors may re-enter
+        // Python. The core closure sees an empty filter and retains no cycle.
+        drop(references);
+    }
+
+    /// Copy scan progress with independently owned Python callback references.
+    fn __copy__(&self, py: Python<'_>) -> Self {
+        let filter = self
+            .bucket_filter
+            .lock()
+            .unwrap()
+            .filter
+            .as_ref()
+            .map(|filter| filter.clone_ref(py));
+        let mut copy = Self {
+            scan: self.scan.clone(),
+            bucket_filter: Arc::new(Mutex::new(PyBucketFilterState {
+                filter,
+                error: None,
+            })),
+        };
+        // Each wrapper owns one Python reference and its core callback captures
+        // that wrapper's state. Sharing the Arc would duplicate GC traversal.
+        copy.install_bucket_filter();
+        copy
+    }
+
+    #[pyo3(signature = (filter = None))]
+    fn with_bucket_filter(
+        mut slf: PyRefMut<'_, Self>,
+        filter: Option<Py<PyAny>>,
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        if filter
+            .as_ref()
+            .is_some_and(|filter| !filter.bind(slf.py()).is_callable())
+        {
+            return Err(PyTypeError::new_err("bucket filter must be callable"));
+        }
+        let previous_filter =
+            std::mem::replace(&mut slf.bucket_filter.lock().unwrap().filter, filter);
+        drop(previous_filter);
+        slf.install_bucket_filter();
         Ok(slf)
     }
 
@@ -1209,6 +1241,67 @@ mod tests {
     use pyo3::types::PyList;
 
     use super::*;
+
+    #[test]
+    fn stream_scan_copy_keeps_callback_ownership_and_progress_independent() {
+        Python::attach(|py| {
+            for bound_method in [false, true] {
+                let schema = Schema::builder()
+                    .column("id", DataType::Int(IntType::new()))
+                    .build()
+                    .unwrap();
+                let table = Arc::new(Table::new(
+                    FileIOBuilder::new("memory").build().unwrap(),
+                    Identifier::new("default", "stream_copy"),
+                    "memory:/stream-copy".into(),
+                    TableSchema::new(0, &schema),
+                    None,
+                ));
+                let scan =
+                    Py::new(py, PyReadBuilder::new(table).new_stream_scan().unwrap()).unwrap();
+                let globals = PyDict::new(py);
+                globals.set_item("scan", scan).unwrap();
+                globals.set_item("bound_method", bound_method).unwrap();
+                py.run(
+                    c"
+import copy
+import gc
+import weakref
+
+class Owner:
+    def __init__(self):
+        self.scan = scan.with_bucket_filter(self.select if bound_method else self)
+        self.scan.restore(1)
+        self.copied = copy.copy(self.scan)
+
+    def select(self, bucket):
+        return True
+
+    def __call__(self, bucket):
+        return self.select(bucket)
+
+owner = Owner()
+assert owner.scan is not owner.copied
+owner.copied.restore(2)
+assert owner.scan.checkpoint() == 1
+assert owner.copied.checkpoint() == 2
+owner.scan.restore(3)
+assert owner.copied.checkpoint() == 2
+reference = weakref.ref(owner)
+del scan
+gc.collect()
+assert reference() is owner
+del owner
+gc.collect()
+assert reference() is None
+",
+                    Some(&globals),
+                    None,
+                )
+                .unwrap();
+            }
+        });
+    }
 
     #[test]
     fn table_read_execution_keywords_validate_before_empty_splits() {
