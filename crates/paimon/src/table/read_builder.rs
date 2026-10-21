@@ -538,14 +538,14 @@ impl<'a> PaimonReadBuilder<'a> {
         }
     }
 
-    /// Push a row-limit hint down to scan planning.
+    /// Configure a row limit for scan planning and reads.
     ///
     /// This allows paimon-core scan planning to generate fewer splits when the
     /// current scan state keeps split-level `merged_row_count()` conservative.
     ///
-    /// Data-evolution [`TableRead`] enforces the limit before BLOB resolution.
-    /// Other read paths still treat it only as a planning hint, so callers or
-    /// query engines must enforce the final LIMIT themselves.
+    /// A [`TableRead`] created by this builder also enforces the final limit
+    /// across splits after filtering and row selection. Data-evolution reads
+    /// enforce it before BLOB resolution.
     pub fn with_limit(&mut self, limit: usize) -> &mut Self {
         self.limit = Some(limit);
         self
