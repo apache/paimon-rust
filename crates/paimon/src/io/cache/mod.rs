@@ -136,6 +136,14 @@ impl LocalCache {
     }
 
     fn background_fill_slot(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        // Current-thread runtimes stop driving spawned fills when block_on returns.
+        // Keep those fills synchronous so their block locks cannot outlive the read.
+        if !matches!(
+            tokio::runtime::Handle::try_current().map(|handle| handle.runtime_flavor()),
+            Ok(tokio::runtime::RuntimeFlavor::MultiThread)
+        ) {
+            return None;
+        }
         // Limit background payloads to 8 MiB per cache; otherwise fill synchronously.
         if !matches!(self.backend, CacheBackend::SharedDisk(_)) || self.block_size > 1024 * 1024 {
             return None;

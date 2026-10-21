@@ -371,7 +371,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn shared_fill_returns_before_publication_and_preserves_single_flight() {
         let directory = tempfile::tempdir().unwrap();
         let delegate = Arc::new(CountingReader {
@@ -425,6 +425,48 @@ mod tests {
             .unwrap();
         assert!(cache.background_fill_slot().is_none());
         drop(permits);
+    }
+
+    #[test]
+    fn shared_fill_does_not_block_reads_on_another_runtime() {
+        let directory = tempfile::tempdir().unwrap();
+        let delegate = Arc::new(CountingReader {
+            data: Bytes::from_static(b"abcdefgh"),
+            reads: AtomicUsize::new(0),
+        });
+        let cache = Arc::new(
+            LocalCache::new(LocalCacheConfig {
+                shared: true,
+                dir: Some(directory.path().to_path_buf()),
+                namespace: "test".into(),
+                max_size: Some(4096),
+                block_size: 4,
+                whitelist: std::collections::HashSet::from([FileType::Meta]),
+            })
+            .unwrap(),
+        );
+        let reader = CachedFileReader::new(delegate.clone(), "data.parquet", 8, cache);
+        let first_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        assert_eq!(first_runtime.block_on(reader.read(0..4)).unwrap(), "abcd");
+
+        // Keep the first runtime alive without driving its background tasks.
+        let second_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let second = second_runtime.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_millis(500), reader.read(0..4)).await
+        });
+        assert_eq!(
+            second
+                .expect("read must not wait for an idle runtime")
+                .unwrap(),
+            "abcd"
+        );
+        assert_eq!(delegate.reads.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
