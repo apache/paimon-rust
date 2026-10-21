@@ -321,7 +321,7 @@ impl<'a> HybridSearchBuilder<'a> {
 
     /// Schedule each route's shard work while preserving one shared snapshot
     /// and the configured core fusion ranker.
-    #[cfg(any(feature = "internal-api", test))]
+    #[cfg(any(feature = "internal-api", all(test, feature = "fulltext")))]
     pub(crate) async fn execute_with_executor(
         &self,
         executor: &dyn super::SearchTaskExecutor,

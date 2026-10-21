@@ -152,6 +152,20 @@ impl FullTextRead {
                         source: None,
                     });
                 }
+                if payloads.iter().any(|file| {
+                    file.index_type != FULL_TEXT_INDEX_TYPE
+                        || file
+                            .global_index_meta
+                            .as_ref()
+                            .map(|meta| meta.index_field_id)
+                            != self.context.primary_key_field_id
+                }) {
+                    return Err(crate::Error::DataInvalid {
+                        message: "Primary-key full-text source does not match the reader's field and index type"
+                            .into(),
+                        source: None,
+                    });
+                }
                 let data_split = if data_split.snapshot_id() == 0 {
                     let mut builder = crate::table::DataSplitBuilder::new()
                         .with_snapshot(plan.snapshot_id().unwrap_or(0))

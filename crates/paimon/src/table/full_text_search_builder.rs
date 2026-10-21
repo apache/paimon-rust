@@ -1324,12 +1324,16 @@ mod tests {
         writer: &mut FullTextIndexWriter,
         query: &str,
     ) -> paimon_ftindex_core::FullTextSearchResult {
-        let mut bytes = Vec::new();
-        writer.write(&mut PosWriter::new(&mut bytes)).unwrap();
-        FullTextIndexReader::open(SliceReader::new(bytes))
+        FullTextIndexReader::open(SliceReader::new(write_test_index(writer)))
             .unwrap()
             .search(query, 10)
             .unwrap()
+    }
+
+    fn write_test_index(writer: &mut FullTextIndexWriter) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        writer.write(&mut PosWriter::new(&mut bytes)).unwrap();
+        bytes
     }
 
     #[test]
@@ -1528,6 +1532,138 @@ mod tests {
             .unwrap();
         assert_eq!(result.snapshot_id(), Some(7));
         assert!(result.positions().unwrap().is_empty());
+    }
+
+    fn pk_full_text_indexed_plan(table: &Table) -> FullTextScanPlan {
+        let snapshot = crate::spec::Snapshot::builder()
+            .version(3)
+            .id(7)
+            .schema_id(0)
+            .base_manifest_list(String::new())
+            .delta_manifest_list(String::new())
+            .commit_user("capture".into())
+            .commit_identifier(1)
+            .commit_kind(crate::spec::CommitKind::APPEND)
+            .time_millis(0)
+            .build();
+        let data_file = crate::spec::DataFileMeta {
+            file_name: "d0".into(),
+            file_size: 1,
+            row_count: 2,
+            min_key: Vec::new(),
+            max_key: Vec::new(),
+            key_stats: crate::spec::stats::BinaryTableStats::empty(),
+            value_stats: crate::spec::stats::BinaryTableStats::empty(),
+            min_sequence_number: 0,
+            max_sequence_number: 0,
+            schema_id: 0,
+            level: 1,
+            extra_files: Vec::new(),
+            creation_time: None,
+            delete_row_count: None,
+            embedded_index: None,
+            file_source: Some(1),
+            value_stats_cols: None,
+            external_path: None,
+            first_row_id: None,
+            write_cols: None,
+            column_max_sequence_numbers: None,
+        };
+        let mut payload = full_text_index_entry("pk-ft", 0, 1).index_file;
+        // Java source metadata: version, level, file count, UTF name, row count.
+        payload.global_index_meta.as_mut().unwrap().source_meta = Some(
+            [
+                1i32.to_be_bytes().as_slice(),
+                1i32.to_be_bytes().as_slice(),
+                1i32.to_be_bytes().as_slice(),
+                2u16.to_be_bytes().as_slice(),
+                b"d0",
+                2i64.to_be_bytes().as_slice(),
+            ]
+            .concat(),
+        );
+        let split = crate::table::SearchScanSplit::PrimaryKey {
+            data_split: crate::table::DataSplitBuilder::new()
+                .with_snapshot(7)
+                .with_partition(crate::spec::BinaryRow::new(0))
+                .with_bucket(0)
+                .with_bucket_path(format!("{}/bucket-0", table.location()))
+                .with_data_files(vec![data_file])
+                .build()
+                .unwrap(),
+            payloads: vec![payload],
+            uncovered_data_files: vec![],
+            row_ranges_by_file: Default::default(),
+        };
+        FullTextScanPlan::new(Some(snapshot), vec![split]).unwrap()
+    }
+
+    #[tokio::test]
+    async fn pk_full_text_source_plan_rejects_incompatible_payloads_before_io() {
+        let table = pk_full_text_table("pk_ft_wrong_source", &[]);
+        let mut builder = table.new_full_text_search_builder();
+        builder
+            .with_query("body", r#"{"match":{"query":"alpha"}}"#)
+            .with_limit(10);
+        let reader = builder.new_read().unwrap();
+        let source = pk_full_text_indexed_plan(&table);
+        for invalid in ["field", "type", "missing-meta"] {
+            let mut splits = source.splits().to_vec();
+            let crate::table::SearchScanSplit::PrimaryKey { payloads, .. } = &mut splits[0] else {
+                unreachable!()
+            };
+            match invalid {
+                "field" => {
+                    payloads[0]
+                        .global_index_meta
+                        .as_mut()
+                        .unwrap()
+                        .index_field_id = 0
+                }
+                "type" => payloads[0].index_type = "lucene-vector".into(),
+                _ => payloads[0].global_index_meta = None,
+            }
+            let plan = FullTextScanPlan::new(source.snapshot().cloned(), splits).unwrap();
+            let error = reader.read(plan).await.unwrap_err();
+            assert!(
+                matches!(error, crate::Error::DataInvalid { ref message, .. }
+                    if message.contains("does not match the reader's field and index type")),
+                "{invalid}: {error:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pk_full_text_source_plan_reads_matching_payload_from_captured_snapshot() {
+        let table = pk_full_text_table("pk_ft_matching_source", &[]);
+        let mut writer = FullTextIndexWriter::new(FullTextIndexConfig::new()).unwrap();
+        writer.add_document(0, "alpha").unwrap();
+        writer.add_document(1, "beta").unwrap();
+        table
+            .file_io()
+            .new_output(&format!("{}/index/pk-ft", table.location()))
+            .unwrap()
+            .write(Bytes::from(write_test_index(&mut writer)))
+            .await
+            .unwrap();
+        let plan = pk_full_text_indexed_plan(&table);
+        let plan: FullTextScanPlan =
+            serde_json::from_slice(&serde_json::to_vec(&plan).unwrap()).unwrap();
+        let result = table
+            .new_full_text_search_builder()
+            .with_query("body", r#"{"match":{"query":"alpha"}}"#)
+            .with_limit(10)
+            .new_read()
+            .unwrap()
+            .read(plan)
+            .await
+            .unwrap();
+        assert_eq!(result.snapshot_id(), Some(7));
+        let positions = result.positions().unwrap();
+        assert_eq!(positions.len(), 1);
+        assert_eq!(positions[0].data_file_name, "d0");
+        assert_eq!(positions[0].row_position, 0);
+        assert!(positions[0].score > 0.0);
     }
 
     // (d) The PK full-text path produces physical positions, not global row-ids:

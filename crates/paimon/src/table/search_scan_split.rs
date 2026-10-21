@@ -280,6 +280,12 @@ pub(super) fn global_entries_from_splits(
             }
         };
         for file in scalar {
+            if normalize_queryable_global_index_type(&file.index_type).is_none() {
+                return Err(invalid_source(format!(
+                    "Scalar search source '{}' has unsupported index type '{}'",
+                    file.file_name, file.index_type
+                )));
+            }
             let meta = file.global_index_meta.as_ref().ok_or_else(|| {
                 invalid_source(format!(
                     "Scalar search index '{}' has no global metadata",
@@ -395,4 +401,97 @@ pub(super) async fn partition_row_ids_for_search_sources(
         selected.insert_range(range.from() as u64..=range.to() as u64);
     }
     Ok(selected)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::spec::{CommitKind, GlobalIndexMeta, Snapshot};
+    use crate::table::VectorScanPlan;
+
+    fn snapshot() -> Snapshot {
+        Snapshot::builder()
+            .version(3)
+            .id(1)
+            .schema_id(0)
+            .base_manifest_list("base".into())
+            .delta_manifest_list("delta".into())
+            .commit_user("test".into())
+            .commit_identifier(1)
+            .commit_kind(CommitKind::APPEND)
+            .time_millis(0)
+            .build()
+    }
+
+    fn raw_source_with_scalar(index_type: &str) -> SearchScanSplit {
+        SearchScanSplit::Raw {
+            row_ranges: vec![RowRange::new(1, 1)],
+            scalar_index_files: vec![IndexFileMeta {
+                index_type: index_type.into(),
+                file_name: "scalar-index".into(),
+                file_size: 1,
+                row_count: 3,
+                deletion_vectors_ranges: None,
+                external_path: None,
+                global_index_meta: Some(GlobalIndexMeta {
+                    row_range_start: 0,
+                    row_range_end: 2,
+                    index_field_id: 1,
+                    extra_field_ids: None,
+                    index_meta: None,
+                    source_meta: None,
+                }),
+            }],
+            index_type: None,
+        }
+    }
+
+    #[test]
+    fn raw_source_scalar_metadata_cannot_add_search_payloads() {
+        // A search payload hidden in scalar metadata would otherwise be searched
+        // over [0, 2], extending the explicitly selected raw source [1, 1].
+        for index_type in ["ivf-flat", "lumina", "lumina-vector-ann", "full-text"] {
+            let source = raw_source_with_scalar(index_type);
+            let error = VectorScanPlan::new(Some(snapshot()), vec![source.clone()]).unwrap_err();
+            assert!(error.to_string().contains("unsupported index type"));
+            let wire = serde_json::json!({
+                "snapshot": snapshot(),
+                "splits": [source.clone()],
+            });
+            assert!(serde_json::from_value::<VectorScanPlan>(wire.clone()).is_err());
+            #[cfg(feature = "fulltext")]
+            {
+                assert!(
+                    crate::table::FullTextScanPlan::new(Some(snapshot()), vec![source]).is_err()
+                );
+                assert!(serde_json::from_value::<crate::table::FullTextScanPlan>(wire).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn raw_source_accepts_queryable_scalar_metadata() {
+        for index_type in [
+            "bitmap",
+            "Bitmap",
+            "btree",
+            "BTREE",
+            "multivalue",
+            "MultiValue",
+            "fm",
+            "FM",
+        ] {
+            let source = raw_source_with_scalar(index_type);
+            let plan = VectorScanPlan::new(Some(snapshot()), vec![source.clone()]).unwrap();
+            let wire = serde_json::to_value(plan).unwrap();
+            assert!(serde_json::from_value::<VectorScanPlan>(wire.clone()).is_ok());
+            #[cfg(feature = "fulltext")]
+            {
+                assert!(
+                    crate::table::FullTextScanPlan::new(Some(snapshot()), vec![source]).is_ok()
+                );
+                assert!(serde_json::from_value::<crate::table::FullTextScanPlan>(wire).is_ok());
+            }
+        }
+    }
 }
