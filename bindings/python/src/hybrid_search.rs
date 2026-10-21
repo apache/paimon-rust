@@ -196,10 +196,6 @@ impl PyHybridSearchBuilder {
         }
         result.map(PyGlobalIndexResult::new).map_err(to_py_err)
     }
-
-    fn execute_local(&self, py: Python<'_>) -> PyResult<PyGlobalIndexResult> {
-        self.execute(py)
-    }
 }
 
 #[cfg(test)]

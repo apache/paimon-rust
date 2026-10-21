@@ -125,7 +125,7 @@ impl PyFullTextSearchBuilder {
                 .map_err(to_py_err)?,
         })
     }
-    fn execute_local(&self, py: Python<'_>) -> PyResult<PyGlobalIndexResult> {
+    fn execute(&self, py: Python<'_>) -> PyResult<PyGlobalIndexResult> {
         let builder = self.config.builder(&self.table).map_err(to_py_err)?;
         py.detach(|| runtime().block_on(builder.execute_scored()))
             .map(PyGlobalIndexResult::new)

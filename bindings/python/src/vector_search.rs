@@ -167,7 +167,7 @@ impl PyVectorSearchBuilder {
         let inner = builder.new_read().map_err(to_py_err)?;
         Ok(PyVectorRead { inner })
     }
-    fn execute_local(&self, py: Python<'_>) -> PyResult<PyGlobalIndexResult> {
+    fn execute(&self, py: Python<'_>) -> PyResult<PyGlobalIndexResult> {
         let mut builder = self.config.single(&self.table).map_err(to_py_err)?;
         if let Some(query) = &self.query {
             builder.with_query_vector(query.clone());
@@ -262,7 +262,7 @@ impl PyBatchVectorSearchBuilder {
         let inner = builder.new_read().map_err(to_py_err)?;
         Ok(PyBatchVectorRead { inner })
     }
-    fn execute_batch_local(&self, py: Python<'_>) -> PyResult<Vec<PyGlobalIndexResult>> {
+    fn execute(&self, py: Python<'_>) -> PyResult<Vec<PyGlobalIndexResult>> {
         let mut builder = self.config.batch(&self.table).map_err(to_py_err)?;
         if let Some(query) = &self.query {
             builder.with_query_vectors(query.clone());
@@ -640,6 +640,79 @@ rejects(ValueError, sdk.Split.deserialize, b'bad')
                 Some(&locals),
             )
             .unwrap();
+        });
+    }
+
+    #[test]
+    fn search_builders_expose_only_execute_and_keep_empty_and_invalid_query_semantics() {
+        use paimon::catalog::Identifier;
+        use paimon::io::FileIOBuilder;
+        use paimon::spec::{ArrayType, DataType, FloatType, Schema, TableSchema, VarCharType};
+
+        let schema = Schema::builder()
+            .column(
+                "embedding",
+                DataType::Array(ArrayType::new(DataType::Float(FloatType::new()))),
+            )
+            .column("body", DataType::VarChar(VarCharType::string_type()))
+            .option("bucket", "-1")
+            .option("row-tracking.enabled", "true")
+            .option("data-evolution.enabled", "true")
+            .option("global-index.enabled", "true")
+            .build()
+            .unwrap();
+        let table = Arc::new(Table::new(
+            FileIOBuilder::new("memory").build().unwrap(),
+            Identifier::new("default", "execute_contract"),
+            "memory:/execute_contract".into(),
+            TableSchema::new(0, &schema),
+            None,
+        ));
+        Python::attach(|py| {
+            let locals = PyDict::new(py);
+            locals.set_item("sdk", module(py)).unwrap();
+            locals
+                .set_item("table", crate::table::PyTable::new(table))
+                .unwrap();
+            py.run(
+                cr#"
+for factory, expected in (
+    (table.new_vector_search_builder, 'Vector column'),
+    (table.new_batch_vector_search_builder, 'Vector column'),
+    (table.new_full_text_search_builder, 'Limit must be positive'),
+    (table.new_hybrid_search_builder, 'Routes cannot be empty'),
+):
+    builder = factory()
+    assert callable(builder.execute)
+    assert not hasattr(builder, 'execute_local')
+    assert not hasattr(builder, 'execute_batch_local')
+    try:
+        builder.execute()
+    except Exception as error:
+        assert expected in str(error), str(error)
+    else:
+        raise AssertionError('Unconfigured query was accepted')
+
+single = table.new_vector_search_builder().with_vector_column('embedding').with_query_vector([1., 0.]).with_limit(1)
+assert isinstance(single.execute(), sdk.GlobalIndexResult)
+assert len(single.execute()) == 0
+batch = table.new_batch_vector_search_builder().with_vector_column('embedding').with_query_vectors([[1., 0.], [0., 1.]]).with_limit(1)
+results = batch.execute()
+assert len(results) == 2 and all(isinstance(result, sdk.GlobalIndexResult) and len(result) == 0 for result in results)
+text = table.new_full_text_search_builder().with_query('body', 'needle').with_limit(1)
+assert isinstance(text.execute(), sdk.GlobalIndexResult) and len(text.execute()) == 0
+hybrid = table.new_hybrid_search_builder().add_vector_route('embedding', [1., 0.], 1).add_full_text_route('body', 'needle', 1).with_limit(1)
+assert isinstance(hybrid.execute(), sdk.GlobalIndexResult) and len(hybrid.execute()) == 0
+try:
+    batch.with_query_vectors([]).execute()
+except Exception as error:
+    assert 'Query vectors' in str(error), str(error)
+else:
+    raise AssertionError('Empty batch query was accepted')
+"#,
+                Some(&locals),
+                Some(&locals),
+            ).unwrap();
         });
     }
 }
