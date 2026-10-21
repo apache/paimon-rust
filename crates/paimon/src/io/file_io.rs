@@ -1677,6 +1677,7 @@ mod file_action_test {
             let service: Servicer = Arc::new(CountingListService {
                 pulls: Arc::clone(&self.pulls),
                 fork_error: None,
+                stat_response: None,
             });
             Ok((
                 Operator::from_parts(OperationContext::default(), service),
@@ -1689,6 +1690,7 @@ mod file_action_test {
     struct CountingListService {
         pulls: Arc<AtomicUsize>,
         fork_error: Option<&'static str>,
+        stat_response: Option<(Arc<AtomicUsize>, u64)>,
     }
 
     impl Service for CountingListService {
@@ -1728,6 +1730,12 @@ mod file_action_test {
         ) -> opendal::Result<RpStat> {
             if let Some(message) = self.fork_error {
                 return Err(fork_test_error(message));
+            }
+            if let Some((calls, size)) = &self.stat_response {
+                calls.fetch_add(1, AtomicOrdering::SeqCst);
+                return Ok(RpStat::new(
+                    Metadata::new(EntryMode::FILE).with_content_length(*size),
+                ));
             }
             Err(unsupported_test_operation())
         }
@@ -1985,6 +1993,7 @@ mod file_action_test {
             let service: Servicer = Arc::new(CountingListService {
                 pulls: Arc::new(AtomicUsize::new(0)),
                 fork_error: Some(message),
+                stat_response: None,
             });
             let operator = Operator::from_parts(OperationContext::default(), service);
             let file_io = setup_memory_file_io().with_provider(Arc::new(FixedProvider(operator)));
@@ -2249,6 +2258,72 @@ mod file_action_test {
 
         assert!(dir.path().join("t1").exists());
         assert!(!dir.path().join("t1 ").exists());
+    }
+
+    #[tokio::test]
+    async fn test_immutable_row_sidecar_size_cache_avoids_repeated_stat() {
+        #[derive(Debug)]
+        struct CountingStatProvider(Operator);
+
+        #[async_trait::async_trait]
+        impl FileIOProvider for CountingStatProvider {
+            async fn create(&self, path: &str) -> crate::Result<(Operator, String)> {
+                Ok((
+                    self.0.clone(),
+                    path.strip_prefix("counting:/").unwrap().to_string(),
+                ))
+            }
+
+            async fn create_with_cache_namespace(
+                &self,
+                path: &str,
+            ) -> crate::Result<(Operator, String, Option<String>)> {
+                let (op, relative_path) = self.create(path).await?;
+                Ok((op, relative_path, Some("counting-stat".to_string())))
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let service: Servicer = Arc::new(CountingListService {
+            pulls: Arc::new(AtomicUsize::new(0)),
+            fork_error: None,
+            stat_response: Some((Arc::clone(&calls), 123)),
+        });
+        let provider = Arc::new(CountingStatProvider(Operator::from_parts(
+            OperationContext::default(),
+            service,
+        )));
+        let path = "counting:/objects/sidecar.row";
+
+        let cached = FileIOBuilder::new("memory")
+            .with_provider(provider.clone())
+            .build()
+            .unwrap();
+        assert_eq!(cached.immutable_row_sidecar_size(path).await.unwrap(), 123);
+        assert_eq!(
+            cached
+                .clone()
+                .immutable_row_sidecar_size(path)
+                .await
+                .unwrap(),
+            123
+        );
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 1);
+
+        let uncached = FileIOBuilder::new("memory")
+            .with_provider(provider)
+            .with_prop(CatalogOptions::FILE_FORMAT_METADATA_CACHE_MAX_SIZE, "0")
+            .build()
+            .unwrap();
+        assert_eq!(
+            uncached.immutable_row_sidecar_size(path).await.unwrap(),
+            123
+        );
+        assert_eq!(
+            uncached.immutable_row_sidecar_size(path).await.unwrap(),
+            123
+        );
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 3);
     }
 }
 
