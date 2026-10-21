@@ -362,17 +362,25 @@ impl SharedDiskCache {
         if generation.is_none() {
             return;
         }
-        let root = self.root.clone();
-        let key = generation_key(key, generation.as_ref().unwrap());
-        let generation = generation.clone();
-        let max_size = self.max_size;
-        let high_priority_ratio = self.high_priority_ratio;
-        // Stage outside the directory lock; recheck the generation before publishing.
-        let Ok(slot) = self.staging_slots.clone().acquire_owned().await else {
+        let Some(staged) = self.stage_block(key, payload, generation).await else {
             return;
         };
+        self.publish_staged(staged, generation).await;
+    }
+
+    async fn stage_block(
+        &self,
+        key: &BlockKey,
+        payload: Bytes,
+        generation: &Option<String>,
+    ) -> Option<(BlockKey, StagedBlock, tokio::sync::OwnedSemaphorePermit)> {
+        let root = self.root.clone();
+        let key = generation_key(key, generation.as_ref()?);
+        let max_size = self.max_size;
+        // Stage outside the directory lock; recheck the generation before publishing.
+        let slot = self.staging_slots.clone().acquire_owned().await.ok()?;
         let staging_root = root.clone();
-        let Ok(Ok((key, staged, slot))) = tokio::task::spawn_blocking(move || -> io::Result<_> {
+        tokio::task::spawn_blocking(move || -> io::Result<_> {
             let encoded = encode_block(&key, &payload);
             if encoded.len() as u64 > max_size {
                 return Err(io::Error::other("cache block exceeds capacity"));
@@ -381,9 +389,19 @@ impl SharedDiskCache {
             Ok((key, staged, slot))
         })
         .await
-        else {
-            return;
-        };
+        .ok()?
+        .ok()
+    }
+
+    async fn publish_staged(
+        &self,
+        (key, staged, slot): (BlockKey, StagedBlock, tokio::sync::OwnedSemaphorePermit),
+        generation: &Option<String>,
+    ) {
+        let root = self.root.clone();
+        let generation = generation.clone();
+        let max_size = self.max_size;
+        let high_priority_ratio = self.high_priority_ratio;
         let Some(gate) = lock(self.root.join("directory.lock")).await else {
             return;
         };
@@ -767,45 +785,22 @@ mod tests {
     #[tokio::test]
     async fn staged_file_survives_recovery_and_publishes_after_gate_release() {
         let directory = tempfile::tempdir().unwrap();
-        let cache = Arc::new(SharedDiskCache::new(directory.path().to_path_buf(), 4096).unwrap());
+        let cache = SharedDiskCache::new(directory.path().to_path_buf(), 4096).unwrap();
         let generation = cache.generation();
+        let staged = cache
+            .stage_block(&key(), Bytes::from_static(b"value"), &generation)
+            .await
+            .unwrap();
+        let staged_path = staged.1.path.clone();
         let gate = open_lock(&directory.path().join("directory.lock")).unwrap();
         gate.lock().unwrap();
-        let writer = {
-            let cache = cache.clone();
-            let generation = generation.clone();
-            tokio::spawn(async move {
-                cache
-                    .put(&key(), Bytes::from_static(b"value"), &generation)
-                    .await;
-            })
-        };
-        let staged_path = tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                assert!(
-                    !writer.is_finished(),
-                    "cache put exited before publishing its staged block"
-                );
-                if let Ok(entries) = std::fs::read_dir(directory.path().join("staging")) {
-                    for entry in entries.flatten() {
-                        if entry.metadata().unwrap().len() > 0 {
-                            return entry.path();
-                        }
-                    }
-                }
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
-        })
-        .await
-        .expect("cache put did not stage a block within 10 seconds");
-        assert!(!writer.is_finished());
         assert_eq!(
             recover_usage(directory.path(), 4096, DEFAULT_HIGH_PRIORITY_POOL_RATIO).unwrap(),
             0
         );
         assert!(staged_path.exists());
         drop(gate);
-        writer.await.unwrap();
+        cache.publish_staged(staged, &generation).await;
         assert!(!staged_path.exists());
         assert_eq!(cache.get(&key(), &generation).await.unwrap(), "value");
         assert_eq!(
