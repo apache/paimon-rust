@@ -63,6 +63,9 @@ impl TableWrite {
                 upper_bound - 1,
             )));
         }
+        if self.has_reconfigured_append_type() {
+            return self.write_reconfigured_append(batch, Some(bucket)).await;
+        }
         let filtered = self.filter_write_input(batch)?;
         let input = filtered.as_ref().unwrap_or(batch);
         let Some(batch) = self.normalize_filtered_write_batch(input)? else {

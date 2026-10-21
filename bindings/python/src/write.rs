@@ -88,6 +88,7 @@ impl WriteContext {
             ))),
             table_location: self.table.location().to_string(),
             commit_user: self.commit_user.clone(),
+            blob_consumers: Vec::new(),
         })
     }
 }
@@ -346,6 +347,19 @@ impl WriteTarget {
         }
     }
 
+    fn row_write_columns(&self, routing: &RecordBatch) -> paimon::Result<Vec<String>> {
+        match self {
+            Self::Table(writer) => Ok(writer
+                .write_fields_for_row(routing)?
+                .iter()
+                .map(|field| field.name().to_owned())
+                .collect()),
+            Self::PostponeFixed(_) => Err(paimon::Error::Unsupported {
+                message: "_row_write_columns requires a Paimon append table".into(),
+            }),
+        }
+    }
+
     async fn write_arrow(
         &mut self,
         batch: &RecordBatch,
@@ -464,6 +478,7 @@ impl PyPostponeFixedBucketWriteBuilder {
                 ))),
                 table_location: context.table.location().to_string(),
                 commit_user: context.commit_user.clone(),
+                blob_consumers: Vec::new(),
             },
             prepared: false,
         })
@@ -478,12 +493,15 @@ struct WriteState {
     inner: Option<WriteTarget>,
     table_location: String,
     commit_user: String,
+    // Core keeps prior consumers in captured partition/bucket settings. Expose
+    // every owned Python reference to GC, including replaced consumers.
+    blob_consumers: Vec<Arc<PythonBlobConsumer>>,
 }
 
 /// Descriptor serialization and exception transport only; record boundaries,
 /// callback timing and requested flushes belong to Rust core.
 struct PythonBlobConsumer {
-    callback: Py<PyAny>,
+    callback: Mutex<Option<Py<PyAny>>>,
 }
 
 impl BlobConsumer for PythonBlobConsumer {
@@ -496,10 +514,14 @@ impl BlobConsumer for PythonBlobConsumer {
             Python::attach(|py| {
                 let encoded =
                     descriptor.map(|descriptor| PyBytes::new(py, &descriptor.serialize()));
-                self.callback
-                    .bind(py)
-                    .call1((field_name, encoded))?
-                    .is_truthy()
+                let callback = self
+                    .callback
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|callback| callback.clone_ref(py))
+                    .ok_or_else(|| PyRuntimeError::new_err("Blob consumer has been cleared"))?;
+                callback.bind(py).call1((field_name, encoded))?.is_truthy()
             })
         });
         result.map_err(callback_error)
@@ -858,7 +880,9 @@ impl WriteState {
                 if !callback.bind(py).is_callable() {
                     return Err(PyTypeError::new_err("blob_consumer must be callable"));
                 }
-                Ok(Arc::new(PythonBlobConsumer { callback }))
+                Ok(Arc::new(PythonBlobConsumer {
+                    callback: Mutex::new(Some(callback)),
+                }))
             })
             .transpose()?;
         self.inner
@@ -870,7 +894,40 @@ impl WriteState {
                     .map(|consumer| consumer as Arc<dyn BlobConsumer>),
             )
             .map_err(to_py_err)?;
+        // Release replaced callbacks which no bucket has captured. A snapshot
+        // retained by core contributes another Arc, without another Py ref.
+        self.blob_consumers
+            .retain(|consumer| Arc::strong_count(consumer) > 1);
+        if let Some(consumer) = consumer {
+            self.blob_consumers.push(consumer);
+        }
         Ok(())
+    }
+
+    fn traverse_callbacks(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
+        for consumer in &self.blob_consumers {
+            visit.call(&*consumer.callback.lock().unwrap())?;
+        }
+        Ok(())
+    }
+
+    fn clear_callbacks(&self) {
+        let references = self
+            .blob_consumers
+            .iter()
+            .map(|consumer| consumer.callback.lock().unwrap().take())
+            .collect::<Vec<_>>();
+        // Destructors may re-enter Native. Drop Python references outside locks.
+        drop(references);
+    }
+
+    fn row_write_columns(&self, routing: &Bound<'_, PyAny>) -> PyResult<Vec<String>> {
+        let routing = crate::arrow_input::write_batch_from_pyarrow(routing)?;
+        let inner = self
+            .inner
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("TableWrite is closed"))?;
+        inner.row_write_columns(&routing).map_err(to_py_err)
     }
 
     fn write_result(&self, result: paimon::Result<()>) -> PyResult<()> {
@@ -1213,6 +1270,18 @@ impl PyBatchTableUpdate {
 
 #[pymethods]
 impl PyBatchTableWrite {
+    fn _row_write_columns(&self, routing_batch: &Bound<'_, PyAny>) -> PyResult<Vec<String>> {
+        self.state.row_write_columns(routing_batch)
+    }
+
+    fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
+        self.state.traverse_callbacks(visit)
+    }
+
+    fn __clear__(&mut self) {
+        self.state.clear_callbacks();
+    }
+
     #[pyo3(signature = (factory))]
     fn with_blob_uri_reader_factory(
         mut slf: PyRefMut<'_, Self>,
@@ -1245,6 +1314,7 @@ impl PyBatchTableWrite {
         if let Some(mut writer) = self.state.inner.take() {
             py.detach(|| runtime().block_on(writer.close()));
         }
+        self.state.clear_callbacks();
     }
 
     #[pyo3(signature = (batch, bucket=None))]
@@ -1279,6 +1349,18 @@ pub struct PyStreamTableWrite {
 
 #[pymethods]
 impl PyStreamTableWrite {
+    fn _row_write_columns(&self, routing_batch: &Bound<'_, PyAny>) -> PyResult<Vec<String>> {
+        self.state.row_write_columns(routing_batch)
+    }
+
+    fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
+        self.state.traverse_callbacks(visit)
+    }
+
+    fn __clear__(&mut self) {
+        self.state.clear_callbacks();
+    }
+
     #[pyo3(signature = (factory))]
     fn with_blob_uri_reader_factory(
         mut slf: PyRefMut<'_, Self>,
@@ -1311,6 +1393,7 @@ impl PyStreamTableWrite {
         if let Some(mut writer) = self.state.inner.take() {
             py.detach(|| runtime().block_on(writer.close()));
         }
+        self.state.clear_callbacks();
     }
 
     #[pyo3(signature = (batch, bucket=None))]
@@ -1686,6 +1769,108 @@ mod tests {
     use paimon::io::FileIOBuilder;
     use paimon::spec::{BigIntType, IntType, Schema, TableSchema, VarCharType};
     use pyo3::ffi::c_str;
+
+    #[test]
+    fn replaced_blob_consumers_are_visible_to_writer_cycle_collection() {
+        Python::attach(|py| {
+            for batch in [false, true] {
+                let schema = Schema::builder()
+                    .column("id", DataType::Int(IntType::new()))
+                    .build()
+                    .unwrap();
+                let table = Arc::new(Table::new(
+                    FileIOBuilder::new("memory").build().unwrap(),
+                    Identifier::new("default", "blob_callback_gc"),
+                    "memory:/blob_callback_gc".into(),
+                    TableSchema::new(0, &schema),
+                    None,
+                ));
+                let context = WriteContext::new(table);
+                let writer = if batch {
+                    Py::new(
+                        py,
+                        PyBatchTableWrite {
+                            state: context.new_write(false).unwrap(),
+                            prepared: false,
+                        },
+                    )
+                    .unwrap()
+                    .into_any()
+                } else {
+                    Py::new(
+                        py,
+                        PyStreamTableWrite {
+                            state: context.new_write(false).unwrap(),
+                        },
+                    )
+                    .unwrap()
+                    .into_any()
+                };
+                let locals = PyDict::new(py);
+                locals.set_item("writer", writer).unwrap();
+                py.run(
+                    c_str!(
+                        r#"
+import gc
+finalized = []
+class Callback:
+    def __init__(self, writer, label):
+        self.writer = writer
+        self.label = label
+    def __call__(self, field, descriptor):
+        return False
+    def __del__(self):
+        finalized.append(self.label)
+writer.with_blob_consumer(Callback(writer, 'first'))
+"#
+                    ),
+                    Some(&locals),
+                    Some(&locals),
+                )
+                .unwrap();
+                // Capture the first callback in core without importing PyArrow
+                // or building/installing the extension for a Python test.
+                let input = RecordBatch::try_from_iter([(
+                    "id",
+                    Arc::new(arrow::array::Int32Array::from(vec![1])) as arrow::array::ArrayRef,
+                )])
+                .unwrap();
+                let object = locals.get_item("writer").unwrap().unwrap();
+                if batch {
+                    let mut writer = object.extract::<PyRefMut<'_, PyBatchTableWrite>>().unwrap();
+                    let inner = writer.state.inner.as_mut().unwrap();
+                    assert_eq!(inner.row_write_columns(&input).unwrap(), vec!["id"]);
+                    assert!(inner.row_write_columns(&input.slice(0, 0)).is_err());
+                    py.detach(|| runtime().block_on(inner.write_arrow(&input, None)))
+                        .unwrap();
+                } else {
+                    let mut writer = object
+                        .extract::<PyRefMut<'_, PyStreamTableWrite>>()
+                        .unwrap();
+                    let inner = writer.state.inner.as_mut().unwrap();
+                    assert_eq!(inner.row_write_columns(&input).unwrap(), vec!["id"]);
+                    assert!(inner.row_write_columns(&input.slice(0, 0)).is_err());
+                    py.detach(|| runtime().block_on(inner.write_arrow(&input, None)))
+                        .unwrap();
+                }
+                drop(object);
+                py.run(
+                    c_str!(
+                        r#"
+writer.with_blob_consumer(Callback(writer, 'second'))
+assert finalized == []
+del writer
+gc.collect()
+assert sorted(finalized) == ['first', 'second'], finalized
+"#
+                    ),
+                    Some(&locals),
+                    Some(&locals),
+                )
+                .unwrap();
+            }
+        });
+    }
 
     #[test]
     fn merge_table_source_conditions_resolve_read_metadata() {

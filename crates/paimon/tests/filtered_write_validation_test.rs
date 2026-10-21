@@ -364,8 +364,8 @@ async fn completely_filtered_batches_do_not_lock_writer_configuration() {
     writer.with_blob_consumer(None).unwrap();
     writer.with_blob_uri_reader_factory(None).unwrap();
     writer.write_arrow_batch(&batch("+I")).await.unwrap();
-    assert!(writer.with_write_type(vec!["id".into()]).is_err());
-    assert!(writer.with_blob_consumer(None).is_err());
+    writer.with_write_type(vec!["id".into()]).unwrap();
+    writer.with_blob_consumer(None).unwrap();
     assert!(writer.with_blob_uri_reader_factory(None).is_err());
     let messages = writer.prepare_commit().await.unwrap();
     assert_eq!(
@@ -396,4 +396,70 @@ async fn completely_filtered_batches_do_not_lock_writer_configuration() {
     assert!(batches
         .iter()
         .all(|batch| batch.column_by_name("op").unwrap().is_null(0)));
+}
+
+#[tokio::test]
+async fn reconfigured_append_filters_events_before_nested_value_validation() {
+    let (value_type, invalid_values) = payload("array", false);
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .column("value", value_type)
+        .column("pt", DataType::Int(IntType::new()))
+        .column("op", DataType::VarChar(VarCharType::string_type()))
+        .partition_keys(["pt"])
+        .option("rowkind.field", "op")
+        .option("ignore-delete", "true")
+        .option("data-evolution.enabled", "true")
+        .option("row-tracking.enabled", "true")
+        .build()
+        .unwrap();
+    let (io, table) = memory_table(
+        "memory:/reconfigured-filtered",
+        TableSchema::new(0, &schema),
+    );
+    setup_dirs(&io, table.location()).await;
+    persist_table_schema(&io, table.location(), table.schema()).await;
+    let mut writer = table.new_write_builder().new_write().unwrap();
+    writer
+        .with_write_type(vec!["pt".into(), "id".into()])
+        .unwrap();
+    let input = |ids, values: ArrayRef, partitions, kinds| {
+        RecordBatch::try_from_iter([
+            ("id", Arc::new(Int32Array::from(ids)) as ArrayRef),
+            ("value", values),
+            ("pt", Arc::new(Int32Array::from(partitions)) as ArrayRef),
+            ("op", Arc::new(StringArray::from(kinds)) as ArrayRef),
+        ])
+        .unwrap()
+    };
+    writer
+        .write_arrow_batch(&input(
+            vec![11],
+            invalid_values.slice(0, 1),
+            vec![1],
+            vec!["+I"],
+        ))
+        .await
+        .unwrap();
+    writer
+        .with_write_type(vec!["pt".into(), "value".into()])
+        .unwrap();
+    writer
+        .write_arrow_batch(&input(
+            vec![99, 88],
+            invalid_values,
+            vec![1, 2],
+            vec!["-D", "+I"],
+        ))
+        .await
+        .unwrap();
+    let messages = writer.prepare_commit().await.unwrap();
+    assert_eq!(
+        messages
+            .iter()
+            .flat_map(|m| &m.new_files)
+            .map(|f| f.row_count)
+            .sum::<i64>(),
+        2
+    );
 }

@@ -64,7 +64,7 @@ impl TableWrite {
             })
     }
 
-    fn normalize_routing_columns(
+    pub(super) fn normalize_routing_columns(
         &self,
         input: &RecordBatch,
         names: &[String],
@@ -113,14 +113,19 @@ impl TableWrite {
         Ok(RoutingInput { batch, fields })
     }
 
-    pub(super) fn normalize_automatic_routing_input(
-        &self,
-        input: &RecordBatch,
-    ) -> Result<Option<RoutingInput>> {
+    pub(super) fn automatic_routing_names(&self) -> Vec<String> {
         let mut names = self.partition_keys.clone();
         if CoreOptions::new(self.table.schema().options()).bucket() > 1 {
             names.extend(self.table.schema().bucket_keys());
         }
+        names
+    }
+
+    pub(super) fn normalize_automatic_routing_input(
+        &self,
+        input: &RecordBatch,
+    ) -> Result<Option<RoutingInput>> {
+        let names = self.automatic_routing_names();
         if names
             .iter()
             .all(|name| self.write_fields.iter().any(|field| field.name() == name))
@@ -141,6 +146,11 @@ impl TableWrite {
         let Some(routing) = routing else {
             return self.divide_by_partition_bucket(physical).await;
         };
+        let output = self.assign_append_routing(routing)?;
+        Self::group_assigned_rows(physical, output)
+    }
+
+    pub(super) fn assign_append_routing(&self, routing: RoutingInput) -> Result<BatchAssignOutput> {
         let indices = |names: &[String]| {
             names
                 .iter()
@@ -155,27 +165,25 @@ impl TableWrite {
         };
         let partitions = indices(&self.partition_keys);
         let options = CoreOptions::new(self.table.schema().options());
-        let mut assigner = if options.bucket() > 1 {
-            BucketAssignerEnum::Fixed(FixedBucketAssigner::new(
+        if options.bucket() > 1 {
+            FixedBucketAssigner::new(
                 partitions,
                 indices(&self.table.schema().bucket_keys()),
                 options.bucket_function_type()?,
                 options.bucket(),
-            ))
+            )
+            .assign_batch_sync(&routing.batch, &routing.fields)
         } else {
-            BucketAssignerEnum::Constant(ConstantBucketAssigner::new(
+            ConstantBucketAssigner::new(
                 partitions,
                 if options.bucket() == POSTPONE_BUCKET {
                     POSTPONE_BUCKET
                 } else {
                     0
                 },
-            ))
-        };
-        let output = assigner
-            .assign_batch(&routing.batch, &routing.fields)
-            .await?;
-        Self::group_assigned_rows(physical, output)
+            )
+            .assign_batch_sync(&routing.batch, &routing.fields)
+        }
     }
 
     pub(super) fn precomputed_partition_bytes(

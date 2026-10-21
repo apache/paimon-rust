@@ -52,10 +52,22 @@ use arrow_array::{Array, ArrayRef, Int8Array, RecordBatch};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+#[path = "table_write_append.rs"]
+mod append;
 #[path = "table_write_input.rs"]
 mod input;
 #[path = "table_write_precomputed.rs"]
 mod precomputed;
+
+/// Java's append writer captures its factory settings per partition/bucket.
+/// Keep only these settings across prepares, not completed file resources.
+#[derive(Clone)]
+struct AppendWriteConfig {
+    schema: Arc<arrow_schema::Schema>,
+    fields: Vec<DataField>,
+    blob_consumer: Option<Arc<dyn crate::spec::BlobConsumer>>,
+    blob_uri_reader_factory: Option<Arc<dyn crate::io::UriReaderFactory>>,
+}
 
 /// Enum to hold either an append-only writer, a key-value writer, or a postpone writer.
 enum FileWriter {
@@ -143,6 +155,8 @@ pub struct TableWrite {
     write_fields: Vec<DataField>,
     written: bool,
     partition_writers: HashMap<PartitionBucketKey, FileWriter>,
+    append_write_configs: HashMap<PartitionBucketKey, AppendWriteConfig>,
+    append_write_type_changed: bool,
     partition_computer: PartitionComputer,
     partition_keys: Vec<String>,
     schema_id: i64,
@@ -213,6 +227,8 @@ impl TableWrite {
             write_fields: schema.fields().to_vec(),
             written: false,
             partition_writers: HashMap::new(),
+            append_write_configs: HashMap::new(),
+            append_write_type_changed: false,
             partition_computer: PartitionComputer::new(
                 schema.partition_keys(),
                 schema.fields(),
@@ -513,6 +529,8 @@ impl TableWrite {
             write_fields: fields.to_vec(),
             written: false,
             partition_writers: HashMap::new(),
+            append_write_configs: HashMap::new(),
+            append_write_type_changed: false,
             partition_computer,
             partition_keys,
             schema_id: schema.id(),
@@ -641,15 +659,13 @@ impl TableWrite {
     /// Full-table inputs may provide routing columns which are not written.
     /// Selected inputs must include partition columns and, unless a bucket is
     /// supplied through [`Self::write_arrow`], the columns used for hashing.
-    /// Configure this before writing any nonempty batch.
+    /// Changes apply to partition/bucket writers created afterwards. Existing
+    /// writers retain their selected columns, including across prepares. A full
+    /// table batch is projected to each writer's captured columns; a selected
+    /// batch must match the destination writer's names and order, optionally
+    /// accompanied by routing and configured row-kind fields.
     pub fn with_write_type(&mut self, write_columns: Vec<String>) -> Result<&mut Self> {
         self.ensure_active()?;
-        if self.written {
-            return Err(crate::Error::DataInvalid {
-                message: "with_write_type must be called before any data is written".into(),
-                source: None,
-            });
-        }
         if self.format_writer.is_some() || !self.table.schema().primary_keys().is_empty() {
             return Err(crate::Error::Unsupported {
                 message: "with_write_type requires a Paimon append table".into(),
@@ -722,27 +738,22 @@ impl TableWrite {
             ))
         };
         let write_schema = build_target_arrow_schema(&fields)?;
+        self.append_write_type_changed |= self.written && self.write_schema != write_schema;
         self.bucket_assigner = assigner;
         self.write_schema = write_schema;
         self.write_fields = fields;
         Ok(self)
     }
 
-    /// Receive dedicated append BLOB payload descriptors. Configure before
-    /// writing, as in PyPaimon. Java's primary-key and inline BLOB writers do
-    /// not invoke this consumer. Automatic abort preserves consumer Blob files;
+    /// Receive dedicated append BLOB payload descriptors. Changes apply to
+    /// newly created partition/bucket writers, as in Java. Primary-key and inline
+    /// BLOB writers do not invoke it. Automatic abort preserves consumer Blob files;
     /// callers can explicitly discard prepared files with TableCommit::abort.
     pub fn with_blob_consumer(
         &mut self,
         consumer: Option<Arc<dyn crate::spec::BlobConsumer>>,
     ) -> Result<&mut Self> {
         self.ensure_active()?;
-        if self.written {
-            return Err(crate::Error::DataInvalid {
-                message: "with_blob_consumer must be called before any write operation".into(),
-                source: None,
-            });
-        }
         if self.format_writer.is_some() {
             return Err(crate::Error::Unsupported {
                 message: "with_blob_consumer requires a Paimon table".into(),
@@ -782,6 +793,9 @@ impl TableWrite {
             return writer.write(batch).await;
         }
         self.ensure_active()?;
+        if self.has_reconfigured_append_type() {
+            return self.write_reconfigured_append(batch, None).await;
+        }
         let filtered = self.filter_write_input(batch)?;
         let input = filtered.as_ref().unwrap_or(batch);
         let Some(batch) = self.normalize_filtered_write_batch(input)? else {
@@ -881,6 +895,23 @@ impl TableWrite {
         // Reject malformed schemas even when every event would be ignored.
         // Empty arrays check equivalent layouts without examining row values.
         self.validate_write_batch_schema(&RecordBatch::new_empty(batch.schema()))?;
+        let projected = self.project_full_write_input(batch)?;
+        self.filter_write_input_with_schema(
+            batch,
+            projected.as_ref().unwrap_or(batch),
+            &self.write_schema,
+        )
+    }
+
+    fn filter_write_input_with_schema(
+        &self,
+        batch: &RecordBatch,
+        physical: &RecordBatch,
+        expected_schema: &arrow_schema::Schema,
+    ) -> Result<Option<RecordBatch>> {
+        if self.primary_key_indices.is_empty() && self.row_kind_generator.is_none() {
+            return Ok(None);
+        }
         let kinds = if let Some(generator) = &self.row_kind_generator {
             generator.generate_batch(batch)?
         } else if let Some(column) = batch.column_by_name(VALUE_KIND_FIELD_NAME) {
@@ -899,9 +930,7 @@ impl TableWrite {
         // still identify the event; other engines and partition migrations
         // require every declared top-level NOT NULL field.
         let delete_required_fields = self.delete_not_null_fields();
-        let projected = self.project_full_write_input(batch)?;
-        let physical = projected.as_ref().unwrap_or(batch);
-        for (index, field) in self.write_schema.fields().iter().enumerate() {
+        for (index, field) in expected_schema.fields().iter().enumerate() {
             if field.is_nullable() || physical.column(index).null_count() == 0 {
                 continue;
             }
@@ -1540,7 +1569,12 @@ impl TableWrite {
         // Only this failed invocation's outputs: no message has been returned
         // or submitted. Earlier successful prepare calls belong to the caller.
         let mut cleanup = messages.to_vec();
-        if self.primary_key_indices.is_empty() && self.blob_consumer.is_some() {
+        if self.primary_key_indices.is_empty()
+            && self
+                .append_write_configs
+                .values()
+                .any(|config| config.blob_consumer.is_some())
+        {
             // A successful partition may already have exposed its dedicated
             // Blob files to the consumer. Preserve Java's deletion policy in
             // this table-wide cleanup too. Explicit TableCommit.abort remains
@@ -1561,7 +1595,15 @@ impl TableWrite {
         let partition_path = self.resolve_partition_path(&partition_bytes)?;
 
         let writer = if self.primary_key_indices.is_empty() {
-            self.create_append_writer(partition_path, bucket)?
+            let key = (partition_bytes.clone(), bucket);
+            let config = self
+                .append_write_configs
+                .get(&key)
+                .cloned()
+                .unwrap_or_else(|| self.append_write_config());
+            let writer = self.create_append_writer(partition_path, bucket, &config)?;
+            self.append_write_configs.insert(key, config);
+            writer
         } else if bucket == POSTPONE_BUCKET {
             self.create_postpone_writer(partition_path, bucket)?
         } else {
@@ -1584,7 +1626,12 @@ impl TableWrite {
     }
 
     /// Create an append-only writer for non-PK tables.
-    fn create_append_writer(&self, partition_path: String, bucket: i32) -> Result<FileWriter> {
+    fn create_append_writer(
+        &self,
+        partition_path: String,
+        bucket: i32,
+        config: &AppendWriteConfig,
+    ) -> Result<FileWriter> {
         if self.has_blob_fields
             || self.has_dedicated_vector_fields
             || !self.blob_view_fields.is_empty()
@@ -1606,15 +1653,15 @@ impl TableWrite {
                     self.file_format.clone(),
                     self.vector_target_file_size,
                     self.vector_file_format.as_deref(),
-                    &self.write_schema,
-                    &self.write_fields,
+                    &config.schema,
+                    &config.fields,
                     fields,
                     self.table.schema().options(),
                     &self.blob_inline_fields,
                 )?
                 .with_blob_writer_options(
-                    self.blob_consumer.clone(),
-                    self.blob_uri_reader_factory.clone(),
+                    config.blob_consumer.clone(),
+                    config.blob_uri_reader_factory.clone(),
                 )?
                 .with_resources(self.resources.clone()),
             )))
@@ -1631,21 +1678,22 @@ impl TableWrite {
                     self.file_compression_zstd_level,
                     self.write_buffer_size,
                     self.file_format.clone(),
-                    self.write_fields.clone(),
+                    config.fields.clone(),
                     self.table.schema().options().clone(),
                     Some(0),
                     None,
                     (!super::data_evolution_fields::can_omit_normal_write_cols(
                         self.table.schema().fields(),
-                        &self
-                            .write_fields
+                        &config
+                            .fields
                             .iter()
                             .map(|field| field.name().to_string())
                             .collect::<Vec<_>>(),
                         &CoreOptions::new(self.table.schema().options()),
                     ))
                     .then(|| {
-                        self.write_fields
+                        config
+                            .fields
                             .iter()
                             .map(|field| field.name().to_string())
                             .collect()
@@ -1654,7 +1702,7 @@ impl TableWrite {
                 .with_file_index(
                     self.file_index_options
                         .as_ref()
-                        .and_then(|options| options.project_to_fields(&self.write_fields))
+                        .and_then(|options| options.project_to_fields(&config.fields))
                         .map(Arc::new),
                 )
                 .with_target_file_row_num(self.target_file_row_num)
@@ -1800,7 +1848,7 @@ pub(in crate::table) mod tests {
         use arrow_array::{ArrayRef, LargeBinaryArray};
         use std::sync::Mutex;
 
-        for has_consumer in [false, true] {
+        for (has_consumer, replace_consumer) in [(false, false), (true, false), (true, true)] {
             let io = test_file_io();
             let schema = Schema::builder()
                 .column("pt", DataType::Int(IntType::new()))
@@ -1842,6 +1890,11 @@ pub(in crate::table) mod tests {
             ])
             .unwrap();
             writer.write_arrow_batch(&batch).await.unwrap();
+            if replace_consumer {
+                // Captured callbacks own these payloads even when the factory
+                // has subsequently disabled its consumer for future writers.
+                writer.with_blob_consumer(None).unwrap();
+            }
             assert_eq!(writer.partition_writers.len(), 2);
             let FileWriter::AppendDedicated(partition) =
                 writer.partition_writers.values_mut().next().unwrap()

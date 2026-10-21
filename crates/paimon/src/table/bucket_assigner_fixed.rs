@@ -52,11 +52,9 @@ impl FixedBucketAssigner {
             total_buckets,
         }
     }
-}
 
-impl BucketAssigner for FixedBucketAssigner {
-    async fn assign_batch(
-        &mut self,
+    pub(super) fn assign_batch_sync(
+        &self,
         batch: &RecordBatch,
         fields: &[DataField],
     ) -> Result<BatchAssignOutput> {
@@ -81,6 +79,16 @@ impl BucketAssigner for FixedBucketAssigner {
             deletes: Vec::new(),
             skips: Vec::new(),
         })
+    }
+}
+
+impl BucketAssigner for FixedBucketAssigner {
+    async fn assign_batch(
+        &mut self,
+        batch: &RecordBatch,
+        fields: &[DataField],
+    ) -> Result<BatchAssignOutput> {
+        self.assign_batch_sync(batch, fields)
     }
 
     async fn prepare_commit_index(

@@ -45,11 +45,9 @@ impl ConstantBucketAssigner {
     pub fn bucket(&self) -> i32 {
         self.bucket
     }
-}
 
-impl BucketAssigner for ConstantBucketAssigner {
-    async fn assign_batch(
-        &mut self,
+    pub(super) fn assign_batch_sync(
+        &self,
         batch: &RecordBatch,
         fields: &[DataField],
     ) -> Result<BatchAssignOutput> {
@@ -66,6 +64,16 @@ impl BucketAssigner for ConstantBucketAssigner {
             deletes: Vec::new(),
             skips: Vec::new(),
         })
+    }
+}
+
+impl BucketAssigner for ConstantBucketAssigner {
+    async fn assign_batch(
+        &mut self,
+        batch: &RecordBatch,
+        fields: &[DataField],
+    ) -> Result<BatchAssignOutput> {
+        self.assign_batch_sync(batch, fields)
     }
 
     async fn prepare_commit_index(
