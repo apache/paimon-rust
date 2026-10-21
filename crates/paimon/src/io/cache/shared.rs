@@ -329,7 +329,7 @@ impl SharedDiskCache {
             let path = root.join(key.cache_relative_path());
             // Immutable inodes survive unlink; recheck the epoch after reading
             // to reject concurrent invalidation.
-            let mut file = File::open(path).ok()?;
+            let mut file = File::open(&path).ok()?;
             let metadata = file.metadata().ok()?;
             // Throttle recency writes for approximate cross-process LRU.
             if metadata
@@ -338,7 +338,12 @@ impl SharedDiskCache {
                 .and_then(|t| t.elapsed().ok())
                 .is_some_and(|age| age >= Duration::from_secs(10))
             {
-                let _ = file.set_modified(std::time::SystemTime::now());
+                // Windows requires a write-capable handle to update mtime.
+                // A failed touch must not turn a valid cached block into a miss.
+                let _ = OpenOptions::new()
+                    .write(true)
+                    .open(&path)
+                    .and_then(|file| file.set_modified(std::time::SystemTime::now()));
             }
             let mut data = Vec::with_capacity(usize::try_from(metadata.len()).ok()?);
             file.read_to_end(&mut data).ok()?;
@@ -775,8 +780,12 @@ mod tests {
                     .await;
             })
         };
-        let staged_path = tokio::time::timeout(Duration::from_secs(1), async {
+        let staged_path = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
+                assert!(
+                    !writer.is_finished(),
+                    "cache put exited before publishing its staged block"
+                );
                 if let Ok(entries) = std::fs::read_dir(directory.path().join("staging")) {
                     for entry in entries.flatten() {
                         if entry.metadata().unwrap().len() > 0 {
@@ -788,7 +797,7 @@ mod tests {
             }
         })
         .await
-        .unwrap();
+        .expect("cache put did not stage a block within 10 seconds");
         assert!(!writer.is_finished());
         assert_eq!(
             recover_usage(directory.path(), 4096, DEFAULT_HIGH_PRIORITY_POOL_RATIO).unwrap(),
@@ -967,15 +976,27 @@ mod tests {
         let path = directory
             .path()
             .join(generation_key(&key(), token.as_ref().unwrap()).cache_relative_path());
-        let file = File::open(path).unwrap();
         let recent = std::time::SystemTime::now() - Duration::from_secs(1);
-        file.set_modified(recent).unwrap();
-        let before = file.metadata().unwrap().modified().unwrap();
+        OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(recent)
+            .unwrap();
+        let before = std::fs::metadata(&path).unwrap().modified().unwrap();
         assert!(cache.get(&key(), &token).await.is_some());
-        assert_eq!(file.metadata().unwrap().modified().unwrap(), before);
-        file.set_modified(recent - Duration::from_secs(60)).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            before
+        );
+        OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(recent - Duration::from_secs(60))
+            .unwrap();
         assert!(cache.get(&key(), &token).await.is_some());
-        assert!(file.metadata().unwrap().modified().unwrap() > before);
+        assert!(std::fs::metadata(&path).unwrap().modified().unwrap() > before);
     }
 
     #[tokio::test]
