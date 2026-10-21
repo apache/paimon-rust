@@ -69,14 +69,15 @@ async fn example() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-`SQLContext::new` creates a session context with the Paimon relation planner and
+`SQLContext::new` creates a session context with the Paimon relation planner,
 the catalog-independent `path_to_descriptor` and `descriptor_to_string` scalar
-functions pre-registered. Use `register_catalog(...).await` to add one or more
+functions and the `paimon_incremental_query` table-valued function
+pre-registered. Use `register_catalog(...).await` to add one or more
 Paimon catalogs; registering a catalog also registers the built-in scalar
 function `blob_view` (alias `sys.blob_view`) and the built-in table-valued
-functions (`vector_search`, `hybrid_search`, `paimon_incremental_query`, and
-`full_text_search` when the `fulltext` feature is enabled) against it. It also
-manages session-scoped dynamic options internally for `SET`/`RESET` support.
+functions (`vector_search`, `hybrid_search`, and `full_text_search` when the
+`fulltext` feature is enabled) against it. It also manages session-scoped
+dynamic options internally for `SET`/`RESET` support.
 
 ### REST Catalog Views and SQL Functions
 
@@ -2326,8 +2327,9 @@ The optional fourth argument selects the mode:
   A data-evolution table's range is read as one batch, as Java's `incremental-between`
   scan reads it, so a column update merges into the rows it updates when they were
   written in the range. For rows written before the range it returns every row of the
-  files the update rewrote, unchanged rows included, with only the updated columns
-  set and the others NULL, NOT NULL columns included.
+  files the updates rewrote, unchanged rows included, with only the updated columns
+  set and the others NULL, NOT NULL columns included. (Java's reader instead fails
+  when two such updates of the same rows leave a NOT NULL column unwritten.)
 - `changelog` returns the changelog rows of each commit.
 - `diff` compares the table at the two snapshots and returns the added and changed
   rows (`$audit_log` adds `-U` and `-D` rows). It requires a primary-key table with
@@ -2337,6 +2339,15 @@ The optional fourth argument selects the mode:
 
 A `$audit_log` suffix puts `rowkind` first, followed by `_SEQUENCE_NUMBER` when
 `table-read.sequence-number.enabled=true`.
+
+The table name resolves as in a `FROM` clause of the same session: `my_table` and
+`my_db.my_table` use the current catalog (and database), and
+`my_catalog.my_db.my_table` names the catalog. Dynamic options set with
+`SET 'paimon.…'` apply as they do to a query on the table, except options that
+choose another range to read (time-travel selectors, `incremental-between*`, file
+creation-time filters and a `scan.mode` other than `default`), which are rejected
+whether the session or the table read sets them. With `SET 'paimon.branch'`, the
+table read is that branch.
 
 ## Dynamic Options (SET / RESET)
 

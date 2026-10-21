@@ -28,13 +28,18 @@
 //!
 //! A `$audit_log` table-name suffix prepends the `rowkind` audit column (and the
 //! optional `_SEQUENCE_NUMBER`), mirroring the core audit-log read.
+//!
+//! The table name resolves as in a `FROM` clause, in the calling session, and
+//! the session's dynamic options apply as they do to an ordinary read of the
+//! table, except those that choose another range to read.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
-use datafusion::catalog::{Session, TableFunctionImpl};
+use datafusion::catalog::{CatalogProviderList, Session, TableFunctionArgs, TableFunctionImpl};
 use datafusion::common::stats::Precision;
 use datafusion::common::{internal_err, project_schema, Statistics};
 use datafusion::datasource::{TableProvider, TableType};
@@ -50,7 +55,7 @@ use datafusion::physical_plan::{
 };
 use datafusion::prelude::SessionContext;
 use futures::{stream, StreamExt, TryStreamExt};
-use paimon::catalog::Catalog;
+use paimon::catalog::DEFAULT_MAIN_BRANCH;
 use paimon::resource::ResourceContext;
 use paimon::spec::{CoreOptions, DataField};
 use paimon::table::{
@@ -58,44 +63,41 @@ use paimon::table::{
     Table,
 };
 
+use crate::catalog::PaimonCatalogProvider;
 use crate::error::to_datafusion_error;
 use crate::memory::reader_resources;
 use crate::physical_plan::scan::to_datafusion_batch;
 use crate::runtime::{await_with_runtime, block_on_with_runtime};
+use crate::system_tables::ensure_audit_log_dynamic_options;
 use crate::table::datafusion_arrow_schema;
 use crate::table_function_args::{
-    extract_int_literal, extract_string_literal, parse_table_identifier,
+    extract_int_literal, extract_string_literal, resolve_table_argument,
 };
 use crate::table_loader::load_data_table_for_read;
 
 const FUNCTION_NAME: &str = "paimon_incremental_query";
 const AUDIT_LOG_SUFFIX: &str = "$audit_log";
 
-/// Registers `paimon_incremental_query` against `catalog`.
-pub(crate) fn register_incremental_query(
-    ctx: &SessionContext,
-    catalog: Arc<dyn Catalog>,
-    default_database: &str,
-) {
+/// Registers `paimon_incremental_query`, which looks its table up among the
+/// catalogs of `ctx` when it is called.
+pub(crate) fn register_incremental_query(ctx: &SessionContext) {
     ctx.register_udtf(
         FUNCTION_NAME,
         Arc::new(IncrementalQueryFunction {
-            catalog,
-            default_database: default_database.to_string(),
+            catalogs: Arc::clone(ctx.state().catalog_list()),
         }),
     );
 }
 
 pub(crate) struct IncrementalQueryFunction {
-    catalog: Arc<dyn Catalog>,
-    default_database: String,
+    /// The catalog list `register_catalog` adds to, as ordinary queries see it.
+    catalogs: Arc<dyn CatalogProviderList>,
 }
 
 impl fmt::Debug for IncrementalQueryFunction {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("IncrementalQueryFunction")
-            .field("default_database", &self.default_database)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -114,17 +116,19 @@ fn parse_mode(raw: &str) -> DFResult<IncrementalScanMode> {
 }
 
 impl TableFunctionImpl for IncrementalQueryFunction {
-    fn call(&self, args: &[Expr]) -> DFResult<Arc<dyn TableProvider>> {
-        if args.len() < 3 || args.len() > 4 {
+    fn call_with_args(&self, args: TableFunctionArgs) -> DFResult<Arc<dyn TableProvider>> {
+        let exprs = args.exprs();
+        if exprs.len() < 3 || exprs.len() > 4 {
             return Err(DataFusionError::Plan(format!(
                 "{FUNCTION_NAME} requires 3 or 4 arguments: (table_name, start_snapshot_exclusive, end_snapshot_inclusive [, mode])"
             )));
         }
-        let table_name = extract_string_literal(FUNCTION_NAME, &args[0], "table_name")?;
+        let table_name = extract_string_literal(FUNCTION_NAME, &exprs[0], "table_name")?;
         let start_exclusive =
-            extract_int_literal(FUNCTION_NAME, &args[1], "start_snapshot_exclusive")?;
-        let end_inclusive = extract_int_literal(FUNCTION_NAME, &args[2], "end_snapshot_inclusive")?;
-        let mode = match args.get(3) {
+            extract_int_literal(FUNCTION_NAME, &exprs[1], "start_snapshot_exclusive")?;
+        let end_inclusive =
+            extract_int_literal(FUNCTION_NAME, &exprs[2], "end_snapshot_inclusive")?;
+        let mode = match exprs.get(3) {
             Some(expr) => parse_mode(&extract_string_literal(FUNCTION_NAME, expr, "mode")?)?,
             None => IncrementalScanMode::Auto,
         };
@@ -139,13 +143,69 @@ impl TableFunctionImpl for IncrementalQueryFunction {
             Some(base) => (base.to_string(), true),
             None => (table_name.clone(), false),
         };
-        let identifier = parse_table_identifier(FUNCTION_NAME, &base_name, &self.default_database)?;
+        // The calling session resolves the name, so `USE` applies here as it
+        // does to a `FROM` clause.
+        let (catalog_name, identifier) = resolve_table_argument(
+            FUNCTION_NAME,
+            &base_name,
+            &args.session().config_options().catalog,
+        )?;
+        let registered = self
+            .catalogs
+            .catalog(&catalog_name)
+            .ok_or_else(|| DataFusionError::Plan(format!("Unknown catalog '{catalog_name}'")))?;
+        let provider = registered
+            .downcast_ref::<PaimonCatalogProvider>()
+            .ok_or_else(|| {
+                DataFusionError::Plan(format!("Catalog '{catalog_name}' is not a Paimon catalog"))
+            })?;
 
-        let catalog = Arc::clone(&self.catalog);
+        // Session options apply as they do to an ordinary read of the table;
+        // those choosing another range are refused before anything is read.
+        let session_options = provider.session_options();
+        ensure_no_range_options(&session_options, |key| {
+            format!(
+                "{FUNCTION_NAME} reads the range its arguments give and cannot run while \
+                 scan option '{key}' is set; RESET 'paimon.{key}' first"
+            )
+        })?;
+        if audit_log {
+            ensure_audit_log_dynamic_options(&session_options)?;
+        }
+        let catalog = Arc::clone(provider.catalog());
         let table = block_on_with_runtime(
-            async move { load_data_table_for_read(&catalog, &identifier, FUNCTION_NAME).await },
+            async move {
+                let table = load_data_table_for_read(&catalog, &identifier, FUNCTION_NAME).await?;
+                let table = if session_options.is_empty() {
+                    table
+                } else {
+                    table
+                        .copy_with_time_travel(session_options)
+                        .await
+                        .map_err(to_datafusion_error)?
+                };
+                // Checked on the table read: a session `branch` reads that
+                // branch, with that branch's options.
+                ensure_no_range_options(table.schema().options(), |key| {
+                    let read = match table.branch() {
+                        DEFAULT_MAIN_BRANCH => format!("table '{}'", identifier.full_name()),
+                        branch => {
+                            format!("branch '{branch}' of table '{}'", identifier.full_name())
+                        }
+                    };
+                    format!(
+                        "{FUNCTION_NAME} reads the range its arguments give and cannot run on \
+                         {read}, which sets scan option '{key}'"
+                    )
+                })?;
+                Ok::<_, DataFusionError>(table)
+            },
             "paimon_incremental_query: catalog access thread panicked",
         )?;
+        // As an ordinary read does, so BLOB descriptors it returns can be read.
+        provider
+            .blob_reader_registry()
+            .register_if_absent(table.location().to_string(), table.file_io().clone());
 
         Ok(Arc::new(IncrementalQueryTableProvider::try_new(
             table,
@@ -156,6 +216,22 @@ impl TableFunctionImpl for IncrementalQueryFunction {
         )?))
     }
 }
+
+/// Fails with `message(key)` when `options` choose what to read, which the
+/// function's arguments do.
+fn ensure_no_range_options(
+    options: &HashMap<String, String>,
+    message: impl FnOnce(&str) -> String,
+) -> DFResult<()> {
+    match CoreOptions::new(options)
+        .configured_scan_range_options()
+        .first()
+    {
+        Some(key) => Err(DataFusionError::Plan(message(key))),
+        None => Ok(()),
+    }
+}
+
 #[derive(Debug, Clone)]
 struct IncrementalQueryTableProvider {
     table: Table,

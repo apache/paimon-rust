@@ -592,3 +592,429 @@ async fn test_data_evolution_range_merges_column_updates() {
         assert_eq!(count.unwrap().value(0), rows, "({start}, {end}]");
     }
 }
+
+#[tokio::test]
+async fn test_data_evolution_range_of_column_updates_reads_unwritten_columns_as_null() {
+    use datafusion::arrow::array::{Array, Int32Array, StringArray};
+    // Snapshot 2 updates `name` and snapshot 3 updates `value`, so (1, 3]
+    // holds two column files of the same rows and no file with `id`.
+    let tmp = TempDir::new().unwrap();
+    let ctx = context(&tmp).await;
+    run(
+        &ctx,
+        "CREATE TABLE paimon.default.de (id INT NOT NULL, name STRING, value INT) WITH (
+            'row-tracking.enabled' = 'true',
+            'data-evolution.enabled' = 'true'
+        )",
+    )
+    .await;
+    run(
+        &ctx,
+        "INSERT INTO paimon.default.de (id, name, value) VALUES (1, 'alice', 10), (2, 'bob', 20)",
+    )
+    .await;
+    for (source, values, column) in [
+        ("renames", "(1, 'ALICE')", "name"),
+        ("revalues", "(2, 99)", "value"),
+    ] {
+        run(
+            &ctx,
+            &format!(
+                "CREATE TEMPORARY TABLE paimon.default.{source} AS
+                    SELECT * FROM (VALUES {values}) AS t(id, {column})"
+            ),
+        )
+        .await;
+        run(
+            &ctx,
+            &format!(
+                "MERGE INTO paimon.default.de t USING paimon.default.{source} s ON t.id = s.id
+                    WHEN MATCHED THEN UPDATE SET {column} = s.{column}"
+            ),
+        )
+        .await;
+    }
+    for mode in ["", ", 'delta'"] {
+        for name in ["de", "de$audit_log"] {
+            let batches = run(
+                &ctx,
+                &format!(
+                    "SELECT id, name, value FROM paimon_incremental_query('default.{name}', 1, 3{mode})"
+                ),
+            )
+            .await;
+            let mut rows = Vec::new();
+            for batch in &batches {
+                let id = batch.column(0).as_any().downcast_ref::<Int32Array>();
+                let name = batch.column(1).as_any().downcast_ref::<StringArray>();
+                let value = batch.column(2).as_any().downcast_ref::<Int32Array>();
+                let (id, name, value) = (id.unwrap(), name.unwrap(), value.unwrap());
+                for row in 0..batch.num_rows() {
+                    rows.push((
+                        id.is_valid(row).then(|| id.value(row)),
+                        name.value(row).to_string(),
+                        value.value(row),
+                    ));
+                }
+            }
+            rows.sort();
+            let expected = [
+                (None, "ALICE".to_string(), 10),
+                (None, "bob".to_string(), 99),
+            ];
+            assert_eq!(rows, expected, "{name}{mode}");
+        }
+    }
+}
+
+/// Asserts that, for `name`, the function reads the rows a `FROM` clause in
+/// the same session reads.
+async fn assert_reads_as_from(ctx: &SQLContext, name: &str) {
+    let expected = sorted_ids(&run(ctx, &format!("SELECT id FROM {name}")).await);
+    let actual = sorted_ids(
+        &run(
+            ctx,
+            &format!("SELECT id FROM paimon_incremental_query('{name}', 0, 1)"),
+        )
+        .await,
+    );
+    assert_eq!(actual, expected, "{name}");
+}
+
+#[tokio::test]
+async fn test_table_name_resolves_as_in_a_from_clause() {
+    use datafusion::catalog::MemoryCatalogProvider;
+    // Two warehouses with a `default.t` each, and a database in cat_a named
+    // like the catalog cat_b.
+    let (a, b) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    let mut ctx = SQLContext::new();
+    ctx.register_catalog("cat_a", catalog(&a)).await.unwrap();
+    ctx.register_catalog("cat_b", catalog(&b)).await.unwrap();
+    run(&ctx, "CREATE SCHEMA cat_a.cat_b").await;
+    for (table, id) in [
+        ("cat_a.default.t", 1),
+        ("cat_b.default.t", 2),
+        ("cat_a.cat_b.t", 3),
+    ] {
+        run(&ctx, &format!("CREATE TABLE {table} (id INT)")).await;
+        run(&ctx, &format!("INSERT INTO {table} VALUES ({id})")).await;
+    }
+
+    // cat_a, registered first, is the current catalog.
+    for name in [
+        "cat_a.default.t",
+        "cat_b.default.t",
+        "default.t",
+        "t",
+        "cat_b.t",
+    ] {
+        assert_reads_as_from(&ctx, name).await;
+    }
+    run(&ctx, "USE cat_b.default").await;
+    for name in ["t", "default.t", "cat_a.default.t"] {
+        assert_reads_as_from(&ctx, name).await;
+    }
+    run(&ctx, "USE cat_a.cat_b").await;
+    assert_reads_as_from(&ctx, "t").await;
+
+    let err = expect_error(
+        &ctx,
+        "SELECT * FROM paimon_incremental_query('nope.default.t', 0, 1)",
+    )
+    .await;
+    assert!(err.contains("Unknown catalog 'nope'"), "{err}");
+    ctx.ctx()
+        .register_catalog("mem", Arc::new(MemoryCatalogProvider::new()));
+    let err = expect_error(
+        &ctx,
+        "SELECT * FROM paimon_incremental_query('mem.public.t', 0, 1)",
+    )
+    .await;
+    assert!(
+        err.contains("Catalog 'mem' is not a Paimon catalog"),
+        "{err}"
+    );
+}
+#[tokio::test]
+async fn test_session_read_options_apply_as_in_an_ordinary_read() {
+    use datafusion::arrow::util::pretty::pretty_format_batches;
+    let tmp = TempDir::new().unwrap();
+    let ctx = context(&tmp).await;
+    run(
+        &ctx,
+        "CREATE TABLE paimon.default.de_assets (id INT, picture BLOB) WITH (
+            'row-tracking.enabled' = 'true',
+            'data-evolution.enabled' = 'true'
+        )",
+    )
+    .await;
+    run(
+        &ctx,
+        "CREATE TABLE paimon.default.pk_assets (id INT NOT NULL, picture BLOB, PRIMARY KEY (id))
+            WITH ('bucket' = '1')",
+    )
+    .await;
+    let format = |batches: Vec<RecordBatch>| pretty_format_batches(&batches).unwrap().to_string();
+    for table in ["de_assets", "pk_assets"] {
+        run(
+            &ctx,
+            &format!("INSERT INTO paimon.default.{table} (id, picture) VALUES (1, X'414141')"),
+        )
+        .await;
+        let ordinary = format!("SELECT id, picture FROM paimon.default.{table}");
+        let payloads = format(run(&ctx, &ordinary).await);
+        run(&ctx, "SET 'paimon.blob-as-descriptor' = 'true'").await;
+        let descriptors = format(run(&ctx, &ordinary).await);
+        assert_ne!(
+            descriptors, payloads,
+            "{table}: the option changes the read"
+        );
+        for (setting, expected) in [
+            ("SET 'paimon.blob-as-descriptor' = 'true'", &descriptors),
+            ("RESET 'paimon.blob-as-descriptor'", &payloads),
+        ] {
+            run(&ctx, setting).await;
+            for name in [table.to_string(), format!("{table}$audit_log")] {
+                let sql = format!(
+                    "SELECT id, picture FROM paimon_incremental_query('default.{name}', 0, 1)"
+                );
+                assert_eq!(
+                    &format(run(&ctx, &sql).await),
+                    expected,
+                    "{name}: {setting}"
+                );
+            }
+        }
+    }
+
+    // Descriptors the function returns can be read back through the session,
+    // as those of an ordinary read can.
+    let fresh = context(&tmp).await;
+    run(&fresh, "SET 'paimon.blob-as-descriptor' = 'true'").await;
+    run(
+        &fresh,
+        "SELECT * FROM paimon_incremental_query('default.pk_assets', 0, 1)",
+    )
+    .await;
+    let location = catalog(&tmp)
+        .get_table(&Identifier::new("default", "pk_assets"))
+        .await
+        .unwrap()
+        .location()
+        .to_string();
+    assert!(fresh
+        .blob_reader_registry()
+        .resolve(&format!("{location}/bucket-0/data.blob"))
+        .is_some());
+
+    run(&ctx, "CREATE TABLE paimon.default.t (id INT)").await;
+    run(
+        &ctx,
+        "INSERT INTO paimon.default.t VALUES (1), (2), (3), (4), (5)",
+    )
+    .await;
+    run(&ctx, "SET 'paimon.read.batch-size' = '2'").await;
+    let sizes = |batches: Vec<RecordBatch>| {
+        batches
+            .iter()
+            .map(RecordBatch::num_rows)
+            .filter(|rows| *rows > 0)
+            .collect::<Vec<_>>()
+    };
+    let ordinary = sizes(run(&ctx, "SELECT id FROM paimon.default.t").await);
+    assert_eq!(ordinary, [2, 2, 1]);
+    let incremental = sizes(
+        run(
+            &ctx,
+            "SELECT id FROM paimon_incremental_query('default.t', 0, 1)",
+        )
+        .await,
+    );
+    assert_eq!(incremental, ordinary);
+}
+
+#[tokio::test]
+async fn test_options_that_choose_another_range_are_refused() {
+    let (_tmp, ctx) = setup_three_snapshots().await;
+    for (key, value) in [
+        ("scan.snapshot-id", "1"),
+        // A tag that does not exist: the option is refused before any lookup.
+        ("scan.tag-name", "not_a_tag"),
+        ("scan.version", "1"),
+        ("scan.timestamp-millis", "0"),
+        ("scan.timestamp", "2024-01-01 00:00:00"),
+        ("scan.watermark", "0"),
+        ("incremental-between", "1,2"),
+        ("incremental-between-timestamp", "0,1"),
+        ("incremental-between-scan-mode", "delta"),
+        ("scan.file-creation-time-millis", "0"),
+        ("scan.creation-time-millis", "0"),
+        ("scan.mode", "latest"),
+    ] {
+        run(&ctx, &format!("SET 'paimon.{key}' = '{value}'")).await;
+        for name in ["t", "t$audit_log"] {
+            let err = expect_error(
+                &ctx,
+                &format!("SELECT * FROM paimon_incremental_query('default.{name}', 1, 3)"),
+            )
+            .await;
+            assert!(
+                err.contains(&format!(
+                    "scan option '{key}' is set; RESET 'paimon.{key}' first"
+                )),
+                "{key} on {name}: {err}"
+            );
+        }
+        run(&ctx, &format!("RESET 'paimon.{key}'")).await;
+    }
+    run(&ctx, "SET 'paimon.scan.mode' = 'default'").await;
+    let batches = run(
+        &ctx,
+        "SELECT * FROM paimon_incremental_query('default.t', 1, 3)",
+    )
+    .await;
+    assert_eq!(sorted_ids(&batches), vec![2, 3]);
+    run(&ctx, "RESET 'paimon.scan.mode'").await;
+
+    // The table's own options choose no range either.
+    run(
+        &ctx,
+        "CREATE TABLE paimon.default.latest (id INT) WITH ('scan.mode' = 'latest')",
+    )
+    .await;
+    run(&ctx, "INSERT INTO paimon.default.latest VALUES (1)").await;
+    let err = expect_error(
+        &ctx,
+        "SELECT * FROM paimon_incremental_query('default.latest', 0, 1)",
+    )
+    .await;
+    assert!(
+        err.contains("table 'default.latest', which sets scan option 'scan.mode'"),
+        "{err}"
+    );
+    // A stored time-travel selector is refused too, with or without other
+    // session options.
+    run(&ctx, "CREATE TABLE paimon.default.tagged (id INT)").await;
+    run(&ctx, "INSERT INTO paimon.default.tagged VALUES (1)").await;
+    run(
+        &ctx,
+        "ALTER TABLE paimon.default.tagged SET TBLPROPERTIES('scan.tag-name' = 'not_a_tag')",
+    )
+    .await;
+    for setting in [None, Some("read.batch-size")] {
+        if let Some(key) = setting {
+            run(&ctx, &format!("SET 'paimon.{key}' = '2'")).await;
+        }
+        let err = expect_error(
+            &ctx,
+            "SELECT * FROM paimon_incremental_query('default.tagged', 0, 1)",
+        )
+        .await;
+        assert!(
+            err.contains("table 'default.tagged', which sets scan option 'scan.tag-name'"),
+            "{setting:?}: {err}"
+        );
+        if let Some(key) = setting {
+            run(&ctx, &format!("RESET 'paimon.{key}'")).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_range_options_are_checked_on_the_branch_read() {
+    use paimon::table::{BranchManager, SnapshotManager, TagManager};
+    // A session `branch` reads that branch, so its options decide: `on_branch`
+    // stores `scan.mode=latest` only on b1, `on_main` only on the main branch.
+    let tmp = TempDir::new().unwrap();
+    let ctx = context(&tmp).await;
+    let warehouse = catalog(&tmp);
+    for (table, created, altered) in [
+        ("on_branch", "latest", "default"),
+        ("on_main", "default", "latest"),
+    ] {
+        run(
+            &ctx,
+            &format!(
+                "CREATE TABLE paimon.default.{table} (id INT) WITH ('scan.mode' = '{created}')"
+            ),
+        )
+        .await;
+        run(
+            &ctx,
+            &format!("INSERT INTO paimon.default.{table} VALUES (1)"),
+        )
+        .await;
+        let loaded = warehouse
+            .get_table(&Identifier::new("default", table))
+            .await
+            .unwrap();
+        let (io, location) = (loaded.file_io().clone(), loaded.location().to_string());
+        let snapshot = SnapshotManager::new(io.clone(), location.clone())
+            .get_latest_snapshot()
+            .await
+            .unwrap()
+            .unwrap();
+        TagManager::new(io.clone(), location.clone())
+            .create("base", &snapshot)
+            .await
+            .unwrap();
+        BranchManager::new(io, location)
+            .create_branch_from_tag("b1", "base")
+            .await
+            .unwrap();
+        run(
+            &ctx,
+            &format!(
+                "ALTER TABLE paimon.default.{table} SET TBLPROPERTIES('scan.mode' = '{altered}')"
+            ),
+        )
+        .await;
+    }
+
+    let query =
+        |table: &str| format!("SELECT id FROM paimon_incremental_query('default.{table}', 0, 1)");
+    assert_eq!(sorted_ids(&run(&ctx, &query("on_branch")).await), vec![1]);
+    let err = expect_error(&ctx, &query("on_main")).await;
+    assert!(
+        err.contains("table 'default.on_main', which sets scan option 'scan.mode'"),
+        "{err}"
+    );
+    run(&ctx, "SET 'paimon.branch' = 'b1'").await;
+    let err = expect_error(&ctx, &query("on_branch")).await;
+    assert!(
+        err.contains(
+            "branch 'b1' of table 'default.on_branch', which sets scan option 'scan.mode'"
+        ),
+        "{err}"
+    );
+    assert_eq!(sorted_ids(&run(&ctx, &query("on_main")).await), vec![1]);
+}
+
+#[tokio::test]
+async fn test_audit_log_refuses_the_session_options_its_ordinary_read_refuses() {
+    let tmp = TempDir::new().unwrap();
+    let ctx = context(&tmp).await;
+    run(
+        &ctx,
+        "CREATE TABLE paimon.default.pk (id INT NOT NULL, PRIMARY KEY (id)) WITH ('bucket' = '1')",
+    )
+    .await;
+    run(&ctx, "INSERT INTO paimon.default.pk VALUES (1)").await;
+    run(
+        &ctx,
+        "SET 'paimon.table-read.sequence-number.enabled' = 'true'",
+    )
+    .await;
+    for sql in [
+        "SELECT * FROM paimon.default.pk$audit_log",
+        "SELECT * FROM paimon_incremental_query('default.pk$audit_log', 0, 1)",
+    ] {
+        let err = expect_error(&ctx, sql).await;
+        assert!(
+            err.contains(
+                "table-read.sequence-number.enabled is not supported by dynamic options for $audit_log"
+            ),
+            "{sql}: {err}"
+        );
+    }
+}

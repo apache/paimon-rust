@@ -2102,3 +2102,162 @@ async fn delta_reads_each_commit_as_its_stream_follow_up() {
         );
     }
 }
+
+/// A range of two column updates of the same rows, without the rows they
+/// update: every reader of the combined plan returns the updated columns and
+/// reads the column no file of the range wrote as NULL, NOT NULL `id`
+/// included.
+#[tokio::test]
+async fn combined_delta_reads_the_columns_a_range_did_not_write_as_null() {
+    use arrow_array::{ArrayRef, Int64Array, StringArray};
+    use paimon::spec::{DataType, IntType, Schema, TableSchema, VarCharType};
+    use paimon::table::{IncrementalPlan, IncrementalSplit};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    let path = "memory:/incremental_batch/column_updates_only";
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::with_nullable(false)))
+        .column("name", DataType::VarChar(VarCharType::string_type()))
+        .column("value", DataType::Int(IntType::new()))
+        .option("row-tracking.enabled", "true")
+        .option("data-evolution.enabled", "true")
+        .build()
+        .unwrap();
+    let (io, table) = memory_table(path, TableSchema::new(0, &schema));
+    setup_dirs(&io, path).await;
+    persist_table_schema(&io, path, table.schema()).await;
+    let rows = RecordBatch::try_from_iter_with_nullable([
+        (
+            "id",
+            Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
+            false,
+        ),
+        (
+            "name",
+            Arc::new(StringArray::from(vec!["alice", "bob"])),
+            true,
+        ),
+        ("value", Arc::new(Int32Array::from(vec![10, 20])), true),
+    ])
+    .unwrap();
+    write_batch(&table, &rows).await;
+    // Snapshot 2 rewrites `name` of row 0 and snapshot 3 `value` of row 1.
+    for (column, row_id, values) in [
+        (
+            "name",
+            0,
+            Arc::new(StringArray::from(vec!["ALICE"])) as ArrayRef,
+        ),
+        ("value", 1, Arc::new(Int32Array::from(vec![99]))),
+    ] {
+        // Distinct commit times, for the timestamp window below.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let builder = table.new_write_builder();
+        let mut update = builder
+            .new_data_evolution_writer(vec![column.into()])
+            .unwrap();
+        update
+            .add_matched_batch(
+                RecordBatch::try_from_iter([
+                    (
+                        "_ROW_ID",
+                        Arc::new(Int64Array::from(vec![row_id])) as ArrayRef,
+                    ),
+                    (column, values),
+                ])
+                .unwrap(),
+            )
+            .unwrap();
+        builder
+            .new_commit()
+            .commit(update.prepare_commit().await.unwrap())
+            .await
+            .unwrap();
+    }
+    type Row = (Option<i32>, Option<String>, Option<i32>);
+    let collect = |batches: &[RecordBatch]| {
+        let mut rows: Vec<Row> = Vec::new();
+        for batch in batches {
+            let column = |name: &str| batch.column_by_name(name).unwrap().clone();
+            let (id, name, value) = (column("id"), column("name"), column("value"));
+            let id = id.as_any().downcast_ref::<Int32Array>().unwrap();
+            let name = name.as_any().downcast_ref::<StringArray>().unwrap();
+            let value = value.as_any().downcast_ref::<Int32Array>().unwrap();
+            for row in 0..batch.num_rows() {
+                rows.push((
+                    id.is_valid(row).then(|| id.value(row)),
+                    name.is_valid(row).then(|| name.value(row).to_string()),
+                    value.is_valid(row).then(|| value.value(row)),
+                ));
+            }
+        }
+        rows.sort();
+        rows
+    };
+    let updates: Vec<Row> = vec![
+        (None, Some("ALICE".into()), Some(10)),
+        (None, Some("bob".into()), Some(99)),
+    ];
+
+    let builder = table.new_read_builder();
+    let splits = builder
+        .new_incremental_scan(IncrementalScanMode::Delta, 1, 3)
+        .plan_combined_delta()
+        .await
+        .unwrap()
+        .into_splits();
+    let read = builder.new_read().unwrap();
+    let batches: Vec<RecordBatch> = read.to_arrow(&splits).unwrap().try_collect().await.unwrap();
+    assert_eq!(collect(&batches), updates, "to_arrow");
+    let plan = IncrementalPlan::try_new(
+        IncrementalScanMode::Delta,
+        splits.into_iter().map(IncrementalSplit::Data).collect(),
+    )
+    .unwrap();
+    for (reader, stream) in [
+        ("to_incremental_arrow", read.to_incremental_arrow(&plan)),
+        ("to_audit_log_arrow", read.to_audit_log_arrow(&plan)),
+    ] {
+        let batches: Vec<RecordBatch> = stream.unwrap().try_collect().await.unwrap();
+        assert_eq!(collect(&batches), updates, "{reader}");
+    }
+
+    // An ordinary scan given the same range as a timestamp window plans it
+    // the same way.
+    let snapshots = table.snapshot_manager();
+    let start = snapshots.get_snapshot(1).await.unwrap().time_millis();
+    let end = snapshots.get_snapshot(3).await.unwrap().time_millis();
+    let windowed = table.copy_with_options(HashMap::from([(
+        "incremental-between-timestamp".to_string(),
+        format!("{start},{end}"),
+    )]));
+    let builder = windowed.new_read_builder();
+    let plan = builder.new_scan().plan().await.unwrap();
+    let batches: Vec<RecordBatch> = builder
+        .new_read()
+        .unwrap()
+        .to_arrow(plan.splits())
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(collect(&batches), updates, "incremental-between-timestamp");
+
+    // The table itself still reads whole rows.
+    let builder = table.new_read_builder();
+    let plan = builder.new_scan().plan().await.unwrap();
+    let batches: Vec<RecordBatch> = builder
+        .new_read()
+        .unwrap()
+        .to_arrow(plan.splits())
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    let current: Vec<Row> = vec![
+        (Some(1), Some("ALICE".into()), Some(10)),
+        (Some(2), Some("bob".into()), Some(99)),
+    ];
+    assert_eq!(collect(&batches), current, "snapshot read");
+}

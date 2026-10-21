@@ -1142,6 +1142,7 @@ impl DataEvolutionReader {
                     partition_fields: &partition_fields,
                     row_id_pushdown: row_ranges.is_some(),
                     nested_enabled,
+                    change_events: split.is_streaming(),
                 },
             )?;
 
@@ -2518,6 +2519,11 @@ struct SourcePlanReadContext<'a> {
     partition_fields: &'a [DataField],
     row_id_pushdown: bool,
     nested_enabled: bool,
+    /// The split holds change events rather than a materialized snapshot
+    /// ([`DataSplit::is_streaming`]). A field no file of the group wrote was
+    /// not written in the planned range, so it reads as NULL, NOT NULL fields
+    /// included.
+    change_events: bool,
 }
 
 #[cfg(test)]
@@ -2537,6 +2543,7 @@ fn build_source_plan(
             partition_fields: &[],
             row_id_pushdown: false,
             nested_enabled: false,
+            change_events: false,
         },
     )
 }
@@ -2553,6 +2560,7 @@ fn build_source_plan_with_row_id_pushdown(
         partition_fields,
         row_id_pushdown,
         nested_enabled,
+        change_events,
     } = context;
     let mut sources = Vec::new();
     let mut normal_providers: HashMap<i32, usize> = HashMap::new(); // field_id -> source_idx
@@ -2697,9 +2705,11 @@ fn build_source_plan_with_row_id_pushdown(
                     },
                 )
                 .collect::<Vec<_>>();
-            if let Some(selection) =
-                super::data_evolution_nested::select_nested_row(field, &physical_sources)?
-            {
+            if let Some(selection) = super::data_evolution_nested::select_nested_row(
+                field,
+                &physical_sources,
+                change_events,
+            )? {
                 if selection.whole_source.is_none() {
                     let current_field = table_fields
                         .iter()
@@ -2771,6 +2781,7 @@ fn build_source_plan_with_row_id_pushdown(
             column_plan.push(Some((source_idx, field_offset)));
             nested_plan.push(None);
         } else if !field.data_type().is_nullable()
+            && !change_events
             && !partition_fields
                 .iter()
                 .any(|partition| partition.id() == field.id())
@@ -4602,12 +4613,59 @@ mod tests {
                 partition_fields: &[],
                 row_id_pushdown: true,
                 nested_enabled: false,
+                change_events: false,
             },
         )
         .unwrap_err();
 
         assert!(matches!(err, Error::DataInvalid { message, .. }
                 if message.contains("non-nullable field 'payload'")));
+    }
+
+    #[test]
+    fn change_events_read_a_field_no_file_wrote_as_null() {
+        // Two column updates of one file, neither of which wrote `id`.
+        let files = vec![
+            data_file("a-update.parquet", 0, 4, 2, Some(vec!["a"])),
+            data_file("b-update.parquet", 0, 4, 3, Some(vec!["b"])),
+        ];
+        let prepared_group = PreparedMergeGroup::new(&files).unwrap();
+        // Newest first: the `b` update, then the `a` update.
+        let file_infos = vec![resolved_info(vec![3]), resolved_info(vec![2])];
+        let read_type = vec![
+            DataField::new(
+                1,
+                "id".to_string(),
+                DataType::Int(IntType::with_nullable(false)),
+            ),
+            DataField::new(2, "a".to_string(), DataType::Int(IntType::new())),
+            DataField::new(3, "b".to_string(), DataType::Int(IntType::new())),
+        ];
+        let plan = |change_events| {
+            build_source_plan_with_row_id_pushdown(
+                &prepared_group,
+                &file_infos,
+                &read_type,
+                &HashSet::new(),
+                SourcePlanReadContext {
+                    table_fields: &read_type,
+                    partition_fields: &[],
+                    row_id_pushdown: false,
+                    nested_enabled: false,
+                    change_events,
+                },
+            )
+        };
+
+        assert!(
+            matches!(plan(false), Err(Error::DataInvalid { message, .. })
+                if message.contains("non-nullable field 'id'"))
+        );
+        let source_plan = plan(true).unwrap();
+        assert_eq!(
+            source_plan.column_plan,
+            vec![None, Some((1, 0)), Some((0, 0))]
+        );
     }
 
     #[test]
@@ -4694,6 +4752,7 @@ mod tests {
                 partition_fields: &[],
                 row_id_pushdown: false,
                 nested_enabled: false,
+                change_events: false,
             },
         )
         .unwrap();
