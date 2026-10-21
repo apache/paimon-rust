@@ -46,9 +46,11 @@ use serde_json::json;
 use std::collections::{HashMap, HashSet};
 
 const FULL_TEXT_INDEX_TYPE: &str = "full-text";
+mod execution;
 mod filter;
 mod read;
 mod scan;
+pub(super) use execution::execute_search_task;
 pub use read::FullTextRead;
 pub use scan::{FullTextScan, FullTextScanPlan};
 
@@ -221,10 +223,20 @@ struct FullTextSearchEvaluation<'a> {
     row_filter: Option<&'a Predicate>,
 }
 
+#[cfg(test)]
 async fn evaluate_full_text_search(
     evaluation: FullTextSearchEvaluation<'_>,
     index_entries: &[IndexManifestEntry],
     search: &FullTextSearch,
+) -> crate::Result<SearchResult> {
+    evaluate_full_text_search_with_executor(evaluation, index_entries, search, None).await
+}
+
+async fn evaluate_full_text_search_with_executor(
+    evaluation: FullTextSearchEvaluation<'_>,
+    index_entries: &[IndexManifestEntry],
+    search: &FullTextSearch,
+    executor: Option<&dyn crate::table::SearchTaskExecutor>,
 ) -> crate::Result<SearchResult> {
     let table_path = evaluation.table_path.trim_end_matches('/');
     let core_options = CoreOptions::new(evaluation.table_options);
@@ -282,38 +294,53 @@ async fn evaluate_full_text_search(
             fulltext_entries,
             indexed_search.include_row_ids.as_ref(),
         )?;
-        let results = plans
-            .into_iter()
-            .map(|plan| {
-                let entry = plan.entry;
-                let global_meta = entry.index_file.global_index_meta.as_ref().unwrap();
-                let path = IndexFileLocation::Global { table_path }.resolve(
-                    &entry.index_file.file_name,
-                    entry.index_file.external_path.as_deref(),
-                );
-                let file_name = entry.index_file.file_name.clone();
-                let query_text = search.query_text.clone();
-                let local_filter = plan.local_filter;
-                let row_range_start = global_meta.row_range_start;
-                let row_range_end = global_meta.row_range_end;
-                // Compound query leaves must see every candidate in the shard
-                // before Boolean/boost composition and the final global Top-K.
-                let limit = candidate_limit(row_range_start, row_range_end)?;
-                Ok::<_, crate::Error>(async move {
-                    let input = evaluation.file_io.new_input(&path)?;
-                    let reader = Box::new(input.reader().await?);
-                    let result =
-                        search_full_text_index(reader, file_name, query_text, limit, local_filter)
-                            .await?;
-                    Ok::<_, crate::Error>(search_result_from_core(result)?.offset(row_range_start))
+        let results = if let Some(executor) = executor {
+            let table = evaluation.table.ok_or_else(|| crate::Error::DataInvalid {
+                message: "Scheduled full-text search requires table context".into(),
+                source: None,
+            })?;
+            execution::search_indexes(table, plans, &search.query_text, executor).await?
+        } else {
+            let results = plans
+                .into_iter()
+                .map(|plan| {
+                    let entry = plan.entry;
+                    let global_meta = entry.index_file.global_index_meta.as_ref().unwrap();
+                    let path = IndexFileLocation::Global { table_path }.resolve(
+                        &entry.index_file.file_name,
+                        entry.index_file.external_path.as_deref(),
+                    );
+                    let file_name = entry.index_file.file_name.clone();
+                    let query_text = search.query_text.clone();
+                    let local_filter = plan.local_filter;
+                    let row_range_start = global_meta.row_range_start;
+                    let row_range_end = global_meta.row_range_end;
+                    // Compound query leaves must see every candidate in the shard
+                    // before Boolean/boost composition and the final global Top-K.
+                    let limit = candidate_limit(row_range_start, row_range_end)?;
+                    Ok::<_, crate::Error>(async move {
+                        let input = evaluation.file_io.new_input(&path)?;
+                        let reader = Box::new(input.reader().await?);
+                        let result = search_full_text_index(
+                            reader,
+                            file_name,
+                            query_text,
+                            limit,
+                            local_filter,
+                        )
+                        .await?;
+                        Ok::<_, crate::Error>(
+                            search_result_from_core(result)?.offset(row_range_start),
+                        )
+                    })
                 })
-            })
-            .collect::<crate::Result<Vec<_>>>()?
-            .into_iter();
-        let results = futures::stream::iter(results)
-            .buffered(core_options.global_index_thread_num()?)
-            .try_collect::<Vec<_>>()
-            .await?;
+                .collect::<crate::Result<Vec<_>>>()?
+                .into_iter();
+            futures::stream::iter(results)
+                .buffered(core_options.global_index_thread_num()?)
+                .try_collect::<Vec<_>>()
+                .await?
+        };
         for r in &results {
             merged = merged.or(r);
         }
@@ -352,14 +379,26 @@ async fn evaluate_full_text_search(
                     matched,
                 ));
             }
-            let raw_result = read_raw_full_text_search_filtered(
-                table,
-                &raw_search,
-                &raw_ranges,
-                evaluation.table_options,
-                evaluation.partition_filter,
-            )
-            .await?;
+            let raw_result = if let Some(executor) = executor {
+                execution::search_raw_rows(
+                    table,
+                    &raw_search,
+                    &raw_ranges,
+                    evaluation.table_options,
+                    evaluation.partition_filter,
+                    executor,
+                )
+                .await?
+            } else {
+                read_raw_full_text_search_filtered(
+                    table,
+                    &raw_search,
+                    &raw_ranges,
+                    evaluation.table_options,
+                    evaluation.partition_filter,
+                )
+                .await?
+            };
             merged = merged.without_row_ranges(&raw_ranges)?;
             merged = merged.or(&raw_result);
         }
@@ -494,6 +533,45 @@ async fn read_raw_full_text_search_filtered(
     if raw_ranges.is_empty() {
         return Ok(SearchResult::empty());
     }
+    let splits = plan_raw_full_text_splits(table, search, raw_ranges, partition_filter).await?;
+    read_raw_full_text_splits(
+        table,
+        search,
+        raw_ranges,
+        table_options,
+        &splits,
+        partition_filter,
+    )
+    .await
+}
+
+async fn plan_raw_full_text_splits(
+    table: &Table,
+    search: &FullTextSearch,
+    raw_ranges: &[RowRange],
+    partition_filter: Option<&Predicate>,
+) -> crate::Result<Vec<crate::table::DataSplit>> {
+    let mut read_builder = table.new_read_builder();
+    read_builder
+        .with_projection(&[search.field_name.as_str(), ROW_ID_FIELD_NAME])?
+        .with_row_ranges(merge_row_ranges(raw_ranges.to_vec()));
+    if let Some(filter) = partition_filter {
+        read_builder.with_filter(filter.clone());
+    }
+    Ok(read_builder.new_scan().plan().await?.splits().to_vec())
+}
+
+async fn read_raw_full_text_splits(
+    table: &Table,
+    search: &FullTextSearch,
+    raw_ranges: &[RowRange],
+    table_options: &HashMap<String, String>,
+    splits: &[crate::table::DataSplit],
+    partition_filter: Option<&Predicate>,
+) -> crate::Result<SearchResult> {
+    if raw_ranges.is_empty() || splits.is_empty() {
+        return Ok(SearchResult::empty());
+    }
     let raw_ranges = merge_row_ranges(raw_ranges.to_vec());
     let row_range_start = raw_ranges.first().map(RowRange::from).unwrap_or(0);
     let row_range_end = raw_ranges
@@ -508,12 +586,8 @@ async fn read_raw_full_text_search_filtered(
     if let Some(filter) = partition_filter {
         read_builder.with_filter(filter.clone());
     }
-    let plan = read_builder.new_scan().plan().await?;
-    if plan.splits().is_empty() {
-        return Ok(SearchResult::empty());
-    }
     let read = read_builder.new_read()?;
-    let mut stream = read.to_arrow(plan.splits())?;
+    let mut stream = read.to_arrow(splits)?;
 
     let config = raw_full_text_config(table_options)?;
     let mut writer = tokio::task::spawn_blocking(move || {
@@ -1362,6 +1436,37 @@ mod tests {
 
     // (d) The PK full-text path produces physical positions, not global row-ids:
     // Only the ranges-only `execute` API rejects the physical-position result.
+    #[tokio::test]
+    async fn scheduled_full_text_rejects_primary_key_plans() {
+        struct NoScheduling;
+        #[async_trait::async_trait]
+        impl crate::table::SearchTaskExecutor for NoScheduling {
+            async fn execute(
+                &self,
+                _: Vec<crate::table::SearchTask>,
+            ) -> crate::Result<Vec<crate::table::SearchTaskResult>> {
+                panic!("a primary-key plan must fail before scheduling");
+            }
+        }
+        let table = pk_full_text_table("pk_ft_scheduled_unsupported", &[]);
+        let mut builder = table.new_full_text_search_builder();
+        builder
+            .with_query("body", r#"{"match":{"query":"alpha"}}"#)
+            .with_limit(10);
+        let plan = builder.new_scan().unwrap().scan().await.unwrap();
+        let error = builder
+            .new_read()
+            .unwrap()
+            .read_with_executor(plan, &NoScheduling)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, crate::Error::Unsupported { ref message }
+            if message.contains("data-evolution")),
+            "{error}"
+        );
+    }
+
     #[tokio::test]
     async fn pk_full_text_ranges_reject_physical_positions() {
         let table = pk_full_text_table("pk_ft_execute_loud", &[]);

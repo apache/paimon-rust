@@ -150,6 +150,8 @@ mod row_sidecar;
 mod scan_stats;
 pub(crate) mod schema_manager;
 mod search_scan_split;
+mod search_task;
+pub use search_task::{SearchTask, SearchTaskExecutor, SearchTaskResult};
 mod shard_table_updater;
 pub(crate) mod snapshot_commit;
 mod snapshot_manager;

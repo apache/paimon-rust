@@ -129,6 +129,30 @@ impl PyFullTextSearchBuilder {
             .map(PyGlobalIndexResult::new)
             .map_err(to_py_err)
     }
+
+    #[pyo3(signature = (executor=None))]
+    fn execute(
+        &self,
+        py: Python<'_>,
+        executor: Option<Py<PyAny>>,
+    ) -> PyResult<PyGlobalIndexResult> {
+        let Some(callback) = executor else {
+            return self.execute_local(py);
+        };
+        let builder = self.config.builder(&self.table).map_err(to_py_err)?;
+        let executor = crate::search_task::PythonSearchTaskExecutor::new(callback);
+        let result = py.detach(|| {
+            runtime().block_on(async {
+                let read = builder.new_read()?;
+                let plan = builder.new_scan()?.scan().await?;
+                read.read_with_executor(plan, &executor).await
+            })
+        });
+        if let Some(error) = executor.take_error() {
+            return Err(error);
+        }
+        result.map(PyGlobalIndexResult::new).map_err(to_py_err)
+    }
 }
 
 #[pyclass(name = "FullTextScan", module = "pypaimon_rust.datafusion")]
@@ -172,11 +196,23 @@ pub struct PyFullTextRead {
 }
 #[pymethods]
 impl PyFullTextRead {
+    #[pyo3(signature = (plan, executor=None))]
     fn read_plan(
         &self,
         py: Python<'_>,
         plan: &PyFullTextScanPlan,
+        executor: Option<Py<PyAny>>,
     ) -> PyResult<PyGlobalIndexResult> {
+        if let Some(callback) = executor {
+            let executor = crate::search_task::PythonSearchTaskExecutor::new(callback);
+            let result = py.detach(|| {
+                runtime().block_on(self.inner.read_with_executor(plan.inner.clone(), &executor))
+            });
+            if let Some(error) = executor.take_error() {
+                return Err(error);
+            }
+            return result.map(PyGlobalIndexResult::new).map_err(to_py_err);
+        }
         py.detach(|| runtime().block_on(self.inner.read(plan.inner.clone())))
             .map(PyGlobalIndexResult::new)
             .map_err(to_py_err)

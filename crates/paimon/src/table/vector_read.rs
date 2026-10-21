@@ -23,7 +23,7 @@ use crate::table::pk_vector_read::PkVectorRead;
 use crate::table::pk_vector_search_params::PkVectorSearchParams;
 use crate::table::vector_scan::{PlanContext, VectorScanPlan, VectorScanWork};
 use crate::table::vector_search_common::{take_only_result, targets_primary_key_column};
-use crate::table::Table;
+use crate::table::{SearchTaskExecutor, Table};
 use crate::vector_search::GlobalIndexResult;
 use std::collections::HashMap;
 use std::future::Future;
@@ -49,6 +49,16 @@ pub struct VectorRead {
 impl VectorRead {
     pub async fn read(&self, plan: VectorScanPlan) -> crate::Result<GlobalIndexResult> {
         take_only_result(self.batch.read(plan).await?, "vector search")
+    }
+    pub async fn read_with_executor(
+        &self,
+        plan: VectorScanPlan,
+        executor: &dyn SearchTaskExecutor,
+    ) -> crate::Result<GlobalIndexResult> {
+        take_only_result(
+            self.batch.read_with_executor(plan, executor).await?,
+            "vector search",
+        )
     }
 }
 
@@ -89,6 +99,20 @@ impl BatchVectorRead {
     }
 
     pub async fn read(&self, plan: VectorScanPlan) -> crate::Result<Vec<GlobalIndexResult>> {
+        self.read_impl(plan, None).await
+    }
+    pub async fn read_with_executor(
+        &self,
+        plan: VectorScanPlan,
+        executor: &dyn SearchTaskExecutor,
+    ) -> crate::Result<Vec<GlobalIndexResult>> {
+        self.read_impl(plan, Some(executor)).await
+    }
+    async fn read_impl(
+        &self,
+        plan: VectorScanPlan,
+        executor: Option<&dyn SearchTaskExecutor>,
+    ) -> crate::Result<Vec<GlobalIndexResult>> {
         if self.context != plan.context {
             return Err(crate::Error::DataInvalid {
                 message: "vector plan and reader must use the same table, column and pre-filter"
@@ -98,9 +122,14 @@ impl BatchVectorRead {
         }
         match (&self.reader, plan.work) {
             (VectorReadKind::DataEvolution(reader), VectorScanWork::DataEvolution(plan)) => {
-                reader.read(*plan).await
+                reader.read_with_executor(*plan, executor).await
             }
             (VectorReadKind::PrimaryKey(reader), VectorScanWork::PrimaryKey(plan)) => {
+                if executor.is_some() {
+                    return Err(crate::Error::Unsupported {
+                        message: "Distributed primary-key vector search is not supported".into(),
+                    });
+                }
                 reader.read(*plan).await
             }
             _ => Err(crate::Error::DataInvalid {

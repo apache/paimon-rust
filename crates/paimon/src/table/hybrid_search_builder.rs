@@ -316,8 +316,29 @@ impl<'a> HybridSearchBuilder<'a> {
     }
 
     pub async fn execute_scored(&self) -> crate::Result<super::GlobalIndexResult> {
+        self.execute_scored_internal(None).await
+    }
+
+    /// Schedule each route's shard work while preserving one shared snapshot
+    /// and the configured core fusion ranker.
+    pub async fn execute_with_executor(
+        &self,
+        executor: &dyn super::SearchTaskExecutor,
+    ) -> crate::Result<super::GlobalIndexResult> {
+        self.execute_scored_internal(Some(executor)).await
+    }
+
+    async fn execute_scored_internal(
+        &self,
+        executor: Option<&dyn super::SearchTaskExecutor>,
+    ) -> crate::Result<super::GlobalIndexResult> {
         let core = CoreOptions::new(self.table.schema().options());
         core.ensure_read_authorized()?;
+        if executor.is_some() && !core.data_evolution_enabled() {
+            return Err(crate::Error::Unsupported {
+                message: "Scheduled hybrid search requires a data-evolution table".into(),
+            });
+        }
         let limit = self.validate_search()?;
 
         // A primary-key hybrid fuses PHYSICAL positions, not global row ids, so a
@@ -342,7 +363,7 @@ impl<'a> HybridSearchBuilder<'a> {
         // selectors independently in the routes can observe different versions.
         let (table, hits) = match self.resolve_pinned_route_table().await? {
             Some(table) => {
-                let hits = self.execute_global_routes(&table, limit).await?;
+                let hits = self.execute_global_routes(&table, limit, executor).await?;
                 (table, hits)
             }
             None => (
@@ -427,19 +448,29 @@ impl<'a> HybridSearchBuilder<'a> {
         &self,
         table: &Table,
         limit: usize,
+        executor: Option<&dyn super::SearchTaskExecutor>,
     ) -> crate::Result<ScoredRowIds> {
         // Bound concurrent route work while retaining input order for float
         // accumulation and keeping each route's weight and limit attached to it.
         let route_results = stream::iter(self.routes.clone())
             .map(|route| async move {
                 let result = match route.kind {
-                    HybridSearchRouteKind::Vector => self
-                        .vector_route_builder(table, &route)
-                        .execute()
-                        .await?
-                        .into_row_ids()?,
+                    HybridSearchRouteKind::Vector => {
+                        let builder = self.vector_route_builder(table, &route);
+                        let result = if let Some(executor) = executor {
+                            let plan = builder.new_scan()?.plan().await?;
+                            builder
+                                .new_read()?
+                                .read_with_executor(plan, executor)
+                                .await?
+                        } else {
+                            builder.execute().await?
+                        };
+                        result.into_row_ids()?
+                    }
                     HybridSearchRouteKind::FullText => {
-                        execute_full_text_route(table, &route, self.filter.as_ref()).await?
+                        execute_full_text_route(table, &route, self.filter.as_ref(), executor)
+                            .await?
                     }
                 };
                 Ok::<_, crate::Error>(WeightedRouteResult {
@@ -1049,9 +1080,16 @@ async fn execute_full_text_route(
     table: &Table,
     route: &HybridSearchRoute,
     filter: Option<&Predicate>,
+    executor: Option<&dyn super::SearchTaskExecutor>,
 ) -> crate::Result<ScoredRowIds> {
     let builder = full_text_route_builder(table, route, filter);
-    let result = builder.execute_scored().await?;
+    let result = if let Some(executor) = executor {
+        let read = builder.new_read()?;
+        let plan = builder.new_scan()?.scan().await?;
+        read.read_with_executor(plan, executor).await?
+    } else {
+        builder.execute_scored().await?
+    };
     result.into_row_ids()
 }
 
@@ -1060,6 +1098,7 @@ async fn execute_full_text_route(
     _table: &Table,
     _route: &HybridSearchRoute,
     _filter: Option<&Predicate>,
+    _executor: Option<&dyn super::SearchTaskExecutor>,
 ) -> crate::Result<ScoredRowIds> {
     Err(crate::Error::ConfigInvalid {
         message: "Full-text hybrid routes require the fulltext feature".to_string(),

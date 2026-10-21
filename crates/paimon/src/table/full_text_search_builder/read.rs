@@ -85,12 +85,35 @@ impl FullTextRead {
         &self,
         plan: FullTextScanPlan,
     ) -> crate::Result<crate::table::GlobalIndexResult> {
+        self.read_internal(plan, None).await
+    }
+
+    /// Execute shard work through a scheduler while retaining the plan's
+    /// snapshot, filtering, and final global ranking in core.
+    pub async fn read_with_executor(
+        &self,
+        plan: FullTextScanPlan,
+        executor: &dyn crate::table::SearchTaskExecutor,
+    ) -> crate::Result<crate::table::GlobalIndexResult> {
+        self.read_internal(plan, Some(executor)).await
+    }
+
+    async fn read_internal(
+        &self,
+        plan: FullTextScanPlan,
+        executor: Option<&dyn crate::table::SearchTaskExecutor>,
+    ) -> crate::Result<crate::table::GlobalIndexResult> {
         CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
         CoreOptions::new(plan.table.schema().options()).ensure_read_authorized()?;
         if self.context != plan.context {
             return Err(crate::Error::DataInvalid {
                 message: "Full-text plan belongs to a different table, column or filter".into(),
                 source: None,
+            });
+        }
+        if executor.is_some() && !self.table.schema().core_options().data_evolution_enabled() {
+            return Err(crate::Error::Unsupported {
+                message: "Scheduled full-text search requires a data-evolution table".into(),
             });
         }
         let table = std::sync::Arc::new(plan.table.clone());
@@ -131,7 +154,7 @@ impl FullTextRead {
         }
         let mut search = self.search.clone();
         search.include_row_ids = self.context.include_row_ids.clone();
-        let hits = evaluate_full_text_search(
+        let hits = evaluate_full_text_search_with_executor(
             FullTextSearchEvaluation {
                 table: Some(&plan.table),
                 file_io: plan.table.file_io(),
@@ -144,6 +167,7 @@ impl FullTextRead {
             },
             &plan.entries,
             &search,
+            executor,
         )
         .await?;
         Ok(crate::table::GlobalIndexResult::from_global_search(

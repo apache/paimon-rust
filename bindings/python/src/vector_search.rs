@@ -367,10 +367,27 @@ pub struct PyVectorRead {
 
 #[pymethods]
 impl PyVectorRead {
-    fn read_plan(&self, py: Python<'_>, plan: &PyVectorScanPlan) -> PyResult<PyGlobalIndexResult> {
-        py.detach(|| runtime().block_on(self.inner.read(plan.inner.clone())))
-            .map(PyGlobalIndexResult::new)
-            .map_err(to_py_err)
+    #[pyo3(signature = (plan, executor=None))]
+    fn read_plan(
+        &self,
+        py: Python<'_>,
+        plan: &PyVectorScanPlan,
+        executor: Option<Py<PyAny>>,
+    ) -> PyResult<PyGlobalIndexResult> {
+        let Some(callback) = executor else {
+            return py
+                .detach(|| runtime().block_on(self.inner.read(plan.inner.clone())))
+                .map(PyGlobalIndexResult::new)
+                .map_err(to_py_err);
+        };
+        let executor = crate::search_task::PythonSearchTaskExecutor::new(callback);
+        let result = py.detach(|| {
+            runtime().block_on(self.inner.read_with_executor(plan.inner.clone(), &executor))
+        });
+        if let Some(error) = executor.take_error() {
+            return Err(error);
+        }
+        result.map(PyGlobalIndexResult::new).map_err(to_py_err)
     }
 }
 
@@ -381,12 +398,26 @@ pub struct PyBatchVectorRead {
 
 #[pymethods]
 impl PyBatchVectorRead {
+    #[pyo3(signature = (plan, executor=None))]
     fn read_batch_plan(
         &self,
         py: Python<'_>,
         plan: &PyVectorScanPlan,
+        executor: Option<Py<PyAny>>,
     ) -> PyResult<Vec<PyGlobalIndexResult>> {
-        py.detach(|| runtime().block_on(self.inner.read(plan.inner.clone())))
+        let result = if let Some(callback) = executor {
+            let executor = crate::search_task::PythonSearchTaskExecutor::new(callback);
+            let result = py.detach(|| {
+                runtime().block_on(self.inner.read_with_executor(plan.inner.clone(), &executor))
+            });
+            if let Some(error) = executor.take_error() {
+                return Err(error);
+            }
+            result
+        } else {
+            py.detach(|| runtime().block_on(self.inner.read(plan.inner.clone())))
+        };
+        result
             .map(|results| results.into_iter().map(PyGlobalIndexResult::new).collect())
             .map_err(to_py_err)
     }

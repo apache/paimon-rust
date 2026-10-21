@@ -417,3 +417,80 @@ async fn empty_tables_still_validate_route_and_partition_configuration() {
         .with_limit(4);
     assert!(missing.execute_scored().await.is_err());
 }
+
+struct WireExecutor {
+    table: Table,
+    kinds: std::sync::Mutex<Vec<String>>,
+}
+
+#[async_trait::async_trait]
+impl crate::table::SearchTaskExecutor for WireExecutor {
+    async fn execute(
+        &self,
+        tasks: Vec<crate::table::SearchTask>,
+    ) -> crate::Result<Vec<crate::table::SearchTaskResult>> {
+        let mut results = Vec::new();
+        let (context, frames) = crate::table::SearchTask::serialize_batch(&tasks)?;
+        for (task, frame) in tasks.into_iter().zip(frames) {
+            let bytes = task.serialize()?;
+            let metadata: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            self.kinds
+                .lock()
+                .unwrap()
+                .push(metadata["kind"].as_str().unwrap().to_string());
+            results.push(crate::table::SearchTaskResult::deserialize(
+                &self.table.execute_search_task(&frame, &context).await?,
+            )?);
+        }
+        results.reverse();
+        Ok(results)
+    }
+}
+
+#[tokio::test]
+async fn scheduled_hybrid_shares_snapshot_and_preserves_all_core_rankers() {
+    let table = table();
+    append(&table, 0).await;
+    append(&table, 4).await;
+    index(&table, "ivf-flat", "embedding").await;
+    index(&table, "full-text", "text").await;
+    let snapshot = table
+        .snapshot_manager()
+        .get_latest_snapshot()
+        .await
+        .unwrap()
+        .unwrap();
+    let pb = PredicateBuilder::new(table.schema().fields());
+    let keep = pb.equal("label", Datum::String("keep".into())).unwrap();
+    // The table used by workers has a later commit than the builder's shared
+    // view. Every route must keep the captured view through task transport.
+    append(&table, 8).await;
+    for ranker in [
+        HybridSearchRanker::Rrf,
+        HybridSearchRanker::WeightedScore,
+        HybridSearchRanker::Mrr,
+    ] {
+        let mut builder = mixed_query(&table, 3);
+        builder
+            .with_snapshot(Some(&snapshot))
+            .with_filter(keep.clone())
+            .with_ranker(ranker.as_str())
+            .unwrap();
+        let expected = builder.execute_scored().await.unwrap();
+        let executor = WireExecutor {
+            table: table.clone(),
+            kinds: Default::default(),
+        };
+        let actual = builder.execute_with_executor(&executor).await.unwrap();
+        assert_eq!(actual.snapshot_id(), Some(snapshot.id()));
+        let actual = actual.into_row_ids().unwrap();
+        let expected = expected.into_row_ids().unwrap();
+        assert_eq!(actual.row_ids, expected.row_ids, "ranker {ranker:?}");
+        assert_eq!(actual.scores, expected.scores, "ranker {ranker:?}");
+        assert!(!actual.row_ids.is_empty());
+        assert!(actual.row_ids.iter().all(|id| [1, 2, 5, 6].contains(id)));
+        let kinds = executor.kinds.lock().unwrap();
+        assert!(kinds.iter().any(|kind| kind.starts_with("vector-")));
+        assert!(kinds.iter().any(|kind| kind == "fulltext-index"));
+    }
+}

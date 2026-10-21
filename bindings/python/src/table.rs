@@ -49,6 +49,18 @@ impl PyTable {
 
 #[pymethods]
 impl PyTable {
+    fn _execute_search_task<'py>(
+        &self,
+        py: Python<'py>,
+        task: &[u8],
+        context: &[u8],
+    ) -> PyResult<Bound<'py, pyo3::types::PyBytes>> {
+        let result = py
+            .detach(|| runtime().block_on(self.inner.execute_search_task(task, context)))
+            .map_err(to_py_err)?;
+        Ok(pyo3::types::PyBytes::new(py, &result))
+    }
+
     /// Construct a filesystem table from a Java-format TableSchema JSON document.
     ///
     /// Preserves the caller's resolved schema and complete table options without

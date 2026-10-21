@@ -655,3 +655,259 @@ async fn scalar_search_pre_filters_exclude_composite_indexes() {
         );
     }
 }
+
+struct WireExecutor {
+    table: Table,
+    work: std::sync::Mutex<Vec<serde_json::Value>>,
+    batch_sizes: std::sync::Mutex<Vec<usize>>,
+    corrupt_scores: bool,
+}
+
+#[async_trait::async_trait]
+impl crate::table::SearchTaskExecutor for WireExecutor {
+    async fn execute(
+        &self,
+        tasks: Vec<crate::table::SearchTask>,
+    ) -> crate::Result<Vec<crate::table::SearchTaskResult>> {
+        self.batch_sizes.lock().unwrap().push(tasks.len());
+        let mut results = Vec::new();
+        let (context, frames) = crate::table::SearchTask::serialize_batch(&tasks)?;
+        for (task, frame) in tasks.into_iter().zip(frames) {
+            let bytes = task.serialize()?;
+            self.work
+                .lock()
+                .unwrap()
+                .push(serde_json::from_slice(&bytes).unwrap());
+            let mut output: serde_json::Value =
+                serde_json::from_slice(&self.table.execute_search_task(&frame, &context).await?)
+                    .unwrap();
+            if self.corrupt_scores {
+                output["payload"]["scores"] = json!([]);
+            }
+            results.push(crate::table::SearchTaskResult::deserialize(
+                &serde_json::to_vec(&output).unwrap(),
+            )?);
+        }
+        // Completion order belongs to the scheduler. Core re-associates the
+        // results before deterministic merge and floating-point accumulation.
+        results.reverse();
+        Ok(results)
+    }
+}
+
+#[tokio::test]
+async fn scheduled_full_text_preserves_filters_global_top_k_raw_corpus_and_snapshot() {
+    let table = new_table(false).copy_with_options(HashMap::from([(
+        "source.split.target-size".into(),
+        "1b".into(),
+    )]));
+    append(&table, 0, 8).await;
+    index(&table, "full-text", "text").await;
+    append(&table, 8, 4).await;
+    append(&table, 12, 4).await;
+    let pb = PredicateBuilder::new(table.schema().fields());
+    let mut builder = query(&table);
+    builder
+        .with_filter(pb.equal("label", Datum::String("keep".into())).unwrap())
+        .with_include_row_ids([1, 5, 9, 13].into_iter().collect())
+        .with_limit(3);
+    let plan = builder.new_scan().unwrap().scan().await.unwrap();
+    let snapshot = plan.snapshot_id().unwrap();
+    let read = builder.new_read().unwrap();
+    // A worker starts from a current table. Its task must restore the captured
+    // snapshot and use the exact data splits selected for the raw corpus.
+    append(&table, 16, 4).await;
+    let expected = read.read(plan.clone()).await.unwrap();
+    let executor = WireExecutor {
+        table: table.clone(),
+        work: Default::default(),
+        batch_sizes: Default::default(),
+        corrupt_scores: false,
+    };
+    let actual = read.read_with_executor(plan, &executor).await.unwrap();
+    assert_eq!(actual.snapshot_id(), Some(snapshot));
+    let actual = actual.into_row_ids().unwrap();
+    let expected = expected.into_row_ids().unwrap();
+    assert_eq!(actual.row_ids, expected.row_ids);
+    assert_eq!(actual.scores, expected.scores);
+    assert_eq!(actual.row_ids, vec![1, 5, 9]);
+    let work = executor.work.lock().unwrap();
+    assert_eq!(
+        work.iter()
+            .filter(|task| task["kind"] == "fulltext-index")
+            .count(),
+        2
+    );
+    let raw = work
+        .iter()
+        .filter(|task| task["kind"] == "fulltext-rows")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        raw.len(),
+        1,
+        "raw BM25 relevance requires one shared corpus"
+    );
+    assert!(raw[0]["payload"]["splits"].as_array().unwrap().len() >= 2);
+    assert!(work.iter().all(|task| task["snapshot"]["id"] == snapshot));
+}
+
+#[tokio::test]
+async fn scheduled_full_text_rejects_malformed_worker_scores() {
+    let table = new_table(false);
+    append(&table, 0, 4).await;
+    index(&table, "full-text", "text").await;
+    let builder = query(&table);
+    let plan = builder.new_scan().unwrap().scan().await.unwrap();
+    let executor = WireExecutor {
+        table: table.clone(),
+        work: Default::default(),
+        batch_sizes: Default::default(),
+        corrupt_scores: true,
+    };
+    let error = builder
+        .new_read()
+        .unwrap()
+        .read_with_executor(plan, &executor)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, crate::Error::DataInvalid { ref message, .. }
+        if message.contains("invalid row IDs or scores")),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn scheduled_full_text_rejects_foreign_plan_before_scheduling() {
+    let table = new_table(false);
+    let other = new_table(false);
+    let builder = query(&table);
+    let plan = query(&other).new_scan().unwrap().scan().await.unwrap();
+    let executor = WireExecutor {
+        table: table.clone(),
+        work: Default::default(),
+        batch_sizes: Default::default(),
+        corrupt_scores: false,
+    };
+    let error = builder
+        .new_read()
+        .unwrap()
+        .read_with_executor(plan, &executor)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, crate::Error::DataInvalid { ref message, .. }
+        if message.contains("different table")),
+        "{error}"
+    );
+    assert!(executor.work.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn scheduled_full_text_keeps_raw_partition_pruning() {
+    let table = new_table(true);
+    append(&table, 0, 4).await;
+    index(&table, "full-text", "text").await;
+    append(&table, 4, 4).await; // An uncovered partition outside the query.
+    append_labels(&table, 8, &[Some("keep"); 4]).await; // More rows in pt=0.
+    let pb = PredicateBuilder::new(table.schema().fields());
+    let mut builder = query(&table);
+    builder
+        .with_partition_filter(pb.equal("pt", Datum::Int(0)).unwrap())
+        .unwrap();
+    let plan = builder.new_scan().unwrap().scan().await.unwrap();
+    let read = builder.new_read().unwrap();
+    let expected = read
+        .read(plan.clone())
+        .await
+        .unwrap()
+        .into_row_ids()
+        .unwrap();
+    let executor = WireExecutor {
+        table: table.clone(),
+        work: Default::default(),
+        batch_sizes: Default::default(),
+        corrupt_scores: false,
+    };
+    let actual = read
+        .read_with_executor(plan, &executor)
+        .await
+        .unwrap()
+        .into_row_ids()
+        .unwrap();
+    assert_eq!(actual.row_ids, expected.row_ids);
+    assert_eq!(actual.scores, expected.scores);
+    let mut ids = actual.row_ids;
+    ids.sort_unstable();
+    assert_eq!(ids, vec![0, 1, 2, 8, 9, 10, 11]);
+}
+
+#[tokio::test]
+async fn scheduled_full_text_bounds_index_task_windows_and_keeps_all_candidates() {
+    use crate::table::search_task::SEARCH_TASK_WINDOW;
+
+    let table = new_table(false).copy_with_options(HashMap::from([
+        ("global-index.row-count-per-shard".into(), "1".into()),
+        ("full-text-index.search-mode".into(), "fast".into()),
+    ]));
+    // Include the null-only shard: planning still schedules its empty index.
+    // Two full windows and one last shard must retain every known matching row.
+    let row_count = SEARCH_TASK_WINDOW * 2 + 1;
+    append(&table, 0, row_count as i32).await;
+    index(&table, "full-text", "text").await;
+    let mut builder = query(&table);
+    builder.with_limit(row_count);
+    let plan = builder.new_scan().unwrap().scan().await.unwrap();
+    let files = plan
+        .entries
+        .iter()
+        .filter(|entry| {
+            entry.kind == FileKind::Add && entry.index_file.index_type == FULL_TEXT_INDEX_TYPE
+        })
+        .map(|entry| entry.index_file.file_name.clone())
+        .collect::<Vec<_>>();
+    let read = builder.new_read().unwrap();
+    let expected = read
+        .read(plan.clone())
+        .await
+        .unwrap()
+        .into_row_ids()
+        .unwrap();
+    let executor = WireExecutor {
+        table: table.clone(),
+        work: Default::default(),
+        batch_sizes: Default::default(),
+        corrupt_scores: false,
+    };
+    let actual = read
+        .read_with_executor(plan, &executor)
+        .await
+        .unwrap()
+        .into_row_ids()
+        .unwrap();
+    assert_eq!(actual.row_ids, expected.row_ids);
+    assert_eq!(actual.scores, expected.scores);
+    let mut ids = actual.row_ids;
+    ids.sort_unstable();
+    assert_eq!(
+        ids,
+        (0..row_count as u64)
+            .filter(|id| *id != 3)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        *executor.batch_sizes.lock().unwrap(),
+        vec![SEARCH_TASK_WINDOW, SEARCH_TASK_WINDOW, 1]
+    );
+    let work = executor.work.lock().unwrap();
+    let actual_files = work
+        .iter()
+        .map(|task| {
+            serde_json::from_value::<IndexManifestEntry>(task["payload"]["entry"].clone())
+                .unwrap()
+                .index_file
+                .file_name
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(actual_files, files, "windows must retain manifest order");
+}
