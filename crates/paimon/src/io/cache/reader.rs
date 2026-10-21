@@ -111,8 +111,7 @@ impl CachedFileReader {
                         let cache = self.cache.clone();
                         let token = self.read_token.clone();
                         let fill_payload = payload.clone();
-                        // Transfer single-flight ownership until publication
-                        // finishes. Same-key waiters recheck the cache afterward.
+                        // Hold download guards until publication completes.
                         tokio::spawn(async move {
                             let _slot = slot;
                             let _shared_guard = shared_guard;

@@ -34,8 +34,7 @@ pub(crate) struct SharedDiskCache {
     staging_slots: Arc<tokio::sync::Semaphore>,
 }
 
-/// A private, locked inode, not yet visible to cache readers or usage accounting.
-/// Keep this in a separate directory so older cache cleanup ignores live staging.
+/// Unpublished inode, locked against cleanup and isolated from legacy temporaries.
 struct StagedBlock {
     path: PathBuf,
     _file: File,
@@ -60,8 +59,7 @@ impl StagedBlock {
             _file: file,
             len: encoded.len() as u64,
         };
-        // Cleanup may win the create-to-lock race. In that case this fill is
-        // best-effort: fail rather than publish or account a missing inode.
+        // Cleanup may reclaim the inode before we lock it.
         staged._file.try_lock().map_err(io::Error::other)?;
         if !staged.path.try_exists()? {
             return Err(io::Error::new(
@@ -76,8 +74,7 @@ impl StagedBlock {
 
 impl Drop for StagedBlock {
     fn drop(&mut self) {
-        // After publication this unique staging path no longer exists. On any
-        // error/cancellation, unlink while the live-file lock is still held.
+        // Remove unpublished staging while still holding its lock.
         let _ = std::fs::remove_file(&self.path);
     }
 }
@@ -104,8 +101,7 @@ fn cleanup_staging(root: &Path) -> io::Result<()> {
             Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
             Err(e) => return Err(e),
         };
-        // Never wait here: a live publisher may itself be waiting for our
-        // directory gate. Process death releases this lock automatically.
+        // Do not wait: the publisher may be waiting for our directory lock.
         match file.try_lock() {
             Ok(()) => match std::fs::remove_file(entry.path()) {
                 Ok(()) => (),
@@ -307,11 +303,8 @@ impl SharedDiskCache {
     }
 
     pub(crate) async fn load_lock(&self, key: &BlockKey) -> Option<File> {
-        // Coalesce the same block without serializing every range of a large file.
-        // Keep a bounded number of stripes. read_full uses the first block's lock;
-        // other blocks can be fetched concurrently (and occasionally redundantly).
-        // Publication and invalidation remain protected by the directory gate and
-        // generation checks, not by these best-effort download locks.
+        // Best-effort block coalescing; read_full locks only the first block.
+        // Publication safety relies on the directory lock and generation checks.
         let stripe = key.cache_relative_path();
         lock(self.root.join(format!(
             "load-{}.lock",
@@ -334,13 +327,11 @@ impl SharedDiskCache {
                 return None;
             }
             let path = root.join(key.cache_relative_path());
-            // Published inodes are immutable. Unlink/rename cannot alter this
-            // descriptor. Validate the epoch again after reading: invalidation
-            // rotates a unique epoch before changing remote storage, preventing
-            // ABA and rejecting reads that overlap a completed mutation.
+            // Immutable inodes survive unlink; recheck the epoch after reading
+            // to reject concurrent invalidation.
             let mut file = File::open(path).ok()?;
             let metadata = file.metadata().ok()?;
-            // Approximate cross-process LRU: avoid a metadata write for every hit.
+            // Throttle recency writes for approximate cross-process LRU.
             if metadata
                 .modified()
                 .ok()
@@ -371,9 +362,7 @@ impl SharedDiskCache {
         let generation = generation.clone();
         let max_size = self.max_size;
         let high_priority_ratio = self.high_priority_ratio;
-        // Encoding touches only owned data. Keep its allocation, copy and CRC
-        // outside the exclusive directory gate. Recheck the generation under
-        // the gate below, since invalidation may run during encoding.
+        // Stage outside the directory lock; recheck the generation before publishing.
         let Ok(slot) = self.staging_slots.clone().acquire_owned().await else {
             return;
         };
@@ -543,8 +532,7 @@ fn clean_usage(root: &Path, max_size: u64) -> Option<u64> {
 }
 
 fn recover_usage(root: &Path, limit: u64, high_priority_ratio: f64) -> io::Result<u64> {
-    // Legacy temporaries were written under the gate. New staged files may be
-    // live outside it; cleanup_staging skips their per-inode locks.
+    // Legacy temporaries are orphaned; staged files may still have live writers.
     cleanup_temporary_files(root)?;
     cleanup_staging(root)?;
     #[cfg(test)]
@@ -872,8 +860,7 @@ mod tests {
                     .await;
             })
         };
-        // Encoding may finish while publication waits for the mutation gate.
-        // Either scheduling order must reject the old generation.
+        // Reject the old generation regardless of when encoding finishes.
         tokio::task::yield_now().await;
         mutation.finish().await;
         writer.await.unwrap();
