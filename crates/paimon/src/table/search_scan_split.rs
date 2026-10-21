@@ -228,12 +228,12 @@ pub(super) fn global_entries_from_splits(
     for split in splits {
         let scalar = match split {
             SearchScanSplit::Index {
-                column,
                 row_range,
                 index_files,
                 scalar_index_files,
+                ..
             } => {
-                if column.is_empty() || row_range.from() < 0 || row_range.to() < row_range.from() {
+                if row_range.from() < 0 || row_range.to() < row_range.from() {
                     return Err(invalid_source("Invalid global search index split"));
                 }
                 for file in index_files {

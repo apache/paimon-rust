@@ -19,148 +19,16 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use paimon::spec::Predicate;
-use paimon::table::{
-    BatchVectorRead, DataSplit, RowRange, SearchScanSplit, Table, VectorRead, VectorScan,
-    VectorScanPlan,
-};
+use paimon::table::{BatchVectorRead, Table, VectorRead, VectorScan, VectorScanPlan};
 use paimon_datafusion::runtime::runtime;
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::types::{PyDict, PyTuple};
 
 use crate::error::to_py_err;
 use crate::global_index_result::PyGlobalIndexResult;
 use crate::predicate::dict_to_table_predicate;
-
-pub(crate) fn search_plan_metadata_json(
-    snapshot: Option<&paimon::spec::Snapshot>,
-    snapshot_id: Option<i64>,
-    splits: &[SearchScanSplit],
-) -> PyResult<String> {
-    use serde_json::json;
-    let files = |files: &[paimon::spec::IndexFileMeta]| {
-        files
-            .iter()
-            .map(|file| file.to_serialized_row_data().map_err(to_py_err))
-            .collect::<PyResult<Vec<_>>>()
-    };
-    let splits = splits.iter().map(|split| Ok(match split {
-        SearchScanSplit::Index { column, row_range, index_files, scalar_index_files } => json!({
-            "kind": "index", "column": column, "row_range": row_range,
-            "index_files": files(index_files)?, "scalar_index_files": files(scalar_index_files)?,
-        }),
-        SearchScanSplit::Raw { row_ranges, scalar_index_files, index_type } => json!({
-            "kind": "raw", "row_ranges": row_ranges, "scalar_index_files": files(scalar_index_files)?, "index_type": index_type,
-        }),
-        SearchScanSplit::PrimaryKey { data_split, payloads, uncovered_data_files, row_ranges_by_file } => json!({
-            "kind": "primary-key", "data_split": data_split.serialize_split_v1().map_err(to_py_err)?,
-            "payloads": files(payloads)?, "uncovered_data_files": uncovered_data_files,
-            "row_ranges_by_file": row_ranges_by_file,
-        }),
-    })).collect::<PyResult<Vec<_>>>()?;
-    serde_json::to_string(
-        &json!({"snapshot": snapshot, "snapshot_id": snapshot_id, "splits": splits}),
-    )
-    .map_err(|error| pyo3::exceptions::PyValueError::new_err(error.to_string()))
-}
-
-/// Decode the same Java metadata codecs used by source-plan export. The binding
-/// does not infer work from the snapshot or bind a plan to a live reader.
-pub(crate) fn search_plan_from_json(
-    snapshot_json: Option<&str>,
-    splits_json: &str,
-) -> PyResult<(Option<paimon::spec::Snapshot>, Vec<SearchScanSplit>)> {
-    use pyo3::exceptions::PyValueError;
-    use serde_json::Value;
-
-    let invalid = |error: serde_json::Error| PyValueError::new_err(error.to_string());
-    let snapshot = snapshot_json
-        .map(serde_json::from_str)
-        .transpose()
-        .map_err(invalid)?;
-    let values: Vec<Value> = serde_json::from_str(splits_json).map_err(invalid)?;
-    let field = |value: &Value, name: &str| -> PyResult<Value> {
-        value
-            .get(name)
-            .cloned()
-            .ok_or_else(|| PyValueError::new_err(format!("Search split is missing '{name}'")))
-    };
-    let files = |value: Value| -> PyResult<Vec<paimon::spec::IndexFileMeta>> {
-        let bytes: Vec<Vec<u8>> = serde_json::from_value(value).map_err(invalid)?;
-        bytes
-            .iter()
-            .map(|bytes| {
-                paimon::spec::IndexFileMeta::from_serialized_row_data(bytes).map_err(to_py_err)
-            })
-            .collect()
-    };
-    let validate_ranges = |ranges: &[RowRange]| -> PyResult<()> {
-        if ranges
-            .iter()
-            .any(|range| range.from() < 0 || range.from() > range.to())
-        {
-            return Err(PyValueError::new_err(
-                "Search row ranges must be nonnegative and ordered",
-            ));
-        }
-        Ok(())
-    };
-    let splits = values
-        .iter()
-        .map(|value| -> PyResult<SearchScanSplit> {
-            let kind: String = serde_json::from_value(field(value, "kind")?).map_err(invalid)?;
-            Ok(match kind.as_str() {
-                "index" => {
-                    let row_range: RowRange =
-                        serde_json::from_value(field(value, "row_range")?).map_err(invalid)?;
-                    validate_ranges(std::slice::from_ref(&row_range))?;
-                    SearchScanSplit::Index {
-                        column: serde_json::from_value(field(value, "column")?).map_err(invalid)?,
-                        row_range,
-                        index_files: files(field(value, "index_files")?)?,
-                        scalar_index_files: files(field(value, "scalar_index_files")?)?,
-                    }
-                }
-                "raw" => {
-                    let row_ranges: Vec<RowRange> =
-                        serde_json::from_value(field(value, "row_ranges")?).map_err(invalid)?;
-                    validate_ranges(&row_ranges)?;
-                    SearchScanSplit::Raw {
-                        row_ranges,
-                        scalar_index_files: files(field(value, "scalar_index_files")?)?,
-                        index_type: serde_json::from_value(field(value, "index_type")?)
-                            .map_err(invalid)?,
-                    }
-                }
-                "primary-key" => {
-                    let bytes: Vec<u8> =
-                        serde_json::from_value(field(value, "data_split")?).map_err(invalid)?;
-                    let row_ranges_by_file: HashMap<String, Vec<RowRange>> =
-                        serde_json::from_value(field(value, "row_ranges_by_file")?)
-                            .map_err(invalid)?;
-                    for ranges in row_ranges_by_file.values() {
-                        validate_ranges(ranges)?;
-                    }
-                    SearchScanSplit::PrimaryKey {
-                        data_split: DataSplit::deserialize_split_v1(&bytes).map_err(to_py_err)?,
-                        payloads: files(field(value, "payloads")?)?,
-                        uncovered_data_files: serde_json::from_value(field(
-                            value,
-                            "uncovered_data_files",
-                        )?)
-                        .map_err(invalid)?,
-                        row_ranges_by_file,
-                    }
-                }
-                _ => {
-                    return Err(PyValueError::new_err(format!(
-                        "Unknown search split kind '{kind}'"
-                    )))
-                }
-            })
-        })
-        .collect::<PyResult<Vec<_>>>()?;
-    Ok((snapshot, splits))
-}
+use crate::search_plan::{vector_splits_from_python, vector_splits_to_python};
+use crate::snapshot::PySnapshot;
 
 #[derive(Clone, Default)]
 struct SearchConfig {
@@ -429,24 +297,31 @@ pub struct PyVectorScanPlan {
 #[pymethods]
 impl PyVectorScanPlan {
     #[new]
-    #[pyo3(signature = (snapshot_json, splits_json))]
-    fn new(snapshot_json: Option<&str>, splits_json: &str) -> PyResult<Self> {
-        let (snapshot, splits) = search_plan_from_json(snapshot_json, splits_json)?;
+    #[pyo3(signature = (splits, snapshot=None))]
+    fn new(splits: &Bound<'_, PyAny>, snapshot: Option<PyRef<'_, PySnapshot>>) -> PyResult<Self> {
         Ok(Self {
-            inner: VectorScanPlan::new(snapshot, splits).map_err(to_py_err)?,
+            inner: VectorScanPlan::new(
+                snapshot.map(|snapshot| snapshot.inner.clone()),
+                vector_splits_from_python(splits)?,
+            )
+            .map_err(to_py_err)?,
         })
     }
 
-    fn metadata(&self) -> PyResult<String> {
-        search_plan_metadata_json(
-            self.inner.snapshot(),
-            self.inner.snapshot_id(),
-            self.inner.splits(),
-        )
+    fn snapshot(&self) -> Option<PySnapshot> {
+        self.inner.snapshot().cloned().map(PySnapshot::new)
     }
 
-    fn snapshot_id(&self) -> Option<i64> {
-        self.inner.snapshot_id()
+    fn splits(&self, py: Python<'_>) -> PyResult<Vec<Py<PyAny>>> {
+        vector_splits_to_python(py, self.inner.splits())
+    }
+
+    fn __reduce__(slf: &Bound<'_, Self>, py: Python<'_>) -> PyResult<(Py<PyAny>, Py<PyTuple>)> {
+        let plan = slf.borrow();
+        let args = (plan.splits(py)?, plan.snapshot())
+            .into_pyobject(py)?
+            .unbind();
+        Ok((slf.get_type().unbind().into_any(), args))
     }
 }
 
@@ -527,27 +402,24 @@ impl PyBatchVectorRead {
 #[cfg(test)]
 mod source_plan_tests {
     use super::*;
-    use crate::full_text_search::PyFullTextScanPlan;
-    use paimon::spec::{BinaryRow, CommitKind, IndexFileMeta, Snapshot};
-    use pyo3::types::PyModule;
-    use serde_json::{json, Value};
+    use crate::search_plan::*;
+    use paimon::spec::{BinaryRow, CommitKind, GlobalIndexMeta, IndexFileMeta, Snapshot};
+    use paimon::table::{DataSplit, RowRange, SearchScanSplit};
+    use pyo3::types::{PyBytes, PyList, PyModule};
 
-    fn snapshot_json() -> String {
-        serde_json::to_string(
-            &Snapshot::builder()
-                .version(3)
-                .id(7)
-                .schema_id(2)
-                .base_manifest_list("base".into())
-                .delta_manifest_list("delta".into())
-                .commit_user("test".into())
-                .commit_identifier(1)
-                .commit_kind(CommitKind::APPEND)
-                .time_millis(0)
-                .next_row_id(Some(10))
-                .build(),
-        )
-        .unwrap()
+    fn snapshot() -> Snapshot {
+        Snapshot::builder()
+            .version(3)
+            .id(7)
+            .schema_id(2)
+            .base_manifest_list("base".into())
+            .delta_manifest_list("delta".into())
+            .commit_user("test".into())
+            .commit_identifier(1)
+            .commit_kind(CommitKind::APPEND)
+            .time_millis(0)
+            .next_row_id(Some(10))
+            .build()
     }
 
     fn index_file() -> IndexFileMeta {
@@ -558,14 +430,37 @@ mod source_plan_tests {
             row_count: 10,
             deletion_vectors_ranges: None,
             external_path: Some("s3://bucket/index-1".into()),
-            global_index_meta: None,
+            global_index_meta: Some(GlobalIndexMeta {
+                row_range_start: 0,
+                row_range_end: 9,
+                index_field_id: 2,
+                extra_field_ids: Some(vec![3]),
+                index_meta: Some(vec![1, 2, 3]),
+                source_meta: None,
+            }),
         }
+    }
+
+    fn module(py: Python<'_>) -> Bound<'_, PyModule> {
+        // Initialize the actual binding module in this embedded interpreter.
+        // This exercises class registration and pickle names without installing
+        // an extension into the PyPaimon test environment.
+        let package = PyModule::new(py, "pypaimon_rust").unwrap();
+        crate::pypaimon_rust(py, &package).unwrap();
+        py.import("sys")
+            .unwrap()
+            .getattr("modules")
+            .unwrap()
+            .set_item("pypaimon_rust", &package)
+            .unwrap();
+        package.getattr("datafusion").unwrap().cast_into().unwrap()
     }
 
     #[test]
     fn source_metadata_reuses_java_index_and_split_codecs() {
-        Python::attach(|_| {
-            let split = DataSplit::builder()
+        Python::attach(|py| {
+            let module = module(py);
+            let data_split = DataSplit::builder()
                 .with_snapshot(7)
                 .with_partition(BinaryRow::new(0))
                 .with_bucket(0)
@@ -587,7 +482,7 @@ mod source_plan_tests {
                     index_type: Some("lucene-vector".into()),
                 },
                 SearchScanSplit::PrimaryKey {
-                    data_split: split,
+                    data_split: data_split.clone(),
                     payloads: vec![index_file()],
                     uncovered_data_files: vec!["data-1.parquet".into()],
                     row_ranges_by_file: HashMap::from([(
@@ -596,82 +491,155 @@ mod source_plan_tests {
                     )]),
                 },
             ];
-            let snapshot: Snapshot = serde_json::from_str(&snapshot_json()).unwrap();
-            let metadata = search_plan_metadata_json(Some(&snapshot), Some(7), &sources).unwrap();
-            let value: Value = serde_json::from_str(&metadata).unwrap();
-            let (restored_snapshot, restored) =
-                search_plan_from_json(Some(&snapshot_json()), &value["splits"].to_string())
-                    .unwrap();
-            assert_eq!(restored_snapshot.as_ref(), Some(&snapshot));
-            assert_eq!(
-                serde_json::from_str::<Value>(
-                    &search_plan_metadata_json(restored_snapshot.as_ref(), Some(7), &restored)
-                        .unwrap()
+            let locals = PyDict::new(py);
+            locals.set_item("sdk", &module).unwrap();
+            locals
+                .set_item("snapshot", PySnapshot::new(snapshot()))
+                .unwrap();
+            locals
+                .set_item(
+                    "index_bytes",
+                    PyBytes::new(py, &index_file().to_serialized_row_data().unwrap()),
                 )
-                .unwrap(),
-                value,
-            );
-            assert_eq!(
-                value["splits"][0]["index_files"][0],
-                json!(index_file().to_serialized_row_data().unwrap())
-            );
-        });
-    }
-
-    #[test]
-    fn python_source_plan_constructors_capture_snapshot_and_splits() {
-        Python::attach(|py| {
-            let module = PyModule::new(py, "plans").unwrap();
-            module.add_class::<PyVectorScanPlan>().unwrap();
-            module.add_class::<PyFullTextScanPlan>().unwrap();
-            let sources = json!([{
-                "kind": "raw", "row_ranges": [{"from": 2, "to": 4}],
-                "scalar_index_files": [], "index_type": null,
-            }])
-            .to_string();
-            for name in ["VectorScanPlan", "FullTextScanPlan"] {
-                let class = module.getattr(name).unwrap();
-                let plan = class.call1((snapshot_json(), &sources)).unwrap();
+                .unwrap();
+            locals
+                .set_item(
+                    "split_bytes",
+                    PyBytes::new(py, &data_split.serialize_split_v1().unwrap()),
+                )
+                .unwrap();
+            for full_text in [false, true] {
+                let objects = if full_text {
+                    full_text_splits_to_python(py, &sources).unwrap()
+                } else {
+                    vector_splits_to_python(py, &sources).unwrap()
+                };
+                let values = PyList::new(py, &objects).unwrap();
+                let restored = if full_text {
+                    full_text_splits_from_python(values.as_any()).unwrap()
+                } else {
+                    vector_splits_from_python(values.as_any()).unwrap()
+                };
                 assert_eq!(
-                    plan.call_method0("snapshot_id")
-                        .unwrap()
-                        .extract::<i64>()
-                        .unwrap(),
-                    7
+                    serde_json::to_value(restored).unwrap(),
+                    serde_json::to_value(&sources).unwrap()
                 );
-                let metadata: String = plan.call_method0("metadata").unwrap().extract().unwrap();
-                let value: Value = serde_json::from_str(&metadata).unwrap();
-                assert_eq!(value["splits"].to_string(), sources);
-                assert_eq!(value["snapshot"]["id"], json!(7));
-                let copied = class
-                    .call1((value["snapshot"].to_string(), value["splits"].to_string()))
-                    .unwrap();
-                let copied_metadata: String =
-                    copied.call_method0("metadata").unwrap().extract().unwrap();
-                assert_eq!(metadata, copied_metadata);
-                let empty = class.call1((py.None(), "[]")).unwrap();
-                assert!(empty.call_method0("snapshot_id").unwrap().is_none());
-                assert!(class.call1((py.None(), &sources)).is_err());
+                locals.set_item("sources", values).unwrap();
+                locals.set_item("full_text", full_text).unwrap();
+                py.run(
+                    cr#"
+import pickle
+cls = sdk.FullTextScanPlan if full_text else sdk.VectorScanPlan
+pk_cls = sdk.PrimaryKeyFullTextSearchSplit if full_text else sdk.PrimaryKeyVectorSearchSplit
+for source in sources:
+    copied = pickle.loads(pickle.dumps(source))
+    assert type(copied) is type(source)
+    assert copied._serialize() == source._serialize()
+meta = sdk.IndexFileMeta._deserialize(index_bytes)
+assert meta.file_name() == 'index-1'
+assert pickle.loads(pickle.dumps(meta))._serialize() == index_bytes
+pk = sources[2]
+assert pk.data_split().serialize() == split_bytes
+rebuilt = pk_cls(pk.data_split(), pk.payloads(), pk.uncovered_data_files(), pk.row_ranges_by_file())
+plan = cls([rebuilt], snapshot)
+restored = pickle.loads(pickle.dumps(plan))
+assert restored.snapshot().id() == 7
+assert restored.splits()[0].data_split().serialize() == split_bytes
+assert restored.splits()[0].payloads()[0]._serialize() == index_bytes
+assert restored.splits()[0].row_ranges_by_file() == {'data-1.parquet': [(1, 2)]}
+"#,
+                    Some(&locals),
+                    Some(&locals),
+                )
+                .unwrap();
             }
         });
     }
 
     #[test]
-    fn source_plan_decode_rejects_corrupt_codecs_and_ranges() {
-        Python::attach(|_| {
-            for value in [
-                json!([{"kind": "unknown"}]),
-                json!([{"kind": "index", "column": "v", "row_range": {"from": 2, "to": 1}, "index_files": [], "scalar_index_files": []}]),
-                json!([{"kind": "raw", "row_ranges": [{"from": -1, "to": 1}], "scalar_index_files": [], "index_type": null}]),
-                json!([{"kind": "index", "column": "v", "row_range": {"from": 0, "to": 1}, "index_files": [[1, 2, 3]], "scalar_index_files": []}]),
-                json!([{"kind": "primary-key", "data_split": [1, 2, 3], "payloads": [], "uncovered_data_files": [], "row_ranges_by_file": {}}]),
-            ] {
-                assert!(
-                    search_plan_from_json(Some(&snapshot_json()), &value.to_string()).is_err(),
-                    "{value}"
-                );
-            }
-            assert!(search_plan_from_json(Some("invalid snapshot"), "[]").is_err());
+    fn python_source_plan_constructors_capture_typed_snapshot_and_splits() {
+        Python::attach(|py| {
+            let locals = PyDict::new(py);
+            locals.set_item("sdk", module(py)).unwrap();
+            locals
+                .set_item("snapshot", PySnapshot::new(snapshot()))
+                .unwrap();
+            locals
+                .set_item(
+                    "meta",
+                    PyIndexFileMeta {
+                        inner: index_file(),
+                    },
+                )
+                .unwrap();
+            py.run(cr#"
+import pickle
+for cls, raw_cls, indexed in (
+    (sdk.VectorScanPlan, sdk.RawVectorSearchSplit, sdk.IndexVectorSearchSplit(0, 9, [meta])),
+    (sdk.FullTextScanPlan, sdk.RawFullTextSearchSplit, sdk.IndexFullTextSearchSplit('body', 0, 9, [meta])),
+):
+    ranges = [(2, 4)]
+    raw = raw_cls(ranges)
+    sources = [indexed, raw]
+    plan = cls(sources, snapshot)
+    sources.clear()
+    ranges.clear()
+    assert plan.snapshot().id() == 7
+    assert len(plan.splits()) == 2
+    assert plan.splits()[1].row_ranges() == [(2, 4)]
+    plan.splits().clear()
+    assert len(plan.splits()) == 2
+    assert len(cls(tuple(plan.splits()), snapshot).splits()) == 2
+    restored = pickle.loads(pickle.dumps(plan))
+    assert restored.snapshot()._to_json() == snapshot._to_json()
+    assert restored.splits()[0].row_range_start() == 0
+    assert restored.splits()[1].row_ranges() == [(2, 4)]
+    assert not hasattr(plan, 'metadata')
+    empty = cls([])
+    assert empty.snapshot() is None and empty.splits() == []
+    assert pickle.loads(pickle.dumps(empty)).snapshot() is None
+"#, Some(&locals), Some(&locals)).unwrap();
+        });
+    }
+
+    #[test]
+    fn source_plan_constructors_reject_wire_values_and_wrong_source_types() {
+        Python::attach(|py| {
+            let locals = PyDict::new(py);
+            locals.set_item("sdk", module(py)).unwrap();
+            locals
+                .set_item("snapshot", PySnapshot::new(snapshot()))
+                .unwrap();
+            py.run(
+                cr#"
+def rejects(error, fn, *args):
+    try:
+        fn(*args)
+    except error:
+        return
+    raise AssertionError('Invalid source input was accepted')
+for cls, raw_cls, wrong_cls in (
+    (sdk.VectorScanPlan, sdk.RawVectorSearchSplit, sdk.RawFullTextSearchSplit),
+    (sdk.FullTextScanPlan, sdk.RawFullTextSearchSplit, sdk.RawVectorSearchSplit),
+):
+    rejects(TypeError, cls, '[]', snapshot)
+    rejects(TypeError, cls, '', snapshot)
+    rejects(TypeError, cls, {}, snapshot)
+    rejects(TypeError, cls, b'', snapshot)
+    rejects(TypeError, cls, bytearray(), snapshot)
+    rejects(TypeError, cls, [{'kind': 'raw'}], snapshot)
+    rejects(TypeError, cls, [wrong_cls([(0, 1)])], snapshot)
+    rejects(TypeError, cls, [], '{}')
+    rejects(ValueError, cls, [raw_cls([(0, 1)])])
+    rejects(ValueError, raw_cls, [(-1, 2)])
+    rejects(ValueError, raw_cls, [(2, 1)])
+rejects(ValueError, sdk.IndexFileMeta._deserialize, b'bad')
+rejects(ValueError, sdk.Split.deserialize, b'bad')
+"#,
+                Some(&locals),
+                Some(&locals),
+            )
+            .unwrap();
         });
     }
 }

@@ -20,11 +20,13 @@
 use crate::error::to_py_err;
 use crate::global_index_result::PyGlobalIndexResult;
 use crate::predicate::dict_to_table_predicate;
+use crate::search_plan::{full_text_splits_from_python, full_text_splits_to_python};
+use crate::snapshot::PySnapshot;
 use paimon::spec::Predicate;
 use paimon::table::{FullTextRead, FullTextScan, FullTextScanPlan, Table};
 use paimon_datafusion::runtime::runtime;
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::types::{PyDict, PyTuple};
 use std::sync::Arc;
 
 #[derive(Default)]
@@ -151,25 +153,31 @@ pub struct PyFullTextScanPlan {
 #[pymethods]
 impl PyFullTextScanPlan {
     #[new]
-    #[pyo3(signature = (snapshot_json, splits_json))]
-    fn new(snapshot_json: Option<&str>, splits_json: &str) -> PyResult<Self> {
-        let (snapshot, splits) =
-            crate::vector_search::search_plan_from_json(snapshot_json, splits_json)?;
+    #[pyo3(signature = (splits, snapshot=None))]
+    fn new(splits: &Bound<'_, PyAny>, snapshot: Option<PyRef<'_, PySnapshot>>) -> PyResult<Self> {
         Ok(Self {
-            inner: FullTextScanPlan::new(snapshot, splits).map_err(to_py_err)?,
+            inner: FullTextScanPlan::new(
+                snapshot.map(|snapshot| snapshot.inner.clone()),
+                full_text_splits_from_python(splits)?,
+            )
+            .map_err(to_py_err)?,
         })
     }
 
-    fn metadata(&self) -> PyResult<String> {
-        crate::vector_search::search_plan_metadata_json(
-            self.inner.snapshot(),
-            self.inner.snapshot_id(),
-            self.inner.splits(),
-        )
+    fn snapshot(&self) -> Option<PySnapshot> {
+        self.inner.snapshot().cloned().map(PySnapshot::new)
     }
 
-    fn snapshot_id(&self) -> Option<i64> {
-        self.inner.snapshot_id()
+    fn splits(&self, py: Python<'_>) -> PyResult<Vec<Py<PyAny>>> {
+        full_text_splits_to_python(py, self.inner.splits())
+    }
+
+    fn __reduce__(slf: &Bound<'_, Self>, py: Python<'_>) -> PyResult<(Py<PyAny>, Py<PyTuple>)> {
+        let plan = slf.borrow();
+        let args = (plan.splits(py)?, plan.snapshot())
+            .into_pyobject(py)?
+            .unbind();
+        Ok((slf.get_type().unbind().into_any(), args))
     }
 }
 

@@ -1004,6 +1004,13 @@ pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> 
     this.add_class::<crate::vector_search::PyBatchVectorSearchBuilder>()?;
     this.add_class::<crate::vector_search::PyVectorScan>()?;
     this.add_class::<crate::vector_search::PyVectorScanPlan>()?;
+    this.add_class::<crate::search_plan::PyIndexFileMeta>()?;
+    this.add_class::<crate::search_plan::PyIndexVectorSearchSplit>()?;
+    this.add_class::<crate::search_plan::PyRawVectorSearchSplit>()?;
+    this.add_class::<crate::search_plan::PyPrimaryKeyVectorSearchSplit>()?;
+    this.add_class::<crate::search_plan::PyIndexFullTextSearchSplit>()?;
+    this.add_class::<crate::search_plan::PyRawFullTextSearchSplit>()?;
+    this.add_class::<crate::search_plan::PyPrimaryKeyFullTextSearchSplit>()?;
     this.add_class::<crate::vector_search::PyVectorRead>()?;
     this.add_class::<crate::vector_search::PyBatchVectorRead>()?;
     this.add_class::<crate::global_index_result::PyGlobalIndexResult>()?;

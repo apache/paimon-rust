@@ -18,11 +18,12 @@
 use std::collections::HashMap;
 
 use paimon::spec::Snapshot;
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
 #[pyclass(name = "Snapshot", module = "pypaimon_rust.datafusion")]
 pub struct PySnapshot {
-    inner: Snapshot,
+    pub(crate) inner: Snapshot,
 }
 
 impl PySnapshot {
@@ -33,6 +34,24 @@ impl PySnapshot {
 
 #[pymethods]
 impl PySnapshot {
+    #[staticmethod]
+    fn _from_json(value: &str) -> PyResult<Self> {
+        serde_json::from_str(value)
+            .map(Self::new)
+            .map_err(|err| PyValueError::new_err(format!("Invalid snapshot metadata: {err}")))
+    }
+
+    fn _to_json(&self) -> PyResult<String> {
+        serde_json::to_string(&self.inner)
+            .map_err(|err| PyValueError::new_err(format!("Cannot serialize snapshot: {err}")))
+    }
+
+    fn __reduce__(slf: &Bound<'_, Self>) -> PyResult<(Py<PyAny>, (String,))> {
+        let value = slf.borrow()._to_json()?;
+        let restore = slf.get_type().getattr("_from_json")?.unbind();
+        Ok((restore, (value,)))
+    }
+
     fn id(&self) -> i64 {
         self.inner.id()
     }

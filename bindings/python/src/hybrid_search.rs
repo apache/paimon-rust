@@ -20,6 +20,7 @@
 use crate::error::to_py_err;
 use crate::global_index_result::PyGlobalIndexResult;
 use crate::predicate::dict_to_table_predicate;
+use crate::snapshot::PySnapshot;
 use paimon::spec::{Predicate, Snapshot};
 use paimon::table::{HybridSearchRanker, HybridSearchRoute, Table};
 use paimon_datafusion::runtime::runtime;
@@ -122,19 +123,13 @@ impl PyHybridSearchBuilder {
         slf
     }
 
-    #[pyo3(signature = (snapshot_json))]
+    #[pyo3(signature = (snapshot))]
     fn with_snapshot<'py>(
         mut slf: PyRefMut<'py, Self>,
-        snapshot_json: Option<&str>,
-    ) -> PyResult<PyRefMut<'py, Self>> {
-        let snapshot = snapshot_json
-            .map(serde_json::from_str)
-            .transpose()
-            .map_err(|error| {
-                pyo3::exceptions::PyValueError::new_err(format!("Invalid snapshot JSON: {error}"))
-            })?;
-        slf.pinned_snapshot = Some(snapshot);
-        Ok(slf)
+        snapshot: Option<PyRef<'_, PySnapshot>>,
+    ) -> PyRefMut<'py, Self> {
+        slf.pinned_snapshot = Some(snapshot.map(|snapshot| snapshot.inner.clone()));
+        slf
     }
 
     #[pyo3(signature = (ranker))]
@@ -204,5 +199,73 @@ impl PyHybridSearchBuilder {
 
     fn execute_local(&self, py: Python<'_>) -> PyResult<PyGlobalIndexResult> {
         self.execute(py)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use paimon::catalog::Identifier;
+    use paimon::io::FileIOBuilder;
+    use paimon::spec::{CommitKind, DataType, IntType, Schema, TableSchema};
+
+    #[test]
+    fn hybrid_snapshot_uses_typed_metadata_and_distinguishes_empty_capture() {
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .build()
+            .unwrap();
+        let table = Arc::new(Table::new(
+            FileIOBuilder::new("memory").build().unwrap(),
+            Identifier::new("default", "hybrid_typed_snapshot"),
+            "memory:/hybrid_typed_snapshot".into(),
+            TableSchema::new(0, &schema),
+            None,
+        ));
+        let snapshot = Snapshot::builder()
+            .version(3)
+            .id(7)
+            .schema_id(0)
+            .base_manifest_list(String::new())
+            .delta_manifest_list(String::new())
+            .commit_user("captured".into())
+            .commit_identifier(1)
+            .commit_kind(CommitKind::APPEND)
+            .time_millis(0)
+            .build();
+        Python::attach(|py| {
+            let builder = Py::new(py, PyHybridSearchBuilder::new(table)).unwrap();
+            assert!(builder.borrow(py).pinned_snapshot.is_none());
+            let captured = Py::new(py, PySnapshot::new(snapshot.clone())).unwrap();
+            let returned = builder
+                .bind(py)
+                .call_method1("with_snapshot", (captured,))
+                .unwrap();
+            assert!(returned.is(builder.bind(py)));
+            assert_eq!(
+                builder
+                    .borrow(py)
+                    .pinned_snapshot
+                    .as_ref()
+                    .unwrap()
+                    .as_ref(),
+                Some(&snapshot),
+            );
+            let error = builder
+                .bind(py)
+                .call_method1("with_snapshot", ("{}",))
+                .unwrap_err();
+            assert!(error.is_instance_of::<pyo3::exceptions::PyTypeError>(py));
+            builder
+                .bind(py)
+                .call_method1("with_snapshot", (py.None(),))
+                .unwrap();
+            assert!(builder
+                .borrow(py)
+                .pinned_snapshot
+                .as_ref()
+                .unwrap()
+                .is_none());
+        });
     }
 }
