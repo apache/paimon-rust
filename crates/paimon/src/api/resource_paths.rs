@@ -121,6 +121,33 @@ impl ResourcePaths {
         format!("{}/snapshot", self.table(database_name, table_name))
     }
 
+    /// Get the branch collection for a table.
+    pub fn branches(&self, database_name: &str, table_name: &str) -> String {
+        format!("{}/branches", self.table(database_name, table_name))
+    }
+
+    /// Get one branch, encoding its name as a single path component.
+    pub fn branch(&self, database_name: &str, table_name: &str, branch_name: &str) -> String {
+        format!(
+            "{}/{}",
+            self.branches(database_name, table_name),
+            RESTUtil::encode_string(branch_name)
+        )
+    }
+
+    /// Get the fast-forward endpoint for a branch.
+    pub fn forward_branch(
+        &self,
+        database_name: &str,
+        table_name: &str,
+        branch_name: &str,
+    ) -> String {
+        format!(
+            "{}/forward",
+            self.branch(database_name, table_name, branch_name)
+        )
+    }
+
     /// Get the views endpoint path for a database.
     pub fn views(&self, database_name: &str) -> String {
         format!(

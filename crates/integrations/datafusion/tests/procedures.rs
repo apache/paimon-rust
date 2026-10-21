@@ -56,6 +56,27 @@ async fn setup_table_with_snapshots() -> (tempfile::TempDir, paimon_datafusion::
     (tmp, sql_context)
 }
 
+async fn setup_table_with_watermarks(
+    watermarks: [Option<i64>; 3],
+) -> (tempfile::TempDir, paimon_datafusion::SQLContext) {
+    let (tmp, sql_context) = setup_table_with_snapshots().await;
+    for (index, watermark) in watermarks.into_iter().enumerate() {
+        let path = tmp
+            .path()
+            .join(format!("test_db.db/t1/snapshot/snapshot-{}", index + 1));
+        let mut snapshot: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        snapshot["watermark"] = serde_json::json!(watermark);
+        std::fs::write(path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+    }
+    (tmp, sql_context)
+}
+
+fn read_tag(tmp: &Path, name: &str) -> serde_json::Value {
+    let path = tmp.join(format!("test_db.db/t1/tag/tag-{name}"));
+    serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+}
+
 #[tokio::test]
 async fn test_create_tag() {
     let (_tmp, sql_context) = setup_table_with_snapshots().await;
@@ -410,6 +431,289 @@ async fn test_rename_branch_rejects_unopenable_source_and_target() {
     );
     // b1 is still openable through the table reader.
     table.copy_with_branch("b1").await.unwrap();
+}
+
+#[tokio::test]
+async fn test_delete_branch() {
+    let (_tmp, catalog) = create_test_env();
+    let sql_context = create_sql_context(catalog.clone()).await;
+    exec(&sql_context, "CREATE SCHEMA paimon.test_db").await;
+    exec(
+        &sql_context,
+        "CREATE TABLE paimon.test_db.t1 (id INT, name VARCHAR(100), PRIMARY KEY (id))",
+    )
+    .await;
+    exec(
+        &sql_context,
+        "INSERT INTO paimon.test_db.t1 VALUES (1, 'alice')",
+    )
+    .await;
+
+    // Seed a branch through the core manager (create_branch is a separate PR).
+    let table = catalog
+        .get_table(&Identifier::new("test_db", "t1"))
+        .await
+        .unwrap();
+    let bm = BranchManager::new(table.file_io().clone(), table.location().to_string());
+    bm.create_branch("b1").await.unwrap();
+    assert!(bm.branch_exists("b1").await.unwrap(), "seed branch exists");
+
+    exec(
+        &sql_context,
+        "CALL sys.delete_branch(table => 'test_db.t1', branch => 'b1')",
+    )
+    .await;
+
+    assert!(
+        !bm.branch_exists("b1").await.unwrap(),
+        "delete_branch should remove the branch"
+    );
+    let count = row_count(
+        &sql_context,
+        "SELECT * FROM paimon.test_db.`t1$branches` WHERE branch_name = 'b1'",
+    )
+    .await;
+    assert_eq!(count, 0);
+
+    // Deleting a branch that no longer exists is a no-op, not an error.
+    exec(
+        &sql_context,
+        "CALL sys.delete_branch(table => 'test_db.t1', branch => 'b1')",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_delete_branch_preserves_leading_space_identity() {
+    // A branch name keeps its leading/trailing spaces: the shared validator
+    // permits `" b1"` (only all-whitespace is rejected) and the reader treats it
+    // as distinct from `"b1"`. Java `Table.deleteBranches` passes each comma
+    // token through unchanged, so `delete_branch(branch => ' b1')` must drop
+    // `" b1"` and leave `"b1"` intact — trimming the token would delete the
+    // wrong branch.
+    let (_tmp, catalog) = create_test_env();
+    let sql_context = create_sql_context(catalog.clone()).await;
+    exec(&sql_context, "CREATE SCHEMA paimon.test_db").await;
+    exec(
+        &sql_context,
+        "CREATE TABLE paimon.test_db.t1 (id INT, name VARCHAR(100), PRIMARY KEY (id))",
+    )
+    .await;
+    exec(
+        &sql_context,
+        "INSERT INTO paimon.test_db.t1 VALUES (1, 'alice')",
+    )
+    .await;
+
+    let table = catalog
+        .get_table(&Identifier::new("test_db", "t1"))
+        .await
+        .unwrap();
+    let bm = BranchManager::new(table.file_io().clone(), table.location().to_string());
+    bm.create_branch("b1").await.unwrap();
+    bm.create_branch(" b1").await.unwrap();
+
+    exec(
+        &sql_context,
+        "CALL sys.delete_branch(table => 'test_db.t1', branch => ' b1')",
+    )
+    .await;
+
+    assert!(
+        !bm.branch_exists(" b1").await.unwrap(),
+        "the leading-space branch is the one requested and must be deleted"
+    );
+    assert!(
+        bm.branch_exists("b1").await.unwrap(),
+        "the un-spaced branch must survive — trimming the token would delete it"
+    );
+}
+
+#[tokio::test]
+async fn test_delete_branch_preserves_trailing_space_identity() {
+    // `"prod "` passes every guard as a branch distinct from the protected
+    // `prod`, so deleting it must not resolve to `prod`'s directory.
+    let (_tmp, catalog) = create_test_env();
+    let sql_context = create_sql_context(catalog.clone()).await;
+    exec(&sql_context, "CREATE SCHEMA paimon.test_db").await;
+    exec(
+        &sql_context,
+        "CREATE TABLE paimon.test_db.t1 (id INT, name VARCHAR(100), PRIMARY KEY (id)) WITH ('scan.primary-branch' = 'prod')",
+    )
+    .await;
+    exec(
+        &sql_context,
+        "INSERT INTO paimon.test_db.t1 VALUES (1, 'alice')",
+    )
+    .await;
+    exec(
+        &sql_context,
+        "CALL sys.create_tag(table => 'test_db.t1', tag => 'v1')",
+    )
+    .await;
+
+    let table = catalog
+        .get_table(&Identifier::new("test_db", "t1"))
+        .await
+        .unwrap();
+    let bm = BranchManager::new(table.file_io().clone(), table.location().to_string());
+    bm.create_branch_from_tag("prod", "v1").await.unwrap();
+    bm.create_branch_from_tag("prod ", "v1").await.unwrap();
+
+    exec(
+        &sql_context,
+        "CALL sys.delete_branch(table => 'test_db.t1', branch => 'prod ')",
+    )
+    .await;
+
+    assert!(!bm.branch_exists("prod ").await.unwrap());
+    assert_eq!(
+        collect_id_name(
+            &sql_context,
+            "SELECT id, name FROM paimon.test_db.`t1$branch_prod`"
+        )
+        .await,
+        vec![(1, "alice".to_string())],
+        "the protected branch must stay readable"
+    );
+}
+
+#[tokio::test]
+async fn test_delete_branch_preserves_scan_configured_branch() {
+    // A branch named by `scan.primary-branch` / `scan.fallback-branch` is on a
+    // reader's path, so `delete_branch` must refuse it (mirrors Java
+    // `AbstractFileStoreTable.deleteBranch`) while still allowing unrelated
+    // branches to be dropped.
+    for (table_name, option_key) in [
+        ("tp", "scan.primary-branch"),
+        ("tf", "scan.fallback-branch"),
+    ] {
+        let (_tmp, catalog) = create_test_env();
+        let sql_context = create_sql_context(catalog.clone()).await;
+        exec(&sql_context, "CREATE SCHEMA paimon.test_db").await;
+        exec(
+            &sql_context,
+            &format!(
+                "CREATE TABLE paimon.test_db.{table_name} (id INT, name VARCHAR(100), PRIMARY KEY (id)) WITH ('{option_key}' = 'prod')"
+            ),
+        )
+        .await;
+        exec(
+            &sql_context,
+            &format!("INSERT INTO paimon.test_db.{table_name} VALUES (1, 'alice')"),
+        )
+        .await;
+
+        let table = catalog
+            .get_table(&Identifier::new("test_db", table_name))
+            .await
+            .unwrap();
+        let bm = BranchManager::new(table.file_io().clone(), table.location().to_string());
+        bm.create_branch("prod").await.unwrap();
+        bm.create_branch("tmp").await.unwrap();
+
+        // The configured branch cannot be deleted, and the error names the option.
+        assert_sql_error(
+            &sql_context,
+            &format!("CALL sys.delete_branch(table => 'test_db.{table_name}', branch => 'prod')"),
+            option_key,
+        )
+        .await;
+        assert!(
+            bm.branch_exists("prod").await.unwrap(),
+            "{option_key}: protected branch must remain"
+        );
+
+        // An unrelated branch is still deletable, so the guard is not over-broad.
+        exec(
+            &sql_context,
+            &format!("CALL sys.delete_branch(table => 'test_db.{table_name}', branch => 'tmp')"),
+        )
+        .await;
+        assert!(
+            !bm.branch_exists("tmp").await.unwrap(),
+            "{option_key}: unrelated branch should be deletable"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_delete_branch_batch_stops_at_protected_branch() {
+    // A comma-separated request must still catch a protected branch even when
+    // it is not listed first. Matches Java `Table.deleteBranches`, which loops
+    // `deleteBranch` per name; the protected branch is never dropped.
+    let (_tmp, catalog) = create_test_env();
+    let sql_context = create_sql_context(catalog.clone()).await;
+    exec(&sql_context, "CREATE SCHEMA paimon.test_db").await;
+    exec(
+        &sql_context,
+        "CREATE TABLE paimon.test_db.t1 (id INT, name VARCHAR(100), PRIMARY KEY (id)) WITH ('scan.primary-branch' = 'prod')",
+    )
+    .await;
+    exec(
+        &sql_context,
+        "INSERT INTO paimon.test_db.t1 VALUES (1, 'alice')",
+    )
+    .await;
+
+    let table = catalog
+        .get_table(&Identifier::new("test_db", "t1"))
+        .await
+        .unwrap();
+    let bm = BranchManager::new(table.file_io().clone(), table.location().to_string());
+    bm.create_branch("prod").await.unwrap();
+    bm.create_branch("keep").await.unwrap();
+
+    // 'prod' is protected and appears second; the call must fail and leave it.
+    assert_sql_error(
+        &sql_context,
+        "CALL sys.delete_branch(table => 'test_db.t1', branch => 'keep,prod')",
+        "scan.primary-branch",
+    )
+    .await;
+    assert!(
+        bm.branch_exists("prod").await.unwrap(),
+        "protected branch must survive the batch"
+    );
+}
+
+#[tokio::test]
+async fn test_delete_branch_rejects_path_separated_name() {
+    // A separator-bearing name slips past the configured-branch guard (it is not
+    // literally `prod`), so without name validation `branch_exists` finds the real
+    // `branch-prod/schema` directory and `drop_branch` deletes it, destroying the
+    // protected branch's schema. The name must be rejected before any deletion.
+    let (_tmp, catalog) = create_test_env();
+    let sql_context = create_sql_context(catalog.clone()).await;
+    exec(&sql_context, "CREATE SCHEMA paimon.test_db").await;
+    exec(
+        &sql_context,
+        "CREATE TABLE paimon.test_db.t1 (id INT, name VARCHAR(100), PRIMARY KEY (id)) WITH ('scan.primary-branch' = 'prod')",
+    )
+    .await;
+    exec(
+        &sql_context,
+        "INSERT INTO paimon.test_db.t1 VALUES (1, 'alice')",
+    )
+    .await;
+
+    let table = catalog
+        .get_table(&Identifier::new("test_db", "t1"))
+        .await
+        .unwrap();
+    let bm = BranchManager::new(table.file_io().clone(), table.location().to_string());
+    bm.create_branch("prod").await.unwrap();
+
+    assert_sql_error(
+        &sql_context,
+        "CALL sys.delete_branch(table => 'test_db.t1', branch => 'prod/schema')",
+        "path separator",
+    )
+    .await;
+
+    // The protected branch and its schema survive and stay openable.
+    assert!(bm.branch_exists("prod").await.unwrap(), "prod must remain");
+    table.copy_with_branch("prod").await.unwrap();
 }
 
 #[tokio::test]
@@ -2474,6 +2778,262 @@ async fn test_create_tag_from_timestamp() {
     )
     .await;
     assert_eq!(count, 1);
+}
+
+#[tokio::test]
+async fn test_create_tag_from_watermark_selects_first_live_snapshot() {
+    for (watermark, expected_id) in [(500, 1), (1000, 1), (1500, 2), (2000, 2)] {
+        let (tmp, sql_context) =
+            setup_table_with_watermarks([Some(1000), Some(2000), Some(2000)]).await;
+        let tag_name = format!("wm_{watermark}");
+        exec(
+            &sql_context,
+            &format!(
+                "CALL sys.create_tag_from_watermark(table => 'paimon.test_db.t1', \
+                 tag => '{tag_name}', watermark => {watermark})"
+            ),
+        )
+        .await;
+        let tag = read_tag(tmp.path(), &tag_name);
+        assert_eq!(tag["id"], expected_id);
+        assert!(tag.get("tagTimeRetained").is_none());
+        assert!(tag.get("tagCreateTime").is_none());
+        assert_eq!(
+            row_count(
+                &sql_context,
+                &format!("SELECT * FROM paimon.test_db.t1 VERSION AS OF '{tag_name}'"),
+            )
+            .await,
+            expected_id as usize
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_create_tag_from_watermark_uses_retained_snapshots() {
+    let (tmp, sql_context) =
+        setup_table_with_watermarks([Some(1000), Some(2000), Some(3000)]).await;
+    let snapshot_dir = tmp.path().join("test_db.db/t1/snapshot");
+    // Tag names deliberately put the later snapshot first in Rust's tag listing.
+    for (name, id) in [("z_earlier", 1), ("a_later", 2)] {
+        exec(
+            &sql_context,
+            &format!(
+                "CALL sys.create_tag(table => 'test_db.t1', tag => '{name}', snapshot_id => {id})"
+            ),
+        )
+        .await;
+        std::fs::remove_file(snapshot_dir.join(format!("snapshot-{id}"))).unwrap();
+    }
+
+    for (watermark, expected_id) in [(999, 1), (1000, 1), (1500, 2), (2000, 2), (2500, 3)] {
+        let tag_name = format!("wm_{watermark}");
+        exec(
+            &sql_context,
+            &format!(
+                "CALL sys.create_tag_from_watermark(table => 'test_db.t1', \
+                 tag => '{tag_name}', watermark => {watermark}, time_retained => '7d')"
+            ),
+        )
+        .await;
+        let tag = read_tag(tmp.path(), &tag_name);
+        assert_eq!(tag["id"], expected_id);
+        assert_eq!(
+            tag["tagTimeRetained"].as_number().unwrap().to_string(),
+            "604800.000000000"
+        );
+        assert_eq!(tag["tagCreateTime"].as_array().unwrap().len(), 7);
+        assert_eq!(
+            row_count(
+                &sql_context,
+                &format!("SELECT * FROM paimon.test_db.t1 VERSION AS OF '{tag_name}'"),
+            )
+            .await,
+            expected_id as usize
+        );
+    }
+
+    // All snapshot files can be gone while tag metadata still supplies a candidate.
+    std::fs::remove_file(snapshot_dir.join("snapshot-3")).unwrap();
+    exec(
+        &sql_context,
+        "CALL sys.create_tag_from_watermark(table => 'test_db.t1', tag => 'tags_only', watermark => 1500)",
+    )
+    .await;
+    assert_eq!(read_tag(tmp.path(), "tags_only")["id"], 2);
+}
+
+#[tokio::test]
+async fn test_create_tag_from_watermark_equal_watermarks_prefer_earlier_snapshot() {
+    for (retained_id, expire_first) in [(1, true), (2, false)] {
+        let (tmp, sql_context) =
+            setup_table_with_watermarks([Some(1000), Some(1000), Some(2000)]).await;
+        exec(
+            &sql_context,
+            &format!(
+                "CALL sys.create_tag(table => 'test_db.t1', tag => 'keep', snapshot_id => {retained_id})"
+            ),
+        )
+        .await;
+        if expire_first {
+            std::fs::remove_file(tmp.path().join("test_db.db/t1/snapshot/snapshot-1")).unwrap();
+        }
+        exec(
+            &sql_context,
+            "CALL sys.create_tag_from_watermark(table => 'test_db.t1', tag => 'equal', watermark => 1000)",
+        )
+        .await;
+        assert_eq!(read_tag(tmp.path(), "equal")["id"], 1);
+    }
+}
+
+#[tokio::test]
+async fn test_create_tag_from_watermark_skips_missing_live_and_tag_watermarks() {
+    let (tmp, sql_context) = setup_table_with_watermarks([None, Some(i64::MIN), Some(2000)]).await;
+    for id in [1, 2] {
+        exec(
+            &sql_context,
+            &format!(
+                "CALL sys.create_tag(table => 'test_db.t1', tag => 'missing_{id}', snapshot_id => {id})"
+            ),
+        )
+        .await;
+    }
+    exec(
+        &sql_context,
+        "CALL sys.create_tag_from_watermark(table => 'test_db.t1', tag => 'live', watermark => 0)",
+    )
+    .await;
+    assert_eq!(read_tag(tmp.path(), "live")["id"], 3);
+    for id in [1, 2] {
+        std::fs::remove_file(
+            tmp.path()
+                .join(format!("test_db.db/t1/snapshot/snapshot-{id}")),
+        )
+        .unwrap();
+    }
+    for (index, watermark) in [i64::MIN, 0, 2000].into_iter().enumerate() {
+        let name = format!("valid_{index}");
+        exec(
+            &sql_context,
+            &format!(
+                "CALL sys.create_tag_from_watermark(table => 'test_db.t1', tag => '{name}', watermark => {watermark})"
+            ),
+        )
+        .await;
+        assert_eq!(read_tag(tmp.path(), &name)["id"], 3);
+    }
+}
+
+#[tokio::test]
+async fn test_create_tag_from_watermark_without_candidate_does_not_write() {
+    for (watermarks, target) in [
+        ([None, None, None], 0),
+        ([None, Some(i64::MIN), None], i64::MIN),
+        ([Some(1000), Some(2000), Some(3000)], 3001),
+    ] {
+        let (tmp, sql_context) = setup_table_with_watermarks(watermarks).await;
+        exec(
+            &sql_context,
+            "CALL sys.create_tag(table => 'test_db.t1', tag => 'keep', snapshot_id => 2)",
+        )
+        .await;
+        let keep_path = tmp.path().join("test_db.db/t1/tag/tag-keep");
+        let original = std::fs::read(&keep_path).unwrap();
+        assert_sql_error(
+            &sql_context,
+            &format!(
+                "CALL sys.create_tag_from_watermark(table => 'test_db.t1', tag => 'missing', watermark => {target})"
+            ),
+            &format!("No snapshot found with watermark >= {target}"),
+        )
+        .await;
+        assert!(!tmp.path().join("test_db.db/t1/tag/tag-missing").exists());
+        assert_eq!(std::fs::read(keep_path).unwrap(), original);
+        assert_eq!(
+            row_count(&sql_context, "SELECT * FROM paimon.test_db.`t1$tags`").await,
+            1
+        );
+    }
+
+    let (tmp, sql_context) = setup_sql_context().await;
+    exec(&sql_context, "CREATE TABLE paimon.test_db.t1 (id INT)").await;
+    assert_sql_error(
+        &sql_context,
+        "CALL sys.create_tag_from_watermark(table => 'test_db.t1', tag => 'empty', watermark => 0)",
+        "No snapshot found with watermark >= 0",
+    )
+    .await;
+    assert!(!tmp.path().join("test_db.db/t1/tag").exists());
+}
+
+#[tokio::test]
+async fn test_create_tag_from_watermark_rejects_invalid_arguments_without_writes() {
+    let (tmp, sql_context) =
+        setup_table_with_watermarks([Some(1000), Some(2000), Some(3000)]).await;
+    exec(
+        &sql_context,
+        "CALL sys.create_tag_from_watermark(table => 'test_db.t1', tag => 'keep', watermark => 1000)",
+    )
+    .await;
+    let keep_path = tmp.path().join("test_db.db/t1/tag/tag-keep");
+    let original = std::fs::read(&keep_path).unwrap();
+
+    for (args, expected_error) in [
+        ("tag => 'invalid', watermark => 1000", "Missing required argument: 'table'"),
+        ("table => 'test_db.t1', watermark => 1000", "Missing required argument: 'tag'"),
+        ("table => 'test_db.t1', tag => 'invalid'", "Missing required argument: 'watermark'"),
+        ("table => 'test_db.t1', tag => 'invalid', watermark => 'abc'", "Invalid watermark"),
+        ("table => 'test_db.t1', tag => 'invalid', watermark => 1.5", "Invalid watermark"),
+        ("table => 'test_db.t1', tag => 'invalid', watermark => 9223372036854775808", "Invalid watermark"),
+        ("table => 'test_db.t1', tag => 'invalid', watermark => -9223372036854775809", "Invalid watermark"),
+        ("table => 'test_db.t1', tag => 'invalid', watermak => 1000", "Argument watermak is unknown"),
+        ("table => 'test_db.t1', tag => 'invalid', watermark => 1000, time_retain => '1d'", "Argument time_retain is unknown"),
+        ("table => 'test_db.t1', tag => 'invalid', watermark => 1000, watermark => 2000", "Procedure argument watermark is duplicated"),
+        ("table => 'test_db.t1', tag => '', watermark => 1000", "Invalid tag name"),
+        ("table => 'test_db.t1', tag => '../invalid', watermark => 1000", "Invalid tag name"),
+        ("table => 'test_db.t1', tag => 'invalid', watermark => 1000, time_retained => ''", "Invalid tag retention"),
+        ("table => 'test_db.t1', tag => 'invalid', watermark => 1000, time_retained => 'invalid'", "Invalid tag retention"),
+        ("table => 'test_db.t1', tag => 'invalid', watermark => 1000, time_retained => '-1d'", "Invalid tag retention"),
+    ] {
+        assert_sql_error(
+            &sql_context,
+            &format!("CALL sys.create_tag_from_watermark({args})"),
+            expected_error,
+        )
+        .await;
+        assert_eq!(std::fs::read(&keep_path).unwrap(), original);
+    }
+    assert!(!tmp.path().join("test_db.db/t1/tag/tag-invalid").exists());
+    assert_eq!(
+        row_count(&sql_context, "SELECT * FROM paimon.test_db.`t1$tags`").await,
+        1
+    );
+}
+
+#[tokio::test]
+async fn test_create_tag_from_watermark_preserves_existing_tag() {
+    let (tmp, sql_context) =
+        setup_table_with_watermarks([Some(1000), Some(2000), Some(3000)]).await;
+    exec(
+        &sql_context,
+        "CALL sys.create_tag_from_watermark(table => 'test_db.t1', tag => 'keep', watermark => 1000, time_retained => '1d')",
+    )
+    .await;
+    let keep_path = tmp.path().join("test_db.db/t1/tag/tag-keep");
+    let original = std::fs::read(&keep_path).unwrap();
+    for (watermark, retention) in [(2000, "2d"), (2000, "invalid"), (4000, "1d")] {
+        assert_sql_error(
+            &sql_context,
+            &format!(
+                "CALL sys.create_tag_from_watermark(table => 'test_db.t1', tag => 'keep', \
+                 watermark => {watermark}, time_retained => '{retention}')"
+            ),
+            "Tag 'keep' already exists",
+        )
+        .await;
+        assert_eq!(std::fs::read(&keep_path).unwrap(), original);
+    }
 }
 
 #[tokio::test]

@@ -53,13 +53,16 @@ impl ConsumerManager {
         )
     }
 
-    pub(super) fn validate_consumer_id(consumer_id: &str) -> crate::Result<()> {
+    /// Validate a consumer name before reading or mutating its metadata.
+    pub fn validate_consumer_id(consumer_id: &str) -> crate::Result<()> {
         if consumer_id.is_empty()
             || matches!(consumer_id, "." | "..")
             || consumer_id.contains(['/', '\\'])
+            // OpenDAL trims path boundaries, so trailing whitespace would alias another ID.
+            || consumer_id.trim_end() != consumer_id
         {
             return Err(crate::Error::DataInvalid {
-                message: "consumer id must be a non-empty name without path separators".into(),
+                message: "consumer id must be a non-empty name without path separators or trailing whitespace".into(),
                 source: None,
             });
         }
@@ -96,6 +99,16 @@ impl ConsumerManager {
             }
         })?;
         self.file_io.new_output(&path)?.write(bytes.into()).await
+    }
+
+    /// Delete one consumer's progress. A missing file is a successful no-op.
+    pub async fn delete(&self, consumer_id: &str) -> crate::Result<()> {
+        Self::validate_consumer_id(consumer_id)?;
+        let path = format!(
+            "{}/{CONSUMER_DIR}/{CONSUMER_PREFIX}{consumer_id}",
+            self.table_path
+        );
+        self.file_io.delete_file(&path).await
     }
 
     async fn read_path(&self, consumer_id: &str, path: &str) -> crate::Result<Option<i64>> {
@@ -185,10 +198,156 @@ struct Consumer {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use bytes::Bytes;
 
     use super::*;
-    use crate::io::FileIOBuilder;
+    use crate::io::{FileIOBuilder, FileIOProvider};
+
+    #[tokio::test]
+    async fn delete_is_idempotent_and_preserves_other_consumers_and_branches() {
+        for scheme in ["memory", "file"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let table_path = if scheme == "file" {
+                format!("file://{}/table", tmp.path().display())
+            } else {
+                "memory:/consumer-delete".to_string()
+            };
+            let file_io = FileIOBuilder::new(scheme).build().unwrap();
+            let manager = ConsumerManager::new(file_io.clone(), table_path.clone());
+            let branch = manager.with_branch("dev");
+            let sibling = manager.with_branch("release");
+            manager.delete("missing").await.unwrap();
+            assert!(!file_io
+                .exists_dir(&format!("{table_path}/consumer"))
+                .await
+                .unwrap());
+            manager.reset("job", 1).await.unwrap();
+            manager.reset("other", 2).await.unwrap();
+            branch.reset("job", 3).await.unwrap();
+            sibling.reset("job", 4).await.unwrap();
+
+            branch.delete("job").await.unwrap();
+            branch.delete("job").await.unwrap();
+            assert_eq!(branch.get("job").await.unwrap(), None);
+            assert_eq!(manager.get("job").await.unwrap(), Some(1));
+            assert_eq!(sibling.get("job").await.unwrap(), Some(4));
+            assert!(file_io
+                .exists_dir(&format!("{table_path}/branch/branch-dev/consumer"))
+                .await
+                .unwrap());
+
+            branch.reset("job", 5).await.unwrap();
+            manager.delete("job").await.unwrap();
+            manager.delete("job").await.unwrap();
+            assert_eq!(
+                manager.list_all().await.unwrap(),
+                vec![("other".to_string(), 2)]
+            );
+            assert_eq!(branch.get("job").await.unwrap(), Some(5));
+            assert_eq!(sibling.get("job").await.unwrap(), Some(4));
+        }
+    }
+
+    #[tokio::test]
+    async fn trailing_whitespace_cannot_alias_another_consumers_progress() {
+        for scheme in ["memory", "file"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let table_path = if scheme == "file" {
+                format!("file://{}/table", tmp.path().display())
+            } else {
+                "memory:/consumer-whitespace".to_string()
+            };
+            let file_io = FileIOBuilder::new(scheme).build().unwrap();
+            let manager = ConsumerManager::new(file_io.clone(), table_path);
+            let branch = manager.with_branch("dev");
+            for scoped in [&manager, &branch] {
+                scoped.reset("job", 1).await.unwrap();
+                let path = format!("{}/consumer/consumer-job", scoped.table_path);
+                let original = file_io.new_input(&path).unwrap().read().await.unwrap();
+                for id in [
+                    "job ",
+                    "job\t",
+                    "job\n",
+                    "job\r\n",
+                    "job\u{a0}",
+                    "job\u{3000}",
+                ] {
+                    assert_eq!(scoped.get(id).await.unwrap(), None);
+                    assert!(scoped.delete(id).await.is_err(), "{scheme}: {id:?}");
+                    assert_eq!(
+                        file_io.new_input(&path).unwrap().read().await.unwrap(),
+                        original
+                    );
+                    assert!(scoped.reset(id, 3).await.is_err(), "{scheme}: {id:?}");
+                    assert_eq!(
+                        file_io.new_input(&path).unwrap().read().await.unwrap(),
+                        original
+                    );
+                }
+                scoped.reset(" job", 2).await.unwrap();
+                assert_eq!(scoped.get(" job").await.unwrap(), Some(2));
+                scoped.delete(" job").await.unwrap();
+                assert_eq!(scoped.get("job").await.unwrap(), Some(1));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_rejects_invalid_ids_without_changing_files() {
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let manager =
+            ConsumerManager::new(file_io.clone(), "memory:/consumer-delete-invalid".into());
+        manager.reset("job", 2).await.unwrap();
+        for invalid in ["", ".", "..", "x/../../snapshot/snapshot-1", "x\\y"] {
+            assert!(manager.delete(invalid).await.is_err());
+        }
+        assert_eq!(
+            manager.list_all().await.unwrap(),
+            vec![("job".to_string(), 2)]
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_propagates_storage_errors() {
+        #[derive(Debug)]
+        struct DeniedProvider;
+
+        #[async_trait::async_trait]
+        impl FileIOProvider for DeniedProvider {
+            async fn create(&self, _path: &str) -> crate::Result<(opendal::Operator, String)> {
+                Err(
+                    opendal::Error::new(opendal::ErrorKind::PermissionDenied, "access denied")
+                        .into(),
+                )
+            }
+        }
+
+        let file_io = FileIOBuilder::new("memory")
+            .build()
+            .unwrap()
+            .with_provider(Arc::new(DeniedProvider));
+        let manager = ConsumerManager::new(file_io, "memory:/consumer-delete-denied".into());
+        let error = manager.delete("job").await.unwrap_err();
+        assert!(matches!(error, crate::Error::IoUnexpected { source, .. }
+            if source.kind() == opendal::ErrorKind::PermissionDenied));
+    }
+
+    #[tokio::test]
+    async fn delete_does_not_recursively_remove_a_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let directory = tmp.path().join("consumer/consumer-job");
+        std::fs::create_dir_all(&directory).unwrap();
+        let child = directory.join("keep");
+        std::fs::write(&child, b"keep").unwrap();
+        let manager = ConsumerManager::new(
+            FileIOBuilder::new("file").build().unwrap(),
+            format!("file://{}", tmp.path().display()),
+        );
+        assert!(manager.delete("job").await.is_err());
+        assert_eq!(std::fs::read(child).unwrap(), b"keep");
+    }
 
     #[tokio::test]
     async fn reset_is_explicit_branch_scoped_and_rejects_path_traversal() {

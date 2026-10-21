@@ -20,6 +20,7 @@
 //! Reference: `org.apache.paimon.table.source.HybridSearchBuilder`.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use futures::{stream, StreamExt, TryStreamExt};
@@ -311,10 +312,10 @@ impl<'a> HybridSearchBuilder<'a> {
     }
 
     pub async fn execute(&self) -> crate::Result<Vec<RowRange>> {
-        self.execute_scored().await?.to_row_ranges()
+        self.execute_scored().await?.row_ids()?.to_row_ranges()
     }
 
-    pub async fn execute_scored(&self) -> crate::Result<ScoredRowIds> {
+    pub async fn execute_scored(&self) -> crate::Result<super::GlobalIndexResult> {
         let core = CoreOptions::new(self.table.schema().options());
         core.ensure_read_authorized()?;
         let limit = self.validate_search()?;
@@ -339,10 +340,20 @@ impl<'a> HybridSearchBuilder<'a> {
         self.validate_global_routes()?;
         // Resolve once even for an empty table or a retained tag. Re-resolving
         // selectors independently in the routes can observe different versions.
-        let Some(table) = self.resolve_pinned_route_table().await? else {
-            return Ok(ScoredRowIds::empty());
+        let (table, hits) = match self.resolve_pinned_route_table().await? {
+            Some(table) => {
+                let hits = self.execute_global_routes(&table, limit).await?;
+                (table, hits)
+            }
+            None => (
+                self.table.copy_with_pinned_snapshot(None),
+                ScoredRowIds::empty(),
+            ),
         };
-        self.execute_global_routes(&table, limit).await
+        Ok(super::GlobalIndexResult::from_global_search(
+            Arc::new(table),
+            hits,
+        ))
     }
 
     fn validate_search(&self) -> crate::Result<usize> {
@@ -585,6 +596,7 @@ impl<'a> HybridSearchBuilder<'a> {
             self.table.schema_manager().clone(),
             self.table.schema().id(),
             self.table.schema().fields().to_vec(),
+            self.table.data_fields_extractor(),
             self.table.schema().fields().to_vec(),
             Vec::new(),
         )
@@ -650,11 +662,7 @@ impl<'a> HybridSearchBuilder<'a> {
             .iter()
             .map(PrimaryKeySearchPosition::from_vector_position)
             .collect::<crate::Result<Vec<_>>>()?;
-        let source_splits = result
-            .indexed_splits()?
-            .iter()
-            .map(|split| split.split.clone())
-            .collect();
+        let source_splits = result.splits()?.to_vec();
         Ok(PkRoute {
             positions,
             source_splits,
@@ -755,6 +763,7 @@ impl<'a> HybridSearchBuilder<'a> {
             table.schema_manager().clone(),
             table.schema().id(),
             table.schema().fields().to_vec(),
+            table.data_fields_extractor(),
             table.schema().fields().to_vec(),
             Vec::new(),
         )

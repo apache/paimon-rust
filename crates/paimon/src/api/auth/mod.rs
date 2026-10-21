@@ -19,6 +19,8 @@
 
 mod base;
 mod bearer_provider;
+mod dlf_openapi_actions;
+mod dlf_openapi_v4_signer;
 mod dlf_provider;
 mod dlf_signer;
 mod factory;

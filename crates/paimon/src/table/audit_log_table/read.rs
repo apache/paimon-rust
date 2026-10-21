@@ -46,7 +46,7 @@ impl<'a> AuditLogRead<'a> {
         // Query-auth is decided per split in `to_arrow`; only the type is known here.
         crate::spec::CoreOptions::new(read.table().schema().options())
             .ensure_type_paimon_served(&read.table().identifier().full_name())?;
-        match read.0 {
+        match read.kind {
             TableReadKind::Paimon(read) => Ok(Self { read }),
             TableReadKind::Format(_) => Err(crate::Error::Unsupported {
                 message: "Format tables do not support audit log batch read".to_string(),
@@ -109,6 +109,7 @@ impl<'a> AuditLogRead<'a> {
                 self.read.table.schema_manager().clone(),
                 self.read.table.schema().id(),
                 self.read.table.schema.fields().to_vec(),
+                self.read.table.data_fields_extractor(),
                 read_type.clone(),
                 self.read.data_predicates.clone(),
             )

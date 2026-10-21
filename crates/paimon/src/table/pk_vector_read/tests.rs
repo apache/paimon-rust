@@ -280,6 +280,7 @@ async fn vector_rerank_fixture(
         schema_manager,
         schema_id,
         read_fields.clone(),
+        |fields| Ok(fields.to_vec()),
         read_fields,
         Vec::new(),
     );
@@ -593,6 +594,7 @@ async fn rerank_aligns_recomputed_distance_by_position_column() {
         schema_manager,
         schema_id,
         read_fields.clone(),
+        |fields| Ok(fields.to_vec()),
         read_fields.clone(),
         Vec::new(),
     );
@@ -1066,7 +1068,7 @@ async fn reader_uses_planned_splits_after_index_manifest_is_removed() {
             .collect::<Vec<_>>(),
         vec![1.0, 0.5]
     );
-    assert_eq!(result.indexed_splits().unwrap().len(), 1);
+    assert_eq!(result.splits().unwrap().len(), 1);
 
     let batches: Vec<RecordBatch> = result
         .new_read_builder()
@@ -1125,15 +1127,19 @@ async fn execute_returns_scored_positions_and_publishes_diagnostics() {
 
     // Every position retains the source file and snapshot needed for a later read.
     assert_eq!(result.snapshot_id(), Some(1), "first commit -> snapshot 1");
-    let splits = result.indexed_splits().unwrap();
+    let splits = result.splits().unwrap();
     assert_eq!(splits.len(), 1);
-    assert_eq!(splits[0].split.snapshot_id(), 1);
+    assert_eq!(splits[0].snapshot_id(), 1);
+    assert_eq!(splits[0].scores(), Some([1.0, 0.5].as_slice()));
+    assert_eq!(
+        splits[0].row_ranges(),
+        Some([crate::table::RowRange::new(1, 2)].as_slice())
+    );
     assert!(
         positions.iter().all(|p| {
-            p.data_file_name == splits[0].split.data_files()[0].file_name
-                && p.bucket == splits[0].split.bucket()
-                && p.partition.to_serialized_bytes()
-                    == splits[0].split.partition().to_serialized_bytes()
+            p.data_file_name == splits[0].data_files()[0].file_name
+                && p.bucket == splits[0].bucket()
+                && p.partition.to_serialized_bytes() == splits[0].partition().to_serialized_bytes()
         }),
         "positions must refer to their retained source split"
     );
@@ -1177,7 +1183,7 @@ async fn execute_empty_plan_yields_empty_pk_result() {
         "no data -> no positions"
     );
     assert!(
-        result.indexed_splits().unwrap().is_empty(),
+        result.splits().unwrap().is_empty(),
         "no data -> no source splits"
     );
     assert_eq!(result.snapshot_id(), None);

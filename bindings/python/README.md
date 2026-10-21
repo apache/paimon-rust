@@ -132,6 +132,17 @@ scan = read_builder.new_scan()
 plan = scan.plan()
 batches = read_builder.new_read().read(plan.splits())
 
+# Core schedules a bounded set of split readers and owns their global limit.
+# Set ordered=True to retain the supplied split order. The default emits
+# whichever split group is ready first. Ordered parallel reads disable background
+# Parquet row-group prefetch; split workers still read concurrently.
+reader = read_builder.new_read().read_arrow(plan.splits(), parallelism=4, ordered=False)
+try:
+    for batch in reader:
+        print(batch)
+finally:
+    reader.close()
+
 print(f"\nRead: {batches[0].num_rows} rows")
 print(batches[0])
 
@@ -157,6 +168,22 @@ batches_tt = read_builder_tt.new_read().read(plan_tt.splits())
 print(f"\nRead: {batches_tt[0].num_rows} rows")
 print(batches_tt[0])
 ```
+
+### Scan statistics
+
+Every scan collects lightweight counters during ordinary metadata planning:
+
+```python
+plan = table.new_read_builder().new_scan().plan()
+scan_stats = plan.stats()
+print(scan_stats.manifest_entries_read, scan_stats.final_files)
+```
+
+Collection retains early manifest/sidecar pruning and LIMIT stopping. Counters
+record the work performed; skipped entries are not decoded to reconstruct totals.
+Combined incremental scans expose
+the same API for their selected Delta or Changelog window. Snapshot metadata is
+available from `plan.snapshot_id()`.
 
 ### Shard column updates
 
@@ -278,11 +305,16 @@ for a partition and bucket must have a single writer owner. Both duplicate
 owners in a commit and stale overlapping writers are rejected. Pending files
 (`bucket=-2`) can coexist with real buckets; they remain pending until assigned.
 
-Without an explicit plan, set `postpone.default-bucket-num` to a positive integer.
-The count is used exactly for new partitions, and append reuses existing layouts
-from the same snapshot used to initialize sequence numbers. Overwrite uses the
-configured default for replaced partitions. No staging, automatic rescaling or
-compaction is performed. Deletion-vector tables are rejected by this writer.
+Without an explicit plan, `postpone.default-bucket-num` can provide an exact count
+for new partitions. Otherwise core buffers unknown partitions until preparation
+and infers their counts from this writer's input: the target row count takes
+precedence over estimated BinaryRow bytes. Counts round up to a power of two,
+then cap at the configured maximum parallelism. Append reuses existing layouts
+from the same snapshot used to initialize sequence numbers and writes known
+partitions directly. Overwrite plans replaced partitions from the new input.
+Distributed writers should share one resolved plan. This does not implement
+Spark's temporary-file measurement, automatic rescaling or compaction.
+Deletion-vector tables are rejected by this writer.
 A failed write cannot be prepared, and close deletes only unprepared output.
 
 Configure overwrite on the batch builder:
@@ -342,6 +374,26 @@ provider and REST environment. The optional branch selects its metadata namespac
 without reading a branch schema file. Omit it to retain the original branch.
 Cached time-travel resolution is discarded so the supplied options select the
 snapshot, with the externally resolved fields preserved.
+
+REST catalogs also expose `create_branch(identifier, branch, from_tag=None)`,
+`drop_branch(identifier, branch)`, `fast_forward(identifier, branch)` and
+`list_branches(identifier)`. These delegate to core REST catalog operations and
+release the GIL while waiting for requests. Creation without a tag creates an
+empty branch, as in Java. REST branch rename is unsupported.
+
+REST authentication also supports explicit `dlf.signing-algorithm=openapi-v4`.
+Rust core signs ACS4-HMAC-SHA256 requests with the same canonical request,
+credential scope and action headers as Java. GET requests retry HTTP 429/503 up
+to five times and honor Retry-After; branch mutations are sent once and ignore
+successful response payloads.
+
+`PaimonCatalog(options, config_required=False)` reuses already resolved REST
+options without fetching `/config` again. Branch operation failures raise
+`CatalogError`, a `ValueError` subclass with `code`, `resource_type`,
+`resource_name` and `message` attributes. `code=0` identifies transport or
+response-decoding failures without an HTTP error status. Malformed identifiers
+remain `ValueError`, unsupported catalogs raise `NotImplementedError`, and
+inherited Native state still raises `ForkSafetyError`.
 
 REST tables load the latest snapshot through the catalog, including empty
 results and branch-scoped requests. Permission and service failures (including

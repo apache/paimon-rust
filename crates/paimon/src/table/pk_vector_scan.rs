@@ -25,8 +25,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use indexmap::IndexMap;
 
 use crate::spec::{
-    should_read_pk_index_source, BinaryRow, DataFileMeta, FileKind, IndexManifest, Predicate,
-    PrimaryKeyIndexSourceFile, PrimaryKeyIndexSourceMeta,
+    should_read_pk_index_source, BinaryRow, DataFileMeta, FileKind, IndexFileMeta, IndexManifest,
+    Predicate, PrimaryKeyIndexSourceFile, PrimaryKeyIndexSourceMeta, Snapshot,
 };
 use crate::table::bucket_filter::split_partition_and_data_predicates;
 use crate::table::index_file_path::IndexFileLocation;
@@ -211,6 +211,8 @@ impl BucketAccumulator {
 /// The per-bucket search splits produced by planning.
 #[derive(Clone)]
 pub(crate) struct PkVectorScanPlan {
+    pub snapshot: Option<Snapshot>,
+    pub payloads: HashMap<BucketKey, Vec<IndexFileMeta>>,
     // The snapshot the plan resolved during planning (pinned before the index
     // manifest is read). It is authoritative even when planning yields zero
     // searchable splits, so a cross-route consistency guard can require one
@@ -340,6 +342,8 @@ impl Scan for PkVectorScan {
         }
         if incremental {
             return Ok(PkVectorScanPlan {
+                snapshot: None,
+                payloads: HashMap::new(),
                 snapshot_id: 0,
                 splits: Vec::new(),
                 physical_row_ranges_by_split: None,
@@ -347,6 +351,8 @@ impl Scan for PkVectorScan {
         }
         let Some(snapshot) = snapshot else {
             return Ok(PkVectorScanPlan {
+                snapshot: None,
+                payloads: HashMap::new(),
                 snapshot_id: 0,
                 splits: Vec::new(),
                 physical_row_ranges_by_split: None,
@@ -357,6 +363,7 @@ impl Scan for PkVectorScan {
         // Index-manifest scan into filtered ANN payload tuples.
         let table_path = self.table.location().trim_end_matches('/');
         let mut entries = Vec::new();
+        let mut payloads = HashMap::<BucketKey, Vec<IndexFileMeta>>::new();
         if let Some(name) = snapshot.index_manifest() {
             let path = snapshot_manager.manifest_path(name);
             for entry in IndexManifest::read(self.table.file_io(), &path).await? {
@@ -381,6 +388,10 @@ impl Scan for PkVectorScan {
                 if gim.source_meta.is_none() {
                     continue;
                 }
+                payloads
+                    .entry((entry.partition.clone(), entry.bucket))
+                    .or_default()
+                    .push(entry.index_file.clone());
                 let partition = BinaryRow::from_serialized_bytes(&entry.partition)?;
                 let file_size = u64::try_from(entry.index_file.file_size)
                     .map_err(|_| data_invalid("index file size must not be negative"))?;
@@ -421,6 +432,8 @@ impl Scan for PkVectorScan {
             index_file_in_data_file_dir,
         )?;
         Ok(PkVectorScanPlan {
+            snapshot: Some(snapshot),
+            payloads,
             snapshot_id,
             splits,
             physical_row_ranges_by_split: None,
@@ -594,6 +607,8 @@ fn plan_from_bucket_splits(
         .collect::<Vec<_>>();
 
     Ok(PkVectorScanPlan {
+        snapshot: None,
+        payloads: HashMap::new(),
         snapshot_id,
         splits,
         physical_row_ranges_by_split: Some(physical_row_ranges_by_split),
@@ -1172,7 +1187,7 @@ mod tests {
         async fn plan_validates_original_scan_mode_and_rejects_nonempty_incremental_search() {
             let (_tmp, table) = build_pruning_test_table(false).await;
             for extra in [
-                HashMap::from([("scan.mode".to_string(), "latest-full".to_string())]),
+                HashMap::from([("scan.mode".to_string(), "compacted-full".to_string())]),
                 HashMap::from([(
                     "incremental-between-timestamp".to_string(),
                     "0,9999999999999".to_string(),
@@ -1204,6 +1219,30 @@ mod tests {
             .unwrap()
             .splits
             .is_empty());
+        }
+
+        #[tokio::test]
+        async fn full_startup_modes_preserve_vector_scan_snapshot() {
+            let (_tmp, table) = build_pruning_test_table(false).await;
+            let snapshot = table.resolve_read_snapshot().await.unwrap().unwrap();
+            for mode in ["latest", "latest-full", "from-snapshot-full"] {
+                let mut options = HashMap::from([("scan.mode".into(), mode.into())]);
+                if mode == "from-snapshot-full" {
+                    options.insert("scan.snapshot-id".into(), snapshot.id().to_string());
+                }
+                let view = table.copy_with_options(options);
+                let plan = PkVectorScan::new(
+                    &view,
+                    prune_vector_field_id(&view),
+                    PRUNE_INDEX_TYPE.to_string(),
+                    None,
+                )
+                .plan()
+                .await
+                .unwrap();
+                assert_eq!(plan.snapshot_id, snapshot.id());
+                assert!(!plan.splits.is_empty());
+            }
         }
 
         #[tokio::test]

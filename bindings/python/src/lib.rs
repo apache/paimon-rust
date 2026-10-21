@@ -17,13 +17,16 @@
 
 use pyo3::prelude::*;
 
+mod arrow_input;
 mod blob;
 mod blob_uri_reader;
+mod catalog_version;
 mod commit_callback;
 mod context;
 mod error;
 mod evolution;
 mod full_text_search;
+mod global_index_result;
 mod hybrid_search;
 mod index_build;
 mod merge_into;
@@ -31,13 +34,14 @@ mod oss_cpp;
 mod predicate;
 mod read;
 mod schema;
-mod search_result;
 mod shard_update;
+mod system_table;
 mod table;
 mod udf;
 mod update_assignment;
 mod variant;
 mod vector_search;
+mod vindex;
 mod write;
 // ---- #285: observability ----
 mod partition;

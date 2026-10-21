@@ -229,17 +229,18 @@ async fn reads_java_written_file_indexes_and_prunes_data_files() {
 
         let mut planning_builder = table.new_read_builder();
         planning_builder.with_filter(missing.clone());
-        let (plan, trace) = planning_builder
+        let plan = planning_builder
             .new_scan()
-            .plan_with_trace()
+            .plan()
             .await
             .expect("plan missing-value query");
+        let scan_stats = plan.stats().clone();
         assert_eq!(
-            trace.manifest_entries_pruned_by_data_stats, 0,
+            scan_stats.manifest_entries_pruned_by_data_stats, 0,
             "{}",
             case.table
         );
-        assert_eq!(trace.final_files, 1, "{}", case.table);
+        assert_eq!(scan_stats.final_files, 1, "{}", case.table);
         let file = &plan.splits()[0].data_files()[0];
         assert_eq!(file.row_count, 4, "{}", case.table);
         assert_eq!(

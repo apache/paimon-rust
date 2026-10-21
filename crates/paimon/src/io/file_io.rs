@@ -43,6 +43,9 @@ use super::Storage;
 #[cfg(all(test, feature = "storage-memory"))]
 mod provider_tests;
 
+#[cfg(feature = "storage-fs")]
+mod fuse;
+
 /// An externally managed block cache used by [`FileIO`].
 ///
 /// Implementations store immutable file ranges. Cache failures must be handled
@@ -265,7 +268,7 @@ impl FileIO {
     /// `block_size` controls the aligned ranges presented to the cache.
     /// `whitelist` uses the same comma-separated values as
     /// `local-cache.whitelist`: `meta`, `global-index`, `bucket-index`, `data`,
-    /// and `file-index`, or `*` for all of them.
+    /// `structured-data`, and `file-index`, or `*` for all of them.
     pub fn with_file_block_cache(
         mut self,
         cache: Arc<dyn FileBlockCache>,
@@ -320,25 +323,32 @@ impl FileIO {
         }
     }
 
+    async fn create_with_cache_namespace(
+        &self,
+        path: &str,
+    ) -> crate::Result<(Operator, String, Option<String>)> {
+        match &self.backend {
+            FileIOBackend::Provider(provider) => {
+                let (op, relative_path, namespace) =
+                    resolve_provider_with_cache_namespace(provider.as_ref(), path).await?;
+                Ok((op, relative_path, namespace))
+            }
+            FileIOBackend::Storage(_) => {
+                let (op, relative_path) = self.create_static(path)?;
+                Ok((
+                    op,
+                    relative_path,
+                    Some(self.cache_namespace_for_path(path)?),
+                ))
+            }
+        }
+    }
+
     async fn create_with_cache_path(
         &self,
         path: &str,
     ) -> crate::Result<(Operator, String, Option<String>)> {
-        let (op, relative_path, namespace) = match &self.backend {
-            FileIOBackend::Provider(provider) => {
-                let (op, relative_path, namespace) =
-                    resolve_provider_with_cache_namespace(provider.as_ref(), path).await?;
-                (op, relative_path, namespace)
-            }
-            FileIOBackend::Storage(_) => {
-                let (op, relative_path) = self.create_static(path)?;
-                (
-                    op,
-                    relative_path,
-                    Some(self.cache_namespace_for_path(path)?),
-                )
-            }
-        };
+        let (op, relative_path, namespace) = self.create_with_cache_namespace(path).await?;
         let cache_path =
             namespace.map(|namespace| cache_object_path(&namespace, &op, &relative_path));
         Ok((op, relative_path, cache_path))
@@ -645,7 +655,7 @@ impl FileIO {
             self.cache.as_ref().filter(|cache| cache.is_cacheable(path)),
             cache_path,
         ) {
-            cache.invalidate_path(&cache_path).await;
+            cache.invalidate_path(&cache_path).await?;
         }
 
         Ok(())
@@ -656,8 +666,12 @@ impl FileIO {
     /// Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/fs/FileIO.java#L139>
     pub async fn delete_dir(&self, path: &str) -> Result<()> {
         let (op, relative_path, cache_path) = self.create_with_cache_path(path).await?;
+        // Without a trailing `/`, OpenDAL trims the path's surrounding whitespace,
+        // and a recursive delete it emulates by listing removes every key with
+        // this prefix.
+        let dir_path = normalize_root(relative_path.as_ref());
 
-        op.delete_with(relative_path.as_ref())
+        op.delete_with(&dir_path)
             .recursive(true)
             .await
             .map_err(|error| {
@@ -667,7 +681,7 @@ impl FileIO {
                 )
             })?;
         if let (Some(cache), Some(cache_path)) = (&self.cache, cache_path) {
-            cache.invalidate_prefix(&cache_path).await;
+            cache.invalidate_prefix(&cache_path).await?;
         }
 
         Ok(())
@@ -745,7 +759,16 @@ impl FileIO {
                     .to_string(),
             });
         }
-        op_src
+        let shared_invalidation = if cache_path_src.is_some() || cache_path_dst.is_some() {
+            match &self.cache {
+                Some(cache) => cache.begin_shared_invalidation().await?,
+                None => None,
+            }
+        } else {
+            None
+        };
+        let shared_cache_fenced = shared_invalidation.is_some();
+        let rename_result = op_src
             .rename(relative_path_src.as_ref(), relative_path_dst.as_ref())
             .await
             .map_err(|error| {
@@ -753,13 +776,21 @@ impl FileIO {
                     error,
                     format!("Failed to rename '{src}' to '{dst}'"),
                 )
-            })?;
-        if let Some(cache) = &self.cache {
-            if let Some(cache_path) = cache_path_src {
-                cache.invalidate_prefix(&cache_path).await;
-            }
-            if let Some(cache_path) = cache_path_dst {
-                cache.invalidate_prefix(&cache_path).await;
+            });
+        // A failed rename may still complete remotely. Leave the shared cache
+        // fenced rather than publish data read while its outcome is uncertain.
+        rename_result?;
+        if let Some(invalidation) = shared_invalidation {
+            invalidation.finish().await;
+        }
+        if !shared_cache_fenced {
+            if let Some(cache) = &self.cache {
+                if let Some(cache_path) = cache_path_src {
+                    cache.invalidate_prefix(&cache_path).await?;
+                }
+                if let Some(cache_path) = cache_path_dst {
+                    cache.invalidate_prefix(&cache_path).await?;
+                }
             }
         }
 
@@ -1118,6 +1149,7 @@ struct CacheInvalidatingWriter {
     delegate: Box<dyn FileWrite>,
     cache: Arc<LocalCache>,
     path: String,
+    delegate_closed: bool,
 }
 
 /// OpenDAL's local position writer retains its last write until close. Use a
@@ -1231,13 +1263,16 @@ impl FileWrite for CacheInvalidatingWriter {
 
     async fn flush(&mut self) -> crate::Result<()> {
         self.delegate.flush().await?;
-        self.cache.invalidate_path(&self.path).await;
+        self.cache.invalidate_path(&self.path).await?;
         Ok(())
     }
 
     async fn close(&mut self) -> crate::Result<()> {
-        self.delegate.close().await?;
-        self.cache.invalidate_path(&self.path).await;
+        if !self.delegate_closed {
+            self.delegate.close().await?;
+            self.delegate_closed = true;
+        }
+        self.cache.invalidate_path(&self.path).await?;
         Ok(())
     }
 }
@@ -1252,7 +1287,7 @@ struct CacheInvalidatingAsyncWriter {
     cache: Arc<LocalCache>,
     path: String,
     delegate_shutdown: bool,
-    invalidation: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
+    invalidation: Option<Pin<Box<dyn Future<Output = crate::Result<()>> + Send>>>,
 }
 
 impl tokio::io::AsyncWrite for CacheInvalidatingAsyncWriter {
@@ -1292,7 +1327,16 @@ impl tokio::io::AsyncWrite for CacheInvalidatingAsyncWriter {
         if let Some(invalidation) = &mut self.invalidation {
             match invalidation.as_mut().poll(context) {
                 Poll::Pending => return Poll::Pending,
-                Poll::Ready(()) => self.invalidation = None,
+                Poll::Ready(Ok(())) => self.invalidation = None,
+                Poll::Ready(Err(error)) => {
+                    // A retry must retry invalidation, not report successful
+                    // shutdown merely because the delegate is already closed.
+                    let cache = self.cache.clone();
+                    let path = self.path.clone();
+                    self.invalidation =
+                        Some(Box::pin(async move { cache.invalidate_path(&path).await }));
+                    return Poll::Ready(Err(std::io::Error::other(error)));
+                }
             }
         }
         Poll::Ready(Ok(()))
@@ -1500,6 +1544,7 @@ impl OutputFile {
             delegate: writer,
             cache: cache.clone(),
             path: cache_path,
+            delegate_closed: false,
         })
     }
 
@@ -2018,6 +2063,39 @@ mod file_action_test {
         .await;
     }
 
+    #[cfg(all(windows, feature = "storage-fs"))]
+    #[tokio::test]
+    async fn windows_drive_paths_and_file_uris_can_list_the_same_files() {
+        let directory = tempdir().unwrap();
+        let native = directory.path().to_string_lossy().into_owned();
+        let forward = native.replace('\\', "/");
+        let uri = url::Url::from_directory_path(directory.path()).unwrap();
+        let file_io = FileIO::from_path(&native).unwrap().build().unwrap();
+        file_io
+            .new_output(&format!("{forward}/data"))
+            .unwrap()
+            .write(Bytes::from_static(b"value"))
+            .await
+            .unwrap();
+
+        for root in [
+            native,
+            forward.clone(),
+            uri.to_string(),
+            format!("file:/{forward}"),
+        ] {
+            let entries = file_io.list_status(&root).await.unwrap();
+            assert_eq!(entries.len(), 1, "{root}");
+            let contents = file_io
+                .new_input(&entries[0].path)
+                .unwrap()
+                .read()
+                .await
+                .unwrap();
+            assert_eq!(contents, Bytes::from_static(b"value"), "{root}");
+        }
+    }
+
     #[tokio::test]
     async fn test_list_status_fs_should_return_entry_paths() {
         let file_io = setup_fs_file_io();
@@ -2043,6 +2121,55 @@ mod file_action_test {
                 .unwrap();
             assert!(file_io.exists(&path).await.unwrap());
         });
+    }
+
+    #[tokio::test]
+    async fn test_delete_dir_keeps_directories_sharing_its_prefix() {
+        // The memory backend deletes recursively by key prefix, as S3 and OSS do.
+        let file_io = setup_memory_file_io();
+        let partitions = ["month=1", "month=10", "month=2"];
+        for partition in partitions {
+            file_io
+                .new_output(&format!("memory:/delete_dir_prefix/{partition}/data"))
+                .unwrap()
+                .write(Bytes::from("data"))
+                .await
+                .unwrap();
+        }
+
+        file_io
+            .delete_dir("memory:/delete_dir_prefix/month=1")
+            .await
+            .unwrap();
+
+        let mut kept = Vec::new();
+        for partition in partitions {
+            let path = format!("memory:/delete_dir_prefix/{partition}/data");
+            if file_io.exists(&path).await.unwrap() {
+                kept.push(partition);
+            }
+        }
+        assert_eq!(kept, ["month=10", "month=2"]);
+    }
+
+    // Windows drops trailing spaces from file names.
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn test_delete_dir_keeps_the_name_without_its_trailing_space() {
+        let dir = tempdir().unwrap();
+        for name in ["t1", "t1 "] {
+            fs::create_dir(dir.path().join(name)).unwrap();
+            fs::write(dir.path().join(name).join("data"), b"data").unwrap();
+        }
+        let file_io = setup_fs_file_io();
+
+        file_io
+            .delete_dir(&local_file_path(&dir.path().join("t1 ")))
+            .await
+            .unwrap();
+
+        assert!(dir.path().join("t1").exists());
+        assert!(!dir.path().join("t1 ").exists());
     }
 }
 
@@ -2326,6 +2453,92 @@ mod input_output_test {
                 assert_eq!(&cache_path, expected_key, "{scheme}");
             } else {
                 expected_key = Some(cache_path);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_structured_data_cache_preserves_existing_selectors() {
+        for disk in [false, true] {
+            for whitelist in [
+                "meta,global-index",
+                "data",
+                "structured-data",
+                "meta,global-index,structured-data",
+                "*",
+            ] {
+                let directory = tempfile::tempdir().unwrap();
+                let mut options = Options::new();
+                options.set(CatalogOptions::LOCAL_CACHE_ENABLED, "true");
+                options.set(CatalogOptions::LOCAL_CACHE_WHITELIST, whitelist);
+                options.set(CatalogOptions::LOCAL_CACHE_BLOCK_SIZE, "4");
+                if disk {
+                    options.set(
+                        CatalogOptions::LOCAL_CACHE_DIR,
+                        directory.path().to_string_lossy(),
+                    );
+                }
+                let cache = Arc::new(
+                    LocalCache::new(LocalCacheConfig::from_options(&options).unwrap().unwrap())
+                        .unwrap(),
+                );
+                let file_io = FileIOBuilder::new("memory")
+                    .with_local_cache(cache)
+                    .build()
+                    .unwrap();
+                for name in [
+                    "data.parquet",
+                    "data.blob",
+                    "data.orc",
+                    "data.avro",
+                    "data.row",
+                    "data.mosaic",
+                    "data.vortex",
+                    "data.csv",
+                    "data.json.zst",
+                    "data.text.snappy",
+                    "data.video",
+                    "data.vector.vortex",
+                    "data.PARQUET",
+                    "data.unknown",
+                    "data.parquet.index",
+                    "snapshot-1",
+                    "snapshot-1.blob",
+                ] {
+                    let path = format!("memory:/{name}");
+                    file_io
+                        .new_output(&path)
+                        .unwrap()
+                        .write(Bytes::from_static(b"abcdefgh"))
+                        .await
+                        .unwrap();
+                    let input = file_io.new_input(&path).unwrap();
+                    let reader = input.reader().await.unwrap();
+                    assert_eq!(reader.read(1..7).await.unwrap(), b"bcdefg"[..]);
+                    drop(reader);
+                    let (op, relative_path, _) = input.source.resolve(&path).await.unwrap();
+                    op.delete(&relative_path).await.unwrap();
+                    let data_file = name.starts_with("data.") && !name.ends_with(".index");
+                    let dedicated =
+                        matches!(name, "data.blob" | "data.video" | "data.vector.vortex");
+                    let cached = match whitelist {
+                        "*" => true,
+                        "data" => data_file,
+                        "structured-data" => data_file && !dedicated,
+                        "meta,global-index,structured-data" => {
+                            name.starts_with("snapshot-") || (data_file && !dedicated)
+                        }
+                        _ => name.starts_with("snapshot-"),
+                    };
+                    let result = input.read().await;
+                    if cached {
+                        assert_eq!(result.unwrap(), b"abcdefgh"[..], "{whitelist}: {name}");
+                        let reader = input.reader().await.unwrap();
+                        assert_eq!(reader.read(1..7).await.unwrap(), b"bcdefg"[..]);
+                    } else {
+                        assert!(result.is_err(), "{whitelist}: {name}");
+                    }
+                }
             }
         }
     }
@@ -2838,6 +3051,272 @@ mod input_output_test {
             file_io.new_input(&location).unwrap().read().await.unwrap(),
             Bytes::from_static(b"new metadata")
         );
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn test_shared_cache_delete_timeout_and_recreate() {
+        use tokio::io::AsyncWriteExt;
+        let source = tempfile::tempdir().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = source.path().join("snapshot-1");
+        std::fs::write(&path, b"old metadata").unwrap();
+        let location = format!("file:{}", path.display());
+        let mut options = Options::new();
+        options.set(CatalogOptions::LOCAL_CACHE_ENABLED, "true");
+        options.set(CatalogOptions::LOCAL_CACHE_SHARED, "true");
+        options.set(
+            CatalogOptions::LOCAL_CACHE_DIR,
+            directory.path().to_string_lossy(),
+        );
+        options.set(CatalogOptions::LOCAL_CACHE_MAX_SIZE, "1 MiB");
+        let cache = Arc::new(
+            LocalCache::new(LocalCacheConfig::from_options(&options).unwrap().unwrap()).unwrap(),
+        );
+        let file_io = FileIOBuilder::new("file")
+            .with_local_cache(cache)
+            .build()
+            .unwrap();
+        assert_eq!(
+            file_io.new_input(&location).unwrap().read().await.unwrap(),
+            "old metadata"
+        );
+        let gate = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(
+                directory
+                    .path()
+                    .join("paimon-shared-local-cache-v1/directory.lock"),
+            )
+            .unwrap();
+        gate.lock().unwrap();
+        let error = file_io.delete_file(&location).await.unwrap_err();
+        assert!(error.to_string().contains("invalidation failed"));
+        drop(gate);
+        // The underlying delete may already have succeeded. Retrying the
+        // idempotent delete must complete invalidation before path reuse.
+        file_io.delete_file(&location).await.unwrap();
+        std::fs::write(&path, b"new metadata").unwrap();
+        assert_eq!(
+            file_io.new_input(&location).unwrap().read().await.unwrap(),
+            "new metadata"
+        );
+        let mut writer = file_io
+            .new_output(&location)
+            .unwrap()
+            .async_writer()
+            .await
+            .unwrap();
+        writer.write_all(b"replacement!").await.unwrap();
+        let gate = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(
+                directory
+                    .path()
+                    .join("paimon-shared-local-cache-v1/directory.lock"),
+            )
+            .unwrap();
+        gate.lock().unwrap();
+        assert!(writer.shutdown().await.is_err());
+        // A second shutdown cannot silently succeed while invalidation still fails.
+        assert!(writer.shutdown().await.is_err());
+        drop(gate);
+        writer.shutdown().await.unwrap();
+        assert_eq!(
+            file_io.new_input(&location).unwrap().read().await.unwrap(),
+            "replacement!"
+        );
+
+        let gate = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(
+                directory
+                    .path()
+                    .join("paimon-shared-local-cache-v1/directory.lock"),
+            )
+            .unwrap();
+        gate.lock().unwrap();
+        let directory_location = format!("file:{}", source.path().display());
+        assert!(file_io.delete_dir(&directory_location).await.is_err());
+        drop(gate);
+        file_io.delete_dir(&directory_location).await.unwrap();
+        std::fs::create_dir_all(source.path()).unwrap();
+        std::fs::write(&path, b"recreated!!!").unwrap();
+        assert_eq!(
+            file_io.new_input(&location).unwrap().read().await.unwrap(),
+            "recreated!!!"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn test_shared_cache_regular_close_retries_invalidation() {
+        let source = tempfile::tempdir().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = source.path().join("snapshot-1");
+        std::fs::write(&path, b"old").unwrap();
+        let location = format!("file:{}", path.display());
+        let mut options = Options::new();
+        options.set(CatalogOptions::LOCAL_CACHE_ENABLED, "true");
+        options.set(CatalogOptions::LOCAL_CACHE_SHARED, "true");
+        options.set(
+            CatalogOptions::LOCAL_CACHE_DIR,
+            directory.path().to_string_lossy(),
+        );
+        options.set(CatalogOptions::LOCAL_CACHE_MAX_SIZE, "1 MiB");
+        let cache = Arc::new(
+            LocalCache::new(LocalCacheConfig::from_options(&options).unwrap().unwrap()).unwrap(),
+        );
+        let file_io = FileIOBuilder::new("file")
+            .with_local_cache(cache)
+            .build()
+            .unwrap();
+        assert_eq!(
+            file_io.new_input(&location).unwrap().read().await.unwrap(),
+            "old"
+        );
+        let mut writer = file_io
+            .new_output(&location)
+            .unwrap()
+            .writer()
+            .await
+            .unwrap();
+        writer.write(Bytes::from_static(b"new")).await.unwrap();
+        let gate = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(
+                directory
+                    .path()
+                    .join("paimon-shared-local-cache-v1/directory.lock"),
+            )
+            .unwrap();
+        gate.lock().unwrap();
+        assert!(writer.close().await.is_err());
+        assert!(writer.close().await.is_err());
+        drop(gate);
+        writer.close().await.unwrap();
+        assert_eq!(
+            file_io.new_input(&location).unwrap().read().await.unwrap(),
+            "new"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn test_shared_cache_rename_waits_for_invalidation_fence() {
+        let source_directory = tempfile::tempdir().unwrap();
+        let cache_directory = tempfile::tempdir().unwrap();
+        let source_path = source_directory.path().join("snapshot-1");
+        let target_path = source_directory.path().join("snapshot-2");
+        std::fs::write(&source_path, b"source value").unwrap();
+        std::fs::write(&target_path, b"target value").unwrap();
+        let source_location = format!("file:{}", source_path.display());
+        let target_location = format!("file:{}", target_path.display());
+        let mut options = Options::new();
+        options.set(CatalogOptions::LOCAL_CACHE_ENABLED, "true");
+        options.set(CatalogOptions::LOCAL_CACHE_SHARED, "true");
+        options.set(
+            CatalogOptions::LOCAL_CACHE_DIR,
+            cache_directory.path().to_string_lossy(),
+        );
+        options.set(CatalogOptions::LOCAL_CACHE_MAX_SIZE, "1 MiB");
+        let cache = Arc::new(
+            LocalCache::new(LocalCacheConfig::from_options(&options).unwrap().unwrap()).unwrap(),
+        );
+        let file_io = FileIOBuilder::new("file")
+            .with_local_cache(cache)
+            .build()
+            .unwrap();
+        assert_eq!(
+            file_io
+                .new_input(&target_location)
+                .unwrap()
+                .read()
+                .await
+                .unwrap(),
+            "target value"
+        );
+
+        let gate = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(
+                cache_directory
+                    .path()
+                    .join("paimon-shared-local-cache-v1/directory.lock"),
+            )
+            .unwrap();
+        gate.lock().unwrap();
+        let rename_io = file_io.clone();
+        let rename_source = source_location.clone();
+        let rename_target = target_location.clone();
+        let rename =
+            tokio::spawn(async move { rename_io.rename(&rename_source, &rename_target).await });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!rename.is_finished());
+        assert_eq!(std::fs::read(&source_path).unwrap(), b"source value");
+        assert_eq!(std::fs::read(&target_path).unwrap(), b"target value");
+
+        drop(gate);
+        tokio::time::timeout(std::time::Duration::from_secs(5), rename)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(!source_path.exists());
+        assert_eq!(std::fs::read(&target_path).unwrap(), b"source value");
+        assert_eq!(
+            file_io
+                .new_input(&target_location)
+                .unwrap()
+                .read()
+                .await
+                .unwrap(),
+            "source value"
+        );
+
+        let missing_source = format!("file:{}", source_directory.path().join("missing").display());
+        assert!(file_io
+            .rename(&missing_source, &target_location)
+            .await
+            .is_err());
+        assert!(cache_directory
+            .path()
+            .join("paimon-shared-local-cache-v1/mutation-pending")
+            .exists());
+        std::fs::write(&target_path, b"newer value").unwrap();
+        assert_eq!(
+            file_io
+                .new_input(&target_location)
+                .unwrap()
+                .read()
+                .await
+                .unwrap(),
+            "newer value"
+        );
+        let next_path = source_directory.path().join("snapshot-3");
+        let next_location = format!("file:{}", next_path.display());
+        file_io
+            .rename(&target_location, &next_location)
+            .await
+            .unwrap();
+        assert_eq!(
+            file_io
+                .new_input(&next_location)
+                .unwrap()
+                .read()
+                .await
+                .unwrap(),
+            "newer value"
+        );
+        assert!(cache_directory
+            .path()
+            .join("paimon-shared-local-cache-v1/mutation-pending")
+            .exists());
     }
 
     #[cfg(not(windows))]

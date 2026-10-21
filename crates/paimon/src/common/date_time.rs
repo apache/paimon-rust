@@ -19,6 +19,24 @@
 
 use chrono::{Datelike, NaiveDateTime, Timelike};
 
+/// Java Timestamp.now stores system-local wall fields, without a time zone.
+/// The UTC label is only the carrier used by manifest timestamp-millis fields.
+pub(crate) fn current_local_timestamp() -> chrono::DateTime<chrono::Utc> {
+    // DataFileMeta persists TIMESTAMP(3), as Java now().toMillisTimestamp().
+    let now = chrono::Utc::now();
+    let now = now
+        .with_nanosecond(now.timestamp_subsec_millis() * 1_000_000)
+        .unwrap();
+    local_timestamp(now, &jiff::tz::TimeZone::system())
+}
+
+pub(crate) fn local_timestamp(
+    instant: chrono::DateTime<chrono::Utc>,
+    zone: &jiff::tz::TimeZone,
+) -> chrono::DateTime<chrono::Utc> {
+    instant + chrono::Duration::seconds(i64::from(local_offset(instant.timestamp(), zone)))
+}
+
 /// Format millis-since-midnight to `HH:mm:ss[.f...]` using Java `DateTimeUtils` semantics.
 ///
 /// Matches Java `DateTimeUtils.formatTimestampMillis(time, precision)`:
@@ -82,8 +100,25 @@ pub(crate) fn format_epoch_timestamp(seconds: i64, nanos: u32, precision: u32) -
     )
 }
 
+/// SQL timestamp CAST from Paimon's full millisecond and sub-millisecond storage.
+pub(crate) fn format_timestamp_millis(
+    millis: i64,
+    sub_milli: i64,
+    precision: u32,
+    zone: Option<&jiff::tz::TimeZone>,
+) -> String {
+    let millis = match zone {
+        Some(zone) => {
+            millis.wrapping_add(i64::from(local_offset(millis.div_euclid(1000), zone)) * 1000)
+        }
+        None => millis,
+    };
+    let nanos = (millis.rem_euclid(1000) * 1_000_000 + sub_milli) as u32;
+    format_epoch_timestamp(millis.div_euclid(1000), nanos, precision)
+}
+
 /// Java Timestamp.toString uses LocalDateTime's ISO form, not a SQL CAST form.
-pub(crate) fn format_iso_timestamp(seconds: i64, nanos: u32) -> String {
+pub fn format_iso_timestamp(seconds: i64, nanos: u32) -> String {
     let (year, month, day) = epoch_day_to_date(i64::from(seconds.div_euclid(86_400) as i32));
     let year = if (0..=9999).contains(&year) {
         format!("{year:04}")

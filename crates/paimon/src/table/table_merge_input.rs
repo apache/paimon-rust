@@ -84,7 +84,8 @@ impl MergeInput {
             });
         }
         crate::spec::CoreOptions::new(table.schema().options()).validate_scan_options()?;
-        let schema = crate::arrow::build_target_arrow_schema(table.schema().fields())?;
+        let schema =
+            crate::arrow::build_target_arrow_schema(&table.schema().fields_with_read_metadata())?;
         for column in columns {
             schema
                 .field_with_name(column)
@@ -118,23 +119,50 @@ impl MergeInput {
         } else {
             super::time_travel::resolve_snapshot(table).await?
         };
-        // Pin the source independently, keeping branch/time-travel resolution
-        // and the caller's resolved schema. Include L0 as Python plan_for_write.
-        let table = if incremental {
+        // Pin the source independently, preserving its resolved read schema.
+        // Authorized sources keep their original catalog identity and plan the
+        // selected snapshot explicitly below. Include L0 as plan_all_files.
+        let query_auth = table.schema().core_options().query_auth_enabled();
+        let table = if incremental || query_auth {
             table.clone()
         } else {
             table.copy_with_pinned_snapshot(snapshot.as_ref())
         };
         let mut builder = table.new_read_builder();
         builder.with_projection(&names)?;
-        let plan = if incremental || snapshot.is_some() {
-            builder.new_scan().with_scan_all_files().plan().await?
+        let scan = if query_auth {
+            // Python materializes the entire source before matching. Ask for
+            // all source columns even when this MERGE only needs its keys,
+            // otherwise an unused column's mask/denial could be bypassed.
+            table
+                .new_read_builder()
+                .new_scan()
+                .authorize_all_files()
+                .await?
+        } else {
+            builder.new_scan()
+        };
+        let plan = if query_auth && !incremental {
+            if let Some(snapshot) = snapshot {
+                scan.plan_selected_snapshot(snapshot, super::table_scan::SnapshotScanMode::All)
+                    .await?
+            } else {
+                super::source::Plan::new(Vec::new())
+            }
+        } else if incremental || snapshot.is_some() {
+            scan.with_scan_all_files().plan().await?
         } else {
             // Run the normal reader's policy checks even with no snapshot, but
             // do not observe files from a commit arriving after resolution.
             super::source::Plan::new(Vec::new())
         };
-        let mut stream = builder.new_read()?.to_arrow(plan.splits())?;
+        let read = builder.new_read()?.for_update();
+        if query_auth && plan.splits().is_empty() {
+            // Empty input carries no splits on which to stamp the live grant.
+            // Authorization above still runs for empty tables/windows.
+            return Self::new(vec![RecordBatch::new_empty(projected)]);
+        }
+        let mut stream = read.to_arrow(plan.splits())?;
         let mut batches = Vec::new();
         while let Some(batch) = stream.try_next().await? {
             if batch.num_rows() > 0 {

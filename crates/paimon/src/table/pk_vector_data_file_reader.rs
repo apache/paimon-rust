@@ -452,6 +452,7 @@ mod integration_tests {
             schema_manager,
             table_schema_id,
             read_fields.clone(),
+            |fields| Ok(fields.to_vec()),
             read_fields.clone(),
             Vec::new(),
         );

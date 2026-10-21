@@ -2528,9 +2528,9 @@ fn test_distributed_postpone_writers_share_bucket_plan() {
         assert!(fixed.error.is_null());
         assert!(!fixed.write_builder.is_null());
         let write = paimon_postpone_fixed_bucket_write_builder_new_write(fixed.write_builder);
-        assert!(write.write.is_null());
-        assert!(error_message(write.error).contains("bucket plan is required"));
-        paimon_error_free(write.error);
+        assert!(write.error.is_null());
+        assert!(!write.write.is_null());
+        paimon_postpone_fixed_bucket_table_write_free(write.write);
         paimon_postpone_fixed_bucket_write_builder_free(fixed.write_builder);
 
         let wb1 = paimon_table_new_postpone_fixed_bucket_write_builder_with_commit_user(
@@ -3118,7 +3118,7 @@ fn test_two_commits_same_builder() {
 //
 // Two storage shapes are exercised end-to-end through the C `execute_read`
 // terminal, each compared against an independent core Rust
-// `SearchResultReadBuilder::read()` reference:
+// `GlobalIndexResultReadBuilder::read()` reference:
 //
 //   * A primary-key vector table backed by a real vindex IVF-flat ANN segment
 //     built in-process (bucket-local ANN search, residual filter supported).

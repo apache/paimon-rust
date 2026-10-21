@@ -213,8 +213,9 @@ fn selected_sidecar<'a>(
     {
         return Ok(None);
     }
-    // The caller clips, sorts and merges the requested ranges into local
-    // positions before intersecting them with indexes and deletion vectors.
+    // The caller intersects requested ranges with bitmap indexes in local
+    // positions, including DV only when a selective bitmap exists. LIMIT
+    // never affects this decision.
     let selected: i64 = ranges.iter().map(RowRange::count).sum();
     Ok((selected > 0
         && selected < file.row_count

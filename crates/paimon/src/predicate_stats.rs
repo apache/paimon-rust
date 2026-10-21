@@ -491,6 +491,7 @@ fn predicate_may_match_with_schema<T: StatsAccessor>(
     file_fields: &[DataField],
 ) -> bool {
     match predicate {
+        Predicate::NestedLeaf { .. } => true,
         Predicate::AlwaysTrue => true,
         Predicate::AlwaysFalse => false,
         Predicate::And(children) => children
@@ -536,6 +537,7 @@ fn predicate_must_match_with_schema<T: StatsAccessor>(
     file_fields: &[DataField],
 ) -> bool {
     match predicate {
+        Predicate::NestedLeaf { .. } => false,
         Predicate::AlwaysTrue => stats.row_count() > 0,
         Predicate::AlwaysFalse => false,
         Predicate::And(children) => children.iter().all(|child| {

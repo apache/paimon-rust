@@ -494,7 +494,7 @@ pub struct DataSplit {
     partition: Arc<BinaryRow>,
     bucket: i32,
     bucket_path: Arc<str>,
-    total_buckets: i32,
+    total_buckets: Option<i32>,
     data_files: Arc<[DataFileMeta]>,
     /// Deletion file for each data file, same order as `data_files`.
     /// `None` at index `i` means no deletion file for `data_files[i]` (matches Java getDeletionFiles() / List<DeletionFile> with null elements).
@@ -504,20 +504,26 @@ pub struct DataSplit {
     /// Primary-key IndexedSplits use file-local physical positions, independent
     /// of row tracking.
     row_ranges: Option<Arc<[RowRange]>>,
+    /// Optional IndexedSplit scores, aligned to expanded row ranges.
+    #[serde(default)]
+    scores: Option<Arc<[f32]>>,
     /// Whether the split can be read raw, without the merge reader: its
     /// physical rows are exactly its logical rows (modulo deletion files).
     /// Mirrors Java `DataSplit#rawConvertible`.
     raw_convertible: bool,
     #[serde(default)]
     is_streaming: bool,
-    /// Mirrors Java `QueryAuthSplit`, but is dropped by serialization, so a
-    /// plan must be read where it was made.
+    /// Live grants are local to a catalog session. Serialized rules remain
+    /// metadata until TableRead::authorize_splits validates them and their files.
     #[serde(skip)]
     query_auth_grant: Option<Arc<QueryAuthGrant>>,
     /// That this split came from a `query-auth.enabled` table. Unlike the grant
     /// it survives serialization, so a round-tripped split fails closed.
     #[serde(default)]
     query_auth_required: bool,
+    /// Transported rules are metadata, never a live catalog grant.
+    #[serde(default)]
+    query_auth_response: Option<crate::api::AuthTableQueryResponse>,
 }
 
 impl DataSplit {
@@ -530,6 +536,7 @@ impl DataSplit {
     /// still refuses at the read.
     pub(crate) fn planned(mut self, grant: Option<Arc<QueryAuthGrant>>) -> Self {
         self.query_auth_required = true;
+        self.query_auth_response = grant.as_ref().and_then(|g| g.response()).cloned();
         self.query_auth_grant = grant;
         self
     }
@@ -542,13 +549,22 @@ impl DataSplit {
         self.query_auth_grant.as_ref()
     }
 
+    pub(crate) fn query_auth_response(&self) -> Option<&crate::api::AuthTableQueryResponse> {
+        self.query_auth_response.as_ref()
+    }
+
     /// Whether the server attached rules to this split's read: its row counts
     /// and column statistics then describe rows the read will not return as
     /// they are.
     pub fn has_query_auth_rules(&self) -> bool {
         self.query_auth_grant
             .as_ref()
-            .is_some_and(|grant| !grant.is_unrestricted())
+            .map(|grant| !grant.is_unrestricted())
+            .unwrap_or_else(|| {
+                self.query_auth_response
+                    .as_ref()
+                    .is_some_and(|response| !response.is_unrestricted())
+            })
     }
 
     pub fn snapshot_id(&self) -> i64 {
@@ -565,7 +581,17 @@ impl DataSplit {
         &self.bucket_path
     }
     pub fn total_buckets(&self) -> i32 {
+        self.total_buckets.unwrap_or(1)
+    }
+
+    pub(crate) fn declared_total_buckets(&self) -> Option<i32> {
         self.total_buckets
+    }
+
+    pub(crate) fn restore_bucket_layout(mut self, source: &Self) -> Self {
+        self.bucket_path = source.bucket_path.clone();
+        self.total_buckets = source.total_buckets;
+        self
     }
 
     pub fn data_files(&self) -> &[DataFileMeta] {
@@ -581,12 +607,55 @@ impl DataSplit {
         self.row_ranges.as_deref()
     }
 
+    pub fn scores(&self) -> Option<&[f32]> {
+        self.scores.as_deref()
+    }
+
+    /// Attach scores in ascending expanded-range order, as in Java IndexedSplit.
+    pub fn with_scores(mut self, scores: Vec<f32>) -> crate::Result<Self> {
+        validate_scores(self.row_ranges(), &scores)?;
+        self.scores = Some(scores.into());
+        Ok(self)
+    }
+
     /// Narrow an already planned split without rebuilding or copying its file
     /// and deletion-vector metadata. Ranges use the same coordinate system as
     /// the existing `row_ranges` field.
     pub(crate) fn with_selected_row_ranges(mut self, ranges: Vec<RowRange>) -> Self {
+        // Scores describe the old selection; callers must supply scores for
+        // the new one explicitly rather than silently misaligning them.
+        self.scores = None;
         self.row_ranges = Some(ranges.into());
         self
+    }
+
+    /// Select one data-evolution file group from a live plan. Retain its
+    /// authorization and the deletion vector associated with each selected
+    /// file; rebuilding a split from metadata would discard the live grant.
+    pub(super) fn for_data_evolution_files(&self, files: Vec<DataFileMeta>) -> Self {
+        let mut split = self.clone();
+        split.data_deletion_files = self.data_deletion_files.as_ref().map(|_| {
+            files
+                .iter()
+                .map(|file| self.deletion_file_for_data_file(file).cloned())
+                .collect::<Vec<_>>()
+                .into()
+        });
+        split.raw_convertible = files.len() == 1;
+        split.data_files = files.into();
+        split.scores = None;
+        split
+    }
+
+    /// A partial-column rewrite preserves the physical row-ID slots, including
+    /// rows already hidden by a deletion vector. The vector stays attached to
+    /// the original normal file at commit time, rather than filtering the
+    /// ordinary-column input and shifting the replacement column's positions.
+    pub(super) fn for_data_evolution_rewrite(&self, files: Vec<DataFileMeta>) -> Self {
+        let mut split = self.for_data_evolution_files(files);
+        split.data_deletion_files = None;
+        split.row_ranges = None;
+        split
     }
 
     /// Java PrimaryKeySortedIndexResult preserves each non-raw split whole,
@@ -600,6 +669,7 @@ impl DataSplit {
             .as_ref()
             .map(|files| vec![files[file_index].clone()].into());
         split.row_ranges = None;
+        split.scores = None;
         split.raw_convertible = false;
         split
     }
@@ -693,7 +763,15 @@ impl DataSplit {
         if self
             .query_auth_grant
             .as_ref()
-            .is_some_and(|grant| !grant.rules().filters.is_empty())
+            .map(|grant| !grant.rules().filters.is_empty())
+            .unwrap_or_else(|| {
+                self.query_auth_response.as_ref().is_some_and(|response| {
+                    response
+                        .filter
+                        .as_ref()
+                        .is_some_and(|filters| !filters.is_empty())
+                })
+            })
         {
             return None;
         }
@@ -797,8 +875,13 @@ impl DataSplit {
         out.extend_from_slice(&p);
         out.extend_from_slice(&self.bucket.to_be_bytes());
         write_java_utf(&mut out, &self.bucket_path)?;
-        out.push(1); // totalBuckets present (version >= 6)
-        out.extend_from_slice(&self.total_buckets.to_be_bytes());
+        match self.total_buckets {
+            Some(total) => {
+                out.push(1);
+                out.extend_from_slice(&total.to_be_bytes());
+            }
+            None => out.push(0),
+        }
         out.extend_from_slice(&0i32.to_be_bytes()); // deprecated beforeFiles count
         out.push(0); // beforeDeletionFiles = null list
         out.extend_from_slice(&(self.data_files.len() as i32).to_be_bytes());
@@ -935,7 +1018,9 @@ impl DataSplit {
         if let Some(dels) = data_deletion_files {
             builder = builder.with_data_deletion_files(dels);
         }
-        builder.build()
+        let mut split = builder.build()?;
+        split.total_buckets = total_buckets;
+        Ok(split)
     }
 
     /// Java `SplitSerializer#serialize` frame: magic + version + type id + body. The cross-language
@@ -944,7 +1029,7 @@ impl DataSplit {
     /// uses `QueryAuthSplit` (type 5), retaining the complete captured REST response. Byte-compatible with
     /// `compatibility/split-v1-data` / `split-v1-indexed`.
     pub fn serialize_split_v1(&self) -> crate::Result<Vec<u8>> {
-        self.serialize_split_v1_with_scores(None)
+        self.serialize_split_v1_with_scores(self.scores())
     }
 
     /// Serialize aligned vector scores using Java's IndexedSplit wire format.
@@ -955,6 +1040,7 @@ impl DataSplit {
                 .query_auth_grant
                 .as_ref()
                 .and_then(|grant| grant.response())
+                .or(self.query_auth_response.as_ref())
                 .ok_or_else(|| {
                     crate::table::query_auth::unsupported(
                         "the split has no live wire authorization",
@@ -975,18 +1061,7 @@ impl DataSplit {
         }
         self.ensure_serializable_without_grant()?;
         if let Some(scores) = scores {
-            let count = self.row_ranges.as_ref().and_then(|ranges| {
-                ranges.iter().try_fold(0usize, |count, range| {
-                    let len = range.to().checked_sub(range.from())?.checked_add(1)?;
-                    count.checked_add(usize::try_from(len).ok()?)
-                })
-            });
-            if count != Some(scores.len()) || scores.len() > i32::MAX as usize {
-                return Err(crate::Error::DataInvalid {
-                    message: "IndexedSplit scores must align with selected row ranges".to_string(),
-                    source: None,
-                });
-            }
+            validate_scores(self.row_ranges(), scores)?;
         }
         let mut out = Vec::new();
         out.extend_from_slice(&SPLIT_SER_MAGIC.to_be_bytes());
@@ -1025,7 +1100,7 @@ impl DataSplit {
     /// Reverse of [`DataSplit::serialize_split_v1`]: parse a Java `SplitSerializer` frame into a
     /// `DataSplit` (type 1), an `IndexedSplit` (type 3, which carries `row_ranges`), or a
     /// `QueryAuthSplit` (type 5, retaining the authorization-required marker without minting
-    /// a grant). Other type ids, and IndexedSplit vector scores, are unsupported.
+    /// a grant). IndexedSplit scores retain their range alignment. Other type ids are unsupported.
     /// Consumes the entire buffer.
     pub fn deserialize_split_v1(data: &[u8]) -> crate::Result<DataSplit> {
         let mut cur = data;
@@ -1063,10 +1138,10 @@ impl DataSplit {
         let split = match type_id {
             SPLIT_SER_TYPE_QUERY_AUTH_SPLIT => {
                 let split = Self::read_split_v1(cur, depth + 1)?;
-                read_auth_response(cur)?;
-                // Rules transported in a frame are not a grant minted by this
-                // catalog session. Reading it still requires the original split.
-                split.planned(None)
+                let response = read_auth_response(cur)?;
+                let mut split = split.planned(None);
+                split.query_auth_response = Some(response);
+                split
             }
             SPLIT_SER_TYPE_DATA_SPLIT => Self::read_body(cur)?,
             SPLIT_SER_TYPE_INDEXED_SPLIT => {
@@ -1105,14 +1180,21 @@ impl DataSplit {
                     }
                     ranges.push(RowRange::new(from, to));
                 }
-                let scores_flag = read_u8(cur)?;
-                if scores_flag != 0 {
-                    return Err(crate::Error::Unsupported {
-                        message: "IndexedSplit scores are not supported".into(),
-                    });
-                }
                 let mut body = body;
                 body.row_ranges = Some(ranges.into());
+                if read_u8(cur)? != 0 {
+                    let count = read_i32(cur)?;
+                    if count < 0 || count as usize > cur.len() / 4 {
+                        return Err(crate::Error::DataInvalid {
+                            message: "Invalid IndexedSplit scores count".into(),
+                            source: None,
+                        });
+                    }
+                    let scores = (0..count)
+                        .map(|_| read_i32(cur).map(|bits| f32::from_bits(bits as u32)))
+                        .collect::<crate::Result<Vec<_>>>()?;
+                    body = body.with_scores(scores)?;
+                }
                 body
             }
             other => {
@@ -1123,6 +1205,22 @@ impl DataSplit {
         };
         Ok(split)
     }
+}
+
+fn validate_scores(ranges: Option<&[RowRange]>, scores: &[f32]) -> crate::Result<()> {
+    let count = ranges.and_then(|ranges| {
+        ranges.iter().try_fold(0usize, |count, range| {
+            let len = range.to().checked_sub(range.from())?.checked_add(1)?;
+            count.checked_add(usize::try_from(len).ok()?)
+        })
+    });
+    if count != Some(scores.len()) || scores.len() > i32::MAX as usize {
+        return Err(crate::Error::DataInvalid {
+            message: "IndexedSplit scores must align with selected row ranges".into(),
+            source: None,
+        });
+    }
+    Ok(())
 }
 
 /// Java `DataSplit#MAGIC` / `VERSION` for the serialize format.
@@ -1181,9 +1279,9 @@ fn write_auth_response(
     Ok(())
 }
 
-/// Consume wire rules without creating a trusted grant from untrusted bytes.
-fn read_auth_response(cur: &mut &[u8]) -> crate::Result<()> {
-    fn string(cur: &mut &[u8]) -> crate::Result<()> {
+/// Decode captured rules as metadata. A reader must still obtain a live grant.
+fn read_auth_response(cur: &mut &[u8]) -> crate::Result<crate::api::AuthTableQueryResponse> {
+    fn string(cur: &mut &[u8]) -> crate::Result<String> {
         let length = read_i32(cur)?;
         if length < 0 {
             return Err(crate::Error::DataInvalid {
@@ -1192,32 +1290,45 @@ fn read_auth_response(cur: &mut &[u8]) -> crate::Result<()> {
             });
         }
         let bytes = take(cur, length as usize)?;
-        std::str::from_utf8(bytes).map_err(|e| crate::Error::DataInvalid {
-            message: e.to_string(),
-            source: None,
-        })?;
-        Ok(())
+        std::str::from_utf8(bytes)
+            .map(str::to_string)
+            .map_err(|e| crate::Error::DataInvalid {
+                message: e.to_string(),
+                source: None,
+            })
     }
-    if read_u8(cur)? == 0 {
-        return Ok(());
-    }
-    for multiplier in [1, 2] {
-        if read_u8(cur)? != 0 {
-            let count = read_i32(cur)?;
-            if count < 0 || count as usize > cur.len() / (4 * multiplier) {
-                return Err(crate::Error::DataInvalid {
-                    message: "invalid QueryAuthSplit rule count".into(),
-                    source: None,
-                });
-            }
-            for _ in 0..count {
-                for _ in 0..multiplier {
-                    string(cur)?;
-                }
-            }
+    fn count(cur: &mut &[u8], multiplier: usize) -> crate::Result<usize> {
+        let count = read_i32(cur)?;
+        if count < 0 || count as usize > cur.len() / (4 * multiplier) {
+            return Err(crate::Error::DataInvalid {
+                message: "invalid QueryAuthSplit rule count".into(),
+                source: None,
+            });
         }
+        Ok(count as usize)
     }
-    Ok(())
+    let mut response = crate::api::AuthTableQueryResponse {
+        filter: None,
+        column_masking: None,
+    };
+    if read_u8(cur)? == 0 {
+        return Ok(response);
+    }
+    if read_u8(cur)? != 0 {
+        let mut filters = Vec::new();
+        for _ in 0..count(cur, 1)? {
+            filters.push(string(cur)?);
+        }
+        response.filter = Some(filters);
+    }
+    if read_u8(cur)? != 0 {
+        let mut masks = std::collections::HashMap::new();
+        for _ in 0..count(cur, 2)? {
+            masks.insert(string(cur)?, string(cur)?);
+        }
+        response.column_masking = Some(masks);
+    }
+    Ok(response)
 }
 
 /// Java `IndexedSplit#MAGIC` / `VERSION`.
@@ -1534,14 +1645,16 @@ impl DataSplitBuilder {
         Ok(DataSplit {
             query_auth_grant: None,
             query_auth_required: false,
+            query_auth_response: None,
             snapshot_id: self.snapshot_id,
             partition: Arc::new(partition),
             bucket: self.bucket,
             bucket_path: bucket_path.into(),
-            total_buckets: self.total_buckets,
+            total_buckets: Some(self.total_buckets),
             data_files: data_files.into(),
             data_deletion_files: self.data_deletion_files.map(Into::into),
             row_ranges: self.row_ranges.map(Into::into),
+            scores: None,
             raw_convertible: self.raw_convertible,
             is_streaming: self.is_streaming,
         })
@@ -1563,14 +1676,20 @@ impl Default for DataSplitBuilder {
 pub struct Plan {
     splits: Vec<DataSplit>,
     snapshot_id: Option<i64>,
+    scan_stats: super::ScanStats,
 }
 
 impl Plan {
     pub fn new(splits: Vec<DataSplit>) -> Self {
-        Self {
+        let mut plan = Self {
             splits,
             snapshot_id: None,
-        }
+            scan_stats: super::ScanStats::default(),
+        };
+        plan.refresh_final_stats();
+        plan.scan_stats.split_candidates_built = plan.splits.len();
+        plan.scan_stats.splits_before_limit = plan.splits.len();
+        plan
     }
 
     pub(crate) fn with_snapshot_id(mut self, snapshot_id: i64) -> Self {
@@ -1587,6 +1706,46 @@ impl Plan {
     }
     pub fn splits(&self) -> &[DataSplit] {
         &self.splits
+    }
+
+    /// Lightweight statistics collected in the same planning pass.
+    pub fn stats(&self) -> &super::ScanStats {
+        &self.scan_stats
+    }
+
+    pub(crate) fn with_scan_stats(mut self, mut stats: super::ScanStats) -> Self {
+        stats.final_splits = self.scan_stats.final_splits;
+        stats.splits_after_limit = self.scan_stats.splits_after_limit;
+        stats.final_files = self.scan_stats.final_files;
+        stats.planned_data_file_bytes = self.scan_stats.planned_data_file_bytes;
+        self.scan_stats = stats;
+        self
+    }
+
+    fn refresh_final_stats(&mut self) {
+        let (files, bytes) = self.splits.iter().flat_map(DataSplit::data_files).fold(
+            (0, 0_u64),
+            |(files, bytes), file| {
+                (
+                    files + 1,
+                    bytes.saturating_add(u64::try_from(file.file_size).unwrap_or(0)),
+                )
+            },
+        );
+        self.scan_stats.final_splits = self.splits.len();
+        self.scan_stats.splits_after_limit = self.splits.len();
+        self.scan_stats.final_files = files;
+        self.scan_stats.planned_data_file_bytes = bytes;
+    }
+
+    /// Transform splits without dropping the snapshot or collected statistics.
+    pub(crate) fn map_splits(
+        mut self,
+        transform: impl FnOnce(Vec<DataSplit>) -> crate::Result<Vec<DataSplit>>,
+    ) -> crate::Result<Self> {
+        self.splits = transform(self.splits)?;
+        self.refresh_final_stats();
+        Ok(self)
     }
 
     /// Stamps the grant every split of this plan was authorized under.
@@ -1607,11 +1766,7 @@ impl Plan {
     /// file size. Totals larger than [`u64::MAX`] saturate at that value so
     /// callers cannot under-count an oversized plan due to integer overflow.
     pub fn planned_data_file_bytes(&self) -> u64 {
-        self.splits
-            .iter()
-            .flat_map(DataSplit::data_files)
-            .filter_map(|file| u64::try_from(file.file_size).ok())
-            .fold(0, u64::saturating_add)
+        self.scan_stats.planned_data_file_bytes
     }
 
     /// Consume this plan and return its splits without cloning their file metadata.
@@ -1724,6 +1879,54 @@ mod tests {
         let plan = Plan::new(vec![split(vec![first, second, overflow, unknown], true)]);
 
         assert_eq!(plan.planned_data_file_bytes(), u64::MAX);
+        assert_eq!(plan.stats().final_files, 4);
+        assert_eq!(plan.stats().planned_data_file_bytes, u64::MAX);
+    }
+
+    #[test]
+    fn transformed_plan_refreshes_totals_and_preserves_planning_work() {
+        let plan = Plan::new(vec![
+            split(
+                vec![
+                    file("a.parquet", 10, Some(0)),
+                    file("b.parquet", 10, Some(10)),
+                ],
+                true,
+            ),
+            split(vec![file("c.parquet", 10, Some(20))], true),
+        ])
+        .with_snapshot_id(7)
+        .with_scan_stats(super::super::ScanStats {
+            manifest_entries_read: 20,
+            split_candidates_built: 2,
+            splits_before_limit: 2,
+            limit_early_stopped: true,
+            limit: Some(10),
+            ..Default::default()
+        });
+        assert_eq!(plan.stats().final_files, 3);
+        assert_eq!(plan.planned_data_file_bytes(), 384);
+
+        let selected = plan
+            .map_splits(|mut splits| Ok(vec![splits.pop().unwrap()]))
+            .unwrap();
+        assert_eq!(selected.snapshot_id(), Some(7));
+        assert_eq!(selected.stats().manifest_entries_read, 20);
+        assert_eq!(selected.stats().split_candidates_built, 2);
+        assert_eq!(selected.stats().splits_before_limit, 2);
+        assert!(selected.stats().limit_early_stopped);
+        assert_eq!(selected.stats().limit, Some(10));
+        assert_eq!(selected.stats().final_splits, 1);
+        assert_eq!(selected.stats().splits_after_limit, 1);
+        assert_eq!(selected.stats().final_files, 1);
+        assert_eq!(selected.planned_data_file_bytes(), 128);
+
+        let empty = selected.map_splits(|_| Ok(Vec::new())).unwrap();
+        assert_eq!(empty.snapshot_id(), Some(7));
+        assert_eq!(empty.stats().manifest_entries_read, 20);
+        assert_eq!(empty.stats().final_splits, 0);
+        assert_eq!(empty.stats().final_files, 0);
+        assert_eq!(empty.planned_data_file_bytes(), 0);
     }
 
     #[test]
@@ -2357,7 +2560,7 @@ mod tests {
         assert!(copy.query_auth_grant().is_none());
         assert_eq!(copy.data_files(), ordinary.data_files());
         assert!(copy.serialize().is_err());
-        assert!(copy.serialize_split_v1().is_err());
+        assert_eq!(copy.serialize_split_v1().unwrap(), frame);
     }
 
     #[test]
@@ -2371,7 +2574,10 @@ mod tests {
         assert_eq!(split.data_files().len(), 2);
         assert!(split.query_auth_required());
         assert!(split.query_auth_grant().is_none());
-        assert!(split.serialize_split_v1().is_err());
+        assert_eq!(
+            split.serialize_split_v1().unwrap(),
+            include_bytes!("goldens/split_v1_query_auth.bin")
+        );
     }
 
     #[test]
@@ -2683,9 +2889,7 @@ mod tests {
             .is_err());
     }
 
-    // The scores-stripped IndexedSplit frame the Rust serializer emits (see
-    // `serialize_indexed_split_v1_matches_golden`): the Java golden's trailing vector scores are
-    // replaced by a `false` scores flag, which is the exact byte form `deserialize_split_v1` supports.
+    // A score-free frame derived from the Java fixture.
     fn indexed_split_v1_no_scores() -> Vec<u8> {
         let golden = include_bytes!("goldens/split_v1_indexed.bin");
         let scores_len = 1 + 4 + 3 * 4; // writeBoolean(true) + count + 3 floats
@@ -2727,13 +2931,56 @@ mod tests {
     }
 
     #[test]
-    fn deserialize_split_v1_rejects_indexed_scores() {
-        // The raw Java golden carries vector scores, which the Rust split cannot model.
+    fn deserialize_split_v1_rejects_misaligned_indexed_scores() {
+        // This historical Java fixture has three scores for seven positions.
         let golden = include_bytes!("goldens/split_v1_indexed.bin");
         assert!(matches!(
             DataSplit::deserialize_split_v1(golden),
-            Err(crate::Error::Unsupported { .. })
+            Err(crate::Error::DataInvalid { .. })
         ));
+    }
+
+    #[test]
+    fn indexed_scores_round_trip_and_reject_malformed_payloads() {
+        let split = DataSplit::deserialize_split_v1(&indexed_split_v1_no_scores()).unwrap();
+        let values = vec![0.5, 1.25, -2.0, 4.0, 5.0, 6.0, 7.0];
+        let split = split.with_scores(values.clone()).unwrap();
+        let bytes = split.serialize_split_v1().unwrap();
+        let restored = DataSplit::deserialize_split_v1(&bytes).unwrap();
+        assert_eq!(restored.scores(), Some(values.as_slice()));
+        assert_eq!(restored, split);
+        assert_eq!(restored.serialize_split_v1().unwrap(), bytes);
+        assert_eq!(
+            serde_json::from_slice::<DataSplit>(&serde_json::to_vec(&split).unwrap()).unwrap(),
+            split
+        );
+        assert!(restored.clone().with_scores(vec![1.0]).is_err());
+        assert!(restored
+            .with_selected_row_ranges(vec![RowRange::new(1, 1)])
+            .scores()
+            .is_none());
+        let count_offset = bytes.len() - values.len() * 4 - 4;
+        for count in [-1, 0, 6, i32::MAX] {
+            let mut malformed = bytes.clone();
+            malformed[count_offset..count_offset + 4].copy_from_slice(&count.to_be_bytes());
+            assert!(DataSplit::deserialize_split_v1(&malformed).is_err());
+        }
+        for length in count_offset..bytes.len() {
+            assert!(DataSplit::deserialize_split_v1(&bytes[..length]).is_err());
+        }
+    }
+
+    #[test]
+    fn absent_total_buckets_round_trips_without_materializing_a_default() {
+        let mut split = v1_data_split_builder().build().unwrap();
+        let present_len = split.serialize_split_v1().unwrap().len();
+        split.total_buckets = None;
+        let bytes = split.serialize_split_v1().unwrap();
+        assert_eq!(bytes.len(), present_len - 4);
+        let restored = DataSplit::deserialize_split_v1(&bytes).unwrap();
+        assert_eq!(restored.total_buckets(), 1);
+        assert_eq!(restored.total_buckets, None);
+        assert_eq!(restored.serialize_split_v1().unwrap(), bytes);
     }
 
     #[test]

@@ -38,6 +38,10 @@ use crate::{Error, Result};
 
 /// Build global indexes by type, like Java's `GlobalIndexer.create`.
 /// Sorting and native writer selection are internal implementation details.
+/// Global builds require a row-tracked unaware-bucket table. Data evolution
+/// and the query-side global-index optimization may both be disabled.
+/// Scalar and vindex builds include physical rows deleted by deletion vectors;
+/// queries filter those rows using the snapshot selected for the query.
 pub struct GlobalIndexBuildBuilder<'a> {
     table: &'a Table,
     columns: Option<IndexColumns>,
@@ -297,6 +301,90 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    fn with_table_options(table: &Table, options: HashMap<String, String>) -> Table {
+        Table::new(
+            table.file_io().clone(),
+            table.identifier().clone(),
+            table.location().to_string(),
+            table.schema().copy_with_replaced_options(options),
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn build_eligibility_uses_table_row_tracking_not_read_optimizations() {
+        for (evolution, enabled) in [(false, true), (true, false), (false, false)] {
+            let original = empty_table();
+            let mut options = original.schema().options().clone();
+            options.insert("data-evolution.enabled".into(), evolution.to_string());
+            options.insert("global-index.enabled".into(), enabled.to_string());
+            let table = with_table_options(&original, options);
+            for (kind, column) in [
+                ("btree", "id"),
+                ("bitmap", "id"),
+                ("full-text", "text"),
+                ("ivf-flat", "vector"),
+                ("ivf-pq", "vector"),
+                ("ivf-sq", "vector"),
+                ("ivf-rq", "vector"),
+                ("diskann", "vector"),
+            ] {
+                if !GlobalIndexBuildBuilder::supports_index_type(kind) {
+                    continue;
+                }
+                let mut build_options = HashMap::from([(format!("{kind}.dimension"), "2".into())]);
+                if kind == "ivf-pq" {
+                    build_options.insert("ivf-pq.pq.m".into(), "1".into());
+                }
+                if ["btree", "bitmap", "full-text"].contains(&kind) {
+                    // Procedure options tune index generation, not table identity.
+                    build_options.insert("row-tracking.enabled".into(), "false".into());
+                    build_options.insert("bucket".into(), "5".into());
+                }
+                let mut builder = table.new_global_index_build_builder();
+                builder
+                    .with_index_column(column)
+                    .with_index_type(kind)
+                    .with_options(build_options);
+                assert!(builder.build().await.unwrap().is_empty(), "{kind}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn build_options_cannot_enable_row_tracking_or_change_table_bucket() {
+        for kind in ["btree", "bitmap", "full-text", "ivf-flat"] {
+            if !GlobalIndexBuildBuilder::supports_index_type(kind) {
+                continue;
+            }
+            for (key, value, error) in [
+                ("row-tracking.enabled", "false", "row-tracking.enabled"),
+                ("bucket", "4", "unaware-bucket"),
+            ] {
+                let original = empty_table();
+                let mut options = original.schema().options().clone();
+                options.insert("data-evolution.enabled".into(), "false".into());
+                options.insert(key.into(), value.into());
+                let table = with_table_options(&original, options);
+                let result = table
+                    .new_global_index_build_builder()
+                    .with_index_type(kind)
+                    .with_index_column(if kind == "ivf-flat" { "vector" } else { "text" })
+                    .with_options(HashMap::from([
+                        ("row-tracking.enabled".into(), "true".into()),
+                        ("bucket".into(), "-1".into()),
+                        ("ivf-flat.dimension".into(), "2".into()),
+                    ]))
+                    .build()
+                    .await;
+                assert!(
+                    result.unwrap_err().to_string().contains(error),
+                    "{kind}: {error}"
+                );
+            }
+        }
     }
 
     #[tokio::test]

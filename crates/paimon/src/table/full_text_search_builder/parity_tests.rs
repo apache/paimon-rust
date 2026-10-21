@@ -135,7 +135,7 @@ fn query(table: &Table) -> FullTextSearchBuilder<'_> {
     builder
 }
 
-fn ids(result: crate::table::SearchResult) -> Vec<u64> {
+fn ids(result: crate::table::GlobalIndexResult) -> Vec<u64> {
     let mut ids = result.into_row_ids().unwrap().row_ids;
     ids.sort_unstable();
     ids
@@ -382,7 +382,7 @@ async fn empty_string_filters_preserve_java_search_refinement() {
     }
 }
 
-async fn user_ids(table: &Table, result: crate::table::SearchResult) -> Vec<i32> {
+async fn user_ids(table: &Table, result: crate::table::GlobalIndexResult) -> Vec<i32> {
     let mut builder = table.new_read_builder();
     builder.with_projection(&["id", ROW_ID_FIELD_NAME]).unwrap();
     let plan = builder.new_scan().plan().await.unwrap();

@@ -76,6 +76,8 @@ pub struct DataFileMeta {
         deserialize_with = "from_millis_opt",
         default
     )]
+    /// Local wall-clock TIMESTAMP(3), matching Java Timestamp.now().
+    /// The UTC label carries the serialized fields; it does not identify an instant.
     pub creation_time: Option<DateTime<Utc>>,
     #[serde(rename = "_DELETE_ROW_COUNT")]
     // rowCount = add_row_count + delete_row_count.
@@ -250,6 +252,25 @@ fn read_compact_millis_as_utc(
 }
 
 impl DataFileMeta {
+    /// Resolve the stored local creation timestamp in the system time zone,
+    /// matching Java DataFileMeta.creationTimeEpochMillis().
+    pub fn creation_time_epoch_millis(&self) -> crate::Result<Option<i64>> {
+        self.creation_time_epoch_millis_in_zone(&jiff::tz::TimeZone::system())
+    }
+
+    pub(crate) fn creation_time_epoch_millis_in_zone(
+        &self,
+        zone: &jiff::tz::TimeZone,
+    ) -> crate::Result<Option<i64>> {
+        self.creation_time
+            .map(|time| {
+                let millis = time.timestamp_millis();
+                crate::common::date_time::local_to_utc_seconds(millis.div_euclid(1000), zone)
+                    .map(|seconds| seconds * 1000 + millis.rem_euclid(1000))
+            })
+            .transpose()
+    }
+
     /// Placeholder for `row_count` when the producer cannot know how many rows
     /// a file holds.
     ///
@@ -680,6 +701,61 @@ mod tests {
             write_cols: None,
             column_max_sequence_numbers: None,
         }
+    }
+
+    #[test]
+    fn creation_time_is_local_wall_time_in_every_wire_format() {
+        use crate::common::date_time::local_timestamp;
+        for (zone, instant, expected_wall) in [
+            (
+                "UTC",
+                "1969-12-31T23:59:59.999Z",
+                "1969-12-31T23:59:59.999Z",
+            ),
+            (
+                "Asia/Shanghai",
+                "2024-01-02T04:34:56.789Z",
+                "2024-01-02T12:34:56.789Z",
+            ),
+            (
+                "America/New_York",
+                "2024-01-02T17:34:56.789Z",
+                "2024-01-02T12:34:56.789Z",
+            ),
+            (
+                "America/New_York",
+                "2024-11-03T05:30:00.456Z",
+                "2024-11-03T01:30:00.456Z",
+            ),
+        ] {
+            let zone = jiff::tz::TimeZone::get(zone).unwrap();
+            let instant = instant.parse::<DateTime<Utc>>().unwrap();
+            let wall = expected_wall.parse::<DateTime<Utc>>().unwrap();
+            let mut metadata = sample_full_data_file_meta();
+            metadata.creation_time = Some(local_timestamp(instant, &zone));
+            assert_eq!(metadata.creation_time, Some(wall));
+            for decoded in [
+                serde_json::from_slice::<DataFileMeta>(&serde_json::to_vec(&metadata).unwrap())
+                    .unwrap(),
+                DataFileMeta::from_serialized_row_data(
+                    &metadata.to_serialized_row_data().unwrap(),
+                    DataFileMetaRowLayout::CURRENT,
+                )
+                .unwrap(),
+            ] {
+                assert_eq!(decoded.creation_time, Some(wall));
+                assert_eq!(
+                    decoded.creation_time_epoch_millis_in_zone(&zone).unwrap(),
+                    Some(instant.timestamp_millis())
+                );
+            }
+        }
+        assert_eq!(
+            sample_minimal_data_file_meta()
+                .creation_time_epoch_millis()
+                .unwrap(),
+            None
+        );
     }
 
     #[test]

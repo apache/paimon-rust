@@ -21,9 +21,11 @@
 //! - `CALL sys.create_tag(table => '...', tag => '...', snapshot_id => ..., time_retained => '...')`
 //! - `CALL sys.delete_tag(table => '...', tag => '...')`
 //! - `CALL sys.rename_tag(table => '...', tag => '...', target_tag => '...')`
+//! - `CALL sys.reset_consumer(table => '...', consumer_id => '...'[, next_snapshot_id => ...])`
 //! - `CALL sys.rollback_to(table => '...', snapshot_id => ... | tag => '...')`
 //! - `CALL sys.rollback_to_timestamp(table => '...', timestamp => ...)`
 //! - `CALL sys.create_tag_from_timestamp(table => '...', tag => '...', timestamp => ...)`
+//! - `CALL sys.create_tag_from_watermark(table => '...', tag => '...', watermark => ..., time_retained => '...')`
 //! - `CALL sys.create_global_index(table => '...', index_column => '...', index_type => 'btree')`
 //! - `CALL sys.create_global_index(table => '...', index_column => '...', index_type => 'bitmap')`
 //! - `CALL sys.create_global_index(table => '...', index_column => '...', index_type => 'ivf-pq')`
@@ -73,8 +75,8 @@ use paimon::catalog::{Catalog, Identifier, RESTCatalog};
 use paimon::lumina::{is_lumina_index_type, LUMINA_IDENTIFIER};
 use paimon::spec::{CoreOptions, DataType, Datum, Predicate, PredicateBuilder, Snapshot};
 use paimon::table::{
-    normalize_global_index_type, BranchManager, SnapshotManager, Table, TagManager,
-    SUPPORTED_GLOBAL_INDEX_TYPES_FOR_DROP,
+    normalize_global_index_type, BranchManager, ConsumerManager, SnapshotManager, Table,
+    TagManager, SUPPORTED_GLOBAL_INDEX_TYPES_FOR_DROP,
 };
 
 use crate::error::to_datafusion_error;
@@ -134,6 +136,35 @@ async fn later_or_equal_from_all(
     }
 }
 
+/// Find a snapshot with watermark >= the requested value, including tag-retained
+/// snapshots. Matches Java's Spark procedure: compare the first eligible live and
+/// tagged snapshots by watermark, then by snapshot ID when watermarks are equal.
+async fn later_or_equal_watermark_from_all(
+    sm: &SnapshotManager,
+    tm: &TagManager,
+    watermark: i64,
+) -> DFResult<Option<Snapshot>> {
+    let live = sm
+        .later_or_equal_watermark(watermark)
+        .await
+        .map_err(to_datafusion_error)?;
+    let tags = tm.list_all().await.map_err(to_datafusion_error)?;
+    let tag_candidate = tags
+        .into_iter()
+        .map(|(_, snapshot)| snapshot)
+        .filter(|snapshot| {
+            snapshot
+                .watermark()
+                .is_some_and(|value| value != i64::MIN && value >= watermark)
+        })
+        // Rust lists tags by name; Java's tag candidates are ordered by snapshot ID.
+        .min_by_key(Snapshot::id);
+    Ok(live
+        .into_iter()
+        .chain(tag_candidate)
+        .min_by_key(|snapshot| (snapshot.watermark(), snapshot.id())))
+}
+
 /// Find the latest snapshot with commit time <= timestamp_millis,
 /// considering both live snapshots and tag-retained snapshots.
 async fn earlier_or_equal_from_all(
@@ -174,10 +205,13 @@ fn declared_parameters(proc_name: &str) -> Option<&'static [&'static str]> {
         "create_tag" => &["table", "tag", "snapshot_id", "time_retained"],
         "delete_tag" => &["table", "tag"],
         "rename_tag" => &["table", "tag", "target_tag"],
+        "reset_consumer" => &["table", "consumer_id", "next_snapshot_id"],
         "rollback_to" => &["table", "snapshot_id", "tag"],
         "rollback_to_timestamp" => &["table", "timestamp"],
         "create_tag_from_timestamp" => &["table", "tag", "timestamp"],
+        "create_tag_from_watermark" => &["table", "tag", "watermark", "time_retained"],
         "rename_branch" => &["table", "from_branch", "to_branch"],
+        "delete_branch" => &["table", "branch"],
         "create_global_index" => &["table", "index_column", "index_type", "options"],
         "drop_global_index" => &[
             "table",
@@ -283,6 +317,7 @@ pub async fn execute_call(
         "create_tag" => proc_create_tag(ctx, catalog, catalog_name, &args).await,
         "delete_tag" => proc_delete_tag(ctx, catalog, catalog_name, &args).await,
         "rename_tag" => proc_rename_tag(ctx, catalog, catalog_name, &args).await,
+        "reset_consumer" => proc_reset_consumer(ctx, catalog, catalog_name, &args).await,
         "rollback_to" => proc_rollback_to(ctx, catalog, catalog_name, &args).await,
         "rollback_to_timestamp" => {
             proc_rollback_to_timestamp(ctx, catalog, catalog_name, &args).await
@@ -290,7 +325,11 @@ pub async fn execute_call(
         "create_tag_from_timestamp" => {
             proc_create_tag_from_timestamp(ctx, catalog, catalog_name, &args).await
         }
+        "create_tag_from_watermark" => {
+            proc_create_tag_from_watermark(ctx, catalog, catalog_name, &args).await
+        }
         "rename_branch" => proc_rename_branch(ctx, catalog, catalog_name, &args).await,
+        "delete_branch" => proc_delete_branch(ctx, catalog, catalog_name, &args).await,
         "create_global_index" => proc_create_global_index(ctx, catalog, catalog_name, &args).await,
         "drop_global_index" => proc_drop_global_index(ctx, catalog, catalog_name, &args).await,
         "create_lumina_index" => proc_create_lumina_index(ctx, catalog, catalog_name, &args).await,
@@ -425,6 +464,60 @@ fn managers(table: &Table) -> (SnapshotManager, TagManager) {
     (sm, tm)
 }
 
+async fn proc_reset_consumer(
+    ctx: &SessionContext,
+    catalog: &Arc<dyn Catalog>,
+    catalog_name: &str,
+    args: &HashMap<String, String>,
+) -> DFResult<DataFrame> {
+    let consumer_id = require_arg(args, "consumer_id")?;
+    ConsumerManager::validate_consumer_id(consumer_id).map_err(to_datafusion_error)?;
+    let next_snapshot_id = args
+        .get("next_snapshot_id")
+        .map(|value| {
+            value
+                .parse::<i64>()
+                .ok()
+                .filter(|id| *id > 0)
+                .ok_or_else(|| {
+                    DataFusionError::Plan(format!(
+                        "Invalid next_snapshot_id: '{value}'. Expected a positive BIGINT"
+                    ))
+                })
+        })
+        .transpose()?;
+    let table = get_table(catalog, catalog_name, args).await?;
+    if table.rest_env().is_some() {
+        return Err(DataFusionError::NotImplemented(
+            "reset_consumer is not supported for tables managed by a REST catalog".to_string(),
+        ));
+    }
+    if table.schema().core_options().is_format_table() {
+        return Err(DataFusionError::NotImplemented(
+            "reset_consumer requires a FileStoreTable; format-table is not supported".to_string(),
+        ));
+    }
+    let manager = table.consumer_manager();
+    if let Some(id) = next_snapshot_id {
+        // Stream recovery reads live snapshot files, not tag-retained metadata.
+        table
+            .snapshot_manager()
+            .get_snapshot(id)
+            .await
+            .map_err(to_datafusion_error)?;
+        manager
+            .reset(consumer_id, id)
+            .await
+            .map_err(to_datafusion_error)?;
+    } else {
+        manager
+            .delete(consumer_id)
+            .await
+            .map_err(to_datafusion_error)?;
+    }
+    ok_result(ctx)
+}
+
 async fn proc_create_tag(
     ctx: &SessionContext,
     catalog: &Arc<dyn Catalog>,
@@ -488,6 +581,58 @@ async fn proc_rename_branch(
     bm.rename_branch(from_branch, to_branch)
         .await
         .map_err(to_datafusion_error)?;
+    ok_result(ctx)
+}
+
+async fn proc_delete_branch(
+    ctx: &SessionContext,
+    catalog: &Arc<dyn Catalog>,
+    catalog_name: &str,
+    args: &HashMap<String, String>,
+) -> DFResult<DataFrame> {
+    let table = get_table(catalog, catalog_name, args).await?;
+    let branch_str = require_arg(args, "branch")?;
+
+    // A REST catalog owns branch metadata and the Rust REST catalog has no
+    // branch-drop endpoint yet (Java `RESTCatalog.dropBranch` DELETEs through the
+    // catalog). Dropping the physical branch directory here would leave the
+    // catalog still listing the branch while its data is gone. Refuse before
+    // deleting anything, until a catalog-aware path exists.
+    if table.rest_env().is_some() {
+        return Err(DataFusionError::NotImplemented(
+            "delete_branch is not yet supported for tables managed by a REST catalog".to_string(),
+        ));
+    }
+
+    let bm = BranchManager::new(table.file_io().clone(), table.location().to_string());
+    let options = table.schema().options();
+    // Java `Table.deleteBranches` splits on comma and passes each token through
+    // unchanged. Branch identities keep leading/trailing spaces (the shared
+    // validator and readers treat `" b1"` and `"b1"` as distinct), so the
+    // delete_tag trim convention must not apply here — trimming could delete a
+    // different branch than the one requested.
+    for branch_name in branch_str.split(',') {
+        if branch_name.is_empty() {
+            continue;
+        }
+        // Validate the logical name before any existence check or deletion: a
+        // separator-bearing name like `prod/schema` would otherwise slip past the
+        // configured-branch guard (it is not literally `prod`) and recursively
+        // delete the inner directory of a protected branch.
+        BranchManager::validate_branch_name(branch_name).map_err(to_datafusion_error)?;
+        BranchManager::ensure_branch_deletable(options, branch_name)
+            .map_err(to_datafusion_error)?;
+        if !bm
+            .branch_exists(branch_name)
+            .await
+            .map_err(to_datafusion_error)?
+        {
+            continue;
+        }
+        bm.drop_branch(branch_name)
+            .await
+            .map_err(to_datafusion_error)?;
+    }
     ok_result(ctx)
 }
 
@@ -581,13 +726,23 @@ async fn proc_rollback_to(
                 .map_err(|_| DataFusionError::Plan(format!("Invalid snapshot_id: '{id_str}'")))?;
             rest_env
                 .api()
-                .rollback_to_snapshot(rest_env.identifier(), id)
+                .rollback_to(
+                    rest_env.identifier(),
+                    &paimon::table::Instant::snapshot(id),
+                    None,
+                    Some(rest_env.uuid()),
+                )
                 .await
                 .map_err(to_datafusion_error)?;
         } else if let Some(tag_name) = args.get("tag") {
             rest_env
                 .api()
-                .rollback_to_tag(rest_env.identifier(), tag_name)
+                .rollback_to(
+                    rest_env.identifier(),
+                    &paimon::table::Instant::tag(tag_name),
+                    None,
+                    Some(rest_env.uuid()),
+                )
                 .await
                 .map_err(to_datafusion_error)?;
         } else {
@@ -669,7 +824,12 @@ async fn proc_rollback_to_timestamp(
     if let Some(rest_env) = table.rest_env() {
         rest_env
             .api()
-            .rollback_to_snapshot(rest_env.identifier(), snapshot.id())
+            .rollback_to(
+                rest_env.identifier(),
+                &paimon::table::Instant::snapshot(snapshot.id()),
+                None,
+                Some(rest_env.uuid()),
+            )
             .await
             .map_err(to_datafusion_error)?;
     } else {
@@ -704,6 +864,46 @@ async fn proc_create_tag_from_timestamp(
         )));
     }
     tm.create(tag_name, &snapshot)
+        .await
+        .map_err(to_datafusion_error)?;
+    ok_result(ctx)
+}
+
+async fn proc_create_tag_from_watermark(
+    ctx: &SessionContext,
+    catalog: &Arc<dyn Catalog>,
+    catalog_name: &str,
+    args: &HashMap<String, String>,
+) -> DFResult<DataFrame> {
+    let table = get_table(catalog, catalog_name, args).await?;
+    let tag_name = require_arg(args, "tag")?;
+    let watermark_str = require_arg(args, "watermark")?;
+    let watermark: i64 = watermark_str
+        .parse()
+        .map_err(|_| DataFusionError::Plan(format!("Invalid watermark: '{watermark_str}'")))?;
+    let time_retained = args.get("time_retained").map(String::as_str);
+
+    // REST snapshots may exist only in the catalog; storage listings cannot
+    // enumerate the authoritative history needed for watermark selection.
+    if table.rest_env().is_some() {
+        return Err(DataFusionError::NotImplemented(
+            "create_tag_from_watermark is not supported for tables managed by a REST catalog"
+                .to_string(),
+        ));
+    }
+
+    let (sm, tm) = managers(&table);
+    if tm.tag_exists(tag_name).await.map_err(to_datafusion_error)? {
+        return Err(DataFusionError::Plan(format!(
+            "Tag '{tag_name}' already exists"
+        )));
+    }
+    let snapshot = later_or_equal_watermark_from_all(&sm, &tm, watermark)
+        .await?
+        .ok_or_else(|| {
+            DataFusionError::Plan(format!("No snapshot found with watermark >= {watermark}"))
+        })?;
+    tm.create_with_retention(tag_name, &snapshot, time_retained)
         .await
         .map_err(to_datafusion_error)?;
     ok_result(ctx)

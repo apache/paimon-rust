@@ -150,9 +150,9 @@ impl TableUpsert {
     }
 
     /// Add rows containing the keys and columns to write. Column order may
-    /// differ from the table schema; names and Arrow layouts follow the same
-    /// normalization as ordinary writes. Batches form one logical upsert input,
-    /// but may carry different non-key columns, preserving absent fields.
+    /// differ from the table schema. Keep original payloads, including keys,
+    /// until last-write-wins and matching have selected their action.
+    /// Batches may carry different non-key columns, preserving absent fields.
     pub(super) fn add_batch(&mut self, batch: RecordBatch) -> crate::Result<()> {
         let target = crate::arrow::build_target_arrow_schema(self.table.schema().fields())?;
         let input_schema = batch.schema();
@@ -170,24 +170,12 @@ impl TableUpsert {
         }
         let mut columns = Vec::with_capacity(target.fields().len());
         let mut fields = Vec::new();
-        let inline = CoreOptions::new(self.table.schema().options()).blob_inline_fields();
-        for (index, field) in target.fields().iter().enumerate() {
+        for field in target.fields() {
             let Some(column) = batch.column_by_name(field.name()) else {
                 continue;
             };
-            let logical = &self.table.schema().fields()[index];
-            let normalized =
-                if logical.data_type().is_blob_file_field() && !inline.contains(logical.name()) {
-                    normalize_blob_write_field(column, field)
-                } else {
-                    normalize_write_array(column, field.data_type())
-                        .map(|column| (field.as_ref().clone(), column))
-                };
-            let (field, column) = normalized.map_err(|error| {
-                invalid(format!("Invalid upsert column '{}': {error}", field.name()))
-            })?;
-            columns.push(column);
-            fields.push(Arc::new(field));
+            columns.push(column.clone());
+            fields.push(input_schema.field_with_name(field.name()).unwrap().clone());
         }
         let ordered = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
             .map_err(|error| invalid(format!("cannot order upsert columns: {error}")))?;
@@ -195,23 +183,103 @@ impl TableUpsert {
         Ok(())
     }
 
+    /// Appends use the ordinary write contract; matched values use the row-ID
+    /// updater's conversion rules. Neither action touches discarded source rows.
+    fn normalize_selected_batch(
+        &self,
+        batch: RecordBatch,
+        append: bool,
+    ) -> crate::Result<RecordBatch> {
+        let target = crate::arrow::build_target_arrow_schema(self.table.schema().fields())?;
+        let update_fields = super::data_evolution_fields::project_by_paths(
+            self.table.schema().fields(),
+            &self.update_columns,
+        )?;
+        let inline = CoreOptions::new(self.table.schema().options()).blob_inline_fields();
+        let mut fields = Vec::new();
+        let mut columns = Vec::new();
+        for (index, field) in target.fields().iter().enumerate() {
+            let Some(column) = batch.column_by_name(field.name()) else {
+                // The row-ID updater diagnoses missing update columns. Absent
+                // append columns stay absent in the file's write_cols metadata.
+                continue;
+            };
+            let logical = &self.table.schema().fields()[index];
+            let update_field = update_fields
+                .iter()
+                .find(|updated| updated.name() == field.name());
+            let normalized = if !append && update_field.is_none() {
+                Ok((
+                    batch
+                        .schema()
+                        .field_with_name(field.name())
+                        .unwrap()
+                        .clone(),
+                    column.clone(),
+                ))
+            } else if logical.data_type().is_blob_file_field()
+                && !inline.contains(logical.name())
+                && (append || matches!(logical.data_type(), crate::spec::DataType::Map(_)))
+            {
+                // Named-row Blob maps carry nullable keys and decimal text in
+                // their dedicated physical layout. Keep that transport intact.
+                if append {
+                    normalize_blob_write_field(column, field)
+                } else {
+                    super::write_batch_normalize::normalize_blob_update_field(column, field)
+                }
+            } else if append {
+                normalize_write_array(column, field.data_type())
+                    .map(|column| (field.as_ref().clone(), column))
+            } else {
+                Ok((
+                    batch
+                        .schema()
+                        .field_with_name(field.name())
+                        .unwrap()
+                        .clone(),
+                    column.clone(),
+                ))
+            };
+            let (field, column) = normalized.map_err(|error| {
+                invalid(format!("Invalid upsert column '{}': {error}", field.name()))
+            })?;
+            fields.push(field);
+            columns.push(column);
+        }
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+            .map_err(|error| invalid(format!("cannot normalize selected upsert rows: {error}")))
+    }
+
     /// Concatenate only match keys. Padding payload columns with NULL would
     /// lose the distinction between an absent field and an explicit NULL.
     fn key_rows(&self) -> crate::Result<RecordBatch> {
+        let target = crate::arrow::build_target_arrow_schema(self.table.schema().fields())?;
+        let fields = target
+            .fields()
+            .iter()
+            .filter(|field| self.keys.contains(field.name()))
+            .cloned()
+            .collect::<Vec<_>>();
+        let key_schema = Arc::new(Schema::new(fields));
         let batches = self
             .source
             .iter()
             .map(|batch| {
-                let columns = batch
-                    .schema()
+                let columns = key_schema
                     .fields()
                     .iter()
-                    .enumerate()
-                    .filter(|(_, field)| self.keys.contains(field.name()))
-                    .map(|(index, _)| index)
-                    .collect::<Vec<_>>();
-                batch
-                    .project(&columns)
+                    .map(|field| {
+                        super::key_normalization::normalize_match_key(
+                            batch.column_by_name(field.name()).unwrap(),
+                            field.data_type(),
+                        )
+                        .map_err(|error| {
+                            invalid(format!("Invalid upsert key '{}': {error}", field.name()))
+                        })
+                    })
+                    .collect::<crate::Result<Vec<_>>>()?;
+                RecordBatch::try_new(key_schema.clone(), columns)
                     .map_err(|error| invalid(error.to_string()))
             })
             .collect::<crate::Result<Vec<_>>>()?;
@@ -277,6 +345,7 @@ impl TableUpsert {
     fn append_groups(&self, indices: &[usize]) -> crate::Result<Vec<Vec<RecordBatch>>> {
         let mut groups: IndexMap<Vec<u8>, Vec<RecordBatch>> = IndexMap::new();
         for (batch, _) in self.selected_batches(indices)? {
+            let batch = self.normalize_selected_batch(batch, true)?;
             let mut by_partition: IndexMap<Vec<u8>, Vec<usize>> = IndexMap::new();
             for (row, partition) in self.serialized_partitions(&batch)?.into_iter().enumerate() {
                 by_partition.entry(partition).or_default().push(row);
@@ -321,7 +390,6 @@ impl TableUpsert {
     /// new rows, then return both sets of commit messages as one operation.
     #[must_use = "commit messages must be passed to TableCommit"]
     pub(super) async fn prepare_commit(self) -> crate::Result<Vec<CommitMessage>> {
-        CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
         let source = self.key_rows()?;
         if source.num_rows() == 0 {
             return Err(invalid("Input data is empty"));
@@ -332,8 +400,8 @@ impl TableUpsert {
         let mut projection = self.keys.iter().map(String::as_str).collect::<Vec<_>>();
         projection.push(ROW_ID);
         read_builder.with_projection(&projection)?;
-        let plan = read_builder.new_scan().plan().await?;
-        let read = read_builder.new_read()?;
+        let plan = read_builder.new_scan().plan_all_files().await?;
+        let read = read_builder.new_read()?.for_update();
         let splits = self.matching_splits(&source, &plan)?;
         let mut stream = read.to_arrow(splits.as_ref())?;
         while let Some(batch) = stream.try_next().await? {
@@ -357,6 +425,7 @@ impl TableUpsert {
                     update.pin_read_snapshot(snapshot_id);
                 }
                 for (selected, range) in matched_batches {
+                    let selected = self.normalize_selected_batch(selected, false)?;
                     let mut fields = selected.schema().fields().to_vec();
                     fields.push(Arc::new(Field::new(ROW_ID, DataType::Int64, false)));
                     let mut columns: Vec<ArrayRef> = selected.columns().to_vec();
@@ -404,7 +473,430 @@ impl TableUpsert {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::Identifier;
+    use crate::io::FileIOBuilder;
     use crate::spec::{DataType as PaimonType, DecimalType, TimestampType, VarCharType};
+    use crate::spec::{IntType, Schema as PaimonSchema, TableSchema};
+    use crate::table::TableCommit;
+    use arrow_array::{Array, Int32Array, StringArray};
+
+    async fn numeric_table(path: &str) -> Table {
+        let schema = PaimonSchema::builder()
+            .column("key", PaimonType::Int(IntType::new()))
+            .column("value", PaimonType::Int(IntType::new()))
+            .column("keep", PaimonType::Int(IntType::new()))
+            .option("data-evolution.enabled", "true")
+            .option("row-tracking.enabled", "true")
+            .build()
+            .unwrap();
+        let table = Table::new(
+            FileIOBuilder::new("memory").build().unwrap(),
+            Identifier::new("db", "upsert"),
+            path.into(),
+            TableSchema::new(0, &schema),
+            None,
+        );
+        let initial = RecordBatch::try_from_iter([
+            ("key", Arc::new(Int32Array::from(vec![1, 1, 2])) as ArrayRef),
+            ("value", Arc::new(Int32Array::from(vec![0; 3])) as ArrayRef),
+            (
+                "keep",
+                Arc::new(Int32Array::from(vec![10, 11, 12])) as ArrayRef,
+            ),
+        ])
+        .unwrap();
+        let mut write = table.new_write_builder().new_write().unwrap();
+        write.write_arrow_batch(&initial).await.unwrap();
+        TableCommit::new(table.clone(), "seed".into())
+            .commit(write.prepare_commit().await.unwrap())
+            .await
+            .unwrap();
+        write.close().await;
+        table
+    }
+
+    fn numeric_source(keys: Vec<i32>, value: ArrayRef) -> RecordBatch {
+        RecordBatch::try_from_iter([
+            ("key", Arc::new(Int32Array::from(keys)) as ArrayRef),
+            ("value", value),
+        ])
+        .unwrap()
+    }
+
+    async fn numeric_rows(table: &Table) -> Vec<(i64, i32, Option<i32>, Option<i32>)> {
+        let mut builder = table.new_read_builder();
+        builder
+            .with_projection(&["_ROW_ID", "key", "value", "keep"])
+            .unwrap();
+        let plan = builder.new_scan().plan().await.unwrap();
+        let batches: Vec<_> = builder
+            .new_read()
+            .unwrap()
+            .to_arrow(plan.splits())
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let mut rows = Vec::new();
+        for batch in batches {
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let keys = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let values = batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let keep = batch
+                .column(3)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            rows.extend((0..batch.num_rows()).map(|row| {
+                (
+                    ids.value(row),
+                    keys.value(row),
+                    (!values.is_null(row)).then(|| values.value(row)),
+                    (!keep.is_null(row)).then(|| keep.value(row)),
+                )
+            }));
+        }
+        rows.sort();
+        rows
+    }
+
+    #[tokio::test]
+    async fn upsert_casts_surviving_matched_values_and_ignores_other_payloads() {
+        let table = numeric_table("memory:/upsert_selected").await;
+        let first = numeric_source(vec![1], Arc::new(StringArray::from(vec!["not-an-int"])));
+        let mut last = numeric_source(vec![1], Arc::new(StringArray::from(vec!["42"])));
+        last = RecordBatch::try_from_iter([
+            ("key", last.column(0).clone()),
+            ("value", last.column(1).clone()),
+            (
+                "keep",
+                Arc::new(StringArray::from(vec!["unwritten"])) as ArrayRef,
+            ),
+        ])
+        .unwrap();
+        let mut update = table.new_write_builder().new_update().unwrap();
+        update.with_update_type(vec!["value".into()]).unwrap();
+        let messages = update
+            .upsert_by_arrow_with_key(vec![first, last], vec!["key".into()])
+            .await
+            .unwrap();
+        assert!(messages
+            .iter()
+            .all(|message| message.check_from_snapshot == Some(1)));
+        TableCommit::new(table.clone(), "update".into())
+            .commit(messages)
+            .await
+            .unwrap();
+        assert_eq!(
+            numeric_rows(&table).await,
+            vec![
+                (0, 1, Some(42), Some(10)),
+                (1, 1, Some(42), Some(11)),
+                (2, 2, Some(0), Some(12)),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn upsert_keeps_update_casts_separate_from_append_validation() {
+        let table = numeric_table("memory:/upsert_mixed_types").await;
+        let matched = numeric_source(vec![1], Arc::new(StringArray::from(vec!["42"])));
+        let append = numeric_source(vec![3], Arc::new(Int32Array::from(vec![7])));
+        let mut update = table.new_write_builder().new_update().unwrap();
+        update.with_update_type(vec!["value".into()]).unwrap();
+        let messages = update
+            .upsert_by_arrow_with_key(vec![matched, append], vec!["key".into()])
+            .await
+            .unwrap();
+        TableCommit::new(table.clone(), "update".into())
+            .commit(messages)
+            .await
+            .unwrap();
+        assert_eq!(
+            numeric_rows(&table).await,
+            vec![
+                (0, 1, Some(42), Some(10)),
+                (1, 1, Some(42), Some(11)),
+                (2, 2, Some(0), Some(12)),
+                (3, 3, Some(7), None),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn upsert_rejects_invalid_appends_before_staging_matched_updates() {
+        let table = numeric_table("memory:/upsert_invalid_append").await;
+        let batch = numeric_source(vec![1, 3], Arc::new(StringArray::from(vec!["42", "7"])));
+        let mut update = table.new_write_builder().new_update().unwrap();
+        update.with_update_type(vec!["value".into()]).unwrap();
+        let error = update
+            .upsert_by_arrow_with_key(vec![batch], vec!["key".into()])
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("Invalid upsert column 'value'"));
+        assert_eq!(
+            table
+                .snapshot_manager()
+                .get_latest_snapshot_id()
+                .await
+                .unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            numeric_rows(&table).await,
+            vec![
+                (0, 1, Some(0), Some(10)),
+                (1, 1, Some(0), Some(11)),
+                (2, 2, Some(0), Some(12)),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn upsert_matched_binary_values_use_existing_row_id_casts() {
+        use arrow_array::{BinaryArray, LargeBinaryArray};
+        let schema = PaimonSchema::builder()
+            .column("key", PaimonType::Int(IntType::new()))
+            .column(
+                "value",
+                PaimonType::VarBinary(crate::spec::VarBinaryType::default()),
+            )
+            .option("data-evolution.enabled", "true")
+            .option("row-tracking.enabled", "true")
+            .build()
+            .unwrap();
+        let table = Table::new(
+            FileIOBuilder::new("memory").build().unwrap(),
+            Identifier::new("db", "upsert"),
+            "memory:/upsert_binary".into(),
+            TableSchema::new(0, &schema),
+            None,
+        );
+        let initial = numeric_source(
+            vec![1],
+            Arc::new(BinaryArray::from(vec![b"old".as_slice()])),
+        );
+        let mut writer = table.new_write_builder().new_write().unwrap();
+        writer.write_arrow_batch(&initial).await.unwrap();
+        TableCommit::new(table.clone(), "seed".into())
+            .commit(writer.prepare_commit().await.unwrap())
+            .await
+            .unwrap();
+        writer.close().await;
+        let update = table.new_write_builder().new_update().unwrap();
+        let input = numeric_source(
+            vec![1],
+            Arc::new(LargeBinaryArray::from(vec![b"\xff\0new".as_slice()])),
+        );
+        let messages = update
+            .upsert_by_arrow_with_key(vec![input], vec!["key".into()])
+            .await
+            .unwrap();
+        TableCommit::new(table.clone(), "update".into())
+            .commit(messages)
+            .await
+            .unwrap();
+        let mut builder = table.new_read_builder();
+        builder.with_projection(&["value"]).unwrap();
+        let plan = builder.new_scan().plan().await.unwrap();
+        let batches: Vec<_> = builder
+            .new_read()
+            .unwrap()
+            .to_arrow(plan.splits())
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+        let values = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+        assert_eq!(values.value(0), b"\xff\0new");
+    }
+
+    #[tokio::test]
+    async fn upsert_matches_integer_key_widths_but_keeps_append_input_types() {
+        let table = numeric_table("memory:/upsert_integer_key_widths").await;
+        let source = |key, value| {
+            RecordBatch::try_from_iter([
+                ("key", Arc::new(Int64Array::from(vec![key])) as ArrayRef),
+                ("value", Arc::new(Int32Array::from(vec![value])) as ArrayRef),
+            ])
+            .unwrap()
+        };
+        let mut update = table.new_write_builder().new_update().unwrap();
+        update.with_update_type(vec!["value".into()]).unwrap();
+        let messages = update
+            .upsert_by_arrow_with_key(vec![source(1, 42)], vec!["key".into()])
+            .await
+            .unwrap();
+        TableCommit::new(table.clone(), "update".into())
+            .commit(messages)
+            .await
+            .unwrap();
+        assert_eq!(
+            numeric_rows(&table).await,
+            vec![
+                (0, 1, Some(42), Some(10)),
+                (1, 1, Some(42), Some(11)),
+                (2, 2, Some(0), Some(12))
+            ]
+        );
+        let error = update
+            .upsert_by_arrow_with_key(vec![source(3, 7)], vec!["key".into()])
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("Invalid upsert column 'key'"));
+        assert_eq!(numeric_rows(&table).await.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn upsert_normalizes_string_offsets_before_matching_and_writing() {
+        use crate::catalog::Identifier;
+        use crate::io::FileIOBuilder;
+        use crate::spec::{IntType, Schema, TableSchema};
+        use crate::table::TableCommit;
+        use arrow_array::{Array, Int32Array, LargeStringArray, StringArray};
+
+        let schema = Schema::builder()
+            .column("key", PaimonType::VarChar(VarCharType::default()))
+            .column("value", PaimonType::VarChar(VarCharType::default()))
+            .column("keep", PaimonType::Int(IntType::new()))
+            .option("data-evolution.enabled", "true")
+            .option("row-tracking.enabled", "true")
+            .build()
+            .unwrap();
+        let table = Table::new(
+            FileIOBuilder::new("memory").build().unwrap(),
+            Identifier::new("db", "upsert"),
+            "memory:/upsert".into(),
+            TableSchema::new(0, &schema),
+            None,
+        );
+        let mut writer = table
+            .new_write_builder()
+            .with_commit_user("test")
+            .unwrap()
+            .new_write()
+            .unwrap();
+        let initial = RecordBatch::try_from_iter([
+            (
+                "key",
+                Arc::new(StringArray::from(vec![Some("中文"), Some("中文"), None])) as ArrayRef,
+            ),
+            (
+                "value",
+                Arc::new(StringArray::from(vec!["old"; 3])) as ArrayRef,
+            ),
+            (
+                "keep",
+                Arc::new(Int32Array::from(vec![10, 11, 12])) as ArrayRef,
+            ),
+        ])
+        .unwrap();
+        writer.write_arrow_batch(&initial).await.unwrap();
+        TableCommit::new(table.clone(), "seed".into())
+            .commit(writer.prepare_commit().await.unwrap())
+            .await
+            .unwrap();
+        writer.close().await;
+
+        let source = RecordBatch::try_from_iter([
+            (
+                "value",
+                Arc::new(LargeStringArray::from(vec![
+                    Some("discarded"),
+                    Some(""),
+                    None,
+                    Some("final"),
+                ])) as ArrayRef,
+            ),
+            (
+                "key",
+                Arc::new(LargeStringArray::from(vec![
+                    Some("中文"),
+                    Some("new"),
+                    None,
+                    Some("中文"),
+                ])) as ArrayRef,
+            ),
+        ])
+        .unwrap();
+        let mut updater = table.new_write_builder().new_update().unwrap();
+        updater.with_update_type(vec!["value".into()]).unwrap();
+        let messages = updater
+            .upsert_by_arrow_with_key(
+                vec![source.slice(0, 1), source.slice(1, 3)],
+                vec!["key".into()],
+            )
+            .await
+            .unwrap();
+        TableCommit::new(table.clone(), "upsert".into())
+            .commit(messages)
+            .await
+            .unwrap();
+        let mut reader = table.new_read_builder();
+        reader
+            .with_projection(&["key", "value", "keep", "_ROW_ID"])
+            .unwrap();
+        let plan = reader.new_scan().plan().await.unwrap();
+        let mut batches = reader.new_read().unwrap().to_arrow(plan.splits()).unwrap();
+        let mut rows = Vec::new();
+        while let Some(batch) = batches.try_next().await.unwrap() {
+            let keys = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let values = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let keep = batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let ids = batch
+                .column(3)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            rows.extend((0..batch.num_rows()).map(|row| {
+                (
+                    ids.value(row),
+                    (!keys.is_null(row)).then(|| keys.value(row).to_string()),
+                    (!values.is_null(row)).then(|| values.value(row).to_string()),
+                    (!keep.is_null(row)).then(|| keep.value(row)),
+                )
+            }));
+        }
+        rows.sort();
+        assert_eq!(
+            rows,
+            vec![
+                (0, Some("中文".into()), Some("final".into()), Some(10)),
+                (1, Some("中文".into()), Some("final".into()), Some(11)),
+                (2, None, None, Some(12)),
+                (3, Some("new".into()), Some("".into()), None),
+            ]
+        );
+    }
 
     #[test]
     fn partition_identity_ignores_java_null_variable_storage() {

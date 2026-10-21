@@ -95,6 +95,36 @@ pub struct FullTextScanPlan {
 }
 
 impl FullTextScanPlan {
+    /// The snapshot captured by the scan; accessing it never resolves latest.
+    pub fn snapshot(&self) -> Option<&crate::spec::Snapshot> {
+        self.table.travel_snapshot()
+    }
+
+    /// Source metadata for inspection or transport to another search reader.
+    pub async fn splits(&self) -> crate::Result<Vec<crate::table::SearchScanSplit>> {
+        if let Some(plan) = &self.primary_key_plan {
+            return Ok(plan
+                .splits
+                .iter()
+                .map(|split| crate::table::SearchScanSplit::PrimaryKey {
+                    data_split: split.data_split.clone(),
+                    payloads: split.current_payloads.clone(),
+                    uncovered_data_files: split.uncovered_data_files.clone(),
+                    row_ranges_by_file: Default::default(),
+                })
+                .collect());
+        }
+        super::super::search_scan_split::global_search_splits(
+            &self.table,
+            &self.entries,
+            &self.context.column,
+            self.context.filter.as_ref(),
+            &Default::default(),
+            true,
+        )
+        .await
+    }
+
     pub fn snapshot_id(&self) -> Option<i64> {
         self.snapshot_id
     }

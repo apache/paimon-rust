@@ -51,6 +51,39 @@ def _make_variant_table_with_data(warehouse):
     return PaimonCatalog({"warehouse": warehouse}).get_table("vdb.t")
 
 
+@pytest.mark.parametrize("limit,split_count", [(None, 1), (0, 0), (1, 1)])
+def test_scan_statistics_preserve_normal_planning(limit, split_count):
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_table_with_data(warehouse)
+        builder = table.new_read_builder()
+        if limit is not None:
+            builder.with_limit(limit)
+        scan = builder.new_scan()
+        plan = scan.plan()
+        stats = plan.stats()
+        assert len(plan.splits()) == split_count
+        assert plan.snapshot_id() == 1
+        assert stats.manifest_entries_read == (0 if limit == 0 else 1)
+        assert stats.final_splits == stats.final_files == split_count
+        assert stats.limit == limit
+        if limit == 0:
+            assert stats.split_candidates_built == 0
+            assert stats.limit_early_stopped
+        with pytest.raises(AttributeError):
+            stats.manifest_entries_read = 10
+
+
+@pytest.mark.parametrize("start,entry_count", [(0, 1), (1, 0)])
+def test_combined_incremental_scan_statistics(start, entry_count):
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_table_with_data(warehouse)
+        scan = table.new_read_builder().new_incremental_scan(start, 1)
+        plan = scan.plan()
+        stats = plan.stats()
+        assert plan.snapshot_id() == 1
+        assert stats.manifest_entries_read == stats.final_files == entry_count
+
+
 def _variant_read_type(table, columns, paths, fail_on_error=False):
     fields = []
     by_name = {field.name(): field for field in table.schema().fields()}
@@ -999,17 +1032,38 @@ def test_filter_decimal_literal_prunes_and_reads():
         assert t.column("id").to_pylist() == [1]
 
 
-def test_filter_decimal_rejects_float_and_rounding():
-    from decimal import Decimal
-
+def test_filter_decimal_rejects_float():
     with tempfile.TemporaryDirectory() as warehouse:
         table = _make_temporal_table(warehouse)
         b = table.new_read_builder()
         with pytest.raises(ValueError):
             b.with_filter({"method": "equal", "field": "dec", "literals": [12.34]})
-        with pytest.raises(ValueError):
-            b.with_filter(
-                {"method": "equal", "field": "dec", "literals": [Decimal("0.005")]})
+
+
+@pytest.mark.parametrize("method,literal,expected_ids", [
+    ("equal", "0.005", []),
+    ("equal", "12.345", []),
+    ("equal", "12.340", [1]),
+    ("lessThan", "12.345", [1]),
+    ("greaterThan", "56.775", [2]),
+    ("lessThan", "100000000.00", [1, 2]),
+    ("greaterThan", "-100000000.00", [1, 2]),
+])
+def test_filter_decimal_preserves_literal_precision_and_scale(
+        method, literal, expected_ids):
+    from decimal import Decimal
+
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_temporal_table(warehouse)
+        builder = table.new_read_builder().with_filter(
+            {"method": method, "field": "dec", "literals": [Decimal(literal)]})
+        filtered_splits = builder.new_scan().plan().splits()
+        all_splits = table.new_read_builder().new_scan().plan().splits()
+        # Check both file-stat pruning and row filtering without file pruning.
+        for splits in (filtered_splits, all_splits):
+            ids = [row["id"] for batch in builder.new_read().read(splits)
+                   for row in batch.to_pylist()]
+            assert sorted(ids) == expected_ids
 
 
 def test_filter_unknown_field_raises():
@@ -1142,6 +1196,79 @@ def test_read_arrow_close_is_idempotent_and_stops_iteration():
         splits = builder.new_scan().plan().splits()
         reader = builder.new_read().read_arrow(splits)
 
+        reader.close()
+        assert reader.read_next_batch() is None
+        assert list(reader) == []
+        reader.close()
+
+
+@pytest.mark.parametrize("method", ["read", "read_arrow"])
+@pytest.mark.parametrize("ordered", [False, True])
+def test_parallel_read_preserves_rows_and_requested_split_order(method, ordered):
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_partitioned_table(warehouse)
+        builder = table.new_read_builder().with_projection(["id", "dt"])
+        splits = list(reversed(builder.new_scan().plan().splits()))
+        assert len(splits) >= 3
+        read = builder.new_read()
+        expected = [row for split in splits for batch in read.read([split])
+                    for row in batch.to_pylist()]
+        # Generators follow the same iterable contract as the original reader.
+        batches = getattr(read, method)((split for split in splits), parallelism=3, ordered=ordered)
+        actual = [row for batch in batches for row in batch.to_pylist()]
+        assert sorted(actual, key=lambda row: row["id"]) == sorted(expected, key=lambda row: row["id"])
+        if ordered:
+            assert actual == expected
+
+
+@pytest.mark.parametrize("method", ["read", "read_arrow"])
+@pytest.mark.parametrize("ordered", [False, True])
+@pytest.mark.parametrize("limit", [0, 1, 3])
+def test_parallel_read_shares_filter_and_limit_across_splits(method, ordered, limit):
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_partitioned_table(warehouse)
+        splits = table.new_read_builder().new_scan().plan().splits()
+        builder = (table.new_read_builder().with_projection(["id"])
+                   .with_filter({"method": "greaterThan", "field": "id", "literals": [1]}))
+        read = builder.new_read()
+        expected = [row for split in splits for batch in read.read([split])
+                    for row in batch.to_pylist()]
+        limited = builder.with_limit(limit).new_read()
+        batches = getattr(limited, method)(splits, parallelism=3, ordered=ordered)
+        actual = [row for batch in batches for row in batch.to_pylist()]
+        assert len(actual) == min(limit, len(expected))
+        assert all(row in expected for row in actual)
+        assert len({row["id"] for row in actual}) == len(actual)
+        if ordered:
+            assert actual == expected[:limit]
+
+
+@pytest.mark.parametrize("method", ["read", "read_arrow"])
+def test_parallel_read_keeps_zero_column_row_counts(method):
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_partitioned_table(warehouse)
+        splits = table.new_read_builder().new_scan().plan().splits()
+        read = table.new_read_builder().with_projection([]).with_limit(3).new_read()
+        batches = list(getattr(read, method)(splits, parallelism=3, ordered=True))
+        assert sum(batch.num_rows for batch in batches) == 3
+        assert all(batch.num_columns == 0 for batch in batches)
+
+
+@pytest.mark.parametrize("method", ["read", "read_arrow"])
+def test_parallel_read_rejects_zero_parallelism_before_empty_splits(method):
+    with tempfile.TemporaryDirectory() as warehouse:
+        read = _make_table_with_data(warehouse).new_read_builder().new_read()
+        with pytest.raises(ValueError, match="parallelism"):
+            getattr(read, method)([], parallelism=0)
+
+
+def test_parallel_read_arrow_close_after_first_batch_stops_iteration():
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_partitioned_table(warehouse)
+        builder = table.new_read_builder()
+        splits = builder.new_scan().plan().splits()
+        reader = builder.new_read().read_arrow(splits, parallelism=3)
+        assert next(reader).num_rows > 0
         reader.close()
         assert reader.read_next_batch() is None
         assert list(reader) == []
@@ -1572,6 +1699,34 @@ def test_incremental_changelog_and_auto_plan_physical_changelog_files():
         assert empty.splits() == []
 
 
+@pytest.mark.parametrize("method", ["read", "read_arrow"])
+@pytest.mark.parametrize("ordered", [False, True])
+def test_parallel_read_keeps_streaming_row_kinds(method, ordered):
+    with tempfile.TemporaryDirectory() as warehouse:
+        ctx = SQLContext()
+        ctx.register_catalog("paimon", {"warehouse": warehouse})
+        ctx.sql("CREATE SCHEMA paimon.parallel_changes")
+        ctx.sql("""CREATE TABLE paimon.parallel_changes.t (
+            dt STRING, id INT, value STRING, PRIMARY KEY (dt, id)
+        ) PARTITIONED BY (dt) WITH ('bucket' = '1', 'changelog-producer' = 'input')""")
+        ctx.sql("INSERT INTO paimon.parallel_changes.t VALUES ('p1', 1, 'a'), ('p2', 2, 'b')")
+        ctx.sql("INSERT INTO paimon.parallel_changes.t VALUES ('p3', 3, 'c')")
+        table = PaimonCatalog({"warehouse": warehouse}).get_table("parallel_changes.t")
+        builder = table.new_read_builder().with_projection(["id"]).with_include_row_kind(True)
+        splits = list(reversed(builder.new_incremental_scan(0, 2, "changelog").plan().splits()))
+        assert len(splits) == 3
+        assert all(split.is_streaming() for split in splits)
+        read = builder.new_read()
+        expected = [row for split in splits for batch in read.read([split])
+                    for row in batch.to_pylist()]
+        batches = getattr(read, method)(splits, parallelism=3, ordered=ordered)
+        actual = [row for batch in batches for row in batch.to_pylist()]
+        assert sorted(actual, key=lambda row: row["id"]) == [
+            {"rowkind": "+I", "id": 1}, {"rowkind": "+I", "id": 2}, {"rowkind": "+I", "id": 3}]
+        if ordered:
+            assert actual == expected
+
+
 @pytest.mark.parametrize("mode", ["changelog", "auto"])
 def test_batch_incremental_changelog_packing_sharding_and_limits(mode):
     with tempfile.TemporaryDirectory() as warehouse:
@@ -1725,20 +1880,26 @@ def test_append_row_position_slices_and_shards_are_native_readable(row_tracking)
         assert shards == list(range(9))
 
 
-def test_append_row_positions_follow_stats_pruned_file_order_before_limit():
+@pytest.mark.parametrize("row_tracking", [False, True])
+@pytest.mark.parametrize("limit,expected", [(None, [4, 5, 6, 7]), (2, [4, 5])])
+def test_append_row_positions_follow_stats_pruned_file_order_before_limit(row_tracking, limit, expected):
     with tempfile.TemporaryDirectory() as warehouse:
-        table = _make_append_position_table(warehouse)
+        table = _make_append_position_table(warehouse, row_tracking)
         builder = (
             table.new_read_builder()
             .with_projection(["id"])
             .with_filter({"method": "greaterOrEqual", "field": "id", "literals": [3]})
-            .with_limit(2)
         )
+        if limit is not None:
+            builder.with_limit(limit)
         plan = builder.new_scan().with_row_position_slice(1, 5).plan()
+        # Stats remove the first file before positions are assigned. LIMIT
+        # must not truncate the candidate files before applying the slice.
+        full_selection = table.new_read_builder().with_projection(["id"]).new_read().read(plan.splits())
+        assert pa.Table.from_batches(full_selection).column("id").to_pylist() == [4, 5, 6, 7]
         actual = pa.Table.from_batches(builder.new_read().read(plan.splits()))
-        # with_limit is a planning hint in the Rust API. The complete selected
-        # range must survive planning; PyPaimon enforces the final two-row limit.
-        assert actual.column("id").to_pylist() == [4, 5, 6, 7]
+        # The configured reader enforces the final LIMIT after selection.
+        assert actual.column("id").to_pylist() == expected
 
 
 def test_append_incremental_row_positions_use_combined_delta_order():

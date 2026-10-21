@@ -49,8 +49,9 @@ fn data_invalid(message: impl Into<String>) -> crate::Error {
 /// `scores`, when present, is aligned to the expanded-range order (ascending
 /// position); `None` means no `__paimon_search_score` column in the output.
 ///
-/// Deliberately NOT reusing `DataSplit.row_ranges`, whose ranges mean stable/global
-/// row ids on the append/data-evolution path. Not serialized.
+/// This is the position reader's explicit physical selection. `GlobalIndexResult`
+/// retains the same ranges in its PK IndexedSplits and recreates this reader input
+/// at materialization. DE split ranges use a separate, global row-ID address space.
 #[derive(Debug, Clone)]
 pub(crate) struct PkVectorIndexedSplit {
     pub split: DataSplit,
@@ -548,6 +549,7 @@ mod e2e_tests {
             schema_manager,
             1,
             id_fields(),
+            |fields| Ok(fields.to_vec()),
             id_fields(),
             Vec::new(),
         );

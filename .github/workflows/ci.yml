@@ -187,6 +187,11 @@ jobs:
           - ubuntu-latest
           - macos-latest
           - windows-latest
+    env:
+      # Core and REST-server tests share a runner. Keep backtrace line numbers
+      # without full debug symbols or one-off incremental build caches.
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
+      CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v7
 
@@ -196,7 +201,6 @@ jobs:
         run: |
           # Full-feature test binaries can exhaust the runner's paging file.
           "CARGO_BUILD_JOBS=2" >> $env:GITHUB_ENV
-          "CARGO_PROFILE_TEST_DEBUG=line-tables-only" >> $env:GITHUB_ENV
 
       - name: Test
         run: cargo test --locked -p paimon --all-targets --features fulltext,vortex

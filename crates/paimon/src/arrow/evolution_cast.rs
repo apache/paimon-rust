@@ -131,43 +131,54 @@ pub(crate) fn cast_numeric(
             let strings = super::evolution_decimal::decimal_to_string(source)?;
             return Ok(Some(super::apply_declared_width(&strings, to)));
         }
-        // DecimalUtils.doubleValue divides the compact long by its scale;
-        // only wide decimals use BigDecimal.doubleValue. FLOAT rounds that
-        // double rather than the decimal coefficient directly.
-        let values: Vec<Option<f64>> = if decimal.precision() <= 18 {
-            let divisor = 10_f64.powi(decimal.scale() as i32);
-            source
-                .as_primitive::<Decimal128Type>()
-                .iter()
-                .map(|value| value.map(|value| value as f64 / divisor))
-                .collect()
-        } else {
-            let strings = super::evolution_decimal::decimal_to_string(source)?;
-            strings
-                .as_string::<i32>()
-                .iter()
-                .map(|value| {
-                    value
-                        .map(|value| {
-                            value
-                                .parse::<f64>()
-                                .map_err(|_| invalid_numeric("Invalid DECIMAL value"))
-                        })
-                        .transpose()
-                })
-                .collect::<crate::Result<Vec<_>>>()?
-        };
-        return Ok(Some(match target {
-            ArrowType::Float32 => Arc::new(Float32Array::from_iter(
-                values.into_iter().map(|v| v.map(|v| v as f32)),
-            )) as ArrayRef,
-            ArrowType::Float64 => Arc::new(Float64Array::from(values)) as ArrayRef,
-            _ => unreachable!("validated DECIMAL numeric target"),
-        }));
+        return cast_decimal_to_floating(source, decimal.precision(), decimal.scale(), &target)
+            .map(Some);
     }
     arrow_cast::cast(source, &target)
         .map(Some)
         .map_err(|error| invalid_numeric(error.to_string()))
+}
+
+/// Java DECIMAL conversion shared by schema reads and external update inputs.
+pub(crate) fn cast_decimal_to_floating(
+    source: &ArrayRef,
+    precision: u32,
+    scale: u32,
+    target: &ArrowType,
+) -> crate::Result<ArrayRef> {
+    // DecimalUtils.doubleValue divides the compact long by its scale;
+    // only wide decimals use BigDecimal.doubleValue. FLOAT rounds that
+    // double rather than the decimal coefficient directly.
+    let values: Vec<Option<f64>> = if precision <= 18 {
+        let divisor = 10_f64.powi(scale as i32);
+        source
+            .as_primitive::<Decimal128Type>()
+            .iter()
+            .map(|value| value.map(|value| value as f64 / divisor))
+            .collect()
+    } else {
+        let strings = super::evolution_decimal::decimal_to_string(source)?;
+        strings
+            .as_string::<i32>()
+            .iter()
+            .map(|value| {
+                value
+                    .map(|value| {
+                        value
+                            .parse::<f64>()
+                            .map_err(|_| invalid_numeric("Invalid DECIMAL value"))
+                    })
+                    .transpose()
+            })
+            .collect::<crate::Result<Vec<_>>>()?
+    };
+    Ok(match target {
+        ArrowType::Float32 => Arc::new(Float32Array::from_iter(
+            values.into_iter().map(|v| v.map(|v| v as f32)),
+        )) as ArrayRef,
+        ArrowType::Float64 => Arc::new(Float64Array::from(values)) as ArrayRef,
+        _ => unreachable!("validated DECIMAL numeric target"),
+    })
 }
 
 fn invalid_numeric(message: impl Into<String>) -> crate::Error {

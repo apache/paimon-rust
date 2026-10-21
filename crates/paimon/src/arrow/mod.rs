@@ -24,8 +24,9 @@ pub(crate) use cast_executor::CastExecutor;
 #[cfg(test)]
 mod cast_completion_java_test;
 mod cast_text;
+pub(crate) use cast_text::parse_timestamp as parse_java_timestamp;
 mod evolution_cast;
-pub(crate) use evolution_cast::{cast_numeric, supports_numeric_cast};
+pub(crate) use evolution_cast::{cast_decimal_to_floating, cast_numeric, supports_numeric_cast};
 mod evolution_decimal;
 mod evolution_string;
 mod evolution_temporal;

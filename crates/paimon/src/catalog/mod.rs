@@ -36,7 +36,10 @@ pub use database::*;
 pub use factory::*;
 pub use filesystem::*;
 pub use function::*;
+#[cfg(test)]
+pub(crate) use partition_listing::aggregate_partition_entries;
 pub use partition_listing::list_partitions_from_file_system;
+pub(crate) use partition_listing::{list_partition_entries, FileSystemPartitionEntry};
 pub use rest::*;
 use serde::{Deserialize, Serialize};
 pub use view::*;
@@ -564,6 +567,79 @@ pub trait Catalog: Send + Sync {
     ) -> Result<()> {
         Err(Error::Unsupported {
             message: "tag management is not supported by this catalog".to_string(),
+        })
+    }
+
+    /// Load the catalog's current snapshot and statistics, or None for an empty table.
+    async fn load_snapshot(
+        &self,
+        _identifier: &Identifier,
+    ) -> Result<Option<crate::api::TableSnapshot>> {
+        Err(Error::Unsupported {
+            message: "catalog snapshot loading is not supported by this catalog".to_string(),
+        })
+    }
+
+    /// Roll back through the catalog, forwarding optional expected head and table identity.
+    async fn rollback_to(
+        &self,
+        _identifier: &Identifier,
+        _instant: &crate::table::Instant,
+        _from_snapshot: Option<i64>,
+        _table_uuid: Option<&str>,
+    ) -> Result<()> {
+        Err(Error::Unsupported {
+            message: "catalog rollback is not supported by this catalog".to_string(),
+        })
+    }
+
+    /// Fetch a page of tag names without scanning tag files on storage.
+    async fn list_tags_paged(
+        &self,
+        _identifier: &Identifier,
+        _max_results: Option<i32>,
+        _page_token: Option<&str>,
+        _tag_name_prefix: Option<&str>,
+    ) -> Result<PagedList<String>> {
+        Err(Error::Unsupported {
+            message: "tag pagination is not supported by this catalog".to_string(),
+        })
+    }
+
+    // ======================= branch methods =============================
+
+    /// Create an empty branch, or create one from a tag when `from_tag` is set.
+    /// Branch names and table capabilities are validated by the catalog.
+    async fn create_branch(
+        &self,
+        _identifier: &Identifier,
+        _branch_name: &str,
+        _from_tag: Option<&str>,
+    ) -> Result<()> {
+        Err(Error::Unsupported {
+            message: "branch management is not supported by this catalog".to_string(),
+        })
+    }
+
+    /// Delete a branch's metadata. Shared data files must remain intact.
+    async fn drop_branch(&self, _identifier: &Identifier, _branch_name: &str) -> Result<()> {
+        Err(Error::Unsupported {
+            message: "branch management is not supported by this catalog".to_string(),
+        })
+    }
+
+    /// Replace the identifier's current branch metadata with that of `branch_name`.
+    /// The REST catalog delegates the operation and its validation to the server.
+    async fn fast_forward(&self, _identifier: &Identifier, _branch_name: &str) -> Result<()> {
+        Err(Error::Unsupported {
+            message: "branch management is not supported by this catalog".to_string(),
+        })
+    }
+
+    /// List branches in the order supplied by the catalog, excluding no names locally.
+    async fn list_branches(&self, _identifier: &Identifier) -> Result<Vec<String>> {
+        Err(Error::Unsupported {
+            message: "branch management is not supported by this catalog".to_string(),
         })
     }
 

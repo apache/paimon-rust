@@ -156,6 +156,15 @@ impl PyTable {
         Ok(Self::new(Arc::new(table)))
     }
 
+    /// Java Table.copy: apply dynamic options and resolve the selected schema.
+    #[pyo3(signature = (options))]
+    fn copy(&self, py: Python<'_>, options: HashMap<String, String>) -> PyResult<Self> {
+        let table = py
+            .detach(|| runtime().block_on(self.inner.copy_with_time_travel_strict(options)))
+            .map_err(to_py_err)?;
+        Ok(Self::new(Arc::new(table)))
+    }
+
     fn identifier(&self) -> String {
         let id = self.inner.identifier();
         format!("{}.{}", id.database(), id.object())
@@ -198,6 +207,13 @@ impl PyTable {
         }
     }
 
+    /// Read metadata through the core system reader.
+    fn new_system_read(&self, name: &str) -> PyResult<crate::system_table::PySystemRead> {
+        Ok(crate::system_table::PySystemRead {
+            inner: self.inner.new_system_read(name).map_err(to_py_err)?,
+        })
+    }
+
     fn new_full_text_search_builder(&self) -> crate::full_text_search::PyFullTextSearchBuilder {
         crate::full_text_search::PyFullTextSearchBuilder::new(Arc::clone(&self.inner))
     }
@@ -207,15 +223,24 @@ impl PyTable {
     }
 
     /// Forward one captured Java-format snapshot, or an explicitly empty view.
-    #[pyo3(signature = (snapshot_json))]
-    fn copy_with_pinned_snapshot(&self, snapshot_json: Option<&str>) -> PyResult<Self> {
+    #[pyo3(signature = (snapshot_json, *, with_schema=false))]
+    fn copy_with_pinned_snapshot(
+        &self,
+        py: Python<'_>,
+        snapshot_json: Option<&str>,
+        with_schema: bool,
+    ) -> PyResult<Self> {
         let snapshot = snapshot_json
             .map(serde_json::from_str::<paimon::spec::Snapshot>)
             .transpose()
             .map_err(|error| PyValueError::new_err(format!("Invalid snapshot JSON: {error}")))?;
-        Ok(Self {
-            inner: Arc::new(self.inner.copy_with_pinned_snapshot(snapshot.as_ref())),
-        })
+        let table = match snapshot.as_ref().filter(|_| with_schema) {
+            Some(snapshot) => py
+                .detach(|| runtime().block_on(self.inner.copy_with_resolved_snapshot(snapshot)))
+                .map_err(to_py_err)?,
+            None => self.inner.copy_with_pinned_snapshot(snapshot.as_ref()),
+        };
+        Ok(Self::new(Arc::new(table)))
     }
 
     fn new_vector_search_builder(&self) -> crate::vector_search::PyVectorSearchBuilder {
@@ -228,6 +253,10 @@ impl PyTable {
 
     fn new_global_index_build_builder(&self) -> crate::index_build::PyGlobalIndexBuildBuilder {
         crate::index_build::PyGlobalIndexBuildBuilder::new(Arc::clone(&self.inner))
+    }
+
+    fn new_global_index_drop_builder(&self) -> crate::index_build::PyGlobalIndexDropBuilder {
+        crate::index_build::PyGlobalIndexDropBuilder::new(Arc::clone(&self.inner))
     }
 
     fn new_batch_write_builder(&self) -> PyBatchWriteBuilder {

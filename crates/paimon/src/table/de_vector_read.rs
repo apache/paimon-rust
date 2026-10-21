@@ -36,13 +36,14 @@ use crate::table::pk_vector_position_read::SEARCH_SCORE_COLUMN;
 use crate::table::row_id_predicate::intersect_sorted_ranges;
 use crate::table::vector_read::Read;
 use crate::table::vector_search_common::{
-    configured_refine_factor, indexed_search_limit, log_vindex_range_io_stats, normalize_metric,
-    resolve_materialize_read_type, vindex_concurrency_limits, VectorIndexBackend,
+    configured_refine_factor, configured_vector_index_type, indexed_search_limit,
+    log_vindex_range_io_stats, normalize_metric, resolve_materialize_read_type,
+    validate_global_vector_index_types, vindex_concurrency_limits, VectorIndexBackend,
 };
 use crate::table::{
     find_field_id_by_name, merge_row_ranges, ArrowRecordBatchStream, RowRange, Table,
 };
-use crate::vector_search::{GlobalIndexIOMeta, ScoredRowIds, SearchResult, VectorSearch};
+use crate::vector_search::{GlobalIndexIOMeta, GlobalIndexResult, ScoredRowIds, VectorSearch};
 use crate::vindex::executor::{
     acquire_process_global_search_permit, drain_indexed_jobs,
     ensure_global_index_executor_capacity, execute_global_index_with_guard,
@@ -185,7 +186,7 @@ pub(super) async fn materialize_row_ids(
 impl Read for DeVectorRead {
     type Plan = DeVectorScanPlan;
 
-    async fn read(&self, plan: DeVectorScanPlan) -> crate::Result<Vec<SearchResult>> {
+    async fn read(&self, plan: DeVectorScanPlan) -> crate::Result<Vec<GlobalIndexResult>> {
         let DeVectorScanPlan {
             table,
             index_entries,
@@ -201,7 +202,7 @@ impl Read for DeVectorRead {
                 .into_iter()
                 .zip(&self.vector_searches)
                 .map(|(hits, query)| {
-                    SearchResult::from_row_ids(table.clone(), query.field_name.clone(), hits)
+                    GlobalIndexResult::from_row_ids(table.clone(), query.field_name.clone(), hits)
                 })
                 .collect()
         };
@@ -312,14 +313,14 @@ async fn execute_vindex_searches<S: SeekRead + 'static, G: Send + 'static>(
 }
 
 #[derive(Clone, Copy)]
-struct VectorSearchEvaluation<'a> {
-    table: Option<&'a Table>,
-    file_io: &'a FileIO,
-    table_path: &'a str,
-    table_options: &'a HashMap<String, String>,
-    schema_fields: &'a [DataField],
-    next_row_id: Option<i64>,
-    filter: Option<&'a Predicate>,
+pub(super) struct VectorSearchEvaluation<'a> {
+    pub(super) table: Option<&'a Table>,
+    pub(super) file_io: &'a FileIO,
+    pub(super) table_path: &'a str,
+    pub(super) table_options: &'a HashMap<String, String>,
+    pub(super) schema_fields: &'a [DataField],
+    pub(super) next_row_id: Option<i64>,
+    pub(super) filter: Option<&'a Predicate>,
 }
 
 #[derive(Clone)]
@@ -506,6 +507,7 @@ async fn evaluate_batch_vector_search(
         Some(id) => id,
         None => return Ok(vec![ScoredRowIds::empty(); vector_searches.len()]),
     };
+    validate_global_vector_index_types(index_entries, field_id, field_name)?;
 
     let vector_entries: Vec<_> = index_entries
         .iter()
@@ -636,9 +638,15 @@ async fn evaluate_batch_vector_search(
             .map(|entry| (entry, None))
             .collect::<Vec<_>>()
     };
+    let configured_index_type =
+        configured_vector_index_type(evaluation.table_options, &search_options, field_name);
+    let index_type = vector_entries
+        .first()
+        .map(|entry| entry.index_file.index_type.as_str())
+        .or(configured_index_type.as_deref());
     let metric_check = VectorMetricCheck {
         persisted: Arc::new(std::sync::Mutex::new(None)),
-        requested: configured_raw_vector_metric_override(&search_options, field_name)?,
+        requested: vector_metric_override(&search_options, field_name, index_type)?,
     };
     let mut permit_wait = Duration::ZERO;
     let mut file_reader_open = Duration::ZERO;
@@ -1067,7 +1075,7 @@ async fn evaluate_batch_vector_search(
 
 /// Predicate coverage requires every referenced field to be covered by a
 /// single-field scalar index. Reuse the table scanner's coverage accounting.
-fn scalar_unindexed_ranges(
+pub(super) fn scalar_unindexed_ranges(
     evaluation: VectorSearchEvaluation<'_>,
     entries: &[IndexManifestEntry],
     filter: &Predicate,
@@ -1436,7 +1444,7 @@ fn localize_shared_include_row_ids(
         .collect())
 }
 
-async fn detail_data_ranges_for_table(table: &Table) -> crate::Result<Vec<RowRange>> {
+pub(super) async fn detail_data_ranges_for_table(table: &Table) -> crate::Result<Vec<RowRange>> {
     let plan = table
         .new_read_builder()
         .new_scan()
@@ -1504,9 +1512,23 @@ async fn resolve_raw_vector_metric(
     field_id: i32,
     field_name: &str,
 ) -> crate::Result<RawVectorMetric> {
+    let configured_type = configured_vector_index_type(table_options, search_options, field_name);
+    let index_type = index_entries
+        .iter()
+        .filter(|entry| entry.kind == FileKind::Add)
+        .find(|entry| {
+            VectorIndexBackend::from_index_type(&entry.index_file.index_type).is_some()
+                && entry
+                    .index_file
+                    .global_index_meta
+                    .as_ref()
+                    .is_some_and(|meta| meta.index_field_id == field_id)
+        })
+        .map(|entry| entry.index_file.index_type.as_str())
+        .or(configured_type.as_deref());
     let check = VectorMetricCheck {
         persisted: Arc::new(std::sync::Mutex::new(None)),
-        requested: configured_raw_vector_metric_override(search_options, field_name)?,
+        requested: vector_metric_override(search_options, field_name, index_type)?,
     };
     let mut persisted = None;
     for entry in index_entries {
@@ -1530,9 +1552,18 @@ async fn resolve_raw_vector_metric(
     if let Some(metric) = check.requested {
         return Ok(metric);
     }
+    let table_metric = vector_metric_override(table_options, field_name, index_type)?;
+    if let Some(metric) = table_metric {
+        return Ok(metric);
+    }
+    // Before files exist, Java creates the configured indexer for raw search.
+    // NativeVectorGlobalIndexer and LuminaVectorIndexOptions both default to IP.
     Ok(
-        configured_raw_vector_metric_override(table_options, field_name)?
-            .unwrap_or(RawVectorMetric::L2),
+        if index_type.is_some_and(|kind| VectorIndexBackend::from_index_type(kind).is_some()) {
+            RawVectorMetric::InnerProduct
+        } else {
+            RawVectorMetric::L2
+        },
     )
 }
 
@@ -1607,24 +1638,27 @@ async fn read_index_vector_metric(
     Ok(None)
 }
 
+fn vector_metric_override(
+    options: &HashMap<String, String>,
+    field_name: &str,
+    index_type: Option<&str>,
+) -> crate::Result<Option<RawVectorMetric>> {
+    // A known index family determines its own defaults and option namespace.
+    // Only a search without a family may infer a metric from suffixes.
+    if index_type.is_some() {
+        direct_raw_vector_metric_override(options, field_name, index_type)
+    } else {
+        configured_raw_vector_metric_override(options, field_name)
+    }
+}
+
 fn configured_raw_vector_metric_override(
     options: &HashMap<String, String>,
     field_name: &str,
 ) -> crate::Result<Option<RawVectorMetric>> {
-    let direct_keys = [
-        format!("fields.{field_name}.distance.metric"),
-        format!("fields.{field_name}.metric"),
-        "test.vector.metric".to_string(),
-        "lumina.distance.metric".to_string(),
-        "distance.metric".to_string(),
-        "metric".to_string(),
-    ];
-    for key in direct_keys {
-        if let Some(value) = options.get(&key) {
-            return RawVectorMetric::parse(value).map(Some);
-        }
+    if let Some(metric) = direct_raw_vector_metric_override(options, field_name, None)? {
+        return Ok(Some(metric));
     }
-
     let mut inferred = None;
     for (key, value) in options {
         if !(key.ends_with(".distance.metric") || key.ends_with(".metric")) {
@@ -1643,6 +1677,34 @@ fn configured_raw_vector_metric_override(
         }
     }
     Ok(inferred)
+}
+
+fn direct_raw_vector_metric_override(
+    options: &HashMap<String, String>,
+    field_name: &str,
+    index_type: Option<&str>,
+) -> crate::Result<Option<RawVectorMetric>> {
+    let mut direct_keys = vec![
+        format!("fields.{field_name}.distance.metric"),
+        format!("fields.{field_name}.metric"),
+    ];
+    if let Some(index_type) = index_type {
+        direct_keys.push(format!("{index_type}.distance.metric"));
+        direct_keys.push(format!("{index_type}.metric"));
+    }
+    direct_keys.extend([
+        "test.vector.metric".to_string(),
+        "lumina.distance.metric".to_string(),
+        "distance.metric".to_string(),
+        "metric".to_string(),
+    ]);
+    for key in direct_keys {
+        if let Some(value) = options.get(&key) {
+            return RawVectorMetric::parse(value).map(Some);
+        }
+    }
+
+    Ok(None)
 }
 
 #[derive(Default)]

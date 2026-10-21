@@ -21,7 +21,7 @@ use std::collections::HashMap;
 
 use async_trait::async_trait;
 
-use super::base::{AuthProvider, RESTAuthParameter};
+use super::base::{merge_auth_headers, AuthProvider, RESTAuthParameter};
 
 /// Authentication provider using Bearer token.
 ///
@@ -47,14 +47,16 @@ impl BearerTokenAuthProvider {
 impl AuthProvider for BearerTokenAuthProvider {
     async fn merge_auth_header(
         &self,
-        mut base_header: HashMap<String, String>,
+        base_header: HashMap<String, String>,
         _parameter: &RESTAuthParameter,
     ) -> crate::Result<HashMap<String, String>> {
-        base_header.insert(
-            "Authorization".to_string(),
-            format!("Bearer {}", self.token),
-        );
-        Ok(base_header)
+        Ok(merge_auth_headers(
+            base_header,
+            HashMap::from([(
+                "Authorization".to_string(),
+                format!("Bearer {}", self.token),
+            )]),
+        ))
     }
 }
 

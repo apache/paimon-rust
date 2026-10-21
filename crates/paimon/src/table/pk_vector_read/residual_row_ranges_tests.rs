@@ -163,6 +163,7 @@ async fn build_reader_and_split(
         SchemaManager::new(file_io, table_path.to_string()),
         1,
         vec![id_field()],
+        |fields| Ok(fields.to_vec()),
         vec![id_field(), row_id_field()],
         Vec::new(),
     );
@@ -423,6 +424,7 @@ async fn build_reader_and_split_no_first_row_id(
         SchemaManager::new(file_io, table_path.to_string()),
         1,
         vec![id_field()],
+        |fields| Ok(fields.to_vec()),
         vec![id_field(), row_id_field()],
         Vec::new(),
     );

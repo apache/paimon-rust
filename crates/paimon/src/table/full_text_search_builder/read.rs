@@ -81,7 +81,10 @@ impl FullTextRead {
         })
     }
 
-    pub async fn read(&self, plan: FullTextScanPlan) -> crate::Result<crate::table::SearchResult> {
+    pub async fn read(
+        &self,
+        plan: FullTextScanPlan,
+    ) -> crate::Result<crate::table::GlobalIndexResult> {
         CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
         CoreOptions::new(plan.table.schema().options()).ensure_read_authorized()?;
         if self.context != plan.context {
@@ -102,6 +105,7 @@ impl FullTextRead {
                 plan.table.schema_manager().clone(),
                 plan.table.schema().id(),
                 plan.table.schema().fields().to_vec(),
+                plan.table.data_fields_extractor(),
                 plan.table.schema().fields().to_vec(),
                 Vec::new(),
             )
@@ -118,7 +122,7 @@ impl FullTextRead {
             let result = read
                 .search_route(source, &self.search.query_text, self.search.limit)
                 .await?;
-            return crate::table::SearchResult::from_full_text_primary_key(
+            return crate::table::GlobalIndexResult::from_full_text_primary_key(
                 table,
                 result.snapshot_id,
                 result.candidates,
@@ -142,7 +146,7 @@ impl FullTextRead {
             &search,
         )
         .await?;
-        Ok(crate::table::SearchResult::from_full_text_row_ids(
+        Ok(crate::table::GlobalIndexResult::from_global_search(
             table,
             crate::vector_search::ScoredRowIds::new(hits.row_ids, hits.scores),
         ))

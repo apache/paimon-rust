@@ -15,9 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub use crate::table::search_result::{
-    PrimaryKeySearchPosition, SearchResult, SearchResultReadBuilder,
-};
+pub use crate::table::{GlobalIndexResult, GlobalIndexResultReadBuilder, PrimaryKeySearchPosition};
 
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
@@ -116,7 +114,7 @@ impl GlobalIndexIOMeta {
 }
 
 /// Global row IDs and aligned scores used by DE index evaluation and ranking.
-/// Table searches return [`SearchResult`], which also represents PK file positions.
+/// Table searches return [`GlobalIndexResult`], which also represents PK file positions.
 #[derive(Debug, Clone)]
 pub struct ScoredRowIds {
     pub row_ids: Vec<u64>,

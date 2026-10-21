@@ -103,29 +103,14 @@ fn boolean_option(table: &Table, key: &str, default: bool) -> PyResult<bool> {
     }
 }
 
-/// Java partition specs may encode numeric values as strings. Other Python
+/// Java partition specs encode schema-typed values as strings. Other Python
 /// literals use the same schema-driven conversion as the predicate API.
-fn partition_value(value: &Bound<'_, PyAny>, data_type: &DataType) -> PyResult<Datum> {
+fn partition_value(value: &Bound<'_, PyAny>, data_type: &DataType) -> PyResult<Option<Datum>> {
     if let Ok(text) = value.cast::<PyString>() {
         let text = text.to_str()?;
-        let invalid = || {
-            PyValueError::new_err(format!(
-                "Invalid partition value '{text}' for {data_type:?}"
-            ))
-        };
-        match data_type {
-            DataType::TinyInt(_) => return text.parse().map(Datum::TinyInt).map_err(|_| invalid()),
-            DataType::SmallInt(_) => {
-                return text.parse().map(Datum::SmallInt).map_err(|_| invalid())
-            }
-            DataType::Int(_) => return text.parse().map(Datum::Int).map_err(|_| invalid()),
-            DataType::BigInt(_) => return text.parse().map(Datum::Long).map_err(|_| invalid()),
-            DataType::Float(_) => return text.parse().map(Datum::Float).map_err(|_| invalid()),
-            DataType::Double(_) => return text.parse().map(Datum::Double).map_err(|_| invalid()),
-            _ => {}
-        }
+        return paimon::table::parse_partition_spec_value(text, data_type).map_err(to_py_err);
     }
-    py_to_datum(value, data_type)
+    py_to_datum(value, data_type).map(Some)
 }
 
 fn partition_spec(
@@ -154,7 +139,7 @@ fn partition_spec(
             let datum = if value.is_none() || is_default {
                 None
             } else {
-                Some(partition_value(value, field.data_type())?)
+                partition_value(value, field.data_type())?
             };
             Ok((key, datum))
         })
@@ -342,8 +327,10 @@ impl WriteTarget {
                 writer.with_blob_consumer(consumer)?;
                 Ok(())
             }
-            // Like Java AbstractFileStoreWrite, PK-only writers ignore it.
-            Self::PostponeFixed(_) => Ok(()),
+            Self::PostponeFixed(writer) => {
+                writer.with_blob_consumer(consumer)?;
+                Ok(())
+            }
         }
     }
 
@@ -540,13 +527,41 @@ fn arrow_table_batches(table: &Bound<'_, PyAny>) -> PyResult<Vec<RecordBatch>> {
     let mut batches = table
         .call_method0("to_batches")?
         .try_iter()?
-        .map(|batch| RecordBatch::from_pyarrow_bound(&batch?))
+        .map(|batch| crate::arrow_input::write_batch_from_pyarrow(&batch?))
         .collect::<PyResult<Vec<_>>>()?;
     // Preserve empty input schema so core validates columns even with no rows.
     if batches.is_empty() {
         batches.push(RecordBatch::new_empty(Arc::new(
             ArrowSchema::from_pyarrow_bound(&table.getattr("schema")?)?,
         )));
+    } else if batches.len() > 1 {
+        // One Arrow Table has one schema, even when NULLs occur in only some
+        // chunks. The write importer relaxes transport fields per batch; union
+        // those flags so core can still require a uniform MERGE source schema.
+        let first = batches[0].schema();
+        let mut fields = first.fields().to_vec();
+        for batch in batches.iter().skip(1) {
+            for (field, actual) in fields.iter_mut().zip(batch.schema().fields()) {
+                if actual.is_nullable() && !field.is_nullable() {
+                    *field = Arc::new(field.as_ref().clone().with_nullable(true));
+                }
+            }
+        }
+        let schema = Arc::new(ArrowSchema::new_with_metadata(
+            fields,
+            first.metadata().clone(),
+        ));
+        for batch in &mut batches {
+            if batch.schema() != schema {
+                *batch = RecordBatch::try_new_with_options(
+                    schema.clone(),
+                    batch.columns().to_vec(),
+                    &arrow::array::RecordBatchOptions::default()
+                        .with_row_count(Some(batch.num_rows())),
+                )
+                .map_err(|error| PyValueError::new_err(error.to_string()))?;
+            }
+        }
     }
     Ok(batches)
 }
@@ -559,7 +574,7 @@ fn arrow_upsert_batches(input: &Bound<'_, PyAny>) -> PyResult<Vec<RecordBatch>> 
     }
     input
         .try_iter()?
-        .map(|batch| RecordBatch::from_pyarrow_bound(&batch?))
+        .map(|batch| crate::arrow_input::write_batch_from_pyarrow(&batch?))
         .collect()
 }
 
@@ -596,6 +611,21 @@ impl UpdateContext {
         })
     }
 
+    fn merge_source_schema(
+        &self,
+        source: &paimon::table::MergeSource,
+    ) -> PyResult<Arc<ArrowSchema>> {
+        let table = match source {
+            paimon::table::MergeSource::Batches(batches) => return Ok(batches[0].schema()),
+            paimon::table::MergeSource::Table(table) => table,
+            paimon::table::MergeSource::SelfTable => &self.table,
+        };
+        // Compile conditions against the same metadata schema that core uses
+        // when projecting a table source, including independently pinned views.
+        paimon::arrow::build_target_arrow_schema(&table.schema().fields_with_read_metadata())
+            .map_err(to_py_err)
+    }
+
     fn merge_into(
         &self,
         py: Python<'_>,
@@ -611,24 +641,7 @@ impl UpdateContext {
             },
             None => paimon::table::MergeSource::SelfTable,
         };
-        let source_schema = match &source {
-            paimon::table::MergeSource::Batches(batches) => batches[0].schema(),
-            paimon::table::MergeSource::Table(table) => {
-                paimon::arrow::build_target_arrow_schema(table.schema().fields())
-                    .map_err(to_py_err)?
-            }
-            paimon::table::MergeSource::SelfTable => {
-                let schema = paimon::arrow::build_target_arrow_schema(self.table.schema().fields())
-                    .map_err(to_py_err)?;
-                let mut fields = schema.fields().to_vec();
-                fields.push(Arc::new(arrow::datatypes::Field::new(
-                    "_ROW_ID",
-                    arrow::datatypes::DataType::Int64,
-                    false,
-                )));
-                Arc::new(ArrowSchema::new(fields))
-            }
-        };
+        let source_schema = self.merge_source_schema(&source)?;
         let errors = Arc::new(Mutex::new(None));
         let (matched, not_matched) = crate::merge_into::from_python(
             py,
@@ -878,7 +891,7 @@ impl WriteState {
         batch: &Bound<'_, PyAny>,
         bucket: Option<i32>,
     ) -> PyResult<()> {
-        let batch = RecordBatch::from_pyarrow_bound(batch)?;
+        let batch = crate::arrow_input::write_batch_from_pyarrow(batch)?;
         let inner = self
             .inner
             .as_mut()
@@ -1663,6 +1676,542 @@ impl PyCommitMessage {
             inner,
             origin: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use paimon::catalog::Identifier;
+    use paimon::io::FileIOBuilder;
+    use paimon::spec::{BigIntType, IntType, Schema, TableSchema, VarCharType};
+    use pyo3::ffi::c_str;
+
+    #[test]
+    fn merge_table_source_conditions_resolve_read_metadata() {
+        Python::attach(|py| {
+            for metadata in ["_ROW_ID", "_SEQUENCE_NUMBER"] {
+                let schema = Schema::builder()
+                    .column("id", DataType::BigInt(BigIntType::new()))
+                    .column("value", DataType::Int(IntType::new()))
+                    .option("row-tracking.enabled", "true")
+                    .option("data-evolution.enabled", "true")
+                    .build()
+                    .unwrap();
+                let file_io = FileIOBuilder::new("memory").build().unwrap();
+                let table = Arc::new(Table::new(
+                    file_io.clone(),
+                    Identifier::new("default", "metadata_merge_target"),
+                    "memory:/metadata-merge-target".into(),
+                    TableSchema::new(0, &schema),
+                    None,
+                ));
+                let source = Arc::new(Table::new(
+                    file_io,
+                    Identifier::new("default", "metadata_merge_source"),
+                    "memory:/metadata-merge-source".into(),
+                    TableSchema::new(0, &schema),
+                    None,
+                ));
+                let source = Py::new(py, crate::table::PyTable::new(source)).unwrap();
+                let context = UpdateContext::new(&WriteContext::new(table)).unwrap();
+                let locals = PyDict::new(py);
+                locals.set_item("metadata", metadata).unwrap();
+                py.run(
+                    c_str!(
+                        r#"
+condition = dict(sql='"s.' + metadata + '" >= 0')
+matched = [dict(assignments=[('value', 'source', 'value')], condition=condition, delete=False)]
+not_matched = [dict(assignments=[('id', 'source', metadata), ('value', 'source', 'value')],
+                    condition=condition)]
+"#
+                    ),
+                    Some(&locals),
+                    Some(&locals),
+                )
+                .unwrap();
+                let messages = context
+                    .merge_into(
+                        py,
+                        Some(source.bind(py).as_any()),
+                        vec![("id".into(), metadata.into())],
+                        &locals.get_item("matched").unwrap().unwrap(),
+                        &locals.get_item("not_matched").unwrap().unwrap(),
+                    )
+                    .unwrap();
+                // Conditions must compile even when both snapshots are empty;
+                // empty input prepares no mutation files or synthetic rows.
+                assert!(messages.is_empty());
+            }
+        });
+    }
+
+    #[test]
+    fn merge_table_source_metadata_conditions_update_and_insert() {
+        use arrow::array::{Array, Int32Array, Int64Array};
+        use futures::TryStreamExt;
+
+        async fn seed(table: &Table, ids: Vec<i64>, values: Vec<i32>) {
+            let batch = RecordBatch::try_new(
+                paimon::arrow::build_target_arrow_schema(table.schema().fields()).unwrap(),
+                vec![
+                    Arc::new(Int64Array::from(ids)),
+                    Arc::new(Int32Array::from(values)),
+                ],
+            )
+            .unwrap();
+            let builder = table.new_write_builder();
+            let mut writer = builder.new_write().unwrap();
+            writer.write_arrow_batch(&batch).await.unwrap();
+            builder
+                .new_commit()
+                .commit(writer.prepare_commit().await.unwrap())
+                .await
+                .unwrap();
+            writer.close().await;
+        }
+
+        async fn read(table: &Table, projection: &[&str]) -> Vec<RecordBatch> {
+            let mut builder = table.new_read_builder();
+            builder.with_projection(projection).unwrap();
+            let plan = builder.new_scan().plan().await.unwrap();
+            builder
+                .new_read()
+                .unwrap()
+                .to_arrow(plan.splits())
+                .unwrap()
+                .try_collect()
+                .await
+                .unwrap()
+        }
+
+        Python::attach(|py| {
+            for metadata in ["_ROW_ID", "_SEQUENCE_NUMBER"] {
+                let schema = Schema::builder()
+                    .column("id", DataType::BigInt(BigIntType::new()))
+                    .column("value", DataType::Int(IntType::new()))
+                    .option("row-tracking.enabled", "true")
+                    .option("data-evolution.enabled", "true")
+                    .build()
+                    .unwrap();
+                let file_io = FileIOBuilder::new("memory").build().unwrap();
+                let target = Arc::new(Table::new(
+                    file_io.clone(),
+                    Identifier::new("default", "metadata_data_target"),
+                    "memory:/metadata-data-target".into(),
+                    TableSchema::new(0, &schema),
+                    None,
+                ));
+                let source = Arc::new(Table::new(
+                    file_io,
+                    Identifier::new("default", "metadata_data_source"),
+                    "memory:/metadata-data-source".into(),
+                    TableSchema::new(0, &schema),
+                    None,
+                ));
+                let (first, second) = py.detach(|| {
+                    runtime().block_on(async {
+                        seed(&source, vec![9], vec![91]).await;
+                        seed(&source, vec![8], vec![82]).await;
+                        let mut identities = HashMap::new();
+                        for batch in read(&source, &[metadata, "value"]).await {
+                            let keys = batch
+                                .column(0)
+                                .as_any()
+                                .downcast_ref::<Int64Array>()
+                                .unwrap();
+                            let values = batch
+                                .column(1)
+                                .as_any()
+                                .downcast_ref::<Int32Array>()
+                                .unwrap();
+                            assert_eq!(keys.null_count(), 0);
+                            for row in 0..batch.num_rows() {
+                                identities.insert(values.value(row), keys.value(row));
+                            }
+                        }
+                        let first = identities[&91];
+                        let second = identities[&82];
+                        assert_ne!(first, second);
+                        seed(&target, vec![first, first + 100], vec![10, 20]).await;
+                        (first, second)
+                    })
+                });
+                let source = Py::new(py, crate::table::PyTable::new(source)).unwrap();
+                let context = UpdateContext::new(&WriteContext::new(target.clone())).unwrap();
+                let locals = PyDict::new(py);
+                locals.set_item("metadata", metadata).unwrap();
+                locals.set_item("first", first).unwrap();
+                locals.set_item("second", second).unwrap();
+                py.run(
+                    c_str!(
+                        r#"
+matched = [dict(assignments=[('value', 'source', 'value')],
+                condition=dict(sql='"s.' + metadata + '" = ' + str(first)), delete=False)]
+not_matched = [dict(assignments=[('id', 'source', metadata), ('value', 'source', 'value')],
+                    condition=dict(sql='"s.' + metadata + '" = ' + str(second)))]
+"#
+                    ),
+                    Some(&locals),
+                    Some(&locals),
+                )
+                .unwrap();
+                let messages = context
+                    .merge_into(
+                        py,
+                        Some(source.bind(py).as_any()),
+                        vec![("id".into(), metadata.into())],
+                        &locals.get_item("matched").unwrap().unwrap(),
+                        &locals.get_item("not_matched").unwrap().unwrap(),
+                    )
+                    .unwrap();
+                assert!(messages
+                    .iter()
+                    .any(|message| message.inner.check_from_snapshot == Some(1)));
+                assert!(messages.iter().any(|message| {
+                    message.inner.check_from_snapshot.is_none()
+                        && message
+                            .inner
+                            .new_files
+                            .iter()
+                            .all(|file| file.first_row_id.is_none())
+                }));
+                let rows = py.detach(|| {
+                    runtime().block_on(async {
+                        target
+                            .new_write_builder()
+                            .new_commit()
+                            .commit(messages.into_iter().map(|message| message.inner).collect())
+                            .await
+                            .unwrap();
+                        let mut rows = Vec::new();
+                        for batch in read(&target, &["id", "value", "_ROW_ID"]).await {
+                            let ids = batch
+                                .column(0)
+                                .as_any()
+                                .downcast_ref::<Int64Array>()
+                                .unwrap();
+                            let values = batch
+                                .column(1)
+                                .as_any()
+                                .downcast_ref::<Int32Array>()
+                                .unwrap();
+                            let row_ids = batch
+                                .column(2)
+                                .as_any()
+                                .downcast_ref::<Int64Array>()
+                                .unwrap();
+                            for row in 0..batch.num_rows() {
+                                rows.push((ids.value(row), values.value(row), row_ids.value(row)));
+                            }
+                        }
+                        rows.sort_by_key(|row| row.2);
+                        rows
+                    })
+                });
+                assert_eq!(
+                    rows,
+                    [(first, 91, 0), (first + 100, 20, 1), (second, 82, 2)]
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn update_inputs_preserve_source_nulls_until_core_selects_payloads() {
+        use arrow::array::{Array, Int32Array};
+
+        Python::attach(|py| {
+            let locals = PyDict::new(py);
+            py.run(
+                c_str!(
+                    r#"
+import pyarrow as pa
+schema = pa.schema([
+    pa.field('id', pa.int32(), nullable=False),
+    pa.field('value', pa.int32(), nullable=False),
+    pa.field('unused', pa.int32(), nullable=False, metadata={'role': 'unselected'}),
+], metadata={'origin': 'update'})
+source = pa.Table.from_pylist([
+    {'id': 0, 'value': 0, 'unused': 0},
+    {'id': 1, 'value': None, 'unused': None},
+    {'id': 1, 'value': 42, 'unused': None},
+], schema=schema).slice(1, 2)
+source.validate(full=True)
+batches = source.to_batches()
+"#
+                ),
+                None,
+                Some(&locals),
+            )
+            .unwrap();
+            let table = locals.get_item("source").unwrap().unwrap();
+            let batches = locals.get_item("batches").unwrap().unwrap();
+            for imported in [
+                arrow_table_batches(&table).unwrap(),
+                arrow_upsert_batches(&batches).unwrap(),
+            ] {
+                assert_eq!(imported.len(), 1);
+                let batch = &imported[0];
+                assert_eq!(batch.num_rows(), 2);
+                assert!(!batch.schema().field(0).is_nullable());
+                assert!(batch.schema().field(1).is_nullable());
+                assert!(batch.schema().field(2).is_nullable());
+                assert_eq!(batch.schema().metadata().get("origin").unwrap(), "update");
+                assert_eq!(
+                    batch.schema().field(2).metadata().get("role").unwrap(),
+                    "unselected"
+                );
+                let values = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap();
+                assert!(values.is_null(0));
+                assert_eq!(values.value(1), 42);
+                assert_eq!(batch.column(2).null_count(), 2);
+            }
+            let original =
+                ArrowSchema::from_pyarrow_bound(&table.getattr("schema").unwrap()).unwrap();
+            assert!(original.fields().iter().all(|field| !field.is_nullable()));
+        });
+    }
+
+    #[test]
+    fn upsert_binding_validates_only_surviving_target_values() {
+        Python::attach(|py| {
+            let schema = Schema::builder()
+                .column("id", DataType::Int(IntType::with_nullable(false)))
+                .column("value", DataType::Int(IntType::with_nullable(false)))
+                .column("keep", DataType::Int(IntType::with_nullable(false)))
+                .option("row-tracking.enabled", "true")
+                .option("data-evolution.enabled", "true")
+                .build()
+                .unwrap();
+            let table = Arc::new(Table::new(
+                FileIOBuilder::new("memory").build().unwrap(),
+                Identifier::new("default", "upsert_source_nullability"),
+                "memory:/upsert-source-nullability".into(),
+                TableSchema::new(0, &schema),
+                None,
+            ));
+            let context = UpdateContext::new(&WriteContext::new(table)).unwrap();
+            let locals = PyDict::new(py);
+            py.run(
+                c_str!(
+                    r#"
+import pyarrow as pa
+schema = pa.schema([pa.field(name, pa.int32(), nullable=False)
+                    for name in ('id', 'value', 'keep')])
+source = pa.Table.from_pylist([
+    {'id': 1, 'value': None, 'keep': None},
+    {'id': 1, 'value': 42, 'keep': 100},
+], schema=schema)
+invalid = source.slice(0, 1)
+"#
+                ),
+                None,
+                Some(&locals),
+            )
+            .unwrap();
+            let source = locals.get_item("source").unwrap().unwrap();
+            let messages = context
+                .upsert_by_arrow_with_key(py, &source, vec!["id".into()])
+                .unwrap();
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0].inner.new_files.len(), 1);
+            assert_eq!(messages[0].inner.new_files[0].row_count, 1);
+            let invalid = locals.get_item("invalid").unwrap().unwrap();
+            let error = context
+                .upsert_by_arrow_with_key(py, &invalid, vec!["id".into()])
+                .err()
+                .expect("a surviving NULL must still fail the declared target schema")
+                .to_string();
+            assert!(error.contains("null"), "{error}");
+        });
+    }
+
+    #[test]
+    fn merge_binding_preserves_one_schema_across_source_chunks() {
+        use arrow::array::Int32Array;
+
+        Python::attach(|py| {
+            for reverse in [false, true] {
+                let schema = Schema::builder()
+                    .column("id", DataType::Int(IntType::with_nullable(false)))
+                    .column("value", DataType::Int(IntType::with_nullable(false)))
+                    .column("keep", DataType::Int(IntType::with_nullable(false)))
+                    .option("row-tracking.enabled", "true")
+                    .option("data-evolution.enabled", "true")
+                    .build()
+                    .unwrap();
+                let table = Arc::new(Table::new(
+                    FileIOBuilder::new("memory").build().unwrap(),
+                    Identifier::new("default", "merge_chunk_nullability"),
+                    "memory:/merge-chunk-nullability".into(),
+                    TableSchema::new(0, &schema),
+                    None,
+                ));
+                let seed = RecordBatch::try_new(
+                    paimon::arrow::build_target_arrow_schema(table.schema().fields()).unwrap(),
+                    vec![
+                        Arc::new(Int32Array::from(vec![1])),
+                        Arc::new(Int32Array::from(vec![10])),
+                        Arc::new(Int32Array::from(vec![100])),
+                    ],
+                )
+                .unwrap();
+                py.detach(|| {
+                    runtime().block_on(async {
+                        let builder = table.new_write_builder();
+                        let mut writer = builder.new_write().unwrap();
+                        writer.write_arrow_batch(&seed).await.unwrap();
+                        builder
+                            .new_commit()
+                            .commit(writer.prepare_commit().await.unwrap())
+                            .await
+                            .unwrap();
+                        writer.close().await;
+                    })
+                });
+                let context = UpdateContext::new(&WriteContext::new(table)).unwrap();
+                let locals = PyDict::new(py);
+                locals.set_item("reverse", reverse).unwrap();
+                py.run(
+                    c_str!(
+                        r#"
+import pyarrow as pa
+schema = pa.schema([
+    pa.field('id', pa.int32(), nullable=False),
+    pa.field('value', pa.int32(), nullable=False),
+    pa.field('keep', pa.int32(), nullable=False, metadata={'role': 'unselected'}),
+], metadata={'origin': 'chunked-merge'})
+def chunk(row):
+    return pa.RecordBatch.from_pylist([
+        {'id': 0, 'value': 0, 'keep': 0}, row], schema=schema).slice(1)
+chunks = [chunk({'id': 1, 'value': 42, 'keep': 100}),
+          chunk({'id': 2, 'value': None, 'keep': None}),
+          chunk({'id': None, 'value': 30, 'keep': 100})]
+source = pa.Table.from_batches(chunks[::-1] if reverse else chunks)
+encoded = pa.chunked_array([pa.DictionaryArray.from_arrays(
+    pa.array([0], type=pa.int8()), pa.array([None], type=pa.int32())) for _ in chunks])
+source = source.append_column(pa.field('encoded_unused', encoded.type, nullable=False), encoded)
+assert source.column('encoded_unused').null_count == 0
+assert source.column('encoded_unused').to_pylist() == [None, None, None]
+matched = [dict(assignments=[('value', 'source', 'value')], condition=None, delete=False)]
+not_matched = []
+"#
+                    ),
+                    Some(&locals),
+                    Some(&locals),
+                )
+                .unwrap();
+                let source = locals.get_item("source").unwrap().unwrap();
+                let matched = locals.get_item("matched").unwrap().unwrap();
+                let not_matched = locals.get_item("not_matched").unwrap().unwrap();
+                let messages = context
+                    .merge_into(
+                        py,
+                        Some(&source),
+                        vec![("id".into(), "id".into())],
+                        &matched,
+                        &not_matched,
+                    )
+                    .unwrap();
+                assert_eq!(messages.len(), 1);
+                assert_eq!(messages[0].inner.new_files.len(), 1);
+                let imported = arrow_table_batches(&source).unwrap();
+                assert_eq!(imported.len(), 3);
+                for batch in &imported {
+                    assert_eq!(batch.schema(), imported[0].schema());
+                    assert!(batch.schema().fields()[..3]
+                        .iter()
+                        .all(|field| field.is_nullable()));
+                    assert!(!batch.schema().field(3).is_nullable());
+                    assert_eq!(
+                        batch.schema().metadata().get("origin").unwrap(),
+                        "chunked-merge"
+                    );
+                    assert_eq!(
+                        batch.schema().field(2).metadata().get("role").unwrap(),
+                        "unselected"
+                    );
+                }
+                let original =
+                    ArrowSchema::from_pyarrow_bound(&source.getattr("schema").unwrap()).unwrap();
+                assert!(original.fields().iter().all(|field| !field.is_nullable()));
+            }
+        });
+    }
+
+    #[test]
+    fn ignored_delete_null_payload_reaches_core_nullability_checks() {
+        Python::attach(|py| {
+            let schema = Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("op", DataType::VarChar(VarCharType::string_type()))
+                .column("payload", DataType::Int(IntType::with_nullable(false)))
+                .primary_key(["id"])
+                .option("bucket", "1")
+                .option("rowkind.field", "op")
+                .option("ignore-delete", "true")
+                .build()
+                .unwrap();
+            let table = Arc::new(Table::new(
+                FileIOBuilder::new("memory").build().unwrap(),
+                Identifier::new("default", "nullable_transport"),
+                "memory:/nullable-transport".into(),
+                TableSchema::new(0, &schema),
+                None,
+            ));
+            let locals = PyDict::new(py);
+            for large_string in [false, true] {
+                locals.set_item("large_string", large_string).unwrap();
+                for (kind, id, payload, error_column) in [
+                    ("-D", Some(1), None, None),
+                    ("-U", Some(1), None, Some("payload")),
+                    ("+I", Some(1), None, Some("payload")),
+                    ("-D", None, Some(42), Some("id")),
+                ] {
+                    locals.set_item("kind", kind).unwrap();
+                    locals.set_item("row_id", id).unwrap();
+                    locals.set_item("payload", payload).unwrap();
+                    py.run(
+                        c_str!(
+                            r#"
+import pyarrow as pa
+schema = pa.schema([
+    pa.field('id', pa.int32(), nullable=False),
+    pa.field('op', pa.large_string() if large_string else pa.string()),
+    pa.field('payload', pa.int32(), nullable=False),
+])
+batch = pa.RecordBatch.from_pylist([
+    {'id': row_id, 'op': kind, 'payload': payload},
+], schema=schema)
+"#
+                        ),
+                        None,
+                        Some(&locals),
+                    )
+                    .unwrap();
+                    let batch = locals.get_item("batch").unwrap().unwrap();
+                    let mut state = WriteContext::new(table.clone()).new_write(false).unwrap();
+                    let result = state.write_arrow(py, &batch, None);
+                    if let Some(column) = error_column {
+                        let error = result.unwrap_err().to_string();
+                        assert!(
+                            error.contains(&format!(
+                                "Cannot write null to non-null column({column})"
+                            )),
+                            "{error}"
+                        );
+                    } else {
+                        result.unwrap();
+                    }
+                    assert!(state.prepare_commit(py).unwrap().is_empty());
+                }
+            }
+        });
     }
 }
 

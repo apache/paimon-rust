@@ -17,7 +17,7 @@
 
 //! Primary-key full-text search read foundation: the score-based candidate type,
 //! its cross-bucket score-descending Top-K, and the FAST-only search over
-//! physical positions. SearchResult materializes the selected rows later.
+//! physical positions. GlobalIndexResult materializes the selected rows later.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
@@ -255,12 +255,12 @@ pub(crate) struct PrimaryKeyFullTextRouteResult<'a> {
 
 /// FAST-only primary-key full-text search. Given a planned set of
 /// per-bucket search splits, it searches each bucket through the full-text archive
-/// reader and fuses physical positions by score. SearchResult owns the selections
+/// reader and fuses physical positions by score. GlobalIndexResult owns the selections
 /// and their later materialization, as Java PrimaryKeyScoredResult does.
 ///
 /// The planning + FAST-mode guard live in the caller (`FullTextSearchBuilder`);
 /// this type searches a prepared plan. Its data reader loads deletion vectors;
-/// projected user columns are read later by SearchResult.
+/// projected user columns are read later by GlobalIndexResult.
 pub(crate) struct PrimaryKeyFullTextRead {
     file_io: FileIO,
     materialize_reader: DataFileReader,
@@ -287,7 +287,7 @@ impl PrimaryKeyFullTextRead {
     /// best-score-first Top-`limit`, WITHOUT materializing any rows. Returns the
     /// surviving candidates together with the route source context (the plan's
     /// resolved snapshot id and its per-bucket source splits) so a caller can fuse
-    /// them with another route before materializing through SearchResult.
+    /// them with another route before materializing through GlobalIndexResult.
     /// `query` is passed verbatim to the archive reader
     /// (spec D2).
     pub(crate) async fn search_route<'p>(
@@ -519,7 +519,7 @@ mod read_tests {
                 None,
             );
             let route = self.search_route(plan, query, limit).await?;
-            crate::table::SearchResult::from_full_text_primary_key(
+            crate::table::GlobalIndexResult::from_full_text_primary_key(
                 Arc::new(table),
                 route.snapshot_id,
                 route.candidates,
@@ -756,6 +756,7 @@ mod read_tests {
             schema_manager,
             1,
             id_fields(),
+            |fields| Ok(fields.to_vec()),
             id_fields(),
             Vec::new(),
         );

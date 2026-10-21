@@ -46,6 +46,11 @@ fn invalid(message: impl Into<String>) -> crate::Error {
 /// Row-ID updates infer columns from the input unless configured with
 /// [`with_update_type`](Self::with_update_type). Key-based upserts accept a
 /// column subset including the keys and match keys within each partition.
+/// Operations may select a historical read view. Matched updates retain its
+/// snapshot as the conflict baseline; upsert and MERGE append unmatched rows
+/// using that view's schema and assign fresh row IDs at publication. Publication
+/// resolves the latest snapshot and current table schema independently of the
+/// selected read view.
 #[derive(Clone)]
 pub struct TableUpdate {
     table: Table,
@@ -243,6 +248,11 @@ impl TableUpdate {
     /// columns are omitted from `upsert_keys`. Existing keys update every
     /// matching row ID; new keys append all input columns. Omitted columns on
     /// matched rows retain their values; on new rows they are absent from the file.
+    /// After last-write-wins, matched values follow row-ID update conversion
+    /// rules; new rows must satisfy the ordinary Arrow write type.
+    /// Numeric keys may use different Arrow types only when conversion keeps
+    /// their exact mathematical value. This matching conversion does not alter
+    /// the original key columns used as update or append payloads.
     /// Input batches may have different non-key columns. After last-write-wins
     /// deduplication, matched rows must supply their update columns and appended
     /// rows in each partition must share a field set.
@@ -309,11 +319,9 @@ impl TableUpdate {
         if row_ids.is_empty() {
             return Ok(Vec::new());
         }
-        let mut writer = self
-            .table
-            .new_write_builder()
-            .with_commit_user(self.commit_user.clone())?
-            .new_delete()?;
+        // The high-level updater selects a read snapshot; the low-level
+        // ordinary write builder continues rejecting historical handles.
+        let mut writer = super::DataEvolutionDeleteWriter::new(&self.table)?;
         writer.add_row_ids(row_ids)?;
         writer.prepare_commit().await
     }

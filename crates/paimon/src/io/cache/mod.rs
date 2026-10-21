@@ -18,11 +18,13 @@
 mod disk;
 mod file_type;
 mod memory;
+mod priority_lru;
 mod reader;
 mod state;
 
 use self::file_type::FileType;
 use self::memory::MemoryCache;
+use self::priority_lru::DEFAULT_HIGH_PRIORITY_POOL_RATIO;
 use self::state::{BlockKey, CacheCoordinator, CacheReadToken};
 use crate::common::{CatalogOptions, Options};
 use crate::io::FileBlockCache;
@@ -31,6 +33,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use disk::shared::SharedDiskCache;
 use disk::DiskCache;
 pub(super) use reader::CachedFileReader;
 
@@ -45,12 +48,15 @@ pub(crate) struct LocalCache {
     block_size: u64,
     whitelist: HashSet<FileType>,
     file_size_capacity: usize,
+    // Bound queued and active background fills.
+    fill_slots: Arc<tokio::sync::Semaphore>,
 }
 
 #[derive(Debug)]
 enum CacheBackend {
     Memory(MemoryCache),
     Disk(Arc<DiskCache>),
+    SharedDisk(SharedDiskCache),
     External(Arc<dyn FileBlockCache>),
 }
 
@@ -72,23 +78,45 @@ impl LocalCache {
             block_size,
             whitelist: FileType::parse_whitelist(whitelist),
             file_size_capacity: DEFAULT_FILE_SIZE_CAPACITY,
+            fill_slots: Arc::new(tokio::sync::Semaphore::new(8)),
         })
     }
 
+    #[cfg(test)]
     pub(super) fn new(config: LocalCacheConfig) -> crate::Result<Self> {
+        Self::new_with_ratio(config, DEFAULT_HIGH_PRIORITY_POOL_RATIO)
+    }
+
+    fn new_with_ratio(config: LocalCacheConfig, ratio: f64) -> crate::Result<Self> {
         let file_size_capacity = config
             .max_size
             .map(|max_size| max_size / config.block_size)
             .and_then(|capacity| usize::try_from(capacity).ok())
             .unwrap_or(DEFAULT_FILE_SIZE_CAPACITY)
             .clamp(1, DEFAULT_FILE_SIZE_CAPACITY);
-        let (backend, coordinator) = if let Some(dir) = config.dir {
-            let disk = DiskCache::shared(dir.join(CACHE_DIRECTORY_NAME), config.max_size)?;
+        let (backend, coordinator) = if config.shared {
+            (
+                CacheBackend::SharedDisk(SharedDiskCache::new_with_ratio(
+                    config
+                        .dir
+                        .ok_or_else(|| crate::Error::ConfigInvalid {
+                            message: "Shared local cache requires local-cache.dir".into(),
+                        })?
+                        .join("paimon-shared-local-cache-v1"),
+                    config.max_size.ok_or_else(|| crate::Error::ConfigInvalid {
+                        message: "Shared local cache requires local-cache.max-size".into(),
+                    })?,
+                    ratio,
+                )?),
+                Arc::new(CacheCoordinator::default()),
+            )
+        } else if let Some(dir) = config.dir {
+            let disk = DiskCache::shared(dir.join(CACHE_DIRECTORY_NAME), config.max_size, ratio)?;
             let coordinator = disk.coordinator();
             (CacheBackend::Disk(disk), coordinator)
         } else {
             (
-                CacheBackend::Memory(MemoryCache::new(config.max_size)),
+                CacheBackend::Memory(MemoryCache::with_ratio(config.max_size, ratio)),
                 Arc::new(CacheCoordinator::default()),
             )
         };
@@ -99,11 +127,28 @@ impl LocalCache {
             block_size: config.block_size,
             whitelist: config.whitelist,
             file_size_capacity,
+            fill_slots: Arc::new(tokio::sync::Semaphore::new(8)),
         })
     }
 
     fn block_size(&self) -> u64 {
         self.block_size
+    }
+
+    fn background_fill_slot(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        // Current-thread runtimes stop driving spawned fills when block_on returns.
+        // Keep those fills synchronous so their block locks cannot outlive the read.
+        if !matches!(
+            tokio::runtime::Handle::try_current().map(|handle| handle.runtime_flavor()),
+            Ok(tokio::runtime::RuntimeFlavor::MultiThread)
+        ) {
+            return None;
+        }
+        // Limit background payloads to 8 MiB per cache; otherwise fill synchronously.
+        if !matches!(self.backend, CacheBackend::SharedDisk(_)) || self.block_size > 1024 * 1024 {
+            return None;
+        }
+        self.fill_slots.clone().try_acquire_owned().ok()
     }
 
     fn block_key(&self, path: &str, block_index: u64) -> BlockKey {
@@ -128,6 +173,7 @@ impl LocalCache {
         let payload = match &self.backend {
             CacheBackend::Memory(memory) => memory.get_block(key),
             CacheBackend::Disk(disk) => disk.get_block(key).await,
+            CacheBackend::SharedDisk(disk) => disk.get(key, &token.shared_generation).await,
             CacheBackend::External(cache) => {
                 let start = key.block_index.checked_mul(key.block_size)?;
                 let length = u64::try_from(expected_len).ok()?;
@@ -151,6 +197,9 @@ impl LocalCache {
         match &self.backend {
             CacheBackend::Memory(memory) => memory.put_block(key, payload),
             CacheBackend::Disk(disk) => disk.put_block(key, payload).await,
+            CacheBackend::SharedDisk(disk) => {
+                disk.put(key, payload, &token.shared_generation).await
+            }
             CacheBackend::External(cache) => {
                 if let Some(offset) = key.block_index.checked_mul(key.block_size) {
                     cache.put(&key.path, offset, payload).await;
@@ -163,12 +212,28 @@ impl LocalCache {
         match &self.backend {
             CacheBackend::Memory(memory) => memory.remove_block(key),
             CacheBackend::Disk(disk) => disk.remove_block(key).await,
+            CacheBackend::SharedDisk(disk) => {
+                if let Err(error) = disk.invalidate().await {
+                    log::debug!("Failed to evict shared cache block: {error}");
+                }
+            }
             CacheBackend::External(cache) => cache.invalidate_path(&key.path).await,
         }
     }
 
     pub(super) fn read_token(&self, path: &str) -> CacheReadToken {
-        self.coordinator.read_token(&self.namespace, path)
+        let mut token = self.coordinator.read_token(&self.namespace, path);
+        if let CacheBackend::SharedDisk(disk) = &self.backend {
+            token.shared_generation = disk.generation();
+        }
+        token
+    }
+
+    async fn shared_load_lock(&self, key: &BlockKey) -> Option<std::fs::File> {
+        match &self.backend {
+            CacheBackend::SharedDisk(disk) => disk.load_lock(key).await,
+            _ => None,
+        }
     }
 
     async fn block_load_lock(&self, key: &BlockKey) -> Arc<tokio::sync::Mutex<()>> {
@@ -180,6 +245,10 @@ impl LocalCache {
     }
 
     pub(super) async fn file_size(&self, path: &str, token: &CacheReadToken) -> Option<u64> {
+        // Process-local file sizes cannot observe another process's invalidation.
+        if matches!(self.backend, CacheBackend::SharedDisk(_)) {
+            return None;
+        }
         let _prefix_guard = self.coordinator.prefix_read_guard().await;
         let _publish_guard = token.publish_guard().await;
         token
@@ -189,6 +258,9 @@ impl LocalCache {
     }
 
     pub(super) async fn put_file_size(&self, path: &str, size: u64, token: &CacheReadToken) {
+        if matches!(self.backend, CacheBackend::SharedDisk(_)) {
+            return;
+        }
         let _prefix_guard = self.coordinator.prefix_read_guard().await;
         let _publish_guard = token.publish_guard().await;
         if !token.is_current() {
@@ -198,7 +270,7 @@ impl LocalCache {
             .put_file_size(&self.namespace, path, size, self.file_size_capacity);
     }
 
-    pub(super) async fn invalidate_path(&self, path: &str) {
+    pub(super) async fn invalidate_path(&self, path: &str) -> crate::Result<()> {
         let _guard = self
             .coordinator
             .begin_path_invalidation(&self.namespace, path)
@@ -206,11 +278,15 @@ impl LocalCache {
         match &self.backend {
             CacheBackend::Memory(memory) => memory.invalidate_path(&self.namespace, path),
             CacheBackend::Disk(disk) => disk.invalidate_path(&self.namespace, path).await,
+            CacheBackend::SharedDisk(disk) => {
+                disk.invalidate().await.map_err(invalidation_error)?
+            }
             CacheBackend::External(cache) => cache.invalidate_path(path).await,
         }
+        Ok(())
     }
 
-    pub(super) async fn invalidate_prefix(&self, prefix: &str) {
+    pub(super) async fn invalidate_prefix(&self, prefix: &str) -> crate::Result<()> {
         if let CacheBackend::Disk(disk) = &self.backend {
             disk.ensure_recovered().await;
         }
@@ -221,8 +297,35 @@ impl LocalCache {
         match &self.backend {
             CacheBackend::Memory(memory) => memory.invalidate_prefix(&self.namespace, prefix),
             CacheBackend::Disk(disk) => disk.invalidate_prefix(&self.namespace, prefix).await,
+            CacheBackend::SharedDisk(disk) => {
+                disk.invalidate().await.map_err(invalidation_error)?
+            }
             CacheBackend::External(cache) => cache.invalidate_prefix(prefix).await,
         }
+        Ok(())
+    }
+
+    pub(in crate::io) async fn begin_shared_invalidation(
+        &self,
+    ) -> crate::Result<Option<disk::shared::SharedInvalidationGuard>> {
+        match &self.backend {
+            CacheBackend::SharedDisk(disk) => {
+                disk.begin_invalidation().await.map(Some).map_err(|error| {
+                    crate::Error::UnexpectedError {
+                        message: "Failed to establish shared cache mutation fence".into(),
+                        source: Some(Box::new(error)),
+                    }
+                })
+            }
+            _ => Ok(None),
+        }
+    }
+}
+
+fn invalidation_error(error: std::io::Error) -> crate::Error {
+    crate::Error::UnexpectedError {
+        message: "Shared cache invalidation failed; storage may already have been modified".into(),
+        source: Some(Box::new(error)),
     }
 }
 
@@ -234,14 +337,64 @@ pub(crate) fn create_local_cache_with_namespace(
     cache_options: &Options,
     namespace_options: &Options,
 ) -> crate::Result<Option<Arc<LocalCache>>> {
-    LocalCacheConfig::from_options_with_namespace(cache_options, namespace_options)?
-        .map(LocalCache::new)
-        .transpose()
-        .map(|cache| cache.map(Arc::new))
+    let Some(config) =
+        LocalCacheConfig::from_options_with_namespace(cache_options, namespace_options)?
+    else {
+        return Ok(None);
+    };
+    let ratio = parse_high_priority_ratio(cache_options)?;
+    LocalCache::new_with_ratio(config, ratio)
+        .map(Arc::new)
+        .map(Some)
+}
+
+fn parse_high_priority_ratio(options: &Options) -> crate::Result<f64> {
+    let key = CatalogOptions::LOCAL_CACHE_HIGH_PRIORITY_POOL_RATIO;
+    let Some(value) = options.get(key) else {
+        return Ok(DEFAULT_HIGH_PRIORITY_POOL_RATIO);
+    };
+    let ratio = value
+        .trim()
+        .parse::<f64>()
+        .map_err(|_| crate::Error::ConfigInvalid {
+            message: format!("{key} must be a number in [0, 1)"),
+        })?;
+    if !(0.0..1.0).contains(&ratio) {
+        return Err(crate::Error::ConfigInvalid {
+            message: format!("{key} must be in [0, 1)"),
+        });
+    }
+    Ok(ratio)
+}
+
+pub(crate) async fn create_local_cache_with_namespace_async(
+    cache_options: &Options,
+    namespace_options: &Options,
+) -> crate::Result<Option<Arc<LocalCache>>> {
+    let Some(config) =
+        LocalCacheConfig::from_options_with_namespace(cache_options, namespace_options)?
+    else {
+        return Ok(None);
+    };
+    let ratio = parse_high_priority_ratio(cache_options)?;
+    if config.shared {
+        tokio::task::spawn_blocking(move || LocalCache::new_with_ratio(config, ratio).map(Arc::new))
+            .await
+            .map_err(|error| crate::Error::UnexpectedError {
+                message: "Shared local cache initialization task failed".into(),
+                source: Some(Box::new(error)),
+            })?
+            .map(Some)
+    } else {
+        LocalCache::new_with_ratio(config, ratio)
+            .map(Arc::new)
+            .map(Some)
+    }
 }
 
 #[derive(Debug)]
 pub(crate) struct LocalCacheConfig {
+    shared: bool,
     dir: Option<PathBuf>,
     namespace: String,
     max_size: Option<u64>,
@@ -306,8 +459,20 @@ impl LocalCacheConfig {
             .get(CatalogOptions::LOCAL_CACHE_WHITELIST)
             .map(String::as_str)
             .unwrap_or("meta,global-index");
-
         Ok(Some(Self {
+            shared: match options
+                .get(CatalogOptions::LOCAL_CACHE_SHARED)
+                .map(|v| v.trim())
+            {
+                None => false,
+                Some(v) if v.eq_ignore_ascii_case("true") => true,
+                Some(v) if v.eq_ignore_ascii_case("false") => false,
+                Some(_) => {
+                    return Err(crate::Error::ConfigInvalid {
+                        message: "Invalid boolean for local-cache.shared".into(),
+                    })
+                }
+            },
             dir,
             namespace: catalog_namespace(namespace_options),
             max_size,
@@ -370,6 +535,7 @@ mod tests {
         assert_eq!(config.dir, None);
         assert_eq!(config.max_size, None);
         assert_eq!(config.block_size, 1024 * 1024);
+        assert_eq!(parse_high_priority_ratio(&options).unwrap(), 0.25);
         assert_eq!(
             config.whitelist,
             HashSet::from([FileType::Meta, FileType::GlobalIndex])
@@ -409,7 +575,11 @@ mod tests {
         assert_eq!(config.block_size, 64 * 1024);
         assert_eq!(
             config.whitelist,
-            std::collections::HashSet::from([FileType::Meta, FileType::Data])
+            std::collections::HashSet::from([
+                FileType::Meta,
+                FileType::DedicatedData,
+                FileType::StructuredData
+            ])
         );
     }
 
@@ -464,10 +634,29 @@ mod tests {
         assert!(error.to_string().contains("local-cache.enabled"));
     }
 
+    #[test]
+    fn test_local_cache_high_priority_ratio_validation() {
+        let mut options = Options::new();
+        options.set(CatalogOptions::LOCAL_CACHE_ENABLED, "true");
+        for (value, expected) in [("0", 0.0), ("0.75", 0.75)] {
+            options.set(CatalogOptions::LOCAL_CACHE_HIGH_PRIORITY_POOL_RATIO, value);
+            assert_eq!(parse_high_priority_ratio(&options).unwrap(), expected);
+        }
+        for value in ["-0.1", "1", "NaN", "inf", "garbage"] {
+            options.set(CatalogOptions::LOCAL_CACHE_HIGH_PRIORITY_POOL_RATIO, value);
+            let error = create_local_cache(&options).unwrap_err();
+            assert!(matches!(error, crate::Error::ConfigInvalid { .. }));
+            assert!(error
+                .to_string()
+                .contains(CatalogOptions::LOCAL_CACHE_HIGH_PRIORITY_POOL_RATIO));
+        }
+    }
+
     #[tokio::test]
     async fn test_local_cache_file_size_is_removed_with_path_invalidation() {
         let directory = tempfile::tempdir().unwrap();
         let cache = LocalCache::new(LocalCacheConfig {
+            shared: false,
             dir: Some(directory.path().to_path_buf()),
             namespace: "test".to_string(),
             max_size: None,
@@ -481,14 +670,55 @@ mod tests {
         assert_eq!(cache.file_size(path, &token).await, None);
         cache.put_file_size(path, 42, &token).await;
         assert_eq!(cache.file_size(path, &token).await, Some(42));
-        cache.invalidate_path(path).await;
+        cache.invalidate_path(path).await.unwrap();
         assert_eq!(cache.file_size(path, &token).await, None);
+    }
+
+    #[test]
+    fn test_structured_data_excludes_dedicated_and_mutable_files() {
+        let mut options = Options::new();
+        options.set(CatalogOptions::LOCAL_CACHE_ENABLED, "true");
+        options.set(CatalogOptions::LOCAL_CACHE_WHITELIST, "structured-data");
+        let cache = create_local_cache(&options).unwrap().unwrap();
+        assert!(cache.is_cacheable("s3://bucket/data.parquet"));
+        assert!(cache.is_cacheable("s3://bucket/data.unknown"));
+        for path in [
+            "s3://bucket/data.parquet.tmp",
+            "s3://bucket/.data.parquet.123e4567-e89b-12d3-a456-426614174000.tmp",
+            "s3://bucket/data.tmp.parquet",
+            "s3://bucket/manifest-1.avro",
+            "s3://bucket/data.parquet.index",
+            "s3://bucket/data.blob",
+            "s3://bucket/data.video",
+            "s3://bucket/data.vector.vortex",
+        ] {
+            assert!(!cache.is_cacheable(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn test_shared_cache_requires_directory_and_explicit_capacity() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut options = Options::default();
+        options.set(CatalogOptions::LOCAL_CACHE_ENABLED, "true");
+        options.set(CatalogOptions::LOCAL_CACHE_SHARED, "true");
+        assert!(create_local_cache(&options).is_err());
+        options.set(
+            CatalogOptions::LOCAL_CACHE_DIR,
+            directory.path().to_str().unwrap(),
+        );
+        assert!(create_local_cache(&options).is_err());
+        options.set(CatalogOptions::LOCAL_CACHE_MAX_SIZE, "1 MiB");
+        assert!(create_local_cache(&options).unwrap().is_some());
+        options.set(CatalogOptions::LOCAL_CACHE_SHARED, "invalid");
+        assert!(create_local_cache(&options).is_err());
     }
 
     #[tokio::test]
     async fn test_local_cache_file_size_is_invalidated_across_shared_instances() {
         let directory = tempfile::tempdir().unwrap();
         let config = || LocalCacheConfig {
+            shared: false,
             dir: Some(directory.path().to_path_buf()),
             namespace: "test".to_string(),
             max_size: None,
@@ -502,7 +732,7 @@ mod tests {
 
         first.put_file_size(path, 42, &token).await;
         assert_eq!(second.file_size(path, &token).await, Some(42));
-        second.invalidate_path(path).await;
+        second.invalidate_path(path).await.unwrap();
         let current_token = first.read_token(path);
         assert_eq!(first.file_size(path, &current_token).await, None);
     }
@@ -511,6 +741,7 @@ mod tests {
     async fn test_stale_file_size_cannot_republish_after_invalidation() {
         let directory = tempfile::tempdir().unwrap();
         let config = || LocalCacheConfig {
+            shared: false,
             dir: Some(directory.path().to_path_buf()),
             namespace: "test".to_string(),
             max_size: None,
@@ -523,7 +754,7 @@ mod tests {
         let stale_token = first.read_token(path);
 
         assert_eq!(first.file_size(path, &stale_token).await, None);
-        second.invalidate_path(path).await;
+        second.invalidate_path(path).await.unwrap();
         first.put_file_size(path, 42, &stale_token).await;
 
         let current_token = first.read_token(path);
@@ -534,6 +765,7 @@ mod tests {
     fn test_local_cache_uses_whitelist_and_bypasses_mutable_files() {
         let directory = tempfile::tempdir().unwrap();
         let cache = LocalCache::new(LocalCacheConfig {
+            shared: false,
             dir: Some(directory.path().to_path_buf()),
             namespace: "test".to_string(),
             max_size: None,
@@ -563,6 +795,7 @@ mod tests {
         std::fs::write(&nested, b"nested foreign").unwrap();
 
         LocalCache::new(LocalCacheConfig {
+            shared: false,
             dir: Some(directory.path().to_path_buf()),
             namespace: "test".to_string(),
             max_size: None,
@@ -583,6 +816,7 @@ mod tests {
     async fn test_local_cache_bounds_file_size_entries() {
         let directory = tempfile::tempdir().unwrap();
         let cache = LocalCache::new(LocalCacheConfig {
+            shared: false,
             dir: Some(directory.path().to_path_buf()),
             namespace: "test".to_string(),
             max_size: Some(8),

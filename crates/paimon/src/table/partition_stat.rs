@@ -15,20 +15,19 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Per-partition statistics computed by scanning the latest snapshot's manifest entries.
+//! Per-partition statistics computed by scanning the selected snapshot's manifest entries.
 //!
 //! Mirrors what Java Paimon exposes via the `$partitions` system table for runtime introspection.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 
-use crate::io::FileIO;
-use crate::spec::{
-    avro::from_avro_bytes_fast, merge_active_entries, BinaryRow, CoreOptions, ManifestEntry,
-    ManifestFileMeta, PartitionComputer, Snapshot,
-};
+#[cfg(test)]
+use crate::catalog::aggregate_partition_entries;
+use crate::catalog::{list_partition_entries, FileSystemPartitionEntry};
+#[cfg(test)]
+use crate::spec::ManifestEntry;
+use crate::spec::{CoreOptions, PartitionComputer};
 use crate::table::Table;
-
-const MANIFEST_DIR: &str = "manifest";
 
 /// Per-partition aggregated statistics.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,36 +42,19 @@ pub struct PartitionStat {
     pub total_size_bytes: u64,
 }
 
-#[derive(Default)]
-struct Accum {
-    record_count: i64,
-    file_count: i64,
-    total_size_bytes: i64,
-}
-
 impl Table {
-    /// Compute per-partition statistics from the latest snapshot.
+    /// Compute per-partition statistics from the selected snapshot.
     ///
     /// Mirrors [`catalog::list_partitions_from_file_system`]: calls
     /// `merge_active_entries` first to deduplicate entries that appear in both
     /// the base and delta manifests, then aggregates the remaining live ADD
     /// files in a `BTreeMap` for a deterministic result order.
     ///
-    /// **Warning:** This method reads all manifest lists and entries from the latest snapshot.
+    /// **Warning:** This method reads all manifest lists and entries from the selected snapshot.
     /// For tables with a large number of manifests, this operation can be expensive.
     ///
     /// Returns an empty Vec when the table has no snapshots yet.
     pub async fn partition_stats(&self) -> crate::Result<Vec<PartitionStat>> {
-        // Manifests carry partition values and per-column stats.
-        CoreOptions::new(self.schema().options()).ensure_read_authorized()?;
-        let sm = self.snapshot_manager();
-        let snapshot = match sm.get_latest_snapshot().await? {
-            Some(s) => s,
-            None => return Ok(Vec::new()),
-        };
-
-        let entries = read_all_manifest_entries(self.file_io(), self.location(), &snapshot).await?;
-
         let schema = self.schema();
         let core = CoreOptions::new(schema.options());
         let computer = PartitionComputer::new(
@@ -82,10 +64,10 @@ impl Table {
             core.legacy_partition_name(),
         )?;
 
-        aggregate_partition_stats(entries, &computer)
+        partition_stats_from_entries(list_partition_entries(self).await?, &computer)
     }
 
-    /// List all partition values present in the latest snapshot.
+    /// List all partition values present in the selected snapshot.
     ///
     /// **Warning:** This method computes partition statistics which reads all manifest lists
     /// and entries. For large tables, this operation can be expensive.
@@ -101,87 +83,32 @@ impl Table {
     }
 }
 
-async fn read_manifest_list(
-    file_io: &FileIO,
-    table_path: &str,
-    list_name: &str,
-) -> crate::Result<Vec<ManifestFileMeta>> {
-    if list_name.is_empty() {
-        return Ok(Vec::new());
-    }
-    let path = format!(
-        "{}/{}/{}",
-        table_path.trim_end_matches('/'),
-        MANIFEST_DIR,
-        list_name
-    );
-    let input = file_io.new_input(&path)?;
-    let bytes = input.read().await?;
-    from_avro_bytes_fast::<ManifestFileMeta>(&bytes)
+fn partition_stats_from_entries(
+    entries: Vec<FileSystemPartitionEntry>,
+    computer: &PartitionComputer,
+) -> crate::Result<Vec<PartitionStat>> {
+    entries
+        .into_iter()
+        .map(|entry| {
+            Ok(PartitionStat {
+                partition: computer
+                    .generate_part_values(&entry.partition)?
+                    .into_iter()
+                    .collect(),
+                record_count: entry.record_count,
+                file_count: entry.file_count as u64,
+                total_size_bytes: entry.file_size_in_bytes as u64,
+            })
+        })
+        .collect()
 }
 
-async fn read_all_manifest_entries(
-    file_io: &FileIO,
-    table_path: &str,
-    snapshot: &Snapshot,
-) -> crate::Result<Vec<ManifestEntry>> {
-    let mut metas = read_manifest_list(file_io, table_path, snapshot.base_manifest_list()).await?;
-    metas.extend(read_manifest_list(file_io, table_path, snapshot.delta_manifest_list()).await?);
-
-    let manifest_dir = format!("{}/{}", table_path.trim_end_matches('/'), MANIFEST_DIR);
-    let mut all_entries = Vec::new();
-    for meta in metas {
-        let path = format!("{}/{}", manifest_dir, meta.file_name());
-        let input = file_io.new_input(&path)?;
-        let bytes = input.read().await?;
-        let entries = from_avro_bytes_fast::<ManifestEntry>(&bytes)?;
-        all_entries.extend(entries);
-    }
-    Ok(all_entries)
-}
-
-/// Aggregate live manifest entries into per-partition statistics.
-///
-/// Mirrors `catalog::list_partitions_from_file_system`:
-/// 1. Call `merge_active_entries` to collapse ADD/DELETE pairs and remove
-///    entries shadowed by a later DELETE, including duplicate ADD entries
-///    that may appear in both base and delta manifests after compaction.
-/// 2. Accumulate the remaining live ADD entries in a `BTreeMap` keyed by
-///    raw partition bytes for a deterministic, sorted result order.
+#[cfg(test)]
 fn aggregate_partition_stats(
     entries: Vec<ManifestEntry>,
     computer: &PartitionComputer,
 ) -> crate::Result<Vec<PartitionStat>> {
-    // Step 1: deduplicate — collapse ADD/DELETE pairs and drop files that have
-    // been deleted. After this point every remaining entry is a live ADD.
-    let live_entries = merge_active_entries(entries);
-
-    // Step 2: accumulate into a BTreeMap for deterministic partition ordering.
-    let mut grouped: BTreeMap<Vec<u8>, Accum> = BTreeMap::new();
-    for entry in &live_entries {
-        let file = entry.file();
-        let accum = grouped.entry(entry.partition().to_vec()).or_default();
-        accum.record_count += file.row_count;
-        accum.file_count += 1;
-        accum.total_size_bytes += file.file_size;
-    }
-
-    let mut out = Vec::with_capacity(grouped.len());
-    for (partition_bytes, accum) in grouped {
-        let partition = if partition_bytes.is_empty() {
-            HashMap::new()
-        } else {
-            let row = BinaryRow::from_serialized_bytes(&partition_bytes)?;
-            computer.generate_part_values(&row)?.into_iter().collect()
-        };
-        out.push(PartitionStat {
-            partition,
-            record_count: accum.record_count,
-            file_count: accum.file_count as u64,
-            total_size_bytes: accum.total_size_bytes as u64,
-        });
-    }
-    Ok(out)
+    partition_stats_from_entries(aggregate_partition_entries(entries)?, computer)
 }
 
 #[cfg(test)]

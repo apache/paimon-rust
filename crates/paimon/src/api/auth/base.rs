@@ -99,6 +99,16 @@ pub trait AuthProvider: Send + Sync {
 }
 /// Authorization header key.
 pub const AUTHORIZATION_HEADER_KEY: &str = "Authorization";
+
+/// Authentication headers override caller headers regardless of spelling case.
+pub(super) fn merge_auth_headers(
+    mut base: HashMap<String, String>,
+    generated: HashMap<String, String>,
+) -> HashMap<String, String> {
+    base.retain(|key, _| !generated.keys().any(|name| key.eq_ignore_ascii_case(name)));
+    base.extend(generated);
+    base
+}
 /// Function wrapper for REST authentication.
 ///
 /// This struct combines an initial set of headers with an authentication provider

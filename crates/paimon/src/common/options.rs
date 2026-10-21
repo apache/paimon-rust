@@ -58,7 +58,7 @@ impl CatalogOptions {
     /// DLF security token (optional, for temporary credentials).
     pub const DLF_ACCESS_SECURITY_TOKEN: &'static str = "dlf.security-token";
 
-    /// DLF signing algorithm (default or openapi).
+    /// DLF signing algorithm (default, openapi or openapi-v4).
     pub const DLF_SIGNING_ALGORITHM: &'static str = "dlf.signing-algorithm";
 
     /// DLF token loader type ("ecs" or "local_file").
@@ -81,9 +81,15 @@ impl CatalogOptions {
 
     /// Directory for the local disk block cache. If unset, an in-memory cache is used.
     pub const LOCAL_CACHE_DIR: &'static str = "local-cache.dir";
+    /// Share a node-local disk cache between cooperating processes.
+    pub const LOCAL_CACHE_SHARED: &'static str = "local-cache.shared";
 
     /// Maximum total size of the local block cache.
     pub const LOCAL_CACHE_MAX_SIZE: &'static str = "local-cache.max-size";
+
+    /// Fraction of the local cache protected for metadata and global indexes.
+    pub const LOCAL_CACHE_HIGH_PRIORITY_POOL_RATIO: &'static str =
+        "local-cache.high-priority-pool-ratio";
 
     /// Block size used by the local cache.
     pub const LOCAL_CACHE_BLOCK_SIZE: &'static str = "local-cache.block-size";
@@ -97,6 +103,20 @@ impl CatalogOptions {
 
     /// Maximum catalog-local cache size for decoded BLOB indexes.
     pub const BLOB_INDEX_CACHE_MAX_SIZE: &'static str = "cache.blob-index.max-size";
+}
+
+/// FUSE mount options shared with PyPaimon's REST catalog.
+pub struct FuseOptions;
+
+impl FuseOptions {
+    /// Enable reads and writes through a local FUSE mount (default: false).
+    pub const ENABLED: &'static str = "fuse.enabled";
+    /// Mounted local root directory.
+    pub const ROOT: &'static str = "fuse.root";
+    /// Path layout: pvfs (database/table names, default) or raw (URI path).
+    pub const MODE: &'static str = "fuse.mode";
+    /// Mount validation: strict (default), warn (fallback), or none.
+    pub const VALIDATION_MODE: &'static str = "fuse.validation-mode";
 }
 
 /// Configuration options container.
@@ -279,6 +299,10 @@ mod tests {
         assert_eq!(CatalogOptions::LOCAL_CACHE_ENABLED, "local-cache.enabled");
         assert_eq!(CatalogOptions::LOCAL_CACHE_DIR, "local-cache.dir");
         assert_eq!(CatalogOptions::LOCAL_CACHE_MAX_SIZE, "local-cache.max-size");
+        assert_eq!(
+            CatalogOptions::LOCAL_CACHE_HIGH_PRIORITY_POOL_RATIO,
+            "local-cache.high-priority-pool-ratio"
+        );
         assert_eq!(
             CatalogOptions::LOCAL_CACHE_BLOCK_SIZE,
             "local-cache.block-size"

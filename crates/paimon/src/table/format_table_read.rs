@@ -163,6 +163,7 @@ impl<'a> FormatTableRead<'a> {
                     schema_manager.clone(),
                     schema_id,
                     data_table_fields.clone(),
+                    |fields| Ok(fields.to_vec()),
                     data_read_type.clone(),
                     data_predicates.clone(),
                 )

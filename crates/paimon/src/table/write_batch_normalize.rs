@@ -26,9 +26,9 @@
 use crate::{Error, Result};
 use arrow_array::{
     Array, ArrayRef, BinaryArray, Decimal128Array, FixedSizeBinaryArray, FixedSizeListArray,
-    ListArray, MapArray, StringArray, StructArray,
+    LargeBinaryArray, LargeStringArray, ListArray, MapArray, StringArray, StructArray,
 };
-use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
+use arrow_buffer::{Buffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::{DataType, Field};
 use std::sync::Arc;
 
@@ -65,6 +65,33 @@ pub(super) fn blob_map_row_type(expected: &DataType) -> Option<DataType> {
 pub(super) fn normalize_blob_write_field(
     array: &ArrayRef,
     expected: &Field,
+) -> Result<(Field, ArrayRef)> {
+    normalize_blob_field(array, expected, true)
+}
+
+/// Normalize Blob map keys and their physical transport, retaining the value
+/// input type for the row-ID updater's conversion at the existing read layout.
+pub(super) fn normalize_blob_update_field(
+    array: &ArrayRef,
+    expected: &Field,
+) -> Result<(Field, ArrayRef)> {
+    let array = super::update_input::decode_dictionary(array)?;
+    if matches!(array.data_type(), DataType::Map(..) | DataType::List(_)) {
+        normalize_blob_field(&array, expected, false)
+    } else {
+        // NULLs and other row-ID constructor inputs retain their conversion
+        // at the existing DE writer position, rather than the declared schema.
+        Ok((
+            expected.clone().with_data_type(array.data_type().clone()),
+            array,
+        ))
+    }
+}
+
+fn normalize_blob_field(
+    array: &ArrayRef,
+    expected: &Field,
+    normalize_values: bool,
 ) -> Result<(Field, ArrayRef)> {
     let Some(target) = blob_map_row_type(expected.data_type()) else {
         return Ok((
@@ -121,17 +148,39 @@ pub(super) fn normalize_blob_write_field(
         .enumerate()
         .map(|(index, (column, field))| {
             if index == 0 {
-                normalize_blob_map_key(column, field.data_type())
-            } else {
+                if normalize_values {
+                    normalize_blob_map_key(column, field.data_type())
+                } else {
+                    normalize_blob_update_key(column, field.data_type())
+                }
+            } else if normalize_values {
                 normalize_write_array(column, field.data_type())
+            } else {
+                Ok(column.clone())
             }
         })
         .collect::<Result<Vec<_>>>()?;
-    let entries =
-        StructArray::try_new(fields.clone(), columns, None).map_err(normalization_error)?;
-    let list = ListArray::try_new(child.clone(), offsets, Arc::new(entries), nulls.cloned())
+    let mut fields = fields.to_vec();
+    fields[1] = Arc::new(
+        fields[1]
+            .as_ref()
+            .clone()
+            .with_data_type(columns[1].data_type().clone()),
+    );
+    let fields = fields.into();
+    let entries = StructArray::try_new(fields, columns, None).map_err(normalization_error)?;
+    let child = Arc::new(
+        child
+            .as_ref()
+            .clone()
+            .with_data_type(entries.data_type().clone()),
+    );
+    let list = ListArray::try_new(child, offsets, Arc::new(entries), nulls.cloned())
         .map_err(normalization_error)?;
-    Ok((expected.clone().with_data_type(target), Arc::new(list)))
+    Ok((
+        expected.clone().with_data_type(list.data_type().clone()),
+        Arc::new(list),
+    ))
 }
 
 fn normalize_blob_map_key(array: &ArrayRef, expected: &DataType) -> Result<ArrayRef> {
@@ -163,6 +212,40 @@ fn normalize_blob_map_key(array: &ArrayRef, expected: &DataType) -> Result<Array
         ));
     }
     normalize_write_array(array, expected)
+}
+
+fn normalize_blob_update_key(array: &ArrayRef, expected: &DataType) -> Result<ArrayRef> {
+    let decoded = super::update_input::decode_dictionary(array)?;
+    if matches!(expected, DataType::Decimal128(..)) && decoded.data_type() != &DataType::Null {
+        // Blob map keys follow Java Decimal.fromBigDecimal (HALF_UP), rather
+        // than the exact decimal conversion used to match table upsert keys.
+        let text = if decoded.data_type().is_decimal() {
+            super::update_input::cast_update_value(
+                &decoded,
+                &DataType::Utf8,
+                super::update_input::CastMode::Assignment,
+            )?
+        } else {
+            decoded
+        };
+        return normalize_blob_map_key(&text, expected);
+    }
+    if matches!(
+        (decoded.data_type(), expected),
+        (
+            DataType::Time32(_) | DataType::Time64(_),
+            DataType::Time32(_) | DataType::Time64(_)
+        )
+    ) {
+        // Java/Python serialize TIME Blob keys in milliseconds. This is a
+        // value normalization step, unlike lossless table-key matching.
+        return super::update_input::cast_update_value(
+            &decoded,
+            expected,
+            super::update_input::CastMode::RowUpdate,
+        );
+    }
+    super::key_normalization::normalize_match_key(&decoded, expected)
 }
 
 /// Decimal.fromBigDecimal: round magnitude HALF_UP, then check precision.
@@ -230,6 +313,11 @@ fn normalize_visible_array(
     }
 
     match (array.data_type(), expected) {
+        // Java has one STRING value representation. Arrow offset widths do
+        // not change the logical values, including in keys and nested fields.
+        (DataType::LargeUtf8, DataType::Utf8) => {
+            normalize_large_string(array.as_any().downcast_ref().unwrap())
+        }
         (DataType::FixedSizeBinary(_), DataType::Binary) => {
             let fixed = array
                 .as_any()
@@ -343,6 +431,90 @@ fn normalize_visible_array(
     }
 }
 
+/// Narrow only the visible byte range. A small slice may start beyond i32::MAX
+/// in its backing buffer, so casting the original absolute offsets is wrong.
+/// The value buffer remains shared and only the offset buffer is rebuilt.
+fn normalize_large_string(array: &LargeStringArray) -> Result<ArrayRef> {
+    let (offsets, values) = narrow_byte_range(array.value_offsets(), array.values())?;
+    StringArray::try_new(offsets, values, array.nulls().cloned())
+        .map(|array| Arc::new(array) as ArrayRef)
+        .map_err(normalization_error)
+}
+
+/// Offset adaptation for matching keys; ordinary append type validation remains
+/// separate so this does not broaden accepted write schemas.
+pub(super) fn normalize_large_binary(array: &LargeBinaryArray) -> Result<ArrayRef> {
+    let (offsets, values) =
+        normalize_large_key_bytes(array.value_offsets(), array.values(), array.nulls())?;
+    BinaryArray::try_new(offsets, values, array.nulls().cloned())
+        .map(|array| Arc::new(array) as ArrayRef)
+        .map_err(normalization_error)
+}
+
+/// Matching reads logical string values, including NULLs with hidden storage.
+/// Ordinary write normalization keeps its existing offset-limit validation.
+pub(super) fn normalize_large_string_key(array: &LargeStringArray) -> Result<ArrayRef> {
+    let (offsets, values) =
+        normalize_large_key_bytes(array.value_offsets(), array.values(), array.nulls())?;
+    StringArray::try_new(offsets, values, array.nulls().cloned())
+        .map(|array| Arc::new(array) as ArrayRef)
+        .map_err(normalization_error)
+}
+
+fn normalize_large_key_bytes(
+    source: &[i64],
+    values: &Buffer,
+    nulls: Option<&NullBuffer>,
+) -> Result<(OffsetBuffer<i32>, Buffer)> {
+    if let Some(nulls) = nulls.filter(|nulls| {
+        nulls.null_count() != 0 && source[source.len() - 1] - source[0] > i64::from(i32::MAX)
+    }) {
+        // NULL slots can retain arbitrarily large, unobservable byte ranges.
+        // Compact only when they prevent narrowing; ordinary arrays continue
+        // to share the visible value buffer below.
+        let visible_len = source
+            .windows(2)
+            .enumerate()
+            .filter(|(row, _)| nulls.is_valid(*row))
+            .try_fold(0_i64, |len, (_, range)| {
+                len.checked_add(range[1] - range[0])
+            });
+        if visible_len.is_none_or(|len| len > i64::from(i32::MAX)) {
+            return Err(Error::DataInvalid {
+                message: "Arrow byte range exceeds 32-bit offsets".into(),
+                source: None,
+            });
+        }
+        let mut compacted = Vec::with_capacity(visible_len.unwrap() as usize);
+        let mut offsets = Vec::with_capacity(source.len());
+        offsets.push(0);
+        for (row, range) in source.windows(2).enumerate() {
+            if nulls.is_valid(row) {
+                compacted.extend_from_slice(&values[range[0] as usize..range[1] as usize]);
+            }
+            offsets.push(compacted.len() as i32);
+        }
+        return Ok((OffsetBuffer::new(offsets.into()), Buffer::from(compacted)));
+    }
+    narrow_byte_range(source, values)
+}
+
+fn narrow_byte_range(source: &[i64], values: &Buffer) -> Result<(OffsetBuffer<i32>, Buffer)> {
+    let start = source[0];
+    let end = source[source.len() - 1];
+    let offsets = source
+        .iter()
+        .map(|offset| {
+            i32::try_from(offset - start).map_err(|_| Error::DataInvalid {
+                message: "Arrow byte range exceeds 32-bit offsets".into(),
+                source: None,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let values = values.slice_with_length(start as usize, (end - start) as usize);
+    Ok((OffsetBuffer::new(offsets.into()), values))
+}
+
 /// Keep only children referenced by visible parents. Ordinary inputs and
 /// slices share their payload buffers; only disjoint ranges across NULL
 /// parents need concatenation. Hidden children must not fail NOT NULL checks
@@ -420,6 +592,269 @@ mod tests {
     use arrow_array::{FixedSizeListArray, Int32Array, LargeBinaryArray, StringArray};
     use arrow_buffer::{OffsetBuffer, ScalarBuffer};
     use arrow_schema::Field;
+
+    #[cfg(all(unix, target_pointer_width = "64"))]
+    #[test]
+    fn large_string_slices_after_two_gib_keep_only_the_visible_byte_range() {
+        use arrow_array::LargeStringArray;
+        use arrow_buffer::Buffer;
+        use std::ptr::NonNull;
+
+        struct Mapping {
+            address: usize,
+            len: usize,
+        }
+        impl Drop for Mapping {
+            fn drop(&mut self) {
+                // SAFETY: the mapping owns this mmap region until the last
+                // Arrow buffer using it is dropped.
+                unsafe { libc::munmap(self.address as *mut libc::c_void, self.len) };
+            }
+        }
+        let start = i32::MAX as usize + 17;
+        let tail = "abc中文tail".as_bytes();
+        let len = start + tail.len();
+        // Reserve virtual memory without allocating/touching a 2 GiB payload.
+        // Only the small visible tail is initialized and read by this test.
+        let address = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(address, libc::MAP_FAILED);
+        let owner = Arc::new(Mapping {
+            address: address as usize,
+            len,
+        });
+        // SAFETY: mmap returned len initialized bytes; the tail fits within
+        // the mapping and all writes finish before publishing the buffer.
+        let values = unsafe {
+            std::ptr::copy_nonoverlapping(
+                tail.as_ptr(),
+                address.cast::<u8>().add(start),
+                tail.len(),
+            );
+            Buffer::from_custom_allocation(NonNull::new(address.cast()).unwrap(), len, owner)
+        };
+        let start = start as i64;
+        let input = LargeStringArray::new(
+            OffsetBuffer::new(vec![start, start + 3, start + 3, start + 9, start + 13].into()),
+            values,
+            Some(NullBuffer::from(vec![true, false, true, true])),
+        );
+        let input: ArrayRef = Arc::new(input.slice(0, 3));
+        let result = normalize_write_array(&input, &DataType::Utf8).unwrap();
+        assert_eq!(
+            result.to_data(),
+            StringArray::from(vec![Some("abc"), None, Some("中文")]).to_data()
+        );
+        let result = result.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(result.value_offsets(), &[0, 3, 3, 9]);
+        assert_eq!(result.values().as_ptr(), unsafe {
+            address.cast::<u8>().add(start as usize)
+        });
+        let empty = normalize_write_array(&input.slice(3, 0), &DataType::Utf8).unwrap();
+        assert!(empty.is_empty());
+        let text = input.as_any().downcast_ref::<LargeStringArray>().unwrap();
+        let binary: ArrayRef = Arc::new(LargeBinaryArray::new(
+            text.offsets().clone(),
+            text.values().clone(),
+            text.nulls().cloned(),
+        ));
+        let normalized =
+            crate::table::key_normalization::normalize_match_key(&binary, &DataType::Binary)
+                .unwrap();
+        assert_eq!(
+            normalized.to_data(),
+            BinaryArray::from(vec![Some("abc".as_bytes()), None, Some("中文".as_bytes())])
+                .to_data()
+        );
+        assert!(normalize_write_array(&binary, &DataType::Binary).is_err());
+        for mixed in [false, true] {
+            let offsets = if mixed {
+                vec![0, start, start + 3]
+            } else {
+                vec![0, start]
+            };
+            let input: ArrayRef = Arc::new(LargeBinaryArray::new(
+                OffsetBuffer::new(offsets.into()),
+                text.values().clone(),
+                // Retain a nonzero validity-bit offset through compaction.
+                Some(NullBuffer::from(vec![true, false, true]).slice(1, if mixed { 2 } else { 1 })),
+            ));
+            let output =
+                crate::table::key_normalization::normalize_match_key(&input, &DataType::Binary)
+                    .unwrap();
+            let expected = if mixed {
+                vec![None, Some(b"abc".as_slice())]
+            } else {
+                vec![None]
+            };
+            assert_eq!(output.to_data(), BinaryArray::from(expected).to_data());
+            let bytes = input.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
+            // SAFETY: the shared mapping contains valid UTF-8. Avoid scanning
+            // the hidden 2 GiB NULL range merely to construct the test input.
+            let strings: ArrayRef = Arc::new(unsafe {
+                LargeStringArray::new_unchecked(
+                    bytes.offsets().clone(),
+                    bytes.values().clone(),
+                    bytes.nulls().cloned(),
+                )
+            });
+            let output =
+                crate::table::key_normalization::normalize_match_key(&strings, &DataType::Utf8)
+                    .unwrap();
+            assert_eq!(
+                output.to_data(),
+                StringArray::from(if mixed {
+                    vec![None, Some("abc")]
+                } else {
+                    vec![None]
+                })
+                .to_data(),
+            );
+            assert!(normalize_write_array(&strings, &DataType::Utf8).is_err());
+        }
+        let visible_overflow: ArrayRef = Arc::new(LargeBinaryArray::new(
+            OffsetBuffer::new(vec![0, start + 3, start + 3].into()),
+            text.values().clone(),
+            Some(NullBuffer::from(vec![true, false])),
+        ));
+        assert!(crate::table::key_normalization::normalize_match_key(
+            &visible_overflow,
+            &DataType::Binary,
+        )
+        .is_err());
+        let bytes = visible_overflow
+            .as_any()
+            .downcast_ref::<LargeBinaryArray>()
+            .unwrap();
+        // SAFETY: as above, both the zero-filled prefix and tail are UTF-8.
+        let visible_string_overflow: ArrayRef = Arc::new(unsafe {
+            LargeStringArray::new_unchecked(
+                bytes.offsets().clone(),
+                bytes.values().clone(),
+                bytes.nulls().cloned(),
+            )
+        });
+        assert!(crate::table::key_normalization::normalize_match_key(
+            &visible_string_overflow,
+            &DataType::Utf8,
+        )
+        .is_err());
+        // A visible range larger than i32::MAX still cannot be represented.
+        // SAFETY: the mapped bytes are zeroes followed by a valid UTF-8 tail;
+        // offsets and NULL bitmap are valid. Skip scanning the 2 GiB prefix.
+        let too_wide: ArrayRef = Arc::new(unsafe {
+            LargeStringArray::new_unchecked(
+                OffsetBuffer::new(vec![0, start + 13].into()),
+                input
+                    .as_any()
+                    .downcast_ref::<LargeStringArray>()
+                    .unwrap()
+                    .values()
+                    .clone(),
+                Some(NullBuffer::from(vec![false])),
+            )
+        });
+        assert!(normalize_write_array(&too_wide, &DataType::Utf8)
+            .unwrap_err()
+            .to_string()
+            .contains("32-bit offsets"));
+    }
+
+    #[test]
+    fn binary_offset_widths_are_not_implicitly_converted() {
+        let small: ArrayRef = Arc::new(BinaryArray::from(vec![Some(b"\xff\0".as_slice()), None]));
+        let large: ArrayRef = Arc::new(LargeBinaryArray::from(vec![
+            Some(b"\xff\0".as_slice()),
+            None,
+        ]));
+        assert!(normalize_write_array(&small, &DataType::LargeBinary).is_err());
+        assert!(normalize_write_array(&large, &DataType::Binary).is_err());
+    }
+
+    #[test]
+    fn large_strings_preserve_slices_unicode_and_nulls() {
+        let input: ArrayRef = Arc::new(
+            arrow_array::LargeStringArray::from(vec![
+                Some("outside"),
+                Some("中文"),
+                None,
+                Some(""),
+                Some("last"),
+            ])
+            .slice(1, 4),
+        );
+        let result = normalize_write_array(&input, &DataType::Utf8).unwrap();
+        assert_eq!(
+            result.to_data(),
+            StringArray::from(vec![Some("中文"), None, Some(""), Some("last")]).to_data()
+        );
+        let empty = normalize_write_array(&input.slice(0, 0), &DataType::Utf8).unwrap();
+        assert!(empty.is_empty());
+        assert_eq!(empty.data_type(), &DataType::Utf8);
+        // Layout compatibility must not become an implicit value cast.
+        assert!(normalize_write_array(&input, &DataType::Int32).is_err());
+        assert!(normalize_write_array(&input, &DataType::Binary).is_err());
+    }
+
+    #[test]
+    fn large_strings_inside_rows_and_arrays_keep_visible_nullability_checks() {
+        let text: ArrayRef = Arc::new(arrow_array::LargeStringArray::from(vec![
+            None,
+            Some("中文"),
+            None,
+        ]));
+        let input = Arc::new(StructArray::new(
+            vec![Field::new("text", DataType::LargeUtf8, true)].into(),
+            vec![text],
+            Some(NullBuffer::from(vec![false, true, true])),
+        )) as ArrayRef;
+        let target = DataType::Struct(vec![Field::new("text", DataType::Utf8, false)].into());
+        assert!(normalize_write_array(&input, &target).is_err());
+        // The first child's NULL is hidden by a NULL ROW, so it is allowed.
+        let normalized = normalize_write_array(&input.slice(0, 2), &target).unwrap();
+        let row = normalized.as_any().downcast_ref::<StructArray>().unwrap();
+        assert!(row.is_null(0));
+        assert_eq!(
+            row.column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(1),
+            "中文"
+        );
+        let list = Arc::new(
+            ListArray::new(
+                Arc::new(Field::new("item", DataType::LargeUtf8, true)),
+                OffsetBuffer::new(vec![0, 1, 3].into()),
+                Arc::new(arrow_array::LargeStringArray::from(vec![
+                    Some("outside"),
+                    Some("中文"),
+                    None,
+                ])),
+                None,
+            )
+            .slice(1, 1),
+        ) as ArrayRef;
+        let expected = DataType::List(Arc::new(Field::new("element", DataType::Utf8, true)));
+        let list = normalize_write_array(&list, &expected).unwrap();
+        assert_eq!(list.data_type(), &expected);
+        assert_eq!(
+            list.as_any()
+                .downcast_ref::<ListArray>()
+                .unwrap()
+                .value(0)
+                .to_data(),
+            StringArray::from(vec![Some("中文"), None]).to_data()
+        );
+    }
 
     #[test]
     fn vector_child_aliases_preserve_sliced_values_and_nulls() {
@@ -761,6 +1196,84 @@ mod tests {
             None,
         );
         assert!(normalize_blob_write_field(&visible_overflow, &expected).is_err());
+    }
+
+    #[test]
+    fn blob_map_updates_normalize_keys_and_transport_before_value_casts() {
+        let entries = StructArray::new(
+            vec![
+                Field::new("k", DataType::Utf8, false),
+                Field::new("v", DataType::Utf8, true),
+            ]
+            .into(),
+            vec![
+                Arc::new(StringArray::from(vec!["1.235"])),
+                Arc::new(StringArray::from(vec!["new"])),
+            ],
+            None,
+        );
+        let entry_field = Arc::new(Field::new("input", entries.data_type().clone(), false));
+        let offsets = OffsetBuffer::new(vec![0_i32, 1].into());
+        let map: ArrayRef = Arc::new(MapArray::new(
+            entry_field.clone(),
+            offsets.clone(),
+            entries.clone(),
+            None,
+            false,
+        ));
+        let list: ArrayRef = Arc::new(ListArray::new(
+            entry_field,
+            offsets,
+            Arc::new(entries),
+            None,
+        ));
+        let expected = Field::new(
+            "payload",
+            DataType::Map(
+                Arc::new(Field::new(
+                    "entries",
+                    DataType::Struct(
+                        vec![
+                            Field::new("key", DataType::Decimal128(10, 2), false),
+                            Field::new("value", DataType::LargeBinary, true),
+                        ]
+                        .into(),
+                    ),
+                    false,
+                )),
+                false,
+            ),
+            true,
+        );
+        let normalized = [map, list]
+            .iter()
+            .map(|array| normalize_blob_update_field(array, &expected).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(normalized[0].0, normalized[1].0);
+        assert_eq!(normalized[0].1.to_data(), normalized[1].1.to_data());
+        let list = normalized[0]
+            .1
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        let entries = list
+            .values()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        assert_eq!(
+            entries
+                .column(0)
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .unwrap()
+                .value(0),
+            124
+        );
+        // Preserve the original input value type until the row-ID updater
+        // casts against the actual read layout, including its nullability.
+        assert_eq!(entries.column(1).data_type(), &DataType::Utf8);
+        assert!(normalize_blob_write_field(&normalized[0].1, &expected).is_err());
     }
 
     #[test]

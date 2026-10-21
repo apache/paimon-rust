@@ -38,6 +38,12 @@ pub struct PostponeBucketPlan {
 }
 
 impl PostponeBucketPlan {
+    pub(super) fn from_counts(bucket_counts: HashMap<Vec<u8>, i32>) -> Self {
+        Self {
+            bucket_counts: Arc::new(bucket_counts),
+            default_bucket_num: None,
+        }
+    }
     pub fn from_arrow(table: &Table, batch: &RecordBatch) -> Result<Self> {
         let partition_fields = table.schema().partition_fields();
         let partition_count = partition_fields.len();

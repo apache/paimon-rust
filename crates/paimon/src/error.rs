@@ -118,6 +118,16 @@ pub enum Error {
     TagAlreadyExist { tag_name: String },
     #[snafu(display("Tag {} does not exist.", tag_name))]
     TagNotExist { tag_name: String },
+    #[snafu(display("Branch {} of table {} already exists.", branch_name, full_name))]
+    BranchAlreadyExist {
+        full_name: String,
+        branch_name: String,
+    },
+    #[snafu(display("Branch {} of table {} does not exist.", branch_name, full_name))]
+    BranchNotExist {
+        full_name: String,
+        branch_name: String,
+    },
     #[snafu(display("View {} already exists.", full_name))]
     ViewAlreadyExist { full_name: String },
     #[snafu(display("View {} does not exist.", full_name))]

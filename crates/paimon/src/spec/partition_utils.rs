@@ -408,9 +408,10 @@ fn format_partition_value(
             s.to_string()
         }
 
-        DataType::Binary(_) | DataType::VarBinary(_) if !legacy => {
-            // Java's BinaryToStringCastRule wraps the raw bytes in a
-            // BinaryString, whose toString decodes them as UTF-8.
+        DataType::Binary(_) | DataType::VarBinary(_) => {
+            // Java uses BinaryToStringCastRule even for legacy names: a raw
+            // byte[].toString() contains a new allocation identity on each read.
+            // BinaryString.toString decodes the bytes as UTF-8.
             let value = decode_java_utf8(row.get_binary(pos)?);
             if is_java_whitespace_only(&value) {
                 return Ok(default_partition_name.to_string());
@@ -467,9 +468,7 @@ fn format_partition_value(
             }
         }
 
-        DataType::Binary(_)
-        | DataType::VarBinary(_)
-        | DataType::Variant(_)
+        DataType::Variant(_)
         | DataType::Blob(_)
         | DataType::Array(_)
         | DataType::Map(_)
@@ -495,7 +494,7 @@ pub fn format_java_float(value: f32) -> String {
 /// Decode as Java's UTF-8 decoder does for `BinaryString.toString()`.
 /// Rust's lossy decoder replaces each byte of a UTF-8 encoded surrogate,
 /// while Java replaces the complete malformed surrogate sequence once.
-fn decode_java_utf8(mut bytes: &[u8]) -> String {
+pub(crate) fn decode_java_utf8(mut bytes: &[u8]) -> String {
     let mut decoded = String::with_capacity(bytes.len());
     loop {
         match std::str::from_utf8(bytes) {
@@ -1435,14 +1434,6 @@ mod tests {
 
     #[test]
     fn test_unsupported_types() {
-        // Legacy binary uses byte[].toString() in Java, which contains an
-        // allocation-specific identity hash and cannot name a stable path.
-        assert_single_partition_err(
-            "data",
-            DataType::Binary(BinaryType::new(10).unwrap()),
-            |b| b.write_int(0, 0),
-            true,
-        );
         // Array
         assert_single_partition_err(
             "arr",
@@ -1505,70 +1496,75 @@ mod tests {
 
     #[test]
     fn test_binary_partition_uses_utf8_cast_and_path_escaping() {
-        assert_single_partition(
-            "bin",
-            DataType::Binary(BinaryType::new(16).unwrap()),
-            |b| b.write_string(0, "a/b=c"),
-            "bin=a%2Fb%3Dc/",
-            false,
-        );
-        assert_single_partition(
-            "bin",
-            DataType::VarBinary(VarBinaryType::new(16).unwrap()),
-            |b| b.write_string(0, "汉字"),
-            "bin=汉字/",
-            false,
-        );
-        assert_single_partition(
-            "bin",
-            DataType::VarBinary(VarBinaryType::new(16).unwrap()),
-            |b| b.write_string(0, "  "),
-            "bin=__DEFAULT_PARTITION__/",
-            false,
-        );
-    }
-
-    #[test]
-    fn test_binary_partition_matches_java_whitespace() {
-        // Modern JVMs (Java 11/17) treat U+001C as whitespace but U+180E as a
-        // format character, and never fold U+00A0 or U+2007. Rust str::trim
-        // differs for controls and NBSP, so we match Java explicitly.
-        for (value, expected) in [
-            (b"\x1c".as_slice(), "bin=__DEFAULT_PARTITION__/"),
-            // U+180E is whitespace only on legacy JDK 8; a modern JVM keeps it.
-            ("\u{180E}".as_bytes(), "bin=\u{180E}/"),
-            ("\u{00A0}".as_bytes(), "bin=\u{00A0}/"),
-            ("\u{2007}".as_bytes(), "bin=\u{2007}/"),
-        ] {
+        for legacy in [false, true] {
+            assert_single_partition(
+                "bin",
+                DataType::Binary(BinaryType::new(16).unwrap()),
+                |b| b.write_string(0, "a/b=c"),
+                "bin=a%2Fb%3Dc/",
+                legacy,
+            );
             assert_single_partition(
                 "bin",
                 DataType::VarBinary(VarBinaryType::new(16).unwrap()),
-                |b| b.write_bytes(0, value),
-                expected,
-                false,
+                |b| b.write_string(0, "汉字"),
+                "bin=汉字/",
+                legacy,
+            );
+            assert_single_partition(
+                "bin",
+                DataType::VarBinary(VarBinaryType::new(16).unwrap()),
+                |b| b.write_string(0, "  "),
+                "bin=__DEFAULT_PARTITION__/",
+                legacy,
             );
         }
     }
 
     #[test]
+    fn test_binary_partition_matches_java_whitespace() {
+        // Modern JVMs treat U+001C as whitespace but U+180E as a format
+        // character, and never fold U+00A0 or U+2007. Rust str::trim differs
+        // for controls and NBSP, so match Java for both naming modes.
+        for legacy in [false, true] {
+            for (value, expected) in [
+                (b"\x1c".as_slice(), "bin=__DEFAULT_PARTITION__/"),
+                ("\u{180E}".as_bytes(), "bin=\u{180E}/"),
+                ("\u{00A0}".as_bytes(), "bin=\u{00A0}/"),
+                ("\u{2007}".as_bytes(), "bin=\u{2007}/"),
+            ] {
+                assert_single_partition(
+                    "bin",
+                    DataType::VarBinary(VarBinaryType::new(16).unwrap()),
+                    |b| b.write_bytes(0, value),
+                    expected,
+                    legacy,
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_binary_partition_matches_java_malformed_utf8() {
-        // Expected replacements were checked against JDK 8 new String(bytes, UTF_8).
-        for (value, expected) in [
-            (b"\xED\xA0\x80".as_slice(), "bin=\u{FFFD}/"),
-            (b"\xED\xA0".as_slice(), "bin=\u{FFFD}/"),
-            (b"\xED\xA0A".as_slice(), "bin=\u{FFFD}A/"),
-            (b"\xED\xA0\xFF".as_slice(), "bin=\u{FFFD}\u{FFFD}/"),
-            (b"\xE0\x80\x80".as_slice(), "bin=\u{FFFD}\u{FFFD}\u{FFFD}/"),
-            (b"\xE2\x82".as_slice(), "bin=\u{FFFD}/"),
-            (b"\xE2(\xA1".as_slice(), "bin=\u{FFFD}(\u{FFFD}/"),
-        ] {
-            assert_single_partition(
-                "bin",
-                DataType::VarBinary(VarBinaryType::new(16).unwrap()),
-                |b| b.write_bytes(0, value),
-                expected,
-                false,
-            );
+        // Expected replacements were checked against new String(bytes, UTF_8).
+        for legacy in [false, true] {
+            for (value, expected) in [
+                (b"\xED\xA0\x80".as_slice(), "bin=\u{FFFD}/"),
+                (b"\xED\xA0".as_slice(), "bin=\u{FFFD}/"),
+                (b"\xED\xA0A".as_slice(), "bin=\u{FFFD}A/"),
+                (b"\xED\xA0\xFF".as_slice(), "bin=\u{FFFD}\u{FFFD}/"),
+                (b"\xE0\x80\x80".as_slice(), "bin=\u{FFFD}\u{FFFD}\u{FFFD}/"),
+                (b"\xE2\x82".as_slice(), "bin=\u{FFFD}/"),
+                (b"\xE2(\xA1".as_slice(), "bin=\u{FFFD}(\u{FFFD}/"),
+            ] {
+                assert_single_partition(
+                    "bin",
+                    DataType::VarBinary(VarBinaryType::new(16).unwrap()),
+                    |b| b.write_bytes(0, value),
+                    expected,
+                    legacy,
+                );
+            }
         }
     }
 

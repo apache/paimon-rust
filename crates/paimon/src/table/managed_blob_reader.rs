@@ -249,10 +249,17 @@ impl ManagedBlobReadPlan {
                             message: format!("Managed BLOB output projection is missing a column: {error}"),
                             source: Some(Box::new(error)),
                         })?;
-                    yield batch.project(&indices).map_err(|error| crate::Error::DataInvalid {
+                    let output = batch.project(&indices).map_err(|error| crate::Error::DataInvalid {
                         message: format!("Failed to project managed BLOB read output: {error}"),
                         source: Some(Box::new(error)),
                     })?;
+                    let source_fields = indices.iter()
+                        .map(|index| self.scan_fields[*index].clone()).collect::<Vec<_>>();
+                    let schema = crate::arrow::build_read_arrow_schema(&self.output_fields)?;
+                    let schema = super::row_sidecar::propagate_blob_data(&schema, &output);
+                    yield super::data_file_reader::project_residual_output(
+                        output, &source_fields, &self.output_fields, schema,
+                    )?;
                 }
             }
         })
@@ -331,7 +338,7 @@ impl<'a> BlobPredicateBatch<'a> {
                         .map(|(active, matched)| *active && !matched)
                         .collect())
                 }
-                Predicate::Leaf { op, .. } => {
+                Predicate::Leaf { op, .. } | Predicate::NestedLeaf { op, .. } => {
                     let fields = self
                         .blob_fields
                         .iter()
@@ -737,6 +744,100 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn nested_and_blob_predicates_restore_pruned_row_output() {
+        use crate::spec::{
+            BlobType, DataType, Datum, IntType, PredicateBuilder, RowType, VarCharType,
+        };
+        use arrow_array::{Int32Array, StringArray};
+        use futures::TryStreamExt;
+
+        let io = FileIOBuilder::new("memory").build().unwrap();
+        io.new_output("memory:/nested-blob")
+            .unwrap()
+            .write(bytes::Bytes::from_static(b"yes"))
+            .await
+            .unwrap();
+        let descriptor = BlobDescriptor::new("memory:/nested-blob".into(), 0, 3).serialize();
+        let score = DataField::new(10, "score".into(), DataType::Int(IntType::new()));
+        let label = DataField::new(
+            11,
+            "label".into(),
+            DataType::VarChar(VarCharType::string_type()),
+        );
+        let fields = vec![
+            DataField::new(
+                0,
+                "profile".into(),
+                DataType::Row(RowType::new(vec![score, label.clone()])),
+            ),
+            DataField::new(1, "payload".into(), DataType::Blob(BlobType::new())),
+        ];
+        let output = vec![DataField::new(
+            0,
+            "profile".into(),
+            DataType::Row(RowType::new(vec![label])),
+        )];
+        let schema = crate::arrow::build_read_arrow_schema(&fields).unwrap();
+        let ArrowDataType::Struct(children) = schema.field(0).data_type() else {
+            unreachable!()
+        };
+        let profiles = StructArray::new(
+            children.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![7, 8])),
+                Arc::new(StringArray::from(vec!["selected", "discarded"])),
+            ],
+            None,
+        );
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(profiles),
+                Arc::new(LargeBinaryArray::from(vec![
+                    descriptor.as_slice(),
+                    descriptor.as_slice(),
+                ])),
+            ],
+        )
+        .unwrap();
+        let builder = PredicateBuilder::new(&fields);
+        let score = builder.nested_field("profile", &["score"]).unwrap();
+        let predicate = Predicate::and(vec![
+            builder.equal(&score, Datum::Int(7)).unwrap(),
+            builder
+                .equal("payload", Datum::Bytes(b"yes".to_vec()))
+                .unwrap(),
+        ]);
+        let values = HashMap::new();
+        let options = CoreOptions::new(&values);
+        let plan = ManagedBlobReadPlan::new(&output, &[predicate], &fields, &options).unwrap();
+        let stream = Box::pin(futures::stream::iter(vec![Ok(batch)]));
+        let batches: Vec<_> = plan
+            .finish(stream, &options, io, 1, None)
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(batches.len(), 1);
+        let batch = &batches[0];
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(
+            batch.schema(),
+            crate::arrow::build_read_arrow_schema(&output).unwrap()
+        );
+        let profile = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let label = profile
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(label.value(0), "selected");
     }
 
     #[tokio::test]

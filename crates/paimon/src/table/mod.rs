@@ -19,6 +19,8 @@
 
 pub(crate) mod aggregator;
 mod audit_log_table;
+#[cfg(test)]
+mod authorized_write_tests;
 mod batch_vector_search_builder;
 pub(crate) mod bin_pack;
 mod bitmap_global_index_format;
@@ -78,6 +80,7 @@ mod full_text_search_builder;
 mod global_index_build_builder;
 pub(crate) mod global_index_build_common;
 mod global_index_drop_builder;
+mod global_index_result;
 pub(crate) mod global_index_scanner;
 mod global_index_search_filter;
 mod global_index_types;
@@ -85,6 +88,7 @@ mod hybrid_search_builder;
 mod incremental_scan;
 pub(crate) mod index_file_path;
 mod inline_blob;
+mod instant;
 mod kv_file_reader;
 mod kv_file_writer;
 mod lumina_index_build_builder;
@@ -101,6 +105,7 @@ mod mosaic_table_write_tests;
 mod object_table;
 mod partition_filter;
 mod partition_row_count;
+mod partition_spec;
 mod partition_stat;
 #[cfg(feature = "fulltext")]
 mod pk_full_text_bucket_search;
@@ -121,6 +126,7 @@ mod pk_vector_read;
 mod pk_vector_scan;
 mod pk_vector_search_params;
 mod postpone_bucket_plan;
+mod postpone_bucket_planner;
 mod postpone_file_writer;
 mod postpone_fixed_bucket_router;
 mod postpone_fixed_bucket_write;
@@ -128,7 +134,12 @@ mod postpone_fixed_bucket_write_builder;
 mod postpone_retract;
 mod prepared_files;
 mod query_auth;
+mod system_table;
+pub use system_table::SystemRead;
+
+mod key_normalization;
 mod read_builder;
+mod read_execution;
 mod read_limit;
 pub mod referenced_files;
 pub(crate) mod rest_env;
@@ -136,9 +147,9 @@ pub(crate) mod row_id_predicate;
 mod row_kind_generator;
 mod row_position_selection;
 mod row_sidecar;
-mod scan_trace;
+mod scan_stats;
 pub(crate) mod schema_manager;
-pub(crate) mod search_result;
+mod search_scan_split;
 mod shard_table_updater;
 pub(crate) mod snapshot_commit;
 mod snapshot_manager;
@@ -202,6 +213,9 @@ pub use full_text_search_builder::{
 use futures::stream::BoxStream;
 pub use global_index_build_builder::GlobalIndexBuildBuilder;
 pub use global_index_drop_builder::GlobalIndexDropBuilder;
+pub use global_index_result::{
+    GlobalIndexResult, GlobalIndexResultReadBuilder, PrimaryKeySearchPosition,
+};
 pub use global_index_types::{normalize_global_index_type, SUPPORTED_GLOBAL_INDEX_TYPES_FOR_DROP};
 pub use hybrid_search_builder::{
     HybridSearchBuilder, HybridSearchRanker, HybridSearchRoute, HybridSearchRouteKind,
@@ -209,8 +223,10 @@ pub use hybrid_search_builder::{
 pub use incremental_scan::{
     IncrementalPlan, IncrementalScan, IncrementalScanMode, IncrementalSplit,
 };
+pub use instant::Instant;
 pub use object_table::{ObjectEntry, ObjectTable};
 pub use partition_row_count::PartitionRowCount;
+pub use partition_spec::parse_partition_spec_value;
 pub use partition_stat::PartitionStat;
 pub use pk_vector_bucket_split::{BucketVectorPayload, BucketVectorSearchSplit};
 pub use postpone_bucket_plan::{PostponeBucketPlan, POSTPONE_BUCKET_PLAN_TOTAL_BUCKETS_FIELD};
@@ -220,9 +236,9 @@ pub use postpone_fixed_bucket_write::{
 pub use postpone_fixed_bucket_write_builder::PostponeFixedBucketWriteBuilder;
 pub use read_builder::ReadBuilder;
 pub use rest_env::RESTEnv;
-pub use scan_trace::ScanTrace;
+pub use scan_stats::ScanStats;
 pub use schema_manager::SchemaManager;
-pub use search_result::{PrimaryKeySearchPosition, SearchResult, SearchResultReadBuilder};
+pub use search_scan_split::SearchScanSplit;
 pub use shard_table_updater::ShardTableUpdater;
 pub use snapshot_commit::{RESTSnapshotCommit, RenamingSnapshotCommit, SnapshotCommit};
 pub use snapshot_manager::SnapshotManager;
@@ -260,14 +276,14 @@ use std::sync::Arc;
 #[derive(Debug, Clone)]
 enum ReadSnapshot {
     Empty,
-    Snapshot(Arc<Snapshot>),
+    Snapshot(Arc<Snapshot>, Arc<tokio::sync::OnceCell<()>>),
 }
 
 impl ReadSnapshot {
     fn snapshot(&self) -> Option<&Snapshot> {
         match self {
             Self::Empty => None,
-            Self::Snapshot(snapshot) => Some(snapshot),
+            Self::Snapshot(snapshot, _) => Some(snapshot),
         }
     }
 }
@@ -286,8 +302,9 @@ pub struct Table {
     /// replay a grant.
     query_auth_session: Option<u64>,
     rest_env: Option<RESTEnv>,
-    /// True when this table copy was switched to a historical schema by
-    /// [`Table::copy_with_time_travel`]. Such a copy is read-only.
+    /// True for a time-traveled or captured read view. Scans and row matching
+    /// use its selected snapshot. Writers retain its schema; commits publish
+    /// against latest state.
     time_traveled: bool,
     /// Captured snapshot or empty view, so scans don't resolve latest again.
     /// Cleared when [`Table::copy_with_options`] changes the selector.
@@ -387,6 +404,23 @@ impl Table {
     /// Get the table's schema.
     pub fn schema(&self) -> &TableSchema {
         &self.schema
+    }
+
+    pub(crate) fn data_fields_extractor(
+        &self,
+    ) -> impl Fn(&[DataField]) -> Result<Vec<DataField>> + Send + Sync + 'static {
+        let primary_key = !self.schema.primary_keys().is_empty();
+        let key_value_fields = kv_file_reader::key_value_fields_extractor(
+            self.schema.fields(),
+            &self.schema.trimmed_primary_keys(),
+        );
+        move |fields| {
+            if primary_key {
+                key_value_fields(fields)
+            } else {
+                Ok(fields.to_vec())
+            }
+        }
     }
 
     /// Get the FileIO instance for this table.
@@ -490,10 +524,16 @@ impl Table {
         if !query_auth {
             return Ok(None);
         }
-        if self.reads_another_schema()? {
+        if self.identifier.system_table_name()?.is_some()
+            || rest_env
+                .identifier()
+                .branch_name()?
+                .as_deref()
+                .unwrap_or(DEFAULT_MAIN_BRANCH)
+                != self.branch
+        {
             return Err(query_auth::unsupported(
-                "a time-travelled or branch read authorizes against the table's current schema, \
-                 which is not the one it reads",
+                "the REST authorization identifier does not address this data table and branch",
             ));
         }
 
@@ -503,12 +543,62 @@ impl Table {
             query_auth::unsupported("this table handle was assembled rather than loaded")
         })?;
 
-        let response = rest_env
+        let (response, current) = rest_env
             .table_query_auth(self.schema.id(), self.schema.fields(), select.clone())
             .await?;
+        self.validate_authorized_snapshot(rest_env).await?;
+        let fields =
+            query_auth::historical_rule_fields(&response, current.fields(), self.schema.fields())?;
         Ok(Some(std::sync::Arc::new(
-            query_auth::QueryAuthGrant::parse(&response, session, select, self.schema.fields())?,
+            query_auth::QueryAuthGrant::parse(&response, session, select, &fields)?.bind(
+                self,
+                fields,
+                (current.id(), current.fields()),
+            ),
         )))
+    }
+
+    /// A captured snapshot supplied across the API boundary is metadata, not
+    /// proof that its manifest lists belong to this table and branch. Verify
+    /// it once while the authoritative snapshot is available, then retain the
+    /// verified view even if the snapshot file expires during the query.
+    async fn validate_authorized_snapshot(&self, rest_env: &RESTEnv) -> Result<()> {
+        let Some(ReadSnapshot::Snapshot(snapshot, verified)) = &self.travel_snapshot else {
+            return Ok(());
+        };
+        verified
+            .get_or_try_init(|| async {
+                match self.snapshot_manager().get_snapshot(snapshot.id()).await {
+                    Ok(stored) if snapshot.has_same_read_metadata(&stored) => return Ok(()),
+                    Ok(_) | Err(crate::Error::SnapshotNotExist { .. }) => (),
+                    Err(error) => return Err(error),
+                }
+                // A tag can retain a view after expiration or after rollback
+                // reuses its snapshot id for a different commit.
+                let retained = self.tag_manager().list_all().await;
+                if retained.as_ref().is_ok_and(|tags| {
+                    tags.iter()
+                        .any(|(_, stored)| snapshot.has_same_read_metadata(stored))
+                }) {
+                    return Ok(());
+                }
+                if rest_env
+                    .load_snapshot(&self.branch)
+                    .await?
+                    .as_ref()
+                    .is_some_and(|stored| snapshot.has_same_read_metadata(stored))
+                {
+                    return Ok(());
+                }
+                // Failure of one optional source must not block a matching
+                // authoritative source. Preserve its error if none can verify.
+                retained?;
+                Err(query_auth::unsupported(
+                    "cannot verify the pinned snapshot against this table and branch",
+                ))
+            })
+            .await?;
+        Ok(())
     }
 
     /// Handed out once per catalog-loaded table; wraps only after 2^64 loads.
@@ -538,6 +628,11 @@ impl Table {
         self.rest_env.is_some()
             && options.is_format_table()
             && options.partitioned_table_in_metastore()
+    }
+
+    /// Read a small system table using this table's resolved environment.
+    pub fn new_system_read(&self, name: &str) -> Result<SystemRead> {
+        SystemRead::new(self.clone(), name)
     }
 
     /// Create a read builder for scan/read.
@@ -649,8 +744,8 @@ impl Table {
     /// selects its metadata namespace without loading a different schema.
     /// An options-only replacement of the catalog-loaded schema keeps its REST
     /// authorization session and the stored immutable options.
-    /// Any cached time-travel resolution is discarded: subsequent scans resolve
-    /// the supplied options without replacing the supplied fields.
+    /// Changing a snapshot selector discards its cached resolution. Unchanged
+    /// selectors retain a verified historical snapshot and its schema.
     pub fn copy_with_resolved_schema(&self, schema: TableSchema, branch: &str) -> Result<Self> {
         schema.validate_resolved_structure()?;
         validate_branch_name(branch)?;
@@ -659,17 +754,31 @@ impl Table {
         // path; supplied fields, IDs, keys, comments and branch must all match.
         // REST synthesizes creation times independently in different clients.
         if self.query_auth_session.is_some()
-            && !self.time_traveled
-            && self.travel_snapshot.is_none()
             && branch == self.branch
             && schema.has_same_definition(&self.schema)
         {
+            let schema = self
+                .schema
+                .copy_with_replaced_dynamic_options(schema.options().clone());
+            let changed = [
+                SCAN_VERSION_OPTION,
+                SCAN_TIMESTAMP_MILLIS_OPTION,
+                SCAN_TIMESTAMP_OPTION,
+                SCAN_WATERMARK_OPTION,
+                SCAN_SNAPSHOT_ID_OPTION,
+                SCAN_TAG_NAME_OPTION,
+                "scan.mode",
+                "incremental-between-timestamp",
+            ]
+            .iter()
+            .any(|key| schema.options().get(*key) != self.schema.options().get(*key));
             return Ok(Self {
-                schema: self
-                    .schema
-                    .copy_with_replaced_dynamic_options(schema.options().clone()),
-                time_traveled: false,
-                travel_snapshot: None,
+                schema,
+                travel_snapshot: if changed {
+                    None
+                } else {
+                    self.travel_snapshot.clone()
+                },
                 applied_dynamic_option_keys: HashSet::new(),
                 ..self.clone()
             });
@@ -694,13 +803,13 @@ impl Table {
         })
     }
 
-    /// Create a read-only copy pinned to an already resolved snapshot.
+    /// Create a read view pinned to an already resolved snapshot.
     ///
     /// Replaces any selector that originally resolved the snapshot with an
     /// explicit `scan.snapshot-id`, so every subsequent scan stage observes the
     /// same snapshot. The snapshot's schema is loaded when it differs from the
     /// current table schema.
-    pub(crate) async fn copy_with_resolved_snapshot(&self, snapshot: &Snapshot) -> Result<Self> {
+    pub async fn copy_with_resolved_snapshot(&self, snapshot: &Snapshot) -> Result<Self> {
         let mut table = self.copy_with_pinned_snapshot(Some(snapshot));
         if snapshot.schema_id() != self.schema.id() {
             let schema = self.schema_manager.schema(snapshot.schema_id()).await?;
@@ -710,11 +819,12 @@ impl Table {
         Ok(table)
     }
 
-    /// Create a read-only copy pinned to a snapshot from this table and branch,
+    /// Create a read view pinned to a snapshot from this table and branch,
     /// preserving the current read schema and options other than scan selectors.
     ///
     /// Unlike time travel, pinning must not change the fields used by an already
-    /// planned query. The resolved snapshot is cached without additional I/O.
+    /// planned query. The resolved snapshot is cached; query authorization
+    /// verifies its origin on first use before trusting its manifest lists.
     /// `None` captures an empty view, which remains empty after later commits.
     pub fn copy_with_pinned_snapshot(&self, snapshot: Option<&Snapshot>) -> Self {
         let mut options = self.schema.options().clone();
@@ -751,7 +861,19 @@ impl Table {
             schema: self.schema.copy_with_replaced_options(options),
             time_traveled: true,
             travel_snapshot: Some(match snapshot {
-                Some(snapshot) => ReadSnapshot::Snapshot(Arc::new(snapshot.clone())),
+                Some(snapshot) => match &self.travel_snapshot {
+                    Some(view)
+                        if view
+                            .snapshot()
+                            .is_some_and(|known| known.has_same_read_metadata(snapshot)) =>
+                    {
+                        view.clone()
+                    }
+                    _ => ReadSnapshot::Snapshot(
+                        Arc::new(snapshot.clone()),
+                        Arc::new(tokio::sync::OnceCell::new()),
+                    ),
+                },
                 None => ReadSnapshot::Empty,
             }),
             ..self.clone()
@@ -769,6 +891,8 @@ impl Table {
     /// table's fields and keys come from that snapshot's schema while the
     /// runtime options stay merged. Column declarations follow the historical
     /// schema unless explicitly overridden, as in Java.
+    /// A different `branch` option first loads that branch's schema and catalog
+    /// identity, retaining the bound FileIO and preceding dynamic overrides.
     /// Like Java, resolution failures fall back silently to the current
     /// schema (the `if let Ok` below swallows them); an invalid selector
     /// still fails later at scan planning.
@@ -849,7 +973,28 @@ impl Table {
         CoreOptions::new(self.schema.options())
             .ensure_type_paimon_served(&self.identifier.full_name())?;
         self.ensure_format_table_partition_options_unchanged(&extra)?;
-        let mut table = self.copy_with_options(extra);
+        // Resolve a different branch before applying dynamic read options so
+        // its schema, REST identity and metadata namespace stay consistent.
+        let mut table = match extra.get("branch") {
+            Some(branch) if branch != self.branch() => {
+                let target = self.copy_with_branch(branch).await?;
+                // Earlier copy() overrides remain in effect on the new branch;
+                // other defaults come from its own schema.
+                let mut dynamic: HashMap<_, _> = self
+                    .applied_dynamic_option_keys
+                    .iter()
+                    .filter_map(|key| {
+                        self.schema
+                            .options()
+                            .get(key)
+                            .map(|value| (key.clone(), value.clone()))
+                    })
+                    .collect();
+                dynamic.extend(extra);
+                target.copy_with_options(dynamic)
+            }
+            _ => self.copy_with_options(extra),
+        };
         // Reject unimplemented scan options on the merged view before any IO, so
         // both table-level and per-read options are covered.
         CoreOptions::new(table.schema().options()).validate_scan_options()?;
@@ -873,7 +1018,12 @@ impl Table {
                 table.schema = snapshot_schema.copy_with_replaced_options(options);
                 table.time_traveled = true;
             }
-            table.travel_snapshot = Some(ReadSnapshot::Snapshot(Arc::new(snapshot)));
+            // Resolved by this table's snapshot/tag manager rather than supplied
+            // by a caller; its origin is already known.
+            table.travel_snapshot = Some(ReadSnapshot::Snapshot(
+                Arc::new(snapshot),
+                Arc::new(tokio::sync::OnceCell::new_with(Some(()))),
+            ));
         }
         Ok(table)
     }
@@ -925,7 +1075,8 @@ impl Table {
         };
         if let Some(env) = &self.rest_env {
             // Catalog branches may have no schema directory in the data store.
-            // Load their schema, identity and FileIO through the same catalog.
+            // Load their schema and identity through the same catalog. A table
+            // copy retains the original FileIO, including its bound FUSE mount.
             let identifier = env.identifier().with_branch(&branch)?;
             let (current, mut table) = tokio::try_join!(
                 env.current_table_identity_checked(),
@@ -942,6 +1093,13 @@ impl Table {
                     source: None,
                 });
             }
+            table.file_io = self.file_io.clone();
+            let schema_manager = SchemaManager::new(table.file_io.clone(), table.location.clone());
+            table.schema_manager = if branch == DEFAULT_MAIN_BRANCH {
+                schema_manager
+            } else {
+                schema_manager.with_branch(&branch)
+            };
             let mut options = table.schema.options().clone();
             options.insert("branch".to_string(), branch);
             table.schema = table.schema.copy_with_replaced_options(options);
@@ -977,8 +1135,9 @@ impl Table {
         })
     }
 
-    /// Whether this copy is read-only because its schema was time-traveled or
-    /// its read view was explicitly pinned (including an empty view).
+    /// Whether this copy has a time-traveled schema or an explicitly pinned
+    /// read view (including an empty view). Ordinary writes and commits reject
+    /// it; row-level updates retain its snapshot as their conflict baseline.
     pub fn is_time_traveled(&self) -> bool {
         self.time_traveled
     }

@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::global_index_result::PyGlobalIndexResult;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -26,7 +27,8 @@ use futures::stream::BoxStream;
 use futures::TryStreamExt;
 use paimon::spec::{is_variant_extraction_row, DataField, DataType, Predicate, RowType};
 use paimon::table::{
-    ArrowRecordBatchStream, DataSplit, IncrementalScanMode, RowRange, StreamTableScan, Table,
+    ArrowRecordBatchStream, DataSplit, GlobalIndexResult, IncrementalScanMode, RowRange,
+    StreamTableScan, Table,
 };
 use paimon_datafusion::runtime::runtime;
 use pyo3::exceptions::{PyBaseException, PyRuntimeError, PyTypeError, PyValueError};
@@ -105,7 +107,7 @@ fn apply_read_config(
 /// any iterable (list/tuple/generator). Runs under the GIL since it touches
 /// Python objects. A non-iterable argument or a non-`Split` element raises
 /// `TypeError`.
-fn extract_splits(splits: &Bound<'_, PyAny>) -> PyResult<Vec<DataSplit>> {
+pub(crate) fn extract_splits(splits: &Bound<'_, PyAny>) -> PyResult<Vec<DataSplit>> {
     let iter = splits
         .try_iter()
         .map_err(|_| PyTypeError::new_err("read() expects a sequence of Split objects"))?;
@@ -344,6 +346,7 @@ impl PyReadBuilder {
             row_ranges: self.row_ranges.clone(),
             case_sensitive: self.case_sensitive,
             incremental_scan: None,
+            global_index_result: None,
             row_position_slice: None,
             row_position_shard: None,
             chunk_shuffle: None,
@@ -407,6 +410,7 @@ pub struct PyTableScan {
     row_ranges: Option<Vec<RowRange>>,
     case_sensitive: bool,
     incremental_scan: Option<PyIncrementalScan>,
+    global_index_result: Option<GlobalIndexResult>,
     row_position_slice: Option<(u64, u64)>,
     row_position_shard: Option<(u64, u64)>,
     chunk_shuffle: Option<PyChunkShuffle>,
@@ -443,6 +447,11 @@ fn parse_incremental_scan_mode(mode: &str) -> PyResult<IncrementalScanMode> {
 impl PyTableScan {
     fn core_scan(&self) -> PyResult<paimon::table::TableScan<'_>> {
         let mut scan = self.read_builder()?.new_scan();
+        if let Some(result) = &self.global_index_result {
+            scan = scan
+                .with_global_index_result(result.clone())
+                .map_err(to_py_err)?;
+        }
         if let Some((start, end)) = self.row_position_slice {
             scan = scan
                 .with_row_position_slice(start, end)
@@ -471,6 +480,11 @@ impl PyTableScan {
         mode: IncrementalScanMode,
     ) -> PyResult<paimon::table::IncrementalScan<'_>> {
         let mut scan = self.read_builder()?.new_incremental_scan(mode, start, end);
+        if let Some(result) = &self.global_index_result {
+            scan = scan
+                .with_global_index_result(result.clone())
+                .map_err(to_py_err)?;
+        }
         if let Some((start, end)) = self.row_position_slice {
             scan = scan
                 .with_row_position_slice(start, end)
@@ -531,40 +545,14 @@ struct PyBucketFilterState {
     error: Option<Py<PyBaseException>>,
 }
 
-#[pymethods]
 impl PyStreamTableScan {
-    fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
-        let state = self.bucket_filter.lock().unwrap();
-        visit.call(&state.filter)?;
-        visit.call(&state.error)
-    }
-
-    fn __clear__(&mut self) {
-        let references = {
-            let mut state = self.bucket_filter.lock().unwrap();
-            (state.filter.take(), state.error.take())
-        };
-        // Drop Python references outside the lock: destructors may re-enter
-        // Python. The core closure sees an empty filter and retains no cycle.
-        drop(references);
-    }
-
-    #[pyo3(signature = (filter = None))]
-    fn with_bucket_filter(
-        mut slf: PyRefMut<'_, Self>,
-        filter: Option<Py<PyAny>>,
-    ) -> PyResult<PyRefMut<'_, Self>> {
-        if filter
-            .as_ref()
-            .is_some_and(|filter| !filter.bind(slf.py()).is_callable())
-        {
-            return Err(PyTypeError::new_err("bucket filter must be callable"));
+    fn install_bucket_filter(&mut self) {
+        if self.bucket_filter.lock().unwrap().filter.is_none() {
+            self.scan.with_bucket_filter(|_| Ok(true));
+            return;
         }
-        let previous_filter =
-            std::mem::replace(&mut slf.bucket_filter.lock().unwrap().filter, filter);
-        drop(previous_filter);
-        let state = Arc::clone(&slf.bucket_filter);
-        slf.scan.with_bucket_filter(move |bucket| {
+        let state = Arc::clone(&self.bucket_filter);
+        self.scan.with_bucket_filter(move |bucket| {
             Python::attach(|py| {
                 // Release the lock before invoking Python: callbacks may run
                 // GC, which traverses this same state.
@@ -591,6 +579,64 @@ impl PyStreamTableScan {
                     })
             })
         });
+    }
+}
+
+#[pymethods]
+impl PyStreamTableScan {
+    fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
+        let state = self.bucket_filter.lock().unwrap();
+        visit.call(&state.filter)?;
+        visit.call(&state.error)
+    }
+
+    fn __clear__(&mut self) {
+        let references = {
+            let mut state = self.bucket_filter.lock().unwrap();
+            (state.filter.take(), state.error.take())
+        };
+        // Drop Python references outside the lock: destructors may re-enter
+        // Python. The core closure sees an empty filter and retains no cycle.
+        drop(references);
+    }
+
+    /// Copy scan progress with independently owned Python callback references.
+    fn __copy__(&self, py: Python<'_>) -> Self {
+        let filter = self
+            .bucket_filter
+            .lock()
+            .unwrap()
+            .filter
+            .as_ref()
+            .map(|filter| filter.clone_ref(py));
+        let mut copy = Self {
+            scan: self.scan.clone(),
+            bucket_filter: Arc::new(Mutex::new(PyBucketFilterState {
+                filter,
+                error: None,
+            })),
+        };
+        // Each wrapper owns one Python reference and its core callback captures
+        // that wrapper's state. Sharing the Arc would duplicate GC traversal.
+        copy.install_bucket_filter();
+        copy
+    }
+
+    #[pyo3(signature = (filter = None))]
+    fn with_bucket_filter(
+        mut slf: PyRefMut<'_, Self>,
+        filter: Option<Py<PyAny>>,
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        if filter
+            .as_ref()
+            .is_some_and(|filter| !filter.bind(slf.py()).is_callable())
+        {
+            return Err(PyTypeError::new_err("bucket filter must be callable"));
+        }
+        let previous_filter =
+            std::mem::replace(&mut slf.bucket_filter.lock().unwrap().filter, filter);
+        drop(previous_filter);
+        slf.install_bucket_filter();
         Ok(slf)
     }
 
@@ -645,6 +691,29 @@ impl PyStreamTableScan {
 
 #[pymethods]
 impl PyTableScan {
+    /// Supply an evaluated selection; validation and authorization stay in core.
+    fn with_global_index_result<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        result: PyRef<'py, PyGlobalIndexResult>,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        let result = result.inner.clone();
+        if let Some(incremental) = slf.incremental_scan {
+            slf.core_incremental_scan(
+                incremental.start_snapshot_id,
+                incremental.end_snapshot_id,
+                incremental.mode,
+            )?
+            .with_global_index_result(result.clone())
+            .map_err(to_py_err)?;
+        } else {
+            slf.core_scan()?
+                .with_global_index_result(result.clone())
+                .map_err(to_py_err)?;
+        }
+        slf.global_index_result = Some(result);
+        Ok(slf)
+    }
+
     /// Select a half-open range of append-table row positions.
     fn with_row_position_slice(
         mut slf: PyRefMut<'_, Self>,
@@ -700,6 +769,18 @@ impl PyTableScan {
         Ok(slf)
     }
 
+    fn plan_all_files(&self, py: Python<'_>) -> PyResult<PyPlan> {
+        py.detach(|| {
+            runtime().block_on(async {
+                self.core_scan()?
+                    .plan_all_files()
+                    .await
+                    .map(PyPlan::from)
+                    .map_err(to_py_err)
+            })
+        })
+    }
+
     fn plan(&self, py: Python<'_>) -> PyResult<PyPlan> {
         py.detach(|| {
             runtime().block_on(async {
@@ -721,6 +802,123 @@ impl PyTableScan {
     }
 }
 
+#[pyclass(name = "ScanStats", module = "pypaimon_rust.datafusion", frozen)]
+pub struct PyScanStats {
+    inner: paimon::table::ScanStats,
+}
+
+#[pymethods]
+impl PyScanStats {
+    #[getter]
+    fn base_manifest_files(&self) -> usize {
+        self.inner.base_manifest_files
+    }
+    #[getter]
+    fn delta_manifest_files(&self) -> usize {
+        self.inner.delta_manifest_files
+    }
+    #[getter]
+    fn manifest_files_before_partition_pruning(&self) -> usize {
+        self.inner.manifest_files_before_partition_pruning
+    }
+    #[getter]
+    fn manifest_files_after_partition_pruning(&self) -> usize {
+        self.inner.manifest_files_after_partition_pruning
+    }
+    #[getter]
+    fn manifest_files_pruned_by_row_ranges(&self) -> usize {
+        self.inner.manifest_files_pruned_by_row_ranges
+    }
+    #[getter]
+    fn manifest_entries_read(&self) -> usize {
+        self.inner.manifest_entries_read
+    }
+    #[getter]
+    fn manifest_entries_pruned_by_bucket(&self) -> usize {
+        self.inner.manifest_entries_pruned_by_bucket
+    }
+    #[getter]
+    fn manifest_entries_pruned_by_partition(&self) -> usize {
+        self.inner.manifest_entries_pruned_by_partition
+    }
+    #[getter]
+    fn manifest_entries_after_entry_pruning(&self) -> usize {
+        self.inner.manifest_entries_after_entry_pruning
+    }
+    #[getter]
+    fn manifest_entries_pruned_by_level(&self) -> usize {
+        self.inner.manifest_entries_pruned_by_level
+    }
+    #[getter]
+    fn manifest_entries_pruned_by_row_ranges(&self) -> usize {
+        self.inner.manifest_entries_pruned_by_row_ranges
+    }
+    #[getter]
+    fn manifest_entries_pruned_by_data_stats(&self) -> usize {
+        self.inner.manifest_entries_pruned_by_data_stats
+    }
+    #[getter]
+    fn manifest_entries_after_manifest_filters(&self) -> usize {
+        self.inner.manifest_entries_after_manifest_filters
+    }
+    #[getter]
+    fn manifest_entries_after_merge(&self) -> usize {
+        self.inner.manifest_entries_after_merge
+    }
+    #[getter]
+    fn manifest_entries_pruned_by_cross_schema_stats(&self) -> usize {
+        self.inner.manifest_entries_pruned_by_cross_schema_stats
+    }
+    #[getter]
+    fn manifest_entries_after_cross_schema_stats(&self) -> usize {
+        self.inner.manifest_entries_after_cross_schema_stats
+    }
+    #[getter]
+    fn data_evolution_groups_before_stats(&self) -> usize {
+        self.inner.data_evolution_groups_before_stats
+    }
+    #[getter]
+    fn data_evolution_groups_pruned_by_stats(&self) -> usize {
+        self.inner.data_evolution_groups_pruned_by_stats
+    }
+    #[getter]
+    fn data_evolution_groups_pruned_by_row_ranges(&self) -> usize {
+        self.inner.data_evolution_groups_pruned_by_row_ranges
+    }
+    #[getter]
+    fn split_candidates_built(&self) -> usize {
+        self.inner.split_candidates_built
+    }
+    #[getter]
+    fn limit_early_stopped(&self) -> bool {
+        self.inner.limit_early_stopped
+    }
+    #[getter]
+    fn splits_before_limit(&self) -> usize {
+        self.inner.splits_before_limit
+    }
+    #[getter]
+    fn splits_after_limit(&self) -> usize {
+        self.inner.splits_after_limit
+    }
+    #[getter]
+    fn final_splits(&self) -> usize {
+        self.inner.final_splits
+    }
+    #[getter]
+    fn final_files(&self) -> usize {
+        self.inner.final_files
+    }
+    #[getter]
+    fn planned_data_file_bytes(&self) -> u64 {
+        self.inner.planned_data_file_bytes
+    }
+    #[getter]
+    fn limit(&self) -> Option<usize> {
+        self.inner.limit
+    }
+}
+
 #[pyclass(name = "TableRead", module = "pypaimon_rust.datafusion")]
 pub struct PyTableRead {
     table: Arc<Table>,
@@ -738,6 +936,8 @@ impl PyTableRead {
         &self,
         py: Python<'_>,
         splits: &Bound<'_, PyAny>,
+        parallelism: usize,
+        ordered: bool,
     ) -> PyResult<ArrowRecordBatchStream> {
         let splits = extract_splits(splits)?;
         py.detach(|| {
@@ -760,7 +960,15 @@ impl PyTableRead {
             // Validate config (e.g. projection) before the empty-splits fast
             // path so an invalid projection fails consistently regardless of
             // how many splits are passed.
-            let read = builder.new_read().map_err(to_py_err)?;
+            let read = builder
+                .new_read()
+                .map_err(to_py_err)?
+                .with_parallelism(parallelism)
+                .map_err(to_py_err)?
+                .with_ordered(ordered);
+            let splits = runtime()
+                .block_on(read.authorize_splits(&splits))
+                .map_err(to_py_err)?;
             if self.include_row_kind {
                 read.to_arrow_with_row_kind(&splits).map_err(to_py_err)
             } else {
@@ -772,20 +980,35 @@ impl PyTableRead {
 
 #[pymethods]
 impl PyTableRead {
-    /// Lazily read the given splits as an iterator of PyArrow RecordBatches.
+    /// Lazily read the given splits as PyArrow RecordBatches.
+    /// Core owns split scheduling, the global row limit and cancellation.
+    /// ordered=True retains the supplied split order; the default emits ready groups first.
+    #[pyo3(signature = (splits, *, parallelism = 1, ordered = false))]
     fn read_arrow(
         &self,
         py: Python<'_>,
         splits: &Bound<'_, PyAny>,
+        parallelism: usize,
+        ordered: bool,
     ) -> PyResult<PyRecordBatchReader> {
-        Ok(PyRecordBatchReader::from_stream(
-            self.read_stream(py, splits)?,
-        ))
+        Ok(PyRecordBatchReader::from_stream(self.read_stream(
+            py,
+            splits,
+            parallelism,
+            ordered,
+        )?))
     }
 
     /// Read the given splits into a list of PyArrow RecordBatches.
-    fn read(&self, py: Python<'_>, splits: &Bound<'_, PyAny>) -> PyResult<Vec<Py<PyAny>>> {
-        let stream = self.read_stream(py, splits)?;
+    #[pyo3(signature = (splits, *, parallelism = 1, ordered = false))]
+    fn read(
+        &self,
+        py: Python<'_>,
+        splits: &Bound<'_, PyAny>,
+        parallelism: usize,
+        ordered: bool,
+    ) -> PyResult<Vec<Py<PyAny>>> {
+        let stream = self.read_stream(py, splits, parallelism, ordered)?;
         let rt = runtime();
         let batches = py.detach(|| {
             rt.block_on(stream.try_collect::<Vec<_>>())
@@ -896,16 +1119,12 @@ impl PyRecordBatchReader {
 
 #[pyclass(name = "Plan", module = "pypaimon_rust.datafusion")]
 pub struct PyPlan {
-    splits: Vec<DataSplit>,
-    snapshot_id: Option<i64>,
+    inner: paimon::table::Plan,
 }
 
 impl From<paimon::table::Plan> for PyPlan {
     fn from(plan: paimon::table::Plan) -> Self {
-        Self {
-            splits: plan.splits().to_vec(),
-            snapshot_id: plan.snapshot_id(),
-        }
+        Self { inner: plan }
     }
 }
 
@@ -914,11 +1133,18 @@ impl PyPlan {
     /// Snapshot selected by the scan, even when pruning produces no splits.
     /// `None` means no snapshot was selected, including snapshot-free format tables.
     fn snapshot_id(&self) -> Option<i64> {
-        self.snapshot_id
+        self.inner.snapshot_id()
+    }
+
+    fn stats(&self) -> PyScanStats {
+        PyScanStats {
+            inner: self.inner.stats().clone(),
+        }
     }
 
     fn splits(&self) -> Vec<PySplit> {
-        self.splits
+        self.inner
+            .splits()
             .iter()
             .cloned()
             .map(|inner| PySplit { inner })
@@ -926,7 +1152,7 @@ impl PyPlan {
     }
 
     fn __len__(&self) -> usize {
-        self.splits.len()
+        self.inner.splits().len()
     }
 }
 
@@ -972,7 +1198,7 @@ impl PySplit {
     ///
     /// This is deliberately separate from the constructor used by pickle:
     /// pickle bytes are an opaque Rust JSON encoding, while this method accepts
-    /// Java/Python-compatible DataSplit and score-free IndexedSplit frames.
+    /// Java/Python-compatible DataSplit and IndexedSplit frames, including scores.
     #[staticmethod]
     fn deserialize(state: &Bound<'_, PyBytes>) -> PyResult<Self> {
         Ok(Self {
@@ -1009,7 +1235,157 @@ mod tests {
     use std::task::Poll;
     use std::time::Duration;
 
+    use paimon::catalog::Identifier;
+    use paimon::io::FileIOBuilder;
+    use paimon::spec::{IntType, Schema, TableSchema};
+    use pyo3::types::PyList;
+
     use super::*;
+
+    #[test]
+    fn stream_scan_copy_keeps_callback_ownership_and_progress_independent() {
+        Python::attach(|py| {
+            for bound_method in [false, true] {
+                let schema = Schema::builder()
+                    .column("id", DataType::Int(IntType::new()))
+                    .build()
+                    .unwrap();
+                let table = Arc::new(Table::new(
+                    FileIOBuilder::new("memory").build().unwrap(),
+                    Identifier::new("default", "stream_copy"),
+                    "memory:/stream-copy".into(),
+                    TableSchema::new(0, &schema),
+                    None,
+                ));
+                let scan =
+                    Py::new(py, PyReadBuilder::new(table).new_stream_scan().unwrap()).unwrap();
+                let globals = PyDict::new(py);
+                globals.set_item("scan", scan).unwrap();
+                globals.set_item("bound_method", bound_method).unwrap();
+                py.run(
+                    c"
+import copy
+import gc
+import weakref
+
+class Owner:
+    def __init__(self):
+        self.scan = scan.with_bucket_filter(self.select if bound_method else self)
+        self.scan.restore(1)
+        self.copied = copy.copy(self.scan)
+
+    def select(self, bucket):
+        return True
+
+    def __call__(self, bucket):
+        return self.select(bucket)
+
+owner = Owner()
+assert owner.scan is not owner.copied
+owner.copied.restore(2)
+assert owner.scan.checkpoint() == 1
+assert owner.copied.checkpoint() == 2
+owner.scan.restore(3)
+assert owner.copied.checkpoint() == 2
+reference = weakref.ref(owner)
+del scan
+gc.collect()
+assert reference() is owner
+del owner
+gc.collect()
+assert reference() is None
+",
+                    Some(&globals),
+                    None,
+                )
+                .unwrap();
+            }
+        });
+    }
+
+    #[test]
+    fn table_read_execution_keywords_validate_before_empty_splits() {
+        Python::attach(|py| {
+            let schema = Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .build()
+                .unwrap();
+            let table = Arc::new(Table::new(
+                FileIOBuilder::new("memory").build().unwrap(),
+                Identifier::new("default", "read_execution_keywords"),
+                "memory:/read-execution-keywords".into(),
+                TableSchema::new(0, &schema),
+                None,
+            ));
+            let read = Py::new(py, PyReadBuilder::new(table).new_read()).unwrap();
+            for method in ["read", "read_arrow"] {
+                for ordered in [false, true] {
+                    let kwargs = PyDict::new(py);
+                    kwargs.set_item("parallelism", 3).unwrap();
+                    kwargs.set_item("ordered", ordered).unwrap();
+                    let result = read
+                        .bind(py)
+                        .call_method(method, (PyList::empty(py),), Some(&kwargs))
+                        .unwrap();
+                    if method == "read" {
+                        assert_eq!(result.len().unwrap(), 0);
+                    } else {
+                        let reader: PyRef<PyRecordBatchReader> = result.extract().unwrap();
+                        assert!(reader.next_record_batch().unwrap().is_none());
+                        reader.close_reader();
+                        reader.close_reader();
+                    }
+
+                    kwargs.set_item("parallelism", 0).unwrap();
+                    let error = read
+                        .bind(py)
+                        .call_method(method, (PyList::empty(py),), Some(&kwargs))
+                        .unwrap_err();
+                    assert!(error.is_instance_of::<PyValueError>(py));
+                    assert!(error.to_string().contains("parallelism"));
+                }
+
+                let signature = py
+                    .import("inspect")
+                    .unwrap()
+                    .getattr("signature")
+                    .unwrap()
+                    .call1((read.bind(py).getattr(method).unwrap(),))
+                    .unwrap();
+                let ordered = signature
+                    .getattr("parameters")
+                    .unwrap()
+                    .get_item("ordered")
+                    .unwrap();
+                assert!(!ordered
+                    .getattr("default")
+                    .unwrap()
+                    .extract::<bool>()
+                    .unwrap());
+                assert_eq!(
+                    ordered
+                        .getattr("kind")
+                        .unwrap()
+                        .getattr("name")
+                        .unwrap()
+                        .extract::<String>()
+                        .unwrap(),
+                    "KEYWORD_ONLY"
+                );
+
+                // Keep the existing no-keyword entry point and reject positional
+                // execution options, which would be ambiguous in future APIs.
+                read.bind(py)
+                    .call_method1(method, (PyList::empty(py),))
+                    .unwrap();
+                let error = read
+                    .bind(py)
+                    .call_method1(method, (PyList::empty(py), 3))
+                    .unwrap_err();
+                assert!(error.is_instance_of::<PyTypeError>(py));
+            }
+        });
+    }
 
     #[test]
     fn record_batch_reader_releases_stream_on_completion_or_error() {

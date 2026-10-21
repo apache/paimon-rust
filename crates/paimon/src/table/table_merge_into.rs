@@ -302,11 +302,9 @@ pub(super) async fn merge_into(
     let projection = projection.into_iter().collect::<Vec<_>>();
     let mut builder = scan_table.new_read_builder();
     builder.with_projection(&projection.iter().map(String::as_str).collect::<Vec<_>>())?;
-    let plan = if snapshot.is_some() {
-        builder.new_scan().with_scan_all_files().plan().await?
-    } else {
-        super::source::Plan::new(Vec::new())
-    };
+    // The target may be empty, but its whole-table authorization must still
+    // precede source callbacks and insert-only MERGE actions.
+    let plan = builder.new_scan().plan_all_files().await?;
     let index = RowIdFileIndex::from_splits(scan_table.clone(), plan.splits())?;
     let source = match source {
         MergeSource::Batches(batches) => Some(MergeInput::new(batches)?),
@@ -427,14 +425,18 @@ pub(super) async fn merge_into(
                         .map_err(|error| invalid(error.to_string()))?
                         .data_type()
                 };
-                if source_type != target_type
+                let mut logical_source_type = source_type;
+                while let DataType::Dictionary(_, value) = logical_source_type {
+                    logical_source_type = value;
+                }
+                if logical_source_type != target_type
                     || !super::upsert_key_matcher::supported_key_type(target_type)
                 {
                     return Err(invalid(
                         "MERGE ON key types must match and support row encoding",
                     ));
                 }
-                Ok(SortField::new(source_type.clone()))
+                Ok(SortField::new(target_type.clone()))
             })
             .collect::<crate::Result<_>>()?;
         let key_converter =
@@ -442,8 +444,18 @@ pub(super) async fn merge_into(
         for (chunk, batch) in source.batches.iter().enumerate() {
             let keys = on
                 .iter()
-                .map(|(_, name)| batch.column_by_name(name).unwrap().clone())
-                .collect::<Vec<_>>();
+                .map(|(target, name)| {
+                    let expected = if target == ROW_ID {
+                        &DataType::Int64
+                    } else {
+                        schema.field_with_name(target).unwrap().data_type()
+                    };
+                    super::key_normalization::normalize_match_key(
+                        batch.column_by_name(name).unwrap(),
+                        expected,
+                    )
+                })
+                .collect::<crate::Result<Vec<_>>>()?;
             let rows = key_converter
                 .convert_columns(&keys)
                 .map_err(|error| invalid(error.to_string()))?;
@@ -463,7 +475,7 @@ pub(super) async fn merge_into(
     let check_cardinality = !matched.is_empty()
         && !(matched.len() == 1 && matched[0].delete && matched[0].condition.is_none());
     let mut joined = Vec::new();
-    let mut stream = builder.new_read()?.to_arrow(plan.splits())?;
+    let mut stream = builder.new_read()?.for_update().to_arrow(plan.splits())?;
     while let Some(target) = stream.try_next().await? {
         if let Some(source) = &source {
             let keys = on

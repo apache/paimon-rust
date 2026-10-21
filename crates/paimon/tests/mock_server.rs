@@ -1055,11 +1055,11 @@ impl RESTServer {
 
         let key = format!("{db}.{table}.{}", request.tag_name);
         if state.tags.contains_key(&key) {
-            return resource_error(StatusCode::CONFLICT, "tag", &request.tag_name);
+            return resource_error(StatusCode::CONFLICT, "TAG", &request.tag_name);
         }
         let snapshot_id = request.snapshot_id.unwrap_or(1);
         if snapshot_id != 1 {
-            return resource_error(StatusCode::NOT_FOUND, "snapshot", &snapshot_id.to_string());
+            return resource_error(StatusCode::NOT_FOUND, "SNAPSHOT", &snapshot_id.to_string());
         }
         state.tags.insert(
             key,
@@ -1083,7 +1083,7 @@ impl RESTServer {
         }
         match state.tags.get(&format!("{db}.{table}.{tag}")) {
             Some(response) => (StatusCode::OK, Json(response.clone())).into_response(),
-            None => resource_error(StatusCode::NOT_FOUND, "tag", &tag),
+            None => resource_error(StatusCode::NOT_FOUND, "TAG", &tag),
         }
     }
 
@@ -1098,7 +1098,7 @@ impl RESTServer {
         if state.tags.remove(&format!("{db}.{table}.{tag}")).is_some() {
             (StatusCode::OK, Json(json!(""))).into_response()
         } else {
-            resource_error(StatusCode::NOT_FOUND, "tag", &tag)
+            resource_error(StatusCode::NOT_FOUND, "TAG", &tag)
         }
     }
 
@@ -1803,6 +1803,17 @@ impl RESTServer {
             )
         });
     }
+    /// Override the database location used to validate FUSE mounts.
+    pub fn set_database_location(&self, name: &str, location: Option<&str>) {
+        self.inner
+            .lock()
+            .unwrap()
+            .databases
+            .get_mut(name)
+            .unwrap()
+            .location = location.map(str::to_string);
+    }
+
     /// Add a no-permission database to the server state.
     pub fn add_no_permission_database(&self, name: &str) {
         let mut s = self.inner.lock().unwrap();

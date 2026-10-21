@@ -63,7 +63,15 @@ pub(crate) fn to_callback_error(error: paimon::Error) -> PyErr {
             ) => source
                 .as_deref()
                 .map(|source| source as &(dyn std::error::Error + 'static)),
-            _ => cause.source(),
+            // std::io::Error::source skips its custom error itself. Inspect
+            // that value too, since positional index I/O wraps Paimon errors.
+            _ => match cause.downcast_ref::<std::io::Error>() {
+                Some(error) => error
+                    .get_ref()
+                    .map(|error| error as &(dyn std::error::Error + 'static))
+                    .or_else(|| cause.source()),
+                None => cause.source(),
+            },
         };
         match next {
             Some(source) => cause = source,

@@ -20,10 +20,10 @@
 use crate::api::rest_api::RESTApi;
 use crate::api::rest_error::RestError;
 use crate::api::GetTableResponse;
-use crate::catalog::{Identifier, RESTToken, RESTTokenFileIO};
+use crate::catalog::{FusePathResolver, Identifier, RESTToken, RESTTokenFileIO};
 use crate::common::{CatalogOptions, Options};
 use crate::error::Error;
-use crate::io::cache::{create_local_cache_with_namespace, LocalCache};
+use crate::io::cache::{create_local_cache_with_namespace_async, LocalCache};
 use crate::io::{FileIO, FileIOCacheContext};
 use crate::spec::{CoreOptions, TableSchema, PATH_OPTION};
 use crate::table::snapshot_commit::{RESTSnapshotCommit, SnapshotCommit};
@@ -64,8 +64,10 @@ impl Table {
             .get(CatalogOptions::DATA_TOKEN_ENABLED)
             .map(|v| v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
-        let local_cache = create_local_cache_with_namespace(&rest_options, api.options())?;
+        let local_cache =
+            create_local_cache_with_namespace_async(&rest_options, api.options()).await?;
         let file_io_cache = FileIOCacheContext::from_props(api.options().to_map())?;
+        let fuse_resolver = Arc::new(FusePathResolver::new(api.options()));
         RESTEnv::build_table_with_token(
             &identifier,
             response,
@@ -75,6 +77,7 @@ impl Table {
             local_cache,
             file_io_cache,
             initial_token,
+            fuse_resolver,
         )
         .await
     }
@@ -91,6 +94,7 @@ pub struct RESTEnv {
     data_token_enabled: bool,
     local_cache: Option<Arc<LocalCache>>,
     file_io_cache: FileIOCacheContext,
+    fuse_resolver: Arc<FusePathResolver>,
 }
 
 impl std::fmt::Debug for RESTEnv {
@@ -113,6 +117,7 @@ impl RESTEnv {
         local_cache: Option<Arc<LocalCache>>,
         file_io_cache: FileIOCacheContext,
     ) -> Self {
+        let fuse_resolver = Arc::new(FusePathResolver::new(api.options()));
         Self {
             identifier,
             uuid,
@@ -121,6 +126,7 @@ impl RESTEnv {
             data_token_enabled,
             local_cache,
             file_io_cache,
+            fuse_resolver,
         }
     }
 
@@ -134,18 +140,36 @@ impl RESTEnv {
         &self.api
     }
 
-    /// Bracketed by a freshness check: the response names no table, so a
-    /// re-create in between would serve a replacement's grant.
+    /// Bind the response to a stable catalog entity and latest rule schema.
+    /// Historical views use their own schema only when executing these rules.
     pub(crate) async fn table_query_auth(
         &self,
         schema_id: i64,
         fields: &[crate::spec::DataField],
         select: Option<Vec<String>>,
-    ) -> Result<crate::api::AuthTableQueryResponse> {
-        self.current_table_checked(schema_id, fields).await?;
+    ) -> Result<(crate::api::AuthTableQueryResponse, TableSchema)> {
+        let current = self.current_table_identity_checked().await?;
+        // A catalog-loaded handle can predate a normal schema evolution, just
+        // as a historical view does. Reusing an id for different fields is not
+        // a legitimate evolution and must still fail closed.
+        if current.schema_id == Some(schema_id) {
+            self.check_schema(&current, schema_id, fields)?;
+        }
+        let schema = current.schema.as_ref().ok_or_else(|| Error::DataInvalid {
+            message: "REST query authorization requires the current schema".into(),
+            source: None,
+        })?;
+        let schema = TableSchema::new(
+            current.schema_id.ok_or_else(|| Error::DataInvalid {
+                message: "REST query authorization requires the current schema id".into(),
+                source: None,
+            })?,
+            schema,
+        );
         let response = self.api.auth_table_query(&self.identifier, select).await?;
-        self.current_table_checked(schema_id, fields).await?;
-        Ok(response)
+        self.current_table_checked(schema.id(), schema.fields())
+            .await?;
+        Ok((response, schema))
     }
 
     /// Refused unless the name still resolves to the loaded table, a missing
@@ -156,6 +180,16 @@ impl RESTEnv {
         fields: &[crate::spec::DataField],
     ) -> Result<GetTableResponse> {
         let response = self.current_table_identity_checked().await?;
+        self.check_schema(&response, schema_id, fields)?;
+        Ok(response)
+    }
+
+    fn check_schema(
+        &self,
+        response: &GetTableResponse,
+        schema_id: i64,
+        fields: &[crate::spec::DataField],
+    ) -> Result<()> {
         let name = self.identifier.full_name();
         let same = |what: &str, loaded: String, now: Option<String>| match now {
             Some(now) if now == loaded => Ok(()),
@@ -190,7 +224,7 @@ impl RESTEnv {
                 source: None,
             });
         }
-        Ok(response)
+        Ok(())
     }
 
     /// Refused unless the identifier still resolves to this catalog entity.
@@ -258,6 +292,7 @@ impl RESTEnv {
             self.data_token_enabled,
             self.local_cache.clone(),
             self.file_io_cache.clone(),
+            self.fuse_resolver.clone(),
         )
         .await
     }
@@ -270,6 +305,7 @@ impl RESTEnv {
         data_token_enabled: bool,
         local_cache: Option<Arc<LocalCache>>,
         file_io_cache: FileIOCacheContext,
+        fuse_resolver: Arc<FusePathResolver>,
     ) -> Result<Table> {
         let response = Self::fetch_table_response(identifier, &api).await?;
         Self::build_table(
@@ -280,6 +316,7 @@ impl RESTEnv {
             data_token_enabled,
             local_cache,
             file_io_cache,
+            fuse_resolver,
         )
         .await
     }
@@ -294,6 +331,7 @@ impl RESTEnv {
             .map_err(|e| map_rest_error_for_table(e, identifier))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn build_table(
         identifier: &Identifier,
         response: crate::api::GetTableResponse,
@@ -302,6 +340,7 @@ impl RESTEnv {
         data_token_enabled: bool,
         local_cache: Option<Arc<LocalCache>>,
         file_io_cache: FileIOCacheContext,
+        fuse_resolver: Arc<FusePathResolver>,
     ) -> Result<Table> {
         Self::build_table_with_token(
             identifier,
@@ -312,6 +351,7 @@ impl RESTEnv {
             local_cache,
             file_io_cache,
             None,
+            fuse_resolver,
         )
         .await
     }
@@ -327,6 +367,7 @@ impl RESTEnv {
         local_cache: Option<Arc<LocalCache>>,
         file_io_cache: FileIOCacheContext,
         initial_token: Option<RESTToken>,
+        fuse_resolver: Arc<FusePathResolver>,
     ) -> Result<Table> {
         let identifier = response_identifier(identifier, &response)?;
         let schema = response.schema.ok_or_else(|| Error::DataInvalid {
@@ -394,10 +435,11 @@ impl RESTEnv {
             local_cache.clone(),
             file_io_cache.clone(),
             initial_token,
+            (!is_external).then_some(fuse_resolver.as_ref()),
         )
         .await?;
 
-        let rest_env = RESTEnv::new(
+        let mut rest_env = RESTEnv::new(
             identifier.clone(),
             uuid,
             api,
@@ -406,6 +448,7 @@ impl RESTEnv {
             local_cache,
             file_io_cache,
         );
+        rest_env.fuse_resolver = fuse_resolver;
         let parsed_identifier = identifier.parsed_object_name()?;
         let branch = parsed_identifier.branch_or_default().to_string();
         let branch_reference = parsed_identifier.branch().is_some();
@@ -423,6 +466,7 @@ impl RESTEnv {
         Ok(table.with_query_auth_session())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn build_object_table(
         identifier: &Identifier,
         response: crate::api::GetTableResponse,
@@ -431,6 +475,7 @@ impl RESTEnv {
         data_token_enabled: bool,
         local_cache: Option<Arc<LocalCache>>,
         file_io_cache: FileIOCacheContext,
+        fuse_resolver: Arc<FusePathResolver>,
     ) -> Result<ObjectTable> {
         let identifier = response_identifier(identifier, &response)?;
         let schema = response.schema.ok_or_else(|| Error::DataInvalid {
@@ -475,12 +520,14 @@ impl RESTEnv {
             data_token_enabled && !is_external,
             local_cache,
             file_io_cache,
+            (!is_external).then_some(fuse_resolver.as_ref()),
         )
         .await?;
 
         ObjectTable::try_new(file_io, identifier, &table_schema)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn build_file_io(
         identifier: &Identifier,
         path: &str,
@@ -489,6 +536,7 @@ impl RESTEnv {
         use_data_token: bool,
         local_cache: Option<Arc<LocalCache>>,
         file_io_cache: FileIOCacheContext,
+        fuse_resolver: Option<&FusePathResolver>,
     ) -> Result<FileIO> {
         Self::build_file_io_with_token(
             identifier,
@@ -499,6 +547,7 @@ impl RESTEnv {
             local_cache,
             file_io_cache,
             None,
+            fuse_resolver,
         )
         .await
     }
@@ -514,7 +563,22 @@ impl RESTEnv {
         local_cache: Option<Arc<LocalCache>>,
         file_io_cache: FileIOCacheContext,
         initial_token: Option<RESTToken>,
+        fuse_resolver: Option<&FusePathResolver>,
     ) -> Result<FileIO> {
+        if let Some(fuse) = fuse_resolver {
+            if let Some(file_io) = fuse
+                .file_io(
+                    path,
+                    identifier,
+                    &api,
+                    local_cache.clone(),
+                    file_io_cache.clone(),
+                )
+                .await?
+            {
+                return Ok(file_io);
+            }
+        }
         if use_data_token {
             let mut token_file_io = RESTTokenFileIO::new(
                 identifier.clone(),
@@ -790,6 +854,7 @@ mod tests {
             false,
             None,
             file_io_cache.clone(),
+            None,
         )
         .await
         .unwrap();
@@ -801,6 +866,7 @@ mod tests {
             false,
             None,
             file_io_cache,
+            None,
         )
         .await
         .unwrap();

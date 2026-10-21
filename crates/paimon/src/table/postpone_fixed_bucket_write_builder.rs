@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::postpone_bucket_plan::data_invalid;
 use super::postpone_fixed_bucket_router::validate_postpone_fixed_bucket_table;
 use crate::resource::ResourceContext;
 use crate::spec::CoreOptions;
@@ -85,11 +84,10 @@ impl<'a> PostponeFixedBucketWriteBuilder<'a> {
         ensure_table_write_allowed(self.table)?;
         let load_existing_buckets = self.bucket_plan.is_none() && !self.overwrite;
         let plan = match &self.bucket_plan {
-            Some(plan) => plan.clone(),
-            None => PostponeBucketPlan::with_default_bucket_num(
-                CoreOptions::new(self.table.schema().options()).postpone_default_bucket_num()?
-                    .ok_or_else(|| data_invalid("A resolved postpone bucket plan is required unless postpone.default-bucket-num is configured"))?,
-            ),
+            Some(plan) => Some(plan.clone()),
+            None => CoreOptions::new(self.table.schema().options())
+                .postpone_default_bucket_num()?
+                .map(PostponeBucketPlan::with_default_bucket_num),
         };
         PostponeFixedBucketTableWrite::new(
             self.table,
@@ -132,13 +130,11 @@ mod tests {
         setup_dirs(&file_io, table_path).await;
         let table = test_postpone_pk_table(&file_io, table_path);
 
-        let error = table
+        table
             .new_postpone_fixed_bucket_write_builder()
             .unwrap()
             .new_write()
-            .err()
             .unwrap();
-        assert!(error.to_string().contains("bucket plan is required"));
 
         let builder = table
             .new_postpone_fixed_bucket_write_builder()
@@ -199,5 +195,38 @@ mod tests {
             .iter()
             .all(|message| message.total_buckets == Some(3) && (0..3).contains(&message.bucket)));
         builder.new_commit().commit(messages).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn automatic_bucket_count_uses_the_whole_input() {
+        let io = test_file_io();
+        let path = "memory:/automatic_postpone_count";
+        setup_dirs(&io, path).await;
+        let table =
+            test_postpone_pk_table(&io, path).copy_with_options(std::collections::HashMap::from([
+                ("postpone.target-row-num-per-bucket".into(), "2".into()),
+                (
+                    "postpone.batch-write-fixed-bucket.max-parallelism".into(),
+                    "8".into(),
+                ),
+            ]));
+        let builder = table.new_postpone_fixed_bucket_write_builder().unwrap();
+        let mut writer = builder.new_write().unwrap();
+        writer
+            .write_arrow_batch(&make_batch(vec![1, 2], vec![10, 20]))
+            .await
+            .unwrap();
+        writer
+            .write_arrow_batch(&make_batch(vec![3, 4, 5], vec![30, 40, 50]))
+            .await
+            .unwrap();
+        let messages = writer.prepare_commit().await.unwrap();
+        assert!(!messages.is_empty());
+        assert!(messages.iter().all(|m| m.total_buckets == Some(4)));
+        builder.new_commit().commit(messages).await.unwrap();
+        assert_eq!(
+            super::super::table_write::tests::read_id_value_rows(&table).await,
+            vec![(1, 10), (2, 20), (3, 30), (4, 40), (5, 50)]
+        );
     }
 }

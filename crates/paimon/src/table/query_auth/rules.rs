@@ -118,6 +118,35 @@ impl Rules {
         Ok(Self { filters, masks })
     }
 
+    /// Java compares an AND of catalog filters as a set of conjuncts.
+    pub(crate) fn same_policy(&self, other: &Self) -> bool {
+        if self.masks != other.masks {
+            return false;
+        }
+        if self.filters == other.filters {
+            return true;
+        }
+        fn conjuncts(filters: &[RowFilter]) -> Vec<RowFilter> {
+            fn collect(filter: &RowFilter, out: &mut Vec<RowFilter>) {
+                match filter {
+                    RowFilter::And(children) => {
+                        children.iter().for_each(|child| collect(child, out))
+                    }
+                    RowFilter::Predicate(Predicate::And(children)) => children
+                        .iter()
+                        .for_each(|child| collect(&child.clone().into(), out)),
+                    _ => out.push(filter.clone()),
+                }
+            }
+            let mut out = Vec::new();
+            filters.iter().for_each(|filter| collect(filter, &mut out));
+            out
+        }
+        let a = conjuncts(&self.filters);
+        let b = conjuncts(&other.filters);
+        a.iter().all(|f| b.contains(f)) && b.iter().all(|f| a.contains(f))
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         self.filters.is_empty() && self.masks.is_empty()
     }
@@ -192,6 +221,13 @@ pub(super) fn rule_mask(
     batch_fields: &[DataField],
 ) -> Result<BooleanArray> {
     match predicate {
+        Predicate::NestedLeaf { .. } => crate::arrow::residual::evaluate_predicate_mask(
+            batch,
+            predicate,
+            schema_fields,
+            batch_fields,
+        )?
+        .ok_or_else(|| unsupported("nested row filter cannot be evaluated")),
         Predicate::AlwaysTrue => Ok(BooleanArray::from(vec![true; batch.num_rows()])),
         Predicate::AlwaysFalse => Ok(BooleanArray::from(vec![false; batch.num_rows()])),
         Predicate::And(children) | Predicate::Or(children) => {

@@ -1373,16 +1373,38 @@ async fn empty_update_type_means_all_columns_for_upsert_only() {
 }
 
 #[tokio::test]
-async fn update_builder_rejects_overwrite_and_time_travel() {
+async fn update_builder_rejects_overwrite_but_historical_handle_can_publish_updates() {
     let table = evolution_table().await;
     assert!(table
         .new_write_builder()
         .with_overwrite()
         .new_update()
         .is_err());
+    seed(&table).await;
     let historical =
         table.copy_with_options(HashMap::from([("scan.snapshot-id".into(), "1".into())]));
-    assert!(historical.new_write_builder().new_update().is_err());
+    let messages = historical
+        .new_write_builder()
+        .new_update()
+        .unwrap()
+        .update_by_arrow_with_row_id(vec![matched(vec![0], &[("value", vec![11])])])
+        .await
+        .unwrap();
+    assert!(!messages.is_empty());
+    assert!(messages
+        .iter()
+        .all(|message| message.check_from_snapshot == Some(1)));
+    historical
+        .new_write_builder()
+        .try_new_commit()
+        .unwrap()
+        .commit(messages)
+        .await
+        .unwrap();
+    assert_eq!(
+        read_rows(&table).await,
+        vec![vec![1, 11, 100], vec![2, 20, 200], vec![3, 30, 300]]
+    );
 }
 
 #[tokio::test]

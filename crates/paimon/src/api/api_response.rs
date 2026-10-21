@@ -114,6 +114,12 @@ impl AuditRESTResponse {
     }
 }
 
+/// Branch names returned by a REST catalog, in server order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListBranchesResponse {
+    pub branches: Option<Vec<String>>,
+}
+
 /// Latest snapshot and table statistics returned by a REST catalog.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -162,6 +168,14 @@ pub struct GetTagResponse {
     pub snapshot: Snapshot,
     pub tag_create_time: Option<i64>,
     pub tag_time_retained: Option<String>,
+}
+
+/// Tag names and an opaque continuation token supplied by the REST server.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListTagsResponse {
+    pub tags: Option<Vec<String>>,
+    pub next_page_token: Option<String>,
 }
 
 /// Response for getting a persistent view.

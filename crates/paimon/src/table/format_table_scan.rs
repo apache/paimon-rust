@@ -24,7 +24,7 @@ use super::format_partition::{
     FormatTablePartitionPaths,
 };
 use super::format_partition_location::FormatPartitionLocations;
-use super::{Plan, RESTEnv, ScanTrace, Table};
+use super::{Plan, RESTEnv, ScanStats, Table};
 use crate::api::RestError;
 use crate::spec::stats::BinaryTableStats;
 use crate::spec::{
@@ -66,15 +66,9 @@ impl<'a> FormatTableScan<'a> {
 
     pub(crate) async fn plan(&self) -> crate::Result<Plan> {
         self.ensure_query_auth_allowed()?;
-        self.plan_inner(None).await
-    }
-
-    pub(crate) async fn plan_with_trace(&self) -> crate::Result<(Plan, ScanTrace)> {
-        self.ensure_query_auth_allowed()?;
-        let mut trace = ScanTrace::default();
-        let plan = self.plan_inner(Some(&mut trace)).await?;
-        trace.planned_data_file_bytes = plan.planned_data_file_bytes();
-        Ok((plan, trace))
+        let mut stats = ScanStats::default();
+        let plan = self.plan_inner(&mut stats).await?;
+        Ok(plan.with_scan_stats(stats))
     }
 
     fn ensure_query_auth_allowed(&self) -> crate::Result<()> {
@@ -82,7 +76,7 @@ impl<'a> FormatTableScan<'a> {
         CoreOptions::new(self.table.schema().options()).ensure_read_authorized()
     }
 
-    async fn plan_inner(&self, trace: Option<&mut ScanTrace>) -> crate::Result<Plan> {
+    async fn plan_inner(&self, scan_stats: &mut ScanStats) -> crate::Result<Plan> {
         if self.row_ranges.is_some() {
             return Err(crate::Error::Unsupported {
                 message: "Row ranges are not supported for format tables".to_string(),
@@ -155,9 +149,7 @@ impl<'a> FormatTableScan<'a> {
         });
         splits = self.apply_limit_pushdown(splits);
 
-        if let Some(trace) = trace {
-            trace.record_final_plan(splits.len(), splits.len(), splits.len());
-        }
+        scan_stats.record_split_planning(splits.len(), false);
         Ok(Plan::new(splits))
     }
 

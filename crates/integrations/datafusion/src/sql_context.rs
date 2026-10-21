@@ -1274,15 +1274,35 @@ impl SQLContext {
             );
         }
         let (catalog, catalog_name, identifier) = self.resolve_catalog_and_table(name)?;
-        let table = match catalog.get_table(&identifier).await {
-            Ok(table) => table,
+        let definition = match catalog.load_table(&identifier).await {
+            Ok(paimon::catalog::LoadedTable::External(external)) => {
+                let catalog_provider = self
+                    .ctx
+                    .catalog(&catalog_name)
+                    .ok_or_else(|| plan_datafusion_err!("Unknown catalog '{catalog_name}'"))?;
+                engine_table_definition(catalog_provider, &identifier, external.declared()).await?
+            }
+            Ok(paimon::catalog::LoadedTable::Paimon(table)) => {
+                crate::table_loader::ensure_paimon_served(&table, &identifier)?;
+                crate::table::build_table_definition(&table)?
+            }
+            Ok(paimon::catalog::LoadedTable::Object(_)) => {
+                return Err(plan_datafusion_err!(
+                    "table '{}' is declared 'object-table' and cannot be read as a Paimon table",
+                    identifier.full_name()
+                ));
+            }
+            Ok(_) => {
+                return Err(plan_datafusion_err!(
+                    "table '{}' cannot be read as a Paimon table",
+                    identifier.full_name()
+                ));
+            }
             Err(paimon::Error::TableNotExist { .. }) => {
                 return self.ctx.sql_with_options(sql, sql_options).await;
             }
             Err(e) => return Err(to_datafusion_error(e)),
         };
-        crate::table_loader::ensure_paimon_served(&table, &identifier)?;
-        let definition = crate::table::build_table_definition(&table)?;
         self.show_create_result(
             catalog_name,
             identifier.database().to_string(),
@@ -1587,15 +1607,13 @@ impl SQLContext {
         ok_result(&self.ctx)
     }
 
-    /// Reject write statements while a session-level time-travel selector is
-    /// active.
+    /// Reject latest-table statement executors while a session-level
+    /// time-travel selector is active.
     ///
-    /// Writes always operate on the latest table state, but in the same
-    /// session reads resolve through the time-travelled snapshot schema (and
-    /// INSERT through the provider is rejected by the write builder), so
-    /// silently ignoring the selector here would be inconsistent. Failing
-    /// with a clear message is safer than writing against a different schema
-    /// than concurrent reads observe.
+    /// These executors load the latest catalog table, while session reads
+    /// resolve the selected snapshot schema. Silently ignoring the selector
+    /// here would be inconsistent. Ordinary INSERT uses the resolved provider
+    /// and its selected schema, so it does not need this guard.
     fn ensure_no_time_travel_for_write(&self, operation: &str) -> DFResult<()> {
         use paimon::spec::{
             SCAN_SNAPSHOT_ID_OPTION, SCAN_TAG_NAME_OPTION, SCAN_TIMESTAMP_MILLIS_OPTION,
@@ -2453,6 +2471,34 @@ impl SQLContext {
     fn resolve_table_name(&self, name: &ObjectName) -> DFResult<Identifier> {
         let (_catalog, _catalog_name, identifier) = self.resolve_catalog_and_table(name)?;
         Ok(identifier)
+    }
+}
+
+/// DDL from the engine provider of an external table.
+async fn engine_table_definition(
+    catalog_provider: Arc<dyn datafusion::catalog::CatalogProvider>,
+    identifier: &Identifier,
+    declared: paimon::spec::TableType,
+) -> DFResult<String> {
+    let table_name = identifier.full_name();
+    let schema = catalog_provider
+        .schema(identifier.database())
+        .ok_or_else(|| plan_datafusion_err!("database '{}' not found", identifier.database()))?;
+    let provider = schema
+        .table(identifier.object())
+        .await?
+        .ok_or_else(|| plan_datafusion_err!("table '{table_name}' not found"))?;
+    if let Some(unavailable) =
+        provider.downcast_ref::<crate::catalog::UnavailableEngineTableProvider>()
+    {
+        return Err(unavailable.unavailable_error());
+    }
+    match provider.get_table_definition() {
+        Some(definition) if !definition.trim().is_empty() => Ok(definition.to_string()),
+        _ => Err(plan_datafusion_err!(
+            "SHOW CREATE TABLE is not supported for '{declared}' table '{table_name}': \
+             the table engine provides no definition"
+        )),
     }
 }
 

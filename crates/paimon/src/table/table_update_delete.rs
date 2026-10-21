@@ -24,17 +24,21 @@ use indexmap::IndexMap;
 
 use super::partition_filter::PartitionFilter;
 use super::{CommitMessage, DataEvolutionDeleteWriter, Table};
-use crate::spec::{
-    field_idx_to_partition_idx, CoreOptions, FileKind, IndexManifest, Predicate, Snapshot,
-};
+use crate::spec::{field_idx_to_partition_idx, FileKind, IndexManifest, Predicate, Snapshot};
 
 pub(super) async fn delete(
     table: &Table,
     predicate: Option<Predicate>,
 ) -> crate::Result<Vec<CommitMessage>> {
-    super::write_builder::ensure_table_write_allowed(table)?;
-    let options = CoreOptions::new(table.schema().options());
-    options.ensure_read_authorized()?;
+    super::write_builder::ensure_paimon_table(table)?;
+    // Partition-only deletes use manifest metadata directly, but still need
+    // the same unrestricted whole-table grant as row-level deletes. Authorize
+    // before the empty-target and partition-optimization branches.
+    let _authorized = table
+        .new_read_builder()
+        .new_scan()
+        .authorize_all_files()
+        .await?;
     if let Some(predicate) = &predicate {
         validate_predicate(predicate, &table.schema().fields_with_read_metadata())?;
     }
@@ -71,8 +75,8 @@ pub(super) async fn delete(
     if let Some(predicate) = predicate {
         builder.with_filter(predicate);
     }
-    let reader = builder.new_read()?;
-    let plan = builder.new_scan().with_scan_all_files().plan().await?;
+    let reader = builder.new_read()?.for_update();
+    let plan = builder.new_scan().plan_for_update().await?;
     let mut writer = DataEvolutionDeleteWriter::new(&scan_table)?;
     let mut batches = reader.to_arrow(plan.splits())?;
     while let Some(batch) = batches.try_next().await? {
@@ -86,6 +90,7 @@ fn validate_predicate(
     fields: &[crate::spec::DataField],
 ) -> crate::Result<()> {
     match predicate {
+        Predicate::NestedLeaf { .. } => predicate.validate_nested_fields(fields)?,
         Predicate::Leaf {
             column,
             index,

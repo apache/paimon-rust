@@ -3808,6 +3808,109 @@ async fn test_query_auth_blob_view_predicate_limit_groups_lookups() {
     }
 }
 
+#[cfg(not(windows))]
+#[tokio::test]
+async fn test_query_auth_blob_view_limit_skips_rejected_split() {
+    let payload = b"admitted-payload".to_vec();
+    let source = written(
+        "rejected_split_source",
+        blob_schema,
+        vec![blob_batch(vec![1], vec!["Source"], vec![payload.clone()])],
+    )
+    .await;
+    let picture_id = source.table.schema().fields()[2].id();
+    let reference = |row_id| {
+        BlobViewStruct::new(source.identifier.clone(), picture_id, row_id)
+            .serialize()
+            .unwrap()
+    };
+    let target = written(
+        "rejected_split_target",
+        |options| {
+            blob_schema(
+                &[
+                    options,
+                    &[
+                        ("blob-view-field", "picture"),
+                        ("source.split.target-size", "1b"),
+                    ],
+                ]
+                .concat(),
+            )
+        },
+        vec![
+            blob_batch(vec![0], vec!["Rejected"], vec![reference(99)]),
+            blob_batch(vec![1], vec!["Admitted"], vec![reference(0)]),
+        ],
+    )
+    .await;
+    let server = &target.ctx.server;
+    server.add_table_with_schema(
+        "default",
+        "rejected_split_source",
+        blob_schema(&[]),
+        source.table.location(),
+    );
+    target.set_rules(&[int_leaf(0, "id", "GREATER_THAN", 0)], &[]);
+    let mut builder = target.table.new_read_builder();
+    builder.with_limit(1);
+    let plan = builder.new_scan().plan().await.unwrap();
+    assert_eq!(plan.splits().len(), 2);
+
+    // Probe only ids so locating the rejected split cannot resolve its bad view.
+    let mut projected = target.table.new_read_builder();
+    projected.with_projection(&["id"]).unwrap();
+    let probe = projected.new_read().unwrap();
+    let mut rejected = None;
+    let mut admitted = None;
+    for split in plan.splits() {
+        let batches = probe
+            .to_arrow(std::slice::from_ref(split))
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let returned = ids(&batches);
+        if returned.is_empty() {
+            rejected = Some(split.clone());
+        } else {
+            assert_eq!(returned, vec![1]);
+            admitted = Some(split.clone());
+        }
+    }
+    let splits = vec![rejected.unwrap(), admitted.unwrap()];
+
+    for (include_row_kind, ordered) in [(false, false), (true, true)] {
+        let label = format!("row_kind={include_row_kind}, ordered={ordered}");
+        let read = builder.new_read().unwrap().with_ordered(ordered);
+        let stream = if include_row_kind {
+            read.to_arrow_with_row_kind(&splits)
+        } else {
+            read.to_arrow(&splits)
+        }
+        .unwrap();
+        let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+        let payload_batches: Vec<_> = batches
+            .iter()
+            .map(|batch| {
+                if include_row_kind {
+                    let kinds = column::<StringArray>(batch, "rowkind");
+                    assert_eq!(kinds.null_count(), 0, "{label}");
+                    assert!(kinds.iter().all(|kind| kind == Some("+I")), "{label}");
+                    batch.project(&[1, 2, 3]).unwrap()
+                } else {
+                    batch.clone()
+                }
+            })
+            .collect();
+        assert_eq!(
+            collect_blob_rows(&payload_batches),
+            vec![(1, "Admitted".to_string(), Some(payload.clone()))],
+            "{label}"
+        );
+    }
+}
+
 fn schema_of(columns: &[&str], options: &[(&str, &str)]) -> Schema {
     let mut builder = Schema::builder();
     for name in columns {
@@ -3990,7 +4093,7 @@ async fn test_query_auth_empty_table_defers_mask_output_class_checks() {
 }
 
 #[tokio::test]
-async fn test_query_auth_refuses_a_stale_handle() {
+async fn test_query_auth_validates_a_long_lived_handle_against_current_rules() {
     let g = guarded("drifting", &["id"]).await;
     g.ctx.server.set_table_schema_id(
         "default",
@@ -3999,10 +4102,8 @@ async fn test_query_auth_refuses_a_stale_handle() {
         7,
     );
 
-    assert_drifted(
-        plan_err(&g.table, "a handle whose schema drifted must be refused").await,
-        "now resolves to schema",
-    );
+    g.table.new_read_builder().new_scan().plan().await.unwrap();
+    assert_eq!(g.ctx.server.auth_selects("default", "drifting"), [None]);
 }
 
 #[tokio::test]
@@ -4200,7 +4301,7 @@ async fn test_a_decorated_name_loads_and_only_query_auth_refuses_it() {
         .await
         .expect("an ordinary table's name is the server's business");
     // The view such a name addresses is not what the server rules on.
-    for name in ["guarded$branch_dev", "guarded$files"] {
+    for name in ["guarded$files"] {
         let table = ctx
             .catalog
             .get_table(&Identifier::new("default", name))
@@ -4284,7 +4385,7 @@ async fn written(
     let mut fs_options = Options::new();
     fs_options.set(
         CatalogOptions::WAREHOUSE,
-        format!("file://{}", tmp.path().display()),
+        tmp.path().to_string_lossy().replace('\\', "/"),
     );
     let fs_catalog = FileSystemCatalog::new(fs_options).unwrap();
     fs_catalog
@@ -4863,10 +4964,53 @@ async fn test_query_auth_keeps_a_mask_source_in_another_partial_file() {
             .sum::<usize>(),
         1
     );
+    let write_plan = projected.new_scan().plan_all_files().await.unwrap();
+    assert_eq!(
+        write_plan
+            .splits()
+            .iter()
+            .map(|split| split.data_files().len())
+            .sum::<usize>(),
+        2
+    );
+
+    // A projected DE plan need not carry unrelated column slices. Restore
+    // against the projection's required files, while validating every supplied
+    // file against the full snapshot inventory.
+    let mut projected = g.table.new_read_builder();
+    projected.with_projection(&["visible"]).unwrap();
+    let projected_plan = projected.new_scan().plan().await.unwrap();
+    let transported = read_path_completion::transport(&projected_plan);
+    let reader = projected.new_read().unwrap();
+    let restored = reader.authorize_splits(&transported).await.unwrap();
+    let rows = reader
+        .to_arrow(&restored)
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    assert_eq!(rows.iter().map(|batch| batch.num_rows()).sum::<usize>(), 2);
+
     g.set_rules(
         &[],
         &[("visible", field_ref_mask(2, "source", "VARCHAR(255)"))],
     );
+    let mut protected = g.table.new_read_builder();
+    protected.with_projection(&["visible"]).unwrap();
+    let mut transported =
+        read_path_completion::transport(&protected.new_scan().plan().await.unwrap());
+    assert_eq!(transported.len(), 1);
+    let mut value = serde_json::to_value(&transported[0]).unwrap();
+    let files = value["data_files"].as_array_mut().unwrap();
+    files.retain(|file| file["_WRITE_COLS"] != serde_json::json!(["source"]));
+    transported[0] = serde_json::from_value(value).unwrap();
+    assert!(protected
+        .new_read()
+        .unwrap()
+        .authorize_splits(&transported)
+        .await
+        .is_err());
+
     for filtered in [false, true] {
         let mut builder = g.table.new_read_builder();
         builder.with_projection(&["visible"]).unwrap();
@@ -5049,31 +5193,21 @@ async fn test_query_auth_chunk_shuffle_with_partition_filters() {
                 .new_scan()
                 .with_chunk_shuffle(7, 2)
                 .expect("partition-only filters must allow chunk shuffle");
-            for traced in [false, true] {
-                let plan = if traced {
-                    scan.plan_with_trace().await.unwrap().0
-                } else {
-                    scan.plan().await.unwrap()
-                };
-                assert_eq!(plan.splits().len(), 2);
-                assert!(plan
-                    .splits()
-                    .iter()
-                    .all(|split| split.partition().get_string(0).unwrap() == "eng"));
-                let batches: Vec<RecordBatch> = read
-                    .new_read()
-                    .unwrap()
-                    .to_arrow(plan.splits())
-                    .unwrap()
-                    .try_collect()
-                    .await
-                    .unwrap();
-                assert_eq!(
-                    ids(&batches),
-                    expected,
-                    "evolution={evolution}, traced={traced}"
-                );
-            }
+            let plan = scan.plan().await.unwrap();
+            assert_eq!(plan.splits().len(), 2);
+            assert!(plan
+                .splits()
+                .iter()
+                .all(|split| split.partition().get_string(0).unwrap() == "eng"));
+            let batches: Vec<RecordBatch> = read
+                .new_read()
+                .unwrap()
+                .to_arrow(plan.splits())
+                .unwrap()
+                .try_collect()
+                .await
+                .unwrap();
+            assert_eq!(ids(&batches), expected, "evolution={evolution}");
         }
 
         let data = predicates.greater_than("id", Datum::Int(2)).unwrap();
@@ -5100,19 +5234,13 @@ async fn test_query_auth_chunk_shuffle_with_partition_filters() {
                 .unwrap(),
         );
         let scan = read.new_scan().with_chunk_shuffle(7, 2).unwrap();
-        for traced in [false, true] {
-            let result = if traced {
-                scan.plan_with_trace().await.map(|(plan, _)| plan)
-            } else {
-                scan.plan().await
-            };
-            let error = result.unwrap_err();
-            assert!(
-                matches!(error, paimon::Error::Unsupported { ref message }
-                if message.contains("unmasked partition predicates")),
-                "{error:?}"
-            );
-        }
+        let result = scan.plan().await;
+        let error = result.unwrap_err();
+        assert!(
+            matches!(error, paimon::Error::Unsupported { ref message }
+            if message.contains("unmasked partition predicates")),
+            "{error:?}"
+        );
     }
 }
 
@@ -5230,8 +5358,9 @@ async fn test_query_auth_filters_masked_partition_values() {
                     equals("region", "east"),
                 ]))
                 .with_limit(1);
-            let (plan, trace) = limited.new_scan().plan_with_trace().await.unwrap();
-            assert_eq!(trace.limit, None);
+            let plan = limited.new_scan().plan().await.unwrap();
+            let scan_stats = plan.stats().clone();
+            assert_eq!(scan_stats.limit, None);
             assert!(plan
                 .splits()
                 .iter()
@@ -5259,8 +5388,9 @@ async fn test_query_auth_filters_masked_partition_values() {
             .with_filter(equals("dept", "eng"));
         assert_eq!(ids(&read_all(&plain).await.unwrap()), vec![1, 3]);
         plain.with_limit(1);
-        let (plan, trace) = plain.new_scan().plan_with_trace().await.unwrap();
-        assert_eq!(trace.limit, Some(1));
+        let plan = plain.new_scan().plan().await.unwrap();
+        let scan_stats = plan.stats().clone();
+        assert_eq!(scan_stats.limit, Some(1));
         assert!(!plan.splits().is_empty());
         let rows = ids(&read_all(&plain).await.unwrap());
         assert_eq!(rows.len(), 1);
@@ -5834,3 +5964,10 @@ async fn test_query_auth_explicit_partition_selector() {
 #[cfg(not(windows))]
 #[path = "rest_catalog/authorized_snapshot_scans.rs"]
 mod authorized_snapshot_scans;
+
+#[cfg(not(windows))]
+#[path = "rest_catalog/merge_sources.rs"]
+mod merge_sources;
+
+#[path = "rest_catalog/read_path_completion.rs"]
+mod read_path_completion;

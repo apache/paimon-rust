@@ -21,7 +21,7 @@ use super::{TableScan, TableScanKind};
 use crate::spec::MergeEngine;
 use crate::table::kv_file_reader::retain_primary_key_conjuncts;
 use crate::table::merge_tree_split_generator::{merge_tree_split_for_batch, KeyComparator};
-use crate::table::{DataSplit, Plan, ReadBuilder, ScanTrace};
+use crate::table::{DataSplit, Plan, ReadBuilder};
 use std::collections::HashMap;
 
 /// Plans current-state audit reads over the wrapped table's files.
@@ -50,91 +50,76 @@ impl<'a> AuditLogScan<'a> {
     }
 
     pub async fn plan(&self) -> crate::Result<Plan> {
-        self.plan_with_trace().await.map(|(plan, _)| plan)
-    }
-
-    pub async fn plan_with_trace(&self) -> crate::Result<(Plan, ScanTrace)> {
         let TableScanKind::Paimon(inner) = &self.scan.0 else {
             return Err(crate::Error::Unsupported {
                 message: "Format tables do not support audit log batch scan".to_string(),
             });
         };
-        let (plan, mut trace) = self.scan.plan_with_trace().await?;
+        let mut plan = self.scan.plan().await?;
         let options = inner.table.schema().core_options();
         let engine = options.merge_engine()?;
         // Ordinary first-row and DV scans pack files without a key merge. Audit
         // reads need the existing merge-tree planner to retain overlapping versions.
-        let plan = if engine == MergeEngine::FirstRow
+        if engine == MergeEngine::FirstRow
             || (options.deletion_vectors_enabled() && !options.deletion_vectors_merge_on_read())
         {
             if let Some(comparator) = KeyComparator::from_table_schema(inner.table.schema()) {
-                let mut buckets: HashMap<(Vec<u8>, i32), Vec<DataSplit>> = HashMap::new();
-                for split in plan.into_splits() {
-                    buckets
-                        .entry((split.partition().to_serialized_bytes(), split.bucket()))
-                        .or_default()
-                        .push(split);
-                }
-                let mut splits = Vec::new();
-                for bucket in buckets.into_values() {
-                    let first = &bucket[0];
-                    let files = bucket
-                        .iter()
-                        .flat_map(|split| split.data_files().iter().cloned())
-                        .collect();
-                    let deletion_files: HashMap<_, _> = bucket
-                        .iter()
-                        .flat_map(|split| {
-                            split.data_files().iter().filter_map(move |file| {
-                                split
-                                    .deletion_file_for_data_file(file)
-                                    .map(|deletion| (file.file_name.clone(), deletion.clone()))
-                            })
-                        })
-                        .collect();
-                    for group in merge_tree_split_for_batch(
-                        files,
-                        &comparator,
-                        options.source_split_target_size(),
-                        options.source_split_open_file_cost(),
-                        matches!(engine, MergeEngine::Deduplicate | MergeEngine::FirstRow),
-                    ) {
-                        let mut builder = DataSplit::builder()
-                            .with_snapshot(first.snapshot_id())
-                            .with_partition(first.partition().clone())
-                            .with_bucket(first.bucket())
-                            .with_bucket_path(first.bucket_path().to_string())
-                            .with_total_buckets(first.total_buckets())
-                            .with_raw_convertible(group.raw_convertible);
-                        if !deletion_files.is_empty() {
-                            builder = builder.with_data_deletion_files(
-                                group
-                                    .files
-                                    .iter()
-                                    .map(|file| deletion_files.get(&file.file_name).cloned())
-                                    .collect(),
-                            );
-                        }
-                        splits.push(builder.with_data_files(group.files).build()?);
+                plan = plan.map_splits(|planned_splits| {
+                    let mut buckets: HashMap<(Vec<u8>, i32), Vec<DataSplit>> = HashMap::new();
+                    for split in planned_splits {
+                        buckets
+                            .entry((split.partition().to_serialized_bytes(), split.bucket()))
+                            .or_default()
+                            .push(split);
                     }
-                }
-                Plan::new(splits)
-            } else {
-                plan
+                    let mut splits = Vec::new();
+                    for bucket in buckets.into_values() {
+                        let first = &bucket[0];
+                        let files = bucket
+                            .iter()
+                            .flat_map(|split| split.data_files().iter().cloned())
+                            .collect();
+                        let deletion_files: HashMap<_, _> = bucket
+                            .iter()
+                            .flat_map(|split| {
+                                split.data_files().iter().filter_map(move |file| {
+                                    split
+                                        .deletion_file_for_data_file(file)
+                                        .map(|deletion| (file.file_name.clone(), deletion.clone()))
+                                })
+                            })
+                            .collect();
+                        for group in merge_tree_split_for_batch(
+                            files,
+                            &comparator,
+                            options.source_split_target_size(),
+                            options.source_split_open_file_cost(),
+                            matches!(engine, MergeEngine::Deduplicate | MergeEngine::FirstRow),
+                        ) {
+                            let mut builder = DataSplit::builder()
+                                .with_snapshot(first.snapshot_id())
+                                .with_partition(first.partition().clone())
+                                .with_bucket(first.bucket())
+                                .with_bucket_path(first.bucket_path().to_string())
+                                .with_total_buckets(first.total_buckets())
+                                .with_raw_convertible(group.raw_convertible);
+                            if !deletion_files.is_empty() {
+                                builder = builder.with_data_deletion_files(
+                                    group
+                                        .files
+                                        .iter()
+                                        .map(|file| deletion_files.get(&file.file_name).cloned())
+                                        .collect(),
+                                );
+                            }
+                            splits.push(builder.with_data_files(group.files).build()?);
+                        }
+                    }
+                    Ok(splits)
+                })?;
             }
-        } else {
-            plan
-        };
-        trace.record_final_plan(
-            plan.splits().len(),
-            plan.splits().len(),
-            plan.splits()
-                .iter()
-                .map(|split| split.data_files().len())
-                .sum(),
-        );
-        trace.planned_data_file_bytes = plan.planned_data_file_bytes();
-        Ok((plan, trace))
+        }
+        Ok(plan)
     }
 }
 
@@ -153,7 +138,7 @@ mod tests {
     };
     use crate::table::table_scan::{
         tests::{
-            data_evolution_test_table, pk_stats_file, pk_stats_gate_table, setup_scan_trace_dirs,
+            data_evolution_test_table, pk_stats_file, pk_stats_gate_table, setup_scan_stats_dirs,
             two_column_schema,
         },
         PaimonTableScan,
@@ -204,7 +189,7 @@ mod tests {
                 (option.to_string(), value.to_string()),
                 ("source.split.target-size".to_string(), "1b".to_string()),
             ]));
-            setup_scan_trace_dirs(&table).await;
+            setup_scan_stats_dirs(&table).await;
 
             let mut old = pk_stats_file("old-version.parquet", (1, 5), (100, 200));
             old.level = 1;
@@ -230,9 +215,9 @@ mod tests {
             let mut reader = table.new_read_builder();
             reader.with_filter(value_filter);
 
-            let (ordinary_plan, ordinary_trace) =
-                reader.new_scan().plan_with_trace().await.unwrap();
-            assert!(ordinary_trace.manifest_entries_pruned_by_data_stats >= 1);
+            let ordinary_plan = reader.new_scan().plan().await.unwrap();
+            let ordinary_stats = ordinary_plan.stats().clone();
+            assert!(ordinary_stats.manifest_entries_pruned_by_data_stats >= 1);
             assert_eq!(
                 ordinary_plan
                     .splits()
@@ -242,9 +227,15 @@ mod tests {
                 1
             );
 
-            let (audit_plan, audit_trace) =
-                reader.new_audit_scan().plan_with_trace().await.unwrap();
-            assert_eq!(audit_trace.manifest_entries_pruned_by_data_stats, 0);
+            let audit_plan = reader.new_audit_scan().plan().await.unwrap();
+            let audit_stats = audit_plan.stats().clone();
+            assert_eq!(audit_plan.snapshot_id(), ordinary_plan.snapshot_id());
+            assert_eq!(audit_stats.final_files, 2);
+            assert_eq!(
+                audit_stats.planned_data_file_bytes,
+                audit_plan.planned_data_file_bytes()
+            );
+            assert_eq!(audit_stats.manifest_entries_pruned_by_data_stats, 0);
             assert_eq!(
                 audit_plan
                     .splits()

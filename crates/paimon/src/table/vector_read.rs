@@ -24,7 +24,7 @@ use crate::table::pk_vector_search_params::PkVectorSearchParams;
 use crate::table::vector_scan::{PlanContext, VectorScanPlan, VectorScanWork};
 use crate::table::vector_search_common::{take_only_result, targets_primary_key_column};
 use crate::table::Table;
-use crate::vector_search::SearchResult;
+use crate::vector_search::GlobalIndexResult;
 use std::collections::HashMap;
 use std::future::Future;
 
@@ -38,7 +38,7 @@ pub(super) trait Read: Sync {
     fn read(
         &self,
         plan: Self::Plan,
-    ) -> impl Future<Output = crate::Result<Vec<SearchResult>>> + Send;
+    ) -> impl Future<Output = crate::Result<Vec<GlobalIndexResult>>> + Send;
 }
 
 /// Searches a common plan with one query, without replanning or materializing rows.
@@ -47,7 +47,7 @@ pub struct VectorRead {
 }
 
 impl VectorRead {
-    pub async fn read(&self, plan: VectorScanPlan) -> crate::Result<SearchResult> {
+    pub async fn read(&self, plan: VectorScanPlan) -> crate::Result<GlobalIndexResult> {
         take_only_result(self.batch.read(plan).await?, "vector search")
     }
 }
@@ -88,7 +88,7 @@ impl BatchVectorRead {
         Ok(Self { context, reader })
     }
 
-    pub async fn read(&self, plan: VectorScanPlan) -> crate::Result<Vec<SearchResult>> {
+    pub async fn read(&self, plan: VectorScanPlan) -> crate::Result<Vec<GlobalIndexResult>> {
         if self.context != plan.context {
             return Err(crate::Error::DataInvalid {
                 message: "vector plan and reader must use the same table, column and pre-filter"
@@ -101,7 +101,7 @@ impl BatchVectorRead {
                 reader.read(*plan).await
             }
             (VectorReadKind::PrimaryKey(reader), VectorScanWork::PrimaryKey(plan)) => {
-                reader.read(plan).await
+                reader.read(*plan).await
             }
             _ => Err(crate::Error::DataInvalid {
                 message: "vector plan and reader use different DE/PK address spaces".to_string(),

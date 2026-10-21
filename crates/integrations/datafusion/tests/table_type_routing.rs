@@ -477,6 +477,13 @@ async fn setup() -> TestEnv {
 }
 
 async fn setup_with_engine(resolver: Option<Arc<dyn TableEngineResolver>>) -> TestEnv {
+    setup_with_external_tables(resolver, &["it", "ghost", "ft"]).await
+}
+
+async fn setup_with_external_tables(
+    resolver: Option<Arc<dyn TableEngineResolver>>,
+    external_tables: &[&str],
+) -> TestEnv {
     let paimon_dir = TempDir::new().unwrap();
     let warehouse = format!("file://{}", paimon_dir.path().display());
     let mut options = Options::new();
@@ -484,11 +491,10 @@ async fn setup_with_engine(resolver: Option<Arc<dyn TableEngineResolver>>) -> Te
     let fs_catalog = Arc::new(FileSystemCatalog::new(options).unwrap());
     let typed_catalog = Arc::new(TypedTestCatalog {
         inner: Arc::clone(&fs_catalog),
-        declared_types: HashMap::from([
-            ("it".to_string(), TableType::IcebergTable),
-            ("ghost".to_string(), TableType::IcebergTable),
-            ("ft".to_string(), TableType::IcebergTable),
-        ]),
+        declared_types: external_tables
+            .iter()
+            .map(|name| (name.to_string(), TableType::IcebergTable))
+            .collect(),
     });
     let mut ctx = SQLContext::new();
     ctx.register_catalog(CATALOG, typed_catalog).await.unwrap();
@@ -2021,19 +2027,234 @@ async fn every_version_clause_on_routed_tables_is_rejected() {
     }
 }
 
-#[tokio::test]
-async fn show_create_on_routed_tables_reports_the_declared_type() {
-    let env = setup().await;
-    let Err(err) = env
-        .ctx
-        .sql(&format!("SHOW CREATE TABLE {CATALOG}.{DB}.it"))
+#[derive(Debug)]
+struct DefinedTable {
+    inner: MemTable,
+    definition: Option<String>,
+}
+
+#[async_trait]
+impl TableProvider for DefinedTable {
+    fn schema(&self) -> datafusion::arrow::datatypes::SchemaRef {
+        self.inner.schema()
+    }
+
+    fn table_type(&self) -> datafusion::logical_expr::TableType {
+        datafusion::logical_expr::TableType::Base
+    }
+
+    fn get_table_definition(&self) -> Option<&str> {
+        self.definition.as_deref()
+    }
+
+    async fn scan(
+        &self,
+        state: &dyn datafusion::catalog::Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[datafusion::logical_expr::Expr],
+        limit: Option<usize>,
+    ) -> DFResult<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+        self.inner.scan(state, projection, filters, limit).await
+    }
+}
+
+const QUOTED_TABLE: &str = "Lake Events";
+
+fn engine_ddl(database: &str, table: &str) -> String {
+    format!("CREATE TABLE lake.{database}.`{table}` (id INT) USING iceberg\n")
+}
+
+#[derive(Debug, Default)]
+struct DdlEngineResolver {
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+impl TableEngineResolver for DdlEngineResolver {
+    async fn resolve_table(
+        &self,
+        request: &EngineTableRequest,
+    ) -> DFResult<Option<Arc<dyn TableProvider>>> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        let definition = match request.table.as_str() {
+            "it" | QUOTED_TABLE => Some(engine_ddl(&request.database, &request.table)),
+            "no_ddl" => None,
+            "blank_ddl" => Some(" \n\t".to_string()),
+            "broken" => {
+                return Err(DataFusionError::Execution(
+                    "ddl backend exploded".to_string(),
+                ))
+            }
+            _ => return Ok(None),
+        };
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        Ok(Some(Arc::new(DefinedTable {
+            inner: MemTable::try_new(schema, vec![vec![]])?,
+            definition,
+        })))
+    }
+}
+
+async fn ddl_env(external_tables: &[&str]) -> (TestEnv, Arc<DdlEngineResolver>) {
+    let resolver = Arc::new(DdlEngineResolver::default());
+    let env = setup_with_external_tables(Some(resolver.clone()), external_tables).await;
+    (env, resolver)
+}
+
+async fn show_create(env: &TestEnv, table: &str) -> DFResult<Vec<RecordBatch>> {
+    show_create_in(env, DB, table).await
+}
+
+async fn show_create_in(env: &TestEnv, db: &str, table: &str) -> DFResult<Vec<RecordBatch>> {
+    env.ctx
+        .sql(&format!("SHOW CREATE TABLE {CATALOG}.{db}.{table}"))
+        .await?
+        .collect()
         .await
-    else {
-        panic!("Paimon DDL would misrepresent an engine-served table");
-    };
-    let msg = err.to_string();
-    assert!(msg.contains("iceberg-table"), "{msg}");
-    assert!(msg.contains("cannot be read as a Paimon table"), "{msg}");
+}
+
+fn show_create_definition(batches: &[RecordBatch]) -> Option<String> {
+    let rows: Vec<_> = batches.iter().filter(|b| b.num_rows() > 0).collect();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].num_rows(), 1);
+    let column = rows[0]
+        .column_by_name("definition")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    column.is_valid(0).then(|| column.value(0).to_string())
+}
+
+#[tokio::test]
+async fn show_create_returns_the_engine_definition() {
+    let (env, resolver) = ddl_env(&["it", QUOTED_TABLE]).await;
+    env.ctx
+        .sql(&format!("CREATE SCHEMA {CATALOG}.other_db"))
+        .await
+        .unwrap();
+    for (db, name, table) in [
+        (DB, "it", "it"),
+        (DB, "\"Lake Events\"", QUOTED_TABLE),
+        ("other_db", "it", "it"),
+    ] {
+        let batches = show_create_in(&env, db, name).await.unwrap();
+        assert_eq!(string_column_values(&batches, "table_catalog"), [CATALOG]);
+        assert_eq!(string_column_values(&batches, "table_schema"), [db]);
+        assert_eq!(string_column_values(&batches, "table_name"), [table]);
+        assert_eq!(
+            show_create_definition(&batches),
+            Some(engine_ddl(db, table))
+        );
+    }
+    assert_eq!(resolver.calls.load(Ordering::Relaxed), 3);
+}
+
+#[tokio::test]
+async fn show_create_reports_external_tables_it_cannot_describe() {
+    let (env, _) = ddl_env(&["no_ddl", "blank_ddl", "broken", "ghost"]).await;
+    for (table, message) in [
+        (
+            "no_ddl",
+            "SHOW CREATE TABLE is not supported for 'iceberg-table' table 'shared_db.no_ddl'",
+        ),
+        (
+            "blank_ddl",
+            "SHOW CREATE TABLE is not supported for 'iceberg-table' table 'shared_db.blank_ddl'",
+        ),
+        ("broken", "ddl backend exploded"),
+        ("ghost", "table 'shared_db.ghost' not found"),
+        ("missing", "not found"),
+    ] {
+        let err = show_create(&env, table).await.unwrap_err();
+        assert!(err.to_string().contains(message), "{table}: {err}");
+    }
+
+    let err = show_create(&setup_with_engine(None).await, "it")
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("no table engine is registered for 'iceberg-table' tables"),
+        "{err}"
+    );
+    let err = show_create(&setup().await, "it").await.unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("SHOW CREATE TABLE is not supported for 'iceberg-table'"),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn show_create_resolves_only_the_target_table() {
+    let (env, resolver) = ddl_env(&["it", "broken"]).await;
+    let err = env
+        .ctx
+        .sql("SELECT * FROM information_schema.views")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("ddl backend exploded"), "{err}");
+
+    let calls = resolver.calls.load(Ordering::Relaxed);
+    let batches = show_create(&env, "it").await.unwrap();
+    assert_eq!(show_create_definition(&batches), Some(engine_ddl(DB, "it")));
+    assert_eq!(resolver.calls.load(Ordering::Relaxed), calls + 1);
+}
+
+#[tokio::test]
+async fn show_create_checks_session_options_before_calling_the_engine() {
+    let (env, resolver) = ddl_env(&["it"]).await;
+    for (key, value, message) in [
+        ("query-auth.enabled", "true", "query-auth"),
+        ("scan.version", "20", "time travel"),
+        ("incremental-between", "1,5", "incremental-between"),
+    ] {
+        env.ctx
+            .sql(&format!("SET 'paimon.{key}' = '{value}'"))
+            .await
+            .unwrap();
+        let err = show_create(&env, "it").await.unwrap_err();
+        assert!(err.to_string().contains(message), "{key}: {err}");
+        env.ctx.sql(&format!("RESET 'paimon.{key}'")).await.unwrap();
+    }
+    assert_eq!(resolver.calls.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn show_create_follows_temporary_shadowing_and_keeps_paimon_ddl() {
+    // `broken` would fail a catalog scan.
+    let (env, resolver) = ddl_env(&["it", "broken"]).await;
+    let paimon_ddl = show_create_definition(&show_create(&env, "pt").await.unwrap()).unwrap();
+    assert!(
+        paimon_ddl.contains("CREATE TABLE \"shared_db\".\"pt\""),
+        "{paimon_ddl}"
+    );
+    assert!(paimon_ddl.contains("\"id\" INT NOT NULL"), "{paimon_ddl}");
+
+    let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+        "id",
+        DataType::Int32,
+        false,
+    )]));
+    env.ctx
+        .register_temp_table(
+            format!("{CATALOG}.{DB}.it"),
+            Arc::new(MemTable::try_new(schema, vec![vec![]]).unwrap()),
+        )
+        .unwrap();
+
+    let batches = show_create(&env, "it").await.unwrap();
+    assert_eq!(string_column_values(&batches, "table_name"), ["it"]);
+    assert_eq!(show_create_definition(&batches), None);
+    assert_eq!(resolver.calls.load(Ordering::Relaxed), 0);
 }
 
 #[tokio::test]

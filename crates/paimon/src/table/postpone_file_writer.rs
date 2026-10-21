@@ -40,9 +40,7 @@ use crate::table::data_file_index_writer::{DataFileIndexWriter, FileIndexOptions
 use crate::table::kv_file_writer::build_physical_schema;
 use crate::Result;
 use arrow_array::{Int64Array, Int8Array, RecordBatch};
-use chrono::{DateTime, Utc};
 use std::sync::Arc;
-use tokio::task::JoinSet;
 
 /// Configuration for [`PostponeFileWriter`].
 pub(crate) struct PostponeWriteConfig {
@@ -84,12 +82,8 @@ pub(crate) struct PostponeFileWriter {
     current_file_name: Option<String>,
     current_file_path: Option<DataFilePath>,
     current_stats: PostponeFileStats,
-    /// Timestamp captured when the current file was opened (used for deterministic replay order).
-    current_file_creation_time: DateTime<Utc>,
     written_files: Vec<DataFileMeta>,
     created_paths: Vec<String>,
-    /// Background file close tasks spawned during rolling.
-    in_flight_closes: JoinSet<Result<DataFileMeta>>,
     resources: Option<ResourceContext>,
 }
 
@@ -130,10 +124,8 @@ impl PostponeFileWriter {
             current_file_name: None,
             current_file_path: None,
             current_stats: PostponeFileStats::default(),
-            current_file_creation_time: Utc::now(),
             written_files: Vec::new(),
             created_paths: Vec::new(),
-            in_flight_closes: JoinSet::new(),
             resources: None,
         })
     }
@@ -220,11 +212,13 @@ impl PostponeFileWriter {
         self.current_stats
             .add_batch(&batch, &self.config, start_seq, end_seq)?;
 
-        // Roll to a new file if target size is reached — close in background
+        // Java creates metadata at result/close time and replays pending files
+        // by that time. Finish closes in arrival order, including equal-millis
+        // ties, so asynchronous completion cannot reorder one writer's rows.
         if self.current_writer.as_ref().unwrap().num_bytes() as i64 >= self.config.target_file_size
             || self.current_stats.row_count >= self.config.target_file_row_num
         {
-            self.roll_file();
+            self.close_current_file().await?;
         }
 
         // Flush row group if in-progress buffer exceeds write_buffer_size
@@ -245,7 +239,6 @@ impl PostponeFileWriter {
         self.current_blob_references = None;
         self.current_file_name = None;
         self.current_file_path = None;
-        while self.in_flight_closes.join_next().await.is_some() {}
         for path in self.created_paths.drain(..) {
             let _ = self.file_io.delete_file(&path).await;
         }
@@ -263,60 +256,9 @@ impl PostponeFileWriter {
 
     async fn finish(&mut self) -> Result<Vec<DataFileMeta>> {
         self.close_current_file().await?;
-        while let Some(result) = self.in_flight_closes.join_next().await {
-            let meta = result.map_err(|e| crate::Error::DataInvalid {
-                message: format!("Background file close task panicked: {e}"),
-                source: None,
-            })??;
-            self.written_files.push(meta);
-        }
-        // Java replays postpone files by millisecond creation time, retaining
-        // manifest order for ties. Background closes must not reorder arrivals.
-        self.written_files
-            .sort_by_key(|file| file.min_sequence_number);
         self.managed_blob_writer.prepare_commit().await?;
         self.created_paths.clear();
         Ok(std::mem::take(&mut self.written_files))
-    }
-
-    /// Spawn the current writer's close in the background for non-blocking rolling.
-    fn roll_file(&mut self) {
-        let writer = match self.current_writer.take() {
-            Some(w) => w,
-            None => return,
-        };
-        let file_name = self.current_file_name.take().unwrap();
-        let index = self.current_index.take();
-        let blob_references = self.current_blob_references.take();
-        let file_io = self.file_io.clone();
-        let location = self.current_file_path.take().unwrap();
-        let bucket_dir = location.parent().to_string();
-        let threshold = self
-            .config
-            .file_index_options
-            .as_ref()
-            .map(|options| options.in_manifest_threshold);
-        let stats = std::mem::take(&mut self.current_stats);
-        let schema_id = self.config.schema_id;
-        // Capture creation_time from when the file was opened, not when the async close finishes.
-        // Java's postpone compaction sorts by creationTime for replay order.
-        let creation_time = self.current_file_creation_time;
-
-        self.in_flight_closes.spawn(async move {
-            let file_size = writer.close().await?.file_size as i64;
-            let mut meta = build_meta(file_name, file_size, stats, schema_id, creation_time);
-            ManagedBlobReferences::finish(
-                blob_references,
-                &file_io,
-                &location.path,
-                &bucket_dir,
-                &mut meta,
-            )
-            .await?;
-            meta.external_path = location.external_path;
-            write_index(index, threshold, &file_io, &bucket_dir, &mut meta).await?;
-            Ok(meta)
-        });
     }
 
     async fn open_new_file(&mut self, user_schema: arrow_schema::SchemaRef) -> Result<()> {
@@ -373,7 +315,6 @@ impl PostponeFileWriter {
         self.current_file_name = Some(file_name);
         self.current_file_path = Some(location);
         self.current_stats = PostponeFileStats::default();
-        self.current_file_creation_time = Utc::now();
         Ok(())
     }
 
@@ -388,13 +329,7 @@ impl PostponeFileWriter {
         let stats = std::mem::take(&mut self.current_stats);
         let file_size = writer.close().await?.file_size as i64;
 
-        let mut meta = build_meta(
-            file_name,
-            file_size,
-            stats,
-            self.config.schema_id,
-            self.current_file_creation_time,
-        );
+        let mut meta = build_meta(file_name, file_size, stats, self.config.schema_id);
         let location = self.current_file_path.take().unwrap();
         let bucket_dir = location.parent().to_string();
         let threshold = self
@@ -412,6 +347,8 @@ impl PostponeFileWriter {
         .await?;
         meta.external_path = location.external_path;
         write_index(index, threshold, &self.file_io, &bucket_dir, &mut meta).await?;
+        // Java constructs the result after auxiliary files have also finished.
+        meta.creation_time = Some(crate::common::date_time::current_local_timestamp());
         self.written_files.push(meta);
         Ok(())
     }
@@ -498,7 +435,6 @@ fn build_meta(
     file_size: i64,
     stats: PostponeFileStats,
     schema_id: i64,
-    creation_time: DateTime<Utc>,
 ) -> DataFileMeta {
     DataFileMeta {
         file_name,
@@ -521,7 +457,7 @@ fn build_meta(
         schema_id,
         level: 0,
         extra_files: vec![],
-        creation_time: Some(creation_time),
+        creation_time: None,
         delete_row_count: Some(stats.delete_row_count),
         embedded_index: None,
         file_source: Some(0), // FileSource.APPEND

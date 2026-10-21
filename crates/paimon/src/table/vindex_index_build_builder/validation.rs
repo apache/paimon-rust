@@ -15,47 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::spec::{CoreOptions, DataField};
+use crate::spec::DataField;
 use crate::table::global_index_build_common::vector::{
     find_index_field as find_vector_index_field,
     validate_vector_field as validate_common_vector_field,
 };
 use crate::table::Table;
 use crate::{Error, Result};
-
-pub(super) fn validate_table_options(table: &Table, core_options: &CoreOptions) -> Result<()> {
-    if !core_options.row_tracking_enabled() {
-        return Err(Error::DataInvalid {
-            message: "vindex index build requires 'row-tracking.enabled' = 'true'".to_string(),
-            source: None,
-        });
-    }
-    if !core_options.data_evolution_enabled() {
-        return Err(Error::DataInvalid {
-            message: "vindex index build requires 'data-evolution.enabled' = 'true'".to_string(),
-            source: None,
-        });
-    }
-    if !core_options.global_index_enabled() {
-        return Err(Error::DataInvalid {
-            message: "vindex index build requires 'global-index.enabled' = 'true'".to_string(),
-            source: None,
-        });
-    }
-    if !table.schema().primary_keys().is_empty() {
-        return Err(Error::Unsupported {
-            message: "vindex index build does not support primary-key tables".to_string(),
-        });
-    }
-    if core_options.deletion_vectors_enabled() {
-        return Err(Error::Unsupported {
-            message:
-                "vindex index build does not support tables with deletion-vectors.enabled=true"
-                    .to_string(),
-        });
-    }
-    Ok(())
-}
 
 pub(super) fn find_index_field<'a>(table: &'a Table, column: &str) -> Result<&'a DataField> {
     find_vector_index_field(table, column)

@@ -583,6 +583,56 @@ async fn prepared_checkpoints_keep_sequence_progress_before_publication() {
 }
 
 #[tokio::test]
+async fn newly_opened_buckets_restore_latest_sequences_after_a_checkpoint() {
+    let table = table(&[("bucket", "2")]).await;
+    let builder = table.new_write_builder();
+    let mut writer = builder.new_write().unwrap();
+    writer
+        .write_arrow(&[make_batch(vec![1], vec![10])], Some(0))
+        .await
+        .unwrap();
+    builder
+        .new_commit()
+        .commit_with_identifier(writer.prepare_commit().await.unwrap(), 1)
+        .await
+        .unwrap();
+
+    let mut other = table.new_write_builder().new_write().unwrap();
+    other
+        .write_arrow(&[make_batch(vec![2, 2, 2], vec![20, 21, 22])], Some(1))
+        .await
+        .unwrap();
+    commit(&table, other.prepare_commit().await.unwrap()).await;
+
+    writer
+        .write_arrow(&[make_batch(vec![2], vec![99])], Some(1))
+        .await
+        .unwrap();
+    let messages = writer.prepare_commit().await.unwrap();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].new_files[0].min_sequence_number, 3);
+    builder
+        .new_commit()
+        .commit_with_identifier(messages, 2)
+        .await
+        .unwrap();
+    assert_eq!(rows(&table).await, vec![(1, 10), (2, 99)]);
+
+    writer
+        .write_arrow(&[make_batch(vec![1], vec![11])], Some(0))
+        .await
+        .unwrap();
+    let messages = writer.prepare_commit().await.unwrap();
+    assert_eq!(messages[0].new_files[0].min_sequence_number, 1);
+    builder
+        .new_commit()
+        .commit_with_identifier(messages, 3)
+        .await
+        .unwrap();
+    assert_eq!(rows(&table).await, vec![(1, 11), (2, 99)]);
+}
+
+#[tokio::test]
 async fn configured_overwrite_can_use_ordinary_and_direct_assignment() {
     let table = table(&[("bucket", "-1")]).await;
     let mut first = table.new_write_builder().new_write().unwrap();

@@ -95,7 +95,7 @@ fn make_lumina_entry(
     }
 }
 
-// ---- Task B: search-and-read (`SearchResultReadBuilder::read`) tests ----
+// ---- Task B: search-and-read (`GlobalIndexResultReadBuilder::read`) tests ----
 
 /// Build a small materialization batch: user column `id: Int32`, the internal
 /// `_PKEY_VECTOR_POSITION: Int64`, and `__paimon_search_score: Float32` (mirroring
@@ -443,6 +443,151 @@ fn test_configured_raw_vector_metric_precedence_and_conflict_default() {
     assert_eq!(
         configured_raw_vector_metric_override(&options, "embedding").unwrap(),
         None
+    );
+}
+
+#[tokio::test]
+async fn raw_search_without_files_uses_the_configured_indexer_default() {
+    let file_io = FileIOBuilder::new("memory").build().unwrap();
+    for (index_type, expected) in [
+        (" IVF-FLAT ", RawVectorMetric::InnerProduct),
+        ("diskann", RawVectorMetric::InnerProduct),
+        ("lumina", RawVectorMetric::InnerProduct),
+        ("lumina-vector-ann", RawVectorMetric::InnerProduct),
+    ] {
+        let options = HashMap::from([(
+            "fields.embedding.index-type".to_string(),
+            index_type.to_string(),
+        )]);
+        assert_eq!(
+            resolve_raw_vector_metric(
+                &file_io,
+                "memory:///test_table",
+                &options,
+                &HashMap::new(),
+                &[],
+                2,
+                "embedding",
+            )
+            .await
+            .unwrap(),
+            expected
+        );
+        let override_options = HashMap::from([("metric".to_string(), "cosine".to_string())]);
+        assert_eq!(
+            resolve_raw_vector_metric(
+                &file_io,
+                "memory:///test_table",
+                &options,
+                &override_options,
+                &[],
+                2,
+                "embedding",
+            )
+            .await
+            .unwrap(),
+            RawVectorMetric::Cosine
+        );
+    }
+    let mut table_options = HashMap::from([
+        (
+            "fields.embedding.index-type".to_string(),
+            "ivf-flat".to_string(),
+        ),
+        ("fields.other.distance.metric".to_string(), "l2".to_string()),
+    ]);
+    for (family_metric, expected) in [
+        (None, RawVectorMetric::InnerProduct),
+        (Some("cosine"), RawVectorMetric::Cosine),
+    ] {
+        if let Some(metric) = family_metric {
+            table_options.insert("ivf-flat.distance.metric".to_string(), metric.to_string());
+        }
+        for query_options in [
+            HashMap::new(),
+            HashMap::from([("fields.other.metric".to_string(), "l2".to_string())]),
+        ] {
+            assert_eq!(
+                resolve_raw_vector_metric(
+                    &file_io,
+                    "memory:///test_table",
+                    &table_options,
+                    &query_options,
+                    &[],
+                    2,
+                    "embedding",
+                )
+                .await
+                .unwrap(),
+                expected
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn mixed_vector_formats_fail_before_opening_files() {
+    let file_io = FileIOBuilder::new("memory").build().unwrap();
+    let fields = vec![make_field(2, "embedding")];
+    let entries = [
+        make_lumina_entry("missing-flat", IVF_FLAT_IDENTIFIER, FileKind::Add, 2),
+        make_lumina_entry("missing-diskann", "diskann", FileKind::Add, 2),
+    ];
+    let query = VectorSearch::new(vec![1.0, 0.0], 1, "embedding".to_string()).unwrap();
+    let error = evaluate_vector_search(
+        eval_context(&file_io, &HashMap::new(), &fields, Some(10)),
+        &entries,
+        &query,
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("multiple index types"));
+    let mut ignored = entries[1].clone();
+    ignored.kind = FileKind::Delete;
+    assert!(
+        validate_global_vector_index_types(&[entries[0].clone(), ignored], 2, "embedding").is_ok()
+    );
+    assert!(validate_global_vector_index_types(&entries, 99, "another_column").is_ok());
+}
+
+#[tokio::test]
+async fn indexed_vector_metric_ignores_unrelated_column_options() {
+    let file_io = FileIOBuilder::new("memory").build().unwrap();
+    let index = build_vindex_segment_bytes("inner_product");
+    file_io
+        .new_output("memory:///test_table/index/test.idx")
+        .unwrap()
+        .write(bytes::Bytes::from(index.clone()))
+        .await
+        .unwrap();
+    let mut entry = make_lumina_entry("test.idx", IVF_FLAT_IDENTIFIER, FileKind::Add, 2);
+    entry.index_file.file_size = index.len() as i64;
+    let fields = vec![make_field(2, "embedding")];
+    let options = HashMap::from([("fields.other.metric".to_string(), "l2".to_string())]);
+    let query = VectorSearch::new(vec![1.0, 0.0], 2, "embedding".to_string())
+        .unwrap()
+        .with_options(options.clone());
+    let results = evaluate_batch_vector_search(
+        eval_context(&file_io, &HashMap::new(), &fields, Some(10)),
+        std::slice::from_ref(&entry),
+        &[query],
+    )
+    .await
+    .unwrap();
+    assert_eq!(results[0].len(), 2);
+    assert_eq!(
+        resolve_raw_vector_metric(
+            &file_io,
+            "memory:///test_table",
+            &HashMap::new(),
+            &options,
+            &[entry],
+            2,
+            "embedding",
+        )
+        .await
+        .unwrap(),
+        RawVectorMetric::InnerProduct
     );
 }
 

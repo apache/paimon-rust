@@ -23,6 +23,49 @@ use paimon::spec::{BinaryRow, POSTPONE_BUCKET};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 #[tokio::test]
+async fn automatic_postpone_configuration_locks_on_buffered_not_filtered_input() {
+    let (io, table) = memory_table(
+        "memory:/postpone_configuration",
+        pk_schema(&[("bucket", "-2"), ("ignore-delete", "true")]),
+    );
+    setup_dirs(&io, table.location()).await;
+    let consumer: std::sync::Arc<dyn paimon::spec::BlobConsumer> =
+        std::sync::Arc::new(|_: &str, _: Option<&paimon::spec::BlobDescriptor>| {
+            panic!("PK consumer must not run")
+        });
+    let mut writer = table
+        .new_postpone_fixed_bucket_write_builder()
+        .unwrap()
+        .new_write()
+        .unwrap();
+    writer
+        .write_arrow_batch(&make_batch_with_kinds(vec![1], vec![10], vec![3]))
+        .await
+        .unwrap();
+    writer.with_blob_consumer(Some(consumer.clone())).unwrap();
+    writer.with_blob_consumer(None).unwrap();
+    writer.with_blob_uri_reader_factory(None).unwrap();
+    // Automatic planning retains this input until prepare_commit. Its inner
+    // writer has no physical output yet, but changing configuration is late.
+    writer
+        .write_arrow_batch(&make_batch_with_kinds(vec![2], vec![20], vec![0]))
+        .await
+        .unwrap();
+    assert!(writer.with_blob_consumer(None).is_err());
+    assert!(writer.with_blob_consumer(Some(consumer)).is_err());
+    assert!(writer.with_blob_uri_reader_factory(None).is_err());
+    let messages = writer.prepare_commit().await.unwrap();
+    assert_eq!(
+        messages
+            .iter()
+            .flat_map(|message| &message.new_files)
+            .map(|file| file.row_count)
+            .sum::<i64>(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn postpone_rolls_by_batch_row_limit_and_preserves_unsorted_retracts() {
     let (io, table) = memory_table(
         "memory:/postpone_row_limit",

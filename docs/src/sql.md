@@ -386,6 +386,11 @@ bytes.
 
 `VARIANT` stores semi-structured data using the same logical value + metadata binary shape as Paimon Java. Use it for JSON-like fields whose schema may differ row by row.
 
+Parquet and ROW files support ordinary `VARIANT` reads and writes. Set
+`'file.format' = 'row'` to use ROW storage. ROW preserves the value and metadata
+buffers in the Java-compatible v1 layout; extracting a path still reads the
+containing compressed row block. The shredding options below apply to Parquet.
+
 Create `VARIANT` columns like ordinary table columns:
 
 ```sql
@@ -1052,6 +1057,47 @@ anything is deleted.
 
 Use `CALL` to invoke built-in procedures. All procedures are under the `sys` namespace.
 
+### reset_consumer
+
+Create or overwrite a consumer's next snapshot to consume:
+
+```sql
+CALL sys.reset_consumer(
+    table => 'paimon.test_db.events',
+    consumer_id => 'pipeline_a',
+    next_snapshot_id => 12
+);
+```
+
+`next_snapshot_id` must be a positive BIGINT identifying an existing live snapshot.
+Missing, expired, or invalid snapshots are rejected before changing consumer progress;
+tag-retained metadata alone is not sufficient. The ID is the next snapshot to process
+using the existing incremental or changelog scan rules, rather than a full-state read.
+
+Omit `next_snapshot_id` to delete the consumer record. Deleting a missing consumer succeeds:
+
+```sql
+CALL sys.reset_consumer(
+    table => 'paimon.test_db.events',
+    consumer_id => 'pipeline_a'
+);
+```
+
+Only filesystem-managed FileStore tables are supported. REST-managed tables and
+format tables are not supported. Consumer IDs must be non-empty names without path
+separators or trailing whitespace; IDs are never trimmed. Arguments use the existing
+named `=>` syntax; explicit `NULL` and positional arguments are not supported.
+Successful calls return `OK`.
+These operations change only consumer metadata, without publishing snapshots or
+changing table data, snapshot files, or manifests.
+
+A new scan with the same consumer ID resumes the stored progress unless the caller
+explicitly restores a checkpoint, which takes precedence. After deletion, a new scan
+without an explicit checkpoint follows its existing initial scan behavior. Scans that
+have already loaded their progress do not switch positions when the record changes.
+A running consumer's checkpoint completion can overwrite or recreate the record,
+so stop the consumer before adjusting its progress manually.
+
 ### create_tag
 
 Create a named tag from a snapshot:
@@ -1080,11 +1126,44 @@ This procedure does not automatically delete expired tags.
 
 ### create_tag_from_timestamp
 
-Create a named tag from a timestamp (finds the latest snapshot at or before the given time):
+Create a named tag from a commit timestamp (finds the earliest retained snapshot at or after the given time):
 
 ```sql
 CALL sys.create_tag_from_timestamp(table => 'paimon.my_db.my_table', tag => 'my_tag', timestamp => 1234567890000);
 ```
+
+### create_tag_from_watermark
+
+This procedure is not supported for tables managed by a REST catalog. Their
+snapshots may exist only in the catalog, while watermark selection currently
+relies on stored snapshot files. REST-managed tables are rejected before
+candidate selection or tag creation.
+
+Create a named tag from the earliest retained snapshot whose watermark is greater
+than or equal to the requested value. Candidates include live snapshots and
+historical snapshots preserved by existing tags. Equal watermarks select the
+earlier snapshot ID; snapshots without a watermark, including the no-watermark
+sentinel `-9223372036854775808`, are skipped.
+
+```sql
+CALL sys.create_tag_from_watermark(
+    table => 'paimon.my_db.my_table',
+    tag => 'business_checkpoint',
+    watermark => 1704067200000,
+    time_retained => '7d'
+);
+```
+
+`table`, `tag`, and `watermark` are required. `watermark` is a signed 64-bit integer
+in milliseconds. It represents the input processing progress recorded by the
+writer, whereas `timestamp` in `create_tag_from_timestamp` refers to snapshot
+commit time. Selecting by watermark fixes an entire snapshot; it does not filter
+rows by event time.
+
+The optional `time_retained` uses the same duration format and metadata as
+`create_tag`. This procedure does not automatically delete expired tags. An
+existing tag name, an invalid argument, or no matching snapshot causes an error
+without creating or replacing a tag. The call does not wait for a future snapshot.
 
 ### delete_tag
 

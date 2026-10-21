@@ -22,7 +22,7 @@ use crate::table::vector_read::{BatchVectorRead, VectorRead};
 use crate::table::vector_scan::{PlanContext, VectorScan};
 use crate::table::vector_search_common::{add_filter, validate_partition_filter};
 use crate::table::Table;
-use crate::vector_search::SearchResult;
+use crate::vector_search::GlobalIndexResult;
 use std::collections::HashMap;
 
 pub struct VectorSearchBuilder<'a> {
@@ -119,7 +119,7 @@ impl<'a> VectorSearchBuilder<'a> {
 
     /// Search locally using the same Scan -> Plan -> Read API exposed to engines.
     /// Use the result's `new_read_builder()` to materialize projected columns.
-    pub async fn execute(&self) -> crate::Result<SearchResult> {
+    pub async fn execute(&self) -> crate::Result<GlobalIndexResult> {
         let read = self.new_read()?;
         read.read(self.new_scan()?.plan().await?).await
     }
