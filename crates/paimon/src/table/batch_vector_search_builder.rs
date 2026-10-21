@@ -122,6 +122,7 @@ impl<'a> BatchVectorSearchBuilder<'a> {
             self.include_row_ids.as_ref(),
             self.prepared_filter.as_ref(),
         )
+        .map(|scan| scan.with_options(&self.options))
     }
 
     /// Create an owned batch reader; result i belongs to input query i.

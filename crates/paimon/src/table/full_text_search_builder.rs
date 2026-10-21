@@ -50,6 +50,7 @@ mod execution;
 mod filter;
 mod read;
 mod scan;
+#[cfg(any(feature = "internal-api", test))]
 pub(super) use execution::execute_search_task;
 pub use read::FullTextRead;
 pub use scan::{FullTextScan, FullTextScanPlan};
@@ -221,6 +222,7 @@ struct FullTextSearchEvaluation<'a> {
     next_row_id: Option<i64>,
     partition_filter: Option<&'a Predicate>,
     row_filter: Option<&'a Predicate>,
+    source_splits: Option<&'a [crate::table::SearchScanSplit]>,
 }
 
 #[cfg(test)]
@@ -261,15 +263,24 @@ async fn evaluate_full_text_search_with_executor(
         .collect();
     let has_fulltext_entries = !fulltext_entries.is_empty();
 
-    if !has_fulltext_entries {
+    if !has_fulltext_entries && evaluation.source_splits.is_none() {
+        return Ok(SearchResult::empty());
+    }
+    if evaluation
+        .source_splits
+        .is_some_and(|splits| splits.is_empty())
+    {
         return Ok(SearchResult::empty());
     }
 
     let deleted_row_index = if core_options.data_evolution_enabled() {
         match evaluation.table {
             Some(table) => {
-                let ranges =
-                    deleted_row_ranges_for_data_evolution_dvs(table, index_entries).await?;
+                let ranges = if evaluation.source_splits.is_some() {
+                    super::search_scan_split::deleted_row_ranges_for_search_sources(table).await?
+                } else {
+                    deleted_row_ranges_for_data_evolution_dvs(table, index_entries).await?
+                };
                 (!ranges.is_empty()).then(|| RowRangeIndex::create(ranges))
             }
             None => None,
@@ -285,6 +296,27 @@ async fn evaluate_full_text_search_with_executor(
                 .await?;
         indexed_search.include_row_ids = Some(filter::intersect_include(
             search.include_row_ids.as_ref(),
+            matched,
+        ));
+    }
+    if let (Some(_), Some(partition)) = (evaluation.source_splits, evaluation.partition_filter) {
+        let table = evaluation.table.ok_or_else(|| crate::Error::DataInvalid {
+            message: "Full-text partition filtering requires table context".into(),
+            source: None,
+        })?;
+        let ranges = fulltext_entries
+            .iter()
+            .map(|entry| {
+                let meta = entry.index_file.global_index_meta.as_ref().unwrap();
+                RowRange::new(meta.row_range_start, meta.row_range_end)
+            })
+            .collect();
+        let matched = super::search_scan_split::partition_row_ids_for_search_sources(
+            table, partition, ranges,
+        )
+        .await?;
+        indexed_search.include_row_ids = Some(filter::intersect_include(
+            indexed_search.include_row_ids.as_ref(),
             matched,
         ));
     }
@@ -346,8 +378,12 @@ async fn evaluate_full_text_search_with_executor(
         }
     }
 
-    if search_mode != GlobalIndexSearchMode::Fast && has_fulltext_entries {
-        let detail_ranges = if search_mode == GlobalIndexSearchMode::Detail {
+    if evaluation.source_splits.is_some()
+        || search_mode != GlobalIndexSearchMode::Fast && has_fulltext_entries
+    {
+        let detail_ranges = if evaluation.source_splits.is_none()
+            && search_mode == GlobalIndexSearchMode::Detail
+        {
             let table = evaluation.table.ok_or_else(|| crate::Error::DataInvalid {
                 message: "Full-text raw search in detail mode requires table context".to_string(),
                 source: None,
@@ -357,14 +393,26 @@ async fn evaluate_full_text_search_with_executor(
             Vec::new()
         };
         let field_ids = HashSet::from([field_id]);
-        let raw_ranges = unindexed_ranges_for_global_index_entries(
-            index_entries,
-            &field_ids,
-            search_mode,
-            evaluation.next_row_id,
-            &detail_ranges,
-            is_full_text_index_file,
-        );
+        let raw_ranges = if let Some(splits) = evaluation.source_splits {
+            merge_row_ranges(
+                splits
+                    .iter()
+                    .flat_map(|split| match split {
+                        crate::table::SearchScanSplit::Raw { row_ranges, .. } => row_ranges.clone(),
+                        _ => vec![],
+                    })
+                    .collect(),
+            )
+        } else {
+            unindexed_ranges_for_global_index_entries(
+                index_entries,
+                &field_ids,
+                search_mode,
+                evaluation.next_row_id,
+                &detail_ranges,
+                is_full_text_index_file,
+            )
+        };
         if !raw_ranges.is_empty() {
             let table = evaluation.table.ok_or_else(|| crate::Error::DataInvalid {
                 message: "Full-text raw search requires table context".to_string(),
@@ -931,6 +979,7 @@ mod tests {
                 next_row_id: Some(10),
                 partition_filter: None,
                 row_filter: None,
+                source_splits: None,
             },
             &[],
             &search,
@@ -1086,6 +1135,7 @@ mod tests {
                 next_row_id: Some(102),
                 partition_filter: None,
                 row_filter: None,
+                source_splits: None,
             },
             &[entry],
             &search,
@@ -1172,6 +1222,7 @@ mod tests {
                 next_row_id: Some(102),
                 partition_filter: None,
                 row_filter: None,
+                source_splits: None,
             },
             &[entry, missing_empty_filter_entry],
             &search,
@@ -1432,6 +1483,51 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn pk_full_text_source_plan_resolves_unknown_split_snapshot_from_capture() {
+        let table = pk_full_text_table("pk_ft_unknown_split_snapshot", &[]);
+        let snapshot = crate::spec::Snapshot::builder()
+            .version(3)
+            .id(7)
+            .schema_id(0)
+            .base_manifest_list(String::new())
+            .delta_manifest_list(String::new())
+            .commit_user("capture".into())
+            .commit_identifier(1)
+            .commit_kind(crate::spec::CommitKind::APPEND)
+            .time_millis(0)
+            .build();
+        let split = |snapshot_id| crate::table::SearchScanSplit::PrimaryKey {
+            data_split: crate::table::DataSplitBuilder::new()
+                .with_snapshot(snapshot_id)
+                .with_partition(crate::spec::BinaryRow::new(0))
+                .with_bucket(0)
+                .with_bucket_path(format!("{}/bucket-0", table.location()))
+                .with_data_files(vec![])
+                .build()
+                .unwrap(),
+            payloads: vec![],
+            uncovered_data_files: vec![],
+            row_ranges_by_file: Default::default(),
+        };
+        assert!(FullTextScanPlan::new(Some(snapshot.clone()), vec![split(8)]).is_err());
+        assert!(FullTextScanPlan::new(None, vec![split(0)]).is_err());
+        let plan = FullTextScanPlan::new(Some(snapshot), vec![split(0)]).unwrap();
+        let plan: FullTextScanPlan =
+            serde_json::from_slice(&serde_json::to_vec(&plan).unwrap()).unwrap();
+        let result = table
+            .new_full_text_search_builder()
+            .with_query("body", r#"{"match":{"query":"alpha"}}"#)
+            .with_limit(10)
+            .new_read()
+            .unwrap()
+            .read(plan)
+            .await
+            .unwrap();
+        assert_eq!(result.snapshot_id(), Some(7));
+        assert!(result.positions().unwrap().is_empty());
     }
 
     // (d) The PK full-text path produces physical positions, not global row-ids:

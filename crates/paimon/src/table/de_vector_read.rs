@@ -216,6 +216,7 @@ impl DeVectorRead {
             next_row_id,
             timing,
             skip_search,
+            source_splits,
         } = plan;
         let table = Arc::new(table);
         let make_results = |results: Vec<ScoredRowIds>| {
@@ -261,6 +262,7 @@ impl DeVectorRead {
                 &index_entries,
                 &vector_searches,
                 executor,
+                source_splits.as_deref(),
             )
             .await?
         };
@@ -678,8 +680,14 @@ async fn evaluate_batch_vector_search(
     index_entries: &[IndexManifestEntry],
     vector_searches: &[VectorSearch],
 ) -> crate::Result<Vec<ScoredRowIds>> {
-    evaluate_batch_vector_search_with_executor(evaluation, index_entries, vector_searches, None)
-        .await
+    evaluate_batch_vector_search_with_executor(
+        evaluation,
+        index_entries,
+        vector_searches,
+        None,
+        None,
+    )
+    .await
 }
 
 async fn evaluate_batch_vector_search_with_executor(
@@ -687,6 +695,7 @@ async fn evaluate_batch_vector_search_with_executor(
     index_entries: &[IndexManifestEntry],
     vector_searches: &[VectorSearch],
     executor: Option<&dyn SearchTaskExecutor>,
+    sources: Option<&[crate::table::SearchScanSplit]>,
 ) -> crate::Result<Vec<ScoredRowIds>> {
     let timing_enabled = vector_search_timing_enabled();
     let total_start = timing_enabled.then(Instant::now);
@@ -743,7 +752,8 @@ async fn evaluate_batch_vector_search_with_executor(
         })
         .collect();
 
-    if vector_entries.is_empty() && search_mode == GlobalIndexSearchMode::Fast {
+    if sources.is_none() && vector_entries.is_empty() && search_mode == GlobalIndexSearchMode::Fast
+    {
         return Ok(vec![ScoredRowIds::empty(); vector_searches.len()]);
     }
 
@@ -760,6 +770,36 @@ async fn evaluate_batch_vector_search_with_executor(
             .collect(),
     );
     let mut indexed_searches = Cow::Borrowed(vector_searches);
+    // Source plans carry global payload addresses, without retaining the
+    // planner's partition predicate or its serialized partition rows. Restrict
+    // ANN candidates from fixed-snapshot data metadata; the raw path applies
+    // the full predicate itself and must keep its original source ranges.
+    if sources.is_some() && !vector_ranges.is_empty() {
+        if let (Some(table), Some(filter)) = (evaluation.table, evaluation.filter) {
+            let (partition, _) = crate::table::bucket_filter::split_partition_and_data_predicates(
+                filter.clone(),
+                table.schema().fields(),
+                table.schema().partition_keys(),
+            );
+            if let Some(partition) = partition {
+                let partition_ids = Arc::new(
+                    super::search_scan_split::partition_row_ids_for_search_sources(
+                        table,
+                        &partition,
+                        vector_ranges.clone(),
+                    )
+                    .await?,
+                );
+                for search in indexed_searches.to_mut() {
+                    let selected = match search.effective_include_row_ids() {
+                        Some(include) => Arc::new(partition_ids.as_ref() & include),
+                        None => Arc::clone(&partition_ids),
+                    };
+                    search.set_shared_include_row_ids(selected);
+                }
+            }
+        }
+    }
     let mut route_indexed_to_raw = false;
     // Partition predicates have already pruned manifest entries. They do not
     // make an otherwise exact scalar lookup candidate-only.
@@ -787,7 +827,11 @@ async fn evaluate_batch_vector_search_with_executor(
             Some(row_ids) => {
                 let row_ids = Arc::new(row_ids);
                 for search in indexed_searches.to_mut() {
-                    search.set_shared_include_row_ids(Arc::clone(&row_ids));
+                    if let Some(include) = search.effective_include_row_ids() {
+                        search.set_shared_include_row_ids(Arc::new(row_ids.as_ref() & include));
+                    } else {
+                        search.set_shared_include_row_ids(Arc::clone(&row_ids));
+                    }
                 }
             }
             None => route_indexed_to_raw = true,
@@ -798,8 +842,11 @@ async fn evaluate_batch_vector_search_with_executor(
     let deleted_row_index = if core_options.data_evolution_enabled() {
         match evaluation.table {
             Some(table) => {
-                let ranges =
-                    deleted_row_ranges_for_data_evolution_dvs(table, index_entries).await?;
+                let ranges = if sources.is_some() {
+                    super::search_scan_split::deleted_row_ranges_for_search_sources(table).await?
+                } else {
+                    deleted_row_ranges_for_data_evolution_dvs(table, index_entries).await?
+                };
                 (!ranges.is_empty()).then(|| RowRangeIndex::create(ranges))
             }
             None => None,
@@ -1030,46 +1077,62 @@ async fn evaluate_batch_vector_search_with_executor(
         refine = refine_start.map_or(Duration::ZERO, |start| start.elapsed());
     }
 
-    if route_indexed_to_raw
+    if sources.is_some()
+        || route_indexed_to_raw
         || search_mode != GlobalIndexSearchMode::Fast
         || scalar_search_mode.is_some_and(|mode| mode != GlobalIndexSearchMode::Fast)
     {
         let raw_fallback_start = timing_enabled.then(Instant::now);
-        let detail_ranges = if search_mode == GlobalIndexSearchMode::Detail
-            || scalar_search_mode == Some(GlobalIndexSearchMode::Detail)
-        {
-            let table = evaluation.table.ok_or_else(|| crate::Error::DataInvalid {
-                message: "Vector raw search in detail mode requires table context".to_string(),
-                source: None,
-            })?;
-            detail_data_ranges_for_table(table).await?
+        let mut raw_ranges = if let Some(sources) = sources {
+            sources
+                .iter()
+                .filter_map(|source| match source {
+                    crate::table::SearchScanSplit::Raw { row_ranges, .. } => {
+                        Some(row_ranges.as_slice())
+                    }
+                    _ => None,
+                })
+                .flatten()
+                .cloned()
+                .collect::<Vec<_>>()
         } else {
-            Vec::new()
-        };
-        let field_ids = HashSet::from([field_id]);
-        let mut raw_ranges = unindexed_ranges_for_global_index_entries(
-            index_entries,
-            &field_ids,
-            search_mode,
-            evaluation.next_row_id,
-            &detail_ranges,
-            is_vector_global_index_file,
-        );
-        if let (Some(filter), Some(scalar_mode)) = (&scalar_filter, scalar_search_mode) {
-            let mut scalar_ranges = scalar_unindexed_ranges(
-                evaluation,
+            let detail_ranges = if search_mode == GlobalIndexSearchMode::Detail
+                || scalar_search_mode == Some(GlobalIndexSearchMode::Detail)
+            {
+                let table = evaluation.table.ok_or_else(|| crate::Error::DataInvalid {
+                    message: "Vector raw search in detail mode requires table context".to_string(),
+                    source: None,
+                })?;
+                detail_data_ranges_for_table(table).await?
+            } else {
+                Vec::new()
+            };
+            let field_ids = HashSet::from([field_id]);
+            let mut ranges = unindexed_ranges_for_global_index_entries(
                 index_entries,
-                filter,
-                scalar_mode,
+                &field_ids,
+                search_mode,
+                evaluation.next_row_id,
                 &detail_ranges,
+                is_vector_global_index_file,
             );
-            // Scalar FULL/DETAIL also recover gaps inside vector coverage. In
-            // vector FAST they must not expand beyond the indexed corpus.
-            if search_mode == GlobalIndexSearchMode::Fast {
-                scalar_ranges = intersect_sorted_ranges(&scalar_ranges, &vector_ranges);
+            if let (Some(filter), Some(scalar_mode)) = (&scalar_filter, scalar_search_mode) {
+                let mut scalar_ranges = scalar_unindexed_ranges(
+                    evaluation,
+                    index_entries,
+                    filter,
+                    scalar_mode,
+                    &detail_ranges,
+                );
+                // Scalar FULL/DETAIL also recover gaps inside vector coverage. In
+                // vector FAST they must not expand beyond the indexed corpus.
+                if search_mode == GlobalIndexSearchMode::Fast {
+                    scalar_ranges = intersect_sorted_ranges(&scalar_ranges, &vector_ranges);
+                }
+                ranges.extend(scalar_ranges);
             }
-            raw_ranges.extend(scalar_ranges);
-        }
+            ranges
+        };
         if route_indexed_to_raw {
             raw_ranges.extend(vector_ranges);
         }
@@ -1080,11 +1143,29 @@ async fn evaluate_batch_vector_search_with_executor(
                 source: None,
             })?;
             let metric_start = timing_enabled.then(Instant::now);
+            let mut metric_options = vector_searches[0].options.clone();
+            if configured_vector_index_type(evaluation.table_options, &metric_options, field_name)
+                .is_none()
+            {
+                if let Some(index_type) =
+                    sources
+                        .into_iter()
+                        .flatten()
+                        .find_map(|source| match source {
+                            crate::table::SearchScanSplit::Raw { index_type, .. } => {
+                                index_type.as_ref()
+                            }
+                            _ => None,
+                        })
+                {
+                    metric_options.insert("index_type".into(), index_type.clone());
+                }
+            }
             let metric = resolve_raw_vector_metric(
                 evaluation.file_io,
                 table_path,
                 evaluation.table_options,
-                &vector_searches[0].options,
+                &metric_options,
                 index_entries,
                 field_id,
                 field_name,
@@ -2666,6 +2747,7 @@ impl TaskVectorQueries {
             .collect::<crate::Result<Vec<_>>>()?;
         Ok(Self { queries, filters })
     }
+    #[cfg(any(feature = "internal-api", test))]
     fn restore(&self) -> crate::Result<Vec<VectorSearch>> {
         let filters = self
             .filters
@@ -2728,6 +2810,7 @@ struct VectorTaskScores {
     results: Vec<TaskScoredRows>,
 }
 impl VectorTaskScores {
+    #[cfg(any(feature = "internal-api", test))]
     fn capture(results: Vec<ScoredRowIds>, metric: Option<RawVectorMetric>) -> Self {
         Self {
             metric,
@@ -2758,6 +2841,7 @@ impl VectorTaskScores {
     }
 }
 
+#[cfg(any(feature = "internal-api", test))]
 pub(super) async fn execute_search_task(
     table: &Table,
     kind: &str,

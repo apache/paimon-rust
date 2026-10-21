@@ -18,7 +18,9 @@
 //! Opaque, snapshot-scoped search work for local or remote schedulers.
 
 use super::Table;
-use crate::spec::{CoreOptions, Snapshot, TableSchema};
+#[cfg(any(feature = "internal-api", test))]
+use crate::spec::CoreOptions;
+use crate::spec::{Snapshot, TableSchema};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -33,10 +35,12 @@ pub(super) fn invalid(message: impl Into<String>) -> crate::Error {
     }
 }
 
+#[cfg(any(feature = "internal-api", test))]
 pub(super) fn encode<T: Serialize>(value: &T) -> crate::Result<Vec<u8>> {
     serde_json::to_vec(value).map_err(|error| invalid(format!("Invalid search task: {error}")))
 }
 
+#[cfg(any(feature = "internal-api", test))]
 pub(super) fn decode<T: serde::de::DeserializeOwned>(value: &[u8]) -> crate::Result<T> {
     serde_json::from_slice(value).map_err(|error| invalid(format!("Invalid search task: {error}")))
 }
@@ -68,7 +72,10 @@ impl SearchTask {
             payload,
         })
     }
+}
 
+#[cfg(any(feature = "internal-api", test))]
+impl SearchTask {
     pub fn serialize(&self) -> crate::Result<Vec<u8>> {
         encode(self)
     }
@@ -219,14 +226,6 @@ impl SearchTask {
         Ok(task)
     }
 
-    pub fn deserialize(bytes: &[u8]) -> crate::Result<Self> {
-        let task: Self = decode(bytes)?;
-        if task.version != VERSION {
-            return Err(invalid("Unsupported search task version"));
-        }
-        Ok(task)
-    }
-
     pub async fn execute(&self, table: &Table) -> crate::Result<SearchTaskResult> {
         // The worker's runtime restrictions take precedence over transported options.
         CoreOptions::new(table.schema().options()).ensure_read_authorized()?;
@@ -268,6 +267,7 @@ pub struct SearchTaskResult {
     payload: Value,
 }
 
+#[cfg(any(feature = "internal-api", test))]
 impl SearchTaskResult {
     pub fn serialize(&self) -> crate::Result<Vec<u8>> {
         encode(self)
@@ -317,12 +317,14 @@ pub(super) async fn execute_tasks(
         .collect()
 }
 
+#[cfg(any(feature = "internal-api", test))]
 #[derive(Serialize, Deserialize)]
 struct SharedTaskContext {
     version: u8,
     id: String,
     values: Vec<Value>,
 }
+#[cfg(any(feature = "internal-api", test))]
 #[derive(Serialize, Deserialize)]
 struct SharedTaskFrame {
     version: u8,
@@ -331,9 +333,14 @@ struct SharedTaskFrame {
     references: Vec<(String, usize)>,
 }
 
+#[cfg(any(feature = "internal-api", test))]
 impl Table {
-    /// Execute one opaque task and its shared inputs using this worker's credentials.
-    pub async fn execute_search_task(&self, task: &[u8], context: &[u8]) -> crate::Result<Vec<u8>> {
+    /// Internal worker bridge; ordinary callers execute a constructed scan plan.
+    pub(crate) async fn execute_search_task(
+        &self,
+        task: &[u8],
+        context: &[u8],
+    ) -> crate::Result<Vec<u8>> {
         SearchTask::deserialize_with_context(task, context)?
             .execute(self)
             .await?

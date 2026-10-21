@@ -177,27 +177,32 @@ impl PyHybridSearchBuilder {
         Ok(slf)
     }
 
-    #[pyo3(signature = (executor=None))]
-    fn execute(
-        &self,
-        py: Python<'_>,
-        executor: Option<Py<PyAny>>,
-    ) -> PyResult<PyGlobalIndexResult> {
+    fn execute(&self, py: Python<'_>) -> PyResult<PyGlobalIndexResult> {
         let builder = self.builder();
-        if let Some(callback) = executor {
-            let executor = crate::search_task::PythonSearchTaskExecutor::new(callback);
-            let result = py.detach(|| runtime().block_on(builder.execute_with_executor(&executor)));
-            if let Some(error) = executor.take_error() {
-                return Err(error);
-            }
-            return result.map(PyGlobalIndexResult::new).map_err(to_py_err);
-        }
         py.detach(|| runtime().block_on(builder.execute_scored()))
             .map(PyGlobalIndexResult::new)
             .map_err(to_py_err)
     }
 
+    fn _execute_with_executor(
+        &self,
+        py: Python<'_>,
+        executor: Py<PyAny>,
+    ) -> PyResult<PyGlobalIndexResult> {
+        let builder = self.builder();
+        let executor = crate::search_task::PythonSearchTaskExecutor::new(executor);
+        let result = py.detach(|| {
+            runtime().block_on(paimon::table::internal::execute_hybrid_with_executor(
+                &builder, &executor,
+            ))
+        });
+        if let Some(error) = executor.take_error() {
+            return Err(error);
+        }
+        result.map(PyGlobalIndexResult::new).map_err(to_py_err)
+    }
+
     fn execute_local(&self, py: Python<'_>) -> PyResult<PyGlobalIndexResult> {
-        self.execute(py, None)
+        self.execute(py)
     }
 }

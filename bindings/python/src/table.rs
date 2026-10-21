@@ -56,7 +56,13 @@ impl PyTable {
         context: &[u8],
     ) -> PyResult<Bound<'py, pyo3::types::PyBytes>> {
         let result = py
-            .detach(|| runtime().block_on(self.inner.execute_search_task(task, context)))
+            .detach(|| {
+                runtime().block_on(paimon::table::internal::execute_search_task(
+                    &self.inner,
+                    task,
+                    context,
+                ))
+            })
             .map_err(to_py_err)?;
         Ok(pyo3::types::PyBytes::new(py, &result))
     }

@@ -51,6 +51,7 @@ struct Hits {
 }
 
 impl Hits {
+    #[cfg(any(feature = "internal-api", test))]
     fn from_search(result: SearchResult) -> Self {
         Self {
             row_ids: result.row_ids,
@@ -90,6 +91,7 @@ fn encode_bitmap(ids: &RoaringTreemap) -> crate::Result<Vec<u8>> {
     Ok(bytes)
 }
 
+#[cfg(any(feature = "internal-api", test))]
 fn decode_bitmap(bytes: Vec<u8>) -> crate::Result<RoaringTreemap> {
     RoaringTreemap::deserialize_from(bytes.as_slice())
         .map_err(|error| invalid(format!("Invalid full-text task row IDs: {error}")))
@@ -166,6 +168,7 @@ pub(super) async fn search_raw_rows(
     decode::<Hits>(&values.remove(0))?.into_search()
 }
 
+#[cfg(any(feature = "internal-api", test))]
 pub(crate) async fn execute_search_task(
     table: &Table,
     kind: &str,

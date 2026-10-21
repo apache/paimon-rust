@@ -195,6 +195,25 @@ async fn both_routes_filter_before_top_k_and_accumulate_predicates() {
         .with_filter(pb.equal("id", Datum::Int(6)).unwrap())
         .with_partition_filter(pb.equal("pt", Datum::Int(1)).unwrap())
         .unwrap();
+    let pinned = builder.resolve_pinned_route_table().await.unwrap().unwrap();
+    let vector = builder
+        .vector_route_builder(&pinned, &builder.routes[0])
+        .execute()
+        .await
+        .unwrap();
+    assert_eq!(
+        vector.row_ids().unwrap().row_ids,
+        vec![6],
+        "the vector route must filter before its top-k"
+    );
+    let text = execute_full_text_route(&pinned, &builder.routes[1], builder.filter.as_ref(), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        text.row_ids,
+        vec![6],
+        "the text route must filter before its top-k"
+    );
     let result = builder.execute_scored().await.unwrap();
     assert_eq!(result.row_ids().unwrap().row_ids, vec![6]);
     assert!((result.row_ids().unwrap().scores[0] - 2.0 / 61.0).abs() < 1e-6);
@@ -493,4 +512,58 @@ async fn scheduled_hybrid_shares_snapshot_and_preserves_all_core_rankers() {
         assert!(kinds.iter().any(|kind| kind.starts_with("vector-")));
         assert!(kinds.iter().any(|kind| kind == "fulltext-index"));
     }
+}
+
+#[tokio::test]
+async fn explicit_raw_source_range_with_partition_filter_keeps_global_row_ids() {
+    use futures::TryStreamExt;
+    let table = table();
+    append(&table, 0).await;
+    append(&table, 4).await;
+    let snapshot = table.resolve_read_snapshot().await.unwrap().unwrap();
+    let plan = crate::table::VectorScanPlan::new(
+        Some(snapshot),
+        vec![crate::table::SearchScanSplit::Raw {
+            row_ranges: vec![RowRange::new(4, 7)],
+            scalar_index_files: vec![],
+            index_type: Some("ivf-flat".into()),
+        }],
+    )
+    .unwrap();
+    let predicates = PredicateBuilder::new(table.schema().fields());
+    let mut builder = table.new_vector_search_builder();
+    builder
+        .with_vector_column("embedding")
+        .with_query_vector(vec![0.0, 0.0])
+        .with_limit(1)
+        .with_filter(Predicate::and(vec![
+            predicates.equal("pt", Datum::Int(1)).unwrap(),
+            predicates.equal("id", Datum::Int(6)).unwrap(),
+        ]));
+    let result = builder.new_read().unwrap().read(plan).await.unwrap();
+    assert_eq!(result.row_ids().unwrap().row_ids, vec![6]);
+    let batches: Vec<RecordBatch> = result
+        .new_read_builder()
+        .with_projection(&["id"])
+        .read()
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    let ids = batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .values()
+                .iter()
+                .copied()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(ids, vec![6]);
 }

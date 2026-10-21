@@ -1969,25 +1969,28 @@ async fn scheduled_vector_selects_global_candidates_before_rerank() {
         .with_query_vector(vec![0.0, 1.0])
         .with_limit(1)
         .with_options(HashMap::from([("refine_factor".into(), "2".into())]));
-    let mut plan = builder.new_scan().unwrap().plan().await.unwrap();
-    let crate::table::vector_scan::VectorScanWork::DataEvolution(work) = &mut plan.work else {
-        unreachable!()
-    };
-    let duplicate = work
-        .index_entries
+    let plan = builder.new_scan().unwrap().plan().await.unwrap();
+    let mut sources = plan.splits().to_vec();
+    let duplicate = sources
         .iter()
-        .find(|entry| entry.index_file.index_type == IVF_FLAT_IDENTIFIER)
+        .find(|source| {
+            matches!(source,
+        crate::table::SearchScanSplit::Index { index_files, .. }
+        if index_files.iter().any(|file| file.index_type == IVF_FLAT_IDENTIFIER))
+        })
         .unwrap()
         .clone();
     for _ in 0..SEARCH_TASK_WINDOW + 1 {
-        work.index_entries.push(duplicate.clone());
+        sources.push(duplicate.clone());
     }
+    let entries = crate::table::search_scan_split::global_entries_from_splits(&sources).unwrap();
+    let plan = crate::table::VectorScanPlan::new(plan.snapshot().cloned(), sources).unwrap();
     let metric = resolve_raw_vector_metric(
         table.file_io(),
         table.location(),
         table.schema().options(),
         &HashMap::new(),
-        &work.index_entries,
+        &entries,
         find_field_id_by_name(table.schema().fields(), "embedding").unwrap(),
         "embedding",
     )

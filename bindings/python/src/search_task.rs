@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use paimon::table::{SearchTask, SearchTaskExecutor, SearchTaskResult};
+use paimon::table::internal::{SearchTask, SearchTaskExecutor, SearchTaskResult};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyList};
 use std::sync::Mutex;

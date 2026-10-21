@@ -64,7 +64,9 @@ pub unsafe extern "C" fn paimon_vector_scan_plan(
 }
 
 /// Construct a common read plan from already-decoded Java PK bucket splits.
-/// No snapshot or index manifest is read. Handles are borrowed and copied;
+/// Capture the supplied snapshot ID, or the scan's configured snapshot for
+/// unversioned buckets, without replanning the index manifest.
+/// Handles are borrowed and copied;
 /// callers may free them as soon as this returns. Failure leaves inputs intact.
 /// Empty input, DE scans and mixed snapshots are rejected.
 /// # Safety
@@ -111,7 +113,7 @@ pub unsafe extern "C" fn paimon_vector_scan_plan_from_bucket_splits(
         }
         decoded.push((&*((*split).inner as *const BucketVectorSearchSplit)).clone());
     }
-    wrap_plan(scan.plan_from_bucket_splits(decoded))
+    wrap_plan(runtime().block_on(scan.plan_from_bucket_splits(decoded)))
 }
 
 /// Free a vector scan. Null is accepted.
