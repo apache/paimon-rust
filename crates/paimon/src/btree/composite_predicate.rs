@@ -22,7 +22,10 @@ use super::CompositeKeyCodec;
 use crate::spec::{DataField, Datum, Predicate, PredicateOperator};
 use crate::Result;
 use std::cmp::Ordering;
+use std::collections::HashSet;
 
+// Bound Cartesian expansion, while allowing a single IN domain to grow
+// linearly with its input, including constant prefixes and suffixes.
 pub(crate) const MAX_INTERVALS: usize = 256;
 type Component = Option<Vec<u8>>;
 
@@ -175,49 +178,69 @@ impl CompositePlan {
             } else {
                 literals.iter().cloned().map(Some).collect()
             };
+            // Other IN predicates on this column must also avoid a linear
+            // literal scan for every candidate. Normalized component bytes
+            // preserve comparison equality, including canonical NaNs.
+            let in_domains = column
+                .iter()
+                .map(|leaf| match leaf {
+                    Predicate::Leaf {
+                        op: PredicateOperator::In,
+                        literals,
+                        ..
+                    } if !std::ptr::eq(leaf, selected) => Some(
+                        literals
+                            .iter()
+                            .map(|value| codec.serialize_component(i, value))
+                            .collect::<HashSet<_>>(),
+                    ),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
             let mut domain: Vec<Option<Datum>> = Vec::new();
+            let mut seen = HashSet::new();
             for candidate in candidates {
                 let encoded = candidate.as_ref().map(|v| codec.serialize_component(i, v));
                 let mut matches = true;
-                for leaf in &column {
-                    if !matches_leaf(&codec, i, encoded.as_deref(), leaf)? {
+                for (leaf, in_domain) in column.iter().zip(&in_domains) {
+                    // Candidates already come from this leaf. Rechecking an
+                    // IN against itself would make planning quadratic.
+                    if std::ptr::eq(leaf, selected) {
+                        continue;
+                    }
+                    let satisfies = if let Some(values) = in_domain {
+                        encoded.as_ref().is_some_and(|value| values.contains(value))
+                    } else {
+                        matches_leaf(&codec, i, encoded.as_deref(), leaf)?
+                    };
+                    if !satisfies {
                         matches = false;
                         break;
                     }
                 }
-                if matches {
-                    let mut duplicate = false;
-                    for value in &domain {
-                        let value = value.as_ref().map(|v| codec.serialize_component(i, v));
-                        if codec.compare_component(i, encoded.as_deref(), value.as_deref())?
-                            == Ordering::Equal
-                        {
-                            duplicate = true;
-                            break;
-                        }
-                    }
-                    if !duplicate {
-                        domain.push(candidate);
-                    }
-                    if domain.len() > MAX_INTERVALS {
-                        break;
-                    }
+                if matches && seen.insert(encoded) {
+                    domain.push(candidate);
                 }
             }
-            equal_columns += 1;
             if domain.is_empty() {
                 return Ok(Some(Self {
                     fields: fields.to_vec(),
                     codec,
                     intervals: Vec::new(),
-                    bound_columns: equal_columns,
-                    equal_columns,
+                    bound_columns: equal_columns + 1,
+                    equal_columns: equal_columns + 1,
                 }));
             }
-            if prefixes.len() * domain.len() > MAX_INTERVALS {
-                return Ok(None);
+            if prefixes.len() > 1
+                && domain.len() > 1
+                && prefixes.len() > MAX_INTERVALS / domain.len()
+            {
+                // Keep the bound prefix and leave this column and its suffix
+                // for residual filtering, without expanding a Cartesian product.
+                break;
             }
-            let mut expanded = Vec::new();
+            equal_columns += 1;
+            let mut expanded = Vec::with_capacity(prefixes.len() * domain.len());
             for prefix in prefixes {
                 for value in &domain {
                     let mut next = prefix.clone();

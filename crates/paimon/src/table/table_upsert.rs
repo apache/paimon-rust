@@ -1205,6 +1205,128 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn upsert_large_composite_domains_keep_index_pruning_and_exact_matches() {
+        for large_domain in [false, true] {
+            let schema = PaimonSchema::builder()
+                .column("key", PaimonType::Int(IntType::new()))
+                .column("tag", PaimonType::Int(IntType::new()))
+                .column("value", PaimonType::Int(IntType::new()))
+                .option("data-evolution.enabled", "true")
+                .option("row-tracking.enabled", "true")
+                .build()
+                .unwrap();
+            let table = Table::new(
+                FileIOBuilder::new("memory").build().unwrap(),
+                Identifier::new("db", "large_composite_upsert"),
+                format!("memory:/upsert_large_composite_domains_{large_domain}"),
+                TableSchema::new(0, &schema),
+                None,
+            );
+            let batch = |keys: Vec<i32>, tags: Vec<i32>, value: i32| {
+                let count = keys.len();
+                RecordBatch::try_from_iter([
+                    ("key", Arc::new(Int32Array::from(keys)) as ArrayRef),
+                    ("tag", Arc::new(Int32Array::from(tags)) as ArrayRef),
+                    (
+                        "value",
+                        Arc::new(Int32Array::from(vec![value; count])) as ArrayRef,
+                    ),
+                ])
+                .unwrap()
+            };
+            let (keys, tags, count, stride, matches, candidates) = if large_domain {
+                (512, 8, 257, 2, 256, 256)
+            } else {
+                (128, 32, 17, 4, 16, 17 * 32)
+            };
+            let mut write = table.new_write_builder().new_write().unwrap();
+            write
+                .write_arrow_batch(&batch(
+                    (0..keys)
+                        .flat_map(|key| std::iter::repeat_n(key, tags as usize))
+                        .collect(),
+                    (0..keys).flat_map(|_| 0..tags).collect(),
+                    0,
+                ))
+                .await
+                .unwrap();
+            TableCommit::new(table.clone(), "seed".into())
+                .commit(write.prepare_commit().await.unwrap())
+                .await
+                .unwrap();
+            write.close().await;
+            table
+                .new_global_index_build_builder()
+                .with_index_columns(&["key", "tag"])
+                .execute()
+                .await
+                .unwrap();
+
+            let mut upsert = TableUpsert::new(
+                &table,
+                "upsert".into(),
+                vec!["key".into(), "tag".into()],
+                vec!["value".into()],
+            )
+            .unwrap();
+            // Exercise a large linear IN and a 17 x 17 Cartesian domain.
+            // The last tuple is absent; prefix candidates with other suffixes
+            // must not be updated or cause an existing match to become an insert.
+            upsert
+                .add_batch(batch(
+                    (0..count).map(|key| key * stride).collect(),
+                    (0..count)
+                        .map(|i| {
+                            if large_domain {
+                                7
+                            } else if i < matches {
+                                i
+                            } else {
+                                99
+                            }
+                        })
+                        .collect(),
+                    42,
+                ))
+                .unwrap();
+            let source = upsert.key_rows().unwrap();
+            let mut matcher = UpsertKeyMatcher::new(&source, upsert.keys.clone()).unwrap();
+            let plan = upsert.match_existing(&source, &mut matcher).await.unwrap();
+            let mut actual_candidates = 0;
+            for split in plan.splits() {
+                for range in split
+                    .row_ranges()
+                    .expect("large domains must retain index pruning")
+                {
+                    actual_candidates += range.to() - range.from() + 1;
+                }
+            }
+            assert_eq!(actual_candidates, candidates);
+            let (_, mut matched, new) = matcher.finish();
+            matched.sort();
+            let expected = (0..matches)
+                .map(|key| i64::from(key * stride * tags + if large_domain { 7 } else { key }))
+                .collect::<Vec<_>>();
+            assert_eq!(matched, expected);
+            assert_eq!(new, vec![(count - 1) as usize]);
+            TableCommit::new(table.clone(), "upsert".into())
+                .commit(upsert.prepare_commit().await.unwrap())
+                .await
+                .unwrap();
+            let rows = values_by_row_id(&table).await;
+            assert_eq!(rows.len(), 4097);
+            for (row_id, value) in rows {
+                let updated = expected.contains(&row_id) || row_id == 4096;
+                assert_eq!(
+                    value,
+                    if updated { 42 } else { 0 },
+                    "row {row_id}, large={large_domain}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn upsert_blob_keys_fall_back_to_byte_matching() {
         use crate::spec::BlobType;
         use arrow_array::LargeBinaryArray;

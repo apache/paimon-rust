@@ -226,12 +226,19 @@ impl<F: Fn(&[u8], &[u8]) -> crate::Result<Ordering>> BTreeIndexReader<F> {
         &self,
         plan: &super::CompositePlan,
     ) -> io::Result<RoaringTreemap> {
+        if plan.is_point_lookup() {
+            let keys = plan
+                .intervals
+                .iter()
+                .map(|interval| interval.point_key.as_deref().expect("complete tuple point"))
+                .collect::<Vec<_>>();
+            return match keys.as_slice() {
+                [key] => self.query_equal(key).await,
+                _ => self.query_in(&keys).await,
+            };
+        }
         let mut result = RoaringTreemap::new();
         for interval in &plan.intervals {
-            if let Some(key) = &interval.point_key {
-                result |= self.query_equal(key).await?;
-                continue;
-            }
             let cmp = |key: &[u8], _: &[u8]| {
                 interval
                     .lower
