@@ -349,11 +349,12 @@ impl WriteTarget {
 
     fn row_write_columns(&self, routing: &RecordBatch) -> paimon::Result<Vec<String>> {
         match self {
-            Self::Table(writer) => Ok(writer
-                .write_fields_for_row(routing)?
-                .iter()
-                .map(|field| field.name().to_owned())
-                .collect()),
+            Self::Table(writer) => Ok(paimon::table::internal::resolve_row_write_fields(
+                writer, routing,
+            )?
+            .iter()
+            .map(|field| field.name().to_owned())
+            .collect()),
             Self::PostponeFixed(_) => Err(paimon::Error::Unsupported {
                 message: "_row_write_columns requires a Paimon append table".into(),
             }),
@@ -380,9 +381,15 @@ impl WriteTarget {
         }
     }
 
-    async fn prepare_commit(&mut self) -> paimon::Result<Vec<CommitMessage>> {
+    async fn prepare_commit(
+        &mut self,
+        commit_identifier: i64,
+    ) -> paimon::Result<Vec<CommitMessage>> {
         match self {
-            Self::Table(writer) => writer.prepare_commit().await,
+            Self::Table(writer) => {
+                paimon::table::internal::prepare_commit_with_identifier(writer, commit_identifier)
+                    .await
+            }
             Self::PostponeFixed(writer) => writer.prepare_commit().await,
         }
     }
@@ -896,12 +903,21 @@ impl WriteState {
             .map_err(to_py_err)?;
         // Release replaced callbacks which no bucket has captured. A snapshot
         // retained by core contributes another Arc, without another Py ref.
-        self.blob_consumers
-            .retain(|consumer| Arc::strong_count(consumer) > 1);
+        self.prune_blob_consumers();
         if let Some(consumer) = consumer {
             self.blob_consumers.push(consumer);
         }
         Ok(())
+    }
+
+    fn prune_blob_consumers(&mut self) {
+        let (retained, retired): (Vec<_>, Vec<_>) = std::mem::take(&mut self.blob_consumers)
+            .into_iter()
+            .partition(|consumer| Arc::strong_count(consumer) > 1);
+        self.blob_consumers = retained;
+        // Python destructors can re-enter Native. No callback mutex is held,
+        // and the retained references are restored before any destructor runs.
+        drop(retired);
     }
 
     fn traverse_callbacks(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
@@ -957,14 +973,18 @@ impl WriteState {
         self.write_result(result)
     }
 
-    fn prepare_commit(&mut self, py: Python<'_>) -> PyResult<Vec<PyCommitMessage>> {
+    fn prepare_commit(
+        &mut self,
+        py: Python<'_>,
+        commit_identifier: i64,
+    ) -> PyResult<Vec<PyCommitMessage>> {
         let inner = self
             .inner
             .as_mut()
             .ok_or_else(|| PyRuntimeError::new_err("TableWrite is closed"))?;
-        let messages = py
-            .detach(|| runtime().block_on(inner.prepare_commit()))
-            .map_err(to_callback_error)?;
+        let result = py.detach(|| runtime().block_on(inner.prepare_commit(commit_identifier)));
+        self.prune_blob_consumers();
+        let messages = result.map_err(to_callback_error)?;
         Ok(wrap_messages(
             messages,
             &self.table_location,
@@ -1334,7 +1354,7 @@ impl PyBatchTableWrite {
             ));
         }
         self.prepared = true;
-        self.state.prepare_commit(py)
+        self.state.prepare_commit(py, i64::MAX)
     }
 }
 
@@ -1407,15 +1427,15 @@ impl PyStreamTableWrite {
     }
 
     /// Rust currently flushes synchronously and has no background compaction.
-    /// The identifier accompanies the returned messages in StreamTableCommit.commit.
+    /// The identifier also bounds retirement of captured bucket configuration.
     fn prepare_commit(
         &mut self,
         py: Python<'_>,
         wait_compaction: bool,
         commit_identifier: i64,
     ) -> PyResult<Vec<PyCommitMessage>> {
-        let _ = (wait_compaction, commit_identifier);
-        self.state.prepare_commit(py)
+        let _ = wait_compaction;
+        self.state.prepare_commit(py, commit_identifier)
     }
 }
 
@@ -1868,6 +1888,141 @@ assert sorted(finalized) == ['first', 'second'], finalized
                     Some(&locals),
                 )
                 .unwrap();
+            }
+        });
+    }
+
+    #[test]
+    fn idle_bucket_prepare_releases_only_retired_python_blob_consumers() {
+        Python::attach(|py| {
+            let schema = Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("pt", DataType::Int(IntType::new()))
+                .partition_keys(["pt"])
+                .option("bucket", "-1")
+                .build()
+                .unwrap();
+            let table = Arc::new(Table::new(
+                FileIOBuilder::new("memory").build().unwrap(),
+                Identifier::new("default", "retired_callbacks"),
+                "memory:/retired_callbacks".into(),
+                TableSchema::new(0, &schema),
+                None,
+            ));
+            let writer = Py::new(
+                py,
+                PyStreamTableWrite {
+                    state: WriteContext::new(table.clone()).new_write(false).unwrap(),
+                },
+            )
+            .unwrap();
+            let locals = PyDict::new(py);
+            locals.set_item("writer", &writer).unwrap();
+            py.run(
+                c_str!(
+                    r#"
+import gc
+import weakref
+finalized = []
+class Callback:
+    def __init__(self, label):
+        self.label = label
+    def __call__(self, field, descriptor):
+        return False
+    def __del__(self):
+        finalized.append(self.label)
+def install(label):
+    callback = Callback(label)
+    writer.with_blob_consumer(callback)
+    return weakref.ref(callback)
+first = install('first')
+"#
+                ),
+                Some(&locals),
+                Some(&locals),
+            )
+            .unwrap();
+            let write_partition = |partition| {
+                let input = RecordBatch::try_from_iter([
+                    (
+                        "id",
+                        Arc::new(arrow::array::Int32Array::from(vec![1])) as arrow::array::ArrayRef,
+                    ),
+                    (
+                        "pt",
+                        Arc::new(arrow::array::Int32Array::from(vec![partition]))
+                            as arrow::array::ArrayRef,
+                    ),
+                ])
+                .unwrap();
+                let mut borrowed = writer.borrow_mut(py);
+                let inner = borrowed.state.inner.as_mut().unwrap();
+                py.detach(|| runtime().block_on(inner.write_arrow(&input, None)))
+                    .unwrap();
+            };
+            write_partition(1);
+            py.run(
+                c_str!("second = install('second')"),
+                Some(&locals),
+                Some(&locals),
+            )
+            .unwrap();
+            write_partition(2);
+            py.run(
+                c_str!("current = install('current')"),
+                Some(&locals),
+                Some(&locals),
+            )
+            .unwrap();
+            assert_eq!(
+                writer
+                    .borrow_mut(py)
+                    .state
+                    .prepare_commit(py, 1)
+                    .unwrap()
+                    .len(),
+                2
+            );
+            let prepared_files = py
+                .detach(|| {
+                    runtime().block_on(table.file_io().list_status_recursive(table.location()))
+                })
+                .unwrap();
+            assert!(!prepared_files.is_empty());
+            py.run(
+                c_str!("gc.collect(); assert first() is not None and second() is not None and current() is not None"),
+                Some(&locals), Some(&locals),
+            ).unwrap();
+            write_partition(2);
+            assert_eq!(
+                writer
+                    .borrow_mut(py)
+                    .state
+                    .prepare_commit(py, 2)
+                    .unwrap()
+                    .len(),
+                1
+            );
+            py.run(
+                c_str!("gc.collect(); assert first() is None; assert second() is not None and current() is not None; assert finalized == ['first']"),
+                Some(&locals), Some(&locals),
+            ).unwrap();
+            for file in prepared_files.iter().filter(|file| !file.is_dir) {
+                assert!(py
+                    .detach(|| runtime().block_on(table.file_io().exists(&file.path)))
+                    .unwrap());
+            }
+            writer.borrow_mut(py).close(py);
+            py.run(
+                c_str!("gc.collect(); assert second() is None and current() is None"),
+                Some(&locals),
+                Some(&locals),
+            )
+            .unwrap();
+            for file in prepared_files.iter().filter(|file| !file.is_dir) {
+                assert!(py
+                    .detach(|| runtime().block_on(table.file_io().exists(&file.path)))
+                    .unwrap());
             }
         });
     }
@@ -2393,7 +2548,7 @@ batch = pa.RecordBatch.from_pylist([
                     } else {
                         result.unwrap();
                     }
-                    assert!(state.prepare_commit(py).unwrap().is_empty());
+                    assert!(state.prepare_commit(py, i64::MAX).unwrap().is_empty());
                 }
             }
         });

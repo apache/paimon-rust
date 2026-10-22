@@ -56,8 +56,17 @@ use std::sync::Arc;
 mod append;
 #[path = "table_write_input.rs"]
 mod input;
+#[cfg(test)]
+#[path = "table_write_lifecycle_tests.rs"]
+mod lifecycle_tests;
 #[path = "table_write_precomputed.rs"]
 mod precomputed;
+
+#[derive(Clone, Copy)]
+enum AppendPrepareIdentifier {
+    Known(i64),
+    Unknown,
+}
 
 /// Java's append writer captures its factory settings per partition/bucket.
 /// Keep only these settings across prepares, not completed file resources.
@@ -67,6 +76,7 @@ struct AppendWriteConfig {
     fields: Vec<DataField>,
     blob_consumer: Option<Arc<dyn crate::spec::BlobConsumer>>,
     blob_uri_reader_factory: Option<Arc<dyn crate::io::UriReaderFactory>>,
+    last_modified_prepare: Option<AppendPrepareIdentifier>,
 }
 
 /// Enum to hold either an append-only writer, a key-value writer, or a postpone writer.
@@ -660,7 +670,8 @@ impl TableWrite {
     /// Selected inputs must include partition columns and, unless a bucket is
     /// supplied through [`Self::write_arrow`], the columns used for hashing.
     /// Changes apply to partition/bucket writers created afterwards. Existing
-    /// writers retain their selected columns, including across prepares. A full
+    /// writers retain their selected columns across active prepares, until an
+    /// idle prepare can safely retire them. A full
     /// table batch is projected to each writer's captured columns; a selected
     /// batch must match the destination writer's names and order, optionally
     /// accompanied by routing and configured row-kind fields.
@@ -1486,19 +1497,70 @@ impl TableWrite {
         for (_, mut writer) in self.partition_writers.drain() {
             writer.abort().await;
         }
+        self.append_write_configs.clear();
+        self.blob_consumer = None;
+        self.blob_uri_reader_factory = None;
     }
 
     /// Flush all writers and collect CommitMessages for use with TableCommit.
     /// Append writers are closed; primary-key writers retain their sequence
     /// counters after handing off the prepared files, as Java does.
+    /// Captured append settings survive active prepares. Empty prepares retire
+    /// idle bucket-unaware writers. This generic operation has no checkpoint
+    /// identifier, so it conservatively retains fixed-bucket settings because
+    /// it cannot prove the previous output has committed.
     ///
     /// Invalidate the snapshot sequence cache used to seed previously unseen
     /// buckets. Already-open key-value writers keep their own advancing counter.
     pub async fn prepare_commit(&mut self) -> Result<Vec<CommitMessage>> {
+        self.prepare_commit_internal(None).await
+    }
+
+    #[cfg(any(test, feature = "internal-api"))]
+    pub(crate) async fn prepare_commit_with_identifier(
+        &mut self,
+        commit_identifier: i64,
+    ) -> Result<Vec<CommitMessage>> {
+        self.prepare_commit_internal(Some(commit_identifier)).await
+    }
+
+    async fn prepare_commit_internal(
+        &mut self,
+        commit_identifier: Option<i64>,
+    ) -> Result<Vec<CommitMessage>> {
         if let Some(writer) = self.format_writer.as_mut() {
             return writer.prepare_commit().await;
         }
         self.ensure_active()?;
+        // Java keeps newly created writers on the first prepare. Later empty
+        // increments may retire them, but active buckets keep their captured
+        // factory configuration across successful prepares.
+        let can_retire = self.append_write_configs.values().any(|config| {
+            matches!(
+                config.last_modified_prepare,
+                Some(AppendPrepareIdentifier::Unknown)
+            ) || matches!(
+                config.last_modified_prepare,
+                Some(AppendPrepareIdentifier::Known(id)) if id != i64::MIN
+            )
+        });
+        let fixed_bucket = CoreOptions::new(self.table.schema().options()).bucket() >= 0;
+        let latest_committed_identifier = if can_retire
+            && fixed_bucket
+            && commit_identifier.is_some()
+            && self.append_write_configs.iter().any(|(key, config)| {
+                !self.partition_writers.contains_key(key)
+                    && matches!(
+                        config.last_modified_prepare,
+                        Some(AppendPrepareIdentifier::Known(_))
+                    )
+            }) {
+            // Resolve before draining files: a metadata failure leaves pending
+            // output available for a retry, with no prepared files lost.
+            Self::latest_committed_append_identifier(&self.table, &self.commit_user).await?
+        } else {
+            None
+        };
         self.partition_seq_cache.clear();
         let writers: Vec<(PartitionBucketKey, FileWriter)> =
             self.partition_writers.drain().collect();
@@ -1560,21 +1622,81 @@ impl TableWrite {
                 messages.push(msg);
             }
         }
+        let modified = messages
+            .iter()
+            .map(|message| (message.partition.clone(), message.bucket))
+            .collect::<HashSet<_>>();
+        self.append_write_configs.retain(|key, config| {
+            if modified.contains(key) {
+                config.last_modified_prepare = Some(match commit_identifier {
+                    Some(id) => AppendPrepareIdentifier::Known(id),
+                    None => AppendPrepareIdentifier::Unknown,
+                });
+                return true;
+            }
+            if !can_retire {
+                return true;
+            }
+            if !fixed_bucket {
+                return false;
+            }
+            // The generic core prepare has no checkpoint identifier, so it
+            // cannot prove a fixed bucket's previous output has committed.
+            match (
+                commit_identifier,
+                config.last_modified_prepare,
+                latest_committed_identifier,
+            ) {
+                (Some(_), Some(AppendPrepareIdentifier::Known(last)), Some(latest)) => {
+                    last >= latest
+                }
+                _ => true,
+            }
+        });
         Ok(messages)
     }
 
+    async fn latest_committed_append_identifier(
+        table: &Table,
+        commit_user: &str,
+    ) -> Result<Option<i64>> {
+        // FileSystemWriteRestore deliberately reads filesystem snapshots, even
+        // for catalog-managed tables, and stops at the first expired snapshot.
+        let manager = table.snapshot_manager().with_rest_env(None);
+        let Some(mut id) = manager.get_latest_snapshot_id().await? else {
+            return Ok(None);
+        };
+        while id >= 1 {
+            let snapshot = match manager.get_snapshot(id).await {
+                Ok(snapshot) => snapshot,
+                Err(crate::Error::SnapshotNotExist { .. }) => break,
+                Err(crate::Error::IoUnexpected { source, .. })
+                    if source.kind() == opendal::ErrorKind::NotFound =>
+                {
+                    break;
+                }
+                Err(error) => return Err(error),
+            };
+            if snapshot.commit_user() == commit_user {
+                return Ok(Some(snapshot.commit_identifier()));
+            }
+            id -= 1;
+        }
+        Ok(None)
+    }
+
     async fn fail_prepare(&mut self, messages: &[CommitMessage]) {
+        let preserve_blob_files = self.primary_key_indices.is_empty()
+            && self
+                .append_write_configs
+                .values()
+                .any(|config| config.blob_consumer.is_some());
         self.failed = true;
         self.close().await;
         // Only this failed invocation's outputs: no message has been returned
         // or submitted. Earlier successful prepare calls belong to the caller.
         let mut cleanup = messages.to_vec();
-        if self.primary_key_indices.is_empty()
-            && self
-                .append_write_configs
-                .values()
-                .any(|config| config.blob_consumer.is_some())
-        {
+        if preserve_blob_files {
             // A successful partition may already have exposed its dedicated
             // Blob files to the consumer. Preserve Java's deletion policy in
             // this table-wide cleanup too. Explicit TableCommit.abort remains

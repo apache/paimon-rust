@@ -563,6 +563,7 @@ async fn append_blob_consumer_is_captured_per_partition_across_prepares() {
     );
 }
 
+#[cfg(feature = "internal-api")]
 #[tokio::test]
 async fn append_row_field_resolution_is_read_only_and_retains_captured_layouts() {
     for fixed in [false, true] {
@@ -595,7 +596,7 @@ async fn append_row_field_resolution_is_read_only_and_retains_captured_layouts()
             .unwrap()
             .len();
         assert_eq!(
-            names(writer.write_fields_for_row(&routing(1)).unwrap()),
+            names(paimon::table::internal::resolve_row_write_fields(&writer, &routing(1)).unwrap()),
             vec!["pt", "id"]
         );
         assert!(writer.prepare_commit().await.unwrap().is_empty());
@@ -604,7 +605,7 @@ async fn append_row_field_resolution_is_read_only_and_retains_captured_layouts()
             .with_write_type(vec!["pt".into(), "omitted".into()])
             .unwrap();
         assert_eq!(
-            names(writer.write_fields_for_row(&routing(1)).unwrap()),
+            names(paimon::table::internal::resolve_row_write_fields(&writer, &routing(1)).unwrap()),
             vec!["pt", "omitted"]
         );
         assert_eq!(
@@ -627,31 +628,33 @@ async fn append_row_field_resolution_is_read_only_and_retains_captured_layouts()
             .with_write_type(vec!["pt".into(), "omitted".into()])
             .unwrap();
         assert_eq!(
-            names(writer.write_fields_for_row(&routing(1)).unwrap()),
+            names(paimon::table::internal::resolve_row_write_fields(&writer, &routing(1)).unwrap()),
             vec!["pt", "id"]
         );
         assert_eq!(
-            names(writer.write_fields_for_row(&routing(2)).unwrap()),
+            names(paimon::table::internal::resolve_row_write_fields(&writer, &routing(2)).unwrap()),
             vec!["pt", "omitted"]
         );
         let messages = writer.prepare_commit().await.unwrap();
         assert_eq!(
-            names(writer.write_fields_for_row(&routing(1)).unwrap()),
+            names(paimon::table::internal::resolve_row_write_fields(&writer, &routing(1)).unwrap()),
             vec!["pt", "id"]
         );
         for invalid in [
             routing(1).slice(0, 0),
             partial(vec![1, 2], vec![Some(1), Some(2)]),
         ] {
-            assert!(writer.write_fields_for_row(&invalid).is_err());
+            assert!(paimon::table::internal::resolve_row_write_fields(&writer, &invalid).is_err());
         }
         let missing_partition =
             RecordBatch::try_from_iter([("id", Arc::new(Int32Array::from(vec![11])) as ArrayRef)])
                 .unwrap();
-        assert!(writer.write_fields_for_row(&missing_partition).is_err());
+        assert!(
+            paimon::table::internal::resolve_row_write_fields(&writer, &missing_partition).is_err()
+        );
         // Failed queries leave prepared outputs and future factory settings intact.
         assert_eq!(
-            names(writer.write_fields_for_row(&routing(2)).unwrap()),
+            names(paimon::table::internal::resolve_row_write_fields(&writer, &routing(2)).unwrap()),
             vec!["pt", "omitted"]
         );
         writer.close().await;
@@ -660,6 +663,7 @@ async fn append_row_field_resolution_is_read_only_and_retains_captured_layouts()
     }
 }
 
+#[cfg(feature = "internal-api")]
 #[tokio::test]
 async fn unpartitioned_row_field_resolution_accepts_zero_column_routing_row() {
     let schema = Schema::builder()
@@ -675,10 +679,15 @@ async fn unpartitioned_row_field_resolution_accepts_zero_column_routing_row() {
         &arrow_array::RecordBatchOptions::new().with_row_count(Some(1)),
     )
     .unwrap();
-    assert_eq!(writer.write_fields_for_row(&routing).unwrap().len(), 2);
+    assert_eq!(
+        paimon::table::internal::resolve_row_write_fields(&writer, &routing)
+            .unwrap()
+            .len(),
+        2
+    );
     writer.with_write_type(vec!["id".into()]).unwrap();
     assert_eq!(
-        writer.write_fields_for_row(&routing).unwrap()[0].name(),
+        paimon::table::internal::resolve_row_write_fields(&writer, &routing).unwrap()[0].name(),
         "id"
     );
     assert!(writer.prepare_commit().await.unwrap().is_empty());

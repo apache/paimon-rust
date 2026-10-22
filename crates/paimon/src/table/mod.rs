@@ -137,6 +137,9 @@ mod query_auth;
 mod system_table;
 pub use system_table::SystemRead;
 
+#[cfg(feature = "internal-api")]
+#[doc(hidden)]
+pub mod internal;
 mod key_normalization;
 mod read_builder;
 mod read_execution;

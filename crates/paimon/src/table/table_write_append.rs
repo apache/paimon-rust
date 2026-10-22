@@ -24,16 +24,20 @@ impl TableWrite {
     /// creating files or changing bucket assignment state. Row adapters can
     /// encode only these columns, leaving unused payloads untouched. The input
     /// must contain exactly one row and the table's routing columns.
-    pub fn write_fields_for_row(&self, routing_batch: &RecordBatch) -> Result<Vec<DataField>> {
+    #[cfg(any(test, feature = "internal-api"))]
+    pub(crate) fn resolve_row_write_fields(
+        &self,
+        routing_batch: &RecordBatch,
+    ) -> Result<Vec<DataField>> {
         self.ensure_active()?;
         if self.format_writer.is_some() || !self.primary_key_indices.is_empty() {
             return Err(crate::Error::Unsupported {
-                message: "write_fields_for_row requires a Paimon append table".into(),
+                message: "Row write field resolution requires a Paimon append table".into(),
             });
         }
         if routing_batch.num_rows() != 1 {
             return Err(crate::Error::DataInvalid {
-                message: "write_fields_for_row requires exactly one routing row".into(),
+                message: "Row write field resolution requires exactly one routing row".into(),
                 source: None,
             });
         }
@@ -69,6 +73,7 @@ impl TableWrite {
             fields: self.write_fields.clone(),
             blob_consumer: self.blob_consumer.clone(),
             blob_uri_reader_factory: self.blob_uri_reader_factory.clone(),
+            last_modified_prepare: None,
         }
     }
 
@@ -280,4 +285,55 @@ fn is_routing_transport(
                 .any(|candidate| candidate.name() == field.name())
                 || routing_names.contains(field.name())
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::catalog::Identifier;
+    use crate::io::FileIOBuilder;
+    use crate::spec::{DataType, IntType, Schema, TableSchema};
+
+    #[test]
+    fn row_write_field_resolution_does_not_capture_a_writer() {
+        let schema = Schema::builder()
+            .column("first", DataType::Int(IntType::new()))
+            .column("second", DataType::Int(IntType::new()))
+            .build()
+            .unwrap();
+        let table = Table::new(
+            FileIOBuilder::new("memory").build().unwrap(),
+            Identifier::new("default", "row_fields"),
+            "memory:/row_fields".into(),
+            TableSchema::new(0, &schema),
+            None,
+        );
+        let mut writer = TableWrite::new(&table, "row-fields".into()).unwrap();
+        let routing = |rows| {
+            RecordBatch::try_new_with_options(
+                Arc::new(arrow_schema::Schema::empty()),
+                vec![],
+                &arrow_array::RecordBatchOptions::new().with_row_count(Some(rows)),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            writer.resolve_row_write_fields(&routing(1)).unwrap().len(),
+            2
+        );
+        writer.with_write_type(vec!["first".into()]).unwrap();
+        assert_eq!(
+            writer.resolve_row_write_fields(&routing(1)).unwrap()[0].name(),
+            "first"
+        );
+        writer.with_write_type(vec!["second".into()]).unwrap();
+        assert_eq!(
+            writer.resolve_row_write_fields(&routing(1)).unwrap()[0].name(),
+            "second"
+        );
+        assert!(writer.resolve_row_write_fields(&routing(0)).is_err());
+        assert!(writer.resolve_row_write_fields(&routing(2)).is_err());
+        assert!(writer.partition_writers.is_empty());
+        assert!(writer.append_write_configs.is_empty());
+    }
 }
