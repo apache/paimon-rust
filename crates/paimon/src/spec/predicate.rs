@@ -586,6 +586,8 @@ impl Predicate {
     /// [`negate`]: Predicate::negate
     pub(crate) fn not_null_guard(&self) -> Option<Predicate> {
         match self {
+            // NOT(NOT(x)) is x, so it is unknown wherever x is.
+            Predicate::Not(inner) => inner.not_null_guard(),
             Predicate::Leaf {
                 column,
                 index,
