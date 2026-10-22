@@ -715,6 +715,64 @@ async fn negated_data_predicate_keeps_null_rows() {
 }
 
 #[tokio::test]
+async fn raw_double_negation_keeps_null_rows_out() {
+    // NOT(NOT(v = 10)) is v = 10, so the NULL row stays out. Widening `v`
+    // makes the read go through the Arrow residual filter.
+    for widened in [false, true] {
+        let table = table(&[]).await;
+        write_batch(
+            &table,
+            &RecordBatch::try_from_iter([
+                ("id", Arc::new(Int32Array::from(vec![0, 1, 2])) as ArrayRef),
+                (
+                    "p",
+                    Arc::new(StringArray::from(vec![Some("a"); 3])) as ArrayRef,
+                ),
+                (
+                    "v",
+                    Arc::new(Int32Array::from(vec![None, Some(10), Some(20)])) as ArrayRef,
+                ),
+                ("q", Arc::new(Int32Array::from(vec![1; 3])) as ArrayRef),
+            ])
+            .unwrap(),
+        )
+        .await;
+        let table = if widened {
+            let mut schema = serde_json::to_value(table.schema()).unwrap();
+            schema["id"] = 1.into();
+            schema["fields"][2]["type"] = "BIGINT".into();
+            let schema: TableSchema = serde_json::from_value(schema).unwrap();
+            persist_table_schema(table.file_io(), table.location(), &schema).await;
+            table.copy_with_resolved_schema(schema, "main").unwrap()
+        } else {
+            table
+        };
+        let pb = PredicateBuilder::new(&table.schema().fields_with_read_metadata());
+        let value = if widened {
+            Datum::Long(10)
+        } else {
+            Datum::Int(10)
+        };
+        let predicate = Predicate::Not(Box::new(Predicate::Not(Box::new(
+            pb.equal("v", value).unwrap(),
+        ))));
+
+        assert_eq!(
+            read_ids(&table, predicate.clone()).await,
+            vec![1],
+            "widened={widened}"
+        );
+        let update = table.new_write_builder().new_update().unwrap();
+        commit(
+            &table,
+            update.delete_by_predicate(Some(predicate)).await.unwrap(),
+        )
+        .await;
+        assert_eq!(ids(&table).await, vec![0, 2], "widened={widened}");
+    }
+}
+
+#[tokio::test]
 async fn negated_float_comparison_keeps_nan_rows() {
     // `NaN < 1.0` and `NaN >= 1.0` are both false. Java orders NaN above
     // every number, so NOT(f < 1.0) selects it, partitioned by `f` or not.

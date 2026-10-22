@@ -391,12 +391,13 @@ impl GlobalIndexScanner {
         // A bitmap answers floating ranges and negations with every non-null
         // row (see `bitmap_meta_may_match`), so those results are candidates
         // only. Sorted indexes answer them exactly.
-        let bitmap_superset = entries
-            .iter()
-            .any(|entry| matches!(entry.index_type, GlobalIndexFileKind::Bitmap))
-            && predicates.iter().any(|(op, _, data_type)| {
-                is_floating_point(data_type) && is_bitmap_floating_residual_sensitive_op(*op)
-            });
+        // An all-NULL bitmap shard is pruned before it answers anything.
+        let bitmap_superset = entries.iter().any(|entry| {
+            matches!(entry.index_type, GlobalIndexFileKind::Bitmap)
+                && !sorted_entry_meta(entry).only_nulls()
+        }) && predicates.iter().any(|(op, _, data_type)| {
+            is_floating_point(data_type) && is_bitmap_floating_residual_sensitive_op(*op)
+        });
         Ok(self.evaluate_leaf_entries(entries, predicates).await?.map(
             |(row_ranges, coverage, fully_evaluated)| {
                 (row_ranges, coverage, fully_evaluated && !bitmap_superset)
