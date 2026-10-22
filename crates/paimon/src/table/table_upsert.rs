@@ -33,8 +33,8 @@ use super::upsert_key_matcher::UpsertKeyMatcher;
 use super::write_batch_normalize::{normalize_blob_write_field, normalize_write_array};
 use crate::spec::{
     batch_to_serialized_bytes, extract_datum, extract_datum_from_arrow, BinaryRow,
-    BinaryRowBuilder, CoreOptions, DataEvolutionIndexSourceMeta, DataField,
-    GlobalIndexColumnUpdateAction, IndexManifest, Predicate, PredicateBuilder, Snapshot,
+    BinaryRowBuilder, CoreOptions, DataEvolutionIndexSourceMeta, DataField, IndexManifest,
+    Predicate, PredicateBuilder, Snapshot,
 };
 use crate::table::source::{DataSplit, Plan};
 use crate::table::{CommitMessage, Table};
@@ -435,6 +435,12 @@ impl TableUpsert {
         let builder = PredicateBuilder::new(self.table.schema().fields());
         let mut predicates = Vec::new();
         for key in &self.keys {
+            // Partition sets compare raw BinaryRows, which may use different
+            // variable-length storage for Java NULL timestamps and decimals.
+            // matching_splits checks their canonical logical identity instead.
+            if self.table.schema().partition_keys().contains(key) {
+                continue;
+            }
             let column = unique_column_index(&source.schema(), key)?;
             // Arrow row encoding preserves NaN payloads and signed zero. SQL
             // equality need not share that identity, so retain the full domain.
@@ -484,8 +490,8 @@ impl TableUpsert {
         Ok((!predicates.is_empty()).then(|| Predicate::and(predicates)))
     }
 
-    /// IGNORE retains indexes after updates. Prove that the indexed match keys
-    /// have not changed since each index's source snapshot before using them.
+    /// Previous writers may have retained indexes under IGNORE. Prove that the
+    /// match keys have not changed since each index's source snapshot.
     async fn lookup_indexes_unchanged(
         &self,
         table: &Table,
@@ -605,14 +611,7 @@ impl TableUpsert {
         // fast mode, or a matching target would incorrectly become an insert.
         let lookup_options = HashMap::from([("scalar-index.search-mode".into(), "full".into())]);
         let mut lookup_table = self.table.copy_with_options(lookup_options);
-        if self
-            .table
-            .schema()
-            .core_options()
-            .global_index_column_update_action()?
-            == GlobalIndexColumnUpdateAction::Ignore
-            && lookup_table.schema().core_options().global_index_enabled()
-        {
+        if lookup_table.schema().core_options().global_index_enabled() {
             let snapshot = super::time_travel::resolve_snapshot(&lookup_table).await?;
             lookup_table = lookup_table.copy_with_pinned_snapshot(snapshot.as_ref());
             if let Some(snapshot) = snapshot {
@@ -1228,6 +1227,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn upsert_key_lookup_checks_ignored_updates_from_other_table_handles() {
+        for action in ["THROW_ERROR", "DROP_PARTITION_INDEX"] {
+            let table = numeric_table(&format!("memory:/upsert_historical_ignore_{action}")).await;
+            table
+                .new_global_index_build_builder()
+                .with_index_column("key")
+                .execute()
+                .await
+                .unwrap();
+            let ignored = table.copy_with_options(HashMap::from([(
+                "global-index.column-update-action".into(),
+                "IGNORE".into(),
+            )]));
+            let changed_keys = RecordBatch::try_from_iter([
+                (ROW_ID, Arc::new(Int64Array::from(vec![0, 1])) as ArrayRef),
+                ("key", Arc::new(Int32Array::from(vec![3, 3])) as ArrayRef),
+            ])
+            .unwrap();
+            let update = ignored.new_write_builder().new_update().unwrap();
+            TableCommit::new(ignored.clone(), "change-keys".into())
+                .commit(
+                    update
+                        .update_by_arrow_with_row_id(vec![changed_keys])
+                        .await
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let table = if action == "THROW_ERROR" {
+                table
+            } else {
+                table.copy_with_options(HashMap::from([(
+                    "global-index.column-update-action".into(),
+                    action.into(),
+                )]))
+            };
+            commit_upsert(
+                &table,
+                vec![numeric_source(
+                    vec![3, 4],
+                    Arc::new(Int32Array::from(vec![43, 44])),
+                )],
+                vec!["key".into()],
+            )
+            .await;
+            assert_eq!(
+                numeric_rows(&table).await,
+                vec![
+                    (0, 3, Some(43), Some(10)),
+                    (1, 3, Some(43), Some(11)),
+                    (2, 2, Some(0), Some(12)),
+                    (3, 4, Some(44), None),
+                ],
+                "current action={action}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn upsert_key_lookup_preserves_updated_keys_and_deleted_rows() {
         let table = numeric_table("memory:/upsert_changed_keys").await;
         let table = table.copy_with_options(HashMap::from([
@@ -1827,6 +1885,61 @@ mod tests {
                 (3, Some("new".into()), Some("".into()), None),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn upsert_finds_java_padded_null_timestamp_partition() {
+        let schema = PaimonSchema::builder()
+            .column(
+                "part",
+                PaimonType::Timestamp(TimestampType::new(6).unwrap()),
+            )
+            .column("key", PaimonType::Int(IntType::new()))
+            .column("value", PaimonType::Int(IntType::new()))
+            .partition_keys(["part"])
+            .option("data-evolution.enabled", "true")
+            .option("row-tracking.enabled", "true")
+            .build()
+            .unwrap();
+        let table = Table::new(
+            FileIOBuilder::new("memory").build().unwrap(),
+            Identifier::new("db", "padded_null_partition"),
+            "memory:/upsert_padded_null_partition".into(),
+            TableSchema::new(0, &schema),
+            None,
+        );
+        let batch = |value| {
+            RecordBatch::try_from_iter([
+                (
+                    "part",
+                    Arc::new(arrow_array::TimestampMicrosecondArray::from(vec![
+                        None::<i64>,
+                    ])) as ArrayRef,
+                ),
+                ("key", Arc::new(Int32Array::from(vec![7])) as ArrayRef),
+                ("value", Arc::new(Int32Array::from(vec![value])) as ArrayRef),
+            ])
+            .unwrap()
+        };
+        let mut write = table.new_write_builder().new_write().unwrap();
+        write.write_arrow_batch(&batch(10)).await.unwrap();
+        let mut messages = write.prepare_commit().await.unwrap();
+        for message in &mut messages {
+            let row = BinaryRow::from_serialized_bytes(&message.partition).unwrap();
+            let mut padded = row.data().to_vec();
+            // Java reserves a variable slot for NULL TIMESTAMP(6), although
+            // the null bit makes its offset irrelevant to the logical value.
+            padded.extend_from_slice(&[0; 8]);
+            padded[8..16].copy_from_slice(&(16_u64 << 32).to_le_bytes());
+            message.partition = BinaryRow::from_bytes(1, padded).to_serialized_bytes();
+        }
+        TableCommit::new(table.clone(), "seed".into())
+            .commit(messages)
+            .await
+            .unwrap();
+        write.close().await;
+        commit_upsert(&table, vec![batch(42)], vec!["key".into()]).await;
+        assert_eq!(values_by_row_id(&table).await, vec![(0, 42)]);
     }
 
     #[test]
