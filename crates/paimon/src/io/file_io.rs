@@ -121,7 +121,7 @@ pub(crate) struct FileFormatMetadataCacheContext {
     max_bytes: usize,
     cache: OnceLock<Arc<dyn Any + Send + Sync>>,
     process_id: u32,
-    row_sidecar_sizes: Mutex<LruCache<String, u64>>,
+    row_sidecar_sizes: OnceLock<Mutex<LruCache<String, u64>>>,
 }
 
 impl std::fmt::Debug for FileFormatMetadataCacheContext {
@@ -153,9 +153,7 @@ impl FileFormatMetadataCacheContext {
             max_bytes,
             cache: OnceLock::new(),
             process_id: std::process::id(),
-            row_sidecar_sizes: Mutex::new(LruCache::new(
-                NonZeroUsize::new(ROW_SIDECAR_SIZE_CACHE_MAX_ENTRIES).unwrap(),
-            )),
+            row_sidecar_sizes: OnceLock::new(),
         }))
     }
 
@@ -167,19 +165,34 @@ impl FileFormatMetadataCacheContext {
         if self.max_bytes == 0 || self.process_id != std::process::id() {
             return None;
         }
-        self.row_sidecar_sizes.lock().unwrap().get(key).copied()
+        self.row_sidecar_sizes
+            .get()?
+            .lock()
+            .unwrap()
+            .get(key)
+            .copied()
     }
 
     fn cache_row_sidecar_size(&self, key: String, size: u64) {
         if self.max_bytes == 0 || self.process_id != std::process::id() {
             return;
         }
-        self.row_sidecar_sizes.lock().unwrap().put(key, size);
+        self.row_sidecar_sizes
+            .get_or_init(|| {
+                Mutex::new(LruCache::new(
+                    NonZeroUsize::new(ROW_SIDECAR_SIZE_CACHE_MAX_ENTRIES).unwrap(),
+                ))
+            })
+            .lock()
+            .unwrap()
+            .put(key, size);
     }
 
     fn invalidate_row_sidecar_size(&self, key: &str) {
         if self.process_id == std::process::id() {
-            self.row_sidecar_sizes.lock().unwrap().pop(key);
+            if let Some(sizes) = self.row_sidecar_sizes.get() {
+                sizes.lock().unwrap().pop(key);
+            }
         }
     }
 
@@ -187,7 +200,10 @@ impl FileFormatMetadataCacheContext {
         if self.process_id != std::process::id() {
             return;
         }
-        let mut sizes = self.row_sidecar_sizes.lock().unwrap();
+        let Some(sizes) = self.row_sidecar_sizes.get() else {
+            return;
+        };
+        let mut sizes = sizes.lock().unwrap();
         let keys: Vec<_> = sizes
             .iter()
             .filter(|(key, _)| key.starts_with(prefix))
@@ -2832,13 +2848,28 @@ mod input_output_test {
     async fn test_immutable_row_sidecar_size_cache_is_scoped_and_disabled_with_metadata_cache() {
         let path = "memory:/row-sidecar-size-cache.row";
         let first = setup_memory_file_io();
+        assert!(first
+            .file_format_metadata_cache
+            .row_sidecar_sizes
+            .get()
+            .is_none());
         first
             .new_output(path)
             .unwrap()
             .write(Bytes::from_static(b"first"))
             .await
             .unwrap();
+        assert!(first
+            .file_format_metadata_cache
+            .row_sidecar_sizes
+            .get()
+            .is_none());
         assert_eq!(first.immutable_row_sidecar_size(path).await.unwrap(), 5);
+        assert!(first
+            .file_format_metadata_cache
+            .row_sidecar_sizes
+            .get()
+            .is_some());
 
         // The same context reuses the size. A different FileIO with the same
         // literal path has its own storage target and must not reuse it.
@@ -2884,6 +2915,11 @@ mod input_output_test {
         assert_eq!(uncached.immutable_row_sidecar_size(path).await.unwrap(), 4);
         uncached.delete_file(path).await.unwrap();
         assert!(uncached.immutable_row_sidecar_size(path).await.is_err());
+        assert!(uncached
+            .file_format_metadata_cache
+            .row_sidecar_sizes
+            .get()
+            .is_none());
     }
 
     #[tokio::test]
