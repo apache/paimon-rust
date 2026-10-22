@@ -39,7 +39,7 @@ use crate::table::index_file_path::IndexFileLocation;
 use crate::table::source::{data_evolution_anchor_file, is_data_evolution_normal_file};
 use crate::table::stats_filter::group_by_overlapping_row_id;
 use crate::table::Table;
-use crate::table::{DataSplit, RowRange};
+use crate::table::{DataSplit, Plan, RowRange};
 use crate::Result;
 use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, StructArray};
 use arrow_buffer::NullBuffer;
@@ -355,6 +355,7 @@ impl DataEvolutionWriter {
         )?;
         let file_matches = group_matched_rows_by_file(&self.matched_batches, file_index)?;
         self.validate_partition_values(file_index, &file_matches)?;
+        index.validate_live_rows(&file_matches).await?;
 
         // 3. For each affected file: read original columns, apply updates, write partial files
         let mut writer = DataEvolutionPartialWriter::new(&self.table, self.update_columns.clone())?;
@@ -598,7 +599,15 @@ impl DataEvolutionDeleteWriter {
     }
 
     #[must_use = "commit messages must be passed to TableCommit"]
-    pub async fn prepare_commit(mut self) -> Result<Vec<CommitMessage>> {
+    pub async fn prepare_commit(self) -> Result<Vec<CommitMessage>> {
+        self.prepare_commit_inner(None).await
+    }
+
+    pub(super) async fn prepare_commit_with_plan(self, plan: &Plan) -> Result<Vec<CommitMessage>> {
+        self.prepare_commit_inner(Some(plan)).await
+    }
+
+    async fn prepare_commit_inner(mut self, captured: Option<&Plan>) -> Result<Vec<CommitMessage>> {
         dedup_i64_in_place(&mut self.row_ids);
         if self.row_ids.is_empty() {
             self.table
@@ -610,9 +619,18 @@ impl DataEvolutionDeleteWriter {
         }
 
         // A row filter or mask cannot authorize a physical file mutation.
-        let snapshot = super::time_travel::resolve_snapshot(&self.table).await?;
-        let scan_table = self.table.copy_with_pinned_snapshot(snapshot.as_ref());
-        let plan = scan_table.new_read_builder().new_scan().plan_all().await?;
+        let (snapshot, plan) = match captured {
+            Some(plan) => {
+                let (_, snapshot, plan) = authorize_row_id_plan(&self.table, plan).await?;
+                (snapshot, plan)
+            }
+            None => {
+                let snapshot = super::time_travel::resolve_snapshot(&self.table).await?;
+                let scan_table = self.table.copy_with_pinned_snapshot(snapshot.as_ref());
+                let plan = scan_table.new_read_builder().new_scan().plan_all().await?;
+                (snapshot, plan)
+            }
+        };
         let snapshot = snapshot.ok_or_else(|| crate::Error::DataInvalid {
             message: "No files with row tracking found in target table".into(),
             source: None,
@@ -1249,6 +1267,11 @@ pub(super) struct RowIdFileIndex {
 }
 
 impl RowIdFileIndex {
+    pub(super) async fn load_plan(table: &Table, plan: &Plan) -> Result<Self> {
+        let (read_table, _, plan) = authorize_row_id_plan(table, plan).await?;
+        Self::from_splits(read_table, plan.splits())
+    }
+
     pub(super) async fn load(table: &Table, snapshot_id: Option<i64>) -> Result<Self> {
         // Authorize before resolving an empty target. The original handle's
         // session is retained when the read view pins the selected snapshot.
@@ -1362,11 +1385,137 @@ impl RowIdFileIndex {
             .map(|&index| self.files[index].first_row_id)
             .collect())
     }
+
+    async fn validate_live_rows(&self, matches: &HashMap<usize, Vec<MatchedRow>>) -> Result<()> {
+        for (&file_pos, rows) in matches {
+            let group = &self.files[file_pos];
+            let anchor = data_evolution_anchor_file(&group.files)?;
+            let Some(deletion_file) = group.split.deletion_file_for_data_file(anchor) else {
+                continue;
+            };
+            let deletion_vector =
+                DeletionVectorFactory::read(self.read_table.file_io(), deletion_file).await?;
+            let first = anchor.first_row_id.expect("validated row-ID anchor");
+            for row in rows {
+                let row_id = group.first_row_id + row.offset as i64;
+                if deletion_vector.is_deleted((row_id - first) as u64) {
+                    return Err(crate::Error::DataInvalid {
+                        message: format!("Cannot update deleted _ROW_ID {row_id}"),
+                        source: None,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Validate transported planner metadata and mint a worker-local mutation grant.
+/// The caller supplies complete planner groups; manifests are deliberately not
+/// re-read to rediscover metadata already captured by the coordinator.
+async fn authorize_row_id_plan(
+    table: &Table,
+    plan: &Plan,
+) -> Result<(Table, Option<Snapshot>, Plan)> {
+    let required = table.schema().core_options().query_auth_enabled()
+        || plan.splits().iter().any(DataSplit::query_auth_required);
+    let grant = table.authorize_read(required, None).await?;
+    if required && grant.is_none() {
+        return Err(super::query_auth::unsupported(
+            "transported row-ID plans require REST authorization",
+        ));
+    }
+    if grant
+        .as_ref()
+        .is_some_and(|grant| !grant.is_unrestricted_whole_table())
+    {
+        return Err(super::query_auth::unsupported(
+            "row-ID updates require an unrestricted whole-table grant",
+        ));
+    }
+    super::RowIdPlan::from_plan(plan.clone())?;
+    if plan.splits().iter().any(|split| {
+        split
+            .query_auth_response()
+            .is_some_and(|response| !response.is_unrestricted())
+    }) {
+        return Err(super::query_auth::unsupported(
+            "a filtered or masked read plan cannot authorize row-ID mutations",
+        ));
+    }
+    let snapshot = match plan.snapshot_id() {
+        None => None,
+        Some(id) => {
+            let snapshot = if let Some(snapshot) = table.travel_snapshot() {
+                snapshot.clone()
+            } else if table.rest_env().is_some() {
+                table
+                    .snapshot_manager()
+                    .get_latest_snapshot()
+                    .await?
+                    .ok_or_else(|| crate::Error::DataInvalid {
+                        message: "The captured row-ID snapshot no longer exists".into(),
+                        source: None,
+                    })?
+            } else {
+                table.snapshot_manager().get_snapshot(id).await?
+            };
+            if snapshot.id() != id || snapshot.schema_id() > table.schema().id() {
+                return Err(crate::Error::DataInvalid {
+                    message: "The row-ID plan does not match the table's captured snapshot/schema"
+                        .into(),
+                    source: None,
+                });
+            }
+            Some(snapshot)
+        }
+    };
+    let options = table.schema().core_options();
+    let computer = if table.schema().partition_keys().is_empty() {
+        None
+    } else {
+        Some(PartitionComputer::new(
+            table.schema().partition_keys(),
+            table.schema().fields(),
+            options.partition_default_name(),
+            options.legacy_partition_name(),
+        )?)
+    };
+    for split in plan.splits() {
+        let expected = bucket_path(
+            &table.data_file_location(),
+            computer.as_ref(),
+            split.partition(),
+            split.bucket(),
+        )?;
+        if split.bucket_path() != expected {
+            return Err(crate::Error::DataInvalid {
+                message: "The row-ID split bucket path does not belong to the target table".into(),
+                source: None,
+            });
+        }
+        for file in split.data_files() {
+            let (first, last) = file.row_id_range().expect("validated row-ID range");
+            if first < 0
+                || snapshot.as_ref().is_none_or(|snapshot| {
+                    file.schema_id > snapshot.schema_id()
+                        || snapshot.next_row_id().is_some_and(|next| last >= next)
+                })
+            {
+                return Err(crate::Error::DataInvalid {
+                    message: "The row-ID split contains file metadata outside its snapshot".into(),
+                    source: None,
+                });
+            }
+        }
+    }
+    let read_table = table.copy_with_pinned_snapshot(snapshot.as_ref());
+    Ok((read_table, snapshot, plan.clone().planned(grant)))
 }
 
 /// Dedicated column files can cross normal-file boundaries. They provide
 /// values, but must not merge anchors or introduce otherwise absent row IDs.
-fn group_by_normal_row_id(files: Vec<DataFileMeta>) -> Vec<Vec<DataFileMeta>> {
+pub(super) fn group_by_normal_row_id(files: Vec<DataFileMeta>) -> Vec<Vec<DataFileMeta>> {
     let (normal, dedicated): (Vec<_>, Vec<_>) =
         files.into_iter().partition(is_data_evolution_normal_file);
     group_by_overlapping_row_id(normal)

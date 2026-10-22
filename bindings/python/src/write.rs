@@ -616,12 +616,24 @@ fn arrow_upsert_batches(input: &Bound<'_, PyAny>) -> PyResult<Vec<RecordBatch>> 
 
 struct UpdateContext {
     inner: TableUpdate,
+    planned: bool,
     table: Arc<Table>,
     table_location: String,
     commit_user: String,
 }
 
 impl UpdateContext {
+    // Reject a mismatched operation before consuming a Python input iterator
+    // or converting callbacks. Core independently enforces the same contract.
+    fn ensure_unplanned(&self) -> PyResult<()> {
+        if self.planned {
+            return Err(PyValueError::new_err(
+                "with_plan supports only row-ID update and delete operations",
+            ));
+        }
+        Ok(())
+    }
+
     fn with_blob_uri_reader_factory(
         &mut self,
         factory: Option<Py<PyAny>>,
@@ -634,6 +646,7 @@ impl UpdateContext {
 
     fn new(context: &WriteContext) -> PyResult<Self> {
         Ok(Self {
+            planned: false,
             inner: context
                 .table
                 .new_write_builder()
@@ -670,6 +683,7 @@ impl UpdateContext {
         when_matched: &Bound<'_, PyAny>,
         when_not_matched: &Bound<'_, PyAny>,
     ) -> PyResult<Vec<PyCommitMessage>> {
+        self.ensure_unplanned()?;
         let source = match source {
             Some(source) => match source.extract::<PyRef<crate::table::PyTable>>() {
                 Ok(table) => paimon::table::MergeSource::Table(table.inner.clone()),
@@ -706,6 +720,7 @@ impl UpdateContext {
         assignments: &Bound<'_, PyDict>,
         read_columns: Option<Vec<String>>,
     ) -> PyResult<Vec<PyCommitMessage>> {
+        self.ensure_unplanned()?;
         let predicate = predicate
             .map(|predicate| dict_to_table_predicate(predicate, self.table.schema(), true))
             .transpose()?;
@@ -795,6 +810,7 @@ impl UpdateContext {
         count: usize,
         read_type: Option<&str>,
     ) -> PyResult<crate::shard_update::PyShardTableUpdator> {
+        self.ensure_unplanned()?;
         let read_type = read_type
             .map(|json| {
                 serde_json::from_str::<RowType>(json)
@@ -829,6 +845,7 @@ impl UpdateContext {
         input: &Bound<'_, PyAny>,
         keys: Vec<String>,
     ) -> PyResult<Vec<PyCommitMessage>> {
+        self.ensure_unplanned()?;
         let batches = arrow_upsert_batches(input)?;
         let messages = py
             .detach(|| runtime().block_on(self.inner.upsert_by_arrow_with_key(batches, keys)))
@@ -845,6 +862,7 @@ impl UpdateContext {
         py: Python<'_>,
         predicate: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<Vec<PyCommitMessage>> {
+        self.ensure_unplanned()?;
         let predicate = predicate
             .map(|predicate| dict_to_table_predicate(predicate, self.table.schema(), true))
             .transpose()?;
@@ -1064,6 +1082,18 @@ pub struct PyStreamTableUpdate {
 
 #[pymethods]
 impl PyStreamTableUpdate {
+    fn with_plan<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        plan: &crate::read::PyPlan,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        slf.context
+            .inner
+            .with_plan(plan.inner.clone())
+            .map_err(to_py_err)?;
+        slf.context.planned = true;
+        Ok(slf)
+    }
+
     #[pyo3(signature = (factory))]
     fn with_blob_uri_reader_factory(
         mut slf: PyRefMut<'_, Self>,
@@ -1184,6 +1214,18 @@ impl PyStreamTableUpdate {
 
 #[pymethods]
 impl PyBatchTableUpdate {
+    fn with_plan<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        plan: &crate::read::PyPlan,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        slf.context
+            .inner
+            .with_plan(plan.inner.clone())
+            .map_err(to_py_err)?;
+        slf.context.planned = true;
+        Ok(slf)
+    }
+
     #[pyo3(signature = (predicate))]
     fn delete_by_predicate(
         &self,
@@ -1615,6 +1657,27 @@ impl PyBatchTableCommit {
         .map_err(to_callback_error)
     }
 
+    /// Validate logical DML conflicts without publishing or deleting any files.
+    fn check_row_id_conflicts(
+        &self,
+        py: Python<'_>,
+        messages: &Bound<'_, PyAny>,
+        latest_snapshot_id: i64,
+        check_from_snapshot: i64,
+    ) -> PyResult<()> {
+        let messages = self
+            .context
+            .messages(messages, "check_row_id_conflicts", false)?;
+        py.detach(|| {
+            runtime().block_on(self.context.inner.check_row_id_conflicts(
+                &messages,
+                latest_snapshot_id,
+                check_from_snapshot,
+            ))
+        })
+        .map_err(to_py_err)
+    }
+
     fn truncate_table(&mut self, py: Python<'_>) -> PyResult<()> {
         self.check_committed()?;
         py.detach(|| runtime().block_on(self.context.inner.truncate_table()))
@@ -1783,6 +1846,186 @@ mod tests {
     use paimon::io::FileIOBuilder;
     use paimon::spec::{BigIntType, IntType, Schema, TableSchema, VarCharType};
     use pyo3::ffi::c_str;
+
+    #[test]
+    fn captured_plan_rejects_other_operations_before_python_input_consumption() {
+        Python::attach(|py| {
+            let schema = Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .option("row-tracking.enabled", "true")
+                .option("data-evolution.enabled", "true")
+                .build()
+                .unwrap();
+            let table = Arc::new(Table::new(
+                FileIOBuilder::new("memory").build().unwrap(),
+                Identifier::new("default", "planned_binding_boundary"),
+                "memory:/planned_binding_boundary".into(),
+                TableSchema::new(0, &schema),
+                None,
+            ));
+            let locals = PyDict::new(py);
+            locals
+                .set_item(
+                    "batch",
+                    Py::new(py, PyBatchWriteBuilder::new(table.clone())).unwrap(),
+                )
+                .unwrap();
+            locals
+                .set_item(
+                    "stream",
+                    Py::new(py, PyStreamWriteBuilder::new(table)).unwrap(),
+                )
+                .unwrap();
+            locals
+                .set_item("Plan", py.get_type::<crate::read::PyPlan>())
+                .unwrap();
+            py.run(c_str!(r#"
+class ExplodingInput:
+    def __iter__(self):
+        raise AssertionError('the supplied plan must reject input before iteration')
+
+for builder, identifier in [(batch, None), (stream, 7)]:
+    update = builder.new_update()
+    assert update.with_plan(Plan(None, [])) is update
+    assert update.with_plan(Plan(None, [])) is update
+    options = {} if identifier is None else {'commit_identifier': identifier}
+    operations = [
+        lambda: update.upsert_by_arrow_with_key(ExplodingInput(), ['id'], **options),
+        lambda: update.merge_into(ExplodingInput(), on=[], when_matched=[], when_not_matched=[], **options),
+    ]
+    for operation in operations:
+        try:
+            operation()
+        except ValueError as error:
+            assert 'with_plan supports only row-ID' in str(error), str(error)
+        else:
+            raise AssertionError('captured plan was silently ignored')
+"#),Some(&locals),Some(&locals)).unwrap();
+        });
+    }
+
+    #[test]
+    fn row_id_conflict_check_does_not_publish_or_consume_batch_commit() {
+        use arrow::array::{Array, Int32Array, Int64Array};
+        use futures::TryStreamExt;
+
+        Python::attach(|py| {
+            let schema = Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .option("row-tracking.enabled", "true")
+                .option("data-evolution.enabled", "true")
+                .build()
+                .unwrap();
+            let table = Arc::new(Table::new(
+                FileIOBuilder::new("memory").build().unwrap(),
+                Identifier::new("default", "conflict_check_binding"),
+                "memory:/conflict_check_binding".into(),
+                TableSchema::new(0, &schema),
+                None,
+            ));
+            let messages = py.detach(|| {
+                runtime().block_on(async {
+                    let mut writer = table.new_write_builder().new_write().unwrap();
+                    let batch = RecordBatch::try_new(
+                        paimon::arrow::build_target_arrow_schema(table.schema().fields()).unwrap(),
+                        vec![Arc::new(Int32Array::from(vec![1, 2]))],
+                    )
+                    .unwrap();
+                    writer.write_arrow_batch(&batch).await.unwrap();
+                    table
+                        .new_write_builder()
+                        .new_commit()
+                        .commit(writer.prepare_commit().await.unwrap())
+                        .await
+                        .unwrap();
+                    writer.close().await;
+                    let updates = RecordBatch::try_from_iter(vec![
+                        (
+                            "_ROW_ID",
+                            Arc::new(Int64Array::from(vec![0])) as arrow::array::ArrayRef,
+                        ),
+                        (
+                            "id",
+                            Arc::new(Int32Array::from(vec![9])) as arrow::array::ArrayRef,
+                        ),
+                    ])
+                    .unwrap();
+                    table
+                        .new_write_builder()
+                        .new_update()
+                        .unwrap()
+                        .update_by_arrow_with_row_id(vec![updates])
+                        .await
+                        .unwrap()
+                })
+            });
+            let messages = messages
+                .into_iter()
+                .map(PyCommitMessage::new)
+                .collect::<Vec<_>>();
+            let builder = PyBatchWriteBuilder::new(table.clone());
+            let commit = Py::new(py, builder.new_commit().unwrap()).unwrap();
+            let locals = PyDict::new(py);
+            locals.set_item("commit", commit).unwrap();
+            locals.set_item("messages", messages).unwrap();
+            py.run(
+                c_str!("commit.check_row_id_conflicts(messages, 1, 1)"),
+                Some(&locals),
+                Some(&locals),
+            )
+            .unwrap();
+            let snapshot = py
+                .detach(|| runtime().block_on(table.snapshot_manager().get_latest_snapshot()))
+                .unwrap()
+                .unwrap();
+            assert_eq!(snapshot.id(), 1, "the independent check must not publish");
+            py.run(
+                c_str!("commit.commit(messages)"),
+                Some(&locals),
+                Some(&locals),
+            )
+            .unwrap();
+            py.detach(|| {
+                runtime().block_on(async {
+                    let snapshot = table
+                        .snapshot_manager()
+                        .get_latest_snapshot()
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(
+                        snapshot.id(),
+                        2,
+                        "the check must not consume the batch boundary"
+                    );
+                    let builder = table.new_read_builder();
+                    let plan = builder.new_scan().plan().await.unwrap();
+                    let batches = builder
+                        .new_read()
+                        .unwrap()
+                        .to_arrow(plan.splits())
+                        .unwrap()
+                        .try_collect::<Vec<_>>()
+                        .await
+                        .unwrap();
+                    let mut values = batches
+                        .iter()
+                        .flat_map(|batch| {
+                            let values = batch
+                                .column(0)
+                                .as_any()
+                                .downcast_ref::<Int32Array>()
+                                .unwrap();
+                            assert_eq!(values.null_count(), 0);
+                            values.values().to_vec()
+                        })
+                        .collect::<Vec<_>>();
+                    values.sort_unstable();
+                    assert_eq!(values, [2, 9]);
+                })
+            });
+        });
+    }
 
     #[test]
     fn public_uri_factory_and_commit_user_setters_are_chainable() {

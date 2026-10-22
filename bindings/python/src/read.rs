@@ -1170,7 +1170,7 @@ impl PyRecordBatchReader {
 
 #[pyclass(name = "Plan", module = "pypaimon_rust.datafusion")]
 pub struct PyPlan {
-    inner: paimon::table::Plan,
+    pub(crate) inner: paimon::table::Plan,
 }
 
 #[pyclass(name = "FileScanPlan", module = "pypaimon_rust.datafusion", frozen)]
@@ -1197,6 +1197,20 @@ impl From<paimon::table::Plan> for PyPlan {
 
 #[pymethods]
 impl PyPlan {
+    /// Restore captured planning metadata using typed splits. Execution
+    /// authorizes the transported plan independently.
+    #[new]
+    #[pyo3(signature = (snapshot_id, splits))]
+    fn new(snapshot_id: Option<i64>, splits: &Bound<'_, PyAny>) -> PyResult<Self> {
+        let splits = splits
+            .try_iter()?
+            .map(|split| Ok(split?.extract::<PyRef<'_, PySplit>>()?.inner.clone()))
+            .collect::<PyResult<Vec<_>>>()?;
+        Ok(Self {
+            inner: paimon::table::Plan::from_splits(snapshot_id, splits),
+        })
+    }
+
     /// Snapshot selected by the scan, even when pruning produces no splits.
     /// `None` means no snapshot was selected, including snapshot-free format tables.
     fn snapshot_id(&self) -> Option<i64> {
@@ -1220,6 +1234,46 @@ impl PyPlan {
 
     fn __len__(&self) -> usize {
         self.inner.splits().len()
+    }
+}
+
+/// Row-tracking routing metadata; constructing it performs no I/O.
+#[pyclass(name = "RowIdPlan", module = "pypaimon_rust.datafusion")]
+pub struct PyRowIdPlan {
+    inner: paimon::table::RowIdPlan,
+}
+
+#[pymethods]
+impl PyRowIdPlan {
+    #[new]
+    fn new(plan: &PyPlan) -> PyResult<Self> {
+        Ok(Self {
+            inner: paimon::table::RowIdPlan::from_plan(plan.inner.clone()).map_err(to_py_err)?,
+        })
+    }
+
+    fn snapshot_id(&self) -> Option<i64> {
+        self.inner.snapshot_id()
+    }
+
+    fn groups(&self) -> Vec<(i64, i64, PySplit)> {
+        self.inner
+            .groups()
+            .iter()
+            .map(|(first, last, split)| {
+                (
+                    *first,
+                    *last,
+                    PySplit {
+                        inner: split.clone(),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn plan(&self) -> PyPlan {
+        self.inner.plan().clone().into()
     }
 }
 

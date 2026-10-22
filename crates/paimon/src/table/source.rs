@@ -1672,7 +1672,7 @@ impl Default for DataSplitBuilder {
 /// Read plan: splits and the snapshot they were planned from.
 ///
 /// Reference: [org.apache.paimon.table.source.PlanImpl](https://github.com/apache/paimon/blob/release-1.3/paimon-core/src/main/java/org/apache/paimon/table/source/PlanImpl.java)
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Plan {
     splits: Vec<DataSplit>,
     snapshot_id: Option<i64>,
@@ -1680,6 +1680,16 @@ pub struct Plan {
 }
 
 impl Plan {
+    /// Restore a captured plan from its snapshot and typed splits.
+    ///
+    /// This transports planning metadata; it does not authorize access to the
+    /// referenced files. Readers and mutation workers authorize independently.
+    pub fn from_splits(snapshot_id: Option<i64>, splits: Vec<DataSplit>) -> Self {
+        let mut plan = Self::new(splits);
+        plan.snapshot_id = snapshot_id;
+        plan
+    }
+
     pub fn new(splits: Vec<DataSplit>) -> Self {
         let mut plan = Self {
             splits,

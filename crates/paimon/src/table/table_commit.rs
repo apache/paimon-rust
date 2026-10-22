@@ -289,6 +289,70 @@ impl TableCommit {
         self
     }
 
+    /// Check logical row-ID/column conflicts before rebasing staged updates.
+    ///
+    /// Both snapshot IDs are resolved through this table's snapshot manager.
+    /// The captured interval must not cross a schema change, and this
+    /// committer's resolved schema must still be current. A newer schema may
+    /// exist before the next data snapshot is published.
+    /// Like Java's `checkRowIdFromSnapshot(..., false)`, COMPACT snapshots are
+    /// excluded: the caller may rewrite physical layouts only after this check
+    /// has rejected concurrent logical writes. This method publishes nothing
+    /// and never deletes prepared files, including on an uncertain outcome.
+    pub async fn check_row_id_conflicts(
+        &self,
+        messages: &[CommitMessage],
+        latest_snapshot_id: i64,
+        check_from_snapshot: i64,
+    ) -> Result<()> {
+        if check_from_snapshot <= 0 || check_from_snapshot > latest_snapshot_id {
+            return Err(crate::Error::DataInvalid {
+                message:
+                    "Row-ID conflict checks require 0 < check-from snapshot <= latest snapshot"
+                        .into(),
+                source: None,
+            });
+        }
+        if Self::check_from_snapshot(messages)? != Some(check_from_snapshot) {
+            return Err(crate::Error::DataInvalid {
+                message: "Row-ID conflict check baseline must match the commit messages".into(),
+                source: None,
+            });
+        }
+        super::write_builder::ensure_table_write_authorized(&self.table)?;
+        if !self.data_evolution_enabled {
+            return Err(crate::Error::Unsupported {
+                message: "Row-ID conflict checks require a data-evolution table".into(),
+            });
+        }
+        reject_compact_increment(messages)?;
+        let latest = self
+            .snapshot_manager
+            .get_snapshot(latest_snapshot_id)
+            .await?;
+        let baseline = if check_from_snapshot == latest_snapshot_id {
+            latest.clone()
+        } else {
+            self.snapshot_manager
+                .get_snapshot(check_from_snapshot)
+                .await?
+        };
+        if baseline.schema_id() != latest.schema_id()
+            || self.latest_schema_id().await? != self.table.schema().id()
+        {
+            return Err(crate::Error::DataInvalid {
+                message: "Row-ID conflict checks require an unchanged, current table schema".into(),
+                source: None,
+            });
+        }
+        self.check_row_id_from_snapshot(
+            Some(&latest),
+            &self.messages_to_entries(messages),
+            Some(check_from_snapshot),
+        )
+        .await
+    }
+
     /// Attach caller properties to snapshots published by this committer.
     ///
     /// Like Java's ManifestCommittable properties, these describe the current
@@ -2756,6 +2820,32 @@ impl TableCommit {
         delta_entries: &[ManifestEntry],
         next_row_id: Option<i64>,
     ) -> Result<()> {
+        // File identity deliberately excludes row IDs. Check DELETE metadata
+        // before identifier-based merging can cancel a reassigned current ADD.
+        let deleted = delta_entries
+            .iter()
+            .filter(|entry| *entry.kind() == FileKind::Delete)
+            .map(|entry| (commit_file_identifier(entry), entry))
+            .collect::<HashMap<_, _>>();
+        for current in base_entries
+            .iter()
+            .filter(|entry| *entry.kind() == FileKind::Add)
+        {
+            if let Some(deleted) = deleted.get(&commit_file_identifier(current)) {
+                if current.file().first_row_id != deleted.file().first_row_id
+                    || current.file().row_count != deleted.file().row_count
+                {
+                    return Err(crate::Error::RowIdExistenceConflict {
+                        file_name: deleted.file().file_name.clone(),
+                        first_row_id: deleted.file().first_row_id,
+                        row_count: deleted.file().row_count,
+                        bucket: deleted.bucket(),
+                        current_first_row_id: current.file().first_row_id,
+                        current_row_count: Some(current.file().row_count),
+                    });
+                }
+            }
+        }
         let Some(next_row_id) = next_row_id else {
             return Ok(());
         };
@@ -2818,15 +2908,13 @@ impl TableCommit {
                 entry.file().row_count,
             );
             if !existing_index.contains(&key) {
-                return Err(crate::Error::DataInvalid {
-                    message: format!(
-                        "Row ID existence conflict: file '{}' references first_row_id={}, row_count={} in bucket {}, but no matching file exists in the current snapshot.",
-                        entry.file().file_name,
-                        first_row_id,
-                        entry.file().row_count,
-                        entry.bucket(),
-                    ),
-                    source: None,
+                return Err(crate::Error::RowIdExistenceConflict {
+                    file_name: entry.file().file_name.clone(),
+                    first_row_id: Some(first_row_id),
+                    row_count: entry.file().row_count,
+                    bucket: entry.bucket(),
+                    current_first_row_id: None,
+                    current_row_count: None,
                 });
             }
         }
@@ -3711,6 +3799,7 @@ mod tests {
         include!("table_commit/property_tests.rs");
         include!("table_commit/callback_tests.rs");
         include!("table_commit/index_delete_tests.rs");
+        include!("table_commit/row_id_conflict_tests.rs");
     }
 
     #[tokio::test]

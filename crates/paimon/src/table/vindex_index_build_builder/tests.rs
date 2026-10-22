@@ -482,6 +482,157 @@ async fn write_vectors(table: &Table, ids: Vec<i32>, vectors: Vec<Vec<f32>>) {
 }
 
 #[tokio::test]
+async fn planned_global_index_validates_dimension_before_empty_snapshot() {
+    let path = "memory:/planned_global_index_empty_dimension";
+    let table = vindex_e2e_table(path, "2");
+    setup_dirs(table.file_io(), path).await;
+    let mut builder = table.new_global_index_build_builder();
+    builder
+        .with_index_type(IVF_FLAT_IDENTIFIER)
+        .with_index_column("embedding")
+        .with_options(HashMap::from([(
+            "ivf-flat.dimension".into(),
+            (i32::MAX as u64 + 1).to_string(),
+        )]));
+    for error in [
+        builder.plan().await.unwrap_err(),
+        builder.build().await.unwrap_err(),
+    ] {
+        assert!(error.to_string().contains("dimension is too large"));
+    }
+}
+
+#[tokio::test]
+async fn planned_global_index_shards_keep_snapshot_schema_and_physical_coverage() {
+    let path = "memory:/planned_global_index_shards";
+    let mut options = vindex_e2e_options("2");
+    options.insert("ivf-flat.nlist".into(), "1".into());
+    options.insert("deletion-vectors.enabled".into(), "true".into());
+    let table = test_table_with_io(
+        FileIOBuilder::new("memory").build().unwrap(),
+        path,
+        vindex_schema_builder(options).build().unwrap(),
+    );
+    setup_dirs(table.file_io(), path).await;
+    write_vectors(&table, vec![1, 2, 3, 4], vec![vec![1., 0.]; 4]).await;
+    let write = table.new_write_builder();
+    write
+        .new_commit()
+        .commit(
+            write
+                .new_update()
+                .unwrap()
+                .delete_by_row_id(vec![1])
+                .await
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let mut builder = table.new_global_index_build_builder();
+    builder
+        .with_index_type(IVF_FLAT_IDENTIFIER)
+        .with_index_column("embedding");
+    let plan = builder.plan().await.unwrap();
+    let snapshot_id = plan.snapshot_id().unwrap();
+    let plan: crate::table::GlobalIndexBuildPlan =
+        serde_json::from_slice(&serde_json::to_vec(&plan).unwrap()).unwrap();
+    let shards = plan.shards();
+    assert_eq!(
+        shards.iter().map(|s| s.row_range()).collect::<Vec<_>>(),
+        vec![RowRange::new(0, 1), RowRange::new(2, 3)]
+    );
+    assert!(shards
+        .iter()
+        .all(|shard| shard.snapshot_id() == snapshot_id));
+    write_vectors(&table, vec![5, 6], vec![vec![0., 1.]; 2]).await;
+    // Changing the builder after planning cannot change a worker's source or field.
+    builder
+        .with_index_column("id")
+        .with_options(HashMap::from([("ivf-flat.dimension".into(), "999".into())]));
+    let messages = builder.build_shard(&shards[0]).await.unwrap();
+    assert_eq!(messages.len(), 1);
+    let file = &messages[0].new_index_files[0];
+    assert_eq!(
+        file.row_count, 2,
+        "deleted vectors remain in physical build coverage"
+    );
+    let meta = file.global_index_meta.as_ref().unwrap();
+    assert_eq!(
+        (
+            meta.row_range_start,
+            meta.row_range_end,
+            meta.index_field_id
+        ),
+        (0, 1, 1)
+    );
+    assert_eq!(
+        latest_vindex_index_files(&table).await.len(),
+        0,
+        "workers do not commit"
+    );
+    assert_eq!(
+        table
+            .file_io()
+            .list_status(&format!("{path}/index/"))
+            .await
+            .unwrap()
+            .iter()
+            .filter(|status| status.path.contains("vector-ivf-flat-global-index-"))
+            .count(),
+        1,
+        "one task must not build another shard or later append"
+    );
+    write.new_commit().commit(messages).await.unwrap();
+    let plan = table
+        .new_global_index_build_builder()
+        .with_index_type(IVF_FLAT_IDENTIFIER)
+        .with_index_column("embedding")
+        .plan()
+        .await
+        .unwrap();
+    assert_eq!(
+        plan.shards()
+            .iter()
+            .map(|s| s.row_range())
+            .collect::<Vec<_>>(),
+        vec![RowRange::new(2, 3), RowRange::new(4, 5)]
+    );
+}
+
+#[tokio::test]
+async fn planned_global_index_shards_recheck_worker_authorization_and_table_identity() {
+    let path = "memory:/planned_global_index_authorization";
+    let table = vindex_e2e_table(path, "2");
+    setup_dirs(table.file_io(), path).await;
+    write_vectors(&table, vec![1, 2], vec![vec![1., 0.]; 2]).await;
+    let plan = table
+        .new_global_index_build_builder()
+        .with_index_type(IVF_FLAT_IDENTIFIER)
+        .with_index_column("embedding")
+        .plan()
+        .await
+        .unwrap();
+    let shard = &plan.shards()[0];
+    let denied = table.copy_with_options(HashMap::from([(
+        "query-auth.enabled".into(),
+        "true".into(),
+    )]));
+    let error = denied
+        .new_global_index_build_builder()
+        .build_shard(shard)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("query-auth"));
+    let other = vindex_e2e_table("memory:/different_table", "2");
+    let error = other
+        .new_global_index_build_builder()
+        .build_shard(shard)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("different table"));
+}
+
+#[tokio::test]
 async fn vector_build_with_deletion_vectors_preserves_physical_coverage() {
     for granule in [false, true] {
         for deleted in [vec![0, 2], vec![0, 1, 2, 3]] {
