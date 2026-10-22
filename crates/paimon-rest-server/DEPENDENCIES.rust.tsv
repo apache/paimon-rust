@@ -268,7 +268,7 @@ rustls-native-certs@0.8.4		X							X		X
 rustls-pki-types@1.15.0		X									X					
 rustls-platform-verifier@0.7.0		X									X					
 rustls-platform-verifier-android@0.1.1		X									X					
-rustls-webpki@0.103.15									X							
+rustls-webpki@0.103.16									X							
 rustversion@1.0.23		X									X					
 ryu@1.0.23		X				X										
 safe_arch@0.7.4		X									X				X	
@@ -363,7 +363,7 @@ wasm-bindgen-shared@0.2.126		X									X
 wasm-streams@0.5.0		X									X					
 web-sys@0.3.103		X									X					
 web-time@1.1.0		X									X					
-webpki-root-certs@1.0.9								X								
+webpki-root-certs@1.0.10								X								
 wide@0.7.33		X									X				X	
 winapi-util@0.1.11											X			X		
 windows-core@0.62.2		X									X					
