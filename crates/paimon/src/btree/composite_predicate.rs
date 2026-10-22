@@ -59,7 +59,7 @@ impl CompositeBound {
         })
     }
 
-    fn compare(&self, other: &Self, codec: &CompositeKeyCodec) -> Result<Ordering> {
+    pub(super) fn compare(&self, other: &Self, codec: &CompositeKeyCodec) -> Result<Ordering> {
         for i in 0..self.values.len().min(other.values.len()) {
             let order = codec.compare_component(
                 i,

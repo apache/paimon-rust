@@ -237,8 +237,18 @@ impl<F: Fn(&[u8], &[u8]) -> crate::Result<Ordering>> BTreeIndexReader<F> {
                 _ => self.query_in(&keys).await,
             };
         }
+        // The planner emits disjoint prefix intervals in input literal order.
+        // Sort them so scans only move forwards, retaining their last block
+        // across intervals even when the shared block cache is disabled.
+        let mut intervals = plan.intervals.iter().collect::<Vec<_>>();
+        try_sort_by(&mut intervals, |left, right| {
+            left.lower
+                .compare(&right.lower, &plan.codec)
+                .map_err(key_comparison_io_error)
+        })?;
+        let mut last_block: Option<(BlockHandle, Arc<BlockReader>)> = None;
         let mut result = RoaringTreemap::new();
-        for interval in &plan.intervals {
+        for interval in intervals {
             let cmp = |key: &[u8], _: &[u8]| {
                 interval
                     .lower
@@ -249,7 +259,18 @@ impl<F: Fn(&[u8], &[u8]) -> crate::Result<Ordering>> BTreeIndexReader<F> {
             let mut first = true;
             while let Some((_, handle_bytes)) = index_iter.next() {
                 let handle = BlockHandle::decode(handle_bytes)?;
-                let block = self.read_data_block(&handle).await?;
+                let block = match &last_block {
+                    Some((previous, block))
+                        if previous.offset == handle.offset && previous.size == handle.size =>
+                    {
+                        Arc::clone(block)
+                    }
+                    _ => {
+                        let block = self.read_data_block(&handle).await?;
+                        last_block = Some((handle, Arc::clone(&block)));
+                        block
+                    }
+                };
                 let mut offset = if first {
                     first = false;
                     block.seek_and_iter(&[], &cmp)?.1.offset

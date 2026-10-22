@@ -672,73 +672,105 @@ async fn composite_point_domain_identity_matches_encoded_keys() {
 }
 
 #[tokio::test]
-async fn composite_point_lookup_batches_reads_without_block_cache() {
+async fn composite_lookup_batches_reads_without_block_cache() {
     use crate::io::FileRead;
-    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
-    use std::sync::Arc;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
 
     struct CountedRead {
         bytes: Bytes,
-        reads: Arc<AtomicUsize>,
+        reads: Arc<Mutex<HashMap<(u64, u64), usize>>>,
     }
 
     #[async_trait::async_trait]
     impl FileRead for CountedRead {
         async fn read(&self, range: std::ops::Range<u64>) -> crate::Result<Bytes> {
-            self.reads.fetch_add(1, AtomicOrdering::Relaxed);
+            *self
+                .reads
+                .lock()
+                .unwrap()
+                .entry((range.start, range.end))
+                .or_default() += 1;
             Ok(self.bytes.slice(range.start as usize..range.end as usize))
         }
     }
 
     let fields = integer_fields();
     let b = PredicateBuilder::new(&fields);
-    let predicate = Predicate::and(vec![
-        b.is_in("k0", (0..128).rev().map(Datum::Int).collect())
+    // Cover complete points, prefixes in one block, and shuffled prefixes
+    // spanning many blocks, with some intervals spanning blocks themselves.
+    for (complete, block_size) in [(true, 1_000_000), (false, 1_000_000), (false, 512)] {
+        let predicate = Predicate::and(vec![
+            b.is_in(
+                "k0",
+                (0..4096).map(|i| Datum::Int((i * 2053) % 4096)).collect(),
+            )
             .unwrap(),
-        b.is_null("k1").unwrap(),
-        b.equal("k2", Datum::Int(7)).unwrap(),
-    ]);
-    let plan = CompositePlan::plan(&fields, &predicate).unwrap().unwrap();
-    let codec = CompositeKeyCodec::new(&fields);
-    let key_type = DataType::Row(RowType::new(fields.clone()));
-    let buf = VecFileWrite::new();
-    let mut writer = BTreeIndexWriter::with_comparator_and_options(
-        Box::new(buf.clone()),
-        1_000_000,
-        BlockCompressionType::None,
-        1,
-        false,
-        make_key_comparator(&key_type),
-    );
-    for id in 0..128 {
-        let key = codec
-            .serialize(&[Some(Datum::Int(id)), None, Some(Datum::Int(7))])
-            .unwrap();
-        writer.write(Some(&key), id as i64).await.unwrap();
+            b.is_null("k1").unwrap(),
+            if complete {
+                b.equal("k2", Datum::Int(7)).unwrap()
+            } else {
+                b.between("k2", Datum::Int(20), Datum::Int(70)).unwrap()
+            },
+        ]);
+        let plan = CompositePlan::plan(&fields, &predicate).unwrap().unwrap();
+        let codec = CompositeKeyCodec::new(&fields);
+        let key_type = DataType::Row(RowType::new(fields.clone()));
+        let buf = VecFileWrite::new();
+        let mut writer = BTreeIndexWriter::with_comparator_and_options(
+            Box::new(buf.clone()),
+            block_size,
+            BlockCompressionType::None,
+            1,
+            false,
+            make_key_comparator(&key_type),
+        );
+        let mut expected = roaring::RoaringTreemap::new();
+        let mut row_id = 0;
+        for id in 0..4096 {
+            let suffixes = if id % 256 == 0 { 0..101 } else { 7..8 };
+            for suffix in suffixes {
+                let key = codec
+                    .serialize(&[Some(Datum::Int(id)), None, Some(Datum::Int(suffix))])
+                    .unwrap();
+                writer.write(Some(&key), row_id).await.unwrap();
+                if (complete && suffix == 7) || (!complete && (20..=70).contains(&suffix)) {
+                    expected.insert(row_id as u64);
+                }
+                row_id += 1;
+            }
+        }
+        let result = writer.finish().await.unwrap();
+        let bytes = Bytes::from(buf.to_vec());
+        let size = bytes.len() as u64;
+        let reads = Arc::new(Mutex::new(HashMap::new()));
+        let reader = BTreeIndexReader::open_with_data_block_cache(
+            Box::new(CountedRead {
+                bytes,
+                reads: Arc::clone(&reads),
+            }),
+            size,
+            &result.meta,
+            make_key_comparator(&key_type),
+            Arc::new(BTreeDataBlockCache::new(0)),
+            Arc::from("memory:/composite-batch.btree"),
+        )
+        .await
+        .unwrap();
+        reads.lock().unwrap().clear();
+        assert_eq!(reader.query_composite(&plan).await.unwrap(), expected);
+        let reads = reads.lock().unwrap();
+        assert!(!reads.is_empty());
+        assert!(
+            reads.values().all(|count| *count == 1),
+            "a target block was read repeatedly: complete={complete}, block_size={block_size}"
+        );
+        if block_size == 1_000_000 {
+            assert_eq!(reads.len(), 1);
+        } else {
+            assert!(reads.len() > 1);
+        }
     }
-    let result = writer.finish().await.unwrap();
-    let bytes = Bytes::from(buf.to_vec());
-    let size = bytes.len() as u64;
-    let reads = Arc::new(AtomicUsize::new(0));
-    let reader = BTreeIndexReader::open_with_data_block_cache(
-        Box::new(CountedRead {
-            bytes,
-            reads: Arc::clone(&reads),
-        }),
-        size,
-        &result.meta,
-        make_key_comparator(&key_type),
-        Arc::new(BTreeDataBlockCache::new(0)),
-        Arc::from("memory:/composite-batch.btree"),
-    )
-    .await
-    .unwrap();
-    reads.store(0, AtomicOrdering::Relaxed);
-    assert_eq!(
-        reader.query_composite(&plan).await.unwrap(),
-        (0..128).collect::<roaring::RoaringTreemap>()
-    );
-    assert_eq!(reads.load(AtomicOrdering::Relaxed), 1);
 }
 
 fn predicates(fields: &[DataField]) -> Vec<Predicate> {
