@@ -765,12 +765,36 @@ impl KeyValueFileReader {
                     // every key is a lone version and needs no merge. Retract
                     // rows are still dropped per batch below: older Rust writers
                     // recorded `delete_row_count = 0` for files holding them.
-                    let skip_merge = skip_single_runs
+                    let mut skip_merge = skip_single_runs
                         && input_stream_count == 1
                         && matches!(
                             config.merge_engine,
                             MergeEngine::Deduplicate | MergeEngine::FirstRow
                         );
+                    // A file written under another engine may hold several
+                    // versions of a key (the aggregation writer kept them before
+                    // #839), and ALTER can switch the engine afterwards.
+                    if skip_merge {
+                        'files: for run in &merge_group {
+                            for file in &run.files {
+                                let schema_id = file.file.schema_id;
+                                if schema_id == table_schema_id {
+                                    continue;
+                                }
+                                let schema =
+                                    config.schema_manager.schema(schema_id).await?;
+                                let engine =
+                                    CoreOptions::new(schema.options()).merge_engine()?;
+                                if !matches!(
+                                    engine,
+                                    MergeEngine::Deduplicate | MergeEngine::FirstRow
+                                ) {
+                                    skip_merge = false;
+                                    break 'files;
+                                }
+                            }
+                        }
+                    }
                     let reject_retracts = config.merge_engine == MergeEngine::FirstRow
                         && !CoreOptions::new(&config.table_options).ignore_delete();
 
@@ -2888,6 +2912,127 @@ mod tests {
                 None => assert!(result.is_err(), "{options:?}"),
             }
         }
+    }
+
+    /// Writes one KV file with `(id, sequence, value)` rows, under schema 0.
+    async fn write_kv_versions(
+        file_io: &FileIO,
+        table_path: &str,
+        file_name: &str,
+        rows: &[(i32, i64, i32)],
+    ) -> DataFileMeta {
+        let schema = crate::arrow::build_target_arrow_schema(&[
+            DataField::new(
+                SEQUENCE_NUMBER_FIELD_ID,
+                SEQUENCE_NUMBER_FIELD_NAME.to_string(),
+                DataType::BigInt(BigIntType::new()),
+            ),
+            DataField::new(
+                VALUE_KIND_FIELD_ID,
+                VALUE_KIND_FIELD_NAME.to_string(),
+                DataType::TinyInt(TinyIntType::new()),
+            ),
+            DataField::new(0, "id".to_string(), DataType::Int(IntType::new())),
+            DataField::new(1, "value".to_string(), DataType::Int(IntType::new())),
+        ])
+        .unwrap();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from_iter_values(rows.iter().map(|row| row.1))),
+                Arc::new(Int8Array::from_value(0, rows.len())),
+                Arc::new(Int32Array::from_iter_values(rows.iter().map(|row| row.0))),
+                Arc::new(Int32Array::from_iter_values(rows.iter().map(|row| row.2))),
+            ],
+        )
+        .unwrap();
+        let mut bytes = Vec::new();
+        {
+            let mut writer = AsyncArrowWriter::try_new(&mut bytes, schema, None).unwrap();
+            writer.write(&batch).await.unwrap();
+            writer.close().await.unwrap();
+        }
+        let bucket_path = format!("{table_path}/bucket-0");
+        file_io.mkdirs(&format!("{bucket_path}/")).await.unwrap();
+        file_io
+            .new_output(&format!("{bucket_path}/{file_name}"))
+            .unwrap()
+            .write(bytes::Bytes::from(bytes.clone()))
+            .await
+            .unwrap();
+
+        let mut file = dummy_data_file(file_name.to_string());
+        file.file_size = bytes.len() as i64;
+        file.row_count = rows.len() as i64;
+        file.min_key = int_key(rows[0].0);
+        file.max_key = int_key(rows[rows.len() - 1].0);
+        file.min_sequence_number = rows.iter().map(|row| row.1).min().unwrap();
+        file.max_sequence_number = rows.iter().map(|row| row.1).max().unwrap();
+        file
+    }
+
+    #[tokio::test]
+    async fn single_run_read_merges_files_written_under_aggregation() {
+        // Before #839 the aggregation writer kept several versions of a key in
+        // one file. After ALTER to deduplicate, such a file still needs merging.
+        let file_io = test_file_io();
+        let table_path = "memory:/kv_engine_change";
+        let old = pk_table(
+            &file_io,
+            table_path,
+            &[
+                ("merge-engine", "aggregation"),
+                ("fields.value.aggregate-function", "sum"),
+            ],
+        );
+        write_schema_file(&old, old.schema()).await;
+        let mut json = serde_json::to_value(old.schema()).unwrap();
+        json["id"] = 1.into();
+        json["options"]["merge-engine"] = "deduplicate".into();
+        let schema: TableSchema = serde_json::from_value(json).unwrap();
+        write_schema_file(&old, &schema).await;
+        let table = old.copy_with_resolved_schema(schema, "main").unwrap();
+        let a =
+            write_kv_versions(&file_io, table_path, "a.parquet", &[(1, 0, 10), (1, 1, 11)]).await;
+        let b = write_kv_versions(&file_io, table_path, "b.parquet", &[(2, 2, 20)]).await;
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(format!("{table_path}/bucket-0"))
+            .with_total_buckets(1)
+            .with_data_files(vec![a, b])
+            .build()
+            .unwrap();
+        let core_options = table.schema().core_options();
+        let batches = KeyValueFileReader::new(
+            table.file_io().clone(),
+            KeyValueReadConfig {
+                table_name: table.identifier().full_name(),
+                table_options: table.schema().options().clone(),
+                schema_manager: table.schema_manager().clone(),
+                table_schema_id: table.schema().id(),
+                table_fields: table.schema().fields().to_vec(),
+                read_type: table.schema().fields().to_vec(),
+                predicates: Vec::new(),
+                primary_keys: table.schema().trimmed_primary_keys(),
+                table_primary_keys: table.schema().primary_keys().to_vec(),
+                merge_engine: core_options.merge_engine().unwrap(),
+                sequence_fields: Vec::new(),
+                read_batch_size: core_options.read_batch_size().unwrap(),
+                merge_splits: false,
+                max_merge_input_streams: None,
+                parquet_read_budget: None,
+                mosaic_prefetch: MosaicPrefetchOptions::default(),
+            },
+        )
+        .read(&[split])
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+        assert_eq!(int_column(&batches, "id"), vec![1, 2]);
+        assert_eq!(int_column(&batches, "value"), vec![11, 20]);
     }
 
     #[tokio::test]
