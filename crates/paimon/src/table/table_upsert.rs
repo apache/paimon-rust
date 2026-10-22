@@ -33,7 +33,8 @@ use super::upsert_key_matcher::UpsertKeyMatcher;
 use super::write_batch_normalize::{normalize_blob_write_field, normalize_write_array};
 use crate::spec::{
     batch_to_serialized_bytes, extract_datum, extract_datum_from_arrow, BinaryRow,
-    BinaryRowBuilder, CoreOptions, DataField, Predicate, PredicateBuilder,
+    BinaryRowBuilder, CoreOptions, DataField, GlobalIndexColumnUpdateAction, Predicate,
+    PredicateBuilder,
 };
 use crate::table::source::{DataSplit, Plan};
 use crate::table::{CommitMessage, Table};
@@ -449,10 +450,20 @@ impl TableUpsert {
     ) -> crate::Result<Plan> {
         // Mutation lookups must include unindexed rows even when queries use
         // fast mode, or a matching target would incorrectly become an insert.
-        let lookup_table = self.table.copy_with_options(HashMap::from([(
-            "scalar-index.search-mode".into(),
-            "full".into(),
-        )]));
+        let mut lookup_options =
+            HashMap::from([("scalar-index.search-mode".into(), "full".into())]);
+        // IGNORE preserves index entries after indexed columns change. Such
+        // entries cannot establish that a key is absent during a mutation.
+        if self
+            .table
+            .schema()
+            .core_options()
+            .global_index_column_update_action()?
+            == GlobalIndexColumnUpdateAction::Ignore
+        {
+            lookup_options.insert("global-index.enabled".into(), "false".into());
+        }
+        let lookup_table = self.table.copy_with_options(lookup_options);
         let mut scan_builder = lookup_table.new_read_builder();
         if let Some(filter) = self.lookup_filter(source)? {
             scan_builder.with_filter(filter);
@@ -802,6 +813,54 @@ mod tests {
                 "indexed={indexed}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn upsert_key_lookup_ignores_stale_indexes_under_ignore_policy() {
+        let table = numeric_table("memory:/upsert_ignored_index_updates").await;
+        let table = table.copy_with_options(HashMap::from([(
+            "global-index.column-update-action".into(),
+            "IGNORE".into(),
+        )]));
+        table
+            .new_global_index_build_builder()
+            .with_index_column("key")
+            .execute()
+            .await
+            .unwrap();
+        let changed_keys = RecordBatch::try_from_iter([
+            (ROW_ID, Arc::new(Int64Array::from(vec![0, 1])) as ArrayRef),
+            ("key", Arc::new(Int32Array::from(vec![3, 3])) as ArrayRef),
+        ])
+        .unwrap();
+        let update = table.new_write_builder().new_update().unwrap();
+        TableCommit::new(table.clone(), "change-keys".into())
+            .commit(
+                update
+                    .update_by_arrow_with_row_id(vec![changed_keys])
+                    .await
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        commit_upsert(
+            &table,
+            vec![numeric_source(
+                vec![3, 4],
+                Arc::new(Int32Array::from(vec![43, 44])),
+            )],
+            vec!["key".into()],
+        )
+        .await;
+        assert_eq!(
+            numeric_rows(&table).await,
+            vec![
+                (0, 3, Some(43), Some(10)),
+                (1, 3, Some(43), Some(11)),
+                (2, 2, Some(0), Some(12)),
+                (3, 4, Some(44), None),
+            ]
+        );
     }
 
     #[tokio::test]
