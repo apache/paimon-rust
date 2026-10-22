@@ -665,3 +665,238 @@ async fn postpone_pending_visibility_is_an_explicit_reader_selection() {
         }
     }
 }
+
+#[tokio::test]
+async fn explicit_file_filters_include_level_zero_with_key_merge() {
+    for engine in ["first-row", "deduplicate"] {
+        for buckets in [1, -2] {
+            let original = table(
+                &format!("file_filters_{engine}_{buckets}"),
+                engine,
+                "none",
+                buckets,
+            )
+            .await;
+            // DV's default read hides unmerged level zero. Explicit inclusion must
+            // pack overlapping keys together and let the reader merge their versions.
+            let table = if engine == "deduplicate" {
+                original.copy_with_options(HashMap::from([(
+                    "deletion-vectors.enabled".into(),
+                    "true".into(),
+                )]))
+            } else {
+                original
+            };
+            write_batch(&table, &make_batch(vec![1], vec![10])).await;
+            write_batch(&table, &make_batch(vec![1], vec![20])).await;
+            let builder = table.new_read_builder();
+            let default = builder.new_scan().plan().await.unwrap();
+            assert!(
+                default.splits().is_empty(),
+                "{engine} must keep its ordinary L0 exclusion"
+            );
+            let scan = builder
+                .new_scan()
+                .with_file_filters(false, buckets > 0)
+                .unwrap();
+            assert_eq!(scan.plan_files().await.unwrap().files().len(), 2);
+            let selected = scan.plan().await.unwrap();
+            assert_eq!(
+                selected.splits().len(),
+                1,
+                "overlapping versions belong together"
+            );
+            assert!(!selected.splits()[0].raw_convertible());
+            let expected = if engine == "first-row" { 10 } else { 20 };
+            assert_eq!(rows(&table, &selected).await, [(1, expected)]);
+            for index in 0..3 {
+                let shard = builder
+                    .new_scan()
+                    .with_file_filters(false, buckets > 0)
+                    .unwrap()
+                    .with_shard(index, 3)
+                    .unwrap()
+                    .plan()
+                    .await
+                    .unwrap();
+                let owner = if buckets < 0 { 2 } else { 0 };
+                let expected_rows = if index == owner {
+                    vec![(1, expected)]
+                } else {
+                    vec![]
+                };
+                assert_eq!(
+                    rows(&table, &shard).await,
+                    expected_rows,
+                    "{engine} bucket={buckets} worker={index}"
+                );
+            }
+            let all = builder
+                .new_scan()
+                .with_file_filters(true, true)
+                .unwrap()
+                .plan_all()
+                .await
+                .unwrap();
+            let baseline = builder.new_scan().plan_all().await.unwrap();
+            if buckets > 0 {
+                assert_eq!(all.splits(), baseline.splits());
+            } else {
+                assert!(
+                    all.splits().is_empty(),
+                    "whole-file planning retains the independent real-buckets filter"
+                );
+            }
+            assert_eq!(
+                baseline
+                    .splits()
+                    .iter()
+                    .flat_map(|split| split.data_files())
+                    .count(),
+                2
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn file_scan_preserves_compacted_key_merge_inputs() {
+    for engine in ["deduplicate", "partial-update", "aggregation"] {
+        let table = table(&format!("file_merge_inputs_{engine}"), engine, "none", 1).await;
+        for (level, value) in [(2, 10), (1, 20)] {
+            let builder = table.new_write_builder();
+            let mut writer = builder.new_write().unwrap();
+            writer
+                .write_arrow_batch(&make_batch(vec![1], vec![value]))
+                .await
+                .unwrap();
+            let mut messages = writer.prepare_commit().await.unwrap();
+            for message in &mut messages {
+                for file in &mut message.new_files {
+                    file.level = level;
+                }
+            }
+            builder.new_commit().commit(messages).await.unwrap();
+        }
+        let expected_value = if engine == "aggregation" { 30 } else { 20 };
+        let mut builder = table.new_read_builder();
+        builder.with_filter(
+            paimon::spec::PredicateBuilder::new(table.schema().fields())
+                .equal("value", paimon::spec::Datum::Int(expected_value))
+                .unwrap(),
+        );
+        for filters in [None, Some((false, false)), Some((true, false))] {
+            let mut scan = builder.new_scan();
+            if let Some((skip, only_real)) = filters {
+                scan = scan.with_file_filters(skip, only_real).unwrap();
+            }
+            let plan = scan.plan().await.unwrap();
+            assert_eq!(rows(&table, &plan).await, [(1, expected_value)]);
+            let files = scan.plan_files().await.unwrap();
+            assert_eq!(
+                files.files().len(),
+                2,
+                "{engine} {filters:?}: skipping L0 must retain overlapping L1/L2 inputs"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn file_scan_uses_effective_first_row_level_policy_for_value_stats() {
+    let uncompacted = table("file_first_row_value_stats", "first-row", "none", 1).await;
+    write_batch(&uncompacted, &make_batch(vec![1], vec![10])).await;
+    write_batch(&uncompacted, &make_batch(vec![1], vec![20])).await;
+    let mut builder = uncompacted.new_read_builder();
+    builder.with_filter(
+        paimon::spec::PredicateBuilder::new(uncompacted.schema().fields())
+            .equal("value", paimon::spec::Datum::Int(20))
+            .unwrap(),
+    );
+    assert_eq!(
+        builder.new_scan().plan_files().await.unwrap().files().len(),
+        2,
+        "default raw planning includes L0 merge inputs, unlike a normal first-row query"
+    );
+    assert!(builder
+        .new_scan()
+        .with_file_filters(true, false)
+        .unwrap()
+        .plan_files()
+        .await
+        .unwrap()
+        .files()
+        .is_empty());
+
+    let compacted = table("file_first_row_materialized", "first-row", "none", 1).await;
+    let builder = compacted.new_write_builder();
+    let mut writer = builder.new_write().unwrap();
+    writer
+        .write_arrow_batch(&make_batch(vec![2], vec![20]))
+        .await
+        .unwrap();
+    let mut messages = writer.prepare_commit().await.unwrap();
+    messages[0].new_files[0].level = 1;
+    builder.new_commit().commit(messages).await.unwrap();
+    let mut builder = compacted.new_read_builder();
+    builder.with_filter(
+        paimon::spec::PredicateBuilder::new(compacted.schema().fields())
+            .equal("value", paimon::spec::Datum::Int(10))
+            .unwrap(),
+    );
+    assert!(
+        builder
+            .new_scan()
+            .with_file_filters(true, false)
+            .unwrap()
+            .plan_files()
+            .await
+            .unwrap()
+            .files()
+            .is_empty(),
+        "materialized first-row files still allow value stats pruning"
+    );
+}
+
+#[tokio::test]
+async fn plan_all_preserves_independent_pending_bucket_filters() {
+    let table = table("all_pending_file_filters", "deduplicate", "none", -2).await;
+    write_batch(&table, &make_batch(vec![1], vec![10])).await;
+    let builder = table.new_read_builder();
+    let baseline = builder.new_scan().plan_all().await.unwrap();
+    assert_eq!(baseline.splits().len(), 1);
+    assert!(baseline.splits()[0].bucket() < 0);
+    for skip_level0 in [false, true] {
+        let scan = builder
+            .new_scan()
+            .with_file_filters(skip_level0, true)
+            .unwrap();
+        assert!(scan.plan().await.unwrap().splits().is_empty());
+        assert!(scan.plan_files().await.unwrap().files().is_empty());
+        assert!(scan
+            .clone()
+            .with_scan_all_files()
+            .plan_files()
+            .await
+            .unwrap()
+            .files()
+            .is_empty());
+        assert!(
+            scan.plan_all().await.unwrap().splits().is_empty(),
+            "plan_all disables L0 filtering without exposing excluded pending buckets"
+        );
+    }
+    let all = builder
+        .new_scan()
+        .only_read_snapshot_real_buckets()
+        .with_file_filters(true, false)
+        .unwrap()
+        .plan_all()
+        .await
+        .unwrap();
+    assert_eq!(
+        all.splits(),
+        baseline.splits(),
+        "an explicit all-buckets policy replaces a previous real-buckets selection"
+    );
+}

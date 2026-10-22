@@ -260,7 +260,7 @@ pub use table_merge_into::{
     MergeAssignment, MergeCondition, MergeSource, WhenMatched, WhenNotMatched,
 };
 pub use table_read::{AuditLogRead, TableRead};
-pub use table_scan::{AuditLogScan, TableScan};
+pub use table_scan::{AuditLogScan, FileScanPlan, TableScan};
 pub use table_update::TableUpdate;
 pub use table_update_by_row_id::TableUpdateByRowId;
 pub use table_write::TableWrite;

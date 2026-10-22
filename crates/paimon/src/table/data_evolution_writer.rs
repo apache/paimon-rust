@@ -612,11 +612,7 @@ impl DataEvolutionDeleteWriter {
         // A row filter or mask cannot authorize a physical file mutation.
         let snapshot = super::time_travel::resolve_snapshot(&self.table).await?;
         let scan_table = self.table.copy_with_pinned_snapshot(snapshot.as_ref());
-        let plan = scan_table
-            .new_read_builder()
-            .new_scan()
-            .plan_all_files()
-            .await?;
+        let plan = scan_table.new_read_builder().new_scan().plan_all().await?;
         let snapshot = snapshot.ok_or_else(|| crate::Error::DataInvalid {
             message: "No files with row tracking found in target table".into(),
             source: None,

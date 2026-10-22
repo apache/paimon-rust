@@ -164,6 +164,11 @@ class GlobalIndexResult:
         ...
 
 class TableScan:
+    def with_file_filters(self, skip_level0: bool, only_read_real_buckets: bool) -> TableScan:
+        """Set independent level-zero and pending-bucket policies for
+        plan() and plan_files(). plan_all() includes L0 and retains the
+        configured bucket policy."""
+        ...
     def with_global_index_result(self, result: GlobalIndexResult) -> "TableScan":
         """Reuse an index selection. Authorized scans ignore supplied index selections."""
         ...
@@ -179,9 +184,19 @@ class TableScan:
         ranges of shuffled chunks. Row-position sharding is a separate API."""
         ...
     def plan(self) -> Plan: ...
-    def plan_all_files(self) -> Plan:
-        """Include L0 and all column files, retaining scan filters and limits. Requires unrestricted query authorization."""
+    def plan_all(self) -> Plan:
+        """Split Plan including L0 and all matching data-evolution column files.
+        Retains scan filters and limits. Requires unrestricted query authorization."""
         ...
+    def plan_files(self) -> FileScanPlan:
+        """Filtered file entries before projection, LIMIT, row selection and index refinement.
+        Without explicit file filters, includes level zero and pending buckets.
+        Requires unrestricted whole-table query authorization."""
+        ...
+
+class FileScanPlan:
+    def snapshot_id(self) -> Optional[int]: ...
+    def files(self) -> List[ManifestEntry]: ...
 
 class StreamTableScan:
     """Stateful continuous scan; checkpoint is the next snapshot to consume."""

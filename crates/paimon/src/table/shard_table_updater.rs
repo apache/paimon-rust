@@ -99,7 +99,7 @@ impl ShardTableUpdater {
                 "FULL".into(),
             )]))
             .copy_with_pinned_snapshot(snapshot.as_ref());
-        let plan = table.new_read_builder().new_scan().plan_all_files().await?;
+        let plan = table.new_read_builder().new_scan().plan_all().await?;
         let splits = select_shard(plan.splits(), shard, shard_count)?;
         let index = RowIdFileIndex::from_splits(table.clone(), &splits)?;
         let read_type = read_type.unwrap_or_else(|| table.schema().fields().to_vec());
