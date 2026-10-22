@@ -18,7 +18,7 @@
 //! Table-level append-only upsert by user-specified keys.
 
 use std::borrow::Cow;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -32,7 +32,8 @@ use super::update_input::unique_column_index;
 use super::upsert_key_matcher::UpsertKeyMatcher;
 use super::write_batch_normalize::{normalize_blob_write_field, normalize_write_array};
 use crate::spec::{
-    batch_to_serialized_bytes, extract_datum, BinaryRow, BinaryRowBuilder, CoreOptions, DataField,
+    batch_to_serialized_bytes, extract_datum, extract_datum_from_arrow, BinaryRow,
+    BinaryRowBuilder, CoreOptions, DataField, Predicate, PredicateBuilder,
 };
 use crate::table::source::{DataSplit, Plan};
 use crate::table::{CommitMessage, Table};
@@ -386,6 +387,92 @@ impl TableUpsert {
         Ok(Cow::Owned(splits))
     }
 
+    /// Each column domain is a superset of the input tuples. The matcher still
+    /// checks complete keys, including NULLs, after index and reader pruning.
+    fn lookup_filter(&self, source: &RecordBatch) -> crate::Result<Option<Predicate>> {
+        let builder = PredicateBuilder::new(self.table.schema().fields());
+        let mut predicates = Vec::new();
+        for key in &self.keys {
+            let column = unique_column_index(&source.schema(), key)?;
+            // Arrow row encoding preserves NaN payloads and signed zero. SQL
+            // equality need not share that identity, so retain the full domain.
+            if matches!(
+                source.column(column).data_type(),
+                DataType::Float32 | DataType::Float64
+            ) {
+                continue;
+            }
+            let field = self
+                .table
+                .schema()
+                .fields()
+                .iter()
+                .find(|field| field.name() == key)
+                .unwrap();
+            // BLOB keys can be matched as Arrow bytes but have no scalar Datum.
+            if field.data_type().is_blob_type() {
+                continue;
+            }
+            let mut seen = HashSet::new();
+            let mut values = Vec::new();
+            let mut has_null = false;
+            for row in 0..source.num_rows() {
+                match extract_datum_from_arrow(source, row, column, field.data_type())? {
+                    Some(value) => {
+                        if seen.insert(crate::btree::serialize_datum(&value, field.data_type())) {
+                            values.push(value);
+                        }
+                    }
+                    None => has_null = true,
+                }
+            }
+            let mut alternatives = Vec::new();
+            if values.len() == 1 {
+                alternatives.push(builder.equal(key.as_str(), values.remove(0))?);
+            } else if !values.is_empty() {
+                alternatives.push(builder.is_in(key.as_str(), values)?);
+            }
+            if has_null {
+                alternatives.push(builder.is_null(key.as_str())?);
+            }
+            if !alternatives.is_empty() {
+                predicates.push(Predicate::or(alternatives));
+            }
+        }
+        Ok((!predicates.is_empty()).then(|| Predicate::and(predicates)))
+    }
+
+    async fn match_existing(
+        &self,
+        source: &RecordBatch,
+        matcher: &mut UpsertKeyMatcher,
+    ) -> crate::Result<Plan> {
+        // Mutation lookups must include unindexed rows even when queries use
+        // fast mode, or a matching target would incorrectly become an insert.
+        let lookup_table = self.table.copy_with_options(HashMap::from([(
+            "scalar-index.search-mode".into(),
+            "full".into(),
+        )]));
+        let mut scan_builder = lookup_table.new_read_builder();
+        if let Some(filter) = self.lookup_filter(source)? {
+            scan_builder.with_filter(filter);
+        }
+        let plan = scan_builder.new_scan().plan_all().await?;
+        // Split row ranges retain index pruning. Exact tuple matching below
+        // avoids evaluating a potentially large IN list again for every row.
+        let mut read_builder = lookup_table.new_read_builder();
+        let mut projection = self.keys.iter().map(String::as_str).collect::<Vec<_>>();
+        projection.push(ROW_ID);
+        read_builder.with_projection(&projection)?;
+        let read = read_builder.new_read()?.for_update();
+        let splits = self.matching_splits(source, &plan)?;
+        let mut stream = read.to_arrow(splits.as_ref())?;
+        while let Some(batch) = stream.try_next().await? {
+            matcher.add_existing_batch(&batch)?;
+        }
+        Ok(plan)
+    }
+
     /// Match source keys against the target snapshot, stage row-ID updates and
     /// new rows, then return both sets of commit messages as one operation.
     #[must_use = "commit messages must be passed to TableCommit"]
@@ -396,17 +483,7 @@ impl TableUpsert {
         }
         let mut matcher = UpsertKeyMatcher::new(&source, self.keys.clone())?;
 
-        let mut read_builder = self.table.new_read_builder();
-        let mut projection = self.keys.iter().map(String::as_str).collect::<Vec<_>>();
-        projection.push(ROW_ID);
-        read_builder.with_projection(&projection)?;
-        let plan = read_builder.new_scan().plan_all().await?;
-        let read = read_builder.new_read()?.for_update();
-        let splits = self.matching_splits(&source, &plan)?;
-        let mut stream = read.to_arrow(splits.as_ref())?;
-        while let Some(batch) = stream.try_next().await? {
-            matcher.add_existing_batch(&batch)?;
-        }
+        let plan = self.match_existing(&source, &mut matcher).await?;
         let (matched_indices, row_ids, new_indices) = matcher.finish();
 
         // Validate append field sets before staging any updates or new files.
@@ -570,6 +647,437 @@ mod tests {
         }
         rows.sort();
         rows
+    }
+
+    #[tokio::test]
+    async fn upsert_key_lookup_uses_btree_row_ranges() {
+        let table = numeric_table("memory:/upsert_btree_lookup").await;
+        table
+            .new_global_index_build_builder()
+            .with_index_column("key")
+            .execute()
+            .await
+            .unwrap();
+        let mut upsert = TableUpsert::new(
+            &table,
+            "upsert".into(),
+            vec!["key".into()],
+            vec!["value".into()],
+        )
+        .unwrap();
+        upsert
+            .add_batch(numeric_source(
+                vec![1],
+                Arc::new(Int32Array::from(vec![42])),
+            ))
+            .unwrap();
+        let source = upsert.key_rows().unwrap();
+        let mut matcher = UpsertKeyMatcher::new(&source, upsert.keys.clone()).unwrap();
+        let plan = upsert.match_existing(&source, &mut matcher).await.unwrap();
+        assert_eq!(plan.snapshot_id(), Some(2));
+        assert!(plan
+            .splits()
+            .iter()
+            .all(|split| { split.row_ranges() == Some(&[crate::table::RowRange::new(0, 1)][..]) }));
+        let (indices, mut row_ids, new) = matcher.finish();
+        row_ids.sort();
+        assert_eq!(indices, vec![0, 0]);
+        assert_eq!(row_ids, vec![0, 1]);
+        assert!(new.is_empty());
+        TableCommit::new(table.clone(), "upsert".into())
+            .commit(upsert.prepare_commit().await.unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            numeric_rows(&table).await,
+            vec![
+                (0, 1, Some(42), Some(10)),
+                (1, 1, Some(42), Some(11)),
+                (2, 2, Some(0), Some(12)),
+            ]
+        );
+        commit_upsert(
+            &table,
+            vec![numeric_source(
+                vec![9],
+                Arc::new(Int32Array::from(vec![49])),
+            )],
+            vec!["key".into()],
+        )
+        .await;
+        assert_eq!(numeric_rows(&table).await[3], (3, 9, Some(49), None));
+    }
+
+    async fn commit_upsert(table: &Table, batches: Vec<RecordBatch>, keys: Vec<String>) {
+        let mut update = table.new_write_builder().new_update().unwrap();
+        update.with_update_type(vec!["value".into()]).unwrap();
+        let messages = update
+            .upsert_by_arrow_with_key(batches, keys)
+            .await
+            .unwrap();
+        TableCommit::new(table.clone(), "upsert".into())
+            .commit(messages)
+            .await
+            .unwrap();
+    }
+
+    async fn values_by_row_id(table: &Table) -> Vec<(i64, i32)> {
+        let mut builder = table.new_read_builder();
+        builder.with_projection(&[ROW_ID, "value"]).unwrap();
+        let plan = builder.new_scan().plan_all().await.unwrap();
+        let batches: Vec<RecordBatch> = builder
+            .new_read()
+            .unwrap()
+            .to_arrow(plan.splits())
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let mut rows = Vec::new();
+        for batch in batches {
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let values = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            rows.extend((0..batch.num_rows()).map(|row| (ids.value(row), values.value(row))));
+        }
+        rows.sort();
+        rows
+    }
+
+    #[tokio::test]
+    async fn upsert_key_lookup_includes_unindexed_rows_in_fast_mode() {
+        for indexed in [false, true] {
+            let table = numeric_table(&format!("memory:/upsert_partial_index_{indexed}")).await;
+            let table = table.copy_with_options(HashMap::from([(
+                "scalar-index.search-mode".into(),
+                "fast".into(),
+            )]));
+            if indexed {
+                table
+                    .new_global_index_build_builder()
+                    .with_index_column("key")
+                    .execute()
+                    .await
+                    .unwrap();
+            }
+            let appended = RecordBatch::try_from_iter([
+                ("key", Arc::new(Int32Array::from(vec![1, 3])) as ArrayRef),
+                ("value", Arc::new(Int32Array::from(vec![0, 0])) as ArrayRef),
+                ("keep", Arc::new(Int32Array::from(vec![13, 14])) as ArrayRef),
+            ])
+            .unwrap();
+            let mut write = table.new_write_builder().new_write().unwrap();
+            write.write_arrow_batch(&appended).await.unwrap();
+            TableCommit::new(table.clone(), "append".into())
+                .commit(write.prepare_commit().await.unwrap())
+                .await
+                .unwrap();
+            write.close().await;
+            commit_upsert(
+                &table,
+                vec![numeric_source(
+                    vec![1, 3, 4],
+                    Arc::new(Int32Array::from(vec![41, 43, 44])),
+                )],
+                vec!["key".into()],
+            )
+            .await;
+            assert_eq!(
+                numeric_rows(&table).await,
+                vec![
+                    (0, 1, Some(41), Some(10)),
+                    (1, 1, Some(41), Some(11)),
+                    (2, 2, Some(0), Some(12)),
+                    (3, 1, Some(41), Some(13)),
+                    (4, 3, Some(43), Some(14)),
+                    (5, 4, Some(44), None),
+                ],
+                "indexed={indexed}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn upsert_key_lookup_preserves_updated_keys_and_deleted_rows() {
+        let table = numeric_table("memory:/upsert_changed_keys").await;
+        let table = table.copy_with_options(HashMap::from([
+            ("deletion-vectors.enabled".into(), "true".into()),
+            (
+                "global-index.column-update-action".into(),
+                "DROP_PARTITION_INDEX".into(),
+            ),
+        ]));
+        table
+            .new_global_index_build_builder()
+            .with_index_column("key")
+            .execute()
+            .await
+            .unwrap();
+        let changed_key = RecordBatch::try_from_iter([
+            (ROW_ID, Arc::new(Int64Array::from(vec![2])) as ArrayRef),
+            ("key", Arc::new(Int32Array::from(vec![3])) as ArrayRef),
+        ])
+        .unwrap();
+        let update = table.new_write_builder().new_update().unwrap();
+        TableCommit::new(table.clone(), "change-key".into())
+            .commit(
+                update
+                    .update_by_arrow_with_row_id(vec![changed_key])
+                    .await
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        commit_upsert(
+            &table,
+            vec![numeric_source(
+                vec![3],
+                Arc::new(Int32Array::from(vec![43])),
+            )],
+            vec!["key".into()],
+        )
+        .await;
+        assert_eq!(numeric_rows(&table).await[2], (2, 3, Some(43), Some(12)));
+        // Rebuild so the next lookup encounters an index entry for a deleted row.
+        table
+            .new_global_index_build_builder()
+            .with_index_column("key")
+            .execute()
+            .await
+            .unwrap();
+        TableCommit::new(table.clone(), "delete".into())
+            .commit(update.delete_by_row_id(vec![0, 1]).await.unwrap())
+            .await
+            .unwrap();
+        commit_upsert(
+            &table,
+            vec![numeric_source(
+                vec![1],
+                Arc::new(Int32Array::from(vec![41])),
+            )],
+            vec!["key".into()],
+        )
+        .await;
+        assert_eq!(
+            numeric_rows(&table).await,
+            vec![(2, 3, Some(43), Some(12)), (3, 1, Some(41), None)]
+        );
+    }
+
+    #[tokio::test]
+    async fn upsert_composite_btree_preserves_nulls_partitions_and_tuple_identity() {
+        let schema = PaimonSchema::builder()
+            .column("part", PaimonType::VarChar(VarCharType::string_type()))
+            .column("key", PaimonType::Int(IntType::new()))
+            .column("tag", PaimonType::VarChar(VarCharType::string_type()))
+            .column("value", PaimonType::Int(IntType::new()))
+            .partition_keys(["part"])
+            .option("data-evolution.enabled", "true")
+            .option("row-tracking.enabled", "true")
+            .build()
+            .unwrap();
+        let table = Table::new(
+            FileIOBuilder::new("memory").build().unwrap(),
+            Identifier::new("db", "upsert_composite"),
+            "memory:/upsert_composite_btree".into(),
+            TableSchema::new(0, &schema),
+            None,
+        );
+        let batch = |parts: Vec<&str>,
+                     keys: Vec<Option<i32>>,
+                     tags: Vec<Option<&str>>,
+                     values: Vec<i32>| {
+            RecordBatch::try_from_iter([
+                ("part", Arc::new(StringArray::from(parts)) as ArrayRef),
+                ("key", Arc::new(Int32Array::from(keys)) as ArrayRef),
+                ("tag", Arc::new(StringArray::from(tags)) as ArrayRef),
+                ("value", Arc::new(Int32Array::from(values)) as ArrayRef),
+            ])
+            .unwrap()
+        };
+        let initial = batch(
+            vec!["a", "a", "a", "a", "a", "b"],
+            vec![Some(1), Some(2), None, Some(1), Some(1), Some(1)],
+            vec![Some("x"), Some("y"), Some("x"), None, Some("y"), Some("x")],
+            vec![0; 6],
+        );
+        let mut write = table.new_write_builder().new_write().unwrap();
+        write.write_arrow_batch(&initial).await.unwrap();
+        TableCommit::new(table.clone(), "seed".into())
+            .commit(write.prepare_commit().await.unwrap())
+            .await
+            .unwrap();
+        write.close().await;
+        table
+            .new_global_index_build_builder()
+            .with_index_columns(&["key", "tag"])
+            .execute()
+            .await
+            .unwrap();
+        commit_upsert(
+            &table,
+            vec![batch(
+                vec!["a"; 6],
+                vec![Some(1), Some(2), None, Some(1), Some(1), Some(9)],
+                vec![Some("x"), Some("y"), Some("x"), None, Some("x"), Some("x")],
+                vec![10, 20, 30, 40, 50, 60],
+            )],
+            vec!["key".into(), "tag".into()],
+        )
+        .await;
+        let mut builder = table.new_read_builder();
+        builder
+            .with_projection(&["part", "key", "tag", "value"])
+            .unwrap();
+        let plan = builder.new_scan().plan_all().await.unwrap();
+        let batches: Vec<RecordBatch> = builder
+            .new_read()
+            .unwrap()
+            .to_arrow(plan.splits())
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let mut rows = Vec::new();
+        for batch in batches {
+            let parts = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let keys = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let tags = batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let values = batch
+                .column(3)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            rows.extend((0..batch.num_rows()).map(|row| {
+                (
+                    parts.value(row).to_string(),
+                    (!keys.is_null(row)).then(|| keys.value(row)),
+                    (!tags.is_null(row)).then(|| tags.value(row).to_string()),
+                    values.value(row),
+                )
+            }));
+        }
+        rows.sort();
+        // (1, y) is only a cross-product candidate. Partition b must not match.
+        let expected = vec![
+            ("a", None, Some("x"), 30),
+            ("a", Some(1), None, 40),
+            ("a", Some(1), Some("x"), 50),
+            ("a", Some(1), Some("y"), 0),
+            ("a", Some(2), Some("y"), 20),
+            ("a", Some(9), Some("x"), 60),
+            ("b", Some(1), Some("x"), 0),
+        ]
+        .into_iter()
+        .map(|(part, key, tag, value)| (part.to_string(), key, tag.map(str::to_string), value))
+        .collect::<Vec<_>>();
+        assert_eq!(rows, expected);
+    }
+
+    #[tokio::test]
+    async fn upsert_blob_keys_fall_back_to_byte_matching() {
+        use crate::spec::BlobType;
+        use arrow_array::LargeBinaryArray;
+
+        let schema = PaimonSchema::builder()
+            .column("key", PaimonType::Blob(BlobType::new()))
+            .column("value", PaimonType::Int(IntType::new()))
+            .option("data-evolution.enabled", "true")
+            .option("row-tracking.enabled", "true")
+            .build()
+            .unwrap();
+        let table = Table::new(
+            FileIOBuilder::new("memory").build().unwrap(),
+            Identifier::new("db", "upsert_blob"),
+            "memory:/upsert_blob_key".into(),
+            TableSchema::new(0, &schema),
+            None,
+        );
+        for value in [41, 42] {
+            let source = RecordBatch::try_from_iter([
+                (
+                    "key",
+                    Arc::new(LargeBinaryArray::from_vec(vec![b"blob-key"])) as ArrayRef,
+                ),
+                ("value", Arc::new(Int32Array::from(vec![value])) as ArrayRef),
+            ])
+            .unwrap();
+            commit_upsert(&table, vec![source], vec!["key".into()]).await;
+        }
+        assert_eq!(values_by_row_id(&table).await, vec![(0, 42)]);
+    }
+
+    #[tokio::test]
+    async fn upsert_float_keys_keep_arrow_nan_and_signed_zero_identity() {
+        use crate::spec::DoubleType;
+        use arrow_array::Float64Array;
+
+        let schema = PaimonSchema::builder()
+            .column("key", PaimonType::Double(DoubleType::new()))
+            .column("value", PaimonType::Int(IntType::new()))
+            .option("data-evolution.enabled", "true")
+            .option("row-tracking.enabled", "true")
+            .build()
+            .unwrap();
+        let table = Table::new(
+            FileIOBuilder::new("memory").build().unwrap(),
+            Identifier::new("db", "upsert_float"),
+            "memory:/upsert_float_btree".into(),
+            TableSchema::new(0, &schema),
+            None,
+        );
+        let batch = |keys: Vec<f64>, values: Vec<i32>| {
+            RecordBatch::try_from_iter([
+                ("key", Arc::new(Float64Array::from(keys)) as ArrayRef),
+                ("value", Arc::new(Int32Array::from(values)) as ArrayRef),
+            ])
+            .unwrap()
+        };
+        let mut write = table.new_write_builder().new_write().unwrap();
+        write
+            .write_arrow_batch(&batch(vec![f64::NAN, -0.0, 0.0, 1.0], vec![0; 4]))
+            .await
+            .unwrap();
+        TableCommit::new(table.clone(), "seed".into())
+            .commit(write.prepare_commit().await.unwrap())
+            .await
+            .unwrap();
+        write.close().await;
+        table
+            .new_global_index_build_builder()
+            .with_index_column("key")
+            .execute()
+            .await
+            .unwrap();
+        commit_upsert(
+            &table,
+            vec![batch(vec![f64::NAN, -0.0], vec![41, 42])],
+            vec!["key".into()],
+        )
+        .await;
+        assert_eq!(
+            values_by_row_id(&table).await,
+            vec![(0, 41), (1, 42), (2, 0), (3, 0)]
+        );
     }
 
     #[tokio::test]
