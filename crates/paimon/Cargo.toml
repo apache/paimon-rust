@@ -45,7 +45,8 @@ storage-all = [
     "storage-oss-cpp",
 ]
 fulltext = ["dep:paimon-ftindex-core"]
-# Unstable bridge used by the repository's language bindings.
+# Unstable bridge used by the repository's language bindings. It is not part
+# of the public table API or the default crate surface.
 internal-api = []
 vortex = ["dep:vortex"]
 

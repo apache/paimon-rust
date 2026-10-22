@@ -436,6 +436,12 @@ do not reuse the affected path until invalidation succeeds.
 A canceled or failed rename bypasses this cache; after confirming storage state,
 use a new cache directory to resume sharing.
 
+Shared range reads allow eight background fills per cache instance for blocks
+up to 1 MiB; larger blocks, whole-file reads, or saturated fills stay synchronous.
+Concurrent whole-file and range reads may download overlapping data.
+Allow disk headroom beyond `local-cache.max-size` for up to eight staged writes
+per cache instance; this staging limit is not node-wide.
+
 ### BLOB Index Cache
 
 Decoded `.blob` indexes are cached per catalog. Set

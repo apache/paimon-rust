@@ -26,11 +26,12 @@ use super::{find_field_id_by_name, merge_row_ranges, DataSplit, RowRange, Table}
 use crate::spec::{
     CoreOptions, FileKind, GlobalIndexSearchMode, IndexFileMeta, IndexManifestEntry, Predicate,
 };
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// Search source metadata, without live readers or filesystem handles.
 /// The global row-ID and primary-key physical address spaces remain distinct.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum SearchScanSplit {
     Index {
         column: String,
@@ -90,7 +91,6 @@ pub(super) async fn global_search_splits(
     if full_text && selected.is_empty() {
         return Ok(vec![]);
     }
-    let mut filter_fields = Vec::new();
     let row_filter = filter.and_then(|filter| {
         let (_, data) = split_partition_and_data_predicates(
             filter.clone(),
@@ -99,26 +99,13 @@ pub(super) async fn global_search_splits(
         );
         (!data.is_empty()).then(|| Predicate::and(data))
     });
-    if let Some(filter) = &row_filter {
-        crate::arrow::residual::collect_predicate_leaf_refs(filter, &mut filter_fields);
-    }
-    let filter_ids = filter_fields
-        .into_iter()
-        .filter_map(|(name, _)| find_field_id_by_name(table.schema().fields(), name))
-        .collect::<HashSet<_>>();
     let scalar_files = entries
         .iter()
         .filter(|entry| entry.kind == FileKind::Add)
         .map(|entry| &entry.index_file)
         .filter(|file| {
             normalize_queryable_global_index_type(&file.index_type).is_some()
-                && file.global_index_meta.as_ref().is_some_and(|meta| {
-                    filter_ids.contains(&meta.index_field_id)
-                        || meta
-                            .extra_field_ids
-                            .as_ref()
-                            .is_some_and(|ids| ids.iter().any(|id| filter_ids.contains(id)))
-                })
+                && file.global_index_meta.is_some()
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -221,4 +208,290 @@ pub(super) async fn global_search_splits(
         });
     }
     Ok(result)
+}
+
+fn invalid_source(message: impl Into<String>) -> crate::Error {
+    crate::Error::DataInvalid {
+        message: message.into(),
+        source: None,
+    }
+}
+
+/// Restore only the index payloads explicitly named by a source plan. The
+/// partition/bucket fields are irrelevant to global payload addressing; scalar
+/// and vector readers use the persisted global metadata instead.
+pub(super) fn global_entries_from_splits(
+    splits: &[SearchScanSplit],
+) -> crate::Result<Vec<IndexManifestEntry>> {
+    let mut entries = Vec::new();
+    let mut scalar_files = Vec::<IndexFileMeta>::new();
+    for split in splits {
+        let scalar = match split {
+            SearchScanSplit::Index {
+                row_range,
+                index_files,
+                scalar_index_files,
+                ..
+            } => {
+                if row_range.from() < 0 || row_range.to() < row_range.from() {
+                    return Err(invalid_source("Invalid global search index split"));
+                }
+                for file in index_files {
+                    let meta = file.global_index_meta.as_ref().ok_or_else(|| {
+                        invalid_source(format!(
+                            "Search index '{}' has no global metadata",
+                            file.file_name
+                        ))
+                    })?;
+                    if meta.row_range_start != row_range.from()
+                        || meta.row_range_end != row_range.to()
+                    {
+                        return Err(invalid_source(
+                            "Search index split range disagrees with its payload",
+                        ));
+                    }
+                    entries.push(IndexManifestEntry {
+                        version: 1,
+                        kind: FileKind::Add,
+                        partition: crate::spec::BinaryRow::new(0).to_serialized_bytes(),
+                        bucket: -1,
+                        index_file: file.clone(),
+                    });
+                }
+                scalar_index_files
+            }
+            SearchScanSplit::Raw {
+                row_ranges,
+                scalar_index_files,
+                ..
+            } => {
+                if row_ranges
+                    .iter()
+                    .any(|range| range.from() < 0 || range.to() < range.from())
+                {
+                    return Err(invalid_source("Invalid global search raw row range"));
+                }
+                scalar_index_files
+            }
+            SearchScanSplit::PrimaryKey { .. } => {
+                return Err(invalid_source(
+                    "Global search cannot consume primary-key physical source splits",
+                ))
+            }
+        };
+        for file in scalar {
+            if normalize_queryable_global_index_type(&file.index_type).is_none() {
+                return Err(invalid_source(format!(
+                    "Scalar search source '{}' has unsupported index type '{}'",
+                    file.file_name, file.index_type
+                )));
+            }
+            let meta = file.global_index_meta.as_ref().ok_or_else(|| {
+                invalid_source(format!(
+                    "Scalar search index '{}' has no global metadata",
+                    file.file_name
+                ))
+            })?;
+            if meta.row_range_start < 0 || meta.row_range_end < meta.row_range_start {
+                return Err(invalid_source("Invalid scalar search index range"));
+            }
+            if !scalar_files.contains(file) {
+                scalar_files.push(file.clone());
+            }
+        }
+    }
+    entries.extend(
+        scalar_files
+            .into_iter()
+            .map(|index_file| IndexManifestEntry {
+                version: 1,
+                kind: FileKind::Add,
+                partition: crate::spec::BinaryRow::new(0).to_serialized_bytes(),
+                bucket: -1,
+                index_file,
+            }),
+    );
+    Ok(entries)
+}
+
+/// Read deletion vectors from the data scan of the supplied pinned snapshot.
+/// A transported source plan need not copy bucket-local DV index entries into
+/// every search split. Data-source planning resolves those vectors without
+/// selecting a newer snapshot or extending the plan's search sources.
+pub(super) async fn deleted_row_ranges_for_search_sources(
+    table: &Table,
+) -> crate::Result<Vec<RowRange>> {
+    if !table.schema().core_options().deletion_vectors_enabled() {
+        return Ok(vec![]);
+    }
+    let plan = table
+        .new_read_builder()
+        .new_scan()
+        .with_scan_all_files()
+        .plan()
+        .await?;
+    let mut ranges = Vec::new();
+    for split in plan.splits() {
+        let Some(dvs) = split.data_deletion_files() else {
+            continue;
+        };
+        for (file, deletion) in split.data_files().iter().zip(dvs) {
+            let Some(deletion) = deletion else {
+                continue;
+            };
+            let first = file.first_row_id.ok_or_else(|| {
+                invalid_source(format!(
+                    "Deletion vector anchor '{}' has no first row id",
+                    file.file_name
+                ))
+            })?;
+            for deleted in
+                crate::deletion_vector::DeletionVectorFactory::read(table.file_io(), deletion)
+                    .await?
+                    .iter()
+            {
+                let deleted = i64::try_from(deleted)
+                    .map_err(|_| invalid_source("Deleted position exceeds i64::MAX"))?;
+                let row_id = first
+                    .checked_add(deleted)
+                    .ok_or_else(|| invalid_source("Deleted row id exceeds i64::MAX"))?;
+                ranges.push(RowRange::new(row_id, row_id));
+            }
+        }
+    }
+    Ok(merge_row_ranges(ranges))
+}
+
+/// Resolve partition membership in the global row-ID address space from the
+/// pinned data-file metadata. Partition predicates are constant per split;
+/// reading Arrow rows would add work and couple this to read projections.
+pub(super) async fn partition_row_ids_for_search_sources(
+    table: &Table,
+    partition: &Predicate,
+    source_ranges: Vec<RowRange>,
+) -> crate::Result<roaring::RoaringTreemap> {
+    let source_ranges = merge_row_ranges(source_ranges);
+    let mut read = table.new_read_builder();
+    read.with_filter(partition.clone())
+        .with_row_ranges(source_ranges.clone());
+    let plan = read.new_scan().plan().await?;
+    let mut file_ranges = Vec::new();
+    for split in plan.splits() {
+        for file in split.data_files() {
+            if file.row_count <= 0 {
+                continue;
+            }
+            let first = file.first_row_id.ok_or_else(|| {
+                invalid_source(format!(
+                    "Partition search source '{}' has no first row id",
+                    file.file_name
+                ))
+            })?;
+            let last = first.checked_add(file.row_count - 1).ok_or_else(|| {
+                invalid_source("Partition search source row range exceeds i64::MAX")
+            })?;
+            if first < 0 {
+                return Err(invalid_source("Partition search source row ID is negative"));
+            }
+            file_ranges.push(RowRange::new(first, last));
+        }
+    }
+    let mut selected = roaring::RoaringTreemap::new();
+    for range in intersect_sorted_ranges(&merge_row_ranges(file_ranges), &source_ranges) {
+        selected.insert_range(range.from() as u64..=range.to() as u64);
+    }
+    Ok(selected)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::spec::{CommitKind, GlobalIndexMeta, Snapshot};
+    use crate::table::VectorScanPlan;
+
+    fn snapshot() -> Snapshot {
+        Snapshot::builder()
+            .version(3)
+            .id(1)
+            .schema_id(0)
+            .base_manifest_list("base".into())
+            .delta_manifest_list("delta".into())
+            .commit_user("test".into())
+            .commit_identifier(1)
+            .commit_kind(CommitKind::APPEND)
+            .time_millis(0)
+            .build()
+    }
+
+    fn raw_source_with_scalar(index_type: &str) -> SearchScanSplit {
+        SearchScanSplit::Raw {
+            row_ranges: vec![RowRange::new(1, 1)],
+            scalar_index_files: vec![IndexFileMeta {
+                index_type: index_type.into(),
+                file_name: "scalar-index".into(),
+                file_size: 1,
+                row_count: 3,
+                deletion_vectors_ranges: None,
+                external_path: None,
+                global_index_meta: Some(GlobalIndexMeta {
+                    row_range_start: 0,
+                    row_range_end: 2,
+                    index_field_id: 1,
+                    extra_field_ids: None,
+                    index_meta: None,
+                    source_meta: None,
+                }),
+            }],
+            index_type: None,
+        }
+    }
+
+    #[test]
+    fn raw_source_scalar_metadata_cannot_add_search_payloads() {
+        // A search payload hidden in scalar metadata would otherwise be searched
+        // over [0, 2], extending the explicitly selected raw source [1, 1].
+        for index_type in ["ivf-flat", "lumina", "lumina-vector-ann", "full-text"] {
+            let source = raw_source_with_scalar(index_type);
+            let error = VectorScanPlan::new(Some(snapshot()), vec![source.clone()]).unwrap_err();
+            assert!(error.to_string().contains("unsupported index type"));
+            let wire = serde_json::json!({
+                "snapshot": snapshot(),
+                "splits": [source.clone()],
+            });
+            assert!(serde_json::from_value::<VectorScanPlan>(wire.clone()).is_err());
+            #[cfg(feature = "fulltext")]
+            {
+                assert!(
+                    crate::table::FullTextScanPlan::new(Some(snapshot()), vec![source]).is_err()
+                );
+                assert!(serde_json::from_value::<crate::table::FullTextScanPlan>(wire).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn raw_source_accepts_queryable_scalar_metadata() {
+        for index_type in [
+            "bitmap",
+            "Bitmap",
+            "btree",
+            "BTREE",
+            "multivalue",
+            "MultiValue",
+            "fm",
+            "FM",
+        ] {
+            let source = raw_source_with_scalar(index_type);
+            let plan = VectorScanPlan::new(Some(snapshot()), vec![source.clone()]).unwrap();
+            let wire = serde_json::to_value(plan).unwrap();
+            assert!(serde_json::from_value::<VectorScanPlan>(wire.clone()).is_ok());
+            #[cfg(feature = "fulltext")]
+            {
+                assert!(
+                    crate::table::FullTextScanPlan::new(Some(snapshot()), vec![source]).is_ok()
+                );
+                assert!(serde_json::from_value::<crate::table::FullTextScanPlan>(wire).is_ok());
+            }
+        }
+    }
 }

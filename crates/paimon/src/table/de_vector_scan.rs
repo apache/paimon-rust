@@ -67,7 +67,7 @@ impl Table {
                 include_row_ids: Arc::new(RoaringTreemap::new()),
             });
         };
-        let table = self.copy_with_resolved_snapshot(&snapshot).await?;
+        let table = self.copy_with_pinned_snapshot(Some(&snapshot));
         let include_row_ids = matching_row_ids_for_filter(&table, &filter, None).await?;
         Ok(PreparedVectorSearchFilter {
             table,
@@ -110,6 +110,8 @@ pub(super) struct DeVectorScanPlan {
     pub(super) timing: Option<DeVectorScanTiming>,
     pub(super) next_row_id: Option<i64>,
     pub(super) skip_search: bool,
+    /// Source metadata supplied by a transportable public plan.
+    pub(super) source_splits: Option<Vec<crate::table::SearchScanSplit>>,
 }
 
 impl DeVectorScanPlan {
@@ -122,6 +124,7 @@ impl DeVectorScanPlan {
             filter: None,
             next_row_id: None,
             timing,
+            source_splits: None,
         }
     }
 }
@@ -194,11 +197,7 @@ impl Scan for DeVectorScan {
         };
         plan.table = match self.prepared_filter.as_ref() {
             Some(prepared) => prepared.table().clone(),
-            None => {
-                execution_table
-                    .copy_with_resolved_snapshot(&snapshot)
-                    .await?
-            }
+            None => execution_table.copy_with_pinned_snapshot(Some(&snapshot)),
         };
         plan.next_row_id = snapshot.next_row_id();
 

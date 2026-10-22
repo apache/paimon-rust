@@ -176,7 +176,7 @@ async fn public_plan_can_be_reused_by_single_and_batch_readers_after_builder_dro
 }
 
 #[tokio::test]
-async fn public_reader_rejects_a_plan_for_another_table_or_filter() {
+async fn public_reader_applies_its_filter_and_requires_available_sources() {
     let table = de_vector_table().await;
     let mut builder = table.new_vector_search_builder();
     builder
@@ -185,15 +185,14 @@ async fn public_reader_rejects_a_plan_for_another_table_or_filter() {
         .with_limit(1);
     let plan = builder.new_scan().unwrap().plan().await.unwrap();
     builder.with_filter(id_gt_filter(&table, 1));
-    let error = builder
+    let result = builder
         .new_read()
         .unwrap()
         .read(plan.clone())
         .await
-        .unwrap_err();
-    assert!(error
-        .to_string()
-        .contains("same table, column and pre-filter"));
+        .unwrap();
+    assert_eq!(result.row_ids().unwrap().row_ids, vec![2]);
+    assert_eq!(result.snapshot_id(), plan.snapshot_id());
     let other = crate::table::vector_search_test_utils::vector_test_table_at(
         "memory:/different_plan_table",
     );
@@ -205,7 +204,7 @@ async fn public_reader_rejects_a_plan_for_another_table_or_filter() {
         .new_read()
         .unwrap();
     let error = read.read(plan).await.unwrap_err();
-    assert!(error
-        .to_string()
-        .contains("same table, column and pre-filter"));
+    let message = error.to_string();
+    assert!(message.contains("NotFound"), "{message}");
+    assert!(message.contains("different_plan_table/index/"), "{message}");
 }

@@ -98,6 +98,7 @@ impl<'a> VectorSearchBuilder<'a> {
                 message: "Vector column must be set via with_vector_column()".to_string(),
             })?;
         VectorScan::new(self.table, column, self.filter.as_ref(), None, None)
+            .map(|scan| scan.with_options(&self.options))
     }
 
     /// Create an owned reader; query errors are reported before planning.

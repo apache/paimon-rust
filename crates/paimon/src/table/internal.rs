@@ -15,10 +15,58 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Unstable adapters for the repository's language bindings.
-//! These operations are available only with `internal-api`.
+//! Unstable execution bridge for the repository's language bindings.
+//!
+//! Source plans are the public input to search readers. Candidate and scoring
+//! requests below are internal execution stages: Core owns their ordering and
+//! global result coordination. Writer adapters forward their existing commit
+//! identifiers through the same bridge. This module is available only with `internal-api`.
 
-use super::{CommitMessage, TableWrite};
+pub use super::search_task::{SearchTask, SearchTaskExecutor, SearchTaskResult};
+use super::{
+    BatchVectorRead, CommitMessage, GlobalIndexResult, HybridSearchBuilder, Table, TableWrite,
+    VectorRead, VectorScanPlan,
+};
+
+pub async fn execute_search_task(
+    table: &Table,
+    task: &[u8],
+    context: &[u8],
+) -> crate::Result<Vec<u8>> {
+    table.execute_search_task(task, context).await
+}
+
+pub async fn read_vector_with_executor(
+    reader: &VectorRead,
+    plan: VectorScanPlan,
+    executor: &dyn SearchTaskExecutor,
+) -> crate::Result<GlobalIndexResult> {
+    reader.read_with_executor(plan, executor).await
+}
+
+pub async fn read_batch_vector_with_executor(
+    reader: &BatchVectorRead,
+    plan: VectorScanPlan,
+    executor: &dyn SearchTaskExecutor,
+) -> crate::Result<Vec<GlobalIndexResult>> {
+    reader.read_with_executor(plan, executor).await
+}
+
+#[cfg(feature = "fulltext")]
+pub async fn read_full_text_with_executor(
+    reader: &super::FullTextRead,
+    plan: super::FullTextScanPlan,
+    executor: &dyn SearchTaskExecutor,
+) -> crate::Result<GlobalIndexResult> {
+    reader.read_with_executor(plan, executor).await
+}
+
+pub async fn execute_hybrid_with_executor(
+    builder: &HybridSearchBuilder<'_>,
+    executor: &dyn SearchTaskExecutor,
+) -> crate::Result<GlobalIndexResult> {
+    builder.execute_with_executor(executor).await
+}
 
 /// Forward an identifier already supplied by the batch or stream facade.
 pub async fn prepare_commit_with_identifier(

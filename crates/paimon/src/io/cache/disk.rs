@@ -693,14 +693,22 @@ fn encode_block(key: &BlockKey, payload: &Bytes) -> Vec<u8> {
 }
 
 fn decode_block(key: &BlockKey, encoded: &[u8]) -> Result<Bytes, BlockDecodeError> {
-    let (decoded_key, payload) = decode_block_any(encoded)?;
+    let (decoded_key, payload) = validate_block(encoded)?;
     if &decoded_key != key {
         return Err(BlockDecodeError("cache block key does not match"));
     }
-    Ok(payload)
+    Ok(Bytes::copy_from_slice(&encoded[payload]))
 }
 
-fn decode_block_any(encoded: &[u8]) -> Result<(BlockKey, Bytes), BlockDecodeError> {
+fn decode_block_owned(key: &BlockKey, encoded: Vec<u8>) -> Result<Bytes, BlockDecodeError> {
+    let (decoded_key, payload) = validate_block(&encoded)?;
+    if &decoded_key != key {
+        return Err(BlockDecodeError("cache block key does not match"));
+    }
+    Ok(Bytes::from(encoded).slice(payload))
+}
+
+fn validate_block(encoded: &[u8]) -> Result<(BlockKey, std::ops::Range<usize>), BlockDecodeError> {
     let (key, layout) = decode_block_header(encoded, encoded.len() as u64)?;
     let payload_len = usize::try_from(layout.payload_len)
         .map_err(|_| BlockDecodeError("cache block payload is too large"))?;
@@ -717,10 +725,7 @@ fn decode_block_any(encoded: &[u8]) -> Result<(BlockKey, Bytes), BlockDecodeErro
         return Err(BlockDecodeError("cache block checksum does not match"));
     }
 
-    Ok((
-        key,
-        Bytes::copy_from_slice(&encoded[layout.header_len..payload_end]),
-    ))
+    Ok((key, layout.header_len..payload_end))
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -844,6 +849,31 @@ mod tests {
         let decoded = decode_block(&key, &encoded).unwrap();
 
         assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn test_owned_block_decode_reuses_allocation_and_validates() {
+        let key = BlockKey::new("s3://bucket/table/data.parquet", 1024, 3);
+        let payload = Bytes::from_static(b"cached block");
+        let encoded = encode_block(&key, &payload);
+        let (_, range) = validate_block(&encoded).unwrap();
+        let expected_address = encoded.as_ptr() as usize + range.start;
+        let decoded = decode_block_owned(&key, encoded).unwrap();
+        assert_eq!(decoded, payload);
+        assert_eq!(decoded.as_ptr() as usize, expected_address);
+
+        let wrong_key = BlockKey::new("s3://bucket/table/data.parquet", 1024, 4);
+        assert!(decode_block_owned(&wrong_key, encode_block(&key, &payload)).is_err());
+        let encoded = encode_block(&key, &payload);
+        for end in 0..encoded.len() {
+            assert!(decode_block_owned(&key, encoded[..end].to_vec()).is_err());
+        }
+        let mut corrupt = encoded;
+        corrupt[range.start] ^= 1;
+        assert!(decode_block_owned(&key, corrupt).is_err());
+        assert!(decode_block_owned(&key, encode_block(&key, &Bytes::new()))
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
