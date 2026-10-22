@@ -25,6 +25,9 @@ use arrow_array::{ArrayRef, Int32Array};
 use arrow_schema::{DataType as ArrowType, Field, Schema as ArrowSchema};
 use std::sync::Arc;
 
+#[path = "append_tests.rs"]
+mod append_tests;
+
 fn new_schema(partitioned: bool) -> Schema {
     let mut schema = Schema::builder()
         .column("id", DataType::Int(IntType::new()))

@@ -195,7 +195,13 @@ pub(super) async fn matching_indexed_rows(
             Some((answer, exact)) => {
                 let candidates = row_ids(&answer)? & &decided;
                 if exact {
-                    matched |= candidates;
+                    matched |= if core.data_evolution_enabled() {
+                        candidates
+                    } else {
+                        // An exact index match does not establish snapshot visibility.
+                        matching_rows(evaluation, &Predicate::AlwaysTrue, ranges(&candidates)?)
+                            .await?
+                    };
                 } else if core.global_index_filter_refine_from_data() {
                     matched |= matching_rows(evaluation, filter, ranges(&candidates)?).await?;
                 }

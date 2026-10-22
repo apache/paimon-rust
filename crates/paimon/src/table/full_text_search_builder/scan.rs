@@ -32,7 +32,8 @@ pub(super) struct PlanContext {
 
 impl PlanContext {
     pub(super) fn new(builder: &FullTextSearchBuilder<'_>) -> crate::Result<Self> {
-        CoreOptions::new(builder.table.schema().options()).ensure_read_authorized()?;
+        let core = builder.table.schema().core_options();
+        core.ensure_read_authorized()?;
         let column = builder
             .text_column
             .as_deref()
@@ -56,9 +57,31 @@ impl PlanContext {
                 message: format!("Full-text column '{column}' must be a character string"),
             });
         }
+        let has_row_filter = builder.filter.as_ref().is_some_and(|filter| {
+            let (_, data) = split_partition_and_data_predicates(
+                filter.clone(),
+                builder.table.schema().fields(),
+                builder.table.schema().partition_keys(),
+            );
+            !data.is_empty()
+        });
+        if has_row_filter && !core.data_evolution_enabled() {
+            if !builder.table.schema().primary_keys().is_empty()
+                || !core.row_tracking_enabled()
+                || core.file_format() != "parquet"
+            {
+                return Err(crate::Error::Unsupported {
+                    message: "Non-data-evolution full-text row filters require a row-tracked Parquet append table".into(),
+                });
+            }
+            if core.full_text_index_search_mode()? != GlobalIndexSearchMode::Fast {
+                return Err(crate::Error::Unsupported {
+                    message: "Non-data-evolution full-text row filters support only the FAST full-text index search mode".into(),
+                });
+            }
+        }
         let primary_key_field_id =
-            resolves_to_pk_full_text_path(&builder.table.schema().core_options(), column)
-                .then_some(field.id());
+            resolves_to_pk_full_text_path(&core, column).then_some(field.id());
         if primary_key_field_id.is_some() && builder.include_row_ids.is_some() {
             return Err(crate::Error::Unsupported {
                 message:
@@ -174,13 +197,7 @@ impl FullTextScan {
 
     pub async fn scan(&self) -> crate::Result<FullTextScanPlan> {
         CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
-        let (partition_filter, row_filter) =
-            bind_filters(&self.table, self.context.filter.as_ref())?;
-        if row_filter.is_some() && !self.table.schema().core_options().data_evolution_enabled() {
-            return Err(crate::Error::Unsupported {
-                message: "Full-text row filters require a data-evolution table".into(),
-            });
-        }
+        let (partition_filter, _) = bind_filters(&self.table, self.context.filter.as_ref())?;
         let Some(snapshot) = crate::table::time_travel::resolve_snapshot(&self.table).await? else {
             return FullTextScanPlan::new(None, vec![]);
         };
