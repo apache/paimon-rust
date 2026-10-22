@@ -864,3 +864,121 @@ async fn transported_optional_bucket_layout_uses_canonical_snapshot_paths() {
         [1, 2]
     );
 }
+
+#[tokio::test]
+async fn file_scan_requires_unrestricted_whole_table_authorization() {
+    let g = written("raw_files", people, vec![people_rows(1..=2)]).await;
+    let mut projected = g.table.new_read_builder();
+    projected.with_projection(&["id"]).unwrap().with_limit(0);
+    let files = projected.new_scan().plan_files(false, false).await.unwrap();
+    assert_eq!(files.snapshot_id(), Some(1));
+    assert!(
+        !files.files().is_empty(),
+        "row LIMIT must not hide metadata"
+    );
+    assert_eq!(
+        g.ctx.server.auth_selects("default", "raw_files").last(),
+        Some(&None)
+    );
+
+    g.ctx
+        .server
+        .set_column_auth("default", "raw_files", vec!["id".into()]);
+    assert_forbidden(
+        projected
+            .new_scan()
+            .plan_files(false, false)
+            .await
+            .unwrap_err(),
+    );
+    g.ctx
+        .server
+        .set_column_auth("default", "raw_files", vec!["id".into(), "name".into()]);
+    for (filters, masks) in [
+        (vec![int_leaf(0, "id", "GREATER_THAN", 1)], vec![]),
+        (vec![], vec![("name", upper(1, "name"))]),
+    ] {
+        g.set_rules(&filters, &masks);
+        assert!(projected.new_scan().plan_files(false, false).await.is_err());
+        let empty = g.table.copy_with_options(HashMap::from([
+            ("incremental-between-timestamp".into(), "100,100".into()),
+            ("scan.mode".into(), "incremental".into()),
+        ]));
+        assert!(
+            empty
+                .new_read_builder()
+                .new_scan()
+                .plan_files(false, false)
+                .await
+                .is_err(),
+            "empty timestamp windows must authorize before returning metadata"
+        );
+    }
+}
+
+#[tokio::test]
+async fn file_scan_refuses_a_replaced_schema() {
+    let g = guarded("file_schema", &["id"]).await;
+    let replaced = g
+        .table
+        .copy_with_resolved_schema(
+            paimon::spec::TableSchema::new(0, &schema_of(&["id", "secret"], GUARDED)),
+            "main",
+        )
+        .unwrap();
+    assert_refused(
+        replaced
+            .new_read_builder()
+            .new_scan()
+            .plan_files(false, false)
+            .await
+            .unwrap_err(),
+    );
+    g.ctx.server.set_table_schema_id(
+        "default",
+        "file_schema",
+        schema_of(&["id", "extra"], GUARDED),
+        0,
+    );
+    assert_drifted(
+        g.table
+            .new_read_builder()
+            .new_scan()
+            .plan_files(false, false)
+            .await
+            .unwrap_err(),
+        "serves other columns",
+    );
+}
+
+#[tokio::test]
+async fn file_scan_checks_identity_after_planning_empty_file_sets() {
+    for timestamp_window in [false, true] {
+        let name = if timestamp_window {
+            "empty_file_window"
+        } else {
+            "empty_file_table"
+        };
+        let g = guarded(name, &["id"]).await;
+        let selected = if timestamp_window {
+            g.table.copy_with_options(HashMap::from([
+                ("incremental-between-timestamp".into(), "100,100".into()),
+                ("scan.mode".into(), "incremental".into()),
+            ]))
+        } else {
+            g.table.clone()
+        };
+        g.ctx
+            .server
+            .set_table_uuid_after_calls("default", name, "replacement-after-grant", 2);
+        assert_drifted(
+            selected
+                .new_read_builder()
+                .new_scan()
+                .plan_files(false, false)
+                .await
+                .unwrap_err(),
+            "now resolves to uuid",
+        );
+    }
+}

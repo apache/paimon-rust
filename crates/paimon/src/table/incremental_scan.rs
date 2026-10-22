@@ -423,6 +423,27 @@ impl<'a> IncrementalScan<'a> {
             // valid boundary even though that snapshot need not exist.
             return Ok(Plan::new(Vec::new()).with_snapshot_id(self.end_inclusive));
         }
+        let (end_snapshot, manifest_lists) = self.selected_event_manifest_lists().await?;
+        let plan = scan
+            .plan_incremental_lists(&end_snapshot, manifest_lists, scan_stats)
+            .await?;
+        self.scan.attach_global_index_scores(plan)
+    }
+
+    /// Collect the physical event sources after the caller resolves and validates
+    /// the snapshot range. File metadata scans use the same AUTO selection as rows.
+    pub(crate) async fn selected_event_manifest_lists(
+        &self,
+    ) -> crate::Result<(crate::spec::Snapshot, Vec<String>)> {
+        let mode = self.resolve_mode();
+        if !matches!(
+            mode,
+            IncrementalScanMode::Delta | IncrementalScanMode::Changelog
+        ) {
+            return Err(crate::Error::Unsupported {
+                message: "File event sources require Delta or Changelog mode".into(),
+            });
+        }
         let end_snapshot = self
             .snapshot_manager
             .get_snapshot(self.end_inclusive)
@@ -454,10 +475,7 @@ impl<'a> IncrementalScan<'a> {
             })
             .map(str::to_owned)
             .collect();
-        let plan = scan
-            .plan_incremental_lists(&end_snapshot, manifest_lists, scan_stats)
-            .await?;
-        self.scan.attach_global_index_scores(plan)
+        Ok((end_snapshot, manifest_lists))
     }
 
     fn resolve_mode(&self) -> IncrementalScanMode {

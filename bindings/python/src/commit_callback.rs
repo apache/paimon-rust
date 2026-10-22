@@ -80,6 +80,12 @@ pub struct PyManifestEntry {
     inner: ManifestEntry,
 }
 
+impl From<ManifestEntry> for PyManifestEntry {
+    fn from(inner: ManifestEntry) -> Self {
+        Self { inner }
+    }
+}
+
 #[pymethods]
 impl PyManifestEntry {
     #[getter]

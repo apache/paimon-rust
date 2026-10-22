@@ -164,6 +164,9 @@ class GlobalIndexResult:
         ...
 
 class TableScan:
+    def with_file_filters(self, skip_level0: bool, only_read_real_buckets: bool) -> TableScan:
+        """Set independent level-zero and pending-bucket policies for query planning."""
+        ...
     def with_global_index_result(self, result: GlobalIndexResult) -> "TableScan":
         """Reuse an index selection. Authorized scans ignore supplied index selections."""
         ...
@@ -182,6 +185,14 @@ class TableScan:
     def plan_all_files(self) -> Plan:
         """Include L0 and all column files, retaining scan filters and limits. Requires unrestricted query authorization."""
         ...
+    def plan_files(self, *, skip_level0: bool = False, only_read_real_buckets: bool = False) -> FileScanPlan:
+        """Filtered file entries before projection, LIMIT, row selection and index refinement.
+        Requires unrestricted whole-table query authorization."""
+        ...
+
+class FileScanPlan:
+    def snapshot_id(self) -> Optional[int]: ...
+    def files(self) -> List[ManifestEntry]: ...
 
 class StreamTableScan:
     """Stateful continuous scan; checkpoint is the next snapshot to consume."""

@@ -665,3 +665,93 @@ async fn postpone_pending_visibility_is_an_explicit_reader_selection() {
         }
     }
 }
+
+#[tokio::test]
+async fn explicit_file_filters_include_level_zero_with_key_merge() {
+    for engine in ["first-row", "deduplicate"] {
+        for buckets in [1, -2] {
+            let original = table(
+                &format!("file_filters_{engine}_{buckets}"),
+                engine,
+                "none",
+                buckets,
+            )
+            .await;
+            // DV's default read hides unmerged level zero. Explicit inclusion must
+            // pack overlapping keys together and let the reader merge their versions.
+            let table = if engine == "deduplicate" {
+                original.copy_with_options(HashMap::from([(
+                    "deletion-vectors.enabled".into(),
+                    "true".into(),
+                )]))
+            } else {
+                original
+            };
+            write_batch(&table, &make_batch(vec![1], vec![10])).await;
+            write_batch(&table, &make_batch(vec![1], vec![20])).await;
+            let builder = table.new_read_builder();
+            let default = builder.new_scan().plan().await.unwrap();
+            assert!(
+                default.splits().is_empty(),
+                "{engine} must keep its ordinary L0 exclusion"
+            );
+            let selected = builder
+                .new_scan()
+                .with_file_filters(false, buckets > 0)
+                .unwrap()
+                .plan()
+                .await
+                .unwrap();
+            assert_eq!(
+                selected.splits().len(),
+                1,
+                "overlapping versions belong together"
+            );
+            assert!(!selected.splits()[0].raw_convertible());
+            let expected = if engine == "first-row" { 10 } else { 20 };
+            assert_eq!(rows(&table, &selected).await, [(1, expected)]);
+            for index in 0..3 {
+                let shard = builder
+                    .new_scan()
+                    .with_file_filters(false, buckets > 0)
+                    .unwrap()
+                    .with_shard(index, 3)
+                    .unwrap()
+                    .plan()
+                    .await
+                    .unwrap();
+                let owner = if buckets < 0 { 2 } else { 0 };
+                let expected_rows = if index == owner {
+                    vec![(1, expected)]
+                } else {
+                    vec![]
+                };
+                assert_eq!(
+                    rows(&table, &shard).await,
+                    expected_rows,
+                    "{engine} bucket={buckets} worker={index}"
+                );
+            }
+            let all = builder
+                .new_scan()
+                .with_file_filters(true, true)
+                .unwrap()
+                .plan_all_files()
+                .await
+                .unwrap();
+            assert!(
+                !all.splits().is_empty(),
+                "whole-file planning clears query overrides"
+            );
+            let baseline = builder.new_scan().plan_all_files().await.unwrap();
+            assert_eq!(all.splits(), baseline.splits());
+            assert_eq!(
+                all.splits()
+                    .iter()
+                    .flat_map(|split| split.data_files())
+                    .count(),
+                2
+            );
+        }
+    }
+}
