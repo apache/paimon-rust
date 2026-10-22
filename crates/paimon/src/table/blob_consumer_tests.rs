@@ -94,7 +94,9 @@ async fn append_consumer_survives_file_rolls_and_checkpoint_recreation() {
                 .sum::<i64>(),
             2
         );
-        assert!(writer.with_blob_consumer(None).is_err());
+        // Java changes the factory setting while an existing bucket keeps the
+        // consumer it captured, including across consecutive prepares.
+        writer.with_blob_consumer(None).unwrap();
     }
     writer.close().await;
     let events = events.lock().unwrap().clone();

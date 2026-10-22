@@ -15,15 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Unstable scheduling bridge for the repository's language bindings.
+//! Unstable execution bridge for the repository's language bindings.
 //!
 //! Source plans are the public input to search readers. Candidate and scoring
 //! requests below are internal execution stages: Core owns their ordering and
-//! global result coordination. This module is available only with `internal-api`.
+//! global result coordination. Writer adapters forward their existing commit
+//! identifiers through the same bridge. This module is available only with `internal-api`.
 
 pub use super::search_task::{SearchTask, SearchTaskExecutor, SearchTaskResult};
 use super::{
-    BatchVectorRead, GlobalIndexResult, HybridSearchBuilder, Table, VectorRead, VectorScanPlan,
+    BatchVectorRead, CommitMessage, GlobalIndexResult, HybridSearchBuilder, Table, TableWrite,
+    VectorRead, VectorScanPlan,
 };
 
 pub async fn execute_search_task(
@@ -64,4 +66,14 @@ pub async fn execute_hybrid_with_executor(
     executor: &dyn SearchTaskExecutor,
 ) -> crate::Result<GlobalIndexResult> {
     builder.execute_with_executor(executor).await
+}
+
+/// Forward an identifier already supplied by the batch or stream facade.
+pub async fn prepare_commit_with_identifier(
+    writer: &mut TableWrite,
+    commit_identifier: i64,
+) -> crate::Result<Vec<CommitMessage>> {
+    writer
+        .prepare_commit_with_identifier(commit_identifier)
+        .await
 }
