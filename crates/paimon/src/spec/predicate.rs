@@ -2471,6 +2471,27 @@ pub(crate) fn eval_row(predicate: &Predicate, row: &BinaryRow) -> Result<bool> {
 ///
 /// This function is infallible: all type decoding happens in `extract_datum`
 /// before this point, and the operator match is exhaustive.
+/// Comparison as Java's `InternalRowUtils.compare`: FLOAT/DOUBLE follow
+/// `Float.compare` / `Double.compare`, where every NaN is one value above
+/// `+Inf` and `-0.0` is below `0.0`.
+pub(crate) fn java_cmp(lhs: &Datum, rhs: &Datum) -> Option<Ordering> {
+    match (lhs, rhs) {
+        (Datum::Float(a), Datum::Float(b)) => {
+            let canonical = |v: f32| if v.is_nan() { f32::NAN } else { v };
+            Some(canonical(*a).total_cmp(&canonical(*b)))
+        }
+        (Datum::Double(a), Datum::Double(b)) => {
+            let canonical = |v: f64| if v.is_nan() { f64::NAN } else { v };
+            Some(canonical(*a).total_cmp(&canonical(*b)))
+        }
+        _ => datum_cmp(lhs, rhs),
+    }
+}
+
+fn java_eq(lhs: &Datum, rhs: &Datum) -> bool {
+    java_cmp(lhs, rhs) == Some(Ordering::Equal)
+}
+
 fn eval_leaf(op: PredicateOperator, datum: Option<&Datum>, literals: &[Datum]) -> bool {
     match op {
         PredicateOperator::IsNull => datum.is_none(),
@@ -2482,24 +2503,24 @@ fn eval_leaf(op: PredicateOperator, datum: Option<&Datum>, literals: &[Datum]) -
                 None => return false,
             };
             match op {
-                PredicateOperator::Eq => literals.first().is_some_and(|lit| datum_eq(val, lit)),
-                PredicateOperator::NotEq => literals.first().is_some_and(|lit| !datum_eq(val, lit)),
+                PredicateOperator::Eq => literals.first().is_some_and(|lit| java_eq(val, lit)),
+                PredicateOperator::NotEq => literals.first().is_some_and(|lit| !java_eq(val, lit)),
                 PredicateOperator::Lt => {
-                    literals.first().and_then(|lit| datum_cmp(val, lit)) == Some(Ordering::Less)
+                    literals.first().and_then(|lit| java_cmp(val, lit)) == Some(Ordering::Less)
                 }
                 PredicateOperator::LtEq => matches!(
-                    literals.first().and_then(|lit| datum_cmp(val, lit)),
+                    literals.first().and_then(|lit| java_cmp(val, lit)),
                     Some(Ordering::Less | Ordering::Equal)
                 ),
                 PredicateOperator::Gt => {
-                    literals.first().and_then(|lit| datum_cmp(val, lit)) == Some(Ordering::Greater)
+                    literals.first().and_then(|lit| java_cmp(val, lit)) == Some(Ordering::Greater)
                 }
                 PredicateOperator::GtEq => matches!(
-                    literals.first().and_then(|lit| datum_cmp(val, lit)),
+                    literals.first().and_then(|lit| java_cmp(val, lit)),
                     Some(Ordering::Greater | Ordering::Equal)
                 ),
-                PredicateOperator::In => literals.iter().any(|lit| datum_eq(val, lit)),
-                PredicateOperator::NotIn => !literals.iter().any(|lit| datum_eq(val, lit)),
+                PredicateOperator::In => literals.iter().any(|lit| java_eq(val, lit)),
+                PredicateOperator::NotIn => !literals.iter().any(|lit| java_eq(val, lit)),
                 PredicateOperator::StartsWith => match (val, literals.first()) {
                     (Datum::String(haystack), Some(Datum::String(needle))) => {
                         haystack.starts_with(needle.as_str())
@@ -2683,11 +2704,11 @@ fn eval_between(value: &Datum, literals: &[Datum]) -> bool {
         unreachable!("BETWEEN must have 2 literals (validated by builder)");
     };
     let above_low = matches!(
-        datum_cmp(value, low),
+        java_cmp(value, low),
         Some(Ordering::Greater | Ordering::Equal)
     );
     let below_high = matches!(
-        datum_cmp(value, high),
+        java_cmp(value, high),
         Some(Ordering::Less | Ordering::Equal)
     );
     above_low && below_high

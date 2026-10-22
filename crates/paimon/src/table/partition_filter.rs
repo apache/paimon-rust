@@ -704,8 +704,10 @@ mod tests {
             (
                 DataType::Double(crate::spec::DoubleType::new()),
                 vec![Datum::Double(f64::NAN), Datum::Double(1.0)],
+                // Java's Double.compare treats every NaN as equal.
                 vec![
-                    (Datum::Double(f64::NAN), false),
+                    (Datum::Double(f64::NAN), true),
+                    (Datum::Double(f64::from_bits(0xfff8_0000_0000_0000)), true),
                     (Datum::Double(1.0), true),
                     (Datum::Double(2.0), false),
                 ],

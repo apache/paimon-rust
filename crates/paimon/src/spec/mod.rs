@@ -129,6 +129,7 @@ mod predicate;
 pub(crate) use predicate::datum_cmp;
 pub(crate) use predicate::eval_row;
 pub(crate) use predicate::extract_datum;
+pub(crate) use predicate::java_cmp;
 pub(crate) use predicate::like_match;
 #[cfg(test)]
 pub(crate) use predicate::row_id_leaf;
