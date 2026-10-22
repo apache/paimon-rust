@@ -79,7 +79,8 @@ impl<'a> PostponeFixedBucketWriteBuilder<'a> {
     /// of historical read selectors. This uses writer metadata access and does
     /// not require a SELECT grant. Overwrite starts with no existing layout;
     /// an explicitly supplied plan takes precedence over that default.
-    pub async fn bucket_plan(&self) -> Result<PostponeBucketPlan> {
+    /// Bucket counts for new input partitions are not inferred by this method.
+    pub async fn resolve_bucket_plan(&self) -> Result<PostponeBucketPlan> {
         ensure_table_write_authorized(self.table)?;
         if let Some(plan) = &self.bucket_plan {
             return Ok(plan.clone());
@@ -148,7 +149,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bucket_plan_obeys_explicit_and_overwrite_precedence_without_default_rows() {
+    async fn resolve_bucket_plan_obeys_explicit_and_overwrite_precedence_without_default_rows() {
         let io = test_file_io();
         let path = "memory:/builder_bucket_plan_modes";
         setup_dirs(&io, path).await;
@@ -159,7 +160,7 @@ mod tests {
         let builder = table.new_postpone_fixed_bucket_write_builder().unwrap();
         assert_eq!(
             builder
-                .bucket_plan()
+                .resolve_bucket_plan()
                 .await
                 .unwrap()
                 .to_arrow(&table)
@@ -170,7 +171,7 @@ mod tests {
         let explicit = bucket_plan(&table, 3);
         let builder = builder.with_overwrite().with_bucket_plan(explicit);
         let exported = builder
-            .bucket_plan()
+            .resolve_bucket_plan()
             .await
             .unwrap()
             .to_arrow(&table)
@@ -190,7 +191,7 @@ mod tests {
                 .new_postpone_fixed_bucket_write_builder()
                 .unwrap()
                 .with_overwrite()
-                .bucket_plan()
+                .resolve_bucket_plan()
                 .await
                 .unwrap()
                 .to_arrow(&table)
@@ -201,7 +202,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bucket_plan_uses_latest_write_baseline_and_ignores_pending_files() {
+    async fn resolve_bucket_plan_uses_latest_write_baseline_and_ignores_pending_files() {
         let io = test_file_io();
         let path = "memory:/builder_bucket_plan_latest";
         setup_dirs(&io, path).await;
@@ -221,7 +222,7 @@ mod tests {
             table
                 .new_postpone_fixed_bucket_write_builder()
                 .unwrap()
-                .bucket_plan()
+                .resolve_bucket_plan()
                 .await
                 .unwrap()
                 .to_arrow(&table)
@@ -250,7 +251,7 @@ mod tests {
         let exported = historical
             .new_postpone_fixed_bucket_write_builder()
             .unwrap()
-            .bucket_plan()
+            .resolve_bucket_plan()
             .await
             .unwrap()
             .to_arrow(&historical)
@@ -270,7 +271,7 @@ mod tests {
                 .new_postpone_fixed_bucket_write_builder()
                 .unwrap()
                 .with_overwrite()
-                .bucket_plan()
+                .resolve_bucket_plan()
                 .await
                 .unwrap()
                 .to_arrow(&historical)
@@ -281,7 +282,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bucket_plan_rejects_conflicting_entries_in_one_bucket() {
+    async fn resolve_bucket_plan_rejects_conflicting_entries_in_one_bucket() {
         use crate::spec::{Manifest, ManifestEntry, ManifestList};
         let io = test_file_io();
         let path = "memory:/builder_bucket_plan_conflict";
@@ -329,7 +330,7 @@ mod tests {
         let error = table
             .new_postpone_fixed_bucket_write_builder()
             .unwrap()
-            .bucket_plan()
+            .resolve_bucket_plan()
             .await
             .unwrap_err();
         assert!(error

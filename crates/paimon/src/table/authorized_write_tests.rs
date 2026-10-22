@@ -297,7 +297,7 @@ impl CommitCallback for Callback {
 }
 
 #[tokio::test]
-async fn rest_postpone_bucket_plan_requires_write_identity_without_select_permission() {
+async fn rest_postpone_resolve_bucket_plan_requires_write_identity_without_select_permission() {
     let fixture = RestTable::new(
         true,
         &[("bucket", "-2"), ("postpone.default-bucket-num", "2")],
@@ -317,7 +317,7 @@ async fn rest_postpone_bucket_plan_requires_write_identity_without_select_permis
     let exported = table
         .new_postpone_fixed_bucket_write_builder()
         .unwrap()
-        .bucket_plan()
+        .resolve_bucket_plan()
         .await
         .unwrap()
         .to_arrow(&table)
@@ -343,7 +343,7 @@ async fn rest_postpone_bucket_plan_requires_write_identity_without_select_permis
     assert!(unbound
         .new_postpone_fixed_bucket_write_builder()
         .unwrap()
-        .bucket_plan()
+        .resolve_bucket_plan()
         .await
         .is_err());
     assert_eq!(fixture.state.query_requests.load(Ordering::SeqCst), 0);

@@ -413,7 +413,7 @@ impl PyPostponeFixedBucketWriteBuilder {
 #[pymethods]
 impl PyPostponeFixedBucketWriteBuilder {
     /// Existing partitions and their bucket counts, using writer metadata access.
-    fn bucket_plan(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+    fn resolve_bucket_plan(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let table = &self.batch.context.table;
         let mut builder = table
             .new_postpone_fixed_bucket_write_builder()
@@ -425,7 +425,7 @@ impl PyPostponeFixedBucketWriteBuilder {
             builder = builder.with_overwrite();
         }
         let plan = py
-            .detach(|| runtime().block_on(builder.bucket_plan()))
+            .detach(|| runtime().block_on(builder.resolve_bucket_plan()))
             .map_err(to_py_err)?;
         plan.to_arrow(table)
             .map_err(to_py_err)?
@@ -1875,7 +1875,7 @@ for builder in [batch, stream]:
     }
 
     #[test]
-    fn postpone_bucket_plan_binding_round_trips_arrow_and_overwrite_precedence() {
+    fn postpone_resolve_bucket_plan_binding_round_trips_arrow_and_overwrite_precedence() {
         Python::attach(|py| {
             let schema = Schema::builder()
                 .column("pt", DataType::VarChar(VarCharType::string_type()))
@@ -1907,7 +1907,8 @@ for builder in [batch, stream]:
                 c_str!(
                     r#"
 import pyarrow as pa
-empty = builder.bucket_plan()
+empty = builder.resolve_bucket_plan()
+assert not hasattr(builder, 'bucket_plan')
 assert isinstance(empty, pa.RecordBatch)
 assert empty.schema.names == ['pt', 'total_buckets']
 assert empty.num_rows == 0
@@ -1915,11 +1916,11 @@ assert empty.schema.field('total_buckets') == pa.field('total_buckets', pa.int32
 plan = pa.RecordBatch.from_arrays([pa.array(['b', 'a']), pa.array([3, 2], type=pa.int32())],
                                  names=['pt', 'total_buckets'])
 builder.with_bucket_plan(plan)
-assert sorted(zip(*builder.bucket_plan().to_pydict().values())) == [('a', 2), ('b', 3)]
+assert sorted(zip(*builder.resolve_bucket_plan().to_pydict().values())) == [('a', 2), ('b', 3)]
 builder.with_overwrite()
-assert builder.bucket_plan().num_rows == 2
+assert builder.resolve_bucket_plan().num_rows == 2
 overwrite.with_overwrite()
-assert overwrite.bucket_plan().num_rows == 0
+assert overwrite.resolve_bucket_plan().num_rows == 0
 "#
                 ),
                 Some(&locals),
