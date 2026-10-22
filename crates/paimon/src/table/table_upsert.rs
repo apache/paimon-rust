@@ -28,13 +28,14 @@ use arrow_select::{concat::concat_batches, take::take};
 use futures::TryStreamExt;
 use indexmap::IndexMap;
 
+use super::global_index_freshness::indexed_columns_unchanged;
+use super::key_normalization::canonical_partition_key;
 use super::update_input::unique_column_index;
 use super::upsert_key_matcher::UpsertKeyMatcher;
 use super::write_batch_normalize::{normalize_blob_write_field, normalize_write_array};
 use crate::spec::{
-    batch_to_serialized_bytes, extract_datum, extract_datum_from_arrow, BinaryRow,
-    BinaryRowBuilder, CoreOptions, DataEvolutionIndexSourceMeta, DataField, IndexManifest,
-    Predicate, PredicateBuilder, Snapshot,
+    batch_to_serialized_bytes, extract_datum_from_arrow, BinaryRow, CoreOptions, Predicate,
+    PredicateBuilder,
 };
 use crate::table::source::{DataSplit, Plan};
 use crate::table::{CommitMessage, Table};
@@ -64,60 +65,6 @@ fn selected_rows(batch: &RecordBatch, rows: &[usize]) -> crate::Result<RecordBat
         .collect::<crate::Result<Vec<_>>>()?;
     RecordBatch::try_new(batch.schema(), columns)
         .map_err(|error| invalid(format!("cannot build selected upsert rows: {error}")))
-}
-
-// Java may reserve variable-length storage for NULL timestamps/decimals.
-// Compare logical partitions using one encoding, independent of that padding.
-fn partition_key(row: &BinaryRow, fields: &[DataField]) -> crate::Result<Vec<u8>> {
-    let mut builder = BinaryRowBuilder::new(fields.len() as i32);
-    for (index, field) in fields.iter().enumerate() {
-        match extract_datum(row, index, field.data_type())? {
-            Some(value) => builder.write_datum(index, &value, field.data_type()),
-            None => builder.set_null_at(index),
-        }
-    }
-    Ok(builder.build().to_serialized_bytes())
-}
-
-fn indexed_keys_unchanged(
-    file: &crate::spec::DataFileMeta,
-    schema: &crate::spec::TableSchema,
-    keys: &[&DataField],
-    source_id: i64,
-) -> bool {
-    // Java aligns column sequences with the physical schema: omitted write
-    // columns and row-tracking metadata do not occupy a sequence slot.
-    let fields = schema.data_file_fields(file.write_cols.as_deref());
-    if fields
-        .iter()
-        .map(DataField::id)
-        .collect::<HashSet<_>>()
-        .len()
-        != fields.len()
-        || file.write_cols.as_ref().is_some_and(|columns| {
-            columns.iter().any(|name| {
-                !crate::spec::is_row_tracking_column(name)
-                    && name != crate::spec::VALUE_KIND_FIELD_NAME
-                    && !schema.fields().iter().any(|field| field.name() == name)
-            })
-        })
-    {
-        return false;
-    }
-    keys.iter().all(|key| {
-        let Some(position) = fields.iter().position(|field| field.id() == key.id()) else {
-            return true;
-        };
-        let sequence = file
-            .column_max_sequence_numbers
-            .as_ref()
-            .filter(|sequences| sequences.len() == fields.len())
-            .and_then(|sequences| sequences.get(position))
-            .copied()
-            .filter(|sequence| *sequence > 0 && *sequence <= file.max_sequence_number)
-            .unwrap_or(file.max_sequence_number);
-        file.row_id_range().is_some() && sequence > 0 && sequence <= source_id
-    })
 }
 
 /// Upsert Arrow rows into a data-evolution table without primary keys.
@@ -422,7 +369,7 @@ impl TableUpsert {
         let fields = schema.partition_fields();
         let mut splits = Vec::new();
         for split in plan.splits() {
-            if partitions.contains(&partition_key(split.partition(), &fields)?) {
+            if partitions.contains(&canonical_partition_key(split.partition(), &fields)?) {
                 splits.push(split.clone());
             }
         }
@@ -490,118 +437,6 @@ impl TableUpsert {
         Ok((!predicates.is_empty()).then(|| Predicate::and(predicates)))
     }
 
-    /// Previous writers may have retained indexes under IGNORE. Prove that the
-    /// match keys have not changed since each index's source snapshot.
-    async fn lookup_indexes_unchanged(
-        &self,
-        table: &Table,
-        source: &RecordBatch,
-        snapshot: &Snapshot,
-    ) -> crate::Result<bool> {
-        let Some(manifest) = snapshot.index_manifest() else {
-            return Ok(true);
-        };
-        let path = table.snapshot_manager().manifest_path(manifest);
-        let entries = IndexManifest::read(table.file_io(), &path).await?;
-        let fields = table.schema().fields();
-        let partition_fields = table.schema().partition_fields();
-        let partitions = self
-            .serialized_partitions(source)?
-            .into_iter()
-            .collect::<HashSet<_>>();
-        let mut indexes = Vec::new();
-        for entry in &entries {
-            if entry.kind != crate::spec::FileKind::Add
-                || super::global_index_types::normalize_queryable_global_index_type(
-                    &entry.index_file.index_type,
-                )
-                .is_none()
-            {
-                continue;
-            }
-            let Some(meta) = &entry.index_file.global_index_meta else {
-                continue;
-            };
-            let index_partition = if partition_fields.is_empty() {
-                Vec::new()
-            } else {
-                partition_key(
-                    &BinaryRow::from_serialized_bytes(&entry.partition)?,
-                    &partition_fields,
-                )?
-            };
-            if !partition_fields.is_empty() && !partitions.contains(&index_partition) {
-                continue;
-            }
-            if meta.row_range_start < 0 || meta.row_range_end < meta.row_range_start {
-                return Ok(false);
-            }
-            let keys = fields
-                .iter()
-                .filter(|field| {
-                    self.keys.iter().any(|key| key == field.name())
-                        && (field.id() == meta.index_field_id
-                            || meta
-                                .extra_field_ids
-                                .as_ref()
-                                .is_some_and(|ids| ids.contains(&field.id())))
-                })
-                .collect::<Vec<_>>();
-            if keys.is_empty() {
-                continue;
-            }
-            let Some(source_id) = meta
-                .source_meta
-                .as_deref()
-                .and_then(|bytes| DataEvolutionIndexSourceMeta::deserialize(bytes).ok())
-                .map(|meta| meta.scan_snapshot_id())
-                .filter(|id| *id <= snapshot.id())
-            else {
-                return Ok(false);
-            };
-            indexes.push((entry, index_partition, keys, source_id));
-        }
-        if indexes.is_empty() {
-            return Ok(true);
-        }
-        // Inspect every active column file before key predicates or indexes can
-        // prune away evidence of historical updates. This reads metadata only.
-        let unindexed = table.copy_with_options(HashMap::from([(
-            "global-index.enabled".into(),
-            "false".into(),
-        )]));
-        let plan = unindexed
-            .new_read_builder()
-            .new_scan()
-            .plan_all_files()
-            .await?;
-        let splits = self.matching_splits(source, &plan)?;
-        for (entry, index_partition, keys, source_id) in indexes {
-            let meta = entry.index_file.global_index_meta.as_ref().unwrap();
-            for split in splits.as_ref() {
-                if split.bucket() != entry.bucket
-                    || (!partition_fields.is_empty()
-                        && partition_key(split.partition(), &partition_fields)? != index_partition)
-                {
-                    continue;
-                }
-                for file in split.data_files() {
-                    if file.row_id_range().is_some_and(|(start, end)| {
-                        start > meta.row_range_end || end < meta.row_range_start
-                    }) {
-                        continue;
-                    }
-                    if file.schema_id != table.schema().id()
-                        || !indexed_keys_unchanged(file, table.schema(), &keys, source_id)
-                    {
-                        return Ok(false);
-                    }
-                }
-            }
-        }
-        Ok(true)
-    }
-
     async fn match_existing(
         &self,
         source: &RecordBatch,
@@ -615,8 +450,8 @@ impl TableUpsert {
             let snapshot = super::time_travel::resolve_snapshot(&lookup_table).await?;
             lookup_table = lookup_table.copy_with_pinned_snapshot(snapshot.as_ref());
             if let Some(snapshot) = snapshot {
-                if !self
-                    .lookup_indexes_unchanged(&lookup_table, source, &snapshot)
+                let partitions = self.serialized_partitions(source)?.into_iter().collect();
+                if !indexed_columns_unchanged(&lookup_table, &snapshot, &self.keys, &partitions)
                     .await
                     .unwrap_or(false)
                 {
@@ -726,7 +561,10 @@ mod tests {
     use super::*;
     use crate::catalog::Identifier;
     use crate::io::FileIOBuilder;
-    use crate::spec::{DataType as PaimonType, DecimalType, TimestampType, VarCharType};
+    use crate::spec::{
+        DataEvolutionIndexSourceMeta, DataType as PaimonType, IndexManifest, TimestampType,
+        VarCharType,
+    };
     use crate::spec::{IntType, Schema as PaimonSchema, TableSchema};
     use crate::table::TableCommit;
     use arrow_array::{Array, Int32Array, StringArray};
@@ -1049,112 +887,63 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upsert_ignore_policy_falls_back_for_unknown_index_sources() {
-        for (label, source) in [
-            ("missing", None),
-            ("malformed", Some(vec![1, 2, 3])),
-            (
-                "future",
-                Some(DataEvolutionIndexSourceMeta::new(100).unwrap().serialize()),
-            ),
-        ] {
-            let table = numeric_table(&format!("memory:/upsert_ignore_source_{label}")).await;
-            let table = table.copy_with_options(HashMap::from([(
-                "global-index.column-update-action".into(),
-                "IGNORE".into(),
-            )]));
-            table
-                .new_global_index_build_builder()
-                .with_index_column("key")
-                .execute()
-                .await
-                .unwrap();
-            let manager = table.snapshot_manager();
-            let snapshot = manager.get_latest_snapshot().await.unwrap().unwrap();
-            let path = manager.manifest_path(snapshot.index_manifest().unwrap());
-            let mut entries = IndexManifest::read(table.file_io(), &path).await.unwrap();
-            for entry in &mut entries {
-                entry
-                    .index_file
-                    .global_index_meta
-                    .as_mut()
-                    .unwrap()
-                    .source_meta = source.clone();
+    async fn upsert_checks_index_sources_only_under_ignore() {
+        for action in ["IGNORE", "THROW_ERROR", "DROP_PARTITION_INDEX"] {
+            for (label, source) in [
+                ("missing", None),
+                ("malformed", Some(vec![1, 2, 3])),
+                (
+                    "future",
+                    Some(DataEvolutionIndexSourceMeta::new(100).unwrap().serialize()),
+                ),
+            ] {
+                let table = numeric_table(&format!("memory:/upsert_source_{action}_{label}")).await;
+                let table = table.copy_with_options(HashMap::from([(
+                    "global-index.column-update-action".into(),
+                    action.into(),
+                )]));
+                table
+                    .new_global_index_build_builder()
+                    .with_index_column("key")
+                    .execute()
+                    .await
+                    .unwrap();
+                let manager = table.snapshot_manager();
+                let snapshot = manager.get_latest_snapshot().await.unwrap().unwrap();
+                let path = manager.manifest_path(snapshot.index_manifest().unwrap());
+                let mut entries = IndexManifest::read(table.file_io(), &path).await.unwrap();
+                for entry in &mut entries {
+                    entry
+                        .index_file
+                        .global_index_meta
+                        .as_mut()
+                        .unwrap()
+                        .source_meta = source.clone();
+                }
+                IndexManifest::write(table.file_io(), &path, &entries)
+                    .await
+                    .unwrap();
+                let (plan, ids, new) = numeric_lookup(&table, 1).await;
+                assert!(!plan.splits().is_empty());
+                if action == "IGNORE" {
+                    assert!(
+                        plan.splits()
+                            .iter()
+                            .all(|split| split.row_ranges().is_none()),
+                        "action={action}, source={label}"
+                    );
+                } else {
+                    assert!(
+                        plan.splits().iter().all(|split| {
+                            split.row_ranges() == Some(&[crate::table::RowRange::new(0, 1)][..])
+                        }),
+                        "action={action}, source={label}"
+                    );
+                }
+                assert_eq!(ids, vec![0, 1]);
+                assert!(new.is_empty());
             }
-            IndexManifest::write(table.file_io(), &path, &entries)
-                .await
-                .unwrap();
-            let (plan, ids, new) = numeric_lookup(&table, 1).await;
-            assert!(!plan.splits().is_empty());
-            assert!(
-                plan.splits()
-                    .iter()
-                    .all(|split| split.row_ranges().is_none()),
-                "{label}"
-            );
-            assert_eq!(ids, vec![0, 1]);
-            assert!(new.is_empty());
         }
-    }
-
-    #[tokio::test]
-    async fn upsert_ignore_policy_uses_compacted_column_sequences() {
-        let table = numeric_table("memory:/upsert_ignore_column_sequences").await;
-        let plan = table
-            .new_read_builder()
-            .new_scan()
-            .plan_all_files()
-            .await
-            .unwrap();
-        let mut file = plan.splits()[0].data_files()[0].clone();
-        file.write_cols = Some(vec!["key".into(), "value".into()]);
-        file.column_max_sequence_numbers = Some(vec![1, 3]);
-        file.max_sequence_number = 3;
-        file.file_source = Some(1);
-        let key = &table.schema().fields()[0];
-        assert!(indexed_keys_unchanged(&file, table.schema(), &[key], 2));
-        file.column_max_sequence_numbers = Some(vec![3, 3]);
-        assert!(!indexed_keys_unchanged(&file, table.schema(), &[key], 2));
-        for sequences in [None, Some(vec![1]), Some(vec![0, 3]), Some(vec![4, 3])] {
-            file.column_max_sequence_numbers = sequences;
-            assert!(!indexed_keys_unchanged(&file, table.schema(), &[key], 2));
-        }
-        file.max_sequence_number = 1;
-        file.column_max_sequence_numbers = None;
-        assert!(indexed_keys_unchanged(&file, table.schema(), &[key], 2));
-        file.max_sequence_number = 3;
-        file.write_cols = None;
-        file.column_max_sequence_numbers = Some(vec![1, 3, 1]);
-        assert!(indexed_keys_unchanged(&file, table.schema(), &[key], 2));
-        file.write_cols = Some(vec![ROW_ID.into(), "value".into(), "key".into()]);
-        file.column_max_sequence_numbers = Some(vec![3, 1]);
-        assert!(indexed_keys_unchanged(&file, table.schema(), &[key], 2));
-        for columns in [
-            vec!["key".into(), "key".into()],
-            vec!["key".into(), "unknown".into()],
-        ] {
-            file.write_cols = Some(columns);
-            file.column_max_sequence_numbers = Some(vec![1, 1]);
-            assert!(!indexed_keys_unchanged(&file, table.schema(), &[key], 2));
-        }
-
-        let schema = PaimonSchema::builder()
-            .column("blob", PaimonType::Blob(crate::spec::BlobType::new()))
-            .column("key", PaimonType::Int(IntType::new()))
-            .column("value", PaimonType::Int(IntType::new()))
-            .option("data-evolution.enabled", "true")
-            .option("row-tracking.enabled", "true")
-            .option("data-evolution.write-cols-optimization.enabled", "true")
-            .build()
-            .unwrap();
-        let schema = TableSchema::new(0, &schema);
-        let key = &schema.fields()[1];
-        file.write_cols = None;
-        file.column_max_sequence_numbers = Some(vec![1, 3]);
-        assert!(indexed_keys_unchanged(&file, &schema, &[key], 2));
-        file.write_cols = Some(vec!["blob".into()]);
-        file.column_max_sequence_numbers = Some(vec![3]);
-        assert!(indexed_keys_unchanged(&file, &schema, &[key], 2));
     }
 
     #[tokio::test]
@@ -1224,65 +1013,6 @@ mod tests {
             .all(|split| { split.row_ranges() == Some(&[crate::table::RowRange::new(0, 1)][..]) }));
         assert_eq!(ids, vec![0, 1]);
         assert!(new.is_empty());
-    }
-
-    #[tokio::test]
-    async fn upsert_key_lookup_checks_ignored_updates_from_other_table_handles() {
-        for action in ["THROW_ERROR", "DROP_PARTITION_INDEX"] {
-            let table = numeric_table(&format!("memory:/upsert_historical_ignore_{action}")).await;
-            table
-                .new_global_index_build_builder()
-                .with_index_column("key")
-                .execute()
-                .await
-                .unwrap();
-            let ignored = table.copy_with_options(HashMap::from([(
-                "global-index.column-update-action".into(),
-                "IGNORE".into(),
-            )]));
-            let changed_keys = RecordBatch::try_from_iter([
-                (ROW_ID, Arc::new(Int64Array::from(vec![0, 1])) as ArrayRef),
-                ("key", Arc::new(Int32Array::from(vec![3, 3])) as ArrayRef),
-            ])
-            .unwrap();
-            let update = ignored.new_write_builder().new_update().unwrap();
-            TableCommit::new(ignored.clone(), "change-keys".into())
-                .commit(
-                    update
-                        .update_by_arrow_with_row_id(vec![changed_keys])
-                        .await
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            let table = if action == "THROW_ERROR" {
-                table
-            } else {
-                table.copy_with_options(HashMap::from([(
-                    "global-index.column-update-action".into(),
-                    action.into(),
-                )]))
-            };
-            commit_upsert(
-                &table,
-                vec![numeric_source(
-                    vec![3, 4],
-                    Arc::new(Int32Array::from(vec![43, 44])),
-                )],
-                vec!["key".into()],
-            )
-            .await;
-            assert_eq!(
-                numeric_rows(&table).await,
-                vec![
-                    (0, 3, Some(43), Some(10)),
-                    (1, 3, Some(43), Some(11)),
-                    (2, 2, Some(0), Some(12)),
-                    (3, 4, Some(44), None),
-                ],
-                "current action={action}"
-            );
-        }
     }
 
     #[tokio::test]
@@ -1940,46 +1670,5 @@ mod tests {
         write.close().await;
         commit_upsert(&table, vec![batch(42)], vec!["key".into()]).await;
         assert_eq!(values_by_row_id(&table).await, vec![(0, 42)]);
-    }
-
-    #[test]
-    fn partition_identity_ignores_java_null_variable_storage() {
-        let fields = vec![
-            DataField::new(
-                0,
-                "ts".into(),
-                PaimonType::Timestamp(TimestampType::new(6).unwrap()),
-            ),
-            DataField::new(
-                1,
-                "amount".into(),
-                PaimonType::Decimal(DecimalType::new(20, 2).unwrap()),
-            ),
-            DataField::new(
-                2,
-                "label".into(),
-                PaimonType::VarChar(VarCharType::new(100).unwrap()),
-            ),
-        ];
-        let mut builder = BinaryRowBuilder::new(3);
-        builder.set_null_at(0);
-        builder.set_null_at(1);
-        builder.write_string(2, "after-null-fields");
-        let canonical = builder.build();
-        let mut java = canonical.data()[..32].to_vec();
-        // BinaryWriter.writeTimestamp(NULL, 6) reserves 8 bytes;
-        // writeDecimal(NULL, 20) reserves another 16, even though both are NULL.
-        java.extend_from_slice(&[0; 24]);
-        java.extend_from_slice(&canonical.data()[32..]);
-        java[8..16].copy_from_slice(&(32_u64 << 32).to_le_bytes());
-        java[16..24].copy_from_slice(&(40_u64 << 32).to_le_bytes());
-        let offset_and_size = u64::from_le_bytes(canonical.data()[24..32].try_into().unwrap());
-        java[24..32].copy_from_slice(&(offset_and_size + (24_u64 << 32)).to_le_bytes());
-        let java = BinaryRow::from_bytes(3, java);
-        assert_ne!(java.to_serialized_bytes(), canonical.to_serialized_bytes());
-        assert_eq!(
-            partition_key(&java, &fields).unwrap(),
-            canonical.to_serialized_bytes()
-        );
     }
 }

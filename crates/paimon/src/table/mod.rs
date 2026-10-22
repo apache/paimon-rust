@@ -80,6 +80,7 @@ mod full_text_search_builder;
 mod global_index_build_builder;
 pub(crate) mod global_index_build_common;
 mod global_index_drop_builder;
+mod global_index_freshness;
 mod global_index_result;
 pub(crate) mod global_index_scanner;
 mod global_index_search_filter;
