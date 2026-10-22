@@ -50,9 +50,10 @@ impl FileScanPlan {
 }
 
 impl TableScan<'_> {
-    /// Override file-level policies without changing snapshot selection or
-    /// whole-file metadata authorization. Unconfigured queries keep their
-    /// normal merge-engine and deletion-vector policies.
+    /// Override file-level policies used by [`Self::plan`] and [`Self::plan_files`].
+    /// Snapshot selection and whole-file metadata authorization are unchanged.
+    /// Unconfigured queries keep their normal merge-engine and deletion-vector
+    /// policies.
     pub fn with_file_filters(
         mut self,
         skip_level0: bool,
@@ -76,17 +77,18 @@ impl TableScan<'_> {
     /// The independent policies match FileStoreScan: skipping level zero never
     /// changes whether pending buckets are visible. Metadata requires an
     /// unrestricted whole-table grant even when the row reader projects fields.
-    pub async fn plan_files(
-        &self,
-        skip_level0: bool,
-        only_read_real_buckets: bool,
-    ) -> crate::Result<FileScanPlan> {
+    /// Without explicit file filters, include level zero and pending buckets.
+    pub async fn plan_files(&self) -> crate::Result<FileScanPlan> {
         let mut requested = self.clone();
         let TableScanKind::Paimon(scan) = &mut requested.0 else {
             return Err(crate::Error::Unsupported {
                 message: "Format tables do not have Paimon manifest entries".into(),
             });
         };
+        let filters = scan.file_scan_options.unwrap_or(FileScanOptions {
+            skip_level0: false,
+            only_read_real_buckets: false,
+        });
         scan.projected_read_field_ids = None;
         scan.row_ranges = None;
         scan.split_selection = None;
@@ -99,7 +101,7 @@ impl TableScan<'_> {
             unreachable!("file metadata planning only accepts Paimon tables")
         };
         let plan = scan
-            .plan_file_entries(skip_level0, only_read_real_buckets)
+            .plan_file_entries(filters.skip_level0, filters.only_read_real_buckets)
             .await?;
         scan.check_planned_files().await?;
         Ok(plan)

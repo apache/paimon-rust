@@ -695,13 +695,12 @@ async fn explicit_file_filters_include_level_zero_with_key_merge() {
                 default.splits().is_empty(),
                 "{engine} must keep its ordinary L0 exclusion"
             );
-            let selected = builder
+            let scan = builder
                 .new_scan()
                 .with_file_filters(false, buckets > 0)
-                .unwrap()
-                .plan()
-                .await
                 .unwrap();
+            assert_eq!(scan.plan_files().await.unwrap().files().len(), 2);
+            let selected = scan.plan().await.unwrap();
             assert_eq!(
                 selected.splits().len(),
                 1,

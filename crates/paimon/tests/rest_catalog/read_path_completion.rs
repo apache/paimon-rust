@@ -870,7 +870,7 @@ async fn file_scan_requires_unrestricted_whole_table_authorization() {
     let g = written("raw_files", people, vec![people_rows(1..=2)]).await;
     let mut projected = g.table.new_read_builder();
     projected.with_projection(&["id"]).unwrap().with_limit(0);
-    let files = projected.new_scan().plan_files(false, false).await.unwrap();
+    let files = projected.new_scan().plan_files().await.unwrap();
     assert_eq!(files.snapshot_id(), Some(1));
     assert!(
         !files.files().is_empty(),
@@ -884,13 +884,7 @@ async fn file_scan_requires_unrestricted_whole_table_authorization() {
     g.ctx
         .server
         .set_column_auth("default", "raw_files", vec!["id".into()]);
-    assert_forbidden(
-        projected
-            .new_scan()
-            .plan_files(false, false)
-            .await
-            .unwrap_err(),
-    );
+    assert_forbidden(projected.new_scan().plan_files().await.unwrap_err());
     g.ctx
         .server
         .set_column_auth("default", "raw_files", vec!["id".into(), "name".into()]);
@@ -899,7 +893,7 @@ async fn file_scan_requires_unrestricted_whole_table_authorization() {
         (vec![], vec![("name", upper(1, "name"))]),
     ] {
         g.set_rules(&filters, &masks);
-        assert!(projected.new_scan().plan_files(false, false).await.is_err());
+        assert!(projected.new_scan().plan_files().await.is_err());
         let empty = g.table.copy_with_options(HashMap::from([
             ("incremental-between-timestamp".into(), "100,100".into()),
             ("scan.mode".into(), "incremental".into()),
@@ -908,7 +902,7 @@ async fn file_scan_requires_unrestricted_whole_table_authorization() {
             empty
                 .new_read_builder()
                 .new_scan()
-                .plan_files(false, false)
+                .plan_files()
                 .await
                 .is_err(),
             "empty timestamp windows must authorize before returning metadata"
@@ -930,7 +924,7 @@ async fn file_scan_refuses_a_replaced_schema() {
         replaced
             .new_read_builder()
             .new_scan()
-            .plan_files(false, false)
+            .plan_files()
             .await
             .unwrap_err(),
     );
@@ -944,7 +938,7 @@ async fn file_scan_refuses_a_replaced_schema() {
         g.table
             .new_read_builder()
             .new_scan()
-            .plan_files(false, false)
+            .plan_files()
             .await
             .unwrap_err(),
         "serves other columns",
@@ -975,7 +969,7 @@ async fn file_scan_checks_identity_after_planning_empty_file_sets() {
             selected
                 .new_read_builder()
                 .new_scan()
-                .plan_files(false, false)
+                .plan_files()
                 .await
                 .unwrap_err(),
             "now resolves to uuid",

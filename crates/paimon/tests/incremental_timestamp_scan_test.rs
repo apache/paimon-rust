@@ -161,7 +161,7 @@ async fn timestamp_options_select_events_and_preserve_end_snapshot() {
             let files = selected
                 .new_read_builder()
                 .new_scan()
-                .plan_files(false, false)
+                .plan_files()
                 .await
                 .unwrap();
             assert_eq!(files.snapshot_id(), snapshot);
@@ -207,7 +207,7 @@ async fn timestamp_auto_uses_physical_changelog_and_preserves_retracts() {
     let selected = window(&table, 100, 300);
     let builder = selected.new_read_builder();
     let plan = builder.new_scan().plan().await.unwrap();
-    let files = builder.new_scan().plan_files(false, false).await.unwrap();
+    let files = builder.new_scan().plan_files().await.unwrap();
     assert_eq!(files.snapshot_id(), Some(3));
     let actual_names = files
         .files()

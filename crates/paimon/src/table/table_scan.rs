@@ -7837,7 +7837,7 @@ mod tests {
             .new_scan()
             .with_row_position_slice(0, 1)
             .unwrap()
-            .plan_files(false, false)
+            .plan_files()
             .await
             .unwrap();
         assert_eq!(plan.snapshot_id(), Some(2));
@@ -7852,7 +7852,7 @@ mod tests {
             .new_scan()
             .with_shard(1, 2)
             .unwrap()
-            .plan_files(false, false)
+            .plan_files()
             .await
             .unwrap();
         assert_eq!(sharded.files(), plan.files());
@@ -7861,7 +7861,7 @@ mod tests {
                 .equal("id", Datum::Int(15))
                 .unwrap(),
         );
-        let filtered = builder.new_scan().plan_files(false, false).await.unwrap();
+        let filtered = builder.new_scan().plan_files().await.unwrap();
         assert_eq!(filtered.files().len(), 1);
         assert_eq!(filtered.files()[0].file().file_name, "keep.parquet");
         assert_eq!(filtered.files()[0].file().value_stats, keep.value_stats);
@@ -7871,7 +7871,7 @@ mod tests {
         let old = historical
             .new_read_builder()
             .new_scan()
-            .plan_files(false, false)
+            .plan_files()
             .await
             .unwrap();
         assert_eq!(old.snapshot_id(), Some(1));
@@ -7921,18 +7921,18 @@ mod tests {
             .commit(vec![real, pending])
             .await
             .unwrap();
+        let builder = table.new_read_builder();
+        let mut scan = builder.new_scan();
+        assert_eq!(scan.plan_files().await.unwrap().files().len(), 4);
         for (skip, only_real, expected) in [
             (false, false, 4),
             (true, false, 2),
             (false, true, 2),
             (true, true, 1),
+            (false, false, 4),
         ] {
-            let plan = table
-                .new_read_builder()
-                .new_scan()
-                .plan_files(skip, only_real)
-                .await
-                .unwrap();
+            scan = scan.with_file_filters(skip, only_real).unwrap();
+            let plan = scan.plan_files().await.unwrap();
             assert_eq!(plan.files().len(), expected);
             assert!(plan
                 .files()
@@ -7989,7 +7989,7 @@ mod tests {
             .new_scan()
             .with_global_index_result(super::GlobalIndexResult::from_row_ranges(Vec::new()))
             .unwrap()
-            .plan_files(false, false)
+            .plan_files()
             .await
             .unwrap();
         assert_eq!(plan.files().len(), 2);

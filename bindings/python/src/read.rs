@@ -698,7 +698,7 @@ impl PyStreamTableScan {
 
 #[pymethods]
 impl PyTableScan {
-    /// Configure independent file filters; unset scans keep their normal defaults.
+    /// Configure independent file filters for plan() and plan_files().
     fn with_file_filters(
         mut slf: PyRefMut<'_, Self>,
         skip_level0: bool,
@@ -807,13 +807,7 @@ impl PyTableScan {
     }
 
     /// Return filtered file metadata before split packing or row selection.
-    #[pyo3(signature = (*, skip_level0 = false, only_read_real_buckets = false))]
-    fn plan_files(
-        &self,
-        py: Python<'_>,
-        skip_level0: bool,
-        only_read_real_buckets: bool,
-    ) -> PyResult<PyFileScanPlan> {
+    fn plan_files(&self, py: Python<'_>) -> PyResult<PyFileScanPlan> {
         if self.incremental_scan.is_some() {
             return Err(PyValueError::new_err(
                 "plan_files uses table snapshot or incremental-between-timestamp options",
@@ -821,9 +815,13 @@ impl PyTableScan {
         }
         py.detach(|| {
             runtime().block_on(async {
-                self.read_builder()?
-                    .new_scan()
-                    .plan_files(skip_level0, only_read_real_buckets)
+                let mut scan = self.read_builder()?.new_scan();
+                if let Some((skip_level0, only_read_real_buckets)) = self.file_filters {
+                    scan = scan
+                        .with_file_filters(skip_level0, only_read_real_buckets)
+                        .map_err(to_py_err)?;
+                }
+                scan.plan_files()
                     .await
                     .map(|inner| PyFileScanPlan { inner })
                     .map_err(to_py_err)
@@ -1366,13 +1364,16 @@ mod tests {
             let mut builder = PyReadBuilder::new(Arc::clone(&table));
             builder.limit = Some(0);
             let scan = Py::new(py, builder.new_scan()).unwrap();
-            let kwargs = PyDict::new(py);
-            kwargs.set_item("skip_level0", false).unwrap();
-            kwargs.set_item("only_read_real_buckets", true).unwrap();
-            let files = scan
-                .bind(py)
-                .call_method("plan_files", (), Some(&kwargs))
-                .unwrap();
+            for name in ["skip_level0", "only_read_real_buckets"] {
+                let kwargs = PyDict::new(py);
+                kwargs.set_item(name, true).unwrap();
+                let error = scan
+                    .bind(py)
+                    .call_method("plan_files", (), Some(&kwargs))
+                    .unwrap_err();
+                assert!(error.is_instance_of::<pyo3::exceptions::PyTypeError>(py));
+            }
+            let files = scan.bind(py).call_method0("plan_files").unwrap();
             assert_eq!(
                 files
                     .call_method0("snapshot_id")
@@ -1424,7 +1425,7 @@ mod tests {
                     table
                         .new_read_builder()
                         .new_scan()
-                        .plan_files(false, true)
+                        .plan_files()
                         .await
                         .unwrap()
                 })
@@ -1444,17 +1445,32 @@ mod tests {
                 scan.bind(py).call_method0("plan").unwrap().len().unwrap(),
                 1
             );
-            let excluded = PyDict::new(py);
-            excluded.set_item("skip_level0", true).unwrap();
-            assert_eq!(
+            for (skip_level0, expected_files, expected_splits) in
+                [(false, 2, 1), (true, 0, 0), (false, 2, 1)]
+            {
                 scan.bind(py)
-                    .call_method("plan_files", (), Some(&excluded))
-                    .unwrap()
-                    .call_method0("files")
-                    .unwrap()
-                    .len()
-                    .unwrap(),
-                0
+                    .call_method1("with_file_filters", (skip_level0, true))
+                    .unwrap();
+                assert_eq!(
+                    scan.bind(py)
+                        .call_method0("plan_files")
+                        .unwrap()
+                        .call_method0("files")
+                        .unwrap()
+                        .len()
+                        .unwrap(),
+                    expected_files
+                );
+                assert_eq!(
+                    scan.bind(py).call_method0("plan").unwrap().len().unwrap(),
+                    expected_splits
+                );
+            }
+            let fresh = Py::new(py, builder.new_scan()).unwrap();
+            assert_eq!(
+                fresh.bind(py).call_method0("plan").unwrap().len().unwrap(),
+                0,
+                "file filters must not change a fresh query scan's defaults"
             );
         });
     }
