@@ -113,10 +113,13 @@ pub struct FileIO {
 
 pub(crate) const DEFAULT_FILE_FORMAT_METADATA_CACHE_MAX_BYTES: usize = 50 * 1024 * 1024;
 pub(crate) const DEFAULT_BLOB_INDEX_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
+const ROW_METADATA_CACHE_MAX_BYTES: usize = 32 * 1024 * 1024;
 
 pub(crate) struct FileFormatMetadataCacheContext {
     max_bytes: usize,
     cache: OnceLock<Arc<dyn Any + Send + Sync>>,
+    row_metadata_cache: OnceLock<Arc<dyn Any + Send + Sync>>,
+    process_id: u32,
 }
 
 impl std::fmt::Debug for FileFormatMetadataCacheContext {
@@ -147,6 +150,8 @@ impl FileFormatMetadataCacheContext {
         Ok(Arc::new(Self {
             max_bytes,
             cache: OnceLock::new(),
+            row_metadata_cache: OnceLock::new(),
+            process_id: std::process::id(),
         }))
     }
 
@@ -165,6 +170,28 @@ impl FileFormatMetadataCacheContext {
         match cache.downcast::<T>() {
             Ok(cache) => cache,
             Err(_) => panic!("file-format metadata cache type mismatch"),
+        }
+    }
+
+    /// ROW footer and block index metadata has its own typed cache. Keep it
+    /// separate from the Parquet cache, which also uses `get_or_init`.
+    pub(crate) fn row_metadata_get_or_init<T>(
+        &self,
+        init: impl FnOnce(usize) -> T,
+    ) -> Option<Arc<T>>
+    where
+        T: Send + Sync + 'static,
+    {
+        if self.max_bytes == 0 || self.process_id != std::process::id() {
+            return None;
+        }
+        let cache = Arc::clone(self.row_metadata_cache.get_or_init(|| {
+            Arc::new(init(self.max_bytes.min(ROW_METADATA_CACHE_MAX_BYTES)))
+                as Arc<dyn Any + Send + Sync>
+        }));
+        match cache.downcast::<T>() {
+            Ok(cache) => Some(cache),
+            Err(_) => panic!("ROW metadata cache type mismatch"),
         }
     }
 }
@@ -2672,6 +2699,15 @@ mod input_output_test {
         assert_ne!(first_key, second_key);
         assert!(std::ptr::eq(first_cache, clone_cache));
         assert!(!std::ptr::eq(first_cache, second_cache));
+    }
+
+    #[test]
+    fn row_metadata_cache_has_separate_type_and_bypasses_inherited_fork_state() {
+        let mut context = FileFormatMetadataCacheContext::from_props(&HashMap::new()).unwrap();
+        assert_eq!(*context.get_or_init(|_| 7u8), 7);
+        assert_eq!(*context.row_metadata_get_or_init(|_| 11u16).unwrap(), 11);
+        Arc::get_mut(&mut context).unwrap().process_id = 0;
+        assert!(context.row_metadata_get_or_init(|_| 13u16).is_none());
     }
 
     #[tokio::test]
