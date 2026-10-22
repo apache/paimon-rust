@@ -1517,10 +1517,10 @@ impl<'a> TableScan<'a> {
         }
     }
 
-    /// Plan matching files including L0 and all data-evolution column files.
+    /// Plan splits including L0 and all matching data-evolution column files.
     /// Existing scan filters and limits still apply. Query authorization must
     /// be unrestricted, as required by writer restore, overwrite and indexing.
-    pub async fn plan_all_files(&self) -> crate::Result<Plan> {
+    pub async fn plan_all(&self) -> crate::Result<Plan> {
         let mut source = self.clone();
         if let TableScanKind::Paimon(scan) = &mut source.0 {
             scan.projected_read_field_ids = None;

@@ -304,7 +304,7 @@ pub(super) async fn merge_into(
     builder.with_projection(&projection.iter().map(String::as_str).collect::<Vec<_>>())?;
     // The target may be empty, but its whole-table authorization must still
     // precede source callbacks and insert-only MERGE actions.
-    let plan = builder.new_scan().plan_all_files().await?;
+    let plan = builder.new_scan().plan_all().await?;
     let index = RowIdFileIndex::from_splits(scan_table.clone(), plan.splits())?;
     let source = match source {
         MergeSource::Batches(batches) => Some(MergeInput::new(batches)?),

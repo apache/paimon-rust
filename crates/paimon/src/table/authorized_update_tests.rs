@@ -353,7 +353,7 @@ async fn assembled_handles_cannot_mutate_or_replay_a_live_grant() {
         .table
         .new_read_builder()
         .new_scan()
-        .plan_all_files()
+        .plan_all()
         .await
         .unwrap();
     let mut builder = fixture.table.new_read_builder();
@@ -397,7 +397,7 @@ async fn only_unrestricted_live_grants_allow_internal_row_id_reads() {
         .table
         .new_read_builder()
         .new_scan()
-        .plan_all_files()
+        .plan_all()
         .await
         .unwrap();
     let serialized = serde_json::to_vec(plan.splits()).unwrap();
@@ -503,7 +503,7 @@ async fn mutation_metadata_predicates_match_unguarded_and_authorized_rows() {
                     .table
                     .new_read_builder()
                     .new_scan()
-                    .plan_all_files()
+                    .plan_all()
                     .await
                     .unwrap();
                 let first = plan
@@ -624,14 +624,14 @@ async fn mutation_metadata_predicates_preserve_restricted_and_public_read_guards
                 .unwrap(),
         );
         assert!(builder.new_scan().plan().await.is_err());
-        assert!(builder.new_scan().plan_all_files().await.is_err());
+        assert!(builder.new_scan().plan_all().await.is_err());
     }
     assert!(fixture
         .table
         .new_read_builder()
         .new_scan()
         .with_row_ranges(vec![super::super::RowRange::new(0, 0)])
-        .plan_all_files()
+        .plan_all()
         .await
         .is_err());
     assert_eq!(fixture.state.query_requests.load(Ordering::SeqCst), 0);
@@ -639,7 +639,7 @@ async fn mutation_metadata_predicates_preserve_restricted_and_public_read_guards
         .table
         .new_read_builder()
         .new_scan()
-        .plan_all_files()
+        .plan_all()
         .await
         .unwrap();
     // The internal marker allows canonical _ROW_ID output only. A forged

@@ -183,8 +183,9 @@ class TableScan:
         ranges of shuffled chunks. Row-position sharding is a separate API."""
         ...
     def plan(self) -> Plan: ...
-    def plan_all_files(self) -> Plan:
-        """Include L0 and all column files, retaining scan filters and limits. Requires unrestricted query authorization."""
+    def plan_all(self) -> Plan:
+        """Split Plan including L0 and all matching data-evolution column files.
+        Retains scan filters and limits. Requires unrestricted query authorization."""
         ...
     def plan_files(self) -> FileScanPlan:
         """Filtered file entries before projection, LIMIT, row selection and index refinement.

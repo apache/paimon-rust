@@ -400,7 +400,7 @@ impl TableUpsert {
         let mut projection = self.keys.iter().map(String::as_str).collect::<Vec<_>>();
         projection.push(ROW_ID);
         read_builder.with_projection(&projection)?;
-        let plan = read_builder.new_scan().plan_all_files().await?;
+        let plan = read_builder.new_scan().plan_all().await?;
         let read = read_builder.new_read()?.for_update();
         let splits = self.matching_splits(&source, &plan)?;
         let mut stream = read.to_arrow(splits.as_ref())?;

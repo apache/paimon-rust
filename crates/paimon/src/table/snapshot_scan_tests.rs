@@ -735,14 +735,14 @@ async fn explicit_file_filters_include_level_zero_with_key_merge() {
                 .new_scan()
                 .with_file_filters(true, true)
                 .unwrap()
-                .plan_all_files()
+                .plan_all()
                 .await
                 .unwrap();
             assert!(
                 !all.splits().is_empty(),
                 "whole-file planning clears query overrides"
             );
-            let baseline = builder.new_scan().plan_all_files().await.unwrap();
+            let baseline = builder.new_scan().plan_all().await.unwrap();
             assert_eq!(all.splits(), baseline.splits());
             assert_eq!(
                 all.splits()

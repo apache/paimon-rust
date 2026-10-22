@@ -794,11 +794,13 @@ impl PyTableScan {
         Ok(slf)
     }
 
-    fn plan_all_files(&self, py: Python<'_>) -> PyResult<PyPlan> {
+    /// Return a split Plan including L0 and all matching data-evolution column files.
+    /// Scan filters and limits remain in effect; requires unrestricted query authorization.
+    fn plan_all(&self, py: Python<'_>) -> PyResult<PyPlan> {
         py.detach(|| {
             runtime().block_on(async {
                 self.core_scan()?
-                    .plan_all_files()
+                    .plan_all()
                     .await
                     .map(PyPlan::from)
                     .map_err(to_py_err)
@@ -1373,6 +1375,15 @@ mod tests {
                     .unwrap_err();
                 assert!(error.is_instance_of::<pyo3::exceptions::PyTypeError>(py));
             }
+            assert_eq!(
+                scan.bind(py)
+                    .call_method0("plan_all")
+                    .unwrap()
+                    .len()
+                    .unwrap(),
+                0,
+                "plan_all retains row LIMIT"
+            );
             let files = scan.bind(py).call_method0("plan_files").unwrap();
             assert_eq!(
                 files
@@ -1464,6 +1475,17 @@ mod tests {
                 assert_eq!(
                     scan.bind(py).call_method0("plan").unwrap().len().unwrap(),
                     expected_splits
+                );
+                let all = scan.bind(py).call_method0("plan_all").unwrap();
+                let all = all.extract::<PyRef<'_, PyPlan>>().unwrap();
+                assert_eq!(
+                    all.inner
+                        .splits()
+                        .iter()
+                        .flat_map(|split| split.data_files())
+                        .count(),
+                    2,
+                    "plan_all includes L0 even when explicit file filters exclude it"
                 );
             }
             let fresh = Py::new(py, builder.new_scan()).unwrap();
