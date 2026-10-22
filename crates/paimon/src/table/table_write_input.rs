@@ -26,7 +26,8 @@ pub(super) struct RoutingInput {
 }
 
 impl TableWrite {
-    /// Accept the declared table layout as well as the selected write layout.
+    /// Accept the declared table layout or the selected write layout with
+    /// additional routing/event columns. The selected columns keep their order.
     /// The empty schema check intentionally does not inspect unwritten values:
     /// an omitted Blob must never open a URI or invoke a Blob consumer.
     pub(super) fn project_full_write_input(
@@ -42,14 +43,59 @@ impl TableWrite {
                 .map(|field| field.name())
                 .eq(expected.iter().map(|field| field.name()))
         };
-        if !self.table.schema().primary_keys().is_empty()
-            || names_match(&self.write_fields)
-            || !names_match(fields)
-        {
+        if !self.table.schema().primary_keys().is_empty() || names_match(&self.write_fields) {
             return Ok(None);
         }
-        let full_schema = build_target_arrow_schema(fields)?;
-        self.normalize_batch_schema(&input.slice(0, 0), &full_schema)?;
+        let transport_fields = if names_match(fields) {
+            fields.to_vec()
+        } else {
+            let selected = self
+                .write_fields
+                .iter()
+                .map(|field| field.name())
+                .collect::<HashSet<_>>();
+            let mut routing = self
+                .partition_keys
+                .iter()
+                .map(String::as_str)
+                .collect::<HashSet<_>>();
+            let bucket_keys = self.table.schema().bucket_keys();
+            let options = CoreOptions::new(self.table.schema().options());
+            if options.bucket() > 1 {
+                routing.extend(bucket_keys.iter().map(String::as_str));
+            }
+            if let Some(field) = options.rowkind_field() {
+                routing.insert(field);
+            }
+            let schema = input.schema();
+            let mut names = HashSet::new();
+            if !schema.fields().iter().all(|field| {
+                names.insert(field.name().as_str())
+                    && (selected.contains(field.name().as_str())
+                        || routing.contains(field.name().as_str()))
+            }) || !schema
+                .fields()
+                .iter()
+                .filter(|field| selected.contains(field.name().as_str()))
+                .map(|field| field.name().as_str())
+                .eq(self.write_fields.iter().map(|field| field.name()))
+            {
+                return Ok(None);
+            }
+            schema
+                .fields()
+                .iter()
+                .map(|field| {
+                    fields
+                        .iter()
+                        .find(|candidate| candidate.name() == field.name())
+                        .unwrap()
+                        .clone()
+                })
+                .collect()
+        };
+        let transport_schema = build_target_arrow_schema(&transport_fields)?;
+        self.normalize_batch_schema(&input.slice(0, 0), &transport_schema)?;
         let indices = self
             .write_fields
             .iter()
@@ -64,7 +110,7 @@ impl TableWrite {
             })
     }
 
-    pub(super) fn normalize_routing_columns(
+    fn normalize_routing_columns(
         &self,
         input: &RecordBatch,
         names: &[String],
@@ -113,19 +159,14 @@ impl TableWrite {
         Ok(RoutingInput { batch, fields })
     }
 
-    pub(super) fn automatic_routing_names(&self) -> Vec<String> {
-        let mut names = self.partition_keys.clone();
-        if CoreOptions::new(self.table.schema().options()).bucket() > 1 {
-            names.extend(self.table.schema().bucket_keys());
-        }
-        names
-    }
-
     pub(super) fn normalize_automatic_routing_input(
         &self,
         input: &RecordBatch,
     ) -> Result<Option<RoutingInput>> {
-        let names = self.automatic_routing_names();
+        let mut names = self.partition_keys.clone();
+        if CoreOptions::new(self.table.schema().options()).bucket() > 1 {
+            names.extend(self.table.schema().bucket_keys());
+        }
         if names
             .iter()
             .all(|name| self.write_fields.iter().any(|field| field.name() == name))
@@ -146,11 +187,6 @@ impl TableWrite {
         let Some(routing) = routing else {
             return self.divide_by_partition_bucket(physical).await;
         };
-        let output = self.assign_append_routing(routing)?;
-        Self::group_assigned_rows(physical, output)
-    }
-
-    pub(super) fn assign_append_routing(&self, routing: RoutingInput) -> Result<BatchAssignOutput> {
         let indices = |names: &[String]| {
             names
                 .iter()
@@ -165,25 +201,27 @@ impl TableWrite {
         };
         let partitions = indices(&self.partition_keys);
         let options = CoreOptions::new(self.table.schema().options());
-        if options.bucket() > 1 {
-            FixedBucketAssigner::new(
+        let mut assigner = if options.bucket() > 1 {
+            BucketAssignerEnum::Fixed(FixedBucketAssigner::new(
                 partitions,
                 indices(&self.table.schema().bucket_keys()),
                 options.bucket_function_type()?,
                 options.bucket(),
-            )
-            .assign_batch_sync(&routing.batch, &routing.fields)
+            ))
         } else {
-            ConstantBucketAssigner::new(
+            BucketAssignerEnum::Constant(ConstantBucketAssigner::new(
                 partitions,
                 if options.bucket() == POSTPONE_BUCKET {
                     POSTPONE_BUCKET
                 } else {
                     0
                 },
-            )
-            .assign_batch_sync(&routing.batch, &routing.fields)
-        }
+            ))
+        };
+        let output = assigner
+            .assign_batch(&routing.batch, &routing.fields)
+            .await?;
+        Self::group_assigned_rows(physical, output)
     }
 
     pub(super) fn precomputed_partition_bytes(

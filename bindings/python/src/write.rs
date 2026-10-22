@@ -347,20 +347,6 @@ impl WriteTarget {
         }
     }
 
-    fn row_write_columns(&self, routing: &RecordBatch) -> paimon::Result<Vec<String>> {
-        match self {
-            Self::Table(writer) => Ok(paimon::table::internal::resolve_row_write_fields(
-                writer, routing,
-            )?
-            .iter()
-            .map(|field| field.name().to_owned())
-            .collect()),
-            Self::PostponeFixed(_) => Err(paimon::Error::Unsupported {
-                message: "_row_write_columns requires a Paimon append table".into(),
-            }),
-        }
-    }
-
     async fn write_arrow(
         &mut self,
         batch: &RecordBatch,
@@ -937,15 +923,6 @@ impl WriteState {
         drop(references);
     }
 
-    fn row_write_columns(&self, routing: &Bound<'_, PyAny>) -> PyResult<Vec<String>> {
-        let routing = crate::arrow_input::write_batch_from_pyarrow(routing)?;
-        let inner = self
-            .inner
-            .as_ref()
-            .ok_or_else(|| PyRuntimeError::new_err("TableWrite is closed"))?;
-        inner.row_write_columns(&routing).map_err(to_py_err)
-    }
-
     fn write_result(&self, result: paimon::Result<()>) -> PyResult<()> {
         result.map_err(to_callback_error)
     }
@@ -1290,10 +1267,6 @@ impl PyBatchTableUpdate {
 
 #[pymethods]
 impl PyBatchTableWrite {
-    fn _row_write_columns(&self, routing_batch: &Bound<'_, PyAny>) -> PyResult<Vec<String>> {
-        self.state.row_write_columns(routing_batch)
-    }
-
     fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
         self.state.traverse_callbacks(visit)
     }
@@ -1369,10 +1342,6 @@ pub struct PyStreamTableWrite {
 
 #[pymethods]
 impl PyStreamTableWrite {
-    fn _row_write_columns(&self, routing_batch: &Bound<'_, PyAny>) -> PyResult<Vec<String>> {
-        self.state.row_write_columns(routing_batch)
-    }
-
     fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
         self.state.traverse_callbacks(visit)
     }
@@ -1859,8 +1828,6 @@ writer.with_blob_consumer(Callback(writer, 'first'))
                 if batch {
                     let mut writer = object.extract::<PyRefMut<'_, PyBatchTableWrite>>().unwrap();
                     let inner = writer.state.inner.as_mut().unwrap();
-                    assert_eq!(inner.row_write_columns(&input).unwrap(), vec!["id"]);
-                    assert!(inner.row_write_columns(&input.slice(0, 0)).is_err());
                     py.detach(|| runtime().block_on(inner.write_arrow(&input, None)))
                         .unwrap();
                 } else {
@@ -1868,8 +1835,6 @@ writer.with_blob_consumer(Callback(writer, 'first'))
                         .extract::<PyRefMut<'_, PyStreamTableWrite>>()
                         .unwrap();
                     let inner = writer.state.inner.as_mut().unwrap();
-                    assert_eq!(inner.row_write_columns(&input).unwrap(), vec!["id"]);
-                    assert!(inner.row_write_columns(&input.slice(0, 0)).is_err());
                     py.detach(|| runtime().block_on(inner.write_arrow(&input, None)))
                         .unwrap();
                 }

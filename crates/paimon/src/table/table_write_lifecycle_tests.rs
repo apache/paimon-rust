@@ -118,7 +118,7 @@ async fn snapshot(table: &Table, id: i64, user: &str, identifier: i64) {
 }
 
 #[tokio::test]
-async fn unaware_append_recaptures_type_only_after_an_idle_prepare() {
+async fn unaware_append_retirement_does_not_unlock_write_type() {
     for idle_prepares in 0..=2 {
         let table = table(false, false).await;
         let mut writer = TableWrite::new(&table, "owner".into()).unwrap();
@@ -127,17 +127,17 @@ async fn unaware_append_recaptures_type_only_after_an_idle_prepare() {
             .unwrap();
         write(&mut writer, false, 1).await;
         assert_columns(&writer.prepare_commit().await.unwrap(), "id");
-        writer
-            .with_write_type(vec!["pt".into(), "value".into()])
-            .unwrap();
         for _ in 0..idle_prepares {
             assert!(writer.prepare_commit().await.unwrap().is_empty());
         }
+        assert!(writer
+            .with_write_type(vec!["pt".into(), "value".into()])
+            .is_err());
+        writer
+            .with_write_type(vec!["pt".into(), "id".into()])
+            .unwrap();
         write(&mut writer, false, 1).await;
-        assert_columns(
-            &writer.prepare_commit().await.unwrap(),
-            if idle_prepares == 0 { "id" } else { "value" },
-        );
+        assert_columns(&writer.prepare_commit().await.unwrap(), "id");
     }
 }
 
@@ -213,9 +213,6 @@ async fn fixed_append_waits_for_a_strictly_newer_committed_identifier_of_its_use
         &writer.prepare_commit_with_identifier(1).await.unwrap(),
         "id",
     );
-    writer
-        .with_write_type(vec!["pt".into(), "value".into()])
-        .unwrap();
     for (id, user, identifier) in [(1, "owner", 1), (2, "owner", 1), (3, "other", 99)] {
         snapshot(&table, id, user, identifier).await;
         assert!(writer
@@ -231,10 +228,11 @@ async fn fixed_append_waits_for_a_strictly_newer_committed_identifier_of_its_use
         .await
         .unwrap()
         .is_empty());
+    assert!(writer.append_write_configs.is_empty());
     write(&mut writer, true, 1).await;
     assert_columns(
         &writer.prepare_commit_with_identifier(3).await.unwrap(),
-        "value",
+        "id",
     );
 }
 
@@ -250,9 +248,6 @@ async fn fixed_append_keeps_unknown_prepare_identifiers() {
         writer
             .prepare_commit_internal(initial_identifier)
             .await
-            .unwrap();
-        writer
-            .with_write_type(vec!["pt".into(), "value".into()])
             .unwrap();
         snapshot(&table, 1, "owner", 2).await;
         assert!(writer.prepare_commit().await.unwrap().is_empty());
@@ -277,9 +272,6 @@ async fn fixed_append_stops_at_an_expired_snapshot_gap() {
         .unwrap();
     write(&mut writer, true, 1).await;
     writer.prepare_commit_with_identifier(1).await.unwrap();
-    writer
-        .with_write_type(vec!["pt".into(), "value".into()])
-        .unwrap();
     snapshot(&table, 1, "owner", 2).await;
     snapshot(&table, 3, "other", 99).await;
     assert!(writer
@@ -303,9 +295,6 @@ async fn fixed_append_metadata_errors_leave_pending_output_available() {
         .unwrap();
     write(&mut writer, true, 1).await;
     writer.prepare_commit_with_identifier(1).await.unwrap();
-    writer
-        .with_write_type(vec!["pt".into(), "value".into()])
-        .unwrap();
     write(&mut writer, true, 2).await;
     let manager = table.snapshot_manager();
     table
@@ -323,7 +312,7 @@ async fn fixed_append_metadata_errors_leave_pending_output_available() {
     snapshot(&table, 1, "owner", 1).await;
     assert_columns(
         &writer.prepare_commit_with_identifier(2).await.unwrap(),
-        "value",
+        "id",
     );
 }
 

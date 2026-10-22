@@ -52,8 +52,6 @@ use arrow_array::{Array, ArrayRef, Int8Array, RecordBatch};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-#[path = "table_write_append.rs"]
-mod append;
 #[path = "table_write_input.rs"]
 mod input;
 #[cfg(test)]
@@ -72,8 +70,6 @@ enum AppendPrepareIdentifier {
 /// Keep only these settings across prepares, not completed file resources.
 #[derive(Clone)]
 struct AppendWriteConfig {
-    schema: Arc<arrow_schema::Schema>,
-    fields: Vec<DataField>,
     blob_consumer: Option<Arc<dyn crate::spec::BlobConsumer>>,
     blob_uri_reader_factory: Option<Arc<dyn crate::io::UriReaderFactory>>,
     last_modified_prepare: Option<AppendPrepareIdentifier>,
@@ -166,7 +162,6 @@ pub struct TableWrite {
     written: bool,
     partition_writers: HashMap<PartitionBucketKey, FileWriter>,
     append_write_configs: HashMap<PartitionBucketKey, AppendWriteConfig>,
-    append_write_type_changed: bool,
     partition_computer: PartitionComputer,
     partition_keys: Vec<String>,
     schema_id: i64,
@@ -238,7 +233,6 @@ impl TableWrite {
             written: false,
             partition_writers: HashMap::new(),
             append_write_configs: HashMap::new(),
-            append_write_type_changed: false,
             partition_computer: PartitionComputer::new(
                 schema.partition_keys(),
                 schema.fields(),
@@ -540,7 +534,6 @@ impl TableWrite {
             written: false,
             partition_writers: HashMap::new(),
             append_write_configs: HashMap::new(),
-            append_write_type_changed: false,
             partition_computer,
             partition_keys,
             schema_id: schema.id(),
@@ -669,12 +662,9 @@ impl TableWrite {
     /// Full-table inputs may provide routing columns which are not written.
     /// Selected inputs must include partition columns and, unless a bucket is
     /// supplied through [`Self::write_arrow`], the columns used for hashing.
-    /// Changes apply to partition/bucket writers created afterwards. Existing
-    /// writers retain their selected columns across active prepares, until an
-    /// idle prepare can safely retire them. A full
-    /// table batch is projected to each writer's captured columns; a selected
-    /// batch must match the destination writer's names and order, optionally
-    /// accompanied by routing and configured row-kind fields.
+    /// Configure this before the first effective write. Afterwards the same
+    /// ordered selection is a no-op and a different selection is rejected,
+    /// including after prepares. Empty or ignored input does not lock it.
     pub fn with_write_type(&mut self, write_columns: Vec<String>) -> Result<&mut Self> {
         self.ensure_active()?;
         if self.format_writer.is_some() || !self.table.schema().primary_keys().is_empty() {
@@ -710,6 +700,15 @@ impl TableWrite {
                     })
             })
             .collect::<Result<Vec<_>>>()?;
+        if fields == self.write_fields {
+            return Ok(self);
+        }
+        if self.written {
+            return Err(crate::Error::DataInvalid {
+                message: "with_write_type must be called before any write operation".into(),
+                source: None,
+            });
+        }
         let indices = |names: &[String]| {
             names
                 .iter()
@@ -749,7 +748,6 @@ impl TableWrite {
             ))
         };
         let write_schema = build_target_arrow_schema(&fields)?;
-        self.append_write_type_changed |= self.written && self.write_schema != write_schema;
         self.bucket_assigner = assigner;
         self.write_schema = write_schema;
         self.write_fields = fields;
@@ -804,9 +802,6 @@ impl TableWrite {
             return writer.write(batch).await;
         }
         self.ensure_active()?;
-        if self.has_reconfigured_append_type() {
-            return self.write_reconfigured_append(batch, None).await;
-        }
         let filtered = self.filter_write_input(batch)?;
         let input = filtered.as_ref().unwrap_or(batch);
         let Some(batch) = self.normalize_filtered_write_batch(input)? else {
@@ -906,23 +901,6 @@ impl TableWrite {
         // Reject malformed schemas even when every event would be ignored.
         // Empty arrays check equivalent layouts without examining row values.
         self.validate_write_batch_schema(&RecordBatch::new_empty(batch.schema()))?;
-        let projected = self.project_full_write_input(batch)?;
-        self.filter_write_input_with_schema(
-            batch,
-            projected.as_ref().unwrap_or(batch),
-            &self.write_schema,
-        )
-    }
-
-    fn filter_write_input_with_schema(
-        &self,
-        batch: &RecordBatch,
-        physical: &RecordBatch,
-        expected_schema: &arrow_schema::Schema,
-    ) -> Result<Option<RecordBatch>> {
-        if self.primary_key_indices.is_empty() && self.row_kind_generator.is_none() {
-            return Ok(None);
-        }
         let kinds = if let Some(generator) = &self.row_kind_generator {
             generator.generate_batch(batch)?
         } else if let Some(column) = batch.column_by_name(VALUE_KIND_FIELD_NAME) {
@@ -941,7 +919,9 @@ impl TableWrite {
         // still identify the event; other engines and partition migrations
         // require every declared top-level NOT NULL field.
         let delete_required_fields = self.delete_not_null_fields();
-        for (index, field) in expected_schema.fields().iter().enumerate() {
+        let projected = self.project_full_write_input(batch)?;
+        let physical = projected.as_ref().unwrap_or(batch);
+        for (index, field) in self.write_schema.fields().iter().enumerate() {
             if field.is_nullable() || physical.column(index).null_count() == 0 {
                 continue;
             }
@@ -1722,7 +1702,11 @@ impl TableWrite {
                 .append_write_configs
                 .get(&key)
                 .cloned()
-                .unwrap_or_else(|| self.append_write_config());
+                .unwrap_or_else(|| AppendWriteConfig {
+                    blob_consumer: self.blob_consumer.clone(),
+                    blob_uri_reader_factory: self.blob_uri_reader_factory.clone(),
+                    last_modified_prepare: None,
+                });
             let writer = self.create_append_writer(partition_path, bucket, &config)?;
             self.append_write_configs.insert(key, config);
             writer
@@ -1775,8 +1759,8 @@ impl TableWrite {
                     self.file_format.clone(),
                     self.vector_target_file_size,
                     self.vector_file_format.as_deref(),
-                    &config.schema,
-                    &config.fields,
+                    &self.write_schema,
+                    &self.write_fields,
                     fields,
                     self.table.schema().options(),
                     &self.blob_inline_fields,
@@ -1800,22 +1784,21 @@ impl TableWrite {
                     self.file_compression_zstd_level,
                     self.write_buffer_size,
                     self.file_format.clone(),
-                    config.fields.clone(),
+                    self.write_fields.clone(),
                     self.table.schema().options().clone(),
                     Some(0),
                     None,
                     (!super::data_evolution_fields::can_omit_normal_write_cols(
                         self.table.schema().fields(),
-                        &config
-                            .fields
+                        &self
+                            .write_fields
                             .iter()
                             .map(|field| field.name().to_string())
                             .collect::<Vec<_>>(),
                         &CoreOptions::new(self.table.schema().options()),
                     ))
                     .then(|| {
-                        config
-                            .fields
+                        self.write_fields
                             .iter()
                             .map(|field| field.name().to_string())
                             .collect()
@@ -1824,7 +1807,7 @@ impl TableWrite {
                 .with_file_index(
                     self.file_index_options
                         .as_ref()
-                        .and_then(|options| options.project_to_fields(&config.fields))
+                        .and_then(|options| options.project_to_fields(&self.write_fields))
                         .map(Arc::new),
                 )
                 .with_target_file_row_num(self.target_file_row_num)

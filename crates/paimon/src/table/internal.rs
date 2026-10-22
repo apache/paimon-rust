@@ -19,17 +19,6 @@
 //! These operations are available only with `internal-api`.
 
 use super::{CommitMessage, TableWrite};
-use crate::spec::DataField;
-use arrow_array::RecordBatch;
-
-/// Inspect only routing metadata before a binding encodes a named row.
-/// This does not create a writer or capture a new bucket configuration.
-pub fn resolve_row_write_fields(
-    writer: &TableWrite,
-    routing_batch: &RecordBatch,
-) -> crate::Result<Vec<DataField>> {
-    writer.resolve_row_write_fields(routing_batch)
-}
 
 /// Forward an identifier already supplied by the batch or stream facade.
 pub async fn prepare_commit_with_identifier(
