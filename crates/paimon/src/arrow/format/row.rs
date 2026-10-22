@@ -27,7 +27,7 @@ use crate::arrow::{
     variant_arrow_type,
 };
 use crate::io::{FileFormatMetadataCacheContext, FileRead, FileWrite, OutputFile};
-use crate::spec::{DataField, DataType, IntType, VarBinaryType, VariantType};
+use crate::spec::{CoreOptions, DataField, DataType, IntType, VarBinaryType, VariantType};
 use crate::table::{ArrowRecordBatchStream, RowRange};
 use crate::Error;
 use arrow_array::builder::{
@@ -49,9 +49,29 @@ use async_stream::try_stream;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::StreamExt;
+use std::collections::HashMap;
 use std::sync::Arc;
 
-pub(crate) struct RowFormatReader;
+pub(crate) struct RowFormatReader {
+    metadata_cache_enabled: bool,
+}
+
+impl Default for RowFormatReader {
+    fn default() -> Self {
+        Self {
+            metadata_cache_enabled: true,
+        }
+    }
+}
+
+impl RowFormatReader {
+    pub(crate) fn with_options(options: &HashMap<String, String>) -> Self {
+        Self {
+            // Format-table files may be replaced in place, even with the same size.
+            metadata_cache_enabled: !CoreOptions::new(options).is_format_table(),
+        }
+    }
+}
 
 pub(crate) struct RowFormatWriter {
     writer: Box<dyn FileWrite>,
@@ -306,11 +326,15 @@ impl FormatFileReader for RowFormatReader {
             });
         }
 
-        let metadata = match reader
-            .file_format_metadata_cache()
-            .and_then(|cache| cache.downcast_ref::<FileFormatMetadataCacheContext>())
-            .and_then(|context| context.row_metadata_get_or_init(RowMetadataCache::new))
-        {
+        let cache = if self.metadata_cache_enabled {
+            reader
+                .file_format_metadata_cache()
+                .and_then(|cache| cache.downcast_ref::<FileFormatMetadataCacheContext>())
+                .and_then(|context| context.row_metadata_get_or_init(RowMetadataCache::new))
+        } else {
+            None
+        };
+        let metadata = match cache {
             Some(cache) => cache.load(reader.as_ref(), file_size).await?,
             None => load_row_file_metadata(reader.as_ref(), file_size).await?,
         };
@@ -2641,7 +2665,7 @@ mod tests {
 
         let input = file_io.new_input(path).unwrap();
         let bytes = input.read().await.unwrap();
-        let batches = RowFormatReader
+        let batches = RowFormatReader::default()
             .read_batch_stream(
                 Box::new(BytesFileRead(bytes.clone())),
                 bytes.len() as u64,
@@ -2719,7 +2743,7 @@ mod tests {
         let input = file_io.new_input(path).unwrap();
         let bytes = input.read().await.unwrap();
         // read_fields is the FULL physical schema, as DataFileReader passes for `.row`.
-        let batches = RowFormatReader
+        let batches = RowFormatReader::default()
             .read_batch_stream(
                 Box::new(BytesFileRead(bytes.clone())),
                 bytes.len() as u64,
@@ -2808,7 +2832,7 @@ mod tests {
 
         let input = file_io.new_input(path).unwrap();
         let bytes = input.read().await.unwrap();
-        let batches = RowFormatReader
+        let batches = RowFormatReader::default()
             .read_batch_stream(
                 Box::new(BytesFileRead(bytes.clone())),
                 bytes.len() as u64,
@@ -2881,7 +2905,7 @@ mod tests {
 
         let input = file_io.new_input(path).unwrap();
         let bytes = input.read().await.unwrap();
-        let actual = RowFormatReader
+        let actual = RowFormatReader::default()
             .read_batch_stream(
                 Box::new(BytesFileRead(bytes.clone())),
                 bytes.len() as u64,
@@ -2941,7 +2965,7 @@ mod tests {
         Box::new(writer).close().await.unwrap();
 
         let bytes = file_io.new_input(path).unwrap().read().await.unwrap();
-        let batches = RowFormatReader
+        let batches = RowFormatReader::default()
             .read_batch_stream(
                 Box::new(BytesFileRead(bytes.clone())),
                 bytes.len() as u64,
@@ -3022,7 +3046,7 @@ mod tests {
         Box::new(writer).close().await.unwrap();
 
         let bytes = file_io.new_input(path).unwrap().read().await.unwrap();
-        let batches = RowFormatReader
+        let batches = RowFormatReader::default()
             .read_batch_stream(
                 Box::new(BytesFileRead(bytes.clone())),
                 bytes.len() as u64,
@@ -3126,7 +3150,7 @@ mod tests {
         Box::new(writer).close().await.unwrap();
 
         let bytes = file_io.new_input(path).unwrap().read().await.unwrap();
-        let batches = RowFormatReader
+        let batches = RowFormatReader::default()
             .read_batch_stream(
                 Box::new(BytesFileRead(bytes.clone())),
                 bytes.len() as u64,
@@ -3290,7 +3314,7 @@ mod tests {
 
         let bytes = file_io.new_input(path).unwrap().read().await.unwrap();
         let reader = TrackingFileRead::new(bytes.clone());
-        let batches = RowFormatReader
+        let batches = RowFormatReader::default()
             .read_batch_stream(
                 Box::new(reader.clone()),
                 bytes.len() as u64,
@@ -3469,7 +3493,7 @@ mod tests {
         Box::new(writer).close().await.unwrap();
 
         let bytes = file_io.new_input(path).unwrap().read().await.unwrap();
-        let batches = RowFormatReader
+        let batches = RowFormatReader::default()
             .read_batch_stream(
                 Box::new(BytesFileRead(bytes.clone())),
                 bytes.len() as u64,
@@ -3688,7 +3712,7 @@ mod tests {
         reads: Arc<AtomicUsize>,
     ) {
         let bytes = java_fixture_bytes();
-        let batches = RowFormatReader
+        let batches = RowFormatReader::default()
             .read_batch_stream(
                 Box::new(CountingFileRead {
                     bytes: bytes.clone(),
@@ -3750,12 +3774,105 @@ mod tests {
         assert_eq!(disabled_reads.load(Ordering::SeqCst), 6);
     }
 
+    fn one_string_row_file(value: &str) -> Bytes {
+        let fields = vec![DataField::new(
+            0,
+            "value".to_string(),
+            DataType::VarChar(VarCharType::new(256).unwrap()),
+        )];
+        let schema = build_target_arrow_schema(&fields).unwrap();
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(vec![value]))]).unwrap();
+        let mut block_writer = RowBlockWriter::new();
+        block_writer.write_row(&batch, 0, &fields).unwrap();
+        let block = block_writer.finish();
+        let compressed = zstd::bulk::compress(&block, 1).unwrap();
+        let index = RowBlockIndex::new(
+            vec![compressed.len() as i64],
+            vec![block.len() as i64],
+            vec![0],
+        )
+        .unwrap()
+        .to_bytes()
+        .unwrap();
+        let footer = RowFileFooter {
+            total_row_count: 1,
+            block_count: 1,
+            index_offset: compressed.len() as i64,
+            index_length: index.len() as i32,
+        };
+        let mut file = compressed;
+        file.extend_from_slice(&index);
+        file.extend_from_slice(&footer.to_bytes());
+        Bytes::from(file)
+    }
+
+    #[tokio::test]
+    async fn format_table_row_metadata_bypasses_cache_after_same_size_replacement() {
+        let old_value = "a".repeat(100);
+        let new_value = "a".repeat(101);
+        let old_file = one_string_row_file(&old_value);
+        let new_file = one_string_row_file(&new_value);
+        assert_eq!(old_file.len(), new_file.len());
+
+        let fields = vec![DataField::new(
+            0,
+            "value".to_string(),
+            DataType::VarChar(VarCharType::new(256).unwrap()),
+        )];
+        let context = FileFormatMetadataCacheContext::from_props(&HashMap::new()).unwrap();
+        let reads = Arc::new(AtomicUsize::new(0));
+        for (file, expected) in [(old_file, old_value), (new_file, new_value)] {
+            let configured = super::super::create_format_reader_with_budget(
+                "data.row",
+                false,
+                super::super::FormatReadFields {
+                    data_schema: &fields,
+                    projected: &fields,
+                },
+                &HashMap::from([("type".to_string(), "format-table".to_string())]),
+                None,
+                super::super::blob::DEFAULT_BLOB_READ_PARALLELISM,
+                super::super::MosaicPrefetchOptions::default(),
+            )
+            .unwrap();
+            let batches = configured
+                .reader
+                .read_batch_stream(
+                    Box::new(CountingFileRead {
+                        bytes: file.clone(),
+                        key: Some("same-path/data.row".to_string()),
+                        context: context.clone(),
+                        reads: reads.clone(),
+                    }),
+                    file.len() as u64,
+                    &fields,
+                    None,
+                    Some(8),
+                    None,
+                )
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            assert_eq!(batches.len(), 1);
+            let values = batches[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            assert_eq!(values.value(0), expected);
+        }
+        assert_eq!(reads.load(Ordering::SeqCst), 6); // footer, index, block each time
+    }
+
     #[tokio::test]
     async fn row_reader_reads_java_generated_fixture() {
         let fields = java_fixture_fields();
         let bytes = java_fixture_bytes();
         let file_size = bytes.len() as u64;
-        let batches = RowFormatReader
+        let batches = RowFormatReader::default()
             .read_batch_stream(
                 Box::new(BytesFileRead(bytes.clone())),
                 file_size,
@@ -4106,7 +4223,7 @@ mod tests {
             .await
             .unwrap();
 
-        let batches = RowFormatReader
+        let batches = RowFormatReader::default()
             .read_batch_stream(
                 Box::new(BytesFileRead(bytes.clone())),
                 bytes.len() as u64,
