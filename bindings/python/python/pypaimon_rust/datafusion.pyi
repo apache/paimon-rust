@@ -18,21 +18,17 @@
 from datetime import datetime
 from os import PathLike
 from typing import (
-    Any, BinaryIO, Callable, Dict, Iterable, List, Literal, Optional, Protocol, Sequence, Tuple,
+    Any, Callable, Dict, Iterable, List, Literal, Optional, Sequence, Tuple,
     TypeAlias, Union,
 )
 
 import pyarrow
 
+from .uri_reader import UriReader as UriReader, UriReaderFactory as UriReaderFactory
+
 ArrowTypeLike: TypeAlias = Union[pyarrow.DataType, pyarrow.Field, str]
 InputFieldsLike: TypeAlias = Union[ArrowTypeLike, Sequence[ArrowTypeLike]]
 VolatilityLike: TypeAlias = Union[str, Any]
-
-class _UriReader(Protocol):
-    def new_input_stream(self, uri: str) -> BinaryIO: ...
-
-class _UriReaderFactory(Protocol):
-    def create(self, uri: str) -> _UriReader: ...
 
 class DataField:
     def id(self) -> int: ...
@@ -462,7 +458,7 @@ class CommitMessage:
 
 class BatchTableWrite:
     def with_blob_uri_reader_factory(
-        self, factory: Optional[_UriReaderFactory]
+        self, factory: Optional[UriReaderFactory]
     ) -> "BatchTableWrite":
         """Use custom source streams for Blob references; Rust copies bounded
         ranges, reuses consecutive sources and closes them on completion."""
@@ -481,7 +477,9 @@ class BatchTableWrite:
         ...
 
 class BatchTableUpdate:
-    def _with_blob_uri_reader_factory(self, factory: Optional[Any]) -> None: ...
+    def with_blob_uri_reader_factory(
+        self, factory: Optional[UriReaderFactory]
+    ) -> "BatchTableUpdate": ...
     def merge_into(
         self, source: Optional[Union[pyarrow.Table, Table]], *, on: Sequence[Tuple[str, str]],
         when_matched: Sequence[Dict[str, Any]], when_not_matched: Sequence[Dict[str, Any]]
@@ -531,7 +529,9 @@ class BatchTableUpdate:
         ...
 
 class TableUpdateByRowId:
-    def _with_blob_uri_reader_factory(self, factory: Optional[Any]) -> None: ...
+    def with_blob_uri_reader_factory(
+        self, factory: Optional[UriReaderFactory]
+    ) -> "TableUpdateByRowId": ...
     def update_columns(self, data: pyarrow.Table, column_names: List[str]) -> List[CommitMessage]:
         """Stage one input table; return the cumulative messages to commit once."""
         ...
@@ -540,7 +540,9 @@ class TableUpdateByRowId:
     def _abort(self) -> None: ...
 
 class StreamTableUpdate:
-    def _with_blob_uri_reader_factory(self, factory: Optional[Any]) -> None: ...
+    def with_blob_uri_reader_factory(
+        self, factory: Optional[UriReaderFactory]
+    ) -> "StreamTableUpdate": ...
     def merge_into(
         self, source: Optional[Union[pyarrow.Table, Table]], *, on: Sequence[Tuple[str, str]],
         when_matched: Sequence[Dict[str, Any]], when_not_matched: Sequence[Dict[str, Any]],
@@ -591,7 +593,7 @@ class StreamTableUpdate:
 
 class StreamTableWrite:
     def with_blob_uri_reader_factory(
-        self, factory: Optional[_UriReaderFactory]
+        self, factory: Optional[UriReaderFactory]
     ) -> "StreamTableWrite": ...
     def with_write_type(self, columns: List[str]) -> "StreamTableWrite": ...
     def with_blob_consumer(
@@ -740,8 +742,8 @@ class StreamTableCommit:
         ...
 
 class BatchWriteBuilder:
-    def _with_commit_user(self, commit_user: str) -> "BatchWriteBuilder":
-        """Internal PyPaimon bridge for commits produced by an external Python writer."""
+    def with_commit_user(self, commit_user: str) -> "BatchWriteBuilder":
+        """Set the commit identity shared by this builder's writers and committers."""
         ...
     def with_overwrite(self, static_partition: Optional[Dict[str, Any]] = {}) -> "BatchWriteBuilder":
         """Configure both writer and committer. Explicit None restores append.
@@ -772,7 +774,7 @@ class PostponeFixedBucketWriteBuilder:
     Unknown partitions buffer until preparation; known layouts write directly.
     Rescaling and compaction are not performed.
     """
-    def _with_commit_user(self, commit_user: str) -> "PostponeFixedBucketWriteBuilder": ...
+    def with_commit_user(self, commit_user: str) -> "PostponeFixedBucketWriteBuilder": ...
     def bucket_plan(self) -> pyarrow.RecordBatch:
         """Known partition layouts from the latest writer snapshot, without SELECT.
 

@@ -85,7 +85,7 @@ def test_public_api_separates_batch_and_stream(tmp_path):
                 factory(**kwargs)
     batch = table.new_batch_write_builder()
     stream = table.new_stream_write_builder()
-    assert not hasattr(batch, "with_commit_user")
+    assert batch.with_commit_user("batch-job") is batch
     assert not hasattr(stream, "with_overwrite")
     for obj in (batch, stream, batch.new_commit(), stream.new_commit()):
         assert not hasattr(obj, "deserialize_commit_message")
@@ -208,11 +208,11 @@ def test_empty_stream_snapshot_properties(tmp_path):
 
 @pytest.mark.parametrize("overwrite", [False, True])
 @pytest.mark.parametrize("serialized", [False, True])
-def test_batch_bridge_preserves_external_commit_user(tmp_path, overwrite, serialized):
+def test_public_batch_commit_user_survives_serialization(tmp_path, overwrite, serialized):
     table = _table(tmp_path, primary_key=True, options={"bucket": "1"})
     _append(table, [1], [10])
     builder = table.new_batch_write_builder()
-    assert builder._with_commit_user("python-batch-job") is builder
+    assert builder.with_commit_user("python-batch-job") is builder
     if overwrite:
         builder.with_overwrite()
     messages = _prepare(builder, [2], [20])
@@ -226,11 +226,11 @@ def test_batch_bridge_preserves_external_commit_user(tmp_path, overwrite, serial
 
 
 @pytest.mark.parametrize("user", ["", "../job", "a/b"])
-def test_invalid_batch_bridge_commit_user_preserves_identity(tmp_path, user):
+def test_invalid_public_batch_commit_user_preserves_identity(tmp_path, user):
     table = _table(tmp_path)
-    builder = table.new_batch_write_builder()._with_commit_user("python-batch-job")
+    builder = table.new_batch_write_builder().with_commit_user("python-batch-job")
     with pytest.raises(ValueError):
-        builder._with_commit_user(user)
+        builder.with_commit_user(user)
     builder.new_commit().commit(_prepare(builder, [1], [10]))
     assert _snapshot(table)["commitUser"] == "python-batch-job"
     assert _rows(table) == [1]

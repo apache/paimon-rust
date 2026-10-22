@@ -165,8 +165,8 @@ impl PyBatchWriteBuilder {
 
 #[pymethods]
 impl PyBatchWriteBuilder {
-    /// Internal PyPaimon bridge: retain the identity of the external Python writer.
-    fn _with_commit_user(
+    /// Set the commit identity shared by this builder's writers and committers.
+    fn with_commit_user(
         mut slf: PyRefMut<'_, Self>,
         commit_user: String,
     ) -> PyResult<PyRefMut<'_, Self>> {
@@ -433,7 +433,7 @@ impl PyPostponeFixedBucketWriteBuilder {
             .map(Bound::unbind)
     }
 
-    fn _with_commit_user(
+    fn with_commit_user(
         mut slf: PyRefMut<'_, Self>,
         commit_user: String,
     ) -> PyResult<PyRefMut<'_, Self>> {
@@ -1015,14 +1015,14 @@ pub struct PyTableUpdateByRowId {
 
 #[pymethods]
 impl PyTableUpdateByRowId {
-    fn _with_blob_uri_reader_factory(
-        &mut self,
-        py: Python<'_>,
+    #[pyo3(signature = (factory))]
+    fn with_blob_uri_reader_factory(
+        mut slf: PyRefMut<'_, Self>,
         factory: Option<Py<PyAny>>,
-    ) -> PyResult<()> {
-        let factory = optional_uri_reader_factory(factory, py)?;
-        self.inner.with_blob_uri_reader_factory(factory);
-        Ok(())
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        let factory = optional_uri_reader_factory(factory, slf.py())?;
+        slf.inner.with_blob_uri_reader_factory(factory);
+        Ok(slf)
     }
 
     fn update_columns(
@@ -1064,12 +1064,14 @@ pub struct PyStreamTableUpdate {
 
 #[pymethods]
 impl PyStreamTableUpdate {
-    fn _with_blob_uri_reader_factory(
-        &mut self,
-        py: Python<'_>,
+    #[pyo3(signature = (factory))]
+    fn with_blob_uri_reader_factory(
+        mut slf: PyRefMut<'_, Self>,
         factory: Option<Py<PyAny>>,
-    ) -> PyResult<()> {
-        self.context.with_blob_uri_reader_factory(factory, py)
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        let py = slf.py();
+        slf.context.with_blob_uri_reader_factory(factory, py)?;
+        Ok(slf)
     }
 
     #[pyo3(signature = (source, *, on, when_matched, when_not_matched, commit_identifier))]
@@ -1191,12 +1193,14 @@ impl PyBatchTableUpdate {
         self.context.delete_by_predicate(py, predicate)
     }
 
-    fn _with_blob_uri_reader_factory(
-        &mut self,
-        py: Python<'_>,
+    #[pyo3(signature = (factory))]
+    fn with_blob_uri_reader_factory(
+        mut slf: PyRefMut<'_, Self>,
         factory: Option<Py<PyAny>>,
-    ) -> PyResult<()> {
-        self.context.with_blob_uri_reader_factory(factory, py)
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        let py = slf.py();
+        slf.context.with_blob_uri_reader_factory(factory, py)?;
+        Ok(slf)
     }
 
     #[pyo3(signature = (source, *, on, when_matched, when_not_matched))]
@@ -1779,6 +1783,96 @@ mod tests {
     use paimon::io::FileIOBuilder;
     use paimon::spec::{BigIntType, IntType, Schema, TableSchema, VarCharType};
     use pyo3::ffi::c_str;
+
+    #[test]
+    fn public_uri_factory_and_commit_user_setters_are_chainable() {
+        Python::attach(|py| {
+            let io = FileIOBuilder::new("memory").build().unwrap();
+            let schema = Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .option("row-tracking.enabled", "true")
+                .option("data-evolution.enabled", "true")
+                .build()
+                .unwrap();
+            let table = Arc::new(Table::new(
+                io.clone(),
+                Identifier::new("default", "public_uri_setters"),
+                "memory:/public_uri_setters".into(),
+                TableSchema::new(0, &schema),
+                None,
+            ));
+            let fixed_schema = Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .primary_key(["id"])
+                .option("bucket", "-2")
+                .build()
+                .unwrap();
+            let fixed = Arc::new(Table::new(
+                io,
+                Identifier::new("default", "public_commit_user"),
+                "memory:/public_commit_user".into(),
+                TableSchema::new(0, &fixed_schema),
+                None,
+            ));
+            let batch = Py::new(py, PyBatchWriteBuilder::new(table.clone())).unwrap();
+            let stream = Py::new(py, PyStreamWriteBuilder::new(table)).unwrap();
+            let fixed =
+                Py::new(py, PyPostponeFixedBucketWriteBuilder::new(fixed).unwrap()).unwrap();
+            let locals = PyDict::new(py);
+            locals.set_item("batch", batch).unwrap();
+            locals.set_item("stream", stream).unwrap();
+            locals.set_item("fixed", fixed).unwrap();
+            py.run(
+                c_str!(
+                    r#"
+import io
+
+class Reader:
+    def new_input_stream(self, uri):
+        return io.BytesIO(uri.encode())
+
+class Factory:
+    def create(self, uri):
+        return Reader()
+
+factory = Factory()
+for builder in [batch, stream, fixed]:
+    assert builder.with_commit_user('public-job') is builder
+    assert not hasattr(builder, '_with_commit_user')
+    for invalid in ['', '..', 'name/part']:
+        try:
+            builder.with_commit_user(invalid)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('invalid commit user accepted')
+
+for builder in [batch, stream]:
+    writer = builder.new_write()
+    assert writer.with_blob_uri_reader_factory(factory) is writer
+    assert writer.with_blob_uri_reader_factory(None) is writer
+    writer.close()
+    update = builder.new_update()
+    row_id = (update.new_update_by_row_id() if builder is batch else
+              update.new_update_by_row_id(7))
+    for operation in [update, row_id]:
+        assert operation.with_blob_uri_reader_factory(factory) is operation
+        try:
+            operation.with_blob_uri_reader_factory(type('Invalid', (), {'create': None})())
+        except TypeError:
+            pass
+        else:
+            raise AssertionError('factory without callable create accepted')
+        assert operation.with_blob_uri_reader_factory(None) is operation
+        assert not hasattr(operation, '_with_blob_uri_reader_factory')
+"#
+                ),
+                Some(&locals),
+                Some(&locals),
+            )
+            .unwrap();
+        });
+    }
 
     #[test]
     fn postpone_bucket_plan_binding_round_trips_arrow_and_overwrite_precedence() {
