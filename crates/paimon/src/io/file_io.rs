@@ -17,12 +17,14 @@
 
 use crate::common::options::{parse_memory_size, CatalogOptions};
 use crate::error::*;
+use lru::LruCache;
 use std::any::Any;
 use std::collections::HashMap;
 use std::future::Future;
+use std::num::NonZeroUsize;
 use std::ops::Range;
 use std::pin::Pin;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll};
 use std::time::SystemTime;
 
@@ -114,12 +116,16 @@ pub struct FileIO {
 pub(crate) const DEFAULT_FILE_FORMAT_METADATA_CACHE_MAX_BYTES: usize = 50 * 1024 * 1024;
 pub(crate) const DEFAULT_BLOB_INDEX_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
 const ROW_METADATA_CACHE_MAX_BYTES: usize = 32 * 1024 * 1024;
+// Keep the combined parsed Parquet and ROW metadata below the configured limit.
+const ROW_METADATA_CACHE_BUDGET_DIVISOR: usize = 4;
+const ROW_SIDECAR_SIZE_CACHE_MAX_ENTRIES: usize = 4096;
 
 pub(crate) struct FileFormatMetadataCacheContext {
     max_bytes: usize,
     cache: OnceLock<Arc<dyn Any + Send + Sync>>,
     row_metadata_cache: OnceLock<Arc<dyn Any + Send + Sync>>,
     process_id: u32,
+    row_sidecar_sizes: OnceLock<Mutex<LruCache<String, u64>>>,
 }
 
 impl std::fmt::Debug for FileFormatMetadataCacheContext {
@@ -152,6 +158,7 @@ impl FileFormatMetadataCacheContext {
             cache: OnceLock::new(),
             row_metadata_cache: OnceLock::new(),
             process_id: std::process::id(),
+            row_sidecar_sizes: OnceLock::new(),
         }))
     }
 
@@ -159,14 +166,74 @@ impl FileFormatMetadataCacheContext {
         self.max_bytes
     }
 
+    fn row_metadata_max_bytes(&self) -> usize {
+        (self.max_bytes / ROW_METADATA_CACHE_BUDGET_DIVISOR).min(ROW_METADATA_CACHE_MAX_BYTES)
+    }
+
+    fn parquet_metadata_max_bytes(&self) -> usize {
+        self.max_bytes - self.row_metadata_max_bytes()
+    }
+
+    fn row_sidecar_size(&self, key: &str) -> Option<u64> {
+        if self.max_bytes == 0 || self.process_id != std::process::id() {
+            return None;
+        }
+        self.row_sidecar_sizes
+            .get()?
+            .lock()
+            .unwrap()
+            .get(key)
+            .copied()
+    }
+
+    fn cache_row_sidecar_size(&self, key: String, size: u64) {
+        if self.max_bytes == 0 || self.process_id != std::process::id() {
+            return;
+        }
+        self.row_sidecar_sizes
+            .get_or_init(|| {
+                Mutex::new(LruCache::new(
+                    NonZeroUsize::new(ROW_SIDECAR_SIZE_CACHE_MAX_ENTRIES).unwrap(),
+                ))
+            })
+            .lock()
+            .unwrap()
+            .put(key, size);
+    }
+
+    fn invalidate_row_sidecar_size(&self, key: &str) {
+        if self.process_id == std::process::id() {
+            if let Some(sizes) = self.row_sidecar_sizes.get() {
+                sizes.lock().unwrap().pop(key);
+            }
+        }
+    }
+
+    fn invalidate_row_sidecar_prefix(&self, prefix: &str) {
+        if self.process_id != std::process::id() {
+            return;
+        }
+        let Some(sizes) = self.row_sidecar_sizes.get() else {
+            return;
+        };
+        let mut sizes = sizes.lock().unwrap();
+        let keys: Vec<_> = sizes
+            .iter()
+            .filter(|(key, _)| key.starts_with(prefix))
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in keys {
+            sizes.pop(&key);
+        }
+    }
+
     pub(crate) fn get_or_init<T>(&self, init: impl FnOnce(usize) -> T) -> Arc<T>
     where
         T: Send + Sync + 'static,
     {
-        let cache = Arc::clone(
-            self.cache
-                .get_or_init(|| Arc::new(init(self.max_bytes)) as Arc<dyn Any + Send + Sync>),
-        );
+        let cache = Arc::clone(self.cache.get_or_init(|| {
+            Arc::new(init(self.parquet_metadata_max_bytes())) as Arc<dyn Any + Send + Sync>
+        }));
         match cache.downcast::<T>() {
             Ok(cache) => cache,
             Err(_) => panic!("file-format metadata cache type mismatch"),
@@ -186,8 +253,7 @@ impl FileFormatMetadataCacheContext {
             return None;
         }
         let cache = Arc::clone(self.row_metadata_cache.get_or_init(|| {
-            Arc::new(init(self.max_bytes.min(ROW_METADATA_CACHE_MAX_BYTES)))
-                as Arc<dyn Any + Send + Sync>
+            Arc::new(init(self.row_metadata_max_bytes())) as Arc<dyn Any + Send + Sync>
         }));
         match cache.downcast::<T>() {
             Ok(cache) => Some(cache),
@@ -523,6 +589,33 @@ impl FileIO {
         })
     }
 
+    /// Return the size of an immutable ROW sidecar without repeating remote
+    /// status requests for subsequent reads through the same cache context.
+    pub(crate) async fn immutable_row_sidecar_size(&self, path: &str) -> Result<u64> {
+        let (op, relative_path, cache_key) = self.create_with_cache_path(path).await?;
+        if let Some(size) = cache_key
+            .as_deref()
+            .and_then(|key| self.file_format_metadata_cache.row_sidecar_size(key))
+        {
+            return Ok(size);
+        }
+        let size = op
+            .stat(relative_path.as_ref())
+            .await
+            .map_err(|error| {
+                Error::from_opendal_with_context(
+                    error,
+                    format!("Failed to get file status for '{path}'"),
+                )
+            })?
+            .content_length();
+        if let Some(key) = cache_key {
+            self.file_format_metadata_cache
+                .cache_row_sidecar_size(key, size);
+        }
+        Ok(size)
+    }
+
     /// List the statuses of the files/directories in the given path if the path is a directory.
     ///
     /// References: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/fs/FileIO.java#L105>
@@ -678,6 +771,10 @@ impl FileIO {
         op.delete(relative_path.as_ref()).await.map_err(|error| {
             Error::from_opendal_with_context(error, format!("Failed to delete file '{path}'"))
         })?;
+        if let Some(ref cache_path) = cache_path {
+            self.file_format_metadata_cache
+                .invalidate_row_sidecar_size(cache_path);
+        }
         if let (Some(cache), Some(cache_path)) = (
             self.cache.as_ref().filter(|cache| cache.is_cacheable(path)),
             cache_path,
@@ -707,6 +804,10 @@ impl FileIO {
                     format!("Failed to delete directory '{path}'"),
                 )
             })?;
+        if let Some(ref cache_path) = cache_path {
+            self.file_format_metadata_cache
+                .invalidate_row_sidecar_prefix(cache_path);
+        }
         if let (Some(cache), Some(cache_path)) = (&self.cache, cache_path) {
             cache.invalidate_prefix(&cache_path).await?;
         }
@@ -1625,6 +1726,7 @@ mod file_action_test {
             let service: Servicer = Arc::new(CountingListService {
                 pulls: Arc::clone(&self.pulls),
                 fork_error: None,
+                stat_response: None,
             });
             Ok((
                 Operator::from_parts(OperationContext::default(), service),
@@ -1637,6 +1739,7 @@ mod file_action_test {
     struct CountingListService {
         pulls: Arc<AtomicUsize>,
         fork_error: Option<&'static str>,
+        stat_response: Option<(Arc<AtomicUsize>, u64)>,
     }
 
     impl Service for CountingListService {
@@ -1676,6 +1779,12 @@ mod file_action_test {
         ) -> opendal::Result<RpStat> {
             if let Some(message) = self.fork_error {
                 return Err(fork_test_error(message));
+            }
+            if let Some((calls, size)) = &self.stat_response {
+                calls.fetch_add(1, AtomicOrdering::SeqCst);
+                return Ok(RpStat::new(
+                    Metadata::new(EntryMode::FILE).with_content_length(*size),
+                ));
             }
             Err(unsupported_test_operation())
         }
@@ -1933,6 +2042,7 @@ mod file_action_test {
             let service: Servicer = Arc::new(CountingListService {
                 pulls: Arc::new(AtomicUsize::new(0)),
                 fork_error: Some(message),
+                stat_response: None,
             });
             let operator = Operator::from_parts(OperationContext::default(), service);
             let file_io = setup_memory_file_io().with_provider(Arc::new(FixedProvider(operator)));
@@ -2197,6 +2307,72 @@ mod file_action_test {
 
         assert!(dir.path().join("t1").exists());
         assert!(!dir.path().join("t1 ").exists());
+    }
+
+    #[tokio::test]
+    async fn test_immutable_row_sidecar_size_cache_avoids_repeated_stat() {
+        #[derive(Debug)]
+        struct CountingStatProvider(Operator);
+
+        #[async_trait::async_trait]
+        impl FileIOProvider for CountingStatProvider {
+            async fn create(&self, path: &str) -> crate::Result<(Operator, String)> {
+                Ok((
+                    self.0.clone(),
+                    path.strip_prefix("counting:/").unwrap().to_string(),
+                ))
+            }
+
+            async fn create_with_cache_namespace(
+                &self,
+                path: &str,
+            ) -> crate::Result<(Operator, String, Option<String>)> {
+                let (op, relative_path) = self.create(path).await?;
+                Ok((op, relative_path, Some("counting-stat".to_string())))
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let service: Servicer = Arc::new(CountingListService {
+            pulls: Arc::new(AtomicUsize::new(0)),
+            fork_error: None,
+            stat_response: Some((Arc::clone(&calls), 123)),
+        });
+        let provider = Arc::new(CountingStatProvider(Operator::from_parts(
+            OperationContext::default(),
+            service,
+        )));
+        let path = "counting:/objects/sidecar.row";
+
+        let cached = FileIOBuilder::new("memory")
+            .with_provider(provider.clone())
+            .build()
+            .unwrap();
+        assert_eq!(cached.immutable_row_sidecar_size(path).await.unwrap(), 123);
+        assert_eq!(
+            cached
+                .clone()
+                .immutable_row_sidecar_size(path)
+                .await
+                .unwrap(),
+            123
+        );
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 1);
+
+        let uncached = FileIOBuilder::new("memory")
+            .with_provider(provider)
+            .with_prop(CatalogOptions::FILE_FORMAT_METADATA_CACHE_MAX_SIZE, "0")
+            .build()
+            .unwrap();
+        assert_eq!(
+            uncached.immutable_row_sidecar_size(path).await.unwrap(),
+            123
+        );
+        assert_eq!(
+            uncached.immutable_row_sidecar_size(path).await.unwrap(),
+            123
+        );
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 3);
     }
 }
 
@@ -2708,6 +2884,104 @@ mod input_output_test {
         assert_eq!(*context.row_metadata_get_or_init(|_| 11u16).unwrap(), 11);
         Arc::get_mut(&mut context).unwrap().process_id = 0;
         assert!(context.row_metadata_get_or_init(|_| 13u16).is_none());
+    }
+
+    #[test]
+    fn row_and_parquet_metadata_share_configured_budget() {
+        let context = FileFormatMetadataCacheContext::from_props(&HashMap::from([(
+            CatalogOptions::FILE_FORMAT_METADATA_CACHE_MAX_SIZE.to_string(),
+            "64 kb".to_string(),
+        )]))
+        .unwrap();
+        let parquet_budget = *context.get_or_init(|bytes| bytes);
+        let row_budget = *context.row_metadata_get_or_init(|bytes| bytes).unwrap();
+        assert_eq!(parquet_budget, 48 * 1024);
+        assert_eq!(row_budget, 16 * 1024);
+        assert_eq!(parquet_budget + row_budget, context.max_bytes());
+
+        let default = FileFormatMetadataCacheContext::from_props(&HashMap::new()).unwrap();
+        assert_eq!(
+            default.parquet_metadata_max_bytes() + default.row_metadata_max_bytes(),
+            DEFAULT_FILE_FORMAT_METADATA_CACHE_MAX_BYTES
+        );
+    }
+
+    #[tokio::test]
+    async fn test_immutable_row_sidecar_size_cache_is_scoped_and_disabled_with_metadata_cache() {
+        let path = "memory:/row-sidecar-size-cache.row";
+        let first = setup_memory_file_io();
+        assert!(first
+            .file_format_metadata_cache
+            .row_sidecar_sizes
+            .get()
+            .is_none());
+        first
+            .new_output(path)
+            .unwrap()
+            .write(Bytes::from_static(b"first"))
+            .await
+            .unwrap();
+        assert!(first
+            .file_format_metadata_cache
+            .row_sidecar_sizes
+            .get()
+            .is_none());
+        assert_eq!(first.immutable_row_sidecar_size(path).await.unwrap(), 5);
+        assert!(first
+            .file_format_metadata_cache
+            .row_sidecar_sizes
+            .get()
+            .is_some());
+
+        // The same context reuses the size. A different FileIO with the same
+        // literal path has its own storage target and must not reuse it.
+        assert_eq!(
+            first
+                .clone()
+                .immutable_row_sidecar_size(path)
+                .await
+                .unwrap(),
+            5
+        );
+        assert!(setup_memory_file_io()
+            .immutable_row_sidecar_size(path)
+            .await
+            .is_err());
+        first.delete_file(path).await.unwrap();
+        assert!(first.immutable_row_sidecar_size(path).await.is_err());
+
+        let nested = "memory:/row-sidecar-size-prefix/sidecar.row";
+        first
+            .new_output(nested)
+            .unwrap()
+            .write(Bytes::from_static(b"nested"))
+            .await
+            .unwrap();
+        assert_eq!(first.immutable_row_sidecar_size(nested).await.unwrap(), 6);
+        first
+            .delete_dir("memory:/row-sidecar-size-prefix")
+            .await
+            .unwrap();
+        assert!(first.immutable_row_sidecar_size(nested).await.is_err());
+
+        let uncached = FileIOBuilder::new("memory")
+            .with_prop(CatalogOptions::FILE_FORMAT_METADATA_CACHE_MAX_SIZE, "0")
+            .build()
+            .unwrap();
+        uncached
+            .new_output(path)
+            .unwrap()
+            .write(Bytes::from_static(b"data"))
+            .await
+            .unwrap();
+        assert_eq!(uncached.immutable_row_sidecar_size(path).await.unwrap(), 4);
+        uncached.delete_file(path).await.unwrap();
+        assert!(uncached.immutable_row_sidecar_size(path).await.is_err());
+        assert!(uncached
+            .file_format_metadata_cache
+            .row_sidecar_sizes
+            .get()
+            .is_none());
     }
 
     #[tokio::test]
