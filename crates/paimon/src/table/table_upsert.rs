@@ -34,8 +34,7 @@ use super::update_input::unique_column_index;
 use super::upsert_key_matcher::UpsertKeyMatcher;
 use super::write_batch_normalize::{normalize_blob_write_field, normalize_write_array};
 use crate::spec::{
-    batch_to_serialized_bytes, extract_datum_from_arrow, BinaryRow, CoreOptions, Predicate,
-    PredicateBuilder,
+    batch_to_serialized_bytes, extract_datum_from_arrow, CoreOptions, Predicate, PredicateBuilder,
 };
 use crate::table::source::{DataSplit, Plan};
 use crate::table::{CommitMessage, Table};
@@ -562,8 +561,8 @@ mod tests {
     use crate::catalog::Identifier;
     use crate::io::FileIOBuilder;
     use crate::spec::{
-        DataEvolutionIndexSourceMeta, DataType as PaimonType, IndexManifest, TimestampType,
-        VarCharType,
+        BinaryRow, DataEvolutionIndexSourceMeta, DataType as PaimonType, IndexManifest,
+        TimestampType, VarCharType,
     };
     use crate::spec::{IntType, Schema as PaimonSchema, TableSchema};
     use crate::table::TableCommit;

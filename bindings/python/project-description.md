@@ -53,6 +53,38 @@ ctx.sql("INSERT INTO paimon.my_db.users VALUES (1, 'alice'), (2, 'bob')")
 batches = ctx.sql("SELECT * FROM paimon.my_db.users")
 ```
 
+### Blob Source Streams and Commit Identity
+
+The write and update APIs accept a `UriReaderFactory` for custom Blob reference
+sources. Both stream protocols are public runtime imports and support structural
+typing; implementations do not need to inherit from them.
+
+```python
+from io import BytesIO
+from pypaimon_rust.datafusion import UriReader, UriReaderFactory
+
+payloads = {"custom://example": b"content"}
+
+class Reader:
+    def new_input_stream(self, uri: str):
+        return BytesIO(payloads[uri])
+
+class Factory:
+    def create(self, uri: str) -> UriReader:
+        return Reader()
+
+factory: UriReaderFactory = Factory()
+builder = table.new_batch_write_builder().with_commit_user("my-job")
+writer = builder.new_write().with_blob_uri_reader_factory(factory)
+update = builder.new_update().with_blob_uri_reader_factory(factory)
+```
+
+Rust copies the requested Blob ranges and closes the source streams. Pass `None`
+to clear the factory. Configure a writer before its first write. Batch and stream
+updates, including incremental row-ID updaters, expose the same chainable setter.
+`with_commit_user` is available on batch, stream, and postpone fixed bucket write
+builders, and the identity applies to both writers and committers from that builder.
+
 ### Multimodal SQL Helpers
 
 `SQLContext` also registers Python scalar UDFs for common BLOB media and vector

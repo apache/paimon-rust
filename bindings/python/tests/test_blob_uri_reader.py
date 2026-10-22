@@ -210,7 +210,7 @@ def test_update_factory_errors_keep_identity_and_existing_data(tmp_path, stream,
 
     builder = table.new_stream_write_builder() if stream else table.new_batch_write_builder()
     update = builder.new_update()
-    update._with_blob_uri_reader_factory(Factory())
+    assert update.with_blob_uri_reader_factory(Factory()) is update
     reference = _reference(source_file.as_uri())
     source = pa.Table.from_batches([_batch([0], [reference])])
     data = pa.table({'_ROW_ID': [row_id], 'payload': pa.array([reference], type=pa.large_binary())})
@@ -252,7 +252,7 @@ def test_predicate_updates_share_blob_factory_across_matched_file_groups(tmp_pat
     factory = ReaderFactory()
     builder = table.new_stream_write_builder() if stream else table.new_batch_write_builder()
     update = builder.new_update()
-    update._with_blob_uri_reader_factory(factory)
+    assert update.with_blob_uri_reader_factory(factory) is update
     reference = descriptor(2, -1)
     read_columns = None
     if assignment == 'scalar':
