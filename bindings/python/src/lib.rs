@@ -34,6 +34,8 @@ mod oss_cpp;
 mod predicate;
 mod read;
 mod schema;
+mod search_plan;
+mod search_task;
 mod shard_update;
 mod system_table;
 mod table;

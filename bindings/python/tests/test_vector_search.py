@@ -56,7 +56,7 @@ def test_filters_accumulate_and_partition_uses_table_schema(table):
     result = (_single(table).with_filter({'method': 'greaterThan', 'field': 'id', 'literals': [1]})
               .with_filter({'method': 'lessThan', 'field': 'id', 'literals': [4]})
               .with_partition_filter({'method': 'equal', 'field': 'pt', 'literals': [1]})
-              .execute_local())
+              .execute())
     assert isinstance(result, GlobalIndexResult)
     assert len(result) == 1
     assert list(result.row_ids().values()) == [1.0]
@@ -91,12 +91,15 @@ def test_scan_read_keeps_snapshot_and_is_reusable(table):
     assert sorted(ids[:2]) == [1, 3]
     assert ids[2] == 2
     assert rows.column('__paimon_search_score').to_pylist() == pytest.approx([1, 1, 1 / 3])
-    assert result.snapshot_id() == plan.snapshot_id() == 1
+    assert result.snapshot_id() == plan.snapshot().id() == 1
     assert reader.read_plan(plan).row_ids() == result.row_ids()
-    assert len(builder.execute_local()) == 4
+    assert len(builder.execute()) == 4
     filtered = _single(table).with_filter({'method': 'equal', 'field': 'id', 'literals': [1]})
-    with pytest.raises(Exception, match='plan.*reader|context|different'):
-        filtered.new_vector_search_read().read_plan(plan)
+    selected = filtered.new_vector_search_read().read_plan(plan)
+    assert len(selected) == 1
+    assert selected.snapshot_id() == 1
+    rows = pa.Table.from_batches(selected.new_read_builder().with_projection(['id']).read())
+    assert rows.column('id').to_pylist() == [1]
 
 
 def test_batch_order_empty_results_and_scan_reuse(table):
@@ -107,10 +110,10 @@ def test_batch_order_empty_results_and_scan_reuse(table):
     results = builder.new_batch_vector_search_read().read_batch_plan(plan)
     assert all(isinstance(r, GlobalIndexResult) for r in results)
     assert [r.row_ids() for r in results] == [
-        _single(table).with_query_vector(q).with_limit(1).execute_local().row_ids() for q in queries]
-    assert [r.row_ids() for r in builder.execute_batch_local()] == [r.row_ids() for r in results]
+        _single(table).with_query_vector(q).with_limit(1).execute().row_ids() for q in queries]
+    assert [r.row_ids() for r in builder.execute()] == [r.row_ids() for r in results]
     builder.with_filter({'method': 'equal', 'field': 'id', 'literals': [99]})
-    assert [len(r) for r in builder.execute_batch_local()] == [0, 0, 0]
+    assert [len(r) for r in builder.execute()] == [0, 0, 0]
 
 
 @pytest.mark.parametrize('query', [None, []])
@@ -121,16 +124,17 @@ def test_invalid_query_is_reported_before_planning(table, query):
     with pytest.raises(Exception, match='vector|Vector'):
         builder.new_vector_search_read()
     with pytest.raises(Exception, match='Query vectors'):
-        table.new_batch_vector_search_builder().with_vector_column('embedding').with_limit(1).with_query_vectors([]).execute_batch_local()
+        (table.new_batch_vector_search_builder().with_vector_column('embedding')
+         .with_limit(1).with_query_vectors([]).execute())
 
 
 def test_single_vector_keyword_matches_stub(table):
     builder = _single(table).with_query_vector(vector=[1, 0]).with_limit(1)
-    assert builder.execute_local().row_ids() == _single(table).with_limit(1).execute_local().row_ids()
+    assert builder.execute().row_ids() == _single(table).with_limit(1).execute().row_ids()
 
 
 def test_external_result_uses_same_scan_type_without_search_context(table):
-    found = _single(table).with_limit(1).execute_local()
+    found = _single(table).with_limit(1).execute()
     external = GlobalIndexResult.from_scored_row_ids(found.row_ids())
     builder = table.new_read_builder().with_projection(['id'])
     plan = builder.new_scan().with_global_index_result(external).plan()

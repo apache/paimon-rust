@@ -46,9 +46,12 @@ use serde_json::json;
 use std::collections::{HashMap, HashSet};
 
 const FULL_TEXT_INDEX_TYPE: &str = "full-text";
+mod execution;
 mod filter;
 mod read;
 mod scan;
+#[cfg(any(feature = "internal-api", test))]
+pub(super) use execution::execute_search_task;
 pub use read::FullTextRead;
 pub use scan::{FullTextScan, FullTextScanPlan};
 
@@ -219,12 +222,23 @@ struct FullTextSearchEvaluation<'a> {
     next_row_id: Option<i64>,
     partition_filter: Option<&'a Predicate>,
     row_filter: Option<&'a Predicate>,
+    source_splits: Option<&'a [crate::table::SearchScanSplit]>,
 }
 
+#[cfg(test)]
 async fn evaluate_full_text_search(
     evaluation: FullTextSearchEvaluation<'_>,
     index_entries: &[IndexManifestEntry],
     search: &FullTextSearch,
+) -> crate::Result<SearchResult> {
+    evaluate_full_text_search_with_executor(evaluation, index_entries, search, None).await
+}
+
+async fn evaluate_full_text_search_with_executor(
+    evaluation: FullTextSearchEvaluation<'_>,
+    index_entries: &[IndexManifestEntry],
+    search: &FullTextSearch,
+    executor: Option<&dyn crate::table::SearchTaskExecutor>,
 ) -> crate::Result<SearchResult> {
     let table_path = evaluation.table_path.trim_end_matches('/');
     let core_options = CoreOptions::new(evaluation.table_options);
@@ -249,15 +263,24 @@ async fn evaluate_full_text_search(
         .collect();
     let has_fulltext_entries = !fulltext_entries.is_empty();
 
-    if !has_fulltext_entries {
+    if !has_fulltext_entries && evaluation.source_splits.is_none() {
+        return Ok(SearchResult::empty());
+    }
+    if evaluation
+        .source_splits
+        .is_some_and(|splits| splits.is_empty())
+    {
         return Ok(SearchResult::empty());
     }
 
     let deleted_row_index = if core_options.data_evolution_enabled() {
         match evaluation.table {
             Some(table) => {
-                let ranges =
-                    deleted_row_ranges_for_data_evolution_dvs(table, index_entries).await?;
+                let ranges = if evaluation.source_splits.is_some() {
+                    super::search_scan_split::deleted_row_ranges_for_search_sources(table).await?
+                } else {
+                    deleted_row_ranges_for_data_evolution_dvs(table, index_entries).await?
+                };
                 (!ranges.is_empty()).then(|| RowRangeIndex::create(ranges))
             }
             None => None,
@@ -276,51 +299,91 @@ async fn evaluate_full_text_search(
             matched,
         ));
     }
+    if let (Some(_), Some(partition)) = (evaluation.source_splits, evaluation.partition_filter) {
+        let table = evaluation.table.ok_or_else(|| crate::Error::DataInvalid {
+            message: "Full-text partition filtering requires table context".into(),
+            source: None,
+        })?;
+        let ranges = fulltext_entries
+            .iter()
+            .map(|entry| {
+                let meta = entry.index_file.global_index_meta.as_ref().unwrap();
+                RowRange::new(meta.row_range_start, meta.row_range_end)
+            })
+            .collect();
+        let matched = super::search_scan_split::partition_row_ids_for_search_sources(
+            table, partition, ranges,
+        )
+        .await?;
+        indexed_search.include_row_ids = Some(filter::intersect_include(
+            indexed_search.include_row_ids.as_ref(),
+            matched,
+        ));
+    }
     let mut merged = SearchResult::empty();
     if !fulltext_entries.is_empty() {
         let plans = plan_full_text_index_searches(
             fulltext_entries,
             indexed_search.include_row_ids.as_ref(),
         )?;
-        let results = plans
-            .into_iter()
-            .map(|plan| {
-                let entry = plan.entry;
-                let global_meta = entry.index_file.global_index_meta.as_ref().unwrap();
-                let path = IndexFileLocation::Global { table_path }.resolve(
-                    &entry.index_file.file_name,
-                    entry.index_file.external_path.as_deref(),
-                );
-                let file_name = entry.index_file.file_name.clone();
-                let query_text = search.query_text.clone();
-                let local_filter = plan.local_filter;
-                let row_range_start = global_meta.row_range_start;
-                let row_range_end = global_meta.row_range_end;
-                // Compound query leaves must see every candidate in the shard
-                // before Boolean/boost composition and the final global Top-K.
-                let limit = candidate_limit(row_range_start, row_range_end)?;
-                Ok::<_, crate::Error>(async move {
-                    let input = evaluation.file_io.new_input(&path)?;
-                    let reader = Box::new(input.reader().await?);
-                    let result =
-                        search_full_text_index(reader, file_name, query_text, limit, local_filter)
-                            .await?;
-                    Ok::<_, crate::Error>(search_result_from_core(result)?.offset(row_range_start))
+        let results = if let Some(executor) = executor {
+            let table = evaluation.table.ok_or_else(|| crate::Error::DataInvalid {
+                message: "Scheduled full-text search requires table context".into(),
+                source: None,
+            })?;
+            execution::search_indexes(table, plans, &search.query_text, executor).await?
+        } else {
+            let results = plans
+                .into_iter()
+                .map(|plan| {
+                    let entry = plan.entry;
+                    let global_meta = entry.index_file.global_index_meta.as_ref().unwrap();
+                    let path = IndexFileLocation::Global { table_path }.resolve(
+                        &entry.index_file.file_name,
+                        entry.index_file.external_path.as_deref(),
+                    );
+                    let file_name = entry.index_file.file_name.clone();
+                    let query_text = search.query_text.clone();
+                    let local_filter = plan.local_filter;
+                    let row_range_start = global_meta.row_range_start;
+                    let row_range_end = global_meta.row_range_end;
+                    // Compound query leaves must see every candidate in the shard
+                    // before Boolean/boost composition and the final global Top-K.
+                    let limit = candidate_limit(row_range_start, row_range_end)?;
+                    Ok::<_, crate::Error>(async move {
+                        let input = evaluation.file_io.new_input(&path)?;
+                        let reader = Box::new(input.reader().await?);
+                        let result = search_full_text_index(
+                            reader,
+                            file_name,
+                            query_text,
+                            limit,
+                            local_filter,
+                        )
+                        .await?;
+                        Ok::<_, crate::Error>(
+                            search_result_from_core(result)?.offset(row_range_start),
+                        )
+                    })
                 })
-            })
-            .collect::<crate::Result<Vec<_>>>()?
-            .into_iter();
-        let results = futures::stream::iter(results)
-            .buffered(core_options.global_index_thread_num()?)
-            .try_collect::<Vec<_>>()
-            .await?;
+                .collect::<crate::Result<Vec<_>>>()?
+                .into_iter();
+            futures::stream::iter(results)
+                .buffered(core_options.global_index_thread_num()?)
+                .try_collect::<Vec<_>>()
+                .await?
+        };
         for r in &results {
             merged = merged.or(r);
         }
     }
 
-    if search_mode != GlobalIndexSearchMode::Fast && has_fulltext_entries {
-        let detail_ranges = if search_mode == GlobalIndexSearchMode::Detail {
+    if evaluation.source_splits.is_some()
+        || search_mode != GlobalIndexSearchMode::Fast && has_fulltext_entries
+    {
+        let detail_ranges = if evaluation.source_splits.is_none()
+            && search_mode == GlobalIndexSearchMode::Detail
+        {
             let table = evaluation.table.ok_or_else(|| crate::Error::DataInvalid {
                 message: "Full-text raw search in detail mode requires table context".to_string(),
                 source: None,
@@ -330,14 +393,26 @@ async fn evaluate_full_text_search(
             Vec::new()
         };
         let field_ids = HashSet::from([field_id]);
-        let raw_ranges = unindexed_ranges_for_global_index_entries(
-            index_entries,
-            &field_ids,
-            search_mode,
-            evaluation.next_row_id,
-            &detail_ranges,
-            is_full_text_index_file,
-        );
+        let raw_ranges = if let Some(splits) = evaluation.source_splits {
+            merge_row_ranges(
+                splits
+                    .iter()
+                    .flat_map(|split| match split {
+                        crate::table::SearchScanSplit::Raw { row_ranges, .. } => row_ranges.clone(),
+                        _ => vec![],
+                    })
+                    .collect(),
+            )
+        } else {
+            unindexed_ranges_for_global_index_entries(
+                index_entries,
+                &field_ids,
+                search_mode,
+                evaluation.next_row_id,
+                &detail_ranges,
+                is_full_text_index_file,
+            )
+        };
         if !raw_ranges.is_empty() {
             let table = evaluation.table.ok_or_else(|| crate::Error::DataInvalid {
                 message: "Full-text raw search requires table context".to_string(),
@@ -352,14 +427,26 @@ async fn evaluate_full_text_search(
                     matched,
                 ));
             }
-            let raw_result = read_raw_full_text_search_filtered(
-                table,
-                &raw_search,
-                &raw_ranges,
-                evaluation.table_options,
-                evaluation.partition_filter,
-            )
-            .await?;
+            let raw_result = if let Some(executor) = executor {
+                execution::search_raw_rows(
+                    table,
+                    &raw_search,
+                    &raw_ranges,
+                    evaluation.table_options,
+                    evaluation.partition_filter,
+                    executor,
+                )
+                .await?
+            } else {
+                read_raw_full_text_search_filtered(
+                    table,
+                    &raw_search,
+                    &raw_ranges,
+                    evaluation.table_options,
+                    evaluation.partition_filter,
+                )
+                .await?
+            };
             merged = merged.without_row_ranges(&raw_ranges)?;
             merged = merged.or(&raw_result);
         }
@@ -494,6 +581,45 @@ async fn read_raw_full_text_search_filtered(
     if raw_ranges.is_empty() {
         return Ok(SearchResult::empty());
     }
+    let splits = plan_raw_full_text_splits(table, search, raw_ranges, partition_filter).await?;
+    read_raw_full_text_splits(
+        table,
+        search,
+        raw_ranges,
+        table_options,
+        &splits,
+        partition_filter,
+    )
+    .await
+}
+
+async fn plan_raw_full_text_splits(
+    table: &Table,
+    search: &FullTextSearch,
+    raw_ranges: &[RowRange],
+    partition_filter: Option<&Predicate>,
+) -> crate::Result<Vec<crate::table::DataSplit>> {
+    let mut read_builder = table.new_read_builder();
+    read_builder
+        .with_projection(&[search.field_name.as_str(), ROW_ID_FIELD_NAME])?
+        .with_row_ranges(merge_row_ranges(raw_ranges.to_vec()));
+    if let Some(filter) = partition_filter {
+        read_builder.with_filter(filter.clone());
+    }
+    Ok(read_builder.new_scan().plan().await?.splits().to_vec())
+}
+
+async fn read_raw_full_text_splits(
+    table: &Table,
+    search: &FullTextSearch,
+    raw_ranges: &[RowRange],
+    table_options: &HashMap<String, String>,
+    splits: &[crate::table::DataSplit],
+    partition_filter: Option<&Predicate>,
+) -> crate::Result<SearchResult> {
+    if raw_ranges.is_empty() || splits.is_empty() {
+        return Ok(SearchResult::empty());
+    }
     let raw_ranges = merge_row_ranges(raw_ranges.to_vec());
     let row_range_start = raw_ranges.first().map(RowRange::from).unwrap_or(0);
     let row_range_end = raw_ranges
@@ -508,12 +634,8 @@ async fn read_raw_full_text_search_filtered(
     if let Some(filter) = partition_filter {
         read_builder.with_filter(filter.clone());
     }
-    let plan = read_builder.new_scan().plan().await?;
-    if plan.splits().is_empty() {
-        return Ok(SearchResult::empty());
-    }
     let read = read_builder.new_read()?;
-    let mut stream = read.to_arrow(plan.splits())?;
+    let mut stream = read.to_arrow(splits)?;
 
     let config = raw_full_text_config(table_options)?;
     let mut writer = tokio::task::spawn_blocking(move || {
@@ -857,6 +979,7 @@ mod tests {
                 next_row_id: Some(10),
                 partition_filter: None,
                 row_filter: None,
+                source_splits: None,
             },
             &[],
             &search,
@@ -1012,6 +1135,7 @@ mod tests {
                 next_row_id: Some(102),
                 partition_filter: None,
                 row_filter: None,
+                source_splits: None,
             },
             &[entry],
             &search,
@@ -1098,6 +1222,7 @@ mod tests {
                 next_row_id: Some(102),
                 partition_filter: None,
                 row_filter: None,
+                source_splits: None,
             },
             &[entry, missing_empty_filter_entry],
             &search,
@@ -1199,12 +1324,16 @@ mod tests {
         writer: &mut FullTextIndexWriter,
         query: &str,
     ) -> paimon_ftindex_core::FullTextSearchResult {
-        let mut bytes = Vec::new();
-        writer.write(&mut PosWriter::new(&mut bytes)).unwrap();
-        FullTextIndexReader::open(SliceReader::new(bytes))
+        FullTextIndexReader::open(SliceReader::new(write_test_index(writer)))
             .unwrap()
             .search(query, 10)
             .unwrap()
+    }
+
+    fn write_test_index(writer: &mut FullTextIndexWriter) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        writer.write(&mut PosWriter::new(&mut bytes)).unwrap();
+        bytes
     }
 
     #[test]
@@ -1360,8 +1489,216 @@ mod tests {
             .is_empty());
     }
 
+    #[tokio::test]
+    async fn pk_full_text_source_plan_resolves_unknown_split_snapshot_from_capture() {
+        let table = pk_full_text_table("pk_ft_unknown_split_snapshot", &[]);
+        let snapshot = crate::spec::Snapshot::builder()
+            .version(3)
+            .id(7)
+            .schema_id(0)
+            .base_manifest_list(String::new())
+            .delta_manifest_list(String::new())
+            .commit_user("capture".into())
+            .commit_identifier(1)
+            .commit_kind(crate::spec::CommitKind::APPEND)
+            .time_millis(0)
+            .build();
+        let split = |snapshot_id| crate::table::SearchScanSplit::PrimaryKey {
+            data_split: crate::table::DataSplitBuilder::new()
+                .with_snapshot(snapshot_id)
+                .with_partition(crate::spec::BinaryRow::new(0))
+                .with_bucket(0)
+                .with_bucket_path(format!("{}/bucket-0", table.location()))
+                .with_data_files(vec![])
+                .build()
+                .unwrap(),
+            payloads: vec![],
+            uncovered_data_files: vec![],
+            row_ranges_by_file: Default::default(),
+        };
+        assert!(FullTextScanPlan::new(Some(snapshot.clone()), vec![split(8)]).is_err());
+        assert!(FullTextScanPlan::new(None, vec![split(0)]).is_err());
+        let plan = FullTextScanPlan::new(Some(snapshot), vec![split(0)]).unwrap();
+        let plan: FullTextScanPlan =
+            serde_json::from_slice(&serde_json::to_vec(&plan).unwrap()).unwrap();
+        let result = table
+            .new_full_text_search_builder()
+            .with_query("body", r#"{"match":{"query":"alpha"}}"#)
+            .with_limit(10)
+            .new_read()
+            .unwrap()
+            .read(plan)
+            .await
+            .unwrap();
+        assert_eq!(result.snapshot_id(), Some(7));
+        assert!(result.positions().unwrap().is_empty());
+    }
+
+    fn pk_full_text_indexed_plan(table: &Table) -> FullTextScanPlan {
+        let snapshot = crate::spec::Snapshot::builder()
+            .version(3)
+            .id(7)
+            .schema_id(0)
+            .base_manifest_list(String::new())
+            .delta_manifest_list(String::new())
+            .commit_user("capture".into())
+            .commit_identifier(1)
+            .commit_kind(crate::spec::CommitKind::APPEND)
+            .time_millis(0)
+            .build();
+        let data_file = crate::spec::DataFileMeta {
+            file_name: "d0".into(),
+            file_size: 1,
+            row_count: 2,
+            min_key: Vec::new(),
+            max_key: Vec::new(),
+            key_stats: crate::spec::stats::BinaryTableStats::empty(),
+            value_stats: crate::spec::stats::BinaryTableStats::empty(),
+            min_sequence_number: 0,
+            max_sequence_number: 0,
+            schema_id: 0,
+            level: 1,
+            extra_files: Vec::new(),
+            creation_time: None,
+            delete_row_count: None,
+            embedded_index: None,
+            file_source: Some(1),
+            value_stats_cols: None,
+            external_path: None,
+            first_row_id: None,
+            write_cols: None,
+            column_max_sequence_numbers: None,
+        };
+        let mut payload = full_text_index_entry("pk-ft", 0, 1).index_file;
+        // Java source metadata: version, level, file count, UTF name, row count.
+        payload.global_index_meta.as_mut().unwrap().source_meta = Some(
+            [
+                1i32.to_be_bytes().as_slice(),
+                1i32.to_be_bytes().as_slice(),
+                1i32.to_be_bytes().as_slice(),
+                2u16.to_be_bytes().as_slice(),
+                b"d0",
+                2i64.to_be_bytes().as_slice(),
+            ]
+            .concat(),
+        );
+        let split = crate::table::SearchScanSplit::PrimaryKey {
+            data_split: crate::table::DataSplitBuilder::new()
+                .with_snapshot(7)
+                .with_partition(crate::spec::BinaryRow::new(0))
+                .with_bucket(0)
+                .with_bucket_path(format!("{}/bucket-0", table.location()))
+                .with_data_files(vec![data_file])
+                .build()
+                .unwrap(),
+            payloads: vec![payload],
+            uncovered_data_files: vec![],
+            row_ranges_by_file: Default::default(),
+        };
+        FullTextScanPlan::new(Some(snapshot), vec![split]).unwrap()
+    }
+
+    #[tokio::test]
+    async fn pk_full_text_source_plan_rejects_incompatible_payloads_before_io() {
+        let table = pk_full_text_table("pk_ft_wrong_source", &[]);
+        let mut builder = table.new_full_text_search_builder();
+        builder
+            .with_query("body", r#"{"match":{"query":"alpha"}}"#)
+            .with_limit(10);
+        let reader = builder.new_read().unwrap();
+        let source = pk_full_text_indexed_plan(&table);
+        for invalid in ["field", "type", "missing-meta"] {
+            let mut splits = source.splits().to_vec();
+            let crate::table::SearchScanSplit::PrimaryKey { payloads, .. } = &mut splits[0] else {
+                unreachable!()
+            };
+            match invalid {
+                "field" => {
+                    payloads[0]
+                        .global_index_meta
+                        .as_mut()
+                        .unwrap()
+                        .index_field_id = 0
+                }
+                "type" => payloads[0].index_type = "lucene-vector".into(),
+                _ => payloads[0].global_index_meta = None,
+            }
+            let plan = FullTextScanPlan::new(source.snapshot().cloned(), splits).unwrap();
+            let error = reader.read(plan).await.unwrap_err();
+            assert!(
+                matches!(error, crate::Error::DataInvalid { ref message, .. }
+                    if message.contains("does not match the reader's field and index type")),
+                "{invalid}: {error:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pk_full_text_source_plan_reads_matching_payload_from_captured_snapshot() {
+        let table = pk_full_text_table("pk_ft_matching_source", &[]);
+        let mut writer = FullTextIndexWriter::new(FullTextIndexConfig::new()).unwrap();
+        writer.add_document(0, "alpha").unwrap();
+        writer.add_document(1, "beta").unwrap();
+        table
+            .file_io()
+            .new_output(&format!("{}/index/pk-ft", table.location()))
+            .unwrap()
+            .write(Bytes::from(write_test_index(&mut writer)))
+            .await
+            .unwrap();
+        let plan = pk_full_text_indexed_plan(&table);
+        let plan: FullTextScanPlan =
+            serde_json::from_slice(&serde_json::to_vec(&plan).unwrap()).unwrap();
+        let result = table
+            .new_full_text_search_builder()
+            .with_query("body", r#"{"match":{"query":"alpha"}}"#)
+            .with_limit(10)
+            .new_read()
+            .unwrap()
+            .read(plan)
+            .await
+            .unwrap();
+        assert_eq!(result.snapshot_id(), Some(7));
+        let positions = result.positions().unwrap();
+        assert_eq!(positions.len(), 1);
+        assert_eq!(positions[0].data_file_name, "d0");
+        assert_eq!(positions[0].row_position, 0);
+        assert!(positions[0].score > 0.0);
+    }
+
     // (d) The PK full-text path produces physical positions, not global row-ids:
     // Only the ranges-only `execute` API rejects the physical-position result.
+    #[tokio::test]
+    async fn scheduled_full_text_rejects_primary_key_plans() {
+        struct NoScheduling;
+        #[async_trait::async_trait]
+        impl crate::table::SearchTaskExecutor for NoScheduling {
+            async fn execute(
+                &self,
+                _: Vec<crate::table::SearchTask>,
+            ) -> crate::Result<Vec<crate::table::SearchTaskResult>> {
+                panic!("a primary-key plan must fail before scheduling");
+            }
+        }
+        let table = pk_full_text_table("pk_ft_scheduled_unsupported", &[]);
+        let mut builder = table.new_full_text_search_builder();
+        builder
+            .with_query("body", r#"{"match":{"query":"alpha"}}"#)
+            .with_limit(10);
+        let plan = builder.new_scan().unwrap().scan().await.unwrap();
+        let error = builder
+            .new_read()
+            .unwrap()
+            .read_with_executor(plan, &NoScheduling)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, crate::Error::Unsupported { ref message }
+            if message.contains("data-evolution")),
+            "{error}"
+        );
+    }
+
     #[tokio::test]
     async fn pk_full_text_ranges_reject_physical_positions() {
         let table = pk_full_text_table("pk_ft_execute_loud", &[]);

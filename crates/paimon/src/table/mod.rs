@@ -150,6 +150,15 @@ mod row_sidecar;
 mod scan_stats;
 pub(crate) mod schema_manager;
 mod search_scan_split;
+mod search_task;
+#[cfg(any(feature = "fulltext", test))]
+pub(crate) use search_task::SearchTask;
+pub(crate) use search_task::SearchTaskExecutor;
+#[cfg(test)]
+pub(crate) use search_task::SearchTaskResult;
+#[cfg(feature = "internal-api")]
+#[doc(hidden)]
+pub mod internal;
 mod shard_table_updater;
 pub(crate) mod snapshot_commit;
 mod snapshot_manager;
