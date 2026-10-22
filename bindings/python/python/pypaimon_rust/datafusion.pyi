@@ -166,7 +166,8 @@ class GlobalIndexResult:
 class TableScan:
     def with_file_filters(self, skip_level0: bool, only_read_real_buckets: bool) -> TableScan:
         """Set independent level-zero and pending-bucket policies for
-        plan() and plan_files()."""
+        plan() and plan_files(). plan_all() includes L0 and retains the
+        configured bucket policy."""
         ...
     def with_global_index_result(self, result: GlobalIndexResult) -> "TableScan":
         """Reuse an index selection. Authorized scans ignore supplied index selections."""

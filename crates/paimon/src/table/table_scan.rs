@@ -1878,7 +1878,11 @@ impl<'a> PaimonTableScan<'a> {
     /// the complete file set regardless of merge engine or DV settings.
     pub fn with_scan_all_files(mut self) -> Self {
         self.scan_all_files = true;
-        self.file_scan_options = None;
+        if let Some(options) = self.file_scan_options.take() {
+            self.split_selection
+                .get_or_insert_with(Default::default)
+                .only_real_buckets = options.only_read_real_buckets;
+        }
         self.projected_read_field_ids = None;
         self
     }

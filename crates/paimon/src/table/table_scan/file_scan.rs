@@ -18,8 +18,8 @@
 //! File metadata planning before row selection and split packing.
 
 use super::{
-    read_all_manifest_entries, retain_primary_key_conjuncts, BucketSelector, CoreOptions,
-    ManifestEntry, ManifestListSource, PaimonTableScan, ScanStats, TableScan, TableScanKind,
+    read_all_manifest_entries, BucketSelector, CoreOptions, ManifestEntry, ManifestListSource,
+    PaimonTableScan, ScanStats, TableScan, TableScanKind,
 };
 use crate::table::incremental_scan::timestamp_snapshot_range;
 use crate::table::{IncrementalScan, IncrementalScanMode};
@@ -53,7 +53,8 @@ impl TableScan<'_> {
     /// Override file-level policies used by [`Self::plan`] and [`Self::plan_files`].
     /// Snapshot selection and whole-file metadata authorization are unchanged.
     /// Unconfigured queries keep their normal merge-engine and deletion-vector
-    /// policies.
+    /// policies. [`Self::plan_all`] disables the level-zero exclusion while
+    /// preserving the configured bucket policy.
     pub fn with_file_filters(
         mut self,
         skip_level0: bool,
@@ -77,7 +78,8 @@ impl TableScan<'_> {
     /// The independent policies match FileStoreScan: skipping level zero never
     /// changes whether pending buckets are visible. Metadata requires an
     /// unrestricted whole-table grant even when the row reader projects fields.
-    /// Without explicit file filters, include level zero and pending buckets.
+    /// By default include level zero and pending buckets; configured bucket
+    /// exclusions also survive [`Self::with_scan_all_files`].
     pub async fn plan_files(&self) -> crate::Result<FileScanPlan> {
         let mut requested = self.clone();
         let TableScanKind::Paimon(scan) = &mut requested.0 else {
@@ -87,12 +89,14 @@ impl TableScan<'_> {
         };
         let filters = scan.file_scan_options.unwrap_or(FileScanOptions {
             skip_level0: false,
-            only_read_real_buckets: false,
+            only_read_real_buckets: scan.only_real_buckets(),
         });
         scan.projected_read_field_ids = None;
         scan.row_ranges = None;
         scan.split_selection = None;
-        scan.file_scan_options = None;
+        // Preserve the effective raw-file policy for the shared merge-safe stats
+        // rules. Raw defaults include L0 even when ordinary first-row reads do not.
+        scan.file_scan_options = Some(filters);
         scan.limit = None;
         // Authorize before turning on trusted metadata-reader behavior.
         scan.scan_all_files = false;
@@ -173,14 +177,8 @@ impl PaimonTableScan<'_> {
         let primary_key = !self.table.schema().primary_keys().is_empty();
         let data_predicates = if options.data_evolution_enabled() {
             Vec::new()
-        } else if primary_key && !skip_level0 {
-            retain_primary_key_conjuncts(
-                &self.data_predicates,
-                self.table.schema().fields(),
-                &self.table.schema().trimmed_primary_keys(),
-            )
         } else {
-            self.data_predicates.clone()
+            self.stats_pruning_predicates()
         };
         let key_predicates = self.key_stats_predicates(&data_predicates);
         let bucket_selector = self

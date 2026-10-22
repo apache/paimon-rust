@@ -699,6 +699,7 @@ impl PyStreamTableScan {
 #[pymethods]
 impl PyTableScan {
     /// Configure independent file filters for plan() and plan_files().
+    /// plan_all() includes L0 while retaining the configured bucket policy.
     fn with_file_filters(
         mut slf: PyRefMut<'_, Self>,
         skip_level0: bool,
