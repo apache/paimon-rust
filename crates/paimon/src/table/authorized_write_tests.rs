@@ -297,6 +297,59 @@ impl CommitCallback for Callback {
 }
 
 #[tokio::test]
+async fn rest_postpone_bucket_plan_requires_write_identity_without_select_permission() {
+    let fixture = RestTable::new(
+        true,
+        &[("bucket", "-2"), ("postpone.default-bucket-num", "2")],
+    )
+    .await;
+    fixture
+        .append("fixed", &[(1, "a", 10), (2, "b", 20)], true)
+        .await;
+    let table = fixture.table.copy_with_pinned_snapshot(None);
+    // The REST response already carries the selected snapshot. The filesystem
+    // copy is not required to inspect its manifests through a writer builder.
+    table
+        .file_io()
+        .delete_file(&table.snapshot_manager().snapshot_path(1))
+        .await
+        .unwrap();
+    let exported = table
+        .new_postpone_fixed_bucket_write_builder()
+        .unwrap()
+        .bucket_plan()
+        .await
+        .unwrap()
+        .to_arrow(&table)
+        .unwrap();
+    assert_eq!(exported.num_rows(), 2);
+    assert_eq!(exported.schema().field(0).name(), "p");
+    assert_eq!(
+        exported
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .values(),
+        &[2, 2]
+    );
+    assert_eq!(fixture.state.query_requests.load(Ordering::SeqCst), 0);
+    let mut schema = serde_json::to_value(table.schema()).unwrap();
+    schema["fields"][2]["name"] = serde_json::json!("another_value");
+    let unbound = table
+        .copy_with_resolved_schema(serde_json::from_value(schema).unwrap(), "main")
+        .unwrap();
+    assert!(unbound.query_auth_session().is_none());
+    assert!(unbound
+        .new_postpone_fixed_bucket_write_builder()
+        .unwrap()
+        .bucket_plan()
+        .await
+        .is_err());
+    assert_eq!(fixture.state.query_requests.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn rest_stream_recovery_and_callbacks_do_not_require_select_permission() {
     let fixture = RestTable::new(false, &[]).await;
     let first = fixture.prepare("stream", &[(1, "a", 10)]).await;

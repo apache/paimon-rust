@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use arrow::datatypes::Schema as ArrowSchema;
-use arrow::pyarrow::FromPyArrow;
+use arrow::pyarrow::{FromPyArrow, ToPyArrow};
 use arrow::record_batch::RecordBatch;
 use paimon::spec::{BlobConsumer, BlobDescriptor, CoreOptions, DataType, Datum, RowType};
 use paimon::table::{
@@ -412,6 +412,27 @@ impl PyPostponeFixedBucketWriteBuilder {
 
 #[pymethods]
 impl PyPostponeFixedBucketWriteBuilder {
+    /// Existing partitions and their bucket counts, using writer metadata access.
+    fn bucket_plan(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let table = &self.batch.context.table;
+        let mut builder = table
+            .new_postpone_fixed_bucket_write_builder()
+            .map_err(to_py_err)?;
+        if let Some(plan) = &self.plan {
+            builder = builder.with_bucket_plan(plan.clone());
+        }
+        if self.batch.static_partition.is_some() {
+            builder = builder.with_overwrite();
+        }
+        let plan = py
+            .detach(|| runtime().block_on(builder.bucket_plan()))
+            .map_err(to_py_err)?;
+        plan.to_arrow(table)
+            .map_err(to_py_err)?
+            .to_pyarrow(py)
+            .map(Bound::unbind)
+    }
+
     fn _with_commit_user(
         mut slf: PyRefMut<'_, Self>,
         commit_user: String,
@@ -1758,6 +1779,61 @@ mod tests {
     use paimon::io::FileIOBuilder;
     use paimon::spec::{BigIntType, IntType, Schema, TableSchema, VarCharType};
     use pyo3::ffi::c_str;
+
+    #[test]
+    fn postpone_bucket_plan_binding_round_trips_arrow_and_overwrite_precedence() {
+        Python::attach(|py| {
+            let schema = Schema::builder()
+                .column("pt", DataType::VarChar(VarCharType::string_type()))
+                .column("id", DataType::Int(IntType::new()))
+                .partition_keys(["pt"])
+                .primary_key(["pt", "id"])
+                .option("bucket", "-2")
+                .option("postpone.default-bucket-num", "7")
+                .build()
+                .unwrap();
+            let table = Arc::new(Table::new(
+                FileIOBuilder::new("memory").build().unwrap(),
+                Identifier::new("default", "bucket_plan_binding"),
+                "memory:/bucket_plan_binding".into(),
+                TableSchema::new(0, &schema),
+                None,
+            ));
+            let builder = Py::new(
+                py,
+                PyPostponeFixedBucketWriteBuilder::new(table.clone()).unwrap(),
+            )
+            .unwrap();
+            let overwrite =
+                Py::new(py, PyPostponeFixedBucketWriteBuilder::new(table).unwrap()).unwrap();
+            let locals = PyDict::new(py);
+            locals.set_item("builder", builder).unwrap();
+            locals.set_item("overwrite", overwrite).unwrap();
+            py.run(
+                c_str!(
+                    r#"
+import pyarrow as pa
+empty = builder.bucket_plan()
+assert isinstance(empty, pa.RecordBatch)
+assert empty.schema.names == ['pt', 'total_buckets']
+assert empty.num_rows == 0
+assert empty.schema.field('total_buckets') == pa.field('total_buckets', pa.int32(), nullable=False)
+plan = pa.RecordBatch.from_arrays([pa.array(['b', 'a']), pa.array([3, 2], type=pa.int32())],
+                                 names=['pt', 'total_buckets'])
+builder.with_bucket_plan(plan)
+assert sorted(zip(*builder.bucket_plan().to_pydict().values())) == [('a', 2), ('b', 3)]
+builder.with_overwrite()
+assert builder.bucket_plan().num_rows == 2
+overwrite.with_overwrite()
+assert overwrite.bucket_plan().num_rows == 0
+"#
+                ),
+                Some(&locals),
+                Some(&locals),
+            )
+            .unwrap();
+        });
+    }
 
     #[test]
     fn replaced_blob_consumers_are_visible_to_writer_cycle_collection() {

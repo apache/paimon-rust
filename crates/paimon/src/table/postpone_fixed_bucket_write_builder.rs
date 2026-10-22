@@ -18,7 +18,9 @@
 use super::postpone_fixed_bucket_router::validate_postpone_fixed_bucket_table;
 use crate::resource::ResourceContext;
 use crate::spec::CoreOptions;
-use crate::table::write_builder::{ensure_table_write_allowed, validate_commit_user};
+use crate::table::write_builder::{
+    ensure_table_write_allowed, ensure_table_write_authorized, validate_commit_user,
+};
 use crate::table::{
     PostponeBucketPlan, PostponeFixedBucketTableCommit, PostponeFixedBucketTableWrite, Table,
 };
@@ -71,6 +73,28 @@ impl<'a> PostponeFixedBucketWriteBuilder<'a> {
         self
     }
 
+    /// Resolve routing metadata before distributed input is materialized.
+    ///
+    /// Existing partitions are read from the latest write baseline, independently
+    /// of historical read selectors. This uses writer metadata access and does
+    /// not require a SELECT grant. Overwrite starts with no existing layout;
+    /// an explicitly supplied plan takes precedence over that default.
+    pub async fn bucket_plan(&self) -> Result<PostponeBucketPlan> {
+        ensure_table_write_authorized(self.table)?;
+        if let Some(plan) = &self.bucket_plan {
+            return Ok(plan.clone());
+        }
+        if self.overwrite {
+            return Ok(PostponeBucketPlan::default());
+        }
+        let mut plan = PostponeBucketPlan::default();
+        if let Some(snapshot) = self.table.snapshot_manager().get_latest_snapshot().await? {
+            plan.load_existing_buckets_from_snapshot(self.table, &snapshot)
+                .await?;
+        }
+        Ok(plan)
+    }
+
     pub fn new_commit(&self) -> PostponeFixedBucketTableCommit {
         PostponeFixedBucketTableCommit::new(self.table, self.commit_user.clone(), self.overwrite)
     }
@@ -121,6 +145,196 @@ mod tests {
         )
         .unwrap();
         PostponeBucketPlan::from_arrow(table, &batch).unwrap()
+    }
+
+    #[tokio::test]
+    async fn bucket_plan_obeys_explicit_and_overwrite_precedence_without_default_rows() {
+        let io = test_file_io();
+        let path = "memory:/builder_bucket_plan_modes";
+        setup_dirs(&io, path).await;
+        let table =
+            test_postpone_pk_table(&io, path).copy_with_options(std::collections::HashMap::from([
+                ("postpone.default-bucket-num".into(), "7".into()),
+            ]));
+        let builder = table.new_postpone_fixed_bucket_write_builder().unwrap();
+        assert_eq!(
+            builder
+                .bucket_plan()
+                .await
+                .unwrap()
+                .to_arrow(&table)
+                .unwrap()
+                .num_rows(),
+            0
+        );
+        let explicit = bucket_plan(&table, 3);
+        let builder = builder.with_overwrite().with_bucket_plan(explicit);
+        let exported = builder
+            .bucket_plan()
+            .await
+            .unwrap()
+            .to_arrow(&table)
+            .unwrap();
+        assert_eq!(exported.num_rows(), 1);
+        assert_eq!(
+            exported
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .value(0),
+            3
+        );
+        assert_eq!(
+            table
+                .new_postpone_fixed_bucket_write_builder()
+                .unwrap()
+                .with_overwrite()
+                .bucket_plan()
+                .await
+                .unwrap()
+                .to_arrow(&table)
+                .unwrap()
+                .num_rows(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn bucket_plan_uses_latest_write_baseline_and_ignores_pending_files() {
+        let io = test_file_io();
+        let path = "memory:/builder_bucket_plan_latest";
+        setup_dirs(&io, path).await;
+        let table = test_postpone_pk_table(&io, path);
+        let pending = table.new_write_builder();
+        let mut writer = pending.new_write().unwrap();
+        writer
+            .write_arrow_batch(&make_batch(vec![1], vec![10]))
+            .await
+            .unwrap();
+        pending
+            .new_commit()
+            .commit(writer.prepare_commit().await.unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            table
+                .new_postpone_fixed_bucket_write_builder()
+                .unwrap()
+                .bucket_plan()
+                .await
+                .unwrap()
+                .to_arrow(&table)
+                .unwrap()
+                .num_rows(),
+            0
+        );
+        let fixed = table
+            .new_postpone_fixed_bucket_write_builder()
+            .unwrap()
+            .with_bucket_plan(bucket_plan(&table, 3));
+        let mut writer = fixed.new_write().unwrap();
+        writer
+            .write_arrow_batch(&make_batch(vec![2], vec![20]))
+            .await
+            .unwrap();
+        fixed
+            .new_commit()
+            .commit(writer.prepare_commit().await.unwrap())
+            .await
+            .unwrap();
+        let historical = table.copy_with_options(std::collections::HashMap::from([(
+            "scan.snapshot-id".into(),
+            "1".into(),
+        )]));
+        let exported = historical
+            .new_postpone_fixed_bucket_write_builder()
+            .unwrap()
+            .bucket_plan()
+            .await
+            .unwrap()
+            .to_arrow(&historical)
+            .unwrap();
+        assert_eq!(exported.num_rows(), 1);
+        assert_eq!(
+            exported
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .value(0),
+            3
+        );
+        assert_eq!(
+            historical
+                .new_postpone_fixed_bucket_write_builder()
+                .unwrap()
+                .with_overwrite()
+                .bucket_plan()
+                .await
+                .unwrap()
+                .to_arrow(&historical)
+                .unwrap()
+                .num_rows(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn bucket_plan_rejects_conflicting_entries_in_one_bucket() {
+        use crate::spec::{Manifest, ManifestEntry, ManifestList};
+        let io = test_file_io();
+        let path = "memory:/builder_bucket_plan_conflict";
+        setup_dirs(&io, path).await;
+        let table = test_postpone_pk_table(&io, path);
+        let fixed = table
+            .new_postpone_fixed_bucket_write_builder()
+            .unwrap()
+            .with_bucket_plan(bucket_plan(&table, 1));
+        let mut writer = fixed.new_write().unwrap();
+        writer
+            .write_arrow_batch(&make_batch(vec![1], vec![10]))
+            .await
+            .unwrap();
+        fixed
+            .new_commit()
+            .commit(writer.prepare_commit().await.unwrap())
+            .await
+            .unwrap();
+        let manager = table.snapshot_manager();
+        let snapshot = manager.get_snapshot(1).await.unwrap();
+        let list_path = manager.manifest_path(snapshot.delta_manifest_list());
+        let mut metas = ManifestList::read(&io, &list_path).await.unwrap();
+        let manifest_path = manager.manifest_path(metas[0].file_name());
+        let mut entries = Manifest::read(&io, &manifest_path).await.unwrap();
+        let original = &entries[0];
+        let mut file = original.file().clone();
+        file.file_name = "different-bucket-count.parquet".into();
+        entries.push(ManifestEntry::new(
+            *original.kind(),
+            original.partition().to_vec(),
+            original.bucket(),
+            2,
+            file,
+            2,
+        ));
+        Manifest::write(&io, &manifest_path, &entries)
+            .await
+            .unwrap();
+        let mut meta = serde_json::to_value(&metas[0]).unwrap();
+        meta["_NUM_ADDED_FILES"] = serde_json::json!(entries.len());
+        meta["_TOTAL_BUCKETS"] = serde_json::Value::Null;
+        metas[0] = serde_json::from_value(meta).unwrap();
+        ManifestList::write(&io, &list_path, &metas).await.unwrap();
+        let error = table
+            .new_postpone_fixed_bucket_write_builder()
+            .unwrap()
+            .bucket_plan()
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("conflicting total bucket counts"));
     }
 
     #[tokio::test]

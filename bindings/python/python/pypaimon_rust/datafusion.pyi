@@ -773,6 +773,14 @@ class PostponeFixedBucketWriteBuilder:
     Rescaling and compaction are not performed.
     """
     def _with_commit_user(self, commit_user: str) -> "PostponeFixedBucketWriteBuilder": ...
+    def bucket_plan(self) -> pyarrow.RecordBatch:
+        """Known partition layouts from the latest writer snapshot, without SELECT.
+
+        Uses the with_bucket_plan schema. Explicit plans take precedence;
+        overwrite otherwise returns no existing layouts. Configured defaults
+        do not create partition rows in this metadata plan.
+        """
+        ...
     def with_bucket_plan(self, plan: pyarrow.RecordBatch) -> "PostponeFixedBucketWriteBuilder":
         """Partition columns in schema order followed by total_buckets: int32.
 
