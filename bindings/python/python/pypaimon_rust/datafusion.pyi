@@ -57,6 +57,9 @@ class Split:
     def serialize(self) -> bytes: ...
 
 class Plan:
+    def __init__(self, snapshot_id: Optional[int], splits: Iterable[Split]) -> None:
+        """Capture typed split metadata; constructing a plan does not authorize execution."""
+        ...
     def snapshot_id(self) -> Optional[int]:
         """Selected snapshot, preserved for empty plans; None if no snapshot was selected."""
         ...
@@ -65,6 +68,16 @@ class Plan:
         """Lightweight statistics collected during ordinary planning."""
         ...
     def __len__(self) -> int: ...
+
+class RowIdPlan:
+    def __init__(self, plan: Plan) -> None:
+        """Group complete data-evolution files from plan_all without reading manifests."""
+        ...
+    def snapshot_id(self) -> Optional[int]: ...
+    def groups(self) -> List[Tuple[int, int, Split]]:
+        """Inclusive row-ID bounds and all physical files of each logical group."""
+        ...
+    def plan(self) -> Plan: ...
 
 class ScanStats:
     """Read-only counters from normal metadata planning."""
@@ -417,6 +430,14 @@ class Table:
         """
         ...
 
+class GlobalIndexBuildPlan:
+    def snapshot_id(self) -> Optional[int]: ...
+    def shards(self) -> List["GlobalIndexBuildShard"]: ...
+
+class GlobalIndexBuildShard:
+    def snapshot_id(self) -> int: ...
+    def row_range(self) -> Tuple[int, int]: ...
+
 class GlobalIndexBuildBuilder:
     @staticmethod
     def supports_index_type(index_type: str) -> bool: ...
@@ -425,6 +446,16 @@ class GlobalIndexBuildBuilder:
     def with_index_type(self, index_type: str) -> "GlobalIndexBuildBuilder": ...
     def with_options(self, options: Dict[str, str]) -> "GlobalIndexBuildBuilder": ...
     def with_partition_filter(self, predicate: Dict[str, Any]) -> "GlobalIndexBuildBuilder": ...
+    def plan(self) -> GlobalIndexBuildPlan:
+        """Capture independently executable vindex shards at one snapshot."""
+        ...
+    def build_shard(self, shard: GlobalIndexBuildShard) -> List["CommitMessage"]:
+        """Build one captured shard with fresh worker authorization.
+
+        The shard supplies its schema, index configuration and options;
+        this builder supplies the worker table and I/O environment.
+        """
+        ...
     def build(self) -> List["CommitMessage"]:
         """Build unpublished index files; the caller decides whether to commit or abort."""
         ...
@@ -477,6 +508,17 @@ class BatchTableWrite:
         ...
 
 class BatchTableUpdate:
+    def with_plan(self, plan: Plan) -> "BatchTableUpdate":
+        """Reuse complete plan_all file groups for row-ID updates and deletes.
+
+        Workers reauthorize against the table; a plan is metadata, not a grant.
+        Data manifests are not replanned. Deletes still read the captured index
+        manifest to preserve deletion vectors for every file in the bucket.
+        Assign all deletes for one partition/bucket to the same worker.
+        Selected row ranges, scores and streaming splits are not mutation plans.
+        Other update operations reject this configuration before consuming input.
+        """
+        ...
     def with_blob_uri_reader_factory(
         self, factory: Optional[UriReaderFactory]
     ) -> "BatchTableUpdate": ...
@@ -540,6 +582,17 @@ class TableUpdateByRowId:
     def _abort(self) -> None: ...
 
 class StreamTableUpdate:
+    def with_plan(self, plan: Plan) -> "StreamTableUpdate":
+        """Reuse complete plan_all file groups for row-ID updates and deletes.
+
+        Workers reauthorize against the table; a plan is metadata, not a grant.
+        Data manifests are not replanned. Deletes still read the captured index
+        manifest to preserve deletion vectors for every file in the bucket.
+        Assign all deletes for one partition/bucket to the same worker.
+        Selected row ranges, scores and streaming splits are not mutation plans.
+        Other update operations reject this configuration before consuming input.
+        """
+        ...
     def with_blob_uri_reader_factory(
         self, factory: Optional[UriReaderFactory]
     ) -> "StreamTableUpdate": ...
@@ -706,6 +759,11 @@ class BatchTableCommit:
         snapshot_properties: Optional[Dict[str, str]] = None,
     ) -> None:
         """Commit once, using the builder's overwrite configuration and batch identifier."""
+        ...
+    def check_row_id_conflicts(
+        self, messages: Iterable[CommitMessage], latest_snapshot_id: int, check_from_snapshot: int
+    ) -> None:
+        """Check captured DML history without publishing; compactions are ignored."""
         ...
     def truncate_table(self) -> None:
         """Truncate all data; shares the one-time guard with commit()."""

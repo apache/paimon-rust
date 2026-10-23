@@ -31,6 +31,30 @@ pub enum Error {
     /// A configured resource budget could not admit the requested reservation.
     #[snafu(display("Paimon resource exhausted: {}", message))]
     ResourceExhausted { message: String },
+    /// A staged row-ID range no longer matches the current data-file layout.
+    ///
+    /// `current_row_count` is present only for a DELETE whose physical file
+    /// still exists with different row-ID metadata. Logical DML conflicts and
+    /// uncertain publication outcomes must not be classified as this error.
+    #[snafu(display(
+        "{}",
+        row_id_existence_conflict_message(
+            file_name,
+            first_row_id,
+            row_count,
+            bucket,
+            current_first_row_id,
+            current_row_count
+        )
+    ))]
+    RowIdExistenceConflict {
+        file_name: String,
+        first_row_id: Option<i64>,
+        row_count: i64,
+        bucket: i32,
+        current_first_row_id: Option<i64>,
+        current_row_count: Option<i64>,
+    },
     #[snafu(whatever, display("Paimon data invalid for {}: {:?}", message, source))]
     DataInvalid {
         message: String,
@@ -149,6 +173,34 @@ pub enum Error {
         #[snafu(source)]
         source: crate::api::rest_error::RestError,
     },
+}
+
+fn row_id_existence_conflict_message(
+    file_name: &str,
+    first_row_id: &Option<i64>,
+    row_count: &i64,
+    bucket: &i32,
+    current_first_row_id: &Option<i64>,
+    current_row_count: &Option<i64>,
+) -> String {
+    let first_row_id = first_row_id.map_or_else(|| "null".into(), |value| value.to_string());
+    if let Some(current_row_count) = current_row_count {
+        let current_first_row_id =
+            current_first_row_id.map_or_else(|| "null".into(), |value| value.to_string());
+        format!(
+            "Row ID existence conflict: DELETE for file '{file_name}' references \
+             firstRowId={first_row_id}, rowCount={row_count} in bucket {bucket}, but the current \
+             file has firstRowId={current_first_row_id}, rowCount={current_row_count}. The file \
+             may have been reassigned by a concurrent commit."
+        )
+    } else {
+        format!(
+            "Row ID existence conflict: file '{file_name}' references firstRowId={first_row_id}, \
+             rowCount={row_count} in bucket {bucket}, but no matching file exists in the current \
+             snapshot. The referenced file may have been rewritten by a concurrent compaction \
+             or removed by an overwrite."
+        )
+    }
 }
 
 impl From<opendal::Error> for Error {

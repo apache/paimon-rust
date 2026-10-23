@@ -993,6 +993,8 @@ pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> 
     this.add_class::<crate::table::PyTable>()?;
     this.add_class::<crate::system_table::PySystemRead>()?;
     this.add_class::<crate::index_build::PyGlobalIndexBuildBuilder>()?;
+    this.add_class::<crate::index_build::PyGlobalIndexBuildPlan>()?;
+    this.add_class::<crate::index_build::PyGlobalIndexBuildShard>()?;
     this.add_class::<crate::index_build::PyGlobalIndexDropBuilder>()?;
     this.add_class::<crate::full_text_search::PyFullTextSearchBuilder>()?;
     this.add_class::<crate::full_text_search::PyFullTextScan>()?;
@@ -1019,6 +1021,7 @@ pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> 
     this.add_class::<crate::read::PyTableScan>()?;
     this.add_class::<crate::read::PyStreamTableScan>()?;
     this.add_class::<crate::read::PyPlan>()?;
+    this.add_class::<crate::read::PyRowIdPlan>()?;
     this.add_class::<crate::read::PyFileScanPlan>()?;
     this.add_class::<crate::read::PyScanStats>()?;
     this.add_class::<crate::read::PyTableRead>()?;

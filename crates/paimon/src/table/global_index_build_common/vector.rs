@@ -26,7 +26,7 @@ use crate::table::{RowRange, Table};
 use crate::{Error, Result};
 use std::collections::HashMap;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct VectorIndexShard {
     pub(crate) partition: BinaryRow,
     pub(crate) partition_bytes: Vec<u8>,

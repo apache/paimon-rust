@@ -26,6 +26,190 @@ const EVOLUTION_OPTIONS: &[(&str, &str)] = &[
     ("deletion-vectors.enabled", "true"),
 ];
 
+#[tokio::test]
+async fn transported_row_id_plans_keep_the_rest_snapshot_after_concurrent_append() {
+    for delete in [false, true] {
+        let fixture = RestTable::new(false, EVOLUTION_OPTIONS).await;
+        fixture.append("seed", &[(1, "a", 10)], false).await;
+        fixture.state.deny_query.store(false, Ordering::SeqCst);
+        let plan = fixture
+            .table
+            .new_read_builder()
+            .new_scan()
+            .plan_all()
+            .await
+            .unwrap();
+        assert_eq!(plan.snapshot_id(), Some(1));
+        fixture.append("concurrent", &[(2, "a", 20)], false).await;
+        let requests = fixture.state.query_requests.load(Ordering::SeqCst);
+        let mut update = fixture.table.new_write_builder().new_update().unwrap();
+        update.with_plan(plan).unwrap();
+        let messages = if delete {
+            update.delete_by_row_id(vec![0]).await.unwrap()
+        } else {
+            update
+                .update_by_arrow_with_row_id(vec![row_update(0, 99)])
+                .await
+                .unwrap()
+        };
+        assert_eq!(messages[0].check_from_snapshot, Some(1));
+        assert!(fixture.state.query_requests.load(Ordering::SeqCst) > requests);
+        fixture
+            .table
+            .new_write_builder()
+            .new_commit()
+            .commit(messages)
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture.stored_rows().await,
+            if delete {
+                vec![(2, "a".into(), 20)]
+            } else {
+                vec![(1, "a".into(), 99), (2, "a".into(), 20)]
+            }
+        );
+        fixture
+            .table
+            .snapshot_manager()
+            .delete_snapshot(1)
+            .await
+            .unwrap();
+        let error = if delete {
+            update.delete_by_row_id(vec![0]).await.unwrap_err()
+        } else {
+            update
+                .update_by_arrow_with_row_id(vec![row_update(0, 100)])
+                .await
+                .unwrap_err()
+        };
+        assert!(matches!(
+            error,
+            crate::Error::SnapshotNotExist { snapshot_id: 1 }
+        ));
+    }
+}
+
+#[tokio::test]
+async fn transported_row_id_plans_refresh_whole_table_authorization_without_snapshot_files() {
+    for delete in [false, true] {
+        for response in [None]
+            .into_iter()
+            .chain(restricted_responses().into_iter().map(Some))
+        {
+            let fixture = RestTable::new(false, EVOLUTION_OPTIONS).await;
+            fixture.append("seed", &[(1, "a", 10)], false).await;
+            fixture.state.deny_query.store(false, Ordering::SeqCst);
+            let plan = fixture
+                .table
+                .new_read_builder()
+                .new_scan()
+                .plan_all()
+                .await
+                .unwrap();
+            let requests = fixture.state.query_requests.load(Ordering::SeqCst);
+            if let Some(response) = response {
+                *fixture.state.query_response.lock().await = response;
+            } else {
+                fixture.state.deny_query.store(true, Ordering::SeqCst);
+            }
+            let before = fixture
+                .table
+                .file_io()
+                .list_status_recursive(fixture.table.location())
+                .await
+                .unwrap()
+                .len();
+            let mut update = fixture.table.new_write_builder().new_update().unwrap();
+            update.with_plan(plan).unwrap();
+            let result = if delete {
+                update.delete_by_row_id(vec![0]).await
+            } else {
+                update
+                    .update_by_arrow_with_row_id(vec![row_update(0, 99)])
+                    .await
+            };
+            assert!(
+                result.is_err(),
+                "captured grant must not survive a policy change"
+            );
+            assert!(fixture.state.query_requests.load(Ordering::SeqCst) > requests);
+            assert_eq!(
+                fixture
+                    .table
+                    .file_io()
+                    .list_status_recursive(fixture.table.location())
+                    .await
+                    .unwrap()
+                    .len(),
+                before
+            );
+        }
+    }
+    let fixture = RestTable::new(false, EVOLUTION_OPTIONS).await;
+    fixture.append("seed", &[(1, "a", 10)], false).await;
+    fixture.state.deny_query.store(false, Ordering::SeqCst);
+    let plan = fixture
+        .table
+        .new_read_builder()
+        .new_scan()
+        .plan_all()
+        .await
+        .unwrap();
+    fixture
+        .table
+        .file_io()
+        .delete_dir(&format!("{}/snapshot", fixture.table.location()))
+        .await
+        .unwrap();
+    assert!(fixture
+        .table
+        .snapshot_manager()
+        .get_snapshot(1)
+        .await
+        .is_err());
+    let mut update = fixture.table.new_write_builder().new_update().unwrap();
+    update.with_plan(plan).unwrap();
+    let messages = update
+        .update_by_arrow_with_row_id(vec![row_update(0, 99)])
+        .await
+        .unwrap();
+    assert_eq!(messages[0].check_from_snapshot, Some(1));
+    assert_eq!(
+        update.delete_by_row_id(vec![0]).await.unwrap()[0].check_from_snapshot,
+        Some(1)
+    );
+}
+
+#[tokio::test]
+async fn restricted_read_plans_cannot_be_repurposed_as_mutation_plans_after_policy_relaxes() {
+    let fixture = RestTable::new(false, EVOLUTION_OPTIONS).await;
+    fixture.append("seed", &[(1, "a", 10)], false).await;
+    fixture.state.deny_query.store(false, Ordering::SeqCst);
+    *fixture.state.query_response.lock().await = restricted_responses().remove(0);
+    let plan = fixture
+        .table
+        .new_read_builder()
+        .new_scan()
+        .plan()
+        .await
+        .unwrap();
+    *fixture.state.query_response.lock().await = serde_json::json!({});
+    let mut update = fixture.table.new_write_builder().new_update().unwrap();
+    update.with_plan(plan).unwrap();
+    let error = update
+        .update_by_arrow_with_row_id(vec![row_update(0, 99)])
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("filtered or masked read plan"));
+    assert!(update
+        .delete_by_row_id(vec![0])
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("filtered or masked read plan"));
+}
+
 fn row_update(row_id: i64, value: i32) -> RecordBatch {
     RecordBatch::try_from_iter([
         (

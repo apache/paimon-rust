@@ -79,6 +79,7 @@ mod full_text_index_build_builder;
 mod full_text_search_builder;
 mod global_index_build_builder;
 pub(crate) mod global_index_build_common;
+mod global_index_build_plan;
 mod global_index_drop_builder;
 mod global_index_freshness;
 mod global_index_result;
@@ -222,6 +223,7 @@ pub use full_text_search_builder::{
 };
 use futures::stream::BoxStream;
 pub use global_index_build_builder::GlobalIndexBuildBuilder;
+pub use global_index_build_plan::{GlobalIndexBuildPlan, GlobalIndexBuildShard};
 pub use global_index_drop_builder::GlobalIndexDropBuilder;
 pub use global_index_result::{
     GlobalIndexResult, GlobalIndexResultReadBuilder, PrimaryKeySearchPosition,
@@ -263,7 +265,7 @@ pub use table_merge_into::{
 pub use table_read::{AuditLogRead, TableRead};
 pub use table_scan::{AuditLogScan, FileScanPlan, TableScan};
 pub use table_update::TableUpdate;
-pub use table_update_by_row_id::TableUpdateByRowId;
+pub use table_update_by_row_id::{RowIdPlan, TableUpdateByRowId};
 pub use table_write::TableWrite;
 pub use tag_manager::TagManager;
 pub use update_assignment::UpdateAssignment;
