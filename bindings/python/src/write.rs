@@ -30,7 +30,7 @@ use paimon::table::{
     COMMIT_MESSAGE_SERIALIZER_VERSION,
 };
 use paimon_datafusion::runtime::runtime;
-use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
+use pyo3::exceptions::{PyModuleNotFoundError, PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyString};
 use pyo3::{PyTraverseError, PyVisit};
@@ -45,7 +45,23 @@ type PythonPartitionSpec = HashMap<String, Py<PyAny>>;
 
 fn delete_row_id_arrays(row_ids: &Bound<'_, PyAny>) -> PyResult<Vec<Int64Array>> {
     let py = row_ids.py();
-    let pa = py.import("pyarrow")?;
+    let pa = match py.import("pyarrow") {
+        Ok(pa) => pa,
+        // Plain sequence deletes do not require the optional PyArrow package.
+        // Preserve errors from a broken installation or its dependencies.
+        Err(error)
+            if error.is_instance_of::<PyModuleNotFoundError>(py)
+                && error
+                    .value(py)
+                    .getattr("name")?
+                    .extract::<Option<String>>()?
+                    .as_deref()
+                    == Some("pyarrow") =>
+        {
+            return Ok(vec![Int64Array::from(row_ids.extract::<Vec<i64>>()?)]);
+        }
+        Err(error) => return Err(error),
+    };
     let is_array = row_ids.is_instance(&pa.getattr("Array")?)?;
     let is_chunked = row_ids.is_instance(&pa.getattr("ChunkedArray")?)?;
     if !is_array && !is_chunked {

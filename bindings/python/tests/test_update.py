@@ -128,6 +128,47 @@ def test_arrow_row_id_delete_input_validation(tmp_path, stream):
     assert table.latest_snapshot().id() == 1
 
 
+@pytest.mark.parametrize('stream', [False, True])
+def test_sequence_row_id_deletes_do_not_require_pyarrow(tmp_path, stream, monkeypatch):
+    import builtins
+
+    context = SQLContext()
+    context.register_catalog('paimon', {'warehouse': str(tmp_path)})
+    context.sql('CREATE SCHEMA paimon.sequence_deletes')
+    context.sql("""CREATE TABLE paimon.sequence_deletes.t (id INT) WITH (
+        'row-tracking.enabled' = 'true', 'data-evolution.enabled' = 'true',
+        'deletion-vectors.enabled' = 'true')""")
+    context.sql('INSERT INTO paimon.sequence_deletes.t (id) VALUES (10), (20), (30)')
+
+    original_import = builtins.__import__
+
+    def without_pyarrow(name, *args, **kwargs):
+        if name == 'pyarrow' or name.startswith('pyarrow.'):
+            raise ModuleNotFoundError("No module named 'pyarrow'", name='pyarrow')
+        return original_import(name, *args, **kwargs)
+
+    # PyArrow is optional for the SDK. Plain sequence deletes and commits
+    # must remain usable against existing tables without that dependency.
+    with monkeypatch.context() as patched:
+        patched.setattr(builtins, '__import__', without_pyarrow)
+        table = PaimonCatalog({'warehouse': str(tmp_path)}).get_table('sequence_deletes.t')
+        builder = (table.new_stream_write_builder().with_commit_user('sequence-deletes')
+                   if stream else table.new_batch_write_builder())
+        for identifier, row_ids in enumerate([[], [0], (1,)]):
+            update = builder.new_update()
+            messages = (update.delete_by_row_id(row_ids, identifier) if stream
+                        else update.delete_by_row_id(row_ids))
+            if not row_ids:
+                assert messages == []
+                continue
+            assert messages
+            commit = builder.new_commit()
+            commit.commit(identifier, messages) if stream else commit.commit(messages)
+
+    assert pa.Table.from_batches(context.sql(
+        'SELECT id FROM paimon.sequence_deletes.t')).column('id').to_pylist() == [30]
+
+
 def test_upsert_batches_preserve_missing_fields_nulls_and_stream_updates(tmp_path):
     context = SQLContext()
     context.register_catalog('paimon', {'warehouse': str(tmp_path)})
