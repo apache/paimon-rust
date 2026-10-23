@@ -230,7 +230,8 @@ pub use global_index_result::{
 };
 pub use global_index_types::{normalize_global_index_type, SUPPORTED_GLOBAL_INDEX_TYPES_FOR_DROP};
 pub use hybrid_search_builder::{
-    HybridSearchBuilder, HybridSearchRanker, HybridSearchRoute, HybridSearchRouteKind,
+    HybridSearchBuilder, HybridSearchRanker, HybridSearchRoute, HybridSearchRouteBuilder,
+    HybridSearchRouteKind, HybridSearchRouteResult, HybridSearchWeightedResult,
 };
 pub use incremental_scan::{
     IncrementalPlan, IncrementalScan, IncrementalScanMode, IncrementalSplit,

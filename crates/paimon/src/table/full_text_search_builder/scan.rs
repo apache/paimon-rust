@@ -31,17 +31,16 @@ pub(super) struct PlanContext {
 }
 
 impl PlanContext {
-    pub(super) fn new(builder: &FullTextSearchBuilder<'_>) -> crate::Result<Self> {
-        let core = builder.table.schema().core_options();
+    pub(super) fn new(table: &Table, config: &FullTextSearchConfig) -> crate::Result<Self> {
+        let core = table.schema().core_options();
         core.ensure_read_authorized()?;
-        let column = builder
+        let column = config
             .text_column
             .as_deref()
             .ok_or_else(|| crate::Error::ConfigInvalid {
                 message: "Text column must be set via with_query() or with_text_column()".into(),
             })?;
-        let field = builder
-            .table
+        let field = table
             .schema()
             .fields()
             .iter()
@@ -57,16 +56,16 @@ impl PlanContext {
                 message: format!("Full-text column '{column}' must be a character string"),
             });
         }
-        let has_row_filter = builder.filter.as_ref().is_some_and(|filter| {
+        let has_row_filter = config.filter.as_ref().is_some_and(|filter| {
             let (_, data) = split_partition_and_data_predicates(
                 filter.clone(),
-                builder.table.schema().fields(),
-                builder.table.schema().partition_keys(),
+                table.schema().fields(),
+                table.schema().partition_keys(),
             );
             !data.is_empty()
         });
         if has_row_filter && !core.data_evolution_enabled() {
-            if !builder.table.schema().primary_keys().is_empty()
+            if !table.schema().primary_keys().is_empty()
                 || !core.row_tracking_enabled()
                 || core.file_format() != "parquet"
             {
@@ -82,7 +81,7 @@ impl PlanContext {
         }
         let primary_key_field_id =
             resolves_to_pk_full_text_path(&core, column).then_some(field.id());
-        if primary_key_field_id.is_some() && builder.include_row_ids.is_some() {
+        if primary_key_field_id.is_some() && config.include_row_ids.is_some() {
             return Err(crate::Error::Unsupported {
                 message:
                     "primary-key full-text search uses physical file positions, not global row IDs"
@@ -91,8 +90,8 @@ impl PlanContext {
         }
         Ok(Self {
             column: column.into(),
-            filter: builder.filter.clone(),
-            include_row_ids: builder.include_row_ids.clone(),
+            filter: config.filter.clone(),
+            include_row_ids: config.include_row_ids.clone(),
             primary_key_field_id,
         })
     }
@@ -188,10 +187,10 @@ pub struct FullTextScan {
 }
 
 impl FullTextScan {
-    pub(super) fn new(builder: &FullTextSearchBuilder<'_>) -> crate::Result<Self> {
+    pub(super) fn new(table: &Table, config: &FullTextSearchConfig) -> crate::Result<Self> {
         Ok(Self {
-            table: builder.table.clone(),
-            context: PlanContext::new(builder)?,
+            table: table.clone(),
+            context: PlanContext::new(table, config)?,
         })
     }
 

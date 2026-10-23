@@ -253,10 +253,7 @@ async fn parallel_native_writers_match_serial_shards_and_incremental_coverage() 
                     .execute()
                     .await
                     .unwrap();
-                let mut ids = result
-                    .into_iter()
-                    .map(|range| range.from())
-                    .collect::<Vec<_>>();
+                let mut ids = result.into_row_ids().unwrap().row_ids;
                 ids.sort_unstable();
                 assert_eq!(ids, (1..24).step_by(2).collect::<Vec<_>>());
             }

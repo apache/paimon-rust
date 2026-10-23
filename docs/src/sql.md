@@ -2228,7 +2228,8 @@ let result = builder.new_read()?.read(plan).await?;
 `FullTextScanPlan` owns a pinned snapshot and can outlive its scan. Readers
 for the same table, branch, column and filter can reuse the plan with different
 queries or limits. Pinning preserves the query's bound schema, including
-schema-only column renames. `execute_scored()` performs both stages directly.
+schema-only column renames. `execute()` performs both stages directly and returns
+`GlobalIndexResult`, including scores and the captured read context.
 
 For Data Evolution, full-text and scalar `fast`, `full`, and `detail` modes
 follow Java's coverage rules. Inexact scalar candidates are read back only

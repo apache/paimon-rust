@@ -52,7 +52,7 @@ async fn scalar_modes_preserve_missing_and_partial_coverage() {
         assert_eq!(
             ids(query(&table)
                 .with_filter(filter.clone())
-                .execute_scored()
+                .execute()
                 .await
                 .unwrap()),
             expected,
@@ -76,7 +76,7 @@ async fn scalar_modes_preserve_missing_and_partial_coverage() {
         assert_eq!(
             ids(query(&table)
                 .with_filter(filter.clone())
-                .execute_scored()
+                .execute()
                 .await
                 .unwrap()),
             expected,
@@ -115,7 +115,7 @@ async fn candidate_refinement_keeps_rust_defaults_and_original_scores() {
         pb.greater_or_equal("id", Datum::Int(5)).unwrap(),
     ]);
     let all = query(&table)
-        .execute_scored()
+        .execute()
         .await
         .unwrap()
         .into_row_ids()
@@ -123,7 +123,7 @@ async fn candidate_refinement_keeps_rust_defaults_and_original_scores() {
     let filtered = query(&table)
         .with_filter(filter.clone())
         .with_limit(2)
-        .execute_scored()
+        .execute()
         .await
         .unwrap();
     assert_eq!(ids(filtered.clone()), vec![5, 7]);
@@ -139,13 +139,13 @@ async fn candidate_refinement_keeps_rust_defaults_and_original_scores() {
     )]));
     assert!(query(&no_refine)
         .with_filter(filter)
-        .execute_scored()
+        .execute()
         .await
         .unwrap()
         .is_empty());
     assert!(query(&table)
         .with_filter(pb.equal("label", Datum::String("missing".into())).unwrap())
-        .execute_scored()
+        .execute()
         .await
         .unwrap()
         .is_empty());
@@ -166,17 +166,17 @@ async fn partition_scalar_and_include_filters_precede_top_k() {
         ]);
         let mut builder = query(&table);
         builder.with_filter(filter).with_limit(2);
-        let result = builder.execute_scored().await.unwrap();
+        let result = builder.execute().await.unwrap();
         assert_eq!(user_ids(&table, result.clone()).await, vec![5, 7]);
         // Partition commit order assigns global IDs independently of user IDs.
         let last = *result.row_ids().unwrap().row_ids.iter().max().unwrap();
         builder.with_include_row_ids([last, 9].into_iter().collect());
         assert_eq!(
-            user_ids(&table, builder.execute_scored().await.unwrap()).await,
+            user_ids(&table, builder.execute().await.unwrap()).await,
             vec![7],
         );
         builder.with_include_row_ids(RoaringTreemap::new());
-        assert!(builder.execute_scored().await.unwrap().is_empty());
+        assert!(builder.execute().await.unwrap().is_empty());
     }
 }
 
@@ -251,7 +251,7 @@ async fn deletion_vectors_filter_exact_index_hits_before_top_k_and_pin_snapshot(
     delete_row(&table, 5).await;
 
     assert_eq!(ids(read.read(plan).await.unwrap()), vec![1, 5]);
-    let result = builder.execute_scored().await.unwrap();
+    let result = builder.execute().await.unwrap();
     assert_eq!(ids(result.clone()), vec![1, 7]);
     let batches: Vec<RecordBatch> = result
         .new_read_builder()
@@ -317,7 +317,7 @@ async fn removed_files_do_not_supply_exact_index_hits() {
         .await
         .unwrap();
     assert_eq!(ids(read.read(plan).await.unwrap()), vec![1]);
-    assert_eq!(ids(builder.execute_scored().await.unwrap()), vec![5]);
+    assert_eq!(ids(builder.execute().await.unwrap()), vec![5]);
 }
 
 #[tokio::test]
@@ -332,7 +332,7 @@ async fn empty_filtered_plans_stay_empty_after_index_build() {
     index(&table, "full-text", "text").await;
     index(&table, "btree", "label").await;
     assert!(read.read(plan).await.unwrap().is_empty());
-    assert_eq!(ids(builder.execute_scored().await.unwrap()), vec![1]);
+    assert_eq!(ids(builder.execute().await.unwrap()), vec![1]);
 }
 
 #[tokio::test]
@@ -353,7 +353,7 @@ async fn unsupported_append_filter_combinations_fail_before_empty_snapshot() {
         let table = table.copy_with_options(HashMap::from([(option.into(), value.into())]));
         let error = query(&table)
             .with_filter(keep_filter(&table))
-            .execute_scored()
+            .execute()
             .await
             .unwrap_err();
         assert!(
@@ -377,7 +377,7 @@ async fn unsupported_append_filter_combinations_fail_before_empty_snapshot() {
     );
     assert!(query(&pk)
         .with_filter(keep_filter(&pk))
-        .execute_scored()
+        .execute()
         .await
         .unwrap_err()
         .to_string()

@@ -23,10 +23,22 @@ use crate::table::vector_scan::{PlanContext, VectorScan};
 use crate::table::vector_search_common::{add_filter, validate_partition_filter};
 use crate::table::Table;
 use crate::vector_search::GlobalIndexResult;
+use std::borrow::Cow;
 use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 
+/// Configures a vector query. Clones share the same live configuration.
+///
+/// Each scan, reader, or execution captures its settings before performing I/O;
+/// later edits affect future requests without changing work already created.
+#[derive(Clone)]
 pub struct VectorSearchBuilder<'a> {
-    table: &'a Table,
+    table: Cow<'a, Table>,
+    config: Arc<RwLock<VectorSearchConfig>>,
+}
+
+#[derive(Clone, Default)]
+struct VectorSearchConfig {
     vector_column: Option<String>,
     query_vector: Option<Vec<f32>>,
     limit: Option<usize>,
@@ -37,32 +49,43 @@ pub struct VectorSearchBuilder<'a> {
 impl<'a> VectorSearchBuilder<'a> {
     pub(crate) fn new(table: &'a Table) -> Self {
         Self {
-            table,
-            vector_column: None,
-            query_vector: None,
-            limit: None,
-            options: HashMap::new(),
-            filter: None,
+            table: Cow::Borrowed(table),
+            config: Arc::new(RwLock::new(VectorSearchConfig::default())),
+        }
+    }
+
+    pub(crate) fn from_owned(table: Arc<Table>) -> VectorSearchBuilder<'static> {
+        VectorSearchBuilder {
+            table: Cow::Owned(table.as_ref().clone()),
+            config: Arc::new(RwLock::new(VectorSearchConfig::default())),
+        }
+    }
+
+    /// Retain this builder's table and shared configuration without a borrow.
+    pub fn into_owned(self) -> VectorSearchBuilder<'static> {
+        VectorSearchBuilder {
+            table: Cow::Owned(self.table.into_owned()),
+            config: self.config,
         }
     }
 
     pub fn with_vector_column(&mut self, name: &str) -> &mut Self {
-        self.vector_column = Some(name.to_string());
+        self.config.write().unwrap().vector_column = Some(name.to_string());
         self
     }
 
     pub fn with_query_vector(&mut self, vector: Vec<f32>) -> &mut Self {
-        self.query_vector = Some(vector);
+        self.config.write().unwrap().query_vector = Some(vector);
         self
     }
 
     pub fn with_limit(&mut self, limit: usize) -> &mut Self {
-        self.limit = Some(limit);
+        self.config.write().unwrap().limit = Some(limit);
         self
     }
 
     pub fn with_options(&mut self, options: HashMap<String, String>) -> &mut Self {
-        self.options.extend(options);
+        self.config.write().unwrap().options.extend(options);
         self
     }
 
@@ -78,68 +101,89 @@ impl<'a> VectorSearchBuilder<'a> {
     /// ranges are scored from raw data even in FAST mode. Raw searches always
     /// apply the row predicate before Top-K, matching Java.
     pub fn with_filter(&mut self, filter: Predicate) -> &mut Self {
-        add_filter(&mut self.filter, filter);
+        add_filter(&mut self.config.write().unwrap().filter, filter);
         self
     }
 
     /// Add a partition-only predicate expressed against the table schema.
     pub fn with_partition_filter(&mut self, filter: Predicate) -> crate::Result<&mut Self> {
-        validate_partition_filter(self.table, &filter)?;
+        validate_partition_filter(&self.table, &filter)?;
         Ok(self.with_filter(filter))
     }
 
     /// Create a query-independent scan. Only the vector column must be configured.
     pub fn new_scan(&self) -> crate::Result<VectorScan> {
+        let config = self.config.read().unwrap().clone();
+        self.scan_with_config(&config)
+    }
+
+    fn scan_with_config(&self, config: &VectorSearchConfig) -> crate::Result<VectorScan> {
         CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
-        let column = self
-            .vector_column
-            .as_deref()
-            .ok_or_else(|| crate::Error::ConfigInvalid {
-                message: "Vector column must be set via with_vector_column()".to_string(),
-            })?;
-        VectorScan::new(self.table, column, self.filter.as_ref(), None, None)
-            .map(|scan| scan.with_options(&self.options))
+        let column =
+            config
+                .vector_column
+                .as_deref()
+                .ok_or_else(|| crate::Error::ConfigInvalid {
+                    message: "Vector column must be set via with_vector_column()".to_string(),
+                })?;
+        VectorScan::new(&self.table, column, config.filter.as_ref(), None, None)
+            .map(|scan| scan.with_options(&config.options))
     }
 
     /// Create an owned reader; query errors are reported before planning.
     pub fn new_read(&self) -> crate::Result<VectorRead> {
-        let (column, query, limit) = self.query()?;
-        let context = PlanContext::new(self.table, column, self.filter.as_ref(), None, None)?;
+        let config = self.config.read().unwrap().clone();
+        self.read_with_config(&config)
+    }
+
+    fn read_with_config(&self, config: &VectorSearchConfig) -> crate::Result<VectorRead> {
+        let (column, query, limit) = self.query(config)?;
+        let context = PlanContext::new(&self.table, column, config.filter.as_ref(), None, None)?;
         Ok(VectorRead {
             batch: BatchVectorRead::new(
-                self.table,
+                &self.table,
                 column,
                 &[query],
                 limit,
-                &self.options,
-                self.filter.as_ref(),
+                &config.options,
+                config.filter.as_ref(),
                 context,
             )?,
         })
     }
 
+    pub(crate) fn new_scan_and_read(&self) -> crate::Result<(VectorScan, VectorRead)> {
+        let config = self.config.read().unwrap().clone();
+        let read = self.read_with_config(&config)?;
+        Ok((self.scan_with_config(&config)?, read))
+    }
+
     /// Search locally using the same Scan -> Plan -> Read API exposed to engines.
     /// Use the result's `new_read_builder()` to materialize projected columns.
     pub async fn execute(&self) -> crate::Result<GlobalIndexResult> {
-        let read = self.new_read()?;
-        read.read(self.new_scan()?.plan().await?).await
+        let (scan, read) = self.new_scan_and_read()?;
+        read.read(scan.plan().await?).await
     }
 
-    fn query(&self) -> crate::Result<(&str, &[f32], usize)> {
+    fn query<'c>(
+        &self,
+        config: &'c VectorSearchConfig,
+    ) -> crate::Result<(&'c str, &'c [f32], usize)> {
         CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
-        let column = self
-            .vector_column
-            .as_deref()
-            .ok_or_else(|| crate::Error::ConfigInvalid {
-                message: "Vector column must be set via with_vector_column()".to_string(),
-            })?;
-        let vector = self
+        let column =
+            config
+                .vector_column
+                .as_deref()
+                .ok_or_else(|| crate::Error::ConfigInvalid {
+                    message: "Vector column must be set via with_vector_column()".to_string(),
+                })?;
+        let vector = config
             .query_vector
             .as_deref()
             .ok_or_else(|| crate::Error::ConfigInvalid {
                 message: "Query vector must be set via with_query_vector()".to_string(),
             })?;
-        let limit = self.limit.ok_or_else(|| crate::Error::ConfigInvalid {
+        let limit = config.limit.ok_or_else(|| crate::Error::ConfigInvalid {
             message: "Limit must be set via with_limit()".to_string(),
         })?;
         Ok((column, vector, limit))

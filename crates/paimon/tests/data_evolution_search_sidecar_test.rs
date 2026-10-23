@@ -375,7 +375,7 @@ async fn full_text_and_hybrid_hits_read_latest_variant_sidecars_with_ranked_scor
         .with_text_column("text")
         .with_query_text("needle")
         .with_limit(3)
-        .execute_scored()
+        .execute()
         .await
         .unwrap();
     let text_hits = text.row_ids().unwrap();
@@ -427,7 +427,7 @@ async fn full_text_and_hybrid_hits_read_latest_variant_sidecars_with_ranked_scor
         )
         .unwrap()
         .with_limit(3);
-    let fused = hybrid.execute_scored().await.unwrap();
+    let fused = hybrid.execute().await.unwrap();
     let hits = fused.row_ids().unwrap();
     assert_eq!(
         hits.row_ids,

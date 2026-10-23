@@ -128,6 +128,47 @@ when_not_matched)` with `WhenNotMatched` objects. The factories compile conditio
 once and return an executor with `execute(Table | RecordBatch) -> Table`.
 The calling engine owns joins, authorization and table writes.
 
+### Hybrid Search Phases
+
+Hybrid queries can execute routes separately and then fuse their results:
+
+```python
+hybrid = (table.new_hybrid_search_builder()
+          .add_vector_route("embedding", [1.0, 0.0], 20)
+          .with_limit(10))
+routes = hybrid.route_builders()
+results = [hybrid.to_route_result(route, route.search_builder().execute())
+           for route in routes]
+ranked = hybrid.rank(results)
+```
+
+`route_builders()` checks read authorization and captures one snapshot for all
+routes, including an empty view. Each route retains its search builder: repeated
+`search_builder()` calls return the same object, and configuring it changes later
+`route.execute()` calls. Returned builders retain their snapshot after later
+commits. `to_route_result()` accepts scored
+global results and normalizes empty unscored selections; nonempty unscored or
+physical primary-key selections cannot participate in global row-ID fusion.
+
+For externally evaluated scores, `HybridSearchWeightedResult` and
+`HybridSearchRanker.RRF`, `.WEIGHTED_SCORE`, or `.MRR` provide the same fusion
+without a table or query:
+
+```python
+from pypaimon_rust.datafusion import (
+    GlobalIndexResult, HybridSearchRanker, HybridSearchWeightedResult,
+)
+
+hits = GlobalIndexResult.from_scored_row_ids({7: 0.9, 8: 0.5})
+ranked = HybridSearchRanker.MRR.rank([HybridSearchWeightedResult(hits, 2.0)], 1)
+assert ranked.row_ids() == {7: 2.0}
+```
+
+Rankers use Java's float32 scores, weights and arithmetic. A shared captured read
+context is retained only when every nonempty input belongs to the same table
+view. Fusing external scores or different views returns scores without attaching
+an unrelated table or snapshot.
+
 ### Multimodal SQL Helpers
 
 `SQLContext` also registers Python scalar UDFs for common BLOB media and vector
