@@ -1449,14 +1449,13 @@ async fn authorize_row_id_plan(
             let snapshot = if let Some(snapshot) = table.travel_snapshot() {
                 snapshot.clone()
             } else if table.rest_env().is_some() {
-                table
-                    .snapshot_manager()
-                    .get_latest_snapshot()
-                    .await?
-                    .ok_or_else(|| crate::Error::DataInvalid {
-                        message: "The captured row-ID snapshot no longer exists".into(),
-                        source: None,
-                    })?
+                match table.snapshot_manager().get_latest_snapshot().await? {
+                    Some(snapshot) if snapshot.id() == id => snapshot,
+                    // A concurrent append does not invalidate the captured
+                    // plan. Resolve its exact snapshot rather than replacing
+                    // the worker's conflict baseline with the latest one.
+                    _ => table.snapshot_manager().get_snapshot(id).await?,
+                }
             } else {
                 table.snapshot_manager().get_snapshot(id).await?
             };

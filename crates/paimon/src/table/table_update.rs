@@ -78,7 +78,10 @@ impl TableUpdate {
     /// among workers; the supplied row IDs must belong to that worker's groups.
     /// Arbitrarily trimmed or incremental splits are not mutation plans.
     /// Workers authorize the whole table again and retain the captured snapshot
-    /// as the conflict baseline without re-reading its manifests.
+    /// as the conflict baseline without replanning its data manifests. Deletes
+    /// still read the captured index manifest to preserve all deletion vectors
+    /// when replacing a bucket's shared index file. Assign all deletes for one
+    /// partition/bucket to the same worker.
     /// Predicate, key-based, MERGE and shard operations reject this setting;
     /// use a separately configured updater for those operations.
     pub fn with_plan(&mut self, plan: super::Plan) -> crate::Result<&mut Self> {

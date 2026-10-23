@@ -512,6 +512,9 @@ class BatchTableUpdate:
         """Reuse complete plan_all file groups for row-ID updates and deletes.
 
         Workers reauthorize against the table; a plan is metadata, not a grant.
+        Data manifests are not replanned. Deletes still read the captured index
+        manifest to preserve deletion vectors for every file in the bucket.
+        Assign all deletes for one partition/bucket to the same worker.
         Selected row ranges, scores and streaming splits are not mutation plans.
         Other update operations reject this configuration before consuming input.
         """
@@ -583,6 +586,9 @@ class StreamTableUpdate:
         """Reuse complete plan_all file groups for row-ID updates and deletes.
 
         Workers reauthorize against the table; a plan is metadata, not a grant.
+        Data manifests are not replanned. Deletes still read the captured index
+        manifest to preserve deletion vectors for every file in the bucket.
+        Assign all deletes for one partition/bucket to the same worker.
         Selected row ranges, scores and streaming splits are not mutation plans.
         Other update operations reject this configuration before consuming input.
         """

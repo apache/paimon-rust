@@ -192,6 +192,81 @@ async fn planned_update_rejects_captured_deleted_rows_but_allows_live_rows() {
 }
 
 #[tokio::test]
+async fn planned_delete_preserves_unselected_bucket_deletion_vectors() {
+    use futures::TryStreamExt;
+
+    let table = table("planned_delete_bucket_deletion_vectors").await;
+    let deletes = table
+        .new_write_builder()
+        .new_update()
+        .unwrap()
+        .delete_by_row_id(vec![0])
+        .await
+        .unwrap();
+    let previous_index = deletes[0].new_index_files[0].clone();
+    let previous_anchor = previous_index
+        .deletion_vectors_ranges
+        .as_ref()
+        .unwrap()
+        .keys()
+        .next()
+        .unwrap()
+        .clone();
+    table
+        .new_write_builder()
+        .new_commit()
+        .commit(deletes)
+        .await
+        .unwrap();
+    let plan = table
+        .new_read_builder()
+        .new_scan()
+        .plan_all()
+        .await
+        .unwrap();
+    let routing = crate::table::RowIdPlan::from_plan(plan.clone()).unwrap();
+    // Route only the second anchor. The first anchor's existing deletion
+    // vector must survive replacement of the bucket's shared index file.
+    let selected = routing
+        .groups()
+        .iter()
+        .find(|(first, _, _)| *first == 1)
+        .unwrap()
+        .2
+        .clone();
+    let mut update = table.new_write_builder().new_update().unwrap();
+    update
+        .with_plan(Plan::from_splits(plan.snapshot_id(), vec![selected]))
+        .unwrap();
+    let messages = update.delete_by_row_id(vec![1]).await.unwrap();
+    assert_eq!(messages[0].check_from_snapshot, Some(3));
+    assert_eq!(messages[0].deleted_index_files, vec![previous_index]);
+    let ranges = messages[0].new_index_files[0]
+        .deletion_vectors_ranges
+        .as_ref()
+        .unwrap();
+    assert_eq!(ranges.len(), 2);
+    assert_eq!(ranges[&previous_anchor].cardinality, Some(1));
+    table
+        .new_write_builder()
+        .new_commit()
+        .commit(messages)
+        .await
+        .unwrap();
+    let builder = table.new_read_builder();
+    let plan = builder.new_scan().plan().await.unwrap();
+    let batches: Vec<RecordBatch> = builder
+        .new_read()
+        .unwrap()
+        .to_arrow(plan.splits())
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 0);
+}
+
+#[tokio::test]
 async fn row_id_plan_routes_complete_groups_and_rejects_ambiguous_ranges() {
     let table = table("planned_row_id_routing").await;
     let plan = table
