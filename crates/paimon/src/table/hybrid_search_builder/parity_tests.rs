@@ -30,7 +30,7 @@ use arrow_array::{ArrayRef, Int32Array, ListArray, StringArray};
 use arrow_schema::{DataType as ArrowType, Field, Schema as ArrowSchema};
 use std::sync::Arc;
 
-fn table() -> Table {
+pub(super) fn table() -> Table {
     let schema = Schema::builder()
         .column("id", DataType::Int(IntType::new()))
         .column("text", DataType::VarChar(VarCharType::string_type()))
@@ -61,7 +61,7 @@ fn table() -> Table {
     )
 }
 
-async fn append(table: &Table, start: i32) {
+pub(super) async fn append(table: &Table, start: i32) {
     let columns: Vec<ArrayRef> = vec![
         Arc::new(Int32Array::from(vec![
             start,
@@ -104,7 +104,7 @@ async fn append(table: &Table, start: i32) {
         .unwrap();
 }
 
-async fn index(table: &Table, kind: &str, column: &str) {
+pub(super) async fn index(table: &Table, kind: &str, column: &str) {
     let mut builder = table.new_global_index_build_builder();
     builder.with_index_type(kind).with_index_column(column);
     if kind == "ivf-flat" {
@@ -158,7 +158,7 @@ async fn full_text_route_rejects_plain_text_as_java_does() {
     assert!(builder.execute_scored().await.is_err());
 }
 
-fn mixed_query(table: &Table, route_limit: usize) -> HybridSearchBuilder<'_> {
+pub(super) fn mixed_query(table: &Table, route_limit: usize) -> HybridSearchBuilder<'_> {
     let mut builder = table.new_hybrid_search_builder();
     builder
         .add_vector_route(

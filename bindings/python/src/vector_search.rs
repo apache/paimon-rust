@@ -19,7 +19,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use paimon::spec::Predicate;
-use paimon::table::{BatchVectorRead, Table, VectorRead, VectorScan, VectorScanPlan};
+use paimon::table::{
+    BatchVectorRead, HybridSearchRouteBuilder, Table, VectorRead, VectorScan, VectorScanPlan,
+};
 use paimon_datafusion::runtime::runtime;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyTuple};
@@ -101,6 +103,23 @@ impl PyVectorSearchBuilder {
             config: SearchConfig::default(),
             query: None,
         }
+    }
+
+    pub(crate) fn from_hybrid_route(route: &HybridSearchRouteBuilder) -> PyResult<Self> {
+        // Core validates the route kind and owns the captured table view.
+        route.vector_search_builder().map_err(to_py_err)?;
+        let config = route.route();
+        Ok(Self {
+            table: Arc::clone(route.table()),
+            config: SearchConfig {
+                column: Some(config.field_name().to_string()),
+                limit: Some(config.limit()),
+                options: vec![config.options().clone()],
+                filters: route.filter().cloned().into_iter().collect(),
+                partition_filters: Vec::new(),
+            },
+            query: config.vector_value().map(<[f32]>::to_vec),
+        })
     }
 }
 

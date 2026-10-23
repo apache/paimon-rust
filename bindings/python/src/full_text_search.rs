@@ -23,7 +23,9 @@ use crate::predicate::dict_to_table_predicate;
 use crate::search_plan::{full_text_splits_from_python, full_text_splits_to_python};
 use crate::snapshot::PySnapshot;
 use paimon::spec::Predicate;
-use paimon::table::{FullTextRead, FullTextScan, FullTextScanPlan, Table};
+use paimon::table::{
+    FullTextRead, FullTextScan, FullTextScanPlan, HybridSearchRouteBuilder, Table,
+};
 use paimon_datafusion::runtime::runtime;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyTuple};
@@ -67,6 +69,22 @@ impl PyFullTextSearchBuilder {
             table,
             config: Config::default(),
         }
+    }
+
+    pub(crate) fn from_hybrid_route(route: &HybridSearchRouteBuilder) -> PyResult<Self> {
+        // Core validates the route kind and owns the captured table view.
+        route.full_text_search_builder().map_err(to_py_err)?;
+        let config = route.route();
+        Ok(Self {
+            table: Arc::clone(route.table()),
+            config: Config {
+                query: config
+                    .full_text_query()
+                    .map(|query| (config.field_name().to_string(), query.to_string())),
+                limit: Some(config.limit()),
+                filters: route.filter().cloned().into_iter().collect(),
+            },
+        })
     }
 }
 

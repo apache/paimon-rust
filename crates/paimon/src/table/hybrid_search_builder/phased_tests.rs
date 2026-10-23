@@ -1,0 +1,358 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+use super::*;
+use crate::catalog::Identifier;
+use crate::io::FileIOBuilder;
+use crate::spec::{DataType, IntType, Schema, TableSchema};
+
+fn scored(ids: &[u64], scores: &[f32], weight: f32) -> HybridSearchWeightedResult {
+    HybridSearchWeightedResult::new(
+        GlobalIndexResult::from_scored_row_ids(ScoredRowIds::new(ids.to_vec(), scores.to_vec())),
+        weight,
+    )
+    .unwrap()
+}
+
+#[test]
+fn ranker_fuses_external_results_with_weights_and_deterministic_ties() {
+    let results = [
+        scored(&[1, 2, 3], &[10.0, 5.0, 0.0], 2.0),
+        scored(&[2, 3, 4], &[100.0, 50.0, 0.0], 1.0),
+    ];
+    for (ranker, ids, expected) in [
+        (
+            HybridSearchRanker::Rrf,
+            vec![2, 3, 1],
+            vec![2.0 / 62.0 + 1.0 / 61.0, 2.0 / 63.0 + 1.0 / 62.0, 2.0 / 61.0],
+        ),
+        (
+            HybridSearchRanker::WeightedScore,
+            vec![1, 2, 3],
+            vec![2.0, 2.0, 0.5],
+        ),
+        (
+            HybridSearchRanker::Mrr,
+            vec![1, 2, 3],
+            vec![2.0, 2.0, 2.0 / 3.0 + 0.5],
+        ),
+    ] {
+        let ranked = ranker.rank(&results, 3).unwrap();
+        let hits = ranked.row_ids().unwrap();
+        assert_eq!(hits.row_ids, ids, "ranker {ranker:?}");
+        for (actual, expected) in hits.scores.iter().zip(expected) {
+            assert!((actual - expected).abs() < 1e-6, "ranker {ranker:?}");
+        }
+        assert!(ranked.table().is_none());
+    }
+
+    // Callers may rank an arbitrary subset or repeat a result. Only each
+    // supplied result's weight participates, independently of a route list.
+    let repeated = HybridSearchRanker::Mrr
+        .rank(&[results[0].clone(), results[0].clone()], 1)
+        .unwrap();
+    assert_eq!(repeated.row_ids().unwrap().row_ids, vec![1]);
+    assert_eq!(repeated.row_ids().unwrap().scores, vec![4.0]);
+}
+
+#[test]
+fn weighted_results_normalize_empty_selections_and_reject_invalid_inputs() {
+    let empty =
+        HybridSearchWeightedResult::new(GlobalIndexResult::from_row_ranges(vec![]), 2.0).unwrap();
+    assert_eq!(empty.weight(), 2.0);
+    assert!(empty.result().row_ids().unwrap().is_empty());
+    assert!(HybridSearchRanker::Rrf
+        .rank(&[empty], 2)
+        .unwrap()
+        .is_empty());
+    assert!(HybridSearchRanker::Mrr.rank(&[], 2).unwrap().is_empty());
+    assert!(HybridSearchRanker::Rrf.rank(&[], 0).is_err());
+    assert!(HybridSearchWeightedResult::new(
+        GlobalIndexResult::from_row_ranges(vec![RowRange::new(1, 1)]),
+        1.0,
+    )
+    .is_err());
+    assert!(
+        HybridSearchWeightedResult::new(GlobalIndexResult::from_splits(Some(1), vec![]), 1.0,)
+            .is_err()
+    );
+    for weight in [0.0, -1.0, f32::INFINITY] {
+        assert!(HybridSearchWeightedResult::new(
+            GlobalIndexResult::from_scored_row_ids(ScoredRowIds::empty()),
+            weight,
+        )
+        .is_err());
+    }
+}
+
+#[test]
+fn builder_ranks_supplied_results_without_authentication_or_query_validation() {
+    // No metadata exists and this query could never execute: rank consumes
+    // evaluated scores only, just as Java HybridSearchBuilder.rank does.
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .option("query-auth.enabled", "true")
+        .build()
+        .unwrap();
+    let table = Table::new(
+        FileIOBuilder::new("memory").build().unwrap(),
+        Identifier::new("default", "rank-only"),
+        "memory:/rank-only-no-metadata".into(),
+        TableSchema::new(0, &schema),
+        None,
+    );
+    let route = HybridSearchRoute::vector("missing", vec![0.0], 1, 2.0, HashMap::new()).unwrap();
+    let result = HybridSearchRouteResult::new(
+        route.clone(),
+        GlobalIndexResult::from_scored_row_ids(ScoredRowIds::new(vec![7], vec![0.5])),
+    )
+    .unwrap();
+    assert_eq!(result.route().field_name(), "missing");
+    let mut builder = table.new_hybrid_search_builder();
+    builder.add_route(route).with_limit(1).with_mrr_ranker();
+    let ranked = builder.rank(&[result]).unwrap();
+    assert_eq!(ranked.row_ids().unwrap().row_ids, vec![7]);
+    assert_eq!(ranked.row_ids().unwrap().scores, vec![2.0]);
+    builder.with_limit(0);
+    assert!(builder.rank(&[]).is_err());
+    assert!(table.new_hybrid_search_builder().rank(&[]).is_err());
+}
+
+#[cfg(feature = "fulltext")]
+mod captured_routes {
+    use super::*;
+    use crate::spec::{Datum, PredicateBuilder};
+
+    use super::super::parity_tests::{append, index, mixed_query, table};
+
+    #[tokio::test]
+    async fn routes_share_one_snapshot_and_remain_owned_after_later_commits() {
+        let table = table();
+        append(&table, 0).await;
+        index(&table, "ivf-flat", "embedding").await;
+        index(&table, "full-text", "text").await;
+        let predicates = PredicateBuilder::new(table.schema().fields());
+        let keep = predicates
+            .equal("label", Datum::String("keep".into()))
+            .unwrap();
+        let (routes, expected) = {
+            let mut builder = mixed_query(&table, 4);
+            builder.with_filter(keep);
+            let expected = builder.execute_scored().await.unwrap();
+            (builder.route_builders().await.unwrap(), expected)
+        };
+        assert_eq!(routes.len(), 2);
+        assert!(Arc::ptr_eq(routes[0].table(), routes[1].table()));
+        assert!(routes[0].filter().is_some());
+        assert_eq!(
+            routes[0].table().travel_snapshot().map(|s| s.id()),
+            expected.snapshot_id()
+        );
+        assert!(routes[0].vector_search_builder().is_ok());
+        assert!(routes[0].full_text_search_builder().is_err());
+        assert!(routes[1].full_text_search_builder().is_ok());
+        assert!(routes[1].vector_search_builder().is_err());
+
+        append(&table, 4).await;
+        let mut results = vec![];
+        for route in &routes {
+            let result = route.execute().await.unwrap();
+            assert_eq!(result.snapshot_id(), expected.snapshot_id());
+            results.push(HybridSearchRouteResult::new(route.route().clone(), result).unwrap());
+        }
+        let builder = mixed_query(&table, 4);
+        let ranked = builder.rank(&results).unwrap();
+        assert_eq!(ranked.snapshot_id(), expected.snapshot_id());
+        assert_eq!(
+            ranked.row_ids().unwrap().row_ids,
+            expected.row_ids().unwrap().row_ids
+        );
+        assert_eq!(
+            ranked.row_ids().unwrap().scores,
+            expected.row_ids().unwrap().scores
+        );
+        assert!(ranked
+            .row_ids()
+            .unwrap()
+            .row_ids
+            .iter()
+            .all(|id| [1, 2].contains(id)));
+        // Repeating a route uses its retained metadata rather than latest.
+        assert_eq!(
+            routes[0].execute().await.unwrap().snapshot_id(),
+            expected.snapshot_id()
+        );
+        assert_ne!(
+            builder.execute_scored().await.unwrap().snapshot_id(),
+            expected.snapshot_id()
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_route_view_stays_empty_after_a_first_commit() {
+        let table = table();
+        let builder = mixed_query(&table, 4);
+        let routes = builder.route_builders().await.unwrap();
+        assert!(Arc::ptr_eq(routes[0].table(), routes[1].table()));
+        assert!(routes[0].table().is_time_traveled());
+        assert!(routes[0].table().travel_snapshot().is_none());
+        append(&table, 0).await;
+        let mut results = vec![];
+        for route in &routes {
+            results.push(
+                builder
+                    .to_route_result(route, route.execute().await.unwrap())
+                    .unwrap(),
+            );
+        }
+        let ranked = builder.rank(&results).unwrap();
+        assert!(ranked.is_empty());
+        assert!(ranked.table().unwrap().is_time_traveled());
+        assert!(ranked.snapshot_id().is_none());
+    }
+
+    #[tokio::test]
+    async fn incomplete_queries_can_be_finished_on_captured_route_builders() {
+        let table = table();
+        append(&table, 0).await;
+        index(&table, "ivf-flat", "embedding").await;
+        index(&table, "full-text", "text").await;
+        let snapshot = table.resolve_read_snapshot().await.unwrap().unwrap();
+        let mut builder = table.new_hybrid_search_builder();
+        builder
+            .add_vector_route("embedding", vec![], 4, 1.0, HashMap::new())
+            .unwrap()
+            .add_full_text_route("text", "", 4, 1.0, HashMap::new())
+            .unwrap()
+            .with_limit(16);
+        let routes = builder.route_builders().await.unwrap();
+        assert!(routes[0].route().vector_value().unwrap().is_empty());
+        assert_eq!(routes[1].route().full_text_query(), Some(""));
+        // Preparing routes does not execute their incomplete queries.
+        assert!(builder.execute_scored().await.is_err());
+        let mut empty_text = table.new_hybrid_search_builder();
+        empty_text
+            .add_full_text_route("text", "", 4, 1.0, HashMap::new())
+            .unwrap()
+            .with_limit(4);
+        assert!(empty_text.execute_scored().await.is_err());
+
+        append(&table, 4).await;
+        let mut vector = routes[0].vector_search_builder().unwrap();
+        vector.with_query_vector(vec![0.0, 0.0]);
+        let mut text = routes[1].full_text_search_builder().unwrap();
+        text.with_query("text", r#"{"match":{"query":"paimon"}}"#);
+        let results = [
+            builder
+                .to_route_result(&routes[0], vector.execute().await.unwrap())
+                .unwrap(),
+            builder
+                .to_route_result(&routes[1], text.execute_scored().await.unwrap())
+                .unwrap(),
+        ];
+        let actual = builder.rank(&results).unwrap();
+        let expected = mixed_query(&table, 4)
+            .with_snapshot(Some(&snapshot))
+            .execute_scored()
+            .await
+            .unwrap();
+        assert_eq!(actual.snapshot_id(), Some(snapshot.id()));
+        assert_eq!(
+            actual.row_ids().unwrap().row_ids,
+            expected.row_ids().unwrap().row_ids
+        );
+        assert_eq!(
+            actual.row_ids().unwrap().scores,
+            expected.row_ids().unwrap().scores
+        );
+    }
+
+    #[tokio::test]
+    async fn rank_drops_read_context_for_different_snapshots_or_external_hits() {
+        let table = table();
+        append(&table, 0).await;
+        let first = table.resolve_read_snapshot().await.unwrap().unwrap();
+        let captured = table.copy_with_pinned_snapshot(Some(&first));
+        let left = HybridSearchWeightedResult::new(
+            GlobalIndexResult::from_global_search(
+                Arc::new(captured.clone()),
+                ScoredRowIds::new(vec![1], vec![0.9]),
+            ),
+            2.0,
+        )
+        .unwrap();
+        let sibling = HybridSearchWeightedResult::new(
+            GlobalIndexResult::from_global_search(
+                Arc::new(captured),
+                ScoredRowIds::new(vec![2], vec![0.8]),
+            ),
+            1.0,
+        )
+        .unwrap();
+        let compatible = HybridSearchRanker::Mrr
+            .rank(&[left.clone(), sibling], 2)
+            .unwrap();
+        assert_eq!(compatible.snapshot_id(), Some(first.id()));
+        assert!(compatible.table().is_some());
+
+        append(&table, 4).await;
+        let later = table.resolve_read_snapshot().await.unwrap().unwrap();
+        let right = HybridSearchWeightedResult::new(
+            GlobalIndexResult::from_global_search(
+                Arc::new(table.copy_with_pinned_snapshot(Some(&later))),
+                ScoredRowIds::new(vec![2], vec![0.8]),
+            ),
+            1.0,
+        )
+        .unwrap();
+        for right in [right, scored(&[2], &[0.8], 1.0)] {
+            let ranked = HybridSearchRanker::Mrr
+                .rank(&[left.clone(), right], 2)
+                .unwrap();
+            assert_eq!(ranked.row_ids().unwrap().row_ids, vec![1, 2]);
+            assert_eq!(ranked.row_ids().unwrap().scores, vec![2.0, 1.0]);
+            assert!(ranked.table().is_none());
+            assert!(ranked.snapshot_id().is_none());
+            assert!(ranked.new_read_builder().read().await.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn route_preparation_validates_before_resolving_snapshots() {
+        let table = table();
+        let guarded = table.copy_with_options(HashMap::from([(
+            "query-auth.enabled".into(),
+            "true".into(),
+        )]));
+        let error = mixed_query(&guarded, 4).route_builders().await.unwrap_err();
+        assert!(format!("{error:?}").contains("query-auth.enabled"));
+        assert!(table
+            .new_hybrid_search_builder()
+            .route_builders()
+            .await
+            .is_err());
+        let mut missing = table.new_hybrid_search_builder();
+        missing
+            .add_vector_route("missing", vec![0.0], 4, 1.0, HashMap::new())
+            .unwrap()
+            .with_limit(4);
+        assert!(missing.route_builders().await.is_err());
+        let mut zero = mixed_query(&table, 4);
+        zero.with_limit(0);
+        assert!(zero.route_builders().await.is_err());
+    }
+}
