@@ -20,6 +20,7 @@
 use crate::arrow_input::{array_from_pyarrow, write_batch_from_pyarrow};
 use crate::error::{to_catalog_py_err, to_py_err};
 use crate::schema::PyTableSchema;
+use crate::table::PyTable;
 use arrow::array::{Array, Int32Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::pyarrow::{FromPyArrow, ToPyArrow};
@@ -111,14 +112,38 @@ pub struct PyDynamicBucketAssigner {
     inner: DynamicBucketAssigner,
 }
 
-impl PyDynamicBucketAssigner {
-    pub(crate) fn new(inner: DynamicBucketAssigner) -> Self {
-        Self { inner }
-    }
-}
-
 #[pymethods]
 impl PyDynamicBucketAssigner {
+    #[new]
+    #[pyo3(signature = (table, num_channels, num_assigners, assign_id, *, restore_snapshot_id=None, overwrite=false))]
+    fn new(
+        py: Python<'_>,
+        table: &PyTable,
+        num_channels: i32,
+        num_assigners: i32,
+        assign_id: i32,
+        restore_snapshot_id: Option<i64>,
+        overwrite: bool,
+    ) -> PyResult<Self> {
+        let builder =
+            DynamicBucketAssigner::builder(&table.inner, num_channels, num_assigners, assign_id);
+        let builder = match restore_snapshot_id {
+            Some(id) => builder
+                .with_restore_snapshot(id)
+                .map_err(to_catalog_py_err)?,
+            None => builder,
+        };
+        let builder = if overwrite {
+            builder.with_overwrite()
+        } else {
+            builder
+        };
+        let inner = py
+            .detach(|| runtime().block_on(builder.build()))
+            .map_err(to_catalog_py_err)?;
+        Ok(Self { inner })
+    }
+
     #[getter]
     fn restore_snapshot_id(&self) -> i64 {
         self.inner.restore_snapshot_id()
@@ -246,6 +271,12 @@ mod tests {
                     py.get_type::<PyDynamicBucketAssignerRouter>(),
                 )
                 .unwrap();
+            locals
+                .set_item(
+                    "DynamicBucketAssigner",
+                    py.get_type::<PyDynamicBucketAssigner>(),
+                )
+                .unwrap();
             py.run(
                 c_str!(
                     r#"
@@ -264,8 +295,15 @@ assert hashes.type == pa.int32() and hashes.null_count == 0
 assert hashes[0] == hashes[2] and hashes[0] != hashes[1]
 
 builder = table.new_batch_write_builder().with_restore_snapshot(0)
-assigner = builder.new_dynamic_bucket_assigner(1, 1, 0)
+assert not hasattr(builder, 'new_dynamic_bucket_assigner')
+assigner = DynamicBucketAssigner(table, 1, 1, 0, restore_snapshot_id=0)
 assert assigner.restore_snapshot_id == 0
+try:
+    DynamicBucketAssigner(table, 1, 1, 0, restore_snapshot_id=-1)
+except ValueError:
+    pass
+else:
+    raise AssertionError('negative restore snapshots must be rejected')
 for invalid in [pa.array([None, 1, 2], type=pa.int32()), hashes.slice(0, 2),
                 pa.array([1, 2, 3], type=pa.int64())]:
     try:
@@ -277,7 +315,7 @@ for invalid in [pa.array([None, 1, 2], type=pa.int32()), hashes.slice(0, 2),
 buckets = assigner.assign(batch, hashes)
 assert buckets.to_pylist() == [0, 1, 0]
 assert assigner.assign(batch.slice(1), hashes.slice(1)).to_pylist() == [1, 0]
-assert builder.new_dynamic_bucket_assigner(1, 1, 0).assign(batch).equals(buckets)
+assert DynamicBucketAssigner(table, 1, 1, 0, restore_snapshot_id=0).assign(batch).equals(buckets)
 
 writer = builder.new_write()
 writer.write_arrow(batch.take(pa.array([0, 2])), bucket=0)
@@ -285,15 +323,15 @@ writer.write_arrow(batch.slice(1, 1), bucket=1)
 messages = writer.prepare_commit()
 builder.new_commit().commit(messages)
 
-restored = table.new_batch_write_builder().new_dynamic_bucket_assigner(1, 1, 0)
+restored = DynamicBucketAssigner(table, 1, 1, 0)
 assert restored.restore_snapshot_id == 1
 assert restored.assign(batch, hashes).equals(buckets)
 # A captured empty base stays empty after publication of a newer snapshot.
 assert assigner.restore_snapshot_id == 0
-empty = builder.new_dynamic_bucket_assigner(1, 1, 0)
+empty = DynamicBucketAssigner(table, 1, 1, 0, restore_snapshot_id=0)
 assert empty.restore_snapshot_id == 0
 assert empty.assign(batch.slice(1, 1)).to_pylist() == [0]
-overwritten = table.new_batch_write_builder().with_overwrite().new_dynamic_bucket_assigner(1, 1, 0)
+overwritten = DynamicBucketAssigner(table, 1, 1, 0, overwrite=True)
 assert overwritten.restore_snapshot_id == 0
 assert overwritten.assign(batch.slice(1, 1)).to_pylist() == [0]
 "#

@@ -371,18 +371,20 @@ For HASH_DYNAMIC primary-key inputs (`bucket=-1`), route rows to assigners
 before allocating buckets:
 
 ```python
-from pypaimon_rust.datafusion import DynamicBucketAssignerRouter
+from pypaimon_rust.datafusion import DynamicBucketAssigner, DynamicBucketAssignerRouter
 
 routing = DynamicBucketAssignerRouter(table.schema(), num_channels=4, num_assigners=4).route(batch)
 # Group rows and key_hash by routing's assigner column, then on that worker:
-builder = table.new_batch_write_builder().with_restore_snapshot(base_snapshot_id)
-assigner = builder.new_dynamic_bucket_assigner(num_channels=4, num_assigners=4, assign_id=worker_id)
+assigner = DynamicBucketAssigner(table, num_channels=4, num_assigners=4, assign_id=worker_id,
+                                restore_snapshot_id=base_snapshot_id)
 buckets = assigner.assign(worker_batch, worker_key_hashes)
 ```
 
-The builder captures the latest write snapshot when none is supplied; zero
-selects an empty base. Overwrite starts with empty assignments. Every worker
+The assigner captures the latest write snapshot when none is supplied; zero
+selects an empty base. `overwrite=True` starts with empty assignments. Every worker
 must use the same baseline, available as `assigner.restore_snapshot_id`.
+Configure the eventual file writers with that restore snapshot and the same
+overwrite mode.
 Assignment reads HASH indexes without creating files. Regroup its output by
 partition and bucket before writing, so one writer publishes the complete
 HASH index for each bucket. Key hashes can be omitted for Core to compute

@@ -877,14 +877,6 @@ class BatchWriteBuilder:
         """
         ...
     def with_restore_snapshot(self, snapshot_id: int) -> "BatchWriteBuilder": ...
-    def new_dynamic_bucket_assigner(self, num_channels: int, num_assigners: int,
-                                   assign_id: int) -> DynamicBucketAssigner:
-        """Restore HASH_DYNAMIC assignments at one write-authorized snapshot.
-
-        Overwrite starts empty. This stage creates no data or index files;
-        group its output by partition and bucket before writing.
-        """
-        ...
     def new_write(self) -> BatchTableWrite: ...
     def new_update(self) -> BatchTableUpdate: ...
     def new_commit(self) -> BatchTableCommit: ...
@@ -907,12 +899,20 @@ class DynamicBucketAssignerRouter:
         ...
 
 class DynamicBucketAssigner:
-    """Stateful bucket assignment; construct through BatchWriteBuilder.
+    """Stateful bucket assignment for distributed HASH_DYNAMIC inputs.
 
     Existing mappings remain stable across assigner parallelism changes.
     New keys use buckets owned by this assigner. Input must already be
     grouped by the DynamicBucketAssignerRouter's assigner column.
     """
+    def __init__(self, table: Table, num_channels: int, num_assigners: int, assign_id: int,
+                 *, restore_snapshot_id: Optional[int] = None, overwrite: bool = False) -> None:
+        """Capture one write-authorized restore point; None is latest and zero is empty.
+
+        Overwrite starts empty. This stage creates no data or index files;
+        group its output by partition and bucket before writing.
+        """
+        ...
     @property
     def restore_snapshot_id(self) -> int:
         """Captured restore snapshot; zero denotes an empty base."""

@@ -216,7 +216,7 @@ pub use consumer_manager::ConsumerManager;
 pub use cow_writer::{CopyOnWriteMergeWriter, FileInfo};
 pub use data_evolution_writer::{DataEvolutionDeleteWriter, DataEvolutionWriter};
 pub use de_vector_scan::PreparedVectorSearchFilter;
-pub use dynamic_bucket_assigner::DynamicBucketAssigner;
+pub use dynamic_bucket_assigner::{DynamicBucketAssigner, DynamicBucketAssignerBuilder};
 pub use dynamic_bucket_assigner_router::{
     DynamicBucketAssignerRouter, DynamicBucketAssignerRouting,
 };

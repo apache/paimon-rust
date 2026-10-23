@@ -40,8 +40,72 @@ pub struct DynamicBucketAssigner {
     restore_snapshot_id: i64,
 }
 
+/// Configuration for a distributed dynamic-bucket assigner.
+///
+/// The restore snapshot is captured by [`Self::build`]. It is independent of
+/// writer configuration and must also be supplied to the eventual file writers.
+pub struct DynamicBucketAssignerBuilder<'a> {
+    table: &'a Table,
+    num_channels: i32,
+    num_assigners: i32,
+    assign_id: i32,
+    restore_snapshot_id: Option<i64>,
+    overwrite: bool,
+}
+
+impl DynamicBucketAssignerBuilder<'_> {
+    /// Restore a specific snapshot. Zero denotes an empty restore state;
+    /// without this option, [`Self::build`] captures the latest snapshot.
+    pub fn with_restore_snapshot(mut self, snapshot_id: i64) -> Result<Self> {
+        if snapshot_id < 0 {
+            return Err(crate::Error::DataInvalid {
+                message: "Restore snapshot id must not be negative".into(),
+                source: None,
+            });
+        }
+        self.restore_snapshot_id = Some(snapshot_id);
+        Ok(self)
+    }
+
+    /// Assign against empty state, ignoring any configured restore snapshot.
+    pub fn with_overwrite(mut self) -> Self {
+        self.overwrite = true;
+        self
+    }
+
+    /// Authorize and capture the immutable restore point used by this assigner.
+    pub async fn build(self) -> Result<DynamicBucketAssigner> {
+        DynamicBucketAssigner::new(
+            self.table,
+            self.num_channels,
+            self.num_assigners,
+            self.assign_id,
+            self.restore_snapshot_id,
+            self.overwrite,
+        )
+        .await
+    }
+}
+
 impl DynamicBucketAssigner {
-    pub(super) async fn new(
+    /// Configure the dynamic-bucket assignment stage separately from file writing.
+    pub fn builder(
+        table: &Table,
+        num_channels: i32,
+        num_assigners: i32,
+        assign_id: i32,
+    ) -> DynamicBucketAssignerBuilder<'_> {
+        DynamicBucketAssignerBuilder {
+            table,
+            num_channels,
+            num_assigners,
+            assign_id,
+            restore_snapshot_id: None,
+            overwrite: false,
+        }
+    }
+
+    async fn new(
         table: &Table,
         num_channels: i32,
         num_assigners: i32,
@@ -233,9 +297,8 @@ mod tests {
         // A changed parallelism can route this historical key to assigner 0
         // even though it was originally written to foreign bucket 3.
         seed(&table, &keys[..1], 3).await;
-        let mut assigner = table
-            .new_write_builder()
-            .new_dynamic_bucket_assigner(2, 2, 0)
+        let mut assigner = DynamicBucketAssigner::builder(&table, 2, 2, 0)
+            .build()
             .await
             .unwrap();
         assert_eq!(assigner.restore_snapshot_id(), 1);
@@ -262,9 +325,8 @@ mod tests {
             1
         );
         // Input assignment never writes HASH files or exposes commit messages.
-        let fresh = table
-            .new_write_builder()
-            .new_dynamic_bucket_assigner(2, 2, 0)
+        let fresh = DynamicBucketAssigner::builder(&table, 2, 2, 0)
+            .build()
             .await
             .unwrap();
         assert_eq!(fresh.restore_snapshot_id(), 1);
@@ -276,9 +338,8 @@ mod tests {
         let (keys, _) = keys_for_owner(&table, 0);
         seed(&table, &keys[..1], 3).await;
         seed(&table, &keys[1..2], 2).await;
-        let mut assigner = table
-            .new_write_builder()
-            .new_dynamic_bucket_assigner(2, 2, 0)
+        let mut assigner = DynamicBucketAssigner::builder(&table, 2, 2, 0)
+            .build()
             .await
             .unwrap();
         assert_eq!(
@@ -312,18 +373,21 @@ mod tests {
     async fn input_assignment_pins_latest_and_empty_restore_points() {
         let table = table("input_snapshot_pin");
         let (keys, _) = keys_for_owner(&table, 0);
-        let mut empty = table
-            .new_write_builder()
-            .new_dynamic_bucket_assigner(2, 2, 0)
+        assert!(DynamicBucketAssigner::builder(&table, 2, 2, 0)
+            .with_restore_snapshot(-1)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("must not be negative"));
+        let mut empty = DynamicBucketAssigner::builder(&table, 2, 2, 0)
+            .build()
             .await
             .unwrap();
         assert_eq!(empty.restore_snapshot_id(), 0);
+        // Creating the builder does not capture an earlier restore point.
+        let pending = DynamicBucketAssigner::builder(&table, 2, 2, 0);
         seed(&table, &keys[..1], 3).await;
-        let mut pinned = table
-            .new_write_builder()
-            .new_dynamic_bucket_assigner(2, 2, 0)
-            .await
-            .unwrap();
+        let mut pinned = pending.build().await.unwrap();
         assert_eq!(pinned.restore_snapshot_id(), 1);
         seed(&table, &keys[1..2], 2).await;
         assert_eq!(
@@ -342,11 +406,10 @@ mod tests {
                 .values(),
             &[0]
         );
-        let mut explicit = table
-            .new_write_builder()
+        let mut explicit = DynamicBucketAssigner::builder(&table, 2, 2, 0)
             .with_restore_snapshot(1)
             .unwrap()
-            .new_dynamic_bucket_assigner(2, 2, 0)
+            .build()
             .await
             .unwrap();
         assert_eq!(explicit.restore_snapshot_id(), 1);
@@ -358,9 +421,8 @@ mod tests {
                 .values(),
             &[0]
         );
-        let mut latest = table
-            .new_write_builder()
-            .new_dynamic_bucket_assigner(2, 2, 0)
+        let mut latest = DynamicBucketAssigner::builder(&table, 2, 2, 0)
+            .build()
             .await
             .unwrap();
         assert_eq!(latest.restore_snapshot_id(), 2);
@@ -372,12 +434,26 @@ mod tests {
                 .values(),
             &[2]
         );
-        let mut overwrite = table
-            .new_write_builder()
+        let mut explicit_empty = DynamicBucketAssigner::builder(&table, 2, 2, 0)
+            .with_restore_snapshot(0)
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(explicit_empty.restore_snapshot_id(), 0);
+        assert_eq!(
+            explicit_empty
+                .assign(&batch(&keys[..1]), None)
+                .await
+                .unwrap()
+                .values(),
+            &[0]
+        );
+        let mut overwrite = DynamicBucketAssigner::builder(&table, 2, 2, 0)
             .with_restore_snapshot(999)
             .unwrap()
             .with_overwrite()
-            .new_dynamic_bucket_assigner(2, 2, 0)
+            .build()
             .await
             .unwrap();
         assert_eq!(overwrite.restore_snapshot_id(), 0);
@@ -396,9 +472,8 @@ mod tests {
         let table = table("input_validate_before_assignment");
         let (keys, hashes) = keys_for_owner(&table, 0);
         let (foreign, _) = keys_for_owner(&table, 1);
-        let mut assigner = table
-            .new_write_builder()
-            .new_dynamic_bucket_assigner(2, 2, 0)
+        let mut assigner = DynamicBucketAssigner::builder(&table, 2, 2, 0)
+            .build()
             .await
             .unwrap();
         let error = assigner
@@ -440,9 +515,8 @@ mod tests {
             &RecordBatchOptions::default().with_row_count(Some(2)),
         )
         .unwrap();
-        let mut assigner = table
-            .new_write_builder()
-            .new_dynamic_bucket_assigner(2, 2, 0)
+        let mut assigner = DynamicBucketAssigner::builder(&table, 2, 2, 0)
+            .build()
             .await
             .unwrap();
         assert_eq!(
@@ -473,9 +547,8 @@ mod tests {
         }
         builder.new_commit().commit(messages).await.unwrap();
         writer.close().await;
-        let mut assigner = table
-            .new_write_builder()
-            .new_dynamic_bucket_assigner(1, 1, 0)
+        let mut assigner = DynamicBucketAssigner::builder(&table, 1, 1, 0)
+            .build()
             .await
             .unwrap();
         assert!(assigner
@@ -484,10 +557,9 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("no complete HASH"));
-        let mut overwrite = table
-            .new_write_builder()
+        let mut overwrite = DynamicBucketAssigner::builder(&table, 1, 1, 0)
             .with_overwrite()
-            .new_dynamic_bucket_assigner(1, 1, 0)
+            .build()
             .await
             .unwrap();
         assert_eq!(
@@ -520,9 +592,8 @@ mod tests {
             crate::spec::IndexManifest::write(table.file_io(), &path, &entries)
                 .await
                 .unwrap();
-            let mut assigner = table
-                .new_write_builder()
-                .new_dynamic_bucket_assigner(1, 1, 0)
+            let mut assigner = DynamicBucketAssigner::builder(&table, 1, 1, 0)
+                .build()
                 .await
                 .unwrap();
             let error = assigner.assign(&batch(&[1]), None).await.unwrap_err();
@@ -540,11 +611,10 @@ mod tests {
             "query-auth.enabled".into(),
             "true".into(),
         )]));
-        assert!(unbound
-            .new_write_builder()
+        assert!(DynamicBucketAssigner::builder(&unbound, 1, 1, 0)
             .with_restore_snapshot(0)
             .unwrap()
-            .new_dynamic_bucket_assigner(1, 1, 0)
+            .build()
             .await
             .err()
             .unwrap()
@@ -558,11 +628,10 @@ mod tests {
             ..unbound
         }
         .with_query_auth_session();
-        let mut assigner = bound
-            .new_write_builder()
+        let mut assigner = DynamicBucketAssigner::builder(&bound, 1, 1, 0)
             .with_restore_snapshot(0)
             .unwrap()
-            .new_dynamic_bucket_assigner(1, 1, 0)
+            .build()
             .await
             .unwrap();
         assert_eq!(
