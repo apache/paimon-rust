@@ -891,6 +891,37 @@ class BucketRouter:
     def with_bucket_plan(self, plan: pyarrow.RecordBatch) -> BucketRouter: ...
     def route(self, batch: pyarrow.RecordBatch) -> pyarrow.Int32Array: ...
 
+class DynamicBucketAssignerRouter:
+    """Pure Java HASH_DYNAMIC routing before grouping input by assigner."""
+    def __init__(self, schema: TableSchema, num_channels: int, num_assigners: int) -> None: ...
+    def route(self, batch: pyarrow.RecordBatch) -> pyarrow.RecordBatch:
+        """Return non-null assigner and key_hash Int32 columns in input order."""
+        ...
+
+class DynamicBucketAssigner:
+    """Stateful bucket assignment for distributed HASH_DYNAMIC inputs.
+
+    Existing mappings remain stable across assigner parallelism changes.
+    New keys use buckets owned by this assigner. Input must already be
+    grouped by the DynamicBucketAssignerRouter's assigner column.
+    """
+    def __init__(self, table: Table, num_channels: int, num_assigners: int, assign_id: int,
+                 *, restore_snapshot_id: Optional[int] = None, overwrite: bool = False) -> None:
+        """Capture one write-authorized restore point; None is latest and zero is empty.
+
+        Overwrite starts empty. This stage creates no data or index files;
+        group its output by partition and bucket before writing.
+        """
+        ...
+    @property
+    def restore_snapshot_id(self) -> int:
+        """Captured restore snapshot; zero denotes an empty base."""
+        ...
+    def assign(self, batch: pyarrow.RecordBatch,
+               key_hashes: Optional[pyarrow.Int32Array] = None) -> pyarrow.Int32Array:
+        """Return buckets in input order, optionally reusing routed key hashes."""
+        ...
+
 class PostponeBucketPlanner:
     """Pure per-partition statistics and bucket-count inference.
 

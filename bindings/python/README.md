@@ -367,6 +367,30 @@ Statistics contain partition columns followed by `row_count: int64` and
 may coincide with statistics names. Existing layouts remain unchanged. The
 shared result can configure every worker with `with_bucket_plan(plan)`.
 
+For HASH_DYNAMIC primary-key inputs (`bucket=-1`), route rows to assigners
+before allocating buckets:
+
+```python
+from pypaimon_rust.datafusion import DynamicBucketAssigner, DynamicBucketAssignerRouter
+
+routing = DynamicBucketAssignerRouter(table.schema(), num_channels=4, num_assigners=4).route(batch)
+# Group rows and key_hash by routing's assigner column, then on that worker:
+assigner = DynamicBucketAssigner(table, num_channels=4, num_assigners=4, assign_id=worker_id,
+                                restore_snapshot_id=base_snapshot_id)
+buckets = assigner.assign(worker_batch, worker_key_hashes)
+```
+
+The assigner captures the latest write snapshot when none is supplied; zero
+selects an empty base. `overwrite=True` starts with empty assignments. Every worker
+must use the same baseline, available as `assigner.restore_snapshot_id`.
+Configure the eventual file writers with that restore snapshot and the same
+overwrite mode.
+Assignment reads HASH indexes without creating files. Regroup its output by
+partition and bucket before writing, so one writer publishes the complete
+HASH index for each bucket. Key hashes can be omitted for Core to compute
+them; when supplied, the batch only needs partition columns. Existing keys
+retain their original buckets even when assigner parallelism changes.
+
 Configure overwrite on the batch builder:
 
 ```python

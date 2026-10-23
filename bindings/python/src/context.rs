@@ -1040,6 +1040,8 @@ pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> 
     this.add_class::<crate::write::PyBatchWriteBuilder>()?;
     this.add_class::<crate::write::PyPostponeFixedBucketWriteBuilder>()?;
     this.add_class::<crate::write_routing::PyBucketRouter>()?;
+    this.add_class::<crate::write_routing::PyDynamicBucketAssignerRouter>()?;
+    this.add_class::<crate::write_routing::PyDynamicBucketAssigner>()?;
     this.add_class::<crate::write_routing::PyPostponeBucketPlanner>()?;
     this.add_class::<crate::write::PyStreamWriteBuilder>()?;
     this.add_class::<crate::write::PyBatchTableWrite>()?;

@@ -32,13 +32,13 @@ use crate::spec::{
 use crate::table::bucket_assigner::{BatchAssignOutput, BucketAssignerEnum, PartitionBucketKey};
 use crate::table::bucket_assigner_constant::ConstantBucketAssigner;
 use crate::table::bucket_assigner_cross::CrossPartitionAssigner;
-use crate::table::bucket_assigner_dynamic::DynamicBucketAssigner;
 use crate::table::bucket_assigner_fixed::FixedBucketAssigner;
 use crate::table::bucket_function::validate_bucket_function;
 use crate::table::commit_message::CommitMessage;
 use crate::table::data_file_index_writer::FileIndexOptions;
 use crate::table::data_file_writer::DataFileWriter;
 use crate::table::dedicated_format_file_writer::AppendDedicatedFormatFileWriter;
+use crate::table::dynamic_bucket_index::DynamicBucketIndex;
 use crate::table::format_table_writer::FormatTableWriter;
 use crate::table::kv_file_writer::{KeyValueFileWriter, KeyValueWriteConfig};
 use crate::table::partition_filter::PartitionFilter;
@@ -470,7 +470,7 @@ impl TableWrite {
                 merge_engine,
             )?))
         } else if is_dynamic_bucket {
-            BucketAssignerEnum::Dynamic(Box::new(DynamicBucketAssigner::new(
+            BucketAssignerEnum::Dynamic(Box::new(DynamicBucketIndex::new(
                 table.clone(),
                 partition_field_indices,
                 primary_key_indices.clone(),

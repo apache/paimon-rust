@@ -28,7 +28,7 @@ use crate::spec::{
 };
 use crate::table::PostponeBucketPlan;
 use crate::Result;
-use arrow_array::{Int32Array, RecordBatch};
+use arrow_array::{Int32Array, RecordBatch, RecordBatchOptions};
 use arrow_schema::SchemaRef;
 use std::collections::{HashMap, HashSet};
 
@@ -146,31 +146,7 @@ impl BucketRouter {
         &self,
         batch: &RecordBatch,
     ) -> Result<(Vec<Vec<u8>>, Int32Array)> {
-        let input_schema = batch.schema();
-        let mut names = HashSet::new();
-        for field in input_schema.fields() {
-            if !names.insert(field.name()) {
-                return Err(data_invalid(format!(
-                    "Duplicate input column '{}' in bucket routing",
-                    field.name()
-                )));
-            }
-        }
-        let columns = self
-            .fields
-            .iter()
-            .zip(self.arrow_schema.fields())
-            .map(|(field, expected)| {
-                let index = input_schema.index_of(field.name()).map_err(|_| {
-                    data_invalid(format!("Missing routing column '{}'", field.name()))
-                })?;
-                normalize_write_array(batch.column(index), expected.data_type())
-            })
-            .collect::<Result<Vec<_>>>()?;
-        // Project by name before applying indices resolved from the table
-        // schema. Unused payloads do not participate in routing validation.
-        let input = RecordBatch::try_new(self.arrow_schema.clone(), columns)
-            .map_err(|error| data_invalid(error.to_string()))?;
+        let input = project_routing_input(batch, &self.fields, &self.arrow_schema)?;
         let partitions = batch_to_serialized_bytes(&input, &self.partition_indices, &self.fields)?;
         if self.total_buckets > 0 {
             let buckets = self.route_count(&input, self.total_buckets)?;
@@ -210,6 +186,42 @@ impl BucketRouter {
             count,
         )
     }
+}
+
+/// Resolve required columns once, keeping unrelated payloads out of validation.
+pub(super) fn project_routing_input(
+    batch: &RecordBatch,
+    fields: &[DataField],
+    arrow_schema: &SchemaRef,
+) -> Result<RecordBatch> {
+    let input_schema = batch.schema();
+    let mut names = HashSet::new();
+    for field in input_schema.fields() {
+        if !names.insert(field.name()) {
+            return Err(data_invalid(format!(
+                "Duplicate input column '{}' in bucket routing",
+                field.name()
+            )));
+        }
+    }
+    let columns = fields
+        .iter()
+        .zip(arrow_schema.fields())
+        .map(|(field, expected)| {
+            let index = input_schema
+                .index_of(field.name())
+                .map_err(|_| data_invalid(format!("Missing routing column '{}'", field.name())))?;
+            normalize_write_array(batch.column(index), expected.data_type())
+        })
+        .collect::<Result<Vec<_>>>()?;
+    // Empty projections still represent the original number of rows, for
+    // example when upstream hashes route an unpartitioned input.
+    RecordBatch::try_new_with_options(
+        arrow_schema.clone(),
+        columns,
+        &RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
+    )
+    .map_err(|error| data_invalid(error.to_string()))
 }
 
 #[cfg(test)]

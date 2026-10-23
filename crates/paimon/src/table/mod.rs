@@ -37,7 +37,6 @@ mod branch_write_tests;
 mod bucket_assigner;
 mod bucket_assigner_constant;
 mod bucket_assigner_cross;
-mod bucket_assigner_dynamic;
 mod bucket_assigner_fixed;
 mod bucket_filter;
 mod bucket_function;
@@ -58,6 +57,9 @@ mod data_file_writer;
 mod de_vector_read;
 mod de_vector_scan;
 mod dedicated_format_file_writer;
+mod dynamic_bucket_assigner;
+mod dynamic_bucket_assigner_router;
+mod dynamic_bucket_index;
 mod external_path;
 mod format_partition;
 mod format_partition_location;
@@ -214,6 +216,10 @@ pub use consumer_manager::ConsumerManager;
 pub use cow_writer::{CopyOnWriteMergeWriter, FileInfo};
 pub use data_evolution_writer::{DataEvolutionDeleteWriter, DataEvolutionWriter};
 pub use de_vector_scan::PreparedVectorSearchFilter;
+pub use dynamic_bucket_assigner::{DynamicBucketAssigner, DynamicBucketAssignerBuilder};
+pub use dynamic_bucket_assigner_router::{
+    DynamicBucketAssignerRouter, DynamicBucketAssignerRouting,
+};
 pub use format_partition::{
     format_partition_value, parse_format_partition_value, FormatTablePartitionPaths,
 };
