@@ -4407,10 +4407,20 @@ pub(in crate::table) mod tests {
     async fn test_non_compact_null_bucket_key() {
         let file_io = test_file_io();
 
-        let bucket_cols = ["d", "ltz", "ntz"];
+        // Current Java InternalRowSerializer(type).toBinaryRow(GenericRow.of(null)):
+        // DECIMAL(38,18) reserves 16 variable bytes; TIMESTAMP/LTZ(6) reserve 8.
+        // Keep independent golden hashes and buckets instead of deriving the
+        // expectation from an untyped NULL, which omits those reserved slots.
+        let bucket_cases = [
+            ("d", -1_380_280_760, 8),
+            ("ltz", -340_882_661, 5),
+            ("ntz", -340_882_661, 5),
+        ];
         let total_buckets = 16;
 
-        for bucket_col in &bucket_cols {
+        for (column_index, &(bucket_col, java_hash, expected_bucket)) in
+            bucket_cases.iter().enumerate()
+        {
             let table_path = format!("memory:/test_null_bk_{bucket_col}");
             setup_dirs(&file_io, &table_path).await;
 
@@ -4423,7 +4433,7 @@ pub(in crate::table) mod tests {
                 .column("ntz", DataType::Timestamp(TimestampType::new(6).unwrap()))
                 .column("k", DataType::Int(IntType::new()))
                 .option("bucket", total_buckets.to_string())
-                .option("bucket-key", *bucket_col)
+                .option("bucket-key", bucket_col)
                 .build()
                 .unwrap();
             let table_schema = TableSchema::new(0, &schema);
@@ -4480,10 +4490,8 @@ pub(in crate::table) mod tests {
                 .unwrap();
             let bucket = batch_output.buckets[0];
 
-            // Expected: BinaryRow with 1 field, null at pos 0
-            let mut builder = BinaryRowBuilder::new(1);
-            builder.set_null_at(0);
-            let expected_bucket = (builder.build().hash_code() % total_buckets).wrapping_abs();
+            let key = BinaryRow::from_arrow(&batch, 0, &[column_index], &fields).unwrap();
+            assert_eq!(key.hash_code(), java_hash, "NULL bucket-key '{bucket_col}'");
 
             assert_eq!(
                 bucket, expected_bucket,

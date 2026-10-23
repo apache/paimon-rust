@@ -354,7 +354,7 @@ pub unsafe extern "C" fn paimon_postpone_fixed_bucket_write_builder_with_bucket_
         Ok(batch) => batch,
         Err(error) => return error,
     };
-    match PostponeBucketPlan::from_arrow(&state.table, &batch) {
+    match PostponeBucketPlan::from_arrow(state.table.schema(), &batch) {
         Ok(plan) => {
             state.bucket_plan = Some(plan);
             ptr::null_mut()
