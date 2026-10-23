@@ -30,7 +30,7 @@ use crate::error::to_py_err;
 
 type CallbackError = Arc<Mutex<Option<PyErr>>>;
 
-fn condition(
+pub(crate) fn condition(
     py: Python<'_>,
     clause: &Bound<'_, PyDict>,
     schema: SchemaRef,
@@ -51,10 +51,10 @@ fn condition(
         .map_err(to_py_err)
 }
 
-fn assignments(
+pub(crate) fn assignments(
     py: Python<'_>,
     clause: &Bound<'_, PyDict>,
-    fields: &[paimon::spec::DataField],
+    schema: SchemaRef,
     errors: CallbackError,
 ) -> PyResult<Vec<(String, MergeAssignment)>> {
     let values = clause
@@ -75,10 +75,14 @@ fn assignments(
                     }
                     let values = PyDict::new(py);
                     values.set_item(&name, value)?;
-                    let assignment =
-                        crate::update_assignment::from_python(py, &values, fields, errors.clone())?
-                            .remove(0)
-                            .1;
+                    let assignment = crate::update_assignment::from_python_schema(
+                        py,
+                        &values,
+                        schema.clone(),
+                        errors.clone(),
+                    )?
+                    .remove(0)
+                    .1;
                     MergeAssignment::Value(assignment)
                 }
                 _ => return Err(PyValueError::new_err("Unknown MERGE assignment kind")),
@@ -123,7 +127,7 @@ pub(crate) fn from_python(
                     .get_item("delete")?
                     .ok_or_else(|| PyValueError::new_err("MERGE matched clause needs action"))?
                     .extract()?,
-                assignments: assignments(py, clause, table.schema().fields(), errors.clone())?,
+                assignments: assignments(py, clause, target_schema.clone(), errors.clone())?,
             })
         })
         .collect::<PyResult<Vec<_>>>()?;
@@ -146,7 +150,7 @@ pub(crate) fn from_python(
             let clause = item.cast::<PyDict>()?;
             Ok(WhenNotMatched {
                 condition: condition(py, clause, schema.clone())?,
-                assignments: assignments(py, clause, table.schema().fields(), errors.clone())?,
+                assignments: assignments(py, clause, target_schema.clone(), errors.clone())?,
             })
         })
         .collect::<PyResult<Vec<_>>>()?;

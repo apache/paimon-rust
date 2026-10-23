@@ -79,6 +79,24 @@ class RowIdPlan:
         ...
     def plan(self) -> Plan: ...
 
+class MergeBatchExecution:
+    """Evaluate ordered MERGE actions over already joined Arrow batches.
+
+    Input fields use the ``t.<column>`` and ``s.<column>`` aliases. This
+    operator evaluates expressions and assignments without reading or writing
+    a table; callers retain responsibility for joins and authorization.
+    Matched input carries ``t._ROW_ID`` or ``_ROW_ID``, never both. Update
+    output contains ``_ROW_ID`` and the requested target columns; delete output
+    contains only ``_ROW_ID``. Insert output uses the target schema.
+    """
+    def __init__(
+        self, input_schema: pyarrow.Schema, output_schema: pyarrow.Schema,
+        clauses: Sequence[Dict[str, Any]], mode: Literal["update", "delete", "insert"],
+    ) -> None: ...
+    def execute(self, batch: Union[pyarrow.Table, pyarrow.RecordBatch]) -> pyarrow.Table:
+        """Return selected actions; unselected assignments are never evaluated."""
+        ...
+
 class ScanStats:
     """Read-only counters from normal metadata planning."""
     @property

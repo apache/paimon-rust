@@ -29,6 +29,7 @@ mod full_text_search;
 mod global_index_result;
 mod hybrid_search;
 mod index_build;
+mod merge_execution;
 mod merge_into;
 mod oss_cpp;
 mod predicate;
