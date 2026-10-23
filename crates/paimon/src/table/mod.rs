@@ -37,7 +37,6 @@ mod branch_write_tests;
 mod bucket_assigner;
 mod bucket_assigner_constant;
 mod bucket_assigner_cross;
-mod bucket_assigner_dynamic;
 mod bucket_assigner_fixed;
 mod bucket_filter;
 mod bucket_function;
@@ -58,7 +57,9 @@ mod data_file_writer;
 mod de_vector_read;
 mod de_vector_scan;
 mod dedicated_format_file_writer;
-mod dynamic_bucket_router;
+mod dynamic_bucket_assigner;
+mod dynamic_bucket_assigner_router;
+mod dynamic_bucket_index;
 mod external_path;
 mod format_partition;
 mod format_partition_location;
@@ -88,7 +89,6 @@ mod global_index_result;
 pub(crate) mod global_index_scanner;
 mod global_index_search_filter;
 mod global_index_types;
-mod hash_bucket_assigner;
 mod hybrid_search_builder;
 mod incremental_scan;
 pub(crate) mod index_file_path;
@@ -216,7 +216,10 @@ pub use consumer_manager::ConsumerManager;
 pub use cow_writer::{CopyOnWriteMergeWriter, FileInfo};
 pub use data_evolution_writer::{DataEvolutionDeleteWriter, DataEvolutionWriter};
 pub use de_vector_scan::PreparedVectorSearchFilter;
-pub use dynamic_bucket_router::{DynamicBucketRouter, DynamicBucketRouting};
+pub use dynamic_bucket_assigner::DynamicBucketAssigner;
+pub use dynamic_bucket_assigner_router::{
+    DynamicBucketAssignerRouter, DynamicBucketAssignerRouting,
+};
 pub use format_partition::{
     format_partition_value, parse_format_partition_value, FormatTablePartitionPaths,
 };
@@ -234,7 +237,6 @@ pub use global_index_result::{
     GlobalIndexResult, GlobalIndexResultReadBuilder, PrimaryKeySearchPosition,
 };
 pub use global_index_types::{normalize_global_index_type, SUPPORTED_GLOBAL_INDEX_TYPES_FOR_DROP};
-pub use hash_bucket_assigner::HashBucketAssigner;
 pub use hybrid_search_builder::{
     HybridSearchBuilder, HybridSearchRanker, HybridSearchRoute, HybridSearchRouteBuilder,
     HybridSearchRouteKind, HybridSearchRouteResult, HybridSearchWeightedResult,

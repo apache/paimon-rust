@@ -22,7 +22,7 @@
 use super::format_write_builder::FormatWriteBuilder;
 use crate::resource::ResourceContext;
 use crate::table::{
-    DataEvolutionDeleteWriter, DataEvolutionWriter, HashBucketAssigner, Table, TableCommit,
+    DataEvolutionDeleteWriter, DataEvolutionWriter, DynamicBucketAssigner, Table, TableCommit,
     TableUpdate, TableWrite,
 };
 use uuid::Uuid;
@@ -151,15 +151,15 @@ impl<'a> WriteBuilder<'a> {
     /// Create a distributed dynamic-bucket assigner using this writer's
     /// overwrite and restore settings. Capture its snapshot now so routing
     /// and the eventual file writers share one immutable restore point.
-    pub async fn new_bucket_assigner(
+    pub async fn new_dynamic_bucket_assigner(
         &self,
         num_channels: i32,
         num_assigners: i32,
         assign_id: i32,
-    ) -> crate::Result<HashBucketAssigner> {
+    ) -> crate::Result<DynamicBucketAssigner> {
         match &self.0 {
             WriteBuilderKind::Paimon(builder) => {
-                HashBucketAssigner::new(
+                DynamicBucketAssigner::new(
                     builder.table,
                     num_channels,
                     num_assigners,

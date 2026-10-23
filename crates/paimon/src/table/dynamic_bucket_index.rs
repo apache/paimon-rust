@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Dynamic bucket assigner for PK tables with bucket=-1 where PK includes partition fields.
+//! Dynamic bucket index state for PK tables whose primary key includes partition fields.
 //!
 //! Also contains the per-bucket index maintainer (`DynamicBucketIndexMaintainer`)
 //! and per-partition index (`PartitionIndex`) used by both dynamic and cross-partition modes.
@@ -589,13 +589,15 @@ impl PartitionIndex {
 }
 
 // ---------------------------------------------------------------------------
-// DynamicBucketAssigner
+// DynamicBucketIndex
 // ---------------------------------------------------------------------------
 
-/// Bucket assigner for dynamic bucket mode (bucket=-1) where PK includes partition fields.
+/// HASH index state for dynamic bucket mode (bucket=-1).
 ///
-/// Maintains a per-partition `PartitionIndex` that maps key hashes to bucket ids.
-pub(crate) struct DynamicBucketAssigner {
+/// Restores and maintains per-partition key-to-bucket mappings. Distributed
+/// assigners restore requested mappings; file writers additionally maintain
+/// complete HASH indexes for publication.
+pub(crate) struct DynamicBucketIndex {
     partition_field_indices: Vec<usize>,
     primary_key_indices: Vec<usize>,
     /// Schema fields for BinaryRow extraction.
@@ -621,7 +623,7 @@ pub(crate) struct DynamicBucketAssigner {
     index_file_in_data_file_dir: bool,
 }
 
-impl DynamicBucketAssigner {
+impl DynamicBucketIndex {
     pub fn new(
         table: Table,
         partition_field_indices: Vec<usize>,
@@ -983,7 +985,7 @@ impl DynamicBucketAssigner {
     }
 }
 
-impl BucketAssigner for DynamicBucketAssigner {
+impl BucketAssigner for DynamicBucketIndex {
     async fn assign_batch(
         &mut self,
         batch: &RecordBatch,

@@ -877,8 +877,8 @@ class BatchWriteBuilder:
         """
         ...
     def with_restore_snapshot(self, snapshot_id: int) -> "BatchWriteBuilder": ...
-    def new_bucket_assigner(self, num_channels: int, num_assigners: int,
-                            assign_id: int) -> HashBucketAssigner:
+    def new_dynamic_bucket_assigner(self, num_channels: int, num_assigners: int,
+                                   assign_id: int) -> DynamicBucketAssigner:
         """Restore HASH_DYNAMIC assignments at one write-authorized snapshot.
 
         Overwrite starts empty. This stage creates no data or index files;
@@ -899,19 +899,19 @@ class BucketRouter:
     def with_bucket_plan(self, plan: pyarrow.RecordBatch) -> BucketRouter: ...
     def route(self, batch: pyarrow.RecordBatch) -> pyarrow.Int32Array: ...
 
-class DynamicBucketRouter:
+class DynamicBucketAssignerRouter:
     """Pure Java HASH_DYNAMIC routing before grouping input by assigner."""
     def __init__(self, schema: TableSchema, num_channels: int, num_assigners: int) -> None: ...
     def route(self, batch: pyarrow.RecordBatch) -> pyarrow.RecordBatch:
         """Return non-null assigner and key_hash Int32 columns in input order."""
         ...
 
-class HashBucketAssigner:
+class DynamicBucketAssigner:
     """Stateful bucket assignment; construct through BatchWriteBuilder.
 
     Existing mappings remain stable across assigner parallelism changes.
     New keys use buckets owned by this assigner. Input must already be
-    grouped by the DynamicBucketRouter's assigner column.
+    grouped by the DynamicBucketAssignerRouter's assigner column.
     """
     @property
     def restore_snapshot_id(self) -> int:

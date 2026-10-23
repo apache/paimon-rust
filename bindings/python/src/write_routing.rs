@@ -26,7 +26,7 @@ use arrow::pyarrow::{FromPyArrow, ToPyArrow};
 use arrow::record_batch::RecordBatch;
 use paimon::spec::TableSchema;
 use paimon::table::{
-    BucketRouter, DynamicBucketRouter, HashBucketAssigner, PostponeBucketPlan,
+    BucketRouter, DynamicBucketAssigner, DynamicBucketAssignerRouter, PostponeBucketPlan,
     PostponeBucketPlanner,
 };
 use paimon_datafusion::runtime::runtime;
@@ -72,17 +72,20 @@ impl PyBucketRouter {
     }
 }
 
-#[pyclass(name = "DynamicBucketRouter", module = "pypaimon_rust.datafusion")]
-pub struct PyDynamicBucketRouter {
-    inner: DynamicBucketRouter,
+#[pyclass(
+    name = "DynamicBucketAssignerRouter",
+    module = "pypaimon_rust.datafusion"
+)]
+pub struct PyDynamicBucketAssignerRouter {
+    inner: DynamicBucketAssignerRouter,
 }
 
 #[pymethods]
-impl PyDynamicBucketRouter {
+impl PyDynamicBucketAssignerRouter {
     #[new]
     fn new(schema: &PyTableSchema, num_channels: i32, num_assigners: i32) -> PyResult<Self> {
         Ok(Self {
-            inner: DynamicBucketRouter::new(&schema.inner, num_channels, num_assigners)
+            inner: DynamicBucketAssignerRouter::new(&schema.inner, num_channels, num_assigners)
                 .map_err(to_py_err)?,
         })
     }
@@ -103,19 +106,19 @@ impl PyDynamicBucketRouter {
     }
 }
 
-#[pyclass(name = "HashBucketAssigner", module = "pypaimon_rust.datafusion")]
-pub struct PyHashBucketAssigner {
-    inner: HashBucketAssigner,
+#[pyclass(name = "DynamicBucketAssigner", module = "pypaimon_rust.datafusion")]
+pub struct PyDynamicBucketAssigner {
+    inner: DynamicBucketAssigner,
 }
 
-impl PyHashBucketAssigner {
-    pub(crate) fn new(inner: HashBucketAssigner) -> Self {
+impl PyDynamicBucketAssigner {
+    pub(crate) fn new(inner: DynamicBucketAssigner) -> Self {
         Self { inner }
     }
 }
 
 #[pymethods]
-impl PyHashBucketAssigner {
+impl PyDynamicBucketAssigner {
     #[getter]
     fn restore_snapshot_id(&self) -> i64 {
         self.inner.restore_snapshot_id()
@@ -239,15 +242,15 @@ mod tests {
                 .unwrap();
             locals
                 .set_item(
-                    "DynamicBucketRouter",
-                    py.get_type::<PyDynamicBucketRouter>(),
+                    "DynamicBucketAssignerRouter",
+                    py.get_type::<PyDynamicBucketAssignerRouter>(),
                 )
                 .unwrap();
             py.run(
                 c_str!(
                     r#"
 import pyarrow as pa
-router = DynamicBucketRouter(table.schema(), 1, 1)
+router = DynamicBucketAssignerRouter(table.schema(), 1, 1)
 batch = pa.record_batch([
     pa.array(['unused', 'a', 'a', 'a', 'unused']),
     pa.array([0, 10, 20, 10, 0], type=pa.int32()),
@@ -261,7 +264,7 @@ assert hashes.type == pa.int32() and hashes.null_count == 0
 assert hashes[0] == hashes[2] and hashes[0] != hashes[1]
 
 builder = table.new_batch_write_builder().with_restore_snapshot(0)
-assigner = builder.new_bucket_assigner(1, 1, 0)
+assigner = builder.new_dynamic_bucket_assigner(1, 1, 0)
 assert assigner.restore_snapshot_id == 0
 for invalid in [pa.array([None, 1, 2], type=pa.int32()), hashes.slice(0, 2),
                 pa.array([1, 2, 3], type=pa.int64())]:
@@ -274,7 +277,7 @@ for invalid in [pa.array([None, 1, 2], type=pa.int32()), hashes.slice(0, 2),
 buckets = assigner.assign(batch, hashes)
 assert buckets.to_pylist() == [0, 1, 0]
 assert assigner.assign(batch.slice(1), hashes.slice(1)).to_pylist() == [1, 0]
-assert builder.new_bucket_assigner(1, 1, 0).assign(batch).equals(buckets)
+assert builder.new_dynamic_bucket_assigner(1, 1, 0).assign(batch).equals(buckets)
 
 writer = builder.new_write()
 writer.write_arrow(batch.take(pa.array([0, 2])), bucket=0)
@@ -282,15 +285,15 @@ writer.write_arrow(batch.slice(1, 1), bucket=1)
 messages = writer.prepare_commit()
 builder.new_commit().commit(messages)
 
-restored = table.new_batch_write_builder().new_bucket_assigner(1, 1, 0)
+restored = table.new_batch_write_builder().new_dynamic_bucket_assigner(1, 1, 0)
 assert restored.restore_snapshot_id == 1
 assert restored.assign(batch, hashes).equals(buckets)
 # A captured empty base stays empty after publication of a newer snapshot.
 assert assigner.restore_snapshot_id == 0
-empty = builder.new_bucket_assigner(1, 1, 0)
+empty = builder.new_dynamic_bucket_assigner(1, 1, 0)
 assert empty.restore_snapshot_id == 0
 assert empty.assign(batch.slice(1, 1)).to_pylist() == [0]
-overwritten = table.new_batch_write_builder().with_overwrite().new_bucket_assigner(1, 1, 0)
+overwritten = table.new_batch_write_builder().with_overwrite().new_dynamic_bucket_assigner(1, 1, 0)
 assert overwritten.restore_snapshot_id == 0
 assert overwritten.assign(batch.slice(1, 1)).to_pylist() == [0]
 "#

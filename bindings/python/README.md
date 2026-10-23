@@ -371,12 +371,12 @@ For HASH_DYNAMIC primary-key inputs (`bucket=-1`), route rows to assigners
 before allocating buckets:
 
 ```python
-from pypaimon_rust.datafusion import DynamicBucketRouter
+from pypaimon_rust.datafusion import DynamicBucketAssignerRouter
 
-routing = DynamicBucketRouter(table.schema(), num_channels=4, num_assigners=4).route(batch)
+routing = DynamicBucketAssignerRouter(table.schema(), num_channels=4, num_assigners=4).route(batch)
 # Group rows and key_hash by routing's assigner column, then on that worker:
 builder = table.new_batch_write_builder().with_restore_snapshot(base_snapshot_id)
-assigner = builder.new_bucket_assigner(num_channels=4, num_assigners=4, assign_id=worker_id)
+assigner = builder.new_dynamic_bucket_assigner(num_channels=4, num_assigners=4, assign_id=worker_id)
 buckets = assigner.assign(worker_batch, worker_key_hashes)
 ```
 

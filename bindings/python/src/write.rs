@@ -208,13 +208,13 @@ impl PyBatchWriteBuilder {
     }
 
     /// Create a distributed HASH_DYNAMIC assigner at this builder's write baseline.
-    fn new_bucket_assigner(
+    fn new_dynamic_bucket_assigner(
         &self,
         py: Python<'_>,
         num_channels: i32,
         num_assigners: i32,
         assign_id: i32,
-    ) -> PyResult<crate::write_routing::PyHashBucketAssigner> {
+    ) -> PyResult<crate::write_routing::PyDynamicBucketAssigner> {
         let builder = self
             .context
             .table
@@ -232,14 +232,14 @@ impl PyBatchWriteBuilder {
         };
         let inner = py
             .detach(|| {
-                runtime().block_on(builder.new_bucket_assigner(
+                runtime().block_on(builder.new_dynamic_bucket_assigner(
                     num_channels,
                     num_assigners,
                     assign_id,
                 ))
             })
             .map_err(to_catalog_py_err)?;
-        Ok(crate::write_routing::PyHashBucketAssigner::new(inner))
+        Ok(crate::write_routing::PyDynamicBucketAssigner::new(inner))
     }
 
     fn new_update(&self) -> PyResult<PyBatchTableUpdate> {

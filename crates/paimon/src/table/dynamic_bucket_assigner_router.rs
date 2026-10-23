@@ -30,7 +30,7 @@ use std::collections::HashSet;
 /// Assigner IDs and Java BinaryRow key hashes in the original input order.
 /// The assigner subsequently uses its persisted HASH index to choose buckets.
 #[derive(Debug, Clone)]
-pub struct DynamicBucketRouting {
+pub struct DynamicBucketAssignerRouting {
     pub assigners: Int32Array,
     pub key_hashes: Int32Array,
 }
@@ -41,7 +41,7 @@ pub struct DynamicBucketRouting {
 /// the trimmed primary-key hash. Neither hash is a bucket ID: one assigner
 /// must own the persisted HASH-index state for each routed input.
 #[derive(Debug, Clone)]
-pub struct DynamicBucketRouter {
+pub struct DynamicBucketAssignerRouter {
     fields: Vec<DataField>,
     arrow_schema: SchemaRef,
     partition_indices: Vec<usize>,
@@ -52,7 +52,7 @@ pub struct DynamicBucketRouter {
     num_assigners: i32,
 }
 
-impl DynamicBucketRouter {
+impl DynamicBucketAssignerRouter {
     pub fn new(schema: &TableSchema, num_channels: i32, num_assigners: i32) -> Result<Self> {
         if num_channels <= 0 || num_assigners <= 0 {
             return Err(data_invalid(
@@ -118,7 +118,7 @@ impl DynamicBucketRouter {
         })
     }
 
-    pub fn route(&self, batch: &RecordBatch) -> Result<DynamicBucketRouting> {
+    pub fn route(&self, batch: &RecordBatch) -> Result<DynamicBucketAssignerRouting> {
         Ok(self.route_input(batch, None)?.1)
     }
 
@@ -128,7 +128,7 @@ impl DynamicBucketRouter {
         &self,
         batch: &RecordBatch,
         key_hashes: Option<&Int32Array>,
-    ) -> Result<(Vec<Vec<u8>>, DynamicBucketRouting)> {
+    ) -> Result<(Vec<Vec<u8>>, DynamicBucketAssignerRouting)> {
         let (partitions, routing) = self.route_input(batch, key_hashes)?;
         Ok((
             partitions
@@ -143,7 +143,7 @@ impl DynamicBucketRouter {
         &self,
         batch: &RecordBatch,
         key_hashes: Option<&Int32Array>,
-    ) -> Result<(Vec<BinaryRow>, DynamicBucketRouting)> {
+    ) -> Result<(Vec<BinaryRow>, DynamicBucketAssignerRouting)> {
         if let Some(hashes) = key_hashes {
             if hashes.len() != batch.num_rows() || hashes.null_count() != 0 {
                 return Err(data_invalid(
@@ -177,7 +177,7 @@ impl DynamicBucketRouter {
         ));
         Ok((
             partitions,
-            DynamicBucketRouting {
+            DynamicBucketAssignerRouting {
                 assigners,
                 key_hashes: hashes,
             },
@@ -272,7 +272,7 @@ mod tests {
     fn routes_reordered_key_only_rows_using_current_java_hashes() {
         // Current BinaryRowWriter + BucketAssigner.computeAssigner(7, 3).
         // The partition columns do not participate in the trimmed key hash.
-        let router = DynamicBucketRouter::new(&schema(), 7, 3).unwrap();
+        let router = DynamicBucketAssignerRouter::new(&schema(), 7, 3).unwrap();
         let batch = input();
         let routed = router.route(&batch).unwrap();
         assert_eq!(
@@ -307,7 +307,7 @@ mod tests {
 
     #[test]
     fn prehashed_routing_reads_only_partition_columns() {
-        let router = DynamicBucketRouter::new(&schema(), 7, 3).unwrap();
+        let router = DynamicBucketAssignerRouter::new(&schema(), 7, 3).unwrap();
         let batch = input();
         let expected = router.route(&batch).unwrap();
         let partition_only = batch.project(&[2]).unwrap();
@@ -336,7 +336,7 @@ mod tests {
                 .build()
                 .unwrap(),
         );
-        let router = DynamicBucketRouter::new(&schema, 7, 3).unwrap();
+        let router = DynamicBucketAssignerRouter::new(&schema, 7, 3).unwrap();
         let batch = RecordBatch::try_from_iter([(
             "payload",
             Arc::new(StringArray::from(vec!["ignored"; 4])) as ArrayRef,
@@ -383,7 +383,7 @@ mod tests {
                     .build()
                     .unwrap(),
             );
-            let router = DynamicBucketRouter::new(&schema, 7, 3).unwrap();
+            let router = DynamicBucketAssignerRouter::new(&schema, 7, 3).unwrap();
             let batch = RecordBatch::try_from_iter([("id", values)]).unwrap();
             assert_eq!(
                 router.route(&batch).unwrap().key_hashes.values(),
@@ -395,14 +395,17 @@ mod tests {
     #[test]
     fn invalid_schemas_parallelism_and_required_inputs_fail_before_routing() {
         for (channels, assigners) in [(0, 1), (1, 0), (-1, 1), (1, -1)] {
-            assert!(DynamicBucketRouter::new(&schema(), channels, assigners).is_err());
+            assert!(DynamicBucketAssignerRouter::new(&schema(), channels, assigners).is_err());
         }
         for options in [
             HashMap::from([("bucket".into(), "4".into())]),
             HashMap::from([("bucket-key".into(), "id".into())]),
             HashMap::from([("bucket-key".into(), "".into())]),
         ] {
-            assert!(DynamicBucketRouter::new(&schema().copy_with_options(options), 7, 3).is_err());
+            assert!(
+                DynamicBucketAssignerRouter::new(&schema().copy_with_options(options), 7, 3)
+                    .is_err()
+            );
         }
         let no_primary_key = TableSchema::new(
             0,
@@ -411,7 +414,7 @@ mod tests {
                 .build()
                 .unwrap(),
         );
-        assert!(DynamicBucketRouter::new(&no_primary_key, 7, 3).is_err());
+        assert!(DynamicBucketAssignerRouter::new(&no_primary_key, 7, 3).is_err());
         let cross_partition = TableSchema::new(
             0,
             &Schema::builder()
@@ -422,8 +425,8 @@ mod tests {
                 .build()
                 .unwrap(),
         );
-        assert!(DynamicBucketRouter::new(&cross_partition, 7, 3).is_err());
-        let router = DynamicBucketRouter::new(&schema(), 7, 3).unwrap();
+        assert!(DynamicBucketAssignerRouter::new(&cross_partition, 7, 3).is_err());
+        let router = DynamicBucketAssignerRouter::new(&schema(), 7, 3).unwrap();
         let batch = input();
         assert!(router.route(&batch.project(&[0, 2]).unwrap()).is_err());
         let duplicate = RecordBatch::try_new(

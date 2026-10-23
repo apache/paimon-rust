@@ -24,8 +24,8 @@ use crate::io::FileIO;
 use crate::spec::{DataField, IndexFileMeta};
 use crate::table::bucket_assigner_constant::ConstantBucketAssigner;
 use crate::table::bucket_assigner_cross::CrossPartitionAssigner;
-use crate::table::bucket_assigner_dynamic::DynamicBucketAssigner;
 use crate::table::bucket_assigner_fixed::FixedBucketAssigner;
+use crate::table::dynamic_bucket_index::DynamicBucketIndex;
 use crate::Result;
 use arrow_array::RecordBatch;
 use std::collections::HashMap;
@@ -66,7 +66,7 @@ pub(crate) trait BucketAssigner: Send {
 pub(crate) enum BucketAssignerEnum {
     Constant(ConstantBucketAssigner),
     Fixed(FixedBucketAssigner),
-    Dynamic(Box<DynamicBucketAssigner>),
+    Dynamic(Box<DynamicBucketIndex>),
     CrossPartition(Box<CrossPartitionAssigner>),
 }
 
