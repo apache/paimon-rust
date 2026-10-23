@@ -638,7 +638,14 @@ class BatchTableUpdate:
         """
         ...
     def with_update_type(self, update_cols: List[str]) -> "BatchTableUpdate": ...
-    def delete_by_row_id(self, row_ids: Sequence[int]) -> List[CommitMessage]: ...
+    def delete_by_row_id(
+        self, row_ids: Union[Sequence[int], pyarrow.Array, pyarrow.ChunkedArray]
+    ) -> List[CommitMessage]:
+        """Prepare row deletes from integer IDs; Arrow inputs retain chunks and slices.
+
+        Nulls and values outside Int64 are rejected. Duplicate IDs are deleted once.
+        """
+        ...
     def delete_by_predicate(
         self, predicate: Optional[Dict[str, Any]]
     ) -> List[CommitMessage]:
@@ -712,7 +719,7 @@ class StreamTableUpdate:
         ...
     def with_update_type(self, update_cols: List[str]) -> "StreamTableUpdate": ...
     def delete_by_row_id(
-        self, row_ids: Sequence[int], commit_identifier: int
+        self, row_ids: Union[Sequence[int], pyarrow.Array, pyarrow.ChunkedArray], commit_identifier: int
     ) -> List[CommitMessage]: ...
     def delete_by_predicate(
         self, predicate: Optional[Dict[str, Any]], commit_identifier: int

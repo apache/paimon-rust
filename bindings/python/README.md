@@ -227,6 +227,10 @@ authorization and the captured snapshot, and adds sorted, deduplicated row range
 for reading. It does not check row liveness or authorize file access; readers
 and mutation workers retain those checks. The selected plan is only for reading.
 
+Batch and stream updates accept integer Arrow arrays and chunked arrays through
+`delete_by_row_id`, as well as integer sequences. Arrow chunks and slices are
+imported directly; nulls and values outside Int64 are rejected before writing.
+
 ### Shard column updates
 
 The batch and stream update objects expose

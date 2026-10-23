@@ -561,7 +561,7 @@ async fn limit_and_deletion_vectors_do_not_trigger_sidecar_reads() {
 
     // Keeping only one live row must not make an otherwise full read use a
     // sidecar either. All the sidecars above are absent, but primaries remain.
-    let deletions = update.delete_by_row_id((1..100).collect()).await.unwrap();
+    let deletions = update.delete_by_row_id(1..100).await.unwrap();
     table
         .new_write_builder()
         .new_commit()
