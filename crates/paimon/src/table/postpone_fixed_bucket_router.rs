@@ -15,14 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::postpone_bucket_plan::data_invalid;
-use crate::spec::{
-    batch_to_serialized_bytes, BucketFunctionType, CoreOptions, DataField, EMPTY_SERIALIZED_ROW,
-    POSTPONE_BUCKET,
-};
-use crate::table::bucket_function::{batch_bucket_ids, validate_bucket_function};
+use crate::spec::{CoreOptions, TableSchema, POSTPONE_BUCKET};
 use crate::table::table_write::take_rows;
-use crate::table::{PostponeBucketPlan, Table};
+use crate::table::{BucketRouter, PostponeBucketPlan, Table};
 use crate::Result;
 use arrow_array::RecordBatch;
 use std::collections::HashMap;
@@ -35,37 +30,18 @@ pub(crate) struct PostponeBucketBatch {
 }
 
 pub(crate) struct PostponeFixedBucketRouter {
-    fields: Vec<DataField>,
-    partition_field_indices: Vec<usize>,
-    bucket_key_indices: Vec<usize>,
-    bucket_function_type: BucketFunctionType,
-    plan: PostponeBucketPlan,
+    router: BucketRouter,
 }
 
 impl PostponeFixedBucketRouter {
     pub(super) fn set_plan(&mut self, plan: PostponeBucketPlan) {
-        self.plan = plan;
+        *self.router.plan_mut() = plan;
     }
 
     pub(crate) fn new(table: &Table, plan: PostponeBucketPlan) -> Result<Self> {
         validate_postpone_fixed_bucket_table(table)?;
-        let schema = table.schema();
-        let options = CoreOptions::new(schema.options());
-        let bucket_key_indices = field_indices(schema.fields(), &schema.bucket_keys());
-        let bucket_key_fields = bucket_key_indices
-            .iter()
-            .map(|&index| schema.fields()[index].clone())
-            .collect::<Vec<_>>();
-        let bucket_function_type = options.bucket_function_type()?;
-        if !bucket_key_fields.is_empty() {
-            validate_bucket_function(bucket_function_type, &bucket_key_fields)?;
-        }
         Ok(Self {
-            fields: schema.fields().to_vec(),
-            partition_field_indices: field_indices(schema.fields(), schema.partition_keys()),
-            bucket_key_indices,
-            bucket_function_type,
-            plan,
+            router: BucketRouter::new(table.schema())?.with_bucket_plan(plan)?,
         })
     }
 
@@ -74,56 +50,49 @@ impl PostponeFixedBucketRouter {
         table: &Table,
         snapshot_id: i64,
     ) -> Result<()> {
-        self.plan.load_existing_buckets(table, snapshot_id).await
+        self.router
+            .plan_mut()
+            .load_existing_buckets(table, snapshot_id)
+            .await
     }
 
     pub(crate) fn route(&self, batch: &RecordBatch) -> Result<Vec<PostponeBucketBatch>> {
-        let mut output = Vec::new();
-        for (partition, batch) in
-            partition_batches(batch, &self.partition_field_indices, &self.fields)?
-        {
-            let total_buckets = self.plan.total_buckets(&partition).ok_or_else(|| {
-                data_invalid("Postpone bucket plan does not contain an input partition")
-            })?;
-            let buckets = if total_buckets <= 1 || self.bucket_key_indices.is_empty() {
-                vec![0; batch.num_rows()]
-            } else {
-                batch_bucket_ids(
-                    &batch,
-                    &self.bucket_key_indices,
-                    &self.fields,
-                    self.bucket_function_type,
-                    total_buckets,
-                )?
-            };
-            let mut groups: HashMap<i32, Vec<usize>> = HashMap::new();
-            for (row, bucket) in buckets.into_iter().enumerate() {
-                groups.entry(bucket).or_default().push(row);
-            }
-            for (bucket, rows) in groups {
-                output.push(PostponeBucketBatch {
-                    partition: partition.clone(),
-                    bucket,
-                    batch: take_rows(&batch, &rows)?,
-                });
-            }
+        let (partitions, buckets) = self.router.route_with_partitions(batch)?;
+        let mut groups: HashMap<(Vec<u8>, i32), Vec<usize>> = HashMap::new();
+        for (row, partition) in partitions.into_iter().enumerate() {
+            groups
+                .entry((partition, buckets.value(row)))
+                .or_default()
+                .push(row);
         }
-        Ok(output)
+        groups
+            .into_iter()
+            .map(|((partition, bucket), rows)| {
+                Ok(PostponeBucketBatch {
+                    partition,
+                    bucket,
+                    batch: take_rows(batch, &rows)?,
+                })
+            })
+            .collect()
     }
 
     pub(crate) fn total_buckets(&self, partition: &[u8]) -> Option<i32> {
-        self.plan.total_buckets(partition)
+        self.router.plan().total_buckets(partition)
     }
 }
 
 pub(crate) fn validate_postpone_fixed_bucket_table(table: &Table) -> Result<()> {
-    let schema = table.schema();
-    let bucket = CoreOptions::new(schema.options()).bucket();
-    if table.is_format_table() || bucket != POSTPONE_BUCKET || schema.primary_keys().is_empty() {
+    validate_postpone_fixed_bucket_schema(table.schema())
+}
+
+pub(super) fn validate_postpone_fixed_bucket_schema(schema: &TableSchema) -> Result<()> {
+    let options = CoreOptions::new(schema.options());
+    let bucket = options.bucket();
+    if options.is_format_table() || bucket != POSTPONE_BUCKET || schema.primary_keys().is_empty() {
         return Err(crate::Error::Unsupported {
             message: format!(
-                "Postpone fixed-bucket writes require a Paimon primary-key table with bucket=-2, but table '{}' has bucket={bucket}",
-                table.identifier().full_name()
+                "Postpone fixed-bucket writes require a Paimon primary-key table with bucket=-2, but schema has bucket={bucket}"
             ),
         });
     }
@@ -138,31 +107,4 @@ pub(crate) fn validate_postpone_fixed_bucket_table(table: &Table) -> Result<()> 
         });
     }
     Ok(())
-}
-
-fn field_indices(fields: &[DataField], names: &[String]) -> Vec<usize> {
-    names
-        .iter()
-        .filter_map(|name| fields.iter().position(|field| field.name() == name))
-        .collect()
-}
-
-fn partition_batches(
-    batch: &RecordBatch,
-    partition_field_indices: &[usize],
-    fields: &[DataField],
-) -> Result<Vec<(Vec<u8>, RecordBatch)>> {
-    let partitions = if partition_field_indices.is_empty() {
-        vec![EMPTY_SERIALIZED_ROW.clone(); batch.num_rows()]
-    } else {
-        batch_to_serialized_bytes(batch, partition_field_indices, fields)?
-    };
-    let mut groups: HashMap<Vec<u8>, Vec<usize>> = HashMap::new();
-    for (row, partition) in partitions.into_iter().enumerate() {
-        groups.entry(partition).or_default().push(row);
-    }
-    groups
-        .into_iter()
-        .map(|(partition, rows)| Ok((partition, take_rows(batch, &rows)?)))
-        .collect()
 }

@@ -336,6 +336,37 @@ Spark's temporary-file measurement, automatic rescaling or compaction.
 Deletion-vector tables are rejected by this writer.
 A failed write cannot be prepared, and close deletes only unprepared output.
 
+Engines can compute buckets before creating writers. `BucketRouter` uses the
+table schema's bucket keys and Java hashing rules, and returns an Arrow `int32`
+array in input order. It accepts reordered columns and ignores unused payload
+fields. It performs no catalog access or file writes:
+
+```python
+from pypaimon_rust.datafusion import BucketRouter, PostponeBucketPlanner
+
+buckets = BucketRouter(table.schema()).route(batch)  # Fixed-bucket table
+```
+
+For POSTPONE inputs, resolve the known layouts through the write builder, then
+collect statistics across the complete distributed input before inferring new
+counts. The planner retains no input batches:
+
+```python
+builder = table.new_postpone_fixed_bucket_write_builder()
+known = builder.resolve_bucket_plan()
+planner = PostponeBucketPlanner(table.schema(), known)
+statistics = planner.input_statistics(batch)
+plan = planner.plan(statistics)
+buckets = BucketRouter(table.schema()).with_bucket_plan(plan).route(batch)
+```
+
+Each worker may call `input_statistics` independently. Concatenate its results
+before calling `plan`; duplicate partition rows are summed before inference.
+Statistics contain partition columns followed by `row_count: int64` and
+`data_size: int64`. These columns are interpreted by position, so partition names
+may coincide with statistics names. Existing layouts remain unchanged. The
+shared result can configure every worker with `with_bucket_plan(plan)`.
+
 Configure overwrite on the batch builder:
 
 ```python

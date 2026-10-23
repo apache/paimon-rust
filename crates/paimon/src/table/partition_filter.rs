@@ -93,7 +93,7 @@ impl PartitionFilter {
                     Some(datum) => {
                         builder.write_datum(i, datum, partition_fields[i].data_type());
                     }
-                    None => builder.set_null_at(i),
+                    None => builder.write_null(i, partition_fields[i].data_type()),
                 }
             }
             let row = builder.build();
@@ -857,6 +857,58 @@ mod tests {
             fields[0].data_type(),
         );
         assert!(!filter.matches_entry(&builder.build_serialized()).unwrap());
+    }
+
+    #[test]
+    fn null_non_compact_partition_candidates_match_java_bytes() {
+        use crate::spec::{DecimalType, LocalZonedTimestampType, TimestampType};
+
+        // Current Java InternalRowSerializer for (NULL, "abcdefghijk").
+        let compact =
+            "000100000000000000000000000000000b000000180000006162636465666768696a6b0000000000";
+        let decimal = "000100000000000000000000180000000b00000028000000000000000000000000000000000000006162636465666768696a6b0000000000";
+        let timestamp = "000100000000000000000000180000000b0000002000000000000000000000006162636465666768696a6b0000000000";
+        let mut cases = Vec::new();
+        for precision in [18, 19] {
+            cases.push((
+                DataType::Decimal(DecimalType::new(precision, 2).unwrap()),
+                if precision <= 18 { compact } else { decimal },
+            ));
+        }
+        for precision in [3, 4] {
+            let bytes = if precision <= 3 { compact } else { timestamp };
+            cases.push((
+                DataType::Timestamp(TimestampType::new(precision).unwrap()),
+                bytes,
+            ));
+            cases.push((
+                DataType::LocalZonedTimestamp(LocalZonedTimestampType::new(precision).unwrap()),
+                bytes,
+            ));
+        }
+        for (data_type, body) in cases {
+            let fields = vec![
+                DataField::new(0, "pt".into(), data_type.clone()),
+                DataField::new(
+                    1,
+                    "code".into(),
+                    DataType::VarChar(VarCharType::string_type()),
+                ),
+            ];
+            let pb = PredicateBuilder::new(&fields);
+            let filter = PartitionFilter::from_predicate(
+                Predicate::and(vec![
+                    pb.is_null("pt").unwrap(),
+                    pb.equal("code", Datum::String("abcdefghijk".into()))
+                        .unwrap(),
+                ]),
+                &fields,
+            );
+            assert!(matches!(filter, PartitionFilter::PartitionSet { .. }));
+            let mut bytes = 2_i32.to_be_bytes().to_vec();
+            bytes.extend(hex::decode(body).unwrap());
+            assert!(filter.matches_entry(&bytes).unwrap(), "{data_type:?}");
+        }
     }
 
     #[test]

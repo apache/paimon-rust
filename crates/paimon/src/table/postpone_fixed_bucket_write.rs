@@ -16,7 +16,7 @@
 // under the License.
 
 use super::postpone_bucket_plan::data_invalid;
-use super::postpone_bucket_planner::PostponeBucketPlanner;
+use super::postpone_bucket_planner::BufferedPostponeBucketPlanner;
 use super::postpone_fixed_bucket_router::{
     validate_postpone_fixed_bucket_table, PostponeFixedBucketRouter,
 };
@@ -35,7 +35,7 @@ pub struct PostponeFixedBucketTableWrite {
     overwrite: bool,
     check_from_snapshot: Option<i64>,
     prepare_started: bool,
-    planner: Option<PostponeBucketPlanner>,
+    planner: Option<BufferedPostponeBucketPlanner>,
 }
 
 impl PostponeFixedBucketTableWrite {
@@ -80,7 +80,7 @@ impl PostponeFixedBucketTableWrite {
     ) -> Result<Self> {
         validate_postpone_fixed_bucket_table(table)?;
         let planner = if plan.is_none() {
-            Some(PostponeBucketPlanner::new(table)?)
+            Some(BufferedPostponeBucketPlanner::new(table)?)
         } else {
             None
         };
@@ -332,7 +332,7 @@ mod tests {
         total_buckets: Vec<i32>,
     ) -> PostponeBucketPlan {
         PostponeBucketPlan::from_arrow(
-            table,
+            table.schema(),
             &make_partition_bucket_plan_batch(partitions, total_buckets),
         )
         .unwrap()
@@ -348,7 +348,7 @@ mod tests {
             vec![Arc::new(Int32Array::from(vec![total_buckets]))],
         )
         .unwrap();
-        PostponeBucketPlan::from_arrow(table, &batch).unwrap()
+        PostponeBucketPlan::from_arrow(table.schema(), &batch).unwrap()
     }
 
     fn cross_partition_postpone_table(file_io: &FileIO, table_path: &str) -> Table {
@@ -1000,7 +1000,7 @@ mod tests {
         let table = test_postpone_partitioned_table(&file_io, table_path);
 
         let error = PostponeBucketPlan::from_arrow(
-            &table,
+            table.schema(),
             &make_partition_bucket_plan_batch(vec!["p"], vec![0]),
         )
         .unwrap_err();

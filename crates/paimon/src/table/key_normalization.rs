@@ -29,8 +29,8 @@ mod numeric;
 #[cfg(test)]
 mod encoded_tests;
 
-// Java may reserve variable-length storage for NULL timestamps/decimals.
-// Compare logical partitions using one encoding, independent of that padding.
+// Re-encode logical partitions with the same typed NULL slots as Java and
+// Arrow input serialization, independently of their original storage order.
 pub(super) fn canonical_partition_key(
     row: &BinaryRow,
     fields: &[DataField],
@@ -39,7 +39,7 @@ pub(super) fn canonical_partition_key(
     for (index, field) in fields.iter().enumerate() {
         match extract_datum(row, index, field.data_type())? {
             Some(value) => builder.write_datum(index, &value, field.data_type()),
-            None => builder.set_null_at(index),
+            None => builder.write_null(index, field.data_type()),
         }
     }
     Ok(builder.build().to_serialized_bytes())
@@ -385,7 +385,7 @@ mod tests {
     }
 
     #[test]
-    fn partition_identity_ignores_java_null_variable_storage() {
+    fn partition_identity_reencodes_java_null_variable_storage() {
         let fields = vec![
             DataField::new(
                 0,
@@ -404,24 +404,26 @@ mod tests {
             ),
         ];
         let mut builder = BinaryRowBuilder::new(3);
-        builder.set_null_at(0);
-        builder.set_null_at(1);
+        builder.write_null(0, fields[0].data_type());
+        builder.write_null(1, fields[1].data_type());
         builder.write_string(2, "after-null-fields");
         let canonical = builder.build();
-        let mut java = canonical.data()[..32].to_vec();
-        // BinaryWriter.writeTimestamp(NULL, 6) reserves 8 bytes;
-        // writeDecimal(NULL, 20) reserves another 16, even though both are NULL.
-        java.extend_from_slice(&[0; 24]);
-        java.extend_from_slice(&canonical.data()[32..]);
-        java[8..16].copy_from_slice(&(32_u64 << 32).to_le_bytes());
-        java[16..24].copy_from_slice(&(40_u64 << 32).to_le_bytes());
-        let offset_and_size = u64::from_le_bytes(canonical.data()[24..32].try_into().unwrap());
-        java[24..32].copy_from_slice(&(offset_and_size + (24_u64 << 32)).to_le_bytes());
-        let java = BinaryRow::from_bytes(3, java);
-        assert_ne!(java.to_serialized_bytes(), canonical.to_serialized_bytes());
-        assert_eq!(
-            canonical_partition_key(&java, &fields).unwrap(),
+        // Physical offsets can differ when variable fields are written in a
+        // different order. Both encodings retain Java's typed NULL storage.
+        let mut reordered = BinaryRowBuilder::new(3);
+        reordered.write_string(2, "after-null-fields");
+        reordered.write_null(1, fields[1].data_type());
+        reordered.write_null(0, fields[0].data_type());
+        let reordered = reordered.build();
+        assert_ne!(
+            reordered.to_serialized_bytes(),
             canonical.to_serialized_bytes()
         );
+        for row in [&canonical, &reordered] {
+            assert_eq!(
+                canonical_partition_key(row, &fields).unwrap(),
+                canonical.to_serialized_bytes()
+            );
+        }
     }
 }

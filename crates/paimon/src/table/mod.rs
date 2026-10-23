@@ -41,6 +41,7 @@ mod bucket_assigner_dynamic;
 mod bucket_assigner_fixed;
 mod bucket_filter;
 mod bucket_function;
+mod bucket_router;
 mod chunk_shuffle;
 mod commit_callback;
 mod commit_message;
@@ -206,6 +207,7 @@ pub use audit_log_table::AuditLogTable;
 pub use batch_vector_search_builder::BatchVectorSearchBuilder;
 pub use blob_resolver::{BlobReader, BlobStream};
 pub use branch_manager::BranchManager;
+pub use bucket_router::BucketRouter;
 pub use commit_callback::{CommitCallback, CommitCallbackContext};
 pub use commit_message::{CommitMessage, COMMIT_MESSAGE_SERIALIZER_VERSION};
 pub use consumer_manager::ConsumerManager;
@@ -243,6 +245,9 @@ pub use partition_spec::parse_partition_spec_value;
 pub use partition_stat::PartitionStat;
 pub use pk_vector_bucket_split::{BucketVectorPayload, BucketVectorSearchSplit};
 pub use postpone_bucket_plan::{PostponeBucketPlan, POSTPONE_BUCKET_PLAN_TOTAL_BUCKETS_FIELD};
+pub use postpone_bucket_planner::{
+    PostponeBucketPlanner, POSTPONE_STATISTICS_DATA_SIZE_FIELD, POSTPONE_STATISTICS_ROW_COUNT_FIELD,
+};
 pub use postpone_fixed_bucket_write::{
     PostponeFixedBucketTableCommit, PostponeFixedBucketTableWrite,
 };

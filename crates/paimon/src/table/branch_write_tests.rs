@@ -786,7 +786,7 @@ async fn fixed_bucket_write(table: &Table, value: i32, buckets: i32, overwrite: 
         Arc::new(Int32Array::from(vec![buckets])) as arrow_array::ArrayRef,
     )])
     .unwrap();
-    let plan = PostponeBucketPlan::from_arrow(table, &plan_batch).unwrap();
+    let plan = PostponeBucketPlan::from_arrow(table.schema(), &plan_batch).unwrap();
     let builder = table
         .new_postpone_fixed_bucket_write_builder()
         .unwrap()

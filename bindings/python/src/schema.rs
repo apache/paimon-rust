@@ -22,7 +22,7 @@ use pyo3::prelude::*;
 
 #[pyclass(name = "TableSchema", module = "pypaimon_rust.datafusion")]
 pub struct PyTableSchema {
-    inner: TableSchema,
+    pub(crate) inner: TableSchema,
 }
 
 impl PyTableSchema {

@@ -85,6 +85,14 @@ updates, including incremental row-ID updaters, expose the same chainable setter
 `with_commit_user` is available on batch, stream, and postpone fixed bucket write
 builders, and the identity applies to both writers and committers from that builder.
 
+`BucketRouter(table.schema()).route(batch)` assigns fixed buckets in Rust and
+returns an Arrow array without creating a writer. POSTPONE engines can use
+`PostponeBucketPlanner` to collect mergeable per-partition statistics, infer a
+shared plan, and configure that router with `with_bucket_plan(plan)`. Collect
+statistics across all input batches before planning; the planner stores schema
+and counts only. Existing layouts are resolved separately by the write builder
+using write authorization, without requiring SELECT.
+
 ### Typed MERGE Actions
 
 Batch and stream `merge_into` accept ordered `WhenMatched` and `WhenNotMatched`

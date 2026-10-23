@@ -410,7 +410,7 @@ impl BinaryRow {
             let field = &fields[field_idx];
             match extract_datum_from_arrow(batch, row_idx, field_idx, field.data_type())? {
                 Some(datum) => builder.write_datum(pos, &datum, field.data_type()),
-                None => builder.set_null_at(pos),
+                None => builder.write_null(pos, field.data_type()),
             }
         }
         Ok(builder.build())
@@ -425,7 +425,7 @@ impl BinaryRow {
         for (pos, (datum_opt, data_type)) in datums.iter().enumerate() {
             match datum_opt {
                 Some(datum) => builder.write_datum(pos, datum, data_type),
-                None => builder.set_null_at(pos),
+                None => builder.write_null(pos, data_type),
             }
         }
 
@@ -474,6 +474,22 @@ impl BinaryRowBuilder {
         self.data[byte_index] |= 1 << bit_offset;
         let offset = self.field_offset(pos);
         self.data[offset..offset + 8].fill(0);
+    }
+
+    /// Java RowHelper writes NULL non-compact decimals and timestamps through
+    /// their value writers. They retain a zeroed variable slot and its offset
+    /// for later updates, and that storage participates in the row hash.
+    pub fn write_null(&mut self, pos: usize, data_type: &DataType) {
+        self.set_null_at(pos);
+        let reserved = match data_type {
+            DataType::Decimal(decimal) if decimal.precision() > 18 => 16,
+            DataType::Timestamp(timestamp) if timestamp.precision() > 3 => 8,
+            DataType::LocalZonedTimestamp(timestamp) if timestamp.precision() > 3 => 8,
+            _ => return,
+        };
+        let variable_offset = self.data.len();
+        self.data.resize(variable_offset + reserved, 0);
+        self.write_long(pos, ((variable_offset as u64) << 32) as i64);
     }
 
     pub fn write_boolean(&mut self, pos: usize, value: bool) {
@@ -718,7 +734,7 @@ pub fn datums_to_binary_row(datums: &[(&Option<Datum>, &DataType)]) -> Vec<u8> {
                 builder.write_datum(pos, datum, data_type);
             }
             None => {
-                builder.set_null_at(pos);
+                builder.write_null(pos, data_type);
             }
         }
     }
@@ -1539,7 +1555,7 @@ fn write_typed_value(
     pos: usize,
     row_idx: usize,
     typed_col: &TypedColumn,
-    _data_type: &DataType,
+    data_type: &DataType,
 ) -> crate::Result<()> {
     use arrow_array::Array;
     match typed_col {
@@ -1647,7 +1663,7 @@ fn write_typed_value(
         }
         TypedColumn::Decimal128(arr, precision, _scale) => {
             if arr.is_null(row_idx) {
-                builder.set_null_at(pos);
+                builder.write_null(pos, data_type);
             } else {
                 let unscaled = arr.value(row_idx);
                 if *precision <= 18 {
@@ -1717,7 +1733,7 @@ fn write_typed_value(
         }
         TypedColumn::TimestampUs(arr) => {
             if arr.is_null(row_idx) {
-                builder.set_null_at(pos);
+                builder.write_null(pos, data_type);
             } else {
                 let (millis, nanos) = timestamp_parts_from_micros(arr.value(row_idx));
                 builder.write_timestamp_non_compact(pos, millis, nanos);
@@ -1725,7 +1741,7 @@ fn write_typed_value(
         }
         TypedColumn::TimestampNs(arr) => {
             if arr.is_null(row_idx) {
-                builder.set_null_at(pos);
+                builder.write_null(pos, data_type);
             } else {
                 let (millis, nanos) = timestamp_parts_from_nanos(arr.value(row_idx));
                 builder.write_timestamp_non_compact(pos, millis, nanos);
@@ -2366,6 +2382,83 @@ mod tests {
         let (millis, nano) = row.get_timestamp_raw(0, 6).unwrap();
         assert_eq!(millis, epoch_millis);
         assert_eq!(nano, nano_of_milli);
+    }
+
+    #[test]
+    fn nullable_non_compact_fields_match_java_serializer_bytes_and_hashes() {
+        use crate::spec::{
+            DataField, DecimalType, LocalZonedTimestampType, TimestampType, VarCharType,
+        };
+        use arrow_array::{new_null_array, StringArray};
+        use std::sync::Arc;
+
+        // Current Java InternalRowSerializer, via RowHelper, for
+        // GenericRow.of(NULL, BinaryString.fromString("abcdefghijk")).
+        let compact =
+            "000100000000000000000000000000000b000000180000006162636465666768696a6b0000000000";
+        let decimal = "000100000000000000000000180000000b00000028000000000000000000000000000000000000006162636465666768696a6b0000000000";
+        let timestamp = "000100000000000000000000180000000b0000002000000000000000000000006162636465666768696a6b0000000000";
+        let mut cases = Vec::new();
+        for precision in [18, 19, 20] {
+            cases.push((
+                DataType::Decimal(DecimalType::new(precision, 2).unwrap()),
+                if precision <= 18 { compact } else { decimal },
+                if precision <= 18 {
+                    1_425_286_886
+                } else {
+                    1_558_048_601
+                },
+            ));
+        }
+        for precision in [3, 4, 9] {
+            let bytes = if precision <= 3 { compact } else { timestamp };
+            let hash = if precision <= 3 {
+                1_425_286_886
+            } else {
+                -684_602_128
+            };
+            cases.push((
+                DataType::Timestamp(TimestampType::new(precision).unwrap()),
+                bytes,
+                hash,
+            ));
+            cases.push((
+                DataType::LocalZonedTimestamp(LocalZonedTimestampType::new(precision).unwrap()),
+                bytes,
+                hash,
+            ));
+        }
+        let string_type = DataType::VarChar(VarCharType::string_type());
+        let text = Some(Datum::String("abcdefghijk".into()));
+        let null = None;
+        for (data_type, bytes, hash) in cases {
+            let fields = vec![
+                DataField::new(0, "key".into(), data_type.clone()),
+                DataField::new(1, "next".into(), string_type.clone()),
+            ];
+            let schema = crate::arrow::build_target_arrow_schema(&fields).unwrap();
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    new_null_array(schema.field(0).data_type(), 1),
+                    Arc::new(StringArray::from(vec!["abcdefghijk"])),
+                ],
+            )
+            .unwrap();
+            let expected = hex::decode(bytes).unwrap();
+            let scalar = BinaryRow::from_arrow(&batch, 0, &[0, 1], &fields).unwrap();
+            let batched = batch_build_binary_rows(&batch, &[0, 1], &fields).unwrap();
+            let datum =
+                BinaryRow::from_datums(&[(None, &data_type), (text.as_ref(), &string_type)]);
+            let serialized = datums_to_binary_row(&[(&null, &data_type), (&text, &string_type)]);
+            let serialized = BinaryRow::from_serialized_bytes(&serialized).unwrap();
+            for row in [&scalar, &batched[0], &datum, &serialized] {
+                assert_eq!(row.data(), expected, "{data_type:?}");
+                assert_eq!(row.hash_code(), hash, "{data_type:?}");
+                assert!(row.is_null_at(0));
+                assert_eq!(row.get_string(1).unwrap(), "abcdefghijk");
+            }
+        }
     }
 
     #[test]
