@@ -1357,6 +1357,7 @@ fn rank_read_table(results: &[HybridSearchWeightedResult]) -> Option<&Table> {
         let other = result.result.table()?;
         if table.identifier() != other.identifier()
             || table.location() != other.location()
+            || !table.file_io().shares_backend(other.file_io())
             || table.branch() != other.branch()
             || table.schema() != other.schema()
             || first.result.snapshot_id() != result.result.snapshot_id()

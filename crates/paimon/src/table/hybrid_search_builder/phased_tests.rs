@@ -493,6 +493,97 @@ mod captured_routes {
         }
     }
 
+    #[derive(Debug)]
+    struct PartitionScopedFileIO {
+        delegate: crate::io::FileIO,
+        denied_partition: &'static str,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::io::FileIOProvider for PartitionScopedFileIO {
+        async fn create(&self, path: &str) -> crate::Result<(opendal::Operator, String)> {
+            if path.contains(self.denied_partition) {
+                return Err(crate::Error::IoUnsupported {
+                    message: "partition is outside this FileIO credential scope".into(),
+                });
+            }
+            self.delegate.create_static(path)
+        }
+    }
+
+    #[tokio::test]
+    async fn rank_drops_read_context_across_partition_scoped_file_io() {
+        let table = table();
+        append(&table, 0).await;
+        append(&table, 4).await;
+        let snapshot = table.resolve_read_snapshot().await.unwrap().unwrap();
+        let predicates = PredicateBuilder::new(table.schema().fields());
+        let mut results = Vec::new();
+        for (partition, denied_partition) in [(0, "/pt=1/"), (1, "/pt=0/")] {
+            // Both handles read exactly the same immutable dataset. Only their
+            // credentials differ: each can read one partition's data files.
+            let file_io = table
+                .file_io()
+                .clone()
+                .with_provider(Arc::new(PartitionScopedFileIO {
+                    delegate: table.file_io().clone(),
+                    denied_partition,
+                }));
+            let scoped_table = Table::new(
+                file_io,
+                table.identifier().clone(),
+                table.location().to_string(),
+                table.schema().clone(),
+                None,
+            )
+            .copy_with_pinned_snapshot(Some(&snapshot));
+            let result = scoped_table
+                .new_vector_search_builder()
+                .with_vector_column("embedding")
+                .with_query_vector(vec![0.0, 0.0])
+                .with_limit(4)
+                .with_partition_filter(predicates.equal("pt", Datum::Int(partition)).unwrap())
+                .unwrap()
+                .execute()
+                .await
+                .unwrap();
+            assert_eq!(result.len(), 4);
+            // Each route can materialize its own hits using its own credentials.
+            let batches = result
+                .new_read_builder()
+                .with_projection(&["id"])
+                .read()
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 4);
+            let weighted = HybridSearchWeightedResult::new(result, 1.0).unwrap();
+            let same_scope = HybridSearchRanker::Mrr
+                .rank(&[weighted.clone(), weighted.clone()], 4)
+                .unwrap();
+            assert!(same_scope.table().is_some());
+            assert_eq!(same_scope.snapshot_id(), Some(snapshot.id()));
+            results.push(weighted);
+        }
+
+        let ranked = HybridSearchRanker::Mrr.rank(&results, 8).unwrap();
+        let mut row_ids = ranked.row_ids().unwrap().row_ids.clone();
+        row_ids.sort_unstable();
+        assert_eq!(row_ids, (0..8).collect::<Vec<_>>());
+        assert!(ranked.table().is_none());
+        assert!(ranked.snapshot_id().is_none());
+        match ranked.new_read_builder().read().await {
+            Err(crate::Error::Unsupported { message }) => {
+                assert!(message
+                    .contains("Direct result reads require a result returned by a table search"));
+            }
+            Err(error) => panic!("expected missing read context, got: {error}"),
+            Ok(_) => panic!("mixed credential scopes must not retain one route's read context"),
+        }
+    }
+
     #[tokio::test]
     async fn route_preparation_validates_before_resolving_snapshots() {
         let table = table();

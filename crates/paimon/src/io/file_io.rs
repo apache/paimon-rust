@@ -291,6 +291,19 @@ impl FileIO {
         self
     }
 
+    /// Whether both handles retain the same storage or provider instance.
+    pub(crate) fn shares_backend(&self, other: &Self) -> bool {
+        match (&self.backend, &other.backend) {
+            (FileIOBackend::Storage(left), FileIOBackend::Storage(right)) => {
+                Arc::ptr_eq(left, right)
+            }
+            (FileIOBackend::Provider(left), FileIOBackend::Provider(right)) => {
+                Arc::ptr_eq(left, right)
+            }
+            _ => false,
+        }
+    }
+
     pub(crate) fn file_format_metadata_cache(&self) -> Arc<FileFormatMetadataCacheContext> {
         Arc::clone(&self.file_format_metadata_cache)
     }
