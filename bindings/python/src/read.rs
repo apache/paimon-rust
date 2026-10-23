@@ -351,6 +351,7 @@ impl PyReadBuilder {
             row_position_shard: None,
             chunk_shuffle: None,
             shard: None,
+            file_filters: None,
         }
     }
 
@@ -415,6 +416,7 @@ pub struct PyTableScan {
     row_position_shard: Option<(u64, u64)>,
     chunk_shuffle: Option<PyChunkShuffle>,
     shard: Option<(usize, usize)>,
+    file_filters: Option<(bool, bool)>,
 }
 
 #[derive(Clone)]
@@ -469,6 +471,11 @@ impl PyTableScan {
         }
         if let Some((index, count)) = self.shard {
             scan = scan.with_shard(index, count).map_err(to_py_err)?;
+        }
+        if let Some((skip_level0, only_read_real_buckets)) = self.file_filters {
+            scan = scan
+                .with_file_filters(skip_level0, only_read_real_buckets)
+                .map_err(to_py_err)?;
         }
         Ok(scan)
     }
@@ -691,6 +698,25 @@ impl PyStreamTableScan {
 
 #[pymethods]
 impl PyTableScan {
+    /// Configure independent file filters for plan() and plan_files().
+    /// plan_all() includes L0 while retaining the configured bucket policy.
+    fn with_file_filters(
+        mut slf: PyRefMut<'_, Self>,
+        skip_level0: bool,
+        only_read_real_buckets: bool,
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        if slf.incremental_scan.is_some() {
+            return Err(PyValueError::new_err(
+                "file filters use table snapshot or incremental-between-timestamp options",
+            ));
+        }
+        slf.core_scan()?
+            .with_file_filters(skip_level0, only_read_real_buckets)
+            .map_err(to_py_err)?;
+        slf.file_filters = Some((skip_level0, only_read_real_buckets));
+        Ok(slf)
+    }
+
     /// Supply an evaluated selection; validation and authorization stay in core.
     fn with_global_index_result<'py>(
         mut slf: PyRefMut<'py, Self>,
@@ -769,13 +795,38 @@ impl PyTableScan {
         Ok(slf)
     }
 
-    fn plan_all_files(&self, py: Python<'_>) -> PyResult<PyPlan> {
+    /// Return a split Plan including L0 and all matching data-evolution column files.
+    /// Scan filters and limits remain in effect; requires unrestricted query authorization.
+    fn plan_all(&self, py: Python<'_>) -> PyResult<PyPlan> {
         py.detach(|| {
             runtime().block_on(async {
                 self.core_scan()?
-                    .plan_all_files()
+                    .plan_all()
                     .await
                     .map(PyPlan::from)
+                    .map_err(to_py_err)
+            })
+        })
+    }
+
+    /// Return filtered file metadata before split packing or row selection.
+    fn plan_files(&self, py: Python<'_>) -> PyResult<PyFileScanPlan> {
+        if self.incremental_scan.is_some() {
+            return Err(PyValueError::new_err(
+                "plan_files uses table snapshot or incremental-between-timestamp options",
+            ));
+        }
+        py.detach(|| {
+            runtime().block_on(async {
+                let mut scan = self.read_builder()?.new_scan();
+                if let Some((skip_level0, only_read_real_buckets)) = self.file_filters {
+                    scan = scan
+                        .with_file_filters(skip_level0, only_read_real_buckets)
+                        .map_err(to_py_err)?;
+                }
+                scan.plan_files()
+                    .await
+                    .map(|inner| PyFileScanPlan { inner })
                     .map_err(to_py_err)
             })
         })
@@ -1119,7 +1170,23 @@ impl PyRecordBatchReader {
 
 #[pyclass(name = "Plan", module = "pypaimon_rust.datafusion")]
 pub struct PyPlan {
-    inner: paimon::table::Plan,
+    pub(crate) inner: paimon::table::Plan,
+}
+
+#[pyclass(name = "FileScanPlan", module = "pypaimon_rust.datafusion", frozen)]
+pub struct PyFileScanPlan {
+    inner: paimon::table::FileScanPlan,
+}
+
+#[pymethods]
+impl PyFileScanPlan {
+    fn snapshot_id(&self) -> Option<i64> {
+        self.inner.snapshot_id()
+    }
+
+    fn files(&self) -> Vec<crate::commit_callback::PyManifestEntry> {
+        self.inner.files().iter().cloned().map(Into::into).collect()
+    }
 }
 
 impl From<paimon::table::Plan> for PyPlan {
@@ -1130,6 +1197,20 @@ impl From<paimon::table::Plan> for PyPlan {
 
 #[pymethods]
 impl PyPlan {
+    /// Restore captured planning metadata using typed splits. Execution
+    /// authorizes the transported plan independently.
+    #[new]
+    #[pyo3(signature = (snapshot_id, splits))]
+    fn new(snapshot_id: Option<i64>, splits: &Bound<'_, PyAny>) -> PyResult<Self> {
+        let splits = splits
+            .try_iter()?
+            .map(|split| Ok(split?.extract::<PyRef<'_, PySplit>>()?.inner.clone()))
+            .collect::<PyResult<Vec<_>>>()?;
+        Ok(Self {
+            inner: paimon::table::Plan::from_splits(snapshot_id, splits),
+        })
+    }
+
     /// Snapshot selected by the scan, even when pruning produces no splits.
     /// `None` means no snapshot was selected, including snapshot-free format tables.
     fn snapshot_id(&self) -> Option<i64> {
@@ -1153,6 +1234,46 @@ impl PyPlan {
 
     fn __len__(&self) -> usize {
         self.inner.splits().len()
+    }
+}
+
+/// Row-tracking routing metadata; constructing it performs no I/O.
+#[pyclass(name = "RowIdPlan", module = "pypaimon_rust.datafusion")]
+pub struct PyRowIdPlan {
+    inner: paimon::table::RowIdPlan,
+}
+
+#[pymethods]
+impl PyRowIdPlan {
+    #[new]
+    fn new(plan: &PyPlan) -> PyResult<Self> {
+        Ok(Self {
+            inner: paimon::table::RowIdPlan::from_plan(plan.inner.clone()).map_err(to_py_err)?,
+        })
+    }
+
+    fn snapshot_id(&self) -> Option<i64> {
+        self.inner.snapshot_id()
+    }
+
+    fn groups(&self) -> Vec<(i64, i64, PySplit)> {
+        self.inner
+            .groups()
+            .iter()
+            .map(|(first, last, split)| {
+                (
+                    *first,
+                    *last,
+                    PySplit {
+                        inner: split.clone(),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn plan(&self) -> PyPlan {
+        self.inner.plan().clone().into()
     }
 }
 
@@ -1241,6 +1362,195 @@ mod tests {
     use pyo3::types::PyList;
 
     use super::*;
+
+    #[test]
+    fn file_planning_binding_keeps_complete_entries_and_independent_query_filters() {
+        Python::attach(|py| {
+            let schema = Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .primary_key(["id"])
+                .option("bucket", "1")
+                .option("merge-engine", "first-row")
+                .build()
+                .unwrap();
+            let table = Arc::new(Table::new(
+                FileIOBuilder::new("memory").build().unwrap(),
+                Identifier::new("default", "file_binding"),
+                "memory:/file-binding".into(),
+                TableSchema::new(0, &schema),
+                None,
+            ));
+            py.detach(|| {
+                runtime().block_on(async {
+                    table
+                        .file_io()
+                        .mkdirs("memory:/file-binding/schema")
+                        .await
+                        .unwrap();
+                    table
+                        .file_io()
+                        .mkdirs("memory:/file-binding/snapshot")
+                        .await
+                        .unwrap();
+                    table
+                        .file_io()
+                        .new_output("memory:/file-binding/schema/schema-0")
+                        .unwrap()
+                        .write(serde_json::to_vec(table.schema()).unwrap().into())
+                        .await
+                        .unwrap();
+                    for id in [1, 1] {
+                        let builder = table.new_write_builder();
+                        let mut writer = builder.new_write().unwrap();
+                        let batch = RecordBatch::try_from_iter(vec![(
+                            "id",
+                            Arc::new(arrow::array::Int32Array::from(vec![id]))
+                                as arrow::array::ArrayRef,
+                        )])
+                        .unwrap();
+                        writer.write_arrow_batch(&batch).await.unwrap();
+                        builder
+                            .new_commit()
+                            .commit(writer.prepare_commit().await.unwrap())
+                            .await
+                            .unwrap();
+                        writer.close().await;
+                    }
+                })
+            });
+            let mut builder = PyReadBuilder::new(Arc::clone(&table));
+            builder.limit = Some(0);
+            let scan = Py::new(py, builder.new_scan()).unwrap();
+            for name in ["skip_level0", "only_read_real_buckets"] {
+                let kwargs = PyDict::new(py);
+                kwargs.set_item(name, true).unwrap();
+                let error = scan
+                    .bind(py)
+                    .call_method("plan_files", (), Some(&kwargs))
+                    .unwrap_err();
+                assert!(error.is_instance_of::<pyo3::exceptions::PyTypeError>(py));
+            }
+            assert_eq!(
+                scan.bind(py)
+                    .call_method0("plan_all")
+                    .unwrap()
+                    .len()
+                    .unwrap(),
+                0,
+                "plan_all retains row LIMIT"
+            );
+            let files = scan.bind(py).call_method0("plan_files").unwrap();
+            assert_eq!(
+                files
+                    .call_method0("snapshot_id")
+                    .unwrap()
+                    .extract::<i64>()
+                    .unwrap(),
+                2
+            );
+            let entries = files.call_method0("files").unwrap();
+            assert_eq!(
+                entries.len().unwrap(),
+                2,
+                "metadata planning ignores row LIMIT"
+            );
+            let first = entries.get_item(0).unwrap();
+            assert_eq!(first.getattr("kind").unwrap().extract::<i32>().unwrap(), 0);
+            assert_eq!(
+                first
+                    .getattr("total_buckets")
+                    .unwrap()
+                    .extract::<i32>()
+                    .unwrap(),
+                1
+            );
+            let file = first.getattr("file").unwrap();
+            assert_eq!(
+                file.getattr("row_count").unwrap().extract::<i64>().unwrap(),
+                1
+            );
+            assert!(file
+                .getattr("file_name")
+                .unwrap()
+                .extract::<String>()
+                .unwrap()
+                .ends_with(".parquet"));
+            let encoded = first
+                .call_method0("_to_commit_message")
+                .unwrap()
+                .call_method0("serialize")
+                .unwrap();
+            let encoded = encoded.cast::<PyBytes>().unwrap();
+            let restored = paimon::table::CommitMessage::deserialize(
+                paimon::table::COMMIT_MESSAGE_SERIALIZER_VERSION,
+                encoded.as_bytes(),
+            )
+            .unwrap();
+            let expected = py.detach(|| {
+                runtime().block_on(async {
+                    table
+                        .new_read_builder()
+                        .new_scan()
+                        .plan_files()
+                        .await
+                        .unwrap()
+                })
+            });
+            assert_eq!(restored.new_files, vec![expected.files()[0].file().clone()]);
+
+            builder.limit = None;
+            let scan = Py::new(py, builder.new_scan()).unwrap();
+            assert_eq!(
+                scan.bind(py).call_method0("plan").unwrap().len().unwrap(),
+                0
+            );
+            scan.bind(py)
+                .call_method1("with_file_filters", (false, true))
+                .unwrap();
+            assert_eq!(
+                scan.bind(py).call_method0("plan").unwrap().len().unwrap(),
+                1
+            );
+            for (skip_level0, expected_files, expected_splits) in
+                [(false, 2, 1), (true, 0, 0), (false, 2, 1)]
+            {
+                scan.bind(py)
+                    .call_method1("with_file_filters", (skip_level0, true))
+                    .unwrap();
+                assert_eq!(
+                    scan.bind(py)
+                        .call_method0("plan_files")
+                        .unwrap()
+                        .call_method0("files")
+                        .unwrap()
+                        .len()
+                        .unwrap(),
+                    expected_files
+                );
+                assert_eq!(
+                    scan.bind(py).call_method0("plan").unwrap().len().unwrap(),
+                    expected_splits
+                );
+                let all = scan.bind(py).call_method0("plan_all").unwrap();
+                let all = all.extract::<PyRef<'_, PyPlan>>().unwrap();
+                assert_eq!(
+                    all.inner
+                        .splits()
+                        .iter()
+                        .flat_map(|split| split.data_files())
+                        .count(),
+                    2,
+                    "plan_all includes L0 even when explicit file filters exclude it"
+                );
+            }
+            let fresh = Py::new(py, builder.new_scan()).unwrap();
+            assert_eq!(
+                fresh.bind(py).call_method0("plan").unwrap().len().unwrap(),
+                0,
+                "file filters must not change a fresh query scan's defaults"
+            );
+        });
+    }
 
     #[test]
     fn stream_scan_copy_keeps_callback_ownership_and_progress_independent() {

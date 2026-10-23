@@ -54,8 +54,26 @@ use std::sync::Arc;
 
 #[path = "table_write_input.rs"]
 mod input;
+#[cfg(test)]
+#[path = "table_write_lifecycle_tests.rs"]
+mod lifecycle_tests;
 #[path = "table_write_precomputed.rs"]
 mod precomputed;
+
+#[derive(Clone, Copy)]
+enum AppendPrepareIdentifier {
+    Known(i64),
+    Unknown,
+}
+
+/// Java's append writer captures its factory settings per partition/bucket.
+/// Keep only these settings across prepares, not completed file resources.
+#[derive(Clone)]
+struct AppendWriteConfig {
+    blob_consumer: Option<Arc<dyn crate::spec::BlobConsumer>>,
+    blob_uri_reader_factory: Option<Arc<dyn crate::io::UriReaderFactory>>,
+    last_modified_prepare: Option<AppendPrepareIdentifier>,
+}
 
 /// Enum to hold either an append-only writer, a key-value writer, or a postpone writer.
 enum FileWriter {
@@ -143,6 +161,7 @@ pub struct TableWrite {
     write_fields: Vec<DataField>,
     written: bool,
     partition_writers: HashMap<PartitionBucketKey, FileWriter>,
+    append_write_configs: HashMap<PartitionBucketKey, AppendWriteConfig>,
     partition_computer: PartitionComputer,
     partition_keys: Vec<String>,
     schema_id: i64,
@@ -213,6 +232,7 @@ impl TableWrite {
             write_fields: schema.fields().to_vec(),
             written: false,
             partition_writers: HashMap::new(),
+            append_write_configs: HashMap::new(),
             partition_computer: PartitionComputer::new(
                 schema.partition_keys(),
                 schema.fields(),
@@ -513,6 +533,7 @@ impl TableWrite {
             write_fields: fields.to_vec(),
             written: false,
             partition_writers: HashMap::new(),
+            append_write_configs: HashMap::new(),
             partition_computer,
             partition_keys,
             schema_id: schema.id(),
@@ -641,15 +662,11 @@ impl TableWrite {
     /// Full-table inputs may provide routing columns which are not written.
     /// Selected inputs must include partition columns and, unless a bucket is
     /// supplied through [`Self::write_arrow`], the columns used for hashing.
-    /// Configure this before writing any nonempty batch.
+    /// Configure this before the first effective write. Afterwards the same
+    /// ordered selection is a no-op and a different selection is rejected,
+    /// including after prepares. Empty or ignored input does not lock it.
     pub fn with_write_type(&mut self, write_columns: Vec<String>) -> Result<&mut Self> {
         self.ensure_active()?;
-        if self.written {
-            return Err(crate::Error::DataInvalid {
-                message: "with_write_type must be called before any data is written".into(),
-                source: None,
-            });
-        }
         if self.format_writer.is_some() || !self.table.schema().primary_keys().is_empty() {
             return Err(crate::Error::Unsupported {
                 message: "with_write_type requires a Paimon append table".into(),
@@ -683,6 +700,15 @@ impl TableWrite {
                     })
             })
             .collect::<Result<Vec<_>>>()?;
+        if fields == self.write_fields {
+            return Ok(self);
+        }
+        if self.written {
+            return Err(crate::Error::DataInvalid {
+                message: "with_write_type must be called before any write operation".into(),
+                source: None,
+            });
+        }
         let indices = |names: &[String]| {
             names
                 .iter()
@@ -728,21 +754,15 @@ impl TableWrite {
         Ok(self)
     }
 
-    /// Receive dedicated append BLOB payload descriptors. Configure before
-    /// writing, as in PyPaimon. Java's primary-key and inline BLOB writers do
-    /// not invoke this consumer. Automatic abort preserves consumer Blob files;
+    /// Receive dedicated append BLOB payload descriptors. Changes apply to
+    /// newly created partition/bucket writers, as in Java. Primary-key and inline
+    /// BLOB writers do not invoke it. Automatic abort preserves consumer Blob files;
     /// callers can explicitly discard prepared files with TableCommit::abort.
     pub fn with_blob_consumer(
         &mut self,
         consumer: Option<Arc<dyn crate::spec::BlobConsumer>>,
     ) -> Result<&mut Self> {
         self.ensure_active()?;
-        if self.written {
-            return Err(crate::Error::DataInvalid {
-                message: "with_blob_consumer must be called before any write operation".into(),
-                source: None,
-            });
-        }
         if self.format_writer.is_some() {
             return Err(crate::Error::Unsupported {
                 message: "with_blob_consumer requires a Paimon table".into(),
@@ -1457,19 +1477,70 @@ impl TableWrite {
         for (_, mut writer) in self.partition_writers.drain() {
             writer.abort().await;
         }
+        self.append_write_configs.clear();
+        self.blob_consumer = None;
+        self.blob_uri_reader_factory = None;
     }
 
     /// Flush all writers and collect CommitMessages for use with TableCommit.
     /// Append writers are closed; primary-key writers retain their sequence
     /// counters after handing off the prepared files, as Java does.
+    /// Captured append settings survive active prepares. Empty prepares retire
+    /// idle bucket-unaware writers. This generic operation has no checkpoint
+    /// identifier, so it conservatively retains fixed-bucket settings because
+    /// it cannot prove the previous output has committed.
     ///
     /// Invalidate the snapshot sequence cache used to seed previously unseen
     /// buckets. Already-open key-value writers keep their own advancing counter.
     pub async fn prepare_commit(&mut self) -> Result<Vec<CommitMessage>> {
+        self.prepare_commit_internal(None).await
+    }
+
+    #[cfg(any(test, feature = "internal-api"))]
+    pub(crate) async fn prepare_commit_with_identifier(
+        &mut self,
+        commit_identifier: i64,
+    ) -> Result<Vec<CommitMessage>> {
+        self.prepare_commit_internal(Some(commit_identifier)).await
+    }
+
+    async fn prepare_commit_internal(
+        &mut self,
+        commit_identifier: Option<i64>,
+    ) -> Result<Vec<CommitMessage>> {
         if let Some(writer) = self.format_writer.as_mut() {
             return writer.prepare_commit().await;
         }
         self.ensure_active()?;
+        // Java keeps newly created writers on the first prepare. Later empty
+        // increments may retire them, but active buckets keep their captured
+        // factory configuration across successful prepares.
+        let can_retire = self.append_write_configs.values().any(|config| {
+            matches!(
+                config.last_modified_prepare,
+                Some(AppendPrepareIdentifier::Unknown)
+            ) || matches!(
+                config.last_modified_prepare,
+                Some(AppendPrepareIdentifier::Known(id)) if id != i64::MIN
+            )
+        });
+        let fixed_bucket = CoreOptions::new(self.table.schema().options()).bucket() >= 0;
+        let latest_committed_identifier = if can_retire
+            && fixed_bucket
+            && commit_identifier.is_some()
+            && self.append_write_configs.iter().any(|(key, config)| {
+                !self.partition_writers.contains_key(key)
+                    && matches!(
+                        config.last_modified_prepare,
+                        Some(AppendPrepareIdentifier::Known(_))
+                    )
+            }) {
+            // Resolve before draining files: a metadata failure leaves pending
+            // output available for a retry, with no prepared files lost.
+            Self::latest_committed_append_identifier(&self.table, &self.commit_user).await?
+        } else {
+            None
+        };
         self.partition_seq_cache.clear();
         let writers: Vec<(PartitionBucketKey, FileWriter)> =
             self.partition_writers.drain().collect();
@@ -1531,16 +1602,81 @@ impl TableWrite {
                 messages.push(msg);
             }
         }
+        let modified = messages
+            .iter()
+            .map(|message| (message.partition.clone(), message.bucket))
+            .collect::<HashSet<_>>();
+        self.append_write_configs.retain(|key, config| {
+            if modified.contains(key) {
+                config.last_modified_prepare = Some(match commit_identifier {
+                    Some(id) => AppendPrepareIdentifier::Known(id),
+                    None => AppendPrepareIdentifier::Unknown,
+                });
+                return true;
+            }
+            if !can_retire {
+                return true;
+            }
+            if !fixed_bucket {
+                return false;
+            }
+            // The generic core prepare has no checkpoint identifier, so it
+            // cannot prove a fixed bucket's previous output has committed.
+            match (
+                commit_identifier,
+                config.last_modified_prepare,
+                latest_committed_identifier,
+            ) {
+                (Some(_), Some(AppendPrepareIdentifier::Known(last)), Some(latest)) => {
+                    last >= latest
+                }
+                _ => true,
+            }
+        });
         Ok(messages)
     }
 
+    async fn latest_committed_append_identifier(
+        table: &Table,
+        commit_user: &str,
+    ) -> Result<Option<i64>> {
+        // FileSystemWriteRestore deliberately reads filesystem snapshots, even
+        // for catalog-managed tables, and stops at the first expired snapshot.
+        let manager = table.snapshot_manager().with_rest_env(None);
+        let Some(mut id) = manager.get_latest_snapshot_id().await? else {
+            return Ok(None);
+        };
+        while id >= 1 {
+            let snapshot = match manager.get_snapshot(id).await {
+                Ok(snapshot) => snapshot,
+                Err(crate::Error::SnapshotNotExist { .. }) => break,
+                Err(crate::Error::IoUnexpected { source, .. })
+                    if source.kind() == opendal::ErrorKind::NotFound =>
+                {
+                    break;
+                }
+                Err(error) => return Err(error),
+            };
+            if snapshot.commit_user() == commit_user {
+                return Ok(Some(snapshot.commit_identifier()));
+            }
+            id -= 1;
+        }
+        Ok(None)
+    }
+
     async fn fail_prepare(&mut self, messages: &[CommitMessage]) {
+        let preserve_blob_files = self.primary_key_indices.is_empty()
+            && self
+                .append_write_configs
+                .values()
+                .any(|config| config.blob_consumer.is_some());
         self.failed = true;
         self.close().await;
         // Only this failed invocation's outputs: no message has been returned
         // or submitted. Earlier successful prepare calls belong to the caller.
         let mut cleanup = messages.to_vec();
-        if self.primary_key_indices.is_empty() && self.blob_consumer.is_some() {
+        if preserve_blob_files {
             // A successful partition may already have exposed its dedicated
             // Blob files to the consumer. Preserve Java's deletion policy in
             // this table-wide cleanup too. Explicit TableCommit.abort remains
@@ -1561,7 +1697,19 @@ impl TableWrite {
         let partition_path = self.resolve_partition_path(&partition_bytes)?;
 
         let writer = if self.primary_key_indices.is_empty() {
-            self.create_append_writer(partition_path, bucket)?
+            let key = (partition_bytes.clone(), bucket);
+            let config = self
+                .append_write_configs
+                .get(&key)
+                .cloned()
+                .unwrap_or_else(|| AppendWriteConfig {
+                    blob_consumer: self.blob_consumer.clone(),
+                    blob_uri_reader_factory: self.blob_uri_reader_factory.clone(),
+                    last_modified_prepare: None,
+                });
+            let writer = self.create_append_writer(partition_path, bucket, &config)?;
+            self.append_write_configs.insert(key, config);
+            writer
         } else if bucket == POSTPONE_BUCKET {
             self.create_postpone_writer(partition_path, bucket)?
         } else {
@@ -1584,7 +1732,12 @@ impl TableWrite {
     }
 
     /// Create an append-only writer for non-PK tables.
-    fn create_append_writer(&self, partition_path: String, bucket: i32) -> Result<FileWriter> {
+    fn create_append_writer(
+        &self,
+        partition_path: String,
+        bucket: i32,
+        config: &AppendWriteConfig,
+    ) -> Result<FileWriter> {
         if self.has_blob_fields
             || self.has_dedicated_vector_fields
             || !self.blob_view_fields.is_empty()
@@ -1613,8 +1766,8 @@ impl TableWrite {
                     &self.blob_inline_fields,
                 )?
                 .with_blob_writer_options(
-                    self.blob_consumer.clone(),
-                    self.blob_uri_reader_factory.clone(),
+                    config.blob_consumer.clone(),
+                    config.blob_uri_reader_factory.clone(),
                 )?
                 .with_resources(self.resources.clone()),
             )))
@@ -1800,7 +1953,7 @@ pub(in crate::table) mod tests {
         use arrow_array::{ArrayRef, LargeBinaryArray};
         use std::sync::Mutex;
 
-        for has_consumer in [false, true] {
+        for (has_consumer, replace_consumer) in [(false, false), (true, false), (true, true)] {
             let io = test_file_io();
             let schema = Schema::builder()
                 .column("pt", DataType::Int(IntType::new()))
@@ -1842,6 +1995,11 @@ pub(in crate::table) mod tests {
             ])
             .unwrap();
             writer.write_arrow_batch(&batch).await.unwrap();
+            if replace_consumer {
+                // Captured callbacks own these payloads even when the factory
+                // has subsequently disabled its consumer for future writers.
+                writer.with_blob_consumer(None).unwrap();
+            }
             assert_eq!(writer.partition_writers.len(), 2);
             let FileWriter::AppendDedicated(partition) =
                 writer.partition_writers.values_mut().next().unwrap()

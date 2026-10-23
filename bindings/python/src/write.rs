@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use arrow::datatypes::Schema as ArrowSchema;
-use arrow::pyarrow::FromPyArrow;
+use arrow::pyarrow::{FromPyArrow, ToPyArrow};
 use arrow::record_batch::RecordBatch;
 use paimon::spec::{BlobConsumer, BlobDescriptor, CoreOptions, DataType, Datum, RowType};
 use paimon::table::{
@@ -88,6 +88,7 @@ impl WriteContext {
             ))),
             table_location: self.table.location().to_string(),
             commit_user: self.commit_user.clone(),
+            blob_consumers: Vec::new(),
         })
     }
 }
@@ -164,8 +165,8 @@ impl PyBatchWriteBuilder {
 
 #[pymethods]
 impl PyBatchWriteBuilder {
-    /// Internal PyPaimon bridge: retain the identity of the external Python writer.
-    fn _with_commit_user(
+    /// Set the commit identity shared by this builder's writers and committers.
+    fn with_commit_user(
         mut slf: PyRefMut<'_, Self>,
         commit_user: String,
     ) -> PyResult<PyRefMut<'_, Self>> {
@@ -366,9 +367,15 @@ impl WriteTarget {
         }
     }
 
-    async fn prepare_commit(&mut self) -> paimon::Result<Vec<CommitMessage>> {
+    async fn prepare_commit(
+        &mut self,
+        commit_identifier: i64,
+    ) -> paimon::Result<Vec<CommitMessage>> {
         match self {
-            Self::Table(writer) => writer.prepare_commit().await,
+            Self::Table(writer) => {
+                paimon::table::internal::prepare_commit_with_identifier(writer, commit_identifier)
+                    .await
+            }
             Self::PostponeFixed(writer) => writer.prepare_commit().await,
         }
     }
@@ -405,7 +412,28 @@ impl PyPostponeFixedBucketWriteBuilder {
 
 #[pymethods]
 impl PyPostponeFixedBucketWriteBuilder {
-    fn _with_commit_user(
+    /// Existing partitions and their bucket counts, using writer metadata access.
+    fn resolve_bucket_plan(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let table = &self.batch.context.table;
+        let mut builder = table
+            .new_postpone_fixed_bucket_write_builder()
+            .map_err(to_py_err)?;
+        if let Some(plan) = &self.plan {
+            builder = builder.with_bucket_plan(plan.clone());
+        }
+        if self.batch.static_partition.is_some() {
+            builder = builder.with_overwrite();
+        }
+        let plan = py
+            .detach(|| runtime().block_on(builder.resolve_bucket_plan()))
+            .map_err(to_py_err)?;
+        plan.to_arrow(table)
+            .map_err(to_py_err)?
+            .to_pyarrow(py)
+            .map(Bound::unbind)
+    }
+
+    fn with_commit_user(
         mut slf: PyRefMut<'_, Self>,
         commit_user: String,
     ) -> PyResult<PyRefMut<'_, Self>> {
@@ -464,6 +492,7 @@ impl PyPostponeFixedBucketWriteBuilder {
                 ))),
                 table_location: context.table.location().to_string(),
                 commit_user: context.commit_user.clone(),
+                blob_consumers: Vec::new(),
             },
             prepared: false,
         })
@@ -478,12 +507,15 @@ struct WriteState {
     inner: Option<WriteTarget>,
     table_location: String,
     commit_user: String,
+    // Core keeps prior consumers in captured partition/bucket settings. Expose
+    // every owned Python reference to GC, including replaced consumers.
+    blob_consumers: Vec<Arc<PythonBlobConsumer>>,
 }
 
 /// Descriptor serialization and exception transport only; record boundaries,
 /// callback timing and requested flushes belong to Rust core.
 struct PythonBlobConsumer {
-    callback: Py<PyAny>,
+    callback: Mutex<Option<Py<PyAny>>>,
 }
 
 impl BlobConsumer for PythonBlobConsumer {
@@ -496,10 +528,14 @@ impl BlobConsumer for PythonBlobConsumer {
             Python::attach(|py| {
                 let encoded =
                     descriptor.map(|descriptor| PyBytes::new(py, &descriptor.serialize()));
-                self.callback
-                    .bind(py)
-                    .call1((field_name, encoded))?
-                    .is_truthy()
+                let callback = self
+                    .callback
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|callback| callback.clone_ref(py))
+                    .ok_or_else(|| PyRuntimeError::new_err("Blob consumer has been cleared"))?;
+                callback.bind(py).call1((field_name, encoded))?.is_truthy()
             })
         });
         result.map_err(callback_error)
@@ -580,12 +616,24 @@ fn arrow_upsert_batches(input: &Bound<'_, PyAny>) -> PyResult<Vec<RecordBatch>> 
 
 struct UpdateContext {
     inner: TableUpdate,
+    planned: bool,
     table: Arc<Table>,
     table_location: String,
     commit_user: String,
 }
 
 impl UpdateContext {
+    // Reject a mismatched operation before consuming a Python input iterator
+    // or converting callbacks. Core independently enforces the same contract.
+    fn ensure_unplanned(&self) -> PyResult<()> {
+        if self.planned {
+            return Err(PyValueError::new_err(
+                "with_plan supports only row-ID update and delete operations",
+            ));
+        }
+        Ok(())
+    }
+
     fn with_blob_uri_reader_factory(
         &mut self,
         factory: Option<Py<PyAny>>,
@@ -598,6 +646,7 @@ impl UpdateContext {
 
     fn new(context: &WriteContext) -> PyResult<Self> {
         Ok(Self {
+            planned: false,
             inner: context
                 .table
                 .new_write_builder()
@@ -634,6 +683,7 @@ impl UpdateContext {
         when_matched: &Bound<'_, PyAny>,
         when_not_matched: &Bound<'_, PyAny>,
     ) -> PyResult<Vec<PyCommitMessage>> {
+        self.ensure_unplanned()?;
         let source = match source {
             Some(source) => match source.extract::<PyRef<crate::table::PyTable>>() {
                 Ok(table) => paimon::table::MergeSource::Table(table.inner.clone()),
@@ -670,6 +720,7 @@ impl UpdateContext {
         assignments: &Bound<'_, PyDict>,
         read_columns: Option<Vec<String>>,
     ) -> PyResult<Vec<PyCommitMessage>> {
+        self.ensure_unplanned()?;
         let predicate = predicate
             .map(|predicate| dict_to_table_predicate(predicate, self.table.schema(), true))
             .transpose()?;
@@ -759,6 +810,7 @@ impl UpdateContext {
         count: usize,
         read_type: Option<&str>,
     ) -> PyResult<crate::shard_update::PyShardTableUpdator> {
+        self.ensure_unplanned()?;
         let read_type = read_type
             .map(|json| {
                 serde_json::from_str::<RowType>(json)
@@ -793,6 +845,7 @@ impl UpdateContext {
         input: &Bound<'_, PyAny>,
         keys: Vec<String>,
     ) -> PyResult<Vec<PyCommitMessage>> {
+        self.ensure_unplanned()?;
         let batches = arrow_upsert_batches(input)?;
         let messages = py
             .detach(|| runtime().block_on(self.inner.upsert_by_arrow_with_key(batches, keys)))
@@ -809,6 +862,7 @@ impl UpdateContext {
         py: Python<'_>,
         predicate: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<Vec<PyCommitMessage>> {
+        self.ensure_unplanned()?;
         let predicate = predicate
             .map(|predicate| dict_to_table_predicate(predicate, self.table.schema(), true))
             .transpose()?;
@@ -858,7 +912,9 @@ impl WriteState {
                 if !callback.bind(py).is_callable() {
                     return Err(PyTypeError::new_err("blob_consumer must be callable"));
                 }
-                Ok(Arc::new(PythonBlobConsumer { callback }))
+                Ok(Arc::new(PythonBlobConsumer {
+                    callback: Mutex::new(Some(callback)),
+                }))
             })
             .transpose()?;
         self.inner
@@ -870,7 +926,40 @@ impl WriteState {
                     .map(|consumer| consumer as Arc<dyn BlobConsumer>),
             )
             .map_err(to_py_err)?;
+        // Release replaced callbacks which no bucket has captured. A snapshot
+        // retained by core contributes another Arc, without another Py ref.
+        self.prune_blob_consumers();
+        if let Some(consumer) = consumer {
+            self.blob_consumers.push(consumer);
+        }
         Ok(())
+    }
+
+    fn prune_blob_consumers(&mut self) {
+        let (retained, retired): (Vec<_>, Vec<_>) = std::mem::take(&mut self.blob_consumers)
+            .into_iter()
+            .partition(|consumer| Arc::strong_count(consumer) > 1);
+        self.blob_consumers = retained;
+        // Python destructors can re-enter Native. No callback mutex is held,
+        // and the retained references are restored before any destructor runs.
+        drop(retired);
+    }
+
+    fn traverse_callbacks(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
+        for consumer in &self.blob_consumers {
+            visit.call(&*consumer.callback.lock().unwrap())?;
+        }
+        Ok(())
+    }
+
+    fn clear_callbacks(&self) {
+        let references = self
+            .blob_consumers
+            .iter()
+            .map(|consumer| consumer.callback.lock().unwrap().take())
+            .collect::<Vec<_>>();
+        // Destructors may re-enter Native. Drop Python references outside locks.
+        drop(references);
     }
 
     fn write_result(&self, result: paimon::Result<()>) -> PyResult<()> {
@@ -900,14 +989,18 @@ impl WriteState {
         self.write_result(result)
     }
 
-    fn prepare_commit(&mut self, py: Python<'_>) -> PyResult<Vec<PyCommitMessage>> {
+    fn prepare_commit(
+        &mut self,
+        py: Python<'_>,
+        commit_identifier: i64,
+    ) -> PyResult<Vec<PyCommitMessage>> {
         let inner = self
             .inner
             .as_mut()
             .ok_or_else(|| PyRuntimeError::new_err("TableWrite is closed"))?;
-        let messages = py
-            .detach(|| runtime().block_on(inner.prepare_commit()))
-            .map_err(to_callback_error)?;
+        let result = py.detach(|| runtime().block_on(inner.prepare_commit(commit_identifier)));
+        self.prune_blob_consumers();
+        let messages = result.map_err(to_callback_error)?;
         Ok(wrap_messages(
             messages,
             &self.table_location,
@@ -940,14 +1033,14 @@ pub struct PyTableUpdateByRowId {
 
 #[pymethods]
 impl PyTableUpdateByRowId {
-    fn _with_blob_uri_reader_factory(
-        &mut self,
-        py: Python<'_>,
+    #[pyo3(signature = (factory))]
+    fn with_blob_uri_reader_factory(
+        mut slf: PyRefMut<'_, Self>,
         factory: Option<Py<PyAny>>,
-    ) -> PyResult<()> {
-        let factory = optional_uri_reader_factory(factory, py)?;
-        self.inner.with_blob_uri_reader_factory(factory);
-        Ok(())
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        let factory = optional_uri_reader_factory(factory, slf.py())?;
+        slf.inner.with_blob_uri_reader_factory(factory);
+        Ok(slf)
     }
 
     fn update_columns(
@@ -989,12 +1082,26 @@ pub struct PyStreamTableUpdate {
 
 #[pymethods]
 impl PyStreamTableUpdate {
-    fn _with_blob_uri_reader_factory(
-        &mut self,
-        py: Python<'_>,
+    fn with_plan<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        plan: &crate::read::PyPlan,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        slf.context
+            .inner
+            .with_plan(plan.inner.clone())
+            .map_err(to_py_err)?;
+        slf.context.planned = true;
+        Ok(slf)
+    }
+
+    #[pyo3(signature = (factory))]
+    fn with_blob_uri_reader_factory(
+        mut slf: PyRefMut<'_, Self>,
         factory: Option<Py<PyAny>>,
-    ) -> PyResult<()> {
-        self.context.with_blob_uri_reader_factory(factory, py)
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        let py = slf.py();
+        slf.context.with_blob_uri_reader_factory(factory, py)?;
+        Ok(slf)
     }
 
     #[pyo3(signature = (source, *, on, when_matched, when_not_matched, commit_identifier))]
@@ -1107,6 +1214,18 @@ impl PyStreamTableUpdate {
 
 #[pymethods]
 impl PyBatchTableUpdate {
+    fn with_plan<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        plan: &crate::read::PyPlan,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        slf.context
+            .inner
+            .with_plan(plan.inner.clone())
+            .map_err(to_py_err)?;
+        slf.context.planned = true;
+        Ok(slf)
+    }
+
     #[pyo3(signature = (predicate))]
     fn delete_by_predicate(
         &self,
@@ -1116,12 +1235,14 @@ impl PyBatchTableUpdate {
         self.context.delete_by_predicate(py, predicate)
     }
 
-    fn _with_blob_uri_reader_factory(
-        &mut self,
-        py: Python<'_>,
+    #[pyo3(signature = (factory))]
+    fn with_blob_uri_reader_factory(
+        mut slf: PyRefMut<'_, Self>,
         factory: Option<Py<PyAny>>,
-    ) -> PyResult<()> {
-        self.context.with_blob_uri_reader_factory(factory, py)
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        let py = slf.py();
+        slf.context.with_blob_uri_reader_factory(factory, py)?;
+        Ok(slf)
     }
 
     #[pyo3(signature = (source, *, on, when_matched, when_not_matched))]
@@ -1213,6 +1334,14 @@ impl PyBatchTableUpdate {
 
 #[pymethods]
 impl PyBatchTableWrite {
+    fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
+        self.state.traverse_callbacks(visit)
+    }
+
+    fn __clear__(&mut self) {
+        self.state.clear_callbacks();
+    }
+
     #[pyo3(signature = (factory))]
     fn with_blob_uri_reader_factory(
         mut slf: PyRefMut<'_, Self>,
@@ -1245,6 +1374,7 @@ impl PyBatchTableWrite {
         if let Some(mut writer) = self.state.inner.take() {
             py.detach(|| runtime().block_on(writer.close()));
         }
+        self.state.clear_callbacks();
     }
 
     #[pyo3(signature = (batch, bucket=None))]
@@ -1264,7 +1394,7 @@ impl PyBatchTableWrite {
             ));
         }
         self.prepared = true;
-        self.state.prepare_commit(py)
+        self.state.prepare_commit(py, i64::MAX)
     }
 }
 
@@ -1279,6 +1409,14 @@ pub struct PyStreamTableWrite {
 
 #[pymethods]
 impl PyStreamTableWrite {
+    fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
+        self.state.traverse_callbacks(visit)
+    }
+
+    fn __clear__(&mut self) {
+        self.state.clear_callbacks();
+    }
+
     #[pyo3(signature = (factory))]
     fn with_blob_uri_reader_factory(
         mut slf: PyRefMut<'_, Self>,
@@ -1311,6 +1449,7 @@ impl PyStreamTableWrite {
         if let Some(mut writer) = self.state.inner.take() {
             py.detach(|| runtime().block_on(writer.close()));
         }
+        self.state.clear_callbacks();
     }
 
     #[pyo3(signature = (batch, bucket=None))]
@@ -1324,15 +1463,15 @@ impl PyStreamTableWrite {
     }
 
     /// Rust currently flushes synchronously and has no background compaction.
-    /// The identifier accompanies the returned messages in StreamTableCommit.commit.
+    /// The identifier also bounds retirement of captured bucket configuration.
     fn prepare_commit(
         &mut self,
         py: Python<'_>,
         wait_compaction: bool,
         commit_identifier: i64,
     ) -> PyResult<Vec<PyCommitMessage>> {
-        let _ = (wait_compaction, commit_identifier);
-        self.state.prepare_commit(py)
+        let _ = wait_compaction;
+        self.state.prepare_commit(py, commit_identifier)
     }
 }
 
@@ -1518,6 +1657,27 @@ impl PyBatchTableCommit {
         .map_err(to_callback_error)
     }
 
+    /// Validate logical DML conflicts without publishing or deleting any files.
+    fn check_row_id_conflicts(
+        &self,
+        py: Python<'_>,
+        messages: &Bound<'_, PyAny>,
+        latest_snapshot_id: i64,
+        check_from_snapshot: i64,
+    ) -> PyResult<()> {
+        let messages = self
+            .context
+            .messages(messages, "check_row_id_conflicts", false)?;
+        py.detach(|| {
+            runtime().block_on(self.context.inner.check_row_id_conflicts(
+                &messages,
+                latest_snapshot_id,
+                check_from_snapshot,
+            ))
+        })
+        .map_err(to_py_err)
+    }
+
     fn truncate_table(&mut self, py: Python<'_>) -> PyResult<()> {
         self.check_committed()?;
         py.detach(|| runtime().block_on(self.context.inner.truncate_table()))
@@ -1686,6 +1846,565 @@ mod tests {
     use paimon::io::FileIOBuilder;
     use paimon::spec::{BigIntType, IntType, Schema, TableSchema, VarCharType};
     use pyo3::ffi::c_str;
+
+    #[test]
+    fn captured_plan_rejects_other_operations_before_python_input_consumption() {
+        Python::attach(|py| {
+            let schema = Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .option("row-tracking.enabled", "true")
+                .option("data-evolution.enabled", "true")
+                .build()
+                .unwrap();
+            let table = Arc::new(Table::new(
+                FileIOBuilder::new("memory").build().unwrap(),
+                Identifier::new("default", "planned_binding_boundary"),
+                "memory:/planned_binding_boundary".into(),
+                TableSchema::new(0, &schema),
+                None,
+            ));
+            let locals = PyDict::new(py);
+            locals
+                .set_item(
+                    "batch",
+                    Py::new(py, PyBatchWriteBuilder::new(table.clone())).unwrap(),
+                )
+                .unwrap();
+            locals
+                .set_item(
+                    "stream",
+                    Py::new(py, PyStreamWriteBuilder::new(table)).unwrap(),
+                )
+                .unwrap();
+            locals
+                .set_item("Plan", py.get_type::<crate::read::PyPlan>())
+                .unwrap();
+            py.run(c_str!(r#"
+class ExplodingInput:
+    def __iter__(self):
+        raise AssertionError('the supplied plan must reject input before iteration')
+
+for builder, identifier in [(batch, None), (stream, 7)]:
+    update = builder.new_update()
+    assert update.with_plan(Plan(None, [])) is update
+    assert update.with_plan(Plan(None, [])) is update
+    options = {} if identifier is None else {'commit_identifier': identifier}
+    operations = [
+        lambda: update.upsert_by_arrow_with_key(ExplodingInput(), ['id'], **options),
+        lambda: update.merge_into(ExplodingInput(), on=[], when_matched=[], when_not_matched=[], **options),
+    ]
+    for operation in operations:
+        try:
+            operation()
+        except ValueError as error:
+            assert 'with_plan supports only row-ID' in str(error), str(error)
+        else:
+            raise AssertionError('captured plan was silently ignored')
+"#),Some(&locals),Some(&locals)).unwrap();
+        });
+    }
+
+    #[test]
+    fn row_id_conflict_check_does_not_publish_or_consume_batch_commit() {
+        use arrow::array::{Array, Int32Array, Int64Array};
+        use futures::TryStreamExt;
+
+        Python::attach(|py| {
+            let schema = Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .option("row-tracking.enabled", "true")
+                .option("data-evolution.enabled", "true")
+                .build()
+                .unwrap();
+            let table = Arc::new(Table::new(
+                FileIOBuilder::new("memory").build().unwrap(),
+                Identifier::new("default", "conflict_check_binding"),
+                "memory:/conflict_check_binding".into(),
+                TableSchema::new(0, &schema),
+                None,
+            ));
+            let messages = py.detach(|| {
+                runtime().block_on(async {
+                    let mut writer = table.new_write_builder().new_write().unwrap();
+                    let batch = RecordBatch::try_new(
+                        paimon::arrow::build_target_arrow_schema(table.schema().fields()).unwrap(),
+                        vec![Arc::new(Int32Array::from(vec![1, 2]))],
+                    )
+                    .unwrap();
+                    writer.write_arrow_batch(&batch).await.unwrap();
+                    table
+                        .new_write_builder()
+                        .new_commit()
+                        .commit(writer.prepare_commit().await.unwrap())
+                        .await
+                        .unwrap();
+                    writer.close().await;
+                    let updates = RecordBatch::try_from_iter(vec![
+                        (
+                            "_ROW_ID",
+                            Arc::new(Int64Array::from(vec![0])) as arrow::array::ArrayRef,
+                        ),
+                        (
+                            "id",
+                            Arc::new(Int32Array::from(vec![9])) as arrow::array::ArrayRef,
+                        ),
+                    ])
+                    .unwrap();
+                    table
+                        .new_write_builder()
+                        .new_update()
+                        .unwrap()
+                        .update_by_arrow_with_row_id(vec![updates])
+                        .await
+                        .unwrap()
+                })
+            });
+            let messages = messages
+                .into_iter()
+                .map(PyCommitMessage::new)
+                .collect::<Vec<_>>();
+            let builder = PyBatchWriteBuilder::new(table.clone());
+            let commit = Py::new(py, builder.new_commit().unwrap()).unwrap();
+            let locals = PyDict::new(py);
+            locals.set_item("commit", commit).unwrap();
+            locals.set_item("messages", messages).unwrap();
+            py.run(
+                c_str!("commit.check_row_id_conflicts(messages, 1, 1)"),
+                Some(&locals),
+                Some(&locals),
+            )
+            .unwrap();
+            let snapshot = py
+                .detach(|| runtime().block_on(table.snapshot_manager().get_latest_snapshot()))
+                .unwrap()
+                .unwrap();
+            assert_eq!(snapshot.id(), 1, "the independent check must not publish");
+            py.run(
+                c_str!("commit.commit(messages)"),
+                Some(&locals),
+                Some(&locals),
+            )
+            .unwrap();
+            py.detach(|| {
+                runtime().block_on(async {
+                    let snapshot = table
+                        .snapshot_manager()
+                        .get_latest_snapshot()
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(
+                        snapshot.id(),
+                        2,
+                        "the check must not consume the batch boundary"
+                    );
+                    let builder = table.new_read_builder();
+                    let plan = builder.new_scan().plan().await.unwrap();
+                    let batches = builder
+                        .new_read()
+                        .unwrap()
+                        .to_arrow(plan.splits())
+                        .unwrap()
+                        .try_collect::<Vec<_>>()
+                        .await
+                        .unwrap();
+                    let mut values = batches
+                        .iter()
+                        .flat_map(|batch| {
+                            let values = batch
+                                .column(0)
+                                .as_any()
+                                .downcast_ref::<Int32Array>()
+                                .unwrap();
+                            assert_eq!(values.null_count(), 0);
+                            values.values().to_vec()
+                        })
+                        .collect::<Vec<_>>();
+                    values.sort_unstable();
+                    assert_eq!(values, [2, 9]);
+                })
+            });
+        });
+    }
+
+    #[test]
+    fn public_uri_factory_and_commit_user_setters_are_chainable() {
+        Python::attach(|py| {
+            let io = FileIOBuilder::new("memory").build().unwrap();
+            let schema = Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .option("row-tracking.enabled", "true")
+                .option("data-evolution.enabled", "true")
+                .build()
+                .unwrap();
+            let table = Arc::new(Table::new(
+                io.clone(),
+                Identifier::new("default", "public_uri_setters"),
+                "memory:/public_uri_setters".into(),
+                TableSchema::new(0, &schema),
+                None,
+            ));
+            let fixed_schema = Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .primary_key(["id"])
+                .option("bucket", "-2")
+                .build()
+                .unwrap();
+            let fixed = Arc::new(Table::new(
+                io,
+                Identifier::new("default", "public_commit_user"),
+                "memory:/public_commit_user".into(),
+                TableSchema::new(0, &fixed_schema),
+                None,
+            ));
+            let batch = Py::new(py, PyBatchWriteBuilder::new(table.clone())).unwrap();
+            let stream = Py::new(py, PyStreamWriteBuilder::new(table)).unwrap();
+            let fixed =
+                Py::new(py, PyPostponeFixedBucketWriteBuilder::new(fixed).unwrap()).unwrap();
+            let locals = PyDict::new(py);
+            locals.set_item("batch", batch).unwrap();
+            locals.set_item("stream", stream).unwrap();
+            locals.set_item("fixed", fixed).unwrap();
+            py.run(
+                c_str!(
+                    r#"
+import io
+
+class Reader:
+    def new_input_stream(self, uri):
+        return io.BytesIO(uri.encode())
+
+class Factory:
+    def create(self, uri):
+        return Reader()
+
+factory = Factory()
+for builder in [batch, stream, fixed]:
+    assert builder.with_commit_user('public-job') is builder
+    assert not hasattr(builder, '_with_commit_user')
+    for invalid in ['', '..', 'name/part']:
+        try:
+            builder.with_commit_user(invalid)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('invalid commit user accepted')
+
+for builder in [batch, stream]:
+    writer = builder.new_write()
+    assert writer.with_blob_uri_reader_factory(factory) is writer
+    assert writer.with_blob_uri_reader_factory(None) is writer
+    writer.close()
+    update = builder.new_update()
+    row_id = (update.new_update_by_row_id() if builder is batch else
+              update.new_update_by_row_id(7))
+    for operation in [update, row_id]:
+        assert operation.with_blob_uri_reader_factory(factory) is operation
+        try:
+            operation.with_blob_uri_reader_factory(type('Invalid', (), {'create': None})())
+        except TypeError:
+            pass
+        else:
+            raise AssertionError('factory without callable create accepted')
+        assert operation.with_blob_uri_reader_factory(None) is operation
+        assert not hasattr(operation, '_with_blob_uri_reader_factory')
+"#
+                ),
+                Some(&locals),
+                Some(&locals),
+            )
+            .unwrap();
+        });
+    }
+
+    #[test]
+    fn postpone_resolve_bucket_plan_binding_round_trips_arrow_and_overwrite_precedence() {
+        Python::attach(|py| {
+            let schema = Schema::builder()
+                .column("pt", DataType::VarChar(VarCharType::string_type()))
+                .column("id", DataType::Int(IntType::new()))
+                .partition_keys(["pt"])
+                .primary_key(["pt", "id"])
+                .option("bucket", "-2")
+                .option("postpone.default-bucket-num", "7")
+                .build()
+                .unwrap();
+            let table = Arc::new(Table::new(
+                FileIOBuilder::new("memory").build().unwrap(),
+                Identifier::new("default", "bucket_plan_binding"),
+                "memory:/bucket_plan_binding".into(),
+                TableSchema::new(0, &schema),
+                None,
+            ));
+            let builder = Py::new(
+                py,
+                PyPostponeFixedBucketWriteBuilder::new(table.clone()).unwrap(),
+            )
+            .unwrap();
+            let overwrite =
+                Py::new(py, PyPostponeFixedBucketWriteBuilder::new(table).unwrap()).unwrap();
+            let locals = PyDict::new(py);
+            locals.set_item("builder", builder).unwrap();
+            locals.set_item("overwrite", overwrite).unwrap();
+            py.run(
+                c_str!(
+                    r#"
+import pyarrow as pa
+empty = builder.resolve_bucket_plan()
+assert not hasattr(builder, 'bucket_plan')
+assert isinstance(empty, pa.RecordBatch)
+assert empty.schema.names == ['pt', 'total_buckets']
+assert empty.num_rows == 0
+assert empty.schema.field('total_buckets') == pa.field('total_buckets', pa.int32(), nullable=False)
+plan = pa.RecordBatch.from_arrays([pa.array(['b', 'a']), pa.array([3, 2], type=pa.int32())],
+                                 names=['pt', 'total_buckets'])
+builder.with_bucket_plan(plan)
+assert sorted(zip(*builder.resolve_bucket_plan().to_pydict().values())) == [('a', 2), ('b', 3)]
+builder.with_overwrite()
+assert builder.resolve_bucket_plan().num_rows == 2
+overwrite.with_overwrite()
+assert overwrite.resolve_bucket_plan().num_rows == 0
+"#
+                ),
+                Some(&locals),
+                Some(&locals),
+            )
+            .unwrap();
+        });
+    }
+
+    #[test]
+    fn replaced_blob_consumers_are_visible_to_writer_cycle_collection() {
+        Python::attach(|py| {
+            for batch in [false, true] {
+                let schema = Schema::builder()
+                    .column("id", DataType::Int(IntType::new()))
+                    .build()
+                    .unwrap();
+                let table = Arc::new(Table::new(
+                    FileIOBuilder::new("memory").build().unwrap(),
+                    Identifier::new("default", "blob_callback_gc"),
+                    "memory:/blob_callback_gc".into(),
+                    TableSchema::new(0, &schema),
+                    None,
+                ));
+                let context = WriteContext::new(table);
+                let writer = if batch {
+                    Py::new(
+                        py,
+                        PyBatchTableWrite {
+                            state: context.new_write(false).unwrap(),
+                            prepared: false,
+                        },
+                    )
+                    .unwrap()
+                    .into_any()
+                } else {
+                    Py::new(
+                        py,
+                        PyStreamTableWrite {
+                            state: context.new_write(false).unwrap(),
+                        },
+                    )
+                    .unwrap()
+                    .into_any()
+                };
+                let locals = PyDict::new(py);
+                locals.set_item("writer", writer).unwrap();
+                py.run(
+                    c_str!(
+                        r#"
+import gc
+finalized = []
+class Callback:
+    def __init__(self, writer, label):
+        self.writer = writer
+        self.label = label
+    def __call__(self, field, descriptor):
+        return False
+    def __del__(self):
+        finalized.append(self.label)
+writer.with_blob_consumer(Callback(writer, 'first'))
+"#
+                    ),
+                    Some(&locals),
+                    Some(&locals),
+                )
+                .unwrap();
+                // Capture the first callback in core without importing PyArrow
+                // or building/installing the extension for a Python test.
+                let input = RecordBatch::try_from_iter([(
+                    "id",
+                    Arc::new(arrow::array::Int32Array::from(vec![1])) as arrow::array::ArrayRef,
+                )])
+                .unwrap();
+                let object = locals.get_item("writer").unwrap().unwrap();
+                if batch {
+                    let mut writer = object.extract::<PyRefMut<'_, PyBatchTableWrite>>().unwrap();
+                    let inner = writer.state.inner.as_mut().unwrap();
+                    py.detach(|| runtime().block_on(inner.write_arrow(&input, None)))
+                        .unwrap();
+                } else {
+                    let mut writer = object
+                        .extract::<PyRefMut<'_, PyStreamTableWrite>>()
+                        .unwrap();
+                    let inner = writer.state.inner.as_mut().unwrap();
+                    py.detach(|| runtime().block_on(inner.write_arrow(&input, None)))
+                        .unwrap();
+                }
+                drop(object);
+                py.run(
+                    c_str!(
+                        r#"
+writer.with_blob_consumer(Callback(writer, 'second'))
+assert finalized == []
+del writer
+gc.collect()
+assert sorted(finalized) == ['first', 'second'], finalized
+"#
+                    ),
+                    Some(&locals),
+                    Some(&locals),
+                )
+                .unwrap();
+            }
+        });
+    }
+
+    #[test]
+    fn idle_bucket_prepare_releases_only_retired_python_blob_consumers() {
+        Python::attach(|py| {
+            let schema = Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("pt", DataType::Int(IntType::new()))
+                .partition_keys(["pt"])
+                .option("bucket", "-1")
+                .build()
+                .unwrap();
+            let table = Arc::new(Table::new(
+                FileIOBuilder::new("memory").build().unwrap(),
+                Identifier::new("default", "retired_callbacks"),
+                "memory:/retired_callbacks".into(),
+                TableSchema::new(0, &schema),
+                None,
+            ));
+            let writer = Py::new(
+                py,
+                PyStreamTableWrite {
+                    state: WriteContext::new(table.clone()).new_write(false).unwrap(),
+                },
+            )
+            .unwrap();
+            let locals = PyDict::new(py);
+            locals.set_item("writer", &writer).unwrap();
+            py.run(
+                c_str!(
+                    r#"
+import gc
+import weakref
+finalized = []
+class Callback:
+    def __init__(self, label):
+        self.label = label
+    def __call__(self, field, descriptor):
+        return False
+    def __del__(self):
+        finalized.append(self.label)
+def install(label):
+    callback = Callback(label)
+    writer.with_blob_consumer(callback)
+    return weakref.ref(callback)
+first = install('first')
+"#
+                ),
+                Some(&locals),
+                Some(&locals),
+            )
+            .unwrap();
+            let write_partition = |partition| {
+                let input = RecordBatch::try_from_iter([
+                    (
+                        "id",
+                        Arc::new(arrow::array::Int32Array::from(vec![1])) as arrow::array::ArrayRef,
+                    ),
+                    (
+                        "pt",
+                        Arc::new(arrow::array::Int32Array::from(vec![partition]))
+                            as arrow::array::ArrayRef,
+                    ),
+                ])
+                .unwrap();
+                let mut borrowed = writer.borrow_mut(py);
+                let inner = borrowed.state.inner.as_mut().unwrap();
+                py.detach(|| runtime().block_on(inner.write_arrow(&input, None)))
+                    .unwrap();
+            };
+            write_partition(1);
+            py.run(
+                c_str!("second = install('second')"),
+                Some(&locals),
+                Some(&locals),
+            )
+            .unwrap();
+            write_partition(2);
+            py.run(
+                c_str!("current = install('current')"),
+                Some(&locals),
+                Some(&locals),
+            )
+            .unwrap();
+            assert_eq!(
+                writer
+                    .borrow_mut(py)
+                    .state
+                    .prepare_commit(py, 1)
+                    .unwrap()
+                    .len(),
+                2
+            );
+            let prepared_files = py
+                .detach(|| {
+                    runtime().block_on(table.file_io().list_status_recursive(table.location()))
+                })
+                .unwrap();
+            assert!(!prepared_files.is_empty());
+            py.run(
+                c_str!("gc.collect(); assert first() is not None and second() is not None and current() is not None"),
+                Some(&locals), Some(&locals),
+            ).unwrap();
+            write_partition(2);
+            assert_eq!(
+                writer
+                    .borrow_mut(py)
+                    .state
+                    .prepare_commit(py, 2)
+                    .unwrap()
+                    .len(),
+                1
+            );
+            py.run(
+                c_str!("gc.collect(); assert first() is None; assert second() is not None and current() is not None; assert finalized == ['first']"),
+                Some(&locals), Some(&locals),
+            ).unwrap();
+            for file in prepared_files.iter().filter(|file| !file.is_dir) {
+                assert!(py
+                    .detach(|| runtime().block_on(table.file_io().exists(&file.path)))
+                    .unwrap());
+            }
+            writer.borrow_mut(py).close(py);
+            py.run(
+                c_str!("gc.collect(); assert second() is None and current() is None"),
+                Some(&locals),
+                Some(&locals),
+            )
+            .unwrap();
+            for file in prepared_files.iter().filter(|file| !file.is_dir) {
+                assert!(py
+                    .detach(|| runtime().block_on(table.file_io().exists(&file.path)))
+                    .unwrap());
+            }
+        });
+    }
 
     #[test]
     fn merge_table_source_conditions_resolve_read_metadata() {
@@ -2208,7 +2927,7 @@ batch = pa.RecordBatch.from_pylist([
                     } else {
                         result.unwrap();
                     }
-                    assert!(state.prepare_commit(py).unwrap().is_empty());
+                    assert!(state.prepare_commit(py, i64::MAX).unwrap().is_empty());
                 }
             }
         });

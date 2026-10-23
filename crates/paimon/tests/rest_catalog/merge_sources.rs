@@ -423,7 +423,7 @@ async fn merge_rejects_restricted_sources_even_for_unused_fields_or_empty_views(
                 source.set_rules(&[int_leaf(0, "id", "GREATER_THAN", 1)], &[]);
             }
             // DELETE matches only `id`: an unused column's mask still makes the
-            // source unsuitable for Python's existing plan_all_files contract.
+            // source unsuitable for Python's existing plan_all contract.
             let error = merge(&target, &source.table, true).await.unwrap_err();
             assert!(error.to_string().contains("unrestricted"), "{error}");
             assert_eq!(

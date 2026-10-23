@@ -194,7 +194,7 @@ async fn read_over_splits(table: &Table, splits: &[Vec<u8>], limit: usize) -> Ve
         .with_query_vector(vec![0.0, 0.0])
         .with_limit(limit);
     async {
-        let plan = builder.new_scan()?.plan_from_bucket_splits(splits)?;
+        let plan = builder.new_scan()?.plan_from_bucket_splits(splits).await?;
         builder
             .new_read()?
             .read(plan)
@@ -298,7 +298,10 @@ async fn rejects_an_empty_split_list() {
         .with_query_vector(vec![0.0, 0.0])
         .with_limit(3);
     let error = match async {
-        let plan = builder.new_scan()?.plan_from_bucket_splits(Vec::new())?;
+        let plan = builder
+            .new_scan()?
+            .plan_from_bucket_splits(Vec::new())
+            .await?;
         builder
             .new_read()?
             .read(plan)
@@ -404,7 +407,7 @@ async fn typed_bucket_plan_is_reusable_without_the_index_manifest() {
     let mut builder = table.new_vector_search_builder();
     builder.with_vector_column(VECTOR_COLUMN);
     let scan = builder.new_scan().unwrap();
-    let plan = scan.plan_from_bucket_splits(splits).unwrap();
+    let plan = scan.plan_from_bucket_splits(splits).await.unwrap();
     let snapshot_id = plan.snapshot_id().unwrap();
     let manager = table.snapshot_manager();
     let snapshot = manager.get_snapshot(snapshot_id).await.unwrap();

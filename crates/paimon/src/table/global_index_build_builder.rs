@@ -21,6 +21,7 @@ use std::time::Instant;
 #[cfg(feature = "fulltext")]
 use super::full_text_index_build_builder::FullTextIndexBuildBuilder;
 use super::global_index_build_common::{resolve_index_fields, IndexColumns};
+use super::global_index_build_plan::{GlobalIndexBuildPlan, GlobalIndexBuildShard};
 use super::global_index_types::{
     normalize_global_index_type, normalize_queryable_global_index_type, BTREE_GLOBAL_INDEX_TYPE,
     FULL_TEXT_GLOBAL_INDEX_TYPE,
@@ -123,6 +124,47 @@ impl<'a> GlobalIndexBuildBuilder<'a> {
     /// No snapshot or no uncovered rows produces an empty list.
     pub async fn build(&self) -> Result<Vec<CommitMessage>> {
         Ok(self.prepare().await?.messages)
+    }
+
+    /// Capture independently executable vector-index shards without writing files.
+    ///
+    /// The plan owns its snapshot, schema and build options. Workers execute a
+    /// shard rather than replanning the table or publishing its commit messages.
+    pub async fn plan(&self) -> Result<GlobalIndexBuildPlan> {
+        CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
+        self.table.ensure_not_branch_reference_for_write()?;
+        let index_type = normalize_global_index_type(self.index_type.trim()).ok_or_else(|| {
+            Error::Unsupported {
+                message: format!("Unsupported global index type: {}", self.index_type),
+            }
+        })?;
+        if !crate::vindex::is_vindex_index_type(index_type) {
+            return Err(Error::Unsupported {
+                message: "Global index build plans currently support only vindex indexes".into(),
+            });
+        }
+        let columns = self.columns.as_ref().ok_or_else(|| Error::DataInvalid {
+            message: "Global index column is required".into(),
+            source: None,
+        })?;
+        let fields = resolve_index_fields(self.table, columns, index_type)?;
+        let mut builder = VindexIndexBuildBuilder::new(self.table, index_type);
+        builder
+            .with_index_column(fields[0].name())
+            .with_options(self.options.clone());
+        builder.partition_filter = self.partition_filter.clone();
+        builder.plan().await
+    }
+
+    /// Build only the files and physical row range captured by this shard.
+    /// Builder settings do not replace the plan's schema or index options.
+    pub async fn build_shard(&self, shard: &GlobalIndexBuildShard) -> Result<Vec<CommitMessage>> {
+        Ok(shard
+            .build(self.table)
+            .await?
+            .into_iter()
+            .map(|(message, _)| message)
+            .collect())
     }
 
     /// Prepare and commit, rejecting changes to the snapshot used for the build.

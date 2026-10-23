@@ -23,7 +23,7 @@ use std::sync::Arc;
 use roaring::RoaringTreemap;
 
 use crate::spec::{CoreOptions, Predicate, Snapshot};
-use crate::table::de_vector_scan::{DeVectorScan, DeVectorScanPlan, PreparedVectorSearchFilter};
+use crate::table::de_vector_scan::{DeVectorScan, PreparedVectorSearchFilter};
 use crate::table::pk_vector_scan::{PkVectorScan, PkVectorScanPlan};
 use crate::table::vector_search_common::{
     targets_primary_key_column, validate_global_vector_index_types,
@@ -42,146 +42,156 @@ pub(super) trait Scan: Sync {
     fn plan(&self) -> impl Future<Output = crate::Result<Self::Plan>> + Send;
 }
 
-/// Snapshot and search work shared by the single-query and batch readers.
-/// Plans own their source context and remain usable after the scan is dropped.
-#[derive(Clone)]
+/// Snapshot and source work shared by single-query and batch readers.
+///
+/// A plan is ordinary transportable data. Query vectors, filters, options,
+/// authorization and filesystem handles belong to the reader that consumes it.
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct VectorScanPlan {
-    pub(super) context: PlanContext,
-    pub(super) work: VectorScanWork,
-    table: Table,
-}
-
-#[derive(Clone)]
-pub(super) enum VectorScanWork {
-    DataEvolution(Box<DeVectorScanPlan>),
-    PrimaryKey(Box<PkVectorScanPlan>),
+    snapshot: Option<Snapshot>,
+    splits: Vec<SearchScanSplit>,
 }
 
 impl VectorScanPlan {
-    /// The snapshot captured by planning, including retained tag snapshots.
-    pub fn snapshot(&self) -> Option<&Snapshot> {
-        match &self.work {
-            VectorScanWork::DataEvolution(plan) => plan.table.travel_snapshot(),
-            VectorScanWork::PrimaryKey(plan) => plan.snapshot.as_ref(),
+    /// Construct a plan from authoritative source work. No table, snapshot
+    /// manager or index manifest is consulted. `None` denotes an empty table.
+    pub fn new(snapshot: Option<Snapshot>, splits: Vec<SearchScanSplit>) -> crate::Result<Self> {
+        if snapshot.is_none() && !splits.is_empty() {
+            return Err(crate::Error::DataInvalid {
+                message: "A vector source plan without a snapshot must be empty".into(),
+                source: None,
+            });
         }
+        let primary_key = splits
+            .iter()
+            .any(|source| matches!(source, SearchScanSplit::PrimaryKey { .. }));
+        if primary_key
+            && splits
+                .iter()
+                .any(|source| !matches!(source, SearchScanSplit::PrimaryKey { .. }))
+        {
+            return Err(crate::Error::DataInvalid {
+                message: "A vector source plan cannot mix global row IDs and primary-key positions"
+                    .into(),
+                source: None,
+            });
+        }
+        if !primary_key {
+            super::search_scan_split::global_entries_from_splits(&splits)?;
+        }
+        if let Some(snapshot) = &snapshot {
+            for split in &splits {
+                if let SearchScanSplit::PrimaryKey { data_split, .. } = split {
+                    if data_split.snapshot_id() != 0 && data_split.snapshot_id() != snapshot.id() {
+                        return Err(crate::Error::DataInvalid {
+                            message: "Primary-key vector split belongs to another snapshot".into(),
+                            source: None,
+                        });
+                    }
+                }
+            }
+        }
+        Ok(Self { snapshot, splits })
     }
 
-    /// Inspect source work using the scan's effective search options. This does
-    /// not resolve a newer snapshot or reread its index manifest. Query readers
-    /// may still use different query vectors, limits and search options.
-    pub async fn splits(
-        &self,
-        options: &HashMap<String, String>,
-    ) -> crate::Result<Vec<SearchScanSplit>> {
-        match &self.work {
-            VectorScanWork::DataEvolution(plan) => {
-                if plan.skip_search {
-                    return Ok(vec![]);
-                }
-                super::search_scan_split::global_search_splits(
-                    &plan.table,
-                    &plan.index_entries,
-                    &self.context.column,
-                    self.context.filter.as_ref(),
-                    options,
-                    false,
-                )
-                .await
-            }
-            VectorScanWork::PrimaryKey(plan) => {
-                if plan.snapshot.is_none()
-                    && plan
-                        .splits
-                        .iter()
-                        .any(|split| !split.ann_segments.is_empty())
-                {
-                    return Err(crate::Error::Unsupported {
-                        message:
-                            "Source metadata export requires a manifest-planned primary-key search"
-                                .into(),
-                    });
-                }
-                let selected = super::pk_vector_read::filtered_row_ranges(
-                    &self.table,
-                    self.context.filter.as_ref(),
-                    plan,
-                )
-                .await?;
-                plan.splits
-                    .iter()
-                    .enumerate()
-                    .map(|(index, split)| {
-                        let payloads = plan
-                            .payloads
-                            .get(&(
-                                split.data_split.partition().to_serialized_bytes(),
-                                split.data_split.bucket(),
-                            ))
-                            .into_iter()
-                            .flatten()
-                            .filter(|payload| {
-                                split.ann_segments.iter().any(|segment| {
-                                    let location =
-                                        super::index_file_path::IndexFileLocation::BucketLocal {
-                                            table_path: &self.context.location,
-                                            bucket_path: split.data_split.bucket_path(),
-                                            index_file_in_data_file_dir: false,
-                                        };
-                                    segment.path
-                                        == location.resolve(
-                                            &payload.file_name,
-                                            payload.external_path.as_deref(),
-                                        )
-                                        || segment
-                                            .path
-                                            .ends_with(&format!("/{}", payload.file_name))
-                                })
-                            })
-                            .cloned()
-                            .collect::<Vec<_>>();
-                        let covered = split
-                            .ann_segments
-                            .iter()
-                            .flat_map(|segment| segment.source_meta.source_files())
-                            .map(|file| file.file_name())
-                            .collect::<HashSet<_>>();
-                        Ok(SearchScanSplit::PrimaryKey {
-                            data_split: split.data_split.clone(),
-                            payloads,
-                            uncovered_data_files: split
-                                .active_files
-                                .iter()
-                                .filter(|file| !covered.contains(file.file_name.as_str()))
-                                .map(|file| file.file_name.clone())
-                                .collect(),
-                            row_ranges_by_file: selected
-                                .as_ref()
-                                .map(|ranges| ranges[index].clone())
-                                .unwrap_or_default(),
-                        })
-                    })
-                    .collect()
-            }
-        }
+    /// The complete snapshot captured by planning, including retained tags.
+    pub fn snapshot(&self) -> Option<&Snapshot> {
+        self.snapshot.as_ref()
+    }
+
+    /// The exact sources selected by the planner. An empty or restricted list
+    /// never causes the reader to discover additional index or raw sources.
+    pub fn splits(&self) -> &[SearchScanSplit] {
+        &self.splits
     }
 
     pub fn snapshot_id(&self) -> Option<i64> {
-        match &self.work {
-            VectorScanWork::DataEvolution(plan) => plan.table.travel_snapshot().map(|s| s.id()),
-            VectorScanWork::PrimaryKey(plan) => (plan.snapshot_id != 0).then_some(plan.snapshot_id),
-        }
+        self.snapshot.as_ref().map(Snapshot::id)
     }
 }
 
-/// A plan must use the reader's table, column and pre-filter. Query vectors,
-/// limits and index search options may differ when a plan is reused.
-#[derive(Clone, PartialEq)]
+impl<'de> serde::Deserialize<'de> for VectorScanPlan {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        #[derive(serde::Deserialize)]
+        struct Sources {
+            snapshot: Option<Snapshot>,
+            splits: Vec<SearchScanSplit>,
+        }
+        let Sources { snapshot, splits } =
+            <Sources as serde::Deserialize>::deserialize(deserializer)?;
+        Self::new(snapshot, splits).map_err(serde::de::Error::custom)
+    }
+}
+
+async fn primary_key_sources(
+    table: &Table,
+    context: &PlanContext,
+    plan: &PkVectorScanPlan,
+) -> crate::Result<Vec<SearchScanSplit>> {
+    let selected =
+        super::pk_vector_read::filtered_row_ranges(table, context.filter.as_ref(), plan).await?;
+    plan.splits
+        .iter()
+        .enumerate()
+        .map(|(index, split)| {
+            let payloads = plan
+                .payloads
+                .get(&(
+                    split.data_split.partition().to_serialized_bytes(),
+                    split.data_split.bucket(),
+                ))
+                .into_iter()
+                .flatten()
+                .filter(|payload| {
+                    split.ann_segments.iter().any(|segment| {
+                        let location = super::index_file_path::IndexFileLocation::BucketLocal {
+                            table_path: table.location(),
+                            bucket_path: split.data_split.bucket_path(),
+                            index_file_in_data_file_dir: table
+                                .schema()
+                                .core_options()
+                                .index_file_in_data_file_dir(),
+                        };
+                        segment.path
+                            == location
+                                .resolve(&payload.file_name, payload.external_path.as_deref())
+                    })
+                })
+                .cloned()
+                .collect();
+            let covered = split
+                .ann_segments
+                .iter()
+                .flat_map(|segment| segment.source_meta.source_files())
+                .map(|file| file.file_name())
+                .collect::<HashSet<_>>();
+            Ok(SearchScanSplit::PrimaryKey {
+                data_split: split.data_split.clone(),
+                payloads,
+                uncovered_data_files: split
+                    .active_files
+                    .iter()
+                    .filter(|file| !covered.contains(file.file_name.as_str()))
+                    .map(|file| file.file_name.clone())
+                    .collect(),
+                row_ranges_by_file: selected
+                    .as_ref()
+                    .map(|ranges| ranges[index].clone())
+                    .unwrap_or_default(),
+            })
+        })
+        .collect()
+}
+
+/// Validated reader/scan configuration. This is never part of a source plan.
+#[derive(Clone)]
 pub(super) struct PlanContext {
-    location: String,
-    branch: String,
-    column: String,
-    filter: Option<Predicate>,
-    include_row_ids: Option<Arc<RoaringTreemap>>,
+    pub(super) column: String,
+    pub(super) filter: Option<Predicate>,
+    pub(super) include_row_ids: Option<Arc<RoaringTreemap>>,
+    pub(super) prepared_snapshot: Option<Option<Snapshot>>,
 }
 
 impl PlanContext {
@@ -220,14 +230,13 @@ impl PlanContext {
             });
         }
         Ok(Self {
-            location: table.location().trim_end_matches('/').to_string(),
-            branch: table.branch().to_string(),
             column: column.to_string(),
             filter: filter.cloned(),
             include_row_ids: prepared
                 .map(PreparedVectorSearchFilter::include_row_ids)
                 .or(include_row_ids)
                 .cloned(),
+            prepared_snapshot: prepared.map(|filter| filter.table().travel_snapshot().cloned()),
         })
     }
 }
@@ -237,6 +246,7 @@ pub struct VectorScan {
     table: Table,
     context: PlanContext,
     scan: VectorScanKind,
+    options: HashMap<String, String>,
 }
 
 enum VectorScanKind {
@@ -281,11 +291,17 @@ impl VectorScan {
             table: table.clone(),
             context,
             scan,
+            options: HashMap::new(),
         })
     }
 
+    pub(super) fn with_options(mut self, options: &HashMap<String, String>) -> Self {
+        self.options = options.clone();
+        self
+    }
+
     pub async fn plan(&self) -> crate::Result<VectorScanPlan> {
-        let work = match &self.scan {
+        match &self.scan {
             VectorScanKind::DataEvolution(scan) => {
                 let plan = scan.plan().await?;
                 if let Some(field_id) =
@@ -297,36 +313,92 @@ impl VectorScan {
                         &self.context.column,
                     )?;
                 }
-                VectorScanWork::DataEvolution(Box::new(plan))
+                let snapshot = plan.table.travel_snapshot().cloned();
+                let splits = if plan.skip_search {
+                    vec![]
+                } else {
+                    super::search_scan_split::global_search_splits(
+                        &plan.table,
+                        &plan.index_entries,
+                        &self.context.column,
+                        self.context.filter.as_ref(),
+                        &self.options,
+                        false,
+                    )
+                    .await?
+                };
+                VectorScanPlan::new(snapshot, splits)
             }
             VectorScanKind::PrimaryKey(scan) => {
-                VectorScanWork::PrimaryKey(Box::new(scan.plan().await?))
+                let plan = scan.plan().await?;
+                let splits = primary_key_sources(&self.table, &self.context, &plan).await?;
+                VectorScanPlan::new(plan.snapshot, splits)
             }
-        };
-        Ok(VectorScanPlan {
-            table: self.table.clone(),
-            context: self.context.clone(),
-            work,
-        })
+        }
     }
 
-    /// Adapt already-decoded Java PK bucket work into a common read plan.
-    /// The supplied snapshot, files and physical row ranges are authoritative;
-    /// this does not consult the table's snapshot or index manifests.
-    pub fn plan_from_bucket_splits(
+    /// Adapt Java bucket work to the same transportable source plan. A positive
+    /// bucket snapshot ID is loaded directly. Unversioned buckets capture the
+    /// scan's configured snapshot once here; the returned plan never follows latest.
+    pub async fn plan_from_bucket_splits(
         &self,
         splits: Vec<BucketVectorSearchSplit>,
     ) -> crate::Result<VectorScanPlan> {
         let VectorScanKind::PrimaryKey(scan) = &self.scan else {
             return Err(crate::Error::DataInvalid {
-                message: "bucket splits require a primary-key vector scan".to_string(),
+                message: "bucket splits require a primary-key vector scan".into(),
                 source: None,
             });
         };
-        Ok(VectorScanPlan {
-            table: self.table.clone(),
-            context: self.context.clone(),
-            work: VectorScanWork::PrimaryKey(Box::new(scan.plan_for_bucket_vector_splits(splits)?)),
-        })
+        // Preserve manifest-form payload metadata beside the canonical bucket
+        // assembler's validated segments, so the resulting plan is transportable.
+        let payloads = splits
+            .iter()
+            .map(|split| {
+                let key = (
+                    split.data_split().partition().to_serialized_bytes(),
+                    split.data_split().bucket(),
+                );
+                let files = split
+                    .payload_files()
+                    .iter()
+                    .map(|payload| crate::spec::IndexFileMeta {
+                        index_type: payload.index_type().to_string(),
+                        file_name: payload.file_name().to_string(),
+                        file_size: payload.file_size(),
+                        row_count: payload.row_count(),
+                        deletion_vectors_ranges: payload.deletion_vectors_ranges().cloned(),
+                        external_path: payload.external_path().map(str::to_string),
+                        global_index_meta: Some(payload.global_index_meta().clone()),
+                    })
+                    .collect();
+                (key, files)
+            })
+            .collect();
+        let mut plan = scan.plan_for_bucket_vector_splits(splits)?;
+        plan.payloads = payloads;
+        let snapshot = match self
+            .table
+            .travel_snapshot()
+            .filter(|snapshot| snapshot.id() == plan.snapshot_id)
+        {
+            Some(snapshot) => snapshot.clone(),
+            None if plan.snapshot_id == 0 => {
+                self.table.resolve_read_snapshot().await?.ok_or_else(|| {
+                    crate::Error::DataInvalid {
+                        message: "Bucket search sources require a captured table snapshot".into(),
+                        source: None,
+                    }
+                })?
+            }
+            None => {
+                self.table
+                    .snapshot_manager()
+                    .get_snapshot(plan.snapshot_id)
+                    .await?
+            }
+        };
+        let sources = primary_key_sources(&self.table, &self.context, &plan).await?;
+        VectorScanPlan::new(Some(snapshot), sources)
     }
 }

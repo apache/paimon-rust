@@ -364,8 +364,11 @@ async fn completely_filtered_batches_do_not_lock_writer_configuration() {
     writer.with_blob_consumer(None).unwrap();
     writer.with_blob_uri_reader_factory(None).unwrap();
     writer.write_arrow_batch(&batch("+I")).await.unwrap();
-    assert!(writer.with_write_type(vec!["id".into()]).is_err());
-    assert!(writer.with_blob_consumer(None).is_err());
+    writer.with_write_type(vec!["id".into()]).unwrap();
+    assert!(writer
+        .with_write_type(vec!["id".into(), "op".into()])
+        .is_err());
+    writer.with_blob_consumer(None).unwrap();
     assert!(writer.with_blob_uri_reader_factory(None).is_err());
     let messages = writer.prepare_commit().await.unwrap();
     assert_eq!(

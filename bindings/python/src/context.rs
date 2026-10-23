@@ -993,6 +993,8 @@ pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> 
     this.add_class::<crate::table::PyTable>()?;
     this.add_class::<crate::system_table::PySystemRead>()?;
     this.add_class::<crate::index_build::PyGlobalIndexBuildBuilder>()?;
+    this.add_class::<crate::index_build::PyGlobalIndexBuildPlan>()?;
+    this.add_class::<crate::index_build::PyGlobalIndexBuildShard>()?;
     this.add_class::<crate::index_build::PyGlobalIndexDropBuilder>()?;
     this.add_class::<crate::full_text_search::PyFullTextSearchBuilder>()?;
     this.add_class::<crate::full_text_search::PyFullTextScan>()?;
@@ -1004,6 +1006,13 @@ pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> 
     this.add_class::<crate::vector_search::PyBatchVectorSearchBuilder>()?;
     this.add_class::<crate::vector_search::PyVectorScan>()?;
     this.add_class::<crate::vector_search::PyVectorScanPlan>()?;
+    this.add_class::<crate::search_plan::PyIndexFileMeta>()?;
+    this.add_class::<crate::search_plan::PyIndexVectorSearchSplit>()?;
+    this.add_class::<crate::search_plan::PyRawVectorSearchSplit>()?;
+    this.add_class::<crate::search_plan::PyPrimaryKeyVectorSearchSplit>()?;
+    this.add_class::<crate::search_plan::PyIndexFullTextSearchSplit>()?;
+    this.add_class::<crate::search_plan::PyRawFullTextSearchSplit>()?;
+    this.add_class::<crate::search_plan::PyPrimaryKeyFullTextSearchSplit>()?;
     this.add_class::<crate::vector_search::PyVectorRead>()?;
     this.add_class::<crate::vector_search::PyBatchVectorRead>()?;
     this.add_class::<crate::global_index_result::PyGlobalIndexResult>()?;
@@ -1012,6 +1021,8 @@ pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> 
     this.add_class::<crate::read::PyTableScan>()?;
     this.add_class::<crate::read::PyStreamTableScan>()?;
     this.add_class::<crate::read::PyPlan>()?;
+    this.add_class::<crate::read::PyRowIdPlan>()?;
+    this.add_class::<crate::read::PyFileScanPlan>()?;
     this.add_class::<crate::read::PyScanStats>()?;
     this.add_class::<crate::read::PyTableRead>()?;
     this.add_class::<crate::read::PyRecordBatchReader>()?;

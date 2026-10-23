@@ -24,7 +24,7 @@ use crate::io::FileIO;
 use crate::spec::stats::BinaryTableStats;
 use crate::spec::FileKind;
 use crate::spec::{
-    bucket_path, bucket_path_under, extract_datum, merge_active_entries, BinaryRow,
+    bucket_path, bucket_path_under, extract_datum, java_cmp, merge_active_entries, BinaryRow,
     BinaryRowBuilder, CommitKind, CoreOptions, DataFileMeta, DataType, Datum,
     GlobalIndexColumnUpdateAction, IndexManifest, IndexManifestEntry, Manifest, ManifestEntry,
     ManifestFileMeta, ManifestList, PartitionComputer, PartitionStatistics, Predicate, Snapshot,
@@ -287,6 +287,70 @@ impl TableCommit {
     pub fn with_ignore_empty_commit(mut self, ignore_empty_commit: bool) -> Self {
         self.ignore_empty_commit = ignore_empty_commit;
         self
+    }
+
+    /// Check logical row-ID/column conflicts before rebasing staged updates.
+    ///
+    /// Both snapshot IDs are resolved through this table's snapshot manager.
+    /// The captured interval must not cross a schema change, and this
+    /// committer's resolved schema must still be current. A newer schema may
+    /// exist before the next data snapshot is published.
+    /// Like Java's `checkRowIdFromSnapshot(..., false)`, COMPACT snapshots are
+    /// excluded: the caller may rewrite physical layouts only after this check
+    /// has rejected concurrent logical writes. This method publishes nothing
+    /// and never deletes prepared files, including on an uncertain outcome.
+    pub async fn check_row_id_conflicts(
+        &self,
+        messages: &[CommitMessage],
+        latest_snapshot_id: i64,
+        check_from_snapshot: i64,
+    ) -> Result<()> {
+        if check_from_snapshot <= 0 || check_from_snapshot > latest_snapshot_id {
+            return Err(crate::Error::DataInvalid {
+                message:
+                    "Row-ID conflict checks require 0 < check-from snapshot <= latest snapshot"
+                        .into(),
+                source: None,
+            });
+        }
+        if Self::check_from_snapshot(messages)? != Some(check_from_snapshot) {
+            return Err(crate::Error::DataInvalid {
+                message: "Row-ID conflict check baseline must match the commit messages".into(),
+                source: None,
+            });
+        }
+        super::write_builder::ensure_table_write_authorized(&self.table)?;
+        if !self.data_evolution_enabled {
+            return Err(crate::Error::Unsupported {
+                message: "Row-ID conflict checks require a data-evolution table".into(),
+            });
+        }
+        reject_compact_increment(messages)?;
+        let latest = self
+            .snapshot_manager
+            .get_snapshot(latest_snapshot_id)
+            .await?;
+        let baseline = if check_from_snapshot == latest_snapshot_id {
+            latest.clone()
+        } else {
+            self.snapshot_manager
+                .get_snapshot(check_from_snapshot)
+                .await?
+        };
+        if baseline.schema_id() != latest.schema_id()
+            || self.latest_schema_id().await? != self.table.schema().id()
+        {
+            return Err(crate::Error::DataInvalid {
+                message: "Row-ID conflict checks require an unchanged, current table schema".into(),
+                source: None,
+            });
+        }
+        self.check_row_id_from_snapshot(
+            Some(&latest),
+            &self.messages_to_entries(messages),
+            Some(check_from_snapshot),
+        )
+        .await
     }
 
     /// Attach caller properties to snapshots published by this committer.
@@ -2756,6 +2820,32 @@ impl TableCommit {
         delta_entries: &[ManifestEntry],
         next_row_id: Option<i64>,
     ) -> Result<()> {
+        // File identity deliberately excludes row IDs. Check DELETE metadata
+        // before identifier-based merging can cancel a reassigned current ADD.
+        let deleted = delta_entries
+            .iter()
+            .filter(|entry| *entry.kind() == FileKind::Delete)
+            .map(|entry| (commit_file_identifier(entry), entry))
+            .collect::<HashMap<_, _>>();
+        for current in base_entries
+            .iter()
+            .filter(|entry| *entry.kind() == FileKind::Add)
+        {
+            if let Some(deleted) = deleted.get(&commit_file_identifier(current)) {
+                if current.file().first_row_id != deleted.file().first_row_id
+                    || current.file().row_count != deleted.file().row_count
+                {
+                    return Err(crate::Error::RowIdExistenceConflict {
+                        file_name: deleted.file().file_name.clone(),
+                        first_row_id: deleted.file().first_row_id,
+                        row_count: deleted.file().row_count,
+                        bucket: deleted.bucket(),
+                        current_first_row_id: current.file().first_row_id,
+                        current_row_count: Some(current.file().row_count),
+                    });
+                }
+            }
+        }
         let Some(next_row_id) = next_row_id else {
             return Ok(());
         };
@@ -2818,15 +2908,13 @@ impl TableCommit {
                 entry.file().row_count,
             );
             if !existing_index.contains(&key) {
-                return Err(crate::Error::DataInvalid {
-                    message: format!(
-                        "Row ID existence conflict: file '{}' references first_row_id={}, row_count={} in bucket {}, but no matching file exists in the current snapshot.",
-                        entry.file().file_name,
-                        first_row_id,
-                        entry.file().row_count,
-                        entry.bucket(),
-                    ),
-                    source: None,
+                return Err(crate::Error::RowIdExistenceConflict {
+                    file_name: entry.file().file_name.clone(),
+                    first_row_id: Some(first_row_id),
+                    row_count: entry.file().row_count,
+                    bucket: entry.bucket(),
+                    current_first_row_id: None,
+                    current_row_count: None,
                 });
             }
         }
@@ -3252,14 +3340,16 @@ impl TableCommit {
             let row = BinaryRow::from_serialized_bytes(partition_bytes)?;
             for i in 0..num_fields {
                 match extract_datum(&row, i, &data_types[i])? {
+                    // Java order keeps NaN and -0.0 from making these depend on
+                    // the entry order.
                     Some(datum) => {
                         mins[i] = Some(match mins[i].take() {
-                            Some(cur) if cur <= datum => cur,
+                            Some(cur) if java_cmp(&cur, &datum).is_some_and(|o| o.is_le()) => cur,
                             Some(_) => datum.clone(),
                             None => datum.clone(),
                         });
                         maxs[i] = Some(match maxs[i].take() {
-                            Some(cur) if cur >= datum => cur,
+                            Some(cur) if java_cmp(&cur, &datum).is_some_and(|o| o.is_ge()) => cur,
                             Some(_) => datum,
                             None => datum,
                         });
@@ -3709,6 +3799,7 @@ mod tests {
         include!("table_commit/property_tests.rs");
         include!("table_commit/callback_tests.rs");
         include!("table_commit/index_delete_tests.rs");
+        include!("table_commit/row_id_conflict_tests.rs");
     }
 
     #[tokio::test]
@@ -7031,6 +7122,59 @@ mod tests {
         assert!(min_row.is_null_at(0));
         assert!(max_row.is_null_at(0));
         assert_eq!(stats.null_counts(), &vec![Some(1)]);
+    }
+
+    /// Java's `Double.compare` orders `-0.0` below `0.0` and NaN above all, so
+    /// the bounds must not depend on the order of the entries.
+    #[test]
+    fn compute_partition_stats_orders_floats_like_java() {
+        use crate::spec::{DataType, DoubleType, IntType, Schema};
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("p", DataType::Double(DoubleType::new()))
+            .partition_keys(["p"])
+            .build()
+            .unwrap();
+        let table = Table::new(
+            test_file_io(),
+            Identifier::new("default", "test_table"),
+            "memory:/test_float_partition_stats".to_string(),
+            TableSchema::new(0, &schema),
+            None,
+        );
+        let commit = TableCommit::new(table, "test-user".to_string());
+        let partition_type = DataType::Double(DoubleType::new());
+        let entry = |value: f64| {
+            let mut builder = BinaryRowBuilder::new(1);
+            builder.write_datum(0, &Datum::Double(value), &partition_type);
+            ManifestEntry::new(
+                FileKind::Add,
+                builder.build_serialized(),
+                0,
+                1,
+                test_data_file("data.parquet", 1),
+                2,
+            )
+        };
+        let bounds = |values: &[f64]| {
+            let entries: Vec<_> = values.iter().map(|value| entry(*value)).collect();
+            let stats = commit.compute_partition_stats(&entries).unwrap();
+            let min = BinaryRow::from_serialized_bytes(stats.min_values()).unwrap();
+            let max = BinaryRow::from_serialized_bytes(stats.max_values()).unwrap();
+            (
+                min.get_double(0).unwrap().to_bits(),
+                max.get_double(0).unwrap().to_bits(),
+            )
+        };
+        let expected = ((-0.0f64).to_bits(), f64::NAN.to_bits());
+        for values in [
+            [0.0, -0.0, f64::NAN, 1.0],
+            [1.0, f64::NAN, 0.0, -0.0],
+            [f64::NAN, 1.0, -0.0, 0.0],
+            [-0.0, 0.0, 1.0, f64::NAN],
+        ] {
+            assert_eq!(bounds(&values), expected, "{values:?}");
+        }
     }
 
     #[tokio::test]

@@ -30,7 +30,7 @@ use crate::spec::{AggregationConfig, CoreOptions, DataField, PartialUpdateConfig
 use crate::table::aggregator::{new_aggregator, FieldAggregator};
 use crate::table::ArrowRecordBatchStream;
 use crate::Error;
-use arrow_array::{new_null_array, ArrayRef, Int64Array, Int8Array, RecordBatch};
+use arrow_array::{new_null_array, Array, ArrayRef, Int64Array, Int8Array, RecordBatch};
 use arrow_ord::ord::make_comparator;
 use arrow_row::{OwnedRow, RowConverter, Rows, SortField};
 use arrow_schema::{SchemaRef, SortOptions};
@@ -1048,10 +1048,41 @@ struct SortMergeCursor {
     rows: Rows,
     /// Typed user-defined sequence fields for the current batch.
     user_rows: Option<Rows>,
+    /// `_SEQUENCE_NUMBER` and `_VALUE_KIND`, downcast once per batch.
+    sequence_numbers: Int64Array,
+    value_kinds: Option<Int8Array>,
     offset: usize,
 }
 
 impl SortMergeCursor {
+    fn new(
+        batch: RecordBatch,
+        rows: Rows,
+        user_rows: Option<Rows>,
+        seq_index: usize,
+        value_kind_index: usize,
+    ) -> Self {
+        let sequence_numbers = batch
+            .column(seq_index)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("_SEQUENCE_NUMBER column must be Int64")
+            .clone();
+        let value_kinds = batch
+            .column(value_kind_index)
+            .as_any()
+            .downcast_ref::<Int8Array>()
+            .cloned();
+        Self {
+            batch,
+            rows,
+            user_rows,
+            sequence_numbers,
+            value_kinds,
+            offset: 0,
+        }
+    }
+
     fn is_finished(&self) -> bool {
         self.offset >= self.rows.num_rows()
     }
@@ -1064,19 +1095,13 @@ impl SortMergeCursor {
         self.offset += 1;
     }
 
-    fn sequence_number(&self, seq_index: usize) -> i64 {
-        let col = self.batch.column(seq_index);
-        let arr = col
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("_SEQUENCE_NUMBER column must be Int64");
-        arr.value(self.offset)
+    fn sequence_number(&self) -> i64 {
+        self.sequence_numbers.value(self.offset)
     }
 
-    fn value_kind(&self, value_kind_index: usize) -> i8 {
-        let col = self.batch.column(value_kind_index);
-        match col.as_any().downcast_ref::<Int8Array>() {
-            Some(arr) if !col.is_null(self.offset) => arr.value(self.offset),
+    fn value_kind(&self) -> i8 {
+        match &self.value_kinds {
+            Some(kinds) if kinds.is_valid(self.offset) => kinds.value(self.offset),
             _ => 0, // default to INSERT for NULL or missing _VALUE_KIND
         }
     }
@@ -1377,7 +1402,7 @@ fn sort_merge_stream(
                         &user_sequence_indices,
                         user_sequence_converter.as_mut(),
                     )?;
-                    cursors.push(Some(SortMergeCursor { batch, rows, user_rows, offset: 0 }));
+                    cursors.push(Some(SortMergeCursor::new(batch, rows, user_rows, seq_index, value_kind_index)));
                     found = true;
                     break;
                 }
@@ -1447,8 +1472,8 @@ fn sort_merge_stream(
                     same_key_rows.push(MergeRow {
                         batch_idx: buf_idx,
                         row_idx: cursor.offset,
-                        sequence_number: cursor.sequence_number(seq_index),
-                        value_kind: cursor.value_kind(value_kind_index),
+                        sequence_number: cursor.sequence_number(),
+                        value_kind: cursor.value_kind(),
                         user_sequence: cursor.user_sequence(),
                     });
                 }
@@ -1473,7 +1498,7 @@ fn sort_merge_stream(
                                 let buf_idx = batch_buffer.len();
                                 batch_buffer.push(BufferedBatch::Source(batch.clone()));
                                 stream_batch_idx[current_winner] = Some(buf_idx);
-                                cursors[current_winner] = Some(SortMergeCursor { batch, rows, user_rows, offset: 0 });
+                                cursors[current_winner] = Some(SortMergeCursor::new(batch, rows, user_rows, seq_index, value_kind_index));
                                 break;
                             }
                         }

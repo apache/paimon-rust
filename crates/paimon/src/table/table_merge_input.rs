@@ -121,7 +121,7 @@ impl MergeInput {
         };
         // Pin the source independently, preserving its resolved read schema.
         // Authorized sources keep their original catalog identity and plan the
-        // selected snapshot explicitly below. Include L0 as plan_all_files.
+        // selected snapshot explicitly below. Include L0 as plan_all.
         let query_auth = table.schema().core_options().query_auth_enabled();
         let table = if incremental || query_auth {
             table.clone()

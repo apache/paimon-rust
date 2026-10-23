@@ -17,8 +17,8 @@
 
 //! Row-ID updates sharing one target snapshot and file index.
 
-use super::data_evolution_writer::RowIdFileIndex;
-use crate::table::{CommitMessage, DataEvolutionWriter, Table};
+use super::data_evolution_writer::{group_by_normal_row_id, RowIdFileIndex};
+use crate::table::{CommitMessage, DataEvolutionWriter, DataSplit, Plan, Table};
 use arrow_array::RecordBatch;
 use std::collections::{HashMap, HashSet};
 
@@ -26,6 +26,99 @@ fn invalid(message: impl Into<String>) -> crate::Error {
     crate::Error::DataInvalid {
         message: message.into(),
         source: None,
+    }
+}
+
+/// Routing metadata for complete row-tracked file groups in a captured plan.
+///
+/// Constructing this object performs no I/O and grants no file access. The
+/// reader or mutation executing the retained plan must authorize independently.
+#[derive(Debug, Clone)]
+pub struct RowIdPlan {
+    plan: Plan,
+    groups: Vec<(i64, i64, DataSplit)>,
+}
+
+impl RowIdPlan {
+    pub fn from_plan(plan: Plan) -> crate::Result<Self> {
+        if plan.snapshot_id().is_none() && !plan.splits().is_empty() {
+            return Err(invalid("A row-ID plan requires its captured snapshot ID"));
+        }
+        let mut groups = Vec::new();
+        for split in plan.splits() {
+            if Some(split.snapshot_id()) != plan.snapshot_id()
+                || split.is_streaming()
+                || split.row_ranges().is_some()
+                || split.scores().is_some()
+            {
+                return Err(invalid(
+                    "A row-ID plan requires full snapshot file groups without row selection",
+                ));
+            }
+            if split.data_files().is_empty() {
+                return Err(invalid("A row-ID split must contain data files"));
+            }
+            if split
+                .data_deletion_files()
+                .is_some_and(|files| files.len() != split.data_files().len())
+            {
+                return Err(invalid(
+                    "Row-ID deletion metadata must match the captured data files",
+                ));
+            }
+            let mut names = HashSet::new();
+            for file in split.data_files() {
+                if file.row_id_range().is_none() || !names.insert(&file.file_name) {
+                    return Err(invalid(
+                        "A row-ID split contains invalid or duplicate file metadata",
+                    ));
+                }
+            }
+            let file_groups = group_by_normal_row_id(split.data_files().to_vec());
+            if file_groups.is_empty() {
+                return Err(invalid("A row-ID split requires a normal anchor file"));
+            }
+            let mut grouped = HashSet::new();
+            for files in file_groups {
+                let anchor = super::source::data_evolution_anchor_file(&files)?;
+                let (first, last) = anchor
+                    .row_id_range()
+                    .ok_or_else(|| invalid("Invalid row-ID anchor range"))?;
+                for file in &files {
+                    grouped.insert(file.file_name.clone());
+                    if super::source::is_data_evolution_normal_file(file)
+                        && file.row_id_range() != Some((first, last))
+                    {
+                        return Err(invalid(
+                            "Overlapping row-ID anchors must have identical ranges",
+                        ));
+                    }
+                }
+                groups.push((first, last, split.for_data_evolution_files(files)));
+            }
+            if grouped.len() != names.len() {
+                return Err(invalid(
+                    "A row-ID split contains a dedicated file without its normal anchor",
+                ));
+            }
+        }
+        groups.sort_by_key(|(first, _, _)| *first);
+        if groups.windows(2).any(|pair| pair[0].1 >= pair[1].0) {
+            return Err(invalid("A row-ID plan contains overlapping file groups"));
+        }
+        Ok(Self { plan, groups })
+    }
+
+    pub fn snapshot_id(&self) -> Option<i64> {
+        self.plan.snapshot_id()
+    }
+
+    pub fn groups(&self) -> &[(i64, i64, DataSplit)] {
+        &self.groups
+    }
+
+    pub fn plan(&self) -> &Plan {
+        &self.plan
     }
 }
 
@@ -45,6 +138,10 @@ pub struct TableUpdateByRowId {
 impl TableUpdateByRowId {
     pub(crate) async fn new(table: &Table) -> crate::Result<Self> {
         Self::with_index(table, RowIdFileIndex::load(table, None).await?)
+    }
+
+    pub(super) async fn with_plan(table: &Table, plan: &Plan) -> crate::Result<Self> {
+        Self::with_index(table, RowIdFileIndex::load_plan(table, plan).await?)
     }
 
     pub(super) fn with_index(table: &Table, index: RowIdFileIndex) -> crate::Result<Self> {

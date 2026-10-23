@@ -24,8 +24,6 @@ use crate::table::partition_filter::PartitionFilter;
 
 #[derive(Clone, PartialEq)]
 pub(super) struct PlanContext {
-    location: String,
-    branch: String,
     pub(super) column: String,
     pub(super) filter: Option<Predicate>,
     pub(super) include_row_ids: Option<RoaringTreemap>,
@@ -34,7 +32,8 @@ pub(super) struct PlanContext {
 
 impl PlanContext {
     pub(super) fn new(builder: &FullTextSearchBuilder<'_>) -> crate::Result<Self> {
-        CoreOptions::new(builder.table.schema().options()).ensure_read_authorized()?;
+        let core = builder.table.schema().core_options();
+        core.ensure_read_authorized()?;
         let column = builder
             .text_column
             .as_deref()
@@ -58,9 +57,31 @@ impl PlanContext {
                 message: format!("Full-text column '{column}' must be a character string"),
             });
         }
+        let has_row_filter = builder.filter.as_ref().is_some_and(|filter| {
+            let (_, data) = split_partition_and_data_predicates(
+                filter.clone(),
+                builder.table.schema().fields(),
+                builder.table.schema().partition_keys(),
+            );
+            !data.is_empty()
+        });
+        if has_row_filter && !core.data_evolution_enabled() {
+            if !builder.table.schema().primary_keys().is_empty()
+                || !core.row_tracking_enabled()
+                || core.file_format() != "parquet"
+            {
+                return Err(crate::Error::Unsupported {
+                    message: "Non-data-evolution full-text row filters require a row-tracked Parquet append table".into(),
+                });
+            }
+            if core.full_text_index_search_mode()? != GlobalIndexSearchMode::Fast {
+                return Err(crate::Error::Unsupported {
+                    message: "Non-data-evolution full-text row filters support only the FAST full-text index search mode".into(),
+                });
+            }
+        }
         let primary_key_field_id =
-            resolves_to_pk_full_text_path(&builder.table.schema().core_options(), column)
-                .then_some(field.id());
+            resolves_to_pk_full_text_path(&core, column).then_some(field.id());
         if primary_key_field_id.is_some() && builder.include_row_ids.is_some() {
             return Err(crate::Error::Unsupported {
                 message:
@@ -69,8 +90,6 @@ impl PlanContext {
             });
         }
         Ok(Self {
-            location: builder.table.location().trim_end_matches('/').into(),
-            branch: builder.table.branch().into(),
             column: column.into(),
             filter: builder.filter.clone(),
             include_row_ids: builder.include_row_ids.clone(),
@@ -79,54 +98,85 @@ impl PlanContext {
     }
 }
 
-/// One selected snapshot and its partition-pruned indexes or PK buckets. A plan remains
-/// usable after its scan is dropped, and does not re-resolve the latest snapshot.
-#[derive(Clone)]
+/// A captured snapshot and its authoritative search sources.
+///
+/// Plans contain transportable metadata only. The reader supplies the table,
+/// filesystem, authorization, schema and query configuration.
+#[derive(Clone, serde::Serialize)]
 pub struct FullTextScanPlan {
-    pub(super) context: PlanContext,
-    pub(super) table: Table,
-    pub(super) entries: Vec<IndexManifestEntry>,
-    pub(super) next_row_id: Option<i64>,
-    pub(super) snapshot_id: Option<i64>,
-    pub(super) partition_filter: Option<Predicate>,
-    pub(super) row_filter: Option<Predicate>,
-    pub(super) primary_key_plan:
-        Option<super::super::pk_full_text_scan::PrimaryKeyFullTextScanPlan>,
+    snapshot: Option<crate::spec::Snapshot>,
+    splits: Vec<crate::table::SearchScanSplit>,
+}
+
+impl<'de> serde::Deserialize<'de> for FullTextScanPlan {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(serde::Deserialize)]
+        struct PlanData {
+            snapshot: Option<crate::spec::Snapshot>,
+            splits: Vec<crate::table::SearchScanSplit>,
+        }
+        let plan = PlanData::deserialize(deserializer)?;
+        Self::new(plan.snapshot, plan.splits).map_err(serde::de::Error::custom)
+    }
 }
 
 impl FullTextScanPlan {
+    pub fn new(
+        snapshot: Option<crate::spec::Snapshot>,
+        splits: Vec<crate::table::SearchScanSplit>,
+    ) -> crate::Result<Self> {
+        if snapshot.is_none() && !splits.is_empty() {
+            return Err(crate::Error::DataInvalid {
+                message: "Full-text sources require a captured snapshot".into(),
+                source: None,
+            });
+        }
+        let primary_key = splits
+            .iter()
+            .any(|split| matches!(split, crate::table::SearchScanSplit::PrimaryKey { .. }));
+        if primary_key
+            && splits
+                .iter()
+                .any(|split| !matches!(split, crate::table::SearchScanSplit::PrimaryKey { .. }))
+        {
+            return Err(crate::Error::DataInvalid {
+                message: "Full-text plans cannot mix global and primary-key sources".into(),
+                source: None,
+            });
+        }
+        if !primary_key {
+            super::super::search_scan_split::global_entries_from_splits(&splits)?;
+        }
+        if let Some(snapshot) = &snapshot {
+            for split in &splits {
+                if let crate::table::SearchScanSplit::PrimaryKey { data_split, .. } = split {
+                    if data_split.snapshot_id() != 0 && data_split.snapshot_id() != snapshot.id() {
+                        return Err(crate::Error::DataInvalid {
+                            message: "Full-text source snapshot does not match its plan".into(),
+                            source: None,
+                        });
+                    }
+                }
+            }
+        }
+        Ok(Self { snapshot, splits })
+    }
+
     /// The snapshot captured by the scan; accessing it never resolves latest.
     pub fn snapshot(&self) -> Option<&crate::spec::Snapshot> {
-        self.table.travel_snapshot()
+        self.snapshot.as_ref()
     }
 
     /// Source metadata for inspection or transport to another search reader.
-    pub async fn splits(&self) -> crate::Result<Vec<crate::table::SearchScanSplit>> {
-        if let Some(plan) = &self.primary_key_plan {
-            return Ok(plan
-                .splits
-                .iter()
-                .map(|split| crate::table::SearchScanSplit::PrimaryKey {
-                    data_split: split.data_split.clone(),
-                    payloads: split.current_payloads.clone(),
-                    uncovered_data_files: split.uncovered_data_files.clone(),
-                    row_ranges_by_file: Default::default(),
-                })
-                .collect());
-        }
-        super::super::search_scan_split::global_search_splits(
-            &self.table,
-            &self.entries,
-            &self.context.column,
-            self.context.filter.as_ref(),
-            &Default::default(),
-            true,
-        )
-        .await
+    pub fn splits(&self) -> &[crate::table::SearchScanSplit] {
+        &self.splits
     }
 
     pub fn snapshot_id(&self) -> Option<i64> {
-        self.snapshot_id
+        self.snapshot.as_ref().map(crate::spec::Snapshot::id)
     }
 }
 
@@ -147,87 +197,95 @@ impl FullTextScan {
 
     pub async fn scan(&self) -> crate::Result<FullTextScanPlan> {
         CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
-        let mut plan = FullTextScanPlan {
-            context: self.context.clone(),
-            table: self.table.clone(),
-            entries: Vec::new(),
-            next_row_id: None,
-            snapshot_id: None,
-            partition_filter: None,
-            row_filter: None,
-            primary_key_plan: None,
-        };
-        let mut partition_pruner = None;
-        if let Some(filter) = &self.context.filter {
-            let (partition, data) = split_partition_and_data_predicates(
-                filter.clone(),
-                self.table.schema().fields(),
-                self.table.schema().partition_keys(),
-            );
-            if let Some(partition) = partition {
-                let fields = self.table.schema().partition_fields();
-                partition_pruner =
-                    Some(PartitionFilter::from_predicate(partition.clone(), &fields));
-                let mapping = self
-                    .table
-                    .schema()
-                    .partition_keys()
-                    .iter()
-                    .map(|key| {
-                        self.table
-                            .schema()
-                            .fields()
-                            .iter()
-                            .position(|field| field.name() == key)
-                    })
-                    .collect::<Vec<_>>();
-                plan.partition_filter =
-                    Some(partition.remap_field_index(&mapping).ok_or_else(|| {
-                        crate::Error::DataInvalid {
-                            message:
-                                "Cannot bind full-text partition predicate to the table schema"
-                                    .into(),
-                            source: None,
-                        }
-                    })?);
-            }
-            plan.row_filter = (!data.is_empty()).then(|| Predicate::and(data));
-        }
-        if plan.row_filter.is_some() && !self.table.schema().core_options().data_evolution_enabled()
-        {
-            return Err(crate::Error::Unsupported {
-                message: "Full-text row filters require a data-evolution table".into(),
-            });
-        }
+        let (partition_filter, _) = bind_filters(&self.table, self.context.filter.as_ref())?;
         let Some(snapshot) = crate::table::time_travel::resolve_snapshot(&self.table).await? else {
-            return Ok(plan);
+            return FullTextScanPlan::new(None, vec![]);
         };
-        plan.snapshot_id = Some(snapshot.id());
-        plan.next_row_id = snapshot.next_row_id();
-        // Pin the data without changing the schema already bound by the query.
-        // A schema-only rename does not create a new data snapshot.
-        plan.table = self.table.copy_with_pinned_snapshot(Some(&snapshot));
-        if let Some(field_id) = self.context.primary_key_field_id {
-            plan.primary_key_plan = Some(
-                PrimaryKeyFullTextScan::new(&plan.table, field_id, self.context.filter.clone())
-                    .plan()
-                    .await?,
-            );
-            return Ok(plan);
-        }
-        if let Some(name) = snapshot.index_manifest() {
-            let path = self.table.snapshot_manager().manifest_path(name);
-            plan.entries = IndexManifest::read(self.table.file_io(), &path).await?;
-        }
-        if let Some(partition) = partition_pruner {
-            let mut entries = Vec::new();
-            for entry in plan.entries {
-                if partition.matches_entry(&entry.partition)? {
-                    entries.push(entry);
+        // Pin only the data: a schema-only rename does not create a snapshot.
+        let table = self.table.copy_with_pinned_snapshot(Some(&snapshot));
+        let splits = if let Some(field_id) = self.context.primary_key_field_id {
+            PrimaryKeyFullTextScan::new(&table, field_id, self.context.filter.clone())
+                .plan()
+                .await?
+                .splits
+                .into_iter()
+                .map(|split| crate::table::SearchScanSplit::PrimaryKey {
+                    data_split: split.data_split,
+                    payloads: split.current_payloads,
+                    uncovered_data_files: split.uncovered_data_files,
+                    row_ranges_by_file: Default::default(),
+                })
+                .collect()
+        } else {
+            let mut entries = if let Some(name) = snapshot.index_manifest() {
+                let path = table.snapshot_manager().manifest_path(name);
+                IndexManifest::read(table.file_io(), &path).await?
+            } else {
+                vec![]
+            };
+            if partition_filter.is_some() {
+                let (partition, _) = split_partition_and_data_predicates(
+                    self.context.filter.clone().unwrap(),
+                    table.schema().fields(),
+                    table.schema().partition_keys(),
+                );
+                let fields = table.schema().partition_fields();
+                let pruner = PartitionFilter::from_predicate(partition.unwrap(), &fields);
+                let mut selected = Vec::new();
+                for entry in entries {
+                    if pruner.matches_entry(&entry.partition)? {
+                        selected.push(entry);
+                    }
                 }
+                entries = selected;
             }
-            plan.entries = entries;
-        }
-        Ok(plan)
+            super::super::search_scan_split::global_search_splits(
+                &table,
+                &entries,
+                &self.context.column,
+                self.context.filter.as_ref(),
+                &Default::default(),
+                true,
+            )
+            .await?
+        };
+        FullTextScanPlan::new(Some(snapshot), splits)
     }
+}
+
+pub(super) fn bind_filters(
+    table: &Table,
+    filter: Option<&Predicate>,
+) -> crate::Result<(Option<Predicate>, Option<Predicate>)> {
+    let Some(filter) = filter else {
+        return Ok((None, None));
+    };
+    let (partition, data) = split_partition_and_data_predicates(
+        filter.clone(),
+        table.schema().fields(),
+        table.schema().partition_keys(),
+    );
+    let partition = partition
+        .map(|partition| {
+            let mapping = table
+                .schema()
+                .partition_keys()
+                .iter()
+                .map(|key| {
+                    table
+                        .schema()
+                        .fields()
+                        .iter()
+                        .position(|field| field.name() == key)
+                })
+                .collect::<Vec<_>>();
+            partition
+                .remap_field_index(&mapping)
+                .ok_or_else(|| crate::Error::DataInvalid {
+                    message: "Cannot bind full-text partition predicate to the table schema".into(),
+                    source: None,
+                })
+        })
+        .transpose()?;
+    Ok((partition, (!data.is_empty()).then(|| Predicate::and(data))))
 }

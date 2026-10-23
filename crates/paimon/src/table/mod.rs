@@ -79,7 +79,9 @@ mod full_text_index_build_builder;
 mod full_text_search_builder;
 mod global_index_build_builder;
 pub(crate) mod global_index_build_common;
+mod global_index_build_plan;
 mod global_index_drop_builder;
+mod global_index_freshness;
 mod global_index_result;
 pub(crate) mod global_index_scanner;
 mod global_index_search_filter;
@@ -150,6 +152,15 @@ mod row_sidecar;
 mod scan_stats;
 pub(crate) mod schema_manager;
 mod search_scan_split;
+mod search_task;
+#[cfg(any(feature = "fulltext", test))]
+pub(crate) use search_task::SearchTask;
+pub(crate) use search_task::SearchTaskExecutor;
+#[cfg(test)]
+pub(crate) use search_task::SearchTaskResult;
+#[cfg(feature = "internal-api")]
+#[doc(hidden)]
+pub mod internal;
 mod shard_table_updater;
 pub(crate) mod snapshot_commit;
 mod snapshot_manager;
@@ -212,6 +223,7 @@ pub use full_text_search_builder::{
 };
 use futures::stream::BoxStream;
 pub use global_index_build_builder::GlobalIndexBuildBuilder;
+pub use global_index_build_plan::{GlobalIndexBuildPlan, GlobalIndexBuildShard};
 pub use global_index_drop_builder::GlobalIndexDropBuilder;
 pub use global_index_result::{
     GlobalIndexResult, GlobalIndexResultReadBuilder, PrimaryKeySearchPosition,
@@ -251,9 +263,9 @@ pub use table_merge_into::{
     MergeAssignment, MergeCondition, MergeSource, WhenMatched, WhenNotMatched,
 };
 pub use table_read::{AuditLogRead, TableRead};
-pub use table_scan::{AuditLogScan, TableScan};
+pub use table_scan::{AuditLogScan, FileScanPlan, TableScan};
 pub use table_update::TableUpdate;
-pub use table_update_by_row_id::TableUpdateByRowId;
+pub use table_update_by_row_id::{RowIdPlan, TableUpdateByRowId};
 pub use table_write::TableWrite;
 pub use tag_manager::TagManager;
 pub use update_assignment::UpdateAssignment;

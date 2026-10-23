@@ -20,11 +20,13 @@
 use crate::error::to_py_err;
 use crate::global_index_result::PyGlobalIndexResult;
 use crate::predicate::dict_to_table_predicate;
+use crate::search_plan::{full_text_splits_from_python, full_text_splits_to_python};
+use crate::snapshot::PySnapshot;
 use paimon::spec::Predicate;
 use paimon::table::{FullTextRead, FullTextScan, FullTextScanPlan, Table};
 use paimon_datafusion::runtime::runtime;
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::types::{PyDict, PyTuple};
 use std::sync::Arc;
 
 #[derive(Default)]
@@ -123,7 +125,7 @@ impl PyFullTextSearchBuilder {
                 .map_err(to_py_err)?,
         })
     }
-    fn execute_local(&self, py: Python<'_>) -> PyResult<PyGlobalIndexResult> {
+    fn execute(&self, py: Python<'_>) -> PyResult<PyGlobalIndexResult> {
         let builder = self.config.builder(&self.table).map_err(to_py_err)?;
         py.detach(|| runtime().block_on(builder.execute_scored()))
             .map(PyGlobalIndexResult::new)
@@ -150,19 +152,32 @@ pub struct PyFullTextScanPlan {
 }
 #[pymethods]
 impl PyFullTextScanPlan {
-    fn _metadata(&self, py: Python<'_>) -> PyResult<String> {
-        let splits = py
-            .detach(|| runtime().block_on(self.inner.splits()))
-            .map_err(to_py_err)?;
-        crate::vector_search::search_plan_metadata_json(
-            self.inner.snapshot(),
-            self.inner.snapshot_id(),
-            splits,
-        )
+    #[new]
+    #[pyo3(signature = (splits, snapshot=None))]
+    fn new(splits: &Bound<'_, PyAny>, snapshot: Option<PyRef<'_, PySnapshot>>) -> PyResult<Self> {
+        Ok(Self {
+            inner: FullTextScanPlan::new(
+                snapshot.map(|snapshot| snapshot.inner.clone()),
+                full_text_splits_from_python(splits)?,
+            )
+            .map_err(to_py_err)?,
+        })
     }
 
-    fn snapshot_id(&self) -> Option<i64> {
-        self.inner.snapshot_id()
+    fn snapshot(&self) -> Option<PySnapshot> {
+        self.inner.snapshot().cloned().map(PySnapshot::new)
+    }
+
+    fn splits(&self, py: Python<'_>) -> PyResult<Vec<Py<PyAny>>> {
+        full_text_splits_to_python(py, self.inner.splits())
+    }
+
+    fn __reduce__(slf: &Bound<'_, Self>, py: Python<'_>) -> PyResult<(Py<PyAny>, Py<PyTuple>)> {
+        let plan = slf.borrow();
+        let args = (plan.splits(py)?, plan.snapshot())
+            .into_pyobject(py)?
+            .unbind();
+        Ok((slf.get_type().unbind().into_any(), args))
     }
 }
 
@@ -180,5 +195,25 @@ impl PyFullTextRead {
         py.detach(|| runtime().block_on(self.inner.read(plan.inner.clone())))
             .map(PyGlobalIndexResult::new)
             .map_err(to_py_err)
+    }
+
+    fn _read_plan_with_executor(
+        &self,
+        py: Python<'_>,
+        plan: &PyFullTextScanPlan,
+        executor: Py<PyAny>,
+    ) -> PyResult<PyGlobalIndexResult> {
+        let executor = crate::search_task::PythonSearchTaskExecutor::new(executor);
+        let result = py.detach(|| {
+            runtime().block_on(paimon::table::internal::read_full_text_with_executor(
+                &self.inner,
+                plan.inner.clone(),
+                &executor,
+            ))
+        });
+        if let Some(error) = executor.take_error() {
+            return Err(error);
+        }
+        result.map(PyGlobalIndexResult::new).map_err(to_py_err)
     }
 }

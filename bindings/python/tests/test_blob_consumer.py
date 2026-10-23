@@ -24,20 +24,25 @@ import pytest
 from pypaimon_rust.datafusion import PaimonCatalog, SQLContext
 
 
-def _table(tmp_path):
+def _table(tmp_path, partitioned=False):
     context = SQLContext()
     context.register_catalog('paimon', {'warehouse': str(tmp_path)})
     context.sql('CREATE SCHEMA paimon.consumer')
-    context.sql("""CREATE TABLE paimon.consumer.t (id INT, payload BLOB) WITH (
+    partition = ', pt INT) PARTITIONED BY (pt)' if partitioned else ')'
+    context.sql("""CREATE TABLE paimon.consumer.t (id INT, payload BLOB{} WITH (
         'row-tracking.enabled' = 'true', 'data-evolution.enabled' = 'true',
-        'blob.copy-buffer-size' = '2 B')""")
+        'blob.copy-buffer-size' = '2 B')""".format(partition))
     return context, PaimonCatalog({'warehouse': str(tmp_path)}).get_table('consumer.t')
 
 
-def _batch():
-    return pa.record_batch([pa.array([1, 2, 3], type=pa.int32()),
-                            pa.array([b'payload', None, b''], type=pa.large_binary())],
-                           names=['id', 'payload'])
+def _batch(partition=None, first_id=1):
+    columns = [pa.array(range(first_id, first_id + 3), type=pa.int32()),
+               pa.array([b'payload', None, b''], type=pa.large_binary())]
+    names = ['id', 'payload']
+    if partition is not None:
+        columns.append(pa.array([partition] * 3, type=pa.int32()))
+        names.append('pt')
+    return pa.record_batch(columns, names=names)
 
 
 def _descriptor_payload(encoded):
@@ -54,7 +59,7 @@ def _descriptor_payload(encoded):
 
 @pytest.mark.parametrize('stream', [False, True])
 def test_blob_consumer_descriptor_bytes_and_nulls(tmp_path, stream):
-    context, table = _table(tmp_path)
+    context, table = _table(tmp_path, partitioned=True)
     builder = table.new_stream_write_builder() if stream else table.new_batch_write_builder()
     writer = builder.new_write()
     received = []
@@ -65,18 +70,22 @@ def test_blob_consumer_descriptor_bytes_and_nulls(tmp_path, stream):
 
     try:
         assert writer.with_blob_consumer(callback) is writer
-        writer.write_arrow(_batch())
-        with pytest.raises(ValueError, match='before any write'):
-            writer.with_blob_consumer(None)
+        writer.write_arrow(_batch(1))
+        assert writer.with_blob_consumer(None) is writer
+        # The first partition retains its callback, while the new partition
+        # captures the cleared factory setting.
+        writer.write_arrow(_batch(1, 4))
+        writer.write_arrow(_batch(2, 7))
         messages = writer.prepare_commit(True, 1) if stream else writer.prepare_commit()
         commit = builder.new_commit()
         commit.commit(1, messages) if stream else commit.commit(messages)
-        assert [name for name, _ in received] == ['payload'] * 3
+        assert [name for name, _ in received] == ['payload'] * 6
         assert [_descriptor_payload(encoded) if encoded is not None else None
-                for _, encoded in received] == [b'payload', None, b'']
+                for _, encoded in received] == [b'payload', None, b''] * 2
         assert pa.Table.from_batches(context.sql(
-            'SELECT id, payload FROM paimon.consumer.t ORDER BY id')).to_pydict() == {
-            'id': [1, 2, 3], 'payload': [b'payload', None, b'']}
+            'SELECT id, payload, pt FROM paimon.consumer.t ORDER BY id')).to_pydict() == {
+            'id': list(range(1, 10)), 'payload': [b'payload', None, b''] * 3,
+            'pt': [1] * 6 + [2] * 3}
     finally:
         writer.close()
     with pytest.raises(RuntimeError, match='closed'):

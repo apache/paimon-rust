@@ -66,27 +66,71 @@ def test_write_commit_read_roundtrip():
 
 @pytest.mark.parametrize("streaming", [False, True])
 def test_partial_write_type_roundtrip_and_lifecycle(tmp_path, streaming):
-    ctx = _make_empty_table(str(tmp_path))
+    ctx = SQLContext()
+    ctx.register_catalog("paimon", {"warehouse": str(tmp_path)})
+    ctx.sql("CREATE SCHEMA paimon.wdb")
+    ctx.sql("CREATE TABLE paimon.wdb.t (id INT, name STRING, pt STRING) PARTITIONED BY (pt)")
     table = _get_table(str(tmp_path))
     builder = table.new_stream_write_builder() if streaming else table.new_batch_write_builder()
     writer = builder.new_write()
-    assert writer.with_write_type(["id"]) is writer
-    writer.write_arrow(pa.record_batch([pa.array([], type=pa.int32())], names=["id"]))
-    assert writer.with_write_type(["id"]) is writer
+    assert writer.with_write_type(["id", "pt"]) is writer
+    empty = pa.record_batch(
+        [pa.array([], type=pa.int32()), pa.array([], type=pa.string())], names=["id", "pt"])
+    writer.write_arrow(empty)
+    assert writer.with_write_type(["name", "pt"]) is writer
+    assert writer.with_write_type(["id", "pt"]) is writer
     for columns in [[], ["missing"], ["id", "id"]]:
         with pytest.raises(ValueError):
             writer.with_write_type(columns)
-    writer.write_arrow(pa.record_batch([pa.array([1, 2], type=pa.int32())], names=["id"]))
-    with pytest.raises(ValueError, match="before any data"):
-        writer.with_write_type(["id", "name"])
+    schema = pa.schema([("id", pa.int32()), ("name", pa.string()), ("pt", pa.string())])
+    writer.write_arrow(pa.record_batch([[1, 2], ["ignored", "ignored"], ["old", "old"]], schema=schema))
+    assert writer.with_write_type(["id", "pt"]) is writer
+    for columns in [["name", "pt"], ["pt", "id"]]:
+        with pytest.raises(ValueError, match="before any write"):
+            writer.with_write_type(columns)
+    writer.write_arrow(pa.record_batch(
+        [pa.array([3, 4], type=pa.int32()), pa.array(["old", "new"])], names=["id", "pt"]))
     messages = writer.prepare_commit(True, 7) if streaming else writer.prepare_commit()
     commit = builder.new_commit()
     commit.commit(7, messages) if streaming else commit.commit(messages)
+    if streaming:
+        assert writer.prepare_commit(True, 8) == []
+    assert writer.with_write_type(["id", "pt"]) is writer
+    with pytest.raises(ValueError, match="before any write"):
+        writer.with_write_type(["name", "pt"])
     writer.close()
     with pytest.raises(RuntimeError, match="closed"):
         writer.with_write_type(["id"])
-    assert pa.Table.from_batches(ctx.sql("SELECT id, name FROM paimon.wdb.t ORDER BY id")).to_pydict() == {
-        "id": [1, 2], "name": [None, None]}
+    assert pa.Table.from_batches(ctx.sql("SELECT id, name, pt FROM paimon.wdb.t ORDER BY pt, id")).to_pydict() == {
+        "id": [4, 1, 2, 3], "name": [None] * 4, "pt": ["new", "old", "old", "old"]}
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_ignored_rows_do_not_lock_write_type(tmp_path, streaming):
+    ctx = SQLContext()
+    ctx.register_catalog("paimon", {"warehouse": str(tmp_path)})
+    ctx.sql("CREATE SCHEMA paimon.wdb")
+    ctx.sql("CREATE TABLE paimon.wdb.t (id INT, name STRING, op STRING) "
+            "WITH ('rowkind.field' = 'op', 'ignore-delete' = 'true')")
+    table = _get_table(str(tmp_path))
+    builder = table.new_stream_write_builder() if streaming else table.new_batch_write_builder()
+    writer = builder.new_write()
+    schema = pa.schema([("id", pa.int32()), ("name", pa.string()), ("op", pa.string())])
+    try:
+        writer.with_write_type(["id", "op"])
+        writer.write_arrow(pa.record_batch([[1], ["ignored"], ["-D"]], schema=schema))
+        assert writer.with_write_type(["name", "op"]) is writer
+        writer.write_arrow(pa.record_batch([[2], ["accepted"], ["+I"]], schema=schema))
+        assert writer.with_write_type(["name", "op"]) is writer
+        with pytest.raises(ValueError, match="before any write"):
+            writer.with_write_type(["id", "op"])
+        messages = writer.prepare_commit(True, 1) if streaming else writer.prepare_commit()
+        commit = builder.new_commit()
+        commit.commit(1, messages) if streaming else commit.commit(messages)
+    finally:
+        writer.close()
+    assert pa.Table.from_batches(ctx.sql("SELECT id, name FROM paimon.wdb.t")).to_pydict() == {
+        "id": [None], "name": ["accepted"]}
 
 
 @pytest.mark.parametrize("streaming", [False, True])

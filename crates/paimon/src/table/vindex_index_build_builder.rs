@@ -26,6 +26,8 @@ use planning::plan_vindex_shards;
 use validation::{checked_i32, find_index_field, validate_vector_field};
 
 use crate::spec::{CoreOptions, Predicate};
+use crate::table::global_index_build_common::vector::VectorIndexShard;
+use crate::table::global_index_build_plan::GlobalIndexBuildPlan;
 use crate::table::{CommitMessage, RowRange, Table};
 use crate::vindex::{is_vindex_index_type, VindexVectorIndexOptions};
 use crate::{Error, Result};
@@ -60,13 +62,7 @@ impl<'a> VindexIndexBuildBuilder<'a> {
         self
     }
 
-    pub(super) async fn prepare(
-        &self,
-    ) -> Result<(
-        Option<i64>,
-        Vec<CommitMessage>,
-        Vec<timing::VectorIndexBuildTiming>,
-    )> {
+    pub(super) async fn plan(&self) -> Result<GlobalIndexBuildPlan> {
         // Building the index scans the table's rows.
         CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
 
@@ -92,29 +88,30 @@ impl<'a> VindexIndexBuildBuilder<'a> {
         let core_options = CoreOptions::new(&merged_options);
         super::global_index_build_common::validate_build_table(self.table)?;
         let rows_per_shard = core_options.global_index_row_count_per_shard()?;
-        let parallelism = core_options.global_index_build_parallelism()?;
+        core_options.global_index_build_parallelism()?;
 
         let index_field = find_index_field(self.table, index_column)?;
         validate_vector_field(index_field)?;
-        let vindex_options = VindexVectorIndexOptions::new(
+        let options = VindexVectorIndexOptions::new(
             self.table.schema().options(),
             &self.options,
             &self.index_type,
             index_field,
         )?;
-        let dimension = checked_i32(
-            vindex_options.dimension() as u64,
+        checked_i32(
+            options.dimension() as u64,
             "vindex dimension is too large for Rust builder",
         )?;
-        let index_meta =
-            serde_json::to_vec(&vindex_options.native_options).map_err(|e| Error::DataInvalid {
-                message: format!("Failed to serialize vindex options metadata: {e}"),
-                source: Some(Box::new(e)),
-            })?;
-
         let snapshot_manager = self.table.snapshot_manager();
         let Some(snapshot) = snapshot_manager.get_latest_snapshot().await? else {
-            return Ok((None, vec![], vec![]));
+            return Ok(GlobalIndexBuildPlan::new(
+                self.table,
+                None,
+                index_column.into(),
+                self.index_type.clone(),
+                self.options.clone(),
+                vec![],
+            ));
         };
 
         let mut read_builder = self.table.new_read_builder();
@@ -144,48 +141,93 @@ impl<'a> VindexIndexBuildBuilder<'a> {
             rows_per_shard,
             &indexed,
         )?;
-        if shards.is_empty() {
-            return Ok((Some(snapshot.id()), vec![], vec![]));
+
+        if !shards.is_empty() {
+            crate::table::global_index_build_common::validate_existing_index_overlap(
+                self.table,
+                snapshot.index_manifest(),
+                &self.index_type,
+                index_field.id(),
+                None,
+                &shards
+                    .iter()
+                    .map(|shard| RowRange::new(shard.row_range_start, shard.row_range_end))
+                    .collect::<Vec<_>>(),
+            )
+            .await?;
         }
 
-        crate::table::global_index_build_common::validate_existing_index_overlap(
+        Ok(GlobalIndexBuildPlan::new(
             self.table,
-            snapshot.index_manifest(),
-            &self.index_type,
-            index_field.id(),
-            None,
-            &shards
-                .iter()
-                .map(|shard| RowRange::new(shard.row_range_start, shard.row_range_end))
-                .collect::<Vec<_>>(),
-        )
-        .await?;
+            Some(snapshot),
+            index_column.into(),
+            self.index_type.clone(),
+            self.options.clone(),
+            shards,
+        ))
+    }
 
+    pub(super) async fn build_planned_shard(
+        &self,
+        shard: &VectorIndexShard,
+    ) -> Result<Option<(CommitMessage, Option<timing::VectorIndexBuildTiming>)>> {
+        let index_column = self
+            .index_column
+            .as_deref()
+            .ok_or_else(|| Error::DataInvalid {
+                message: "vindex index column is required".into(),
+                source: None,
+            })?;
+        let index_field = find_index_field(self.table, index_column)?;
+        validate_vector_field(index_field)?;
+        let options = VindexVectorIndexOptions::new(
+            self.table.schema().options(),
+            &self.options,
+            &self.index_type,
+            index_field,
+        )?;
+        let dimension = checked_i32(
+            options.dimension() as u64,
+            "vindex dimension is too large for Rust builder",
+        )?;
+        let index_meta =
+            serde_json::to_vec(&options.native_options).map_err(|error| Error::DataInvalid {
+                message: format!("Failed to serialize vindex options metadata: {error}"),
+                source: Some(Box::new(error)),
+            })?;
+        let built = self
+            .build_index_file(
+                shard,
+                index_column,
+                dimension,
+                index_field.id(),
+                &options,
+                index_meta,
+            )
+            .await?;
+        Ok(built.map(|built| {
+            let mut message = CommitMessage::new(shard.partition_bytes.clone(), 0, vec![]);
+            message.new_index_files = vec![built.meta];
+            (message, built.timing)
+        }))
+    }
+
+    pub(super) async fn prepare(
+        &self,
+    ) -> Result<(
+        Option<i64>,
+        Vec<CommitMessage>,
+        Vec<timing::VectorIndexBuildTiming>,
+    )> {
+        let plan = self.plan().await?;
+        let mut options = self.table.schema().options().clone();
+        options.extend(self.options.clone());
+        let parallelism = CoreOptions::new(&options).global_index_build_parallelism()?;
         let prepared = super::global_index_build_common::preparation::prepare_shards(
             self.table,
-            shards,
+            plan.shards(),
             parallelism,
-            |shard| {
-                let vindex_options = &vindex_options;
-                let index_meta = index_meta.clone();
-                async move {
-                    let built = self
-                        .build_index_file(
-                            &shard,
-                            index_column,
-                            dimension,
-                            index_field.id(),
-                            vindex_options,
-                            index_meta,
-                        )
-                        .await?;
-                    Ok(built.map(|built| {
-                        let mut message = CommitMessage::new(shard.partition_bytes, 0, vec![]);
-                        message.new_index_files = vec![built.meta];
-                        (message, built.timing)
-                    }))
-                }
-            },
+            |shard| async move { shard.build(self.table).await },
         )
         .await?;
         let mut messages = Vec::with_capacity(prepared.len());
@@ -196,8 +238,7 @@ impl<'a> VindexIndexBuildBuilder<'a> {
                 timings.push(timing);
             }
         }
-
-        Ok((Some(snapshot.id()), messages, timings))
+        Ok((plan.snapshot_id(), messages, timings))
     }
 }
 

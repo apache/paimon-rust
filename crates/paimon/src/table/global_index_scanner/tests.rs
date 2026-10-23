@@ -2121,6 +2121,103 @@ async fn test_composite_prefers_fully_covering_leading_bitmap() {
     assert_eq!(result.unwrap(), vec![RowRange::new(105, 106)]);
 }
 
+#[tokio::test]
+async fn test_composite_interval_limit_keeps_suffix_scalar_index() {
+    let fields = two_field_schema_fields();
+    let key_type = DataType::Row(crate::spec::RowType::new(fields.clone()));
+    let composite_output = VecFileWrite::new();
+    let mut composite_writer = BTreeIndexWriter::with_comparator(
+        Box::new(composite_output.clone()),
+        256,
+        BlockCompressionType::None,
+        make_key_comparator(&key_type),
+    );
+    let tuples = [[0, 0], [0, 1], [1, 0], [1, 1]];
+    for (id, [first, second]) in tuples.iter().enumerate() {
+        let key = crate::btree::serialize_composite_key(
+            &[Some(Datum::Int(*first)), Some(Datum::Int(*second))],
+            &fields,
+        )
+        .unwrap();
+        composite_writer.write(Some(&key), id as i64).await.unwrap();
+    }
+    let composite_meta = composite_writer.finish().await.unwrap().meta;
+    let scalar_output = VecFileWrite::new();
+    let mut scalar_writer = BTreeIndexWriter::with_comparator(
+        Box::new(scalar_output.clone()),
+        256,
+        BlockCompressionType::None,
+        make_key_comparator(fields[1].data_type()),
+    );
+    for (value, ids) in [(0, [0, 2]), (1, [1, 3])] {
+        for id in ids {
+            scalar_writer
+                .write(Some(&le_int_key(value)), id)
+                .await
+                .unwrap();
+        }
+    }
+    let scalar_meta = scalar_writer.finish().await.unwrap().meta;
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(tmp.path().join("index")).unwrap();
+    let composite_bytes = composite_output.to_vec();
+    let scalar_bytes = scalar_output.to_vec();
+    std::fs::write(tmp.path().join("index/composite.btree"), &composite_bytes).unwrap();
+    std::fs::write(tmp.path().join("index/suffix.btree"), &scalar_bytes).unwrap();
+    let mut composite = make_global_index_entry("composite.btree", 1, 0, 3, &composite_meta);
+    composite.index_file.file_size = composite_bytes.len() as i64;
+    composite
+        .index_file
+        .global_index_meta
+        .as_mut()
+        .unwrap()
+        .extra_field_ids = Some(vec![2]);
+    let mut scalar = make_global_index_entry("suffix.btree", 2, 0, 3, &scalar_meta);
+    scalar.index_file.file_size = scalar_bytes.len() as i64;
+    let entries = [composite, scalar];
+    let io = crate::io::FileIOBuilder::new("file").build().unwrap();
+    let path = format!("file://{}", tmp.path().display());
+    let mut scanner =
+        GlobalIndexScanner::create(&io, &path, 2, i64::MAX, i64::MAX, &entries, &fields)
+            .unwrap()
+            .unwrap();
+    let probe = Arc::new(QueryIoProbe::default());
+    scanner.query_io_probe = Some(Arc::clone(&probe));
+    let b = crate::spec::PredicateBuilder::new(&fields);
+    // 17 x 17 stops the tuple plan after the first column. Its unbound suffix
+    // must remain available for the independent scalar index to narrow rows.
+    let predicate = Predicate::and(vec![
+        b.is_in(
+            "id",
+            [0, 1].into_iter().chain(100..115).map(Datum::Int).collect(),
+        )
+        .unwrap(),
+        b.is_in(
+            "value",
+            [1].into_iter().chain(100..116).map(Datum::Int).collect(),
+        )
+        .unwrap(),
+    ]);
+    let expected = tuples
+        .iter()
+        .enumerate()
+        .filter(|(_, tuple)| {
+            let datums = tuple.map(Datum::Int);
+            let row = crate::spec::BinaryRow::from_datums(&[
+                (Some(&datums[0]), fields[0].data_type()),
+                (Some(&datums[1]), fields[1].data_type()),
+            ]);
+            crate::spec::eval_row(&predicate, &row).unwrap()
+        })
+        .map(|(id, _)| id as u64)
+        .collect::<RoaringTreemap>();
+    assert_eq!(expected.iter().collect::<Vec<_>>(), vec![1, 3]);
+    let result = scanner.evaluate(&predicate).await.unwrap().unwrap();
+    assert_eq!(result.row_ranges, bitmap_to_ranges(&expected));
+    assert_eq!(result.evaluated_field_ids, HashSet::from([1, 2]));
+    assert_eq!(probe.predicate_queries.load(TestOrdering::SeqCst), 1);
+}
+
 async fn assert_bitmap_int_fixture(file_name: &str) {
     let data_type = DataType::Int(crate::spec::IntType::new());
     let (file_io, table_path, file_name, meta, _tmp) = setup_bitmap_testdata_table(file_name);

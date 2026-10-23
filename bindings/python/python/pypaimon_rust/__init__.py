@@ -16,3 +16,10 @@
 # under the License.
 
 from .pypaimon_rust import *
+from .pypaimon_rust import datafusion as datafusion
+from .uri_reader import UriReader as UriReader, UriReaderFactory as UriReaderFactory
+
+# The native submodule is registered during extension initialization. Export the
+# Python stream protocols beside its writers and update APIs.
+datafusion.UriReader = UriReader
+datafusion.UriReaderFactory = UriReaderFactory

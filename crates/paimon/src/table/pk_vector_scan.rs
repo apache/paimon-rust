@@ -615,6 +615,200 @@ fn plan_from_bucket_splits(
     })
 }
 
+/// Restore authoritative engine/transport sources through the same ANN source
+/// validation and bucket assembler used by the manifest planner.
+pub(super) fn plan_from_search_splits(
+    table: &Table,
+    column: &str,
+    filter: Option<&Predicate>,
+    snapshot: Option<Snapshot>,
+    sources: &[crate::table::SearchScanSplit],
+) -> crate::Result<PkVectorScanPlan> {
+    let snapshot_id = snapshot.as_ref().map_or(0, Snapshot::id);
+    let core = table.schema().core_options();
+    let index_type = core.primary_key_vector_index_type(column)?;
+    let field_id = crate::table::find_field_id_by_name(table.schema().fields(), column)
+        .ok_or_else(|| data_invalid("PK-vector column does not exist"))?;
+    let partition = filter
+        .and_then(|filter| {
+            split_partition_and_data_predicates(
+                filter.clone(),
+                table.schema().fields(),
+                table.schema().partition_keys(),
+            )
+            .0
+        })
+        .map(|filter| PartitionFilter::from_predicate(filter, &table.schema().partition_fields()));
+    let mut data = Vec::new();
+    let mut entries = Vec::new();
+    let mut payloads = HashMap::new();
+    let mut restrictions = HashMap::new();
+    let mut uncovered = HashMap::new();
+    let mut seen = HashSet::new();
+    for source in sources {
+        let crate::table::SearchScanSplit::PrimaryKey {
+            data_split,
+            payloads: files,
+            uncovered_data_files,
+            row_ranges_by_file,
+        } = source
+        else {
+            return Err(data_invalid(
+                "Primary-key vector reader cannot consume global row-ID sources",
+            ));
+        };
+        if data_split.snapshot_id() != 0 && data_split.snapshot_id() != snapshot_id {
+            return Err(data_invalid(
+                "Primary-key source split belongs to another snapshot",
+            ));
+        }
+        if data_split.query_auth_required() {
+            return Err(crate::table::query_auth::unsupported(
+                "transported primary-key vector split carries no authorization",
+            ));
+        }
+        if data_split.row_ranges().is_some() {
+            return Err(data_invalid(
+                "Primary-key bucket sources must use row_ranges_by_file",
+            ));
+        }
+        let key = (
+            data_split.partition().to_serialized_bytes(),
+            data_split.bucket(),
+        );
+        if !seen.insert(key.clone()) {
+            return Err(data_invalid("Primary-key search sources repeat a bucket"));
+        }
+        if let Some(filter) = &partition {
+            if !filter.matches_entry(&key.0)? {
+                continue;
+            }
+        }
+        let names = data_split
+            .data_files()
+            .iter()
+            .map(|file| file.file_name.as_str())
+            .collect::<HashSet<_>>();
+        if uncovered_data_files
+            .iter()
+            .any(|name| !names.contains(name.as_str()))
+            || row_ranges_by_file
+                .keys()
+                .any(|name| !names.contains(name.as_str()))
+        {
+            return Err(data_invalid(
+                "Primary-key source selects an unknown data file",
+            ));
+        }
+        for (name, ranges) in row_ranges_by_file {
+            let rows = data_split
+                .data_files()
+                .iter()
+                .find(|file| file.file_name == *name)
+                .unwrap()
+                .row_count;
+            if ranges
+                .iter()
+                .any(|range| range.from() < 0 || range.to() < range.from() || range.to() >= rows)
+            {
+                return Err(data_invalid(
+                    "Primary-key source row range exceeds its data file",
+                ));
+            }
+        }
+        for file in files {
+            let meta = file
+                .global_index_meta
+                .as_ref()
+                .ok_or_else(|| data_invalid("PK payload lacks global metadata"))?;
+            if file.index_type != index_type || meta.index_field_id != field_id {
+                return Err(data_invalid(
+                    "PK payload does not match the reader's vector column or index type",
+                ));
+            }
+            entries.push((
+                data_split.partition().clone(),
+                data_split.bucket(),
+                UnresolvedAnnSegment {
+                    source_meta: PrimaryKeyIndexSourceMeta::from_global_index_meta(meta)?,
+                    file_name: file.file_name.clone(),
+                    external_path: file.external_path.clone(),
+                    file_size: u64::try_from(file.file_size)
+                        .map_err(|_| data_invalid("Index file size must not be negative"))?,
+                    index_meta: meta.index_meta.clone().unwrap_or_default(),
+                },
+            ));
+        }
+        let data_split = if data_split.snapshot_id() == 0 {
+            let mut builder = DataSplitBuilder::new()
+                .with_snapshot(snapshot_id)
+                .with_partition(data_split.partition().clone())
+                .with_bucket(data_split.bucket())
+                .with_bucket_path(data_split.bucket_path().to_string())
+                .with_total_buckets(data_split.total_buckets())
+                .with_data_files(data_split.data_files().to_vec())
+                .with_raw_convertible(data_split.raw_convertible())
+                .with_streaming(data_split.is_streaming());
+            if let Some(dvs) = data_split.data_deletion_files() {
+                builder = builder.with_data_deletion_files(dvs.to_vec());
+            }
+            builder.build()?
+        } else {
+            data_split.clone()
+        };
+        data.push(data_split);
+        payloads.insert(key.clone(), files.clone());
+        restrictions.insert(
+            key.clone(),
+            row_ranges_by_file
+                .iter()
+                .map(|(name, ranges)| (name.clone(), merge_row_ranges(ranges.clone())))
+                .collect(),
+        );
+        uncovered.insert(
+            key,
+            uncovered_data_files.iter().cloned().collect::<HashSet<_>>(),
+        );
+    }
+    let mut splits = plan_from_inputs(
+        snapshot_id,
+        data,
+        entries,
+        table.location(),
+        core.index_file_in_data_file_dir(),
+    )?;
+    let physical_row_ranges_by_split = splits
+        .iter_mut()
+        .map(|split| {
+            let key = (
+                split.data_split.partition().to_serialized_bytes(),
+                split.data_split.bucket(),
+            );
+            // A source subset is authoritative even if it omitted an eligible raw
+            // file. The ANN source policy may validate segments, but never adds files
+            // to the caller's exact fallback set.
+            let names = &uncovered[&key];
+            let covered = split
+                .ann_segments
+                .iter()
+                .flat_map(|segment| segment.source_meta.source_files())
+                .map(|file| file.file_name())
+                .collect::<HashSet<_>>();
+            split.active_files.retain(|file| {
+                names.contains(&file.file_name) || covered.contains(file.file_name.as_str())
+            });
+            restrictions.remove(&key).unwrap_or_default()
+        })
+        .collect();
+    Ok(PkVectorScanPlan {
+        snapshot,
+        payloads,
+        snapshot_id,
+        splits,
+        physical_row_ranges_by_split: Some(physical_row_ranges_by_split),
+    })
+}
+
 /// Pure planning core, drivable without a live snapshot: group ANN payloads and
 /// data splits by `(partition, bucket)`, then assemble one search split per
 /// bucket that has data. Index-only buckets are dropped, not errored.
