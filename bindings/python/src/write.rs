@@ -427,7 +427,7 @@ impl PyPostponeFixedBucketWriteBuilder {
         let plan = py
             .detach(|| runtime().block_on(builder.resolve_bucket_plan()))
             .map_err(to_py_err)?;
-        plan.to_arrow(table)
+        plan.to_arrow(table.schema())
             .map_err(to_py_err)?
             .to_pyarrow(py)
             .map(Bound::unbind)
@@ -454,7 +454,8 @@ impl PyPostponeFixedBucketWriteBuilder {
     ) -> PyResult<PyRefMut<'py, Self>> {
         let plan = RecordBatch::from_pyarrow_bound(plan)?;
         slf.plan = Some(
-            PostponeBucketPlan::from_arrow(&slf.batch.context.table, &plan).map_err(to_py_err)?,
+            PostponeBucketPlan::from_arrow(slf.batch.context.table.schema(), &plan)
+                .map_err(to_py_err)?,
         );
         Ok(slf)
     }

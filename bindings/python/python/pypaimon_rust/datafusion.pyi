@@ -881,6 +881,30 @@ class BatchWriteBuilder:
     def new_update(self) -> BatchTableUpdate: ...
     def new_commit(self) -> BatchTableCommit: ...
 
+class BucketRouter:
+    """Pure input-order bucket assignment using the table schema's Java rules.
+
+    No catalog access or file writes occur. POSTPONE routing requires a known
+    plan or a configured default; an explicit plan replaces that default.
+    """
+    def __init__(self, schema: TableSchema) -> None: ...
+    def with_bucket_plan(self, plan: pyarrow.RecordBatch) -> BucketRouter: ...
+    def route(self, batch: pyarrow.RecordBatch) -> pyarrow.Int32Array: ...
+
+class PostponeBucketPlanner:
+    """Pure per-partition statistics and bucket-count inference.
+
+    Statistics contain partition columns in schema order followed by
+    row_count: int64 and data_size: int64, interpreted positionally. Combine
+    statistics for each input partition before calling plan(). Input batches
+    are never retained. Known bucket counts are preserved.
+    """
+    def __init__(self, schema: TableSchema,
+                 known_plan: Optional[pyarrow.RecordBatch] = None) -> None: ...
+    def current_plan(self) -> pyarrow.RecordBatch: ...
+    def input_statistics(self, batch: pyarrow.RecordBatch) -> pyarrow.RecordBatch: ...
+    def plan(self, statistics: pyarrow.RecordBatch) -> pyarrow.RecordBatch: ...
+
 class PostponeFixedBucketWriteBuilder:
     """Real-bucket batch writes for a bucket=-2 primary-key table.
 

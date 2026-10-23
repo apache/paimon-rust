@@ -145,7 +145,7 @@ mod tests {
             vec![Arc::new(Int32Array::from(vec![total_buckets]))],
         )
         .unwrap();
-        PostponeBucketPlan::from_arrow(table, &batch).unwrap()
+        PostponeBucketPlan::from_arrow(table.schema(), &batch).unwrap()
     }
 
     #[tokio::test]
@@ -163,7 +163,7 @@ mod tests {
                 .resolve_bucket_plan()
                 .await
                 .unwrap()
-                .to_arrow(&table)
+                .to_arrow(table.schema())
                 .unwrap()
                 .num_rows(),
             0
@@ -174,7 +174,7 @@ mod tests {
             .resolve_bucket_plan()
             .await
             .unwrap()
-            .to_arrow(&table)
+            .to_arrow(table.schema())
             .unwrap();
         assert_eq!(exported.num_rows(), 1);
         assert_eq!(
@@ -194,7 +194,7 @@ mod tests {
                 .resolve_bucket_plan()
                 .await
                 .unwrap()
-                .to_arrow(&table)
+                .to_arrow(table.schema())
                 .unwrap()
                 .num_rows(),
             0
@@ -225,7 +225,7 @@ mod tests {
                 .resolve_bucket_plan()
                 .await
                 .unwrap()
-                .to_arrow(&table)
+                .to_arrow(table.schema())
                 .unwrap()
                 .num_rows(),
             0
@@ -254,7 +254,7 @@ mod tests {
             .resolve_bucket_plan()
             .await
             .unwrap()
-            .to_arrow(&historical)
+            .to_arrow(historical.schema())
             .unwrap();
         assert_eq!(exported.num_rows(), 1);
         assert_eq!(
@@ -274,7 +274,7 @@ mod tests {
                 .resolve_bucket_plan()
                 .await
                 .unwrap()
-                .to_arrow(&historical)
+                .to_arrow(historical.schema())
                 .unwrap()
                 .num_rows(),
             0

@@ -47,6 +47,7 @@ mod variant;
 mod vector_search;
 mod vindex;
 mod write;
+mod write_routing;
 // ---- #285: observability ----
 mod partition;
 mod snapshot;
