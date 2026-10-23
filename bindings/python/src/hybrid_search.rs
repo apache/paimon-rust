@@ -194,6 +194,24 @@ impl PyHybridSearchRoute {
 )]
 pub struct PyHybridSearchRouteBuilder {
     inner: HybridSearchRouteBuilder,
+    search_builder: Py<PyAny>,
+}
+
+impl PyHybridSearchRouteBuilder {
+    fn new(py: Python<'_>, inner: HybridSearchRouteBuilder) -> PyResult<Self> {
+        let search_builder = match inner.route().kind() {
+            HybridSearchRouteKind::Vector => {
+                Py::new(py, PyVectorSearchBuilder::from_hybrid_route(&inner)?)?.into_any()
+            }
+            HybridSearchRouteKind::FullText => {
+                Py::new(py, PyFullTextSearchBuilder::from_hybrid_route(&inner)?)?.into_any()
+            }
+        };
+        Ok(Self {
+            inner,
+            search_builder,
+        })
+    }
 }
 
 #[pymethods]
@@ -212,17 +230,8 @@ impl PyHybridSearchRouteBuilder {
             .map(PySnapshot::new)
     }
 
-    fn search_builder(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        match self.inner.route().kind() {
-            HybridSearchRouteKind::Vector => {
-                Py::new(py, PyVectorSearchBuilder::from_hybrid_route(&self.inner)?)
-                    .map(Py::into_any)
-            }
-            HybridSearchRouteKind::FullText => {
-                Py::new(py, PyFullTextSearchBuilder::from_hybrid_route(&self.inner)?)
-                    .map(Py::into_any)
-            }
-        }
+    fn search_builder(&self, py: Python<'_>) -> Py<PyAny> {
+        self.search_builder.clone_ref(py)
     }
 
     fn execute(&self, py: Python<'_>) -> PyResult<PyGlobalIndexResult> {
@@ -405,21 +414,20 @@ impl PyHybridSearchBuilder {
 
     fn execute(&self, py: Python<'_>) -> PyResult<PyGlobalIndexResult> {
         let builder = self.builder();
-        py.detach(|| runtime().block_on(builder.execute_scored()))
+        py.detach(|| runtime().block_on(builder.execute()))
             .map(PyGlobalIndexResult::new)
             .map_err(to_py_err)
     }
 
     fn route_builders(&self, py: Python<'_>) -> PyResult<Vec<PyHybridSearchRouteBuilder>> {
         let builder = self.builder();
-        py.detach(|| runtime().block_on(builder.route_builders()))
-            .map(|routes| {
-                routes
-                    .into_iter()
-                    .map(|inner| PyHybridSearchRouteBuilder { inner })
-                    .collect()
-            })
-            .map_err(to_py_err)
+        let routes = py
+            .detach(|| runtime().block_on(builder.route_builders()))
+            .map_err(to_py_err)?;
+        routes
+            .into_iter()
+            .map(|inner| PyHybridSearchRouteBuilder::new(py, inner))
+            .collect()
     }
 
     fn to_route_result(
@@ -681,6 +689,18 @@ assert all(route.snapshot() is None for route in routes)
 vector, text = (route.search_builder() for route in routes)
 assert isinstance(vector, sdk.VectorSearchBuilder)
 assert isinstance(text, sdk.FullTextSearchBuilder)
+assert routes[0].search_builder() is vector
+assert routes[1].search_builder() is text
+for route, search in zip(routes, (vector, text)):
+    assert search.with_limit(0) is search
+    try:
+        route.execute()
+    except ValueError as error:
+        assert 'Limit must be' in str(error), str(error)
+    else:
+        raise AssertionError('route.execute must observe search builder mutations')
+    search.with_limit(1)
+    assert route.execute().row_ids() == {}
 for scan in (vector.new_vector_search_scan(), text.new_full_text_scan()):
     plan = scan.scan()
     assert plan.snapshot() is None and plan.splits() == []
@@ -709,6 +729,9 @@ vector, text = (route.search_builder() for route in unfinished)
 vector.with_query_vector([1.0, 0.0])
 text.with_query('text', '{"match":{"query":"paimon"}}')
 assert vector.execute().row_ids() == {} and text.execute().row_ids() == {}
+assert unfinished[0].search_builder() is vector
+assert unfinished[1].search_builder() is text
+assert all(route.execute().row_ids() == {} for route in unfinished)
 invalid.add_vector_route('missing', [1.0], 3).with_limit(2).with_snapshot(None)
 try:
     invalid.route_builders()

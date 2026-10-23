@@ -143,8 +143,10 @@ ranked = hybrid.rank(results)
 ```
 
 `route_builders()` checks read authorization and captures one snapshot for all
-routes, including an empty view. Returned search builders remain configurable
-and retain that snapshot after later commits. `to_route_result()` accepts scored
+routes, including an empty view. Each route retains its search builder: repeated
+`search_builder()` calls return the same object, and configuring it changes later
+`route.execute()` calls. Returned builders retain their snapshot after later
+commits. `to_route_result()` accepts scored
 global results and normalizes empty unscored selections; nonempty unscored or
 physical primary-key selections cannot participate in global row-ID fusion.
 

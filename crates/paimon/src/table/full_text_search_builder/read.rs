@@ -29,23 +29,24 @@ pub struct FullTextRead {
 }
 
 impl FullTextRead {
-    pub(super) fn new(builder: &FullTextSearchBuilder<'_>) -> crate::Result<Self> {
-        CoreOptions::new(builder.table.schema().options()).ensure_read_authorized()?;
-        let limit = builder.limit.filter(|limit| *limit > 0).ok_or_else(|| {
-            crate::Error::ConfigInvalid {
-                message: "Limit must be positive, set via with_limit()".into(),
-            }
-        })?;
-        let context = PlanContext::new(builder)?;
-        let query = builder
+    pub(super) fn new(table: &Table, config: &FullTextSearchConfig) -> crate::Result<Self> {
+        CoreOptions::new(table.schema().options()).ensure_read_authorized()?;
+        let limit =
+            config
+                .limit
+                .filter(|limit| *limit > 0)
+                .ok_or_else(|| crate::Error::ConfigInvalid {
+                    message: "Limit must be positive, set via with_limit()".into(),
+                })?;
+        let context = PlanContext::new(table, config)?;
+        let query = config
             .query_text
             .as_deref()
             .ok_or_else(|| crate::Error::ConfigInvalid {
                 message: "Query text must be set via with_query() or with_query_text()".into(),
             })?;
         if context.primary_key_field_id.is_some() {
-            if builder
-                .table
+            if table
                 .schema()
                 .core_options()
                 .full_text_index_search_mode()?
@@ -56,8 +57,8 @@ impl FullTextRead {
             if let Some(filter) = &context.filter {
                 let (_, data) = super::super::bucket_filter::split_partition_and_data_predicates(
                     filter.clone(),
-                    builder.table.schema().fields(),
-                    builder.table.schema().partition_keys(),
+                    table.schema().fields(),
+                    table.schema().partition_keys(),
                 );
                 if !data.is_empty() {
                     return Err(crate::Error::Unsupported {
@@ -68,14 +69,14 @@ impl FullTextRead {
                 }
             }
         }
-        let query = if builder.query_is_dsl || context.primary_key_field_id.is_some() {
+        let query = if config.query_is_dsl || context.primary_key_field_id.is_some() {
             query.to_string()
         } else {
             normalize_query_text(query, &context.column)?
         };
         let search = FullTextSearch::new(query, limit, context.column.clone())?;
         Ok(Self {
-            table: builder.table.clone(),
+            table: table.clone(),
             context,
             search,
         })

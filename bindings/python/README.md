@@ -106,6 +106,25 @@ results expose physical positions and Java-compatible scored split bytes;
 `new_read_builder()` reads both result types from their source snapshot and
 returns projected columns plus `__paimon_search_score` in relevance order.
 
+Hybrid searches return the same `GlobalIndexResult` from `execute()`. To run
+routes separately, call `route_builders()` once and configure each route through
+its `search_builder()`:
+
+```python
+hybrid = (table.new_hybrid_search_builder()
+          .add_vector_route("embedding", [1.0, 0.0], 10)
+          .with_limit(5))
+route = hybrid.route_builders()[0]
+route.search_builder().with_query_vector([0.0, 1.0]).with_limit(3)
+result = route.execute()
+fused = hybrid.rank([hybrid.to_route_result(route, result)])
+```
+
+Each route returns the same live search builder on repeated calls. Query,
+limit, option and filter changes affect later `route.execute()` calls. All
+returned routes keep the snapshot captured by `route_builders()`, including
+a captured empty table, even if later writes publish a newer snapshot.
+
 ### Native Read / Write
 
 Beyond SQL, you can use the lower-level read and write APIs directly from Python.

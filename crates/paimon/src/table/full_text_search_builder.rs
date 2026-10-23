@@ -43,7 +43,9 @@ use paimon_ftindex_core::io::PosWriter;
 use paimon_ftindex_core::{FullTextIndexConfig, FullTextIndexWriter};
 use roaring::RoaringTreemap;
 use serde_json::json;
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, RwLock};
 
 const FULL_TEXT_INDEX_TYPE: &str = "full-text";
 mod execution;
@@ -57,6 +59,9 @@ pub use scan::{FullTextScan, FullTextScanPlan};
 
 /// Builder for executing full-text search on a Paimon table.
 ///
+/// Clones share configuration. Setters update every handle, and each execution
+/// captures the current configuration before planning its sources.
+///
 /// Usage:
 /// ```ignore
 /// let result = table.new_full_text_search_builder()
@@ -68,8 +73,14 @@ pub use scan::{FullTextScan, FullTextScanPlan};
 /// ```
 ///
 /// Reference: `org.apache.paimon.table.source.FullTextSearchBuilder`
+#[derive(Clone)]
 pub struct FullTextSearchBuilder<'a> {
-    table: &'a Table,
+    table: Cow<'a, Table>,
+    config: Arc<RwLock<FullTextSearchConfig>>,
+}
+
+#[derive(Clone, Default)]
+struct FullTextSearchConfig {
     text_column: Option<String>,
     query_text: Option<String>,
     query_is_dsl: bool,
@@ -81,85 +92,102 @@ pub struct FullTextSearchBuilder<'a> {
 impl<'a> FullTextSearchBuilder<'a> {
     pub(crate) fn new(table: &'a Table) -> Self {
         Self {
-            table,
-            text_column: None,
-            query_text: None,
-            query_is_dsl: false,
-            limit: None,
-            include_row_ids: None,
-            filter: None,
+            table: Cow::Borrowed(table),
+            config: Arc::new(RwLock::new(FullTextSearchConfig::default())),
         }
+    }
+
+    pub(crate) fn from_owned(table: Arc<Table>) -> FullTextSearchBuilder<'static> {
+        FullTextSearchBuilder {
+            table: Cow::Owned(table.as_ref().clone()),
+            config: Arc::new(RwLock::new(FullTextSearchConfig::default())),
+        }
+    }
+
+    /// Own the table handle while preserving shared configuration with clones.
+    pub fn into_owned(self) -> FullTextSearchBuilder<'static> {
+        FullTextSearchBuilder {
+            table: Cow::Owned(self.table.into_owned()),
+            config: self.config,
+        }
+    }
+
+    fn config_snapshot(&self) -> FullTextSearchConfig {
+        self.config
+            .read()
+            .expect("full-text search configuration lock poisoned")
+            .clone()
     }
 
     /// Set the text column to search.
     pub fn with_text_column(&mut self, name: &str) -> &mut Self {
-        self.text_column = Some(name.to_string());
+        self.config.write().unwrap().text_column = Some(name.to_string());
         self
     }
 
     /// Set the query text to search for.
     pub fn with_query_text(&mut self, query: &str) -> &mut Self {
-        self.query_text = Some(query.to_string());
-        self.query_is_dsl = false;
+        let mut config = self.config.write().unwrap();
+        config.query_text = Some(query.to_string());
+        config.query_is_dsl = false;
+        drop(config);
         self
     }
 
     /// Set candidate row IDs to include in the search.
     pub fn with_include_row_ids(&mut self, include_row_ids: RoaringTreemap) -> &mut Self {
-        self.include_row_ids = Some(include_row_ids);
+        self.config.write().unwrap().include_row_ids = Some(include_row_ids);
         self
     }
 
     /// Set the top-k limit for results.
     pub fn with_limit(&mut self, limit: usize) -> &mut Self {
-        self.limit = Some(limit);
+        self.config.write().unwrap().limit = Some(limit);
         self
-    }
-
-    /// Execute the full-text search and return row ranges.
-    ///
-    /// This reads the latest snapshot, loads the index manifest, and evaluates
-    /// the search against full-text indexes.
-    ///
-    /// Reference: `FullTextSearchBuilder.executeLocal()`
-    /// For primary-key file positions, use [`Self::execute_scored`].
-    pub async fn execute(&self) -> crate::Result<Vec<RowRange>> {
-        self.execute_scored().await?.row_ids()?.to_row_ranges()
     }
 
     /// Search one snapshot without materializing user columns. Results carry
     /// global row IDs or primary-key file positions and can be read later with
     /// [`crate::table::GlobalIndexResult::new_read_builder`].
-    pub async fn execute_scored(&self) -> crate::Result<crate::table::GlobalIndexResult> {
-        let read = self.new_read()?;
-        read.read(self.new_scan()?.scan().await?).await
+    pub async fn execute(&self) -> crate::Result<crate::table::GlobalIndexResult> {
+        let (scan, read) = self.new_scan_and_read()?;
+        read.read(scan.scan().await?).await
     }
 
     /// Configure the queried field and query, matching Java withQuery.
     pub fn with_query(&mut self, field_name: &str, query: &str) -> &mut Self {
-        self.with_text_column(field_name);
-        self.query_text = Some(query.to_string());
-        self.query_is_dsl = true;
+        let mut config = self.config.write().unwrap();
+        config.text_column = Some(field_name.to_string());
+        config.query_text = Some(query.to_string());
+        config.query_is_dsl = true;
+        drop(config);
         self
     }
 
     /// Exclude rows before Top-K; partition conjuncts prune the manifest.
     pub fn with_filter(&mut self, filter: Predicate) -> &mut Self {
-        super::vector_search_common::add_filter(&mut self.filter, filter);
+        super::vector_search_common::add_filter(&mut self.config.write().unwrap().filter, filter);
         self
     }
 
     pub fn with_partition_filter(&mut self, filter: Predicate) -> crate::Result<&mut Self> {
-        super::partition_filter::validate_partition_filter(self.table, &filter)?;
+        super::partition_filter::validate_partition_filter(&self.table, &filter)?;
         Ok(self.with_filter(filter))
     }
 
     pub fn new_scan(&self) -> crate::Result<FullTextScan> {
-        FullTextScan::new(self)
+        FullTextScan::new(&self.table, &self.config_snapshot())
     }
 
     pub fn new_read(&self) -> crate::Result<FullTextRead> {
-        FullTextRead::new(self)
+        FullTextRead::new(&self.table, &self.config_snapshot())
+    }
+
+    pub(crate) fn new_scan_and_read(&self) -> crate::Result<(FullTextScan, FullTextRead)> {
+        let config = self.config_snapshot();
+        let read = FullTextRead::new(&self.table, &config)?;
+        let scan = FullTextScan::new(&self.table, &config)?;
+        Ok((scan, read))
     }
 
     /// Run the full-text search and materialize the matching rows as Arrow batches,
@@ -179,8 +207,10 @@ impl<'a> FullTextSearchBuilder<'a> {
         // Fail closed: returns data outside `TableScan`/`TableRead`.
         let core = CoreOptions::new(self.table.schema().options());
         core.ensure_read_authorized()?;
+        let config = self.config_snapshot();
         let text_column =
-            self.text_column
+            config
+                .text_column
                 .as_deref()
                 .ok_or_else(|| crate::Error::ConfigInvalid {
                     message: "Text column must be set via with_text_column()".to_string(),
@@ -195,7 +225,13 @@ impl<'a> FullTextSearchBuilder<'a> {
             });
         }
 
-        self.execute_scored().await?.new_read_builder().read().await
+        let read = FullTextRead::new(&self.table, &config)?;
+        let scan = FullTextScan::new(&self.table, &config)?;
+        read.read(scan.scan().await?)
+            .await?
+            .new_read_builder()
+            .read()
+            .await
     }
 }
 
@@ -1666,8 +1702,6 @@ mod tests {
         assert!(positions[0].score > 0.0);
     }
 
-    // (d) The PK full-text path produces physical positions, not global row-ids:
-    // Only the ranges-only `execute` API rejects the physical-position result.
     #[tokio::test]
     async fn scheduled_full_text_rejects_primary_key_plans() {
         struct NoScheduling;
@@ -1700,31 +1734,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pk_full_text_ranges_reject_physical_positions() {
+    async fn pk_full_text_result_rejects_global_row_id_conversion() {
         let table = pk_full_text_table("pk_ft_execute_loud", &[]);
-        let err = table
+        let result = table
             .new_full_text_search_builder()
             .with_text_column("body")
             .with_query_text(r#"{"match":{"query":"alpha"}}"#)
             .with_limit(10)
             .execute()
             .await
-            .unwrap_err();
+            .unwrap();
+        let err = result.row_ids().unwrap_err();
         assert!(
             matches!(&err, crate::Error::Unsupported { message } if message.contains("physical file positions")),
-            "the ranges-only API must reject primary-key file positions, got: {err}"
+            "global row ID conversion must reject primary-key file positions, got: {err}"
         );
     }
 
     #[tokio::test]
-    async fn pk_full_text_scored_empty_result_keeps_its_address_space() {
+    async fn pk_full_text_empty_result_keeps_its_address_space() {
         let table = pk_full_text_table("pk_ft_scored_loud", &[]);
         let result = table
             .new_full_text_search_builder()
             .with_text_column("body")
             .with_query_text(r#"{"match":{"query":"alpha"}}"#)
             .with_limit(10)
-            .execute_scored()
+            .execute()
             .await
             .unwrap();
         assert_eq!(result.snapshot_id(), None);
@@ -1779,7 +1814,7 @@ mod tests {
     }
 
     // (e) A non-PK (append) table: execute_read is unsupported and must fail loud
-    // rather than silently return nothing; the append execute/execute_scored path
+    // rather than silently return nothing; the append execute path
     // stays unaffected (exercised by the raw-search tests above).
     #[tokio::test]
     async fn append_execute_read_fails_loud_unsupported() {
@@ -1804,7 +1839,7 @@ mod tests {
 
     // Dispatch: with data-evolution ENABLED, a configured pk-full-text column must
     // NOT resolve to the PK path (mirrors Java `primaryKeyFullTextDefinition`), so
-    // execute_scored returns global row IDs rather than physical PK positions.
+    // execute returns global row IDs rather than physical PK positions.
     #[tokio::test]
     async fn data_evolution_enabled_does_not_take_pk_path() {
         let de_on = HashMap::from([

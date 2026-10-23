@@ -152,12 +152,11 @@ mod captured_routes {
         let (routes, expected) = {
             let mut builder = mixed_query(&table, 4);
             builder.with_filter(keep);
-            let expected = builder.execute_scored().await.unwrap();
+            let expected = builder.execute().await.unwrap();
             (builder.route_builders().await.unwrap(), expected)
         };
         assert_eq!(routes.len(), 2);
         assert!(Arc::ptr_eq(routes[0].table(), routes[1].table()));
-        assert!(routes[0].filter().is_some());
         assert_eq!(
             routes[0].table().travel_snapshot().map(|s| s.id()),
             expected.snapshot_id()
@@ -197,7 +196,7 @@ mod captured_routes {
             expected.snapshot_id()
         );
         assert_ne!(
-            builder.execute_scored().await.unwrap().snapshot_id(),
+            builder.execute().await.unwrap().snapshot_id(),
             expected.snapshot_id()
         );
     }
@@ -226,6 +225,169 @@ mod captured_routes {
     }
 
     #[tokio::test]
+    async fn vector_route_getters_share_query_limit_and_filter_updates() {
+        let table = table();
+        append(&table, 0).await;
+        index(&table, "ivf-flat", "embedding").await;
+        let routes = mixed_query(&table, 4).route_builders().await.unwrap();
+        let route = routes[0].clone();
+        let snapshot_id = route.table().travel_snapshot().unwrap().id();
+        let mut vector = route.vector_search_builder().unwrap();
+        vector.with_query_vector(vec![3.0, 0.0]).with_limit(2);
+        assert_eq!(
+            route.execute().await.unwrap().row_ids().unwrap().row_ids,
+            vec![3, 2]
+        );
+
+        let predicates = PredicateBuilder::new(table.schema().fields());
+        route.vector_search_builder().unwrap().with_filter(
+            predicates
+                .equal("label", Datum::String("keep".into()))
+                .unwrap(),
+        );
+        assert_eq!(
+            vector.execute().await.unwrap().row_ids().unwrap().row_ids,
+            vec![2, 1]
+        );
+        let mut repeated = route.vector_search_builder().unwrap();
+        repeated.with_query_vector(vec![0.0, 0.0]).with_limit(1);
+        // Handles and cloned routes keep the shared query state and owned view.
+        drop(routes);
+        append(&table, 4).await;
+        for result in [
+            route.execute().await.unwrap(),
+            vector.execute().await.unwrap(),
+        ] {
+            assert_eq!(result.row_ids().unwrap().row_ids, vec![1]);
+            assert_eq!(result.snapshot_id(), Some(snapshot_id));
+        }
+    }
+
+    #[tokio::test]
+    async fn full_text_route_getters_share_query_limit_and_filter_updates() {
+        let table = table();
+        append(&table, 0).await;
+        index(&table, "full-text", "text").await;
+        let routes = mixed_query(&table, 4).route_builders().await.unwrap();
+        let route = routes[1].clone();
+        let snapshot_id = route.table().travel_snapshot().unwrap().id();
+        let mut text = route.full_text_search_builder().unwrap();
+        text.with_limit(1);
+        assert_eq!(route.execute().await.unwrap().len(), 1);
+
+        route
+            .full_text_search_builder()
+            .unwrap()
+            .with_query("text", r#"{"match":{"query":"lake"}}"#);
+        assert_eq!(
+            text.execute().await.unwrap().row_ids().unwrap().row_ids,
+            vec![2]
+        );
+        let predicates = PredicateBuilder::new(table.schema().fields());
+        let mut repeated = route.full_text_search_builder().unwrap();
+        repeated
+            .with_query("text", r#"{"match":{"query":"paimon"}}"#)
+            .with_filter(predicates.equal("id", Datum::Int(1)).unwrap());
+        drop(routes);
+        append(&table, 4).await;
+        for result in [
+            route.execute().await.unwrap(),
+            text.execute().await.unwrap(),
+        ] {
+            assert_eq!(result.row_ids().unwrap().row_ids, vec![1]);
+            assert_eq!(result.snapshot_id(), Some(snapshot_id));
+        }
+    }
+
+    struct UpdatingExecutor {
+        table: Table,
+        update: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::table::SearchTaskExecutor for UpdatingExecutor {
+        async fn execute(
+            &self,
+            tasks: Vec<crate::table::SearchTask>,
+        ) -> crate::Result<Vec<crate::table::SearchTaskResult>> {
+            let update = self.update.lock().unwrap().take();
+            if let Some(update) = update {
+                update();
+            }
+            let (context, frames) = crate::table::SearchTask::serialize_batch(&tasks)?;
+            let mut results = Vec::new();
+            for frame in frames {
+                results.push(crate::table::SearchTaskResult::deserialize(
+                    &self.table.execute_search_task(&frame, &context).await?,
+                )?);
+            }
+            Ok(results)
+        }
+    }
+
+    #[tokio::test]
+    async fn active_route_execution_keeps_its_configuration_while_getters_are_mutated() {
+        fn require_send<T: Send>(value: T) -> T {
+            value
+        }
+
+        let table = table();
+        append(&table, 0).await;
+        index(&table, "ivf-flat", "embedding").await;
+        index(&table, "full-text", "text").await;
+        let routes = mixed_query(&table, 4).route_builders().await.unwrap();
+        let predicates = PredicateBuilder::new(table.schema().fields());
+        for route in routes {
+            let (update, expected, later): (Box<dyn FnOnce() + Send>, _, _) =
+                match route.route().kind() {
+                    HybridSearchRouteKind::Vector => {
+                        let mut vector = route.vector_search_builder().unwrap();
+                        let filter = predicates.equal("id", Datum::Int(3)).unwrap();
+                        (
+                            Box::new(move || {
+                                vector
+                                    .with_query_vector(vec![3.0, 0.0])
+                                    .with_limit(1)
+                                    .with_filter(filter);
+                            }),
+                            vec![0, 1, 2, 3],
+                            vec![3],
+                        )
+                    }
+                    HybridSearchRouteKind::FullText => {
+                        let mut text = route.full_text_search_builder().unwrap();
+                        let filter = predicates.equal("id", Datum::Int(2)).unwrap();
+                        (
+                            Box::new(move || {
+                                text.with_query("text", r#"{"match":{"query":"lake"}}"#)
+                                    .with_limit(1)
+                                    .with_filter(filter);
+                            }),
+                            vec![0, 1, 2],
+                            vec![2],
+                        )
+                    }
+                };
+            let executor = UpdatingExecutor {
+                table: table.clone(),
+                update: std::sync::Mutex::new(Some(update)),
+            };
+            // Mutating through a worker callback must succeed while execution is
+            // awaiting I/O. The in-flight request keeps its original settings.
+            let result = require_send(route.execute_internal(Some(&executor)))
+                .await
+                .unwrap();
+            let mut ids = result.into_row_ids().unwrap().row_ids;
+            ids.sort_unstable();
+            assert_eq!(ids, expected);
+            assert_eq!(
+                route.execute().await.unwrap().row_ids().unwrap().row_ids,
+                later
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn incomplete_queries_can_be_finished_on_captured_route_builders() {
         let table = table();
         append(&table, 0).await;
@@ -243,13 +405,13 @@ mod captured_routes {
         assert!(routes[0].route().vector_value().unwrap().is_empty());
         assert_eq!(routes[1].route().full_text_query(), Some(""));
         // Preparing routes does not execute their incomplete queries.
-        assert!(builder.execute_scored().await.is_err());
+        assert!(builder.execute().await.is_err());
         let mut empty_text = table.new_hybrid_search_builder();
         empty_text
             .add_full_text_route("text", "", 4, 1.0, HashMap::new())
             .unwrap()
             .with_limit(4);
-        assert!(empty_text.execute_scored().await.is_err());
+        assert!(empty_text.execute().await.is_err());
 
         append(&table, 4).await;
         let mut vector = routes[0].vector_search_builder().unwrap();
@@ -258,16 +420,16 @@ mod captured_routes {
         text.with_query("text", r#"{"match":{"query":"paimon"}}"#);
         let results = [
             builder
-                .to_route_result(&routes[0], vector.execute().await.unwrap())
+                .to_route_result(&routes[0], routes[0].execute().await.unwrap())
                 .unwrap(),
             builder
-                .to_route_result(&routes[1], text.execute_scored().await.unwrap())
+                .to_route_result(&routes[1], routes[1].execute().await.unwrap())
                 .unwrap(),
         ];
         let actual = builder.rank(&results).unwrap();
         let expected = mixed_query(&table, 4)
             .with_snapshot(Some(&snapshot))
-            .execute_scored()
+            .execute()
             .await
             .unwrap();
         assert_eq!(actual.snapshot_id(), Some(snapshot.id()));

@@ -21,6 +21,7 @@ use std::sync::Arc;
 use paimon::spec::Predicate;
 use paimon::table::{
     BatchVectorRead, HybridSearchRouteBuilder, Table, VectorRead, VectorScan, VectorScanPlan,
+    VectorSearchBuilder,
 };
 use paimon_datafusion::runtime::runtime;
 use pyo3::prelude::*;
@@ -42,29 +43,6 @@ struct SearchConfig {
 }
 
 impl SearchConfig {
-    fn single<'a>(
-        &self,
-        table: &'a Table,
-    ) -> paimon::Result<paimon::table::VectorSearchBuilder<'a>> {
-        let mut builder = table.new_vector_search_builder();
-        if let Some(column) = &self.column {
-            builder.with_vector_column(column);
-        }
-        if let Some(limit) = self.limit {
-            builder.with_limit(limit);
-        }
-        for options in &self.options {
-            builder.with_options(options.clone());
-        }
-        for filter in &self.filters {
-            builder.with_filter(filter.clone());
-        }
-        for filter in &self.partition_filters {
-            builder.with_partition_filter(filter.clone())?;
-        }
-        Ok(builder)
-    }
-
     fn batch<'a>(
         &self,
         table: &'a Table,
@@ -92,33 +70,19 @@ impl SearchConfig {
 #[pyclass(name = "VectorSearchBuilder", module = "pypaimon_rust.datafusion")]
 pub struct PyVectorSearchBuilder {
     table: Arc<Table>,
-    config: SearchConfig,
-    query: Option<Vec<f32>>,
+    inner: VectorSearchBuilder<'static>,
 }
 
 impl PyVectorSearchBuilder {
     pub(crate) fn new(table: Arc<Table>) -> Self {
-        Self {
-            table,
-            config: SearchConfig::default(),
-            query: None,
-        }
+        let inner = table.new_vector_search_builder().into_owned();
+        Self { table, inner }
     }
 
     pub(crate) fn from_hybrid_route(route: &HybridSearchRouteBuilder) -> PyResult<Self> {
-        // Core validates the route kind and owns the captured table view.
-        route.vector_search_builder().map_err(to_py_err)?;
-        let config = route.route();
         Ok(Self {
             table: Arc::clone(route.table()),
-            config: SearchConfig {
-                column: Some(config.field_name().to_string()),
-                limit: Some(config.limit()),
-                options: vec![config.options().clone()],
-                filters: route.filter().cloned().into_iter().collect(),
-                partition_filters: Vec::new(),
-            },
-            query: config.vector_value().map(<[f32]>::to_vec),
+            inner: route.vector_search_builder().map_err(to_py_err)?,
         })
     }
 }
@@ -126,26 +90,26 @@ impl PyVectorSearchBuilder {
 #[pymethods]
 impl PyVectorSearchBuilder {
     fn with_vector_column(mut slf: PyRefMut<'_, Self>, name: String) -> PyRefMut<'_, Self> {
-        slf.config.column = Some(name);
+        slf.inner.with_vector_column(&name);
         slf
     }
     fn with_limit(mut slf: PyRefMut<'_, Self>, limit: usize) -> PyRefMut<'_, Self> {
-        slf.config.limit = Some(limit);
+        slf.inner.with_limit(limit);
         slf
     }
     fn with_query_vector(mut slf: PyRefMut<'_, Self>, vector: Vec<f32>) -> PyRefMut<'_, Self> {
-        slf.query = Some(vector);
+        slf.inner.with_query_vector(vector);
         slf
     }
     fn with_option(mut slf: PyRefMut<'_, Self>, key: String, value: String) -> PyRefMut<'_, Self> {
-        slf.config.options.push(HashMap::from([(key, value)]));
+        slf.inner.with_options(HashMap::from([(key, value)]));
         slf
     }
     fn with_options(
         mut slf: PyRefMut<'_, Self>,
         options: HashMap<String, String>,
     ) -> PyRefMut<'_, Self> {
-        slf.config.options.push(options);
+        slf.inner.with_options(options);
         slf
     }
     fn with_filter<'py>(
@@ -153,7 +117,7 @@ impl PyVectorSearchBuilder {
         predicate: &Bound<'_, PyDict>,
     ) -> PyResult<PyRefMut<'py, Self>> {
         let predicate = dict_to_table_predicate(predicate, slf.table.schema(), true)?;
-        slf.config.filters.push(predicate);
+        slf.inner.with_filter(predicate);
         Ok(slf)
     }
     fn with_partition_filter<'py>(
@@ -161,38 +125,22 @@ impl PyVectorSearchBuilder {
         predicate: &Bound<'_, PyDict>,
     ) -> PyResult<PyRefMut<'py, Self>> {
         let predicate = dict_to_table_predicate(predicate, slf.table.schema(), true)?;
-        slf.config
-            .single(&slf.table)
-            .map_err(to_py_err)?
-            .with_partition_filter(predicate.clone())
+        slf.inner
+            .with_partition_filter(predicate)
             .map_err(to_py_err)?;
-        slf.config.partition_filters.push(predicate);
         Ok(slf)
     }
     fn new_vector_search_scan(&self) -> PyResult<PyVectorScan> {
-        let inner = self
-            .config
-            .single(&self.table)
-            .map_err(to_py_err)?
-            .new_scan()
-            .map_err(to_py_err)?;
+        let inner = self.inner.new_scan().map_err(to_py_err)?;
         Ok(PyVectorScan { inner })
     }
     fn new_vector_search_read(&self) -> PyResult<PyVectorRead> {
-        let mut builder = self.config.single(&self.table).map_err(to_py_err)?;
-        if let Some(query) = &self.query {
-            builder.with_query_vector(query.clone());
-        }
-        let inner = builder.new_read().map_err(to_py_err)?;
+        let inner = self.inner.new_read().map_err(to_py_err)?;
         Ok(PyVectorRead { inner })
     }
     fn execute(&self, py: Python<'_>) -> PyResult<PyGlobalIndexResult> {
-        let mut builder = self.config.single(&self.table).map_err(to_py_err)?;
-        if let Some(query) = &self.query {
-            builder.with_query_vector(query.clone());
-        }
         let results = py
-            .detach(|| runtime().block_on(builder.execute()))
+            .detach(|| runtime().block_on(self.inner.execute()))
             .map_err(to_py_err)?;
         Ok(PyGlobalIndexResult::new(results))
     }
@@ -703,6 +651,7 @@ for factory, expected in (
 ):
     builder = factory()
     assert callable(builder.execute)
+    assert not hasattr(builder, 'execute_scored')
     assert not hasattr(builder, 'execute_local')
     assert not hasattr(builder, 'execute_batch_local')
     try:
