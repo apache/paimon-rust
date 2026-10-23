@@ -20,7 +20,7 @@
 //! Also contains the per-bucket index maintainer (`DynamicBucketIndexMaintainer`)
 //! and per-partition index (`PartitionIndex`) used by both dynamic and cross-partition modes.
 
-use crate::io::FileIO;
+use crate::io::{FileIO, FileRead};
 use crate::spec::MAX_DYNAMIC_BUCKETS;
 use crate::spec::{
     batch_hash_codes, batch_to_serialized_bytes, bucket_path_under, BinaryRow, CoreOptions,
@@ -44,6 +44,7 @@ use uuid::Uuid;
 
 /// Index type identifier for hash index files, matching Java's `HashIndexFile.HASH_INDEX`.
 const HASH_INDEX: &str = "HASH";
+const HASH_INDEX_READ_CHUNK_SIZE: u64 = 8 * 1024 * 1024;
 
 /// Read/write hash index files.
 ///
@@ -78,6 +79,49 @@ impl HashIndexFile {
             hashes.push(i32::from_be_bytes(bytes));
         }
         Ok(hashes)
+    }
+
+    /// Distributed input assigners retain only hashes requested by their
+    /// current batch. Scan bounded ranges rather than materializing a whole
+    /// partition's index or constructing writer-side index maintainers.
+    async fn read_requested(
+        file_io: &FileIO,
+        path: &str,
+        expected_count: i64,
+        requested: &HashSet<i32>,
+    ) -> Result<HashSet<i32>> {
+        let input = file_io.new_input(path)?;
+        let size = input.metadata().await?.size;
+        let count = u64::try_from(expected_count).ok();
+        if size % 4 != 0 || count.and_then(|count| count.checked_mul(4)) != Some(size) {
+            return Err(crate::Error::DataInvalid {
+                message: format!(
+                    "Corrupt HASH index {path}: expected {expected_count} hashes, got {size} bytes"
+                ),
+                source: None,
+            });
+        }
+        let reader = input.reader().await?;
+        let mut found = HashSet::new();
+        let mut offset = 0;
+        while offset < size {
+            let end = (offset + HASH_INDEX_READ_CHUNK_SIZE).min(size);
+            let content = reader.read(offset..end).await?;
+            if content.len() as u64 != end - offset {
+                return Err(crate::Error::DataInvalid {
+                    message: format!("Short read in HASH index {path}"),
+                    source: None,
+                });
+            }
+            for bytes in content.as_chunks::<4>().0 {
+                let hash = i32::from_be_bytes(*bytes);
+                if requested.contains(&hash) {
+                    found.insert(hash);
+                }
+            }
+            offset = end;
+        }
+        Ok(found)
     }
 
     /// Write key hashes to a new hash index file, returning its metadata.
@@ -430,15 +474,36 @@ impl PartitionIndex {
     /// 2. Otherwise, find a non-full bucket and assign the hash there.
     /// 3. If all buckets are full, create a new bucket.
     fn assign(&mut self, hash: i32, max_buckets: i32) -> Result<i32> {
+        let (bucket, new) = self.allocate(hash, max_buckets, |_| true)?;
+        if new {
+            self.bucket_maintainers
+                .entry(bucket)
+                .or_insert_with(|| DynamicBucketIndexMaintainer::new(vec![]))
+                .notify_new_record(hash);
+        }
+        Ok(bucket)
+    }
+
+    /// Java PartitionIndex allocation, shared by writers and distributed
+    /// input assignment. Only writers notify HASH-file maintainers.
+    fn allocate(
+        &mut self,
+        hash: i32,
+        max_buckets: i32,
+        bucket_filter: impl Fn(i32) -> bool,
+    ) -> Result<(i32, bool)> {
         // 1. Already assigned
         if let Some(&bucket) = self.hash_to_bucket.get(&hash) {
-            return Ok(bucket);
+            return Ok((bucket, false));
         }
 
         // 2. Find a non-full bucket
         let mut full_buckets = Vec::new();
         let mut assigned_bucket = None;
         for (&bucket, count) in &mut self.non_full_buckets {
+            if !bucket_filter(bucket) {
+                continue;
+            }
             if *count < self.target_bucket_row_number {
                 *count += 1;
                 self.hash_to_bucket.insert(hash, bucket);
@@ -452,11 +517,7 @@ impl PartitionIndex {
             self.non_full_buckets.remove(&b);
         }
         if let Some(bucket) = assigned_bucket {
-            self.bucket_maintainers
-                .entry(bucket)
-                .or_insert_with(|| DynamicBucketIndexMaintainer::new(vec![]))
-                .notify_new_record(hash);
-            return Ok(bucket);
+            return Ok((bucket, true));
         }
 
         // Java PartitionIndex first allocates an unused id in range. A configured
@@ -466,7 +527,10 @@ impl PartitionIndex {
         } else {
             max_buckets
         };
-        while self.next_bucket_id < limit && self.all_buckets.contains(&self.next_bucket_id) {
+        while self.next_bucket_id < limit
+            && (self.all_buckets.contains(&self.next_bucket_id)
+                || !bucket_filter(self.next_bucket_id))
+        {
             self.next_bucket_id += 1;
         }
         let bucket = if self.next_bucket_id < limit {
@@ -485,16 +549,12 @@ impl PartitionIndex {
                 .bucket_ids
                 .choose(&mut rand::thread_rng())
                 .ok_or_else(|| crate::Error::DataInvalid {
-                    message: "No dynamic bucket is available".to_string(),
+                    message: "No dynamic bucket is available for this assigner".to_string(),
                     source: None,
                 })?
         };
         self.hash_to_bucket.insert(hash, bucket);
-        self.bucket_maintainers
-            .entry(bucket)
-            .or_insert_with(|| DynamicBucketIndexMaintainer::new(vec![]))
-            .notify_new_record(hash);
-        Ok(bucket)
+        Ok((bucket, true))
     }
 
     /// Write hash index files for all modified buckets, returning (bucket, index_files) pairs.
@@ -602,6 +662,156 @@ impl DynamicBucketAssigner {
         self.restore_snapshot_id = Some(snapshot_id);
     }
 
+    /// Input assignment and the eventual file writer must restore the exact
+    /// same snapshot, including an explicitly captured empty table.
+    pub(super) fn pin_restore_snapshot(&mut self, snapshot: Option<Snapshot>) {
+        self.restore_snapshot_id = Some(snapshot.as_ref().map_or(0, Snapshot::id));
+        self.snapshot = snapshot;
+    }
+
+    /// Restore only mappings requested by this input, without constructing
+    /// writer-side maintainers. Historical mappings may belong to a bucket
+    /// owned by another current assigner after a parallelism change.
+    pub(super) async fn restore_input_hashes(
+        &mut self,
+        requested: &HashMap<Vec<u8>, HashSet<i32>>,
+        num_assigners: i32,
+        assign_id: i32,
+    ) -> Result<()> {
+        let mut missing = Vec::new();
+        for (partition, hashes) in requested {
+            let index = self.partition_indexes.get(partition);
+            let hashes = hashes
+                .iter()
+                .copied()
+                .filter(|hash| index.is_none_or(|index| !index.hash_to_bucket.contains_key(hash)))
+                .collect::<HashSet<_>>();
+            if !hashes.is_empty() {
+                missing.push((partition, hashes));
+            }
+        }
+        if missing.is_empty() {
+            return Ok(());
+        }
+        self.ensure_index_entries_loaded().await?;
+        // Apply restored maps only after every requested partition was read
+        // successfully. Input owner/shape checks run before this method.
+        let mut restored = Vec::with_capacity(missing.len());
+        for (partition, hashes) in missing {
+            let entries = self
+                .cached_index_entries
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .filter(|entry| {
+                    entry.partition == *partition && entry.index_file.index_type == HASH_INDEX
+                })
+                .collect::<Vec<_>>();
+            let mut buckets = HashSet::new();
+            for entry in &entries {
+                if !(0..MAX_DYNAMIC_BUCKETS).contains(&entry.bucket) {
+                    return Err(crate::Error::DataInvalid {
+                        message: format!(
+                            "Dynamic bucket id must be between 0 and {}, but was {}",
+                            MAX_DYNAMIC_BUCKETS - 1,
+                            entry.bucket
+                        ),
+                        source: None,
+                    });
+                }
+                if !buckets.insert(entry.bucket) {
+                    return Err(crate::Error::DataInvalid {
+                        message: format!(
+                            "Multiple HASH indexes for dynamic bucket {}",
+                            entry.bucket
+                        ),
+                        source: None,
+                    });
+                }
+            }
+            let new_partition = !self.partition_indexes.contains_key(partition);
+            if new_partition {
+                self.validate_data_buckets(
+                    partition,
+                    &entries
+                        .iter()
+                        .map(|entry| (*entry).clone())
+                        .collect::<Vec<_>>(),
+                )
+                .await?;
+            }
+            let mut index = PartitionIndex::empty(self.target_bucket_row_number);
+            let partition_path = self.partition_path(partition)?;
+            let options = CoreOptions::new(self.table.schema().options());
+            let layout = HashIndexLayout {
+                table_path: self.table.location().trim_end_matches('/'),
+                partition_path: &partition_path,
+                data_file_path_directory: options.data_file_path_directory(),
+                index_file_in_data_file_dir: self.index_file_in_data_file_dir,
+            };
+            for entry in entries {
+                let path = layout.resolve(
+                    entry.bucket,
+                    &entry.index_file.file_name,
+                    entry.index_file.external_path.as_deref(),
+                );
+                for hash in HashIndexFile::read_requested(
+                    self.table.file_io(),
+                    &path,
+                    entry.index_file.row_count,
+                    &hashes,
+                )
+                .await?
+                {
+                    if let Some(previous) = index.hash_to_bucket.insert(hash, entry.bucket) {
+                        if previous != entry.bucket {
+                            return Err(crate::Error::DataInvalid {
+                                message: format!("HASH index assigns hash {hash} to both buckets {previous} and {}", entry.bucket),
+                                source: None,
+                            });
+                        }
+                    }
+                }
+                // Restored foreign buckets only supply historical mappings.
+                // New keys can use or grow buckets owned by this assigner.
+                if new_partition && entry.bucket % num_assigners == assign_id % num_assigners {
+                    index.all_buckets.insert(entry.bucket);
+                    index.bucket_ids.push(entry.bucket);
+                    if entry.index_file.row_count < self.target_bucket_row_number {
+                        index
+                            .non_full_buckets
+                            .insert(entry.bucket, entry.index_file.row_count);
+                    }
+                }
+            }
+            restored.push((partition.clone(), index));
+        }
+        for (partition, index) in restored {
+            if let Some(existing) = self.partition_indexes.get_mut(&partition) {
+                existing.hash_to_bucket.extend(index.hash_to_bucket);
+            } else {
+                self.partition_indexes.insert(partition, index);
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn assign_input_hash(
+        &mut self,
+        partition: &[u8],
+        hash: i32,
+        num_assigners: i32,
+        assign_id: i32,
+    ) -> Result<i32> {
+        self.partition_indexes
+            .get_mut(partition)
+            .expect("requested input hashes were restored before assignment")
+            .allocate(hash, self.max_buckets, |bucket| {
+                bucket % num_assigners == assign_id % num_assigners
+            })
+            .map(|(bucket, _)| bucket)
+    }
+
     /// Java's DynamicBucketIndexMaintainer sees keys after bucket assignment.
     /// Keep that same full-file replacement lifecycle for precomputed groups.
     pub async fn notify_precomputed_batch(
@@ -661,10 +871,14 @@ impl DynamicBucketAssigner {
             return Ok(());
         }
         let snapshot_manager = self.table.snapshot_manager();
-        let latest_snapshot = match self.restore_snapshot_id {
-            Some(0) => None,
-            Some(id) => Some(snapshot_manager.get_snapshot(id).await?),
-            None => snapshot_manager.get_latest_snapshot().await?,
+        let latest_snapshot = if self.snapshot.is_some() {
+            self.snapshot.clone()
+        } else {
+            match self.restore_snapshot_id {
+                Some(0) => None,
+                Some(id) => Some(snapshot_manager.get_snapshot(id).await?),
+                None => snapshot_manager.get_latest_snapshot().await?,
+            }
         };
 
         let entries = if let Some(snapshot) = &latest_snapshot {
@@ -1004,6 +1218,79 @@ mod tests {
     }
 
     // -- PartitionIndex tests --
+
+    #[test]
+    fn input_allocation_uses_owned_holes_without_writer_maintainers() {
+        let mut index = PartitionIndex::empty(1);
+        index.hash_to_bucket.insert(10, 3);
+        index.hash_to_bucket.insert(20, 0);
+        index.all_buckets.insert(0);
+        index.bucket_ids.push(0);
+        // Java restores foreign mappings but only keeps owned buckets as
+        // candidates for new keys. Historical max bucket 3 cannot hide id 2.
+        assert_eq!(
+            index.allocate(10, 4, |bucket| bucket % 2 == 0).unwrap(),
+            (3, false)
+        );
+        assert_eq!(
+            index.allocate(30, 4, |bucket| bucket % 2 == 0).unwrap(),
+            (2, true)
+        );
+        let (bucket, new) = index.allocate(40, 4, |bucket| bucket % 2 == 0).unwrap();
+        assert!(new);
+        assert!([0, 2].contains(&bucket));
+        assert_eq!(
+            index.allocate(40, 4, |bucket| bucket % 2 == 0).unwrap(),
+            (bucket, false)
+        );
+        assert!(index.bucket_maintainers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn requested_hash_reads_cross_chunks_and_validate_complete_file_size() {
+        let io = crate::io::FileIOBuilder::new("memory").build().unwrap();
+        let count = HASH_INDEX_READ_CHUNK_SIZE as usize / 4 + 3;
+        let hashes = (0..count as i32).collect::<Vec<_>>();
+        let meta = write_hash_index(&io, "memory:/input-hash-chunks/index", &hashes)
+            .await
+            .unwrap();
+        let path = format!("memory:/input-hash-chunks/index/{}", meta.file_name);
+        let requested =
+            HashSet::from([0, count as i32 - 4, count as i32 - 3, count as i32 - 1, -1]);
+        let found = HashIndexFile::read_requested(&io, &path, meta.row_count, &requested)
+            .await
+            .unwrap();
+        assert_eq!(
+            found,
+            requested
+                .difference(&HashSet::from([-1]))
+                .copied()
+                .collect()
+        );
+        assert_eq!(found.len(), 4);
+        assert!(
+            HashIndexFile::read_requested(&io, &path, meta.row_count - 1, &requested)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("Corrupt HASH")
+        );
+        let output = io.new_output("memory:/input-hash-chunks/trailing").unwrap();
+        output
+            .write(bytes::Bytes::from_static(&[0, 0, 0, 1, 2]))
+            .await
+            .unwrap();
+        assert!(HashIndexFile::read_requested(
+            &io,
+            "memory:/input-hash-chunks/trailing",
+            1,
+            &requested
+        )
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("Corrupt HASH"));
+    }
 
     #[test]
     fn test_assign_new_keys() {

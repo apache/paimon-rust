@@ -22,7 +22,8 @@
 use super::format_write_builder::FormatWriteBuilder;
 use crate::resource::ResourceContext;
 use crate::table::{
-    DataEvolutionDeleteWriter, DataEvolutionWriter, Table, TableCommit, TableUpdate, TableWrite,
+    DataEvolutionDeleteWriter, DataEvolutionWriter, HashBucketAssigner, Table, TableCommit,
+    TableUpdate, TableWrite,
 };
 use uuid::Uuid;
 
@@ -144,6 +145,33 @@ impl<'a> WriteBuilder<'a> {
         match &self.0 {
             WriteBuilderKind::Paimon(builder) => builder.new_write(),
             WriteBuilderKind::Format(builder) => builder.new_write(),
+        }
+    }
+
+    /// Create a distributed dynamic-bucket assigner using this writer's
+    /// overwrite and restore settings. Capture its snapshot now so routing
+    /// and the eventual file writers share one immutable restore point.
+    pub async fn new_bucket_assigner(
+        &self,
+        num_channels: i32,
+        num_assigners: i32,
+        assign_id: i32,
+    ) -> crate::Result<HashBucketAssigner> {
+        match &self.0 {
+            WriteBuilderKind::Paimon(builder) => {
+                HashBucketAssigner::new(
+                    builder.table,
+                    num_channels,
+                    num_assigners,
+                    assign_id,
+                    builder.restore_snapshot_id,
+                    builder.overwrite,
+                )
+                .await
+            }
+            WriteBuilderKind::Format(_) => Err(crate::Error::Unsupported {
+                message: "Bucket assignment requires a Paimon HASH_DYNAMIC table".into(),
+            }),
         }
     }
 

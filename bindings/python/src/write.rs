@@ -35,7 +35,7 @@ use pyo3::{PyTraverseError, PyVisit};
 
 use crate::blob_uri_reader::{callback_error, optional_uri_reader_factory, to_callback_error};
 use crate::commit_callback::PyCommitCallbackContext;
-use crate::error::to_py_err;
+use crate::error::{to_catalog_py_err, to_py_err};
 use crate::predicate::{dict_to_table_predicate, py_to_datum};
 
 type PartitionSpec = HashMap<String, Option<Datum>>;
@@ -205,6 +205,41 @@ impl PyBatchWriteBuilder {
             state: self.context.new_write(self.static_partition.is_some())?,
             prepared: false,
         })
+    }
+
+    /// Create a distributed HASH_DYNAMIC assigner at this builder's write baseline.
+    fn new_bucket_assigner(
+        &self,
+        py: Python<'_>,
+        num_channels: i32,
+        num_assigners: i32,
+        assign_id: i32,
+    ) -> PyResult<crate::write_routing::PyHashBucketAssigner> {
+        let builder = self
+            .context
+            .table
+            .new_write_builder()
+            .with_commit_user(self.context.commit_user.clone())
+            .map_err(to_py_err)?;
+        let builder = if self.static_partition.is_some() {
+            builder.with_overwrite()
+        } else {
+            builder
+        };
+        let builder = match self.context.restore_snapshot_id {
+            Some(id) => builder.with_restore_snapshot(id).map_err(to_py_err)?,
+            None => builder,
+        };
+        let inner = py
+            .detach(|| {
+                runtime().block_on(builder.new_bucket_assigner(
+                    num_channels,
+                    num_assigners,
+                    assign_id,
+                ))
+            })
+            .map_err(to_catalog_py_err)?;
+        Ok(crate::write_routing::PyHashBucketAssigner::new(inner))
     }
 
     fn new_update(&self) -> PyResult<PyBatchTableUpdate> {
