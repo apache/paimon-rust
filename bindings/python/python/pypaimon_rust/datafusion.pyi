@@ -18,7 +18,7 @@
 from datetime import datetime
 from os import PathLike
 from typing import (
-    Any, Callable, Dict, Iterable, List, Literal, Optional, Sequence, Tuple,
+    Any, Callable, Dict, Iterable, List, Literal, Mapping, Optional, Sequence, Tuple,
     TypeAlias, Union,
 )
 
@@ -79,6 +79,40 @@ class RowIdPlan:
         ...
     def plan(self) -> Plan: ...
 
+class MergeAssignment:
+    """An immutable source reference, target reference, literal or callback."""
+    @staticmethod
+    def source_column(name: str) -> "MergeAssignment": ...
+    @staticmethod
+    def target_column(name: str) -> "MergeAssignment": ...
+    @staticmethod
+    def literal(value: Any) -> "MergeAssignment":
+        """Defer scalar conversion; Arrow arrays provide values for selected rows."""
+        ...
+    @staticmethod
+    def function(
+        function: Callable[[pyarrow.Table], Union[pyarrow.Array, pyarrow.ChunkedArray]],
+    ) -> "MergeAssignment": ...
+
+class WhenMatched:
+    """An immutable, ordered UPDATE or DELETE clause with an optional SQL condition.
+
+    Conditions reference quoted Arrow names, such as ``"s.value" > "t.value"``.
+    The first matching clause consumes a row; NULL conditions fall through.
+    """
+    @staticmethod
+    def update(
+        assignments: Mapping[str, MergeAssignment], condition: Optional[str] = None,
+    ) -> "WhenMatched": ...
+    @staticmethod
+    def delete(condition: Optional[str] = None) -> "WhenMatched": ...
+
+class WhenNotMatched:
+    """An immutable, ordered INSERT clause."""
+    def __init__(
+        self, assignments: Mapping[str, MergeAssignment], condition: Optional[str] = None,
+    ) -> None: ...
+
 class MergeBatchExecution:
     """Evaluate ordered MERGE actions over already joined Arrow batches.
 
@@ -89,10 +123,22 @@ class MergeBatchExecution:
     output contains ``_ROW_ID`` and the requested target columns; delete output
     contains only ``_ROW_ID``. Insert output uses the target schema.
     """
-    def __init__(
-        self, input_schema: pyarrow.Schema, output_schema: pyarrow.Schema,
-        clauses: Sequence[Dict[str, Any]], mode: Literal["update", "delete", "insert"],
-    ) -> None: ...
+    @staticmethod
+    def for_updates(
+        input_schema: pyarrow.Schema, update_schema: pyarrow.Schema,
+        when_matched: Sequence[WhenMatched],
+    ) -> "MergeBatchExecution": ...
+    @staticmethod
+    def for_deletes(
+        input_schema: pyarrow.Schema, when_matched: Sequence[WhenMatched],
+    ) -> "MergeBatchExecution":
+        """Keep all matched conditions; skip UPDATE assignment conversion and evaluation."""
+        ...
+    @staticmethod
+    def for_inserts(
+        input_schema: pyarrow.Schema, target_schema: pyarrow.Schema,
+        when_not_matched: Sequence[WhenNotMatched],
+    ) -> "MergeBatchExecution": ...
     def execute(self, batch: Union[pyarrow.Table, pyarrow.RecordBatch]) -> pyarrow.Table:
         """Return selected actions; unselected assignments are never evaluated."""
         ...
@@ -542,15 +588,14 @@ class BatchTableUpdate:
     ) -> "BatchTableUpdate": ...
     def merge_into(
         self, source: Optional[Union[pyarrow.Table, Table]], *, on: Sequence[Tuple[str, str]],
-        when_matched: Sequence[Dict[str, Any]], when_not_matched: Sequence[Dict[str, Any]]
+        when_matched: Sequence[WhenMatched], when_not_matched: Sequence[WhenNotMatched]
     ) -> List[CommitMessage]:
         """Prepare MERGE against one target snapshot. None selects self-merge on _ROW_ID.
 
         A Table source reads its selected snapshot or numeric timestamp window
         in core, independently of the target. Arrow input preserves batches and source row order.
 
-        Clauses carry assignments as (column, source/target/literal/callable, value)
-        tuples, a delete flag, and optional SQL condition metadata. Callables
+        Typed clauses carry MergeAssignment values and optional SQL conditions. Callables
         consume the complete clause's qualified t./s. Arrow columns and return
         an Array or ChunkedArray with the same row count; empty clauses are lazy.
         Commit returned messages through the matching builder's committer.
@@ -616,7 +661,7 @@ class StreamTableUpdate:
     ) -> "StreamTableUpdate": ...
     def merge_into(
         self, source: Optional[Union[pyarrow.Table, Table]], *, on: Sequence[Tuple[str, str]],
-        when_matched: Sequence[Dict[str, Any]], when_not_matched: Sequence[Dict[str, Any]],
+        when_matched: Sequence[WhenMatched], when_not_matched: Sequence[WhenNotMatched],
         commit_identifier: int
     ) -> List[CommitMessage]:
         """Prepare MERGE against one target snapshot. None selects self-merge on _ROW_ID.
@@ -624,8 +669,7 @@ class StreamTableUpdate:
         A Table source reads its selected snapshot or numeric timestamp window
         in core, independently of the target. Arrow input preserves batches and source row order.
 
-        Clauses carry assignments as (column, source/target/literal/callable, value)
-        tuples, a delete flag, and optional SQL condition metadata. Callables
+        Typed clauses carry MergeAssignment values and optional SQL conditions. Callables
         consume the complete clause's qualified t./s. Arrow columns and return
         an Array or ChunkedArray with the same row count; empty clauses are lazy.
         Commit returned messages through the matching builder's committer.

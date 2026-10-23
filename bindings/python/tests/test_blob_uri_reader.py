@@ -22,7 +22,7 @@ import pyarrow as pa
 import pytest
 
 from test_blob_consumer import _table
-from pypaimon_rust.datafusion import PaimonCatalog, SQLContext
+from pypaimon_rust.datafusion import MergeAssignment, PaimonCatalog, SQLContext, WhenMatched
 
 
 def descriptor(offset, length):
@@ -217,9 +217,9 @@ def test_update_factory_errors_keep_identity_and_existing_data(tmp_path, stream,
     extra = {'commit_identifier': 7} if stream else {}
     with pytest.raises(OSError) as caught:
         if operation == 'merge':
-            update.merge_into(source, on=[('id', 'id')], when_matched=[{
-                'delete': False, 'assignments': [('payload', 'source', 'payload')],
-            }], when_not_matched=[], **extra)
+            update.merge_into(source, on=[('id', 'id')], when_matched=[
+                WhenMatched.update({'payload': MergeAssignment.source_column('payload')}),
+            ], when_not_matched=[], **extra)
         elif operation == 'row_id':
             update.update_by_arrow_with_row_id(data, **extra)
         elif operation == 'grouped_row_id':

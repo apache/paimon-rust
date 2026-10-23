@@ -85,6 +85,49 @@ updates, including incremental row-ID updaters, expose the same chainable setter
 `with_commit_user` is available on batch, stream, and postpone fixed bucket write
 builders, and the identity applies to both writers and committers from that builder.
 
+### Typed MERGE Actions
+
+Batch and stream `merge_into` accept ordered `WhenMatched` and `WhenNotMatched`
+objects. Assignments use `MergeAssignment.source_column`, `target_column`,
+`literal`, or `function`. A function receives the selected clause's Arrow table
+and returns an Array or ChunkedArray with the same number of rows.
+
+Execution engines that already joined target and source data can reuse these
+types through the batch execution factories:
+
+```python
+import pyarrow as pa
+from pypaimon_rust.datafusion import MergeAssignment, MergeBatchExecution, WhenMatched
+
+joined = pa.table({
+    "t._ROW_ID": [10, 11],
+    "t.value": pa.array([20, 30], type=pa.int32()),
+    "s.value": pa.array([40, 10], type=pa.int32()),
+})
+matched = [
+    WhenMatched.update(
+        {"value": MergeAssignment.source_column("value")},
+        condition='"s.value" > "t.value"',
+    ),
+    WhenMatched.delete(),
+]
+update_schema = pa.schema([
+    pa.field("_ROW_ID", pa.int64(), nullable=False),
+    pa.field("value", pa.int32()),
+])
+updates = MergeBatchExecution.for_updates(joined.schema, update_schema, matched)
+deletes = MergeBatchExecution.for_deletes(joined.schema, matched)
+assert updates.execute(joined).to_pylist() == [{"_ROW_ID": 10, "value": 40}]
+assert deletes.execute(joined).to_pylist() == [{"_ROW_ID": 11}]
+```
+
+Both matched factories consume the complete ordered branch list. The delete
+factory skips UPDATE assignments and callbacks while preserving their conditions.
+For unmatched source batches, use `for_inserts(source_schema, target_schema,
+when_not_matched)` with `WhenNotMatched` objects. The factories compile conditions
+once and return an executor with `execute(Table | RecordBatch) -> Table`.
+The calling engine owns joins, authorization and table writes.
+
 ### Multimodal SQL Helpers
 
 `SQLContext` also registers Python scalar UDFs for common BLOB media and vector
