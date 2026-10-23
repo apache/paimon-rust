@@ -240,7 +240,12 @@ async fn planned_delete_preserves_unselected_bucket_deletion_vectors() {
     update
         .with_plan(Plan::from_splits(plan.snapshot_id(), vec![selected]))
         .unwrap();
-    let messages = update.delete_by_row_id(vec![1]).await.unwrap();
+    append(&table, 30).await;
+    let row_ids = Int64Array::from(vec![-1, 1, 1, -1]).slice(1, 2);
+    let messages = update
+        .delete_by_row_id(row_ids.values().iter().copied())
+        .await
+        .unwrap();
     assert_eq!(messages[0].check_from_snapshot, Some(3));
     assert_eq!(messages[0].deleted_index_files, vec![previous_index]);
     let ranges = messages[0].new_index_files[0]
@@ -265,7 +270,20 @@ async fn planned_delete_preserves_unselected_bucket_deletion_vectors() {
         .try_collect()
         .await
         .unwrap();
-    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 0);
+    let values: Vec<i32> = batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .values()
+                .iter()
+                .copied()
+        })
+        .collect();
+    assert_eq!(values, vec![30]);
 }
 
 #[tokio::test]

@@ -18,7 +18,9 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use arrow::datatypes::Schema as ArrowSchema;
+use arrow::array::{Array, Int64Array};
+use arrow::compute::{cast_with_options, CastOptions};
+use arrow::datatypes::{DataType as ArrowDataType, Schema as ArrowSchema};
 use arrow::pyarrow::{FromPyArrow, ToPyArrow};
 use arrow::record_batch::RecordBatch;
 use paimon::spec::{BlobConsumer, BlobDescriptor, CoreOptions, DataType, Datum, RowType};
@@ -40,6 +42,59 @@ use crate::predicate::{dict_to_table_predicate, py_to_datum};
 
 type PartitionSpec = HashMap<String, Option<Datum>>;
 type PythonPartitionSpec = HashMap<String, Py<PyAny>>;
+
+fn delete_row_id_arrays(row_ids: &Bound<'_, PyAny>) -> PyResult<Vec<Int64Array>> {
+    let py = row_ids.py();
+    let pa = py.import("pyarrow")?;
+    let is_array = row_ids.is_instance(&pa.getattr("Array")?)?;
+    let is_chunked = row_ids.is_instance(&pa.getattr("ChunkedArray")?)?;
+    if !is_array && !is_chunked {
+        return Ok(vec![Int64Array::from(row_ids.extract::<Vec<i64>>()?)]);
+    }
+    // Check the declared type even when a ChunkedArray contains no chunks.
+    if !ArrowDataType::from_pyarrow_bound(&row_ids.getattr("type")?)?.is_integer() {
+        return Err(PyTypeError::new_err(
+            "_ROW_ID input must be an integer Arrow array",
+        ));
+    }
+    let arrays = if is_array {
+        vec![crate::arrow_input::array_from_pyarrow(row_ids)?]
+    } else {
+        row_ids
+            .getattr("chunks")?
+            .try_iter()?
+            .map(|chunk| crate::arrow_input::array_from_pyarrow(&chunk?))
+            .collect::<PyResult<Vec<_>>>()?
+    };
+    py.detach(|| {
+        arrays
+            .into_iter()
+            .map(|array| {
+                if array.null_count() != 0 {
+                    return Err(PyValueError::new_err("_ROW_ID must not be null"));
+                }
+                let converted = cast_with_options(
+                    array.as_ref(),
+                    &ArrowDataType::Int64,
+                    &CastOptions {
+                        safe: false,
+                        ..Default::default()
+                    },
+                )
+                .map_err(|error| {
+                    PyValueError::new_err(format!(
+                        "_ROW_ID cannot be represented as Int64: {error}"
+                    ))
+                })?;
+                Ok(converted
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("cast to Int64 returned an Int64Array")
+                    .clone())
+            })
+            .collect()
+    })
+}
 
 /// Shared implementation state; public builders keep batch and stream contracts separate.
 struct WriteContext {
@@ -880,10 +935,19 @@ impl UpdateContext {
     fn delete_by_row_id(
         &self,
         py: Python<'_>,
-        row_ids: Vec<i64>,
+        row_ids: &Bound<'_, PyAny>,
     ) -> PyResult<Vec<PyCommitMessage>> {
+        let arrays = delete_row_id_arrays(row_ids)?;
         let messages = py
-            .detach(|| runtime().block_on(self.inner.delete_by_row_id(row_ids)))
+            .detach(|| {
+                runtime().block_on(
+                    self.inner.delete_by_row_id(
+                        arrays
+                            .iter()
+                            .flat_map(|array| array.values().iter().copied()),
+                    ),
+                )
+            })
             .map_err(to_py_err)?;
         Ok(wrap_messages(
             messages,
@@ -1193,7 +1257,7 @@ impl PyStreamTableUpdate {
     fn delete_by_row_id(
         &self,
         py: Python<'_>,
-        row_ids: Vec<i64>,
+        row_ids: &Bound<'_, PyAny>,
         commit_identifier: i64,
     ) -> PyResult<Vec<PyCommitMessage>> {
         // The stream committer applies the identifier to the returned messages.
@@ -1327,7 +1391,7 @@ impl PyBatchTableUpdate {
     fn delete_by_row_id(
         &self,
         py: Python<'_>,
-        row_ids: Vec<i64>,
+        row_ids: &Bound<'_, PyAny>,
     ) -> PyResult<Vec<PyCommitMessage>> {
         self.context.delete_by_row_id(py, row_ids)
     }
@@ -1869,6 +1933,89 @@ mod tests {
             )
             .unwrap();
         locals
+    }
+
+    #[test]
+    fn row_id_delete_inputs_preserve_arrow_chunks_and_integer_values() {
+        Python::attach(|py| {
+            let locals = PyDict::new(py);
+            py.run(
+                c_str!(
+                    r#"
+import pyarrow as pa
+valid = [
+    ([2, 1], [2, 1], [2]),
+    ((2, 1), [2, 1], [2]),
+    (pa.array([None, 2, 1, None], type=pa.int64()).slice(1, 2), [2, 1], [2]),
+    (pa.chunked_array([[999, 2], [1, 999]], type=pa.int16()).slice(1, 2), [2, 1], [1, 1]),
+    (pa.array([2 ** 63 - 1], type=pa.uint64()), [2 ** 63 - 1], [1]),
+    (pa.array([], type=pa.uint32()), [], [0]),
+    (pa.chunked_array([], type=pa.int64()), [], []),
+]
+invalid = [
+    (pa.array([None], type=pa.int64()), 'value'),
+    (pa.chunked_array([[0], [None]], type=pa.int64()), 'value'),
+    (pa.array([2 ** 63], type=pa.uint64()), 'value'),
+    (pa.chunked_array([[0], [2 ** 63]], type=pa.uint64()), 'value'),
+    (pa.array([1.5]), 'type'),
+    (pa.array([True]), 'type'),
+    (pa.array([], type=pa.bool_()), 'type'),
+    (pa.array([], type=pa.string()), 'type'),
+    (pa.chunked_array([], type=pa.float64()), 'type'),
+    ([1.5], 'type'),
+    ([None], 'type'),
+    ([2 ** 63], 'overflow'),
+]
+"#
+                ),
+                Some(&locals),
+                Some(&locals),
+            )
+            .unwrap();
+            for case in locals
+                .get_item("valid")
+                .unwrap()
+                .unwrap()
+                .try_iter()
+                .unwrap()
+            {
+                let case = case.unwrap();
+                let arrays = delete_row_id_arrays(&case.get_item(0).unwrap()).unwrap();
+                let values: Vec<i64> = arrays
+                    .iter()
+                    .flat_map(|array| array.values().iter().copied())
+                    .collect();
+                let lengths: Vec<usize> = arrays.iter().map(Int64Array::len).collect();
+                assert_eq!(
+                    values,
+                    case.get_item(1).unwrap().extract::<Vec<i64>>().unwrap()
+                );
+                assert_eq!(
+                    lengths,
+                    case.get_item(2).unwrap().extract::<Vec<usize>>().unwrap()
+                );
+            }
+            for case in locals
+                .get_item("invalid")
+                .unwrap()
+                .unwrap()
+                .try_iter()
+                .unwrap()
+            {
+                let case = case.unwrap();
+                let error = delete_row_id_arrays(&case.get_item(0).unwrap()).unwrap_err();
+                let kind: String = case.get_item(1).unwrap().extract().unwrap();
+                assert!(
+                    match kind.as_str() {
+                        "type" => error.is_instance_of::<PyTypeError>(py),
+                        "value" => error.is_instance_of::<PyValueError>(py),
+                        "overflow" => error.is_instance_of::<pyo3::exceptions::PyOverflowError>(py),
+                        _ => false,
+                    },
+                    "unexpected {kind} error: {error}"
+                );
+            }
+        });
     }
 
     #[test]
