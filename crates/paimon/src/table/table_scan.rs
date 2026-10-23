@@ -3168,7 +3168,10 @@ impl<'a> PaimonTableScan<'a> {
                 };
 
                 let row_id_groups = if let Some(read_field_ids) = data_evolution_read_field_ids {
-                    if read_field_ids.is_empty() {
+                    // Change events keep each group whole, as Java's
+                    // `incremental-between` scan does: a group read file by
+                    // file must return the same rows whatever the projection.
+                    if read_field_ids.is_empty() || self.is_streaming() {
                         row_id_groups
                     } else {
                         let mut pruned = Vec::with_capacity(row_id_groups.len());

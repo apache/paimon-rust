@@ -735,6 +735,7 @@ async fn test_table_name_resolves_as_in_a_from_clause() {
         "{err}"
     );
 }
+
 #[tokio::test]
 async fn test_session_read_options_apply_as_in_an_ordinary_read() {
     use datafusion::arrow::util::pretty::pretty_format_batches;
@@ -1017,4 +1018,193 @@ async fn test_audit_log_refuses_the_session_options_its_ordinary_read_refuses() 
             "{sql}: {err}"
         );
     }
+}
+
+/// A range that only rewrites a VECTOR column of rows written before it, as a
+/// recomputed embedding does, is read as the files it wrote: the rewritten
+/// vectors, with the columns the range did not write NULL. A range with the
+/// insert merges the rewrite into the inserted rows. DataFusion always pushes a
+/// projection, so `SELECT *` and a single column take the projected path.
+#[tokio::test]
+async fn test_range_of_vector_rewrites_reads_the_rewritten_vectors() {
+    use datafusion::arrow::array::{
+        Array, ArrayRef, FixedSizeListArray, Float32Array, Int32Array, Int64Array, StringArray,
+    };
+    use datafusion::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
+    use paimon::spec::{DataType, FloatType, IntType, Schema, VarCharType, VectorType};
+
+    let tmp = TempDir::new().unwrap();
+    let ctx = context(&tmp).await;
+    let warehouse = catalog(&tmp);
+    let identifier = Identifier::new("default", "vectors");
+    let vector = VectorType::try_new(true, 2, DataType::Float(FloatType::new())).unwrap();
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::with_nullable(false)))
+        .column("name", DataType::VarChar(VarCharType::string_type()))
+        .column("embedding", DataType::Vector(vector))
+        .option("row-tracking.enabled", "true")
+        .option("data-evolution.enabled", "true")
+        .option("vector.file.format", "parquet")
+        .build()
+        .unwrap();
+    warehouse
+        .create_database("default", true, std::collections::HashMap::new())
+        .await
+        .unwrap();
+    warehouse
+        .create_table(&identifier, schema, false)
+        .await
+        .unwrap();
+    let element = Arc::new(Field::new("element", ArrowDataType::Float32, true));
+    let embedding_field = Field::new(
+        "embedding",
+        ArrowDataType::FixedSizeList(element.clone(), 2),
+        true,
+    );
+    let embeddings = |values: &[[f32; 2]]| -> ArrayRef {
+        use datafusion::arrow::array::builder::{FixedSizeListBuilder, Float32Builder};
+        let mut builder =
+            FixedSizeListBuilder::new(Float32Builder::new(), 2).with_field(element.clone());
+        for value in values {
+            builder.values().append_slice(value);
+            builder.append(true);
+        }
+        Arc::new(builder.finish())
+    };
+    let table = warehouse.get_table(&identifier).await.unwrap();
+    let rows = RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![
+            Field::new("id", ArrowDataType::Int32, false),
+            Field::new("name", ArrowDataType::Utf8, true),
+            embedding_field.clone(),
+        ])),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
+            Arc::new(StringArray::from(vec!["alice", "bob"])),
+            embeddings(&[[1.0, 0.0], [0.0, 1.0]]),
+        ],
+    )
+    .unwrap();
+    let builder = table.new_write_builder();
+    let mut writer = builder.new_write().unwrap();
+    writer.write_arrow_batch(&rows).await.unwrap();
+    builder
+        .new_commit()
+        .commit(writer.prepare_commit().await.unwrap())
+        .await
+        .unwrap();
+    // Snapshots 2 and 3 recompute the embedding of row 0, then of row 1.
+    for (row_id, value) in [(0, [9.0, 9.0]), (1, [7.0, 7.0])] {
+        let mut update = builder
+            .new_data_evolution_writer(vec!["embedding".to_string()])
+            .unwrap();
+        update
+            .add_matched_batch(
+                RecordBatch::try_new(
+                    Arc::new(ArrowSchema::new(vec![
+                        Field::new("_ROW_ID", ArrowDataType::Int64, false),
+                        embedding_field.clone(),
+                    ])),
+                    vec![
+                        Arc::new(Int64Array::from(vec![row_id])),
+                        embeddings(&[value]),
+                    ],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        builder
+            .new_commit()
+            .commit(update.prepare_commit().await.unwrap())
+            .await
+            .unwrap();
+    }
+
+    type Row = (Option<i32>, Option<String>, Option<Vec<i32>>);
+    let collect = |batches: &[RecordBatch]| {
+        let mut rows: Vec<Row> = Vec::new();
+        for batch in batches {
+            let column = |name: &str| batch.column_by_name(name).map(|c| c.as_any());
+            let ids = column("id").map(|c| c.downcast_ref::<Int32Array>().unwrap());
+            // SQL reads strings as Utf8View; core streams Utf8.
+            let names = batch.column_by_name("name").map(|names| {
+                datafusion::arrow::compute::cast(names, &ArrowDataType::Utf8).unwrap()
+            });
+            let names = names
+                .as_ref()
+                .map(|c| c.as_any().downcast_ref::<StringArray>().unwrap());
+            let vectors =
+                column("embedding").map(|c| c.downcast_ref::<FixedSizeListArray>().unwrap());
+            for row in 0..batch.num_rows() {
+                let vector = vectors.filter(|v| v.is_valid(row)).map(|v| {
+                    let values = v.value(row);
+                    let values = values.as_any().downcast_ref::<Float32Array>().unwrap();
+                    values.values().iter().map(|value| *value as i32).collect()
+                });
+                rows.push((
+                    ids.filter(|ids| ids.is_valid(row))
+                        .map(|ids| ids.value(row)),
+                    names
+                        .filter(|n| n.is_valid(row))
+                        .map(|n| n.value(row).to_string()),
+                    vector,
+                ));
+            }
+        }
+        rows.sort();
+        rows
+    };
+    let vector = |values: [i32; 2]| -> Row { (None, None, Some(values.to_vec())) };
+    let count = |batches: &[RecordBatch]| {
+        let counts = batches[0].column(0).as_any().downcast_ref::<Int64Array>();
+        counts.unwrap().value(0)
+    };
+    for mode in ["", ", 'delta'"] {
+        for name in ["vectors", "vectors$audit_log"] {
+            let query = |columns: &str, start, end| {
+                format!(
+                    "SELECT {columns} FROM paimon_incremental_query('default.{name}', {start}, {end}{mode})"
+                )
+            };
+            let label = format!("{name}{mode}");
+            for (start, end, expected) in [
+                (1, 2, vec![vector([0, 1]), vector([9, 9])]),
+                (2, 3, vec![vector([7, 7]), vector([9, 9])]),
+                (
+                    1,
+                    3,
+                    vec![
+                        vector([0, 1]),
+                        vector([7, 7]),
+                        vector([9, 9]),
+                        vector([9, 9]),
+                    ],
+                ),
+                // With the insert, the first rewrite merges into its rows.
+                (
+                    0,
+                    2,
+                    vec![
+                        (Some(1), Some("alice".into()), Some(vec![9, 9])),
+                        (Some(2), Some("bob".into()), Some(vec![0, 1])),
+                    ],
+                ),
+            ] {
+                let label = format!("{label} ({start},{end}]");
+                let rows = collect(&run(&ctx, &query("*", start, end)).await);
+                assert_eq!(rows, expected, "{label} *");
+                let ids = collect(&run(&ctx, &query("id", start, end)).await);
+                let expected_ids: Vec<Row> = expected.iter().map(|r| (r.0, None, None)).collect();
+                assert_eq!(ids, expected_ids, "{label} id");
+                let count = count(&run(&ctx, &query("count(*)", start, end)).await);
+                assert_eq!(count, expected.len() as i64, "{label} count");
+            }
+        }
+    }
+    let rows = collect(&run(&ctx, "SELECT * FROM paimon.default.vectors").await);
+    let current: Vec<Row> = vec![
+        (Some(1), Some("alice".into()), Some(vec![9, 9])),
+        (Some(2), Some("bob".into()), Some(vec![7, 7])),
+    ];
+    assert_eq!(rows, current, "ordinary read");
 }

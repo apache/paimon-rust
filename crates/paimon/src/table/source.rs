@@ -34,6 +34,23 @@ pub(crate) fn is_data_evolution_normal_file(file: &DataFileMeta) -> bool {
         && !is_vector_store_file_name(&file.file_name)
 }
 
+/// Whether the files of a data-evolution row-id group are column slices of
+/// one row range: the group has a normal data file, every normal file covers
+/// the same row ids, and every BLOB or VECTOR file lies within them.
+pub(crate) fn is_data_evolution_column_slice_group(files: &[DataFileMeta]) -> bool {
+    let mut normal_files = files
+        .iter()
+        .filter(|file| is_data_evolution_normal_file(file));
+    let Some((first, last)) = normal_files.next().and_then(DataFileMeta::row_id_range) else {
+        return false;
+    };
+    normal_files.all(|file| file.row_id_range() == Some((first, last)))
+        && files.iter().all(|file| {
+            file.row_id_range()
+                .is_some_and(|(from, to)| from >= first && to <= last)
+        })
+}
+
 pub(crate) fn data_evolution_anchor_file(files: &[DataFileMeta]) -> crate::Result<&DataFileMeta> {
     files
         .iter()
@@ -1828,6 +1845,54 @@ mod tests {
             .with_raw_convertible(raw_convertible)
             .build()
             .unwrap()
+    }
+
+    #[test]
+    fn column_slice_groups_have_a_normal_file_covering_every_file() {
+        let meta = |name: &str, first_row_id, row_count| file(name, row_count, Some(first_row_id));
+        for (files, expected) in [
+            (vec![meta("data.parquet", 0, 4)], true),
+            (
+                vec![
+                    meta("data.parquet", 0, 4),
+                    meta("update.parquet", 0, 4),
+                    meta("emb.vector.parquet", 0, 4),
+                    meta("pic.blob", 1, 2),
+                ],
+                true,
+            ),
+            // Dedicated files only, as a range that rewrites only them holds.
+            (vec![meta("emb.vector.parquet", 0, 4)], false),
+            (
+                vec![meta("emb.vector.parquet", 0, 4), meta("pic.blob", 0, 1)],
+                false,
+            ),
+            // A dedicated file reaching past the normal files' rows.
+            (
+                vec![meta("data.parquet", 0, 2), meta("emb.vector.parquet", 0, 4)],
+                false,
+            ),
+            // Normal files of different row ranges.
+            (
+                vec![meta("data.parquet", 0, 4), meta("update.parquet", 2, 2)],
+                false,
+            ),
+        ] {
+            let names = files
+                .iter()
+                .map(|f| f.file_name.clone())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                is_data_evolution_column_slice_group(&files),
+                expected,
+                "{names:?}"
+            );
+        }
+        assert!(!is_data_evolution_column_slice_group(&[file(
+            "legacy.parquet",
+            4,
+            None
+        )]));
     }
 
     #[test]

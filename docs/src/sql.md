@@ -2336,11 +2336,19 @@ The optional fourth argument selects the mode:
 
 - `delta` returns the rows each APPEND commit wrote, every version of a key included.
   A data-evolution table's range is read as one batch, as Java's `incremental-between`
-  scan reads it, so a column update merges into the rows it updates when they were
-  written in the range. For rows written before the range it returns every row of the
-  files the updates rewrote, unchanged rows included, with only the updated columns
-  set and the others NULL, NOT NULL columns included. (Java's reader instead fails
-  when two such updates of the same rows leave a NOT NULL column unwritten.)
+  scan reads it: the files it wrote for the same rows merge into rows when they are
+  column slices of one row range, that is, its normal data files cover the same rows,
+  its BLOB and VECTOR files lie within them, and each VECTOR column has one layout.
+  For rows written before the range it returns every row of the files the updates
+  rewrote, unchanged rows included, with only the updated columns set and the others
+  NULL, NOT NULL columns included. (Java's reader instead fails when two such updates
+  of the same rows leave a NOT NULL column unwritten.) Other files are returned as
+  written, one row per row of each file. These include BLOB or VECTOR files alone, such
+  as recomputed embeddings, so two embedding updates of the same rows return both
+  versions where Java returns the latest; every file of rows whose VECTOR column the
+  range wrote in two layouts (before and after an `ALTER TABLE`, or with and without
+  another VECTOR column); and every file of rows whose files are no longer column
+  slices because a compaction in the range merged some of them.
 - `changelog` returns the changelog rows of each commit.
 - `diff` compares the table at the two snapshots and returns the added and changed
   rows (`$audit_log` adds `-U` and `-D` rows). It requires a primary-key table with
