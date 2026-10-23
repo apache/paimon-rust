@@ -782,6 +782,26 @@ async fn evaluate_batch_vector_search_with_executor(
                 table.schema().partition_keys(),
             );
             if let Some(partition) = partition {
+                // The split helper projects onto the partition row, while the
+                // source scan expects positions in the complete table schema.
+                let mapping = table
+                    .schema()
+                    .partition_keys()
+                    .iter()
+                    .map(|name| {
+                        table
+                            .schema()
+                            .fields()
+                            .iter()
+                            .position(|field| field.name() == name)
+                    })
+                    .collect::<Vec<_>>();
+                let partition = partition.remap_field_index(&mapping).ok_or_else(|| {
+                    crate::Error::DataInvalid {
+                        message: "Cannot map source partition filter to table fields".into(),
+                        source: None,
+                    }
+                })?;
                 let partition_ids = Arc::new(
                     super::search_scan_split::partition_row_ids_for_search_sources(
                         table,
