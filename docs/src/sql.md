@@ -1098,6 +1098,62 @@ have already loaded their progress do not switch positions when the record chang
 A running consumer's checkpoint completion can overwrite or recreate the record,
 so stop the consumer before adjusting its progress manually.
 
+### clear_consumers
+
+Delete a group of consumer records while retaining exceptions:
+
+```sql
+CALL sys.clear_consumers(
+    table => 'paimon.test_db.events',
+    including_consumers => 'pipeline_.*',
+    excluding_consumers => 'pipeline_critical|pipeline_backup'
+);
+```
+
+Both expressions match the **entire consumer ID**, excluding the `consumer-` filename
+prefix. A record is deleted only when inclusion matches and exclusion does not.
+For example, `pipeline_a` does not match `pipeline_a_backup`; use `pipeline_a.*`
+to match that suffix. Alternation and inline multiline flags do not bypass the
+whole-ID requirement.
+
+Patterns use [Rust `regex` syntax](https://docs.rs/regex/1/regex/#syntax), including
+groups, alternation, character classes, repetition, Unicode classes, and inline
+flags such as `(?i)`, `(?m)`, `(?s)`, and `(?x)`. Look-around and backreferences are
+not supported. This is not the Java Pattern dialect: for example, `\w`, `\d`, and
+`\s` are Unicode-aware by default, and `.` excludes LF but matches CR. Use explicit
+classes or flags when those distinctions matter. Invalid expressions fail before
+any files are deleted, including an invalid exclusion when inclusion matches nothing.
+
+Omitting `including_consumers`, or passing an empty or Java-whitespace-only string,
+uses `.*`. The equivalent exclusion means no exclusions. Nonbreaking spaces such
+as U+00A0 are literal patterns, not blank placeholders. Nonblank patterns are never
+trimmed. The default `.*` does not match IDs containing LF; use `(?s).*` if needed.
+To clear all ordinary consumer IDs:
+
+```sql
+CALL sys.clear_consumers(table => 'paimon.test_db.events');
+```
+
+The procedure uses the same table resolution and branch-scoped manager as
+`reset_consumer`; it does not add branch-qualified name resolution to catalogs.
+REST-managed tables and format tables are not supported. Arguments require named
+`=>` syntax; explicit `NULL` and positional arguments are not supported. Successful
+calls return `OK`, including when the consumer directory is absent or nothing matches.
+
+Only filenames are inspected, so corrupt consumer JSON does not prevent cleanup.
+Directories and unrelated files are skipped. A matching listed path with trailing
+whitespace is rejected before deletion because OpenDAL could otherwise normalize it
+to a different consumer's path. Filenames are taken from the storage listing; the
+filesystem backend normalizes trailing whitespace before returning entries.
+Retained consumer records, table data, snapshots, and manifests are unchanged.
+Storage errors are propagated; deletion is not atomic and an error can leave some
+matching records already removed.
+
+This operation does not determine whether a consumer has stopped. Stop the target
+consumers before cleanup: running scans retain their loaded positions, and checkpoint
+completion can recreate deleted records. A fresh scan without an explicit checkpoint
+follows its existing initial scan behavior after its consumer record is deleted.
+
 ### create_tag
 
 Create a named tag from a snapshot:

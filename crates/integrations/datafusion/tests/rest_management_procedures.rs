@@ -652,7 +652,7 @@ async fn test_non_rest_catalog_is_rejected_by_every_procedure() {
 }
 
 #[tokio::test]
-async fn test_reset_consumer_rejected_on_rest_catalog_without_changing_progress() {
+async fn test_consumer_procedures_rejected_on_rest_catalog_without_changing_progress() {
     let (tmp, server, context) = setup().await;
     let schema = Schema::builder()
         .column("id", DataType::Int(IntType::new()))
@@ -675,6 +675,13 @@ async fn test_reset_consumer_rejected_on_rest_catalog_without_changing_progress(
         ).await;
         assert_eq!(std::fs::read(&consumer_path).unwrap(), original);
     }
+    common::assert_sql_error(
+        &context,
+        &format!("CALL sys.clear_consumers(table => '{DATABASE}.{TABLE}')"),
+        "clear_consumers is not supported for tables managed by a REST catalog",
+    )
+    .await;
+    assert_eq!(std::fs::read(&consumer_path).unwrap(), original);
 }
 
 #[tokio::test]
