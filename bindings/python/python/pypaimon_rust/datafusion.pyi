@@ -78,6 +78,24 @@ class RowIdPlan:
         """Inclusive row-ID bounds and all physical files of each logical group."""
         ...
     def plan(self) -> Plan: ...
+    def route(self, row_ids: pyarrow.Int64Array) -> pyarrow.Int64Array:
+        """Return each row's owning file-group first row ID, preserving input order."""
+        ...
+    def route_by_bucket(self, row_ids: pyarrow.Int64Array) -> pyarrow.Int64Array:
+        """Return one opaque routing ID per captured partition/bucket.
+
+        IDs are stable within this plan. Multiple file groups in the same
+        partition/bucket share an ID so one worker can publish their DV index.
+        """
+        ...
+    def select(self, row_ids: pyarrow.Int64Array) -> Plan:
+        """Build a read-only plan with sorted, deduplicated row selections.
+
+        Complete file groups, deletion metadata, grants, paths and the captured
+        snapshot are retained. Readers authorize execution independently. This
+        selected plan must not be used as a mutation plan.
+        """
+        ...
 
 class MergeAssignment:
     """An immutable source reference, target reference, literal or callback."""

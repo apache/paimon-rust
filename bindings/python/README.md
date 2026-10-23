@@ -204,6 +204,29 @@ Combined incremental scans expose
 the same API for their selected Delta or Changelog window. Snapshot metadata is
 available from `plan.snapshot_id()`.
 
+### Captured row-ID routing
+
+`RowIdPlan` provides pure routing for distributed Data Evolution operations:
+
+```python
+from pypaimon_rust.datafusion import RowIdPlan
+
+routing = RowIdPlan(table.new_read_builder().new_scan().plan_all())
+first_row_ids = routing.route(row_ids)  # row_ids is an Arrow Int64Array
+delete_groups = routing.route_by_bucket(row_ids)
+selected = routing.select(row_ids)
+```
+
+Routing preserves input order and duplicates, and rejects null or foreign IDs.
+Read/update groups use their anchor's first row ID. Delete groups share one
+routing ID per partition and bucket so each worker can publish a complete
+deletion-vector index. These IDs are local to the captured plan.
+
+`select` retains complete normal and dedicated file groups, deletion metadata,
+authorization and the captured snapshot, and adds sorted, deduplicated row ranges
+for reading. It does not check row liveness or authorize file access; readers
+and mutation workers retain those checks. The selected plan is only for reading.
+
 ### Shard column updates
 
 The batch and stream update objects expose

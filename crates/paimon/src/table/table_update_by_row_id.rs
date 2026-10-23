@@ -18,9 +18,9 @@
 //! Row-ID updates sharing one target snapshot and file index.
 
 use super::data_evolution_writer::{group_by_normal_row_id, RowIdFileIndex};
-use crate::table::{CommitMessage, DataEvolutionWriter, DataSplit, Plan, Table};
-use arrow_array::RecordBatch;
-use std::collections::{HashMap, HashSet};
+use crate::table::{CommitMessage, DataEvolutionWriter, DataSplit, Plan, RowRange, Table};
+use arrow_array::{Array, Int64Array, RecordBatch};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 fn invalid(message: impl Into<String>) -> crate::Error {
     crate::Error::DataInvalid {
@@ -37,6 +37,7 @@ fn invalid(message: impl Into<String>) -> crate::Error {
 pub struct RowIdPlan {
     plan: Plan,
     groups: Vec<(i64, i64, DataSplit)>,
+    bucket_first_row_ids: Vec<i64>,
 }
 
 impl RowIdPlan {
@@ -106,7 +107,22 @@ impl RowIdPlan {
         if groups.windows(2).any(|pair| pair[0].1 >= pair[1].0) {
             return Err(invalid("A row-ID plan contains overlapping file groups"));
         }
-        Ok(Self { plan, groups })
+        let mut buckets = HashMap::new();
+        let bucket_first_row_ids = groups
+            .iter()
+            .map(|(first, _, split)| {
+                // Groups are sorted, so the first anchor encountered is a
+                // deterministic representative for its partition and bucket.
+                *buckets
+                    .entry((split.partition().to_serialized_bytes(), split.bucket()))
+                    .or_insert(*first)
+            })
+            .collect();
+        Ok(Self {
+            plan,
+            groups,
+            bucket_first_row_ids,
+        })
     }
 
     pub fn snapshot_id(&self) -> Option<i64> {
@@ -119,6 +135,82 @@ impl RowIdPlan {
 
     pub fn plan(&self) -> &Plan {
         &self.plan
+    }
+
+    /// Route each row ID to its normal-file group's first row ID.
+    ///
+    /// Output retains input order and duplicates. NULLs, negative IDs and IDs
+    /// outside the captured groups are rejected. This is metadata routing:
+    /// deletion vectors and row existence are checked by the eventual reader
+    /// or mutation, which must authorize independently.
+    pub fn route(&self, row_ids: &Int64Array) -> crate::Result<Int64Array> {
+        let groups = self.group_indices(row_ids)?;
+        Ok(Int64Array::from_iter_values(
+            groups.into_iter().map(|index| self.groups[index].0),
+        ))
+    }
+
+    /// Route each row ID to a stable representative of its partition/bucket.
+    ///
+    /// The representative is the smallest anchor first row ID in that bucket
+    /// across this captured plan. Deletion-vector mutations must assign all
+    /// rows for one partition/bucket to the same worker, including rows from
+    /// different normal-file groups sharing that bucket's index file.
+    pub fn route_by_bucket(&self, row_ids: &Int64Array) -> crate::Result<Int64Array> {
+        let groups = self.group_indices(row_ids)?;
+        Ok(Int64Array::from_iter_values(
+            groups
+                .into_iter()
+                .map(|index| self.bucket_first_row_ids[index]),
+        ))
+    }
+
+    /// Select row IDs for reading from the captured snapshot.
+    ///
+    /// Keep every file, deletion vector, exact path and authorization grant in
+    /// each selected logical group. Only the read's absolute row-ID ranges are
+    /// narrowed; input duplicates and order do not duplicate or reorder rows.
+    /// The returned plan is a read selection, not a complete mutation plan.
+    pub fn select(&self, row_ids: &Int64Array) -> crate::Result<Plan> {
+        let groups = self.group_indices(row_ids)?;
+        let mut selections: BTreeMap<usize, Vec<RowRange>> = BTreeMap::new();
+        for (index, row_id) in groups.into_iter().zip(row_ids.values()) {
+            selections
+                .entry(index)
+                .or_default()
+                .push(RowRange::new(*row_id, *row_id));
+        }
+        let splits = selections
+            .into_iter()
+            .map(|(index, ranges)| {
+                self.groups[index]
+                    .2
+                    .clone()
+                    .with_selected_row_ranges(super::source::merge_row_ranges(ranges))
+            })
+            .collect();
+        self.plan.clone().map_splits(|_| Ok(splits))
+    }
+
+    fn group_indices(&self, row_ids: &Int64Array) -> crate::Result<Vec<usize>> {
+        if row_ids.null_count() != 0 {
+            return Err(invalid("_ROW_ID must not be null"));
+        }
+        row_ids
+            .values()
+            .iter()
+            .map(|row_id| {
+                let position = self.groups.partition_point(|(first, _, _)| first <= row_id);
+                position
+                    .checked_sub(1)
+                    .filter(|index| *row_id >= 0 && *row_id <= self.groups[*index].1)
+                    .ok_or_else(|| {
+                        invalid(format!(
+                            "_ROW_ID {row_id} does not belong to any valid range in the captured plan"
+                        ))
+                    })
+            })
+            .collect()
     }
 }
 

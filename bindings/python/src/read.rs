@@ -20,6 +20,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use arrow::array::{Array, Int64Array};
 use arrow::datatypes::SchemaRef;
 use arrow::pyarrow::ToPyArrow;
 use arrow::record_batch::RecordBatch;
@@ -1243,6 +1244,16 @@ pub struct PyRowIdPlan {
     inner: paimon::table::RowIdPlan,
 }
 
+impl PyRowIdPlan {
+    fn row_ids(value: &Bound<'_, PyAny>) -> PyResult<Int64Array> {
+        crate::arrow_input::array_from_pyarrow(value)?
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .cloned()
+            .ok_or_else(|| PyTypeError::new_err("Row-ID routing requires an Int64Array"))
+    }
+}
+
 #[pymethods]
 impl PyRowIdPlan {
     #[new]
@@ -1274,6 +1285,32 @@ impl PyRowIdPlan {
 
     fn plan(&self) -> PyPlan {
         self.inner.plan().clone().into()
+    }
+
+    /// Return the owning file group's first row ID in input order.
+    fn route(&self, py: Python<'_>, row_ids: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        let row_ids = Self::row_ids(row_ids)?;
+        let groups = py
+            .detach(|| self.inner.route(&row_ids))
+            .map_err(to_py_err)?;
+        groups.to_data().to_pyarrow(py).map(Bound::unbind)
+    }
+
+    /// Return one routing ID per captured partition/bucket, preserving order.
+    fn route_by_bucket(&self, py: Python<'_>, row_ids: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        let row_ids = Self::row_ids(row_ids)?;
+        let groups = py
+            .detach(|| self.inner.route_by_bucket(&row_ids))
+            .map_err(to_py_err)?;
+        groups.to_data().to_pyarrow(py).map(Bound::unbind)
+    }
+
+    /// Select rows for reading while retaining complete groups and their grants.
+    fn select(&self, py: Python<'_>, row_ids: &Bound<'_, PyAny>) -> PyResult<PyPlan> {
+        let row_ids = Self::row_ids(row_ids)?;
+        py.detach(|| self.inner.select(&row_ids))
+            .map(Into::into)
+            .map_err(to_py_err)
     }
 }
 
@@ -1362,6 +1399,105 @@ mod tests {
     use pyo3::types::PyList;
 
     use super::*;
+
+    #[test]
+    fn row_id_plan_binding_routes_arrow_and_keeps_read_selection_separate() {
+        Python::attach(|py| {
+            let schema = Schema::builder()
+                .column("value", DataType::Int(IntType::new()))
+                .option("bucket", "-1")
+                .option("data-evolution.enabled", "true")
+                .option("row-tracking.enabled", "true")
+                .option("deletion-vectors.enabled", "true")
+                .build()
+                .unwrap();
+            let table = Table::new(
+                FileIOBuilder::new("memory").build().unwrap(),
+                Identifier::new("default", "row_id_binding"),
+                "memory:/row-id-binding".into(),
+                TableSchema::new(0, &schema),
+                None,
+            );
+            let plan = py.detach(|| {
+                runtime().block_on(async {
+                    for values in [vec![10, 11], vec![12]] {
+                        let builder = table.new_write_builder();
+                        let mut writer = builder.new_write().unwrap();
+                        let batch = RecordBatch::try_from_iter(vec![(
+                            "value",
+                            Arc::new(arrow::array::Int32Array::from(values))
+                                as arrow::array::ArrayRef,
+                        )])
+                        .unwrap();
+                        writer.write_arrow_batch(&batch).await.unwrap();
+                        builder
+                            .new_commit()
+                            .commit(writer.prepare_commit().await.unwrap())
+                            .await
+                            .unwrap();
+                    }
+                    table
+                        .new_read_builder()
+                        .new_scan()
+                        .plan_all()
+                        .await
+                        .unwrap()
+                })
+            });
+            let locals = PyDict::new(py);
+            locals.set_item("plan", PyPlan::from(plan)).unwrap();
+            locals
+                .set_item("RowIdPlan", py.get_type::<PyRowIdPlan>())
+                .unwrap();
+            locals.set_item("Plan", py.get_type::<PyPlan>()).unwrap();
+            py.run(
+                pyo3::ffi::c_str!(
+                    r#"
+import pyarrow as pa
+
+routing = RowIdPlan(plan)
+assert routing.snapshot_id() == 2
+ids = pa.array([999, 2, 0, 1, 0, 999], type=pa.int64()).slice(1, 4)
+assert routing.route(ids).to_pylist() == [2, 0, 0, 0]
+assert routing.route_by_bucket(ids).to_pylist() == [0, 0, 0, 0]
+selected = routing.select(ids)
+assert selected.snapshot_id() == 2 and len(selected) == 2
+assert sum(split.row_count() for split in selected.splits()) == 3
+assert routing.route(pa.array([2], type=pa.int64())).to_pylist() == [2]
+try:
+    RowIdPlan(selected)
+except ValueError as error:
+    assert 'without row selection' in str(error)
+else:
+    raise AssertionError('A read selection must not become a mutation plan')
+
+for operation in [routing.route, routing.route_by_bucket, routing.select]:
+    for invalid, error_type in [(pa.array([None], type=pa.int64()), ValueError),
+                                (pa.array([-1], type=pa.int64()), ValueError),
+                                (pa.array([3], type=pa.int64()), ValueError),
+                                (pa.array([0], type=pa.int32()), TypeError)]:
+        try:
+            operation(invalid)
+        except error_type:
+            pass
+        else:
+            raise AssertionError('Invalid row IDs were accepted')
+
+empty_ids = pa.array([], type=pa.int64())
+empty = RowIdPlan(Plan(7, []))
+assert empty.route(empty_ids).to_pylist() == []
+assert empty.route_by_bucket(empty_ids).to_pylist() == []
+assert empty.select(empty_ids).snapshot_id() == 7
+assert len(empty.select(empty_ids)) == 0
+assert routing.plan().snapshot_id() == 2
+"#
+                ),
+                Some(&locals),
+                None,
+            )
+            .unwrap();
+        });
+    }
 
     #[test]
     fn file_planning_binding_keeps_complete_entries_and_independent_query_filters() {
