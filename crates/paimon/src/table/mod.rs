@@ -260,7 +260,8 @@ pub use source::{
 pub use stream_table_scan::StreamTableScan;
 pub use table_commit::TableCommit;
 pub use table_merge_into::{
-    MergeAssignment, MergeCondition, MergeSource, WhenMatched, WhenNotMatched,
+    evaluate_merge_actions, MergeActionOutput, MergeActions, MergeAssignment, MergeCondition,
+    MergeSource, WhenMatched, WhenNotMatched,
 };
 pub use table_read::{AuditLogRead, TableRead};
 pub use table_scan::{AuditLogScan, FileScanPlan, TableScan};

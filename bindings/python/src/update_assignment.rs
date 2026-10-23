@@ -18,6 +18,7 @@
 //! Python object and callback conversion for core update assignments.
 
 use arrow::array::ArrayRef;
+use arrow::datatypes::SchemaRef;
 use arrow::pyarrow::ToPyArrow;
 use paimon::spec::DataField;
 use paimon::table::UpdateAssignment;
@@ -62,6 +63,15 @@ pub(crate) fn from_python(
     error: CallbackError,
 ) -> PyResult<Vec<(String, UpdateAssignment)>> {
     let schema = paimon::arrow::build_target_arrow_schema(fields).map_err(to_py_err)?;
+    from_python_schema(py, assignments, schema, error)
+}
+
+pub(crate) fn from_python_schema(
+    py: Python<'_>,
+    assignments: &Bound<'_, PyDict>,
+    schema: SchemaRef,
+    error: CallbackError,
+) -> PyResult<Vec<(String, UpdateAssignment)>> {
     let pa = py.import("pyarrow")?;
     let array_type = pa.getattr("Array")?;
     let chunked_type = pa.getattr("ChunkedArray")?;
