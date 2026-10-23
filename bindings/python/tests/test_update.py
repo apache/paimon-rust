@@ -19,7 +19,9 @@ import pyarrow as pa
 import pytest
 import pypaimon_rust.datafusion as datafusion
 
-from pypaimon_rust.datafusion import PaimonCatalog, SQLContext
+from pypaimon_rust.datafusion import (
+    MergeAssignment, PaimonCatalog, SQLContext, WhenMatched, WhenNotMatched,
+)
 
 
 def test_upsert_batches_preserve_missing_fields_nulls_and_stream_updates(tmp_path):
@@ -449,13 +451,14 @@ def test_prepared_merge_conditions_chunks_and_lazy_literals(tmp_path, stream):
         ('id', pa.int32()), ('value', pa.int32())]))
     update = builder.new_update()
     kwargs = dict(commit_identifier=42) if stream else {}
-    false_clause = dict(delete=False, condition=dict(sql='"s.value" < 0'),
-                        assignments=[('value', 'literal', 'invalid int')])
+    false_clause = WhenMatched.update(
+        {'value': MergeAssignment.literal('invalid int')}, condition='"s.value" < 0')
     assert update.merge_into(source, on=[('id', 'id')], when_matched=[false_clause],
                              when_not_matched=[], **kwargs) == []
     messages = update.merge_into(source, on=[('id', 'id')], when_matched=[
-        dict(delete=False, condition=dict(sql='"s.value" IN (SELECT v FROM (VALUES (11), (22)) AS m(v))'),
-             assignments=[('value', 'literal', pa.chunked_array([[100], [200]]))])],
+        WhenMatched.update(
+            {'value': MergeAssignment.literal(pa.chunked_array([[100], [200]]))},
+            condition='"s.value" IN (SELECT v FROM (VALUES (11), (22)) AS m(v))')],
         when_not_matched=[], **kwargs)
     # Preparation leaves the visible snapshot unchanged.
 
@@ -495,12 +498,14 @@ def test_prepared_merge_accepts_native_table_sources(tmp_path, stream, historica
     builder = (target.new_stream_write_builder().with_commit_user('source-merge')
                if stream else target.new_batch_write_builder())
     kwargs = dict(commit_identifier=42) if stream else {}
-    condition = dict(sql='"s.flag" = 1')
+    condition = '"s.flag" = 1'
     messages = builder.new_update().merge_into(
         source, on=[('id', 'source_id')], when_matched=[
-            dict(delete=False, condition=condition, assignments=[('value', 'source', 'amount')])],
-        when_not_matched=[dict(condition=condition, assignments=[
-            ('id', 'source', 'source_id'), ('value', 'source', 'amount')])], **kwargs)
+            WhenMatched.update({'value': MergeAssignment.source_column('amount')}, condition)],
+        when_not_matched=[WhenNotMatched({
+            'id': MergeAssignment.source_column('source_id'),
+            'value': MergeAssignment.source_column('amount'),
+        }, condition)], **kwargs)
     assert target.latest_snapshot().id() == target_snapshot
     assert source.latest_snapshot().id() == source_snapshot
     commit = builder.new_commit()
@@ -533,8 +538,9 @@ def test_prepared_merge_callable_uses_complete_clause_and_preserves_exception(tm
         return pa.chunked_array([[100], [200]], type=pa.int32())
 
     messages = update.merge_into(source, on=[('id', 'id')], when_matched=[
-        dict(delete=False, assignments=[('value', 'callable', values)])], when_not_matched=[
-        dict(assignments=[('id', 'source', 'id'), ('value', 'callable', lambda batch: batch['s.delta'])])],
+        WhenMatched.update({'value': MergeAssignment.function(values)})], when_not_matched=[
+        WhenNotMatched({'id': MergeAssignment.source_column('id'),
+                        'value': MergeAssignment.function(lambda batch: batch['s.delta'])})],
         **kwargs)
     assert calls == [2]
     commit = builder.new_commit()
@@ -547,7 +553,7 @@ def test_prepared_merge_callable_uses_complete_clause_and_preserves_exception(tm
     def fail(batch):
         raise error
 
-    clause = [dict(delete=False, assignments=[('value', 'callable', fail)])]
+    clause = [WhenMatched.update({'value': MergeAssignment.function(fail)})]
     update = builder.new_update()
     assert update.merge_into(pa.table({'id': pa.array([99], pa.int32())}), on=[('id', 'id')],
                              when_matched=clause, when_not_matched=[], **kwargs) == []

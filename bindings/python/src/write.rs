@@ -1847,6 +1847,29 @@ mod tests {
     use paimon::spec::{BigIntType, IntType, Schema, TableSchema, VarCharType};
     use pyo3::ffi::c_str;
 
+    fn merge_locals(py: Python<'_>) -> Bound<'_, PyDict> {
+        let locals = PyDict::new(py);
+        locals
+            .set_item(
+                "MergeAssignment",
+                py.get_type::<crate::merge_types::PyMergeAssignment>(),
+            )
+            .unwrap();
+        locals
+            .set_item(
+                "WhenMatched",
+                py.get_type::<crate::merge_types::PyWhenMatched>(),
+            )
+            .unwrap();
+        locals
+            .set_item(
+                "WhenNotMatched",
+                py.get_type::<crate::merge_types::PyWhenNotMatched>(),
+            )
+            .unwrap();
+        locals
+    }
+
     #[test]
     fn captured_plan_rejects_other_operations_before_python_input_consumption() {
         Python::attach(|py| {
@@ -2407,6 +2430,174 @@ first = install('first')
     }
 
     #[test]
+    fn merge_into_rejects_legacy_dictionary_clauses() {
+        Python::attach(|py| {
+            let schema = Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .option("row-tracking.enabled", "true")
+                .option("data-evolution.enabled", "true")
+                .build()
+                .unwrap();
+            let table = Arc::new(Table::new(
+                FileIOBuilder::new("memory").build().unwrap(),
+                Identifier::new("default", "typed_merge_clauses"),
+                "memory:/typed-merge-clauses".into(),
+                TableSchema::new(0, &schema),
+                None,
+            ));
+            let update = Py::new(py, PyBatchWriteBuilder::new(table))
+                .unwrap()
+                .bind(py)
+                .call_method0("new_update")
+                .unwrap();
+            let locals = PyDict::new(py);
+            locals.set_item("update", update).unwrap();
+            py.run(
+                c_str!(
+                    r#"
+import pyarrow as pa
+source = pa.table({'id': pa.array([], pa.int32())})
+for matched, unmatched in [
+    ([dict(condition=None, delete=False, assignments=[('id', 'source', 'id')])], []),
+    ([], [dict(condition=None, assignments=[('id', 'source', 'id')])]),
+]:
+    try:
+        update.merge_into(source, on=[('id', 'id')],
+                          when_matched=matched, when_not_matched=unmatched)
+    except TypeError:
+        pass
+    else:
+        raise AssertionError('MERGE accepted a legacy dictionary clause')
+"#
+                ),
+                Some(&locals),
+                Some(&locals),
+            )
+            .unwrap();
+        });
+    }
+
+    #[test]
+    fn typed_merge_into_preserves_literal_and_callback_evaluation() {
+        use arrow::array::Int32Array;
+        use futures::TryStreamExt;
+
+        Python::attach(|py| {
+            let schema = Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("value", DataType::Int(IntType::new()))
+                .option("row-tracking.enabled", "true")
+                .option("data-evolution.enabled", "true")
+                .build()
+                .unwrap();
+            let table = Arc::new(Table::new(
+                FileIOBuilder::new("memory").build().unwrap(),
+                Identifier::new("default", "typed_merge_lazy_values"),
+                "memory:/typed-merge-lazy-values".into(),
+                TableSchema::new(0, &schema),
+                None,
+            ));
+            let locals = merge_locals(py);
+            locals
+                .set_item(
+                    "builder",
+                    Py::new(py, PyBatchWriteBuilder::new(table.clone())).unwrap(),
+                )
+                .unwrap();
+            py.run(
+                c_str!(
+                    r#"
+import pyarrow as pa
+source = pa.table({'id': pa.array([1, 2], pa.int32()),
+                   'value': pa.array([10, 20], pa.int32())})
+update = builder.new_update()
+literal_calls = []
+def literal_value(rows):
+    literal_calls.append(rows.num_rows)
+    return pa.array([99, 99], pa.int32())
+unused = WhenNotMatched({'id': MergeAssignment.source_column('id'),
+                         'value': MergeAssignment.literal(literal_value)},
+                        condition='"s.id" < 0')
+assert update.merge_into(source, on=[('id', 'id')], when_matched=[],
+                         when_not_matched=[unused]) == []
+assert literal_calls == []
+selected = WhenNotMatched({'id': MergeAssignment.source_column('id'),
+                           'value': MergeAssignment.literal(literal_value)})
+try:
+    update.merge_into(source, on=[('id', 'id')], when_matched=[],
+                      when_not_matched=[selected])
+except (TypeError, ValueError):
+    pass
+else:
+    raise AssertionError('callable literal was evaluated as an assignment function')
+assert literal_calls == []
+
+failure = LookupError('typed MERGE callback failed')
+callback_rows = []
+def assignment(rows):
+    callback_rows.append(rows['s.id'].to_pylist())
+    if len(callback_rows) == 1:
+        raise failure
+    return pa.chunked_array([pa.array([21], pa.int32())])
+assignments = {'id': MergeAssignment.source_column('id'),
+               'value': MergeAssignment.function(function=assignment)}
+clause = WhenNotMatched(assignments, condition='"s.id" = 2')
+assignments.clear()
+for attempt in [1, 2]:
+    try:
+        messages = update.merge_into(source, on=[('id', 'id')], when_matched=[],
+                                     when_not_matched=[unused, clause])
+    except LookupError as error:
+        assert attempt == 1
+        assert error is failure
+    else:
+        assert attempt == 2
+        builder.new_commit().commit(messages)
+assert callback_rows == [[2], [2]]
+assert literal_calls == []
+"#
+                ),
+                Some(&locals),
+                Some(&locals),
+            )
+            .unwrap();
+            let batches = py.detach(|| {
+                runtime().block_on(async {
+                    let builder = table.new_read_builder();
+                    let plan = builder.new_scan().plan().await.unwrap();
+                    builder
+                        .new_read()
+                        .unwrap()
+                        .to_arrow(plan.splits())
+                        .unwrap()
+                        .try_collect::<Vec<_>>()
+                        .await
+                        .unwrap()
+                })
+            });
+            assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+            assert_eq!(
+                batches[0]
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .value(0),
+                2
+            );
+            assert_eq!(
+                batches[0]
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .value(0),
+                21
+            );
+        });
+    }
+
+    #[test]
     fn merge_table_source_conditions_resolve_read_metadata() {
         Python::attach(|py| {
             for metadata in ["_ROW_ID", "_SEQUENCE_NUMBER"] {
@@ -2434,15 +2625,15 @@ first = install('first')
                 ));
                 let source = Py::new(py, crate::table::PyTable::new(source)).unwrap();
                 let context = UpdateContext::new(&WriteContext::new(table)).unwrap();
-                let locals = PyDict::new(py);
+                let locals = merge_locals(py);
                 locals.set_item("metadata", metadata).unwrap();
                 py.run(
                     c_str!(
                         r#"
-condition = dict(sql='"s.' + metadata + '" >= 0')
-matched = [dict(assignments=[('value', 'source', 'value')], condition=condition, delete=False)]
-not_matched = [dict(assignments=[('id', 'source', metadata), ('value', 'source', 'value')],
-                    condition=condition)]
+condition = '"s.' + metadata + '" >= 0'
+matched = [WhenMatched.update({'value': MergeAssignment.source_column('value')}, condition=condition)]
+not_matched = [WhenNotMatched({'id': MergeAssignment.source_column(metadata),
+                              'value': MergeAssignment.source_column('value')}, condition=condition)]
 "#
                     ),
                     Some(&locals),
@@ -2558,17 +2749,18 @@ not_matched = [dict(assignments=[('id', 'source', metadata), ('value', 'source',
                 });
                 let source = Py::new(py, crate::table::PyTable::new(source)).unwrap();
                 let context = UpdateContext::new(&WriteContext::new(target.clone())).unwrap();
-                let locals = PyDict::new(py);
+                let locals = merge_locals(py);
                 locals.set_item("metadata", metadata).unwrap();
                 locals.set_item("first", first).unwrap();
                 locals.set_item("second", second).unwrap();
                 py.run(
                     c_str!(
                         r#"
-matched = [dict(assignments=[('value', 'source', 'value')],
-                condition=dict(sql='"s.' + metadata + '" = ' + str(first)), delete=False)]
-not_matched = [dict(assignments=[('id', 'source', metadata), ('value', 'source', 'value')],
-                    condition=dict(sql='"s.' + metadata + '" = ' + str(second)))]
+matched = [WhenMatched.update({'value': MergeAssignment.source_column('value')},
+                              condition='"s.' + metadata + '" = ' + str(first))]
+not_matched = [WhenNotMatched({'id': MergeAssignment.source_column(metadata),
+                              'value': MergeAssignment.source_column('value')},
+                             condition='"s.' + metadata + '" = ' + str(second))]
 "#
                     ),
                     Some(&locals),
@@ -2794,7 +2986,7 @@ invalid = source.slice(0, 1)
                     })
                 });
                 let context = UpdateContext::new(&WriteContext::new(table)).unwrap();
-                let locals = PyDict::new(py);
+                let locals = merge_locals(py);
                 locals.set_item("reverse", reverse).unwrap();
                 py.run(
                     c_str!(
@@ -2817,7 +3009,7 @@ encoded = pa.chunked_array([pa.DictionaryArray.from_arrays(
 source = source.append_column(pa.field('encoded_unused', encoded.type, nullable=False), encoded)
 assert source.column('encoded_unused').null_count == 0
 assert source.column('encoded_unused').to_pylist() == [None, None, None]
-matched = [dict(assignments=[('value', 'source', 'value')], condition=None, delete=False)]
+matched = [WhenMatched.update({'value': MergeAssignment.source_column('value')})]
 not_matched = []
 "#
                     ),

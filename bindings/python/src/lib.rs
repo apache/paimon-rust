@@ -31,6 +31,7 @@ mod hybrid_search;
 mod index_build;
 mod merge_execution;
 mod merge_into;
+mod merge_types;
 mod oss_cpp;
 mod predicate;
 mod read;

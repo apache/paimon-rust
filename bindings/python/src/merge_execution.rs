@@ -21,7 +21,7 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use arrow::array::Int64Array;
-use arrow::datatypes::{DataType, Schema, SchemaRef};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::pyarrow::{FromPyArrow, ToPyArrow};
 use arrow::record_batch::RecordBatch;
 use paimon::table::{
@@ -30,7 +30,7 @@ use paimon::table::{
 use paimon_datafusion::runtime::runtime;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList};
+use pyo3::types::PyList;
 
 use crate::error::to_py_err;
 
@@ -79,28 +79,14 @@ fn row_ids(batch: RecordBatch) -> PyResult<RecordBatch> {
     RecordBatch::try_new(schema, columns).map_err(|error| PyValueError::new_err(error.to_string()))
 }
 
-#[pymethods]
 impl PyMergeBatchExecution {
-    #[new]
-    fn new(
+    fn compile(
         py: Python<'_>,
-        input_schema: &Bound<'_, PyAny>,
-        output_schema: &Bound<'_, PyAny>,
+        input_schema: SchemaRef,
+        output_schema: SchemaRef,
         clauses: &Bound<'_, PyAny>,
-        mode: &str,
+        output: MergeActionOutput,
     ) -> PyResult<Self> {
-        let output = match mode {
-            "update" => MergeActionOutput::Updates,
-            "delete" => MergeActionOutput::Deletes,
-            "insert" => MergeActionOutput::Inserts,
-            _ => {
-                return Err(PyValueError::new_err(
-                    "MERGE execution mode must be update, delete or insert",
-                ));
-            }
-        };
-        let input_schema = Arc::new(Schema::from_pyarrow_bound(input_schema)?);
-        let output_schema = Arc::new(Schema::from_pyarrow_bound(output_schema)?);
         if output != MergeActionOutput::Inserts {
             let row_id = output_schema.field_with_name("_ROW_ID").map_err(|_| {
                 PyValueError::new_err("Matched MERGE output needs an Int64 _ROW_ID field")
@@ -110,60 +96,46 @@ impl PyMergeBatchExecution {
                     "Matched MERGE output needs an Int64 _ROW_ID field",
                 ));
             }
-            if output == MergeActionOutput::Deletes && output_schema.fields().len() != 1 {
-                return Err(PyValueError::new_err(
-                    "MERGE DELETE output must contain only _ROW_ID",
-                ));
-            }
         }
         let condition_schema = if output == MergeActionOutput::Inserts {
             input_schema.clone()
         } else {
             matched_schema(input_schema.clone())?
         };
-        let target_schema = Arc::new(Schema::new(
+        let target_schema = Arc::new(Schema::new_with_metadata(
             output_schema
                 .fields()
                 .iter()
                 .filter(|field| output == MergeActionOutput::Inserts || field.name() != "_ROW_ID")
                 .cloned()
                 .collect::<Vec<_>>(),
+            output_schema.metadata().clone(),
         ));
         let callback_error = Arc::new(Mutex::new(None));
-        let mut matched = Vec::new();
-        let mut not_matched = Vec::new();
-        for clause in clauses.try_iter()? {
-            let clause = clause?;
-            let clause = clause.cast::<PyDict>()?;
-            let condition = crate::merge_into::condition(py, clause, condition_schema.clone())?;
-            let assignments = if output == MergeActionOutput::Deletes {
-                // A DELETE route still consumes preceding UPDATE conditions,
-                // but must not inspect or evaluate those assignments.
-                Vec::new()
-            } else {
-                crate::merge_into::assignments(
+        let (mut matched, not_matched) = if output == MergeActionOutput::Inserts {
+            (
+                Vec::new(),
+                crate::merge_into::not_matched(
                     py,
-                    clause,
+                    clauses,
+                    condition_schema,
                     target_schema.clone(),
                     callback_error.clone(),
-                )?
-            };
-            if output == MergeActionOutput::Inserts {
-                not_matched.push(WhenNotMatched {
-                    condition,
-                    assignments,
-                });
-            } else {
-                matched.push(WhenMatched {
-                    condition,
-                    delete: clause
-                        .get_item("delete")?
-                        .ok_or_else(|| PyValueError::new_err("MERGE matched clause needs action"))?
-                        .extract()?,
-                    assignments,
-                });
-            }
-        }
+                )?,
+            )
+        } else {
+            (
+                crate::merge_into::matched(
+                    py,
+                    clauses,
+                    condition_schema,
+                    target_schema.clone(),
+                    callback_error.clone(),
+                    output != MergeActionOutput::Deletes,
+                )?,
+                Vec::new(),
+            )
+        };
         if output == MergeActionOutput::Updates {
             // The explicit output schema may request fields untouched by every
             // clause. Include them in core's shared update-column projection.
@@ -205,6 +177,62 @@ impl PyMergeBatchExecution {
             callback_error,
             execution: Mutex::new(()),
         })
+    }
+}
+
+#[pymethods]
+impl PyMergeBatchExecution {
+    #[staticmethod]
+    fn for_updates(
+        py: Python<'_>,
+        input_schema: &Bound<'_, PyAny>,
+        update_schema: &Bound<'_, PyAny>,
+        when_matched: &Bound<'_, PyAny>,
+    ) -> PyResult<Self> {
+        Self::compile(
+            py,
+            Arc::new(Schema::from_pyarrow_bound(input_schema)?),
+            Arc::new(Schema::from_pyarrow_bound(update_schema)?),
+            when_matched,
+            MergeActionOutput::Updates,
+        )
+    }
+
+    #[staticmethod]
+    fn for_deletes(
+        py: Python<'_>,
+        input_schema: &Bound<'_, PyAny>,
+        when_matched: &Bound<'_, PyAny>,
+    ) -> PyResult<Self> {
+        let input_schema = Arc::new(Schema::from_pyarrow_bound(input_schema)?);
+        let output_schema = Arc::new(Schema::new(vec![Field::new(
+            "_ROW_ID",
+            DataType::Int64,
+            false,
+        )]));
+        Self::compile(
+            py,
+            input_schema,
+            output_schema,
+            when_matched,
+            MergeActionOutput::Deletes,
+        )
+    }
+
+    #[staticmethod]
+    fn for_inserts(
+        py: Python<'_>,
+        input_schema: &Bound<'_, PyAny>,
+        target_schema: &Bound<'_, PyAny>,
+        when_not_matched: &Bound<'_, PyAny>,
+    ) -> PyResult<Self> {
+        Self::compile(
+            py,
+            Arc::new(Schema::from_pyarrow_bound(input_schema)?),
+            Arc::new(Schema::from_pyarrow_bound(target_schema)?),
+            when_not_matched,
+            MergeActionOutput::Inserts,
+        )
     }
 
     fn execute(&self, py: Python<'_>, batch: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
@@ -302,6 +330,7 @@ impl PyMergeBatchExecution {
 mod tests {
     use super::*;
     use pyo3::ffi::c_str;
+    use pyo3::types::PyDict;
 
     fn locals(py: Python<'_>) -> Bound<'_, PyDict> {
         let locals = PyDict::new(py);
@@ -309,6 +338,24 @@ mod tests {
             .set_item(
                 "MergeBatchExecution",
                 py.get_type::<PyMergeBatchExecution>(),
+            )
+            .unwrap();
+        locals
+            .set_item(
+                "MergeAssignment",
+                py.get_type::<crate::merge_types::PyMergeAssignment>(),
+            )
+            .unwrap();
+        locals
+            .set_item(
+                "WhenMatched",
+                py.get_type::<crate::merge_types::PyWhenMatched>(),
+            )
+            .unwrap();
+        locals
+            .set_item(
+                "WhenNotMatched",
+                py.get_type::<crate::merge_types::PyWhenNotMatched>(),
             )
             .unwrap();
         locals
@@ -346,10 +393,11 @@ def update(rows):
     assert rows['s.value'].to_pylist() == [15, 20]
     return pa.chunked_array([pa.array([30]), pa.array([40])])
 clauses = [
-    dict(condition={'sql': '"s.value" >= 90'}, delete=True, assignments=[]),
-    dict(condition={'sql': '"s.value" > 10'}, delete=False,
-         assignments=[('value', 'callable', update), ('keep', 'target', 'keep')]),
-    dict(condition=None, delete=False, assignments=[('value', 'literal', 50)]),
+    WhenMatched.delete(condition='"s.value" >= 90'),
+    WhenMatched.update({'value': MergeAssignment.function(update),
+                        'keep': MergeAssignment.target_column('keep')},
+                       condition='"s.value" > 10'),
+    WhenMatched.update({'value': MergeAssignment.literal(50)}),
 ]
 output_schema = pa.schema([
     pa.field('_ROW_ID', pa.int64(), nullable=False),
@@ -357,7 +405,7 @@ output_schema = pa.schema([
     pa.field('unassigned', pa.int32()),
     pa.field('value', pa.int32()),
 ], metadata={'output': 'updates'})
-execution = MergeBatchExecution(input_schema, output_schema, clauses, 'update')
+execution = MergeBatchExecution.for_updates(input_schema, output_schema, clauses)
 result = execution.execute(joined)
 assert result.schema.equals(output_schema, check_metadata=True)
 assert result.to_pydict() == {
@@ -367,7 +415,7 @@ assert result.to_pydict() == {
 }
 assert calls == [[1, 4]]
 delete_schema = pa.schema([pa.field('_ROW_ID', pa.int64(), nullable=False)])
-deletes = MergeBatchExecution(input_schema, delete_schema, clauses, 'delete').execute(joined)
+deletes = MergeBatchExecution.for_deletes(input_schema, clauses).execute(joined)
 assert deletes.schema == delete_schema
 assert deletes.to_pydict() == {'_ROW_ID': [3]}
 assert calls == [[1, 4]]
@@ -394,26 +442,29 @@ source = pa.table({'s.value': pa.array([None, 20, 5], pa.int32()),
                    's.id': pa.array([3, 1, 2], pa.int32())})
 source = pa.Table.from_batches(source.to_batches(max_chunksize=1))
 target = pa.schema([pa.field('label', pa.string()), pa.field('id', pa.int32()),
-                    pa.field('value', pa.int32()), pa.field('missing', pa.bool_())])
+                    pa.field('value', pa.int32()), pa.field('missing', pa.bool_())],
+                   metadata={'output': 'inserts'})
 calls = []
 def insert(rows):
     calls.append(rows['s.id'].to_pylist())
     return pa.array([21], pa.int32())
 clauses = [
-    dict(condition={'sql': '"s.value" > 10'},
-         assignments=[('id', 'source', 'id'), ('value', 'callable', insert),
-                      ('label', 'literal', 'first')]),
-    dict(condition=None,
-         assignments=[('id', 'source', 'id'), ('value', 'literal', 7),
-                      ('label', 'literal', 'last'), ('missing', 'literal', True)]),
+    WhenNotMatched({'id': MergeAssignment.source_column('id'),
+                    'value': MergeAssignment.function(insert),
+                    'label': MergeAssignment.literal('first')},
+                   condition='"s.value" > 10'),
+    WhenNotMatched({'id': MergeAssignment.source_column('id'),
+                    'value': MergeAssignment.literal(7),
+                    'label': MergeAssignment.literal('last'),
+                    'missing': MergeAssignment.literal(True)}),
 ]
-execution = MergeBatchExecution(source.schema, target, clauses, 'insert')
+execution = MergeBatchExecution.for_inserts(source.schema, target, clauses)
 result = execution.execute(source)
-assert result.schema == target
+assert result.schema.equals(target, check_metadata=True)
 assert result.to_pydict() == {'label': ['first', 'last', 'last'], 'id': [1, 3, 2],
                             'value': [21, 7, 7], 'missing': [None, True, True]}
 assert calls == [[1]]
-assert execution.execute(source.slice(0, 0)).schema == target
+assert execution.execute(source.slice(0, 0)).schema.equals(target, check_metadata=True)
 assert calls == [[1]]
 "#
                 ),
@@ -443,9 +494,8 @@ def assignment(rows):
     if len(attempts) == 1:
         raise failure
     return pa.array([9], pa.int32())
-clauses = [dict(condition=None, delete=False,
-                assignments=[('value', 'callable', assignment)])]
-execution = MergeBatchExecution(joined.schema, output, clauses, 'update')
+clauses = [WhenMatched.update({'value': MergeAssignment.function(assignment)})]
+execution = MergeBatchExecution.for_updates(joined.schema, output, clauses)
 try:
     execution.execute(joined)
 except LookupError as error:
@@ -484,31 +534,171 @@ def rejected(function, text):
         assert text in str(error), str(error)
     else:
         raise AssertionError('invalid MERGE operation succeeded')
-clause = dict(condition={'sql': '"s.absent" > 0'}, delete=False,
-              assignments=[('value', 'literal', 1)])
-rejected(lambda: MergeBatchExecution(joined.schema, output, [clause], 'update'), 'absent')
-clause = dict(condition=None, delete=False,
-              assignments=[('value', 'callable', lambda rows: pa.array([1], pa.int32()))])
-execution = MergeBatchExecution(joined.schema, output, [clause], 'update')
+clause = WhenMatched.update({'value': MergeAssignment.literal(1)},
+                            condition='"s.absent" > 0')
+rejected(lambda: MergeBatchExecution.for_updates(joined.schema, output, [clause]), 'absent')
+clause = WhenMatched.update({'value': MergeAssignment.function(
+    lambda rows: pa.array([1], pa.int32()))})
+execution = MergeBatchExecution.for_updates(joined.schema, output, [clause])
 rejected(lambda: execution.execute(joined), 'length')
 rejected(lambda: execution.execute(joined.rename_columns(['t._ROW_ID', 's.other'])), 'schema')
-rejected(lambda: MergeBatchExecution(joined.schema, output, [clause], 'unknown'), 'mode')
-rejected(lambda: MergeBatchExecution(joined.schema, pa.schema([('value', pa.int32())]),
-                                    [clause], 'update'), '_ROW_ID')
-rejected(lambda: MergeBatchExecution(joined.schema, pa.schema([('_ROW_ID', pa.int32())]),
-                                    [clause], 'delete'), 'Int64')
-rejected(lambda: MergeBatchExecution(joined.schema, output, [clause], 'delete'), 'only')
-rejected(lambda: MergeBatchExecution(joined.schema, output, [clause, clause], 'update'), 'last')
+rejected(lambda: MergeBatchExecution.for_updates(joined.schema,
+    pa.schema([('value', pa.int32())]), [clause]), '_ROW_ID')
+rejected(lambda: MergeBatchExecution.for_updates(joined.schema,
+    pa.schema([('_ROW_ID', pa.int32()), ('value', pa.int32())]), [clause]), 'Int64')
+rejected(lambda: MergeBatchExecution.for_updates(joined.schema, output, [clause, clause]), 'last')
 dual_ids = joined.append_column('_ROW_ID', pa.array([99, 98], pa.int64()))
-rejected(lambda: MergeBatchExecution(dual_ids.schema, output, [clause], 'update'), 'ambiguous')
-bad_type = dict(condition=None, delete=False,
-                assignments=[('value', 'callable', lambda rows: [1, 2])])
-rejected(lambda: MergeBatchExecution(joined.schema, output, [bad_type], 'update').execute(joined),
+rejected(lambda: MergeBatchExecution.for_updates(dual_ids.schema, output, [clause]), 'ambiguous')
+rejected(lambda: MergeBatchExecution.for_deletes(dual_ids.schema, [WhenMatched.delete()]), 'ambiguous')
+rejected(lambda: MergeBatchExecution.for_deletes(pa.schema([('s.value', pa.int32())]),
+    [WhenMatched.delete()]), '_ROW_ID')
+wrong_ids = pa.table({'t._ROW_ID': pa.array([1], pa.int32())})
+rejected(lambda: MergeBatchExecution.for_deletes(wrong_ids.schema,
+    [WhenMatched.delete()]).execute(wrong_ids), 'Int64')
+null_ids = pa.table({'_ROW_ID': pa.array([None], pa.int64())})
+rejected(lambda: MergeBatchExecution.for_deletes(null_ids.schema,
+    [WhenMatched.delete()]).execute(null_ids), 'NULL')
+bad_type = WhenMatched.update({'value': MergeAssignment.function(lambda rows: [1, 2])})
+rejected(lambda: MergeBatchExecution.for_updates(joined.schema, output, [bad_type]).execute(joined),
          'pyarrow.Array')
 # A no-match clause must not convert an unused literal or invoke a callback.
-clause = dict(condition={'sql': '"s.value" < 0'}, delete=False,
-              assignments=[('value', 'literal', object())])
-assert MergeBatchExecution(joined.schema, output, [clause], 'update').execute(joined).num_rows == 0
+clause = WhenMatched.update({'value': MergeAssignment.literal(object())},
+                            condition='"s.value" < 0')
+assert MergeBatchExecution.for_updates(joined.schema, output, [clause]).execute(joined).num_rows == 0
+"#
+                ),
+                Some(&locals),
+                Some(&locals),
+            )
+            .unwrap();
+        });
+    }
+
+    #[test]
+    fn named_factories_reject_dictionary_protocol_and_wrong_clause_families() {
+        Python::attach(|py| {
+            let locals = locals(py);
+            py.run(
+                c_str!(
+                    r#"
+import pyarrow as pa
+input_schema = pa.schema([('t._ROW_ID', pa.int64()), ('s.value', pa.int32())])
+update_schema = pa.schema([('_ROW_ID', pa.int64()), ('value', pa.int32())])
+target_schema = pa.schema([('value', pa.int32())])
+matched = WhenMatched.update({'value': MergeAssignment.source_column('value')})
+not_matched = WhenNotMatched({'value': MergeAssignment.source_column('value')})
+legacy = dict(condition=None, delete=False,
+              assignments=[('value', 'source', 'value')])
+def rejected(function):
+    try:
+        function()
+    except TypeError:
+        pass
+    else:
+        raise AssertionError('untyped MERGE protocol or wrong clause family was accepted')
+for clause in [legacy, not_matched]:
+    rejected(lambda: MergeBatchExecution.for_updates(input_schema, update_schema, [clause]))
+    rejected(lambda: MergeBatchExecution.for_deletes(input_schema, [clause]))
+for clause in [legacy, matched]:
+    rejected(lambda: MergeBatchExecution.for_inserts(input_schema, target_schema, [clause]))
+rejected(lambda: MergeBatchExecution(input_schema, update_schema, [legacy], 'update'))
+rejected(lambda: MergeBatchExecution())
+"#
+                ),
+                Some(&locals),
+                Some(&locals),
+            )
+            .unwrap();
+        });
+    }
+
+    #[test]
+    fn deletes_keep_update_conditions_without_converting_update_assignments() {
+        Python::attach(|py| {
+            let locals = locals(py);
+            py.run(
+                c_str!(
+                    r#"
+import pyarrow as pa
+schema = pa.schema([
+    pa.field('_ROW_ID', pa.int64(), nullable=True, metadata={'input': 'row-id'}),
+    pa.field('s.value', pa.int32()),
+], metadata={'input': 'joined'})
+joined = pa.record_batch([pa.array([1, 2, 3], pa.int64()),
+                          pa.array([10, 20, 30], pa.int32())], schema=schema)
+calls = []
+def unused(rows):
+    calls.append(rows.num_rows)
+    raise AssertionError('DELETE evaluated an UPDATE callback')
+clauses = [
+    WhenMatched.update({'absent': MergeAssignment.literal(object()),
+                        'also_absent': MergeAssignment.source_column('missing')},
+                       condition='"_ROW_ID" = 1'),
+    WhenMatched.update({'unavailable': MergeAssignment.function(unused)},
+                       condition='"s.value" > 20'),
+    WhenMatched.delete(),
+]
+execution = MergeBatchExecution.for_deletes(input_schema=schema, when_matched=clauses)
+result = execution.execute(joined)
+expected = pa.schema([pa.field('_ROW_ID', pa.int64(), nullable=False)])
+assert result.schema.equals(expected, check_metadata=True)
+assert result.to_pydict() == {'_ROW_ID': [2]}
+assert execution.execute(schema.empty_table()).schema.equals(expected, check_metadata=True)
+assert calls == []
+"#
+                ),
+                Some(&locals),
+                Some(&locals),
+            )
+            .unwrap();
+        });
+    }
+
+    #[test]
+    fn cached_execution_keeps_concurrent_callback_errors_with_their_callers() {
+        Python::attach(|py| {
+            let locals = locals(py);
+            py.run(
+                c_str!(
+                    r#"
+import pyarrow as pa
+import threading
+from concurrent.futures import ThreadPoolExecutor
+schema = pa.schema([('t._ROW_ID', pa.int64()), ('s.value', pa.int32())])
+output = pa.schema([('_ROW_ID', pa.int64()), ('value', pa.int32())])
+failures = {i: LookupError('assignment failed for ' + str(i)) for i in range(4)}
+callback_entered = threading.Event()
+release_callback = threading.Event()
+def assignment(rows):
+    row_id = rows['t._ROW_ID'][0].as_py()
+    callback_entered.set()
+    assert release_callback.wait(timeout=10)
+    if row_id in failures:
+        raise failures[row_id]
+    return pa.array([9], pa.int32())
+execution = MergeBatchExecution.for_updates(schema, output,
+    [WhenMatched.update({'value': MergeAssignment.function(assignment)})])
+barrier = threading.Barrier(4)
+def execute(row_id):
+    batch = pa.record_batch([pa.array([row_id], pa.int64()), pa.array([1], pa.int32())],
+                             schema=schema)
+    barrier.wait()
+    try:
+        execution.execute(batch)
+    except LookupError as error:
+        return error
+    raise AssertionError('callback exception was lost')
+with ThreadPoolExecutor(max_workers=4) as threads:
+    futures = [threads.submit(execute, row_id) for row_id in range(4)]
+    try:
+        assert callback_entered.wait(timeout=10)
+    finally:
+        release_callback.set()
+    results = [future.result(timeout=10) for future in futures]
+assert all(error is failures[i] for i, error in enumerate(results))
+failures.clear()
+batch = pa.record_batch([pa.array([7], pa.int64()), pa.array([1], pa.int32())], schema=schema)
+assert execution.execute(batch).to_pydict() == {'_ROW_ID': [7], 'value': [9]}
 "#
                 ),
                 Some(&locals),

@@ -72,72 +72,85 @@ pub(crate) fn from_python_schema(
     schema: SchemaRef,
     error: CallbackError,
 ) -> PyResult<Vec<(String, UpdateAssignment)>> {
-    let pa = py.import("pyarrow")?;
-    let array_type = pa.getattr("Array")?;
-    let chunked_type = pa.getattr("ChunkedArray")?;
     assignments
         .iter()
         .map(|(name, value)| {
             let name: String = name.extract()?;
             let assignment = if value.is_callable() {
-                let value = value.unbind();
-                let error = error.clone();
-                UpdateAssignment::Function(Arc::new(move |batches| {
-                    // A Python callback may invoke another native read or write.
-                    tokio::task::block_in_place(|| {
-                        Python::attach(|py| -> PyResult<_> {
-                            let pa = py.import("pyarrow")?;
-                            let batches = batches
-                                .iter()
-                                .map(|batch| batch.to_pyarrow(py))
-                                .collect::<PyResult<Vec<_>>>()?;
-                            let matched = pa
-                                .getattr("Table")?
-                                .call_method1("from_batches", (PyList::new(py, batches)?,))?;
-                            arrow_arrays(py, &value.bind(py).call1((matched,))?)
-                        })
-                    })
-                    .map_err(|cause| bridge_error(cause, &error))
-                }))
-            } else if value.is_instance(&array_type)? || value.is_instance(&chunked_type)? {
-                UpdateAssignment::Array(arrow_arrays(py, &value)?)
+                function(value.unbind(), error.clone())
             } else {
-                // Literal conversion stays lazy: a no-match update must neither
-                // evaluate callbacks nor reject a scalar that is never assigned.
-                let value = value.unbind();
-                let name = name.clone();
-                let schema = schema.clone();
-                let error = error.clone();
-                UpdateAssignment::DeferredScalar(Arc::new(move || {
-                    tokio::task::block_in_place(|| {
-                        Python::attach(|py| -> PyResult<_> {
-                            let pa = py.import("pyarrow")?;
-                            let value = value.bind(py);
-                            let scalar = if value.is_instance(&pa.getattr("Scalar")?)? {
-                                value.call_method0("as_py")?
-                            } else {
-                                value.clone()
-                            };
-                            let kwargs = PyDict::new(py);
-                            kwargs.set_item(
-                                "type",
-                                schema
-                                    .to_pyarrow(py)?
-                                    .call_method1("field", (&name,))?
-                                    .getattr("type")?,
-                            )?;
-                            let one = pa.call_method(
-                                "array",
-                                (PyList::new(py, [scalar])?,),
-                                Some(&kwargs),
-                            )?;
-                            crate::arrow_input::array_from_pyarrow(&one)
-                        })
-                    })
-                    .map_err(|cause| bridge_error(cause, &error))
-                }))
+                literal(
+                    py,
+                    name.clone(),
+                    value.unbind(),
+                    schema.clone(),
+                    error.clone(),
+                )?
             };
             Ok((name, assignment))
         })
         .collect()
+}
+
+pub(crate) fn function(value: Py<PyAny>, error: CallbackError) -> UpdateAssignment {
+    UpdateAssignment::Function(Arc::new(move |batches| {
+        // A Python callback may invoke another native read or write.
+        tokio::task::block_in_place(|| {
+            Python::attach(|py| -> PyResult<_> {
+                let pa = py.import("pyarrow")?;
+                let batches = batches
+                    .iter()
+                    .map(|batch| batch.to_pyarrow(py))
+                    .collect::<PyResult<Vec<_>>>()?;
+                let matched = pa
+                    .getattr("Table")?
+                    .call_method1("from_batches", (PyList::new(py, batches)?,))?;
+                arrow_arrays(py, &value.bind(py).call1((matched,))?)
+            })
+        })
+        .map_err(|cause| bridge_error(cause, &error))
+    }))
+}
+
+pub(crate) fn literal(
+    py: Python<'_>,
+    name: String,
+    value: Py<PyAny>,
+    schema: SchemaRef,
+    error: CallbackError,
+) -> PyResult<UpdateAssignment> {
+    let pa = py.import("pyarrow")?;
+    let bound = value.bind(py);
+    if bound.is_instance(&pa.getattr("Array")?)?
+        || bound.is_instance(&pa.getattr("ChunkedArray")?)?
+    {
+        return Ok(UpdateAssignment::Array(arrow_arrays(py, bound)?));
+    }
+    // Literal conversion stays lazy: a no-match update must neither evaluate
+    // callbacks nor reject a scalar that is never assigned. Explicit MERGE
+    // literals also stay literals when the Python value happens to be callable.
+    Ok(UpdateAssignment::DeferredScalar(Arc::new(move || {
+        tokio::task::block_in_place(|| {
+            Python::attach(|py| -> PyResult<_> {
+                let pa = py.import("pyarrow")?;
+                let value = value.bind(py);
+                let scalar = if value.is_instance(&pa.getattr("Scalar")?)? {
+                    value.call_method0("as_py")?
+                } else {
+                    value.clone()
+                };
+                let kwargs = PyDict::new(py);
+                kwargs.set_item(
+                    "type",
+                    schema
+                        .to_pyarrow(py)?
+                        .call_method1("field", (&name,))?
+                        .getattr("type")?,
+                )?;
+                let one = pa.call_method("array", (PyList::new(py, [scalar])?,), Some(&kwargs))?;
+                crate::arrow_input::array_from_pyarrow(&one)
+            })
+        })
+        .map_err(|cause| bridge_error(cause, &error))
+    })))
 }
