@@ -91,6 +91,7 @@ pub use full_text_search::{register_full_text_search, FullTextSearchFunction};
 pub use hybrid_search::{register_hybrid_search, HybridSearchFunction};
 pub use merge_condition::compile_merge_condition;
 pub use physical_plan::PaimonTableScan;
+pub use procedures::execute_procedure;
 pub use relation_planner::PaimonRelationPlanner;
 pub use sql_context::{SQLContext, SQLContextBuilder};
 pub use table::PaimonTableProvider;

@@ -309,11 +309,20 @@ pub async fn execute_call(
     let catalog = catalogs
         .get(catalog_name)
         .ok_or_else(|| DataFusionError::Plan(format!("Unknown catalog '{catalog_name}'")))?;
-    let args = extract_named_args(&func.args)?;
+    execute_procedure(ctx, catalog, catalog_name, &proc_name, &func.args).await
+}
 
-    reject_unknown_args(&proc_name, &args)?;
+pub async fn execute_procedure(
+    ctx: &SessionContext,
+    catalog: &Arc<dyn Catalog>,
+    catalog_name: &str,
+    proc_name: &str,
+    arguments: &FunctionArguments,
+) -> DFResult<DataFrame> {
+    let args = extract_named_args(arguments)?;
+    reject_unknown_args(proc_name, &args)?;
 
-    match proc_name.as_str() {
+    match proc_name {
         "create_tag" => proc_create_tag(ctx, catalog, catalog_name, &args).await,
         "delete_tag" => proc_delete_tag(ctx, catalog, catalog_name, &args).await,
         "rename_tag" => proc_rename_tag(ctx, catalog, catalog_name, &args).await,
