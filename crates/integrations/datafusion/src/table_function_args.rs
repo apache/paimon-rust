@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use datafusion::common::config::CatalogOptions;
 use datafusion::common::ScalarValue;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::logical_expr::Expr;
@@ -70,11 +71,35 @@ pub(crate) fn parse_table_identifier(
     name: &str,
     default_database: &str,
 ) -> DFResult<Identifier> {
-    let parts: Vec<&str> = name.split('.').collect();
-    match parts.len() {
-        1 => Ok(Identifier::new(default_database, parts[0])),
-        2 => Ok(Identifier::new(parts[0], parts[1])),
-        3 => Ok(Identifier::new(parts[1], parts[2])),
+    let (_, database, table) = split_table_name(function_name, name)?;
+    Ok(Identifier::new(database.unwrap_or(default_database), table))
+}
+
+/// Resolves a table-name argument the way a `FROM` clause resolves a table
+/// name: `table` and `database.table` take the session's current catalog (and
+/// database), and `catalog.database.table` names the catalog. Returns the
+/// catalog's name and the table's identifier in that catalog.
+pub(crate) fn resolve_table_argument(
+    function_name: &str,
+    name: &str,
+    session: &CatalogOptions,
+) -> DFResult<(String, Identifier)> {
+    let (catalog, database, table) = split_table_name(function_name, name)?;
+    Ok((
+        catalog.unwrap_or(&session.default_catalog).to_string(),
+        Identifier::new(database.unwrap_or(&session.default_schema), table),
+    ))
+}
+
+/// Splits `table`, `database.table` or `catalog.database.table`.
+fn split_table_name<'a>(
+    function_name: &str,
+    name: &'a str,
+) -> DFResult<(Option<&'a str>, Option<&'a str>, &'a str)> {
+    match name.split('.').collect::<Vec<_>>().as_slice() {
+        [table] => Ok((None, None, *table)),
+        [database, table] => Ok((None, Some(*database), *table)),
+        [catalog, database, table] => Ok((Some(*catalog), Some(*database), *table)),
         _ => Err(DataFusionError::Plan(format!(
             "{function_name}: invalid table name '{name}', expected 'table', 'database.table', or 'catalog.database.table'"
         ))),

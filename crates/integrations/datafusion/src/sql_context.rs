@@ -170,6 +170,7 @@ impl SQLContextBuilder {
         let ctx = SessionContext::new_with_state(state);
         crate::blob_descriptor_functions::register_blob_descriptor_functions(&ctx);
         crate::variant_functions::register_variant_functions(&ctx);
+        crate::incremental_query::register_incremental_query(&ctx);
         SQLContext {
             ctx,
             catalogs: HashMap::new(),

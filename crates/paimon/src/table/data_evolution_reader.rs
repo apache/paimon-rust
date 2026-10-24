@@ -38,7 +38,7 @@ use crate::spec::{
 };
 use crate::table::dedicated_format_file_writer::is_blob_or_video_file_name;
 use crate::table::schema_manager::SchemaManager;
-use crate::table::source::any_range_overlaps_file;
+use crate::table::source::{any_range_overlaps_file, is_data_evolution_column_slice_group};
 use crate::table::stats_filter::group_by_overlapping_row_id;
 use crate::table::{ArrowRecordBatchStream, RESTEnv, RowRange};
 use crate::{DataSplit, Error};
@@ -267,6 +267,29 @@ impl DataEvolutionReader {
         }
     }
 
+    /// Whether a row-id group of change events merges into rows: its files
+    /// are column slices of one row range, and each VECTOR field is written
+    /// by files of one layout. Other groups are read file by file.
+    async fn merges_change_events(&self, files: &[DataFileMeta]) -> crate::Result<bool> {
+        if !is_data_evolution_column_slice_group(files) {
+            return Ok(false);
+        }
+        if !files
+            .iter()
+            .any(|file| is_vector_store_file_name(&file.file_name))
+        {
+            return Ok(true);
+        }
+        let (infos, _) = load_file_infos(
+            &self.schema_manager,
+            self.table_schema_id,
+            &self.table_fields,
+            files,
+        )
+        .await?;
+        Ok(!vector_field_has_two_layouts(files, &infos))
+    }
+
     /// Managed BLOB payloads are fetched by the format reader, before the
     /// residual predicate. A LIMIT with a predicate on ordinary columns must
     /// therefore select matching row IDs before opening those payloads.
@@ -294,6 +317,10 @@ impl DataEvolutionReader {
                     .iter()
                     .all(|file| file.first_row_id.is_some())
             })
+            // Change events may read a row-id group file by file, where a row
+            // id names a row of each file, so selecting by row id would
+            // return rows of files the predicate did not match.
+            || splits.iter().any(DataSplit::is_streaming)
         {
             return false;
         }
@@ -525,7 +552,12 @@ impl DataEvolutionReader {
                     if remaining == Some(0) {
                         break 'splits;
                     }
-                    if is_raw_convertible(&files) {
+                    // Change events merge a group only as column slices of
+                    // one row range (`merges_change_events`). Any other group,
+                    // such as a VECTOR rewrite alone, is read file by file.
+                    if is_raw_convertible(&files)
+                        || (split.is_streaming() && !self.merges_change_events(&files).await?)
+                    {
                         for file_meta in files {
                             if remaining == Some(0) {
                                 break 'splits;
@@ -634,6 +666,11 @@ impl DataEvolutionReader {
                             let mut row_id_offset: usize = 0;
 
                             let mut stream = raw_file_reader.clone()
+                                // A BLOB file of change events read on its own
+                                // yields what the merged sources yield.
+                                .with_blob_as_descriptor(
+                                    split.is_streaming() && self.blob_as_descriptor,
+                                )
                                 .with_nested_field_enabled(
                                     CoreOptions::new(&self.table_options)
                                         .data_evolution_nested_field_enabled()
@@ -1142,6 +1179,7 @@ impl DataEvolutionReader {
                     partition_fields: &partition_fields,
                     row_id_pushdown: row_ranges.is_some(),
                     nested_enabled,
+                    change_events: split.is_streaming(),
                 },
             )?;
 
@@ -1223,6 +1261,7 @@ impl DataEvolutionReader {
                             mosaic_prefetch,
                             read_timing.clone(),
                             anchor_deletion_vector.as_ref(),
+                            split.is_streaming(),
                         )
                         .map(Some)
                     }
@@ -1856,6 +1895,7 @@ fn open_source_stream(
     mosaic_prefetch: MosaicPrefetchOptions,
     read_timing: Option<Arc<DataFileReadTiming>>,
     anchor_deletion_vector: Option<&DeletionVectorContext>,
+    change_events: bool,
 ) -> crate::Result<ArrowRecordBatchStream> {
     let mut row_ranges = row_ranges;
     if let FieldSource::BlobBunch { bunch, read_fields } = source {
@@ -1865,33 +1905,42 @@ fn open_source_stream(
             row_ranges.as_deref(),
             anchor_deletion_vector.map(|context| context.deletion_vector.as_ref()),
         )?;
-        if let Some(selected_ranges) = selected_ranges.as_deref() {
-            let uncovered_ranges =
-                crate::table::source::exclude_row_ranges(selected_ranges, bunch.logical_ranges());
-            if !uncovered_ranges.is_empty() {
-                if read_fields
+        // Change events read the rows of the group that no BLOB file of the
+        // range wrote as NULL, NOT NULL fields included.
+        let uncovered_ranges = match selected_ranges.as_deref() {
+            Some(selected_ranges) => {
+                crate::table::source::exclude_row_ranges(selected_ranges, bunch.logical_ranges())
+            }
+            None if change_events => crate::table::source::exclude_row_ranges(
+                &[bunch.expected_range()?],
+                bunch.logical_ranges(),
+            ),
+            None => Vec::new(),
+        };
+        if !uncovered_ranges.is_empty() {
+            if !change_events
+                && read_fields
                     .iter()
                     .any(|field| !field.data_type().is_nullable())
-                {
-                    return Err(Error::DataInvalid {
-                        message: format!(
-                            "Cannot NULL-fill uncovered ranges {uncovered_ranges:?} for non-nullable BLOB field"
-                        ),
-                        source: None,
-                    });
-                }
-                return blob_fallback::read(
-                    split,
-                    bunch.clone(),
-                    read_fields.clone(),
-                    row_ranges,
-                    batch_size,
-                    file_io,
-                    blob_as_descriptor,
-                    blob_parallelism,
-                    anchor_deletion_vector.cloned(),
-                );
+            {
+                return Err(Error::DataInvalid {
+                    message: format!(
+                        "Cannot NULL-fill uncovered ranges {uncovered_ranges:?} for non-nullable BLOB field"
+                    ),
+                    source: None,
+                });
             }
+            return blob_fallback::read(
+                split,
+                bunch.clone(),
+                read_fields.clone(),
+                row_ranges,
+                batch_size,
+                file_io,
+                blob_as_descriptor,
+                blob_parallelism,
+                anchor_deletion_vector.cloned(),
+            );
         }
 
         // A single sequence group has no fallback work, so keep per-file lazy streaming.
@@ -1966,6 +2015,17 @@ fn open_source_stream(
                 row_ranges.as_deref(),
                 anchor_deletion_vector.map(|context| context.deletion_vector.as_ref()),
             )?;
+            // Change events read the rows of the group that no VECTOR file of
+            // the range wrote as NULL, NOT NULL fields included.
+            let selected_ranges = match selected_ranges {
+                None if change_events && bunch.row_count() < bunch.expected_row_count => {
+                    Some(vec![RowRange::new(
+                        bunch.expected_first_row_id,
+                        bunch.expected_first_row_id + bunch.expected_row_count - 1,
+                    )])
+                }
+                selected_ranges => selected_ranges,
+            };
             let files = match selected_ranges.as_deref() {
                 Some([]) => Vec::new(),
                 Some(ranges) => {
@@ -1977,10 +2037,11 @@ fn open_source_stream(
                     let uncovered_ranges =
                         crate::table::source::exclude_row_ranges(ranges, &covered_ranges);
                     if !uncovered_ranges.is_empty() {
-                        if source
-                            .read_fields()
-                            .iter()
-                            .any(|field| !field.data_type().is_nullable())
+                        if !change_events
+                            && source
+                                .read_fields()
+                                .iter()
+                                .any(|field| !field.data_type().is_nullable())
                         {
                             return Err(Error::DataInvalid {
                                 message: format!(
@@ -2459,6 +2520,42 @@ fn resolve_field_ids(file: &DataFileMeta, fields: &[DataField]) -> crate::Result
     }
 }
 
+/// The key of the vector bunch a vector file joins: its schema, format and
+/// normalized write columns.
+fn vector_bunch_key(
+    file: &DataFileMeta,
+    normalized_write_cols: &[String],
+) -> (i64, String, Vec<String>) {
+    (
+        file.schema_id,
+        vector_format_suffix(&file.file_name),
+        normalized_write_cols.to_vec(),
+    )
+}
+
+/// Whether some VECTOR field is written by files of two vector bunch keys,
+/// such as a rewrite after `ALTER TABLE`; the source plan cannot combine
+/// their bunches.
+fn vector_field_has_two_layouts(files: &[DataFileMeta], infos: &[ResolvedFileInfo]) -> bool {
+    let mut layouts = HashMap::new();
+    for (file, info) in files.iter().zip(infos) {
+        let Some(columns) = info
+            .normalized_write_cols
+            .as_deref()
+            .filter(|_| is_vector_store_file_name(&file.file_name))
+        else {
+            continue;
+        };
+        let layout = vector_bunch_key(file, columns);
+        for field_id in &info.field_ids {
+            if layouts.entry(*field_id).or_insert_with(|| layout.clone()) != &layout {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Lowercased final filename extension, used as a vector bunch's format identifier.
 /// `"data.vector.parquet" -> "parquet"`, `"emb-1.vector.vortex" -> "vortex"`.
 fn vector_format_suffix(file_name: &str) -> String {
@@ -2518,6 +2615,12 @@ struct SourcePlanReadContext<'a> {
     partition_fields: &'a [DataField],
     row_id_pushdown: bool,
     nested_enabled: bool,
+    /// The split holds change events rather than a materialized snapshot
+    /// ([`DataSplit::is_streaming`]). A field no file of the group wrote, or a
+    /// row of the group no BLOB or VECTOR file of its field wrote, was not
+    /// written in the planned range, so it reads as NULL, NOT NULL fields
+    /// included.
+    change_events: bool,
 }
 
 #[cfg(test)]
@@ -2537,6 +2640,7 @@ fn build_source_plan(
             partition_fields: &[],
             row_id_pushdown: false,
             nested_enabled: false,
+            change_events: false,
         },
     )
 }
@@ -2553,6 +2657,7 @@ fn build_source_plan_with_row_id_pushdown(
         partition_fields,
         row_id_pushdown,
         nested_enabled,
+        change_events,
     } = context;
     let mut sources = Vec::new();
     let mut normal_providers: HashMap<i32, usize> = HashMap::new(); // field_id -> source_idx
@@ -2606,7 +2711,7 @@ fn build_source_plan_with_row_id_pushdown(
                         source: None,
                     })?;
             let format_suffix = vector_format_suffix(&file.file_name);
-            let key = (file.schema_id, format_suffix.clone(), normalized.clone());
+            let key = vector_bunch_key(file, &normalized);
 
             let source_idx = if let Some(&existing_idx) = vector_bunch_indices.get(&key) {
                 existing_idx
@@ -2620,7 +2725,8 @@ fn build_source_plan_with_row_id_pushdown(
                         format_suffix,
                         normalized.clone(),
                     )
-                    .with_row_id_pushdown(row_id_pushdown),
+                    // Row ranges and change events may leave gaps between files.
+                    .with_row_id_pushdown(row_id_pushdown || change_events),
                     data_fields: info.data_fields.clone(),
                     read_fields: Vec::new(),
                 });
@@ -2697,9 +2803,11 @@ fn build_source_plan_with_row_id_pushdown(
                     },
                 )
                 .collect::<Vec<_>>();
-            if let Some(selection) =
-                super::data_evolution_nested::select_nested_row(field, &physical_sources)?
-            {
+            if let Some(selection) = super::data_evolution_nested::select_nested_row(
+                field,
+                &physical_sources,
+                change_events,
+            )? {
                 if selection.whole_source.is_none() {
                     let current_field = table_fields
                         .iter()
@@ -2771,6 +2879,7 @@ fn build_source_plan_with_row_id_pushdown(
             column_plan.push(Some((source_idx, field_offset)));
             nested_plan.push(None);
         } else if !field.data_type().is_nullable()
+            && !change_events
             && !partition_fields
                 .iter()
                 .any(|partition| partition.id() == field.id())
@@ -2788,13 +2897,17 @@ fn build_source_plan_with_row_id_pushdown(
         }
     }
 
+    // A range's BLOB and VECTOR files may cover only some rows of the change
+    // events it merges into: a BLOB update writes the rows it updates, and a
+    // VECTOR update before a compaction merged its normal file with others
+    // covers the rows of the file it updated. The reader NULL-fills the rest.
     for source in &mut sources {
         if let FieldSource::BlobBunch {
             bunch, read_fields, ..
         } = source
         {
             bunch.finalize()?;
-            if !read_fields.is_empty() && !row_id_pushdown {
+            if !read_fields.is_empty() && !row_id_pushdown && !change_events {
                 bunch.validate_logical_range()?;
             }
         }
@@ -2807,6 +2920,7 @@ fn build_source_plan_with_row_id_pushdown(
         {
             if !read_fields.is_empty()
                 && !row_id_pushdown
+                && !change_events
                 && bunch.row_count() != prepared_group.logical_row_count
             {
                 return Err(Error::DataInvalid {
@@ -4602,12 +4716,59 @@ mod tests {
                 partition_fields: &[],
                 row_id_pushdown: true,
                 nested_enabled: false,
+                change_events: false,
             },
         )
         .unwrap_err();
 
         assert!(matches!(err, Error::DataInvalid { message, .. }
                 if message.contains("non-nullable field 'payload'")));
+    }
+
+    #[test]
+    fn change_events_read_a_field_no_file_wrote_as_null() {
+        // Two column updates of one file, neither of which wrote `id`.
+        let files = vec![
+            data_file("a-update.parquet", 0, 4, 2, Some(vec!["a"])),
+            data_file("b-update.parquet", 0, 4, 3, Some(vec!["b"])),
+        ];
+        let prepared_group = PreparedMergeGroup::new(&files).unwrap();
+        // Newest first: the `b` update, then the `a` update.
+        let file_infos = vec![resolved_info(vec![3]), resolved_info(vec![2])];
+        let read_type = vec![
+            DataField::new(
+                1,
+                "id".to_string(),
+                DataType::Int(IntType::with_nullable(false)),
+            ),
+            DataField::new(2, "a".to_string(), DataType::Int(IntType::new())),
+            DataField::new(3, "b".to_string(), DataType::Int(IntType::new())),
+        ];
+        let plan = |change_events| {
+            build_source_plan_with_row_id_pushdown(
+                &prepared_group,
+                &file_infos,
+                &read_type,
+                &HashSet::new(),
+                SourcePlanReadContext {
+                    table_fields: &read_type,
+                    partition_fields: &[],
+                    row_id_pushdown: false,
+                    nested_enabled: false,
+                    change_events,
+                },
+            )
+        };
+
+        assert!(
+            matches!(plan(false), Err(Error::DataInvalid { message, .. })
+                if message.contains("non-nullable field 'id'"))
+        );
+        let source_plan = plan(true).unwrap();
+        assert_eq!(
+            source_plan.column_plan,
+            vec![None, Some((1, 0)), Some((0, 0))]
+        );
     }
 
     #[test]
@@ -4694,6 +4855,7 @@ mod tests {
                 partition_fields: &[],
                 row_id_pushdown: false,
                 nested_enabled: false,
+                change_events: false,
             },
         )
         .unwrap();
@@ -6329,6 +6491,132 @@ mod tests {
             }
         }
         assert_eq!(row, expected.len(), "row count mismatch");
+    }
+
+    /// Change events merge BLOB and VECTOR files that cover only some rows of
+    /// the normal file of their range, with gaps before, between and after
+    /// the VECTOR files, and read the rows they do not cover as NULL, NOT NULL
+    /// fields included. Java's compaction leaves such groups: it merges normal
+    /// files but not their VECTOR files, so a later update of the merged rows
+    /// writes a normal file wider than a VECTOR file of the range. A snapshot
+    /// read of the same files still fails.
+    #[tokio::test]
+    async fn change_events_null_fill_rows_no_blob_or_vector_file_wrote() {
+        let tempdir = tempdir().unwrap();
+        let bucket_dir = tempdir.path().join("bucket-0");
+        fs::create_dir_all(&bucket_dir).unwrap();
+        let normal_path = bucket_dir.join("data.parquet");
+        write_int_parquet_file(
+            &normal_path,
+            vec![("id", vec![1, 2, 3, 4, 5, 6, 7, 8])],
+            None,
+        );
+        let size = |path: &Path| path.metadata().unwrap().len() as i64;
+        // Rows 2-3 and 5 have vectors, leaving gaps before, between and after
+        // them; row 1 has a picture.
+        let mut files = vec![data_file_meta_with_path(
+            "data.parquet",
+            0,
+            8,
+            1,
+            size(&normal_path),
+            Some(vec!["id"]),
+        )];
+        for (name, first_row_id, values) in [
+            ("emb-2.vector.parquet", 2, vec![[3.0, 3.0], [4.0, 4.0]]),
+            ("emb-5.vector.parquet", 5, vec![[6.0, 6.0]]),
+        ] {
+            let path = bucket_dir.join(name);
+            let rows: Vec<_> = values.iter().map(|value| Some(value.to_vec())).collect();
+            write_fixed_size_list_parquet(&path, "embedding", 2, &rows);
+            files.push(data_file_meta_with_path(
+                name,
+                first_row_id,
+                rows.len() as i64,
+                1,
+                size(&path),
+                Some(vec!["embedding"]),
+            ));
+        }
+        let blob_path = bucket_dir.join("payload-1.blob");
+        write_blob_file(&blob_path, &[Some(&b"one"[..])]);
+        files.push(data_file_meta_with_path(
+            "payload-1.blob",
+            1,
+            1,
+            1,
+            size(&blob_path),
+            Some(vec!["payload"]),
+        ));
+
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column(
+                "embedding",
+                DataType::Vector(
+                    VectorType::try_new(false, 2, DataType::Float(FloatType::new())).unwrap(),
+                ),
+            )
+            .column("payload", DataType::Blob(BlobType::with_nullable(false)))
+            .option("data-evolution.enabled", "true")
+            .option("row-tracking.enabled", "true")
+            .build()
+            .unwrap();
+        let table = Table::new(
+            FileIOBuilder::new("file").build().unwrap(),
+            Identifier::new("default", "change_event_gaps_t"),
+            local_file_path(tempdir.path()),
+            TableSchema::new(0, &schema),
+            None,
+        );
+        let split = |streaming| {
+            DataSplitBuilder::new()
+                .with_snapshot(1)
+                .with_partition(BinaryRow::new(0))
+                .with_bucket(0)
+                .with_bucket_path(local_file_path(&bucket_dir))
+                .with_total_buckets(1)
+                .with_data_files(files.clone())
+                .with_streaming(streaming)
+                .build()
+                .unwrap()
+        };
+        let read = TableRead::new(&table, table.schema().fields().to_vec(), Vec::new());
+
+        let batches = read
+            .to_arrow(&[split(true)])
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(
+            collect_int_values(&batches, "id"),
+            vec![1, 2, 3, 4, 5, 6, 7, 8]
+        );
+        let vectors = [
+            None,
+            None,
+            Some(vec![3.0, 3.0]),
+            Some(vec![4.0, 4.0]),
+            None,
+            Some(vec![6.0, 6.0]),
+            None,
+            None,
+        ];
+        assert_fixed_size_list(&batches, "embedding", 2, &vectors);
+        let mut payloads = vec![None; 8];
+        payloads[1] = Some(b"one".to_vec());
+        assert_eq!(collect_binary_values(&batches, "payload"), payloads);
+
+        let snapshot = read
+            .to_arrow(&[split(false)])
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await;
+        assert!(
+            snapshot.is_err(),
+            "a snapshot read keeps the coverage checks"
+        );
     }
 
     /// (1) Provider priority: the normal data file ALSO advertises the embedding write_col,
