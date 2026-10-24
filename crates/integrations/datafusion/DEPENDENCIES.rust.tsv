@@ -110,7 +110,7 @@ crypto-common@0.1.7		X									X
 crypto-common@0.2.2		X									X							
 csv@1.4.0											X				X			
 csv-core@0.1.13											X				X			
-ctutils@0.4.2		X									X							
+ctutils@0.4.4		X									X							
 custom-labels@0.4.6		X																
 darling@0.23.0											X							
 darling_core@0.23.0											X							
@@ -509,7 +509,7 @@ time@0.3.54		X									X
 time-core@0.1.9		X									X							
 tiny-keccak@2.0.2							X											
 tinystr@0.8.3														X				
-tokio@1.53.0											X							
+tokio@1.53.3											X							
 tokio-macros@2.7.1											X							
 tokio-native-tls@0.3.1											X							
 tokio-rustls@0.26.4		X									X							
