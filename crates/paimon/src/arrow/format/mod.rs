@@ -411,7 +411,7 @@ pub(crate) fn create_format_reader_with_budget(
     } else if lower.ends_with(".avro") {
         Box::new(avro::AvroFormatReader)
     } else if lower.ends_with(".row") {
-        Box::new(row::RowFormatReader)
+        Box::new(row::RowFormatReader::with_options(table_options))
     } else if lower.ends_with(".mosaic") {
         Box::new(mosaic::MosaicFormatReader::with_prefetch(mosaic_prefetch))
     } else {
