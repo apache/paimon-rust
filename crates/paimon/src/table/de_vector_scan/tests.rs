@@ -1007,3 +1007,245 @@ async fn transported_vector_sources_keep_pk_positions_separate_from_global_ids()
     );
     assert!(mixed.is_err());
 }
+
+#[tokio::test]
+async fn pruned_null_bitmap_keeps_btree_answer_exact() {
+    // The bitmap shard covers only NULL rows, so `f > 1.5` prunes it and the
+    // BTree answer stays exact even without refinement.
+    use crate::spec::{ArrayType, DataType, Datum, DoubleType, FloatType, IntType};
+    use arrow_array::types::Float32Type;
+    use arrow_array::{Float64Array, ListArray};
+
+    let schema = crate::spec::Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .column("f", DataType::Double(DoubleType::new()))
+        .column(
+            "embedding",
+            DataType::Array(ArrayType::new(DataType::Float(FloatType::new()))),
+        )
+        .options(HashMap::from([
+            ("bucket".into(), "-1".into()),
+            ("row-tracking.enabled".into(), "true".into()),
+            ("data-evolution.enabled".into(), "true".into()),
+            ("global-index.enabled".into(), "true".into()),
+        ]))
+        .build()
+        .unwrap();
+    let table = Table::new(
+        crate::io::FileIOBuilder::new("memory").build().unwrap(),
+        crate::catalog::Identifier::new("default", "pruned_bitmap"),
+        format!("memory:/pruned-bitmap-{}", uuid::Uuid::new_v4()),
+        crate::spec::TableSchema::new(0, &schema),
+        None,
+    );
+    let write = |ids: Vec<i32>, f: Vec<Option<f64>>, embedding: Vec<Vec<f32>>| {
+        let table = table.clone();
+        async move {
+            let columns: Vec<ArrayRef> = vec![
+                Arc::new(Int32Array::from(ids)),
+                Arc::new(Float64Array::from(f)),
+                Arc::new(ListArray::from_iter_primitive::<Float32Type, _, _>(
+                    embedding
+                        .into_iter()
+                        .map(|v| Some(v.into_iter().map(Some).collect::<Vec<_>>())),
+                )),
+            ];
+            let arrow_schema = Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("id", ArrowDataType::Int32, true),
+                ArrowField::new("f", ArrowDataType::Float64, true),
+                ArrowField::new("embedding", columns[2].data_type().clone(), true),
+            ]));
+            let mut writer = TableWrite::new(&table, "test".to_string()).unwrap();
+            writer
+                .write_arrow_batch(&RecordBatch::try_new(arrow_schema, columns).unwrap())
+                .await
+                .unwrap();
+            TableCommit::new(table.clone(), "test".to_string())
+                .commit(writer.prepare_commit().await.unwrap())
+                .await
+                .unwrap();
+        }
+    };
+    write(
+        vec![0, 1],
+        vec![None, None],
+        vec![vec![0.0, 1.0], vec![0.0, 1.0]],
+    )
+    .await;
+    let mut builder = table.new_global_index_build_builder();
+    builder.with_index_type("bitmap").with_index_column("f");
+    builder.execute().await.unwrap();
+    write(
+        vec![2, 3],
+        vec![Some(2.0), Some(3.0)],
+        vec![vec![1.0, 0.0], vec![0.0, 1.0]],
+    )
+    .await;
+    let mut builder = table.new_global_index_build_builder();
+    builder.with_index_type("btree").with_index_column("f");
+    builder.execute().await.unwrap();
+    let mut builder = table.new_global_index_build_builder();
+    builder
+        .with_index_type("ivf-flat")
+        .with_index_column("embedding")
+        .with_options(HashMap::from([
+            ("ivf-flat.dimension".into(), "2".into()),
+            ("ivf-flat.nlist".into(), "1".into()),
+            ("ivf-flat.distance.metric".into(), "l2".into()),
+        ]));
+    builder.execute().await.unwrap();
+
+    let table = table.copy_with_options(HashMap::from([(
+        "global-index.filter.refine-from-data".to_string(),
+        "false".to_string(),
+    )]));
+    let pb = crate::spec::PredicateBuilder::new(table.schema().fields());
+    let batches: Vec<RecordBatch> = table
+        .new_vector_search_builder()
+        .with_vector_column("embedding")
+        .with_query_vector(vec![1.0, 0.0])
+        .with_limit(1)
+        .with_filter(pb.greater_than("f", Datum::Double(1.5)).unwrap())
+        .execute()
+        .await
+        .unwrap()
+        .new_read_builder()
+        .read()
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    let ids: Vec<i32> = batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        })
+        .collect();
+    assert_eq!(ids, vec![2]);
+}
+
+#[tokio::test]
+async fn floating_bitmap_candidates_are_refined_before_top_k() {
+    // A bitmap index answers `!=` and range filters on FLOAT/DOUBLE with all
+    // non-null rows. Row 0 is closest to [1, 0] but fails every filter, so
+    // ranking those candidates unrefined would return it. A BTree answers the
+    // same filters exactly, so its candidates need no refinement.
+    use crate::spec::{ArrayType, DataType, Datum, DoubleType, FloatType, IntType};
+    use arrow_array::types::Float32Type;
+    use arrow_array::{Float64Array, ListArray};
+
+    for (index_type, refine_from_data) in
+        [("bitmap", None), ("btree", None), ("btree", Some("false"))]
+    {
+        let schema = crate::spec::Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("f", DataType::Double(DoubleType::new()))
+            .column(
+                "embedding",
+                DataType::Array(ArrayType::new(DataType::Float(FloatType::new()))),
+            )
+            .options(HashMap::from([
+                ("bucket".into(), "-1".into()),
+                ("row-tracking.enabled".into(), "true".into()),
+                ("data-evolution.enabled".into(), "true".into()),
+                ("global-index.enabled".into(), "true".into()),
+            ]))
+            .build()
+            .unwrap();
+        let table = Table::new(
+            crate::io::FileIOBuilder::new("memory").build().unwrap(),
+            crate::catalog::Identifier::new("default", "float_bitmap"),
+            format!("memory:/float-bitmap-{}", uuid::Uuid::new_v4()),
+            crate::spec::TableSchema::new(0, &schema),
+            None,
+        );
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(Int32Array::from(vec![0, 1])),
+            Arc::new(Float64Array::from(vec![1.0, 2.0])),
+            Arc::new(ListArray::from_iter_primitive::<Float32Type, _, _>(vec![
+                Some(vec![Some(1.0), Some(0.0)]),
+                Some(vec![Some(0.0), Some(1.0)]),
+            ])),
+        ];
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", ArrowDataType::Int32, true),
+            ArrowField::new("f", ArrowDataType::Float64, true),
+            ArrowField::new("embedding", columns[2].data_type().clone(), true),
+        ]));
+        let mut writer = TableWrite::new(&table, "test".to_string()).unwrap();
+        writer
+            .write_arrow_batch(&RecordBatch::try_new(arrow_schema, columns).unwrap())
+            .await
+            .unwrap();
+        TableCommit::new(table.clone(), "test".to_string())
+            .commit(writer.prepare_commit().await.unwrap())
+            .await
+            .unwrap();
+        let mut builder = table.new_global_index_build_builder();
+        builder.with_index_type(index_type).with_index_column("f");
+        builder.execute().await.unwrap();
+        let mut builder = table.new_global_index_build_builder();
+        builder
+            .with_index_type("ivf-flat")
+            .with_index_column("embedding")
+            .with_options(HashMap::from([
+                ("ivf-flat.dimension".into(), "2".into()),
+                ("ivf-flat.nlist".into(), "1".into()),
+                ("ivf-flat.distance.metric".into(), "l2".into()),
+            ]));
+        builder.execute().await.unwrap();
+
+        let table = match refine_from_data {
+            Some(refine) => table.copy_with_options(HashMap::from([(
+                "global-index.filter.refine-from-data".to_string(),
+                refine.to_string(),
+            )])),
+            None => table,
+        };
+        let pb = crate::spec::PredicateBuilder::new(table.schema().fields());
+        for filter in [
+            Predicate::negate(pb.equal("f", Datum::Double(1.0)).unwrap()),
+            pb.not_equal("f", Datum::Double(1.0)).unwrap(),
+            pb.greater_than("f", Datum::Double(1.5)).unwrap(),
+        ] {
+            let batches: Vec<RecordBatch> = table
+                .new_vector_search_builder()
+                .with_vector_column("embedding")
+                .with_query_vector(vec![1.0, 0.0])
+                .with_limit(1)
+                .with_filter(filter.clone())
+                .execute()
+                .await
+                .unwrap()
+                .new_read_builder()
+                .read()
+                .await
+                .unwrap()
+                .try_collect()
+                .await
+                .unwrap();
+            let ids: Vec<i32> = batches
+                .iter()
+                .flat_map(|batch| {
+                    batch
+                        .column_by_name("id")
+                        .unwrap()
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .unwrap()
+                        .values()
+                        .to_vec()
+                })
+                .collect();
+            assert_eq!(ids, vec![1], "{index_type} {refine_from_data:?} {filter}");
+        }
+    }
+}
