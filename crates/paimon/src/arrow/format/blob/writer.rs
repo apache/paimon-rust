@@ -136,6 +136,7 @@ impl FormatWriterFactory for BlobWriterFactory {
 
 pub(crate) struct BlobFormatWriter {
     writer: Box<dyn FileWrite>,
+    /// Reads descriptor sources from origin: other writers own them and may replace them.
     file_io: Option<FileIO>,
     kind: BlobFieldKind,
     path: String,
@@ -180,7 +181,7 @@ impl BlobFormatWriter {
         }
         Ok(Self {
             writer,
-            file_io,
+            file_io: file_io.map(|file_io| file_io.origin_only()),
             kind,
             path: output.location().to_string(),
             field_name: field.map_or_else(String::new, |field| field.name().to_string()),

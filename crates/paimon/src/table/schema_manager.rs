@@ -72,6 +72,15 @@ impl SchemaManager {
         Self::new(self.file_io.clone(), branch_path)
     }
 
+    /// This manager reading through `file_io`, sharing the cache of loaded schemas.
+    pub(crate) fn with_file_io(&self, file_io: FileIO) -> Self {
+        Self {
+            file_io,
+            table_path: self.table_path.clone(),
+            cache: self.cache.clone(),
+        }
+    }
+
     /// Path to a specific schema file (e.g. `{table_path}/schema/schema-0`).
     pub fn schema_path(&self, schema_id: i64) -> String {
         format!("{}/{}{}", self.schema_directory(), SCHEMA_PREFIX, schema_id)

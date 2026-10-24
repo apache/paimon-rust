@@ -94,6 +94,8 @@ mod incremental_scan;
 pub(crate) mod index_file_path;
 mod inline_blob;
 mod instant;
+#[cfg(all(test, feature = "storage-oss"))]
+mod io_cache_routing_tests;
 mod kv_file_reader;
 mod kv_file_writer;
 mod lumina_index_build_builder;
@@ -288,7 +290,7 @@ pub use vector_search_builder::VectorSearchBuilder;
 pub use write_builder::WriteBuilder;
 
 use crate::catalog::{validate_branch_name, Identifier, DEFAULT_MAIN_BRANCH};
-use crate::io::FileIO;
+use crate::io::{FileIO, SchemaFilePrefixes};
 use crate::spec::{
     CoreOptions, DataField, Snapshot, TableSchema, SCAN_SNAPSHOT_ID_OPTION, SCAN_TAG_NAME_OPTION,
     SCAN_TIMESTAMP_MILLIS_OPTION, SCAN_TIMESTAMP_OPTION, SCAN_VERSION_OPTION,
@@ -338,6 +340,33 @@ pub struct Table {
     applied_dynamic_option_keys: HashSet<String>,
 }
 
+// Format Table files may be replaced in place under the same name, so they never use io-cache;
+// other tables tell io-cache routing the prefixes their data files are named with.
+fn table_file_io(file_io: &FileIO, schema: &TableSchema) -> FileIO {
+    let options = CoreOptions::new(schema.options());
+    if options.is_format_table() {
+        return file_io.origin_only();
+    }
+    file_io.with_file_prefixes([options.data_file_prefix(), options.changelog_file_prefix()])
+}
+
+// Data files committed before a prefix option changed keep using io-cache; the schemas are read
+// from origin on the first request that may use io-cache.
+fn with_schema_history(file_io: &FileIO, schema_manager: &SchemaManager) -> FileIO {
+    let schemas = schema_manager.with_file_io(file_io.origin_only());
+    file_io.with_schema_file_prefixes(SchemaFilePrefixes::new(move || {
+        let schemas = schemas.clone();
+        async move {
+            let schemas = schemas.list_all().await?;
+            let prefixes = schemas.iter().flat_map(|schema| {
+                let options = CoreOptions::new(schema.options());
+                [options.data_file_prefix(), options.changelog_file_prefix()].map(String::from)
+            });
+            Ok(prefixes.collect())
+        }
+    }))
+}
+
 impl Table {
     /// Create a new table.
     pub fn new(
@@ -347,7 +376,9 @@ impl Table {
         schema: TableSchema,
         rest_env: Option<RESTEnv>,
     ) -> Self {
+        let file_io = table_file_io(&file_io, &schema);
         let schema_manager = SchemaManager::new(file_io.clone(), location.clone());
+        let file_io = with_schema_history(&file_io, &schema_manager);
         let branch = DEFAULT_MAIN_BRANCH.to_string();
         Self {
             file_io,
@@ -384,12 +415,14 @@ impl Table {
         identifier.validate()?;
         validate_branch_name(&branch)?;
         schema.validate_resolved_structure()?;
+        let file_io = table_file_io(&file_io, &schema);
         let schema_manager = SchemaManager::new(file_io.clone(), location.clone());
         let schema_manager = if branch == DEFAULT_MAIN_BRANCH {
             schema_manager
         } else {
             schema_manager.with_branch(&branch)
         };
+        let file_io = with_schema_history(&file_io, &schema_manager);
         let branch_reference = branch != DEFAULT_MAIN_BRANCH;
 
         Ok(Self {
@@ -741,11 +774,12 @@ impl Table {
                 || k == "scan.mode"
                 || k == "incremental-between-timestamp"
         });
+        let schema = self.schema.copy_with_options(extra);
         Self {
-            file_io: self.file_io.clone(),
+            file_io: table_file_io(&self.file_io, &schema),
             identifier: self.identifier.clone(),
             location: self.location.clone(),
-            schema: self.schema.copy_with_options(extra),
+            schema,
             schema_manager: self.schema_manager.clone(),
             branch: self.branch.clone(),
             branch_reference: self.branch_reference,
@@ -798,6 +832,7 @@ impl Table {
             .iter()
             .any(|key| schema.options().get(*key) != self.schema.options().get(*key));
             return Ok(Self {
+                file_io: table_file_io(&self.file_io, &schema),
                 schema,
                 travel_snapshot: if changed {
                     None
@@ -814,7 +849,14 @@ impl Table {
         } else {
             schema_manager.with_branch(branch)
         };
+        let file_io = table_file_io(&self.file_io, &schema);
+        let file_io = if branch == self.branch {
+            file_io
+        } else {
+            with_schema_history(&file_io, &schema_manager)
+        };
         Ok(Self {
+            file_io,
             schema,
             schema_manager,
             branch: branch.to_string(),
@@ -1125,6 +1167,7 @@ impl Table {
             } else {
                 schema_manager.with_branch(&branch)
             };
+            table.file_io = with_schema_history(&table.file_io, &table.schema_manager);
             let mut options = table.schema.options().clone();
             options.insert("branch".to_string(), branch);
             table.schema = table.schema.copy_with_replaced_options(options);
@@ -1145,7 +1188,7 @@ impl Table {
         let mut options = schema.options().clone();
         options.insert("branch".to_string(), branch.clone());
         Ok(Self {
-            file_io: self.file_io.clone(),
+            file_io: with_schema_history(&self.file_io, &schema_manager),
             identifier: self.identifier.clone(),
             location: self.location.clone(),
             schema: schema.copy_with_replaced_options(options),

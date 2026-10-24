@@ -1397,6 +1397,8 @@ async fn resolve_descriptor_columns(
     file_io: &FileIO,
     limiter: &BlobReadLimiter,
 ) -> crate::Result<RecordBatch> {
+    // Descriptor fields reference objects the table does not own, which may be replaced.
+    let file_io = file_io.origin_only();
     resolve_descriptor_columns_with(
         batch,
         blob_descriptor_fields,
