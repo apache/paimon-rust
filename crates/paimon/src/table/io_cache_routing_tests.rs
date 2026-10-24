@@ -31,7 +31,7 @@ use crate::catalog::{Catalog, FileSystemCatalog, Identifier, LoadedTable};
 use crate::common::{CatalogOptions, Options};
 use crate::io::oss_test_server::TestOss;
 use crate::io::FileIOBuilder;
-use crate::spec::{BlobType, DataType, IntType, Schema, SchemaBuilder};
+use crate::spec::{BlobDescriptor, BlobType, DataType, IntType, Schema, SchemaBuilder};
 
 const WAREHOUSE: &str = "bkt/warehouse";
 const FILE_NAME: &str = "data-123e4567-e89b-12d3-a456-426614174000-1.parquet";
@@ -75,15 +75,20 @@ async fn create_table(catalog: &FileSystemCatalog, name: &str, schema: Schema) -
     catalog.get_table(&identifier).await.unwrap()
 }
 
+/// Options of a client without io-cache routing, which only talks to `server`.
+fn plain_options(server: &TestOss) -> [(&str, &str); 4] {
+    [
+        ("fs.oss.endpoint", server.endpoint()),
+        ("fs.oss.accessKeyId", "ak"),
+        ("fs.oss.accessKeySecret", "sk"),
+        ("fs.oss.path-style-access", "true"),
+    ]
+}
+
 /// Writes `content` to `path` on `server` only, so the other endpoint keeps what it had.
 async fn put(server: &TestOss, path: &str, content: Bytes) {
     let file_io = FileIOBuilder::new("oss")
-        .with_props([
-            ("fs.oss.endpoint", server.endpoint()),
-            ("fs.oss.accessKeyId", "ak"),
-            ("fs.oss.accessKeySecret", "sk"),
-            ("fs.oss.path-style-access", "true"),
-        ])
+        .with_props(plain_options(server))
         .build()
         .unwrap();
     file_io
@@ -344,37 +349,36 @@ async fn postpone_bucket_files_use_the_target() {
     assert_eq!(methods(&origin.take_requests(), file), Vec::<String>::new());
 }
 
-#[tokio::test]
-async fn managed_blob_packs_use_the_target() {
-    let origin = TestOss::start().await;
-    let cache = TestOss::start_sharing(&origin).await;
-    let catalog = data_target_catalog(&origin, &cache).await;
-    let schema = Schema::builder()
+fn blob_schema() -> SchemaBuilder {
+    Schema::builder()
         .column("id", DataType::Int(IntType::new()))
         .column("payload", DataType::Blob(BlobType::new()))
+}
+
+/// A primary-key table, which copies its BLOBs into managed packs.
+fn pk_blob_schema() -> SchemaBuilder {
+    blob_schema()
         .primary_key(["id"])
         .option("bucket", "1")
         .option("file.format", "parquet")
-        .build()
-        .unwrap();
-    let table = create_table(&catalog, "managed_blob", schema).await;
+}
 
-    let batch = RecordBatch::try_new(
+fn blob_batch(ids: &[i32], payloads: &[&[u8]]) -> RecordBatch {
+    RecordBatch::try_new(
         Arc::new(ArrowSchema::new(vec![
             ArrowField::new("id", ArrowDataType::Int32, false),
             ArrowField::new("payload", ArrowDataType::LargeBinary, true),
         ])),
         vec![
-            Arc::new(Int32Array::from(vec![1, 2])),
-            Arc::new(LargeBinaryArray::from(vec![
-                Some(b"hello".as_slice()),
-                Some(b"world".as_slice()),
-            ])),
+            Arc::new(Int32Array::from(ids.to_vec())),
+            Arc::new(LargeBinaryArray::from(payloads.to_vec())),
         ],
     )
-    .unwrap();
-    write_and_commit(&table, &batch).await;
-    let payloads: Vec<Vec<u8>> = read(&table)
+    .unwrap()
+}
+
+async fn payloads(table: &Table) -> Vec<Vec<u8>> {
+    read(table)
         .await
         .iter()
         .flat_map(|batch| {
@@ -384,12 +388,84 @@ async fn managed_blob_packs_use_the_target() {
                 .map(|row| column.value(row).to_vec())
                 .collect::<Vec<_>>()
         })
-        .collect();
-    assert_eq!(payloads, [b"hello".to_vec(), b"world".to_vec()]);
+        .collect()
+}
+
+#[tokio::test]
+async fn managed_blob_packs_use_the_target() {
+    let origin = TestOss::start().await;
+    let cache = TestOss::start_sharing(&origin).await;
+    let catalog = data_target_catalog(&origin, &cache).await;
+    let table = create_table(&catalog, "managed_blob", pk_blob_schema().build().unwrap()).await;
+
+    write_and_commit(&table, &blob_batch(&[1, 2], &[b"hello", b"world"])).await;
+    assert_eq!(
+        payloads(&table).await,
+        [b"hello".to_vec(), b"world".to_vec()]
+    );
 
     assert_reads_and_writes(&cache.take_requests(), ".managed.blob");
     assert_eq!(
         methods(&origin.take_requests(), ".managed.blob"),
         Vec::<String>::new()
     );
+}
+
+#[tokio::test]
+async fn blob_descriptor_sources_are_read_from_origin() {
+    let origin = TestOss::start().await;
+    let cache = TestOss::start_sharing(&origin).await;
+    let catalog = data_target_catalog(&origin, &cache).await;
+    let mut plain = Options::new();
+    plain.set(CatalogOptions::WAREHOUSE, format!("oss://{WAREHOUSE}"));
+    for (key, value) in plain_options(&origin) {
+        plain.set(key, value);
+    }
+    let origin_catalog = FileSystemCatalog::new(plain).unwrap();
+    // Primary-key tables copy descriptor sources into managed packs, append tables into .blob files.
+    let append_blob_schema = blob_schema()
+        .option("data-evolution.enabled", "true")
+        .option("row-tracking.enabled", "true");
+    for (name, schema) in [
+        ("pk_blob", pk_blob_schema()),
+        ("append_blob", append_blob_schema),
+    ] {
+        let table = create_table(&catalog, name, schema.build().unwrap()).await;
+        // An import job owns the source; the target kept the copy from before origin replaced it.
+        let source =
+            format!("oss://bkt/import/{name}/data-123e4567-e89b-12d3-a456-426614174000-1.png");
+        let key = source.strip_prefix("oss://").unwrap();
+        put(&origin, &source, Bytes::from("NEW")).await;
+        cache.retain(key, Bytes::from("OLD"));
+        origin.take_requests();
+        cache.take_requests();
+
+        let descriptor = BlobDescriptor::new(source.clone(), 0, 3).serialize();
+        write_and_commit(&table, &blob_batch(&[1], &[&descriptor])).await;
+        let (origin_requests, cache_requests) = (origin.take_requests(), cache.take_requests());
+        assert_eq!(methods(&origin_requests, key), ["GET"], "{name}");
+        assert_eq!(
+            methods(&cache_requests, key),
+            Vec::<String>::new(),
+            "{name}"
+        );
+        // The copy is a new immutable file of the table, so it is still written to the target.
+        let blob_puts = |requests: &[String]| {
+            requests
+                .iter()
+                .filter(|request| request.starts_with("PUT ") && request.ends_with(".blob"))
+                .count()
+        };
+        assert_eq!(blob_puts(&cache_requests), 1, "{name}: {cache_requests:?}");
+        assert_eq!(
+            blob_puts(&origin_requests),
+            0,
+            "{name}: {origin_requests:?}"
+        );
+
+        assert_eq!(payloads(&table).await, [b"NEW".to_vec()], "{name}");
+        let identifier = Identifier::new("db", name);
+        let origin_table = origin_catalog.get_table(&identifier).await.unwrap();
+        assert_eq!(payloads(&origin_table).await, [b"NEW".to_vec()], "{name}");
+    }
 }

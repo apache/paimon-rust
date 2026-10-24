@@ -35,6 +35,7 @@ struct ServerState {
     requests: Mutex<Vec<String>>,
     unavailable: AtomicBool,
     hidden: Mutex<BTreeSet<String>>,
+    retained: Objects,
 }
 
 pub(crate) struct TestOss {
@@ -91,6 +92,15 @@ impl TestOss {
             .lock()
             .unwrap()
             .insert(bucket_and_key.to_string());
+    }
+
+    /// Answers HEAD and GET of `bucket_and_key` with `content`, like a cache that kept an old copy.
+    pub(crate) fn retain(&self, bucket_and_key: &str, content: Bytes) {
+        self.state
+            .retained
+            .lock()
+            .unwrap()
+            .insert(bucket_and_key.to_string(), content);
     }
 
     /// Requests served so far, as `METHOD bucket/key`, or `LIST bucket/prefix`.
@@ -165,7 +175,9 @@ async fn handle(
         }
         Method::HEAD | Method::GET => {
             let hidden = state.hidden.lock().unwrap().contains(&path);
-            let Some(data) = objects.get(&path).cloned().filter(|_| !hidden) else {
+            let retained = state.retained.lock().unwrap().get(&path).cloned();
+            let Some(data) = retained.or_else(|| objects.get(&path).cloned().filter(|_| !hidden))
+            else {
                 return error(StatusCode::NOT_FOUND, "NoSuchKey");
             };
             if method == Method::HEAD {
