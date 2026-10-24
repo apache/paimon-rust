@@ -4770,6 +4770,7 @@ dependencies = [
  "flate2",
  "futures",
  "log",
+ "opendal-core",
  "paimon",
  "paimon-ftindex-core",
  "parquet",
