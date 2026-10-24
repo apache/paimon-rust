@@ -227,10 +227,11 @@ impl ExtensionPlanner for VariantExtractionExtensionPlanner {
             read_builder.with_limit(limit);
         }
         let scan = read_builder.new_scan();
-        let (plan, scan_trace) = await_with_runtime(scan.plan_with_trace())
+        let plan = await_with_runtime(scan.plan())
             .await
             .map_err(to_datafusion_error)?;
 
+        let scan_stats = Some(plan.stats().clone());
         let splits = plan.into_splits();
         let target = session_state.config_options().execution.target_partitions;
         let planned_partitions: Vec<Arc<[_]>> = if splits.is_empty() {
@@ -256,7 +257,7 @@ impl ExtensionPlanner for VariantExtractionExtensionPlanner {
             planned_partitions,
             pushed_limit,
             filter_exact,
-            Some(scan_trace),
+            scan_stats,
             Some(node.pushed_variants.clone()),
             case_sensitive,
         )?)))
@@ -389,7 +390,7 @@ fn build_projection_rewrite(
         .transpose()?;
 
     let arrow_schema =
-        paimon::arrow::build_target_arrow_schema(&read_type).map_err(to_datafusion_error)?;
+        paimon::arrow::build_read_arrow_schema(&read_type).map_err(to_datafusion_error)?;
     let schema = Arc::new(DFSchema::try_from_qualified_schema(
         scan.table_name.clone(),
         arrow_schema.as_ref(),

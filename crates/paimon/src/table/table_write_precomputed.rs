@@ -18,7 +18,7 @@
 //! Java TableWrite.write(row, bucket) for groups assigned upstream.
 
 use super::{BucketAssignerEnum, CoreOptions, RecordBatch, Result, TableWrite};
-use crate::spec::{batch_to_serialized_bytes, EMPTY_SERIALIZED_ROW, MAX_DYNAMIC_BUCKETS};
+use crate::spec::MAX_DYNAMIC_BUCKETS;
 
 fn invalid(message: impl Into<String>) -> crate::Error {
     crate::Error::DataInvalid {
@@ -63,24 +63,12 @@ impl TableWrite {
                 upper_bound - 1,
             )));
         }
-        let Some(batch) = self.normalize_write_batch(batch)? else {
+        let filtered = self.filter_write_input(batch)?;
+        let input = filtered.as_ref().unwrap_or(batch);
+        let Some(batch) = self.normalize_filtered_write_batch(input)? else {
             return Ok(());
         };
-        let partition_indices = self
-            .partition_keys
-            .iter()
-            .map(|name| {
-                self.write_fields
-                    .iter()
-                    .position(|field| field.name() == name)
-                    .unwrap()
-            })
-            .collect::<Vec<_>>();
-        let partitions = if partition_indices.is_empty() {
-            vec![EMPTY_SERIALIZED_ROW.clone(); batch.num_rows()]
-        } else {
-            batch_to_serialized_bytes(&batch, &partition_indices, &self.write_fields)?
-        };
+        let partitions = self.precomputed_partition_bytes(input, &batch)?;
         let partition = &partitions[0];
         if partitions.iter().any(|actual| actual != partition) {
             return Err(invalid(

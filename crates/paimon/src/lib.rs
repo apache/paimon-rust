@@ -54,7 +54,7 @@ pub use table::{
     DataSplit, DataSplitBuilder, DeletionFile, IncrementalPlan, IncrementalScan,
     IncrementalScanMode, IncrementalSplit, PartitionBucket, Plan, PostponeBucketPlan,
     PostponeFixedBucketTableCommit, PostponeFixedBucketTableWrite, RESTEnv, RESTSnapshotCommit,
-    ReadBuilder, RenamingSnapshotCommit, RowRange, ScanTrace, SnapshotCommit, SnapshotManager,
+    ReadBuilder, RenamingSnapshotCommit, RowRange, ScanStats, SnapshotCommit, SnapshotManager,
     Table, TableCommit, TableRead, TableScan, TableUpdate, TableUpdateByRowId, TableWrite,
     TagManager, WriteBuilder,
 };

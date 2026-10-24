@@ -89,7 +89,7 @@ impl CatalogFactory {
             .unwrap_or(METASTORE_FILESYSTEM);
 
         match metastore {
-            METASTORE_FILESYSTEM => Self::create_filesystem_catalog(options),
+            METASTORE_FILESYSTEM => Self::create_filesystem_catalog(options).await,
             METASTORE_REST => Self::create_rest_catalog(options).await,
             _ => ConfigInvalidSnafu {
                 message: format!(
@@ -101,8 +101,13 @@ impl CatalogFactory {
     }
 
     /// Create a filesystem catalog.
-    fn create_filesystem_catalog(options: Options) -> Result<Arc<dyn Catalog>> {
-        let catalog = FileSystemCatalog::new(options)?;
+    async fn create_filesystem_catalog(options: Options) -> Result<Arc<dyn Catalog>> {
+        let catalog = tokio::task::spawn_blocking(move || FileSystemCatalog::new(options))
+            .await
+            .map_err(|error| crate::Error::UnexpectedError {
+                message: "Filesystem catalog initialization task failed".into(),
+                source: Some(Box::new(error)),
+            })??;
         Ok(Arc::new(catalog))
     }
 
@@ -138,6 +143,54 @@ mod tests {
 
         let result = CatalogFactory::create(options).await;
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_shared_cache_factory_init_does_not_block_current_thread_runtime() {
+        use std::fs::File;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut options = Options::new();
+        options.set(
+            CatalogOptions::WAREHOUSE,
+            directory.path().join("warehouse").to_str().unwrap(),
+        );
+        options.set(CatalogOptions::LOCAL_CACHE_ENABLED, "true");
+        options.set(CatalogOptions::LOCAL_CACHE_SHARED, "true");
+        options.set(CatalogOptions::LOCAL_CACHE_MAX_SIZE, "1 MiB");
+        options.set(
+            CatalogOptions::LOCAL_CACHE_DIR,
+            directory.path().to_str().unwrap(),
+        );
+        drop(FileSystemCatalog::new(options.clone()).unwrap());
+        let gate = File::open(
+            directory
+                .path()
+                .join("paimon-shared-local-cache-v1/directory.lock"),
+        )
+        .unwrap();
+        gate.lock().unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        let catalog_thread = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    tx.send(()).unwrap();
+                });
+                CatalogFactory::create(options).await.unwrap();
+            });
+        });
+        let runtime_progressed = rx.recv_timeout(Duration::from_secs(2)).is_ok();
+        drop(gate);
+        catalog_thread.join().unwrap();
+        assert!(runtime_progressed, "catalog factory blocked the runtime");
     }
 
     #[tokio::test]

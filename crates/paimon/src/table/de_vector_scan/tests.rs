@@ -23,7 +23,7 @@ use crate::table::vector_search_test_utils::{
     de_vector_table, id_gt_filter, vector_test_table, vector_test_table_at,
 };
 use crate::table::{TableCommit, TableWrite};
-use crate::vector_search::SearchResult;
+use crate::vector_search::GlobalIndexResult;
 use arrow_array::builder::{Float32Builder, ListBuilder};
 use arrow_array::{ArrayRef, Float32Array, Int32Array, RecordBatch};
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
@@ -341,7 +341,7 @@ async fn de_scalar_filter_with_no_matching_rows_returns_empty() {
         .await
         .unwrap();
     assert_eq!(results.len(), 2);
-    assert!(results.iter().all(SearchResult::is_empty));
+    assert!(results.iter().all(GlobalIndexResult::is_empty));
 }
 
 #[tokio::test]
@@ -642,4 +642,368 @@ async fn scalar_coverage_gaps_follow_scalar_and_vector_modes() {
             }
         }
     }
+}
+
+#[tokio::test]
+async fn source_plan_round_trip_allows_reader_queries_limits_and_filters() {
+    let table = de_vector_table().await;
+    let mut builder = table.new_vector_search_builder();
+    builder.with_vector_column("embedding");
+    let exported = builder.new_scan().unwrap().plan().await.unwrap();
+    let constructed =
+        crate::table::VectorScanPlan::new(exported.snapshot().cloned(), exported.splits().to_vec())
+            .unwrap();
+    let wire = serde_json::to_vec(&constructed).unwrap();
+    let restored: crate::table::VectorScanPlan = serde_json::from_slice(&wire).unwrap();
+    assert_eq!(restored.snapshot(), exported.snapshot());
+    assert_eq!(
+        serde_json::to_value(restored.splits()).unwrap(),
+        serde_json::to_value(exported.splits()).unwrap()
+    );
+
+    for query in [vec![1.0, 0.0], vec![0.0, 1.0]] {
+        let mut filtered = table.new_vector_search_builder();
+        filtered
+            .with_vector_column("embedding")
+            .with_query_vector(query)
+            .with_limit(1)
+            .with_filter(id_gt_filter(&table, 1))
+            .with_options(HashMap::from([("ivf.nprobe".into(), "2".into())]));
+        let expected = filtered.execute().await.unwrap();
+        let actual = filtered
+            .new_read()
+            .unwrap()
+            .read(restored.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            actual.row_ids().unwrap().row_ids,
+            expected.row_ids().unwrap().row_ids
+        );
+        assert_eq!(
+            actual.row_ids().unwrap().scores,
+            expected.row_ids().unwrap().scores
+        );
+    }
+}
+
+#[tokio::test]
+async fn explicit_raw_sources_and_empty_sources_never_discover_other_work() {
+    let table = de_vector_table().await;
+    let snapshot = table.resolve_read_snapshot().await.unwrap().unwrap();
+    let source = crate::table::SearchScanSplit::Raw {
+        row_ranges: vec![crate::table::RowRange::new(1, 1)],
+        scalar_index_files: vec![],
+        index_type: Some("ivf-flat".into()),
+    };
+    let plan = crate::table::VectorScanPlan::new(Some(snapshot.clone()), vec![source]).unwrap();
+    // The reader's default FAST mode must not reinterpret an explicit raw source
+    // as absent, nor add the index shards present in the snapshot manifest.
+    let mut builder = table.new_batch_vector_search_builder();
+    builder
+        .with_vector_column("embedding")
+        .with_query_vectors(vec![vec![1.0, 0.0], vec![0.0, 1.0]])
+        .with_limit(3);
+    let reader = builder.new_read().unwrap();
+    for result in reader.read(plan).await.unwrap() {
+        assert_eq!(result.row_ids().unwrap().row_ids, vec![1]);
+        assert_eq!(result.snapshot_id(), Some(snapshot.id()));
+    }
+    for snapshot in [Some(snapshot), None] {
+        let expected_id = snapshot.as_ref().map(crate::spec::Snapshot::id);
+        let plan = crate::table::VectorScanPlan::new(snapshot, vec![]).unwrap();
+        let results = reader.read(plan).await.unwrap();
+        assert_eq!(results.len(), 2);
+        for result in results {
+            assert!(result.is_empty());
+            assert_eq!(result.snapshot_id(), expected_id);
+        }
+    }
+}
+
+#[tokio::test]
+async fn transported_vector_sources_pin_snapshot_and_keep_bound_read_schema() {
+    let table = de_vector_table().await;
+    // The fixture bypasses a catalog and holds schema zero only in memory.
+    // A renamed reader must be able to load the historical data-file schema.
+    table
+        .file_io()
+        .new_output(&table.schema_manager().schema_path(table.schema().id()))
+        .unwrap()
+        .write(serde_json::to_vec(table.schema()).unwrap().into())
+        .await
+        .unwrap();
+    let mut old_builder = table.new_vector_search_builder();
+    old_builder.with_vector_column("embedding");
+    let plan = old_builder.new_scan().unwrap().plan().await.unwrap();
+    let schema = table
+        .schema()
+        .apply_changes(vec![crate::spec::SchemaChange::rename_column(
+            "embedding".into(),
+            "renamed_vector".into(),
+        )])
+        .unwrap();
+    let renamed = table
+        .copy_with_resolved_schema(schema, table.branch())
+        .unwrap();
+    let mut builder = renamed.new_vector_search_builder();
+    builder
+        .with_vector_column("renamed_vector")
+        .with_query_vector(vec![1.0, 0.0])
+        .with_limit(3)
+        .with_options(HashMap::from([
+            ("refine_factor".into(), "2".into()),
+            ("ivf.nprobe".into(), "2".into()),
+        ]));
+    let renamed_plan = builder.new_scan().unwrap().plan().await.unwrap();
+    assert_eq!(renamed_plan.snapshot_id(), plan.snapshot_id());
+    let captured_id = plan.snapshot_id().unwrap();
+    let wire = serde_json::to_vec(&plan).unwrap();
+    // Snapshot JSON is unnecessary after capture, including on another process.
+    let manager = table.snapshot_manager();
+    for id in manager.list_all_ids().await.unwrap() {
+        table
+            .file_io()
+            .delete_file(&manager.snapshot_path(id))
+            .await
+            .unwrap();
+    }
+    let plan: crate::table::VectorScanPlan = serde_json::from_slice(&wire).unwrap();
+    let result = builder.new_read().unwrap().read(plan).await.unwrap();
+    assert_eq!(result.snapshot_id(), Some(captured_id));
+    assert_eq!(result.row_ids().unwrap().row_ids.len(), 3);
+    let batches: Vec<RecordBatch> = result
+        .new_read_builder()
+        .read()
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert!(batches
+        .iter()
+        .all(|batch| batch.column_by_name("renamed_vector").is_some()
+            && batch.column_by_name("embedding").is_none()));
+}
+
+#[test]
+fn transported_vector_plan_rejects_missing_snapshot_and_invalid_ranges() {
+    let raw = crate::table::SearchScanSplit::Raw {
+        row_ranges: vec![crate::table::RowRange::new(0, 0)],
+        scalar_index_files: vec![],
+        index_type: None,
+    };
+    assert!(crate::table::VectorScanPlan::new(None, vec![raw.clone()]).is_err());
+    let wire =
+        serde_json::json!({"snapshot": null, "splits": [serde_json::to_value(raw).unwrap()]});
+    assert!(serde_json::from_value::<crate::table::VectorScanPlan>(wire).is_err());
+}
+
+#[tokio::test]
+async fn transported_vector_sources_apply_snapshot_deletion_vectors() {
+    let table = de_vector_table().await.copy_with_options(HashMap::from([(
+        "deletion-vectors.enabled".into(),
+        "true".into(),
+    )]));
+    let write = table.new_write_builder();
+    let delete = write.new_update().unwrap();
+    write
+        .new_commit()
+        .commit(delete.delete_by_row_id(vec![0]).await.unwrap())
+        .await
+        .unwrap();
+    let mut builder = table.new_vector_search_builder();
+    builder
+        .with_vector_column("embedding")
+        .with_query_vector(vec![1.0, 0.0])
+        .with_limit(3)
+        .with_options(HashMap::from([("ivf.nprobe".into(), "2".into())]));
+    let exported = builder.new_scan().unwrap().plan().await.unwrap();
+    let plan = serde_json::from_slice(&serde_json::to_vec(&exported).unwrap()).unwrap();
+    let reader = builder.new_read().unwrap();
+    let indexed = reader.read(plan).await.unwrap();
+    let mut expected = indexed.row_ids().unwrap().row_ids.clone();
+    expected.sort_unstable();
+    assert_eq!(expected, vec![1, 2]);
+    let raw = crate::table::VectorScanPlan::new(
+        exported.snapshot().cloned(),
+        vec![crate::table::SearchScanSplit::Raw {
+            row_ranges: vec![crate::table::RowRange::new(0, 2)],
+            scalar_index_files: vec![],
+            index_type: Some("ivf-flat".into()),
+        }],
+    )
+    .unwrap();
+    let actual = reader.read(raw).await.unwrap();
+    let mut actual = actual.row_ids().unwrap().row_ids.clone();
+    actual.sort_unstable();
+    assert_eq!(actual, expected);
+}
+
+#[tokio::test]
+async fn reader_partition_filter_is_intersected_with_scalar_candidates() {
+    use crate::spec::{
+        ArrayType, DataType, Datum, FloatType, IntType, PredicateBuilder, Schema, TableSchema,
+    };
+    let schema = Schema::builder()
+        .column("p", DataType::Int(IntType::new()))
+        .column("id", DataType::Int(IntType::new()))
+        .column(
+            "embedding",
+            DataType::Array(ArrayType::new(DataType::Float(FloatType::new()))),
+        )
+        .partition_keys(["p"])
+        .option("row-tracking.enabled", "true")
+        .option("data-evolution.enabled", "true")
+        .option("global-index.enabled", "true")
+        .option("ivf-flat.dimension", "2")
+        .option("ivf-flat.nlist", "1")
+        .build()
+        .unwrap();
+    let table = Table::new(
+        crate::io::FileIOBuilder::new("memory").build().unwrap(),
+        crate::catalog::Identifier::new("default", "partition_source"),
+        "memory:/partition_source".into(),
+        TableSchema::new(0, &schema),
+        None,
+    );
+    let element = Arc::new(ArrowField::new("element", ArrowDataType::Float32, true));
+    let mut vectors = ListBuilder::new(Float32Builder::new()).with_field(element.clone());
+    for vector in [[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]] {
+        vectors.values().append_slice(&vector);
+        vectors.append(true);
+    }
+    let batch = RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("p", ArrowDataType::Int32, false),
+            ArrowField::new("id", ArrowDataType::Int32, false),
+            ArrowField::new("embedding", ArrowDataType::List(element), true),
+        ])),
+        vec![
+            Arc::new(Int32Array::from(vec![0, 1, 1])),
+            Arc::new(Int32Array::from(vec![3, 2, 3])),
+            Arc::new(vectors.finish()),
+        ],
+    )
+    .unwrap();
+    let mut writer = TableWrite::new(&table, "partition_source".into()).unwrap();
+    writer.write_arrow_batch(&batch).await.unwrap();
+    TableCommit::new(table.clone(), "partition_source".into())
+        .commit(writer.prepare_commit().await.unwrap())
+        .await
+        .unwrap();
+    for (column, kind) in [("embedding", "ivf-flat"), ("id", "btree")] {
+        table
+            .new_global_index_build_builder()
+            .with_index_column(column)
+            .with_index_type(kind)
+            .execute()
+            .await
+            .unwrap();
+    }
+    let mut builder = table.new_vector_search_builder();
+    builder.with_vector_column("embedding");
+    let exported = builder.new_scan().unwrap().plan().await.unwrap();
+    let predicates = PredicateBuilder::new(table.schema().fields());
+    builder
+        .with_query_vector(vec![1.0, 0.0])
+        .with_limit(3)
+        .with_filter(crate::spec::Predicate::and(vec![
+            predicates.equal("p", Datum::Int(1)).unwrap(),
+            predicates.greater_than("id", Datum::Int(1)).unwrap(),
+        ]));
+    let result = builder.new_read().unwrap().read(exported).await.unwrap();
+    let batches: Vec<RecordBatch> = result
+        .new_read_builder()
+        .read()
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    let mut ids = batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .values()
+                .iter()
+                .copied()
+        })
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    assert_eq!(ids, vec![2, 3]);
+}
+
+#[tokio::test]
+async fn prepared_filter_rejects_a_source_plan_from_another_snapshot() {
+    let table = de_vector_table().await;
+    let prepared = table
+        .prepare_vector_search_filter(id_gt_filter(&table, 1))
+        .await
+        .unwrap();
+    let mut builder = table.new_batch_vector_search_builder();
+    builder
+        .with_vector_column("embedding")
+        .with_query_vectors(vec![vec![1.0, 0.0]])
+        .with_limit(2)
+        .with_prepared_filter(prepared);
+    let empty = crate::table::VectorScanPlan::new(None, vec![]).unwrap();
+    let error = builder.new_read().unwrap().read(empty).await.err().unwrap();
+    assert!(
+        error.to_string().contains("same captured snapshot"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn transported_vector_sources_keep_pk_positions_separate_from_global_ids() {
+    let table = de_vector_table().await;
+    let snapshot = table.resolve_read_snapshot().await.unwrap().unwrap();
+    let split = |snapshot_id| crate::table::SearchScanSplit::PrimaryKey {
+        data_split: crate::table::DataSplitBuilder::new()
+            .with_snapshot(snapshot_id)
+            .with_partition(crate::spec::BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path("memory:/pk_sources/bucket-0".into())
+            .with_data_files(vec![])
+            .build()
+            .unwrap(),
+        payloads: vec![],
+        uncovered_data_files: vec![],
+        row_ranges_by_file: HashMap::new(),
+    };
+    assert!(crate::table::VectorScanPlan::new(
+        Some(snapshot.clone()),
+        vec![split(snapshot.id() + 1)]
+    )
+    .is_err());
+    let plan = crate::table::VectorScanPlan::new(Some(snapshot.clone()), vec![split(0)]).unwrap();
+    let plan = serde_json::from_slice(&serde_json::to_vec(&plan).unwrap()).unwrap();
+    let mut builder = table.new_vector_search_builder();
+    builder
+        .with_vector_column("embedding")
+        .with_query_vector(vec![1.0, 0.0])
+        .with_limit(1);
+    let error = builder.new_read().unwrap().read(plan).await.err().unwrap();
+    assert!(
+        error.to_string().contains("primary-key physical"),
+        "{error}"
+    );
+    let mixed = crate::table::VectorScanPlan::new(
+        Some(snapshot),
+        vec![
+            split(0),
+            crate::table::SearchScanSplit::Raw {
+                row_ranges: vec![crate::table::RowRange::new(0, 0)],
+                scalar_index_files: vec![],
+                index_type: None,
+            },
+        ],
+    );
+    assert!(mixed.is_err());
 }

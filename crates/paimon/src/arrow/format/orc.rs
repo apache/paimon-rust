@@ -477,6 +477,7 @@ fn build_orc_predicate_inner(
     mode: CompoundPredicateMode,
 ) -> Option<orc_rust::predicate::Predicate> {
     match predicate {
+        Predicate::NestedLeaf { .. } => None,
         Predicate::Leaf { .. } => build_orc_leaf_predicate(predicate, file_fields),
         Predicate::And(children) => build_orc_and_predicate(children, file_fields, mode),
         Predicate::Or(children) => build_orc_or_predicate(children, file_fields),

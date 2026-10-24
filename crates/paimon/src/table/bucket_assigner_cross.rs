@@ -81,6 +81,12 @@ impl GlobalPartitionIndex {
         // The cross-partition index reads every primary key.
         crate::spec::CoreOptions::new(table.schema().options()).ensure_read_authorized()?;
 
+        // Read selectors describe the caller's query view, not the state that
+        // the next write extends. Java IndexBootstrap forces a latest scan too.
+        // Pin that state while retaining this writer's schema and field IDs.
+        let snapshot = table.snapshot_manager().get_latest_snapshot().await?;
+        let table = table.copy_with_pinned_snapshot(snapshot.as_ref());
+
         let mut key_to_location: HashMap<Vec<u8>, (Vec<u8>, i32)> = HashMap::new();
         let mut partition_bucket_counts: HashMap<Vec<u8>, BTreeMap<i32, i64>> = HashMap::new();
 

@@ -24,22 +24,24 @@ const TEMP_FILE_SUFFIX_LEN: usize = 41;
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum FileType {
     Meta,
-    Data,
+    DedicatedData,
+    StructuredData,
     BucketIndex,
     GlobalIndex,
     FileIndex,
 }
 
 impl FileType {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 6] = [
         Self::Meta,
-        Self::Data,
+        Self::DedicatedData,
+        Self::StructuredData,
         Self::BucketIndex,
         Self::GlobalIndex,
         Self::FileIndex,
     ];
 
-    /// Mirrors Java `org.apache.paimon.utils.FileType#classify`, including its check order.
+    /// Keeps metadata/index classification ahead of dedicated data detection.
     pub(crate) fn classify(path: &str) -> Self {
         let mut segments = path.rsplit('/');
         let name = unwrap_temp_file_name(segments.next().unwrap_or(path));
@@ -78,7 +80,17 @@ impl FileType {
             return Self::Meta;
         }
 
-        Self::Data
+        if Self::is_dedicated_file(name) {
+            Self::DedicatedData
+        } else {
+            Self::StructuredData
+        }
+    }
+
+    /// Matches Java's BLOB/video and vector-store file naming rules.
+    pub(crate) fn is_dedicated_file(name: &str) -> bool {
+        let name = name.to_ascii_lowercase();
+        name.ends_with(".blob") || name.ends_with(".video") || name.contains(".vector.")
     }
 
     pub(crate) fn is_mutable(path: &str) -> bool {
@@ -107,13 +119,15 @@ impl FileType {
                     "meta" => &[Self::Meta],
                     "global-index" => &[Self::GlobalIndex],
                     "bucket-index" => &[Self::BucketIndex],
-                    "data" => &[Self::Data],
+                    // Preserve the existing broad data selector.
+                    "data" => &[Self::DedicatedData, Self::StructuredData],
+                    "structured-data" => &[Self::StructuredData],
                     "file-index" => &[Self::FileIndex],
                     "" => &[],
                     unknown => {
                         log::warn!(
                             "Unknown local-cache.whitelist value '{}'; supported values are \
-                             meta, global-index, bucket-index, data, file-index, \
+                             meta, global-index, bucket-index, data, structured-data, file-index, \
                              or * for all of them",
                             unknown
                         );
@@ -168,7 +182,7 @@ mod tests {
             ),
             (
                 "s3://bucket/table/bucket-0/data-abc.parquet",
-                FileType::Data,
+                FileType::StructuredData,
             ),
             (
                 "s3://bucket/table/manifest/manifest-123e4567-e89b-12d3-a456-426614174000-0.avro.sidecar",
@@ -182,7 +196,7 @@ mod tests {
             ("s3://bucket/table/changelog/changelog-5", FileType::Meta),
             (
                 "s3://bucket/table/bucket-0/changelog-123e4567-e89b-12d3-a456-426614174000-0.parquet",
-                FileType::Data,
+                FileType::StructuredData,
             ),
             (
                 "s3://bucket/table/snapshot/.snapshot-13.123e4567-e89b-12d3-a456-426614174000.tmp",
@@ -194,7 +208,7 @@ mod tests {
             ),
             (
                 "s3://bucket/table/bucket-0/.data-abc.parquet.123e4567-e89b-12d3-a456-426614174000.tmp",
-                FileType::Data,
+                FileType::StructuredData,
             ),
         ];
 
@@ -249,12 +263,60 @@ mod tests {
     }
 
     #[test]
+    fn test_dedicated_file_classification_keeps_metadata_and_indexes_separate() {
+        for name in [
+            "data.parquet",
+            "data.ORC",
+            "data.avro",
+            "data.row",
+            "data.mosaic",
+            "data.vortex",
+            "data.csv",
+            "data.json",
+            "data.text",
+            "data.csv.gz",
+            "data.JSON.ZST",
+            "data.text.snappy",
+            "data.unknown",
+            "dir.parquet/data",
+        ] {
+            assert_eq!(FileType::classify(name), FileType::StructuredData);
+        }
+        for name in [
+            "data.blob",
+            "data.BLOB",
+            "data.parquet.blob",
+            "data.video",
+            "data.VIDEO",
+            "data.vector.vortex",
+            "data.VECTOR.index-data",
+        ] {
+            assert_eq!(FileType::classify(name), FileType::DedicatedData);
+        }
+        assert_eq!(FileType::classify("manifest-1.avro"), FileType::Meta);
+        assert_eq!(FileType::classify("snapshot-1.parquet"), FileType::Meta);
+        assert_eq!(
+            FileType::classify("data.parquet.index"),
+            FileType::FileIndex
+        );
+        assert_eq!(
+            FileType::parse_whitelist("data"),
+            HashSet::from([FileType::DedicatedData, FileType::StructuredData])
+        );
+        assert_eq!(
+            FileType::parse_whitelist("structured-data"),
+            HashSet::from([FileType::StructuredData])
+        );
+    }
+
+    #[test]
     fn test_file_type_parses_whitelist() {
         let all = HashSet::from([
             FileType::Meta,
             FileType::GlobalIndex,
             FileType::BucketIndex,
-            FileType::Data,
+            FileType::DedicatedData,
+            FileType::StructuredData,
             FileType::FileIndex,
         ]);
 

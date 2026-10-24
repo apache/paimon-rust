@@ -16,15 +16,11 @@
 // under the License.
 
 //! Primary-key full-text search read foundation: the score-based candidate type,
-//! its cross-bucket score-descending Top-K, and the FAST-only materialized read
-//! orchestration (plan the buckets, search each, fuse by score, materialize the
-//! winning physical rows best-score-first with a `__paimon_search_score` column).
+//! its cross-bucket score-descending Top-K, and the FAST-only search over
+//! physical positions. GlobalIndexResult materializes the selected rows later.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
-
-use arrow_array::RecordBatch;
-use futures::{stream, TryStreamExt};
 
 use crate::deletion_vector::DeletionVector;
 use crate::io::FileIO;
@@ -32,12 +28,9 @@ use crate::spec::BinaryRow;
 use crate::table::data_file_reader::DataFileReader;
 use crate::table::pk_full_text_bucket_search::search_bucket;
 use crate::table::pk_full_text_scan::{PrimaryKeyFullTextScanPlan, PrimaryKeyFullTextSearchSplit};
-use crate::table::pk_vector_indexed_split_read::{PkVectorIndexedSplit, PkVectorIndexedSplitRead};
+use crate::table::pk_vector_indexed_split_read::PkVectorIndexedSplit;
 use crate::table::source::DataSplitBuilder;
-use crate::table::vector_search_common::{
-    collect_ranked_rows, reorder_and_strip_position, RankedRow,
-};
-use crate::table::{ArrowRecordBatchStream, RowRange};
+use crate::table::RowRange;
 
 fn data_invalid(message: impl Into<String>) -> crate::Error {
     crate::Error::DataInvalid {
@@ -255,24 +248,19 @@ pub(crate) fn build_full_text_indexed_splits(
 /// [`PrimaryKeyFullTextRead::search_route`].
 pub(crate) struct PrimaryKeyFullTextRouteResult<'a> {
     pub(crate) candidates: Vec<PrimaryKeyFullTextCandidate>,
-    // Read by the hybrid route consumer (fuses routes before materializing); the
-    // materialized read reaches candidates directly and holds the plan itself.
+    // Both shared results and hybrid routes retain the selected snapshot.
     pub(crate) snapshot_id: i64,
     pub(crate) splits: &'a [PrimaryKeyFullTextSearchSplit],
 }
 
-/// FAST-only primary-key full-text materialized read. Given a planned set of
+/// FAST-only primary-key full-text search. Given a planned set of
 /// per-bucket search splits, it searches each bucket through the full-text archive
-/// reader, fuses the hits cross-bucket by score, materializes the winning physical
-/// rows, and re-orders them best-score-first with a `__paimon_search_score` column
-/// (the internal `_PKEY_VECTOR_POSITION` column is stripped). Mirrors Java
-/// `PrimaryKeyFullTextRead` feeding its result splits into an ordinary table read:
-/// the search decides which rows, the reader decides which columns.
+/// reader and fuses physical positions by score. GlobalIndexResult owns the selections
+/// and their later materialization, as Java PrimaryKeyScoredResult does.
 ///
 /// The planning + FAST-mode guard live in the caller (`FullTextSearchBuilder`);
-/// this type is the Table-free search+materialize core (it holds only the
-/// predicate-free materialization reader, the `FileIO`, and the table path for the
-/// archive directory), so it can be driven end-to-end from a hand-built plan.
+/// this type searches a prepared plan. Its data reader loads deletion vectors;
+/// projected user columns are read later by GlobalIndexResult.
 pub(crate) struct PrimaryKeyFullTextRead {
     file_io: FileIO,
     materialize_reader: DataFileReader,
@@ -299,8 +287,8 @@ impl PrimaryKeyFullTextRead {
     /// best-score-first Top-`limit`, WITHOUT materializing any rows. Returns the
     /// surviving candidates together with the route source context (the plan's
     /// resolved snapshot id and its per-bucket source splits) so a caller can fuse
-    /// them with another route before materializing. [`read`](Self::read) is
-    /// layered on top of this. `query` is passed verbatim to the archive reader
+    /// them with another route before materializing through GlobalIndexResult.
+    /// `query` is passed verbatim to the archive reader
     /// (spec D2).
     pub(crate) async fn search_route<'p>(
         &self,
@@ -361,71 +349,6 @@ impl PrimaryKeyFullTextRead {
             snapshot_id: plan.snapshot_id,
             splits: &plan.splits,
         })
-    }
-
-    /// Search every planned bucket, fuse the hits by score into a global Top-`limit`,
-    /// materialize the winning rows, and emit them best-score-first with the
-    /// unified score column. An empty plan or an empty result yields an empty
-    /// stream. `query` is passed verbatim to the archive reader (spec D2).
-    pub(crate) async fn read(
-        &self,
-        plan: &PrimaryKeyFullTextScanPlan,
-        query: &str,
-        limit: usize,
-    ) -> crate::Result<ArrowRecordBatchStream> {
-        let survivors = self.search_route(plan, query, limit).await?.candidates;
-        if survivors.is_empty() {
-            return Ok(Box::pin(stream::empty()));
-        }
-
-        // Rank each survivor by its best-first position, keyed by its FULL physical
-        // position `(partition bytes, bucket, file, row position)` so the physical
-        // materialization order can be reduced back to best-first (gap 8). Keying on
-        // just file+position would collide across partitions/buckets.
-        let mut rank_of: HashMap<(Vec<u8>, i32, String, i64), usize> = HashMap::new();
-        for (rank, c) in survivors.iter().enumerate() {
-            rank_of.insert(
-                (
-                    c.partition.to_serialized_bytes(),
-                    c.bucket,
-                    c.data_file_name.clone(),
-                    c.row_position,
-                ),
-                rank,
-            );
-        }
-
-        let indexed_splits = build_full_text_indexed_splits(survivors, &plan.splits)?;
-
-        // Materialize every indexed split, retaining each batch and, per row, the
-        // (rank, batch_index, row_index) tuple so we can reorder to best-first.
-        // Top-K is small, so full in-memory collection is acceptable.
-        let mut batches: Vec<RecordBatch> = Vec::new();
-        let mut ranked: Vec<RankedRow> = Vec::new();
-        for indexed in indexed_splits {
-            let partition_bytes = indexed.split.partition().to_serialized_bytes();
-            let bucket = indexed.split.bucket();
-            let file_name = indexed.split.data_files()[0].file_name.clone();
-            let mut stream =
-                PkVectorIndexedSplitRead::new(self.materialize_reader.clone()).read(&indexed)?;
-            while let Some(batch) = stream.try_next().await? {
-                let batch_index = batches.len();
-                collect_ranked_rows(
-                    &batch,
-                    batch_index,
-                    &partition_bytes,
-                    bucket,
-                    &file_name,
-                    &rank_of,
-                    &mut ranked,
-                )?;
-                batches.push(batch);
-            }
-        }
-
-        // Reorder to best-first and drop the internal position column.
-        let output = reorder_and_strip_position(&batches, ranked)?;
-        Ok(Box::pin(stream::iter(output.into_iter().map(Ok))))
     }
 }
 
@@ -566,14 +489,47 @@ mod read_tests {
     use crate::table::pk_vector_position_read::{PKEY_VECTOR_POSITION_COLUMN, SEARCH_SCORE_COLUMN};
     use crate::table::schema_manager::SchemaManager;
     use crate::table::source::{DataSplit, DataSplitBuilder, DeletionFile};
+    use crate::table::ArrowRecordBatchStream;
     use arrow_array::{Array, Float32Array, Int32Array, RecordBatch};
     use bytes::Bytes;
+    use futures::TryStreamExt;
     use paimon_ftindex_core::io::PosWriter;
     use paimon_ftindex_core::{FullTextIndexConfig, FullTextIndexWriter};
     use paimon_mosaic_core::spec::COMPRESSION_NONE;
     use paimon_mosaic_core::writer::{MosaicWriter, OutputFile, WriterOptions};
     use std::io;
     use std::sync::Arc;
+
+    // Exercise the same shared result materialization as the public builder.
+    impl PrimaryKeyFullTextRead {
+        async fn read(
+            &self,
+            plan: &PrimaryKeyFullTextScanPlan,
+            query: &str,
+            limit: usize,
+        ) -> crate::Result<ArrowRecordBatchStream> {
+            let schema = crate::spec::Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .build()?;
+            let table = crate::table::Table::new(
+                self.file_io.clone(),
+                crate::catalog::Identifier::new("default", "text"),
+                self.table_path.clone(),
+                crate::spec::TableSchema::new(1, &schema),
+                None,
+            );
+            let route = self.search_route(plan, query, limit).await?;
+            crate::table::GlobalIndexResult::from_full_text_primary_key(
+                Arc::new(table),
+                route.snapshot_id,
+                route.candidates,
+                route.splits,
+            )?
+            .new_read_builder()
+            .read()
+            .await
+        }
+    }
 
     const FILE_SOURCE_COMPACT: i32 = 1;
 
@@ -800,6 +756,7 @@ mod read_tests {
             schema_manager,
             1,
             id_fields(),
+            |fields| Ok(fields.to_vec()),
             id_fields(),
             Vec::new(),
         );

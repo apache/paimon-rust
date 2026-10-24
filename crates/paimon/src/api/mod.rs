@@ -33,19 +33,20 @@ mod user_agent;
 
 // Re-export request types
 pub use api_request::{
-    AlterDatabaseRequest, AlterTableRequest, AuthTableQueryRequest, CreateDatabaseRequest,
-    CreateFunctionRequest, CreatePartitionsRequest, CreateTableRequest, CreateTagRequest,
-    CreateViewRequest, DropPartitionsRequest, DropPolicyRequest, ListPartitionsByFilterRequest,
-    ListPartitionsByNamesRequest, PolicyRequest, RenameTableRequest, RevokePermissionRequest,
+    AlterDatabaseRequest, AlterTableRequest, AuthTableQueryRequest, CreateBranchRequest,
+    CreateDatabaseRequest, CreateFunctionRequest, CreatePartitionsRequest, CreateTableRequest,
+    CreateTagRequest, CreateViewRequest, DropPartitionsRequest, DropPolicyRequest,
+    ForwardBranchRequest, ListPartitionsByFilterRequest, ListPartitionsByNamesRequest,
+    PolicyRequest, RenameTableRequest, RevokePermissionRequest, RollbackTableRequest,
 };
 
 // Re-export response types
 pub use api_response::{
     AuditRESTResponse, AuthTableQueryResponse, ConfigResponse, ErrorResponse, GetDatabaseResponse,
     GetFunctionResponse, GetTableResponse, GetTableSnapshotResponse, GetTableTokenResponse,
-    GetTagResponse, GetViewResponse, ListDatabasesResponse, ListFunctionsResponse,
-    ListPartitionsResponse, ListPermissionsResponse, ListPoliciesResponse, ListTablesResponse,
-    ListViewsResponse, PagedList, TableSnapshot,
+    GetTagResponse, GetViewResponse, ListBranchesResponse, ListDatabasesResponse,
+    ListFunctionsResponse, ListPartitionsResponse, ListPermissionsResponse, ListPoliciesResponse,
+    ListTablesResponse, ListTagsResponse, ListViewsResponse, PagedList, TableSnapshot,
 };
 
 // Re-export management types

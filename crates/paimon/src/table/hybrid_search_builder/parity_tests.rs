@@ -30,7 +30,7 @@ use arrow_array::{ArrayRef, Int32Array, ListArray, StringArray};
 use arrow_schema::{DataType as ArrowType, Field, Schema as ArrowSchema};
 use std::sync::Arc;
 
-fn table() -> Table {
+pub(super) fn table() -> Table {
     let schema = Schema::builder()
         .column("id", DataType::Int(IntType::new()))
         .column("text", DataType::VarChar(VarCharType::string_type()))
@@ -61,7 +61,7 @@ fn table() -> Table {
     )
 }
 
-async fn append(table: &Table, start: i32) {
+pub(super) async fn append(table: &Table, start: i32) {
     let columns: Vec<ArrayRef> = vec![
         Arc::new(Int32Array::from(vec![
             start,
@@ -104,7 +104,7 @@ async fn append(table: &Table, start: i32) {
         .unwrap();
 }
 
-async fn index(table: &Table, kind: &str, column: &str) {
+pub(super) async fn index(table: &Table, kind: &str, column: &str) {
     let mut builder = table.new_global_index_build_builder();
     builder.with_index_type(kind).with_index_column(column);
     if kind == "ivf-flat" {
@@ -133,7 +133,16 @@ async fn full_text_route_uses_java_structured_query() {
         )
         .unwrap();
     builder.with_limit(4);
-    assert_eq!(builder.execute_scored().await.unwrap().row_ids, vec![2]);
+    assert_eq!(
+        builder
+            .execute()
+            .await
+            .unwrap()
+            .into_row_ids()
+            .unwrap()
+            .row_ids,
+        vec![2]
+    );
 }
 
 #[tokio::test]
@@ -146,10 +155,10 @@ async fn full_text_route_rejects_plain_text_as_java_does() {
         .add_full_text_route("text", "paimon", 4, 1.0, HashMap::new())
         .unwrap();
     builder.with_limit(4);
-    assert!(builder.execute_scored().await.is_err());
+    assert!(builder.execute().await.is_err());
 }
 
-fn mixed_query(table: &Table, route_limit: usize) -> HybridSearchBuilder<'_> {
+pub(super) fn mixed_query(table: &Table, route_limit: usize) -> HybridSearchBuilder<'_> {
     let mut builder = table.new_hybrid_search_builder();
     builder
         .add_vector_route(
@@ -186,13 +195,33 @@ async fn both_routes_filter_before_top_k_and_accumulate_predicates() {
         .with_filter(pb.equal("id", Datum::Int(6)).unwrap())
         .with_partition_filter(pb.equal("pt", Datum::Int(1)).unwrap())
         .unwrap();
-    let result = builder.execute_scored().await.unwrap();
-    assert_eq!(result.row_ids, vec![6]);
-    assert!((result.scores[0] - 2.0 / 61.0).abs() < 1e-6);
+    let pinned = builder.resolve_pinned_route_table().await.unwrap().unwrap();
+    let vector = builder
+        .vector_route_builder(&pinned, &builder.routes[0])
+        .execute()
+        .await
+        .unwrap();
+    assert_eq!(
+        vector.row_ids().unwrap().row_ids,
+        vec![6],
+        "the vector route must filter before its top-k"
+    );
+    let text = full_text_route_builder(&pinned, &builder.routes[1], builder.filter.as_ref())
+        .execute()
+        .await
+        .unwrap();
+    assert_eq!(
+        text.row_ids().unwrap().row_ids,
+        vec![6],
+        "the text route must filter before its top-k"
+    );
+    let result = builder.execute().await.unwrap();
+    assert_eq!(result.row_ids().unwrap().row_ids, vec![6]);
+    assert!((result.row_ids().unwrap().scores[0] - 2.0 / 61.0).abs() < 1e-6);
     builder
         .with_partition_filter(pb.equal("pt", Datum::Int(0)).unwrap())
         .unwrap();
-    assert!(builder.execute_scored().await.unwrap().is_empty());
+    assert!(builder.execute().await.unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -210,8 +239,10 @@ async fn scalar_coverage_and_refinement_are_shared_by_both_routes() {
         )]));
         let mut ids = mixed_query(&table, 4)
             .with_filter(keep.clone())
-            .execute_scored()
+            .execute()
             .await
+            .unwrap()
+            .into_row_ids()
             .unwrap()
             .row_ids;
         ids.sort_unstable();
@@ -223,7 +254,7 @@ async fn scalar_coverage_and_refinement_are_shared_by_both_routes() {
             .with_filter(keep.clone())
             .with_limit(4);
         assert_eq!(
-            text.execute_scored().await.unwrap().len(),
+            text.execute().await.unwrap().len(),
             if mode == "fast" { 0 } else { 2 }
         );
     }
@@ -239,8 +270,10 @@ async fn scalar_coverage_and_refinement_are_shared_by_both_routes() {
         ]));
         let mut ids = mixed_query(&table, 4)
             .with_filter(candidate.clone())
-            .execute_scored()
+            .execute()
             .await
+            .unwrap()
+            .into_row_ids()
             .unwrap()
             .row_ids;
         ids.sort_unstable();
@@ -271,16 +304,25 @@ async fn concurrent_routes_preserve_weights_limits_and_java_fusion() {
             .with_limit(4)
             .with_ranker(ranker)
             .unwrap();
-        let result = builder.execute_scored().await.unwrap();
-        assert_eq!(result.row_ids, ids, "ranker {ranker}");
-        for (actual, expected) in result.scores.iter().zip(scores) {
+        let result = builder.execute().await.unwrap();
+        assert_eq!(result.row_ids().unwrap().row_ids, ids, "ranker {ranker}");
+        for (actual, expected) in result.row_ids().unwrap().scores.iter().zip(scores) {
             assert!(
                 (actual - expected).abs() < 1e-6,
                 "ranker {ranker}: {actual} != {expected}"
             );
         }
         builder.with_limit(1);
-        assert_eq!(builder.execute_scored().await.unwrap().row_ids, vec![3]);
+        assert_eq!(
+            builder
+                .execute()
+                .await
+                .unwrap()
+                .into_row_ids()
+                .unwrap()
+                .row_ids,
+            vec![3]
+        );
     }
 }
 
@@ -312,20 +354,15 @@ async fn retained_tag_keeps_both_routes_on_the_expired_snapshot() {
         "hybrid-before".into(),
     )]));
     let mut old = mixed_query(&tagged, 16)
-        .execute_scored()
+        .execute()
         .await
+        .unwrap()
+        .into_row_ids()
         .unwrap()
         .row_ids;
     old.sort_unstable();
     assert_eq!(old, vec![0, 1, 2, 3]);
-    assert_eq!(
-        mixed_query(&table, 16)
-            .execute_scored()
-            .await
-            .unwrap()
-            .len(),
-        8
-    );
+    assert_eq!(mixed_query(&table, 16).execute().await.unwrap().len(), 8);
 }
 
 #[tokio::test]
@@ -343,7 +380,7 @@ async fn caller_pinned_empty_and_snapshot_views_do_not_read_latest() {
     append(&table, 4).await;
     assert!(mixed_query(&table, 16)
         .with_snapshot(None)
-        .execute_scored()
+        .execute()
         .await
         .unwrap()
         .is_empty());
@@ -354,8 +391,10 @@ async fn caller_pinned_empty_and_snapshot_views_do_not_read_latest() {
         .unwrap();
     let mut old = mixed_query(&table, 16)
         .with_snapshot(Some(&snapshot))
-        .execute_scored()
+        .execute()
         .await
+        .unwrap()
+        .into_row_ids()
         .unwrap()
         .row_ids;
     old.sort_unstable();
@@ -365,11 +404,7 @@ async fn caller_pinned_empty_and_snapshot_views_do_not_read_latest() {
 #[tokio::test]
 async fn empty_tables_still_validate_route_and_partition_configuration() {
     let table = table();
-    assert!(mixed_query(&table, 4)
-        .execute_scored()
-        .await
-        .unwrap()
-        .is_empty());
+    assert!(mixed_query(&table, 4).execute().await.unwrap().is_empty());
     let pb = PredicateBuilder::new(table.schema().fields());
     assert!(mixed_query(&table, 4)
         .with_partition_filter(pb.equal("id", Datum::Int(1)).unwrap())
@@ -380,14 +415,145 @@ async fn empty_tables_still_validate_route_and_partition_configuration() {
         .unwrap()
         .with_limit(4);
     // Java does not parse the DSL until a route actually evaluates a corpus.
-    assert!(invalid.execute_scored().await.unwrap().is_empty());
+    assert!(invalid.execute().await.unwrap().is_empty());
     append(&table, 0).await;
     index(&table, "full-text", "text").await;
-    assert!(invalid.execute_scored().await.is_err());
+    assert!(invalid.execute().await.is_err());
     let mut missing = table.new_hybrid_search_builder();
     missing
         .add_vector_route("missing", vec![0.0, 0.0], 4, 1.0, HashMap::new())
         .unwrap()
         .with_limit(4);
-    assert!(missing.execute_scored().await.is_err());
+    assert!(missing.execute().await.is_err());
+}
+
+struct WireExecutor {
+    table: Table,
+    kinds: std::sync::Mutex<Vec<String>>,
+}
+
+#[async_trait::async_trait]
+impl crate::table::SearchTaskExecutor for WireExecutor {
+    async fn execute(
+        &self,
+        tasks: Vec<crate::table::SearchTask>,
+    ) -> crate::Result<Vec<crate::table::SearchTaskResult>> {
+        let mut results = Vec::new();
+        let (context, frames) = crate::table::SearchTask::serialize_batch(&tasks)?;
+        for (task, frame) in tasks.into_iter().zip(frames) {
+            let bytes = task.serialize()?;
+            let metadata: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            self.kinds
+                .lock()
+                .unwrap()
+                .push(metadata["kind"].as_str().unwrap().to_string());
+            results.push(crate::table::SearchTaskResult::deserialize(
+                &self.table.execute_search_task(&frame, &context).await?,
+            )?);
+        }
+        results.reverse();
+        Ok(results)
+    }
+}
+
+#[tokio::test]
+async fn scheduled_hybrid_shares_snapshot_and_preserves_all_core_rankers() {
+    let table = table();
+    append(&table, 0).await;
+    append(&table, 4).await;
+    index(&table, "ivf-flat", "embedding").await;
+    index(&table, "full-text", "text").await;
+    let snapshot = table
+        .snapshot_manager()
+        .get_latest_snapshot()
+        .await
+        .unwrap()
+        .unwrap();
+    let pb = PredicateBuilder::new(table.schema().fields());
+    let keep = pb.equal("label", Datum::String("keep".into())).unwrap();
+    // The table used by workers has a later commit than the builder's shared
+    // view. Every route must keep the captured view through task transport.
+    append(&table, 8).await;
+    for ranker in [
+        HybridSearchRanker::Rrf,
+        HybridSearchRanker::WeightedScore,
+        HybridSearchRanker::Mrr,
+    ] {
+        let mut builder = mixed_query(&table, 3);
+        builder
+            .with_snapshot(Some(&snapshot))
+            .with_filter(keep.clone())
+            .with_ranker(ranker.as_str())
+            .unwrap();
+        let expected = builder.execute().await.unwrap();
+        let executor = WireExecutor {
+            table: table.clone(),
+            kinds: Default::default(),
+        };
+        let actual = builder.execute_with_executor(&executor).await.unwrap();
+        assert_eq!(actual.snapshot_id(), Some(snapshot.id()));
+        let actual = actual.into_row_ids().unwrap();
+        let expected = expected.into_row_ids().unwrap();
+        assert_eq!(actual.row_ids, expected.row_ids, "ranker {ranker:?}");
+        assert_eq!(actual.scores, expected.scores, "ranker {ranker:?}");
+        assert!(!actual.row_ids.is_empty());
+        assert!(actual.row_ids.iter().all(|id| [1, 2, 5, 6].contains(id)));
+        let kinds = executor.kinds.lock().unwrap();
+        assert!(kinds.iter().any(|kind| kind.starts_with("vector-")));
+        assert!(kinds.iter().any(|kind| kind == "fulltext-index"));
+    }
+}
+
+#[tokio::test]
+async fn explicit_raw_source_range_with_partition_filter_keeps_global_row_ids() {
+    use futures::TryStreamExt;
+    let table = table();
+    append(&table, 0).await;
+    append(&table, 4).await;
+    let snapshot = table.resolve_read_snapshot().await.unwrap().unwrap();
+    let plan = crate::table::VectorScanPlan::new(
+        Some(snapshot),
+        vec![crate::table::SearchScanSplit::Raw {
+            row_ranges: vec![RowRange::new(4, 7)],
+            scalar_index_files: vec![],
+            index_type: Some("ivf-flat".into()),
+        }],
+    )
+    .unwrap();
+    let predicates = PredicateBuilder::new(table.schema().fields());
+    let mut builder = table.new_vector_search_builder();
+    builder
+        .with_vector_column("embedding")
+        .with_query_vector(vec![0.0, 0.0])
+        .with_limit(1)
+        .with_filter(Predicate::and(vec![
+            predicates.equal("pt", Datum::Int(1)).unwrap(),
+            predicates.equal("id", Datum::Int(6)).unwrap(),
+        ]));
+    let result = builder.new_read().unwrap().read(plan).await.unwrap();
+    assert_eq!(result.row_ids().unwrap().row_ids, vec![6]);
+    let batches: Vec<RecordBatch> = result
+        .new_read_builder()
+        .with_projection(&["id"])
+        .read()
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    let ids = batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .values()
+                .iter()
+                .copied()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(ids, vec![6]);
 }

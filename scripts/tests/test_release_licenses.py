@@ -22,7 +22,9 @@ from pathlib import Path
 from scripts.release_licenses import (
     LicenseCorrection,
     PYTHON_MIT_CORRECTIONS,
+    Report,
     binary_notice,
+    bundled_component_html,
     correction_html,
     resolved_packages,
 )
@@ -215,6 +217,43 @@ class ResolvedPackagesTest(unittest.TestCase):
             notice = binary_notice(root, [metadata])
             self.assertIn("Required dependency notice", notice)
             self.assertNotIn("Optional dependency notice", notice)
+
+
+class ManifestCodecLicenseTest(unittest.TestCase):
+    def test_python_and_go_reports_include_statically_linked_xz_license(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            crate_dir = root / "liblzma-sys"
+            license_path = crate_dir / "xz" / "COPYING.0BSD"
+            license_path.parent.mkdir(parents=True)
+            license_path.write_text("XZ Utils bundled license\n", encoding="utf-8")
+            package = {
+                "name": "liblzma-sys",
+                "id": "liblzma-sys-package",
+                "version": "0.4.7",
+                "manifest_path": str(crate_dir / "Cargo.toml"),
+            }
+            metadata = {
+                "normal_packages": {("liblzma-sys", "0.4.7")},
+                "packages": [package],
+                "resolve": {
+                    "nodes": [{"id": package["id"], "features": ["static"]}],
+                },
+            }
+            report_text = (
+                '<ul><li><a href="https://crates.io/crates/liblzma-sys">'
+                'liblzma-sys 0.4.7</a></li></ul>'
+            )
+            for component in ("python", "go"):
+                with self.subTest(component=component):
+                    report = Report(component, "", "aarch64-apple-darwin", "")
+                    result = bundled_component_html(root, report, report_text, metadata)
+                    self.assertIn("XZ Utils bundled license", result)
+                    self.assertIn("statically linked through", result)
+                    metadata["resolve"]["nodes"][0]["features"] = []
+                    with self.assertRaisesRegex(RuntimeError, "missing required features"):
+                        bundled_component_html(root, report, report_text, metadata)
+                    metadata["resolve"]["nodes"][0]["features"] = ["static"]
 
 
 if __name__ == "__main__":

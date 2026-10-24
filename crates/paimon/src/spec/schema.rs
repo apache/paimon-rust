@@ -19,10 +19,11 @@ use crate::spec::core_options::{
     first_row_supports_changelog_producer, ChangelogProducer, CoreOptions, MergeEngine,
     BLOB_DESCRIPTOR_FIELD_FALLBACK, BLOB_DESCRIPTOR_FIELD_OPTION, BLOB_FIELD_OPTION,
     BLOB_VIEW_FIELD_OPTION, BUCKET_KEY_OPTION, CHANGELOG_PRODUCER_OPTION,
-    INDEX_FILE_IN_DATA_FILE_DIR_OPTION, POSTPONE_BUCKET, QUERY_AUTH_ENABLED_OPTION,
-    SEQUENCE_FIELD_OPTION, TABLE_READ_SEQUENCE_NUMBER_ENABLED_OPTION, TABLE_TYPE_OPTION,
+    INDEX_FILE_IN_DATA_FILE_DIR_OPTION, POSTPONE_BUCKET, PRIMARY_KEY_NULLABLE_OPTION,
+    QUERY_AUTH_ENABLED_OPTION, SEQUENCE_FIELD_OPTION, TABLE_READ_SEQUENCE_NUMBER_ENABLED_OPTION,
+    TABLE_TYPE_OPTION,
 };
-use crate::spec::types::{ArrayType, DataType, MapType, MultisetType, RowType, VarCharType};
+use crate::spec::types::{ArrayType, DataType, MapType, MultisetType, RowType};
 use crate::spec::{
     remove_field_scoped_options, rename_field_scoped_options,
     validate_no_aggregation_on_sequence_field, AggregationConfig, BlobType, ColumnMove,
@@ -97,6 +98,33 @@ impl TableSchema {
 
     pub fn fields(&self) -> &[DataField] {
         &self.fields
+    }
+
+    /// Fields physically present in a file, following Java TableSchema.dataFileSchema.
+    /// Explicit write columns retain their order and omit metadata columns.
+    pub fn data_file_fields(&self, write_cols: Option<&[String]>) -> Vec<DataField> {
+        if let Some(columns) = write_cols {
+            return columns
+                .iter()
+                .filter_map(|name| self.fields.iter().find(|f| f.name() == name).cloned())
+                .collect();
+        }
+        let options = CoreOptions::new(&self.options);
+        if !options.data_evolution_enabled()
+            || !options.data_evolution_write_cols_optimization_enabled()
+        {
+            return self.fields.clone();
+        }
+        let inline = options.blob_inline_fields();
+        self.fields
+            .iter()
+            .filter(|field| {
+                !(field.data_type().is_blob_file_field() && !inline.contains(field.name())
+                    || options.vector_file_format().is_some()
+                        && matches!(field.data_type(), DataType::Vector(_)))
+            })
+            .cloned()
+            .collect()
     }
 
     /// Logical fields followed by the metadata available to table reads.
@@ -178,6 +206,36 @@ impl TableSchema {
     /// fail, so the stored value wins instead, and an absent one leaves the
     /// default standing.
     pub fn copy_with_options(&self, mut extra: HashMap<String, String>) -> Self {
+        self.retain_immutable_options(&mut extra);
+        let mut new_schema = self.clone();
+        new_schema.options.extend(extra);
+        new_schema
+    }
+
+    /// REST returns a Schema without its creation timestamp. Independently
+    /// loaded copies can have different local timestamps while describing the
+    /// same schema. Options are compared separately when copying a handle.
+    pub(crate) fn has_same_definition(&self, other: &Self) -> bool {
+        self.version == other.version
+            && self.id == other.id
+            && self.fields == other.fields
+            && self.highest_field_id == other.highest_field_id
+            && self.partition_keys == other.partition_keys
+            && self.primary_keys == other.primary_keys
+            && self.comment == other.comment
+    }
+
+    /// Replace dynamic options without allowing an override of stored immutable
+    /// options. Unlike merging, absence in this map removes a mutable option.
+    pub(crate) fn copy_with_replaced_dynamic_options(
+        &self,
+        mut options: HashMap<String, String>,
+    ) -> Self {
+        self.retain_immutable_options(&mut options);
+        self.copy_with_replaced_options(options)
+    }
+
+    fn retain_immutable_options(&self, extra: &mut HashMap<String, String>) {
         if self.core_options().query_auth_enabled() {
             extra.insert(QUERY_AUTH_ENABLED_OPTION.to_string(), "true".to_string());
         }
@@ -188,15 +246,13 @@ impl TableSchema {
         for key in [
             INDEX_FILE_IN_DATA_FILE_DIR_OPTION,
             "data-file.path-directory",
+            PRIMARY_KEY_NULLABLE_OPTION,
         ] {
             match self.options.get(key) {
                 Some(stored) => extra.insert(key.to_string(), stored.clone()),
                 None => extra.remove(key),
             };
         }
-        let mut new_schema = self.clone();
-        new_schema.options.extend(extra);
-        new_schema
     }
 
     /// Create a copy of this schema with the options replaced entirely,
@@ -297,6 +353,8 @@ impl TableSchema {
     /// Column errors ([`crate::Error::ColumnNotExist`] /
     /// [`crate::Error::ColumnAlreadyExist`]) are returned with an empty table
     /// name; the calling catalog fills in the table's full name.
+    /// The catalog also checks snapshot-dependent immutable options before
+    /// applying changes; this schema transformation has no snapshot context.
     pub fn apply_changes(&self, changes: Vec<crate::spec::SchemaChange>) -> crate::Result<Self> {
         use crate::spec::SchemaChange;
 
@@ -626,8 +684,8 @@ impl TableSchema {
                     new_nullability,
                 } => {
                     let name = top_level_field(&field_names)?;
-                    // Primary keys are normalized to NOT NULL at create time;
-                    // a nullable key column would break key/bucket semantics.
+                    // Key nullability is selected at create time by the immutable
+                    // primary-key.nullable option, not by ALTER COLUMN.
                     if new_nullability && new_schema.primary_keys.iter().any(|k| k == name) {
                         return Err(crate::Error::Unsupported {
                             message: "Cannot change nullability of primary key".to_string(),
@@ -646,8 +704,9 @@ impl TableSchema {
                         disable_null_to_not_null,
                     )?;
                     let nt = old.data_type().copy_with_nullable(new_nullability)?;
-                    fields[idx] = DataField::new(old.id(), old.name().to_string(), nt)
-                        .with_description(old.description().map(|s| s.to_string()));
+                    let mut field = old.clone();
+                    field.typ = nt;
+                    fields[idx] = field;
                 }
                 SchemaChange::UpdateColumnComment {
                     field_names,
@@ -667,6 +726,13 @@ impl TableSchema {
             }
         }
 
+        // Java rebuilds Schema after ALTER, reapplying the key option even if
+        // an individual column change requested a different nullability.
+        Schema::normalize_primary_key_nullability(
+            &mut fields,
+            &new_schema.primary_keys,
+            new_schema.core_options().primary_key_nullable(),
+        )?;
         new_schema.fields = fields;
         new_schema.highest_field_id =
             highest_field_id.max(Self::current_highest_field_id(&new_schema.fields));
@@ -1142,6 +1208,10 @@ fn move_reference(mv: &ColumnMove) -> crate::Result<&str> {
         })
 }
 
+/// Must match Java Paimon's `SpecialFields.KEY_FIELD_ID_START`. Duplicated
+/// primary-key fields belong to reserved ID space, outside all user fields.
+pub(crate) const KEY_FIELD_ID_START: i32 = i32::MAX / 2;
+
 pub const ROW_ID_FIELD_NAME: &str = "_ROW_ID";
 
 pub const ROW_ID_FIELD_ID: i32 = i32::MAX - 5;
@@ -1323,6 +1393,13 @@ impl Schema {
     ) -> crate::Result<()> {
         // Create and alter share this, so an unparsable type never lands.
         CoreOptions::new(options).table_type()?;
+        if primary_keys.is_empty() && CoreOptions::new(options).primary_key_nullable() {
+            return Err(crate::Error::ConfigInvalid {
+                message: format!(
+                    "Option '{PRIMARY_KEY_NULLABLE_OPTION}' can only be enabled for a table with primary keys."
+                ),
+            });
+        }
         validate_no_reserved_field_names(fields)?;
         Self::validate_key_field_types(fields, partition_keys, primary_keys, options)?;
         Self::validate_bucket_count(options)?;
@@ -1339,7 +1416,7 @@ impl Schema {
         Self::validate_first_row_changelog_producer(options)?;
         Self::validate_changelog_producer_requires_primary_keys(options, primary_keys)?;
         Self::validate_read_sequence_number_requires_primary_keys(options, primary_keys)?;
-        Self::validate_rowkind_field(options, primary_keys, fields)?;
+        Self::validate_rowkind_field(options, fields)?;
         Self::validate_deletion_vectors(options)?;
         Self::validate_bucket_keys(options, fields, partition_keys, primary_keys)?;
         Self::validate_sequence_field(options, fields, partition_keys, primary_keys)?;
@@ -1467,7 +1544,7 @@ impl Schema {
     }
 
     /// Normalize fields: validate duplicate/subset checks, promote configured
-    /// binary BLOB fields, and make primary key columns non-nullable.
+    /// binary BLOB fields, and apply the configured primary key nullability.
     /// Corresponds to Java `normalizeFields`.
     fn normalize_fields(
         fields: &[DataField],
@@ -1481,7 +1558,8 @@ impl Schema {
         Self::validate_primary_keys(&field_names, primary_keys)?;
         Self::validate_primary_keys_not_partition_only(partition_keys, primary_keys)?;
 
-        let blob_field_names = CoreOptions::new(options).blob_fields();
+        let core_options = CoreOptions::new(options);
+        let blob_field_names = core_options.blob_fields();
         for name in &blob_field_names {
             if !field_names.iter().any(|field| field == name) {
                 return Err(crate::Error::ConfigInvalid {
@@ -1494,23 +1572,40 @@ impl Schema {
             return Ok(fields.to_vec());
         }
 
-        let pk_set: HashSet<&str> = primary_keys.iter().map(String::as_str).collect();
         let mut new_fields = Vec::with_capacity(fields.len());
         for f in fields {
-            let mut data_type = if blob_field_names.contains(f.name()) {
+            let data_type = if blob_field_names.contains(f.name()) {
                 normalize_blob_field_type(f.name(), f.data_type().clone())?
             } else {
                 f.data_type().clone()
             };
-            if pk_set.contains(f.name()) && data_type.is_nullable() {
-                data_type = data_type.copy_with_nullable(false)?;
-            }
-            new_fields.push(
-                DataField::new(f.id(), f.name().to_string(), data_type)
-                    .with_description(f.description().map(|s| s.to_string())),
-            );
+            let mut field = f.clone();
+            field.typ = data_type;
+            new_fields.push(field);
         }
+        Self::normalize_primary_key_nullability(
+            &mut new_fields,
+            primary_keys,
+            core_options.primary_key_nullable(),
+        )?;
         Ok(new_fields)
+    }
+
+    fn normalize_primary_key_nullability(
+        fields: &mut [DataField],
+        primary_keys: &[String],
+        nullable: bool,
+    ) -> crate::Result<()> {
+        if primary_keys.is_empty() {
+            return Ok(());
+        }
+        let primary_keys: HashSet<&str> = primary_keys.iter().map(String::as_str).collect();
+        for field in fields {
+            if primary_keys.contains(field.name()) && field.typ.is_nullable() != nullable {
+                field.typ = field.typ.copy_with_nullable(nullable)?;
+            }
+        }
+        Ok(())
     }
 
     /// Table columns must not contain duplicate field names.
@@ -2025,28 +2120,14 @@ impl Schema {
 
     fn validate_rowkind_field(
         options: &HashMap<String, String>,
-        primary_keys: &[String],
         fields: &[DataField],
     ) -> crate::Result<()> {
         let core = CoreOptions::new(options);
         let Some(field_name) = core.rowkind_field() else {
             return Ok(());
         };
-
-        if primary_keys.is_empty() {
-            return Err(crate::Error::ConfigInvalid {
-                message: "rowkind.field requires a primary-key table".to_string(),
-            });
-        }
-
-        let producer = core
-            .try_changelog_producer()
+        core.try_changelog_producer()
             .map_err(Self::options_error_to_config_invalid)?;
-        if producer == ChangelogProducer::Input {
-            return Err(crate::Error::ConfigInvalid {
-                message: "rowkind.field cannot be used with changelog-producer=input".to_string(),
-            });
-        }
 
         let Some(field) = fields.iter().find(|f| f.name() == field_name) else {
             return Err(crate::Error::ConfigInvalid {
@@ -2054,13 +2135,10 @@ impl Schema {
             });
         };
 
-        if !matches!(
-            field.data_type(),
-            DataType::VarChar(v) if v.length() == VarCharType::MAX_LENGTH
-        ) {
+        if !matches!(field.data_type(), DataType::Char(_) | DataType::VarChar(_)) {
             return Err(crate::Error::ConfigInvalid {
                 message: format!(
-                    "rowkind.field '{field_name}' must be STRING (unbounded VARCHAR) type"
+                    "rowkind.field '{field_name}' must be CHARACTER_STRING (CHAR or VARCHAR) type"
                 ),
             });
         }
@@ -2507,7 +2585,8 @@ impl SchemaBuilder {
         self
     }
 
-    /// Set primary key columns. They must not be nullable.
+    /// Set primary key columns. Their nullability follows `primary-key.nullable`
+    /// (false by default), regardless of the declared column nullability.
     pub fn primary_key(mut self, names: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.primary_keys = names.into_iter().map(Into::into).collect();
         self
@@ -2803,6 +2882,160 @@ mod tests {
                     if message.contains("read.batch-size")),
                 "got {err:?} for read.batch-size={value}"
             );
+        }
+    }
+
+    #[test]
+    fn nullable_primary_key_option_normalizes_declared_not_null_keys() {
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::with_nullable(false)))
+            .column("value", DataType::Int(IntType::new()))
+            .primary_key(["id"])
+            .option("bucket", "1")
+            .option("primary-key.nullable", "true")
+            .build()
+            .unwrap();
+        assert!(schema.fields()[0].data_type().is_nullable());
+    }
+
+    #[test]
+    fn primary_key_normalization_preserves_field_metadata() {
+        for nullable in [false, true] {
+            let fields = vec![
+                DataField::new(
+                    7,
+                    "id".into(),
+                    DataType::Int(IntType::with_nullable(!nullable)),
+                )
+                .with_description(Some("identifier".into()))
+                .with_default_value(Some("42".into())),
+                DataField::new(11, "value".into(), DataType::Int(IntType::new()))
+                    .with_default_value(Some("1".into())),
+            ];
+            let schema = Schema::new(
+                fields.clone(),
+                vec![],
+                vec!["id".into()],
+                HashMap::from([(PRIMARY_KEY_NULLABLE_OPTION.into(), nullable.to_string())]),
+                None,
+            )
+            .unwrap();
+            let mut expected = fields;
+            expected[0].typ = DataType::Int(IntType::with_nullable(nullable));
+            assert_eq!(schema.fields(), expected.as_slice());
+            let stored = TableSchema::new(0, &schema).copy_with_options(HashMap::from([(
+                "alter-column-null-to-not-null.disabled".into(),
+                "false".into(),
+            )]));
+            let changed = stored
+                .apply_changes(vec![crate::spec::SchemaChange::UpdateColumnNullability {
+                    field_names: vec!["id".into()],
+                    new_nullability: false,
+                }])
+                .unwrap();
+            assert_eq!(changed.fields(), expected.as_slice());
+        }
+    }
+
+    #[test]
+    fn nullable_primary_keys_include_partition_columns() {
+        let schema = Schema::builder()
+            .column("pt", DataType::Int(IntType::with_nullable(false)))
+            .column("id", DataType::Int(IntType::with_nullable(false)))
+            .column("value", DataType::Int(IntType::with_nullable(false)))
+            .primary_key(["pt", "id"])
+            .partition_keys(["pt"])
+            .option(PRIMARY_KEY_NULLABLE_OPTION, "TRUE")
+            .build()
+            .unwrap();
+        assert!(schema.fields()[0].data_type().is_nullable());
+        assert!(schema.fields()[1].data_type().is_nullable());
+        assert!(!schema.fields()[2].data_type().is_nullable());
+    }
+
+    #[test]
+    fn nullable_primary_key_option_requires_primary_keys() {
+        let error = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .option(PRIMARY_KEY_NULLABLE_OPTION, "true")
+            .build()
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("can only be enabled for a table with primary keys"));
+    }
+
+    #[test]
+    fn dynamic_options_preserve_primary_key_nullability() {
+        for nullable in [false, true] {
+            let schema = Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .primary_key(["id"])
+                .option(PRIMARY_KEY_NULLABLE_OPTION, nullable.to_string())
+                .build()
+                .unwrap();
+            let stored = TableSchema::new(0, &schema);
+            let copied = stored.copy_with_options(HashMap::from([(
+                PRIMARY_KEY_NULLABLE_OPTION.into(),
+                (!nullable).to_string(),
+            )]));
+            assert_eq!(copied.core_options().primary_key_nullable(), nullable);
+            assert_eq!(copied.fields(), stored.fields());
+            let replaced = stored.copy_with_replaced_dynamic_options(HashMap::new());
+            assert_eq!(replaced.core_options().primary_key_nullable(), nullable);
+        }
+    }
+
+    #[test]
+    fn nullable_key_option_wins_over_alter_column_not_null() {
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("value", DataType::Int(IntType::new()))
+            .primary_key(["id"])
+            .option(PRIMARY_KEY_NULLABLE_OPTION, "true")
+            .option("alter-column-null-to-not-null.disabled", "false")
+            .build()
+            .unwrap();
+        let stored = TableSchema::new(0, &schema);
+        let changed = stored
+            .apply_changes(vec![crate::spec::SchemaChange::UpdateColumnNullability {
+                field_names: vec!["id".into()],
+                new_nullability: false,
+            }])
+            .unwrap();
+        // Java reconstructs Schema after ALTER and reapplies the key option.
+        assert!(changed.fields()[0].data_type().is_nullable());
+        assert!(changed.core_options().primary_key_nullable());
+    }
+
+    #[test]
+    fn schema_changes_normalize_primary_key_nullability_option() {
+        use crate::spec::SchemaChange;
+
+        for nullable in [false, true] {
+            let schema = Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .primary_key(["id"])
+                .option(PRIMARY_KEY_NULLABLE_OPTION, nullable.to_string())
+                .build()
+                .unwrap();
+            let stored = TableSchema::new(0, &schema);
+            let changed = stored
+                .apply_changes(vec![SchemaChange::SetOption {
+                    key: PRIMARY_KEY_NULLABLE_OPTION.into(),
+                    value: (!nullable).to_string(),
+                }])
+                .unwrap();
+            assert_eq!(changed.core_options().primary_key_nullable(), !nullable);
+            assert_eq!(changed.fields()[0].data_type().is_nullable(), !nullable);
+            assert_eq!(stored.fields()[0].data_type().is_nullable(), nullable);
+            let removed = stored
+                .apply_changes(vec![SchemaChange::RemoveOption {
+                    key: PRIMARY_KEY_NULLABLE_OPTION.into(),
+                }])
+                .unwrap();
+            assert!(!removed.core_options().primary_key_nullable());
+            assert!(!removed.fields()[0].data_type().is_nullable());
         }
     }
 
@@ -6341,17 +6574,13 @@ mod tests {
     }
 
     #[test]
-    fn rowkind_field_requires_primary_key_table() {
-        let err = Schema::builder()
+    fn rowkind_field_accepts_append_tables() {
+        Schema::builder()
             .column("id", DataType::Int(IntType::new()))
             .column("op", DataType::VarChar(VarCharType::string_type()))
             .option("rowkind.field", "op")
             .build()
-            .unwrap_err();
-        assert!(
-            matches!(err, crate::Error::ConfigInvalid { ref message } if message.contains("rowkind.field")),
-            "got {err:?}"
-        );
+            .unwrap();
     }
 
     #[test]
@@ -6440,20 +6669,15 @@ mod tests {
     }
 
     #[test]
-    fn rowkind_field_rejects_changelog_producer_input() {
-        let err = Schema::builder()
+    fn rowkind_field_accepts_changelog_producer_input() {
+        Schema::builder()
             .column("id", DataType::Int(IntType::new()))
             .column("op", DataType::VarChar(VarCharType::string_type()))
             .primary_key(["id"])
             .option("changelog-producer", "input")
             .option("rowkind.field", "op")
             .build()
-            .unwrap_err();
-        assert!(
-            matches!(err, crate::Error::ConfigInvalid { ref message }
-                if message.contains("changelog-producer=input")),
-            "got {err:?}"
-        );
+            .unwrap();
     }
 
     #[test]

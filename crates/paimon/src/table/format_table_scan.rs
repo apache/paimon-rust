@@ -24,7 +24,7 @@ use super::format_partition::{
     FormatTablePartitionPaths,
 };
 use super::format_partition_location::FormatPartitionLocations;
-use super::{Plan, RESTEnv, ScanTrace, Table};
+use super::{Plan, RESTEnv, ScanStats, Table};
 use crate::api::RestError;
 use crate::spec::stats::BinaryTableStats;
 use crate::spec::{
@@ -66,15 +66,9 @@ impl<'a> FormatTableScan<'a> {
 
     pub(crate) async fn plan(&self) -> crate::Result<Plan> {
         self.ensure_query_auth_allowed()?;
-        self.plan_inner(None).await
-    }
-
-    pub(crate) async fn plan_with_trace(&self) -> crate::Result<(Plan, ScanTrace)> {
-        self.ensure_query_auth_allowed()?;
-        let mut trace = ScanTrace::default();
-        let plan = self.plan_inner(Some(&mut trace)).await?;
-        trace.planned_data_file_bytes = plan.planned_data_file_bytes();
-        Ok((plan, trace))
+        let mut stats = ScanStats::default();
+        let plan = self.plan_inner(&mut stats).await?;
+        Ok(plan.with_scan_stats(stats))
     }
 
     fn ensure_query_auth_allowed(&self) -> crate::Result<()> {
@@ -82,7 +76,7 @@ impl<'a> FormatTableScan<'a> {
         CoreOptions::new(self.table.schema().options()).ensure_read_authorized()
     }
 
-    async fn plan_inner(&self, trace: Option<&mut ScanTrace>) -> crate::Result<Plan> {
+    async fn plan_inner(&self, scan_stats: &mut ScanStats) -> crate::Result<Plan> {
         if self.row_ranges.is_some() {
             return Err(crate::Error::Unsupported {
                 message: "Row ranges are not supported for format tables".to_string(),
@@ -155,9 +149,7 @@ impl<'a> FormatTableScan<'a> {
         });
         splits = self.apply_limit_pushdown(splits);
 
-        if let Some(trace) = trace {
-            trace.record_final_plan(splits.len(), splits.len(), splits.len());
-        }
+        scan_stats.record_split_planning(splits.len(), false);
         Ok(Plan::new(splits))
     }
 
@@ -820,7 +812,7 @@ fn partition_row_from_path(
     let mut builder = BinaryRowBuilder::new(partition_fields.len() as i32);
     for (idx, value) in values.iter().enumerate() {
         if value == default_partition_name {
-            builder.set_null_at(idx);
+            builder.write_null(idx, partition_fields[idx].data_type());
             continue;
         }
         let Some(datum) = parse_format_partition_value(value, partition_fields[idx].data_type())
@@ -845,7 +837,7 @@ fn partition_row_from_catalog_spec(
             source: None,
         })?;
         if value == default_partition_name {
-            builder.set_null_at(index);
+            builder.write_null(index, field.data_type());
             continue;
         }
         let datum = parse_format_partition_value(value, field.data_type()).ok_or_else(|| {
@@ -942,6 +934,78 @@ mod tests {
     use crate::spec::{IntType, Schema, TableSchema, VarCharType};
     use bytes::Bytes;
     use std::collections::HashSet;
+
+    #[test]
+    fn null_partition_reconstruction_uses_java_non_compact_slots() {
+        use crate::spec::{DecimalType, LocalZonedTimestampType, TimestampType};
+
+        // Java InternalRowSerializer for (NULL, "abcdefghijk"). Reconstructing
+        // a directory or catalog spec must match the exact partition filter.
+        let decimal = "000100000000000000000000180000000b00000028000000000000000000000000000000000000006162636465666768696a6b0000000000";
+        let timestamp = "000100000000000000000000180000000b0000002000000000000000000000006162636465666768696a6b0000000000";
+        for (data_type, expected) in [
+            (DataType::Decimal(DecimalType::new(19, 2).unwrap()), decimal),
+            (
+                DataType::Timestamp(TimestampType::new(4).unwrap()),
+                timestamp,
+            ),
+            (
+                DataType::LocalZonedTimestamp(LocalZonedTimestampType::new(4).unwrap()),
+                timestamp,
+            ),
+        ] {
+            let fields = vec![
+                DataField::new(0, "pt".into(), data_type),
+                DataField::new(
+                    1,
+                    "code".into(),
+                    DataType::VarChar(VarCharType::string_type()),
+                ),
+            ];
+            let keys = vec!["pt".into(), "code".into()];
+            let spec = HashMap::from([
+                ("pt".into(), "DEFAULT".into()),
+                ("code".into(), "abcdefghijk".into()),
+            ]);
+            let catalog =
+                partition_row_from_catalog_spec(&spec, &fields, &keys, "DEFAULT").unwrap();
+            let named = partition_row_from_path(
+                "memory:/format",
+                "memory:/format/pt=DEFAULT/code=abcdefghijk",
+                &fields,
+                &keys,
+                "DEFAULT",
+                false,
+            )
+            .unwrap()
+            .unwrap();
+            let values = partition_row_from_path(
+                "memory:/format",
+                "memory:/format/DEFAULT/abcdefghijk",
+                &fields,
+                &keys,
+                "DEFAULT",
+                true,
+            )
+            .unwrap()
+            .unwrap();
+            let expected = hex::decode(expected).unwrap();
+            for row in [&catalog, &named, &values] {
+                assert_eq!(row.data(), expected);
+                let builder = crate::spec::PredicateBuilder::new(&fields);
+                let filter = PartitionFilter::from_predicate(
+                    Predicate::and(vec![
+                        builder.is_null("pt").unwrap(),
+                        builder
+                            .equal("code", Datum::String("abcdefghijk".into()))
+                            .unwrap(),
+                    ]),
+                    &fields,
+                );
+                assert!(filter.matches_entry(&row.to_serialized_bytes()).unwrap());
+            }
+        }
+    }
 
     /// A Parquet format table in memory, partitioned by the given string keys.
     fn format_table(location: &str, partition_keys: &[&str], options: &[(&str, &str)]) -> Table {

@@ -75,6 +75,9 @@ pub(super) fn split_scan_predicates(
 
 fn bucket_predicate(table: &Table, filter: &Predicate) -> Option<Predicate> {
     let core_options = CoreOptions::new(table.schema().options());
+    if core_options.bucket() < 1 && core_options.bucket() != -2 {
+        return None;
+    }
     let bucket_keys = core_options.bucket_key().unwrap_or_else(|| {
         if table.schema().trimmed_primary_keys().is_empty() {
             Vec::new()
@@ -86,18 +89,22 @@ fn bucket_predicate(table: &Table, filter: &Predicate) -> Option<Predicate> {
         return None;
     }
 
+    let mut referenced = std::collections::HashSet::new();
+    filter.collect_leaf_field_indices(&mut referenced);
     let has_all_bucket_fields = bucket_keys.iter().all(|key| {
         table
             .schema()
             .fields()
             .iter()
-            .any(|field| field.name() == key)
+            .enumerate()
+            .any(|(index, field)| field.name() == key && referenced.contains(&index))
     });
     if !has_all_bucket_fields {
         return None;
     }
 
-    extract_predicate_for_keys(filter, table.schema().fields(), &bucket_keys)
+    // Preserve partition leaves until the entry's concrete partition is known.
+    Some(filter.clone())
 }
 
 fn normalize_filter(table: &Table, filter: Predicate) -> NormalizedFilter {
@@ -220,6 +227,40 @@ impl<'a> ReadBuilder<'a> {
             }
         }
         self
+    }
+
+    /// Select partitions at scan time, independently of the row filter.
+    ///
+    /// The predicate uses table-field indices and may reference only partition
+    /// keys. Like Java's `ReadBuilder.withPartitionFilter`, this replaces the
+    /// partition pruning derived from `with_filter`; the row filter still applies
+    /// during reading. `None` restores derived partition pruning. Query-auth
+    /// scans reject selectors on masked keys because they cannot be checked
+    /// against the masked values after scanning. Format tables are unsupported.
+    pub fn with_partition_filter(&mut self, filter: Option<Predicate>) -> Result<&mut Self> {
+        let table = match &self.kind {
+            ReadBuilderKind::Paimon(builder) => builder.table,
+            ReadBuilderKind::Format(_) => {
+                return Err(Error::Unsupported {
+                    message: "Explicit partition filters are not supported for format tables"
+                        .into(),
+                })
+            }
+        };
+        if let Some(filter) = &filter {
+            super::partition_filter::validate_partition_filter(table, filter)?;
+            if table.schema().core_options().query_auth_enabled() {
+                super::query_auth::reject_noncanonical_leaves(
+                    std::slice::from_ref(filter),
+                    table.schema().fields(),
+                )?;
+            }
+        }
+        match &mut self.kind {
+            ReadBuilderKind::Paimon(builder) => builder.partition_filter = filter.map(Box::new),
+            ReadBuilderKind::Format(_) => unreachable!("format tables rejected above"),
+        }
+        Ok(self)
     }
 
     /// Whether a translated predicate is exact at the table-provider boundary.
@@ -355,6 +396,7 @@ struct PaimonReadBuilder<'a> {
     /// ("last projection setter wins").
     projection_names: Option<Vec<String>>,
     filter: NormalizedFilter,
+    partition_filter: Option<Box<Predicate>>,
     limit: Option<usize>,
     /// Ranges the caller set. Each `with_row_ranges` replaces them.
     explicit_row_ranges: Option<Vec<RowRange>>,
@@ -373,6 +415,7 @@ impl<'a> PaimonReadBuilder<'a> {
             read_type: None,
             projection_names: None,
             filter: NormalizedFilter::default(),
+            partition_filter: None,
             limit: None,
             explicit_row_ranges: None,
             derived_row_ranges: None,
@@ -492,22 +535,17 @@ impl<'a> PaimonReadBuilder<'a> {
         let combined = Predicate::and(self.filter.data_predicates.clone());
         if let Some(ranges) = super::row_id_predicate::extract_row_id_ranges(&combined) {
             self.derived_row_ranges = Some(ranges);
-            // Ranges are a superset, so a conjunct leaves the residual only when
-            // they represent it exactly.
-            self.filter
-                .data_predicates
-                .retain(|conjunct| !super::row_id_predicate::ranges_represent_conjunct(conjunct));
         }
     }
 
-    /// Push a row-limit hint down to scan planning.
+    /// Configure a row limit for scan planning and reads.
     ///
     /// This allows paimon-core scan planning to generate fewer splits when the
     /// current scan state keeps split-level `merged_row_count()` conservative.
     ///
-    /// Data-evolution [`TableRead`] enforces the limit before BLOB resolution.
-    /// Other read paths still treat it only as a planning hint, so callers or
-    /// query engines must enforce the final LIMIT themselves.
+    /// A [`TableRead`] created by this builder also enforces the final limit
+    /// across splits after filtering and row selection. Data-evolution reads
+    /// enforce it before BLOB resolution.
     pub fn with_limit(&mut self, limit: usize) -> &mut Self {
         self.limit = Some(limit);
         self
@@ -534,15 +572,24 @@ impl<'a> PaimonReadBuilder<'a> {
     /// does return `Result` and surfaces the error to the caller. This keeps the
     /// scan infallible without silently discarding an error that a read would hit.
     pub fn new_scan(&self) -> TableScan<'a> {
-        let partition_filter = self.filter.partition_predicate.clone().map(|pred| {
+        let partition_predicate = match &self.partition_filter {
+            Some(filter) => extract_predicate_for_keys(
+                filter,
+                self.table.schema().fields(),
+                self.table.schema().partition_keys(),
+            ),
+            None => self.filter.partition_predicate.clone(),
+        };
+        let partition_filter = partition_predicate.map(|pred| {
             PartitionFilter::from_predicate(pred, &self.table.schema().partition_fields())
         });
         let read_type = self.resolve_read_type().unwrap_or(None);
+        let data_predicates = self.scan_data_predicates();
         let scan_predicates =
-            super::managed_blob_reader::scan_predicates(self.table, &self.filter.data_predicates);
+            super::managed_blob_reader::scan_predicates(self.table, &data_predicates);
         // A payload predicate is evaluated after descriptor resolution. A
         // scan limit must not count rows which may fail that residual filter.
-        let scan_limit = if scan_predicates.len() == self.filter.data_predicates.len() {
+        let scan_limit = if scan_predicates.len() == data_predicates.len() {
             self.limit
         } else {
             None
@@ -557,7 +604,7 @@ impl<'a> PaimonReadBuilder<'a> {
         )
         .with_projected_read_field_ids(projected_read_field_ids_with_predicates(
             &read_type,
-            &self.filter.data_predicates,
+            &data_predicates,
             self.table.schema().fields(),
         ))
     }
@@ -590,9 +637,52 @@ impl<'a> PaimonReadBuilder<'a> {
             None => configured_parquet_read_budget(self.table)?,
         };
         TableRead::new(self.table, read_type, self.filter.data_predicates.clone())
+            .with_partition_predicate(self.filter.partition_predicate.clone())
             .with_parquet_read_budget(parquet_read_budget)
             .with_blob_parallelism(self.blob_parallelism)
             .map(|read| read.with_limit(self.limit))
+    }
+
+    /// An explicit selector replaces derived partition pruning. Retain the
+    /// ordinary partition conjuncts for safe stats/LIMIT decisions, rebound from
+    /// the partition row to the table layout (partition order may differ).
+    fn scan_data_predicates(&self) -> Vec<Predicate> {
+        // Range extraction replaces exact scan conjuncts only. A reader can
+        // consume splits from another plan, so retain its complete predicate.
+        let mut predicates = self
+            .filter
+            .data_predicates
+            .iter()
+            .filter(|conjunct| {
+                self.derived_row_ranges.is_none()
+                    || !super::row_id_predicate::ranges_represent_conjunct(conjunct)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if self.partition_filter.is_none() {
+            return predicates;
+        }
+        if let Some(partition) = &self.filter.partition_predicate {
+            let mapping = self
+                .table
+                .schema()
+                .partition_keys()
+                .iter()
+                .map(|name| {
+                    self.table
+                        .schema()
+                        .fields()
+                        .iter()
+                        .position(|field| field.name() == name)
+                })
+                .collect::<Vec<_>>();
+            predicates.push(
+                partition
+                    .remap_field_index(&mapping)
+                    .expect("partition fields belong to the table schema"),
+            );
+        }
+        predicates
     }
 
     /// Resolve the effective read type, deferring projection name resolution to
@@ -1223,7 +1313,7 @@ mod tests {
             Some(vec![RowRange::new(1, 1)])
         );
         assert_eq!(
-            builder.filter.data_predicates,
+            builder.scan_data_predicates(),
             vec![row_id_leaf(PredicateOperator::NotEq, 1)]
         );
 
@@ -1233,7 +1323,8 @@ mod tests {
             exact.effective_row_ranges(),
             Some(vec![RowRange::new(10, i64::MAX)])
         );
-        assert!(exact.filter.data_predicates.is_empty());
+        assert!(exact.scan_data_predicates().is_empty());
+        assert_eq!(exact.new_read().unwrap().data_predicates().len(), 1);
     }
 
     #[test]
@@ -1258,7 +1349,7 @@ mod tests {
             builder.effective_row_ranges(),
             Some(vec![RowRange::new(10, i64::MAX)])
         );
-        assert_eq!(builder.filter.data_predicates, vec![disjunction]);
+        assert_eq!(builder.scan_data_predicates(), vec![disjunction]);
     }
 
     #[test]
@@ -1279,7 +1370,8 @@ mod tests {
             builder.effective_row_ranges(),
             Some(vec![RowRange::new(7, 7)])
         );
-        assert!(builder.filter.data_predicates.is_empty());
+        assert!(builder.scan_data_predicates().is_empty());
+        assert_eq!(builder.new_read().unwrap().data_predicates().len(), 1);
     }
 
     #[test]
@@ -1329,7 +1421,7 @@ mod tests {
         ]));
 
         assert_eq!(builder.effective_row_ranges(), Some(Vec::new()));
-        assert_eq!(builder.filter.data_predicates, vec![unsatisfiable]);
+        assert_eq!(builder.scan_data_predicates(), vec![unsatisfiable]);
     }
 
     #[test]
@@ -1358,7 +1450,8 @@ mod tests {
                 Some(vec![RowRange::new(102, i64::MAX)]),
                 "row_tracking={row_tracking} data_evolution={data_evolution}"
             );
-            assert!(builder.filter.data_predicates.is_empty());
+            assert!(builder.scan_data_predicates().is_empty());
+            assert_eq!(builder.new_read().unwrap().data_predicates().len(), 1);
         }
     }
 
@@ -1372,7 +1465,7 @@ mod tests {
             row_id_leaf(PredicateOperator::Eq, 8),
         ]));
         assert!(
-            builder.filter.data_predicates.is_empty(),
+            builder.scan_data_predicates().is_empty(),
             "handed to ranges"
         );
 
@@ -2118,9 +2211,11 @@ mod tests {
             None,
         );
 
+        let mut partition = crate::spec::BinaryRowBuilder::new(1);
+        partition.write_string(0, "2024-01-01");
         let split = DataSplitBuilder::new()
             .with_snapshot(1)
-            .with_partition(BinaryRow::new(1))
+            .with_partition(partition.build())
             .with_bucket(0)
             .with_bucket_path(local_file_path(&bucket_dir))
             .with_total_buckets(1)
@@ -2203,9 +2298,16 @@ mod tests {
         assert_eq!(ranges[0].from(), 10);
         assert_eq!(ranges[0].to(), 20);
 
-        // _ROW_ID predicates should be removed from data_predicates
-        assert!(!inner.filter.data_predicates.is_empty());
-        for p in &inner.filter.data_predicates {
+        // Only scan predicates omit exact ranges. Independent readers retain
+        // the full filter even when their supplied splits were not filtered.
+        assert!(inner
+            .filter
+            .data_predicates
+            .iter()
+            .any(super::super::row_id_predicate::references_row_id));
+        let scan_predicates = inner.scan_data_predicates();
+        assert!(!scan_predicates.is_empty());
+        for p in &scan_predicates {
             if let Predicate::Leaf { column, .. } = p {
                 assert_ne!(column, crate::spec::ROW_ID_FIELD_NAME);
             }

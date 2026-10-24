@@ -36,7 +36,7 @@ use crate::catalog::{
 };
 use crate::common::{CatalogOptions, Options};
 use crate::error::Error;
-use crate::io::cache::{create_local_cache_with_namespace, LocalCache};
+use crate::io::cache::{create_local_cache_with_namespace_async, LocalCache};
 use crate::io::FileIOCacheContext;
 use crate::spec::{Partition, PartitionStatistics, Schema, SchemaChange};
 use crate::table::{RESTEnv, Table};
@@ -51,6 +51,7 @@ const PARTITION_BATCH_SIZE: usize = 1000;
 ///
 /// Corresponds to Python `RESTCatalog` in `pypaimon/catalog/rest/rest_catalog.py`.
 pub struct RESTCatalog {
+    fuse_resolver: Arc<super::FusePathResolver>,
     /// The REST API client (shared with RESTEnv).
     api: Arc<RESTApi>,
     /// Catalog configuration options.
@@ -89,10 +90,12 @@ impl RESTCatalog {
             .unwrap_or(false);
 
         let api_options = api.options().clone();
-        let local_cache = create_local_cache_with_namespace(&options, &api_options)?;
+        let local_cache = create_local_cache_with_namespace_async(&options, &api_options).await?;
         let file_io_cache = FileIOCacheContext::from_props(api_options.to_map())?;
 
+        let fuse_resolver = Arc::new(super::FusePathResolver::new(&api_options));
         Ok(Self {
+            fuse_resolver,
             api,
             options: api_options,
             warehouse,
@@ -285,6 +288,7 @@ impl Catalog for RESTCatalog {
             self.data_token_enabled,
             self.local_cache.clone(),
             self.file_io_cache.clone(),
+            self.fuse_resolver.clone(),
         )
         .await
     }
@@ -303,6 +307,7 @@ impl Catalog for RESTCatalog {
                     self.data_token_enabled,
                     self.local_cache.clone(),
                     self.file_io_cache.clone(),
+                    self.fuse_resolver.clone(),
                 )
                 .await
                 .map(crate::catalog::LoadedTable::Object);
@@ -324,6 +329,7 @@ impl Catalog for RESTCatalog {
             self.data_token_enabled,
             self.local_cache.clone(),
             self.file_io_cache.clone(),
+            self.fuse_resolver.clone(),
         )
         .await
         .map(|table| crate::catalog::LoadedTable::Paimon(Box::new(table)))
@@ -408,6 +414,44 @@ impl Catalog for RESTCatalog {
         })
     }
 
+    async fn load_snapshot(
+        &self,
+        identifier: &Identifier,
+    ) -> Result<Option<crate::api::TableSnapshot>> {
+        match self.api.load_snapshot(identifier).await {
+            Err(Error::RestApi {
+                source: RestError::NoSuchResource { resource_type, .. },
+            }) if resource_type.as_deref() == Some("SNAPSHOT") => Ok(None),
+            result => result.map_err(|error| map_table_not_exist(error, identifier)),
+        }
+    }
+
+    async fn rollback_to(
+        &self,
+        identifier: &Identifier,
+        instant: &crate::table::Instant,
+        from_snapshot: Option<i64>,
+        table_uuid: Option<&str>,
+    ) -> Result<()> {
+        self.api
+            .rollback_to(identifier, instant, from_snapshot, table_uuid)
+            .await
+            .map_err(|error| map_rest_error_for_rollback(error, identifier, instant))
+    }
+
+    async fn list_tags_paged(
+        &self,
+        identifier: &Identifier,
+        max_results: Option<i32>,
+        page_token: Option<&str>,
+        tag_name_prefix: Option<&str>,
+    ) -> Result<PagedList<String>> {
+        self.api
+            .list_tags_paged(identifier, max_results, page_token, tag_name_prefix)
+            .await
+            .map_err(|error| map_table_not_exist(error, identifier))
+    }
+
     async fn create_tag(
         &self,
         identifier: &Identifier,
@@ -485,6 +529,78 @@ impl Catalog for RESTCatalog {
         ignore_error_if(result, |error| {
             ignore_if_exists && matches!(error, Error::ViewAlreadyExist { .. })
         })
+    }
+
+    async fn create_branch(
+        &self,
+        identifier: &Identifier,
+        branch_name: &str,
+        from_tag: Option<&str>,
+    ) -> Result<()> {
+        self.api
+            .create_branch(identifier, branch_name, from_tag)
+            .await
+            .map_err(|error| match error {
+                Error::RestApi {
+                    source:
+                        RestError::NoSuchResource {
+                            resource_type: Some(kind),
+                            ..
+                        },
+                } if kind == "TABLE" => Error::TableNotExist {
+                    full_name: identifier.full_name(),
+                },
+                Error::RestApi {
+                    source:
+                        RestError::NoSuchResource {
+                            resource_type: Some(kind),
+                            ..
+                        },
+                } if kind == "TAG" => Error::TagNotExist {
+                    tag_name: from_tag.unwrap_or_default().to_string(),
+                },
+                Error::RestApi {
+                    source: RestError::AlreadyExists { .. },
+                } => Error::BranchAlreadyExist {
+                    full_name: identifier.full_name(),
+                    branch_name: branch_name.to_string(),
+                },
+                Error::RestApi {
+                    source: RestError::BadRequest { message },
+                } => Error::DataInvalid {
+                    message,
+                    source: None,
+                },
+                other => other,
+            })
+    }
+
+    async fn drop_branch(&self, identifier: &Identifier, branch_name: &str) -> Result<()> {
+        self.api
+            .drop_branch(identifier, branch_name)
+            .await
+            .map_err(|error| map_rest_error_for_branch(error, identifier, branch_name))
+    }
+
+    async fn fast_forward(&self, identifier: &Identifier, branch_name: &str) -> Result<()> {
+        self.api
+            .fast_forward(identifier, branch_name)
+            .await
+            .map_err(|error| map_rest_error_for_branch(error, identifier, branch_name))
+    }
+
+    async fn list_branches(&self, identifier: &Identifier) -> Result<Vec<String>> {
+        self.api
+            .list_branches(identifier)
+            .await
+            .map_err(|error| match error {
+                Error::RestApi {
+                    source: RestError::NoSuchResource { .. },
+                } => Error::TableNotExist {
+                    full_name: identifier.full_name(),
+                },
+                other => other,
+            })
     }
 
     async fn list_views(&self, database_name: &str) -> Result<Vec<String>> {
@@ -711,6 +827,18 @@ impl Catalog for RESTCatalog {
 // Error mapping helpers
 // ============================================================================
 
+fn map_rest_error_for_branch(error: Error, identifier: &Identifier, branch_name: &str) -> Error {
+    match error {
+        Error::RestApi {
+            source: RestError::NoSuchResource { .. },
+        } => Error::BranchNotExist {
+            full_name: identifier.full_name(),
+            branch_name: branch_name.to_string(),
+        },
+        other => other,
+    }
+}
+
 /// Map a REST API error to a catalog-level database error.
 ///
 /// Converts `RestError::NoSuchResource` -> `Error::DatabaseNotExist`,
@@ -790,6 +918,60 @@ fn map_rest_error_for_table(err: Error, identifier: &Identifier) -> Error {
     }
 }
 
+fn map_table_not_exist(error: Error, identifier: &Identifier) -> Error {
+    match error {
+        Error::RestApi {
+            source: RestError::NoSuchResource { .. },
+        } => Error::TableNotExist {
+            full_name: identifier.full_name(),
+        },
+        other => other,
+    }
+}
+
+fn map_rest_error_for_rollback(
+    error: Error,
+    identifier: &Identifier,
+    instant: &crate::table::Instant,
+) -> Error {
+    if let Error::RestApi {
+        source:
+            RestError::NoSuchResource {
+                resource_type,
+                resource_name,
+                ..
+            },
+    } = &error
+    {
+        if resource_type.as_deref() == Some("SNAPSHOT") {
+            let snapshot_id = resource_name
+                .as_deref()
+                .and_then(|name| name.parse().ok())
+                .or(match instant {
+                    crate::table::Instant::Snapshot { snapshot_id } => Some(*snapshot_id),
+                    _ => None,
+                });
+            return snapshot_id
+                .map(|snapshot_id| Error::SnapshotNotExist { snapshot_id })
+                .unwrap_or(error);
+        }
+        if resource_type.as_deref() == Some("TAG") {
+            let tag_name = resource_name
+                .clone()
+                .or_else(|| match instant {
+                    crate::table::Instant::Tag { tag_name } => Some(tag_name.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            return Error::TagNotExist { tag_name };
+        }
+        return Error::TableNotExist {
+            full_name: identifier.full_name(),
+        };
+    }
+    error
+}
+
 fn map_rest_error_for_tag(
     error: Error,
     identifier: &Identifier,
@@ -807,32 +989,29 @@ fn map_rest_error_for_tag(
                 RestError::NoSuchResource {
                     resource_type,
                     resource_name,
-                    ..
+                    message,
                 },
-        } if resource_type
-            .as_deref()
-            .is_some_and(|kind| kind.eq_ignore_ascii_case("snapshot")) =>
-        {
-            match snapshot_id.or_else(|| resource_name.and_then(|value| value.parse().ok())) {
+        } if resource_type.as_deref() == Some("SNAPSHOT") => {
+            match snapshot_id.or_else(|| {
+                resource_name
+                    .as_deref()
+                    .and_then(|value| value.parse().ok())
+            }) {
                 Some(snapshot_id) => Error::SnapshotNotExist { snapshot_id },
-                None => Error::DataInvalid {
-                    message: format!(
-                        "Cannot create tag '{tag_name}' because the latest snapshot does not exist"
-                    ),
-                    source: None,
+                None => Error::RestApi {
+                    source: RestError::NoSuchResource {
+                        resource_type,
+                        resource_name,
+                        message,
+                    },
                 },
             }
         }
         Error::RestApi {
             source: RestError::NoSuchResource { resource_type, .. },
-        } if resource_type
-            .as_deref()
-            .is_some_and(|kind| kind.eq_ignore_ascii_case("tag")) =>
-        {
-            Error::TagNotExist {
-                tag_name: tag_name.to_string(),
-            }
-        }
+        } if resource_type.as_deref() == Some("TAG") => Error::TagNotExist {
+            tag_name: tag_name.to_string(),
+        },
         Error::RestApi {
             source: RestError::NoSuchResource { .. },
         } => Error::TableNotExist {
@@ -844,7 +1023,9 @@ fn map_rest_error_for_tag(
             message,
             source: None,
         },
-        other => map_unsupported_endpoint(other, "tag"),
+        // Preserve HTTP status and resource metadata for catalog clients. A
+        // remote 501 is not a locally unsupported operation eligible for fallback.
+        other => other,
     }
 }
 
@@ -1049,6 +1230,57 @@ mod tests {
     }
 
     #[test]
+    fn test_shared_cache_catalog_init_does_not_block_current_thread_runtime() {
+        use std::fs::File;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut options = Options::new();
+        options.set(CatalogOptions::URI, "http://localhost:1");
+        options.set(CatalogOptions::WAREHOUSE, "test-warehouse");
+        options.set("token.provider", "bear");
+        options.set("token", "test-token");
+        options.set(CatalogOptions::LOCAL_CACHE_ENABLED, "true");
+        options.set(CatalogOptions::LOCAL_CACHE_SHARED, "true");
+        options.set(CatalogOptions::LOCAL_CACHE_MAX_SIZE, "1 MiB");
+        options.set(
+            CatalogOptions::LOCAL_CACHE_DIR,
+            directory.path().to_str().unwrap(),
+        );
+        drop(crate::io::cache::create_local_cache_with_namespace(&options, &options).unwrap());
+        let gate = File::open(
+            directory
+                .path()
+                .join("paimon-shared-local-cache-v1/directory.lock"),
+        )
+        .unwrap();
+        gate.lock().unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        let catalog_thread = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    tx.send(()).unwrap();
+                });
+                RESTCatalog::new(options, false).await.unwrap();
+            });
+        });
+        let runtime_progressed = rx.recv_timeout(Duration::from_secs(2)).is_ok();
+        drop(gate);
+        catalog_thread.join().unwrap();
+        assert!(
+            runtime_progressed,
+            "catalog initialization blocked the runtime"
+        );
+    }
+
+    #[test]
     fn test_tag_error_mapping() {
         let identifier = Identifier::new("db", "table");
         let error = |resource_type: &str| Error::RestApi {
@@ -1060,16 +1292,58 @@ mod tests {
         };
 
         assert!(matches!(
-            map_rest_error_for_tag(error("tag"), &identifier, "release", None),
+            map_rest_error_for_tag(error("TAG"), &identifier, "release", None),
             Error::TagNotExist { .. }
         ));
         assert!(matches!(
-            map_rest_error_for_tag(error("snapshot"), &identifier, "release", Some(7)),
+            map_rest_error_for_tag(error("SNAPSHOT"), &identifier, "release", Some(7)),
             Error::SnapshotNotExist { snapshot_id: 7 }
         ));
+        // Java compares resource types exactly. Other 404 resources describe
+        // a missing table, including noncanonical lowercase names.
+        for resource_type in ["TABLE", "OTHER", "tag", "snapshot"] {
+            assert!(matches!(
+                map_rest_error_for_tag(error(resource_type), &identifier, "release", None),
+                Error::TableNotExist { full_name } if full_name == "db.table"
+            ));
+        }
+    }
+
+    #[test]
+    fn test_tag_error_mapping_preserves_missing_latest_snapshot() {
+        let identifier = Identifier::new("db", "table");
+        for name in [None, Some("null"), Some("7")] {
+            let error = Error::RestApi {
+                source: RestError::NoSuchResource {
+                    resource_type: Some("SNAPSHOT".to_string()),
+                    resource_name: name.map(str::to_string),
+                    message: "missing latest snapshot".to_string(),
+                },
+            };
+            let mapped = map_rest_error_for_tag(error, &identifier, "release", None);
+            if name == Some("7") {
+                assert!(matches!(mapped, Error::SnapshotNotExist { snapshot_id: 7 }));
+            } else {
+                assert!(matches!(mapped, Error::RestApi {
+                    source: RestError::NoSuchResource { resource_type, resource_name, message }
+                } if resource_type.as_deref() == Some("SNAPSHOT")
+                    && resource_name.as_deref() == name
+                    && message == "missing latest snapshot"));
+            }
+        }
+    }
+
+    #[test]
+    fn test_tag_error_mapping_preserves_unimplemented_endpoint() {
+        let error = Error::RestApi {
+            source: RestError::NotImplemented {
+                message: "tag endpoint unavailable".to_string(),
+            },
+        };
         assert!(matches!(
-            map_rest_error_for_tag(error("table"), &identifier, "release", None),
-            Error::TableNotExist { .. }
+            map_rest_error_for_tag(error, &Identifier::new("db", "table"), "release", None),
+            Error::RestApi { source: RestError::NotImplemented { message } }
+                if message == "tag endpoint unavailable"
         ));
     }
 

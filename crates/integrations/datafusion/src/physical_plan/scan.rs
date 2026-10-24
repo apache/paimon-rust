@@ -53,7 +53,7 @@ use paimon::arrow::ReadBudget;
 use paimon::spec::{
     CoreOptions, DataField, Datum, MergeEngine, Predicate, PredicateBuilder, PredicateOperator,
 };
-use paimon::table::{ArrowRecordBatchStream, ScanTrace, Table, TableRead};
+use paimon::table::{ArrowRecordBatchStream, ScanStats, Table, TableRead};
 use paimon::DataSplit;
 
 use crate::error::to_datafusion_error;
@@ -789,8 +789,8 @@ pub struct PaimonTableScan {
     /// Whether the pushed predicate is exact (no residual filtering needed).
     /// When true and all splits have known merged_row_count, statistics can be exact.
     filter_exact: bool,
-    /// Metadata-pruning trace captured during eager scan planning.
-    scan_trace: Option<ScanTrace>,
+    /// Metadata-pruning statistics captured during eager scan planning.
+    scan_stats: Option<ScanStats>,
     /// Human-readable Variant extraction summary for explain output.
     pushed_variants: Option<String>,
     /// Column-name case sensitivity carried from planning to execution so the
@@ -818,7 +818,7 @@ impl PaimonTableScan {
         planned_partitions: Vec<Arc<[DataSplit]>>,
         limit: Option<usize>,
         filter_exact: bool,
-        scan_trace: Option<ScanTrace>,
+        scan_stats: Option<ScanStats>,
         pushed_variants: Option<String>,
         case_sensitive: bool,
     ) -> Self {
@@ -830,7 +830,7 @@ impl PaimonTableScan {
             planned_partitions,
             limit,
             filter_exact,
-            scan_trace,
+            scan_stats,
             pushed_variants,
             case_sensitive,
             Arc::new(ReadBudget::default()),
@@ -846,7 +846,7 @@ impl PaimonTableScan {
         planned_partitions: Vec<Arc<[DataSplit]>>,
         limit: Option<usize>,
         filter_exact: bool,
-        scan_trace: Option<ScanTrace>,
+        scan_stats: Option<ScanStats>,
         pushed_variants: Option<String>,
         case_sensitive: bool,
     ) -> DFResult<Self> {
@@ -870,7 +870,7 @@ impl PaimonTableScan {
             planned_partitions,
             limit,
             filter_exact,
-            scan_trace,
+            scan_stats,
             pushed_variants,
             case_sensitive,
             parquet_read_budget,
@@ -886,7 +886,7 @@ impl PaimonTableScan {
         planned_partitions: Vec<Arc<[DataSplit]>>,
         limit: Option<usize>,
         filter_exact: bool,
-        scan_trace: Option<ScanTrace>,
+        scan_stats: Option<ScanStats>,
         pushed_variants: Option<String>,
         case_sensitive: bool,
         parquet_read_budget: Arc<ReadBudget>,
@@ -905,7 +905,7 @@ impl PaimonTableScan {
             plan_properties,
             limit,
             filter_exact,
-            scan_trace,
+            scan_stats,
             pushed_variants,
             case_sensitive,
             runtime_filters: Vec::new(),
@@ -1280,8 +1280,8 @@ impl DisplayAs for PaimonTableScan {
         if let Some(limit) = self.limit {
             write!(f, ", limit={limit}")?;
         }
-        if let Some(trace) = self.scan_trace.as_ref().filter(|_| !hidden) {
-            write!(f, ", trace={trace}")?;
+        if let Some(scan_stats) = self.scan_stats.as_ref().filter(|_| !hidden) {
+            write!(f, ", stats={scan_stats}")?;
         }
         if let Some(ref pushed_variants) = self.pushed_variants {
             write!(f, ", PushedVariants=[{pushed_variants}]")?;

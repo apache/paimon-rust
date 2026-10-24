@@ -386,6 +386,11 @@ bytes.
 
 `VARIANT` stores semi-structured data using the same logical value + metadata binary shape as Paimon Java. Use it for JSON-like fields whose schema may differ row by row.
 
+Parquet and ROW files support ordinary `VARIANT` reads and writes. Set
+`'file.format' = 'row'` to use ROW storage. ROW preserves the value and metadata
+buffers in the Java-compatible v1 layout; extracting a path still reads the
+containing compressed row block. The shredding options below apply to Parquet.
+
 Create `VARIANT` columns like ordinary table columns:
 
 ```sql
@@ -1052,6 +1057,103 @@ anything is deleted.
 
 Use `CALL` to invoke built-in procedures. All procedures are under the `sys` namespace.
 
+### reset_consumer
+
+Create or overwrite a consumer's next snapshot to consume:
+
+```sql
+CALL sys.reset_consumer(
+    table => 'paimon.test_db.events',
+    consumer_id => 'pipeline_a',
+    next_snapshot_id => 12
+);
+```
+
+`next_snapshot_id` must be a positive BIGINT identifying an existing live snapshot.
+Missing, expired, or invalid snapshots are rejected before changing consumer progress;
+tag-retained metadata alone is not sufficient. The ID is the next snapshot to process
+using the existing incremental or changelog scan rules, rather than a full-state read.
+
+Omit `next_snapshot_id` to delete the consumer record. Deleting a missing consumer succeeds:
+
+```sql
+CALL sys.reset_consumer(
+    table => 'paimon.test_db.events',
+    consumer_id => 'pipeline_a'
+);
+```
+
+Only filesystem-managed FileStore tables are supported. REST-managed tables and
+format tables are not supported. Consumer IDs must be non-empty names without path
+separators or trailing whitespace; IDs are never trimmed. Arguments use the existing
+named `=>` syntax; explicit `NULL` and positional arguments are not supported.
+Successful calls return `OK`.
+These operations change only consumer metadata, without publishing snapshots or
+changing table data, snapshot files, or manifests.
+
+A new scan with the same consumer ID resumes the stored progress unless the caller
+explicitly restores a checkpoint, which takes precedence. After deletion, a new scan
+without an explicit checkpoint follows its existing initial scan behavior. Scans that
+have already loaded their progress do not switch positions when the record changes.
+A running consumer's checkpoint completion can overwrite or recreate the record,
+so stop the consumer before adjusting its progress manually.
+
+### clear_consumers
+
+Delete a group of consumer records while retaining exceptions:
+
+```sql
+CALL sys.clear_consumers(
+    table => 'paimon.test_db.events',
+    including_consumers => 'pipeline_.*',
+    excluding_consumers => 'pipeline_critical|pipeline_backup'
+);
+```
+
+Both expressions match the **entire consumer ID**, excluding the `consumer-` filename
+prefix. A record is deleted only when inclusion matches and exclusion does not.
+For example, `pipeline_a` does not match `pipeline_a_backup`; use `pipeline_a.*`
+to match that suffix. Alternation and inline multiline flags do not bypass the
+whole-ID requirement.
+
+Patterns use [Rust `regex` syntax](https://docs.rs/regex/1/regex/#syntax), including
+groups, alternation, character classes, repetition, Unicode classes, and inline
+flags such as `(?i)`, `(?m)`, `(?s)`, and `(?x)`. Look-around and backreferences are
+not supported. This is not the Java Pattern dialect: for example, `\w`, `\d`, and
+`\s` are Unicode-aware by default, and `.` excludes LF but matches CR. Use explicit
+classes or flags when those distinctions matter. Invalid expressions fail before
+any files are deleted, including an invalid exclusion when inclusion matches nothing.
+
+Omitting `including_consumers`, or passing an empty or Java-whitespace-only string,
+uses `.*`. The equivalent exclusion means no exclusions. Nonbreaking spaces such
+as U+00A0 are literal patterns, not blank placeholders. Nonblank patterns are never
+trimmed. The default `.*` does not match IDs containing LF; use `(?s).*` if needed.
+To clear all ordinary consumer IDs:
+
+```sql
+CALL sys.clear_consumers(table => 'paimon.test_db.events');
+```
+
+The procedure uses the same table resolution and branch-scoped manager as
+`reset_consumer`; it does not add branch-qualified name resolution to catalogs.
+REST-managed tables and format tables are not supported. Arguments require named
+`=>` syntax; explicit `NULL` and positional arguments are not supported. Successful
+calls return `OK`, including when the consumer directory is absent or nothing matches.
+
+Only filenames are inspected, so corrupt consumer JSON does not prevent cleanup.
+Directories and unrelated files are skipped. A matching listed path with trailing
+whitespace is rejected before deletion because OpenDAL could otherwise normalize it
+to a different consumer's path. Filenames are taken from the storage listing; the
+filesystem backend normalizes trailing whitespace before returning entries.
+Retained consumer records, table data, snapshots, and manifests are unchanged.
+Storage errors are propagated; deletion is not atomic and an error can leave some
+matching records already removed.
+
+This operation does not determine whether a consumer has stopped. Stop the target
+consumers before cleanup: running scans retain their loaded positions, and checkpoint
+completion can recreate deleted records. A fresh scan without an explicit checkpoint
+follows its existing initial scan behavior after its consumer record is deleted.
+
 ### create_tag
 
 Create a named tag from a snapshot:
@@ -1080,11 +1182,44 @@ This procedure does not automatically delete expired tags.
 
 ### create_tag_from_timestamp
 
-Create a named tag from a timestamp (finds the latest snapshot at or before the given time):
+Create a named tag from a commit timestamp (finds the earliest retained snapshot at or after the given time):
 
 ```sql
 CALL sys.create_tag_from_timestamp(table => 'paimon.my_db.my_table', tag => 'my_tag', timestamp => 1234567890000);
 ```
+
+### create_tag_from_watermark
+
+This procedure is not supported for tables managed by a REST catalog. Their
+snapshots may exist only in the catalog, while watermark selection currently
+relies on stored snapshot files. REST-managed tables are rejected before
+candidate selection or tag creation.
+
+Create a named tag from the earliest retained snapshot whose watermark is greater
+than or equal to the requested value. Candidates include live snapshots and
+historical snapshots preserved by existing tags. Equal watermarks select the
+earlier snapshot ID; snapshots without a watermark, including the no-watermark
+sentinel `-9223372036854775808`, are skipped.
+
+```sql
+CALL sys.create_tag_from_watermark(
+    table => 'paimon.my_db.my_table',
+    tag => 'business_checkpoint',
+    watermark => 1704067200000,
+    time_retained => '7d'
+);
+```
+
+`table`, `tag`, and `watermark` are required. `watermark` is a signed 64-bit integer
+in milliseconds. It represents the input processing progress recorded by the
+writer, whereas `timestamp` in `create_tag_from_timestamp` refers to snapshot
+commit time. Selecting by watermark fixes an entire snapshot; it does not filter
+rows by event time.
+
+The optional `time_retained` uses the same duration format and metadata as
+`create_tag`. This procedure does not automatically delete expired tags. An
+existing tag name, an invalid argument, or no matching snapshot causes an error
+without creating or replacing a tag. The call does not wait for a future snapshot.
 
 ### delete_tag
 
@@ -2149,7 +2284,8 @@ let result = builder.new_read()?.read(plan).await?;
 `FullTextScanPlan` owns a pinned snapshot and can outlive its scan. Readers
 for the same table, branch, column and filter can reuse the plan with different
 queries or limits. Pinning preserves the query's bound schema, including
-schema-only column renames. `execute_scored()` performs both stages directly.
+schema-only column renames. `execute()` performs both stages directly and returns
+`GlobalIndexResult`, including scores and the captured read context.
 
 For Data Evolution, full-text and scalar `fast`, `full`, and `detail` modes
 follow Java's coverage rules. Inexact scalar candidates are read back only
@@ -2159,9 +2295,20 @@ unfiltered corpus for BM25 scores; Boolean and boosted queries collect leaf
 candidates before applying the final limit. Index shard searches use
 `global-index.thread-num` workers.
 
+Non-Data-Evolution tables also support row filters when they are append tables
+without primary keys, use Parquet, enable row tracking, and use full-text `fast`
+mode. Scalar `fast`, `full`, and `detail` retain their coverage rules, with data
+reads restricted to the full-text index coverage. Candidate refinement keeps
+the Rust default of `global-index.filter.refine-from-data=true`. Matching rows
+are checked against the pinned snapshot's live data and deletion vectors before
+full-text Top-K; filtering preserves the original index corpus and BM25 scores.
+Full-text `full`/`detail` row filtering on these tables remains unsupported.
+
 The existing `with_text_column()` / `with_query_text()` API continues to
-accept plain text for the SQL table function. Full-text row filters require
-Data Evolution; primary-key materialized reads use `execute_read()`.
+accept plain text for the SQL table function. These pre-filters are configured
+through the Rust core builder's `with_filter()`; the SQL table function does not
+push an outer `WHERE` into full-text search. Primary-key materialized reads use
+`execute_read()`.
 
 
 ## Time Travel

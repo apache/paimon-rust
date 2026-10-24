@@ -18,8 +18,10 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use arrow::datatypes::Schema as ArrowSchema;
-use arrow::pyarrow::FromPyArrow;
+use arrow::array::{Array, Int64Array};
+use arrow::compute::{cast_with_options, CastOptions};
+use arrow::datatypes::{DataType as ArrowDataType, Schema as ArrowSchema};
+use arrow::pyarrow::{FromPyArrow, ToPyArrow};
 use arrow::record_batch::RecordBatch;
 use paimon::spec::{BlobConsumer, BlobDescriptor, CoreOptions, DataType, Datum, RowType};
 use paimon::table::{
@@ -28,7 +30,7 @@ use paimon::table::{
     COMMIT_MESSAGE_SERIALIZER_VERSION,
 };
 use paimon_datafusion::runtime::runtime;
-use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
+use pyo3::exceptions::{PyModuleNotFoundError, PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyString};
 use pyo3::{PyTraverseError, PyVisit};
@@ -40,6 +42,75 @@ use crate::predicate::{dict_to_table_predicate, py_to_datum};
 
 type PartitionSpec = HashMap<String, Option<Datum>>;
 type PythonPartitionSpec = HashMap<String, Py<PyAny>>;
+
+fn delete_row_id_arrays(row_ids: &Bound<'_, PyAny>) -> PyResult<Vec<Int64Array>> {
+    let py = row_ids.py();
+    let pa = match py.import("pyarrow") {
+        Ok(pa) => pa,
+        // Plain sequence deletes do not require the optional PyArrow package.
+        // Preserve errors from a broken installation or its dependencies.
+        Err(error)
+            if error.is_instance_of::<PyModuleNotFoundError>(py)
+                && error
+                    .value(py)
+                    .getattr("name")?
+                    .extract::<Option<String>>()?
+                    .as_deref()
+                    == Some("pyarrow") =>
+        {
+            return Ok(vec![Int64Array::from(row_ids.extract::<Vec<i64>>()?)]);
+        }
+        Err(error) => return Err(error),
+    };
+    let is_array = row_ids.is_instance(&pa.getattr("Array")?)?;
+    let is_chunked = row_ids.is_instance(&pa.getattr("ChunkedArray")?)?;
+    if !is_array && !is_chunked {
+        return Ok(vec![Int64Array::from(row_ids.extract::<Vec<i64>>()?)]);
+    }
+    // Check the declared type even when a ChunkedArray contains no chunks.
+    if !ArrowDataType::from_pyarrow_bound(&row_ids.getattr("type")?)?.is_integer() {
+        return Err(PyTypeError::new_err(
+            "_ROW_ID input must be an integer Arrow array",
+        ));
+    }
+    let arrays = if is_array {
+        vec![crate::arrow_input::array_from_pyarrow(row_ids)?]
+    } else {
+        row_ids
+            .getattr("chunks")?
+            .try_iter()?
+            .map(|chunk| crate::arrow_input::array_from_pyarrow(&chunk?))
+            .collect::<PyResult<Vec<_>>>()?
+    };
+    py.detach(|| {
+        arrays
+            .into_iter()
+            .map(|array| {
+                if array.null_count() != 0 {
+                    return Err(PyValueError::new_err("_ROW_ID must not be null"));
+                }
+                let converted = cast_with_options(
+                    array.as_ref(),
+                    &ArrowDataType::Int64,
+                    &CastOptions {
+                        safe: false,
+                        ..Default::default()
+                    },
+                )
+                .map_err(|error| {
+                    PyValueError::new_err(format!(
+                        "_ROW_ID cannot be represented as Int64: {error}"
+                    ))
+                })?;
+                Ok(converted
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("cast to Int64 returned an Int64Array")
+                    .clone())
+            })
+            .collect()
+    })
+}
 
 /// Shared implementation state; public builders keep batch and stream contracts separate.
 struct WriteContext {
@@ -88,6 +159,7 @@ impl WriteContext {
             ))),
             table_location: self.table.location().to_string(),
             commit_user: self.commit_user.clone(),
+            blob_consumers: Vec::new(),
         })
     }
 }
@@ -103,29 +175,14 @@ fn boolean_option(table: &Table, key: &str, default: bool) -> PyResult<bool> {
     }
 }
 
-/// Java partition specs may encode numeric values as strings. Other Python
+/// Java partition specs encode schema-typed values as strings. Other Python
 /// literals use the same schema-driven conversion as the predicate API.
-fn partition_value(value: &Bound<'_, PyAny>, data_type: &DataType) -> PyResult<Datum> {
+fn partition_value(value: &Bound<'_, PyAny>, data_type: &DataType) -> PyResult<Option<Datum>> {
     if let Ok(text) = value.cast::<PyString>() {
         let text = text.to_str()?;
-        let invalid = || {
-            PyValueError::new_err(format!(
-                "Invalid partition value '{text}' for {data_type:?}"
-            ))
-        };
-        match data_type {
-            DataType::TinyInt(_) => return text.parse().map(Datum::TinyInt).map_err(|_| invalid()),
-            DataType::SmallInt(_) => {
-                return text.parse().map(Datum::SmallInt).map_err(|_| invalid())
-            }
-            DataType::Int(_) => return text.parse().map(Datum::Int).map_err(|_| invalid()),
-            DataType::BigInt(_) => return text.parse().map(Datum::Long).map_err(|_| invalid()),
-            DataType::Float(_) => return text.parse().map(Datum::Float).map_err(|_| invalid()),
-            DataType::Double(_) => return text.parse().map(Datum::Double).map_err(|_| invalid()),
-            _ => {}
-        }
+        return paimon::table::parse_partition_spec_value(text, data_type).map_err(to_py_err);
     }
-    py_to_datum(value, data_type)
+    py_to_datum(value, data_type).map(Some)
 }
 
 fn partition_spec(
@@ -154,7 +211,7 @@ fn partition_spec(
             let datum = if value.is_none() || is_default {
                 None
             } else {
-                Some(partition_value(value, field.data_type())?)
+                partition_value(value, field.data_type())?
             };
             Ok((key, datum))
         })
@@ -179,8 +236,8 @@ impl PyBatchWriteBuilder {
 
 #[pymethods]
 impl PyBatchWriteBuilder {
-    /// Internal PyPaimon bridge: retain the identity of the external Python writer.
-    fn _with_commit_user(
+    /// Set the commit identity shared by this builder's writers and committers.
+    fn with_commit_user(
         mut slf: PyRefMut<'_, Self>,
         commit_user: String,
     ) -> PyResult<PyRefMut<'_, Self>> {
@@ -342,8 +399,10 @@ impl WriteTarget {
                 writer.with_blob_consumer(consumer)?;
                 Ok(())
             }
-            // Like Java AbstractFileStoreWrite, PK-only writers ignore it.
-            Self::PostponeFixed(_) => Ok(()),
+            Self::PostponeFixed(writer) => {
+                writer.with_blob_consumer(consumer)?;
+                Ok(())
+            }
         }
     }
 
@@ -379,9 +438,15 @@ impl WriteTarget {
         }
     }
 
-    async fn prepare_commit(&mut self) -> paimon::Result<Vec<CommitMessage>> {
+    async fn prepare_commit(
+        &mut self,
+        commit_identifier: i64,
+    ) -> paimon::Result<Vec<CommitMessage>> {
         match self {
-            Self::Table(writer) => writer.prepare_commit().await,
+            Self::Table(writer) => {
+                paimon::table::internal::prepare_commit_with_identifier(writer, commit_identifier)
+                    .await
+            }
             Self::PostponeFixed(writer) => writer.prepare_commit().await,
         }
     }
@@ -418,7 +483,28 @@ impl PyPostponeFixedBucketWriteBuilder {
 
 #[pymethods]
 impl PyPostponeFixedBucketWriteBuilder {
-    fn _with_commit_user(
+    /// Existing partitions and their bucket counts, using writer metadata access.
+    fn resolve_bucket_plan(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let table = &self.batch.context.table;
+        let mut builder = table
+            .new_postpone_fixed_bucket_write_builder()
+            .map_err(to_py_err)?;
+        if let Some(plan) = &self.plan {
+            builder = builder.with_bucket_plan(plan.clone());
+        }
+        if self.batch.static_partition.is_some() {
+            builder = builder.with_overwrite();
+        }
+        let plan = py
+            .detach(|| runtime().block_on(builder.resolve_bucket_plan()))
+            .map_err(to_py_err)?;
+        plan.to_arrow(table.schema())
+            .map_err(to_py_err)?
+            .to_pyarrow(py)
+            .map(Bound::unbind)
+    }
+
+    fn with_commit_user(
         mut slf: PyRefMut<'_, Self>,
         commit_user: String,
     ) -> PyResult<PyRefMut<'_, Self>> {
@@ -439,7 +525,8 @@ impl PyPostponeFixedBucketWriteBuilder {
     ) -> PyResult<PyRefMut<'py, Self>> {
         let plan = RecordBatch::from_pyarrow_bound(plan)?;
         slf.plan = Some(
-            PostponeBucketPlan::from_arrow(&slf.batch.context.table, &plan).map_err(to_py_err)?,
+            PostponeBucketPlan::from_arrow(slf.batch.context.table.schema(), &plan)
+                .map_err(to_py_err)?,
         );
         Ok(slf)
     }
@@ -477,6 +564,7 @@ impl PyPostponeFixedBucketWriteBuilder {
                 ))),
                 table_location: context.table.location().to_string(),
                 commit_user: context.commit_user.clone(),
+                blob_consumers: Vec::new(),
             },
             prepared: false,
         })
@@ -491,12 +579,15 @@ struct WriteState {
     inner: Option<WriteTarget>,
     table_location: String,
     commit_user: String,
+    // Core keeps prior consumers in captured partition/bucket settings. Expose
+    // every owned Python reference to GC, including replaced consumers.
+    blob_consumers: Vec<Arc<PythonBlobConsumer>>,
 }
 
 /// Descriptor serialization and exception transport only; record boundaries,
 /// callback timing and requested flushes belong to Rust core.
 struct PythonBlobConsumer {
-    callback: Py<PyAny>,
+    callback: Mutex<Option<Py<PyAny>>>,
 }
 
 impl BlobConsumer for PythonBlobConsumer {
@@ -509,10 +600,14 @@ impl BlobConsumer for PythonBlobConsumer {
             Python::attach(|py| {
                 let encoded =
                     descriptor.map(|descriptor| PyBytes::new(py, &descriptor.serialize()));
-                self.callback
-                    .bind(py)
-                    .call1((field_name, encoded))?
-                    .is_truthy()
+                let callback = self
+                    .callback
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|callback| callback.clone_ref(py))
+                    .ok_or_else(|| PyRuntimeError::new_err("Blob consumer has been cleared"))?;
+                callback.bind(py).call1((field_name, encoded))?.is_truthy()
             })
         });
         result.map_err(callback_error)
@@ -540,13 +635,41 @@ fn arrow_table_batches(table: &Bound<'_, PyAny>) -> PyResult<Vec<RecordBatch>> {
     let mut batches = table
         .call_method0("to_batches")?
         .try_iter()?
-        .map(|batch| RecordBatch::from_pyarrow_bound(&batch?))
+        .map(|batch| crate::arrow_input::write_batch_from_pyarrow(&batch?))
         .collect::<PyResult<Vec<_>>>()?;
     // Preserve empty input schema so core validates columns even with no rows.
     if batches.is_empty() {
         batches.push(RecordBatch::new_empty(Arc::new(
             ArrowSchema::from_pyarrow_bound(&table.getattr("schema")?)?,
         )));
+    } else if batches.len() > 1 {
+        // One Arrow Table has one schema, even when NULLs occur in only some
+        // chunks. The write importer relaxes transport fields per batch; union
+        // those flags so core can still require a uniform MERGE source schema.
+        let first = batches[0].schema();
+        let mut fields = first.fields().to_vec();
+        for batch in batches.iter().skip(1) {
+            for (field, actual) in fields.iter_mut().zip(batch.schema().fields()) {
+                if actual.is_nullable() && !field.is_nullable() {
+                    *field = Arc::new(field.as_ref().clone().with_nullable(true));
+                }
+            }
+        }
+        let schema = Arc::new(ArrowSchema::new_with_metadata(
+            fields,
+            first.metadata().clone(),
+        ));
+        for batch in &mut batches {
+            if batch.schema() != schema {
+                *batch = RecordBatch::try_new_with_options(
+                    schema.clone(),
+                    batch.columns().to_vec(),
+                    &arrow::array::RecordBatchOptions::default()
+                        .with_row_count(Some(batch.num_rows())),
+                )
+                .map_err(|error| PyValueError::new_err(error.to_string()))?;
+            }
+        }
     }
     Ok(batches)
 }
@@ -559,18 +682,30 @@ fn arrow_upsert_batches(input: &Bound<'_, PyAny>) -> PyResult<Vec<RecordBatch>> 
     }
     input
         .try_iter()?
-        .map(|batch| RecordBatch::from_pyarrow_bound(&batch?))
+        .map(|batch| crate::arrow_input::write_batch_from_pyarrow(&batch?))
         .collect()
 }
 
 struct UpdateContext {
     inner: TableUpdate,
+    planned: bool,
     table: Arc<Table>,
     table_location: String,
     commit_user: String,
 }
 
 impl UpdateContext {
+    // Reject a mismatched operation before consuming a Python input iterator
+    // or converting callbacks. Core independently enforces the same contract.
+    fn ensure_unplanned(&self) -> PyResult<()> {
+        if self.planned {
+            return Err(PyValueError::new_err(
+                "with_plan supports only row-ID update and delete operations",
+            ));
+        }
+        Ok(())
+    }
+
     fn with_blob_uri_reader_factory(
         &mut self,
         factory: Option<Py<PyAny>>,
@@ -583,6 +718,7 @@ impl UpdateContext {
 
     fn new(context: &WriteContext) -> PyResult<Self> {
         Ok(Self {
+            planned: false,
             inner: context
                 .table
                 .new_write_builder()
@@ -596,6 +732,21 @@ impl UpdateContext {
         })
     }
 
+    fn merge_source_schema(
+        &self,
+        source: &paimon::table::MergeSource,
+    ) -> PyResult<Arc<ArrowSchema>> {
+        let table = match source {
+            paimon::table::MergeSource::Batches(batches) => return Ok(batches[0].schema()),
+            paimon::table::MergeSource::Table(table) => table,
+            paimon::table::MergeSource::SelfTable => &self.table,
+        };
+        // Compile conditions against the same metadata schema that core uses
+        // when projecting a table source, including independently pinned views.
+        paimon::arrow::build_target_arrow_schema(&table.schema().fields_with_read_metadata())
+            .map_err(to_py_err)
+    }
+
     fn merge_into(
         &self,
         py: Python<'_>,
@@ -604,6 +755,7 @@ impl UpdateContext {
         when_matched: &Bound<'_, PyAny>,
         when_not_matched: &Bound<'_, PyAny>,
     ) -> PyResult<Vec<PyCommitMessage>> {
+        self.ensure_unplanned()?;
         let source = match source {
             Some(source) => match source.extract::<PyRef<crate::table::PyTable>>() {
                 Ok(table) => paimon::table::MergeSource::Table(table.inner.clone()),
@@ -611,24 +763,7 @@ impl UpdateContext {
             },
             None => paimon::table::MergeSource::SelfTable,
         };
-        let source_schema = match &source {
-            paimon::table::MergeSource::Batches(batches) => batches[0].schema(),
-            paimon::table::MergeSource::Table(table) => {
-                paimon::arrow::build_target_arrow_schema(table.schema().fields())
-                    .map_err(to_py_err)?
-            }
-            paimon::table::MergeSource::SelfTable => {
-                let schema = paimon::arrow::build_target_arrow_schema(self.table.schema().fields())
-                    .map_err(to_py_err)?;
-                let mut fields = schema.fields().to_vec();
-                fields.push(Arc::new(arrow::datatypes::Field::new(
-                    "_ROW_ID",
-                    arrow::datatypes::DataType::Int64,
-                    false,
-                )));
-                Arc::new(ArrowSchema::new(fields))
-            }
-        };
+        let source_schema = self.merge_source_schema(&source)?;
         let errors = Arc::new(Mutex::new(None));
         let (matched, not_matched) = crate::merge_into::from_python(
             py,
@@ -657,6 +792,7 @@ impl UpdateContext {
         assignments: &Bound<'_, PyDict>,
         read_columns: Option<Vec<String>>,
     ) -> PyResult<Vec<PyCommitMessage>> {
+        self.ensure_unplanned()?;
         let predicate = predicate
             .map(|predicate| dict_to_table_predicate(predicate, self.table.schema(), true))
             .transpose()?;
@@ -746,6 +882,7 @@ impl UpdateContext {
         count: usize,
         read_type: Option<&str>,
     ) -> PyResult<crate::shard_update::PyShardTableUpdator> {
+        self.ensure_unplanned()?;
         let read_type = read_type
             .map(|json| {
                 serde_json::from_str::<RowType>(json)
@@ -780,6 +917,7 @@ impl UpdateContext {
         input: &Bound<'_, PyAny>,
         keys: Vec<String>,
     ) -> PyResult<Vec<PyCommitMessage>> {
+        self.ensure_unplanned()?;
         let batches = arrow_upsert_batches(input)?;
         let messages = py
             .detach(|| runtime().block_on(self.inner.upsert_by_arrow_with_key(batches, keys)))
@@ -796,6 +934,7 @@ impl UpdateContext {
         py: Python<'_>,
         predicate: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<Vec<PyCommitMessage>> {
+        self.ensure_unplanned()?;
         let predicate = predicate
             .map(|predicate| dict_to_table_predicate(predicate, self.table.schema(), true))
             .transpose()?;
@@ -812,10 +951,19 @@ impl UpdateContext {
     fn delete_by_row_id(
         &self,
         py: Python<'_>,
-        row_ids: Vec<i64>,
+        row_ids: &Bound<'_, PyAny>,
     ) -> PyResult<Vec<PyCommitMessage>> {
+        let arrays = delete_row_id_arrays(row_ids)?;
         let messages = py
-            .detach(|| runtime().block_on(self.inner.delete_by_row_id(row_ids)))
+            .detach(|| {
+                runtime().block_on(
+                    self.inner.delete_by_row_id(
+                        arrays
+                            .iter()
+                            .flat_map(|array| array.values().iter().copied()),
+                    ),
+                )
+            })
             .map_err(to_py_err)?;
         Ok(wrap_messages(
             messages,
@@ -845,7 +993,9 @@ impl WriteState {
                 if !callback.bind(py).is_callable() {
                     return Err(PyTypeError::new_err("blob_consumer must be callable"));
                 }
-                Ok(Arc::new(PythonBlobConsumer { callback }))
+                Ok(Arc::new(PythonBlobConsumer {
+                    callback: Mutex::new(Some(callback)),
+                }))
             })
             .transpose()?;
         self.inner
@@ -857,7 +1007,40 @@ impl WriteState {
                     .map(|consumer| consumer as Arc<dyn BlobConsumer>),
             )
             .map_err(to_py_err)?;
+        // Release replaced callbacks which no bucket has captured. A snapshot
+        // retained by core contributes another Arc, without another Py ref.
+        self.prune_blob_consumers();
+        if let Some(consumer) = consumer {
+            self.blob_consumers.push(consumer);
+        }
         Ok(())
+    }
+
+    fn prune_blob_consumers(&mut self) {
+        let (retained, retired): (Vec<_>, Vec<_>) = std::mem::take(&mut self.blob_consumers)
+            .into_iter()
+            .partition(|consumer| Arc::strong_count(consumer) > 1);
+        self.blob_consumers = retained;
+        // Python destructors can re-enter Native. No callback mutex is held,
+        // and the retained references are restored before any destructor runs.
+        drop(retired);
+    }
+
+    fn traverse_callbacks(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
+        for consumer in &self.blob_consumers {
+            visit.call(&*consumer.callback.lock().unwrap())?;
+        }
+        Ok(())
+    }
+
+    fn clear_callbacks(&self) {
+        let references = self
+            .blob_consumers
+            .iter()
+            .map(|consumer| consumer.callback.lock().unwrap().take())
+            .collect::<Vec<_>>();
+        // Destructors may re-enter Native. Drop Python references outside locks.
+        drop(references);
     }
 
     fn write_result(&self, result: paimon::Result<()>) -> PyResult<()> {
@@ -878,7 +1061,7 @@ impl WriteState {
         batch: &Bound<'_, PyAny>,
         bucket: Option<i32>,
     ) -> PyResult<()> {
-        let batch = RecordBatch::from_pyarrow_bound(batch)?;
+        let batch = crate::arrow_input::write_batch_from_pyarrow(batch)?;
         let inner = self
             .inner
             .as_mut()
@@ -887,14 +1070,18 @@ impl WriteState {
         self.write_result(result)
     }
 
-    fn prepare_commit(&mut self, py: Python<'_>) -> PyResult<Vec<PyCommitMessage>> {
+    fn prepare_commit(
+        &mut self,
+        py: Python<'_>,
+        commit_identifier: i64,
+    ) -> PyResult<Vec<PyCommitMessage>> {
         let inner = self
             .inner
             .as_mut()
             .ok_or_else(|| PyRuntimeError::new_err("TableWrite is closed"))?;
-        let messages = py
-            .detach(|| runtime().block_on(inner.prepare_commit()))
-            .map_err(to_callback_error)?;
+        let result = py.detach(|| runtime().block_on(inner.prepare_commit(commit_identifier)));
+        self.prune_blob_consumers();
+        let messages = result.map_err(to_callback_error)?;
         Ok(wrap_messages(
             messages,
             &self.table_location,
@@ -927,14 +1114,14 @@ pub struct PyTableUpdateByRowId {
 
 #[pymethods]
 impl PyTableUpdateByRowId {
-    fn _with_blob_uri_reader_factory(
-        &mut self,
-        py: Python<'_>,
+    #[pyo3(signature = (factory))]
+    fn with_blob_uri_reader_factory(
+        mut slf: PyRefMut<'_, Self>,
         factory: Option<Py<PyAny>>,
-    ) -> PyResult<()> {
-        let factory = optional_uri_reader_factory(factory, py)?;
-        self.inner.with_blob_uri_reader_factory(factory);
-        Ok(())
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        let factory = optional_uri_reader_factory(factory, slf.py())?;
+        slf.inner.with_blob_uri_reader_factory(factory);
+        Ok(slf)
     }
 
     fn update_columns(
@@ -976,12 +1163,26 @@ pub struct PyStreamTableUpdate {
 
 #[pymethods]
 impl PyStreamTableUpdate {
-    fn _with_blob_uri_reader_factory(
-        &mut self,
-        py: Python<'_>,
+    fn with_plan<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        plan: &crate::read::PyPlan,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        slf.context
+            .inner
+            .with_plan(plan.inner.clone())
+            .map_err(to_py_err)?;
+        slf.context.planned = true;
+        Ok(slf)
+    }
+
+    #[pyo3(signature = (factory))]
+    fn with_blob_uri_reader_factory(
+        mut slf: PyRefMut<'_, Self>,
         factory: Option<Py<PyAny>>,
-    ) -> PyResult<()> {
-        self.context.with_blob_uri_reader_factory(factory, py)
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        let py = slf.py();
+        slf.context.with_blob_uri_reader_factory(factory, py)?;
+        Ok(slf)
     }
 
     #[pyo3(signature = (source, *, on, when_matched, when_not_matched, commit_identifier))]
@@ -1072,7 +1273,7 @@ impl PyStreamTableUpdate {
     fn delete_by_row_id(
         &self,
         py: Python<'_>,
-        row_ids: Vec<i64>,
+        row_ids: &Bound<'_, PyAny>,
         commit_identifier: i64,
     ) -> PyResult<Vec<PyCommitMessage>> {
         // The stream committer applies the identifier to the returned messages.
@@ -1094,6 +1295,18 @@ impl PyStreamTableUpdate {
 
 #[pymethods]
 impl PyBatchTableUpdate {
+    fn with_plan<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        plan: &crate::read::PyPlan,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        slf.context
+            .inner
+            .with_plan(plan.inner.clone())
+            .map_err(to_py_err)?;
+        slf.context.planned = true;
+        Ok(slf)
+    }
+
     #[pyo3(signature = (predicate))]
     fn delete_by_predicate(
         &self,
@@ -1103,12 +1316,14 @@ impl PyBatchTableUpdate {
         self.context.delete_by_predicate(py, predicate)
     }
 
-    fn _with_blob_uri_reader_factory(
-        &mut self,
-        py: Python<'_>,
+    #[pyo3(signature = (factory))]
+    fn with_blob_uri_reader_factory(
+        mut slf: PyRefMut<'_, Self>,
         factory: Option<Py<PyAny>>,
-    ) -> PyResult<()> {
-        self.context.with_blob_uri_reader_factory(factory, py)
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        let py = slf.py();
+        slf.context.with_blob_uri_reader_factory(factory, py)?;
+        Ok(slf)
     }
 
     #[pyo3(signature = (source, *, on, when_matched, when_not_matched))]
@@ -1192,7 +1407,7 @@ impl PyBatchTableUpdate {
     fn delete_by_row_id(
         &self,
         py: Python<'_>,
-        row_ids: Vec<i64>,
+        row_ids: &Bound<'_, PyAny>,
     ) -> PyResult<Vec<PyCommitMessage>> {
         self.context.delete_by_row_id(py, row_ids)
     }
@@ -1200,6 +1415,14 @@ impl PyBatchTableUpdate {
 
 #[pymethods]
 impl PyBatchTableWrite {
+    fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
+        self.state.traverse_callbacks(visit)
+    }
+
+    fn __clear__(&mut self) {
+        self.state.clear_callbacks();
+    }
+
     #[pyo3(signature = (factory))]
     fn with_blob_uri_reader_factory(
         mut slf: PyRefMut<'_, Self>,
@@ -1232,6 +1455,7 @@ impl PyBatchTableWrite {
         if let Some(mut writer) = self.state.inner.take() {
             py.detach(|| runtime().block_on(writer.close()));
         }
+        self.state.clear_callbacks();
     }
 
     #[pyo3(signature = (batch, bucket=None))]
@@ -1251,7 +1475,7 @@ impl PyBatchTableWrite {
             ));
         }
         self.prepared = true;
-        self.state.prepare_commit(py)
+        self.state.prepare_commit(py, i64::MAX)
     }
 }
 
@@ -1266,6 +1490,14 @@ pub struct PyStreamTableWrite {
 
 #[pymethods]
 impl PyStreamTableWrite {
+    fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
+        self.state.traverse_callbacks(visit)
+    }
+
+    fn __clear__(&mut self) {
+        self.state.clear_callbacks();
+    }
+
     #[pyo3(signature = (factory))]
     fn with_blob_uri_reader_factory(
         mut slf: PyRefMut<'_, Self>,
@@ -1298,6 +1530,7 @@ impl PyStreamTableWrite {
         if let Some(mut writer) = self.state.inner.take() {
             py.detach(|| runtime().block_on(writer.close()));
         }
+        self.state.clear_callbacks();
     }
 
     #[pyo3(signature = (batch, bucket=None))]
@@ -1311,15 +1544,15 @@ impl PyStreamTableWrite {
     }
 
     /// Rust currently flushes synchronously and has no background compaction.
-    /// The identifier accompanies the returned messages in StreamTableCommit.commit.
+    /// The identifier also bounds retirement of captured bucket configuration.
     fn prepare_commit(
         &mut self,
         py: Python<'_>,
         wait_compaction: bool,
         commit_identifier: i64,
     ) -> PyResult<Vec<PyCommitMessage>> {
-        let _ = (wait_compaction, commit_identifier);
-        self.state.prepare_commit(py)
+        let _ = wait_compaction;
+        self.state.prepare_commit(py, commit_identifier)
     }
 }
 
@@ -1505,6 +1738,27 @@ impl PyBatchTableCommit {
         .map_err(to_callback_error)
     }
 
+    /// Validate logical DML conflicts without publishing or deleting any files.
+    fn check_row_id_conflicts(
+        &self,
+        py: Python<'_>,
+        messages: &Bound<'_, PyAny>,
+        latest_snapshot_id: i64,
+        check_from_snapshot: i64,
+    ) -> PyResult<()> {
+        let messages = self
+            .context
+            .messages(messages, "check_row_id_conflicts", false)?;
+        py.detach(|| {
+            runtime().block_on(self.context.inner.check_row_id_conflicts(
+                &messages,
+                latest_snapshot_id,
+                check_from_snapshot,
+            ))
+        })
+        .map_err(to_py_err)
+    }
+
     fn truncate_table(&mut self, py: Python<'_>) -> PyResult<()> {
         self.check_committed()?;
         py.detach(|| runtime().block_on(self.context.inner.truncate_table()))
@@ -1663,6 +1917,1376 @@ impl PyCommitMessage {
             inner,
             origin: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use paimon::catalog::Identifier;
+    use paimon::io::FileIOBuilder;
+    use paimon::spec::{BigIntType, IntType, Schema, TableSchema, VarCharType};
+    use pyo3::ffi::c_str;
+
+    fn merge_locals(py: Python<'_>) -> Bound<'_, PyDict> {
+        let locals = PyDict::new(py);
+        locals
+            .set_item(
+                "MergeAssignment",
+                py.get_type::<crate::merge_types::PyMergeAssignment>(),
+            )
+            .unwrap();
+        locals
+            .set_item(
+                "WhenMatched",
+                py.get_type::<crate::merge_types::PyWhenMatched>(),
+            )
+            .unwrap();
+        locals
+            .set_item(
+                "WhenNotMatched",
+                py.get_type::<crate::merge_types::PyWhenNotMatched>(),
+            )
+            .unwrap();
+        locals
+    }
+
+    #[test]
+    fn row_id_delete_inputs_preserve_arrow_chunks_and_integer_values() {
+        Python::attach(|py| {
+            let locals = PyDict::new(py);
+            py.run(
+                c_str!(
+                    r#"
+import pyarrow as pa
+valid = [
+    ([2, 1], [2, 1], [2]),
+    ((2, 1), [2, 1], [2]),
+    (pa.array([None, 2, 1, None], type=pa.int64()).slice(1, 2), [2, 1], [2]),
+    (pa.chunked_array([[999, 2], [1, 999]], type=pa.int16()).slice(1, 2), [2, 1], [1, 1]),
+    (pa.array([2 ** 63 - 1], type=pa.uint64()), [2 ** 63 - 1], [1]),
+    (pa.array([], type=pa.uint32()), [], [0]),
+    (pa.chunked_array([], type=pa.int64()), [], []),
+]
+invalid = [
+    (pa.array([None], type=pa.int64()), 'value'),
+    (pa.chunked_array([[0], [None]], type=pa.int64()), 'value'),
+    (pa.array([2 ** 63], type=pa.uint64()), 'value'),
+    (pa.chunked_array([[0], [2 ** 63]], type=pa.uint64()), 'value'),
+    (pa.array([1.5]), 'type'),
+    (pa.array([True]), 'type'),
+    (pa.array([], type=pa.bool_()), 'type'),
+    (pa.array([], type=pa.string()), 'type'),
+    (pa.chunked_array([], type=pa.float64()), 'type'),
+    ([1.5], 'type'),
+    ([None], 'type'),
+    ([2 ** 63], 'overflow'),
+]
+"#
+                ),
+                Some(&locals),
+                Some(&locals),
+            )
+            .unwrap();
+            for case in locals
+                .get_item("valid")
+                .unwrap()
+                .unwrap()
+                .try_iter()
+                .unwrap()
+            {
+                let case = case.unwrap();
+                let arrays = delete_row_id_arrays(&case.get_item(0).unwrap()).unwrap();
+                let values: Vec<i64> = arrays
+                    .iter()
+                    .flat_map(|array| array.values().iter().copied())
+                    .collect();
+                let lengths: Vec<usize> = arrays.iter().map(Int64Array::len).collect();
+                assert_eq!(
+                    values,
+                    case.get_item(1).unwrap().extract::<Vec<i64>>().unwrap()
+                );
+                assert_eq!(
+                    lengths,
+                    case.get_item(2).unwrap().extract::<Vec<usize>>().unwrap()
+                );
+            }
+            for case in locals
+                .get_item("invalid")
+                .unwrap()
+                .unwrap()
+                .try_iter()
+                .unwrap()
+            {
+                let case = case.unwrap();
+                let error = delete_row_id_arrays(&case.get_item(0).unwrap()).unwrap_err();
+                let kind: String = case.get_item(1).unwrap().extract().unwrap();
+                assert!(
+                    match kind.as_str() {
+                        "type" => error.is_instance_of::<PyTypeError>(py),
+                        "value" => error.is_instance_of::<PyValueError>(py),
+                        "overflow" => error.is_instance_of::<pyo3::exceptions::PyOverflowError>(py),
+                        _ => false,
+                    },
+                    "unexpected {kind} error: {error}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn captured_plan_rejects_other_operations_before_python_input_consumption() {
+        Python::attach(|py| {
+            let schema = Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .option("row-tracking.enabled", "true")
+                .option("data-evolution.enabled", "true")
+                .build()
+                .unwrap();
+            let table = Arc::new(Table::new(
+                FileIOBuilder::new("memory").build().unwrap(),
+                Identifier::new("default", "planned_binding_boundary"),
+                "memory:/planned_binding_boundary".into(),
+                TableSchema::new(0, &schema),
+                None,
+            ));
+            let locals = PyDict::new(py);
+            locals
+                .set_item(
+                    "batch",
+                    Py::new(py, PyBatchWriteBuilder::new(table.clone())).unwrap(),
+                )
+                .unwrap();
+            locals
+                .set_item(
+                    "stream",
+                    Py::new(py, PyStreamWriteBuilder::new(table)).unwrap(),
+                )
+                .unwrap();
+            locals
+                .set_item("Plan", py.get_type::<crate::read::PyPlan>())
+                .unwrap();
+            py.run(c_str!(r#"
+class ExplodingInput:
+    def __iter__(self):
+        raise AssertionError('the supplied plan must reject input before iteration')
+
+for builder, identifier in [(batch, None), (stream, 7)]:
+    update = builder.new_update()
+    assert update.with_plan(Plan(None, [])) is update
+    assert update.with_plan(Plan(None, [])) is update
+    options = {} if identifier is None else {'commit_identifier': identifier}
+    operations = [
+        lambda: update.upsert_by_arrow_with_key(ExplodingInput(), ['id'], **options),
+        lambda: update.merge_into(ExplodingInput(), on=[], when_matched=[], when_not_matched=[], **options),
+    ]
+    for operation in operations:
+        try:
+            operation()
+        except ValueError as error:
+            assert 'with_plan supports only row-ID' in str(error), str(error)
+        else:
+            raise AssertionError('captured plan was silently ignored')
+"#),Some(&locals),Some(&locals)).unwrap();
+        });
+    }
+
+    #[test]
+    fn row_id_conflict_check_does_not_publish_or_consume_batch_commit() {
+        use arrow::array::{Array, Int32Array, Int64Array};
+        use futures::TryStreamExt;
+
+        Python::attach(|py| {
+            let schema = Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .option("row-tracking.enabled", "true")
+                .option("data-evolution.enabled", "true")
+                .build()
+                .unwrap();
+            let table = Arc::new(Table::new(
+                FileIOBuilder::new("memory").build().unwrap(),
+                Identifier::new("default", "conflict_check_binding"),
+                "memory:/conflict_check_binding".into(),
+                TableSchema::new(0, &schema),
+                None,
+            ));
+            let messages = py.detach(|| {
+                runtime().block_on(async {
+                    let mut writer = table.new_write_builder().new_write().unwrap();
+                    let batch = RecordBatch::try_new(
+                        paimon::arrow::build_target_arrow_schema(table.schema().fields()).unwrap(),
+                        vec![Arc::new(Int32Array::from(vec![1, 2]))],
+                    )
+                    .unwrap();
+                    writer.write_arrow_batch(&batch).await.unwrap();
+                    table
+                        .new_write_builder()
+                        .new_commit()
+                        .commit(writer.prepare_commit().await.unwrap())
+                        .await
+                        .unwrap();
+                    writer.close().await;
+                    let updates = RecordBatch::try_from_iter(vec![
+                        (
+                            "_ROW_ID",
+                            Arc::new(Int64Array::from(vec![0])) as arrow::array::ArrayRef,
+                        ),
+                        (
+                            "id",
+                            Arc::new(Int32Array::from(vec![9])) as arrow::array::ArrayRef,
+                        ),
+                    ])
+                    .unwrap();
+                    table
+                        .new_write_builder()
+                        .new_update()
+                        .unwrap()
+                        .update_by_arrow_with_row_id(vec![updates])
+                        .await
+                        .unwrap()
+                })
+            });
+            let messages = messages
+                .into_iter()
+                .map(PyCommitMessage::new)
+                .collect::<Vec<_>>();
+            let builder = PyBatchWriteBuilder::new(table.clone());
+            let commit = Py::new(py, builder.new_commit().unwrap()).unwrap();
+            let locals = PyDict::new(py);
+            locals.set_item("commit", commit).unwrap();
+            locals.set_item("messages", messages).unwrap();
+            py.run(
+                c_str!("commit.check_row_id_conflicts(messages, 1, 1)"),
+                Some(&locals),
+                Some(&locals),
+            )
+            .unwrap();
+            let snapshot = py
+                .detach(|| runtime().block_on(table.snapshot_manager().get_latest_snapshot()))
+                .unwrap()
+                .unwrap();
+            assert_eq!(snapshot.id(), 1, "the independent check must not publish");
+            py.run(
+                c_str!("commit.commit(messages)"),
+                Some(&locals),
+                Some(&locals),
+            )
+            .unwrap();
+            py.detach(|| {
+                runtime().block_on(async {
+                    let snapshot = table
+                        .snapshot_manager()
+                        .get_latest_snapshot()
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(
+                        snapshot.id(),
+                        2,
+                        "the check must not consume the batch boundary"
+                    );
+                    let builder = table.new_read_builder();
+                    let plan = builder.new_scan().plan().await.unwrap();
+                    let batches = builder
+                        .new_read()
+                        .unwrap()
+                        .to_arrow(plan.splits())
+                        .unwrap()
+                        .try_collect::<Vec<_>>()
+                        .await
+                        .unwrap();
+                    let mut values = batches
+                        .iter()
+                        .flat_map(|batch| {
+                            let values = batch
+                                .column(0)
+                                .as_any()
+                                .downcast_ref::<Int32Array>()
+                                .unwrap();
+                            assert_eq!(values.null_count(), 0);
+                            values.values().to_vec()
+                        })
+                        .collect::<Vec<_>>();
+                    values.sort_unstable();
+                    assert_eq!(values, [2, 9]);
+                })
+            });
+        });
+    }
+
+    #[test]
+    fn public_uri_factory_and_commit_user_setters_are_chainable() {
+        Python::attach(|py| {
+            let io = FileIOBuilder::new("memory").build().unwrap();
+            let schema = Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .option("row-tracking.enabled", "true")
+                .option("data-evolution.enabled", "true")
+                .build()
+                .unwrap();
+            let table = Arc::new(Table::new(
+                io.clone(),
+                Identifier::new("default", "public_uri_setters"),
+                "memory:/public_uri_setters".into(),
+                TableSchema::new(0, &schema),
+                None,
+            ));
+            let fixed_schema = Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .primary_key(["id"])
+                .option("bucket", "-2")
+                .build()
+                .unwrap();
+            let fixed = Arc::new(Table::new(
+                io,
+                Identifier::new("default", "public_commit_user"),
+                "memory:/public_commit_user".into(),
+                TableSchema::new(0, &fixed_schema),
+                None,
+            ));
+            let batch = Py::new(py, PyBatchWriteBuilder::new(table.clone())).unwrap();
+            let stream = Py::new(py, PyStreamWriteBuilder::new(table)).unwrap();
+            let fixed =
+                Py::new(py, PyPostponeFixedBucketWriteBuilder::new(fixed).unwrap()).unwrap();
+            let locals = PyDict::new(py);
+            locals.set_item("batch", batch).unwrap();
+            locals.set_item("stream", stream).unwrap();
+            locals.set_item("fixed", fixed).unwrap();
+            py.run(
+                c_str!(
+                    r#"
+import io
+
+class Reader:
+    def new_input_stream(self, uri):
+        return io.BytesIO(uri.encode())
+
+class Factory:
+    def create(self, uri):
+        return Reader()
+
+factory = Factory()
+for builder in [batch, stream, fixed]:
+    assert builder.with_commit_user('public-job') is builder
+    assert not hasattr(builder, '_with_commit_user')
+    for invalid in ['', '..', 'name/part']:
+        try:
+            builder.with_commit_user(invalid)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('invalid commit user accepted')
+
+for builder in [batch, stream]:
+    writer = builder.new_write()
+    assert writer.with_blob_uri_reader_factory(factory) is writer
+    assert writer.with_blob_uri_reader_factory(None) is writer
+    writer.close()
+    update = builder.new_update()
+    row_id = (update.new_update_by_row_id() if builder is batch else
+              update.new_update_by_row_id(7))
+    for operation in [update, row_id]:
+        assert operation.with_blob_uri_reader_factory(factory) is operation
+        try:
+            operation.with_blob_uri_reader_factory(type('Invalid', (), {'create': None})())
+        except TypeError:
+            pass
+        else:
+            raise AssertionError('factory without callable create accepted')
+        assert operation.with_blob_uri_reader_factory(None) is operation
+        assert not hasattr(operation, '_with_blob_uri_reader_factory')
+"#
+                ),
+                Some(&locals),
+                Some(&locals),
+            )
+            .unwrap();
+        });
+    }
+
+    #[test]
+    fn postpone_resolve_bucket_plan_binding_round_trips_arrow_and_overwrite_precedence() {
+        Python::attach(|py| {
+            let schema = Schema::builder()
+                .column("pt", DataType::VarChar(VarCharType::string_type()))
+                .column("id", DataType::Int(IntType::new()))
+                .partition_keys(["pt"])
+                .primary_key(["pt", "id"])
+                .option("bucket", "-2")
+                .option("postpone.default-bucket-num", "7")
+                .build()
+                .unwrap();
+            let table = Arc::new(Table::new(
+                FileIOBuilder::new("memory").build().unwrap(),
+                Identifier::new("default", "bucket_plan_binding"),
+                "memory:/bucket_plan_binding".into(),
+                TableSchema::new(0, &schema),
+                None,
+            ));
+            let builder = Py::new(
+                py,
+                PyPostponeFixedBucketWriteBuilder::new(table.clone()).unwrap(),
+            )
+            .unwrap();
+            let overwrite =
+                Py::new(py, PyPostponeFixedBucketWriteBuilder::new(table).unwrap()).unwrap();
+            let locals = PyDict::new(py);
+            locals.set_item("builder", builder).unwrap();
+            locals.set_item("overwrite", overwrite).unwrap();
+            py.run(
+                c_str!(
+                    r#"
+import pyarrow as pa
+empty = builder.resolve_bucket_plan()
+assert not hasattr(builder, 'bucket_plan')
+assert isinstance(empty, pa.RecordBatch)
+assert empty.schema.names == ['pt', 'total_buckets']
+assert empty.num_rows == 0
+assert empty.schema.field('total_buckets') == pa.field('total_buckets', pa.int32(), nullable=False)
+plan = pa.RecordBatch.from_arrays([pa.array(['b', 'a']), pa.array([3, 2], type=pa.int32())],
+                                 names=['pt', 'total_buckets'])
+builder.with_bucket_plan(plan)
+assert sorted(zip(*builder.resolve_bucket_plan().to_pydict().values())) == [('a', 2), ('b', 3)]
+builder.with_overwrite()
+assert builder.resolve_bucket_plan().num_rows == 2
+overwrite.with_overwrite()
+assert overwrite.resolve_bucket_plan().num_rows == 0
+"#
+                ),
+                Some(&locals),
+                Some(&locals),
+            )
+            .unwrap();
+        });
+    }
+
+    #[test]
+    fn replaced_blob_consumers_are_visible_to_writer_cycle_collection() {
+        Python::attach(|py| {
+            for batch in [false, true] {
+                let schema = Schema::builder()
+                    .column("id", DataType::Int(IntType::new()))
+                    .build()
+                    .unwrap();
+                let table = Arc::new(Table::new(
+                    FileIOBuilder::new("memory").build().unwrap(),
+                    Identifier::new("default", "blob_callback_gc"),
+                    "memory:/blob_callback_gc".into(),
+                    TableSchema::new(0, &schema),
+                    None,
+                ));
+                let context = WriteContext::new(table);
+                let writer = if batch {
+                    Py::new(
+                        py,
+                        PyBatchTableWrite {
+                            state: context.new_write(false).unwrap(),
+                            prepared: false,
+                        },
+                    )
+                    .unwrap()
+                    .into_any()
+                } else {
+                    Py::new(
+                        py,
+                        PyStreamTableWrite {
+                            state: context.new_write(false).unwrap(),
+                        },
+                    )
+                    .unwrap()
+                    .into_any()
+                };
+                let locals = PyDict::new(py);
+                locals.set_item("writer", writer).unwrap();
+                py.run(
+                    c_str!(
+                        r#"
+import gc
+finalized = []
+class Callback:
+    def __init__(self, writer, label):
+        self.writer = writer
+        self.label = label
+    def __call__(self, field, descriptor):
+        return False
+    def __del__(self):
+        finalized.append(self.label)
+writer.with_blob_consumer(Callback(writer, 'first'))
+"#
+                    ),
+                    Some(&locals),
+                    Some(&locals),
+                )
+                .unwrap();
+                // Capture the first callback in core without importing PyArrow
+                // or building/installing the extension for a Python test.
+                let input = RecordBatch::try_from_iter([(
+                    "id",
+                    Arc::new(arrow::array::Int32Array::from(vec![1])) as arrow::array::ArrayRef,
+                )])
+                .unwrap();
+                let object = locals.get_item("writer").unwrap().unwrap();
+                if batch {
+                    let mut writer = object.extract::<PyRefMut<'_, PyBatchTableWrite>>().unwrap();
+                    let inner = writer.state.inner.as_mut().unwrap();
+                    py.detach(|| runtime().block_on(inner.write_arrow(&input, None)))
+                        .unwrap();
+                } else {
+                    let mut writer = object
+                        .extract::<PyRefMut<'_, PyStreamTableWrite>>()
+                        .unwrap();
+                    let inner = writer.state.inner.as_mut().unwrap();
+                    py.detach(|| runtime().block_on(inner.write_arrow(&input, None)))
+                        .unwrap();
+                }
+                drop(object);
+                py.run(
+                    c_str!(
+                        r#"
+writer.with_blob_consumer(Callback(writer, 'second'))
+assert finalized == []
+del writer
+gc.collect()
+assert sorted(finalized) == ['first', 'second'], finalized
+"#
+                    ),
+                    Some(&locals),
+                    Some(&locals),
+                )
+                .unwrap();
+            }
+        });
+    }
+
+    #[test]
+    fn idle_bucket_prepare_releases_only_retired_python_blob_consumers() {
+        Python::attach(|py| {
+            let schema = Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("pt", DataType::Int(IntType::new()))
+                .partition_keys(["pt"])
+                .option("bucket", "-1")
+                .build()
+                .unwrap();
+            let table = Arc::new(Table::new(
+                FileIOBuilder::new("memory").build().unwrap(),
+                Identifier::new("default", "retired_callbacks"),
+                "memory:/retired_callbacks".into(),
+                TableSchema::new(0, &schema),
+                None,
+            ));
+            let writer = Py::new(
+                py,
+                PyStreamTableWrite {
+                    state: WriteContext::new(table.clone()).new_write(false).unwrap(),
+                },
+            )
+            .unwrap();
+            let locals = PyDict::new(py);
+            locals.set_item("writer", &writer).unwrap();
+            py.run(
+                c_str!(
+                    r#"
+import gc
+import weakref
+finalized = []
+class Callback:
+    def __init__(self, label):
+        self.label = label
+    def __call__(self, field, descriptor):
+        return False
+    def __del__(self):
+        finalized.append(self.label)
+def install(label):
+    callback = Callback(label)
+    writer.with_blob_consumer(callback)
+    return weakref.ref(callback)
+first = install('first')
+"#
+                ),
+                Some(&locals),
+                Some(&locals),
+            )
+            .unwrap();
+            let write_partition = |partition| {
+                let input = RecordBatch::try_from_iter([
+                    (
+                        "id",
+                        Arc::new(arrow::array::Int32Array::from(vec![1])) as arrow::array::ArrayRef,
+                    ),
+                    (
+                        "pt",
+                        Arc::new(arrow::array::Int32Array::from(vec![partition]))
+                            as arrow::array::ArrayRef,
+                    ),
+                ])
+                .unwrap();
+                let mut borrowed = writer.borrow_mut(py);
+                let inner = borrowed.state.inner.as_mut().unwrap();
+                py.detach(|| runtime().block_on(inner.write_arrow(&input, None)))
+                    .unwrap();
+            };
+            write_partition(1);
+            py.run(
+                c_str!("second = install('second')"),
+                Some(&locals),
+                Some(&locals),
+            )
+            .unwrap();
+            write_partition(2);
+            py.run(
+                c_str!("current = install('current')"),
+                Some(&locals),
+                Some(&locals),
+            )
+            .unwrap();
+            assert_eq!(
+                writer
+                    .borrow_mut(py)
+                    .state
+                    .prepare_commit(py, 1)
+                    .unwrap()
+                    .len(),
+                2
+            );
+            let prepared_files = py
+                .detach(|| {
+                    runtime().block_on(table.file_io().list_status_recursive(table.location()))
+                })
+                .unwrap();
+            assert!(!prepared_files.is_empty());
+            py.run(
+                c_str!("gc.collect(); assert first() is not None and second() is not None and current() is not None"),
+                Some(&locals), Some(&locals),
+            ).unwrap();
+            write_partition(2);
+            assert_eq!(
+                writer
+                    .borrow_mut(py)
+                    .state
+                    .prepare_commit(py, 2)
+                    .unwrap()
+                    .len(),
+                1
+            );
+            py.run(
+                c_str!("gc.collect(); assert first() is None; assert second() is not None and current() is not None; assert finalized == ['first']"),
+                Some(&locals), Some(&locals),
+            ).unwrap();
+            for file in prepared_files.iter().filter(|file| !file.is_dir) {
+                assert!(py
+                    .detach(|| runtime().block_on(table.file_io().exists(&file.path)))
+                    .unwrap());
+            }
+            writer.borrow_mut(py).close(py);
+            py.run(
+                c_str!("gc.collect(); assert second() is None and current() is None"),
+                Some(&locals),
+                Some(&locals),
+            )
+            .unwrap();
+            for file in prepared_files.iter().filter(|file| !file.is_dir) {
+                assert!(py
+                    .detach(|| runtime().block_on(table.file_io().exists(&file.path)))
+                    .unwrap());
+            }
+        });
+    }
+
+    #[test]
+    fn merge_into_rejects_legacy_dictionary_clauses() {
+        Python::attach(|py| {
+            let schema = Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .option("row-tracking.enabled", "true")
+                .option("data-evolution.enabled", "true")
+                .build()
+                .unwrap();
+            let table = Arc::new(Table::new(
+                FileIOBuilder::new("memory").build().unwrap(),
+                Identifier::new("default", "typed_merge_clauses"),
+                "memory:/typed-merge-clauses".into(),
+                TableSchema::new(0, &schema),
+                None,
+            ));
+            let update = Py::new(py, PyBatchWriteBuilder::new(table))
+                .unwrap()
+                .bind(py)
+                .call_method0("new_update")
+                .unwrap();
+            let locals = PyDict::new(py);
+            locals.set_item("update", update).unwrap();
+            py.run(
+                c_str!(
+                    r#"
+import pyarrow as pa
+source = pa.table({'id': pa.array([], pa.int32())})
+for matched, unmatched in [
+    ([dict(condition=None, delete=False, assignments=[('id', 'source', 'id')])], []),
+    ([], [dict(condition=None, assignments=[('id', 'source', 'id')])]),
+]:
+    try:
+        update.merge_into(source, on=[('id', 'id')],
+                          when_matched=matched, when_not_matched=unmatched)
+    except TypeError:
+        pass
+    else:
+        raise AssertionError('MERGE accepted a legacy dictionary clause')
+"#
+                ),
+                Some(&locals),
+                Some(&locals),
+            )
+            .unwrap();
+        });
+    }
+
+    #[test]
+    fn typed_merge_into_preserves_literal_and_callback_evaluation() {
+        use arrow::array::Int32Array;
+        use futures::TryStreamExt;
+
+        Python::attach(|py| {
+            let schema = Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("value", DataType::Int(IntType::new()))
+                .option("row-tracking.enabled", "true")
+                .option("data-evolution.enabled", "true")
+                .build()
+                .unwrap();
+            let table = Arc::new(Table::new(
+                FileIOBuilder::new("memory").build().unwrap(),
+                Identifier::new("default", "typed_merge_lazy_values"),
+                "memory:/typed-merge-lazy-values".into(),
+                TableSchema::new(0, &schema),
+                None,
+            ));
+            let locals = merge_locals(py);
+            locals
+                .set_item(
+                    "builder",
+                    Py::new(py, PyBatchWriteBuilder::new(table.clone())).unwrap(),
+                )
+                .unwrap();
+            py.run(
+                c_str!(
+                    r#"
+import pyarrow as pa
+source = pa.table({'id': pa.array([1, 2], pa.int32()),
+                   'value': pa.array([10, 20], pa.int32())})
+update = builder.new_update()
+literal_calls = []
+def literal_value(rows):
+    literal_calls.append(rows.num_rows)
+    return pa.array([99, 99], pa.int32())
+unused = WhenNotMatched({'id': MergeAssignment.source_column('id'),
+                         'value': MergeAssignment.literal(literal_value)},
+                        condition='"s.id" < 0')
+assert update.merge_into(source, on=[('id', 'id')], when_matched=[],
+                         when_not_matched=[unused]) == []
+assert literal_calls == []
+selected = WhenNotMatched({'id': MergeAssignment.source_column('id'),
+                           'value': MergeAssignment.literal(literal_value)})
+try:
+    update.merge_into(source, on=[('id', 'id')], when_matched=[],
+                      when_not_matched=[selected])
+except (TypeError, ValueError):
+    pass
+else:
+    raise AssertionError('callable literal was evaluated as an assignment function')
+assert literal_calls == []
+
+failure = LookupError('typed MERGE callback failed')
+callback_rows = []
+def assignment(rows):
+    callback_rows.append(rows['s.id'].to_pylist())
+    if len(callback_rows) == 1:
+        raise failure
+    return pa.chunked_array([pa.array([21], pa.int32())])
+assignments = {'id': MergeAssignment.source_column('id'),
+               'value': MergeAssignment.function(function=assignment)}
+clause = WhenNotMatched(assignments, condition='"s.id" = 2')
+assignments.clear()
+for attempt in [1, 2]:
+    try:
+        messages = update.merge_into(source, on=[('id', 'id')], when_matched=[],
+                                     when_not_matched=[unused, clause])
+    except LookupError as error:
+        assert attempt == 1
+        assert error is failure
+    else:
+        assert attempt == 2
+        builder.new_commit().commit(messages)
+assert callback_rows == [[2], [2]]
+assert literal_calls == []
+"#
+                ),
+                Some(&locals),
+                Some(&locals),
+            )
+            .unwrap();
+            let batches = py.detach(|| {
+                runtime().block_on(async {
+                    let builder = table.new_read_builder();
+                    let plan = builder.new_scan().plan().await.unwrap();
+                    builder
+                        .new_read()
+                        .unwrap()
+                        .to_arrow(plan.splits())
+                        .unwrap()
+                        .try_collect::<Vec<_>>()
+                        .await
+                        .unwrap()
+                })
+            });
+            assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+            assert_eq!(
+                batches[0]
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .value(0),
+                2
+            );
+            assert_eq!(
+                batches[0]
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .value(0),
+                21
+            );
+        });
+    }
+
+    #[test]
+    fn merge_table_source_conditions_resolve_read_metadata() {
+        Python::attach(|py| {
+            for metadata in ["_ROW_ID", "_SEQUENCE_NUMBER"] {
+                let schema = Schema::builder()
+                    .column("id", DataType::BigInt(BigIntType::new()))
+                    .column("value", DataType::Int(IntType::new()))
+                    .option("row-tracking.enabled", "true")
+                    .option("data-evolution.enabled", "true")
+                    .build()
+                    .unwrap();
+                let file_io = FileIOBuilder::new("memory").build().unwrap();
+                let table = Arc::new(Table::new(
+                    file_io.clone(),
+                    Identifier::new("default", "metadata_merge_target"),
+                    "memory:/metadata-merge-target".into(),
+                    TableSchema::new(0, &schema),
+                    None,
+                ));
+                let source = Arc::new(Table::new(
+                    file_io,
+                    Identifier::new("default", "metadata_merge_source"),
+                    "memory:/metadata-merge-source".into(),
+                    TableSchema::new(0, &schema),
+                    None,
+                ));
+                let source = Py::new(py, crate::table::PyTable::new(source)).unwrap();
+                let context = UpdateContext::new(&WriteContext::new(table)).unwrap();
+                let locals = merge_locals(py);
+                locals.set_item("metadata", metadata).unwrap();
+                py.run(
+                    c_str!(
+                        r#"
+condition = '"s.' + metadata + '" >= 0'
+matched = [WhenMatched.update({'value': MergeAssignment.source_column('value')}, condition=condition)]
+not_matched = [WhenNotMatched({'id': MergeAssignment.source_column(metadata),
+                              'value': MergeAssignment.source_column('value')}, condition=condition)]
+"#
+                    ),
+                    Some(&locals),
+                    Some(&locals),
+                )
+                .unwrap();
+                let messages = context
+                    .merge_into(
+                        py,
+                        Some(source.bind(py).as_any()),
+                        vec![("id".into(), metadata.into())],
+                        &locals.get_item("matched").unwrap().unwrap(),
+                        &locals.get_item("not_matched").unwrap().unwrap(),
+                    )
+                    .unwrap();
+                // Conditions must compile even when both snapshots are empty;
+                // empty input prepares no mutation files or synthetic rows.
+                assert!(messages.is_empty());
+            }
+        });
+    }
+
+    #[test]
+    fn merge_table_source_metadata_conditions_update_and_insert() {
+        use arrow::array::{Array, Int32Array, Int64Array};
+        use futures::TryStreamExt;
+
+        async fn seed(table: &Table, ids: Vec<i64>, values: Vec<i32>) {
+            let batch = RecordBatch::try_new(
+                paimon::arrow::build_target_arrow_schema(table.schema().fields()).unwrap(),
+                vec![
+                    Arc::new(Int64Array::from(ids)),
+                    Arc::new(Int32Array::from(values)),
+                ],
+            )
+            .unwrap();
+            let builder = table.new_write_builder();
+            let mut writer = builder.new_write().unwrap();
+            writer.write_arrow_batch(&batch).await.unwrap();
+            builder
+                .new_commit()
+                .commit(writer.prepare_commit().await.unwrap())
+                .await
+                .unwrap();
+            writer.close().await;
+        }
+
+        async fn read(table: &Table, projection: &[&str]) -> Vec<RecordBatch> {
+            let mut builder = table.new_read_builder();
+            builder.with_projection(projection).unwrap();
+            let plan = builder.new_scan().plan().await.unwrap();
+            builder
+                .new_read()
+                .unwrap()
+                .to_arrow(plan.splits())
+                .unwrap()
+                .try_collect()
+                .await
+                .unwrap()
+        }
+
+        Python::attach(|py| {
+            for metadata in ["_ROW_ID", "_SEQUENCE_NUMBER"] {
+                let schema = Schema::builder()
+                    .column("id", DataType::BigInt(BigIntType::new()))
+                    .column("value", DataType::Int(IntType::new()))
+                    .option("row-tracking.enabled", "true")
+                    .option("data-evolution.enabled", "true")
+                    .build()
+                    .unwrap();
+                let file_io = FileIOBuilder::new("memory").build().unwrap();
+                let target = Arc::new(Table::new(
+                    file_io.clone(),
+                    Identifier::new("default", "metadata_data_target"),
+                    "memory:/metadata-data-target".into(),
+                    TableSchema::new(0, &schema),
+                    None,
+                ));
+                let source = Arc::new(Table::new(
+                    file_io,
+                    Identifier::new("default", "metadata_data_source"),
+                    "memory:/metadata-data-source".into(),
+                    TableSchema::new(0, &schema),
+                    None,
+                ));
+                let (first, second) = py.detach(|| {
+                    runtime().block_on(async {
+                        seed(&source, vec![9], vec![91]).await;
+                        seed(&source, vec![8], vec![82]).await;
+                        let mut identities = HashMap::new();
+                        for batch in read(&source, &[metadata, "value"]).await {
+                            let keys = batch
+                                .column(0)
+                                .as_any()
+                                .downcast_ref::<Int64Array>()
+                                .unwrap();
+                            let values = batch
+                                .column(1)
+                                .as_any()
+                                .downcast_ref::<Int32Array>()
+                                .unwrap();
+                            assert_eq!(keys.null_count(), 0);
+                            for row in 0..batch.num_rows() {
+                                identities.insert(values.value(row), keys.value(row));
+                            }
+                        }
+                        let first = identities[&91];
+                        let second = identities[&82];
+                        assert_ne!(first, second);
+                        seed(&target, vec![first, first + 100], vec![10, 20]).await;
+                        (first, second)
+                    })
+                });
+                let source = Py::new(py, crate::table::PyTable::new(source)).unwrap();
+                let context = UpdateContext::new(&WriteContext::new(target.clone())).unwrap();
+                let locals = merge_locals(py);
+                locals.set_item("metadata", metadata).unwrap();
+                locals.set_item("first", first).unwrap();
+                locals.set_item("second", second).unwrap();
+                py.run(
+                    c_str!(
+                        r#"
+matched = [WhenMatched.update({'value': MergeAssignment.source_column('value')},
+                              condition='"s.' + metadata + '" = ' + str(first))]
+not_matched = [WhenNotMatched({'id': MergeAssignment.source_column(metadata),
+                              'value': MergeAssignment.source_column('value')},
+                             condition='"s.' + metadata + '" = ' + str(second))]
+"#
+                    ),
+                    Some(&locals),
+                    Some(&locals),
+                )
+                .unwrap();
+                let messages = context
+                    .merge_into(
+                        py,
+                        Some(source.bind(py).as_any()),
+                        vec![("id".into(), metadata.into())],
+                        &locals.get_item("matched").unwrap().unwrap(),
+                        &locals.get_item("not_matched").unwrap().unwrap(),
+                    )
+                    .unwrap();
+                assert!(messages
+                    .iter()
+                    .any(|message| message.inner.check_from_snapshot == Some(1)));
+                assert!(messages.iter().any(|message| {
+                    message.inner.check_from_snapshot.is_none()
+                        && message
+                            .inner
+                            .new_files
+                            .iter()
+                            .all(|file| file.first_row_id.is_none())
+                }));
+                let rows = py.detach(|| {
+                    runtime().block_on(async {
+                        target
+                            .new_write_builder()
+                            .new_commit()
+                            .commit(messages.into_iter().map(|message| message.inner).collect())
+                            .await
+                            .unwrap();
+                        let mut rows = Vec::new();
+                        for batch in read(&target, &["id", "value", "_ROW_ID"]).await {
+                            let ids = batch
+                                .column(0)
+                                .as_any()
+                                .downcast_ref::<Int64Array>()
+                                .unwrap();
+                            let values = batch
+                                .column(1)
+                                .as_any()
+                                .downcast_ref::<Int32Array>()
+                                .unwrap();
+                            let row_ids = batch
+                                .column(2)
+                                .as_any()
+                                .downcast_ref::<Int64Array>()
+                                .unwrap();
+                            for row in 0..batch.num_rows() {
+                                rows.push((ids.value(row), values.value(row), row_ids.value(row)));
+                            }
+                        }
+                        rows.sort_by_key(|row| row.2);
+                        rows
+                    })
+                });
+                assert_eq!(
+                    rows,
+                    [(first, 91, 0), (first + 100, 20, 1), (second, 82, 2)]
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn update_inputs_preserve_source_nulls_until_core_selects_payloads() {
+        use arrow::array::{Array, Int32Array};
+
+        Python::attach(|py| {
+            let locals = PyDict::new(py);
+            py.run(
+                c_str!(
+                    r#"
+import pyarrow as pa
+schema = pa.schema([
+    pa.field('id', pa.int32(), nullable=False),
+    pa.field('value', pa.int32(), nullable=False),
+    pa.field('unused', pa.int32(), nullable=False, metadata={'role': 'unselected'}),
+], metadata={'origin': 'update'})
+source = pa.Table.from_pylist([
+    {'id': 0, 'value': 0, 'unused': 0},
+    {'id': 1, 'value': None, 'unused': None},
+    {'id': 1, 'value': 42, 'unused': None},
+], schema=schema).slice(1, 2)
+source.validate(full=True)
+batches = source.to_batches()
+"#
+                ),
+                None,
+                Some(&locals),
+            )
+            .unwrap();
+            let table = locals.get_item("source").unwrap().unwrap();
+            let batches = locals.get_item("batches").unwrap().unwrap();
+            for imported in [
+                arrow_table_batches(&table).unwrap(),
+                arrow_upsert_batches(&batches).unwrap(),
+            ] {
+                assert_eq!(imported.len(), 1);
+                let batch = &imported[0];
+                assert_eq!(batch.num_rows(), 2);
+                assert!(!batch.schema().field(0).is_nullable());
+                assert!(batch.schema().field(1).is_nullable());
+                assert!(batch.schema().field(2).is_nullable());
+                assert_eq!(batch.schema().metadata().get("origin").unwrap(), "update");
+                assert_eq!(
+                    batch.schema().field(2).metadata().get("role").unwrap(),
+                    "unselected"
+                );
+                let values = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap();
+                assert!(values.is_null(0));
+                assert_eq!(values.value(1), 42);
+                assert_eq!(batch.column(2).null_count(), 2);
+            }
+            let original =
+                ArrowSchema::from_pyarrow_bound(&table.getattr("schema").unwrap()).unwrap();
+            assert!(original.fields().iter().all(|field| !field.is_nullable()));
+        });
+    }
+
+    #[test]
+    fn upsert_binding_validates_only_surviving_target_values() {
+        Python::attach(|py| {
+            let schema = Schema::builder()
+                .column("id", DataType::Int(IntType::with_nullable(false)))
+                .column("value", DataType::Int(IntType::with_nullable(false)))
+                .column("keep", DataType::Int(IntType::with_nullable(false)))
+                .option("row-tracking.enabled", "true")
+                .option("data-evolution.enabled", "true")
+                .build()
+                .unwrap();
+            let table = Arc::new(Table::new(
+                FileIOBuilder::new("memory").build().unwrap(),
+                Identifier::new("default", "upsert_source_nullability"),
+                "memory:/upsert-source-nullability".into(),
+                TableSchema::new(0, &schema),
+                None,
+            ));
+            let context = UpdateContext::new(&WriteContext::new(table)).unwrap();
+            let locals = PyDict::new(py);
+            py.run(
+                c_str!(
+                    r#"
+import pyarrow as pa
+schema = pa.schema([pa.field(name, pa.int32(), nullable=False)
+                    for name in ('id', 'value', 'keep')])
+source = pa.Table.from_pylist([
+    {'id': 1, 'value': None, 'keep': None},
+    {'id': 1, 'value': 42, 'keep': 100},
+], schema=schema)
+invalid = source.slice(0, 1)
+"#
+                ),
+                None,
+                Some(&locals),
+            )
+            .unwrap();
+            let source = locals.get_item("source").unwrap().unwrap();
+            let messages = context
+                .upsert_by_arrow_with_key(py, &source, vec!["id".into()])
+                .unwrap();
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0].inner.new_files.len(), 1);
+            assert_eq!(messages[0].inner.new_files[0].row_count, 1);
+            let invalid = locals.get_item("invalid").unwrap().unwrap();
+            let error = context
+                .upsert_by_arrow_with_key(py, &invalid, vec!["id".into()])
+                .err()
+                .expect("a surviving NULL must still fail the declared target schema")
+                .to_string();
+            assert!(error.contains("null"), "{error}");
+        });
+    }
+
+    #[test]
+    fn merge_binding_preserves_one_schema_across_source_chunks() {
+        use arrow::array::Int32Array;
+
+        Python::attach(|py| {
+            for reverse in [false, true] {
+                let schema = Schema::builder()
+                    .column("id", DataType::Int(IntType::with_nullable(false)))
+                    .column("value", DataType::Int(IntType::with_nullable(false)))
+                    .column("keep", DataType::Int(IntType::with_nullable(false)))
+                    .option("row-tracking.enabled", "true")
+                    .option("data-evolution.enabled", "true")
+                    .build()
+                    .unwrap();
+                let table = Arc::new(Table::new(
+                    FileIOBuilder::new("memory").build().unwrap(),
+                    Identifier::new("default", "merge_chunk_nullability"),
+                    "memory:/merge-chunk-nullability".into(),
+                    TableSchema::new(0, &schema),
+                    None,
+                ));
+                let seed = RecordBatch::try_new(
+                    paimon::arrow::build_target_arrow_schema(table.schema().fields()).unwrap(),
+                    vec![
+                        Arc::new(Int32Array::from(vec![1])),
+                        Arc::new(Int32Array::from(vec![10])),
+                        Arc::new(Int32Array::from(vec![100])),
+                    ],
+                )
+                .unwrap();
+                py.detach(|| {
+                    runtime().block_on(async {
+                        let builder = table.new_write_builder();
+                        let mut writer = builder.new_write().unwrap();
+                        writer.write_arrow_batch(&seed).await.unwrap();
+                        builder
+                            .new_commit()
+                            .commit(writer.prepare_commit().await.unwrap())
+                            .await
+                            .unwrap();
+                        writer.close().await;
+                    })
+                });
+                let context = UpdateContext::new(&WriteContext::new(table)).unwrap();
+                let locals = merge_locals(py);
+                locals.set_item("reverse", reverse).unwrap();
+                py.run(
+                    c_str!(
+                        r#"
+import pyarrow as pa
+schema = pa.schema([
+    pa.field('id', pa.int32(), nullable=False),
+    pa.field('value', pa.int32(), nullable=False),
+    pa.field('keep', pa.int32(), nullable=False, metadata={'role': 'unselected'}),
+], metadata={'origin': 'chunked-merge'})
+def chunk(row):
+    return pa.RecordBatch.from_pylist([
+        {'id': 0, 'value': 0, 'keep': 0}, row], schema=schema).slice(1)
+chunks = [chunk({'id': 1, 'value': 42, 'keep': 100}),
+          chunk({'id': 2, 'value': None, 'keep': None}),
+          chunk({'id': None, 'value': 30, 'keep': 100})]
+source = pa.Table.from_batches(chunks[::-1] if reverse else chunks)
+encoded = pa.chunked_array([pa.DictionaryArray.from_arrays(
+    pa.array([0], type=pa.int8()), pa.array([None], type=pa.int32())) for _ in chunks])
+source = source.append_column(pa.field('encoded_unused', encoded.type, nullable=False), encoded)
+assert source.column('encoded_unused').null_count == 0
+assert source.column('encoded_unused').to_pylist() == [None, None, None]
+matched = [WhenMatched.update({'value': MergeAssignment.source_column('value')})]
+not_matched = []
+"#
+                    ),
+                    Some(&locals),
+                    Some(&locals),
+                )
+                .unwrap();
+                let source = locals.get_item("source").unwrap().unwrap();
+                let matched = locals.get_item("matched").unwrap().unwrap();
+                let not_matched = locals.get_item("not_matched").unwrap().unwrap();
+                let messages = context
+                    .merge_into(
+                        py,
+                        Some(&source),
+                        vec![("id".into(), "id".into())],
+                        &matched,
+                        &not_matched,
+                    )
+                    .unwrap();
+                assert_eq!(messages.len(), 1);
+                assert_eq!(messages[0].inner.new_files.len(), 1);
+                let imported = arrow_table_batches(&source).unwrap();
+                assert_eq!(imported.len(), 3);
+                for batch in &imported {
+                    assert_eq!(batch.schema(), imported[0].schema());
+                    assert!(batch.schema().fields()[..3]
+                        .iter()
+                        .all(|field| field.is_nullable()));
+                    assert!(!batch.schema().field(3).is_nullable());
+                    assert_eq!(
+                        batch.schema().metadata().get("origin").unwrap(),
+                        "chunked-merge"
+                    );
+                    assert_eq!(
+                        batch.schema().field(2).metadata().get("role").unwrap(),
+                        "unselected"
+                    );
+                }
+                let original =
+                    ArrowSchema::from_pyarrow_bound(&source.getattr("schema").unwrap()).unwrap();
+                assert!(original.fields().iter().all(|field| !field.is_nullable()));
+            }
+        });
+    }
+
+    #[test]
+    fn ignored_delete_null_payload_reaches_core_nullability_checks() {
+        Python::attach(|py| {
+            let schema = Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("op", DataType::VarChar(VarCharType::string_type()))
+                .column("payload", DataType::Int(IntType::with_nullable(false)))
+                .primary_key(["id"])
+                .option("bucket", "1")
+                .option("rowkind.field", "op")
+                .option("ignore-delete", "true")
+                .build()
+                .unwrap();
+            let table = Arc::new(Table::new(
+                FileIOBuilder::new("memory").build().unwrap(),
+                Identifier::new("default", "nullable_transport"),
+                "memory:/nullable-transport".into(),
+                TableSchema::new(0, &schema),
+                None,
+            ));
+            let locals = PyDict::new(py);
+            for large_string in [false, true] {
+                locals.set_item("large_string", large_string).unwrap();
+                for (kind, id, payload, error_column) in [
+                    ("-D", Some(1), None, None),
+                    ("-U", Some(1), None, Some("payload")),
+                    ("+I", Some(1), None, Some("payload")),
+                    ("-D", None, Some(42), Some("id")),
+                ] {
+                    locals.set_item("kind", kind).unwrap();
+                    locals.set_item("row_id", id).unwrap();
+                    locals.set_item("payload", payload).unwrap();
+                    py.run(
+                        c_str!(
+                            r#"
+import pyarrow as pa
+schema = pa.schema([
+    pa.field('id', pa.int32(), nullable=False),
+    pa.field('op', pa.large_string() if large_string else pa.string()),
+    pa.field('payload', pa.int32(), nullable=False),
+])
+batch = pa.RecordBatch.from_pylist([
+    {'id': row_id, 'op': kind, 'payload': payload},
+], schema=schema)
+"#
+                        ),
+                        None,
+                        Some(&locals),
+                    )
+                    .unwrap();
+                    let batch = locals.get_item("batch").unwrap().unwrap();
+                    let mut state = WriteContext::new(table.clone()).new_write(false).unwrap();
+                    let result = state.write_arrow(py, &batch, None);
+                    if let Some(column) = error_column {
+                        let error = result.unwrap_err().to_string();
+                        assert!(
+                            error.contains(&format!(
+                                "Cannot write null to non-null column({column})"
+                            )),
+                            "{error}"
+                        );
+                    } else {
+                        result.unwrap();
+                    }
+                    assert!(state.prepare_commit(py, i64::MAX).unwrap().is_empty());
+                }
+            }
+        });
     }
 }
 

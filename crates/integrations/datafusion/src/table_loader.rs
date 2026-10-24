@@ -18,7 +18,7 @@
 use std::sync::Arc;
 
 use datafusion::error::{DataFusionError, Result as DFResult};
-use paimon::catalog::{Catalog, Identifier};
+use paimon::catalog::{Catalog, Identifier, LoadedTable};
 use paimon::table::Table;
 
 use crate::error::to_datafusion_error;
@@ -62,36 +62,51 @@ pub(crate) async fn load_table_for_read(
     let parsed = identifier
         .parsed_object_name()
         .map_err(to_datafusion_error)?;
+    let base = Identifier::new(
+        identifier.database().to_string(),
+        parsed.table().to_string(),
+    );
+    let loaded = catalog
+        .load_table(&base)
+        .await
+        .map_err(to_datafusion_error)?;
+    loaded_table_for_read(loaded, identifier).await
+}
+
+pub(crate) async fn loaded_table_for_read(
+    loaded: LoadedTable,
+    identifier: &Identifier,
+) -> DFResult<(Table, Identifier, Option<String>)> {
+    let parsed = identifier
+        .parsed_object_name()
+        .map_err(to_datafusion_error)?;
     let base_identifier = Identifier::new(
         identifier.database().to_string(),
         parsed.table().to_string(),
     );
-    let mut table = match catalog.load_table(&base_identifier).await {
-        Ok(paimon::catalog::LoadedTable::Paimon(table)) => *table,
-        Ok(paimon::catalog::LoadedTable::Object(_)) => {
-            // The search UDTFs land here too, so the message names the table
-            // rather than what the caller asked of it.
+    let mut table = match loaded {
+        LoadedTable::Paimon(table) => *table,
+        LoadedTable::Object(_) => {
+            // Shared with search UDTFs, so errors name the base table.
             return Err(DataFusionError::Plan(format!(
                 "table '{}' is declared 'object-table' and cannot be read as a Paimon table",
                 base_identifier.full_name()
             )));
         }
-        Ok(paimon::catalog::LoadedTable::External(external)) => {
+        LoadedTable::External(external) => {
             return Err(DataFusionError::Plan(format!(
                 "table '{}' is declared '{}' and cannot be read as a Paimon table",
                 base_identifier.full_name(),
                 external.declared()
             )));
         }
-        // `LoadedTable` is non_exhaustive: a variant added upstream is not a
-        // Paimon table until this path says how to read one.
-        Ok(_) => {
+        // Reject unknown variants of non-exhaustive LoadedTable.
+        _ => {
             return Err(DataFusionError::Plan(format!(
                 "table '{}' cannot be read as a Paimon table",
                 base_identifier.full_name()
             )));
         }
-        Err(err) => return Err(to_datafusion_error(err)),
     };
     let system_table = parsed.system_table().map(str::to_string);
     if let Some(branch) = parsed.branch() {

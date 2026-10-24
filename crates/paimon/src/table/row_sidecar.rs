@@ -213,8 +213,9 @@ fn selected_sidecar<'a>(
     {
         return Ok(None);
     }
-    // The caller clips, sorts and merges the requested ranges into local
-    // positions before intersecting them with indexes and deletion vectors.
+    // The caller intersects requested ranges with bitmap indexes in local
+    // positions, including DV only when a selective bitmap exists. LIMIT
+    // never affects this decision.
     let selected: i64 = ranges.iter().map(RowRange::count).sum();
     Ok((selected > 0
         && selected < file.row_count
@@ -241,8 +242,8 @@ pub(super) async fn read_target(
 ) -> Result<(String, u64)> {
     if let Some(name) = selected_sidecar(file, local_ranges, options)? {
         let path = file.aligned_file_path(bucket_path, name);
-        let status = io.get_status(&path).await?;
-        return Ok((path, status.size));
+        let size = io.immutable_row_sidecar_size(&path).await?;
+        return Ok((path, size));
     }
     Ok((file.data_file_path(bucket_path), file.file_size as u64))
 }

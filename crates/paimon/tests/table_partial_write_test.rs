@@ -153,13 +153,7 @@ async fn invalid_write_type_does_not_replace_previous_configuration() {
     writer
         .with_write_type(vec!["pt".into(), "id".into()])
         .unwrap();
-    for columns in [
-        vec![],
-        vec!["pt", "id", "id"],
-        vec!["pt", "missing"],
-        vec!["id"],
-        vec!["pt"],
-    ] {
+    for columns in [vec![], vec!["pt", "id", "id"], vec!["pt", "missing"]] {
         assert!(writer
             .with_write_type(columns.into_iter().map(str::to_string).collect())
             .is_err());
@@ -178,11 +172,219 @@ async fn invalid_write_type_does_not_replace_previous_configuration() {
         .await
         .unwrap();
     let messages = writer.prepare_commit().await.unwrap();
+    writer
+        .with_write_type(vec!["pt".into(), "id".into()])
+        .unwrap();
     assert!(writer
         .with_write_type(vec!["id".into(), "omitted".into(), "pt".into()])
         .is_err());
     builder.new_commit().commit(messages).await.unwrap();
     assert_eq!(rows(&table).await, vec![vec![Some(1), None, Some(2)]]);
+}
+
+#[tokio::test]
+async fn append_write_type_stays_locked_across_partitions_and_prepares() {
+    for fixed in [false, true] {
+        let table = table(!fixed, fixed, false).await;
+        let builder = table.new_write_builder();
+        let mut writer = builder.new_write().unwrap();
+        writer
+            .with_write_type(vec!["pt".into(), "id".into()])
+            .unwrap();
+        writer
+            .write_arrow(&[partial(vec![11], vec![Some(1)])], fixed.then_some(0))
+            .await
+            .unwrap();
+        for columns in [vec!["pt", "omitted"], vec!["id", "pt"]] {
+            let error = writer
+                .with_write_type(columns.into_iter().map(str::to_string).collect())
+                .err()
+                .unwrap();
+            assert!(error.to_string().contains("before any write operation"));
+        }
+        writer
+            .with_write_type(vec!["pt".into(), "id".into()])
+            .unwrap();
+        let full = RecordBatch::try_from_iter([
+            ("id", Arc::new(Int32Array::from(vec![22, 33])) as ArrayRef),
+            (
+                "omitted",
+                Arc::new(Int32Array::from(vec![99, 99])) as ArrayRef,
+            ),
+            ("pt", Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef),
+        ])
+        .unwrap();
+        if fixed {
+            for row in 0..2 {
+                writer
+                    .write_arrow(&[full.slice(row, 1)], Some(0))
+                    .await
+                    .unwrap();
+            }
+        } else {
+            writer.write_arrow_batch(&full).await.unwrap();
+        }
+        let mut messages = writer.prepare_commit().await.unwrap();
+        assert!(writer.prepare_commit().await.unwrap().is_empty());
+        assert!(writer.with_write_type(vec!["omitted".into()]).is_err());
+        writer
+            .write_arrow(&[partial(vec![44], vec![Some(3)])], fixed.then_some(0))
+            .await
+            .unwrap();
+        messages.extend(writer.prepare_commit().await.unwrap());
+        builder.new_commit().commit(messages).await.unwrap();
+        assert_eq!(
+            rows(&table).await,
+            vec![
+                vec![Some(11), None, Some(1)],
+                vec![Some(22), None, Some(1)],
+                vec![Some(33), None, Some(2)],
+                vec![Some(44), None, Some(3)],
+            ]
+        );
+    }
+}
+
+#[tokio::test]
+async fn selected_input_accepts_only_current_columns_and_routing_fields() {
+    use paimon::spec::{BlobType, VarCharType};
+    for fixed in [false, true] {
+        let mut schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("value", DataType::Int(IntType::with_nullable(false)))
+            .column(
+                "unused",
+                if fixed {
+                    DataType::Int(IntType::new())
+                } else {
+                    DataType::Blob(BlobType::new())
+                },
+            )
+            .column("pt", DataType::Int(IntType::with_nullable(false)))
+            .column("op", DataType::VarChar(VarCharType::string_type()))
+            .partition_keys(["pt"])
+            .option("rowkind.field", "op")
+            .option("ignore-delete", "true")
+            .option("data-evolution.enabled", (!fixed).to_string())
+            .option("row-tracking.enabled", (!fixed).to_string());
+        if fixed {
+            schema = schema.option("bucket", "4").option("bucket-key", "id");
+        }
+        let (io, table) = memory_table(
+            "memory:/selected_transport",
+            TableSchema::new(0, &schema.build().unwrap()),
+        );
+        setup_dirs(&io, table.location()).await;
+        persist_table_schema(&io, table.location(), table.schema()).await;
+        let builder = table.new_write_builder();
+        let mut writer = builder.new_write().unwrap();
+        writer.with_write_type(vec!["value".into()]).unwrap();
+        let transport = |values: Vec<Option<i32>>, kinds: Vec<&str>, extra_payload| {
+            let count = values.len();
+            let mut columns = vec![
+                ("value", Arc::new(Int32Array::from(values)) as ArrayRef),
+                (
+                    "pt",
+                    Arc::new(Int32Array::from(vec![Some(1); count])) as ArrayRef,
+                ),
+                (
+                    "op",
+                    Arc::new(arrow_array::StringArray::from(kinds)) as ArrayRef,
+                ),
+            ];
+            if fixed {
+                columns.push((
+                    "id",
+                    Arc::new(Int32Array::from(vec![10; count])) as ArrayRef,
+                ));
+            }
+            if extra_payload {
+                let unused: ArrayRef = if fixed {
+                    Arc::new(Int32Array::from(vec![99; count]))
+                } else {
+                    Arc::new(arrow_array::LargeBinaryArray::from(vec![
+                        b"bad".as_slice();
+                        count
+                    ]))
+                };
+                columns.push(("unused", unused));
+            }
+            RecordBatch::try_from_iter(columns).unwrap()
+        };
+        // Ignored events do not validate nested or omitted payload values, but
+        // the current selected NOT NULL fields still have their logical rule.
+        assert!(writer
+            .write_arrow_batch(&transport(vec![None], vec!["-D"], false))
+            .await
+            .is_err());
+        writer
+            .write_arrow_batch(&transport(vec![Some(1)], vec!["-D"], false))
+            .await
+            .unwrap();
+        writer
+            .with_write_type(vec!["value".into(), "pt".into()])
+            .unwrap();
+        writer.with_write_type(vec!["value".into()]).unwrap();
+        writer
+            .write_arrow_batch(&transport(
+                vec![Some(22), Some(33)],
+                vec!["+I", "-D"],
+                false,
+            ))
+            .await
+            .unwrap();
+        assert!(writer
+            .write_arrow_batch(&transport(vec![Some(99)], vec!["+I"], true))
+            .await
+            .is_err());
+        assert!(writer.with_write_type(vec!["id".into()]).is_err());
+        let messages = writer.prepare_commit().await.unwrap();
+        assert_eq!(
+            messages
+                .iter()
+                .flat_map(|m| &m.new_files)
+                .map(|file| file.row_count)
+                .sum::<i64>(),
+            1
+        );
+        assert!(messages
+            .iter()
+            .flat_map(|m| &m.new_files)
+            .all(|file| !file.file_name.ends_with(".blob")));
+        builder.new_commit().commit(messages).await.unwrap();
+        let mut read = table.new_read_builder();
+        read.with_projection(&["value", "pt"]).unwrap();
+        let plan = read.new_scan().plan().await.unwrap();
+        let batches: Vec<RecordBatch> = read
+            .new_read()
+            .unwrap()
+            .to_arrow(plan.splits())
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+        assert_eq!(
+            batches[0]
+                .column_by_name("value")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .value(0),
+            22
+        );
+        assert_eq!(
+            batches[0]
+                .column_by_name("pt")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .value(0),
+            1
+        );
+    }
 }
 
 #[tokio::test]
@@ -340,5 +542,61 @@ async fn selected_columns_validate_input_before_staging() {
     assert_eq!(
         writer.prepare_commit().await.unwrap()[0].new_files[0].row_count,
         1
+    );
+}
+
+#[tokio::test]
+async fn append_blob_consumer_is_captured_per_partition_across_prepares() {
+    use paimon::spec::BlobDescriptor;
+    use std::sync::Mutex;
+    let table = table(true, false, true).await;
+    let builder = table.new_write_builder();
+    let mut writer = builder.new_write().unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let consumer = |name: &'static str| {
+        let calls = calls.clone();
+        Arc::new(move |_: &str, descriptor: Option<&BlobDescriptor>| {
+            if descriptor.is_some() {
+                calls.lock().unwrap().push(name);
+            }
+            Ok(false)
+        }) as Arc<dyn paimon::spec::BlobConsumer>
+    };
+    let blob_batch = |partition| {
+        RecordBatch::try_from_iter([
+            ("id", Arc::new(Int32Array::from(vec![1])) as ArrayRef),
+            (
+                "omitted",
+                Arc::new(arrow_array::LargeBinaryArray::from(vec![
+                    b"payload".as_slice()
+                ])) as ArrayRef,
+            ),
+            (
+                "pt",
+                Arc::new(Int32Array::from(vec![partition])) as ArrayRef,
+            ),
+        ])
+        .unwrap()
+    };
+    writer.with_blob_consumer(Some(consumer("first"))).unwrap();
+    writer.write_arrow_batch(&blob_batch(1)).await.unwrap();
+    writer.with_blob_consumer(Some(consumer("second"))).unwrap();
+    writer.write_arrow_batch(&blob_batch(1)).await.unwrap();
+    writer.write_arrow_batch(&blob_batch(2)).await.unwrap();
+    let first = writer.prepare_commit().await.unwrap();
+    builder.new_commit().commit(first).await.unwrap();
+    writer.with_blob_consumer(None).unwrap();
+    writer.write_arrow_batch(&blob_batch(1)).await.unwrap();
+    writer.write_arrow_batch(&blob_batch(2)).await.unwrap();
+    writer.write_arrow_batch(&blob_batch(3)).await.unwrap();
+    let second = writer.prepare_commit().await.unwrap();
+    writer.close().await;
+    // Closing the writer cannot remove any successfully prepared payload.
+    builder.new_commit().commit(second).await.unwrap();
+    let mut received = calls.lock().unwrap().clone();
+    received.sort();
+    assert_eq!(
+        received,
+        vec!["first", "first", "first", "second", "second"]
     );
 }

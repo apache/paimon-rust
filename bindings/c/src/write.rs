@@ -167,7 +167,8 @@ pub unsafe extern "C" fn paimon_table_new_write_builder(
 }
 
 /// Create a one-shot fixed-bucket WriteBuilder for a postpone table.
-/// A bucket plan must be set before creating a writer.
+/// An explicit bucket plan is optional. Without one, core reuses existing
+/// layouts and uses the configured default or infers new partition counts.
 ///
 /// # Safety
 /// `table` must be a valid table pointer, or null (returns error).
@@ -195,7 +196,8 @@ pub unsafe extern "C" fn paimon_table_new_write_builder_with_commit_user(
 }
 
 /// Create a fixed-bucket WriteBuilder with a stable commit identity.
-/// A bucket plan must be set before creating a writer.
+/// Share an explicit bucket plan across distributed writers. Without one, core
+/// reuses existing layouts and infers new counts independently per writer.
 ///
 /// # Safety
 /// `table` must be a valid table pointer. `commit_user` must be a valid UTF-8
@@ -352,7 +354,7 @@ pub unsafe extern "C" fn paimon_postpone_fixed_bucket_write_builder_with_bucket_
         Ok(batch) => batch,
         Err(error) => return error,
     };
-    match PostponeBucketPlan::from_arrow(&state.table, &batch) {
+    match PostponeBucketPlan::from_arrow(state.table.schema(), &batch) {
         Ok(plan) => {
             state.bucket_plan = Some(plan);
             ptr::null_mut()

@@ -22,8 +22,12 @@ use crate::Result;
 
 /// Build new opendal operator from give path.
 pub(crate) fn fs_config_build() -> Result<Operator> {
+    fs_config_build_with_root("/")
+}
+
+pub(crate) fn fs_config_build_with_root(root: &str) -> Result<Operator> {
     let mut cfg = FsConfig::default();
-    cfg.root = Some("/".to_string());
+    cfg.root = Some(root.to_string());
 
     Ok(Operator::from_config(cfg)?)
 }

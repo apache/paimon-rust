@@ -20,13 +20,14 @@ mod blob_fallback;
 use super::blob_resolver::BlobReadLimiter;
 use super::data_file_reader::{
     append_null_row_id_column, attach_row_id, expand_selected_row_ids,
-    file_index_selection_to_local_ranges, insert_column_at, DataFileReadTiming, DataFileReader,
+    file_index_selection_to_local_ranges, insert_column_at, project_residual_output,
+    DataFileReadTiming, DataFileReader,
 };
 use super::read_limit::take_limited_batch;
 use crate::arrow::format::blob::DEFAULT_BLOB_READ_PARALLELISM;
 use crate::arrow::format::FilePredicates;
 use crate::arrow::format::MosaicPrefetchOptions;
-use crate::arrow::{build_target_arrow_schema, ReadBudget};
+use crate::arrow::ReadBudget;
 use crate::deletion_vector::{DeletionVector, DeletionVectorFactory};
 use crate::file_index::evaluator::evaluate_file_index;
 use crate::file_index::file_index_result::FileIndexResult;
@@ -111,8 +112,9 @@ pub(crate) struct DataEvolutionReader {
     schema_manager: SchemaManager,
     table_schema_id: i64,
     table_fields: Vec<DataField>,
-    /// read_type with _ROW_ID filtered out, widened with predicate-only
-    /// columns (appended strictly at the END) — used for file reads and the
+    partition_fields: Vec<DataField>,
+    /// read_type with _ROW_ID filtered out, widened with complete predicate
+    /// ROW inputs and extra top-level columns — used for file reads and the
     /// column-merge plan.
     wide_file_read_type: Vec<DataField>,
     /// Position of _ROW_ID in the original read_type, if requested.
@@ -121,6 +123,7 @@ pub(crate) struct DataEvolutionReader {
     /// _ROW_ID if requested). Batches are projected back to this after the
     /// residual filter.
     output_schema: Arc<arrow_schema::Schema>,
+    output_read_type: Vec<DataField>,
     /// Arrow schema of wide batches at the _ROW_ID attach point: the original
     /// read_type columns in caller order, then the extra predicate columns.
     wide_output_schema: Arc<arrow_schema::Schema>,
@@ -163,12 +166,11 @@ impl DataEvolutionReader {
             .filter(|f| f.name() != ROW_ID_FIELD_NAME)
             .cloned()
             .collect();
-        let output_schema = build_target_arrow_schema(&read_type)?;
+        let output_schema = crate::arrow::build_read_arrow_schema(&read_type)?;
 
-        // Widen the file read set with predicate columns not already projected
-        // so the residual filter can evaluate every leaf. Extras land strictly
-        // at the END: `project_output` relies on that to project the
-        // final batch back to `read_type` by prefix. Predicate leaf indices
+        // Widen predicate ROW inputs as well as extra top-level columns. The
+        // root positions remain stable; project_output restores the original
+        // nested fields after filtering. Predicate leaf indices
         // point into the table schema, so `file_fields` = `table_fields`.
         let file_predicates = (!predicates.is_empty()).then(|| FilePredicates {
             predicates: predicates.clone(),
@@ -181,8 +183,10 @@ impl DataEvolutionReader {
         // (caller order, _ROW_ID at row_id_index) followed by the extras. A
         // projected row_id_index is <= file_read_type.len(), so inserting
         // _ROW_ID never displaces a trailing extra column.
-        let mut wide_read_type = read_type;
-        wide_read_type.extend_from_slice(&wide_file_read_type[file_read_type.len()..]);
+        let mut wide_read_type = wide_file_read_type.clone();
+        if let Some(index) = projected_row_id_index {
+            wide_read_type.insert(index, read_type[index].clone());
+        }
         // A residual on `_ROW_ID` needs the column when `filter_wide_batch`
         // runs, even unprojected. `widen_scan_fields` cannot supply a
         // synthesized column, so append it and let `project_output` trim it.
@@ -197,16 +201,18 @@ impl DataEvolutionReader {
             }
             None => None,
         };
-        let wide_output_schema = build_target_arrow_schema(&wide_read_type)?;
+        let wide_output_schema = crate::arrow::build_read_arrow_schema(&wide_read_type)?;
 
         Ok(Self {
             file_io,
             schema_manager,
             table_schema_id,
             table_fields,
+            partition_fields: Vec::new(),
             wide_file_read_type,
             row_id_index,
             output_schema,
+            output_read_type: read_type,
             wide_output_schema,
             predicates,
             blob_as_descriptor,
@@ -227,6 +233,11 @@ impl DataEvolutionReader {
 
     pub(crate) fn with_batch_size(mut self, batch_size: Option<usize>) -> Self {
         self.batch_size = batch_size;
+        self
+    }
+
+    pub(crate) fn with_partition_fields(mut self, fields: Vec<DataField>) -> Self {
+        self.partition_fields = fields;
         self
     }
 
@@ -324,6 +335,7 @@ impl DataEvolutionReader {
                 false,
                 None,
             )?
+            .with_partition_fields(self.partition_fields.clone())
             .with_batch_size(self.batch_size)
             .with_limit(Some(remaining))
             .with_parquet_read_budget(self.parquet_read_budget.clone())
@@ -466,7 +478,10 @@ impl DataEvolutionReader {
             let push_down_raw_predicates = !self.predicates.is_empty()
                 && self.row_id_index.is_none()
                 && filter_before_blob_resolution;
-            let read_raw_file_index = push_down_raw_predicates
+            // A bitmap selection preserves physical positions, including when
+            // `_ROW_ID` needs attaching before the residual predicate runs.
+            let read_file_index = !self.predicates.is_empty()
+                && filter_before_blob_resolution
                 && CoreOptions::new(&self.table_options).file_index_read_enabled();
             // A managed BLOB file fetches payloads as its batch is decoded.
             // Keep batches small and restrict predicate-free file selections
@@ -477,6 +492,7 @@ impl DataEvolutionReader {
                 self.schema_manager.clone(),
                 self.table_schema_id,
                 self.table_fields.clone(),
+                |fields| Ok(fields.to_vec()),
                 self.wide_file_read_type.clone(),
                 if push_down_raw_predicates {
                     self.predicates.clone()
@@ -484,6 +500,7 @@ impl DataEvolutionReader {
                     Vec::new()
                 },
             )
+            .with_partition_fields(self.partition_fields.clone())
             .with_batch_size(batch_size)
             .with_blob_parallelism(self.blob_parallelism)
             .with_parquet_read_budget(self.parquet_read_budget.clone())
@@ -495,7 +512,9 @@ impl DataEvolutionReader {
                 if remaining == Some(0) {
                     break;
                 }
-                let row_ranges = split.row_ranges().map(|r| r.to_vec());
+                let row_ranges = split
+                    .row_ranges()
+                    .map(|ranges| crate::table::merge_row_ranges(ranges.to_vec()));
                 // A chunk may span several disjoint row-id groups while one
                 // group still needs column-wise merging. Process each aligned
                 // group independently; treating the whole chunk as one merge
@@ -528,10 +547,8 @@ impl DataEvolutionReader {
                             let has_row_id = file_meta.first_row_id.is_some();
                             let requested_row_ranges = if has_row_id { row_ranges.clone() } else { None };
                             let mut effective_row_ranges = requested_row_ranges.clone();
-                            if read_raw_file_index {
-                                // Independent files can apply a physical row selection
-                                // before decoding. Column-merge groups cannot: an older
-                                // file may hold values still needed by a newer file.
+                            let mut has_bitmap_selection = false;
+                            if read_file_index {
                                 match evaluate_file_index(
                                     &self.file_io,
                                     split.bucket_path(),
@@ -547,6 +564,7 @@ impl DataEvolutionReader {
                                                 &selection,
                                                 file_meta.row_count,
                                             )? {
+                                            has_bitmap_selection = selection.len() < file_meta.row_count as u64;
                                             let base = file_meta.first_row_id.unwrap_or(0);
                                             let index_ranges = local_ranges
                                                 .into_iter()
@@ -565,6 +583,18 @@ impl DataEvolutionReader {
                                     FileIndexResult::Remain => {}
                                 }
                             }
+                            // Java applies DV to a selective bitmap before
+                            // choosing ROW. DV alone and LIMIT cannot trigger it.
+                            let sidecar_row_ranges = if has_bitmap_selection {
+                                selected_absolute_row_ranges_for_file(
+                                    file_meta.first_row_id.unwrap_or(0),
+                                    file_meta.row_count,
+                                    effective_row_ranges.as_deref(),
+                                    deletion_vector.as_deref(),
+                                )?
+                            } else {
+                                effective_row_ranges.clone()
+                            };
                             if self.predicates.is_empty() {
                                 if let Some(left) = remaining {
                                     let selected = selected_absolute_row_ranges_for_file(
@@ -615,7 +645,7 @@ impl DataEvolutionReader {
                                 data_fields,
                                 deletion_vector,
                                 effective_row_ranges,
-                                requested_row_ranges,
+                                sidecar_row_ranges,
                             )?;
                             while remaining != Some(0) {
                                 let Some(batch) = stream.next().await else { break };
@@ -646,6 +676,35 @@ impl DataEvolutionReader {
                         }
                     } else {
                         let prepared_group = PreparedMergeGroup::new(&files)?;
+                        let mut indexed_row_ranges = row_ranges.clone();
+                        let mut has_bitmap_selection = false;
+                        if read_file_index {
+                            match self.evaluate_group_file_indexes(&split, &prepared_group).await? {
+                                FileIndexResult::Skip => continue,
+                                FileIndexResult::Selection(selection) => {
+                                    if let Some(local_ranges) = file_index_selection_to_local_ranges(
+                                        &selection,
+                                        prepared_group.logical_row_count,
+                                    )? {
+                                        has_bitmap_selection = selection.len() < prepared_group.logical_row_count as u64;
+                                        let index_ranges = local_ranges.into_iter().map(|range| {
+                                            RowRange::new(
+                                                prepared_group.first_row_id + range.from(),
+                                                prepared_group.first_row_id + range.to(),
+                                            )
+                                        }).collect::<Vec<_>>();
+                                        indexed_row_ranges = Some(match indexed_row_ranges {
+                                            Some(ref ranges) => intersect_local_ranges(ranges, &index_ranges),
+                                            None => index_ranges,
+                                        });
+                                    }
+                                }
+                                FileIndexResult::Remain => {}
+                            }
+                        }
+                        if indexed_row_ranges.as_ref().is_some_and(Vec::is_empty) {
+                            continue;
+                        }
                         let anchor_deletion_vector = read_anchor_deletion_vector(
                             &self.file_io,
                             &split,
@@ -655,11 +714,19 @@ impl DataEvolutionReader {
                         let mut selected_ranges = selected_absolute_row_ranges_for_file(
                             prepared_group.first_row_id,
                             prepared_group.logical_row_count,
-                            row_ranges.as_deref(),
+                            indexed_row_ranges.as_deref(),
                             anchor_deletion_vector
                                 .as_ref()
                                 .map(|ctx| ctx.deletion_vector.as_ref()),
                         )?;
+                        // Every provider shares the DV-aware bitmap. Without
+                        // a selective bitmap, only caller ranges choose ROW.
+                        // LIMIT never changes sidecar eligibility.
+                        let sidecar_row_ranges = if has_bitmap_selection {
+                            selected_ranges.clone()
+                        } else {
+                            indexed_row_ranges.clone()
+                        };
                         let effective_row_ranges = if self.predicates.is_empty() {
                             if let Some(left) = remaining {
                                 selected_ranges = Some(prefix_row_ranges(
@@ -670,10 +737,10 @@ impl DataEvolutionReader {
                                 ));
                                 selected_ranges.clone()
                             } else {
-                                row_ranges.clone()
+                                indexed_row_ranges.clone()
                             }
                         } else {
-                            row_ranges.clone()
+                            indexed_row_ranges
                         };
                         let expected_output_rows = match selected_ranges.as_ref() {
                             Some(ranges) => ranges.iter().map(|r| r.count() as usize).sum(),
@@ -698,7 +765,7 @@ impl DataEvolutionReader {
                             &split,
                             &prepared_group,
                             effective_row_ranges,
-                            row_ranges.clone(),
+                            sidecar_row_ranges,
                             expected_output_rows,
                             anchor_deletion_vector,
                         )?;
@@ -759,38 +826,15 @@ impl DataEvolutionReader {
         }
     }
 
-    /// Project a wide batch back to the caller's read_type.
-    ///
-    /// Layout invariant: the first `output_schema.fields().len()` columns of
-    /// `batch` are exactly the original read_type columns. Extras were appended
-    /// at the end — by `widen_scan_fields`, plus an unprojected `_ROW_ID` a
-    /// residual needs — and `_ROW_ID` insertion at `row_id_index` keeps them
-    /// trailing.
+    /// Restore the original top-level prefix and nested projection after the
+    /// residual has evaluated against complete ROW inputs.
     fn project_output(&self, filtered: RecordBatch) -> crate::Result<RecordBatch> {
-        let final_width = self.output_schema.fields().len();
-        if filtered.num_columns() == final_width
-            && !filtered
-                .schema()
-                .fields()
-                .iter()
-                .any(|field| super::row_sidecar::is_blob_data(field))
-        {
-            return Ok(filtered);
-        }
-        let columns = filtered.columns()[..final_width].to_vec();
-        let projected = if columns.is_empty() {
-            RecordBatch::try_new_with_options(
-                self.output_schema.clone(),
-                columns,
-                &arrow_array::RecordBatchOptions::new().with_row_count(Some(filtered.num_rows())),
-            )
-        } else {
-            RecordBatch::try_new(self.output_schema.clone(), columns)
-        };
-        projected.map_err(|e| Error::UnexpectedError {
-            message: format!("Failed to project data-evolution batch to read_type: {e}"),
-            source: Some(Box::new(e)),
-        })
+        project_residual_output(
+            filtered,
+            &self.wide_file_read_type,
+            &self.output_read_type,
+            self.output_schema.clone(),
+        )
     }
 
     async fn finish_wide_batch(
@@ -912,6 +956,7 @@ impl DataEvolutionReader {
             false,
             None,
         )?
+        .with_partition_fields(self.partition_fields.clone())
         .with_batch_size(self.batch_size)
         .with_parquet_read_budget(self.parquet_read_budget.clone())
         .with_table_options(Arc::clone(&self.table_options))
@@ -953,6 +998,83 @@ impl DataEvolutionReader {
         .await
     }
 
+    /// Evaluate only the fields each normal file wins in the merged row.
+    ///
+    /// The group is newest first. A newer writer claims its fields even when
+    /// it has no index, so an obsolete value can never reject a live row.
+    async fn evaluate_group_file_indexes(
+        &self,
+        split: &DataSplit,
+        group: &PreparedMergeGroup,
+    ) -> crate::Result<FileIndexResult> {
+        // Dedicated sources may cover only part of the normal files' range.
+        // Like Java, they prevent a shared positional bitmap selection.
+        let can_select = group.files.iter().all(|file| {
+            !is_blob_or_video_file_name(&file.file_name)
+                && !is_vector_store_file_name(&file.file_name)
+        });
+        let mut claimed = HashSet::new();
+        let mut result = FileIndexResult::Remain;
+        for file in &group.files {
+            if is_blob_or_video_file_name(&file.file_name)
+                || is_vector_store_file_name(&file.file_name)
+            {
+                continue;
+            }
+            let (data_fields, _) = raw_file_physical_fields(
+                &self.schema_manager,
+                self.table_schema_id,
+                &self.table_fields,
+                file,
+            )
+            .await?;
+            let data_fields = data_fields.as_deref().unwrap_or(&self.table_fields);
+            let winning_ids = data_fields
+                .iter()
+                .filter_map(|field| claimed.insert(field.id()).then_some(field.id()))
+                .collect::<HashSet<_>>();
+            let mapping = self
+                .table_fields
+                .iter()
+                .enumerate()
+                .map(|(index, field)| {
+                    // Partition values come from the split. A partially written
+                    // ROW can have several providers for its parent nullness.
+                    (winning_ids.contains(&field.id())
+                        && !matches!(field.data_type(), DataType::Row(_))
+                        && !self.partition_fields.iter().any(|p| p.id() == field.id()))
+                    .then_some(index)
+                })
+                .collect::<Vec<_>>();
+            let predicates = self
+                .predicates
+                .iter()
+                .filter_map(|predicate| predicate.project_field_index_inclusive(&mapping))
+                .collect::<Vec<_>>();
+            let file_result = evaluate_file_index(
+                &self.file_io,
+                split.bucket_path(),
+                file,
+                &self.table_fields,
+                data_fields,
+                &predicates,
+            )
+            .await?;
+            if !file_result.remain() {
+                return Ok(FileIndexResult::Skip);
+            }
+            if can_select {
+                // Each file contributes a necessary condition, so intersect
+                // candidates rather than independently filtering its stream.
+                result = result.and(file_result);
+                if !result.remain() {
+                    return Ok(FileIndexResult::Skip);
+                }
+            }
+        }
+        Ok(result)
+    }
+
     /// Merge multiple logical sources column-wise for data evolution.
     ///
     /// Normal partial-column files remain one source per file. Rolling `.blob`
@@ -983,6 +1105,7 @@ impl DataEvolutionReader {
         // whose values would be transformed by resolution.
         let read_type = self.wide_file_read_type.clone();
         let table_fields = self.table_fields.clone();
+        let partition_fields = self.partition_fields.clone();
         let mut blob_inline_fields = self.blob_descriptor_fields.clone();
         blob_inline_fields.extend(self.blob_view_fields.iter().cloned());
         let blob_as_descriptor = self.blob_as_descriptor;
@@ -996,7 +1119,7 @@ impl DataEvolutionReader {
         // Match the input cap so a LIMIT cannot resolve payloads for rows that
         // are only going to be discarded from the merge output.
         let merge_batch_size = batch_size.unwrap_or(1024).clamp(1, 1024);
-        let target_schema = build_target_arrow_schema(&read_type)?;
+        let target_schema = crate::arrow::build_read_arrow_schema(&read_type)?;
 
         Ok(try_stream! {
             let (file_infos, file_schema_nested_enabled) = load_file_infos(
@@ -1013,10 +1136,13 @@ impl DataEvolutionReader {
                 &prepared_group,
                 &file_infos,
                 &read_type,
-                &table_fields,
                 &blob_inline_fields,
-                row_ranges.is_some(),
-                nested_enabled,
+                SourcePlanReadContext {
+                    table_fields: &table_fields,
+                    partition_fields: &partition_fields,
+                    row_id_pushdown: row_ranges.is_some(),
+                    nested_enabled,
+                },
             )?;
 
             let active_source_indices: Vec<usize> = source_plan
@@ -1034,8 +1160,12 @@ impl DataEvolutionReader {
                     let columns: Vec<Arc<dyn arrow_array::Array>> = target_schema
                         .fields()
                         .iter()
-                        .map(|f| arrow_array::new_null_array(f.data_type(), rows_to_emit))
-                        .collect();
+                        .zip(&read_type)
+                        .map(|(arrow_field, field)| super::data_file_reader::missing_file_column(
+                            field, arrow_field.data_type(), split.partition(),
+                            &partition_fields, rows_to_emit,
+                        ))
+                        .collect::<crate::Result<_>>()?;
                     let batch = if columns.is_empty() {
                         RecordBatch::try_new_with_options(
                             target_schema.clone(),
@@ -1184,10 +1314,14 @@ impl DataEvolutionReader {
                             source_cursors[source_idx].as_ref().map(|(batch, offset)| {
                                 batch.column(field_offset).slice(*offset, rows_to_emit)
                             })
-                        })
-                        .unwrap_or_else(|| {
-                            arrow_array::new_null_array(target_field.data_type(), rows_to_emit)
                         });
+                    let array = match array {
+                        Some(array) => array,
+                        None => super::data_file_reader::missing_file_column(
+                            &read_type[idx], target_field.data_type(), split.partition(),
+                            &partition_fields, rows_to_emit,
+                        )?,
+                    };
                     let array = if let Some((source_idx, field_offset)) = provider {
                         crate::arrow::nested_evolution::evolve_field(
                             &array,
@@ -1345,6 +1479,7 @@ fn predicate_references_any_field(
     table_fields: &[DataField],
 ) -> bool {
     match predicate {
+        Predicate::NestedLeaf { root, .. } => field_names.contains(root.name()),
         Predicate::Leaf { column, index, .. } => {
             // Never a BLOB column; resolving its placeholder index would force
             // every BLOB to be resolved before filtering.
@@ -1781,6 +1916,7 @@ fn open_source_stream(
         schema_manager,
         table_schema_id,
         table_fields,
+        |fields| Ok(fields.to_vec()),
         source.read_fields().to_vec(),
         Vec::new(),
     )
@@ -1931,7 +2067,7 @@ fn read_vector_bunch_with_null_gaps_stream(
         }
     }
 
-    let target_schema = build_target_arrow_schema(read_fields)?;
+    let target_schema = crate::arrow::build_read_arrow_schema(read_fields)?;
     let null_batch_size = batch_size.unwrap_or(1024).max(1);
     let split = split.clone();
 
@@ -2167,15 +2303,15 @@ fn prefix_row_ranges(
 fn non_deleted_local_ranges(row_count: i64, deletion_vector: &DeletionVector) -> Vec<RowRange> {
     let mut ranges = Vec::new();
     let mut cursor = 0i64;
-    for deleted in deletion_vector.iter() {
-        let deleted = deleted as i64;
-        if deleted >= row_count {
+    for (start, end) in deletion_vector.deleted_ranges() {
+        let (start, end) = (i64::from(start), i64::from(end));
+        if start >= row_count {
             break;
         }
-        if deleted > cursor {
-            ranges.push(RowRange::new(cursor, deleted - 1));
+        if start > cursor {
+            ranges.push(RowRange::new(cursor, start - 1));
         }
-        cursor = deleted + 1;
+        cursor = end + 1;
     }
     if cursor < row_count {
         ranges.push(RowRange::new(cursor, row_count - 1));
@@ -2374,6 +2510,16 @@ struct SourcePlan {
     nested_plan: Vec<Option<super::data_evolution_nested::NestedFieldPlan>>,
 }
 
+/// Logical inputs needed while selecting physical column providers.
+/// Partition columns may have no provider: the merge restores them from the
+/// split, including when the declared partition type is NOT NULL.
+struct SourcePlanReadContext<'a> {
+    table_fields: &'a [DataField],
+    partition_fields: &'a [DataField],
+    row_id_pushdown: bool,
+    nested_enabled: bool,
+}
+
 #[cfg(test)]
 fn build_source_plan(
     prepared_group: &PreparedMergeGroup,
@@ -2385,10 +2531,13 @@ fn build_source_plan(
         prepared_group,
         file_infos,
         read_type,
-        read_type,
         blob_descriptor_fields,
-        false,
-        false,
+        SourcePlanReadContext {
+            table_fields: read_type,
+            partition_fields: &[],
+            row_id_pushdown: false,
+            nested_enabled: false,
+        },
     )
 }
 
@@ -2396,11 +2545,15 @@ fn build_source_plan_with_row_id_pushdown(
     prepared_group: &PreparedMergeGroup,
     file_infos: &[ResolvedFileInfo],
     read_type: &[DataField],
-    table_fields: &[DataField],
     blob_descriptor_fields: &HashSet<String>,
-    row_id_pushdown: bool,
-    nested_enabled: bool,
+    context: SourcePlanReadContext<'_>,
 ) -> crate::Result<SourcePlan> {
+    let SourcePlanReadContext {
+        table_fields,
+        partition_fields,
+        row_id_pushdown,
+        nested_enabled,
+    } = context;
     let mut sources = Vec::new();
     let mut normal_providers: HashMap<i32, usize> = HashMap::new(); // field_id -> source_idx
     let mut vector_field_providers: HashMap<i32, usize> = HashMap::new(); // field_id -> source_idx
@@ -2617,7 +2770,11 @@ fn build_source_plan_with_row_id_pushdown(
             let field_offset = sources[source_idx].add_read_field(source_field.clone());
             column_plan.push(Some((source_idx, field_offset)));
             nested_plan.push(None);
-        } else if !field.data_type().is_nullable() {
+        } else if !field.data_type().is_nullable()
+            && !partition_fields
+                .iter()
+                .any(|partition| partition.id() == field.id())
+        {
             return Err(Error::DataInvalid {
                 message: format!(
                     "Cannot read non-nullable field '{}' without a provider",
@@ -3239,6 +3396,172 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn nested_predicates_restore_projection_after_raw_and_column_merge_reads() {
+        use crate::arrow::format::create_format_writer;
+        use crate::spec::{RowType, VarCharType};
+        use arrow_array::{StringArray, StructArray};
+        use arrow_buffer::NullBuffer;
+        use arrow_schema::DataType as ArrowDataType;
+
+        let score = DataField::new(1, "score".into(), DataType::Int(IntType::new()));
+        let label = DataField::new(
+            2,
+            "label".into(),
+            DataType::VarChar(VarCharType::string_type()),
+        );
+        let profile = DataField::new(
+            0,
+            "profile".into(),
+            DataType::Row(RowType::new(vec![score.clone(), label.clone()])),
+        );
+        let other = DataField::new(3, "other".into(), DataType::Int(IntType::new()));
+        let fields = vec![profile.clone(), other.clone()];
+        let schema = crate::arrow::build_read_arrow_schema(std::slice::from_ref(&profile)).unwrap();
+        let ArrowDataType::Struct(children) = schema.field(0).data_type() else {
+            unreachable!()
+        };
+        let profiles = StructArray::new(
+            children.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![7, 9, 7])),
+                Arc::new(StringArray::from(vec!["match", "other", "hidden"])),
+            ],
+            Some(NullBuffer::from(vec![true, true, false])),
+        );
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(profiles)]).unwrap();
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let table_path = "memory:/de_nested_residual";
+        let bucket_path = format!("{table_path}/bucket-0");
+        let mut files = Vec::new();
+        for (name, batch, columns) in [
+            ("profile.parquet", batch, vec!["profile"]),
+            (
+                "other.parquet",
+                RecordBatch::try_new(
+                    crate::arrow::build_read_arrow_schema(&[other]).unwrap(),
+                    vec![Arc::new(Int32Array::from(vec![10, 20, 30]))],
+                )
+                .unwrap(),
+                vec!["other"],
+            ),
+        ] {
+            let output = file_io
+                .new_output(&format!("{bucket_path}/{name}"))
+                .unwrap();
+            let mut writer =
+                create_format_writer(&output, batch.schema(), "zstd", 1, None, None, None)
+                    .await
+                    .unwrap();
+            writer.write(&batch).await.unwrap();
+            let mut file = data_file(name, 100, 3, 1, Some(columns));
+            file.file_size = writer.close().await.unwrap().file_size as i64;
+            files.push(file);
+        }
+        let builder = PredicateBuilder::new(&fields);
+        let score_ref = builder.nested_field("profile", &["score"]).unwrap();
+        let predicate = builder.equal(&score_ref, Datum::Int(7)).unwrap();
+        for merged in [false, true] {
+            let split = DataSplitBuilder::new()
+                .with_snapshot(1)
+                .with_partition(BinaryRow::new(0))
+                .with_bucket(0)
+                .with_bucket_path(bucket_path.clone())
+                .with_total_buckets(1)
+                .with_data_files(if merged {
+                    files.clone()
+                } else {
+                    files[..1].to_vec()
+                })
+                .build()
+                .unwrap();
+            for children in [
+                vec![score.clone()],
+                vec![label.clone()],
+                vec![label.clone(), score.clone()],
+            ] {
+                for row_id_at in [None, Some(0), Some(1)] {
+                    let mut projected = vec![DataField::new(
+                        0,
+                        "profile".into(),
+                        DataType::Row(RowType::new(children.clone())),
+                    )];
+                    if let Some(index) = row_id_at {
+                        projected.insert(index, crate::spec::row_id_data_field());
+                    }
+                    let reader = DataEvolutionReader::new(
+                        file_io.clone(),
+                        SchemaManager::new(file_io.clone(), table_path.into()),
+                        0,
+                        fields.clone(),
+                        projected.clone(),
+                        vec![predicate.clone()],
+                        false,
+                        HashSet::new(),
+                        HashSet::new(),
+                        false,
+                        None,
+                    )
+                    .unwrap();
+                    let batches = reader
+                        .read(std::slice::from_ref(&split))
+                        .unwrap()
+                        .try_collect::<Vec<_>>()
+                        .await
+                        .unwrap();
+                    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+                    for batch in batches {
+                        assert_eq!(
+                            batch.schema(),
+                            crate::arrow::build_read_arrow_schema(&projected).unwrap()
+                        );
+                        let profile_at = usize::from(row_id_at == Some(0));
+                        let values = batch
+                            .column(profile_at)
+                            .as_any()
+                            .downcast_ref::<StructArray>()
+                            .unwrap();
+                        assert_eq!(values.num_columns(), children.len());
+                        for (index, child) in children.iter().enumerate() {
+                            if child.name() == "score" {
+                                assert_eq!(
+                                    values
+                                        .column(index)
+                                        .as_any()
+                                        .downcast_ref::<Int32Array>()
+                                        .unwrap()
+                                        .value(0),
+                                    7
+                                );
+                            } else {
+                                assert_eq!(
+                                    values
+                                        .column(index)
+                                        .as_any()
+                                        .downcast_ref::<StringArray>()
+                                        .unwrap()
+                                        .value(0),
+                                    "match"
+                                );
+                            }
+                        }
+                        if let Some(index) = row_id_at {
+                            assert_eq!(
+                                batch
+                                    .column(index)
+                                    .as_any()
+                                    .downcast_ref::<Int64Array>()
+                                    .unwrap()
+                                    .value(0),
+                                100
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[tokio::test]
     async fn blob_view_payloads_use_each_upstream_file_io_even_for_the_same_uri() {
@@ -4273,10 +4596,13 @@ mod tests {
             &prepared_group,
             &file_infos,
             &read_type,
-            &read_type,
             &HashSet::new(),
-            true,
-            false,
+            SourcePlanReadContext {
+                table_fields: &read_type,
+                partition_fields: &[],
+                row_id_pushdown: true,
+                nested_enabled: false,
+            },
         )
         .unwrap_err();
 
@@ -4362,10 +4688,13 @@ mod tests {
             &group,
             &[resolved_info(vec![1]), resolved_info(vec![2])],
             &[selected],
-            std::slice::from_ref(&map),
             &HashSet::new(),
-            false,
-            false,
+            SourcePlanReadContext {
+                table_fields: std::slice::from_ref(&map),
+                partition_fields: &[],
+                row_id_pushdown: false,
+                nested_enabled: false,
+            },
         )
         .unwrap();
         assert_eq!(plan.column_plan, vec![Some((1, 0))]);
@@ -7115,7 +7444,8 @@ mod tests {
 
         let mut builder = table.new_read_builder();
         builder.with_row_ranges(vec![RowRange::new(0, 0)]);
-        let (plan, trace) = builder.new_scan().plan_with_trace().await.unwrap();
+        let plan = builder.new_scan().plan().await.unwrap();
+        let scan_stats = plan.stats().clone();
         let mut planned_files = plan
             .splits()
             .iter()
@@ -7129,8 +7459,8 @@ mod tests {
             "payload-1.blob".to_string(),
         ];
         assert_eq!(planned_files, expected_planned_files);
-        assert_eq!(trace.manifest_entries_pruned_by_row_ranges, 4);
-        assert_eq!(trace.final_files, 3);
+        assert_eq!(scan_stats.manifest_entries_pruned_by_row_ranges, 4);
+        assert_eq!(scan_stats.final_files, 3);
 
         let batches = builder
             .new_read()
@@ -7744,7 +8074,8 @@ mod tests {
             None,
         );
 
-        let row_schema = build_target_arrow_schema(std::slice::from_ref(&id_field)).unwrap();
+        let row_schema =
+            crate::arrow::build_target_arrow_schema(std::slice::from_ref(&id_field)).unwrap();
         let batch = RecordBatch::try_new(
             row_schema.clone(),
             vec![Arc::new(Int32Array::from(vec![1, 2]))],

@@ -23,7 +23,7 @@ use crate::table::vector_read::BatchVectorRead;
 use crate::table::vector_scan::{PlanContext, VectorScan};
 use crate::table::vector_search_common::{add_filter, validate_partition_filter};
 use crate::table::Table;
-use crate::vector_search::SearchResult;
+use crate::vector_search::GlobalIndexResult;
 use roaring::RoaringTreemap;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -122,6 +122,7 @@ impl<'a> BatchVectorSearchBuilder<'a> {
             self.include_row_ids.as_ref(),
             self.prepared_filter.as_ref(),
         )
+        .map(|scan| scan.with_options(&self.options))
     }
 
     /// Create an owned batch reader; result i belongs to input query i.
@@ -157,7 +158,7 @@ impl<'a> BatchVectorSearchBuilder<'a> {
     }
 
     /// Search every query against one plan, including empty per-query results.
-    pub async fn execute(&self) -> crate::Result<Vec<SearchResult>> {
+    pub async fn execute(&self) -> crate::Result<Vec<GlobalIndexResult>> {
         let read = self.new_read()?;
         read.read(self.new_scan()?.plan().await?).await
     }

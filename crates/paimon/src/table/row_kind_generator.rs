@@ -19,17 +19,17 @@
 //!
 //! Reference: Java `org.apache.paimon.table.sink.RowKindGenerator`.
 
-use arrow_array::{Array, RecordBatch, StringArray};
+use arrow_array::{LargeStringArray, RecordBatch, StringArray};
 
 use crate::spec::{RowKind, TableSchema};
 
 pub struct RowKindGenerator {
-    index: usize,
+    field_name: String,
 }
 
 impl RowKindGenerator {
     pub fn create(schema: &TableSchema, field_name: &str) -> crate::Result<Self> {
-        let index = schema
+        schema
             .fields()
             .iter()
             .position(|f| f.name() == field_name)
@@ -40,24 +40,42 @@ impl RowKindGenerator {
                 ),
                 source: None,
             })?;
-        Ok(Self { index })
+        Ok(Self {
+            field_name: field_name.to_owned(),
+        })
     }
 
-    pub fn generate(&self, batch: &RecordBatch, row: usize) -> crate::Result<RowKind> {
-        let col = batch.column(self.index);
-        if col.is_null(row) {
-            return Err(crate::Error::DataInvalid {
-                message: "Row kind cannot be null.".to_string(),
+    pub fn generate_batch(&self, batch: &RecordBatch) -> crate::Result<Vec<RowKind>> {
+        // with_write_type may reorder the physical columns. Resolve once for
+        // the batch, then parse values without a per-row field-name search.
+        let col =
+            batch
+                .column_by_name(&self.field_name)
+                .ok_or_else(|| crate::Error::DataInvalid {
+                    message: format!(
+                        "Cannot find rowkind field '{}' in write input",
+                        self.field_name
+                    ),
+                    source: None,
+                })?;
+        let parse = |value: Option<&str>| {
+            value
+                .ok_or_else(|| crate::Error::DataInvalid {
+                    message: "Row kind cannot be null.".into(),
+                    source: None,
+                })
+                .and_then(RowKind::from_short_string)
+        };
+        if let Some(strings) = col.as_any().downcast_ref::<StringArray>() {
+            strings.iter().map(parse).collect()
+        } else if let Some(strings) = col.as_any().downcast_ref::<LargeStringArray>() {
+            strings.iter().map(parse).collect()
+        } else {
+            Err(crate::Error::DataInvalid {
+                message: "rowkind.field column must be Utf8/String".into(),
                 source: None,
-            });
+            })
         }
-        let strings = col.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
-            crate::Error::DataInvalid {
-                message: "rowkind.field column must be Utf8/String".to_string(),
-                source: None,
-            }
-        })?;
-        RowKind::from_short_string(strings.value(row))
     }
 }
 
@@ -100,6 +118,6 @@ mod tests {
             ],
         )
         .unwrap();
-        assert_eq!(gen.generate(&batch, 0).unwrap(), RowKind::Delete);
+        assert_eq!(gen.generate_batch(&batch).unwrap(), vec![RowKind::Delete]);
     }
 }

@@ -29,16 +29,17 @@ use crate::spec::{Partition, PartitionStatistics, Schema, SchemaChange, Snapshot
 use crate::Result;
 
 use super::api_request::{
-    AlterDatabaseRequest, AlterTableRequest, AuthTableQueryRequest, CreateDatabaseRequest,
-    CreateFunctionRequest, CreatePartitionsRequest, CreateTableRequest, CreateTagRequest,
-    CreateViewRequest, DropPartitionsRequest, DropPolicyRequest, ListPartitionsByFilterRequest,
-    ListPartitionsByNamesRequest, PolicyRequest, RenameTableRequest, RevokePermissionRequest,
+    AlterDatabaseRequest, AlterTableRequest, AuthTableQueryRequest, CreateBranchRequest,
+    CreateDatabaseRequest, CreateFunctionRequest, CreatePartitionsRequest, CreateTableRequest,
+    CreateTagRequest, CreateViewRequest, DropPartitionsRequest, DropPolicyRequest,
+    ForwardBranchRequest, ListPartitionsByFilterRequest, ListPartitionsByNamesRequest,
+    PolicyRequest, RenameTableRequest, RevokePermissionRequest, RollbackTableRequest,
 };
 use super::api_response::{
     AuthTableQueryResponse, ConfigResponse, ErrorResponse, GetDatabaseResponse,
-    GetFunctionResponse, GetTableResponse, GetTagResponse, GetViewResponse, ListDatabasesResponse,
-    ListFunctionsResponse, ListPartitionsResponse, ListPermissionsResponse, ListPoliciesResponse,
-    ListTablesResponse, ListViewsResponse, PagedList,
+    GetFunctionResponse, GetTableResponse, GetTagResponse, GetViewResponse, ListBranchesResponse,
+    ListDatabasesResponse, ListFunctionsResponse, ListPartitionsResponse, ListPermissionsResponse,
+    ListPoliciesResponse, ListTablesResponse, ListTagsResponse, ListViewsResponse, PagedList,
 };
 use super::auth::{AuthProviderFactory, RESTAuthFunction};
 use super::management::{
@@ -76,6 +77,20 @@ fn validate_non_empty(value: &str, field_name: &str) -> Result<()> {
 fn validate_non_empty_multi(values: &[(&str, &str)]) -> Result<()> {
     for (value, field_name) in values {
         validate_non_empty(value, field_name)?;
+    }
+    Ok(())
+}
+
+/// `url` normalizes dot segments even when their dots are percent encoded.
+/// Reject them before a branch mutation can be redirected to a parent resource.
+fn validate_resource_path(values: &[(&str, &str)]) -> Result<()> {
+    validate_non_empty_multi(values)?;
+    for (value, field_name) in values {
+        if matches!(*value, "." | "..") {
+            return Err(crate::Error::ConfigInvalid {
+                message: format!("{field_name} must not be a dot path segment"),
+            });
+        }
     }
     Ok(())
 }
@@ -405,16 +420,16 @@ impl RESTApi {
         &self,
         identifier: &Identifier,
     ) -> Result<Option<super::TableSnapshot>> {
-        validate_non_empty_multi(&[
+        validate_resource_path(&[
             (identifier.database(), "database name"),
             (identifier.object(), "table name"),
         ])?;
         let path = self
             .resource_paths
             .table_snapshot(identifier.database(), identifier.object());
-        let response: super::GetTableSnapshotResponse =
+        let response: Option<super::GetTableSnapshotResponse> =
             self.client.get(&path, None::<&[(&str, &str)]>).await?;
-        Ok(response.snapshot)
+        Ok(response.and_then(|response| response.snapshot))
     }
 
     /// Rename a table.
@@ -521,6 +536,73 @@ impl RESTApi {
         let path = self.resource_paths.view(database, view);
         let _resp: serde_json::Value = self.client.delete(&path, None::<&[(&str, &str)]>).await?;
         Ok(())
+    }
+
+    // ==================== Branch Operations ====================
+
+    /// Create an empty branch or create one from a tag, as in Java `RESTApi`.
+    pub async fn create_branch(
+        &self,
+        identifier: &Identifier,
+        branch_name: &str,
+        from_tag: Option<&str>,
+    ) -> Result<()> {
+        validate_resource_path(&[
+            (identifier.database(), "database name"),
+            (identifier.object(), "table name"),
+        ])?;
+        let path = self
+            .resource_paths
+            .branches(identifier.database(), identifier.object());
+        let request = CreateBranchRequest {
+            branch: branch_name.to_string(),
+            from_tag: from_tag.map(str::to_string),
+        };
+        self.client.post_without_response(&path, &request).await
+    }
+
+    /// Drop branch metadata through the catalog's publication protocol.
+    pub async fn drop_branch(&self, identifier: &Identifier, branch_name: &str) -> Result<()> {
+        validate_resource_path(&[
+            (identifier.database(), "database name"),
+            (identifier.object(), "table name"),
+            (branch_name, "branch name"),
+        ])?;
+        let path =
+            self.resource_paths
+                .branch(identifier.database(), identifier.object(), branch_name);
+        self.client.delete_without_response(&path).await
+    }
+
+    /// Ask the server to fast-forward from a branch. No files are changed locally.
+    pub async fn fast_forward(&self, identifier: &Identifier, branch_name: &str) -> Result<()> {
+        validate_resource_path(&[
+            (identifier.database(), "database name"),
+            (identifier.object(), "table name"),
+            (branch_name, "branch name"),
+        ])?;
+        let path = self.resource_paths.forward_branch(
+            identifier.database(),
+            identifier.object(),
+            branch_name,
+        );
+        self.client
+            .post_without_response(&path, &ForwardBranchRequest {})
+            .await
+    }
+
+    /// List the server's branches, preserving its order and null-list behavior.
+    pub async fn list_branches(&self, identifier: &Identifier) -> Result<Vec<String>> {
+        validate_resource_path(&[
+            (identifier.database(), "database name"),
+            (identifier.object(), "table name"),
+        ])?;
+        let path = self
+            .resource_paths
+            .branches(identifier.database(), identifier.object());
+        let response: ListBranchesResponse =
+            self.client.get(&path, None::<&[(&str, &str)]>).await?;
+        Ok(response.branches.unwrap_or_default())
     }
 
     // ==================== Function Operations ====================
@@ -985,22 +1067,18 @@ impl RESTApi {
     ) -> Result<()> {
         let database = identifier.database();
         let table = identifier.object();
-        validate_non_empty_multi(&[
-            (database, "database name"),
-            (table, "table name"),
-            (tag_name, "tag name"),
-        ])?;
+        validate_resource_path(&[(database, "database name"), (table, "table name")])?;
+        validate_non_empty(tag_name, "tag name")?;
         let path = self.resource_paths.tags(database, table);
         let mut request = CreateTagRequest::new(tag_name.to_string(), snapshot_id);
         request.time_retained = time_retained.map(str::to_string);
-        let _response: serde_json::Value = self.client.post(&path, &request).await?;
-        Ok(())
+        self.client.post_without_response(&path, &request).await
     }
 
     pub async fn get_tag(&self, identifier: &Identifier, tag_name: &str) -> Result<GetTagResponse> {
         let database = identifier.database();
         let table = identifier.object();
-        validate_non_empty_multi(&[
+        validate_resource_path(&[
             (database, "database name"),
             (table, "table name"),
             (tag_name, "tag name"),
@@ -1009,18 +1087,50 @@ impl RESTApi {
         self.client.get(&path, None::<&[(&str, &str)]>).await
     }
 
+    /// Fetch one tag-name page, preserving server ordering and opaque tokens.
+    pub async fn list_tags_paged(
+        &self,
+        identifier: &Identifier,
+        max_results: Option<i32>,
+        page_token: Option<&str>,
+        tag_name_prefix: Option<&str>,
+    ) -> Result<PagedList<String>> {
+        validate_resource_path(&[
+            (identifier.database(), "database name"),
+            (identifier.object(), "table name"),
+        ])?;
+        let mut params = Vec::new();
+        if let Some(max_results) = max_results.filter(|value| *value > 0) {
+            params.push((Self::MAX_RESULTS, max_results.to_string()));
+        }
+        if let Some(page_token) = page_token {
+            params.push((Self::PAGE_TOKEN, page_token.to_string()));
+        }
+        if let Some(prefix) = tag_name_prefix.filter(|value| !value.is_empty()) {
+            params.push(("tagNamePrefix", prefix.to_string()));
+        }
+        let path = self
+            .resource_paths
+            .tags(identifier.database(), identifier.object());
+        let response: ListTagsResponse = self.client.get(&path, Some(&params)).await?;
+        // Java ends pagination when the response has no tags field, including
+        // explicit null, even if a server also returned a continuation token.
+        Ok(match response.tags {
+            Some(tags) => PagedList::new(tags, response.next_page_token),
+            None => PagedList::new(Vec::new(), None),
+        })
+    }
+
     pub async fn delete_tag(&self, identifier: &Identifier, tag_name: &str) -> Result<()> {
         let database = identifier.database();
         let table = identifier.object();
-        validate_non_empty_multi(&[
+        validate_resource_path(&[
             (database, "database name"),
             (table, "table name"),
             (tag_name, "tag name"),
         ])?;
         let path = self.resource_paths.tag(database, table, tag_name);
-        let _response: serde_json::Value =
-            self.client.delete(&path, None::<&[(&str, &str)]>).await?;
-        Ok(())
+        self.client.delete_without_response(&path).await
     }
 
     // ==================== Policy Management ====================
@@ -1114,43 +1224,30 @@ impl RESTApi {
             .unwrap_or(false))
     }
 
-    /// Rollback a table to a specific snapshot.
-    pub async fn rollback_to_snapshot(
+    /// Roll back a table through the server, optionally comparing its identity
+    /// and current head. Omitted guards stay omitted on the wire, as in Java.
+    pub async fn rollback_to(
         &self,
         identifier: &Identifier,
-        snapshot_id: i64,
+        instant: &crate::table::Instant,
+        from_snapshot: Option<i64>,
+        table_uuid: Option<&str>,
     ) -> Result<()> {
-        let database = identifier.database();
-        let table = identifier.object();
-        validate_non_empty_multi(&[(database, "database name"), (table, "table name")])?;
-        let path = self.resource_paths.rollback(database, table);
-        let request = serde_json::json!({
-            "instant": {
-                "type": "snapshot",
-                "snapshotId": snapshot_id,
-            }
-        });
-        let _resp: serde_json::Value = self.client.post(&path, &request).await?;
-        Ok(())
-    }
-
-    /// Rollback a table to a specific tag.
-    pub async fn rollback_to_tag(&self, identifier: &Identifier, tag_name: &str) -> Result<()> {
-        let database = identifier.database();
-        let table = identifier.object();
-        validate_non_empty_multi(&[
-            (database, "database name"),
-            (table, "table name"),
-            (tag_name, "tag name"),
+        validate_resource_path(&[
+            (identifier.database(), "database name"),
+            (identifier.object(), "table name"),
         ])?;
-        let path = self.resource_paths.rollback(database, table);
-        let request = serde_json::json!({
-            "instant": {
-                "type": "tag",
-                "tagName": tag_name,
-            }
-        });
-        let _resp: serde_json::Value = self.client.post(&path, &request).await?;
-        Ok(())
+        if let crate::table::Instant::Tag { tag_name } = instant {
+            validate_non_empty(tag_name, "tag name")?;
+        }
+        let request = RollbackTableRequest {
+            instant: instant.clone(),
+            from_snapshot,
+            table_id: table_uuid.map(str::to_string),
+        };
+        let path = self
+            .resource_paths
+            .rollback(identifier.database(), identifier.object());
+        self.client.post_without_response(&path, &request).await
     }
 }

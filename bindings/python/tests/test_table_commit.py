@@ -85,7 +85,7 @@ def test_public_api_separates_batch_and_stream(tmp_path):
                 factory(**kwargs)
     batch = table.new_batch_write_builder()
     stream = table.new_stream_write_builder()
-    assert not hasattr(batch, "with_commit_user")
+    assert batch.with_commit_user("batch-job") is batch
     assert not hasattr(stream, "with_overwrite")
     for obj in (batch, stream, batch.new_commit(), stream.new_commit()):
         assert not hasattr(obj, "deserialize_commit_message")
@@ -208,11 +208,11 @@ def test_empty_stream_snapshot_properties(tmp_path):
 
 @pytest.mark.parametrize("overwrite", [False, True])
 @pytest.mark.parametrize("serialized", [False, True])
-def test_batch_bridge_preserves_external_commit_user(tmp_path, overwrite, serialized):
+def test_public_batch_commit_user_survives_serialization(tmp_path, overwrite, serialized):
     table = _table(tmp_path, primary_key=True, options={"bucket": "1"})
     _append(table, [1], [10])
     builder = table.new_batch_write_builder()
-    assert builder._with_commit_user("python-batch-job") is builder
+    assert builder.with_commit_user("python-batch-job") is builder
     if overwrite:
         builder.with_overwrite()
     messages = _prepare(builder, [2], [20])
@@ -226,11 +226,11 @@ def test_batch_bridge_preserves_external_commit_user(tmp_path, overwrite, serial
 
 
 @pytest.mark.parametrize("user", ["", "../job", "a/b"])
-def test_invalid_batch_bridge_commit_user_preserves_identity(tmp_path, user):
+def test_invalid_public_batch_commit_user_preserves_identity(tmp_path, user):
     table = _table(tmp_path)
-    builder = table.new_batch_write_builder()._with_commit_user("python-batch-job")
+    builder = table.new_batch_write_builder().with_commit_user("python-batch-job")
     with pytest.raises(ValueError):
-        builder._with_commit_user(user)
+        builder.with_commit_user(user)
     builder.new_commit().commit(_prepare(builder, [1], [10]))
     assert _snapshot(table)["commitUser"] == "python-batch-job"
     assert _rows(table) == [1]
@@ -402,6 +402,29 @@ def test_partition_truncation_matches_java_lifecycle(tmp_path):
     commit.commit([])
     commit.truncate_partitions([{"pt": 20}])
     assert _rows(table) == []
+
+
+@pytest.mark.parametrize("overwrite", [False, True])
+def test_decimal_partition_precision_overflow_matches_java_null_spec(tmp_path, overwrite):
+    ctx = SQLContext()
+    ctx.register_catalog("paimon", {"warehouse": str(tmp_path)})
+    ctx.sql("CREATE SCHEMA paimon.db")
+    ctx.sql("""CREATE TABLE paimon.db.t (id INT, pt DECIMAL(3, 0)) PARTITIONED BY (pt)
+        WITH ('dynamic-partition-overwrite' = 'false')""")
+    ctx.sql("INSERT INTO paimon.db.t (id, pt) VALUES (1, NULL), (2, 12)")
+    table = PaimonCatalog({"warehouse": str(tmp_path)}).get_table("db.t")
+    if overwrite:
+        table.new_batch_write_builder().with_overwrite({"pt": "1000"}).new_commit().commit([])
+    else:
+        table.new_batch_write_builder().new_commit().truncate_partitions([{"pt": "1000"}])
+    assert _rows(table) == [2]
+
+
+def test_integer_partition_spec_accepts_java_unicode_digits(tmp_path):
+    table = _table(tmp_path, partitioned=True)
+    _append(table, [1, 2], [12, 13])
+    table.new_batch_write_builder().new_commit().truncate_partitions([{"pt": "１２"}])
+    assert _rows(table) == [2]
 
 
 @pytest.mark.parametrize("spec", [{"id": 1}, {"pt": "bad"}, {"pt": True}])

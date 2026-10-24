@@ -24,7 +24,7 @@ use crate::io::FileIO;
 use crate::spec::stats::BinaryTableStats;
 use crate::spec::FileKind;
 use crate::spec::{
-    bucket_path, bucket_path_under, extract_datum, merge_active_entries, BinaryRow,
+    bucket_path, bucket_path_under, extract_datum, java_cmp, merge_active_entries, BinaryRow,
     BinaryRowBuilder, CommitKind, CoreOptions, DataFileMeta, DataType, Datum,
     GlobalIndexColumnUpdateAction, IndexManifest, IndexManifestEntry, Manifest, ManifestEntry,
     ManifestFileMeta, ManifestList, PartitionComputer, PartitionStatistics, Predicate, Snapshot,
@@ -289,6 +289,70 @@ impl TableCommit {
         self
     }
 
+    /// Check logical row-ID/column conflicts before rebasing staged updates.
+    ///
+    /// Both snapshot IDs are resolved through this table's snapshot manager.
+    /// The captured interval must not cross a schema change, and this
+    /// committer's resolved schema must still be current. A newer schema may
+    /// exist before the next data snapshot is published.
+    /// Like Java's `checkRowIdFromSnapshot(..., false)`, COMPACT snapshots are
+    /// excluded: the caller may rewrite physical layouts only after this check
+    /// has rejected concurrent logical writes. This method publishes nothing
+    /// and never deletes prepared files, including on an uncertain outcome.
+    pub async fn check_row_id_conflicts(
+        &self,
+        messages: &[CommitMessage],
+        latest_snapshot_id: i64,
+        check_from_snapshot: i64,
+    ) -> Result<()> {
+        if check_from_snapshot <= 0 || check_from_snapshot > latest_snapshot_id {
+            return Err(crate::Error::DataInvalid {
+                message:
+                    "Row-ID conflict checks require 0 < check-from snapshot <= latest snapshot"
+                        .into(),
+                source: None,
+            });
+        }
+        if Self::check_from_snapshot(messages)? != Some(check_from_snapshot) {
+            return Err(crate::Error::DataInvalid {
+                message: "Row-ID conflict check baseline must match the commit messages".into(),
+                source: None,
+            });
+        }
+        super::write_builder::ensure_table_write_authorized(&self.table)?;
+        if !self.data_evolution_enabled {
+            return Err(crate::Error::Unsupported {
+                message: "Row-ID conflict checks require a data-evolution table".into(),
+            });
+        }
+        reject_compact_increment(messages)?;
+        let latest = self
+            .snapshot_manager
+            .get_snapshot(latest_snapshot_id)
+            .await?;
+        let baseline = if check_from_snapshot == latest_snapshot_id {
+            latest.clone()
+        } else {
+            self.snapshot_manager
+                .get_snapshot(check_from_snapshot)
+                .await?
+        };
+        if baseline.schema_id() != latest.schema_id()
+            || self.latest_schema_id().await? != self.table.schema().id()
+        {
+            return Err(crate::Error::DataInvalid {
+                message: "Row-ID conflict checks require an unchanged, current table schema".into(),
+                source: None,
+            });
+        }
+        self.check_row_id_from_snapshot(
+            Some(&latest),
+            &self.messages_to_entries(messages),
+            Some(check_from_snapshot),
+        )
+        .await
+    }
+
     /// Attach caller properties to snapshots published by this committer.
     ///
     /// Like Java's ManifestCommittable properties, these describe the current
@@ -306,8 +370,7 @@ impl TableCommit {
         &self,
         mut commits: Vec<(i64, Vec<CommitMessage>)>,
     ) -> Result<usize> {
-        CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
-        super::write_builder::ensure_table_write_allowed(&self.table)?;
+        super::write_builder::ensure_table_write_authorized(&self.table)?;
         commits.sort_by_key(|(id, _)| *id);
         for pair in commits.windows(2) {
             if pair[0].0 == pair[1].0 {
@@ -404,8 +467,7 @@ impl TableCommit {
         // A commit validates against the existing snapshot.
         // A refusal here must not clean up: a retry with an identifier that
         // already committed names files a snapshot references.
-        CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
-        super::write_builder::ensure_table_write_allowed(&self.table)?;
+        super::write_builder::ensure_table_write_authorized(&self.table)?;
         reject_compact_increment(&commit_messages)?;
         validate_fixed_bucket_commit_mode(&commit_messages, false)?;
         validate_bucket_ownership(&commit_messages)?;
@@ -454,8 +516,7 @@ impl TableCommit {
         commit_identifier: i64,
     ) -> Result<()> {
         // A commit validates against the existing snapshot.
-        CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
-        super::write_builder::ensure_table_write_allowed(&self.table)?;
+        super::write_builder::ensure_table_write_authorized(&self.table)?;
         reject_compact_increment(&commit_messages)?;
         validate_fixed_bucket_commit_mode(&commit_messages, false)?;
         validate_bucket_ownership(&commit_messages)?;
@@ -540,8 +601,7 @@ impl TableCommit {
         filter_committed: bool,
     ) -> Result<()> {
         // A commit validates against the existing snapshot.
-        CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
-        super::write_builder::ensure_table_write_allowed(&self.table)?;
+        super::write_builder::ensure_table_write_authorized(&self.table)?;
         reject_compact_increment(&commit_messages)?;
         validate_fixed_bucket_commit_mode(&commit_messages, true)?;
         validate_bucket_ownership(&commit_messages)?;
@@ -800,9 +860,8 @@ impl TableCommit {
         filter_committed: bool,
     ) -> Result<()> {
         // A commit validates against the existing snapshot.
-        CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
         self.ensure_not_format_table()?;
-        super::write_builder::ensure_table_write_allowed(&self.table)?;
+        super::write_builder::ensure_table_write_authorized(&self.table)?;
 
         if partitions.is_empty() {
             return Ok(());
@@ -850,7 +909,7 @@ impl TableCommit {
         partitions: Vec<HashMap<String, Option<Datum>>>,
         commit_identifier: i64,
     ) -> Result<()> {
-        super::write_builder::ensure_table_write_allowed(&self.table)?;
+        super::write_builder::ensure_table_write_authorized(&self.table)?;
 
         if partitions.is_empty() {
             return Err(crate::Error::DataInvalid {
@@ -882,9 +941,8 @@ impl TableCommit {
         filter_committed: bool,
     ) -> Result<()> {
         // A commit validates against the existing snapshot.
-        CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
         self.ensure_not_format_table()?;
-        super::write_builder::ensure_table_write_allowed(&self.table)?;
+        super::write_builder::ensure_table_write_authorized(&self.table)?;
 
         self.try_commit(
             CommitEntriesPlan::Overwrite {
@@ -1802,11 +1860,10 @@ impl TableCommit {
                 self.check_global_index_sources(latest_snapshot, entries, new_index_entries)
                     .await?;
                 let mut index_entries = new_index_entries.clone();
-                index_entries.extend(self.global_index_update_entries(
-                    &previous,
-                    entries,
-                    new_index_entries,
-                )?);
+                index_entries.extend(
+                    self.global_index_update_entries(&previous, entries, new_index_entries)
+                        .await?,
+                );
                 let all = Self::merge_index_entries(&previous, &index_entries, false)?;
                 self.check_deletion_vector_references(
                     latest_snapshot,
@@ -1923,11 +1980,45 @@ impl TableCommit {
             .filter(|entry| entry.kind == FileKind::Delete)
             .collect::<Vec<_>>();
         for deletion in deletions {
-            let position = all
-                .iter()
-                .position(|entry| same_index_file_entry(entry, deletion));
+            let global_index = !matches!(
+                deletion.index_file.index_type.as_str(),
+                "HASH" | DELETION_VECTORS_INDEX_TYPE
+            );
+            // Java combines global indexes by type and file name, then checks
+            // the complete current metadata before removing an entry. A stale
+            // removal must not discard metadata-only row-id reassignment.
+            let position = all.iter().position(|entry| {
+                if global_index {
+                    entry.index_file.index_type == deletion.index_file.index_type
+                        && entry.index_file.file_name == deletion.index_file.file_name
+                } else {
+                    same_index_file_entry(entry, deletion)
+                }
+            });
             if let Some(position) = position {
+                let previous = &all[position];
+                if global_index
+                    && (!same_index_partition(&previous.partition, &deletion.partition)
+                        || previous.bucket != deletion.bucket
+                        || previous.index_file != deletion.index_file)
+                {
+                    return Err(crate::Error::DataInvalid {
+                        message: format!(
+                            "Index file {} metadata does not match the current entry.",
+                            deletion.index_file.file_name
+                        ),
+                        source: None,
+                    });
+                }
                 all.remove(position);
+            } else if global_index {
+                return Err(crate::Error::DataInvalid {
+                    message: format!(
+                        "Trying to delete global index file {} which does not exist.",
+                        deletion.index_file.file_name
+                    ),
+                    source: None,
+                });
             } else if deletion.index_file.index_type == DELETION_VECTORS_INDEX_TYPE {
                 return Err(crate::Error::DataInvalid {
                     message: format!("Cannot replace missing deletion vector index '{}'; prepare the DELETE again from the latest snapshot", deletion.index_file.file_name),
@@ -1991,34 +2082,69 @@ impl TableCommit {
         Ok(all)
     }
 
-    fn global_index_update_entries(
+    async fn global_index_update_entries(
         &self,
         previous_entries: &[IndexManifestEntry],
         commit_entries: &[ManifestEntry],
         new_index_entries: &[IndexManifestEntry],
     ) -> Result<Vec<IndexManifestEntry>> {
+        if !previous_entries
+            .iter()
+            .any(|entry| entry.index_file.global_index_meta.is_some())
+        {
+            return Ok(vec![]);
+        }
+        let action =
+            CoreOptions::new(self.table.schema().options()).global_index_column_update_action()?;
+        if action == GlobalIndexColumnUpdateAction::Ignore {
+            return Ok(vec![]);
+        }
         let mut updated_cols = HashSet::new();
+        let mut updated_field_ids = HashSet::new();
         let mut written_partitions: Vec<Vec<u8>> = Vec::new();
         for entry in commit_entries
             .iter()
             .filter(|entry| *entry.kind() == FileKind::Add)
         {
-            let Some(write_cols) = entry.file().write_cols.as_ref() else {
-                continue;
-            };
+            let file = entry.file();
             // Dedicated normal/vector/blob INSERT files also carry write_cols.
             // Only files targeting existing row IDs can invalidate an existing index.
-            if entry.file().first_row_id.is_none()
-                && !write_cols
-                    .iter()
-                    .any(|col| col == crate::spec::ROW_ID_FIELD_NAME)
+            if file.first_row_id.is_none()
+                && !file.write_cols.as_ref().is_some_and(|columns| {
+                    columns
+                        .iter()
+                        .any(|col| col == crate::spec::ROW_ID_FIELD_NAME)
+                })
             {
                 continue;
             }
-            for col in write_cols {
-                if !is_system_field(col) {
-                    updated_cols.insert(col.clone());
-                }
+            // Partial files retain their writer's schema, including historical
+            // names. Index metadata identifies fields by ID; comparing against
+            // today's names would miss renames and confuse dropped/readded names.
+            let historical_schema = if file.schema_id == self.table.schema().id() {
+                None
+            } else {
+                Some(self.table.schema_manager().schema(file.schema_id).await?)
+            };
+            let schema = historical_schema
+                .as_deref()
+                .unwrap_or_else(|| self.table.schema());
+            let fields = match &file.write_cols {
+                Some(columns) => super::data_evolution_fields::project_by_paths(
+                    schema.fields(),
+                    &columns
+                        .iter()
+                        .filter(|name| !is_system_field(name))
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                )?,
+                // A complete-row update can omit write_cols, as can a compact
+                // normal file which excludes dedicated Blob/vector columns.
+                None => schema.data_file_fields(None),
+            };
+            for field in fields {
+                updated_field_ids.insert(field.id());
+                updated_cols.insert(field.name().to_string());
             }
             if !written_partitions
                 .iter()
@@ -2061,8 +2187,8 @@ impl TableCommit {
             }
             let matched = indexed_field_ids
                 .iter()
+                .filter(|field_id| updated_field_ids.contains(field_id))
                 .filter_map(|field_id| field_by_id.get(field_id))
-                .filter(|field_name| updated_cols.contains(*field_name))
                 .cloned()
                 .collect::<Vec<_>>();
             if !matched.is_empty() {
@@ -2074,7 +2200,7 @@ impl TableCommit {
             return Ok(vec![]);
         }
 
-        match CoreOptions::new(self.table.schema().options()).global_index_column_update_action()? {
+        match action {
             GlobalIndexColumnUpdateAction::Ignore => Ok(vec![]),
             GlobalIndexColumnUpdateAction::DropPartitionIndex => Ok(affected
                 .into_iter()
@@ -2694,6 +2820,32 @@ impl TableCommit {
         delta_entries: &[ManifestEntry],
         next_row_id: Option<i64>,
     ) -> Result<()> {
+        // File identity deliberately excludes row IDs. Check DELETE metadata
+        // before identifier-based merging can cancel a reassigned current ADD.
+        let deleted = delta_entries
+            .iter()
+            .filter(|entry| *entry.kind() == FileKind::Delete)
+            .map(|entry| (commit_file_identifier(entry), entry))
+            .collect::<HashMap<_, _>>();
+        for current in base_entries
+            .iter()
+            .filter(|entry| *entry.kind() == FileKind::Add)
+        {
+            if let Some(deleted) = deleted.get(&commit_file_identifier(current)) {
+                if current.file().first_row_id != deleted.file().first_row_id
+                    || current.file().row_count != deleted.file().row_count
+                {
+                    return Err(crate::Error::RowIdExistenceConflict {
+                        file_name: deleted.file().file_name.clone(),
+                        first_row_id: deleted.file().first_row_id,
+                        row_count: deleted.file().row_count,
+                        bucket: deleted.bucket(),
+                        current_first_row_id: current.file().first_row_id,
+                        current_row_count: Some(current.file().row_count),
+                    });
+                }
+            }
+        }
         let Some(next_row_id) = next_row_id else {
             return Ok(());
         };
@@ -2756,15 +2908,13 @@ impl TableCommit {
                 entry.file().row_count,
             );
             if !existing_index.contains(&key) {
-                return Err(crate::Error::DataInvalid {
-                    message: format!(
-                        "Row ID existence conflict: file '{}' references first_row_id={}, row_count={} in bucket {}, but no matching file exists in the current snapshot.",
-                        entry.file().file_name,
-                        first_row_id,
-                        entry.file().row_count,
-                        entry.bucket(),
-                    ),
-                    source: None,
+                return Err(crate::Error::RowIdExistenceConflict {
+                    file_name: entry.file().file_name.clone(),
+                    first_row_id: Some(first_row_id),
+                    row_count: entry.file().row_count,
+                    bucket: entry.bucket(),
+                    current_first_row_id: None,
+                    current_row_count: None,
                 });
             }
         }
@@ -3190,14 +3340,16 @@ impl TableCommit {
             let row = BinaryRow::from_serialized_bytes(partition_bytes)?;
             for i in 0..num_fields {
                 match extract_datum(&row, i, &data_types[i])? {
+                    // Java order keeps NaN and -0.0 from making these depend on
+                    // the entry order.
                     Some(datum) => {
                         mins[i] = Some(match mins[i].take() {
-                            Some(cur) if cur <= datum => cur,
+                            Some(cur) if java_cmp(&cur, &datum).is_some_and(|o| o.is_le()) => cur,
                             Some(_) => datum.clone(),
                             None => datum.clone(),
                         });
                         maxs[i] = Some(match maxs[i].take() {
-                            Some(cur) if cur >= datum => cur,
+                            Some(cur) if java_cmp(&cur, &datum).is_some_and(|o| o.is_ge()) => cur,
                             Some(_) => datum,
                             None => datum,
                         });
@@ -3240,8 +3392,7 @@ impl TableCommit {
 
             let file = entry.file();
             let file_creation_time = file
-                .creation_time
-                .map(|t| t.timestamp_millis())
+                .creation_time_epoch_millis()?
                 .unwrap_or_else(|| current_time_millis() as i64);
 
             let stats = match stats_map.entry(partition_bytes) {
@@ -3260,7 +3411,9 @@ impl TableCommit {
                         record_count: 0,
                         file_size_in_bytes: 0,
                         file_count: 0,
-                        last_file_creation_time: 0,
+                        // Java starts with the first PartitionEntry, so
+                        // pre-epoch creation times must remain negative.
+                        last_file_creation_time: file_creation_time,
                         total_buckets: entry.total_buckets(),
                     })
                 }
@@ -3645,6 +3798,8 @@ mod tests {
         include!("table_commit/abort_tests.rs");
         include!("table_commit/property_tests.rs");
         include!("table_commit/callback_tests.rs");
+        include!("table_commit/index_delete_tests.rs");
+        include!("table_commit/row_id_conflict_tests.rs");
     }
 
     #[tokio::test]
@@ -4001,6 +4156,73 @@ mod tests {
     fn setup_partitioned_commit(file_io: &FileIO, table_path: &str) -> TableCommit {
         let table = test_partitioned_table(file_io, table_path);
         TableCommit::new(table, "test-user".to_string())
+    }
+
+    #[test]
+    fn partition_creation_time_uses_java_local_zone_and_keeps_millis() {
+        const CHILD: &str = "PAIMON_CREATION_TIME_ZONE_CHILD";
+        if let Ok(zone) = std::env::var(CHILD) {
+            let commit = TableCommit::new(
+                test_table(&test_file_io(), "memory:/creation-time"),
+                "user".into(),
+            );
+            let cases: &[(&str, &str)] = match zone.as_str() {
+                "UTC" => &[
+                    ("2024-01-02T12:34:56.789Z", "2024-01-02T12:34:56.789Z"),
+                    ("1970-01-01T00:00:00.000Z", "1970-01-01T00:00:00.000Z"),
+                    ("1969-12-31T23:59:59.999Z", "1969-12-31T23:59:59.999Z"),
+                ],
+                "Asia/Shanghai" => &[
+                    ("2024-01-02T12:34:56.789Z", "2024-01-02T04:34:56.789Z"),
+                    ("1970-01-01T07:59:59.999Z", "1969-12-31T23:59:59.999Z"),
+                ],
+                "America/New_York" => &[
+                    ("2024-01-02T12:34:56.789Z", "2024-01-02T17:34:56.789Z"),
+                    ("2024-03-10T02:30:00.123Z", "2024-03-10T07:30:00.123Z"),
+                    ("2024-11-03T01:30:00.456Z", "2024-11-03T05:30:00.456Z"),
+                ],
+                _ => unreachable!(),
+            };
+            for (wall, expected) in cases {
+                let mut file = test_data_file("data.parquet", 1);
+                file.creation_time = Some(wall.parse::<DateTime<Utc>>().unwrap());
+                let mut earlier = file.clone();
+                earlier.file_name = "earlier.parquet".into();
+                earlier.creation_time = file
+                    .creation_time
+                    .map(|wall| wall - chrono::Duration::milliseconds(1));
+                let mut entries = [
+                    ManifestEntry::new(FileKind::Add, vec![], 0, 1, file, 2),
+                    ManifestEntry::new(FileKind::Add, vec![], 0, 1, earlier, 2),
+                ];
+                for _ in 0..2 {
+                    let stats = commit.generate_partition_statistics(&entries).unwrap();
+                    assert_eq!(stats[0].file_count, 2);
+                    assert_eq!(stats[0].record_count, 2);
+                    assert_eq!(
+                        stats[0].last_file_creation_time,
+                        expected
+                            .parse::<DateTime<Utc>>()
+                            .unwrap()
+                            .timestamp_millis(),
+                        "{zone} {wall}"
+                    );
+                    entries.reverse();
+                }
+            }
+            return;
+        }
+        for zone in ["UTC", "Asia/Shanghai", "America/New_York"] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "table::table_commit::tests::partition_creation_time_uses_java_local_zone_and_keeps_millis", "--nocapture"])
+                .env(CHILD, zone).env("TZ", zone).output().unwrap();
+            assert!(
+                output.status.success(),
+                "{zone}: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 
     #[test]
@@ -5107,6 +5329,158 @@ mod tests {
                 .unwrap();
         assert_eq!(index_entries.len(), 1);
         assert_eq!(index_entries[0].index_file.file_name, "lumina-0.index");
+    }
+
+    #[tokio::test]
+    async fn test_index_update_policy_uses_file_schema_identity() {
+        for mode in ["rename", "drop_readd", "complete_row"] {
+            for action in ["THROW_ERROR", "DROP_PARTITION_INDEX", "IGNORE"] {
+                for extra_field in [false, true] {
+                    let file_io = test_file_io();
+                    let path = format!("memory:/index_identity_{mode}_{action}_{extra_field}");
+                    setup_dirs(&file_io, &path).await;
+                    let old = test_schema();
+                    let mut encoded = serde_json::to_value(&old).unwrap();
+                    encoded["id"] = serde_json::json!(1);
+                    if mode == "rename" {
+                        encoded["fields"][0]["name"] = serde_json::json!("renamed_id");
+                    } else if mode == "drop_readd" {
+                        encoded["fields"][0]["id"] = serde_json::json!(2);
+                        encoded["highestFieldId"] = serde_json::json!(2);
+                    }
+                    let current: TableSchema = serde_json::from_value(encoded).unwrap();
+                    let current = current.copy_with_options(HashMap::from([(
+                        "global-index.column-update-action".into(),
+                        action.into(),
+                    )]));
+                    let index_id = current.fields()[0].id();
+                    let table = Table::new(
+                        file_io.clone(),
+                        Identifier::new("default", "t"),
+                        path.clone(),
+                        current,
+                        None,
+                    );
+                    file_io.mkdirs(&format!("{path}/schema/")).await.unwrap();
+                    file_io
+                        .new_output(&format!("{path}/schema/schema-0"))
+                        .unwrap()
+                        .write(serde_json::to_vec(&old).unwrap().into())
+                        .await
+                        .unwrap();
+                    let commit = TableCommit::new(table, "test-user".into());
+                    let index_file = if extra_field {
+                        test_global_index_file_with_extra_fields(
+                            "id.index",
+                            1,
+                            vec![index_id],
+                            0,
+                            9,
+                        )
+                    } else {
+                        test_global_index_file("id.index", index_id, 0, 9)
+                    };
+                    let previous = vec![IndexManifestEntry {
+                        kind: FileKind::Add,
+                        partition: vec![],
+                        bucket: 0,
+                        index_file,
+                        version: 1,
+                    }];
+                    let mut file = test_data_file("update.parquet", 10);
+                    file.first_row_id = Some(0);
+                    if mode == "complete_row" {
+                        file.schema_id = 1;
+                        file.write_cols = None;
+                    } else {
+                        file.write_cols = Some(vec!["id".into()]);
+                    }
+                    let entries =
+                        commit.messages_to_entries(&[CommitMessage::new(vec![], 0, vec![file])]);
+                    let result = commit
+                        .global_index_update_entries(&previous, &entries, &[])
+                        .await;
+                    if mode == "drop_readd" || action == "IGNORE" {
+                        assert!(result.unwrap().is_empty(), "{mode}/{action}/{extra_field}");
+                    } else if action == "THROW_ERROR" {
+                        let error = result.unwrap_err().to_string();
+                        assert!(error.contains("globally indexed columns"), "{error}");
+                        if mode == "rename" {
+                            assert!(error.contains("renamed_id"), "{error}");
+                        }
+                    } else {
+                        let deleted = result.unwrap();
+                        assert_eq!(deleted.len(), 1, "{mode}/{action}/{extra_field}");
+                        assert_eq!(deleted[0].kind, FileKind::Delete);
+                        assert_eq!(deleted[0].index_file, previous[0].index_file);
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_explicit_index_deletes_only_exempt_the_deleted_indexes() {
+        for action in ["THROW_ERROR", "DROP_PARTITION_INDEX", "IGNORE"] {
+            for deleted in ["affected", "other", "both"] {
+                let file_io = test_file_io();
+                let path = format!("memory:/explicit_index_delete_{action}_{deleted}");
+                let table = test_table_with_options(
+                    &file_io,
+                    &path,
+                    HashMap::from([("global-index.column-update-action".into(), action.into())]),
+                );
+                let commit = TableCommit::new(table, "test-user".into());
+                let previous: Vec<_> = [("affected.index", 0), ("other.index", 1)]
+                    .into_iter()
+                    .map(|(name, id)| IndexManifestEntry {
+                        kind: FileKind::Add,
+                        partition: vec![],
+                        bucket: 0,
+                        index_file: test_global_index_file(name, id, 0, 9),
+                        version: 1,
+                    })
+                    .collect();
+                let deletions: Vec<_> = previous
+                    .iter()
+                    .filter(|entry| {
+                        deleted == "both"
+                            || entry.index_file.file_name == format!("{deleted}.index")
+                    })
+                    .cloned()
+                    .map(|mut entry| {
+                        entry.kind = FileKind::Delete;
+                        entry
+                    })
+                    .collect();
+                let mut update = test_data_file("update.parquet", 10);
+                update.first_row_id = Some(0);
+                update.write_cols = Some(vec!["id".into()]);
+                let entries =
+                    commit.messages_to_entries(&[CommitMessage::new(vec![], 0, vec![update])]);
+                let result = commit
+                    .global_index_update_entries(&previous, &entries, &deletions)
+                    .await;
+                if action == "THROW_ERROR" && deleted == "other" {
+                    assert!(
+                        result
+                            .unwrap_err()
+                            .to_string()
+                            .contains("globally indexed columns"),
+                        "{action}/{deleted}"
+                    );
+                } else {
+                    let automatic = result.unwrap();
+                    if action == "DROP_PARTITION_INDEX" && deleted == "other" {
+                        assert_eq!(automatic.len(), 1);
+                        assert_eq!(automatic[0].kind, FileKind::Delete);
+                        assert_eq!(automatic[0].index_file, previous[0].index_file);
+                    } else {
+                        assert!(automatic.is_empty(), "{action}/{deleted}");
+                    }
+                }
+            }
+        }
     }
 
     #[tokio::test]
@@ -6748,6 +7122,59 @@ mod tests {
         assert!(min_row.is_null_at(0));
         assert!(max_row.is_null_at(0));
         assert_eq!(stats.null_counts(), &vec![Some(1)]);
+    }
+
+    /// Java's `Double.compare` orders `-0.0` below `0.0` and NaN above all, so
+    /// the bounds must not depend on the order of the entries.
+    #[test]
+    fn compute_partition_stats_orders_floats_like_java() {
+        use crate::spec::{DataType, DoubleType, IntType, Schema};
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("p", DataType::Double(DoubleType::new()))
+            .partition_keys(["p"])
+            .build()
+            .unwrap();
+        let table = Table::new(
+            test_file_io(),
+            Identifier::new("default", "test_table"),
+            "memory:/test_float_partition_stats".to_string(),
+            TableSchema::new(0, &schema),
+            None,
+        );
+        let commit = TableCommit::new(table, "test-user".to_string());
+        let partition_type = DataType::Double(DoubleType::new());
+        let entry = |value: f64| {
+            let mut builder = BinaryRowBuilder::new(1);
+            builder.write_datum(0, &Datum::Double(value), &partition_type);
+            ManifestEntry::new(
+                FileKind::Add,
+                builder.build_serialized(),
+                0,
+                1,
+                test_data_file("data.parquet", 1),
+                2,
+            )
+        };
+        let bounds = |values: &[f64]| {
+            let entries: Vec<_> = values.iter().map(|value| entry(*value)).collect();
+            let stats = commit.compute_partition_stats(&entries).unwrap();
+            let min = BinaryRow::from_serialized_bytes(stats.min_values()).unwrap();
+            let max = BinaryRow::from_serialized_bytes(stats.max_values()).unwrap();
+            (
+                min.get_double(0).unwrap().to_bits(),
+                max.get_double(0).unwrap().to_bits(),
+            )
+        };
+        let expected = ((-0.0f64).to_bits(), f64::NAN.to_bits());
+        for values in [
+            [0.0, -0.0, f64::NAN, 1.0],
+            [1.0, f64::NAN, 0.0, -0.0],
+            [f64::NAN, 1.0, -0.0, 0.0],
+            [-0.0, 0.0, 1.0, f64::NAN],
+        ] {
+            assert_eq!(bounds(&values), expected, "{values:?}");
+        }
     }
 
     #[tokio::test]

@@ -17,47 +17,11 @@
 
 //! Build-option, field-type, and row-range validation.
 
-use crate::spec::{CoreOptions, DataField, DataType};
+use crate::spec::{DataField, DataType};
 use crate::table::global_index_types::{FM_GLOBAL_INDEX_TYPE, MULTIVALUE_GLOBAL_INDEX_TYPE};
+#[cfg(test)]
 use crate::table::Table;
 use crate::{Error, Result};
-
-pub(super) fn validate_table_options(table: &Table, core_options: &CoreOptions) -> Result<()> {
-    if !core_options.row_tracking_enabled() {
-        return Err(Error::DataInvalid {
-            message: "Sorted global index build requires 'row-tracking.enabled' = 'true'"
-                .to_string(),
-            source: None,
-        });
-    }
-    if !core_options.data_evolution_enabled() {
-        return Err(Error::DataInvalid {
-            message: "Sorted global index build requires 'data-evolution.enabled' = 'true'"
-                .to_string(),
-            source: None,
-        });
-    }
-    if !core_options.global_index_enabled() {
-        return Err(Error::DataInvalid {
-            message: "Sorted global index build requires 'global-index.enabled' = 'true'"
-                .to_string(),
-            source: None,
-        });
-    }
-    if !table.schema().primary_keys().is_empty() {
-        return Err(Error::Unsupported {
-            message: "Sorted global index build does not support primary-key tables".to_string(),
-        });
-    }
-    if core_options.deletion_vectors_enabled() {
-        return Err(Error::Unsupported {
-            message:
-                "Sorted global index build does not support tables with deletion-vectors.enabled=true"
-                    .to_string(),
-        });
-    }
-    Ok(())
-}
 
 #[cfg(test)]
 pub(super) fn find_index_field<'a>(table: &'a Table, column: &str) -> Result<&'a DataField> {

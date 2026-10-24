@@ -389,9 +389,9 @@ async fn test_query_auth_explain_shows_the_restriction_but_not_the_files() {
     assert!(!plan.contains("files="), "{plan}");
 }
 
-/// Pruning can leave no split to carry the grant; the counts and trace still precede the rules.
+/// Pruning can leave no split to carry the grant; the counts and statistics still precede the rules.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_query_auth_explain_hides_the_trace_when_pruning_leaves_no_split() {
+async fn test_query_auth_explain_hides_statistics_when_pruning_leaves_no_split() {
     let (_tmp, _server, context) = restricted_people(None).await;
 
     let plan = datafusion::arrow::util::pretty::pretty_format_batches(
@@ -404,7 +404,7 @@ async fn test_query_auth_explain_hides_the_trace_when_pruning_leaves_no_split() 
     .unwrap()
     .to_string();
     assert!(!plan.contains("files="), "{plan}");
-    assert!(!plan.contains("trace="), "{plan}");
+    assert!(!plan.contains("stats="), "{plan}");
 }
 
 /// Rows `(1, {"x":"bad"})` and `(2, {"x":7})`, served under the rule `id > 1`.
@@ -512,4 +512,49 @@ async fn test_query_auth_variant_get_runs_on_the_admitted_rows_only() {
         datafusion::arrow::util::display::array_value_to_string(&value, 0).unwrap(),
         "7"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn not_null_masks_are_nullable_before_sql_optimization() {
+    let not_null_schema = |options: &[(&str, &str)]| {
+        let mut builder = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("name", DataType::VarChar(VarCharType::new(255).unwrap()))
+            .column(
+                "secret",
+                DataType::VarChar(VarCharType::with_nullable(false, 255).unwrap()),
+            );
+        for (key, value) in options {
+            builder = builder.option(*key, *value);
+        }
+        builder.build().unwrap()
+    };
+    let (_tmp, _server, context) = restricted_people_with_schema(masks(), not_null_schema).await;
+    assert_eq!(
+        count(
+            &query(
+                &context,
+                &format!("SELECT COUNT(*) FROM {TABLE} WHERE secret IS NULL")
+            )
+            .await
+        ),
+        4
+    );
+    assert_eq!(
+        count(
+            &query(
+                &context,
+                &format!("SELECT COUNT(*) FROM {TABLE} WHERE secret IS NOT NULL")
+            )
+            .await
+        ),
+        0
+    );
+    assert_eq!(
+        count(&query(&context, &format!("SELECT COUNT(secret) FROM {TABLE}")).await),
+        0
+    );
+    let output = query(&context, &format!("SELECT secret FROM {TABLE} LIMIT 1")).await;
+    assert!(output[0].schema().field(0).is_nullable());
+    assert!(output[0].column(0).is_null(0));
 }

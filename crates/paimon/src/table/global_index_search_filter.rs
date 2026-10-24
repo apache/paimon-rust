@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Exact row-ID filtering shared by data-evolution index searches.
+//! Exact row-ID filtering shared by global index searches.
 
 use crate::spec::{Predicate, ROW_ID_FIELD_NAME};
 use crate::table::{RowRange, Table};

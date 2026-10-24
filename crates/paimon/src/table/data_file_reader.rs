@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#[cfg(test)]
 use crate::arrow::build_target_arrow_schema;
 use crate::arrow::format::blob::DEFAULT_BLOB_READ_PARALLELISM;
 use crate::arrow::format::{
@@ -43,6 +44,10 @@ use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+#[cfg(test)]
+#[path = "data_file_reader_partition_tests.rs"]
+mod partition_tests;
 
 #[derive(Debug, Default)]
 pub(crate) struct DataFileReadTiming {
@@ -121,6 +126,8 @@ impl FileRead for TimedFileRead {
     }
 }
 
+type DataFieldsExtractor = dyn Fn(&[DataField]) -> crate::Result<Vec<DataField>> + Send + Sync;
+
 /// Reads data files through their format-specific readers.
 #[derive(Clone)]
 pub(crate) struct DataFileReader {
@@ -128,6 +135,8 @@ pub(crate) struct DataFileReader {
     schema_manager: SchemaManager,
     table_schema_id: i64,
     table_fields: Vec<DataField>,
+    fields_extractor: Arc<DataFieldsExtractor>,
+    partition_fields: Vec<DataField>,
     read_type: Vec<DataField>,
     predicates: Vec<Predicate>,
     file_index_read_enabled: bool,
@@ -148,6 +157,7 @@ impl DataFileReader {
         schema_manager: SchemaManager,
         table_schema_id: i64,
         table_fields: Vec<DataField>,
+        fields_extractor: impl Fn(&[DataField]) -> crate::Result<Vec<DataField>> + Send + Sync + 'static,
         read_type: Vec<DataField>,
         predicates: Vec<Predicate>,
     ) -> Self {
@@ -156,6 +166,8 @@ impl DataFileReader {
             schema_manager,
             table_schema_id,
             table_fields,
+            fields_extractor: Arc::new(fields_extractor),
+            partition_fields: Vec::new(),
             read_type,
             predicates,
             file_index_read_enabled: false,
@@ -174,6 +186,25 @@ impl DataFileReader {
     pub(crate) fn with_blob_as_descriptor(mut self, blob_as_descriptor: bool) -> Self {
         self.blob_as_descriptor = blob_as_descriptor;
         self
+    }
+
+    pub(crate) fn with_partition_fields(mut self, fields: Vec<DataField>) -> Self {
+        self.partition_fields = fields;
+        self
+    }
+
+    fn physical_data_fields(
+        &self,
+        file_meta: &DataFileMeta,
+        file_fields: &[DataField],
+        supplied_fields: Option<&[DataField]>,
+    ) -> crate::Result<Vec<DataField>> {
+        data_schema_fields_for_file(
+            file_fields,
+            file_meta.write_cols.as_deref(),
+            supplied_fields,
+            self.fields_extractor.as_ref(),
+        )
     }
 
     pub(crate) fn with_blob_parallelism(mut self, blob_parallelism: usize) -> Self {
@@ -330,7 +361,7 @@ impl DataFileReader {
                         )
                     });
                     split_file_offset += file_meta.row_count;
-                    let sidecar_ranges = split_ranges.clone();
+                    let mut has_bitmap_selection = false;
                     let selected_ranges = match file_index_result {
                         FileIndexResult::Remain => split_ranges,
                         FileIndexResult::Skip => Some(Vec::new()),
@@ -339,12 +370,15 @@ impl DataFileReader {
                                 &selection,
                                 file_meta.row_count,
                             )? {
-                                Some(index_ranges) => Some(match split_ranges {
-                                    Some(split_ranges) => {
-                                        intersect_sorted_ranges(&index_ranges, &split_ranges)
-                                    }
-                                    None => index_ranges,
-                                }),
+                                Some(index_ranges) => {
+                                    has_bitmap_selection = selection.len() < file_meta.row_count as u64;
+                                    Some(match split_ranges {
+                                        Some(split_ranges) => {
+                                            intersect_sorted_ranges(&index_ranges, &split_ranges)
+                                        }
+                                        None => index_ranges,
+                                    })
+                                }
                                 None => split_ranges,
                             }
                         }
@@ -354,6 +388,13 @@ impl DataFileReader {
                         dv.as_deref(),
                         selected_ranges.as_deref(),
                     );
+                    // Like Java, only a selective bitmap allows DV to narrow
+                    // sidecar eligibility. DV alone cannot trigger a ROW read.
+                    let sidecar_ranges = if has_bitmap_selection {
+                        row_selection.clone()
+                    } else {
+                        selected_ranges
+                    };
 
                     let mut stream = reader.read_single_file_stream_with_selection(
                         &split,
@@ -449,8 +490,8 @@ impl DataFileReader {
         )
     }
 
-    /// Physical selection may be narrowed by file indexes or a LIMIT, while
-    /// Java selects the ROW sidecar from the caller's original row ranges.
+    /// The caller supplies sidecar candidates separately from physical ranges:
+    /// a selective bitmap includes DV filtering, while LIMIT never affects it.
     pub(super) fn read_single_file_stream_with_requested_ranges(
         &self,
         split: &DataSplit,
@@ -526,10 +567,15 @@ impl DataFileReader {
             return Ok(futures::stream::empty().boxed());
         }
 
-        let mut read_type = self.read_type.clone();
-        let output_field_count = read_type.len();
+        let output_read_type = self.read_type.clone();
+        let output_schema = crate::arrow::build_read_arrow_schema(&output_read_type)?;
+        let mut read_type = output_read_type.clone();
         let table_fields = self.table_fields.clone();
+        let partition_fields = self.partition_fields.clone();
         let predicates = self.predicates.clone();
+        let file_fields = data_fields.clone().unwrap_or_else(|| table_fields.clone());
+        let data_schema_fields =
+            self.physical_data_fields(&file_meta, &file_fields, data_schema_fields.as_deref())?;
         let projects_row_id = read_type
             .iter()
             .any(|field| field.name() == ROW_ID_FIELD_NAME);
@@ -561,7 +607,18 @@ impl DataFileReader {
                 })
             })
         });
+        let partition_predicate = refs.iter().any(|(_, index)| {
+            table_fields.get(*index).is_some_and(|target| {
+                partition_fields
+                    .iter()
+                    .any(|field| field.id() == target.id())
+                    && !data_schema_fields
+                        .iter()
+                        .any(|field| field.id() == target.id())
+            })
+        });
         let post_read_filter = evolved_predicate
+            || partition_predicate
             || (projects_row_id
                 && predicates
                     .iter()
@@ -569,7 +626,7 @@ impl DataFileReader {
             || (row_tracking_enabled
                 && refs
                     .iter()
-                    .any(|(name, _)| *name == crate::spec::SEQUENCE_NUMBER_FIELD_NAME));
+                    .any(|(name, _)| crate::spec::is_row_tracking_column(name)));
         if post_read_filter {
             // Read predicate-only columns without decoder filtering. Reconcile
             // old-file types and attach original row IDs before exact filtering.
@@ -599,12 +656,27 @@ impl DataFileReader {
             row_filter_factory: None,
             file_fields: table_fields.clone(),
         });
+        if post_read_filter {
+            // Nested residuals need the complete ROW even when the caller only
+            // projects a sibling. Widen before reconciliation; restoring only
+            // the top-level column count would leak the extra nested children.
+            read_type =
+                crate::arrow::residual::widen_scan_fields(&read_type, residual_predicates.as_ref());
+        }
         // The first version of the engine hook is deliberately limited to a
         // schema-identical raw read. Schema-evolution readers retain their exact
         // post-filter until expression adaptation is proven for that path.
         // Positional `_ROW_ID` materialization must see the unfiltered row
         // stream, so the engine hook stays disabled for this projection.
-        let row_filter_factory = (data_fields.is_none() && !projects_row_id && !post_read_filter)
+        let missing_partition_fields = partition_fields.iter().any(|target| {
+            !data_schema_fields
+                .iter()
+                .any(|field| field.id() == target.id())
+        });
+        let row_filter_factory = (data_fields.is_none()
+            && !projects_row_id
+            && !post_read_filter
+            && !missing_partition_fields)
             .then(|| self.row_filter_factory.clone())
             .flatten();
         let file_io = self.file_io.clone();
@@ -617,13 +689,7 @@ impl DataFileReader {
         let mosaic_prefetch = self.mosaic_prefetch;
         let read_timing = self.read_timing.clone();
 
-        let target_schema = build_target_arrow_schema(&read_type)?;
-        let file_fields = data_fields.clone().unwrap_or_else(|| table_fields.clone());
-        let data_schema_fields = data_schema_fields_for_file(
-            &file_fields,
-            file_meta.write_cols.as_deref(),
-            data_schema_fields.as_deref(),
-        )?;
+        let target_schema = crate::arrow::build_read_arrow_schema(&read_type)?;
         // What the reader is asked for.
         let projected_read_fields: Vec<DataField> = if data_fields.is_some()
             || file_meta.write_cols.is_some()
@@ -833,8 +899,10 @@ impl DataFileReader {
                             columns.push(reconcile_column(col, source_field, &read_type[i])?);
                         }
                         _ => {
-                            let null_array = arrow_array::new_null_array(target_field.data_type(), num_rows);
-                            columns.push(null_array);
+                            columns.push(missing_file_column(
+                                &read_type[i], target_field.data_type(),
+                                split.partition(), &partition_fields, num_rows,
+                            )?);
                         }
                     }
                 }
@@ -860,16 +928,8 @@ impl DataFileReader {
                         residual,
                         &read_type,
                     )?;
-                    if read_type.len() > output_field_count {
-                        filtered.project(&(0..output_field_count).collect::<Vec<_>>()).map_err(|e| {
-                            Error::UnexpectedError {
-                                message: format!("Failed to project filtered RecordBatch: {e}"),
-                                source: Some(Box::new(e)),
-                            }
-                        })?
-                    } else {
-                        filtered
-                    }
+                    let output_schema = super::row_sidecar::propagate_blob_data(&output_schema, &filtered);
+                    project_residual_output(filtered, &read_type, &output_read_type, output_schema)?
                 } else {
                     result
                 };
@@ -945,6 +1005,7 @@ impl DataFileReader {
 
         let read_type = self.read_type.clone();
         let table_fields = self.table_fields.clone();
+        let partition_fields = self.partition_fields.clone();
         let predicates = self.predicates.clone();
         let file_io = self.file_io.clone();
         let split = split.clone();
@@ -954,10 +1015,9 @@ impl DataFileReader {
         let table_options = Arc::clone(&self.table_options);
         let mosaic_prefetch = self.mosaic_prefetch;
 
-        let target_schema = build_target_arrow_schema(&read_type)?;
+        let target_schema = crate::arrow::build_read_arrow_schema(&read_type)?;
         let file_fields = data_fields.clone().unwrap_or_else(|| table_fields.clone());
-        let data_schema_fields =
-            data_schema_fields_for_file(&file_fields, file_meta.write_cols.as_deref(), None)?;
+        let data_schema_fields = self.physical_data_fields(&file_meta, &file_fields, None)?;
         // What the reader is asked for.
         let projected_read_fields: Vec<DataField> = if data_fields.is_some()
             || file_meta.write_cols.is_some()
@@ -1050,12 +1110,51 @@ impl DataFileReader {
                     &table_fields,
                     index_mapping.as_deref(),
                     source_fields.as_deref(),
+                    (split.partition(), &partition_fields),
                 )?;
                 yield result;
             }
         }
         .boxed())
     }
+}
+
+/// Restore an output projection after reading complete predicate ROW inputs.
+/// Columns retain their prefix order; ROW children are paired by Paimon field
+/// identity rather than Arrow position, including reordered nested projections.
+pub(super) fn project_residual_output(
+    batch: RecordBatch,
+    source_fields: &[DataField],
+    output_fields: &[DataField],
+    output_schema: Arc<arrow_schema::Schema>,
+) -> crate::Result<RecordBatch> {
+    if batch.schema() == output_schema {
+        return Ok(batch);
+    }
+    let columns = output_fields
+        .iter()
+        .enumerate()
+        .map(|(index, target)| {
+            let source = source_fields
+                .iter()
+                .find(|field| field.id() == target.id())
+                .unwrap_or(target);
+            if source == target {
+                Ok(batch.column(index).clone())
+            } else {
+                crate::arrow::nested_evolution::evolve_field(batch.column(index), source, target)
+            }
+        })
+        .collect::<crate::Result<Vec<_>>>()?;
+    RecordBatch::try_new_with_options(
+        output_schema,
+        columns,
+        &arrow_array::RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
+    )
+    .map_err(|error| Error::UnexpectedError {
+        message: format!("Failed to restore residual output projection: {error}"),
+        source: Some(Box::new(error)),
+    })
 }
 
 /// Reconcile one decoded column with the read schema's type for it.
@@ -1081,6 +1180,32 @@ fn reconcile_column(
     })
 }
 
+/// Restore only absent physical partition columns. Present columns, including
+/// explicit NULLs, retain the file's value and ordinary schema reconciliation.
+pub(super) fn missing_file_column(
+    target: &DataField,
+    arrow_type: &arrow_schema::DataType,
+    partition: &crate::spec::BinaryRow,
+    partition_fields: &[DataField],
+    num_rows: usize,
+) -> crate::Result<Arc<dyn Array>> {
+    if let Some((index, source)) = partition_fields
+        .iter()
+        .enumerate()
+        .find(|(_, field)| field.id() == target.id())
+    {
+        let column = crate::arrow::partition::partition_array(
+            partition,
+            index,
+            source.data_type(),
+            num_rows,
+        )?;
+        reconcile_column(&column, source, target)
+    } else {
+        Ok(arrow_array::new_null_array(arrow_type, num_rows))
+    }
+}
+
 /// Project one decoded file `batch` onto `target_schema`, resolving each target
 /// column through the field-ID `index_mapping` (or by name when the file schema
 /// matches the table schema), casting on type mismatch and null-filling absent
@@ -1094,6 +1219,7 @@ fn project_file_batch(
     table_fields: &[DataField],
     index_mapping: Option<&[i32]>,
     source_fields: Option<&[DataField]>,
+    partition: (&crate::spec::BinaryRow, &[DataField]),
 ) -> crate::Result<RecordBatch> {
     let num_rows = batch.num_rows();
     let batch_schema = batch.schema();
@@ -1128,10 +1254,13 @@ fn project_file_batch(
                 columns.push(reconcile_column(col, source_field, &read_type[i])?);
             }
             _ => {
-                columns.push(arrow_array::new_null_array(
+                columns.push(missing_file_column(
+                    &read_type[i],
                     target_field.data_type(),
+                    partition.0,
+                    partition.1,
                     num_rows,
-                ));
+                )?);
             }
         }
     }
@@ -1281,11 +1410,15 @@ fn data_schema_fields_for_file(
     file_fields: &[DataField],
     write_cols: Option<&[String]>,
     data_schema_fields: Option<&[DataField]>,
+    fields_extractor: &DataFieldsExtractor,
 ) -> crate::Result<Vec<DataField>> {
     if let Some(write_cols) = write_cols {
         return super::data_evolution_fields::project_by_paths(file_fields, write_cols);
     }
-    Ok(data_schema_fields.unwrap_or(file_fields).to_vec())
+    match data_schema_fields {
+        Some(fields) => Ok(fields.to_vec()),
+        None => fields_extractor(file_fields),
+    }
 }
 
 /// Convert ranges from their read-path coordinate system to file-local ranges.
@@ -1419,15 +1552,15 @@ fn ranges_cover_all_rows(ranges: &[RowRange], row_count: i64) -> bool {
 fn dv_to_non_deleted_ranges(dv: &DeletionVector, row_count: i64) -> Vec<RowRange> {
     let mut result = Vec::new();
     let mut cursor: i64 = 0;
-    for deleted in dv.iter() {
-        let del = deleted as i64;
-        if del >= row_count {
+    for (start, end) in dv.deleted_ranges() {
+        let (start, end) = (i64::from(start), i64::from(end));
+        if start >= row_count {
             break;
         }
-        if del > cursor {
-            result.push(RowRange::new(cursor, del - 1));
+        if start > cursor {
+            result.push(RowRange::new(cursor, start - 1));
         }
-        cursor = del + 1;
+        cursor = end + 1;
     }
     if cursor < row_count {
         result.push(RowRange::new(cursor, row_count - 1));
@@ -1624,19 +1757,29 @@ mod row_tests {
             field(1, "id", DataType::Int(IntType::new())),
             field(2, "value", DataType::Int(IntType::new())),
         ];
-        let physical = vec![field(1_000_001, "_KEY_id", DataType::Int(IntType::new()))];
+        let physical = vec![field(
+            1 + crate::spec::KEY_FIELD_ID_START,
+            "_KEY_id",
+            DataType::Int(IntType::new()),
+        )];
+        let extractor = |fields: &[DataField]| Ok(fields.iter().rev().cloned().collect());
         assert_eq!(
-            data_schema_fields_for_file(&fields, None, None).unwrap(),
-            fields
+            data_schema_fields_for_file(&fields, None, None, &extractor).unwrap(),
+            fields.iter().rev().cloned().collect::<Vec<_>>()
         );
-        let selected = data_schema_fields_for_file(&fields, None, Some(&physical)).unwrap();
+        let selected =
+            data_schema_fields_for_file(&fields, None, Some(&physical), &extractor).unwrap();
         assert_eq!(
             selected.iter().map(DataField::name).collect::<Vec<_>>(),
             vec!["_KEY_id"]
         );
-        let partial =
-            data_schema_fields_for_file(&fields, Some(&["value".to_string()]), Some(&physical))
-                .unwrap();
+        let partial = data_schema_fields_for_file(
+            &fields,
+            Some(&["value".to_string()]),
+            Some(&physical),
+            &extractor,
+        )
+        .unwrap();
         assert_eq!(
             partial.iter().map(DataField::name).collect::<Vec<_>>(),
             vec!["value"]
@@ -1961,6 +2104,7 @@ mod row_tests {
             SchemaManager::new(file_io, table_path.to_string()),
             schema_id,
             fields,
+            |fields| Ok(fields.to_vec()),
             read_type,
             Vec::new(),
         );
@@ -2036,6 +2180,7 @@ mod row_tests {
             SchemaManager::new(file_io, table_path.to_string()),
             schema_id,
             fields,
+            |fields| Ok(fields.to_vec()),
             read_type,
             vec![predicate],
         );
@@ -2104,6 +2249,7 @@ mod row_tests {
                 SchemaManager::new(file_io.clone(), table_path.to_string()),
                 1,
                 fields.clone(),
+                |fields| Ok(fields.to_vec()),
                 vec![fields[0].clone()],
                 vec![predicate],
             );
@@ -2118,6 +2264,171 @@ mod row_tests {
                 expected_rows
             );
         }
+    }
+
+    #[tokio::test]
+    async fn row_variant_extraction_after_schema_evolution_uses_local_positions() {
+        use crate::spec::VariantType;
+        use crate::variant::GenericVariant;
+        use arrow_array::{BinaryArray, StructArray};
+        use arrow_buffer::NullBuffer;
+
+        let physical_fields = vec![
+            field(7, "old_id", DataType::Int(IntType::new())),
+            field(41, "old_payload", DataType::Variant(VariantType::new())),
+        ];
+        let schema = build_target_arrow_schema(&physical_fields).unwrap();
+        let variants = [
+            Some(r#"{"x":7,"items":[1,9]}"#),
+            Some(r#"{"x":99}"#),
+            Some("null"),
+            None,
+            Some(r#"{"x":88}"#),
+            Some(r#"{"x":"invalid","items":[]}"#),
+        ]
+        .into_iter()
+        .map(|json| json.map(|json| GenericVariant::parse_json(json).unwrap()))
+        .collect::<Vec<_>>();
+        let arrow_schema::DataType::Struct(children) = schema.field(1).data_type() else {
+            unreachable!()
+        };
+        let payload = StructArray::new(
+            children.clone(),
+            vec![
+                Arc::new(BinaryArray::from_iter_values(variants.iter().map(
+                    |value| value.as_ref().map_or(&[][..], GenericVariant::value),
+                ))),
+                Arc::new(BinaryArray::from_iter_values(variants.iter().map(
+                    |value| value.as_ref().map_or(&[][..], GenericVariant::metadata),
+                ))),
+            ],
+            Some(NullBuffer::from(
+                variants.iter().map(Option::is_some).collect::<Vec<_>>(),
+            )),
+        );
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5, 6])),
+                Arc::new(payload),
+            ],
+        )
+        .unwrap();
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let table_path = "memory:/row_variant_local_evolution";
+        let bucket_path = format!("{table_path}/bucket-0");
+        let file_name = "part.row";
+        let output = file_io
+            .new_output(&format!("{bucket_path}/{file_name}"))
+            .unwrap();
+        let mut writer = create_format_writer(&output, schema, "zstd", 1, None, None, None)
+            .await
+            .unwrap();
+        writer.write(&batch).await.unwrap();
+        let file_size = writer.close().await.unwrap().file_size as i64;
+        let mut file = data_file(file_name, file_size, 6, 1);
+        file.first_row_id = Some(1_000);
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(bucket_path)
+            .with_total_buckets(1)
+            .with_data_files(vec![file.clone()])
+            .build()
+            .unwrap();
+
+        let current_fields = vec![
+            field(7, "id", DataType::BigInt(BigIntType::new())),
+            field(41, "payload", DataType::Variant(VariantType::new())),
+        ];
+        let extraction = variant_extraction_row(
+            true,
+            vec![
+                (
+                    DataType::Int(IntType::new()),
+                    "$.x".into(),
+                    false,
+                    "UTC".into(),
+                ),
+                (
+                    DataType::Int(IntType::new()),
+                    "$.items[1]".into(),
+                    false,
+                    "UTC".into(),
+                ),
+                (
+                    DataType::Int(IntType::new()),
+                    "$.missing.deep".into(),
+                    false,
+                    "UTC".into(),
+                ),
+            ],
+        )
+        .unwrap();
+        let reader = DataFileReader::new(
+            file_io.clone(),
+            SchemaManager::new(file_io, table_path.to_string()),
+            2,
+            current_fields.clone(),
+            |fields| Ok(fields.to_vec()),
+            vec![
+                field(41, "payload", DataType::Row(extraction)),
+                current_fields[0].clone(),
+            ],
+            vec![],
+        );
+        let batches = reader
+            .read_single_file_stream_local(
+                &split,
+                file,
+                Some(physical_fields),
+                None,
+                vec![0, 2, 3, 5],
+            )
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(batches.len(), 1);
+        let result = &batches[0];
+        assert_eq!(result.num_rows(), 4);
+        assert_eq!(result.schema().field(0).name(), "payload");
+        assert_eq!(
+            result
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap(),
+            &Int64Array::from(vec![1, 3, 4, 6]),
+        );
+        let extracted = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        assert_eq!(
+            extracted
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap(),
+            &Int32Array::from(vec![Some(7), None, None, None]),
+        );
+        assert_eq!(
+            extracted
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap(),
+            &Int32Array::from(vec![Some(9), None, None, None]),
+        );
+        assert_eq!(extracted.column(2).null_count(), 4);
+        assert!(
+            extracted.is_valid(1),
+            "Variant null retains its parent value"
+        );
+        assert!(extracted.is_null(2), "SQL null has no parent Variant value");
     }
 
     /// The predicate must not renumber a projected `_ROW_ID`: the surviving row
@@ -2179,6 +2490,7 @@ mod row_tests {
             SchemaManager::new(file_io, table_path),
             1,
             fields,
+            |fields| Ok(fields.to_vec()),
             read_type,
             vec![predicate],
         );
@@ -2237,6 +2549,159 @@ mod row_tests {
             .await
             .unwrap();
         assert_eq!(row_ids(&selected), vec![101]);
+    }
+
+    #[tokio::test]
+    async fn nested_residual_reads_unprojected_sibling_before_restoring_output() {
+        use arrow_array::StructArray;
+        use arrow_buffer::NullBuffer;
+        use arrow_schema::DataType as ArrowDataType;
+
+        for (evolved, row_id) in [(true, false), (false, true), (true, true)] {
+            let score = field(1, "score", DataType::Int(IntType::new()));
+            let label = field(2, "label", DataType::VarChar(VarCharType::string_type()));
+            let physical = vec![field(
+                0,
+                "profile",
+                DataType::Row(RowType::new(vec![score.clone(), label.clone()])),
+            )];
+            let mut current = physical.clone();
+            if evolved {
+                current[0] = field(
+                    0,
+                    "profile",
+                    DataType::Row(RowType::new(vec![
+                        field(1, "score", DataType::BigInt(BigIntType::new())),
+                        label.clone(),
+                    ])),
+                );
+            }
+            let schema = build_target_arrow_schema(&physical).unwrap();
+            let ArrowDataType::Struct(children) = schema.field(0).data_type() else {
+                unreachable!()
+            };
+            let values = StructArray::new(
+                children.clone(),
+                vec![
+                    Arc::new(Int32Array::from(vec![7, 9, 7])),
+                    Arc::new(StringArray::from(vec!["match", "other", "hidden"])),
+                ],
+                Some(NullBuffer::from(vec![true, true, false])),
+            );
+            let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(values)]).unwrap();
+            let file_io = FileIOBuilder::new("memory").build().unwrap();
+            let table_path = format!("memory:/nested_residual_{evolved}_{row_id}");
+            let bucket_path = format!("{table_path}/bucket-0");
+            let output = file_io
+                .new_output(&format!("{bucket_path}/part.parquet"))
+                .unwrap();
+            let mut writer = create_format_writer(&output, schema, "zstd", 1, None, None, None)
+                .await
+                .unwrap();
+            writer.write(&batch).await.unwrap();
+            let file_size = writer.close().await.unwrap().file_size as i64;
+            let mut file_meta = data_file("part.parquet", file_size, 3, 1);
+            file_meta.first_row_id = Some(100);
+            let split = DataSplitBuilder::new()
+                .with_snapshot(1)
+                .with_partition(BinaryRow::new(0))
+                .with_bucket(0)
+                .with_bucket_path(bucket_path)
+                .with_total_buckets(1)
+                .with_data_files(vec![file_meta.clone()])
+                .build()
+                .unwrap();
+            let mut projected = vec![field(
+                0,
+                "profile",
+                DataType::Row(RowType::new(vec![label])),
+            )];
+            if row_id {
+                projected.insert(0, crate::spec::row_id_data_field());
+            }
+            let builder = PredicateBuilder::new(&current);
+            for op in [
+                crate::spec::PredicateOperator::Eq,
+                crate::spec::PredicateOperator::IsNull,
+            ] {
+                let literals = if op == crate::spec::PredicateOperator::IsNull {
+                    vec![]
+                } else if evolved {
+                    vec![Datum::Long(7)]
+                } else {
+                    vec![Datum::Int(7)]
+                };
+                let score = builder.nested_field("profile", &["score"]).unwrap();
+                let predicate = if op == crate::spec::PredicateOperator::IsNull {
+                    builder.is_null(&score)
+                } else {
+                    builder.equal(&score, literals[0].clone())
+                }
+                .unwrap();
+                let reader = DataFileReader::new(
+                    file_io.clone(),
+                    SchemaManager::new(file_io.clone(), table_path.clone()),
+                    2,
+                    current.clone(),
+                    |fields| Ok(fields.to_vec()),
+                    projected.clone(),
+                    vec![predicate],
+                );
+                let batches = reader
+                    .read_single_file_stream(
+                        &split,
+                        file_meta.clone(),
+                        evolved.then(|| physical.clone()),
+                        None,
+                        None,
+                    )
+                    .unwrap()
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .unwrap();
+                assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+                for batch in batches {
+                    assert_eq!(
+                        batch.schema(),
+                        crate::arrow::build_read_arrow_schema(&projected).unwrap()
+                    );
+                    let profile = batch
+                        .column(usize::from(row_id))
+                        .as_any()
+                        .downcast_ref::<StructArray>()
+                        .unwrap();
+                    assert_eq!(profile.num_columns(), 1);
+                    if op == crate::spec::PredicateOperator::IsNull {
+                        assert!(profile.is_null(0));
+                    } else {
+                        assert_eq!(
+                            profile
+                                .column(0)
+                                .as_any()
+                                .downcast_ref::<StringArray>()
+                                .unwrap()
+                                .value(0),
+                            "match"
+                        );
+                    }
+                    if row_id {
+                        assert_eq!(
+                            batch
+                                .column(0)
+                                .as_any()
+                                .downcast_ref::<Int64Array>()
+                                .unwrap()
+                                .value(0),
+                            if op == crate::spec::PredicateOperator::IsNull {
+                                102
+                            } else {
+                                100
+                            }
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[tokio::test]
@@ -2356,6 +2821,30 @@ mod tests {
     }
 
     #[test]
+    fn dv_to_non_deleted_ranges_handles_long_runs() {
+        let dv = DeletionVector::from_bitmap;
+        // A run crossing roaring containers.
+        assert_eq!(
+            dv_to_non_deleted_ranges(&dv((70_000..140_000).collect()), 200_000),
+            vec![RowRange::new(0, 69_999), RowRange::new(140_000, 199_999)]
+        );
+        // A run that goes past the end of the file.
+        assert_eq!(
+            dv_to_non_deleted_ranges(&dv((3..100_000).collect()), 50_000),
+            vec![RowRange::new(0, 2)]
+        );
+        // Positions at or past row_count are ignored.
+        assert_eq!(
+            dv_to_non_deleted_ranges(&dv((0..10).chain(60_000..60_010).collect()), 50_000),
+            vec![RowRange::new(10, 49_999)]
+        );
+        assert_eq!(
+            dv_to_non_deleted_ranges(&dv((0..50_000).collect()), 50_000),
+            vec![]
+        );
+    }
+
+    #[test]
     fn file_index_selection_coalesces_positions_and_rejects_out_of_range_values() {
         let selection = [0_u32, 1, 3].into_iter().collect();
         assert_eq!(
@@ -2434,6 +2923,7 @@ mod tests {
             schema_manager.clone(),
             1,
             fields.clone(),
+            |fields| Ok(fields.to_vec()),
             fields.clone(),
             vec![],
         );
@@ -2445,6 +2935,7 @@ mod tests {
             schema_manager.clone(),
             1,
             fields.clone(),
+            |fields| Ok(fields.to_vec()),
             fields.clone(),
             vec![crate::spec::Predicate::AlwaysTrue],
         );
@@ -2461,6 +2952,7 @@ mod tests {
             schema_manager.clone(),
             1,
             fields.clone(),
+            |fields| Ok(fields.to_vec()),
             fields.clone(),
             vec![filtering],
         );
@@ -2474,6 +2966,7 @@ mod tests {
             schema_manager.clone(),
             1,
             fields.clone(),
+            |fields| Ok(fields.to_vec()),
             fields.clone(),
             vec![],
         )
@@ -2746,6 +3239,7 @@ mod tests {
                     SchemaManager::new(file_io.clone(), table_path.to_string()),
                     1,
                     read_fields.clone(),
+                    |fields| Ok(fields.to_vec()),
                     read_fields.clone(),
                     predicates.clone(),
                 )
@@ -2843,6 +3337,7 @@ mod tests {
             schema_manager,
             table_schema_id,
             read_fields.clone(),
+            |fields| Ok(fields.to_vec()),
             read_fields.clone(),
             Vec::new(),
         );
@@ -3014,6 +3509,7 @@ mod tests {
             schema_manager.clone(),
             0,
             fields.clone(),
+            |fields| Ok(fields.to_vec()),
             fields.clone(),
             vec![predicate.clone()],
         )
@@ -3030,6 +3526,7 @@ mod tests {
             schema_manager,
             0,
             fields.clone(),
+            |fields| Ok(fields.to_vec()),
             fields,
             vec![predicate],
         )
@@ -3117,6 +3614,7 @@ mod tests {
                 schema_manager.clone(),
                 0,
                 fields.clone(),
+                |fields| Ok(fields.to_vec()),
                 fields.clone(),
                 vec![predicate.clone()],
             )
@@ -3205,6 +3703,7 @@ mod tests {
             schema_manager,
             0,
             fields.clone(),
+            |fields| Ok(fields.to_vec()),
             fields,
             vec![predicate],
         )
@@ -3277,6 +3776,7 @@ mod tests {
             schema_manager,
             current_schema.id(),
             current_schema.fields().to_vec(),
+            |fields| Ok(fields.to_vec()),
             current_schema.fields().to_vec(),
             vec![predicate],
         )
@@ -3549,6 +4049,7 @@ mod tests {
                 schema_manager.clone(),
                 current_schema.id(),
                 current_schema.fields().to_vec(),
+                |fields| Ok(fields.to_vec()),
                 vec![current_schema.fields()[0].clone()],
                 vec![predicate.clone()],
             )
@@ -3604,6 +4105,7 @@ mod tests {
             schema_manager,
             table_schema_id,
             fields.clone(),
+            |fields| Ok(fields.to_vec()),
             fields.clone(),
             Vec::new(),
         );
@@ -3682,6 +4184,7 @@ mod tests {
             schema_manager,
             table_schema_id,
             fields.clone(),
+            |fields| Ok(fields.to_vec()),
             fields.clone(),
             Vec::new(),
         );
@@ -3751,6 +4254,7 @@ mod tests {
             schema_manager,
             table_schema_id,
             fields.clone(),
+            |fields| Ok(fields.to_vec()),
             read_type,
             vec![predicate],
         );
@@ -3898,6 +4402,7 @@ mod vector_parquet_tests {
             schema_manager,
             table_schema_id,
             read_fields.clone(),
+            |fields| Ok(fields.to_vec()),
             read_fields.clone(),
             Vec::new(),
         );
@@ -4021,6 +4526,7 @@ mod vector_parquet_tests {
             SchemaManager::new(file_io, table_path.to_string()),
             schema_id,
             read_fields.clone(),
+            |fields| Ok(fields.to_vec()),
             read_fields,
             predicates,
         );

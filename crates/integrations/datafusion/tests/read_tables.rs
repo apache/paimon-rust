@@ -2290,9 +2290,25 @@ mod vector_search_tests {
 
     #[tokio::test]
     async fn test_vector_search_without_matching_index_returns_empty() {
-        let (ctx, _catalog, _tmp) = create_lumina_vector_search_context().await;
+        let (ctx, catalog, _tmp) = create_lumina_vector_search_context().await;
+        let table = catalog
+            .get_table(&Identifier::new("default", "test_lumina_vector"))
+            .await
+            .expect("load table");
+        let dropped = table
+            .new_global_index_drop_builder()
+            .with_index_column("embedding")
+            .with_index_type("lumina")
+            .execute()
+            .await
+            .expect("drop vector indexes");
+        assert!(
+            dropped > 0,
+            "the fixture must have a vector index to remove"
+        );
+
         let batches = ctx
-            .sql("SELECT id FROM vector_search('paimon.default.test_lumina_vector', 'missing_embedding', '[1.0]', 10)")
+            .sql("SELECT id FROM vector_search('paimon.default.test_lumina_vector', 'embedding', '[1.0, 0.0, 0.0, 0.0]', 10)")
             .await
             .expect("SQL should parse")
             .collect()
@@ -2304,6 +2320,21 @@ mod vector_search_tests {
             total_rows, 0,
             "vector_search without a matching Lumina index should not fall back to a full table scan"
         );
+    }
+
+    #[tokio::test]
+    async fn test_vector_search_rejects_missing_column() {
+        let (ctx, _catalog, _tmp) = create_lumina_vector_search_context().await;
+        let error = ctx
+            .sql("SELECT id FROM vector_search('paimon.default.test_lumina_vector', 'missing_embedding', '[1.0]', 10)")
+            .await
+            .expect("SQL should parse")
+            .collect()
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("Search column 'missing_embedding' does not exist"));
     }
 
     #[tokio::test]

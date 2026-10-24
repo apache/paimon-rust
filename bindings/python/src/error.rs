@@ -25,13 +25,147 @@ pyo3::create_exception!(
     "Raised when native state inherited across process fork cannot be used safely."
 );
 
+pyo3::create_exception!(
+    pypaimon_rust,
+    CatalogError,
+    PyValueError,
+    "A catalog failure with code, resource_type, resource_name and message attributes."
+);
+
+pyo3::create_exception!(
+    pypaimon_rust,
+    RowIdExistenceConflict,
+    PyRuntimeError,
+    "A staged file no longer matches the current row-ID layout."
+);
+
 pub fn register_module(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
-    module.add("ForkSafetyError", py.get_type::<ForkSafetyError>())
+    module.add("ForkSafetyError", py.get_type::<ForkSafetyError>())?;
+    module.add("CatalogError", py.get_type::<CatalogError>())?;
+    module.add(
+        "RowIdExistenceConflict",
+        py.get_type::<RowIdExistenceConflict>(),
+    )
+}
+
+/// Preserve the catalog error contract across the FFI without parsing display strings.
+pub(crate) fn to_catalog_py_err(error: paimon::Error) -> PyErr {
+    use paimon::api::RestError;
+    use paimon::Error;
+
+    if error.is_process_fork_unsupported() {
+        return to_py_err(error);
+    }
+    let snapshot_name = match &error {
+        Error::SnapshotNotExist { snapshot_id } => Some(snapshot_id.to_string()),
+        _ => None,
+    };
+    let (code, resource_type, resource_name, message) = match &error {
+        Error::BranchAlreadyExist { branch_name, .. } => (
+            409,
+            Some("BRANCH"),
+            Some(branch_name.as_str()),
+            error.to_string(),
+        ),
+        Error::BranchNotExist { branch_name, .. } => (
+            404,
+            Some("BRANCH"),
+            Some(branch_name.as_str()),
+            error.to_string(),
+        ),
+        Error::TableNotExist { full_name } => (
+            404,
+            Some("TABLE"),
+            Some(full_name.as_str()),
+            error.to_string(),
+        ),
+        Error::TagNotExist { tag_name } => {
+            (404, Some("TAG"), Some(tag_name.as_str()), error.to_string())
+        }
+        Error::TagAlreadyExist { tag_name } => {
+            (409, Some("TAG"), Some(tag_name.as_str()), error.to_string())
+        }
+        Error::SnapshotNotExist { .. } => (
+            404,
+            Some("SNAPSHOT"),
+            snapshot_name.as_deref(),
+            error.to_string(),
+        ),
+        Error::DataInvalid { message, .. } => (400, None, None, message.clone()),
+        Error::RestApi { source } => {
+            let (code, resource_type, resource_name, message) = match source {
+                RestError::BadRequest { message } => (400, None, None, message),
+                RestError::NotAuthorized { message } => (401, None, None, message),
+                RestError::Forbidden { message } => (403, None, None, message),
+                RestError::NoSuchResource {
+                    resource_type,
+                    resource_name,
+                    message,
+                } => (
+                    404,
+                    resource_type.as_deref(),
+                    resource_name.as_deref(),
+                    message,
+                ),
+                RestError::AlreadyExists {
+                    resource_type,
+                    resource_name,
+                    message,
+                } => (
+                    409,
+                    resource_type.as_deref(),
+                    resource_name.as_deref(),
+                    message,
+                ),
+                RestError::ServiceFailure { message } => (500, None, None, message),
+                RestError::NotImplemented { message } => (501, None, None, message),
+                RestError::ServiceUnavailable { message } => (503, None, None, message),
+                RestError::Unexpected { code, message } => (*code, None, None, message),
+            };
+            (code, resource_type, resource_name, message.clone())
+        }
+        Error::UnexpectedError { .. } | Error::IoUnexpected { .. } => {
+            (0, None, None, error.to_string())
+        }
+        _ => return to_py_err(error),
+    };
+    Python::attach(|py| {
+        let exception = CatalogError::new_err(error.to_string());
+        let value = exception.value(py);
+        value.setattr("code", code)?;
+        value.setattr("resource_type", resource_type)?;
+        value.setattr("resource_name", resource_name)?;
+        value.setattr("message", message)?;
+        Ok::<_, PyErr>(exception)
+    })
+    .unwrap_or_else(|error| error)
 }
 
 pub fn to_py_err(err: paimon::Error) -> PyErr {
     if err.is_process_fork_unsupported() {
         return ForkSafetyError::new_err(err.to_string());
+    }
+    if let paimon::Error::RowIdExistenceConflict {
+        file_name,
+        first_row_id,
+        row_count,
+        bucket,
+        current_first_row_id,
+        current_row_count,
+    } = &err
+    {
+        return Python::attach(|py| {
+            let exception = RowIdExistenceConflict::new_err(err.to_string());
+            let value = exception.value(py);
+            value.setattr("file_name", file_name)?;
+            value.setattr("first_row_id", first_row_id)?;
+            value.setattr("row_count", row_count)?;
+            value.setattr("bucket", bucket)?;
+            value.setattr("current_first_row_id", current_first_row_id)?;
+            value.setattr("current_row_count", current_row_count)?;
+            Ok::<_, PyErr>(exception)
+        })
+        .unwrap_or_else(|error| error);
     }
     match err {
         // Unimplemented scan semantics: distinct from malformed input so upper
@@ -68,6 +202,124 @@ pub fn df_to_py_err(err: datafusion::error::DataFusionError) -> PyErr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn row_id_existence_error_preserves_structured_layout() {
+        Python::attach(|py| {
+            let error = to_py_err(paimon::Error::RowIdExistenceConflict {
+                file_name: "opaque '(4): file.parquet".into(),
+                first_row_id: Some(4),
+                row_count: 8,
+                bucket: 3,
+                current_first_row_id: None,
+                current_row_count: Some(9),
+            });
+            assert!(error.is_instance_of::<RowIdExistenceConflict>(py));
+            let value = error.value(py);
+            assert_eq!(
+                value
+                    .getattr("file_name")
+                    .unwrap()
+                    .extract::<String>()
+                    .unwrap(),
+                "opaque '(4): file.parquet"
+            );
+            assert_eq!(
+                value
+                    .getattr("first_row_id")
+                    .unwrap()
+                    .extract::<i64>()
+                    .unwrap(),
+                4
+            );
+            assert_eq!(
+                value
+                    .getattr("row_count")
+                    .unwrap()
+                    .extract::<i64>()
+                    .unwrap(),
+                8
+            );
+            assert_eq!(
+                value.getattr("bucket").unwrap().extract::<i32>().unwrap(),
+                3
+            );
+            assert!(value.getattr("current_first_row_id").unwrap().is_none());
+            assert_eq!(
+                value
+                    .getattr("current_row_count")
+                    .unwrap()
+                    .extract::<i64>()
+                    .unwrap(),
+                9
+            );
+        });
+    }
+
+    #[test]
+    fn row_id_existence_error_survives_python_worker_serialization() {
+        Python::attach(|py| {
+            let modules = py
+                .import("sys")
+                .unwrap()
+                .getattr("modules")
+                .unwrap()
+                .cast_into::<pyo3::types::PyDict>()
+                .unwrap();
+            let previous = modules.get_item("pypaimon_rust").unwrap();
+            let module = PyModule::new(py, "pypaimon_rust").unwrap();
+            register_module(py, &module).unwrap();
+            modules.set_item("pypaimon_rust", &module).unwrap();
+            let result = (|| -> PyResult<()> {
+                let error = to_py_err(paimon::Error::RowIdExistenceConflict {
+                    file_name: "worker:staged.parquet".into(),
+                    first_row_id: Some(4),
+                    row_count: 8,
+                    bucket: 3,
+                    current_first_row_id: None,
+                    current_row_count: Some(9),
+                });
+                let pickle = py.import("pickle")?;
+                let bytes = pickle.call_method1("dumps", (error.value(py),))?;
+                let restored = pickle.call_method1("loads", (bytes,))?;
+                assert!(restored.is_instance_of::<RowIdExistenceConflict>());
+                assert_eq!(
+                    restored.getattr("file_name")?.extract::<String>()?,
+                    "worker:staged.parquet"
+                );
+                assert_eq!(restored.getattr("first_row_id")?.extract::<i64>()?, 4);
+                assert_eq!(restored.getattr("row_count")?.extract::<i64>()?, 8);
+                assert_eq!(restored.getattr("bucket")?.extract::<i32>()?, 3);
+                assert!(restored.getattr("current_first_row_id")?.is_none());
+                assert_eq!(restored.getattr("current_row_count")?.extract::<i64>()?, 9);
+                Ok(())
+            })();
+            match previous {
+                Some(previous) => modules.set_item("pypaimon_rust", previous).unwrap(),
+                None => modules.del_item("pypaimon_rust").unwrap(),
+            }
+            result.unwrap();
+        });
+    }
+
+    #[test]
+    fn unknown_commit_outcome_does_not_expose_a_rewritable_conflict() {
+        Python::attach(|py| {
+            let error = to_py_err(paimon::Error::UnexpectedError {
+                message: "Commit outcome may be unknown; retain prepared files".into(),
+                source: Some(Box::new(paimon::Error::RowIdExistenceConflict {
+                    file_name: "staged.parquet".into(),
+                    first_row_id: Some(0),
+                    row_count: 10,
+                    bucket: 0,
+                    current_first_row_id: None,
+                    current_row_count: None,
+                })),
+            });
+            assert!(error.is_instance_of::<PyValueError>(py));
+            assert!(!error.is_instance_of::<RowIdExistenceConflict>(py));
+        });
+    }
 
     #[test]
     fn process_fork_error_has_distinct_python_type() {

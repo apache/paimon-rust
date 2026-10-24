@@ -93,7 +93,7 @@ crypto-common@0.1.7		X									X
 crypto-common@0.2.2		X									X					
 csv@1.4.0											X			X		
 csv-core@0.1.13											X			X		
-ctutils@0.4.2		X									X					
+ctutils@0.4.4		X									X					
 darling@0.23.0											X					
 darling_core@0.23.0											X					
 darling_macro@0.23.0											X					
@@ -328,12 +328,12 @@ roaring@0.11.4		X									X
 rust-ini@0.21.3											X					
 rustc_version@0.4.1		X									X					
 rustix@1.1.4		X	X								X					
-rustls@0.23.45		X							X		X					
+rustls@0.23.46		X							X		X					
 rustls-native-certs@0.8.4		X							X		X					
 rustls-pki-types@1.15.0		X									X					
 rustls-platform-verifier@0.7.0		X									X					
 rustls-platform-verifier-android@0.1.1		X									X					
-rustls-webpki@0.103.15									X							
+rustls-webpki@0.103.16									X							
 rustversion@1.0.23		X									X					
 ryu@1.0.23		X				X										
 safe_arch@0.7.4		X									X				X	
@@ -393,7 +393,7 @@ thiserror-impl@2.0.19		X									X
 thrift@0.17.0		X														
 tiny-keccak@2.0.2							X									
 tinystr@0.8.3													X			
-tokio@1.53.0											X					
+tokio@1.53.3											X					
 tokio-macros@2.7.1											X					
 tokio-native-tls@0.3.1											X					
 tokio-rustls@0.26.4		X									X					
@@ -433,7 +433,7 @@ wasm-bindgen-shared@0.2.126		X									X
 wasm-streams@0.5.0		X									X					
 web-sys@0.3.103		X									X					
 web-time@1.1.0		X									X					
-webpki-root-certs@1.0.9								X								
+webpki-root-certs@1.0.10								X								
 wide@0.7.33		X									X				X	
 winapi-util@0.1.11											X			X		
 windows-core@0.62.2		X									X					

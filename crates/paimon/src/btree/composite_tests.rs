@@ -318,12 +318,14 @@ fn composite_interval_expansion_and_residual_columns() {
             .len(),
         1
     );
-    let too_many = b.is_in("item", (0..257).map(Datum::Int).collect()).unwrap();
+    let many = b.is_in("item", (0..257).map(Datum::Int).collect()).unwrap();
     let predicate = Predicate::and(vec![
         b.equal("category", Datum::String("a".into())).unwrap(),
-        too_many,
+        many,
     ]);
-    assert!(CompositePlan::plan(&fields, &predicate).unwrap().is_none());
+    let plan = CompositePlan::plan(&fields, &predicate).unwrap().unwrap();
+    assert_eq!(plan.intervals.len(), 257);
+    assert_eq!(plan.equal_columns, 2);
     let predicate = Predicate::and(vec![
         b.greater_than("category", Datum::String("a".into()))
             .unwrap(),
@@ -346,6 +348,429 @@ fn composite_interval_expansion_and_residual_columns() {
         .unwrap()
         .intervals
         .is_empty());
+}
+
+fn integer_fields() -> Vec<DataField> {
+    (0..3)
+        .map(|i| DataField::new(i, format!("k{i}"), DataType::Int(IntType::new())))
+        .collect()
+}
+
+async fn reader_for_tuples(
+    fields: &[DataField],
+    tuples: &[Vec<Option<Datum>>],
+) -> BTreeIndexReader<super::key_serde::KeyComparator> {
+    let codec = CompositeKeyCodec::new(fields);
+    let mut entries = tuples
+        .iter()
+        .enumerate()
+        .map(|(id, tuple)| (codec.serialize(tuple).unwrap(), id as i64))
+        .collect::<Vec<_>>();
+    entries.sort_by(|(left, _), (right, _)| codec.compare_keys(left, right).unwrap());
+    let key_type = DataType::Row(RowType::new(fields.to_vec()));
+    let buf = VecFileWrite::new();
+    let mut writer = BTreeIndexWriter::with_comparator_and_options(
+        Box::new(buf.clone()),
+        256,
+        BlockCompressionType::None,
+        1,
+        false,
+        make_key_comparator(&key_type),
+    );
+    for (key, id) in entries {
+        writer.write(Some(&key), id).await.unwrap();
+    }
+    let result = writer.finish().await.unwrap();
+    let bytes = Bytes::from(buf.to_vec());
+    let size = bytes.len() as u64;
+    BTreeIndexReader::open(
+        Box::new(BytesFileRead(bytes)),
+        size,
+        &result.meta,
+        make_key_comparator(&key_type),
+    )
+    .await
+    .unwrap()
+}
+
+fn row_matches(fields: &[DataField], tuple: &[Option<Datum>], predicate: &Predicate) -> bool {
+    let row = BinaryRow::from_datums(
+        &tuple
+            .iter()
+            .zip(fields)
+            .map(|(value, field)| (value.as_ref(), field.data_type()))
+            .collect::<Vec<_>>(),
+    );
+    crate::spec::eval_row(predicate, &row).unwrap()
+}
+
+async fn assert_prefix_candidates_and_residual(
+    fields: &[DataField],
+    tuples: &[Vec<Option<Datum>>],
+    predicate: &Predicate,
+    prefix: &Predicate,
+    expected_prefixes: usize,
+) {
+    let plan = CompositePlan::plan(fields, predicate).unwrap().unwrap();
+    assert_eq!(plan.bound_columns, 1);
+    assert_eq!(plan.equal_columns, 1);
+    assert_eq!(plan.intervals.len(), expected_prefixes);
+    assert!(!plan.is_point_lookup());
+    assert!(plan
+        .intervals
+        .iter()
+        .all(|interval| interval.point_key.is_none()));
+    let reader = reader_for_tuples(fields, tuples).await;
+    let candidates = reader.query_composite(&plan).await.unwrap();
+    let expected = tuples
+        .iter()
+        .enumerate()
+        .filter(|(_, tuple)| row_matches(fields, tuple, predicate))
+        .map(|(id, _)| id as u64)
+        .collect::<roaring::RoaringTreemap>();
+    let expected_candidates = tuples
+        .iter()
+        .enumerate()
+        .filter(|(_, tuple)| row_matches(fields, tuple, prefix))
+        .map(|(id, _)| id as u64)
+        .collect::<roaring::RoaringTreemap>();
+    assert!(!expected.is_empty());
+    assert!(expected.is_subset(&candidates));
+    assert!(candidates.len() > expected.len());
+    assert_eq!(candidates, expected_candidates);
+    let actual = candidates
+        .iter()
+        .filter(|id| row_matches(fields, &tuples[*id as usize], predicate))
+        .collect::<roaring::RoaringTreemap>();
+    assert_eq!(actual, expected);
+}
+
+#[tokio::test]
+async fn composite_large_in_keeps_every_point_and_null_suffix() {
+    let fields = integer_fields();
+    let b = PredicateBuilder::new(&fields);
+    // An odd multiplier permutes the complete domain; duplicates must not
+    // inflate expansion and the final values must not be silently truncated.
+    let mut literals = (0..4096)
+        .map(|i| Datum::Int((i * 1021) % 4096))
+        .collect::<Vec<_>>();
+    literals.extend((0..1000).map(Datum::Int));
+    let predicate = Predicate::and(vec![
+        b.is_in("k0", literals).unwrap(),
+        b.is_null("k1").unwrap(),
+        b.equal("k2", Datum::Int(7)).unwrap(),
+    ]);
+    let plan = CompositePlan::plan(&fields, &predicate).unwrap().unwrap();
+    assert_eq!(plan.intervals.len(), 4096);
+    assert_eq!(plan.bound_columns, 3);
+    assert_eq!(plan.equal_columns, 3);
+    assert!(plan.is_point_lookup());
+    assert!(plan
+        .intervals
+        .iter()
+        .all(|interval| interval.point_key.is_some()));
+    let mut tuples = (0..4096)
+        .map(|i| vec![Some(Datum::Int(i)), None, Some(Datum::Int(7))])
+        .collect::<Vec<_>>();
+    tuples.extend([
+        vec![
+            Some(Datum::Int(4095)),
+            Some(Datum::Int(0)),
+            Some(Datum::Int(7)),
+        ],
+        vec![Some(Datum::Int(4095)), None, Some(Datum::Int(8))],
+        vec![Some(Datum::Int(5000)), None, Some(Datum::Int(7))],
+    ]);
+    let reader = reader_for_tuples(&fields, &tuples).await;
+    let actual = reader.query_composite(&plan).await.unwrap();
+    assert_eq!(actual, (0..4096).collect::<roaring::RoaringTreemap>());
+    assert!(actual.contains(4095));
+}
+
+#[tokio::test]
+async fn composite_cartesian_limit_keeps_left_prefix_and_residual() {
+    let fields = integer_fields();
+    let b = PredicateBuilder::new(&fields);
+    let prefix = b
+        .is_in("k0", (0..17).rev().map(Datum::Int).collect())
+        .unwrap();
+    let predicate = Predicate::and(vec![
+        prefix.clone(),
+        b.is_in("k1", (0..17).map(Datum::Int).collect()).unwrap(),
+        b.equal("k2", Datum::Int(5)).unwrap(),
+    ]);
+    let mut tuples = Vec::new();
+    for first in -1..19 {
+        for second in -1..19 {
+            for suffix in [4, 5] {
+                tuples.push(vec![
+                    Some(Datum::Int(first)),
+                    Some(Datum::Int(second)),
+                    Some(Datum::Int(suffix)),
+                ]);
+            }
+        }
+    }
+    assert_prefix_candidates_and_residual(&fields, &tuples, &predicate, &prefix, 17).await;
+}
+
+#[tokio::test]
+async fn composite_oversized_prefix_is_preserved_before_next_in() {
+    let fields = integer_fields();
+    let b = PredicateBuilder::new(&fields);
+    let prefix = b
+        .is_in("k0", (0..513).rev().map(Datum::Int).collect())
+        .unwrap();
+    let predicate = Predicate::and(vec![
+        prefix.clone(),
+        b.is_in("k1", vec![Datum::Int(0), Datum::Int(1)]).unwrap(),
+        b.equal("k2", Datum::Int(5)).unwrap(),
+    ]);
+    let mut tuples = Vec::new();
+    for first in 0..514 {
+        for second in [0, 1, 2] {
+            for suffix in [4, 5] {
+                tuples.push(vec![
+                    Some(Datum::Int(first)),
+                    Some(Datum::Int(second)),
+                    Some(Datum::Int(suffix)),
+                ]);
+            }
+        }
+    }
+    assert_prefix_candidates_and_residual(&fields, &tuples, &predicate, &prefix, 513).await;
+}
+
+#[tokio::test]
+async fn composite_large_in_intersects_other_constraints() {
+    let fields = integer_fields();
+    let b = PredicateBuilder::new(&fields);
+    let first = b
+        .is_in("k0", (0..4096).rev().map(Datum::Int).collect())
+        .unwrap();
+    let mut tuples = (0..8192)
+        .map(|i| {
+            vec![
+                Some(Datum::Int(i)),
+                Some(Datum::Int(1)),
+                Some(Datum::Int(1)),
+            ]
+        })
+        .collect::<Vec<_>>();
+    tuples.push(vec![None, Some(Datum::Int(1)), Some(Datum::Int(1))]);
+    let reader = reader_for_tuples(&fields, &tuples).await;
+    for (constraint, expected) in [
+        (
+            Predicate::and(vec![
+                b.greater_or_equal("k0", Datum::Int(4089)).unwrap(),
+                b.less_than("k0", Datum::Int(4096)).unwrap(),
+            ]),
+            4089..4096,
+        ),
+        (
+            b.is_in("k0", (2048..6144).map(Datum::Int).collect())
+                .unwrap(),
+            2048..4096,
+        ),
+    ] {
+        let predicate = Predicate::and(vec![
+            first.clone(),
+            constraint,
+            b.equal("k1", Datum::Int(1)).unwrap(),
+            b.equal("k2", Datum::Int(1)).unwrap(),
+        ]);
+        let plan = CompositePlan::plan(&fields, &predicate).unwrap().unwrap();
+        assert!(plan.is_point_lookup());
+        assert_eq!(
+            plan.intervals.len(),
+            (expected.end - expected.start) as usize
+        );
+        let actual = reader.query_composite(&plan).await.unwrap();
+        assert_eq!(actual, expected.collect::<roaring::RoaringTreemap>());
+    }
+}
+
+#[tokio::test]
+async fn composite_point_domain_identity_matches_encoded_keys() {
+    use crate::spec::{DecimalType, DoubleType, FloatType};
+
+    let fields = vec![
+        DataField::new(0, "f".into(), DataType::Float(FloatType::new())),
+        DataField::new(1, "d".into(), DataType::Double(DoubleType::new())),
+        DataField::new(
+            2,
+            "n".into(),
+            DataType::Decimal(DecimalType::new(18, 2).unwrap()),
+        ),
+    ];
+    let b = PredicateBuilder::new(&fields);
+    let decimal = |unscaled, scale| Datum::Decimal {
+        unscaled,
+        precision: 18,
+        scale,
+    };
+    let predicate = Predicate::and(vec![
+        b.is_in(
+            "f",
+            vec![
+                Datum::Float(f32::NAN),
+                Datum::Float(f32::from_bits(0xffc00001)),
+                Datum::Float(-0.0),
+                Datum::Float(0.0),
+            ],
+        )
+        .unwrap(),
+        b.is_in(
+            "d",
+            vec![
+                Datum::Double(f64::NAN),
+                Datum::Double(f64::from_bits(0xfff8000000000001)),
+                Datum::Double(-0.0),
+                Datum::Double(0.0),
+            ],
+        )
+        .unwrap(),
+        b.is_in("n", vec![decimal(1, 0), decimal(100, 2), decimal(1000, 3)])
+            .unwrap(),
+    ]);
+    let plan = CompositePlan::plan(&fields, &predicate).unwrap().unwrap();
+    assert!(plan.is_point_lookup());
+    // Each floating domain has one canonical NaN and two distinct zeros;
+    // all three decimal literals normalize to the same indexed value.
+    assert_eq!(plan.intervals.len(), 9);
+    let mut tuples = Vec::new();
+    for float in [f32::NAN, -0.0, 0.0] {
+        for double in [f64::NAN, -0.0, 0.0] {
+            tuples.push(vec![
+                Some(Datum::Float(float)),
+                Some(Datum::Double(double)),
+                Some(decimal(100, 2)),
+            ]);
+        }
+    }
+    let reader = reader_for_tuples(&fields, &tuples).await;
+    assert_eq!(
+        reader.query_composite(&plan).await.unwrap(),
+        (0..9).collect::<roaring::RoaringTreemap>()
+    );
+    let narrowed = Predicate::and(vec![
+        predicate,
+        b.is_in(
+            "f",
+            vec![Datum::Float(0.0), Datum::Float(f32::from_bits(0xffc00001))],
+        )
+        .unwrap(),
+        b.is_in("n", vec![decimal(1000, 3)]).unwrap(),
+    ]);
+    let plan = CompositePlan::plan(&fields, &narrowed).unwrap().unwrap();
+    assert_eq!(
+        reader.query_composite(&plan).await.unwrap(),
+        [0, 1, 2, 6, 7, 8]
+            .into_iter()
+            .collect::<roaring::RoaringTreemap>()
+    );
+}
+
+#[tokio::test]
+async fn composite_lookup_batches_reads_without_block_cache() {
+    use crate::io::FileRead;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    struct CountedRead {
+        bytes: Bytes,
+        reads: Arc<Mutex<HashMap<(u64, u64), usize>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl FileRead for CountedRead {
+        async fn read(&self, range: std::ops::Range<u64>) -> crate::Result<Bytes> {
+            *self
+                .reads
+                .lock()
+                .unwrap()
+                .entry((range.start, range.end))
+                .or_default() += 1;
+            Ok(self.bytes.slice(range.start as usize..range.end as usize))
+        }
+    }
+
+    let fields = integer_fields();
+    let b = PredicateBuilder::new(&fields);
+    // Cover complete points, prefixes in one block, and shuffled prefixes
+    // spanning many blocks, with some intervals spanning blocks themselves.
+    for (complete, block_size) in [(true, 1_000_000), (false, 1_000_000), (false, 512)] {
+        let predicate = Predicate::and(vec![
+            b.is_in(
+                "k0",
+                (0..4096).map(|i| Datum::Int((i * 2053) % 4096)).collect(),
+            )
+            .unwrap(),
+            b.is_null("k1").unwrap(),
+            if complete {
+                b.equal("k2", Datum::Int(7)).unwrap()
+            } else {
+                b.between("k2", Datum::Int(20), Datum::Int(70)).unwrap()
+            },
+        ]);
+        let plan = CompositePlan::plan(&fields, &predicate).unwrap().unwrap();
+        let codec = CompositeKeyCodec::new(&fields);
+        let key_type = DataType::Row(RowType::new(fields.clone()));
+        let buf = VecFileWrite::new();
+        let mut writer = BTreeIndexWriter::with_comparator_and_options(
+            Box::new(buf.clone()),
+            block_size,
+            BlockCompressionType::None,
+            1,
+            false,
+            make_key_comparator(&key_type),
+        );
+        let mut expected = roaring::RoaringTreemap::new();
+        let mut row_id = 0;
+        for id in 0..4096 {
+            let suffixes = if id % 256 == 0 { 0..101 } else { 7..8 };
+            for suffix in suffixes {
+                let key = codec
+                    .serialize(&[Some(Datum::Int(id)), None, Some(Datum::Int(suffix))])
+                    .unwrap();
+                writer.write(Some(&key), row_id).await.unwrap();
+                if (complete && suffix == 7) || (!complete && (20..=70).contains(&suffix)) {
+                    expected.insert(row_id as u64);
+                }
+                row_id += 1;
+            }
+        }
+        let result = writer.finish().await.unwrap();
+        let bytes = Bytes::from(buf.to_vec());
+        let size = bytes.len() as u64;
+        let reads = Arc::new(Mutex::new(HashMap::new()));
+        let reader = BTreeIndexReader::open_with_data_block_cache(
+            Box::new(CountedRead {
+                bytes,
+                reads: Arc::clone(&reads),
+            }),
+            size,
+            &result.meta,
+            make_key_comparator(&key_type),
+            Arc::new(BTreeDataBlockCache::new(0)),
+            Arc::from("memory:/composite-batch.btree"),
+        )
+        .await
+        .unwrap();
+        reads.lock().unwrap().clear();
+        assert_eq!(reader.query_composite(&plan).await.unwrap(), expected);
+        let reads = reads.lock().unwrap();
+        assert!(!reads.is_empty());
+        assert!(
+            reads.values().all(|count| *count == 1),
+            "a target block was read repeatedly: complete={complete}, block_size={block_size}"
+        );
+        if block_size == 1_000_000 {
+            assert_eq!(reads.len(), 1);
+        } else {
+            assert!(reads.len() > 1);
+        }
+    }
 }
 
 fn predicates(fields: &[DataField]) -> Vec<Predicate> {

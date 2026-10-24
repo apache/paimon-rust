@@ -273,8 +273,10 @@ pub(crate) fn routable_type(
     if is_data_file_name(name, data_prefixes.iter().chain(table_prefixes)) {
         return Some(if name.ends_with(".index") {
             FileType::FileIndex
+        } else if FileType::is_dedicated_file(name) {
+            FileType::DedicatedData
         } else {
-            FileType::Data
+            FileType::StructuredData
         });
     }
     if is_sequential(path) {
@@ -814,41 +816,41 @@ mod tests {
         assert_type("statistics/stat-{uuid}-0", Some(FileType::Meta), &[]);
         assert_type(
             "dt=1/bucket-0/data-{uuid}-0.parquet",
-            Some(FileType::Data),
+            Some(FileType::StructuredData),
             &[],
         );
         assert_type(
             "dt=1/bucket-0/changelog-{uuid}-0.parquet",
-            Some(FileType::Data),
+            Some(FileType::StructuredData),
             &[],
         );
         assert_type(
             "dt=1/bucket-0/data-{uuid}-0.blob",
-            Some(FileType::Data),
+            Some(FileType::DedicatedData),
             &[],
         );
         assert_type(
             "dt=1/8b1f7c2e/data-{uuid}-0.parquet",
-            Some(FileType::Data),
+            Some(FileType::StructuredData),
             &[],
         );
         let file_index = "dt=1/bucket-0/data-{uuid}-0.parquet.index";
         assert_type(file_index, Some(FileType::FileIndex), &[]);
         let blob_references = "dt=1/bucket-0/data-{uuid}-0.parquet.blobref";
-        assert_type(blob_references, Some(FileType::Data), &[]);
+        assert_type(blob_references, Some(FileType::StructuredData), &[]);
         let pack = "dt=1/bucket-0/data-{uuid}.managed.blob";
-        assert_type(pack, Some(FileType::Data), &[]);
+        assert_type(pack, Some(FileType::DedicatedData), &[]);
         // the postpone writer puts its commit user and write id before {uuid}-{count}
         for postpone in [
             "bucket-postpone/data--u-io-cache-user-s-7-w-{uuid}-0.parquet",
             "dt=1/bucket-postpone/data--u-{uuid}-s-2147483647-w-{uuid}-12.orc",
             "bucket-postpone/changelog--u-user-s-0-w-{uuid}-0.parquet",
         ] {
-            assert_type(postpone, Some(FileType::Data), &[]);
+            assert_type(postpone, Some(FileType::StructuredData), &[]);
             let index = format!("{postpone}.index");
             assert_type(&index, Some(FileType::FileIndex), &[]);
             let blob_references = format!("{postpone}.blobref");
-            assert_type(&blob_references, Some(FileType::Data), &[]);
+            assert_type(&blob_references, Some(FileType::StructuredData), &[]);
         }
         assert_type("index/index-{uuid}-0", Some(FileType::BucketIndex), &[]);
         let btree = "index/btree-global-index-{uuid}.index";
@@ -859,7 +861,7 @@ mod tests {
 
     #[test]
     fn test_cacheable_type_with_file_prefixes() {
-        let data = Some(FileType::Data);
+        let data = Some(FileType::StructuredData);
         let custom = &["data-file.prefix=custom-"];
         assert_type("dt=1/bucket-0/custom-{uuid}-0.orc", data, custom);
         assert_type("dt=1/bucket-0/data-{uuid}-0.orc", data, custom);
@@ -945,7 +947,7 @@ mod tests {
                 &prefixes,
                 &[]
             ),
-            Some(FileType::Data)
+            Some(FileType::StructuredData)
         );
     }
 

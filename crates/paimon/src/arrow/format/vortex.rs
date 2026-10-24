@@ -273,7 +273,7 @@ fn constant_predicate_value(predicate: &Predicate) -> Option<bool> {
             (!saw_unknown).then_some(false)
         }
         Predicate::Not(inner) => constant_predicate_value(inner).map(|value| !value),
-        Predicate::Leaf { .. } => None,
+        Predicate::Leaf { .. } | Predicate::NestedLeaf { .. } => None,
     }
 }
 

@@ -27,7 +27,7 @@ use crate::spec::{
     extract_datum, is_row_tracking_column, BinaryRow, DataField, DataFileMeta, DataType, Datum,
     Predicate,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 #[derive(Debug, Clone)]
@@ -300,6 +300,40 @@ async fn resolve_stats_schema(
     resolved
 }
 
+/// Partition values absent from every physical provider come from the split,
+/// not from NULL-filled data columns. File statistics cannot evaluate them;
+/// retain these candidates for the reader's exact filter after restoration.
+pub(super) fn predicates_reference_unwritten_partitions<'a>(
+    predicates: &[Predicate],
+    table_fields: &[DataField],
+    partition_fields: &[DataField],
+    files: impl IntoIterator<Item = (&'a DataFileMeta, &'a [DataField])>,
+) -> bool {
+    let mut referenced = HashSet::new();
+    for predicate in predicates {
+        predicate.collect_leaf_field_indices(&mut referenced);
+    }
+    let mut missing: HashSet<_> = referenced
+        .into_iter()
+        .filter_map(|index| {
+            let field = table_fields.get(index)?;
+            partition_fields
+                .iter()
+                .any(|partition| partition.id() == field.id())
+                .then_some(field.id())
+        })
+        .collect();
+    for (file, fields) in files {
+        let columns = file_data_columns(file, fields);
+        missing.retain(|id| {
+            !fields
+                .iter()
+                .any(|field| field.id() == *id && columns.contains(&field.name()))
+        });
+    }
+    !missing.is_empty()
+}
+
 pub(super) async fn data_file_matches_predicates_for_table(
     table: &Table,
     file: &DataFileMeta,
@@ -316,6 +350,14 @@ pub(super) async fn data_file_matches_predicates_for_table(
     }
 
     if file.schema_id == table.schema().id() {
+        if predicates_reference_unwritten_partitions(
+            predicates,
+            table.schema().fields(),
+            &table.schema().partition_fields(),
+            [(file, table.schema().fields())],
+        ) {
+            return true;
+        }
         return data_file_matches_predicates_with_key_stats(
             file,
             predicates,
@@ -329,6 +371,14 @@ pub(super) async fn data_file_matches_predicates_for_table(
     let Some(resolved) = resolve_stats_schema(table, file.schema_id, schema_cache).await else {
         return true;
     };
+    if predicates_reference_unwritten_partitions(
+        predicates,
+        table.schema().fields(),
+        &table.schema().partition_fields(),
+        [(file, resolved.file_fields.as_slice())],
+    ) {
+        return true;
+    }
 
     matches_file_stats(
         file,
@@ -383,6 +433,17 @@ pub(super) async fn data_evolution_group_matches_predicates_for_table(
             return true;
         };
         schemas.push(schema);
+    }
+    if predicates_reference_unwritten_partitions(
+        predicates,
+        table.schema().fields(),
+        &table.schema().partition_fields(),
+        group
+            .iter()
+            .zip(&schemas)
+            .map(|(file, schema)| (file, schema.file_fields.as_slice())),
+    ) {
+        return true;
     }
     data_evolution_group_matches_resolved_predicates(
         group,
@@ -575,6 +636,7 @@ fn data_evolution_predicate_may_match(
     row_count: i64,
 ) -> bool {
     match predicate {
+        Predicate::NestedLeaf { .. } => true,
         Predicate::AlwaysTrue => true,
         Predicate::AlwaysFalse => false,
         Predicate::And(children) => children.iter().all(|child| {
@@ -640,6 +702,7 @@ fn data_evolution_predicate_must_match(
     row_count: i64,
 ) -> bool {
     match predicate {
+        Predicate::NestedLeaf { .. } => false,
         Predicate::AlwaysTrue => row_count > 0,
         Predicate::AlwaysFalse => false,
         Predicate::And(children) => children.iter().all(|child| {

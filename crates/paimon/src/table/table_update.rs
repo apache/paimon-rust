@@ -46,11 +46,17 @@ fn invalid(message: impl Into<String>) -> crate::Error {
 /// Row-ID updates infer columns from the input unless configured with
 /// [`with_update_type`](Self::with_update_type). Key-based upserts accept a
 /// column subset including the keys and match keys within each partition.
+/// Operations may select a historical read view. Matched updates retain its
+/// snapshot as the conflict baseline; upsert and MERGE append unmatched rows
+/// using that view's schema and assign fresh row IDs at publication. Publication
+/// resolves the latest snapshot and current table schema independently of the
+/// selected read view.
 #[derive(Clone)]
 pub struct TableUpdate {
     table: Table,
     commit_user: String,
     update_cols: Option<Vec<String>>,
+    plan: Option<super::Plan>,
     blob_uri_reader_factory: Option<std::sync::Arc<dyn crate::io::UriReaderFactory>>,
 }
 
@@ -60,8 +66,37 @@ impl TableUpdate {
             table: table.clone(),
             commit_user,
             update_cols: None,
+            plan: None,
             blob_uri_reader_factory: None,
         }
+    }
+
+    /// Reuse a captured `plan_all` result for row-ID updates and deletes.
+    ///
+    /// Each split must contain complete logical file groups, including their
+    /// partial-column files and deletion vectors. Splits may be distributed
+    /// among workers; the supplied row IDs must belong to that worker's groups.
+    /// Arbitrarily trimmed or incremental splits are not mutation plans.
+    /// Workers authorize the whole table again and retain the captured snapshot
+    /// as the conflict baseline without replanning its data manifests. Deletes
+    /// still read the captured index manifest to preserve all deletion vectors
+    /// when replacing a bucket's shared index file. Assign all deletes for one
+    /// partition/bucket to the same worker.
+    /// Predicate, key-based, MERGE and shard operations reject this setting;
+    /// use a separately configured updater for those operations.
+    pub fn with_plan(&mut self, plan: super::Plan) -> crate::Result<&mut Self> {
+        super::RowIdPlan::from_plan(plan.clone())?;
+        self.plan = Some(plan);
+        Ok(self)
+    }
+
+    fn ensure_unplanned(&self) -> crate::Result<()> {
+        if self.plan.is_some() {
+            return Err(crate::Error::Unsupported {
+                message: "with_plan supports only row-ID update and delete operations".into(),
+            });
+        }
+        Ok(())
     }
 
     /// Configure readers for Blob input references. The same factory supplies
@@ -115,6 +150,7 @@ impl TableUpdate {
         shard_count: usize,
         read_type: Option<Vec<DataField>>,
     ) -> crate::Result<super::ShardTableUpdater> {
+        self.ensure_unplanned()?;
         let mut updater = super::ShardTableUpdater::new(
             &self.table,
             read_type,
@@ -165,7 +201,10 @@ impl TableUpdate {
 
     /// Create a row-ID updater sharing one snapshot across per-call columns.
     pub async fn new_update_by_row_id(&self) -> crate::Result<TableUpdateByRowId> {
-        let mut writer = TableUpdateByRowId::new(&self.table).await?;
+        let mut writer = match &self.plan {
+            Some(plan) => TableUpdateByRowId::with_plan(&self.table, plan).await?,
+            None => TableUpdateByRowId::new(&self.table).await?,
+        };
         writer.with_blob_uri_reader_factory(self.blob_uri_reader_factory.clone());
         Ok(writer)
     }
@@ -228,6 +267,7 @@ impl TableUpdate {
         assignments: Vec<(String, super::UpdateAssignment)>,
         read_columns: Vec<String>,
     ) -> crate::Result<Vec<CommitMessage>> {
+        self.ensure_unplanned()?;
         super::table_update_predicate::update(
             &self.table,
             predicate,
@@ -243,6 +283,11 @@ impl TableUpdate {
     /// columns are omitted from `upsert_keys`. Existing keys update every
     /// matching row ID; new keys append all input columns. Omitted columns on
     /// matched rows retain their values; on new rows they are absent from the file.
+    /// After last-write-wins, matched values follow row-ID update conversion
+    /// rules; new rows must satisfy the ordinary Arrow write type.
+    /// Numeric keys may use different Arrow types only when conversion keeps
+    /// their exact mathematical value. This matching conversion does not alter
+    /// the original key columns used as update or append payloads.
     /// Input batches may have different non-key columns. After last-write-wins
     /// deduplication, matched rows must supply their update columns and appended
     /// rows in each partition must share a field set.
@@ -251,6 +296,7 @@ impl TableUpdate {
         batches: Vec<RecordBatch>,
         upsert_keys: Vec<String>,
     ) -> crate::Result<Vec<CommitMessage>> {
+        self.ensure_unplanned()?;
         let mut writer = super::table_upsert::TableUpsert::new(
             &self.table,
             self.commit_user.clone(),
@@ -276,6 +322,7 @@ impl TableUpdate {
         when_matched: Vec<super::WhenMatched>,
         when_not_matched: Vec<super::WhenNotMatched>,
     ) -> crate::Result<Vec<CommitMessage>> {
+        self.ensure_unplanned()?;
         super::table_merge_into::merge_into(
             &self.table,
             &self.commit_user,
@@ -301,24 +348,34 @@ impl TableUpdate {
         &self,
         predicate: Option<crate::spec::Predicate>,
     ) -> crate::Result<Vec<CommitMessage>> {
+        self.ensure_unplanned()?;
         super::table_update_delete::delete(&self.table, predicate).await
     }
 
     /// Delete rows by row ID using deletion vectors.
-    pub async fn delete_by_row_id(&self, row_ids: Vec<i64>) -> crate::Result<Vec<CommitMessage>> {
-        if row_ids.is_empty() {
+    pub async fn delete_by_row_id(
+        &self,
+        row_ids: impl IntoIterator<Item = i64>,
+    ) -> crate::Result<Vec<CommitMessage>> {
+        let mut row_ids = row_ids.into_iter().peekable();
+        if row_ids.peek().is_none() {
             return Ok(Vec::new());
         }
-        let mut writer = self
-            .table
-            .new_write_builder()
-            .with_commit_user(self.commit_user.clone())?
-            .new_delete()?;
+        // The high-level updater selects a read snapshot; the low-level
+        // ordinary write builder continues rejecting historical handles.
+        let mut writer = super::DataEvolutionDeleteWriter::new(&self.table)?;
         writer.add_row_ids(row_ids)?;
-        writer.prepare_commit().await
+        match &self.plan {
+            Some(plan) => writer.prepare_commit_with_plan(plan).await,
+            None => writer.prepare_commit().await,
+        }
     }
 }
 
 fn same_columns(left: &[String], right: &[String]) -> bool {
     left.len() == right.len() && left.iter().all(|column| right.contains(column))
 }
+
+#[cfg(test)]
+#[path = "table_update_plan_tests.rs"]
+mod plan_tests;

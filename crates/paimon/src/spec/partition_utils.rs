@@ -23,6 +23,8 @@
 //! - Java `InternalRowPartitionComputer` for value formatting
 //! - Java `PartitionPathUtils` for path escaping and assembly
 
+use crate::common::date_time::{format_time, format_timestamp};
+use crate::common::number::format_java_float as format_java_floating;
 use crate::error::*;
 use crate::spec::types::DataType;
 use crate::spec::BinaryRow;
@@ -391,7 +393,7 @@ fn format_partition_value(
         DataType::Int(_) => row.get_int(pos)?.to_string(),
         DataType::BigInt(_) => row.get_long(pos)?.to_string(),
         DataType::Float(_) => format_java_float(row.get_float(pos)?),
-        DataType::Double(_) => format_java_float(row.get_double(pos)?),
+        DataType::Double(_) => format_java_floating(row.get_double(pos)?),
 
         DataType::Char(_) | DataType::VarChar(_) => {
             let s = row.get_string(pos)?;
@@ -406,9 +408,10 @@ fn format_partition_value(
             s.to_string()
         }
 
-        DataType::Binary(_) | DataType::VarBinary(_) if !legacy => {
-            // Java's BinaryToStringCastRule wraps the raw bytes in a
-            // BinaryString, whose toString decodes them as UTF-8.
+        DataType::Binary(_) | DataType::VarBinary(_) => {
+            // Java uses BinaryToStringCastRule even for legacy names: a raw
+            // byte[].toString() contains a new allocation identity on each read.
+            // BinaryString.toString decodes the bytes as UTF-8.
             let value = decode_java_utf8(row.get_binary(pos)?);
             if is_java_whitespace_only(&value) {
                 return Ok(default_partition_name.to_string());
@@ -436,7 +439,7 @@ fn format_partition_value(
             if legacy {
                 format_timestamp_legacy(dt)
             } else {
-                format_timestamp_non_legacy(dt, t.precision())
+                format_timestamp(dt, t.precision())
             }
         }
 
@@ -452,7 +455,7 @@ fn format_partition_value(
             if legacy {
                 format_timestamp_legacy(dt)
             } else {
-                format_timestamp_non_legacy(dt, t.precision())
+                format_timestamp(dt, t.precision())
             }
         }
 
@@ -465,9 +468,7 @@ fn format_partition_value(
             }
         }
 
-        DataType::Binary(_)
-        | DataType::VarBinary(_)
-        | DataType::Variant(_)
+        DataType::Variant(_)
         | DataType::Blob(_)
         | DataType::Array(_)
         | DataType::Map(_)
@@ -486,91 +487,14 @@ fn format_partition_value(
 /// Java's shortest-decimal string contract (JDK 19+), including its notation
 /// thresholds and closest choice among one- and two-digit decimals. Rust's
 /// shortest Display chooses different digits at ties; Ryū uses ties-to-even.
-fn format_java_float<T: ryu::Float + std::fmt::LowerExp + Copy + Into<f64>>(value: T) -> String {
-    let number = value.into();
-    if number.is_nan() {
-        return "NaN".into();
-    }
-    if number.is_infinite() {
-        return if number.is_sign_negative() {
-            "-Infinity"
-        } else {
-            "Infinity"
-        }
-        .into();
-    }
-    if number == 0.0 {
-        return if number.is_sign_negative() {
-            "-0.0"
-        } else {
-            "0.0"
-        }
-        .into();
-    }
-
-    let mut buffer = ryu::Buffer::new();
-    let (mut negative, mut digits, mut exponent) = decimal_parts(buffer.format_finite(value));
-    if digits.len() == 1 {
-        // Padding the shortest digit with zero would miss the closer two-digit
-        // form of small subnormals, e.g. Double.MIN_VALUE -> 4.9E-324.
-        (negative, digits, exponent) = decimal_parts(&format!("{value:.1e}"));
-    }
-    let mut result = if negative {
-        "-".to_string()
-    } else {
-        String::new()
-    };
-    if (-3..7).contains(&exponent) {
-        let point = exponent + 1;
-        if point <= 0 {
-            result.push_str("0.");
-            result.push_str(&"0".repeat((-point) as usize));
-            result.push_str(&digits);
-        } else if point as usize >= digits.len() {
-            result.push_str(&digits);
-            result.push_str(&"0".repeat(point as usize - digits.len()));
-            result.push_str(".0");
-        } else {
-            result.push_str(&digits[..point as usize]);
-            result.push('.');
-            result.push_str(&digits[point as usize..]);
-        }
-    } else {
-        result.push_str(&digits[..1]);
-        result.push('.');
-        result.push_str(if digits.len() > 1 { &digits[1..] } else { "0" });
-        result.push('E');
-        result.push_str(&exponent.to_string());
-    }
-    result
-}
-
-fn decimal_parts(text: &str) -> (bool, String, i32) {
-    let (mantissa, exponent) = text
-        .split_once('e')
-        .map_or((text, 0), |(mantissa, exponent)| {
-            (mantissa, exponent.parse::<i32>().expect("decimal exponent"))
-        });
-    let negative = mantissa.starts_with('-');
-    let mantissa = mantissa.trim_start_matches('-');
-    let point = mantissa.find('.').unwrap_or(mantissa.len()) as i32;
-    let digits = mantissa.replace('.', "");
-    let first = digits
-        .bytes()
-        .position(|byte| byte != b'0')
-        .expect("nonzero decimal");
-    let exponent = exponent + point - first as i32 - 1;
-    let mut digits = digits[first..].to_string();
-    while digits.len() > 1 && digits.ends_with('0') {
-        digits.pop();
-    }
-    (negative, digits, exponent)
+pub fn format_java_float(value: f32) -> String {
+    format_java_floating(value)
 }
 
 /// Decode as Java's UTF-8 decoder does for `BinaryString.toString()`.
 /// Rust's lossy decoder replaces each byte of a UTF-8 encoded surrogate,
 /// while Java replaces the complete malformed surrogate sequence once.
-fn decode_java_utf8(mut bytes: &[u8]) -> String {
+pub(crate) fn decode_java_utf8(mut bytes: &[u8]) -> String {
     let mut decoded = String::with_capacity(bytes.len());
     loop {
         match std::str::from_utf8(bytes) {
@@ -640,43 +564,6 @@ fn format_date(epoch_days: i32) -> String {
     let date = NaiveDate::from_num_days_from_ce_opt(epoch_days + 719_163)
         .unwrap_or(NaiveDate::from_ymd_opt(1970, 1, 1).unwrap());
     date.format("%Y-%m-%d").to_string()
-}
-
-/// Format millis-since-midnight to `HH:mm:ss[.f...]` for non-legacy TIME partitions.
-///
-/// Matches Java `DateTimeUtils.formatTimestampMillis(time, precision)`:
-/// outputs up to `precision` fractional digits, stripping trailing zeros.
-fn format_time(millis_of_day: i32, precision: u32) -> String {
-    let mut ms = millis_of_day;
-    // Handle negative millis (same guard as Java)
-    while ms < 0 {
-        ms += 86_400_000;
-    }
-    let ms = ms as u32;
-    let h = ms / 3_600_000;
-    let m = (ms % 3_600_000) / 60_000;
-    let s = (ms % 60_000) / 1_000;
-    let mut frac_ms = ms % 1_000;
-
-    let hms = format!("{h:02}:{m:02}:{s:02}");
-    if precision == 0 || frac_ms == 0 {
-        return hms;
-    }
-
-    // Emit up to `precision` digits, each extracted from the ms value.
-    // Matches Java's digit-by-digit loop with trailing-zero break.
-    let mut frac = String::with_capacity(precision as usize);
-    let mut remaining = precision;
-    while remaining > 0 {
-        frac.push((b'0' + (frac_ms / 100) as u8) as char);
-        frac_ms = (frac_ms % 100) * 10;
-        if frac_ms == 0 {
-            break;
-        }
-        remaining -= 1;
-    }
-
-    format!("{hms}.{frac}")
 }
 
 /// Format an unscaled i128 value with the given scale to a plain decimal string.
@@ -790,30 +677,6 @@ fn format_timestamp_legacy(dt: NaiveDateTime) -> String {
         result.push_str(&frac[..digits]);
     }
     result
-}
-
-/// Format a timestamp using non-legacy `DateTimeUtils.formatTimestamp()` semantics.
-///
-/// Always uses space separator: `yyyy-MM-dd HH:mm:ss[.fraction]`.
-/// Fraction: pad nano to 9 digits, strip trailing zeros while keeping at least `precision` digits.
-fn format_timestamp_non_legacy(dt: NaiveDateTime, precision: u32) -> String {
-    let nano = dt.nanosecond();
-    let ymdhms = dt.format("%Y-%m-%d %H:%M:%S").to_string();
-
-    // Whole seconds keep the declared precision; nonzero fractions are never truncated.
-    let nano_str = format!("{nano:09}");
-    let mut fraction = &nano_str[..];
-
-    // Strip trailing zeros, but don't go below the precision boundary.
-    while fraction.len() > precision as usize && fraction.ends_with('0') {
-        fraction = &fraction[..fraction.len() - 1];
-    }
-
-    if fraction.is_empty() {
-        ymdhms
-    } else {
-        format!("{ymdhms}.{fraction}")
-    }
 }
 
 /// Escape a path component following Java `PartitionPathUtils.escapePathName`.
@@ -1418,20 +1281,11 @@ mod tests {
             .and_hms_nano_opt(12, 0, 0, 123_000_000)
             .unwrap();
         // Precision is a minimum fraction width, not a truncation boundary.
-        assert_eq!(
-            format_timestamp_non_legacy(dt, 0),
-            "2024-01-01 12:00:00.123"
-        );
+        assert_eq!(format_timestamp(dt, 0), "2024-01-01 12:00:00.123");
         // precision=3 → strip trailing zeros down to 3 digits
-        assert_eq!(
-            format_timestamp_non_legacy(dt, 3),
-            "2024-01-01 12:00:00.123"
-        );
+        assert_eq!(format_timestamp(dt, 3), "2024-01-01 12:00:00.123");
         // precision=9 → preserve all 9 digits (no stripping since len == precision)
-        assert_eq!(
-            format_timestamp_non_legacy(dt, 9),
-            "2024-01-01 12:00:00.123000000"
-        );
+        assert_eq!(format_timestamp(dt, 9), "2024-01-01 12:00:00.123000000");
     }
 
     #[test]
@@ -1447,7 +1301,7 @@ mod tests {
             (6, "2024-01-01 12:00:00.000000"),
             (9, "2024-01-01 12:00:00.000000000"),
         ] {
-            assert_eq!(format_timestamp_non_legacy(dt, precision), expected);
+            assert_eq!(format_timestamp(dt, precision), expected);
         }
     }
 
@@ -1464,7 +1318,7 @@ mod tests {
                 .unwrap()
                 .and_hms_nano_opt(12, 0, 0, nanos)
                 .unwrap();
-            assert_eq!(format_timestamp_non_legacy(dt, precision), expected);
+            assert_eq!(format_timestamp(dt, precision), expected);
         }
     }
 
@@ -1580,14 +1434,6 @@ mod tests {
 
     #[test]
     fn test_unsupported_types() {
-        // Legacy binary uses byte[].toString() in Java, which contains an
-        // allocation-specific identity hash and cannot name a stable path.
-        assert_single_partition_err(
-            "data",
-            DataType::Binary(BinaryType::new(10).unwrap()),
-            |b| b.write_int(0, 0),
-            true,
-        );
         // Array
         assert_single_partition_err(
             "arr",
@@ -1650,70 +1496,75 @@ mod tests {
 
     #[test]
     fn test_binary_partition_uses_utf8_cast_and_path_escaping() {
-        assert_single_partition(
-            "bin",
-            DataType::Binary(BinaryType::new(16).unwrap()),
-            |b| b.write_string(0, "a/b=c"),
-            "bin=a%2Fb%3Dc/",
-            false,
-        );
-        assert_single_partition(
-            "bin",
-            DataType::VarBinary(VarBinaryType::new(16).unwrap()),
-            |b| b.write_string(0, "汉字"),
-            "bin=汉字/",
-            false,
-        );
-        assert_single_partition(
-            "bin",
-            DataType::VarBinary(VarBinaryType::new(16).unwrap()),
-            |b| b.write_string(0, "  "),
-            "bin=__DEFAULT_PARTITION__/",
-            false,
-        );
-    }
-
-    #[test]
-    fn test_binary_partition_matches_java_whitespace() {
-        // Modern JVMs (Java 11/17) treat U+001C as whitespace but U+180E as a
-        // format character, and never fold U+00A0 or U+2007. Rust str::trim
-        // differs for controls and NBSP, so we match Java explicitly.
-        for (value, expected) in [
-            (b"\x1c".as_slice(), "bin=__DEFAULT_PARTITION__/"),
-            // U+180E is whitespace only on legacy JDK 8; a modern JVM keeps it.
-            ("\u{180E}".as_bytes(), "bin=\u{180E}/"),
-            ("\u{00A0}".as_bytes(), "bin=\u{00A0}/"),
-            ("\u{2007}".as_bytes(), "bin=\u{2007}/"),
-        ] {
+        for legacy in [false, true] {
+            assert_single_partition(
+                "bin",
+                DataType::Binary(BinaryType::new(16).unwrap()),
+                |b| b.write_string(0, "a/b=c"),
+                "bin=a%2Fb%3Dc/",
+                legacy,
+            );
             assert_single_partition(
                 "bin",
                 DataType::VarBinary(VarBinaryType::new(16).unwrap()),
-                |b| b.write_bytes(0, value),
-                expected,
-                false,
+                |b| b.write_string(0, "汉字"),
+                "bin=汉字/",
+                legacy,
+            );
+            assert_single_partition(
+                "bin",
+                DataType::VarBinary(VarBinaryType::new(16).unwrap()),
+                |b| b.write_string(0, "  "),
+                "bin=__DEFAULT_PARTITION__/",
+                legacy,
             );
         }
     }
 
     #[test]
+    fn test_binary_partition_matches_java_whitespace() {
+        // Modern JVMs treat U+001C as whitespace but U+180E as a format
+        // character, and never fold U+00A0 or U+2007. Rust str::trim differs
+        // for controls and NBSP, so match Java for both naming modes.
+        for legacy in [false, true] {
+            for (value, expected) in [
+                (b"\x1c".as_slice(), "bin=__DEFAULT_PARTITION__/"),
+                ("\u{180E}".as_bytes(), "bin=\u{180E}/"),
+                ("\u{00A0}".as_bytes(), "bin=\u{00A0}/"),
+                ("\u{2007}".as_bytes(), "bin=\u{2007}/"),
+            ] {
+                assert_single_partition(
+                    "bin",
+                    DataType::VarBinary(VarBinaryType::new(16).unwrap()),
+                    |b| b.write_bytes(0, value),
+                    expected,
+                    legacy,
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_binary_partition_matches_java_malformed_utf8() {
-        // Expected replacements were checked against JDK 8 new String(bytes, UTF_8).
-        for (value, expected) in [
-            (b"\xED\xA0\x80".as_slice(), "bin=\u{FFFD}/"),
-            (b"\xED\xA0".as_slice(), "bin=\u{FFFD}/"),
-            (b"\xED\xA0A".as_slice(), "bin=\u{FFFD}A/"),
-            (b"\xED\xA0\xFF".as_slice(), "bin=\u{FFFD}\u{FFFD}/"),
-            (b"\xE0\x80\x80".as_slice(), "bin=\u{FFFD}\u{FFFD}\u{FFFD}/"),
-            (b"\xE2\x82".as_slice(), "bin=\u{FFFD}/"),
-            (b"\xE2(\xA1".as_slice(), "bin=\u{FFFD}(\u{FFFD}/"),
-        ] {
-            assert_single_partition(
-                "bin",
-                DataType::VarBinary(VarBinaryType::new(16).unwrap()),
-                |b| b.write_bytes(0, value),
-                expected,
-                false,
-            );
+        // Expected replacements were checked against new String(bytes, UTF_8).
+        for legacy in [false, true] {
+            for (value, expected) in [
+                (b"\xED\xA0\x80".as_slice(), "bin=\u{FFFD}/"),
+                (b"\xED\xA0".as_slice(), "bin=\u{FFFD}/"),
+                (b"\xED\xA0A".as_slice(), "bin=\u{FFFD}A/"),
+                (b"\xED\xA0\xFF".as_slice(), "bin=\u{FFFD}\u{FFFD}/"),
+                (b"\xE0\x80\x80".as_slice(), "bin=\u{FFFD}\u{FFFD}\u{FFFD}/"),
+                (b"\xE2\x82".as_slice(), "bin=\u{FFFD}/"),
+                (b"\xE2(\xA1".as_slice(), "bin=\u{FFFD}(\u{FFFD}/"),
+            ] {
+                assert_single_partition(
+                    "bin",
+                    DataType::VarBinary(VarBinaryType::new(16).unwrap()),
+                    |b| b.write_bytes(0, value),
+                    expected,
+                    legacy,
+                );
+            }
         }
     }
 
@@ -1734,7 +1585,7 @@ mod tests {
     #[test]
     fn test_format_time() {
         // precision=3, 12:34:56 = 45_296_000 ms
-        assert_eq!(format_time(45_296_000, 3), "12:34:56");
+        assert_eq!(format_time(45_296_000, 3), "12:34:56.0");
         // precision=3, 12:34:56.123 = 45_296_123 ms
         assert_eq!(format_time(45_296_123, 3), "12:34:56.123");
         // precision=3, 00:00:00.100 = 100 ms → trailing zero stripped to .1
@@ -1767,6 +1618,13 @@ mod tests {
             DataType::Time(TimeType::new(3).unwrap()),
             |b| b.write_int(0, 45_296_123), // 12:34:56.123
             "t=12%3A34%3A56.123/",
+            false,
+        );
+        assert_single_partition(
+            "t",
+            DataType::Time(TimeType::new(3).unwrap()),
+            |b| b.write_int(0, 0),
+            "t=00%3A00%3A00.0/",
             false,
         );
     }

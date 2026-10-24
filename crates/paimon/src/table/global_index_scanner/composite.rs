@@ -184,7 +184,14 @@ impl GlobalIndexScanner {
                 continue;
             }
             return Ok(Some(CompositeIndexScanResult {
-                key_field_ids: plan.fields.iter().map(|field| field.id()).collect(),
+                // Unbound suffix predicates can still use independent scalar
+                // indexes after the composite prefix has been consumed.
+                key_field_ids: plan
+                    .fields
+                    .iter()
+                    .take(plan.bound_columns)
+                    .map(|field| field.id())
+                    .collect(),
                 result: GlobalIndexScanResult {
                     row_ranges: merge_row_ranges(ranges),
                     // Remaining predicates are always retained by the table reader.

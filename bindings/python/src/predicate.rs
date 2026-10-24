@@ -15,10 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::error::to_py_err;
 use paimon::spec::{
     DataField, DataType, Datum, DecimalType, Predicate, PredicateBuilder, TableSchema,
 };
-use pyo3::exceptions::{PyNotImplementedError, PyValueError};
+use pyo3::exceptions::{PyAttributeError, PyNotImplementedError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyTzInfoAccess;
 use pyo3::types::{
@@ -199,6 +200,22 @@ fn micros_to_millis_nanos(micros: i64) -> (i64, i32) {
     )
 }
 
+fn submicrosecond_nanos(value: &Bound<'_, PyAny>) -> PyResult<i32> {
+    // datetime itself has no nanosecond attribute. Arrow's pandas.Timestamp
+    // subclass carries the remaining three digits outside its microseconds.
+    let nanos = match value.getattr("nanosecond") {
+        Ok(nanos) => nanos.extract::<i32>()?,
+        Err(error) if error.is_instance_of::<PyAttributeError>(value.py()) => 0,
+        Err(error) => return Err(error),
+    };
+    if !(0..1_000).contains(&nanos) {
+        return Err(PyValueError::new_err(
+            "datetime nanosecond remainder must be between 0 and 999",
+        ));
+    }
+    Ok(nanos)
+}
+
 /// Convert a naive `datetime.datetime` into `Datum::Timestamp`.
 ///
 /// TIMESTAMP (without time zone) is timezone-less, so timezone-aware datetimes
@@ -218,7 +235,8 @@ fn timestamp_datum(value: &Bound<'_, PyAny>) -> PyResult<Datum> {
     let naive: chrono::NaiveDateTime = value.extract().map_err(|_| {
         PyValueError::new_err("expected a datetime.datetime literal for Timestamp field")
     })?;
-    let (millis, nanos) = micros_to_millis_nanos(naive.and_utc().timestamp_micros());
+    let (millis, micros_nanos) = micros_to_millis_nanos(naive.and_utc().timestamp_micros());
+    let nanos = micros_nanos + submicrosecond_nanos(value)?;
     Ok(Datum::Timestamp { millis, nanos })
 }
 
@@ -253,7 +271,8 @@ fn local_zoned_timestamp_datum(value: &Bound<'_, PyAny>) -> PyResult<Datum> {
     let utc = PyTzInfo::utc(py)?;
     let as_utc = dt.call_method1(pyo3::intern!(py, "astimezone"), (utc,))?;
     let instant: chrono::DateTime<chrono::Utc> = as_utc.extract()?;
-    let (millis, nanos) = micros_to_millis_nanos(instant.timestamp_micros());
+    let (millis, micros_nanos) = micros_to_millis_nanos(instant.timestamp_micros());
+    let nanos = micros_nanos + submicrosecond_nanos(value)?;
     Ok(Datum::LocalZonedTimestamp { millis, nanos })
 }
 
@@ -299,6 +318,64 @@ fn decimal_datum(value: &Bound<'_, PyAny>, dec: &DecimalType) -> PyResult<Datum>
         unscaled,
         precision,
         scale,
+    })
+}
+
+/// Predicate literals are values to compare, not values to store in the column.
+/// Java Decimal.compareTo permits a different precision and scale. Keep the
+/// strict column conversion above for partition writes and other stored values.
+fn predicate_datum(value: &Bound<'_, PyAny>, data_type: &DataType) -> PyResult<Datum> {
+    let DataType::Decimal(column) = data_type else {
+        return py_to_datum(value, data_type);
+    };
+    if let Ok(value) = decimal_datum(value, column) {
+        return Ok(value);
+    }
+    let decimal_class = value.py().import("decimal")?.getattr("Decimal")?;
+    let value = if value.is_instance_of::<PyInt>() && !value.is_instance_of::<PyBool>() {
+        decimal_class.call1((value,))?
+    } else if value.is_instance(&decimal_class)? {
+        value.clone()
+    } else {
+        return decimal_datum(value, column);
+    };
+    let tuple = value.call_method0("as_tuple")?;
+    let sign: u8 = tuple.getattr("sign")?.extract()?;
+    let mut exponent: i64 = tuple
+        .getattr("exponent")?
+        .extract()
+        .map_err(|_| PyValueError::new_err("expected a finite decimal predicate literal"))?;
+    let digits: Vec<u8> = tuple.getattr("digits")?.extract()?;
+    let start = digits.iter().position(|d| *d != 0).unwrap_or(digits.len());
+    let mut digits = &digits[start..];
+    if digits.is_empty() {
+        return Ok(Datum::Decimal {
+            unscaled: 0,
+            precision: column.precision(),
+            scale: column.scale(),
+        });
+    }
+    while digits.last() == Some(&0) {
+        digits = &digits[..digits.len() - 1];
+        exponent = exponent
+            .checked_add(1)
+            .ok_or_else(|| PyValueError::new_err("decimal exponent overflow"))?;
+    }
+    let scale = exponent.checked_neg().unwrap_or(i64::MAX).max(0);
+    let precision = (digits.len() as i64)
+        .saturating_add(exponent.max(0))
+        .max(scale);
+    if precision > 38 || scale > 38 {
+        return Err(PyValueError::new_err(
+            "decimal predicate literal exceeds Java DECIMAL precision",
+        ));
+    }
+    let magnitude = digits.iter().fold(0_i128, |v, d| v * 10 + i128::from(*d))
+        * 10_i128.pow(exponent.max(0) as u32);
+    Ok(Datum::Decimal {
+        unscaled: if sign == 1 { -magnitude } else { magnitude },
+        precision: precision as u32,
+        scale: scale as u32,
     })
 }
 
@@ -364,6 +441,8 @@ const METHOD_NOT_SUPPORTED: &[&str] = &["not"];
 /// The dict shape mirrors the Python predicate tree:
 /// - Leaf: `{"method": <op>, "field": <name>, "literals": [..]}`
 /// - Compound: `{"method": "and"|"or", "children": [<dict>, ..]}`
+/// - Nested ROW leaf: the same leaf dict with `field` naming the root and
+///   `nested_path` containing separate descendant names (not a dotted string).
 ///
 /// Field types are resolved authoritatively from `fields` (the table schema); any
 /// `index`/`data_type` present in the dict is ignored. Literal conversion is
@@ -430,37 +509,6 @@ pub(crate) fn dict_to_table_predicate(
     dict_to_predicate(node, &schema.fields_with_read_metadata(), case_sensitive)
 }
 
-/// Resolve a leaf's field name to its schema [`DataType`] under the given case
-/// sensitivity.
-///
-/// Case-sensitive: exact match. Case-insensitive: ASCII-fold and require a
-/// unique match. Absent → `ValueError("Column '{field}' not found in schema")`;
-/// ambiguous (2+ fields collide under folding) → `ValueError` naming the clash.
-fn resolve_leaf_field_type(
-    fields: &[DataField],
-    field: &str,
-    case_sensitive: bool,
-) -> PyResult<DataType> {
-    let not_found = || PyValueError::new_err(format!("Column '{field}' not found in schema"));
-    if case_sensitive {
-        return fields
-            .iter()
-            .find(|f| f.name() == field)
-            .map(|f| f.data_type().clone())
-            .ok_or_else(not_found);
-    }
-    let mut matches = fields
-        .iter()
-        .filter(|f| f.name().eq_ignore_ascii_case(field));
-    let first = matches.next().ok_or_else(not_found)?;
-    if matches.next().is_some() {
-        return Err(PyValueError::new_err(format!(
-            "Ambiguous column '{field}': multiple schema fields match case-insensitively"
-        )));
-    }
-    Ok(first.data_type().clone())
-}
-
 /// Convert a single leaf dict (already known not to be `and`/`or`) into a
 /// [`Predicate`], resolving the field type from the schema.
 fn leaf_to_predicate(
@@ -469,16 +517,21 @@ fn leaf_to_predicate(
     fields: &[DataField],
     case_sensitive: bool,
 ) -> PyResult<Predicate> {
-    let field: String = node
+    let field_name: String = node
         .get_item("field")?
         .ok_or_else(|| PyValueError::new_err(format!("'{method}' leaf requires 'field'")))?
         .extract()?;
-
-    // Resolve field DataType from schema (authoritative) for literal conversion.
-    let data_type = resolve_leaf_field_type(fields, &field, case_sensitive)?;
-
-    let literals_obj = node.get_item("literals")?;
     let pb = PredicateBuilder::new_with_case_sensitive(fields, case_sensitive);
+    let field = if let Some(path) = node.get_item("nested_path")? {
+        let path = path.extract::<Vec<String>>()?;
+        let names = path.iter().map(String::as_str).collect::<Vec<_>>();
+        pb.nested_field(&field_name, &names)
+    } else {
+        pb.field(&field_name)
+    }
+    .map_err(to_py_err)?;
+    let data_type = field.data_type().clone();
+    let literals_obj = node.get_item("literals")?;
 
     // Convert literals (DataType-driven), wrapping NotImplemented type messages
     // with field context.
@@ -494,8 +547,8 @@ fn leaf_to_predicate(
                     continue;
                 }
                 out.push(Some(
-                    py_to_datum(&item, &data_type)
-                        .map_err(|e| with_field_context(e, &field, &data_type))?,
+                    predicate_datum(&item, &data_type)
+                        .map_err(|e| with_field_context(e, &field_name, &data_type))?,
                 ));
             }
         }
@@ -1434,6 +1487,67 @@ mod tests {
     }
 
     #[test]
+    fn timestamp_literals_preserve_nanosecond_tails() {
+        Python::attach(|py| {
+            // Arrow's pandas.Timestamp is a datetime subclass with a
+            // nanosecond remainder. Keep this unit independent of pandas.
+            let module = pyo3::types::PyModule::from_code(
+                py,
+                c"import datetime
+def stamp(ticks, hours):
+    class NanosecondDateTime(datetime.datetime):
+        @property
+        def nanosecond(self):
+            return ticks % 1000
+    base = datetime.datetime(1970, 1, 1) + datetime.timedelta(microseconds=ticks // 1000)
+    value = NanosecondDateTime(base.year, base.month, base.day, base.hour, base.minute, base.second, base.microsecond)
+    if hours is not None:
+        value = value.replace(tzinfo=datetime.timezone.utc).astimezone(datetime.timezone(datetime.timedelta(hours=hours)))
+    return value
+",
+                c"ns_literal.py",
+                c"ns_literal",
+            )
+            .unwrap();
+            for ticks in [
+                i64::MIN + 1,
+                i64::MIN + 807,
+                1,
+                2,
+                -1,
+                -1_000_001,
+                999_999,
+                1_000_001,
+                i64::MAX,
+            ] {
+                for hours in [None, Some(0), Some(-5), Some(8)] {
+                    let value = module
+                        .getattr("stamp")
+                        .unwrap()
+                        .call1((ticks, hours))
+                        .unwrap();
+                    let millis = ticks.div_euclid(1_000_000);
+                    let nanos = ticks.rem_euclid(1_000_000) as i32;
+                    let (data_type, expected) = if hours.is_some() {
+                        (
+                            DataType::LocalZonedTimestamp(
+                                paimon::spec::LocalZonedTimestampType::new(9).unwrap(),
+                            ),
+                            Datum::LocalZonedTimestamp { millis, nanos },
+                        )
+                    } else {
+                        (
+                            DataType::Timestamp(paimon::spec::TimestampType::new(9).unwrap()),
+                            Datum::Timestamp { millis, nanos },
+                        )
+                    };
+                    assert_eq!(py_to_datum(&value, &data_type).unwrap(), expected);
+                }
+            }
+        });
+    }
+
+    #[test]
     fn timestamp_field_rejects_aware_datetime() {
         Python::attach(|py| {
             // TIMESTAMP is timezone-less; parity with the DataFusion path which
@@ -1538,6 +1652,79 @@ value = datetime.datetime(2024, 1, 1, tzinfo=FloatingTz())",
 
     fn decimal_type(precision: u32, scale: u32) -> DataType {
         DataType::Decimal(paimon::spec::DecimalType::new(precision, scale).unwrap())
+    }
+
+    #[test]
+    fn decimal_predicate_literals_preserve_comparison_value() {
+        Python::attach(|py| {
+            for (text, unscaled, precision, scale) in [
+                ("1.235", 1235, 4, 3),
+                ("-1.23500000000000000000000000000000000000000", -1235, 4, 3),
+                ("123456789.12", 12345678912, 11, 2),
+                ("1E-38", 1, 38, 38),
+                ("1E+37", 10_i128.pow(37), 38, 0),
+                ("0E+100", 0, 10, 2),
+            ] {
+                let value = py_decimal(py, text);
+                assert_eq!(
+                    predicate_datum(&value, &decimal_type(10, 2)).unwrap(),
+                    Datum::Decimal {
+                        unscaled,
+                        precision,
+                        scale
+                    },
+                    "{text}"
+                );
+                // A comparison literal must not relax stored partition values.
+                assert!(py_to_datum(&value, &decimal_type(10, 2)).is_err(), "{text}");
+            }
+            let value = 123456789_i64.into_pyobject(py).unwrap();
+            assert_eq!(
+                predicate_datum(&value, &decimal_type(10, 2)).unwrap(),
+                Datum::Decimal {
+                    unscaled: 123456789,
+                    precision: 9,
+                    scale: 0
+                }
+            );
+            for text in ["1E-39", "1E+38"] {
+                assert!(predicate_datum(&py_decimal(py, text), &decimal_type(10, 2)).is_err());
+            }
+        });
+    }
+
+    #[test]
+    fn decimal_comparison_and_membership_use_literal_scale() {
+        Python::attach(|py| {
+            let fields = vec![DataField::new(0, "amount".into(), decimal_type(10, 2))];
+            for method in [
+                "equal",
+                "notEqual",
+                "lessThan",
+                "lessOrEqual",
+                "greaterThan",
+                "greaterOrEqual",
+                "in",
+                "notIn",
+            ] {
+                let node = leaf_dict(py, method, "amount", &[]);
+                let literals = PyList::empty(py);
+                literals.append(py_decimal(py, "1.235")).unwrap();
+                node.set_item("literals", literals).unwrap();
+                let predicate = dict_to_predicate(&node, &fields, true).unwrap();
+                let Predicate::Leaf { literals, .. } = predicate else {
+                    panic!("expected leaf")
+                };
+                assert_eq!(
+                    literals,
+                    vec![Datum::Decimal {
+                        unscaled: 1235,
+                        precision: 4,
+                        scale: 3
+                    }]
+                );
+            }
+        });
     }
 
     #[test]

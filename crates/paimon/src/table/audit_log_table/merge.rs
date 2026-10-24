@@ -21,7 +21,6 @@ use super::super::sort_merge::{
     compare_sequence_order, AggregateMergeFunction, BufferedBatch, MergeFunction, MergeResult,
     MergeRow, PartialUpdateMergeFunction,
 };
-use crate::arrow::build_target_arrow_schema;
 use crate::spec::{
     CoreOptions, DataField, MergeEngine, RowKind, SEQUENCE_NUMBER_FIELD_ID, VALUE_KIND_FIELD_ID,
 };
@@ -76,7 +75,7 @@ pub(in crate::table) fn new_merge_function(
     Ok(Box::new(AuditValueMergeFunction {
         inner,
         value_projection,
-        value_schema: build_target_arrow_schema(&value_fields)?,
+        value_schema: crate::arrow::build_read_arrow_schema(&value_fields)?,
         fields: fields.to_vec(),
     }))
 }

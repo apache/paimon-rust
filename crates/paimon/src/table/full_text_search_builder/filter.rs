@@ -67,6 +67,9 @@ fn ranges(ids: &RoaringTreemap) -> crate::Result<Vec<RowRange>> {
 
 fn field_ids(predicate: &Predicate, fields: &[DataField], ids: &mut HashSet<i32>) {
     match predicate {
+        Predicate::NestedLeaf { root, .. } => {
+            ids.insert(root.id());
+        }
         Predicate::Leaf { column, .. } => {
             if let Some(id) = find_field_id_by_name(fields, column) {
                 ids.insert(id);
@@ -192,7 +195,13 @@ pub(super) async fn matching_indexed_rows(
             Some((answer, exact)) => {
                 let candidates = row_ids(&answer)? & &decided;
                 if exact {
-                    matched |= candidates;
+                    matched |= if core.data_evolution_enabled() {
+                        candidates
+                    } else {
+                        // An exact index match does not establish snapshot visibility.
+                        matching_rows(evaluation, &Predicate::AlwaysTrue, ranges(&candidates)?)
+                            .await?
+                    };
                 } else if core.global_index_filter_refine_from_data() {
                     matched |= matching_rows(evaluation, filter, ranges(&candidates)?).await?;
                 }

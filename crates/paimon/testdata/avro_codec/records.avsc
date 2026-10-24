@@ -1,0 +1,9 @@
+{
+  "type": "record",
+  "name": "CodecFixture",
+  "fields": [
+    {"name": "id", "type": "long"},
+    {"name": "label", "type": "string"},
+    {"name": "payload", "type": "bytes"}
+  ]
+}

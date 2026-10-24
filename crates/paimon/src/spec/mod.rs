@@ -119,22 +119,24 @@ pub use types::*;
 mod partition;
 pub use partition::Partition;
 mod partition_utils;
-pub use partition_utils::is_java_whitespace_only;
+pub(crate) use partition_utils::decode_java_utf8;
 pub(crate) use partition_utils::{
     bucket_path, bucket_path_under, data_file_path, escape_path_name, relative_bucket_path,
     unescape_path_name, PartitionComputer,
 };
+pub use partition_utils::{format_java_float, is_java_whitespace_only};
 mod predicate;
 pub(crate) use predicate::datum_cmp;
 pub(crate) use predicate::eval_row;
 pub(crate) use predicate::extract_datum;
+pub(crate) use predicate::java_cmp;
 pub(crate) use predicate::like_match;
 #[cfg(test)]
 pub(crate) use predicate::row_id_leaf;
 pub(crate) use predicate::validate_datum_matches_type;
 pub use predicate::{
-    field_idx_to_partition_idx, Datum, Predicate, PredicateBuilder, PredicateOperator, Transform,
-    TransformInput,
+    field_idx_to_partition_idx, DatePart, Datum, FieldRef, PadDirection, Predicate,
+    PredicateBuilder, PredicateField, PredicateOperator, Transform, TransformInput, TrimFlag,
 };
 pub(crate) mod murmur_hash;
 mod partition_statistics;

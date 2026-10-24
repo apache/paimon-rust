@@ -21,7 +21,6 @@ use super::{
     audit_sequence_number_enabled, rowkind_array_from_column, PaimonTableRead, TableRead,
     TableReadKind, MAX_MERGE_INPUT_STREAMS,
 };
-use crate::arrow::build_target_arrow_schema;
 use crate::spec::{
     DataField, DataType, MergeEngine, TinyIntType, ROW_KIND_FIELD_ID, SEQUENCE_NUMBER_FIELD_ID,
     VALUE_KIND_FIELD_ID, VALUE_KIND_FIELD_NAME,
@@ -47,7 +46,7 @@ impl<'a> AuditLogRead<'a> {
         // Query-auth is decided per split in `to_arrow`; only the type is known here.
         crate::spec::CoreOptions::new(read.table().schema().options())
             .ensure_type_paimon_served(&read.table().identifier().full_name())?;
-        match read.0 {
+        match read.kind {
             TableReadKind::Paimon(read) => Ok(Self { read }),
             TableReadKind::Format(_) => Err(crate::Error::Unsupported {
                 message: "Format tables do not support audit log batch read".to_string(),
@@ -79,7 +78,7 @@ impl<'a> AuditLogRead<'a> {
                 source: None,
             });
         }
-        let audit_schema = build_target_arrow_schema(&output_read_type)?;
+        let audit_schema = crate::arrow::build_read_arrow_schema(&output_read_type)?;
         let mut read_type: Vec<_> = output_read_type
             .iter()
             .filter(|field| field.id() != ROW_KIND_FIELD_ID)
@@ -110,6 +109,7 @@ impl<'a> AuditLogRead<'a> {
                 self.read.table.schema_manager().clone(),
                 self.read.table.schema().id(),
                 self.read.table.schema.fields().to_vec(),
+                self.read.table.data_fields_extractor(),
                 read_type.clone(),
                 self.read.data_predicates.clone(),
             )

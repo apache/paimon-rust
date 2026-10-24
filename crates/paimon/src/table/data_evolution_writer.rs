@@ -39,7 +39,7 @@ use crate::table::index_file_path::IndexFileLocation;
 use crate::table::source::{data_evolution_anchor_file, is_data_evolution_normal_file};
 use crate::table::stats_filter::group_by_overlapping_row_id;
 use crate::table::Table;
-use crate::table::{DataSplit, DataSplitBuilder, RowRange};
+use crate::table::{DataSplit, Plan, RowRange};
 use crate::Result;
 use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, StructArray};
 use arrow_buffer::NullBuffer;
@@ -307,11 +307,15 @@ impl DataEvolutionWriter {
     /// Returns `CommitMessage`s for the caller to commit via [`TableCommit`](super::TableCommit).
     #[must_use = "commit messages must be passed to TableCommit"]
     pub async fn prepare_commit(self) -> Result<Vec<CommitMessage>> {
-        // A row-id update reads the original rows it rewrites.
-        CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
-
         let total_matched: usize = self.matched_batches.iter().map(|b| b.num_rows()).sum();
         if total_matched == 0 {
+            // Empty input still checks the guarded handle, but does not need
+            // to load a snapshot or walk its manifests.
+            self.table
+                .new_read_builder()
+                .new_scan()
+                .authorize_all_files()
+                .await?;
             return Ok(Vec::new());
         }
 
@@ -351,6 +355,7 @@ impl DataEvolutionWriter {
         )?;
         let file_matches = group_matched_rows_by_file(&self.matched_batches, file_index)?;
         self.validate_partition_values(file_index, &file_matches)?;
+        index.validate_live_rows(&file_matches).await?;
 
         // 3. For each affected file: read original columns, apply updates, write partial files
         let mut writer = DataEvolutionPartialWriter::new(&self.table, self.update_columns.clone())?;
@@ -413,20 +418,18 @@ impl DataEvolutionWriter {
                     file_range.first_row_id,
                     file_range.last_row_id,
                 )]);
-                let read = rb.new_read()?;
+                let read = rb.new_read()?.for_update();
 
                 // Base + partial-column files share row-id ranges, so physical
                 // row counts overcount the group's logical rows.
                 let read_files = blob_updates::normal_read_files(&file_range.files);
-                let split = DataSplitBuilder::new()
-                    .with_snapshot(file_range.snapshot_id)
-                    .with_partition(BinaryRow::from_serialized_bytes(&file_range.partition)?)
-                    .with_bucket(file_range.bucket)
-                    .with_bucket_path(file_range.bucket_path.clone())
-                    .with_total_buckets(file_range.total_buckets)
-                    .with_raw_convertible(read_files.len() == 1)
-                    .with_data_files(read_files)
-                    .build()?;
+                let split = file_range
+                    .split
+                    .for_data_evolution_rewrite(read_files)
+                    .with_selected_row_ranges(vec![RowRange::new(
+                        file_range.first_row_id,
+                        file_range.last_row_id,
+                    )]);
 
                 let stream = read.to_arrow(&[split])?;
                 let original_batches: Vec<RecordBatch> = stream.try_collect().await?;
@@ -596,27 +599,43 @@ impl DataEvolutionDeleteWriter {
     }
 
     #[must_use = "commit messages must be passed to TableCommit"]
-    pub async fn prepare_commit(mut self) -> Result<Vec<CommitMessage>> {
-        // A row-id delete reads the files it rewrites.
-        CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
+    pub async fn prepare_commit(self) -> Result<Vec<CommitMessage>> {
+        self.prepare_commit_inner(None).await
+    }
 
+    pub(super) async fn prepare_commit_with_plan(self, plan: &Plan) -> Result<Vec<CommitMessage>> {
+        self.prepare_commit_inner(Some(plan)).await
+    }
+
+    async fn prepare_commit_inner(mut self, captured: Option<&Plan>) -> Result<Vec<CommitMessage>> {
         dedup_i64_in_place(&mut self.row_ids);
         if self.row_ids.is_empty() {
+            self.table
+                .new_read_builder()
+                .new_scan()
+                .authorize_all_files()
+                .await?;
             return Ok(Vec::new());
         }
 
-        let snapshot = super::time_travel::resolve_snapshot(&self.table)
-            .await?
-            .ok_or_else(|| crate::Error::DataInvalid {
-                message: "No files with row tracking found in target table".into(),
-                source: None,
-            })?;
-        let scan_table = self.table.copy_with_pinned_snapshot(Some(&snapshot));
-        let scan = scan_table
-            .new_read_builder()
-            .new_scan()
-            .with_scan_all_files();
-        let plan = scan.plan().await?;
+        // A row filter or mask cannot authorize a physical file mutation.
+        let (snapshot, plan) = match captured {
+            Some(plan) => {
+                let (_, snapshot, plan) = authorize_row_id_plan(&self.table, plan).await?;
+                (snapshot, plan)
+            }
+            None => {
+                let snapshot = super::time_travel::resolve_snapshot(&self.table).await?;
+                let scan_table = self.table.copy_with_pinned_snapshot(snapshot.as_ref());
+                let plan = scan_table.new_read_builder().new_scan().plan_all().await?;
+                (snapshot, plan)
+            }
+        };
+        let snapshot = snapshot.ok_or_else(|| crate::Error::DataInvalid {
+            message: "No files with row tracking found in target table".into(),
+            source: None,
+        })?;
+
         let mut file_index = Vec::new();
 
         for split in plan.splits() {
@@ -1121,7 +1140,12 @@ fn apply_field_updates(
     matches: &[(usize, usize, usize)],
 ) -> Result<ArrayRef> {
     if update_columns.iter().any(|column| column == path) {
-        return interleave_updated_leaf(path, original, matched_batches, matches);
+        let updated = interleave_updated_leaf(path, original, matched_batches, matches)?;
+        // Readers allow runtime NULLs and relax nested field nullability.
+        // Restore the declared write layout, validating only visible children,
+        // before constructing a partial-column file with the table schema.
+        let target = crate::arrow::paimon_type_to_arrow(write_field.data_type())?;
+        return super::write_batch_normalize::normalize_write_array(&updated, &target);
     }
 
     let DataType::Row(row) = write_field.data_type() else {
@@ -1243,8 +1267,19 @@ pub(super) struct RowIdFileIndex {
 }
 
 impl RowIdFileIndex {
+    pub(super) async fn load_plan(table: &Table, plan: &Plan) -> Result<Self> {
+        let (read_table, _, plan) = authorize_row_id_plan(table, plan).await?;
+        Self::from_splits(read_table, plan.splits())
+    }
+
     pub(super) async fn load(table: &Table, snapshot_id: Option<i64>) -> Result<Self> {
-        CoreOptions::new(table.schema().options()).ensure_read_authorized()?;
+        // Authorize before resolving an empty target. The original handle's
+        // session is retained when the read view pins the selected snapshot.
+        let scan = table
+            .new_read_builder()
+            .new_scan()
+            .authorize_all_files()
+            .await?;
         let snapshot = if let Some(id) = snapshot_id {
             Some(table.snapshot_manager().get_snapshot(id).await?)
         } else {
@@ -1257,18 +1292,27 @@ impl RowIdFileIndex {
             });
         };
         let read_table = table.copy_with_pinned_snapshot(Some(&snapshot));
-        let plan = read_table.new_read_builder().new_scan().plan().await?;
+        let plan = scan
+            .plan_selected_snapshot(snapshot, super::table_scan::SnapshotScanMode::All)
+            .await?;
         Self::from_splits(read_table, plan.splits())
     }
 
     pub(super) fn from_splits(read_table: Table, splits: &[DataSplit]) -> Result<Self> {
         let mut file_index: Vec<FileRowRange> = Vec::new();
         for split in splits {
+            if read_table.schema().core_options().query_auth_enabled()
+                && !split.query_auth_grant().is_some_and(|grant| {
+                    grant.matches_table(&read_table) && grant.is_unrestricted_whole_table()
+                })
+            {
+                return Err(super::query_auth::unsupported(
+                    "row-ID updates require an unrestricted whole-table grant",
+                ));
+            }
             let partition_bytes = split.partition().to_serialized_bytes();
             let bucket = split.bucket();
-            let bucket_path = split.bucket_path().to_string();
             let snapshot_id = split.snapshot_id();
-            let total_buckets = split.total_buckets();
 
             let all_files: Vec<DataFileMeta> = split
                 .data_files()
@@ -1301,9 +1345,8 @@ impl RowIdFileIndex {
                     row_count,
                     partition: partition_bytes.clone(),
                     bucket,
-                    bucket_path: bucket_path.clone(),
                     snapshot_id,
-                    total_buckets,
+                    split: split.clone(),
                     files: group,
                 });
             }
@@ -1342,11 +1385,136 @@ impl RowIdFileIndex {
             .map(|&index| self.files[index].first_row_id)
             .collect())
     }
+
+    async fn validate_live_rows(&self, matches: &HashMap<usize, Vec<MatchedRow>>) -> Result<()> {
+        for (&file_pos, rows) in matches {
+            let group = &self.files[file_pos];
+            let anchor = data_evolution_anchor_file(&group.files)?;
+            let Some(deletion_file) = group.split.deletion_file_for_data_file(anchor) else {
+                continue;
+            };
+            let deletion_vector =
+                DeletionVectorFactory::read(self.read_table.file_io(), deletion_file).await?;
+            let first = anchor.first_row_id.expect("validated row-ID anchor");
+            for row in rows {
+                let row_id = group.first_row_id + row.offset as i64;
+                if deletion_vector.is_deleted((row_id - first) as u64) {
+                    return Err(crate::Error::DataInvalid {
+                        message: format!("Cannot update deleted _ROW_ID {row_id}"),
+                        source: None,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Validate transported planner metadata and mint a worker-local mutation grant.
+/// The caller supplies complete planner groups; manifests are deliberately not
+/// re-read to rediscover metadata already captured by the coordinator.
+async fn authorize_row_id_plan(
+    table: &Table,
+    plan: &Plan,
+) -> Result<(Table, Option<Snapshot>, Plan)> {
+    let required = table.schema().core_options().query_auth_enabled()
+        || plan.splits().iter().any(DataSplit::query_auth_required);
+    let grant = table.authorize_read(required, None).await?;
+    if required && grant.is_none() {
+        return Err(super::query_auth::unsupported(
+            "transported row-ID plans require REST authorization",
+        ));
+    }
+    if grant
+        .as_ref()
+        .is_some_and(|grant| !grant.is_unrestricted_whole_table())
+    {
+        return Err(super::query_auth::unsupported(
+            "row-ID updates require an unrestricted whole-table grant",
+        ));
+    }
+    super::RowIdPlan::from_plan(plan.clone())?;
+    if plan.splits().iter().any(|split| {
+        split
+            .query_auth_response()
+            .is_some_and(|response| !response.is_unrestricted())
+    }) {
+        return Err(super::query_auth::unsupported(
+            "a filtered or masked read plan cannot authorize row-ID mutations",
+        ));
+    }
+    let snapshot = match plan.snapshot_id() {
+        None => None,
+        Some(id) => {
+            let snapshot = if let Some(snapshot) = table.travel_snapshot() {
+                snapshot.clone()
+            } else if table.rest_env().is_some() {
+                match table.snapshot_manager().get_latest_snapshot().await? {
+                    Some(snapshot) if snapshot.id() == id => snapshot,
+                    // A concurrent append does not invalidate the captured
+                    // plan. Resolve its exact snapshot rather than replacing
+                    // the worker's conflict baseline with the latest one.
+                    _ => table.snapshot_manager().get_snapshot(id).await?,
+                }
+            } else {
+                table.snapshot_manager().get_snapshot(id).await?
+            };
+            if snapshot.id() != id || snapshot.schema_id() > table.schema().id() {
+                return Err(crate::Error::DataInvalid {
+                    message: "The row-ID plan does not match the table's captured snapshot/schema"
+                        .into(),
+                    source: None,
+                });
+            }
+            Some(snapshot)
+        }
+    };
+    let options = table.schema().core_options();
+    let computer = if table.schema().partition_keys().is_empty() {
+        None
+    } else {
+        Some(PartitionComputer::new(
+            table.schema().partition_keys(),
+            table.schema().fields(),
+            options.partition_default_name(),
+            options.legacy_partition_name(),
+        )?)
+    };
+    for split in plan.splits() {
+        let expected = bucket_path(
+            &table.data_file_location(),
+            computer.as_ref(),
+            split.partition(),
+            split.bucket(),
+        )?;
+        if split.bucket_path() != expected {
+            return Err(crate::Error::DataInvalid {
+                message: "The row-ID split bucket path does not belong to the target table".into(),
+                source: None,
+            });
+        }
+        for file in split.data_files() {
+            let (first, last) = file.row_id_range().expect("validated row-ID range");
+            if first < 0
+                || snapshot.as_ref().is_none_or(|snapshot| {
+                    file.schema_id > snapshot.schema_id()
+                        || snapshot.next_row_id().is_some_and(|next| last >= next)
+                })
+            {
+                return Err(crate::Error::DataInvalid {
+                    message: "The row-ID split contains file metadata outside its snapshot".into(),
+                    source: None,
+                });
+            }
+        }
+    }
+    let read_table = table.copy_with_pinned_snapshot(snapshot.as_ref());
+    Ok((read_table, snapshot, plan.clone().planned(grant)))
 }
 
 /// Dedicated column files can cross normal-file boundaries. They provide
 /// values, but must not merge anchors or introduce otherwise absent row IDs.
-fn group_by_normal_row_id(files: Vec<DataFileMeta>) -> Vec<Vec<DataFileMeta>> {
+pub(super) fn group_by_normal_row_id(files: Vec<DataFileMeta>) -> Vec<Vec<DataFileMeta>> {
     let (normal, dedicated): (Vec<_>, Vec<_>) =
         files.into_iter().partition(is_data_evolution_normal_file);
     group_by_overlapping_row_id(normal)
@@ -1382,9 +1550,9 @@ struct FileRowRange {
     row_count: i64,
     partition: Vec<u8>,
     bucket: i32,
-    bucket_path: String,
     snapshot_id: i64,
-    total_buckets: i32,
+    /// Canonical file metadata and the live authorization of this operation.
+    split: DataSplit,
     /// All files in this row-id group (base file + partial-column files).
     files: Vec<DataFileMeta>,
 }
@@ -1971,6 +2139,77 @@ mod tests {
         assert!(error
             .to_string()
             .contains("Ambiguous data-evolution write path"));
+    }
+
+    #[test]
+    fn whole_row_updates_restore_declared_child_nullability() {
+        let write_field = DataField::new(
+            0,
+            "value".into(),
+            DataType::Row(RowType::new(vec![DataField::new(
+                1,
+                "text".into(),
+                DataType::VarChar(crate::spec::VarCharType::with_nullable(false, 100).unwrap()),
+            )])),
+        );
+        let runtime_fields = vec![arrow_schema::Field::new("text", ArrowDataType::Utf8, true)];
+        let row = |values: Vec<Option<&str>>, validity: Option<Vec<bool>>| -> ArrayRef {
+            Arc::new(StructArray::new(
+                runtime_fields.clone().into(),
+                vec![Arc::new(StringArray::from(values))],
+                validity.map(NullBuffer::from),
+            ))
+        };
+        let original = row(vec![Some("old"), Some("keep")], None::<Vec<bool>>);
+        let updates = RecordBatch::try_from_iter([
+            (
+                "_ROW_ID",
+                Arc::new(Int64Array::from(vec![0, 1])) as ArrayRef,
+            ),
+            (
+                "value",
+                row(vec![None, Some("中文")], Some(vec![false, true])),
+            ),
+        ])
+        .unwrap();
+        let result = apply_field_updates(
+            &write_field,
+            "value",
+            &original,
+            &["value".into()],
+            &[updates],
+            &[(0, 0, 0), (1, 0, 1)],
+        )
+        .unwrap();
+        let expected = crate::arrow::paimon_type_to_arrow(write_field.data_type()).unwrap();
+        assert_eq!(result.data_type(), &expected);
+        let result = result.as_any().downcast_ref::<StructArray>().unwrap();
+        assert!(result.is_null(0));
+        assert_eq!(
+            result
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(1),
+            "中文"
+        );
+        // Required children are enforced for a visible ROW, including when
+        // Arrow's runtime read type had relaxed their nullability.
+        let invalid = RecordBatch::try_from_iter([
+            ("_ROW_ID", Arc::new(Int64Array::from(vec![0])) as ArrayRef),
+            ("value", row(vec![None], None::<Vec<bool>>)),
+        ])
+        .unwrap();
+        assert!(apply_field_updates(
+            &write_field,
+            "value",
+            &original,
+            &["value".into()],
+            &[invalid],
+            &[(0, 0, 0)]
+        )
+        .is_err());
     }
 
     fn nested_profile_batch(
@@ -2578,9 +2817,15 @@ mod tests {
             row_count: 3,
             partition: vec![],
             bucket: 0,
-            bucket_path: String::new(),
             snapshot_id: 1,
-            total_buckets: 1,
+            split: super::super::DataSplitBuilder::new()
+                .with_snapshot(1)
+                .with_partition(BinaryRow::new(0))
+                .with_bucket(0)
+                .with_bucket_path(String::new())
+                .with_data_files(vec![])
+                .build()
+                .unwrap(),
             files: vec![make_test_file_meta("base.parquet", 3, Some(10), 1, None)],
         }]
     }
@@ -2819,9 +3064,15 @@ mod tests {
                 row_count: 100,
                 partition: vec![],
                 bucket: 0,
-                bucket_path: String::new(),
                 snapshot_id: 1,
-                total_buckets: 1,
+                split: super::super::DataSplitBuilder::new()
+                    .with_snapshot(1)
+                    .with_partition(BinaryRow::new(0))
+                    .with_bucket(0)
+                    .with_bucket_path(String::new())
+                    .with_data_files(vec![])
+                    .build()
+                    .unwrap(),
                 files: vec![base_file, partial_file],
             },
             FileRowRange {
@@ -2830,9 +3081,15 @@ mod tests {
                 row_count: 50,
                 partition: vec![],
                 bucket: 0,
-                bucket_path: String::new(),
                 snapshot_id: 1,
-                total_buckets: 1,
+                split: super::super::DataSplitBuilder::new()
+                    .with_snapshot(1)
+                    .with_partition(BinaryRow::new(0))
+                    .with_bucket(0)
+                    .with_bucket_path(String::new())
+                    .with_data_files(vec![])
+                    .build()
+                    .unwrap(),
                 files: vec![make_test_file_meta(
                     "base-1.parquet",
                     50,

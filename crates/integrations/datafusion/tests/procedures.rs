@@ -56,6 +56,27 @@ async fn setup_table_with_snapshots() -> (tempfile::TempDir, paimon_datafusion::
     (tmp, sql_context)
 }
 
+async fn setup_table_with_watermarks(
+    watermarks: [Option<i64>; 3],
+) -> (tempfile::TempDir, paimon_datafusion::SQLContext) {
+    let (tmp, sql_context) = setup_table_with_snapshots().await;
+    for (index, watermark) in watermarks.into_iter().enumerate() {
+        let path = tmp
+            .path()
+            .join(format!("test_db.db/t1/snapshot/snapshot-{}", index + 1));
+        let mut snapshot: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        snapshot["watermark"] = serde_json::json!(watermark);
+        std::fs::write(path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+    }
+    (tmp, sql_context)
+}
+
+fn read_tag(tmp: &Path, name: &str) -> serde_json::Value {
+    let path = tmp.join(format!("test_db.db/t1/tag/tag-{name}"));
+    serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+}
+
 #[tokio::test]
 async fn test_create_tag() {
     let (_tmp, sql_context) = setup_table_with_snapshots().await;
@@ -410,6 +431,289 @@ async fn test_rename_branch_rejects_unopenable_source_and_target() {
     );
     // b1 is still openable through the table reader.
     table.copy_with_branch("b1").await.unwrap();
+}
+
+#[tokio::test]
+async fn test_delete_branch() {
+    let (_tmp, catalog) = create_test_env();
+    let sql_context = create_sql_context(catalog.clone()).await;
+    exec(&sql_context, "CREATE SCHEMA paimon.test_db").await;
+    exec(
+        &sql_context,
+        "CREATE TABLE paimon.test_db.t1 (id INT, name VARCHAR(100), PRIMARY KEY (id))",
+    )
+    .await;
+    exec(
+        &sql_context,
+        "INSERT INTO paimon.test_db.t1 VALUES (1, 'alice')",
+    )
+    .await;
+
+    // Seed a branch through the core manager (create_branch is a separate PR).
+    let table = catalog
+        .get_table(&Identifier::new("test_db", "t1"))
+        .await
+        .unwrap();
+    let bm = BranchManager::new(table.file_io().clone(), table.location().to_string());
+    bm.create_branch("b1").await.unwrap();
+    assert!(bm.branch_exists("b1").await.unwrap(), "seed branch exists");
+
+    exec(
+        &sql_context,
+        "CALL sys.delete_branch(table => 'test_db.t1', branch => 'b1')",
+    )
+    .await;
+
+    assert!(
+        !bm.branch_exists("b1").await.unwrap(),
+        "delete_branch should remove the branch"
+    );
+    let count = row_count(
+        &sql_context,
+        "SELECT * FROM paimon.test_db.`t1$branches` WHERE branch_name = 'b1'",
+    )
+    .await;
+    assert_eq!(count, 0);
+
+    // Deleting a branch that no longer exists is a no-op, not an error.
+    exec(
+        &sql_context,
+        "CALL sys.delete_branch(table => 'test_db.t1', branch => 'b1')",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_delete_branch_preserves_leading_space_identity() {
+    // A branch name keeps its leading/trailing spaces: the shared validator
+    // permits `" b1"` (only all-whitespace is rejected) and the reader treats it
+    // as distinct from `"b1"`. Java `Table.deleteBranches` passes each comma
+    // token through unchanged, so `delete_branch(branch => ' b1')` must drop
+    // `" b1"` and leave `"b1"` intact — trimming the token would delete the
+    // wrong branch.
+    let (_tmp, catalog) = create_test_env();
+    let sql_context = create_sql_context(catalog.clone()).await;
+    exec(&sql_context, "CREATE SCHEMA paimon.test_db").await;
+    exec(
+        &sql_context,
+        "CREATE TABLE paimon.test_db.t1 (id INT, name VARCHAR(100), PRIMARY KEY (id))",
+    )
+    .await;
+    exec(
+        &sql_context,
+        "INSERT INTO paimon.test_db.t1 VALUES (1, 'alice')",
+    )
+    .await;
+
+    let table = catalog
+        .get_table(&Identifier::new("test_db", "t1"))
+        .await
+        .unwrap();
+    let bm = BranchManager::new(table.file_io().clone(), table.location().to_string());
+    bm.create_branch("b1").await.unwrap();
+    bm.create_branch(" b1").await.unwrap();
+
+    exec(
+        &sql_context,
+        "CALL sys.delete_branch(table => 'test_db.t1', branch => ' b1')",
+    )
+    .await;
+
+    assert!(
+        !bm.branch_exists(" b1").await.unwrap(),
+        "the leading-space branch is the one requested and must be deleted"
+    );
+    assert!(
+        bm.branch_exists("b1").await.unwrap(),
+        "the un-spaced branch must survive — trimming the token would delete it"
+    );
+}
+
+#[tokio::test]
+async fn test_delete_branch_preserves_trailing_space_identity() {
+    // `"prod "` passes every guard as a branch distinct from the protected
+    // `prod`, so deleting it must not resolve to `prod`'s directory.
+    let (_tmp, catalog) = create_test_env();
+    let sql_context = create_sql_context(catalog.clone()).await;
+    exec(&sql_context, "CREATE SCHEMA paimon.test_db").await;
+    exec(
+        &sql_context,
+        "CREATE TABLE paimon.test_db.t1 (id INT, name VARCHAR(100), PRIMARY KEY (id)) WITH ('scan.primary-branch' = 'prod')",
+    )
+    .await;
+    exec(
+        &sql_context,
+        "INSERT INTO paimon.test_db.t1 VALUES (1, 'alice')",
+    )
+    .await;
+    exec(
+        &sql_context,
+        "CALL sys.create_tag(table => 'test_db.t1', tag => 'v1')",
+    )
+    .await;
+
+    let table = catalog
+        .get_table(&Identifier::new("test_db", "t1"))
+        .await
+        .unwrap();
+    let bm = BranchManager::new(table.file_io().clone(), table.location().to_string());
+    bm.create_branch_from_tag("prod", "v1").await.unwrap();
+    bm.create_branch_from_tag("prod ", "v1").await.unwrap();
+
+    exec(
+        &sql_context,
+        "CALL sys.delete_branch(table => 'test_db.t1', branch => 'prod ')",
+    )
+    .await;
+
+    assert!(!bm.branch_exists("prod ").await.unwrap());
+    assert_eq!(
+        collect_id_name(
+            &sql_context,
+            "SELECT id, name FROM paimon.test_db.`t1$branch_prod`"
+        )
+        .await,
+        vec![(1, "alice".to_string())],
+        "the protected branch must stay readable"
+    );
+}
+
+#[tokio::test]
+async fn test_delete_branch_preserves_scan_configured_branch() {
+    // A branch named by `scan.primary-branch` / `scan.fallback-branch` is on a
+    // reader's path, so `delete_branch` must refuse it (mirrors Java
+    // `AbstractFileStoreTable.deleteBranch`) while still allowing unrelated
+    // branches to be dropped.
+    for (table_name, option_key) in [
+        ("tp", "scan.primary-branch"),
+        ("tf", "scan.fallback-branch"),
+    ] {
+        let (_tmp, catalog) = create_test_env();
+        let sql_context = create_sql_context(catalog.clone()).await;
+        exec(&sql_context, "CREATE SCHEMA paimon.test_db").await;
+        exec(
+            &sql_context,
+            &format!(
+                "CREATE TABLE paimon.test_db.{table_name} (id INT, name VARCHAR(100), PRIMARY KEY (id)) WITH ('{option_key}' = 'prod')"
+            ),
+        )
+        .await;
+        exec(
+            &sql_context,
+            &format!("INSERT INTO paimon.test_db.{table_name} VALUES (1, 'alice')"),
+        )
+        .await;
+
+        let table = catalog
+            .get_table(&Identifier::new("test_db", table_name))
+            .await
+            .unwrap();
+        let bm = BranchManager::new(table.file_io().clone(), table.location().to_string());
+        bm.create_branch("prod").await.unwrap();
+        bm.create_branch("tmp").await.unwrap();
+
+        // The configured branch cannot be deleted, and the error names the option.
+        assert_sql_error(
+            &sql_context,
+            &format!("CALL sys.delete_branch(table => 'test_db.{table_name}', branch => 'prod')"),
+            option_key,
+        )
+        .await;
+        assert!(
+            bm.branch_exists("prod").await.unwrap(),
+            "{option_key}: protected branch must remain"
+        );
+
+        // An unrelated branch is still deletable, so the guard is not over-broad.
+        exec(
+            &sql_context,
+            &format!("CALL sys.delete_branch(table => 'test_db.{table_name}', branch => 'tmp')"),
+        )
+        .await;
+        assert!(
+            !bm.branch_exists("tmp").await.unwrap(),
+            "{option_key}: unrelated branch should be deletable"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_delete_branch_batch_stops_at_protected_branch() {
+    // A comma-separated request must still catch a protected branch even when
+    // it is not listed first. Matches Java `Table.deleteBranches`, which loops
+    // `deleteBranch` per name; the protected branch is never dropped.
+    let (_tmp, catalog) = create_test_env();
+    let sql_context = create_sql_context(catalog.clone()).await;
+    exec(&sql_context, "CREATE SCHEMA paimon.test_db").await;
+    exec(
+        &sql_context,
+        "CREATE TABLE paimon.test_db.t1 (id INT, name VARCHAR(100), PRIMARY KEY (id)) WITH ('scan.primary-branch' = 'prod')",
+    )
+    .await;
+    exec(
+        &sql_context,
+        "INSERT INTO paimon.test_db.t1 VALUES (1, 'alice')",
+    )
+    .await;
+
+    let table = catalog
+        .get_table(&Identifier::new("test_db", "t1"))
+        .await
+        .unwrap();
+    let bm = BranchManager::new(table.file_io().clone(), table.location().to_string());
+    bm.create_branch("prod").await.unwrap();
+    bm.create_branch("keep").await.unwrap();
+
+    // 'prod' is protected and appears second; the call must fail and leave it.
+    assert_sql_error(
+        &sql_context,
+        "CALL sys.delete_branch(table => 'test_db.t1', branch => 'keep,prod')",
+        "scan.primary-branch",
+    )
+    .await;
+    assert!(
+        bm.branch_exists("prod").await.unwrap(),
+        "protected branch must survive the batch"
+    );
+}
+
+#[tokio::test]
+async fn test_delete_branch_rejects_path_separated_name() {
+    // A separator-bearing name slips past the configured-branch guard (it is not
+    // literally `prod`), so without name validation `branch_exists` finds the real
+    // `branch-prod/schema` directory and `drop_branch` deletes it, destroying the
+    // protected branch's schema. The name must be rejected before any deletion.
+    let (_tmp, catalog) = create_test_env();
+    let sql_context = create_sql_context(catalog.clone()).await;
+    exec(&sql_context, "CREATE SCHEMA paimon.test_db").await;
+    exec(
+        &sql_context,
+        "CREATE TABLE paimon.test_db.t1 (id INT, name VARCHAR(100), PRIMARY KEY (id)) WITH ('scan.primary-branch' = 'prod')",
+    )
+    .await;
+    exec(
+        &sql_context,
+        "INSERT INTO paimon.test_db.t1 VALUES (1, 'alice')",
+    )
+    .await;
+
+    let table = catalog
+        .get_table(&Identifier::new("test_db", "t1"))
+        .await
+        .unwrap();
+    let bm = BranchManager::new(table.file_io().clone(), table.location().to_string());
+    bm.create_branch("prod").await.unwrap();
+
+    assert_sql_error(
+        &sql_context,
+        "CALL sys.delete_branch(table => 'test_db.t1', branch => 'prod/schema')",
+        "path separator",
+    )
+    .await;
+
+    // The protected branch and its schema survive and stay openable.
+    assert!(bm.branch_exists("prod").await.unwrap(), "prod must remain");
+    table.copy_with_branch("prod").await.unwrap();
 }
 
 #[tokio::test]
@@ -1133,7 +1437,11 @@ async fn test_drop_global_index_dry_run_rejects_invalid_args() {
         ("dry_run => NULL", "Unsupported argument value"),
         (
             "dry_run => true, partitions => 'pt=p1'",
-            "drop_global_index partitions are not supported yet",
+            "unpartitioned table",
+        ),
+        (
+            "dry_run => true, partitions => NULL",
+            "Unsupported argument value",
         ),
     ] {
         assert_sql_error(
@@ -1145,6 +1453,941 @@ async fn test_drop_global_index_dry_run_rejects_invalid_args() {
         )
         .await;
         assert_eq!(table_files(tmp.path()), before);
+    }
+}
+
+async fn setup_partitioned_global_index_table(
+    table_name: &str,
+    populated: bool,
+) -> (
+    tempfile::TempDir,
+    paimon_datafusion::SQLContext,
+    paimon::Table,
+) {
+    let (tmp, catalog) = create_test_env();
+    let sql_context = create_sql_context(catalog.clone()).await;
+    exec(&sql_context, "CREATE SCHEMA paimon.test_db").await;
+    exec(
+        &sql_context,
+        &format!(
+            "CREATE TABLE paimon.test_db.{table_name} (id INT, dt DATE, name VARCHAR(100), hr INT) \
+             PARTITIONED BY (hr, dt) WITH (\
+                'row-tracking.enabled' = 'true',\
+                'data-evolution.enabled' = 'true',\
+                'global-index.enabled' = 'true',\
+                'sorted-index.records-per-range' = '10'\
+             )"
+        ),
+    )
+    .await;
+    if populated {
+        exec(
+            &sql_context,
+            &format!(
+                "INSERT INTO paimon.test_db.{table_name} (id, dt, name, hr) VALUES \
+                 (1, DATE '2026-10-10', 'a', 1), (2, DATE '2026-10-10', 'b', 2), \
+                 (3, DATE '2026-10-11', 'c', 1), (4, DATE '2026-10-11', 'd', 2), \
+                 (5, DATE '2026-10-12', 'e', 1), (6, NULL, 'f', 1)"
+            ),
+        )
+        .await;
+        for (column, index_type) in [
+            ("id", "btree"),
+            ("name", "btree"),
+            ("id,name", "btree"),
+            ("id", "bitmap"),
+        ] {
+            exec(
+                &sql_context,
+                &format!(
+                    "CALL sys.create_global_index(table => 'test_db.{table_name}', \
+                 index_column => '{column}', index_type => '{index_type}')"
+                ),
+            )
+            .await;
+        }
+    }
+    let table = catalog
+        .get_table(&Identifier::new("test_db", table_name))
+        .await
+        .unwrap();
+    (tmp, sql_context, table)
+}
+
+async fn global_index_entries(
+    table: &paimon::Table,
+) -> BTreeMap<String, paimon::spec::IndexManifestEntry> {
+    let sm = table.snapshot_manager();
+    let snapshot = sm.get_latest_snapshot().await.unwrap().unwrap();
+    let Some(manifest_name) = snapshot.index_manifest() else {
+        return BTreeMap::new();
+    };
+    paimon::spec::IndexManifest::read(table.file_io(), &sm.manifest_path(manifest_name))
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|entry| (entry.index_file.file_name.clone(), entry))
+        .collect()
+}
+
+#[tokio::test]
+async fn test_drop_global_index_partitions_preserve_other_partitions_and_definitions() {
+    let day = |text: &str| {
+        (chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d").unwrap()
+            - chrono::DateTime::UNIX_EPOCH.date_naive())
+        .num_days() as i32
+    };
+    let d10 = Some(day("2026-10-10"));
+    let d11 = Some(day("2026-10-11"));
+    for (case, columns, partitions, selected) in [
+        (
+            "dates",
+            "id",
+            "dt=2026-10-10;dt=2026-10-11",
+            vec![(1, d10), (2, d10), (1, d11), (2, d11)],
+        ),
+        (
+            "pairs",
+            "id",
+            " dt = 2026-10-10, hr = 01 ; hr=2,dt=2026-10-11 ",
+            vec![(1, d10), (2, d11)],
+        ),
+        (
+            "composite",
+            "id,name",
+            "dt=2026-10-10,hr=1;dt=2026-10-11,hr=2",
+            vec![(1, d10), (2, d11)],
+        ),
+        ("null", "id", "dt=__DEFAULT_PARTITION__", vec![(1, None)]),
+    ] {
+        let name = format!("drop_partitions_{case}");
+        let (tmp, sql_context, table) = setup_partitioned_global_index_table(&name, true).await;
+        let before = table_files(tmp.path());
+        let entries = global_index_entries(&table).await;
+        let id = table
+            .schema()
+            .fields()
+            .iter()
+            .find(|field| field.name() == "id")
+            .unwrap()
+            .id();
+        let name_id = table
+            .schema()
+            .fields()
+            .iter()
+            .find(|field| field.name() == "name")
+            .unwrap()
+            .id();
+        let extra_ids = if columns == "id" {
+            vec![]
+        } else {
+            vec![name_id]
+        };
+        let mut expected = entries.clone();
+        expected.retain(|_, entry| {
+            let row = paimon::spec::BinaryRow::from_serialized_bytes(&entry.partition).unwrap();
+            let partition = (
+                row.get_int(0).unwrap(),
+                if row.is_null_at(1) {
+                    None
+                } else {
+                    Some(row.get_int(1).unwrap())
+                },
+            );
+            let target = entry.index_file.index_type == "btree"
+                && entry
+                    .index_file
+                    .global_index_meta
+                    .as_ref()
+                    .is_some_and(|meta| {
+                        meta.index_field_id == id
+                            && meta.extra_field_ids.as_deref().unwrap_or_default() == extra_ids
+                    })
+                && selected.contains(&partition);
+            !target
+        });
+        let matched = entries.len() - expected.len();
+        assert_eq!(matched, selected.len(), "{case}");
+        let snapshot_id = table
+            .snapshot_manager()
+            .get_latest_snapshot()
+            .await
+            .unwrap()
+            .unwrap()
+            .id();
+        let call = format!(
+            "CALL sys.drop_global_index(table => 'test_db.{name}', index_column => '{columns}', \
+             partitions => '{partitions}'"
+        );
+        let result = sql_context
+            .sql(&format!("{call}, dry_run => true)"))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(
+            string_value(result[0].column(0).as_ref(), 0),
+            format!("Would drop {matched} global index file(s)")
+        );
+        assert_eq!(table_files(tmp.path()), before, "{case}");
+        exec(&sql_context, &format!("{call})")).await;
+        assert_eq!(global_index_entries(&table).await, expected, "{case}");
+        assert_eq!(
+            table
+                .snapshot_manager()
+                .get_latest_snapshot()
+                .await
+                .unwrap()
+                .unwrap()
+                .id(),
+            snapshot_id + 1
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_drop_global_index_partitions_no_match_does_not_commit() {
+    for populated in [false, true] {
+        let (tmp, sql_context, _) =
+            setup_partitioned_global_index_table("drop_partitions_empty", populated).await;
+        let before = table_files(tmp.path());
+        for dry_run in [true, false] {
+            let result = sql_context.sql(&format!(
+                "CALL sys.drop_global_index(table => 'test_db.drop_partitions_empty', index_column => 'id', \
+                 partitions => 'dt=2026-10-09', dry_run => {dry_run})"
+            )).await.unwrap().collect().await.unwrap();
+            assert_eq!(
+                string_value(result[0].column(0).as_ref(), 0),
+                if dry_run {
+                    "Would drop 0 global index file(s)"
+                } else {
+                    "OK"
+                }
+            );
+            assert_eq!(table_files(tmp.path()), before);
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_drop_global_index_partitions_string_keys_and_custom_null_name() {
+    let (tmp, catalog) = create_test_env();
+    let sql_context = create_sql_context(catalog.clone()).await;
+    exec(&sql_context, "CREATE SCHEMA paimon.test_db").await;
+    exec(
+        &sql_context,
+        "CREATE TABLE paimon.test_db.drop_string_partitions (id INT, dt VARCHAR(20)) \
+         PARTITIONED BY (dt) WITH ('row-tracking.enabled'='true', 'data-evolution.enabled'='true', \
+         'global-index.enabled'='true', 'partition.default-name'='NULL_PART')",
+    )
+    .await;
+    exec(&sql_context,
+        "INSERT INTO paimon.test_db.drop_string_partitions (id, dt) VALUES \
+         (1, '2026-10-10'), (2, '2026-10-11'), (3, '2026-10-12'), (4, 'a=b'), (5, NULL), (6, 'NULL')"
+    ).await;
+    exec(&sql_context,
+        "CALL sys.create_global_index(table => 'test_db.drop_string_partitions', index_column => 'id')"
+    ).await;
+    let table = catalog
+        .get_table(&Identifier::new("test_db", "drop_string_partitions"))
+        .await
+        .unwrap();
+    let mut expected = global_index_entries(&table).await;
+    assert_eq!(expected.len(), 6);
+    for (partitions, selected, matched) in [
+        (
+            "dt=2026-10-10;dt=2026-10-11",
+            vec![Some("2026-10-10"), Some("2026-10-11")],
+            2,
+        ),
+        ("dt=a=b", vec![Some("a=b")], 1),
+        ("dt=NULL_PART", vec![None], 1),
+    ] {
+        let before = table_files(tmp.path());
+        let call = format!(
+            "CALL sys.drop_global_index(table => 'test_db.drop_string_partitions', \
+             index_column => 'id', partitions => '{partitions}'"
+        );
+        let result = sql_context
+            .sql(&format!("{call}, dry_run => true)"))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(
+            string_value(result[0].column(0).as_ref(), 0),
+            format!("Would drop {matched} global index file(s)")
+        );
+        assert_eq!(table_files(tmp.path()), before);
+        exec(&sql_context, &format!("{call})")).await;
+        expected.retain(|_, entry| {
+            let row = paimon::spec::BinaryRow::from_serialized_bytes(&entry.partition).unwrap();
+            let dt = if row.is_null_at(0) {
+                None
+            } else {
+                Some(row.get_string(0).unwrap())
+            };
+            !selected.contains(&dt)
+        });
+        assert_eq!(global_index_entries(&table).await, expected);
+    }
+}
+
+#[tokio::test]
+async fn test_drop_global_index_floating_partition_identity() {
+    for sql_type in ["FLOAT", "DOUBLE"] {
+        assert_floating_partition_drops(sql_type, &["-0.0", "NaN", "0.0", "1.5"]).await;
+    }
+}
+
+#[tokio::test]
+async fn test_drop_global_index_float_generated_partition_names() {
+    assert_floating_partition_drops("FLOAT", &["147318.12", "-2096723.2", "1.4E-45"]).await;
+}
+
+async fn assert_floating_partition_drops(sql_type: &str, values: &[&str]) {
+    let (tmp, catalog) = create_test_env();
+    let sql_context = create_sql_context(catalog.clone()).await;
+    exec(&sql_context, "CREATE SCHEMA paimon.test_db").await;
+    exec(
+        &sql_context,
+        &format!(
+            "CREATE TABLE paimon.test_db.drop_float_partitions (id INT, f {sql_type}) \
+         PARTITIONED BY (f) WITH ('row-tracking.enabled'='true', 'data-evolution.enabled'='true', \
+         'global-index.enabled'='true')"
+        ),
+    )
+    .await;
+    let rows = values
+        .iter()
+        .enumerate()
+        .map(|(i, value)| format!("({}, CAST('{value}' AS {sql_type}))", i + 1))
+        .collect::<Vec<_>>()
+        .join(", ");
+    exec(
+        &sql_context,
+        &format!("INSERT INTO paimon.test_db.drop_float_partitions (id, f) VALUES {rows}"),
+    )
+    .await;
+    exec(&sql_context,
+        "CALL sys.create_global_index(table => 'test_db.drop_float_partitions', index_column => 'id')"
+    ).await;
+    let table = catalog
+        .get_table(&Identifier::new("test_db", "drop_float_partitions"))
+        .await
+        .unwrap();
+    let directory_names = std::fs::read_dir(table.location().strip_prefix("file://").unwrap())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .filter(|name| name.starts_with("f="))
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        directory_names,
+        values.iter().map(|value| format!("f={value}")).collect()
+    );
+    let mut expected = global_index_entries(&table).await;
+    assert_eq!(expected.len(), values.len());
+    if sql_type == "FLOAT" {
+        let before = table_files(tmp.path());
+        for partitions in ["f=1e100", "f=1e-100", "f=1.234567891", "f=-0.0;f=bad"] {
+            for dry_run in [true, false] {
+                assert_sql_error(
+                    &sql_context,
+                    &format!(
+                        "CALL sys.drop_global_index(table => 'test_db.drop_float_partitions', \
+                     index_column => 'id', partitions => '{partitions}', dry_run => {dry_run})"
+                    ),
+                    "Invalid partitions value",
+                )
+                .await;
+                assert_eq!(table_files(tmp.path()), before);
+            }
+        }
+    }
+    for value in values {
+        // Use the directory name produced by the writer as the procedure parameter.
+        let partition_name = directory_names.get(&format!("f={value}")).unwrap();
+        let selected = if sql_type == "FLOAT" {
+            f64::from(value.parse::<f32>().unwrap())
+        } else {
+            value.parse::<f64>().unwrap()
+        };
+        let before = table_files(tmp.path());
+        let snapshot_id = table
+            .snapshot_manager()
+            .get_latest_snapshot_id()
+            .await
+            .unwrap()
+            .unwrap();
+        let call = format!(
+            "CALL sys.drop_global_index(table => 'test_db.drop_float_partitions', \
+             index_column => 'id', partitions => '{partition_name}'"
+        );
+        let result = sql_context
+            .sql(&format!("{call}, dry_run => true)"))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(
+            string_value(result[0].column(0).as_ref(), 0),
+            "Would drop 1 global index file(s)",
+            "{sql_type}: {partition_name}"
+        );
+        assert_eq!(table_files(tmp.path()), before);
+        exec(&sql_context, &format!("{call})")).await;
+        let previous_len = expected.len();
+        expected.retain(|_, entry| {
+            let row = paimon::spec::BinaryRow::from_serialized_bytes(&entry.partition).unwrap();
+            let actual = if sql_type == "FLOAT" {
+                f64::from(row.get_float(0).unwrap())
+            } else {
+                row.get_double(0).unwrap()
+            };
+            !(actual.to_bits() == selected.to_bits() || (actual.is_nan() && selected.is_nan()))
+        });
+        assert_eq!(expected.len(), previous_len - 1);
+        assert_eq!(
+            global_index_entries(&table).await,
+            expected,
+            "{sql_type}: {partition_name}"
+        );
+        assert_eq!(
+            table
+                .snapshot_manager()
+                .get_latest_snapshot_id()
+                .await
+                .unwrap(),
+            Some(snapshot_id + 1)
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_drop_global_index_native_timestamp_partition_identity() {
+    use paimon::spec::{DataType, Datum, IntType, LocalZonedTimestampType, Schema, TimestampType};
+
+    for precision in [1, 2, 4, 5, 7, 8] {
+        for zoned in [false, true] {
+            let (tmp, catalog) = create_test_env();
+            let sql_context = create_sql_context(catalog.clone()).await;
+            exec(&sql_context, "CREATE SCHEMA paimon.test_db").await;
+            let data_type = if zoned {
+                DataType::LocalZonedTimestamp(LocalZonedTimestampType::new(precision).unwrap())
+            } else {
+                DataType::Timestamp(TimestampType::new(precision).unwrap())
+            };
+            let schema = Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("other", DataType::Int(IntType::new()))
+                .column("ts", data_type.clone())
+                .partition_keys(["ts"])
+                .options([
+                    ("row-tracking.enabled".into(), "true".into()),
+                    ("data-evolution.enabled".into(), "true".into()),
+                    ("global-index.enabled".into(), "true".into()),
+                    ("partition.legacy-name".into(), "false".into()),
+                ])
+                .build()
+                .unwrap();
+            let identifier = Identifier::new("test_db", "drop_native_timestamp");
+            catalog
+                .create_table(&identifier, schema, false)
+                .await
+                .unwrap();
+            let (first, selected, millis, nanos) = match precision {
+                1 | 2 => ("100", "199", 199, 0),
+                4 | 5 => ("123400", "123499", 123, 499_000),
+                _ => ("123456700", "123456799", 123, 456_799),
+            };
+            exec(
+                &sql_context,
+                &format!(
+                    "INSERT INTO paimon.test_db.drop_native_timestamp (id, other, ts) VALUES \
+                 (1, 10, TIMESTAMP '1970-01-01 00:00:00.{first}Z'), \
+                 (2, 20, TIMESTAMP '1970-01-01 00:00:00.{selected}Z')"
+                ),
+            )
+            .await;
+            for (column, index_type) in [("id", "btree"), ("other", "btree"), ("id", "bitmap")] {
+                exec(
+                    &sql_context,
+                    &format!(
+                        "CALL sys.create_global_index(table => 'test_db.drop_native_timestamp', \
+                     index_column => '{column}', index_type => '{index_type}')"
+                    ),
+                )
+                .await;
+            }
+            let table = catalog.get_table(&identifier).await.unwrap();
+            assert_eq!(table.schema().partition_fields()[0].data_type(), &data_type);
+            assert_eq!(
+                row_count(
+                    &sql_context,
+                    &format!(
+                        "SELECT * FROM paimon.test_db.`drop_native_timestamp$partitions` \
+                 WHERE partition LIKE 'ts=%.{selected}'"
+                    )
+                )
+                .await,
+                1
+            );
+            let selected_datum = if zoned {
+                Datum::LocalZonedTimestamp { millis, nanos }
+            } else {
+                Datum::Timestamp { millis, nanos }
+            };
+            let mut expected = global_index_entries(&table).await;
+            assert_eq!(expected.len(), 6);
+            expected.retain(|_, entry| {
+                let row = paimon::spec::BinaryRow::from_serialized_bytes(&entry.partition).unwrap();
+                !(entry.index_file.index_type == "btree"
+                    && entry
+                        .index_file
+                        .global_index_meta
+                        .as_ref()
+                        .unwrap()
+                        .index_field_id
+                        == 0
+                    && row.get_datum(0, &data_type).unwrap().as_ref() == Some(&selected_datum))
+            });
+            assert_eq!(expected.len(), 5);
+            let before = table_files(tmp.path());
+            let snapshot_id = table
+                .snapshot_manager()
+                .get_latest_snapshot_id()
+                .await
+                .unwrap()
+                .unwrap();
+            let suffix = if zoned { "Z" } else { "" };
+            let absent = format!("{}8", &selected[..selected.len() - 1]);
+            let no_match = format!(
+                "CALL sys.drop_global_index(table => 'test_db.drop_native_timestamp', \
+                 index_column => 'id', partitions => 'ts=1970-01-01T00:00:00.{absent}{suffix}'"
+            );
+            let batches = sql_context
+                .sql(&format!("{no_match}, dry_run => true)"))
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+            assert_eq!(
+                string_value(batches[0].column(0).as_ref(), 0),
+                "Would drop 0 global index file(s)"
+            );
+            exec(&sql_context, &format!("{no_match})")).await;
+            assert_eq!(table_files(tmp.path()), before);
+            for dry_run in [true, false] {
+                assert_sql_error(&sql_context, &format!(
+                    "CALL sys.drop_global_index(table => 'test_db.drop_native_timestamp', \
+                     index_column => 'id', partitions => 'ts=1970-01-01T00:00:00.{selected}{suffix};\
+                     ts=1970-01-01T00:00:00.1234567891{suffix}', dry_run => {dry_run})"
+                ), "Invalid partitions value").await;
+                assert_eq!(table_files(tmp.path()), before);
+            }
+            let call = format!(
+                "CALL sys.drop_global_index(table => 'test_db.drop_native_timestamp', \
+                 index_column => 'id', partitions => 'ts=1970-01-01T00:00:00.{selected}{suffix}'"
+            );
+            let batches = sql_context
+                .sql(&format!("{call}, dry_run => true)"))
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+            assert_eq!(
+                string_value(batches[0].column(0).as_ref(), 0),
+                "Would drop 1 global index file(s)"
+            );
+            assert_eq!(table_files(tmp.path()), before);
+            exec(&sql_context, &format!("{call})")).await;
+            assert_eq!(
+                global_index_entries(&table).await,
+                expected,
+                "{data_type:?}"
+            );
+            assert_eq!(
+                table
+                    .snapshot_manager()
+                    .get_latest_snapshot_id()
+                    .await
+                    .unwrap(),
+                Some(snapshot_id + 1)
+            );
+            assert_eq!(
+                row_count(
+                    &sql_context,
+                    "SELECT * FROM paimon.test_db.drop_native_timestamp"
+                )
+                .await,
+                2
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_drop_global_index_ltz_partitions_use_display_timezone() {
+    const CHILD: &str = "PAIMON_DROP_LTZ_PARTITIONS_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        // Local timezone is process-global; isolate it from parallel SQL tests.
+        for timezone in ["Asia/Shanghai", "America/New_York", "Africa/Monrovia"] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "test_drop_global_index_ltz_partitions_use_display_timezone",
+                ])
+                .env("TZ", timezone)
+                .env(CHILD, timezone)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{timezone}:\n{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        return;
+    }
+    let timezone = std::env::var(CHILD).unwrap();
+    if timezone == "Asia/Shanghai" {
+        let instants = ["1970-01-01 00:00:00+00:00", "1970-01-01 08:00:00+00:00"];
+        for (legacy, input, selected) in [
+            (false, "1970-01-01 08:00:00.000", 0),
+            (false, "1970-01-01T08:00:00.000+08:00", 0),
+            (false, "1970-01-01T08:00:00.000Z", 28_800_000),
+            (false, "0", 0),
+            (true, "1970-01-01T00:00", 0),
+        ] {
+            assert_timestamp_partition_drop(
+                "TIMESTAMP(3) WITH TIME ZONE",
+                legacy,
+                instants,
+                input,
+                (selected, 0),
+            )
+            .await;
+        }
+        assert_timestamp_partition_drop(
+            "TIMESTAMP(3)",
+            false,
+            instants,
+            "1970-01-01 00:00:00.000",
+            (0, 0),
+        )
+        .await;
+        assert_timestamp_partition_drop("TIMESTAMP(3)", true, instants, "1970-01-01T00:00", (0, 0))
+            .await;
+        for (sql_type, input, expected_nanos) in [
+            (
+                "TIMESTAMP(6) WITH TIME ZONE",
+                "1970-01-01 08:00:00.123456",
+                456_000,
+            ),
+            (
+                "TIMESTAMP(9) WITH TIME ZONE",
+                "1970-01-01 08:00:00.123456789",
+                456_789,
+            ),
+        ] {
+            assert_timestamp_partition_drop(
+                sql_type,
+                false,
+                [
+                    "1970-01-01 00:00:00.123456789+00:00",
+                    "1970-01-01 08:00:00.123456789+00:00",
+                ],
+                input,
+                (123, expected_nanos),
+            )
+            .await;
+        }
+    } else if timezone == "America/New_York" {
+        // Summer offset is -04:00, not the timezone's winter offset of -05:00.
+        assert_timestamp_partition_drop(
+            "TIMESTAMP(3) WITH TIME ZONE",
+            false,
+            ["2024-07-01 16:00:00+00:00", "2024-07-01 17:00:00+00:00"],
+            "2024-07-01 12:00:00.000",
+            (1_719_849_600_000, 0),
+        )
+        .await;
+        assert_timestamp_partition_drop(
+            "TIMESTAMP(3) WITH TIME ZONE",
+            false,
+            ["2024-11-03 05:30:00+00:00", "2024-11-03 06:30:00+00:00"],
+            "2024-11-03T01:30:00-04:00",
+            (1_730_611_800_000, 0),
+        )
+        .await;
+    } else {
+        // Monrovia's historical offset of -00:44:30 must not shift the instant by 30 seconds.
+        for input in ["1970-12-31 23:15:30.000", "1971-01-01T00:00:00Z"] {
+            assert_timestamp_partition_drop(
+                "TIMESTAMP(3) WITH TIME ZONE",
+                false,
+                ["1971-01-01 00:00:00+00:00", "1971-01-01 00:00:30+00:00"],
+                input,
+                (31_536_000_000, 0),
+            )
+            .await;
+        }
+    }
+}
+
+async fn assert_timestamp_partition_drop(
+    sql_type: &str,
+    legacy: bool,
+    instants: [&str; 2],
+    input: &str,
+    selected: (i64, i32),
+) {
+    let (tmp, catalog) = create_test_env();
+    let sql_context = create_sql_context(catalog.clone()).await;
+    exec(&sql_context, "CREATE SCHEMA paimon.test_db").await;
+    exec(
+        &sql_context,
+        &format!(
+            "CREATE TABLE paimon.test_db.drop_ltz_partitions (id INT, name STRING, ts {sql_type}) \
+         PARTITIONED BY (ts) WITH ('row-tracking.enabled'='true', 'data-evolution.enabled'='true', \
+         'global-index.enabled'='true', 'partition.legacy-name'='{legacy}')"
+        ),
+    )
+    .await;
+    exec(
+        &sql_context,
+        &format!(
+            "INSERT INTO paimon.test_db.drop_ltz_partitions (id, name, ts) VALUES \
+         (1, 'a', TIMESTAMP '{}'), (2, 'b', TIMESTAMP '{}')",
+            instants[0], instants[1]
+        ),
+    )
+    .await;
+    for (column, index_type) in [("id", "btree"), ("name", "btree"), ("id", "bitmap")] {
+        exec(
+            &sql_context,
+            &format!(
+                "CALL sys.create_global_index(table => 'test_db.drop_ltz_partitions', \
+             index_column => '{column}', index_type => '{index_type}')"
+            ),
+        )
+        .await;
+    }
+    let table = catalog
+        .get_table(&Identifier::new("test_db", "drop_ltz_partitions"))
+        .await
+        .unwrap();
+    let partition_type = table.schema().partition_fields()[0].data_type().clone();
+    let selected_datum = match partition_type {
+        paimon::spec::DataType::Timestamp(_) => paimon::spec::Datum::Timestamp {
+            millis: selected.0,
+            nanos: selected.1,
+        },
+        paimon::spec::DataType::LocalZonedTimestamp(_) => {
+            paimon::spec::Datum::LocalZonedTimestamp {
+                millis: selected.0,
+                nanos: selected.1,
+            }
+        }
+        other => panic!("Unexpected partition type: {other:?}"),
+    };
+    let mut expected = global_index_entries(&table).await;
+    assert_eq!(expected.len(), 6);
+    if input.contains(' ') || legacy {
+        assert_eq!(row_count(&sql_context, &format!(
+            "SELECT * FROM paimon.test_db.`drop_ltz_partitions$partitions` WHERE partition = 'ts={input}'"
+        )).await, 1);
+    }
+    expected.retain(|_, entry| {
+        let row = paimon::spec::BinaryRow::from_serialized_bytes(&entry.partition).unwrap();
+        !(entry.index_file.index_type == "btree"
+            && entry
+                .index_file
+                .global_index_meta
+                .as_ref()
+                .unwrap()
+                .index_field_id
+                == 0
+            && row.get_datum(0, &partition_type).unwrap().as_ref() == Some(&selected_datum))
+    });
+    assert_eq!(expected.len(), 5);
+    let before = table_files(tmp.path());
+    let snapshot_id = table
+        .snapshot_manager()
+        .get_latest_snapshot_id()
+        .await
+        .unwrap()
+        .unwrap();
+    if std::env::var("TZ").unwrap() == "America/New_York" {
+        for invalid in [
+            "2024-03-10 02:30:00",
+            "2024-11-03 01:30:00",
+            "not-a-timestamp",
+        ] {
+            for dry_run in [true, false] {
+                assert_sql_error(&sql_context, &format!(
+                    "CALL sys.drop_global_index(table => 'test_db.drop_ltz_partitions', index_column => 'id', \
+                     partitions => 'ts={input};ts={invalid}', dry_run => {dry_run})"
+                ), "Invalid partitions value").await;
+                assert_eq!(table_files(tmp.path()), before);
+            }
+        }
+    }
+    let call = format!(
+        "CALL sys.drop_global_index(table => 'test_db.drop_ltz_partitions', index_column => 'id', partitions => 'ts={input}'"
+    );
+    let result = sql_context
+        .sql(&format!("{call}, dry_run => true)"))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        string_value(result[0].column(0).as_ref(), 0),
+        "Would drop 1 global index file(s)"
+    );
+    assert_eq!(table_files(tmp.path()), before);
+    exec(&sql_context, &format!("{call})")).await;
+    assert_eq!(
+        global_index_entries(&table).await,
+        expected,
+        "{sql_type}, legacy={legacy}, {input}"
+    );
+    assert_eq!(
+        table
+            .snapshot_manager()
+            .get_latest_snapshot_id()
+            .await
+            .unwrap(),
+        Some(snapshot_id + 1)
+    );
+    assert_eq!(
+        row_count(
+            &sql_context,
+            "SELECT * FROM paimon.test_db.drop_ltz_partitions"
+        )
+        .await,
+        2
+    );
+}
+
+#[tokio::test]
+async fn test_drop_global_index_partitions_timestamp_and_decimal_are_exact() {
+    let (tmp, catalog) = create_test_env();
+    let sql_context = create_sql_context(catalog.clone()).await;
+    exec(&sql_context, "CREATE SCHEMA paimon.test_db").await;
+    exec(&sql_context,
+        "CREATE TABLE paimon.test_db.drop_typed_partitions (id INT, ts TIMESTAMP(3), price DECIMAL(10,2)) \
+         PARTITIONED BY (ts, price) WITH ('row-tracking.enabled'='true', 'data-evolution.enabled'='true', \
+         'global-index.enabled'='true')"
+    ).await;
+    exec(&sql_context,
+        "INSERT INTO paimon.test_db.drop_typed_partitions (id, ts, price) VALUES \
+         (1, TIMESTAMP '2026-10-10 12:00:00.199', 1.24), (2, TIMESTAMP '2026-10-10 12:00:00.199', 1.23), \
+         (3, TIMESTAMP '2026-10-10 12:00:00.2', 1.24)"
+    ).await;
+    exec(&sql_context,
+        "CALL sys.create_global_index(table => 'test_db.drop_typed_partitions', index_column => 'id')"
+    ).await;
+    let table = catalog
+        .get_table(&Identifier::new("test_db", "drop_typed_partitions"))
+        .await
+        .unwrap();
+    let before = table_files(tmp.path());
+    let mut expected = global_index_entries(&table).await;
+    assert_eq!(expected.len(), 3);
+    let millis =
+        chrono::NaiveDateTime::parse_from_str("2026-10-10 12:00:00.199", "%Y-%m-%d %H:%M:%S%.f")
+            .unwrap()
+            .and_utc()
+            .timestamp_millis();
+    expected.retain(|_, entry| {
+        let row = paimon::spec::BinaryRow::from_serialized_bytes(&entry.partition).unwrap();
+        !(row.get_long(0).unwrap() == millis && row.get_long(1).unwrap() == 124)
+    });
+    assert_eq!(expected.len(), 2);
+    let no_match = "CALL sys.drop_global_index(table => 'test_db.drop_typed_partitions', index_column => 'id', \
+                partitions => 'ts=2026-10-10 12:00:00.1999,price=1.235'";
+    let result = sql_context
+        .sql(&format!("{no_match}, dry_run => true)"))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        string_value(result[0].column(0).as_ref(), 0),
+        "Would drop 0 global index file(s)"
+    );
+    exec(&sql_context, &format!("{no_match})")).await;
+    assert_eq!(table_files(tmp.path()), before);
+    let call = "CALL sys.drop_global_index(table => 'test_db.drop_typed_partitions', index_column => 'id', \
+                partitions => 'ts=2026-10-10 12:00:00.199,price=1.235'";
+    let result = sql_context
+        .sql(&format!("{call}, dry_run => true)"))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        string_value(result[0].column(0).as_ref(), 0),
+        "Would drop 1 global index file(s)"
+    );
+    assert_eq!(table_files(tmp.path()), before);
+    exec(&sql_context, &format!("{call})")).await;
+    assert_eq!(global_index_entries(&table).await, expected);
+}
+
+#[tokio::test]
+async fn test_drop_global_index_partitions_invalid_parameters_never_commit() {
+    for populated in [false, true] {
+        let (tmp, sql_context, _) =
+            setup_partitioned_global_index_table("drop_partitions_invalid", populated).await;
+        let before = table_files(tmp.path());
+        for partitions in [
+            "",
+            " ",
+            ";",
+            "dt",
+            "dt=",
+            "=2026-10-10",
+            "missing=x",
+            "id=1",
+            "dt=not-a-date",
+            "dt=2026-02-30",
+            "hr=not-an-int",
+            "hr=1.5",
+            "hr=2147483648",
+            "dt=2026-10-10;",
+            ";dt=2026-10-10",
+            "dt=2026-10-10;;dt=2026-10-11",
+            "dt=2026-10-10,",
+            ",dt=2026-10-10",
+            "dt=2026-10-10,,hr=1",
+            "dt=2026-10-10,dt=2026-10-11",
+            "dt=2026-10-10;missing=x",
+            "dt=2026-10-10;hr=bad",
+        ] {
+            for dry_run in [true, false] {
+                assert_sql_error(&sql_context, &format!(
+                    "CALL sys.drop_global_index(table => 'test_db.drop_partitions_invalid', index_column => 'id', \
+                     partitions => '{partitions}', dry_run => {dry_run})"
+                ), "partition").await;
+                assert_eq!(
+                    table_files(tmp.path()),
+                    before,
+                    "{partitions:?}, dry_run={dry_run}"
+                );
+            }
+        }
     }
 }
 
@@ -1535,6 +2778,262 @@ async fn test_create_tag_from_timestamp() {
     )
     .await;
     assert_eq!(count, 1);
+}
+
+#[tokio::test]
+async fn test_create_tag_from_watermark_selects_first_live_snapshot() {
+    for (watermark, expected_id) in [(500, 1), (1000, 1), (1500, 2), (2000, 2)] {
+        let (tmp, sql_context) =
+            setup_table_with_watermarks([Some(1000), Some(2000), Some(2000)]).await;
+        let tag_name = format!("wm_{watermark}");
+        exec(
+            &sql_context,
+            &format!(
+                "CALL sys.create_tag_from_watermark(table => 'paimon.test_db.t1', \
+                 tag => '{tag_name}', watermark => {watermark})"
+            ),
+        )
+        .await;
+        let tag = read_tag(tmp.path(), &tag_name);
+        assert_eq!(tag["id"], expected_id);
+        assert!(tag.get("tagTimeRetained").is_none());
+        assert!(tag.get("tagCreateTime").is_none());
+        assert_eq!(
+            row_count(
+                &sql_context,
+                &format!("SELECT * FROM paimon.test_db.t1 VERSION AS OF '{tag_name}'"),
+            )
+            .await,
+            expected_id as usize
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_create_tag_from_watermark_uses_retained_snapshots() {
+    let (tmp, sql_context) =
+        setup_table_with_watermarks([Some(1000), Some(2000), Some(3000)]).await;
+    let snapshot_dir = tmp.path().join("test_db.db/t1/snapshot");
+    // Tag names deliberately put the later snapshot first in Rust's tag listing.
+    for (name, id) in [("z_earlier", 1), ("a_later", 2)] {
+        exec(
+            &sql_context,
+            &format!(
+                "CALL sys.create_tag(table => 'test_db.t1', tag => '{name}', snapshot_id => {id})"
+            ),
+        )
+        .await;
+        std::fs::remove_file(snapshot_dir.join(format!("snapshot-{id}"))).unwrap();
+    }
+
+    for (watermark, expected_id) in [(999, 1), (1000, 1), (1500, 2), (2000, 2), (2500, 3)] {
+        let tag_name = format!("wm_{watermark}");
+        exec(
+            &sql_context,
+            &format!(
+                "CALL sys.create_tag_from_watermark(table => 'test_db.t1', \
+                 tag => '{tag_name}', watermark => {watermark}, time_retained => '7d')"
+            ),
+        )
+        .await;
+        let tag = read_tag(tmp.path(), &tag_name);
+        assert_eq!(tag["id"], expected_id);
+        assert_eq!(
+            tag["tagTimeRetained"].as_number().unwrap().to_string(),
+            "604800.000000000"
+        );
+        assert_eq!(tag["tagCreateTime"].as_array().unwrap().len(), 7);
+        assert_eq!(
+            row_count(
+                &sql_context,
+                &format!("SELECT * FROM paimon.test_db.t1 VERSION AS OF '{tag_name}'"),
+            )
+            .await,
+            expected_id as usize
+        );
+    }
+
+    // All snapshot files can be gone while tag metadata still supplies a candidate.
+    std::fs::remove_file(snapshot_dir.join("snapshot-3")).unwrap();
+    exec(
+        &sql_context,
+        "CALL sys.create_tag_from_watermark(table => 'test_db.t1', tag => 'tags_only', watermark => 1500)",
+    )
+    .await;
+    assert_eq!(read_tag(tmp.path(), "tags_only")["id"], 2);
+}
+
+#[tokio::test]
+async fn test_create_tag_from_watermark_equal_watermarks_prefer_earlier_snapshot() {
+    for (retained_id, expire_first) in [(1, true), (2, false)] {
+        let (tmp, sql_context) =
+            setup_table_with_watermarks([Some(1000), Some(1000), Some(2000)]).await;
+        exec(
+            &sql_context,
+            &format!(
+                "CALL sys.create_tag(table => 'test_db.t1', tag => 'keep', snapshot_id => {retained_id})"
+            ),
+        )
+        .await;
+        if expire_first {
+            std::fs::remove_file(tmp.path().join("test_db.db/t1/snapshot/snapshot-1")).unwrap();
+        }
+        exec(
+            &sql_context,
+            "CALL sys.create_tag_from_watermark(table => 'test_db.t1', tag => 'equal', watermark => 1000)",
+        )
+        .await;
+        assert_eq!(read_tag(tmp.path(), "equal")["id"], 1);
+    }
+}
+
+#[tokio::test]
+async fn test_create_tag_from_watermark_skips_missing_live_and_tag_watermarks() {
+    let (tmp, sql_context) = setup_table_with_watermarks([None, Some(i64::MIN), Some(2000)]).await;
+    for id in [1, 2] {
+        exec(
+            &sql_context,
+            &format!(
+                "CALL sys.create_tag(table => 'test_db.t1', tag => 'missing_{id}', snapshot_id => {id})"
+            ),
+        )
+        .await;
+    }
+    exec(
+        &sql_context,
+        "CALL sys.create_tag_from_watermark(table => 'test_db.t1', tag => 'live', watermark => 0)",
+    )
+    .await;
+    assert_eq!(read_tag(tmp.path(), "live")["id"], 3);
+    for id in [1, 2] {
+        std::fs::remove_file(
+            tmp.path()
+                .join(format!("test_db.db/t1/snapshot/snapshot-{id}")),
+        )
+        .unwrap();
+    }
+    for (index, watermark) in [i64::MIN, 0, 2000].into_iter().enumerate() {
+        let name = format!("valid_{index}");
+        exec(
+            &sql_context,
+            &format!(
+                "CALL sys.create_tag_from_watermark(table => 'test_db.t1', tag => '{name}', watermark => {watermark})"
+            ),
+        )
+        .await;
+        assert_eq!(read_tag(tmp.path(), &name)["id"], 3);
+    }
+}
+
+#[tokio::test]
+async fn test_create_tag_from_watermark_without_candidate_does_not_write() {
+    for (watermarks, target) in [
+        ([None, None, None], 0),
+        ([None, Some(i64::MIN), None], i64::MIN),
+        ([Some(1000), Some(2000), Some(3000)], 3001),
+    ] {
+        let (tmp, sql_context) = setup_table_with_watermarks(watermarks).await;
+        exec(
+            &sql_context,
+            "CALL sys.create_tag(table => 'test_db.t1', tag => 'keep', snapshot_id => 2)",
+        )
+        .await;
+        let keep_path = tmp.path().join("test_db.db/t1/tag/tag-keep");
+        let original = std::fs::read(&keep_path).unwrap();
+        assert_sql_error(
+            &sql_context,
+            &format!(
+                "CALL sys.create_tag_from_watermark(table => 'test_db.t1', tag => 'missing', watermark => {target})"
+            ),
+            &format!("No snapshot found with watermark >= {target}"),
+        )
+        .await;
+        assert!(!tmp.path().join("test_db.db/t1/tag/tag-missing").exists());
+        assert_eq!(std::fs::read(keep_path).unwrap(), original);
+        assert_eq!(
+            row_count(&sql_context, "SELECT * FROM paimon.test_db.`t1$tags`").await,
+            1
+        );
+    }
+
+    let (tmp, sql_context) = setup_sql_context().await;
+    exec(&sql_context, "CREATE TABLE paimon.test_db.t1 (id INT)").await;
+    assert_sql_error(
+        &sql_context,
+        "CALL sys.create_tag_from_watermark(table => 'test_db.t1', tag => 'empty', watermark => 0)",
+        "No snapshot found with watermark >= 0",
+    )
+    .await;
+    assert!(!tmp.path().join("test_db.db/t1/tag").exists());
+}
+
+#[tokio::test]
+async fn test_create_tag_from_watermark_rejects_invalid_arguments_without_writes() {
+    let (tmp, sql_context) =
+        setup_table_with_watermarks([Some(1000), Some(2000), Some(3000)]).await;
+    exec(
+        &sql_context,
+        "CALL sys.create_tag_from_watermark(table => 'test_db.t1', tag => 'keep', watermark => 1000)",
+    )
+    .await;
+    let keep_path = tmp.path().join("test_db.db/t1/tag/tag-keep");
+    let original = std::fs::read(&keep_path).unwrap();
+
+    for (args, expected_error) in [
+        ("tag => 'invalid', watermark => 1000", "Missing required argument: 'table'"),
+        ("table => 'test_db.t1', watermark => 1000", "Missing required argument: 'tag'"),
+        ("table => 'test_db.t1', tag => 'invalid'", "Missing required argument: 'watermark'"),
+        ("table => 'test_db.t1', tag => 'invalid', watermark => 'abc'", "Invalid watermark"),
+        ("table => 'test_db.t1', tag => 'invalid', watermark => 1.5", "Invalid watermark"),
+        ("table => 'test_db.t1', tag => 'invalid', watermark => 9223372036854775808", "Invalid watermark"),
+        ("table => 'test_db.t1', tag => 'invalid', watermark => -9223372036854775809", "Invalid watermark"),
+        ("table => 'test_db.t1', tag => 'invalid', watermak => 1000", "Argument watermak is unknown"),
+        ("table => 'test_db.t1', tag => 'invalid', watermark => 1000, time_retain => '1d'", "Argument time_retain is unknown"),
+        ("table => 'test_db.t1', tag => 'invalid', watermark => 1000, watermark => 2000", "Procedure argument watermark is duplicated"),
+        ("table => 'test_db.t1', tag => '', watermark => 1000", "Invalid tag name"),
+        ("table => 'test_db.t1', tag => '../invalid', watermark => 1000", "Invalid tag name"),
+        ("table => 'test_db.t1', tag => 'invalid', watermark => 1000, time_retained => ''", "Invalid tag retention"),
+        ("table => 'test_db.t1', tag => 'invalid', watermark => 1000, time_retained => 'invalid'", "Invalid tag retention"),
+        ("table => 'test_db.t1', tag => 'invalid', watermark => 1000, time_retained => '-1d'", "Invalid tag retention"),
+    ] {
+        assert_sql_error(
+            &sql_context,
+            &format!("CALL sys.create_tag_from_watermark({args})"),
+            expected_error,
+        )
+        .await;
+        assert_eq!(std::fs::read(&keep_path).unwrap(), original);
+    }
+    assert!(!tmp.path().join("test_db.db/t1/tag/tag-invalid").exists());
+    assert_eq!(
+        row_count(&sql_context, "SELECT * FROM paimon.test_db.`t1$tags`").await,
+        1
+    );
+}
+
+#[tokio::test]
+async fn test_create_tag_from_watermark_preserves_existing_tag() {
+    let (tmp, sql_context) =
+        setup_table_with_watermarks([Some(1000), Some(2000), Some(3000)]).await;
+    exec(
+        &sql_context,
+        "CALL sys.create_tag_from_watermark(table => 'test_db.t1', tag => 'keep', watermark => 1000, time_retained => '1d')",
+    )
+    .await;
+    let keep_path = tmp.path().join("test_db.db/t1/tag/tag-keep");
+    let original = std::fs::read(&keep_path).unwrap();
+    for (watermark, retention) in [(2000, "2d"), (2000, "invalid"), (4000, "1d")] {
+        assert_sql_error(
+            &sql_context,
+            &format!(
+                "CALL sys.create_tag_from_watermark(table => 'test_db.t1', tag => 'keep', \
+                 watermark => {watermark}, time_retained => '{retention}')"
+            ),
+            "Tag 'keep' already exists",
+        )
+        .await;
+        assert_eq!(std::fs::read(&keep_path).unwrap(), original);
+    }
 }
 
 #[tokio::test]

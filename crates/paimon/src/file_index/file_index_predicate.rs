@@ -35,6 +35,7 @@ impl FileIndexPredicate {
     /// Evaluates a predicate without reading data outside the supplied indexes.
     pub(crate) fn evaluate(&self, predicate: &Predicate) -> FileIndexResult {
         match predicate {
+            Predicate::NestedLeaf { .. } => FileIndexResult::Remain,
             Predicate::AlwaysTrue => FileIndexResult::Remain,
             Predicate::AlwaysFalse => FileIndexResult::Skip,
             Predicate::And(children) => self.evaluate_and(children),

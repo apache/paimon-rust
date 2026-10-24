@@ -94,6 +94,7 @@ struct PathCacheState {
 
 #[derive(Clone)]
 pub(in crate::io) struct CacheReadToken {
+    pub(super) shared_generation: Option<String>,
     generation: u64,
     state: Arc<PathCacheState>,
 }
@@ -134,6 +135,7 @@ impl CacheCoordinator {
     pub(super) fn read_token(&self, namespace: &str, path: &str) -> CacheReadToken {
         let state = self.path_state(namespace, path);
         CacheReadToken {
+            shared_generation: None,
             generation: state.generation.load(std::sync::atomic::Ordering::SeqCst),
             state,
         }

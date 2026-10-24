@@ -22,10 +22,171 @@ use std::sync::Arc;
 use arrow_array::types::{
     Decimal128Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, Int8Type,
 };
-use arrow_array::{cast::AsArray, ArrayRef, Int16Array, Int32Array, Int64Array, Int8Array};
+use arrow_array::{
+    cast::AsArray, ArrayRef, BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array,
+    Int64Array, Int8Array,
+};
 use arrow_schema::{DataType as ArrowType, TimeUnit};
 
 use crate::spec::DataType;
+
+/// Existing Python-supported numeric/Boolean CAST rules whose Java semantics
+/// differ from generic Arrow casts. Shared by authorization and old-file reads.
+pub(crate) fn supports_numeric_cast(from: &DataType, to: &DataType) -> bool {
+    let integer = |t: &DataType| {
+        matches!(
+            t,
+            DataType::TinyInt(_) | DataType::SmallInt(_) | DataType::Int(_) | DataType::BigInt(_)
+        )
+    };
+    let numeric = |t: &DataType| {
+        integer(t)
+            || matches!(
+                t,
+                DataType::Float(_) | DataType::Double(_) | DataType::Decimal(_)
+            )
+    };
+    let text = |t: &DataType| matches!(t, DataType::Char(_) | DataType::VarChar(_));
+    numeric(from) && numeric(to)
+        || matches!(from, DataType::Boolean(_))
+            && numeric(to)
+            && !matches!(to, DataType::Decimal(_))
+        || text(from) && (integer(to) || matches!(to, DataType::Boolean(_) | DataType::Decimal(_)))
+        || integer(from) && matches!(to, DataType::Boolean(_))
+        || matches!(from, DataType::Decimal(_)) && text(to)
+}
+
+pub(crate) fn cast_numeric(
+    source: &ArrayRef,
+    from: &DataType,
+    to: &DataType,
+) -> crate::Result<Option<ArrayRef>> {
+    if !supports_numeric_cast(from, to) {
+        return Ok(None);
+    }
+    // Old files can store a logical STRING as LargeUtf8 or Utf8View. Resolve
+    // that physical representation before typed access instead of panicking.
+    let normalized;
+    let source = if matches!(from, DataType::Char(_) | DataType::VarChar(_))
+        && source.data_type() != &ArrowType::Utf8
+    {
+        normalized = arrow_cast::cast(source, &ArrowType::Utf8)
+            .map_err(|error| invalid_numeric(error.to_string()))?;
+        &normalized
+    } else {
+        source
+    };
+    if let Some(decimal) = super::evolution_decimal::cast_decimal(source, from, to)? {
+        return Ok(Some(decimal));
+    }
+    let target = super::paimon_type_to_arrow(to)?;
+    let text = matches!(from, DataType::Char(_) | DataType::VarChar(_));
+    if text && matches!(to, DataType::Boolean(_)) {
+        let values = source
+            .as_string::<i32>()
+            .iter()
+            .map(|value| {
+                value
+                    .map(|value| match value.to_ascii_lowercase().as_str() {
+                        "t" | "true" | "y" | "yes" | "1" => Ok(true),
+                        "f" | "false" | "n" | "no" | "0" => Ok(false),
+                        _ => Err(invalid_numeric(format!(
+                            "Cannot parse '{value}' as BOOLEAN"
+                        ))),
+                    })
+                    .transpose()
+            })
+            .collect::<crate::Result<Vec<_>>>()?;
+        return Ok(Some(Arc::new(BooleanArray::from(values))));
+    }
+    let integral = matches!(
+        target,
+        ArrowType::Int8 | ArrowType::Int16 | ArrowType::Int32 | ArrowType::Int64
+    );
+    if text && integral {
+        let (min, max) = match target {
+            ArrowType::Int8 => (i64::from(i8::MIN), i64::from(i8::MAX)),
+            ArrowType::Int16 => (i64::from(i16::MIN), i64::from(i16::MAX)),
+            ArrowType::Int32 => (i64::from(i32::MIN), i64::from(i32::MAX)),
+            _ => (i64::MIN, i64::MAX),
+        };
+        let values = source
+            .as_string::<i32>()
+            .iter()
+            .map(|value| {
+                value
+                    .map(|value| crate::common::number::parse_java_integer(value, min, max))
+                    .transpose()
+            })
+            .collect::<crate::Result<Vec<_>>>()?;
+        return arrow_cast::cast(&(Arc::new(Int64Array::from(values)) as ArrayRef), &target)
+            .map(Some)
+            .map_err(|error| invalid_numeric(error.to_string()));
+    }
+    if integral && !matches!(from, DataType::Boolean(_)) {
+        return numeric_to_integer(source, &target).map(Some);
+    }
+    if let DataType::Decimal(decimal) = from {
+        if matches!(to, DataType::Char(_) | DataType::VarChar(_)) {
+            let strings = super::evolution_decimal::decimal_to_string(source)?;
+            return Ok(Some(super::apply_declared_width(&strings, to)));
+        }
+        return cast_decimal_to_floating(source, decimal.precision(), decimal.scale(), &target)
+            .map(Some);
+    }
+    arrow_cast::cast(source, &target)
+        .map(Some)
+        .map_err(|error| invalid_numeric(error.to_string()))
+}
+
+/// Java DECIMAL conversion shared by schema reads and external update inputs.
+pub(crate) fn cast_decimal_to_floating(
+    source: &ArrayRef,
+    precision: u32,
+    scale: u32,
+    target: &ArrowType,
+) -> crate::Result<ArrayRef> {
+    // DecimalUtils.doubleValue divides the compact long by its scale;
+    // only wide decimals use BigDecimal.doubleValue. FLOAT rounds that
+    // double rather than the decimal coefficient directly.
+    let values: Vec<Option<f64>> = if precision <= 18 {
+        let divisor = 10_f64.powi(scale as i32);
+        source
+            .as_primitive::<Decimal128Type>()
+            .iter()
+            .map(|value| value.map(|value| value as f64 / divisor))
+            .collect()
+    } else {
+        let strings = super::evolution_decimal::decimal_to_string(source)?;
+        strings
+            .as_string::<i32>()
+            .iter()
+            .map(|value| {
+                value
+                    .map(|value| {
+                        value
+                            .parse::<f64>()
+                            .map_err(|_| invalid_numeric("Invalid DECIMAL value"))
+                    })
+                    .transpose()
+            })
+            .collect::<crate::Result<Vec<_>>>()?
+    };
+    Ok(match target {
+        ArrowType::Float32 => Arc::new(Float32Array::from_iter(
+            values.into_iter().map(|v| v.map(|v| v as f32)),
+        )) as ArrayRef,
+        ArrowType::Float64 => Arc::new(Float64Array::from(values)) as ArrayRef,
+        _ => unreachable!("validated DECIMAL numeric target"),
+    })
+}
+
+fn invalid_numeric(message: impl Into<String>) -> crate::Error {
+    crate::Error::DataInvalid {
+        message: message.into(),
+        source: None,
+    }
+}
 
 /// Java Number narrowing keeps low bits for integers. Floating-point values
 /// first truncate and saturate to int/long, then narrow to byte/short. DECIMAL
@@ -192,7 +353,11 @@ pub(super) fn timestamp_precision(
         value.and_then(|value| {
             let nanos = i128::from(value) * nanos_per_tick(source_unit);
             let truncated = nanos.div_euclid(quantum) * quantum;
-            i64::try_from(truncated / nanos_per_tick(target_unit)).ok()
+            // Java Timestamp keeps signed-long milliseconds. Flooring below
+            // i64::MIN wraps that millisecond value before Arrow unit scaling.
+            let millis = truncated.div_euclid(1_000_000) as i64;
+            let nanos = i128::from(millis) * 1_000_000 + truncated.rem_euclid(1_000_000);
+            i64::try_from(nanos / nanos_per_tick(target_unit)).ok()
         })
     }));
     Ok(Some(
@@ -212,6 +377,73 @@ mod tests {
     use super::*;
     use crate::spec::{LocalZonedTimestampType, TimestampType};
     use arrow_array::{Decimal128Array, Float32Array, Float64Array};
+
+    #[test]
+    fn physical_string_encodings_are_normalized_before_numeric_typed_access() {
+        use arrow_array::{LargeStringArray, StringViewArray};
+        let from: DataType = serde_json::from_str("\"STRING\"").unwrap();
+        for (target, values, expected) in [
+            (
+                "INT",
+                vec![
+                    Some("bad-prefix"),
+                    Some("1.9"),
+                    Some("-2.5"),
+                    None,
+                    Some("bad-suffix"),
+                ],
+                Arc::new(Int32Array::from(vec![Some(1), Some(-2), None])) as ArrayRef,
+            ),
+            (
+                "BOOLEAN",
+                vec![
+                    Some("bad-prefix"),
+                    Some("YES"),
+                    Some("0"),
+                    None,
+                    Some("bad-suffix"),
+                ],
+                Arc::new(BooleanArray::from(vec![Some(true), Some(false), None])) as ArrayRef,
+            ),
+            (
+                "DECIMAL(4,2)",
+                vec![
+                    Some("bad-prefix"),
+                    Some("1.005"),
+                    Some("99.995"),
+                    None,
+                    Some("bad-suffix"),
+                ],
+                Arc::new(
+                    Decimal128Array::from(vec![Some(101), None, None])
+                        .with_precision_and_scale(4, 2)
+                        .unwrap(),
+                ) as ArrayRef,
+            ),
+        ] {
+            let to: DataType = serde_json::from_value(serde_json::json!(target)).unwrap();
+            for source in [
+                Arc::new(LargeStringArray::from(values.clone())) as ArrayRef,
+                Arc::new(StringViewArray::from(values.clone())) as ArrayRef,
+            ] {
+                let result =
+                    crate::arrow::nested_evolution::evolve_column(&source.slice(1, 3), &from, &to)
+                        .unwrap();
+                assert_eq!(
+                    result.to_data(),
+                    expected.to_data(),
+                    "{target}: {:?}",
+                    source.data_type()
+                );
+                assert!(crate::arrow::nested_evolution::evolve_column(
+                    &source.slice(0, 1),
+                    &from,
+                    &to
+                )
+                .is_err());
+            }
+        }
+    }
 
     #[test]
     fn floating_point_narrowing_saturates_before_retaining_low_bits() {

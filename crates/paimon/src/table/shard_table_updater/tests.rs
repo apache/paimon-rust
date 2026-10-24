@@ -234,6 +234,154 @@ async fn partitioned_shard_accepts_rebatched_values_and_pins_snapshot() {
 }
 
 #[tokio::test]
+async fn partitioned_shard_accepts_unchanged_partition_carriers() {
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    for partition_only in [false, true] {
+        let table = table(true);
+        seed(&table, batch(vec!["a", "b"], vec![1, 2], vec![10, 20])).await;
+        let mut configured = table.new_write_builder().new_update().unwrap();
+        if partition_only {
+            configured.with_update_type(vec!["p".into()]).unwrap();
+        }
+        let mut update = configured.new_shard_updater(0, 1, None).await.unwrap();
+        let inputs: Vec<_> = update.arrow_reader().unwrap().try_collect().await.unwrap();
+        assert_eq!(inputs.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
+        // Rebatch across partitions so both the first writer and each writer
+        // created at a file-group boundary use the same carrier validation.
+        let input = arrow_select::concat::concat_batches(&inputs[0].schema(), &inputs).unwrap();
+        let output = if partition_only {
+            input.project(&[0]).unwrap()
+        } else {
+            let ids = input
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            RecordBatch::try_from_iter([
+                ("p", input.column_by_name("p").unwrap().clone()),
+                ("id", input.column_by_name("id").unwrap().clone()),
+                (
+                    "value",
+                    Arc::new(Int32Array::from_iter_values(
+                        ids.values().iter().map(|id| id * 100),
+                    )) as ArrayRef,
+                ),
+            ])
+            .unwrap()
+        };
+        update.update_by_arrow_batch(output).await.unwrap();
+        let messages = update.prepare_commit().await.unwrap();
+        assert_eq!(messages.len(), 2);
+        let files = table
+            .file_io()
+            .list_status_recursive(table.location())
+            .await
+            .unwrap();
+        let mut ranges = Vec::new();
+        for message in &messages {
+            assert_eq!(message.check_from_snapshot, Some(1));
+            for file in &message.new_files {
+                assert_eq!(file.schema_id, 0);
+                assert_eq!(file.row_count, 1);
+                ranges.push(file.first_row_id.unwrap());
+                assert_eq!(file.write_cols, partition_only.then(|| vec!["p".into()]));
+                let path = &files
+                    .iter()
+                    .find(|status| status.path.ends_with(&file.file_name))
+                    .unwrap()
+                    .path;
+                let bytes = table
+                    .file_io()
+                    .new_input(path)
+                    .unwrap()
+                    .read()
+                    .await
+                    .unwrap();
+                let reader = ParquetRecordBatchReaderBuilder::try_new(bytes).unwrap();
+                let schema = reader.schema();
+                let names = schema
+                    .fields()
+                    .iter()
+                    .map(|field| field.name().as_str())
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    names,
+                    if partition_only {
+                        vec!["p"]
+                    } else {
+                        vec!["p", "id", "value"]
+                    }
+                );
+            }
+        }
+        ranges.sort_unstable();
+        assert_eq!(ranges, vec![0, 1]);
+        commit(&table, messages).await;
+        assert_eq!(
+            rows(&table).await,
+            if partition_only {
+                vec![(1, 10), (2, 20)]
+            } else {
+                vec![(1, 100), (2, 200)]
+            }
+        );
+    }
+}
+
+#[tokio::test]
+async fn partitioned_shard_rejects_moving_rows_to_another_partition() {
+    let table = table(true);
+    seed(&table, batch(vec!["a", "b"], vec![1, 2], vec![10, 20])).await;
+    let mut update = table
+        .new_write_builder()
+        .new_update()
+        .unwrap()
+        .new_shard_updater(0, 1, None)
+        .await
+        .unwrap();
+    let inputs: Vec<_> = update.arrow_reader().unwrap().try_collect().await.unwrap();
+    let result: crate::Result<()> = async {
+        for input in inputs {
+            let ids = input
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            update
+                .update_by_arrow_batch(batch(
+                    vec!["changed"; input.num_rows()],
+                    ids.values().to_vec(),
+                    vec![99; input.num_rows()],
+                ))
+                .await?;
+        }
+        update.prepare_commit().await?;
+        Ok(())
+    }
+    .await;
+    let error = result.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("Cannot change partition column 'p'"),
+        "{error}"
+    );
+    assert!(update.prepare_commit().await.is_err());
+    assert_eq!(
+        table
+            .snapshot_manager()
+            .get_latest_snapshot_id()
+            .await
+            .unwrap(),
+        Some(1)
+    );
+    assert_eq!(rows(&table).await, vec![(1, 10), (2, 20)]);
+}
+
+#[tokio::test]
 async fn deleted_rows_do_not_shift_positional_assignments() {
     let table = table(false);
     seed(

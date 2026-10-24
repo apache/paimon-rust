@@ -162,7 +162,11 @@ impl TableProvider for FullTextSearchTableProvider {
                 .with_text_column(&self.column_name)
                 .with_query_text(&self.query_text)
                 .with_limit(self.limit);
-            builder.execute().await.map_err(to_datafusion_error)
+            builder
+                .execute()
+                .await
+                .and_then(|result| result.row_ids()?.to_row_ranges())
+                .map_err(to_datafusion_error)
         })
         .await?;
 
@@ -186,7 +190,6 @@ impl TableProvider for FullTextSearchTableProvider {
             table,
             schema: &self.schema(),
             plan,
-            scan_trace: None,
             projection,
             pushed_predicate: None,
             limit,

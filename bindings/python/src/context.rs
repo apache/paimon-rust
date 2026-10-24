@@ -41,7 +41,8 @@ use pyo3::prelude::*;
 use pyo3::types::PyCapsule;
 
 use crate::blob::PyBlobReaderRegistry;
-use crate::error::{df_to_py_err, to_py_err};
+use crate::catalog_version::{PyGetTagResponse, PyInstant, PyTableSnapshot};
+use crate::error::{df_to_py_err, to_catalog_py_err, to_py_err};
 use crate::read::PyRecordBatchReader;
 use crate::table::PyTable;
 use crate::udf::{build_python_scalar_udf, udf, PyPythonScalarUDFObject};
@@ -189,12 +190,26 @@ pub(crate) fn complete_storage_options(
     )
 }
 
-fn build_paimon_catalog(catalog_options: HashMap<String, String>) -> PyResult<Arc<dyn Catalog>> {
+fn build_paimon_catalog(
+    catalog_options: HashMap<String, String>,
+    config_required: bool,
+) -> PyResult<Arc<dyn Catalog>> {
     let catalog_options = complete_storage_options(catalog_options);
     let rt = runtime();
     rt.block_on(async {
         let options = Options::from_map(catalog_options);
-        let catalog = CatalogFactory::create(options).await.map_err(to_py_err)?;
+        let catalog: Arc<dyn Catalog> =
+            if !config_required && options.get("metastore").map(String::as_str) == Some("rest") {
+                Arc::new(
+                    paimon::catalog::RESTCatalog::new(options, false)
+                        .await
+                        .map_err(to_catalog_py_err)?,
+                )
+            } else {
+                CatalogFactory::create(options)
+                    .await
+                    .map_err(to_catalog_py_err)?
+            };
         Ok::<_, PyErr>(catalog)
     })
 }
@@ -278,12 +293,51 @@ pub struct PaimonCatalog {
     provider: Arc<PaimonCatalogProvider>,
 }
 
+fn catalog_identifier(identifier: &Bound<'_, PyAny>) -> PyResult<Identifier> {
+    let (database, object_name) = if let Ok(name) = identifier.extract::<String>() {
+        let (database, table) = name.split_once('.').ok_or_else(|| {
+            PyValueError::new_err(format!(
+                "expected identifier in 'db.table' format, got '{name}'"
+            ))
+        })?;
+        (database.to_string(), table.to_string())
+    } else {
+        identifier.extract::<(String, String)>()?
+    };
+    if database.is_empty() || object_name.is_empty() {
+        return Err(PyValueError::new_err(
+            "database and table names must not be empty",
+        ));
+    }
+    Ok(Identifier::new(&database, &object_name))
+}
+
+fn catalog_table_identifier(identifier: &Bound<'_, PyAny>) -> PyResult<Identifier> {
+    let identifier = catalog_identifier(identifier)?;
+    if identifier
+        .parsed_object_name()
+        .map_err(to_py_err)?
+        .system_table()
+        .is_some()
+    {
+        return Err(PyValueError::new_err(
+            "Catalog table operations do not support system-table identifiers",
+        ));
+    }
+    Ok(identifier)
+}
+
 #[pymethods]
 impl PaimonCatalog {
     /// Create a Paimon catalog that can be registered into a DataFusion session.
     #[new]
-    fn new(py: Python<'_>, catalog_options: HashMap<String, String>) -> PyResult<Self> {
-        let catalog = py.detach(|| build_paimon_catalog(catalog_options))?;
+    #[pyo3(signature = (catalog_options, *, config_required=true))]
+    fn new(
+        py: Python<'_>,
+        catalog_options: HashMap<String, String>,
+        config_required: bool,
+    ) -> PyResult<Self> {
+        let catalog = py.detach(|| build_paimon_catalog(catalog_options, config_required))?;
         let provider = Arc::new(
             PaimonCatalogProvider::new(
                 None,
@@ -334,29 +388,9 @@ impl PaimonCatalog {
     /// Get a table by "db.table" or a (database, table) tuple.
     /// Tuple components preserve dots; the table can include a branch suffix.
     fn get_table(&self, py: Python<'_>, identifier: &Bound<'_, PyAny>) -> PyResult<PyTable> {
-        let (database, object_name) = if let Ok(name) = identifier.extract::<String>() {
-            let (database, table) = name.split_once('.').ok_or_else(|| {
-                PyValueError::new_err(format!(
-                    "expected identifier in 'db.table' format, got '{name}'"
-                ))
-            })?;
-            (database.to_string(), table.to_string())
-        } else {
-            identifier.extract::<(String, String)>()?
-        };
-        if database.is_empty() || object_name.is_empty() {
-            return Err(PyValueError::new_err(
-                "database and table names must not be empty",
-            ));
-        }
-        let id = Identifier::new(&database, &object_name);
+        let id = catalog_table_identifier(identifier)?;
         let parsed = id.parsed_object_name().map_err(to_py_err)?;
-        if parsed.system_table().is_some() {
-            return Err(PyValueError::new_err(
-                "get_table() does not support system-table identifiers",
-            ));
-        }
-        let base_id = Identifier::new(&database, parsed.table());
+        let base_id = Identifier::new(id.database(), parsed.table());
         let branch = parsed.branch().map(str::to_string);
         let catalog = Arc::clone(&self.catalog);
         let table = py.detach(|| {
@@ -371,6 +405,163 @@ impl PaimonCatalog {
                 .map_err(to_py_err)
         })?;
         Ok(PyTable::new(Arc::new(table)))
+    }
+
+    /// Create an empty branch or one initialized from a tag through the REST catalog.
+    #[pyo3(signature = (identifier, branch_name, from_tag=None))]
+    fn create_branch(
+        &self,
+        py: Python<'_>,
+        identifier: &Bound<'_, PyAny>,
+        branch_name: &str,
+        from_tag: Option<&str>,
+    ) -> PyResult<()> {
+        let identifier = catalog_table_identifier(identifier)?;
+        py.detach(|| {
+            runtime().block_on(
+                self.catalog
+                    .create_branch(&identifier, branch_name, from_tag),
+            )
+        })
+        .map_err(to_catalog_py_err)
+    }
+
+    /// Delete branch metadata through the REST catalog.
+    fn drop_branch(
+        &self,
+        py: Python<'_>,
+        identifier: &Bound<'_, PyAny>,
+        branch_name: &str,
+    ) -> PyResult<()> {
+        let identifier = catalog_table_identifier(identifier)?;
+        py.detach(|| runtime().block_on(self.catalog.drop_branch(&identifier, branch_name)))
+            .map_err(to_catalog_py_err)
+    }
+
+    /// Fast-forward the identifier's current branch through the REST catalog.
+    fn fast_forward(
+        &self,
+        py: Python<'_>,
+        identifier: &Bound<'_, PyAny>,
+        branch_name: &str,
+    ) -> PyResult<()> {
+        let identifier = catalog_table_identifier(identifier)?;
+        py.detach(|| runtime().block_on(self.catalog.fast_forward(&identifier, branch_name)))
+            .map_err(to_catalog_py_err)
+    }
+
+    /// List branch names in REST server order.
+    fn list_branches(
+        &self,
+        py: Python<'_>,
+        identifier: &Bound<'_, PyAny>,
+    ) -> PyResult<Vec<String>> {
+        let identifier = catalog_table_identifier(identifier)?;
+        py.detach(|| runtime().block_on(self.catalog.list_branches(&identifier)))
+            .map_err(to_catalog_py_err)
+    }
+
+    /// Create a tag through core catalog handling, including optional retention.
+    #[pyo3(signature = (identifier, tag_name, snapshot_id=None, time_retained=None, ignore_if_exists=false))]
+    fn create_tag(
+        &self,
+        py: Python<'_>,
+        identifier: &Bound<'_, PyAny>,
+        tag_name: &str,
+        snapshot_id: Option<i64>,
+        time_retained: Option<&str>,
+        ignore_if_exists: bool,
+    ) -> PyResult<()> {
+        let identifier = catalog_identifier(identifier)?;
+        py.detach(|| {
+            runtime().block_on(self.catalog.create_tag_with_retention(
+                &identifier,
+                tag_name,
+                snapshot_id,
+                time_retained,
+                ignore_if_exists,
+            ))
+        })
+        .map_err(to_catalog_py_err)
+    }
+
+    fn get_tag(
+        &self,
+        py: Python<'_>,
+        identifier: &Bound<'_, PyAny>,
+        tag_name: &str,
+    ) -> PyResult<PyGetTagResponse> {
+        let identifier = catalog_identifier(identifier)?;
+        let inner = py
+            .detach(|| runtime().block_on(self.catalog.get_tag(&identifier, tag_name)))
+            .map_err(to_catalog_py_err)?;
+        Ok(PyGetTagResponse { inner })
+    }
+
+    #[pyo3(signature = (identifier, max_results=None, page_token=None, tag_name_prefix=None))]
+    fn list_tags_paged(
+        &self,
+        py: Python<'_>,
+        identifier: &Bound<'_, PyAny>,
+        max_results: Option<i32>,
+        page_token: Option<&str>,
+        tag_name_prefix: Option<&str>,
+    ) -> PyResult<(Vec<String>, Option<String>)> {
+        let identifier = catalog_identifier(identifier)?;
+        let page = py
+            .detach(|| {
+                runtime().block_on(self.catalog.list_tags_paged(
+                    &identifier,
+                    max_results,
+                    page_token,
+                    tag_name_prefix,
+                ))
+            })
+            .map_err(to_catalog_py_err)?;
+        Ok((page.elements, page.next_page_token))
+    }
+
+    fn delete_tag(
+        &self,
+        py: Python<'_>,
+        identifier: &Bound<'_, PyAny>,
+        tag_name: &str,
+    ) -> PyResult<()> {
+        let identifier = catalog_identifier(identifier)?;
+        py.detach(|| runtime().block_on(self.catalog.delete_tag(&identifier, tag_name, false)))
+            .map_err(to_catalog_py_err)
+    }
+
+    fn load_snapshot(
+        &self,
+        py: Python<'_>,
+        identifier: &Bound<'_, PyAny>,
+    ) -> PyResult<Option<PyTableSnapshot>> {
+        let identifier = catalog_identifier(identifier)?;
+        py.detach(|| runtime().block_on(self.catalog.load_snapshot(&identifier)))
+            .map(|snapshot| snapshot.map(|inner| PyTableSnapshot { inner }))
+            .map_err(to_catalog_py_err)
+    }
+
+    #[pyo3(signature = (identifier, instant, from_snapshot=None, *, table_uuid=None))]
+    fn rollback_to(
+        &self,
+        py: Python<'_>,
+        identifier: &Bound<'_, PyAny>,
+        instant: &PyInstant,
+        from_snapshot: Option<i64>,
+        table_uuid: Option<&str>,
+    ) -> PyResult<()> {
+        let identifier = catalog_identifier(identifier)?;
+        py.detach(|| {
+            runtime().block_on(self.catalog.rollback_to(
+                &identifier,
+                &instant.inner,
+                from_snapshot,
+                table_uuid,
+            ))
+        })
+        .map_err(to_catalog_py_err)
     }
 }
 
@@ -794,28 +985,50 @@ impl PySQLContext {
 
 pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     let this = PyModule::new(py, "datafusion")?;
+    this.add("CatalogError", py.get_type::<crate::error::CatalogError>())?;
     this.add_class::<PaimonCatalog>()?;
+    this.add_class::<PyInstant>()?;
+    this.add_class::<PyGetTagResponse>()?;
+    this.add_class::<PyTableSnapshot>()?;
     this.add_class::<crate::table::PyTable>()?;
+    this.add_class::<crate::system_table::PySystemRead>()?;
     this.add_class::<crate::index_build::PyGlobalIndexBuildBuilder>()?;
+    this.add_class::<crate::index_build::PyGlobalIndexBuildPlan>()?;
+    this.add_class::<crate::index_build::PyGlobalIndexBuildShard>()?;
+    this.add_class::<crate::index_build::PyGlobalIndexDropBuilder>()?;
     this.add_class::<crate::full_text_search::PyFullTextSearchBuilder>()?;
     this.add_class::<crate::full_text_search::PyFullTextScan>()?;
     this.add_class::<crate::full_text_search::PyFullTextScanPlan>()?;
     this.add_class::<crate::full_text_search::PyFullTextRead>()?;
-    this.add_class::<crate::full_text_search::PyFullTextSearchResult>()?;
     this.add_class::<crate::hybrid_search::PyHybridSearchBuilder>()?;
-    this.add_class::<crate::hybrid_search::PyHybridSearchResult>()?;
+    this.add_class::<crate::hybrid_search::PyHybridSearchRoute>()?;
+    this.add_class::<crate::hybrid_search::PyHybridSearchRouteBuilder>()?;
+    this.add_class::<crate::hybrid_search::PyHybridSearchRouteResult>()?;
+    this.add_class::<crate::hybrid_search::PyHybridSearchWeightedResult>()?;
+    this.add_class::<crate::hybrid_search::PyHybridSearchRanker>()?;
     this.add_class::<crate::vector_search::PyVectorSearchBuilder>()?;
+    this.add_class::<crate::vindex::PyVindexVectorGlobalIndexReader>()?;
     this.add_class::<crate::vector_search::PyBatchVectorSearchBuilder>()?;
     this.add_class::<crate::vector_search::PyVectorScan>()?;
     this.add_class::<crate::vector_search::PyVectorScanPlan>()?;
+    this.add_class::<crate::search_plan::PyIndexFileMeta>()?;
+    this.add_class::<crate::search_plan::PyIndexVectorSearchSplit>()?;
+    this.add_class::<crate::search_plan::PyRawVectorSearchSplit>()?;
+    this.add_class::<crate::search_plan::PyPrimaryKeyVectorSearchSplit>()?;
+    this.add_class::<crate::search_plan::PyIndexFullTextSearchSplit>()?;
+    this.add_class::<crate::search_plan::PyRawFullTextSearchSplit>()?;
+    this.add_class::<crate::search_plan::PyPrimaryKeyFullTextSearchSplit>()?;
     this.add_class::<crate::vector_search::PyVectorRead>()?;
     this.add_class::<crate::vector_search::PyBatchVectorRead>()?;
-    this.add_class::<crate::vector_search::PySearchResult>()?;
-    this.add_class::<crate::vector_search::PySearchResultReadBuilder>()?;
+    this.add_class::<crate::global_index_result::PyGlobalIndexResult>()?;
+    this.add_class::<crate::global_index_result::PyGlobalIndexResultReadBuilder>()?;
     this.add_class::<crate::read::PyReadBuilder>()?;
     this.add_class::<crate::read::PyTableScan>()?;
     this.add_class::<crate::read::PyStreamTableScan>()?;
     this.add_class::<crate::read::PyPlan>()?;
+    this.add_class::<crate::read::PyRowIdPlan>()?;
+    this.add_class::<crate::read::PyFileScanPlan>()?;
+    this.add_class::<crate::read::PyScanStats>()?;
     this.add_class::<crate::read::PyTableRead>()?;
     this.add_class::<crate::read::PyRecordBatchReader>()?;
     this.add_class::<crate::read::PySplit>()?;
@@ -826,10 +1039,18 @@ pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> 
     this.add_class::<PySQLContext>()?;
     this.add_class::<crate::write::PyBatchWriteBuilder>()?;
     this.add_class::<crate::write::PyPostponeFixedBucketWriteBuilder>()?;
+    this.add_class::<crate::write_routing::PyBucketRouter>()?;
+    this.add_class::<crate::write_routing::PyDynamicBucketAssignerRouter>()?;
+    this.add_class::<crate::write_routing::PyDynamicBucketAssigner>()?;
+    this.add_class::<crate::write_routing::PyPostponeBucketPlanner>()?;
     this.add_class::<crate::write::PyStreamWriteBuilder>()?;
     this.add_class::<crate::write::PyBatchTableWrite>()?;
     this.add_class::<crate::write::PyBatchTableUpdate>()?;
     this.add_class::<crate::write::PyTableUpdateByRowId>()?;
+    this.add_class::<crate::merge_execution::PyMergeBatchExecution>()?;
+    this.add_class::<crate::merge_types::PyMergeAssignment>()?;
+    this.add_class::<crate::merge_types::PyWhenMatched>()?;
+    this.add_class::<crate::merge_types::PyWhenNotMatched>()?;
     this.add_class::<crate::shard_update::PyShardTableUpdator>()?;
     this.add_class::<crate::write::PyStreamTableUpdate>()?;
     this.add_class::<crate::write::PyStreamTableWrite>()?;

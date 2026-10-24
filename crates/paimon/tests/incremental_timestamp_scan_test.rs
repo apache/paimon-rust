@@ -157,16 +157,36 @@ async fn timestamp_options_select_events_and_preserve_end_snapshot() {
                 assert_eq!(actual_snapshot, snapshot, "{mode}: ({start},{end}]");
                 assert_eq!(rows, expected, "{mode}: ({start},{end}]");
             }
-            let (plan, trace) = selected
+            let plan = selected.new_read_builder().new_scan().plan().await.unwrap();
+            let files = selected
                 .new_read_builder()
                 .new_scan()
-                .plan_with_trace()
+                .plan_files()
                 .await
                 .unwrap();
-            assert_eq!(trace.snapshot_id, snapshot);
-            assert_eq!(trace.final_splits, plan.splits().len());
+            assert_eq!(files.snapshot_id(), snapshot);
+            let mut actual_names = files
+                .files()
+                .iter()
+                .map(|entry| entry.file().file_name.clone())
+                .collect::<Vec<_>>();
+            let mut expected_names = plan
+                .splits()
+                .iter()
+                .flat_map(|split| split.data_files())
+                .map(|file| file.file_name.clone())
+                .collect::<Vec<_>>();
+            actual_names.sort();
+            expected_names.sort();
             assert_eq!(
-                trace.planned_data_file_bytes,
+                actual_names, expected_names,
+                "file events {mode}: ({start},{end}]"
+            );
+            let scan_stats = plan.stats().clone();
+            assert_eq!(plan.snapshot_id(), snapshot);
+            assert_eq!(scan_stats.final_splits, plan.splits().len());
+            assert_eq!(
+                scan_stats.planned_data_file_bytes,
                 plan.planned_data_file_bytes()
             );
         }
@@ -186,10 +206,28 @@ async fn timestamp_auto_uses_physical_changelog_and_preserves_retracts() {
     append(&table, 300, vec![3], vec![30]).await;
     let selected = window(&table, 100, 300);
     let builder = selected.new_read_builder();
-    let (plan, trace) = builder.new_scan().plan_with_trace().await.unwrap();
+    let plan = builder.new_scan().plan().await.unwrap();
+    let files = builder.new_scan().plan_files().await.unwrap();
+    assert_eq!(files.snapshot_id(), Some(3));
+    let actual_names = files
+        .files()
+        .iter()
+        .map(|entry| entry.file().file_name.as_str())
+        .collect::<Vec<_>>();
+    let expected_names = plan
+        .splits()
+        .iter()
+        .flat_map(|split| split.data_files())
+        .map(|file| file.file_name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        actual_names, expected_names,
+        "AUTO must select physical changelog files"
+    );
+    let scan_stats = plan.stats().clone();
     assert_eq!(plan.snapshot_id(), Some(3));
     assert!(plan.splits().iter().all(|split| split.snapshot_id() == 3));
-    assert!(trace.manifest_entries_read >= 2);
+    assert!(scan_stats.manifest_entries_read >= 2);
     let batches: Vec<RecordBatch> = builder
         .new_read()
         .unwrap()

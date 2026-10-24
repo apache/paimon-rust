@@ -90,6 +90,7 @@ impl GlobalIndexScanner {
         fields: &HashSet<i32>,
     ) -> Result<bool> {
         match predicate {
+            Predicate::NestedLeaf { .. } => Ok(false),
             Predicate::Leaf { column, .. } => Ok(self
                 .find_field_id_by_name(column)?
                 .is_some_and(|id| fields.contains(&id))),
@@ -814,6 +815,9 @@ impl GlobalIndexScanner {
         field_ids: &mut HashSet<i32>,
     ) -> Result<()> {
         match predicate {
+            Predicate::NestedLeaf { root, .. } => {
+                field_ids.insert(root.id());
+            }
             Predicate::Leaf { column, .. } => {
                 if let Some(field_id) = self.find_field_id_by_name(column)? {
                     field_ids.insert(field_id);

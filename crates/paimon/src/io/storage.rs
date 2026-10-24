@@ -27,6 +27,7 @@ use std::borrow::Borrow;
 use std::borrow::Cow;
 use std::collections::HashMap;
 #[cfg(any(
+    all(windows, feature = "storage-fs"),
     feature = "storage-azdls",
     feature = "storage-cos",
     feature = "storage-gcs",
@@ -46,6 +47,7 @@ use std::hash::Hash;
 ))]
 use std::sync::Mutex;
 #[cfg(any(
+    all(windows, feature = "storage-fs"),
     feature = "storage-azdls",
     feature = "storage-cos",
     feature = "storage-gcs",
@@ -102,7 +104,11 @@ pub enum Storage {
     #[cfg(feature = "storage-memory")]
     Memory { op: Operator },
     #[cfg(feature = "storage-fs")]
-    LocalFs { op: Operator },
+    LocalFs {
+        op: Operator,
+        #[cfg(windows)]
+        drive_operators: Mutex<HashMap<String, Operator>>,
+    },
     #[cfg(feature = "storage-oss")]
     Oss {
         config: Box<OssStorageConfig>,
@@ -165,6 +171,8 @@ impl Storage {
             #[cfg(feature = "storage-fs")]
             "file" | "fs" | "" => Ok(Self::LocalFs {
                 op: super::fs_config_build()?,
+                #[cfg(windows)]
+                drive_operators: Mutex::new(HashMap::new()),
             }),
             #[cfg(feature = "storage-oss")]
             "oss" => {
@@ -292,7 +300,25 @@ impl Storage {
                 Ok((op.clone(), Cow::Borrowed(Self::memory_relative_path(path)?)))
             }
             #[cfg(feature = "storage-fs")]
-            Storage::LocalFs { op } => Ok((op.clone(), Self::fs_relative_path(path)?)),
+            Storage::LocalFs {
+                op,
+                #[cfg(windows)]
+                drive_operators,
+            } => {
+                let relative = Self::fs_relative_path(path)?;
+                #[cfg(windows)]
+                if super::looks_like_windows_drive_path(&relative) {
+                    // Joining a drive-qualified path replaces OpenDAL's canonical
+                    // root, losing its Windows verbatim prefix. Keep the operator
+                    // rooted at the drive and pass only the path within that drive.
+                    let drive = relative[..2].to_ascii_uppercase();
+                    let op = Self::cached_operator(drive_operators, "filesystem", &drive, || {
+                        super::fs_config_build_with_root(&format!("{drive}/"))
+                    })?;
+                    return Ok((op, Cow::Owned(relative[3..].to_string())));
+                }
+                Ok((op.clone(), relative))
+            }
             #[cfg(feature = "storage-oss")]
             Storage::Oss { config, operators } => {
                 let (bucket, relative_path) =
@@ -447,17 +473,18 @@ impl Storage {
     /// On POSIX an absolute path `/tmp/wh` becomes `tmp/wh`: dropping the single
     /// leading separator lets opendal rebuild `/tmp/wh` from its `/` root.
     ///
-    /// A bare drop-the-first-char would corrupt a Windows path such as
-    /// `C:\dir` into `:\dir` (the drive letter is lost — the historical source
-    /// of the "invalid filename" failures on Windows). Instead we keep the
-    /// drive specifier and only normalize separators to `/`, mirroring how Java
-    /// Paimon's `Path` (modeled on Hadoop's) handles Windows paths. opendal then
-    /// does `PathBuf::from("/").join("C:/dir")`, and because the argument
-    /// carries a drive prefix `Path::join` replaces the base, yielding the real
-    /// `C:\dir` on Windows.
+    /// Windows drive paths retain their drive here. LocalFs resolves them
+    /// against a drive-scoped operator and removes the drive before IO.
     fn fs_relative_path(path: &str) -> crate::Result<Cow<'_, str>> {
         // A `file://` / `file:/` URL is already in scheme-relative form.
         if let Some(stripped) = path.strip_prefix("file:/") {
+            #[cfg(windows)]
+            {
+                let drive_path = stripped.trim_start_matches('/');
+                if super::looks_like_windows_drive_path(drive_path) {
+                    return Ok(Cow::Owned(drive_path.replace('\\', "/")));
+                }
+            }
             return Ok(if cfg!(windows) && stripped.contains('\\') {
                 Cow::Owned(stripped.replace('\\', "/"))
             } else {
@@ -514,6 +541,7 @@ impl Storage {
     }
 
     #[cfg(any(
+        all(windows, feature = "storage-fs"),
         feature = "storage-azdls",
         feature = "storage-cos",
         feature = "storage-gcs",
@@ -533,6 +561,7 @@ impl Storage {
     }
 
     #[cfg(any(
+        all(windows, feature = "storage-fs"),
         feature = "storage-azdls",
         feature = "storage-cos",
         feature = "storage-gcs",
@@ -754,9 +783,7 @@ mod fs_relative_path_tests {
 
     #[test]
     fn windows_drive_path_keeps_drive_and_normalizes_separators() {
-        // The historical bug dropped the drive letter (`C:\wh` -> `:\wh`); we
-        // must keep it and only switch `\` to `/` so opendal's
-        // `PathBuf::from("/").join(..)` rebuilds the real `C:\wh` on Windows.
+        // Keep the drive available to LocalFs when selecting its operator.
         assert_eq!(rel(r"C:\Users\wh"), "C:/Users/wh");
         assert_eq!(rel("C:/Users/wh"), "C:/Users/wh");
         assert_eq!(rel(r"D:\a\b\c"), "D:/a/b/c");

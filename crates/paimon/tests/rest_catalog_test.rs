@@ -3257,8 +3257,10 @@ async fn test_blob_masks_keep_predicates_and_projection_lazy() {
                 Some(serde_json::json!({"name": "FIELD_REF", "fieldRef": field})),
             ),
             (
-                "cast",
-                Some(serde_json::json!({"name": "CAST", "fieldRef": field, "type": "BLOB"})),
+                "field-ref-rebound",
+                Some(serde_json::json!({"name": "FIELD_REF", "fieldRef": {
+                    "index": 99, "name": "payload", "type": "BLOB NOT NULL",
+                }})),
             ),
         ] {
             let masks: Vec<_> = mask.into_iter().map(|mask| ("payload", mask)).collect();
@@ -3393,7 +3395,9 @@ async fn test_blob_mask_alias_keeps_the_source_reference_format() {
         let field = serde_json::json!({"index": 1, "name": "payload", "type": "BLOB"});
         for mask in [
             serde_json::json!({"name": "FIELD_REF", "fieldRef": field}),
-            serde_json::json!({"name": "CAST", "fieldRef": field, "type": "BLOB"}),
+            serde_json::json!({"name": "FIELD_REF", "fieldRef": {
+                "index": 99, "name": "payload", "type": "BLOB NOT NULL",
+            }}),
         ] {
             g.set_rules(&[int_leaf(0, "id", "GREATER_THAN", 0)], &[("alias", mask)]);
             let predicates = PredicateBuilder::new(g.table.schema().fields());
@@ -3804,6 +3808,109 @@ async fn test_query_auth_blob_view_predicate_limit_groups_lookups() {
     }
 }
 
+#[cfg(not(windows))]
+#[tokio::test]
+async fn test_query_auth_blob_view_limit_skips_rejected_split() {
+    let payload = b"admitted-payload".to_vec();
+    let source = written(
+        "rejected_split_source",
+        blob_schema,
+        vec![blob_batch(vec![1], vec!["Source"], vec![payload.clone()])],
+    )
+    .await;
+    let picture_id = source.table.schema().fields()[2].id();
+    let reference = |row_id| {
+        BlobViewStruct::new(source.identifier.clone(), picture_id, row_id)
+            .serialize()
+            .unwrap()
+    };
+    let target = written(
+        "rejected_split_target",
+        |options| {
+            blob_schema(
+                &[
+                    options,
+                    &[
+                        ("blob-view-field", "picture"),
+                        ("source.split.target-size", "1b"),
+                    ],
+                ]
+                .concat(),
+            )
+        },
+        vec![
+            blob_batch(vec![0], vec!["Rejected"], vec![reference(99)]),
+            blob_batch(vec![1], vec!["Admitted"], vec![reference(0)]),
+        ],
+    )
+    .await;
+    let server = &target.ctx.server;
+    server.add_table_with_schema(
+        "default",
+        "rejected_split_source",
+        blob_schema(&[]),
+        source.table.location(),
+    );
+    target.set_rules(&[int_leaf(0, "id", "GREATER_THAN", 0)], &[]);
+    let mut builder = target.table.new_read_builder();
+    builder.with_limit(1);
+    let plan = builder.new_scan().plan().await.unwrap();
+    assert_eq!(plan.splits().len(), 2);
+
+    // Probe only ids so locating the rejected split cannot resolve its bad view.
+    let mut projected = target.table.new_read_builder();
+    projected.with_projection(&["id"]).unwrap();
+    let probe = projected.new_read().unwrap();
+    let mut rejected = None;
+    let mut admitted = None;
+    for split in plan.splits() {
+        let batches = probe
+            .to_arrow(std::slice::from_ref(split))
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let returned = ids(&batches);
+        if returned.is_empty() {
+            rejected = Some(split.clone());
+        } else {
+            assert_eq!(returned, vec![1]);
+            admitted = Some(split.clone());
+        }
+    }
+    let splits = vec![rejected.unwrap(), admitted.unwrap()];
+
+    for (include_row_kind, ordered) in [(false, false), (true, true)] {
+        let label = format!("row_kind={include_row_kind}, ordered={ordered}");
+        let read = builder.new_read().unwrap().with_ordered(ordered);
+        let stream = if include_row_kind {
+            read.to_arrow_with_row_kind(&splits)
+        } else {
+            read.to_arrow(&splits)
+        }
+        .unwrap();
+        let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+        let payload_batches: Vec<_> = batches
+            .iter()
+            .map(|batch| {
+                if include_row_kind {
+                    let kinds = column::<StringArray>(batch, "rowkind");
+                    assert_eq!(kinds.null_count(), 0, "{label}");
+                    assert!(kinds.iter().all(|kind| kind == Some("+I")), "{label}");
+                    batch.project(&[1, 2, 3]).unwrap()
+                } else {
+                    batch.clone()
+                }
+            })
+            .collect();
+        assert_eq!(
+            collect_blob_rows(&payload_batches),
+            vec![(1, "Admitted".to_string(), Some(payload.clone()))],
+            "{label}"
+        );
+    }
+}
+
 fn schema_of(columns: &[&str], options: &[(&str, &str)]) -> Schema {
     let mut builder = Schema::builder();
     for name in columns {
@@ -3923,10 +4030,10 @@ fn upper(index: usize, column: &str) -> serde_json::Value {
 #[tokio::test]
 async fn test_query_auth_rules_this_client_cannot_parse_fail_closed_at_planning() {
     let g = guarded("unparseable", &["id"]).await;
-    let widened = serde_json::json!({
+    let unsupported_cast = serde_json::json!({
         "name": "CAST",
-        "fieldRef": {"index": 0, "name": "id", "type": "INT"},
-        "type": "BIGINT",
+        "fieldRef": {"index": 0, "name": "id", "type": "DOUBLE"},
+        "type": "BOOLEAN",
     });
     for response in [
         // Not a predicate, or nothing at all.
@@ -3941,8 +4048,20 @@ async fn test_query_auth_rules_this_client_cannot_parse_fail_closed_at_planning(
         // Columns the table does not have.
         rules(&[int_leaf(0, "missing", "EQUAL", 1)], &[]),
         rules(&[], &[("missing", serde_json::json!({"name": "NULL"}))]),
-        // A mask must keep its column's type.
-        rules(&[], &[("id", widened)]),
+        // An unsupported original executor is invalid even for an empty table.
+        rules(&[], &[("id", unsupported_cast)]),
+        // Java emits FIELD_REF for BLOB identity; an explicit CAST has no executor.
+        rules(
+            &[],
+            &[(
+                "id",
+                serde_json::json!({
+                    "name": "CAST",
+                    "fieldRef": {"index": 0, "name": "id", "type": "BLOB"},
+                    "type": "BLOB",
+                }),
+            )],
+        ),
     ] {
         g.ctx
             .server
@@ -3952,7 +4071,29 @@ async fn test_query_auth_rules_this_client_cannot_parse_fail_closed_at_planning(
 }
 
 #[tokio::test]
-async fn test_query_auth_refuses_a_stale_handle() {
+async fn test_query_auth_empty_table_defers_mask_output_class_checks() {
+    let g = guarded("empty_mask_output", &["id"]).await;
+    // Java checks the output object's class only for a non-NULL active row.
+    // INT -> BIGINT is a valid executor even when the target column is INT.
+    g.set_rules(
+        &[],
+        &[(
+            "id",
+            serde_json::json!({
+                "name": "CAST",
+                "fieldRef": {"index": 0, "name": "id", "type": "INT"},
+                "type": "BIGINT",
+            }),
+        )],
+    );
+    let builder = g.table.new_read_builder();
+    let plan = builder.new_scan().plan().await.unwrap();
+    assert!(plan.splits().is_empty());
+    assert!(read_all(&builder).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_query_auth_validates_a_long_lived_handle_against_current_rules() {
     let g = guarded("drifting", &["id"]).await;
     g.ctx.server.set_table_schema_id(
         "default",
@@ -3961,10 +4102,8 @@ async fn test_query_auth_refuses_a_stale_handle() {
         7,
     );
 
-    assert_drifted(
-        plan_err(&g.table, "a handle whose schema drifted must be refused").await,
-        "now resolves to schema",
-    );
+    g.table.new_read_builder().new_scan().plan().await.unwrap();
+    assert_eq!(g.ctx.server.auth_selects("default", "drifting"), [None]);
 }
 
 #[tokio::test]
@@ -4162,7 +4301,7 @@ async fn test_a_decorated_name_loads_and_only_query_auth_refuses_it() {
         .await
         .expect("an ordinary table's name is the server's business");
     // The view such a name addresses is not what the server rules on.
-    for name in ["guarded$branch_dev", "guarded$files"] {
+    for name in ["guarded$files"] {
         let table = ctx
             .catalog
             .get_table(&Identifier::new("default", name))
@@ -4246,7 +4385,7 @@ async fn written(
     let mut fs_options = Options::new();
     fs_options.set(
         CatalogOptions::WAREHOUSE,
-        format!("file://{}", tmp.path().display()),
+        tmp.path().to_string_lossy().replace('\\', "/"),
     );
     let fs_catalog = FileSystemCatalog::new(fs_options).unwrap();
     fs_catalog
@@ -4445,6 +4584,158 @@ async fn test_query_auth_refuses_a_mask_that_reads_another_masked_column() {
 
     g.set_rules(&[], &[("a", hidden), ("b", field_ref(1, "a"))]);
     assert_refused(plan_err(&g.table, "'b' would publish the raw value of 'a'").await);
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn test_query_auth_calendar_masks_read_hidden_operands_before_filter_and_limit() {
+    use arrow_array::{Date32Array, TimestampMillisecondArray};
+    use paimon::spec::{DateType, TimestampType};
+    for (primary_key, evolution) in [(false, false), (true, false), (false, true)] {
+        let schema = |options: &[(&str, &str)]| {
+            let mut builder = Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("n", DataType::Int(IntType::new()))
+                .column("d", DataType::Date(DateType::new()))
+                .column("ts", DataType::Timestamp(TimestampType::new(3).unwrap()));
+            if primary_key {
+                builder = builder.primary_key(["id"]).option("bucket", "1");
+            }
+            if evolution {
+                builder = builder
+                    .option("data-evolution.enabled", "true")
+                    .option("row-tracking.enabled", "true");
+            }
+            for (key, value) in options {
+                builder = builder.option(*key, *value);
+            }
+            builder.build().unwrap()
+        };
+        let source = RecordBatch::try_from_iter(vec![
+            (
+                "id",
+                Arc::new(Int32Array::from(vec![1, 2, 3])) as Arc<dyn Array>,
+            ),
+            ("n", Arc::new(Int32Array::from(vec![0, 0, 0]))),
+            (
+                "d",
+                Arc::new(Date32Array::from(vec![Some(20087), Some(-1), None])),
+            ),
+            (
+                "ts",
+                Arc::new(TimestampMillisecondArray::from(vec![
+                    Some(1735516800000),
+                    Some(-1),
+                    None,
+                ])),
+            ),
+        ])
+        .unwrap();
+        let g = written("calendar_mask", schema, vec![source]).await;
+        for (name, type_) in [("d", "DATE"), ("ts", "TIMESTAMP(3)")] {
+            g.set_rules(&[], &[("n", serde_json::json!({
+                "name": "YEAR_OF_WEEK", "fieldRef": {"name": name, "index": 99, "type": type_},
+            }))]);
+            let mut builder = g.table.new_read_builder();
+            builder.with_projection(&["n"]).unwrap();
+            let batches = read_all(&builder).await.unwrap();
+            let values: Vec<_> = batches
+                .iter()
+                .flat_map(|batch| column::<Int32Array>(batch, "n").iter())
+                .collect();
+            assert_eq!(values, vec![Some(2025), Some(1970), None]);
+            assert!(batches.iter().all(|batch| batch.num_columns() == 1));
+            // The raw zero in n must not prune away a matching masked value.
+            builder.with_filter(
+                PredicateBuilder::new(g.table.schema().fields())
+                    .equal("n", Datum::Int(1970))
+                    .unwrap(),
+            );
+            builder.with_projection(&["id"]).unwrap();
+            builder.with_limit(1);
+            assert_eq!(ids(&read_all(&builder).await.unwrap()), vec![2]);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn test_query_auth_transformed_filter_precedes_mask_user_filter_and_limit() {
+    use arrow_array::Date32Array;
+    use paimon::spec::DateType;
+    for (primary_key, evolution) in [(false, false), (true, false), (false, true)] {
+        let schema = |options: &[(&str, &str)]| {
+            let mut builder = Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("value", DataType::VarChar(VarCharType::string_type()))
+                .column("source", DataType::VarChar(VarCharType::string_type()))
+                .column("p", DataType::BigInt(BigIntType::new()))
+                .column("d", DataType::Date(DateType::new()));
+            if primary_key {
+                builder = builder.primary_key(["id"]).option("bucket", "1");
+            }
+            if evolution {
+                builder = builder
+                    .option("data-evolution.enabled", "true")
+                    .option("row-tracking.enabled", "true");
+            }
+            for (key, value) in options {
+                builder = builder.option(*key, *value);
+            }
+            builder.build().unwrap()
+        };
+        let source = RecordBatch::try_from_iter(vec![
+            (
+                "id",
+                Arc::new(Int32Array::from(vec![1, 2, 3, 4])) as Arc<dyn Array>,
+            ),
+            ("value", Arc::new(StringArray::from(vec!["raw"; 4]))),
+            (
+                "source",
+                Arc::new(StringArray::from(vec![
+                    Some("old"),
+                    Some("abc"),
+                    Some("xyz"),
+                    None,
+                ])),
+            ),
+            (
+                "p",
+                Arc::new(Int64Array::from(vec![i64::MAX, 1, i64::MAX, i64::MAX])),
+            ),
+            (
+                "d",
+                Arc::new(Date32Array::from(vec![
+                    Some(19782),
+                    Some(20087),
+                    Some(-1),
+                    None,
+                ])),
+            ),
+        ])
+        .unwrap();
+        let g = written("transformed_filter", schema, vec![source]).await;
+        let filter = serde_json::json!({"kind":"COMPOUND","function":"AND","children":[
+            {"kind":"LEAF","transform":{"name":"YEAR_OF_WEEK","fieldRef":{"name":"d","type":"DATE","index":99}},"function":"EQUAL","literals":[2025]},
+            {"kind":"LEAF","transform":{"name":"SUBSTRING","inputs":[{"name":"source","type":"STRING"},{"name":"p","type":"BIGINT"},1]},"function":"EQUAL","literals":["a"]}
+        ]});
+        g.set_rules(
+            &[filter],
+            &[(
+                "value",
+                serde_json::json!({"name":"CONCAT","inputs":["visible"]}),
+            )],
+        );
+        let mut builder = g.table.new_read_builder();
+        builder.with_projection(&["id"]).unwrap();
+        builder.with_filter(
+            PredicateBuilder::new(g.table.schema().fields())
+                .equal("value", Datum::String("visible".into()))
+                .unwrap(),
+        );
+        builder.with_limit(1);
+        assert_eq!(ids(&read_all(&builder).await.unwrap()), vec![2]);
+    }
 }
 
 #[cfg(not(windows))]
@@ -4673,10 +4964,53 @@ async fn test_query_auth_keeps_a_mask_source_in_another_partial_file() {
             .sum::<usize>(),
         1
     );
+    let write_plan = projected.new_scan().plan_all().await.unwrap();
+    assert_eq!(
+        write_plan
+            .splits()
+            .iter()
+            .map(|split| split.data_files().len())
+            .sum::<usize>(),
+        2
+    );
+
+    // A projected DE plan need not carry unrelated column slices. Restore
+    // against the projection's required files, while validating every supplied
+    // file against the full snapshot inventory.
+    let mut projected = g.table.new_read_builder();
+    projected.with_projection(&["visible"]).unwrap();
+    let projected_plan = projected.new_scan().plan().await.unwrap();
+    let transported = read_path_completion::transport(&projected_plan);
+    let reader = projected.new_read().unwrap();
+    let restored = reader.authorize_splits(&transported).await.unwrap();
+    let rows = reader
+        .to_arrow(&restored)
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    assert_eq!(rows.iter().map(|batch| batch.num_rows()).sum::<usize>(), 2);
+
     g.set_rules(
         &[],
         &[("visible", field_ref_mask(2, "source", "VARCHAR(255)"))],
     );
+    let mut protected = g.table.new_read_builder();
+    protected.with_projection(&["visible"]).unwrap();
+    let mut transported =
+        read_path_completion::transport(&protected.new_scan().plan().await.unwrap());
+    assert_eq!(transported.len(), 1);
+    let mut value = serde_json::to_value(&transported[0]).unwrap();
+    let files = value["data_files"].as_array_mut().unwrap();
+    files.retain(|file| file["_WRITE_COLS"] != serde_json::json!(["source"]));
+    transported[0] = serde_json::from_value(value).unwrap();
+    assert!(protected
+        .new_read()
+        .unwrap()
+        .authorize_splits(&transported)
+        .await
+        .is_err());
+
     for filtered in [false, true] {
         let mut builder = g.table.new_read_builder();
         builder.with_projection(&["visible"]).unwrap();
@@ -4859,31 +5193,21 @@ async fn test_query_auth_chunk_shuffle_with_partition_filters() {
                 .new_scan()
                 .with_chunk_shuffle(7, 2)
                 .expect("partition-only filters must allow chunk shuffle");
-            for traced in [false, true] {
-                let plan = if traced {
-                    scan.plan_with_trace().await.unwrap().0
-                } else {
-                    scan.plan().await.unwrap()
-                };
-                assert_eq!(plan.splits().len(), 2);
-                assert!(plan
-                    .splits()
-                    .iter()
-                    .all(|split| split.partition().get_string(0).unwrap() == "eng"));
-                let batches: Vec<RecordBatch> = read
-                    .new_read()
-                    .unwrap()
-                    .to_arrow(plan.splits())
-                    .unwrap()
-                    .try_collect()
-                    .await
-                    .unwrap();
-                assert_eq!(
-                    ids(&batches),
-                    expected,
-                    "evolution={evolution}, traced={traced}"
-                );
-            }
+            let plan = scan.plan().await.unwrap();
+            assert_eq!(plan.splits().len(), 2);
+            assert!(plan
+                .splits()
+                .iter()
+                .all(|split| split.partition().get_string(0).unwrap() == "eng"));
+            let batches: Vec<RecordBatch> = read
+                .new_read()
+                .unwrap()
+                .to_arrow(plan.splits())
+                .unwrap()
+                .try_collect()
+                .await
+                .unwrap();
+            assert_eq!(ids(&batches), expected, "evolution={evolution}");
         }
 
         let data = predicates.greater_than("id", Datum::Int(2)).unwrap();
@@ -4910,19 +5234,13 @@ async fn test_query_auth_chunk_shuffle_with_partition_filters() {
                 .unwrap(),
         );
         let scan = read.new_scan().with_chunk_shuffle(7, 2).unwrap();
-        for traced in [false, true] {
-            let result = if traced {
-                scan.plan_with_trace().await.map(|(plan, _)| plan)
-            } else {
-                scan.plan().await
-            };
-            let error = result.unwrap_err();
-            assert!(
-                matches!(error, paimon::Error::Unsupported { ref message }
-                if message.contains("unmasked partition predicates")),
-                "{error:?}"
-            );
-        }
+        let result = scan.plan().await;
+        let error = result.unwrap_err();
+        assert!(
+            matches!(error, paimon::Error::Unsupported { ref message }
+            if message.contains("unmasked partition predicates")),
+            "{error:?}"
+        );
     }
 }
 
@@ -5040,8 +5358,9 @@ async fn test_query_auth_filters_masked_partition_values() {
                     equals("region", "east"),
                 ]))
                 .with_limit(1);
-            let (plan, trace) = limited.new_scan().plan_with_trace().await.unwrap();
-            assert_eq!(trace.limit, None);
+            let plan = limited.new_scan().plan().await.unwrap();
+            let scan_stats = plan.stats().clone();
+            assert_eq!(scan_stats.limit, None);
             assert!(plan
                 .splits()
                 .iter()
@@ -5069,8 +5388,9 @@ async fn test_query_auth_filters_masked_partition_values() {
             .with_filter(equals("dept", "eng"));
         assert_eq!(ids(&read_all(&plain).await.unwrap()), vec![1, 3]);
         plain.with_limit(1);
-        let (plan, trace) = plain.new_scan().plan_with_trace().await.unwrap();
-        assert_eq!(trace.limit, Some(1));
+        let plan = plain.new_scan().plan().await.unwrap();
+        let scan_stats = plan.stats().clone();
+        assert_eq!(scan_stats.limit, Some(1));
         assert!(!plan.splits().is_empty());
         let rows = ids(&read_all(&plain).await.unwrap());
         assert_eq!(rows.len(), 1);
@@ -5529,3 +5849,125 @@ async fn test_branch_write_copy_rejects_replaced_source_identity_or_location() {
         "{error}"
     );
 }
+
+/// Explicit selectors are scan-only and must not turn into masked row filters.
+#[cfg(not(windows))]
+#[tokio::test]
+async fn test_query_auth_explicit_partition_selector() {
+    for data_evolution in [false, true] {
+        let schema = |options: &[(&str, &str)]| {
+            let mut builder = Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("dept", DataType::VarChar(VarCharType::new(255).unwrap()))
+                .column("region", DataType::VarChar(VarCharType::new(255).unwrap()))
+                .partition_keys(["region", "dept"]);
+            if data_evolution {
+                builder = builder
+                    .option("data-evolution.enabled", "true")
+                    .option("row-tracking.enabled", "true");
+            }
+            for (key, value) in options {
+                builder = builder.option(*key, *value);
+            }
+            builder.build().unwrap()
+        };
+        let batch = RecordBatch::try_from_iter([
+            (
+                "id",
+                Arc::new(Int32Array::from(vec![1, 2, 3, 4])) as arrow_array::ArrayRef,
+            ),
+            (
+                "dept",
+                Arc::new(StringArray::from(vec!["eng", "ops", "eng", "ops"]))
+                    as arrow_array::ArrayRef,
+            ),
+            (
+                "region",
+                Arc::new(StringArray::from(vec!["east", "east", "west", "west"]))
+                    as arrow_array::ArrayRef,
+            ),
+        ])
+        .unwrap();
+        let g = written("explicit_parts", schema, vec![batch]).await;
+        let predicates = PredicateBuilder::new(g.table.schema().fields());
+        let equal = |field: &str, value: &str| {
+            predicates
+                .equal(field, Datum::String(value.into()))
+                .unwrap()
+        };
+        g.set_rules(&[], &[("dept", upper(1, "dept"))]);
+        let mut read = g.table.new_read_builder();
+        read.with_projection(&["id"])
+            .unwrap()
+            .with_filter(equal("dept", "ENG"))
+            .with_partition_filter(Some(equal("region", "east")))
+            .unwrap()
+            .with_limit(1);
+        let plan = read.new_scan().plan().await.unwrap();
+        assert_eq!(plan.splits().len(), 2);
+        assert_eq!(ids(&read_all(&read).await.unwrap()), [1]);
+        let selected = g.ctx.server.auth_selects("default", "explicit_parts");
+        assert!(selected.iter().all(|select| {
+            let mut fields = select.clone().unwrap();
+            fields.sort();
+            fields == ["dept", "id", "region"]
+        }));
+
+        // A mask on another partition key must not reject an unmasked selector.
+        let mut selector_only = g.table.new_read_builder();
+        selector_only
+            .with_projection(&["id"])
+            .unwrap()
+            .with_partition_filter(Some(equal("region", "west")))
+            .unwrap();
+        assert_eq!(ids(&read_all(&selector_only).await.unwrap()), [3, 4]);
+
+        // A selector on a masked key is unsafe even with an empty result/LIMIT 0.
+        for limit in [0, 1] {
+            let mut masked = g.table.new_read_builder();
+            masked
+                .with_projection(&["id"])
+                .unwrap()
+                .with_limit(limit)
+                .with_partition_filter(Some(equal("dept", "missing")))
+                .unwrap();
+            let error = masked.new_scan().plan().await.unwrap_err();
+            assert!(
+                error.to_string().contains("partition key 'dept' is masked"),
+                "{error}"
+            );
+        }
+        // Validate names before equality predicates become opaque partition sets.
+        let forged = Predicate::Leaf {
+            column: "id".into(),
+            index: 1,
+            data_type: g.table.schema().fields()[1].data_type().clone(),
+            op: PredicateOperator::Eq,
+            literals: vec![Datum::String("eng".into())],
+        };
+        assert_disagreeing_leaf(
+            g.table
+                .new_read_builder()
+                .with_partition_filter(Some(forged))
+                .unwrap_err(),
+        );
+
+        // An explicit scan-only operand must be included in column authorization.
+        g.set_rules(&[], &[]);
+        g.ctx
+            .server
+            .set_column_auth("default", "explicit_parts", vec!["id".into()]);
+        assert_forbidden(selector_only.new_scan().plan().await.unwrap_err());
+    }
+}
+
+#[cfg(not(windows))]
+#[path = "rest_catalog/authorized_snapshot_scans.rs"]
+mod authorized_snapshot_scans;
+
+#[cfg(not(windows))]
+#[path = "rest_catalog/merge_sources.rs"]
+mod merge_sources;
+
+#[path = "rest_catalog/read_path_completion.rs"]
+mod read_path_completion;

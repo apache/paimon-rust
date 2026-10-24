@@ -462,25 +462,31 @@ async fn branch_write_missing_schema_never_creates_a_branch() {
 }
 
 #[tokio::test]
-async fn branch_write_historical_handles_remain_read_only() {
+async fn branch_write_historical_handles_retain_their_read_view() {
     let (_dir, main) = table(false, &[]).await;
     append(&main, "seed", batch(vec![1], vec![10])).await;
     let branch = tagged_branch(&main).await;
     let snapshot = latest(&branch).await;
     let mut historical = branch.copy_with_pinned_snapshot(Some(&snapshot));
-    // The pinned snapshot remains read-only even with no selector in its options.
+    // A captured view is independent of the writer's publication state, even
+    // when the corresponding selector is absent from its options.
     historical.schema = historical
         .schema
         .copy_with_replaced_options(branch.schema().options().clone());
-    assert!(historical.new_write_builder().new_write().is_err());
-    assert!(historical.new_write_builder().try_new_commit().is_err());
-    assert!(historical
-        .new_write_builder()
-        .new_commit()
-        .commit(vec![])
-        .await
-        .is_err());
-    assert_eq!(latest(&branch).await, snapshot);
+    append(&historical, "historical", batch(vec![2], vec![20])).await;
+    assert_eq!(latest(&branch).await.id(), snapshot.id() + 1);
+    assert_eq!(
+        table_write::tests::read_id_value_rows(&historical).await,
+        vec![(1, 10)]
+    );
+    assert_eq!(
+        table_write::tests::read_id_value_rows(&branch).await,
+        vec![(1, 10), (2, 20)]
+    );
+    assert_eq!(
+        table_write::tests::read_id_value_rows(&main).await,
+        vec![(1, 10)]
+    );
 }
 
 #[tokio::test]
@@ -561,6 +567,123 @@ async fn branch_write_schema_id_is_resolved_in_its_own_namespace() {
         table_write::tests::read_id_value_rows(&branch).await,
         vec![(1, 10), (3, 30), (4, 40)]
     );
+}
+
+#[tokio::test]
+async fn rest_branch_copy_retains_bound_file_io_and_loads_branch_identity() {
+    use axum::{extract::Path, routing::get, Json, Router};
+
+    let mount = tempfile::tempdir().unwrap();
+    let location = "oss://bucket/warehouse/db/t";
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .option("query-auth.enabled", "true")
+        .build()
+        .unwrap();
+    let response = move |name: &str| {
+        serde_json::json!({
+            "database": "db", "name": name, "id": format!("uuid-{name}"),
+            "path": location, "isExternal": false,
+            "schemaId": if name == "t" { 0 } else { 1 }, "schema": schema
+        })
+    };
+    let original = response("t");
+    let app = Router::new().route(
+        "/v1/databases/:db/tables/:table",
+        get(move |Path((_db, name)): Path<(String, String)>| {
+            let body = response(&name);
+            async move { Json(body) }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let mut options = crate::Options::new();
+    for (key, value) in [
+        ("uri", format!("http://{address}")),
+        ("warehouse", "test".into()),
+        ("token.provider", "bear".into()),
+        ("token", "test-token".into()),
+        ("fuse.enabled", "true".into()),
+        ("fuse.mode", "pvfs".into()),
+        ("fuse.root", mount.path().to_string_lossy().into_owned()),
+        ("fuse.validation-mode", "none".into()),
+    ] {
+        options.set(key, value);
+    }
+    let main = Table::from_rest_response(
+        Identifier::new("db", "t"),
+        serde_json::from_value(original).unwrap(),
+        options,
+    )
+    .await
+    .unwrap();
+    let branch_schema = TableSchema::new(
+        1,
+        &Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .option("query-auth.enabled", "true")
+            .build()
+            .unwrap(),
+    );
+    let schema_path = format!("{location}/branch/branch-dev/schema/schema-1");
+    main.file_io()
+        .new_output(&schema_path)
+        .unwrap()
+        .write(bytes::Bytes::from(
+            serde_json::to_vec(&branch_schema).unwrap(),
+        ))
+        .await
+        .unwrap();
+    // The Python binding's existing Table.copy delegates to this core API.
+    let copied = main
+        .copy_with_time_travel_strict(HashMap::from([
+            ("branch".into(), "dev".into()),
+            ("read.batch-size".into(), "17".into()),
+        ]))
+        .await
+        .unwrap();
+    assert_eq!(copied.branch(), "dev");
+    assert_eq!(copied.schema().id(), 1);
+    assert_eq!(
+        copied.rest_env().unwrap().identifier().object(),
+        "t$branch_dev"
+    );
+    assert_eq!(copied.rest_env().unwrap().uuid(), "uuid-t$branch_dev");
+    assert!(copied.query_auth_session.is_some());
+    assert_ne!(copied.query_auth_session, main.query_auth_session);
+    assert_eq!(copied.schema().options()["read.batch-size"], "17");
+    assert_eq!(
+        copied.schema_manager().schema(1).await.unwrap().as_ref(),
+        &branch_schema
+    );
+    assert!(!mount
+        .path()
+        .join("db/t$branch_dev/branch/branch-dev/schema/schema-1")
+        .exists());
+    let main_schema_path = format!("{location}/schema/schema-0");
+    main.file_io()
+        .new_output(&main_schema_path)
+        .unwrap()
+        .write(bytes::Bytes::from(
+            serde_json::to_vec(main.schema()).unwrap(),
+        ))
+        .await
+        .unwrap();
+    let restored = copied
+        .copy_with_time_travel_strict(HashMap::from([("branch".into(), "main".into())]))
+        .await
+        .unwrap();
+    assert_eq!(restored.branch(), "main");
+    assert_eq!(restored.schema().id(), 0);
+    assert_eq!(restored.schema().options()["read.batch-size"], "17");
+    assert_eq!(restored.rest_env().unwrap().uuid(), "uuid-t");
+    assert_ne!(restored.query_auth_session, copied.query_auth_session);
+    assert_eq!(
+        restored.schema_manager().schema(0).await.unwrap().as_ref(),
+        main.schema()
+    );
+    server.abort();
 }
 
 #[tokio::test]
@@ -663,7 +786,7 @@ async fn fixed_bucket_write(table: &Table, value: i32, buckets: i32, overwrite: 
         Arc::new(Int32Array::from(vec![buckets])) as arrow_array::ArrayRef,
     )])
     .unwrap();
-    let plan = PostponeBucketPlan::from_arrow(table, &plan_batch).unwrap();
+    let plan = PostponeBucketPlan::from_arrow(table.schema(), &plan_batch).unwrap();
     let builder = table
         .new_postpone_fixed_bucket_write_builder()
         .unwrap()

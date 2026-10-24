@@ -629,7 +629,8 @@ async fn test_partitions_system_table_shows_unreported_statistics_as_null() {
     sql_context
         .sql(
             "CREATE TABLE paimon.default.unknown_stats_orders \
-             (id INT, name STRING) PARTITIONED BY (id)",
+             (id INT, name STRING) PARTITIONED BY (id) \
+             WITH ('bucket' = '4', 'bucket-key' = 'name')",
         )
         .await
         .unwrap()
@@ -658,6 +659,15 @@ async fn test_partitions_system_table_shows_unreported_statistics_as_null() {
             "column {column} should carry a measurement before the switch"
         );
     }
+    assert_eq!(
+        measured
+            .column(3)
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::Int32Array>()
+            .unwrap()
+            .value(0),
+        4
+    );
 
     catalog.set_unknown_statistics(true);
 
@@ -2850,6 +2860,165 @@ async fn test_show_create_table_round_trip_with_quoted_identifiers_and_options()
         .await
         .expect("recreated table exists");
     assert_schema_equivalent(&original_schema, recreated.schema());
+}
+
+/// The `table_name` and `definition` (`None` for NULL) of a one-row `SHOW CREATE TABLE` result.
+async fn show_create_row(sql_context: &SQLContext, table_ref: &str) -> (String, Option<String>) {
+    let batches = sql_context
+        .sql(&format!("SHOW CREATE TABLE {table_ref}"))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let rows: Vec<_> = batches.iter().filter(|b| b.num_rows() > 0).collect();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].num_rows(), 1);
+    let column = |name| {
+        rows[0]
+            .column_by_name(name)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::StringArray>()
+            .unwrap()
+    };
+    let definition = column("definition");
+    (
+        column("table_name").value(0).to_string(),
+        definition
+            .is_valid(0)
+            .then(|| definition.value(0).to_string()),
+    )
+}
+
+#[tokio::test]
+async fn test_show_create_table_prefers_temporary_objects() {
+    let (_tmp, catalog) = create_test_env();
+    let sql_context = create_sql_context(catalog).await;
+    sql_context
+        .sql("CREATE SCHEMA paimon.test_db")
+        .await
+        .unwrap();
+    for table in ["t", "u"] {
+        sql_context
+            .sql(&format!("CREATE TABLE paimon.test_db.{table} (id INT)"))
+            .await
+            .unwrap();
+    }
+    let definition = collect_definition(&sql_context, "paimon.test_db.t").await;
+    assert!(
+        definition.contains("CREATE TABLE \"test_db\".\"t\""),
+        "{definition}"
+    );
+
+    sql_context
+        .sql("CREATE TEMPORARY VIEW paimon.test_db.t AS SELECT 1 AS id")
+        .await
+        .unwrap();
+    sql_context
+        .sql("CREATE TEMPORARY TABLE paimon.test_db.u (id INT)")
+        .await
+        .unwrap();
+    assert_eq!(
+        show_create_row(&sql_context, "paimon.test_db.t").await,
+        ("t".to_string(), Some("SELECT 1 AS id".to_string()))
+    );
+    assert_eq!(
+        show_create_row(&sql_context, "paimon.test_db.u").await,
+        ("u".to_string(), None)
+    );
+}
+
+#[tokio::test]
+async fn test_show_create_table_names_temporary_objects_like_queries() {
+    let (_tmp, catalog) = create_test_env();
+    let sql_context = create_sql_context(catalog).await;
+    sql_context
+        .sql("CREATE SCHEMA paimon.test_db")
+        .await
+        .unwrap();
+    let schema = Arc::new(datafusion::arrow::datatypes::Schema::empty());
+    sql_context
+        .register_temp_table(
+            "paimon.test_db.\"Foo\"",
+            Arc::new(MemTable::try_new(schema, vec![vec![]]).unwrap()),
+        )
+        .unwrap();
+    sql_context
+        .sql("CREATE TEMPORARY VIEW paimon.test_db.foo AS SELECT 1 AS id")
+        .await
+        .unwrap();
+
+    assert_eq!(
+        show_create_row(&sql_context, "paimon.test_db.Foo").await,
+        ("foo".to_string(), Some("SELECT 1 AS id".to_string()))
+    );
+    assert_eq!(
+        show_create_row(&sql_context, "paimon.test_db.\"Foo\"").await,
+        ("Foo".to_string(), None)
+    );
+}
+
+#[tokio::test]
+async fn test_show_create_temporary_object_ignores_unrelated_tables() {
+    let (tmp, catalog) = create_test_env();
+    let sql_context = create_sql_context(catalog).await;
+    sql_context
+        .sql("CREATE SCHEMA paimon.test_db")
+        .await
+        .unwrap();
+    sql_context
+        .sql("CREATE TABLE paimon.test_db.broken (id INT)")
+        .await
+        .unwrap();
+    std::fs::write(
+        tmp.path().join("test_db.db/broken/schema/schema-0"),
+        "not a schema",
+    )
+    .unwrap();
+    sql_context
+        .sql("SELECT * FROM information_schema.views")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .expect_err("a catalog scan should load the broken table");
+
+    sql_context
+        .sql("CREATE TEMPORARY VIEW paimon.test_db.v AS SELECT 1 AS id")
+        .await
+        .unwrap();
+    assert_eq!(
+        show_create_row(&sql_context, "paimon.test_db.v").await,
+        ("v".to_string(), Some("SELECT 1 AS id".to_string()))
+    );
+}
+
+#[tokio::test]
+async fn test_show_create_table_resolves_information_schema_like_queries() {
+    let (_tmp, catalog) = create_test_env();
+    let sql_context = create_sql_context(catalog).await;
+    sql_context
+        .sql("CREATE TEMPORARY VIEW paimon.information_schema.tables AS SELECT 1 AS id")
+        .await
+        .unwrap();
+
+    let df = sql_context
+        .sql("SELECT * FROM paimon.information_schema.tables")
+        .await
+        .unwrap();
+    assert!(df.schema().has_column_with_unqualified_name("table_name"));
+    let batches = sql_context
+        .sql("SHOW CREATE TABLE paimon.information_schema.tables")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let shown = datafusion::arrow::util::pretty::pretty_format_batches(&batches)
+        .unwrap()
+        .to_string();
+    assert!(!shown.contains("SELECT 1 AS id"), "{shown}");
 }
 
 #[tokio::test]

@@ -62,8 +62,16 @@ pub struct Snapshot {
     schema_id: i64,
     /// a manifest list recording all changes from the previous snapshots
     base_manifest_list: String,
+    /// byte size of the base manifest list, absent in older snapshots
+    #[builder(default = None)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    base_manifest_list_size: Option<i64>,
     /// a manifest list recording all new changes occurred in this snapshot
     delta_manifest_list: String,
+    /// byte size of the delta manifest list, absent in older snapshots
+    #[builder(default = None)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    delta_manifest_list_size: Option<i64>,
     /// a manifest list recording all changelog produced in this snapshot
     #[builder(default = None)]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -119,11 +127,24 @@ pub struct Snapshot {
     #[builder(default = None)]
     #[serde(skip_serializing_if = "Option::is_none")]
     next_row_id: Option<i64>,
+    /// Engine version that produced this snapshot, absent in older metadata.
+    #[builder(default = None)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    writer_version: Option<String>,
 }
 
 impl Snapshot {
     pub fn uuid(&self) -> Option<&str> {
         self.uuid.as_deref()
+    }
+
+    /// Compare a captured read view with authoritative snapshot metadata.
+    /// Log offsets are not used by file reads and are absent from the Python
+    /// snapshot transport; all file references and other metadata must match.
+    pub(crate) fn has_same_read_metadata(&self, other: &Self) -> bool {
+        let mut comparable = self.clone();
+        comparable.log_offsets.clone_from(&other.log_offsets);
+        comparable == *other
     }
 
     /// Get the version of this snapshot.
@@ -150,10 +171,18 @@ impl Snapshot {
         &self.base_manifest_list
     }
 
+    pub fn base_manifest_list_size(&self) -> Option<i64> {
+        self.base_manifest_list_size
+    }
+
     /// Get the delta manifest list of this snapshot.
     #[inline]
     pub fn delta_manifest_list(&self) -> &str {
         &self.delta_manifest_list
+    }
+
+    pub fn delta_manifest_list_size(&self) -> Option<i64> {
+        self.delta_manifest_list_size
     }
 
     /// Get the changelog manifest list of this snapshot.
@@ -240,6 +269,11 @@ impl Snapshot {
         self.next_row_id
     }
 
+    /// Get the writer version, when recorded by the producer.
+    pub fn writer_version(&self) -> Option<&str> {
+        self.writer_version.as_deref()
+    }
+
     /// Get the commit kind of this snapshot.
     #[inline]
     pub fn commit_kind(&self) -> &CommitKind {
@@ -253,6 +287,16 @@ mod tests {
     use pretty_assertions::assert_eq;
     use serde_json;
     use std::env::current_dir;
+
+    #[test]
+    fn captured_read_metadata_ignores_log_offsets_but_not_file_references() {
+        let original: Snapshot = serde_json::from_str(&load_fixture("snapshot-v3")).unwrap();
+        let mut transported = original.clone();
+        transported.log_offsets = Some(HashMap::from([(0, 42)]));
+        assert!(transported.has_same_read_metadata(&original));
+        transported.delta_manifest_list.push_str("-different");
+        assert!(!transported.has_same_read_metadata(&original));
+    }
 
     fn load_fixture(name: &str) -> String {
         let path = current_dir()

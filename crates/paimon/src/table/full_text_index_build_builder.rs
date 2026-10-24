@@ -421,31 +421,7 @@ impl<'a> TextColumn<'a> {
 }
 
 fn validate_table_options(table: &Table, core_options: &CoreOptions) -> Result<()> {
-    if !table.schema().primary_keys().is_empty() {
-        return Err(Error::Unsupported {
-            message: "Full-text index build does not support primary-key tables; \
-                      use 'pk-full-text.index.columns' instead"
-                .to_string(),
-        });
-    }
-    if !core_options.row_tracking_enabled() {
-        return Err(Error::DataInvalid {
-            message: "Full-text index build requires 'row-tracking.enabled' = 'true'".to_string(),
-            source: None,
-        });
-    }
-    if !core_options.data_evolution_enabled() {
-        return Err(Error::DataInvalid {
-            message: "Full-text index build requires 'data-evolution.enabled' = 'true'".to_string(),
-            source: None,
-        });
-    }
-    if !core_options.global_index_enabled() {
-        return Err(Error::DataInvalid {
-            message: "Full-text index build requires 'global-index.enabled' = 'true'".to_string(),
-            source: None,
-        });
-    }
+    super::global_index_build_common::validate_build_table(table)?;
     if core_options.deletion_vectors_enabled() {
         return Err(Error::Unsupported {
             message:

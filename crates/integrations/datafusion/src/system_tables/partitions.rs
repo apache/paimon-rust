@@ -22,7 +22,8 @@ use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use datafusion::arrow::array::{
-    BooleanArray, Int32Array, Int64Array, RecordBatch, StringArray, TimestampMillisecondArray,
+    ArrayRef, BooleanArray, Int32Array, Int64Array, RecordBatch, StringArray,
+    TimestampMillisecondArray,
 };
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use datafusion::catalog::Session;
@@ -32,7 +33,7 @@ use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::logical_expr::Expr;
 use datafusion::physical_plan::ExecutionPlan;
 use paimon::catalog::{list_partitions_from_file_system, Catalog, Identifier};
-use paimon::spec::{CoreOptions, Partition};
+use paimon::spec::{CoreOptions, LocalZonedTimestampType, Partition, TimestampType};
 use paimon::table::Table;
 
 use crate::error::to_datafusion_error;
@@ -216,8 +217,8 @@ impl TableProvider for PartitionsTable {
                 Arc::new(Int64Array::from(record_counts)),
                 Arc::new(Int64Array::from(file_sizes)),
                 Arc::new(Int64Array::from(file_counts)),
-                Arc::new(TimestampMillisecondArray::from(last_update_times)),
-                Arc::new(TimestampMillisecondArray::from(created_ats)),
+                local_timestamp_column(last_update_times)?,
+                local_timestamp_column(created_ats)?,
                 Arc::new(StringArray::from(created_bys)),
                 Arc::new(StringArray::from(updated_bys)),
                 Arc::new(StringArray::from(options_jsons)),
@@ -232,6 +233,19 @@ impl TableProvider for PartitionsTable {
             projection.cloned(),
         )?)
     }
+}
+
+fn local_timestamp_column(values: Vec<Option<i64>>) -> DFResult<ArrayRef> {
+    // Partition metadata stores epoch instants. Java PartitionsTable.toTimestamp
+    // converts these to the system-local wall clock for its TIMESTAMP columns.
+    let source = paimon::spec::DataType::LocalZonedTimestamp(
+        LocalZonedTimestampType::new(3).map_err(to_datafusion_error)?,
+    );
+    let target =
+        paimon::spec::DataType::Timestamp(TimestampType::new(3).map_err(to_datafusion_error)?);
+    let values: ArrayRef = Arc::new(TimestampMillisecondArray::from(values));
+    paimon::arrow::cast_array_for_schema_evolution(&values, &source, &target)
+        .map_err(to_datafusion_error)
 }
 
 /// Format `spec` as `key1=val1/key2=val2` in `partition_keys` order. Empty

@@ -16,6 +16,7 @@
 // under the License.
 
 use super::postpone_bucket_plan::data_invalid;
+use super::postpone_bucket_planner::BufferedPostponeBucketPlanner;
 use super::postpone_fixed_bucket_router::{
     validate_postpone_fixed_bucket_table, PostponeFixedBucketRouter,
 };
@@ -34,27 +35,55 @@ pub struct PostponeFixedBucketTableWrite {
     overwrite: bool,
     check_from_snapshot: Option<i64>,
     prepare_started: bool,
+    planner: Option<BufferedPostponeBucketPlanner>,
 }
 
 impl PostponeFixedBucketTableWrite {
+    /// Configure the Blob consumer before accepting input, including input
+    /// buffered for automatic bucket planning. Primary-key writers do not call
+    /// this consumer, just as for ordinary TableWrite.
+    pub fn with_blob_consumer(
+        &mut self,
+        consumer: Option<std::sync::Arc<dyn crate::spec::BlobConsumer>>,
+    ) -> Result<&mut Self> {
+        self.ensure_configurable("with_blob_consumer")?;
+        self.inner.with_blob_consumer(consumer)?;
+        Ok(self)
+    }
+
     pub fn with_blob_uri_reader_factory(
         &mut self,
         factory: Option<std::sync::Arc<dyn crate::io::UriReaderFactory>>,
     ) -> Result<&mut Self> {
-        self.ensure_writable()?;
+        self.ensure_configurable("with_blob_uri_reader_factory")?;
         self.inner.with_blob_uri_reader_factory(factory)?;
         Ok(self)
+    }
+
+    fn ensure_configurable(&self, method: &str) -> Result<()> {
+        self.ensure_writable()?;
+        if self.check_from_snapshot.is_some() {
+            return Err(data_invalid(format!(
+                "{method} must be called before any write operation"
+            )));
+        }
+        Ok(())
     }
 
     pub(crate) fn new(
         table: &Table,
         commit_user: String,
-        plan: PostponeBucketPlan,
+        plan: Option<PostponeBucketPlan>,
         load_existing_buckets: bool,
         overwrite: bool,
         resources: Option<ResourceContext>,
     ) -> Result<Self> {
         validate_postpone_fixed_bucket_table(table)?;
+        let planner = if plan.is_none() {
+            Some(BufferedPostponeBucketPlanner::new(table)?)
+        } else {
+            None
+        };
         let mut inner = TableWrite::new(table, commit_user)?;
         if let Some(resources) = resources {
             inner = inner.with_resources(resources);
@@ -69,10 +98,11 @@ impl PostponeFixedBucketTableWrite {
             } else {
                 inner
             },
-            router: PostponeFixedBucketRouter::new(table, plan)?,
+            router: PostponeFixedBucketRouter::new(table, plan.unwrap_or_default())?,
             overwrite,
             check_from_snapshot: None,
             prepare_started: false,
+            planner,
         })
     }
 
@@ -94,13 +124,28 @@ impl PostponeFixedBucketTableWrite {
         if self.check_from_snapshot.is_none() {
             let snapshot_id = self.inner.pin_sequence_snapshot().await?;
             if self.load_existing_buckets {
-                self.router
-                    .load_existing_buckets(&self.table, snapshot_id)
-                    .await?;
+                if let Some(planner) = &mut self.planner {
+                    planner.load_metadata(&self.table, snapshot_id).await?;
+                    self.router.set_plan(planner.known_plan());
+                } else {
+                    self.router
+                        .load_existing_buckets(&self.table, snapshot_id)
+                        .await?;
+                }
             }
             self.check_from_snapshot = Some(snapshot_id);
         }
-        for routed in self.router.route(&batch)? {
+        if let Some(planner) = &mut self.planner {
+            if let Some(known) = planner.add(batch)? {
+                return self.write_routed_batch(&known).await;
+            }
+            return Ok(());
+        }
+        self.write_routed_batch(&batch).await
+    }
+
+    async fn write_routed_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+        for routed in self.router.route(batch)? {
             self.inner
                 .write_partition_bucket_batch(routed.partition, routed.bucket, routed.batch)
                 .await?;
@@ -118,6 +163,22 @@ impl PostponeFixedBucketTableWrite {
     pub async fn prepare_commit(&mut self) -> Result<Vec<CommitMessage>> {
         self.ensure_writable()?;
         self.prepare_started = true;
+        let result = self.prepare_commit_inner().await;
+        if result.is_err() {
+            self.failed = true;
+            self.inner.close().await;
+        }
+        result
+    }
+
+    async fn prepare_commit_inner(&mut self) -> Result<Vec<CommitMessage>> {
+        if let Some(planner) = self.planner.take() {
+            let (plan, batches) = planner.finish();
+            self.router.set_plan(plan);
+            for batch in batches {
+                self.write_routed_batch(&batch).await?;
+            }
+        }
         let mut messages = self.inner.prepare_commit().await?;
         for message in &mut messages {
             message.total_buckets = self.router.total_buckets(&message.partition);
@@ -132,6 +193,7 @@ impl PostponeFixedBucketTableWrite {
     /// Discard unprepared files. Prepared messages and their files belong to the caller.
     pub async fn close(&mut self) {
         self.closed = true;
+        self.planner = None;
         self.inner.close().await;
     }
 
@@ -270,7 +332,7 @@ mod tests {
         total_buckets: Vec<i32>,
     ) -> PostponeBucketPlan {
         PostponeBucketPlan::from_arrow(
-            table,
+            table.schema(),
             &make_partition_bucket_plan_batch(partitions, total_buckets),
         )
         .unwrap()
@@ -286,7 +348,7 @@ mod tests {
             vec![Arc::new(Int32Array::from(vec![total_buckets]))],
         )
         .unwrap();
-        PostponeBucketPlan::from_arrow(table, &batch).unwrap()
+        PostponeBucketPlan::from_arrow(table.schema(), &batch).unwrap()
     }
 
     fn cross_partition_postpone_table(file_io: &FileIO, table_path: &str) -> Table {
@@ -938,7 +1000,7 @@ mod tests {
         let table = test_postpone_partitioned_table(&file_io, table_path);
 
         let error = PostponeBucketPlan::from_arrow(
-            &table,
+            table.schema(),
             &make_partition_bucket_plan_batch(vec!["p"], vec![0]),
         )
         .unwrap_err();

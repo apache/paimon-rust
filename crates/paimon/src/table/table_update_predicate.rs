@@ -26,8 +26,7 @@ use futures::TryStreamExt;
 use super::data_evolution_writer::RowIdFileIndex;
 use super::stats_filter::group_by_overlapping_row_id;
 use super::{
-    CommitMessage, DataEvolutionWriter, DataSplit, DataSplitBuilder, Table, TableUpdateByRowId,
-    UpdateAssignment,
+    CommitMessage, DataEvolutionWriter, DataSplit, Table, TableUpdateByRowId, UpdateAssignment,
 };
 use crate::spec::{CoreOptions, Predicate};
 
@@ -96,7 +95,6 @@ fn validate(
         table,
         assignments.iter().map(|(name, _)| name.clone()).collect(),
     )?;
-    options.ensure_read_authorized()?;
     Ok(array)
 }
 
@@ -108,9 +106,17 @@ pub(super) async fn update(
     blob_uri_reader_factory: Option<Arc<dyn crate::io::UriReaderFactory>>,
 ) -> crate::Result<Vec<CommitMessage>> {
     let combine_all = validate(table, &assignments, &read_columns)?;
-    let Some(snapshot) = super::time_travel::resolve_snapshot(table).await? else {
-        return Ok(Vec::new());
-    };
+    if table.schema().core_options().query_auth_enabled() {
+        if let Some(predicate) = &predicate {
+            // Row-ID range extraction can remove exact leaves from the scan;
+            // validate their original index/type before deriving those ranges.
+            super::query_auth::reject_noncanonical_leaves(
+                std::slice::from_ref(predicate),
+                &table.schema().fields_with_read_metadata(),
+            )?;
+        }
+    }
+    let snapshot = super::time_travel::resolve_snapshot(table).await?;
     // Updates must include unindexed rows even when normal reads request the
     // partial/detail scalar-index search mode.
     let scan_table = table
@@ -118,7 +124,7 @@ pub(super) async fn update(
             "scalar-index.search-mode".into(),
             "FULL".into(),
         )]))
-        .copy_with_pinned_snapshot(Some(&snapshot));
+        .copy_with_pinned_snapshot(snapshot.as_ref());
     let mut read_builder = scan_table.new_read_builder();
     let mut projection = Vec::new();
     for name in &read_columns {
@@ -133,12 +139,12 @@ pub(super) async fn update(
     }
     // Rewrites need all existing column versions, including columns outside
     // the callback/predicate projection, to preserve values of unmatched rows.
-    let plan = read_builder.new_scan().with_scan_all_files().plan().await?;
+    let plan = read_builder.new_scan().plan_for_update().await?;
     let index = RowIdFileIndex::from_splits(scan_table.clone(), plan.splits())?;
     let groups = ordered_file_groups(plan.splits())?;
     let mut updater = TableUpdateByRowId::with_index(table, index)?;
     updater.with_blob_uri_reader_factory(blob_uri_reader_factory);
-    let reader = read_builder.new_read()?;
+    let reader = read_builder.new_read()?.for_update();
     let schema = crate::arrow::build_target_arrow_schema(table.schema().fields())?;
     let columns: Vec<_> = assignments.iter().map(|(name, _)| name.clone()).collect();
     let result = async {
@@ -200,26 +206,6 @@ fn ordered_file_groups(splits: &[DataSplit]) -> crate::Result<Vec<DataSplit>> {
 fn file_groups(split: &DataSplit) -> crate::Result<Vec<DataSplit>> {
     group_by_overlapping_row_id(split.data_files().to_vec())
         .into_iter()
-        .map(|files| {
-            let mut builder = DataSplitBuilder::new()
-                .with_snapshot(split.snapshot_id())
-                .with_partition(split.partition().clone())
-                .with_bucket(split.bucket())
-                .with_bucket_path(split.bucket_path().into())
-                .with_total_buckets(split.total_buckets())
-                .with_raw_convertible(files.len() == 1);
-            if split.data_deletion_files().is_some() {
-                builder = builder.with_data_deletion_files(
-                    files
-                        .iter()
-                        .map(|file| split.deletion_file_for_data_file(file).cloned())
-                        .collect(),
-                );
-            }
-            if let Some(ranges) = split.row_ranges() {
-                builder = builder.with_row_ranges(ranges.to_vec());
-            }
-            builder.with_data_files(files).build()
-        })
+        .map(|files| Ok(split.for_data_evolution_files(files)))
         .collect()
 }

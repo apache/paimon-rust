@@ -106,6 +106,25 @@ results expose physical positions and Java-compatible scored split bytes;
 `new_read_builder()` reads both result types from their source snapshot and
 returns projected columns plus `__paimon_search_score` in relevance order.
 
+Hybrid searches return the same `GlobalIndexResult` from `execute()`. To run
+routes separately, call `route_builders()` once and configure each route through
+its `search_builder()`:
+
+```python
+hybrid = (table.new_hybrid_search_builder()
+          .add_vector_route("embedding", [1.0, 0.0], 10)
+          .with_limit(5))
+route = hybrid.route_builders()[0]
+route.search_builder().with_query_vector([0.0, 1.0]).with_limit(3)
+result = route.execute()
+fused = hybrid.rank([hybrid.to_route_result(route, result)])
+```
+
+Each route returns the same live search builder on repeated calls. Query,
+limit, option and filter changes affect later `route.execute()` calls. All
+returned routes keep the snapshot captured by `route_builders()`, including
+a captured empty table, even if later writes publish a newer snapshot.
+
 ### Native Read / Write
 
 Beyond SQL, you can use the lower-level read and write APIs directly from Python.
@@ -132,6 +151,17 @@ scan = read_builder.new_scan()
 plan = scan.plan()
 batches = read_builder.new_read().read(plan.splits())
 
+# Core schedules a bounded set of split readers and owns their global limit.
+# Set ordered=True to retain the supplied split order. The default emits
+# whichever split group is ready first. Ordered parallel reads disable background
+# Parquet row-group prefetch; split workers still read concurrently.
+reader = read_builder.new_read().read_arrow(plan.splits(), parallelism=4, ordered=False)
+try:
+    for batch in reader:
+        print(batch)
+finally:
+    reader.close()
+
 print(f"\nRead: {batches[0].num_rows} rows")
 print(batches[0])
 
@@ -157,6 +187,49 @@ batches_tt = read_builder_tt.new_read().read(plan_tt.splits())
 print(f"\nRead: {batches_tt[0].num_rows} rows")
 print(batches_tt[0])
 ```
+
+### Scan statistics
+
+Every scan collects lightweight counters during ordinary metadata planning:
+
+```python
+plan = table.new_read_builder().new_scan().plan()
+scan_stats = plan.stats()
+print(scan_stats.manifest_entries_read, scan_stats.final_files)
+```
+
+Collection retains early manifest/sidecar pruning and LIMIT stopping. Counters
+record the work performed; skipped entries are not decoded to reconstruct totals.
+Combined incremental scans expose
+the same API for their selected Delta or Changelog window. Snapshot metadata is
+available from `plan.snapshot_id()`.
+
+### Captured row-ID routing
+
+`RowIdPlan` provides pure routing for distributed Data Evolution operations:
+
+```python
+from pypaimon_rust.datafusion import RowIdPlan
+
+routing = RowIdPlan(table.new_read_builder().new_scan().plan_all())
+first_row_ids = routing.route(row_ids)  # row_ids is an Arrow Int64Array
+delete_groups = routing.route_by_bucket(row_ids)
+selected = routing.select(row_ids)
+```
+
+Routing preserves input order and duplicates, and rejects null or foreign IDs.
+Read/update groups use their anchor's first row ID. Delete groups share one
+routing ID per partition and bucket so each worker can publish a complete
+deletion-vector index. These IDs are local to the captured plan.
+
+`select` retains complete normal and dedicated file groups, deletion metadata,
+authorization and the captured snapshot, and adds sorted, deduplicated row ranges
+for reading. It does not check row liveness or authorize file access; readers
+and mutation workers retain those checks. The selected plan is only for reading.
+
+Batch and stream updates accept integer Arrow arrays and chunked arrays through
+`delete_by_row_id`, as well as integer sequences. Arrow chunks and slices are
+imported directly; nulls and values outside Int64 are rejected before writing.
 
 ### Shard column updates
 
@@ -278,12 +351,72 @@ for a partition and bucket must have a single writer owner. Both duplicate
 owners in a commit and stale overlapping writers are rejected. Pending files
 (`bucket=-2`) can coexist with real buckets; they remain pending until assigned.
 
-Without an explicit plan, set `postpone.default-bucket-num` to a positive integer.
-The count is used exactly for new partitions, and append reuses existing layouts
-from the same snapshot used to initialize sequence numbers. Overwrite uses the
-configured default for replaced partitions. No staging, automatic rescaling or
-compaction is performed. Deletion-vector tables are rejected by this writer.
+Without an explicit plan, `postpone.default-bucket-num` can provide an exact count
+for new partitions. Otherwise core buffers unknown partitions until preparation
+and infers their counts from this writer's input: the target row count takes
+precedence over estimated BinaryRow bytes. Counts round up to a power of two,
+then cap at the configured maximum parallelism. Append reuses existing layouts
+from the same snapshot used to initialize sequence numbers and writes known
+partitions directly. Overwrite plans replaced partitions from the new input.
+Distributed writers should share one resolved plan. This does not implement
+Spark's temporary-file measurement, automatic rescaling or compaction.
+Deletion-vector tables are rejected by this writer.
 A failed write cannot be prepared, and close deletes only unprepared output.
+
+Engines can compute buckets before creating writers. `BucketRouter` uses the
+table schema's bucket keys and Java hashing rules, and returns an Arrow `int32`
+array in input order. It accepts reordered columns and ignores unused payload
+fields. It performs no catalog access or file writes:
+
+```python
+from pypaimon_rust.datafusion import BucketRouter, PostponeBucketPlanner
+
+buckets = BucketRouter(table.schema()).route(batch)  # Fixed-bucket table
+```
+
+For POSTPONE inputs, resolve the known layouts through the write builder, then
+collect statistics across the complete distributed input before inferring new
+counts. The planner retains no input batches:
+
+```python
+builder = table.new_postpone_fixed_bucket_write_builder()
+known = builder.resolve_bucket_plan()
+planner = PostponeBucketPlanner(table.schema(), known)
+statistics = planner.input_statistics(batch)
+plan = planner.plan(statistics)
+buckets = BucketRouter(table.schema()).with_bucket_plan(plan).route(batch)
+```
+
+Each worker may call `input_statistics` independently. Concatenate its results
+before calling `plan`; duplicate partition rows are summed before inference.
+Statistics contain partition columns followed by `row_count: int64` and
+`data_size: int64`. These columns are interpreted by position, so partition names
+may coincide with statistics names. Existing layouts remain unchanged. The
+shared result can configure every worker with `with_bucket_plan(plan)`.
+
+For HASH_DYNAMIC primary-key inputs (`bucket=-1`), route rows to assigners
+before allocating buckets:
+
+```python
+from pypaimon_rust.datafusion import DynamicBucketAssigner, DynamicBucketAssignerRouter
+
+routing = DynamicBucketAssignerRouter(table.schema(), num_channels=4, num_assigners=4).route(batch)
+# Group rows and key_hash by routing's assigner column, then on that worker:
+assigner = DynamicBucketAssigner(table, num_channels=4, num_assigners=4, assign_id=worker_id,
+                                restore_snapshot_id=base_snapshot_id)
+buckets = assigner.assign(worker_batch, worker_key_hashes)
+```
+
+The assigner captures the latest write snapshot when none is supplied; zero
+selects an empty base. `overwrite=True` starts with empty assignments. Every worker
+must use the same baseline, available as `assigner.restore_snapshot_id`.
+Configure the eventual file writers with that restore snapshot and the same
+overwrite mode.
+Assignment reads HASH indexes without creating files. Regroup its output by
+partition and bucket before writing, so one writer publishes the complete
+HASH index for each bucket. Key hashes can be omitted for Core to compute
+them; when supplied, the batch only needs partition columns. Existing keys
+retain their original buckets even when assigner parallelism changes.
 
 Configure overwrite on the batch builder:
 
@@ -342,6 +475,26 @@ provider and REST environment. The optional branch selects its metadata namespac
 without reading a branch schema file. Omit it to retain the original branch.
 Cached time-travel resolution is discarded so the supplied options select the
 snapshot, with the externally resolved fields preserved.
+
+REST catalogs also expose `create_branch(identifier, branch, from_tag=None)`,
+`drop_branch(identifier, branch)`, `fast_forward(identifier, branch)` and
+`list_branches(identifier)`. These delegate to core REST catalog operations and
+release the GIL while waiting for requests. Creation without a tag creates an
+empty branch, as in Java. REST branch rename is unsupported.
+
+REST authentication also supports explicit `dlf.signing-algorithm=openapi-v4`.
+Rust core signs ACS4-HMAC-SHA256 requests with the same canonical request,
+credential scope and action headers as Java. GET requests retry HTTP 429/503 up
+to five times and honor Retry-After; branch mutations are sent once and ignore
+successful response payloads.
+
+`PaimonCatalog(options, config_required=False)` reuses already resolved REST
+options without fetching `/config` again. Branch operation failures raise
+`CatalogError`, a `ValueError` subclass with `code`, `resource_type`,
+`resource_name` and `message` attributes. `code=0` identifies transport or
+response-decoding failures without an HTTP error status. Malformed identifiers
+remain `ValueError`, unsupported catalogs raise `NotImplementedError`, and
+inherited Native state still raises `ForkSafetyError`.
 
 REST tables load the latest snapshot through the catalog, including empty
 results and branch-scoped requests. Permission and service failures (including

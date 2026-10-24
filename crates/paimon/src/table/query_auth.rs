@@ -17,6 +17,12 @@
 
 //! What the REST server authorized a user to read from one table.
 
+#[cfg(test)]
+mod numeric_cast_java_test;
+mod row_filter;
+mod transform;
+pub(crate) use row_filter::RowFilter;
+mod mask_output;
 mod rules;
 
 use crate::api::AuthTableQueryResponse;
@@ -24,12 +30,32 @@ pub(crate) use rules::{filter_batch, mask_batch, mask_inputs, ColumnMask, Rules}
 
 /// The server's answer for one user on one table; `session` ties it to the
 /// handle that asked, as the response names no table or user.
-#[derive(Debug, PartialEq)]
+#[derive(Debug)]
 pub(crate) struct QueryAuthGrant {
     session: u64,
     /// The columns the request asked about; `None` asked about the whole table.
     select: Option<Vec<String>>,
     rules: Rules,
+    /// Original wire rules for Java QueryAuthSplit metadata transport.
+    response: Option<AuthTableQueryResponse>,
+    /// The read schema and branch for which the rules were compiled.
+    binding: Option<(i64, Vec<crate::spec::DataField>, String)>,
+    /// Historical reads can need NULL columns introduced after their snapshot.
+    fields: Option<Vec<crate::spec::DataField>>,
+    current_schema: Option<(i64, Vec<crate::spec::DataField>)>,
+}
+
+impl PartialEq for QueryAuthGrant {
+    fn eq(&self, other: &Self) -> bool {
+        if std::ptr::eq(self, other) {
+            return true;
+        }
+        self.session == other.session
+            && self.select == other.select
+            && self.rules.same_policy(&other.rules)
+            && self.binding == other.binding
+            && self.fields == other.fields
+    }
 }
 
 impl QueryAuthGrant {
@@ -40,7 +66,9 @@ impl QueryAuthGrant {
         select: Option<Vec<String>>,
         fields: &[crate::spec::DataField],
     ) -> crate::Result<Self> {
-        Ok(Self::new(session, select, Rules::parse(response, fields)?))
+        let mut grant = Self::new(session, select, Rules::parse(response, fields)?);
+        grant.response = Some(response.clone());
+        Ok(grant)
     }
 
     pub(crate) fn new(session: u64, select: Option<Vec<String>>, rules: Rules) -> Self {
@@ -48,12 +76,32 @@ impl QueryAuthGrant {
             session,
             select,
             rules,
+            response: None,
+            binding: None,
+            fields: None,
+            current_schema: None,
         }
+    }
+
+    pub(crate) fn response(&self) -> Option<&AuthTableQueryResponse> {
+        self.response.as_ref()
     }
 
     /// No row filter and no masking.
     pub(crate) fn is_unrestricted(&self) -> bool {
         self.rules.is_empty()
+    }
+
+    /// Physical file-group operations need a grant over every table column,
+    /// without any wire restriction. A mask ignored by an ordinary projection
+    /// (for example a reserved system field) is still not a mutation grant.
+    pub(super) fn is_unrestricted_whole_table(&self) -> bool {
+        self.select.is_none()
+            && self.is_unrestricted()
+            && self
+                .response
+                .as_ref()
+                .is_none_or(AuthTableQueryResponse::is_unrestricted)
     }
 
     pub(crate) fn rules(&self) -> &Rules {
@@ -64,56 +112,91 @@ impl QueryAuthGrant {
         self.select.as_deref()
     }
 
-    /// A view of another schema is not the one the server ruled on.
+    pub(crate) fn bind(
+        mut self,
+        table: &super::Table,
+        fields: Vec<crate::spec::DataField>,
+        current: (i64, &[crate::spec::DataField]),
+    ) -> Self {
+        self.binding = Some((
+            table.schema().id(),
+            table.schema().fields().to_vec(),
+            table.branch().into(),
+        ));
+        self.fields = Some(fields);
+        self.current_schema = Some((current.0, current.1.to_vec()));
+        self
+    }
+
+    pub(crate) fn current_schema(&self) -> Option<(i64, &[crate::spec::DataField])> {
+        self.current_schema
+            .as_ref()
+            .map(|(id, fields)| (*id, fields.as_slice()))
+    }
+
+    pub(crate) fn fields<'a>(&'a self, table: &'a super::Table) -> &'a [crate::spec::DataField] {
+        self.fields
+            .as_deref()
+            .unwrap_or_else(|| table.schema().fields())
+    }
+
     pub(crate) fn matches_table(&self, table: &super::Table) -> bool {
-        !table.reads_another_schema().unwrap_or(true)
-            && table.query_auth_session() == Some(self.session)
+        table.query_auth_session() == Some(self.session)
+            && match &self.binding {
+                Some((id, fields, branch)) => {
+                    *id == table.schema().id()
+                        && fields == table.schema().fields()
+                        && branch == table.branch()
+                }
+                None => !table.reads_another_schema().unwrap_or(true),
+            }
     }
 }
 
-/// An older file can name a dropped column; refused rather than scrubbed.
-pub(crate) async fn reject_unauthorized_stats(
-    plan: &super::Plan,
-    current: &crate::spec::TableSchema,
-    schemas: &super::schema_manager::SchemaManager,
-) -> crate::Result<()> {
-    let refuse = |column: &str| {
-        Err(unsupported(&format!(
-            "a data file still carries statistics for '{column}', which the current schema — the \
-             one the server authorized — does not have"
-        )))
-    };
-    let named = |name: &String| current.fields().iter().any(|f| f.name() == name);
-    let mut checked = std::collections::HashSet::new();
-    for split in plan.splits() {
-        for file in split.data_files() {
-            for column in file
-                .value_stats_cols
-                .iter()
-                .chain(file.write_cols.iter())
-                .flatten()
-            {
-                if !named(column) {
-                    return refuse(column);
-                }
-            }
-            // The file's schema decides: a name can be re-added under a new id, and
-            // either list may be absent.
-            if file.schema_id == current.id() || !checked.insert(file.schema_id) {
-                continue;
-            }
-            let older = schemas.schema(file.schema_id).await?;
-            if let Some(gone) = older.fields().iter().find(|f| {
-                !current
-                    .fields()
-                    .iter()
-                    .any(|c| c.id() == f.id() && c.name() == f.name() && contains_field(c, f))
-            }) {
-                return refuse(gone.name());
-            }
+/// Java validates rules against the latest schema, then binds them by name to
+/// the snapshot. A rename or a dropped-and-recreated rule operand is unrelated
+/// data, even when one of its name and id still matches.
+pub(crate) fn historical_rule_fields(
+    response: &AuthTableQueryResponse,
+    current: &[crate::spec::DataField],
+    read: &[crate::spec::DataField],
+) -> crate::Result<Vec<crate::spec::DataField>> {
+    let rules = Rules::parse(response, current)?;
+    let mut required = rules.filter_columns();
+    for mask in &rules.masks {
+        required.insert(mask.column);
+        if read
+            .iter()
+            .any(|field| field.name() == current[mask.column].name())
+        {
+            required.extend(mask_inputs(mask));
         }
     }
-    Ok(())
+    for index in required {
+        let field = &current[index];
+        if let Some(old) = read.iter().find(|old| old.name() == field.name()) {
+            if old.id() != field.id() {
+                return Err(unsupported(&format!(
+                    "rule column '{}' was dropped and re-added",
+                    field.name()
+                )));
+            }
+        } else if read.iter().any(|old| old.id() == field.id()) {
+            return Err(unsupported(&format!(
+                "rule column '{}' was renamed",
+                field.name()
+            )));
+        }
+    }
+    // Append missing operands without disturbing the historical indices used
+    // by user predicates. Schema evolution supplies NULL for these new fields.
+    let mut fields = read.to_vec();
+    for field in current {
+        if !fields.iter().any(|old| old.name() == field.name()) {
+            fields.push(field.clone());
+        }
+    }
+    Ok(fields)
 }
 
 fn contains_field(wide: &crate::spec::DataField, narrow: &crate::spec::DataField) -> bool {
@@ -162,6 +245,9 @@ pub(crate) fn leaf_names(
     fn collect(predicate: &crate::spec::Predicate, out: &mut std::collections::HashSet<String>) {
         use crate::spec::Predicate;
         match predicate {
+            Predicate::NestedLeaf { root, .. } => {
+                out.insert(root.name().to_string());
+            }
             Predicate::Leaf { column, .. } => {
                 out.insert(column.clone());
             }
@@ -269,6 +355,7 @@ pub(crate) fn reject_noncanonical_leaves(
     use crate::spec::Predicate;
     fn check(predicate: &Predicate, fields: &[crate::spec::DataField]) -> crate::Result<()> {
         match predicate {
+            Predicate::NestedLeaf { .. } => predicate.validate_nested_fields(fields),
             Predicate::Leaf {
                 column,
                 index,
@@ -300,7 +387,7 @@ pub(crate) fn reject_noncanonical_leaves(
 #[cfg(test)]
 mod tests {
     use super::reject_system_columns;
-    use crate::table::{query_auth_table, rest_query_auth_table};
+    use crate::table::rest_query_auth_table;
 
     #[test]
     fn authorized_map_allows_only_valid_selected_value_types() {
@@ -350,33 +437,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_a_time_travel_selector_alone_is_refused() {
-        for selector in [
-            "scan.snapshot-id",
-            "scan.version",
-            "scan.tag-name",
-            "scan.timestamp-millis",
-            "scan.timestamp",
-            "scan.watermark",
-        ] {
-            let table =
-                rest_query_auth_table()
-                    .await
-                    .copy_with_options(std::collections::HashMap::from([(
-                        selector.to_string(),
-                        "1".to_string(),
-                    )]));
-            assert!(!table.is_time_traveled(), "{selector} sets no flag");
-            let err = table.authorize_read(true, None).await.unwrap_err();
-            assert!(
-                matches!(err, crate::Error::Unsupported { ref message }
-                    if message.contains("time-travelled or branch read")),
-                "{selector}: {err:?}"
-            );
-        }
-    }
-
-    #[tokio::test]
     async fn test_a_conflicting_selector_pair_is_planning_business_not_authorization() {
         // `scan.version` is adapted before the one-selector rule, so an ordinary
         // table must reach planning rather than fail here.
@@ -405,13 +465,84 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_a_schema_replaced_copy_loses_its_session() {
+    async fn test_options_only_schema_replacement_keeps_its_session() {
         let table = crate::table::rest_query_auth_table().await;
         assert!(table.query_auth_session().is_some());
+        let mut json = serde_json::to_value(table.schema()).unwrap();
+        json["timeMillis"] = serde_json::json!(1);
         let copy = table
-            .copy_with_resolved_schema(table.schema().clone(), "main")
+            .copy_with_resolved_schema(serde_json::from_value(json).unwrap(), "main")
             .unwrap();
-        assert!(copy.query_auth_session().is_none());
+        assert_eq!(copy.query_auth_session(), table.query_auth_session());
+        let table = table.copy_with_options(std::collections::HashMap::from([
+            ("scan.snapshot-id".into(), "7".into()),
+            ("read.batch-size".into(), "99".into()),
+        ]));
+        let schema = table
+            .schema()
+            .copy_with_replaced_options(std::collections::HashMap::from([
+                ("query-auth.enabled".into(), "false".into()),
+                ("type".into(), "format".into()),
+                ("data-file.path-directory".into(), "/tmp/other".into()),
+            ]));
+        let copy = table.copy_with_resolved_schema(schema, "main").unwrap();
+        assert_eq!(copy.query_auth_session(), table.query_auth_session());
+        assert!(copy.schema().core_options().query_auth_enabled());
+        for key in [
+            "scan.snapshot-id",
+            "read.batch-size",
+            "type",
+            "data-file.path-directory",
+        ] {
+            assert!(!copy.schema().options().contains_key(key), "{key}");
+        }
+        assert!(!copy.reads_another_schema().unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_changed_schema_or_branch_loses_its_session() {
+        let table = crate::table::rest_query_auth_table().await;
+        let mut json = serde_json::to_value(table.schema()).unwrap();
+        json["id"] = serde_json::json!(table.schema().id() + 1);
+        let changed = serde_json::from_value(json).unwrap();
+        assert!(table
+            .copy_with_resolved_schema(changed, "main")
+            .unwrap()
+            .query_auth_session()
+            .is_none());
+        assert!(table
+            .copy_with_resolved_schema(table.schema().clone(), "test")
+            .unwrap()
+            .query_auth_session()
+            .is_none());
+        let assembled = crate::table::query_auth_table();
+        assert!(assembled
+            .copy_with_resolved_schema(assembled.schema().clone(), "main")
+            .unwrap()
+            .query_auth_session()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn test_resolved_schema_copy_preserves_verified_historical_session() {
+        let table = crate::table::rest_query_auth_table().await;
+        let grant = super::QueryAuthGrant::new(
+            table.query_auth_session().unwrap(),
+            None,
+            Default::default(),
+        );
+        let mut travelled = table.clone();
+        travelled.time_traveled = true;
+        let pinned = table.copy_with_pinned_snapshot(None);
+        for view in [travelled, pinned] {
+            let schema = view
+                .schema()
+                .copy_with_replaced_options(table.schema().options().clone());
+            let copy = view.copy_with_resolved_schema(schema, "main").unwrap();
+            assert_eq!(copy.query_auth_session(), table.query_auth_session());
+            assert!(copy.is_time_traveled());
+            assert!(!grant.matches_table(&copy));
+        }
     }
 
     #[tokio::test]
@@ -456,137 +587,6 @@ mod tests {
         assert!(
             !grant.matches_table(&branch),
             "a branch view is refused even when its schema id coincides"
-        );
-    }
-
-    fn data_file_for_stats(
-        schema_id: i64,
-        cols: Option<Vec<&str>>,
-        written: Option<Vec<&str>>,
-    ) -> crate::spec::DataFileMeta {
-        crate::spec::DataFileMeta {
-            file_name: "f.parquet".to_string(),
-            file_size: 1,
-            row_count: 1,
-            min_key: Vec::new(),
-            max_key: Vec::new(),
-            key_stats: crate::spec::stats::BinaryTableStats::empty(),
-            value_stats: crate::spec::stats::BinaryTableStats::empty(),
-            min_sequence_number: 0,
-            max_sequence_number: 0,
-            schema_id,
-            level: 0,
-            extra_files: Vec::new(),
-            creation_time: None,
-            delete_row_count: Some(0),
-            embedded_index: None,
-            file_source: None,
-            value_stats_cols: cols.map(|c| c.iter().map(|s| s.to_string()).collect()),
-            external_path: None,
-            first_row_id: None,
-            write_cols: written.map(|c| c.iter().map(|s| s.to_string()).collect()),
-            column_max_sequence_numbers: None,
-        }
-    }
-
-    fn plan_of(meta: crate::spec::DataFileMeta) -> crate::table::Plan {
-        crate::table::Plan::new(vec![crate::table::DataSplitBuilder::new()
-            .with_snapshot(1)
-            .with_partition(crate::spec::BinaryRowBuilder::new(0).build())
-            .with_bucket(0)
-            .with_bucket_path("p".to_string())
-            .with_total_buckets(1)
-            .with_data_files(vec![meta])
-            .with_raw_convertible(false)
-            .build()
-            .unwrap()])
-    }
-
-    #[tokio::test]
-    async fn test_stats_for_a_dropped_column_are_refused() {
-        let table = query_auth_table();
-        let schemas = table.schema_manager();
-
-        for meta in [
-            data_file_for_stats(table.schema().id(), Some(vec!["id", "gone"]), None),
-            data_file_for_stats(table.schema().id(), None, Some(vec!["id", "gone"])),
-            data_file_for_stats(
-                table.schema().id(),
-                Some(vec!["id"]),
-                Some(vec!["id", "gone"]),
-            ),
-        ] {
-            let err = super::reject_unauthorized_stats(&plan_of(meta), table.schema(), schemas)
-                .await
-                .unwrap_err();
-            assert!(
-                matches!(err, crate::Error::Unsupported { ref message }
-                    if message.contains("statistics for 'gone'")),
-                "{err:?}"
-            );
-        }
-
-        assert!(super::reject_unauthorized_stats(
-            &plan_of(data_file_for_stats(
-                table.schema().id(),
-                Some(vec!["id"]),
-                Some(vec!["id"])
-            )),
-            table.schema(),
-            schemas
-        )
-        .await
-        .is_ok());
-    }
-
-    #[tokio::test]
-    async fn test_an_old_schema_whose_column_changed_type_is_refused() {
-        let tmp = tempfile::tempdir().unwrap();
-        let location = tmp.path().display().to_string();
-        let column = |ty| {
-            crate::spec::Schema::builder()
-                .column("id", ty)
-                .option("query-auth.enabled", "true")
-                .build()
-                .unwrap()
-        };
-        let table = crate::table::Table::new(
-            crate::io::FileIOBuilder::new("file").build().unwrap(),
-            crate::catalog::Identifier::new("default", "evolved"),
-            location,
-            crate::spec::TableSchema::new(
-                0,
-                &column(crate::spec::DataType::Int(crate::spec::IntType::new())),
-            ),
-            None,
-        );
-
-        // Same field id and name, a different type: the server ruled on the
-        // current one, so the older file's stats are not covered.
-        let older = crate::spec::TableSchema::new(
-            1,
-            &column(crate::spec::DataType::BigInt(crate::spec::BigIntType::new())),
-        );
-        let schemas = table.schema_manager();
-        table
-            .file_io()
-            .new_output(&schemas.schema_path(1))
-            .unwrap()
-            .write(serde_json::to_vec(&older).unwrap().into())
-            .await
-            .unwrap();
-
-        let err = super::reject_unauthorized_stats(
-            &plan_of(data_file_for_stats(1, None, None)),
-            table.schema(),
-            schemas,
-        )
-        .await
-        .unwrap_err();
-        assert!(
-            matches!(err, crate::Error::Unsupported { ref message }
-                if message.contains("statistics for 'id'")),
-            "{err:?}"
         );
     }
 
@@ -661,18 +661,60 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_time_travelled_or_branch_read_is_refused() {
-        let mut travelled = rest_query_auth_table().await;
-        travelled.time_traveled = true;
-        let err = travelled.authorize_read(true, None).await.unwrap_err();
-        assert!(
-            matches!(err, crate::Error::Unsupported { ref message }
-                if message.contains("time-travelled or branch read")),
-            "got {err:?}"
+    async fn a_grant_is_bound_to_the_verified_read_schema_and_branch() {
+        let table = rest_query_auth_table()
+            .await
+            .copy_with_pinned_snapshot(None);
+        let grant = super::QueryAuthGrant::new(
+            table.query_auth_session().unwrap(),
+            None,
+            Default::default(),
+        )
+        .bind(
+            &table,
+            table.schema().fields().to_vec(),
+            (table.schema().id(), table.schema().fields()),
         );
+        assert!(grant.matches_table(&table));
+        let mut other = table.clone();
+        other.branch = "other".into();
+        assert!(!grant.matches_table(&other));
+        let mut value = serde_json::to_value(table.schema()).unwrap();
+        value["fields"][0]["name"] = serde_json::json!("renamed");
+        other = table.clone();
+        other.schema = serde_json::from_value(value).unwrap();
+        assert!(!grant.matches_table(&other));
+    }
 
-        let mut branch = rest_query_auth_table().await;
-        branch.branch_reference = true;
-        assert!(branch.authorize_read(true, None).await.is_err());
+    #[test]
+    fn historical_rules_reject_renames_and_readded_columns() {
+        use crate::spec::{DataField, DataType, IntType};
+        let field = |id, name: &str| DataField::new(id, name.into(), DataType::Int(IntType::new()));
+        let current = [field(1, "id"), field(2, "n")];
+        let response = crate::api::AuthTableQueryResponse {
+            filter: Some(vec![
+                serde_json::json!({"kind":"LEAF", "function":"GREATER_THAN", "literals":[0],
+                "transform":{"name":"FIELD_REF", "fieldRef":{"name":"n", "type":"INT", "index":1}}})
+                .to_string(),
+            ]),
+            column_masking: None,
+        };
+        for read in [
+            vec![field(1, "id"), field(2, "old_n")],
+            vec![field(1, "id"), field(3, "n")],
+        ] {
+            assert!(super::historical_rule_fields(&response, &current, &read).is_err());
+        }
+        let read = vec![field(1, "id")];
+        let fields = super::historical_rule_fields(&response, &current, &read).unwrap();
+        assert_eq!(fields, current);
+        // Unrelated schema renames are legal when no rule references the field.
+        let unrestricted = crate::api::AuthTableQueryResponse {
+            filter: None,
+            column_masking: None,
+        };
+        assert!(
+            super::historical_rule_fields(&unrestricted, &current, &[field(1, "renamed")]).is_ok()
+        );
     }
 }

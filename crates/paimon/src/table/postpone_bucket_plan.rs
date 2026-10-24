@@ -15,10 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::spec::batch_to_serialized_bytes;
+use crate::spec::{batch_to_serialized_bytes, BinaryRow, DataField, Snapshot, TableSchema};
 use crate::table::{Table, TableScan};
 use crate::Result;
-use arrow_array::{Array, Int32Array, RecordBatch};
+use arrow_array::{new_empty_array, Array, ArrayRef, Int32Array, RecordBatch};
+use arrow_schema::{DataType, Field, Schema};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -38,8 +39,14 @@ pub struct PostponeBucketPlan {
 }
 
 impl PostponeBucketPlan {
-    pub fn from_arrow(table: &Table, batch: &RecordBatch) -> Result<Self> {
-        let partition_fields = table.schema().partition_fields();
+    pub(super) fn from_counts(bucket_counts: HashMap<Vec<u8>, i32>) -> Self {
+        Self {
+            bucket_counts: Arc::new(bucket_counts),
+            default_bucket_num: None,
+        }
+    }
+    pub fn from_arrow(schema: &TableSchema, batch: &RecordBatch) -> Result<Self> {
+        let partition_fields = schema.partition_fields();
         let partition_count = partition_fields.len();
         if batch.num_columns() != partition_count + 1 {
             return Err(data_invalid(format!(
@@ -112,10 +119,33 @@ impl PostponeBucketPlan {
                 }
             }
         }
-        Ok(Self {
-            bucket_counts: Arc::new(bucket_counts),
-            default_bucket_num: None,
-        })
+        Ok(Self::from_counts(bucket_counts))
+    }
+
+    /// Export known partitions using the same schema accepted by `from_arrow`.
+    /// A configured default is not an existing partition and is not exported.
+    pub fn to_arrow(&self, schema: &TableSchema) -> Result<RecordBatch> {
+        let partition_fields = schema.partition_fields();
+        let mut fields = crate::arrow::build_target_arrow_schema(&partition_fields)?
+            .fields()
+            .to_vec();
+        fields.push(Arc::new(Field::new(
+            POSTPONE_BUCKET_PLAN_TOTAL_BUCKETS_FIELD,
+            DataType::Int32,
+            false,
+        )));
+        let mut entries = self.bucket_counts.iter().collect::<Vec<_>>();
+        entries.sort_unstable_by_key(|(partition, _)| *partition);
+        let partitions = entries
+            .iter()
+            .map(|(bytes, _)| bytes.as_slice())
+            .collect::<Vec<_>>();
+        let mut columns = serialized_partition_columns(&partition_fields, &partitions)?;
+        columns.push(Arc::new(Int32Array::from_iter_values(
+            entries.iter().map(|(_, count)| **count),
+        )));
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+            .map_err(|error| data_invalid(error.to_string()))
     }
 
     pub(crate) fn with_default_bucket_num(default_bucket_num: i32) -> Self {
@@ -136,9 +166,18 @@ impl PostponeBucketPlan {
             return Ok(());
         }
         let snapshot = table.snapshot_manager().get_snapshot(snapshot_id).await?;
+        self.load_existing_buckets_from_snapshot(table, &snapshot)
+            .await
+    }
+
+    pub(super) async fn load_existing_buckets_from_snapshot(
+        &mut self,
+        table: &Table,
+        snapshot: &Snapshot,
+    ) -> Result<()> {
         let entries = TableScan::new(table, None, vec![], None, None, None)
             .with_scan_all_files()
-            .plan_manifest_entries(&snapshot)
+            .plan_manifest_entries(snapshot)
             .await?;
         let mut counts = HashMap::new();
         for entry in entries {
@@ -166,5 +205,122 @@ impl PostponeBucketPlan {
             .get(partition)
             .copied()
             .or(self.default_bucket_num)
+    }
+
+    pub(super) fn explicit_bucket_counts(&self) -> &HashMap<Vec<u8>, i32> {
+        &self.bucket_counts
+    }
+
+    pub(super) fn insert(&mut self, partition: Vec<u8>, count: i32) {
+        Arc::make_mut(&mut self.bucket_counts).insert(partition, count);
+    }
+}
+
+/// Decode the common partition prefix of plans and input statistics.
+pub(super) fn serialized_partition_columns(
+    fields: &[DataField],
+    partitions: &[&[u8]],
+) -> Result<Vec<ArrayRef>> {
+    let rows = partitions
+        .iter()
+        .map(|bytes| {
+            let row = BinaryRow::from_serialized_bytes(bytes)?;
+            if row.arity() as usize != fields.len() {
+                return Err(data_invalid(
+                    "Postpone partition arity does not match the table schema",
+                ));
+            }
+            Ok(row)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let schema = crate::arrow::build_target_arrow_schema(fields)?;
+    fields
+        .iter()
+        .enumerate()
+        .map(|(index, field)| {
+            let arrays = rows
+                .iter()
+                .map(|row| {
+                    crate::arrow::partition::partition_array(row, index, field.data_type(), 1)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            if arrays.is_empty() {
+                Ok(new_empty_array(schema.field(index).data_type()))
+            } else {
+                arrow_select::concat::concat(
+                    &arrays
+                        .iter()
+                        .map(|array| array.as_ref())
+                        .collect::<Vec<_>>(),
+                )
+                .map_err(|error| data_invalid(error.to_string()))
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::table::table_write::tests::test_file_io;
+    use arrow_array::StringArray;
+
+    #[test]
+    fn arrow_plan_round_trip_keeps_null_partition_and_excludes_default_rows() {
+        let schema = crate::spec::Schema::builder()
+            .column(
+                "pt",
+                crate::spec::DataType::VarChar(crate::spec::VarCharType::string_type()),
+            )
+            .column(
+                "id",
+                crate::spec::DataType::Int(crate::spec::IntType::new()),
+            )
+            .primary_key(["pt", "id"])
+            .partition_keys(["pt"])
+            .option("bucket", "-2")
+            .option("primary-key.nullable", "true")
+            .build()
+            .unwrap();
+        let table = Table::new(
+            test_file_io(),
+            crate::catalog::Identifier::new("default", "bucket_plan_arrow"),
+            "memory:/bucket_plan_arrow".into(),
+            crate::spec::TableSchema::new(0, &schema),
+            None,
+        );
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("pt", DataType::Utf8, true),
+                Field::new(
+                    POSTPONE_BUCKET_PLAN_TOTAL_BUCKETS_FIELD,
+                    DataType::Int32,
+                    false,
+                ),
+            ])),
+            vec![
+                Arc::new(StringArray::from(vec![Some("b"), None, Some("a")])),
+                Arc::new(Int32Array::from(vec![2, 3, 4])),
+            ],
+        )
+        .unwrap();
+        let plan = PostponeBucketPlan::from_arrow(table.schema(), &batch).unwrap();
+        let exported = plan.to_arrow(table.schema()).unwrap();
+        assert_eq!(exported.schema().field(0).name(), "pt");
+        assert_eq!(exported.schema().field(0).data_type(), &DataType::Utf8);
+        assert_eq!(exported.schema().field(1), batch.schema().field(1));
+        assert_eq!(exported.num_rows(), 3);
+        assert_eq!(
+            PostponeBucketPlan::from_arrow(table.schema(), &exported)
+                .unwrap()
+                .bucket_counts,
+            plan.bucket_counts
+        );
+        let expected_schema = exported.schema();
+        let default = PostponeBucketPlan::with_default_bucket_num(7);
+        let exported = default.to_arrow(table.schema()).unwrap();
+        assert_eq!(exported.schema(), expected_schema);
+        assert_eq!(exported.num_rows(), 0);
+        assert_eq!(default.total_buckets(&[]), Some(7));
     }
 }

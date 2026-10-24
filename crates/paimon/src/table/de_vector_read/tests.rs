@@ -95,7 +95,7 @@ fn make_lumina_entry(
     }
 }
 
-// ---- Task B: search-and-read (`SearchResultReadBuilder::read`) tests ----
+// ---- Task B: search-and-read (`GlobalIndexResultReadBuilder::read`) tests ----
 
 /// Build a small materialization batch: user column `id: Int32`, the internal
 /// `_PKEY_VECTOR_POSITION: Int64`, and `__paimon_search_score: Float32` (mirroring
@@ -237,6 +237,36 @@ fn shared_raw_filter_does_not_expand_row_query_associations() {
         &shared
     ));
     assert_eq!(plan.shared_filter_groups[0].query_indices.len(), 128);
+}
+
+#[test]
+fn scheduled_vector_transport_restores_one_shared_raw_filter_per_bitmap() {
+    let shared = Arc::new(RoaringTreemap::from_iter(0..100_000));
+    let mut searches = (0..128)
+        .map(|_| VectorSearch::new(vec![1.0, 0.0], 2, "embedding".into()).unwrap())
+        .collect::<Vec<_>>();
+    for search in &mut searches {
+        search.set_shared_include_row_ids(Arc::clone(&shared));
+    }
+    let wire = TaskVectorQueries::capture(&searches).unwrap();
+    assert_eq!(
+        wire.filters.len(),
+        1,
+        "encode a shared bitmap once per query batch"
+    );
+    let restored = wire.restore().unwrap();
+    let restored_shared = shared_batch_include_row_ids(&restored).unwrap();
+    assert_eq!(restored_shared.as_ref(), shared.as_ref());
+    let scoring = RawScoringPlan::new(&restored, RawVectorMetric::L2);
+    assert!(
+        scoring.candidate_query_indices.is_empty(),
+        "shared filters must not expand row × query associations"
+    );
+    assert_eq!(scoring.shared_filter_groups.len(), 1);
+    assert_eq!(
+        scoring.shared_filter_groups[0].query_indices.len(),
+        searches.len()
+    );
 }
 
 #[test]
@@ -443,6 +473,151 @@ fn test_configured_raw_vector_metric_precedence_and_conflict_default() {
     assert_eq!(
         configured_raw_vector_metric_override(&options, "embedding").unwrap(),
         None
+    );
+}
+
+#[tokio::test]
+async fn raw_search_without_files_uses_the_configured_indexer_default() {
+    let file_io = FileIOBuilder::new("memory").build().unwrap();
+    for (index_type, expected) in [
+        (" IVF-FLAT ", RawVectorMetric::InnerProduct),
+        ("diskann", RawVectorMetric::InnerProduct),
+        ("lumina", RawVectorMetric::InnerProduct),
+        ("lumina-vector-ann", RawVectorMetric::InnerProduct),
+    ] {
+        let options = HashMap::from([(
+            "fields.embedding.index-type".to_string(),
+            index_type.to_string(),
+        )]);
+        assert_eq!(
+            resolve_raw_vector_metric(
+                &file_io,
+                "memory:///test_table",
+                &options,
+                &HashMap::new(),
+                &[],
+                2,
+                "embedding",
+            )
+            .await
+            .unwrap(),
+            expected
+        );
+        let override_options = HashMap::from([("metric".to_string(), "cosine".to_string())]);
+        assert_eq!(
+            resolve_raw_vector_metric(
+                &file_io,
+                "memory:///test_table",
+                &options,
+                &override_options,
+                &[],
+                2,
+                "embedding",
+            )
+            .await
+            .unwrap(),
+            RawVectorMetric::Cosine
+        );
+    }
+    let mut table_options = HashMap::from([
+        (
+            "fields.embedding.index-type".to_string(),
+            "ivf-flat".to_string(),
+        ),
+        ("fields.other.distance.metric".to_string(), "l2".to_string()),
+    ]);
+    for (family_metric, expected) in [
+        (None, RawVectorMetric::InnerProduct),
+        (Some("cosine"), RawVectorMetric::Cosine),
+    ] {
+        if let Some(metric) = family_metric {
+            table_options.insert("ivf-flat.distance.metric".to_string(), metric.to_string());
+        }
+        for query_options in [
+            HashMap::new(),
+            HashMap::from([("fields.other.metric".to_string(), "l2".to_string())]),
+        ] {
+            assert_eq!(
+                resolve_raw_vector_metric(
+                    &file_io,
+                    "memory:///test_table",
+                    &table_options,
+                    &query_options,
+                    &[],
+                    2,
+                    "embedding",
+                )
+                .await
+                .unwrap(),
+                expected
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn mixed_vector_formats_fail_before_opening_files() {
+    let file_io = FileIOBuilder::new("memory").build().unwrap();
+    let fields = vec![make_field(2, "embedding")];
+    let entries = [
+        make_lumina_entry("missing-flat", IVF_FLAT_IDENTIFIER, FileKind::Add, 2),
+        make_lumina_entry("missing-diskann", "diskann", FileKind::Add, 2),
+    ];
+    let query = VectorSearch::new(vec![1.0, 0.0], 1, "embedding".to_string()).unwrap();
+    let error = evaluate_vector_search(
+        eval_context(&file_io, &HashMap::new(), &fields, Some(10)),
+        &entries,
+        &query,
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("multiple index types"));
+    let mut ignored = entries[1].clone();
+    ignored.kind = FileKind::Delete;
+    assert!(
+        validate_global_vector_index_types(&[entries[0].clone(), ignored], 2, "embedding").is_ok()
+    );
+    assert!(validate_global_vector_index_types(&entries, 99, "another_column").is_ok());
+}
+
+#[tokio::test]
+async fn indexed_vector_metric_ignores_unrelated_column_options() {
+    let file_io = FileIOBuilder::new("memory").build().unwrap();
+    let index = build_vindex_segment_bytes("inner_product");
+    file_io
+        .new_output("memory:///test_table/index/test.idx")
+        .unwrap()
+        .write(bytes::Bytes::from(index.clone()))
+        .await
+        .unwrap();
+    let mut entry = make_lumina_entry("test.idx", IVF_FLAT_IDENTIFIER, FileKind::Add, 2);
+    entry.index_file.file_size = index.len() as i64;
+    let fields = vec![make_field(2, "embedding")];
+    let options = HashMap::from([("fields.other.metric".to_string(), "l2".to_string())]);
+    let query = VectorSearch::new(vec![1.0, 0.0], 2, "embedding".to_string())
+        .unwrap()
+        .with_options(options.clone());
+    let results = evaluate_batch_vector_search(
+        eval_context(&file_io, &HashMap::new(), &fields, Some(10)),
+        std::slice::from_ref(&entry),
+        &[query],
+    )
+    .await
+    .unwrap();
+    assert_eq!(results[0].len(), 2);
+    assert_eq!(
+        resolve_raw_vector_metric(
+            &file_io,
+            "memory:///test_table",
+            &HashMap::new(),
+            &options,
+            &[entry],
+            2,
+            "embedding",
+        )
+        .await
+        .unwrap(),
+        RawVectorMetric::InnerProduct
     );
 }
 
@@ -1638,5 +1813,356 @@ fn scalar_unindexed_coverage_intersects_all_predicate_fields() {
             vec![RowRange::new(0, 19)]
         );
         id.index_file.index_type = "btree".to_string();
+    }
+}
+
+struct WireSearchExecutor {
+    table: Table,
+    kinds: std::sync::Mutex<Vec<String>>,
+    fail: bool,
+}
+
+#[async_trait::async_trait]
+impl crate::table::SearchTaskExecutor for WireSearchExecutor {
+    async fn execute(
+        &self,
+        tasks: Vec<crate::table::SearchTask>,
+    ) -> crate::Result<Vec<crate::table::SearchTaskResult>> {
+        if self.fail {
+            return Err(crate::Error::UnexpectedError {
+                message: "scheduler cancelled".into(),
+                source: None,
+            });
+        }
+        let (context, frames) = crate::table::SearchTask::serialize_batch(&tasks)?;
+        let mut results = Vec::new();
+        for (task, frame) in tasks.iter().zip(frames) {
+            let value: serde_json::Value = serde_json::from_slice(&task.serialize()?).unwrap();
+            self.kinds
+                .lock()
+                .unwrap()
+                .push(value["kind"].as_str().unwrap().into());
+            results.push(crate::table::SearchTaskResult::deserialize(
+                &self.table.execute_search_task(&frame, &context).await?,
+            )?);
+        }
+        // Completion order must never decide index precedence or query order.
+        results.reverse();
+        Ok(results)
+    }
+}
+
+#[tokio::test]
+async fn scheduled_batch_vector_matches_local_filter_refine_and_pinned_plan() {
+    let table = de_vector_table().await;
+    let mut builder = table.new_batch_vector_search_builder();
+    builder
+        .with_vector_column("embedding")
+        .with_query_vectors(vec![vec![1.0, 0.0], vec![0.0, 1.0]])
+        .with_limit(2)
+        .with_filter(id_gt_filter(&table, 1))
+        .with_options(HashMap::from([("refine_factor".into(), "2".into())]));
+    let plan = builder.new_scan().unwrap().plan().await.unwrap();
+    let reader = builder.new_read().unwrap();
+    let expected = reader.read(plan.clone()).await.unwrap();
+    let executor = WireSearchExecutor {
+        table: table.clone(),
+        kinds: std::sync::Mutex::new(Vec::new()),
+        fail: false,
+    };
+    let actual = reader.read_with_executor(plan, &executor).await.unwrap();
+    for (expected, actual) in expected.iter().zip(&actual) {
+        assert_eq!(
+            expected.row_ids().unwrap().row_ids,
+            actual.row_ids().unwrap().row_ids
+        );
+        assert_eq!(
+            expected.row_ids().unwrap().scores,
+            actual.row_ids().unwrap().scores
+        );
+    }
+    let kinds = executor.kinds.lock().unwrap();
+    assert!(kinds.iter().any(|kind| kind == "vector-index"));
+    assert!(kinds.iter().any(|kind| kind == "vector-rows"));
+}
+
+#[tokio::test]
+async fn scheduled_vector_failure_does_not_replay_locally() {
+    let table = de_vector_table().await;
+    let mut builder = table.new_vector_search_builder();
+    builder
+        .with_vector_column("embedding")
+        .with_query_vector(vec![1.0, 0.0])
+        .with_limit(1);
+    let plan = builder.new_scan().unwrap().plan().await.unwrap();
+    let reader = builder.new_read().unwrap();
+    let executor = WireSearchExecutor {
+        table,
+        kinds: std::sync::Mutex::new(Vec::new()),
+        fail: true,
+    };
+    let error = reader
+        .read_with_executor(plan, &executor)
+        .await
+        .err()
+        .unwrap();
+    assert!(error.to_string().contains("scheduler cancelled"), "{error}");
+}
+
+struct CandidateSearchExecutor {
+    table: Table,
+    metric: RawVectorMetric,
+    index_ordinal: std::sync::atomic::AtomicUsize,
+    index_batch_sizes: std::sync::Mutex<Vec<usize>>,
+}
+#[async_trait::async_trait]
+impl crate::table::SearchTaskExecutor for CandidateSearchExecutor {
+    async fn execute(
+        &self,
+        tasks: Vec<crate::table::SearchTask>,
+    ) -> crate::Result<Vec<crate::table::SearchTaskResult>> {
+        let mut results = Vec::new();
+        let batch_size = tasks.len();
+        let mut recorded_batch = false;
+        for task in tasks {
+            let wire: serde_json::Value = serde_json::from_slice(&task.serialize()?).unwrap();
+            if wire["kind"] == "vector-index" {
+                if !recorded_batch {
+                    assert!(batch_size <= SEARCH_TASK_WINDOW);
+                    self.index_batch_sizes.lock().unwrap().push(batch_size);
+                    recorded_batch = true;
+                }
+                let ordinal = self
+                    .index_ordinal
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let rows = if ordinal == 0 { vec![0, 2] } else { vec![1] };
+                let scores = if ordinal == 0 {
+                    vec![10.0_f32, 9.0]
+                } else {
+                    vec![8.0]
+                };
+                let payload = serde_json::to_value(VectorTaskScores::capture(
+                    vec![ScoredRowIds::new(rows, scores)],
+                    Some(self.metric),
+                ))
+                .unwrap();
+                let result =
+                    serde_json::json!({"version": 1, "id": wire["id"], "payload": payload});
+                results.push(crate::table::SearchTaskResult::deserialize(
+                    &serde_json::to_vec(&result).unwrap(),
+                )?);
+            } else {
+                results.push(task.execute(&self.table).await?);
+            }
+        }
+        results.reverse();
+        Ok(results)
+    }
+}
+
+#[tokio::test]
+async fn scheduled_vector_selects_global_candidates_before_rerank() {
+    let table = de_vector_table().await;
+    let mut builder = table.new_vector_search_builder();
+    builder
+        .with_vector_column("embedding")
+        .with_query_vector(vec![0.0, 1.0])
+        .with_limit(1)
+        .with_options(HashMap::from([("refine_factor".into(), "2".into())]));
+    let plan = builder.new_scan().unwrap().plan().await.unwrap();
+    let mut sources = plan.splits().to_vec();
+    let duplicate = sources
+        .iter()
+        .find(|source| {
+            matches!(source,
+        crate::table::SearchScanSplit::Index { index_files, .. }
+        if index_files.iter().any(|file| file.index_type == IVF_FLAT_IDENTIFIER))
+        })
+        .unwrap()
+        .clone();
+    for _ in 0..SEARCH_TASK_WINDOW + 1 {
+        sources.push(duplicate.clone());
+    }
+    let entries = crate::table::search_scan_split::global_entries_from_splits(&sources).unwrap();
+    let plan = crate::table::VectorScanPlan::new(plan.snapshot().cloned(), sources).unwrap();
+    let metric = resolve_raw_vector_metric(
+        table.file_io(),
+        table.location(),
+        table.schema().options(),
+        &HashMap::new(),
+        &entries,
+        find_field_id_by_name(table.schema().fields(), "embedding").unwrap(),
+        "embedding",
+    )
+    .await
+    .unwrap();
+    let executor = CandidateSearchExecutor {
+        table: table.clone(),
+        metric,
+        index_ordinal: std::sync::atomic::AtomicUsize::new(0),
+        index_batch_sizes: std::sync::Mutex::new(Vec::new()),
+    };
+    let reader = builder.new_read().unwrap();
+    let result = reader.read_with_executor(plan, &executor).await.unwrap();
+    // Global ANN candidates are 0 and 2. Exact nearest row 1 is outside that
+    // budget; reranking each shard before merging would incorrectly admit it.
+    assert_eq!(result.row_ids().unwrap().row_ids, vec![2]);
+    let expected = match metric {
+        RawVectorMetric::L2 => 0.5,
+        RawVectorMetric::Cosine => 1.0_f32 / 2.0_f32.sqrt(),
+        RawVectorMetric::InnerProduct => 1.0,
+    };
+    assert!((result.row_ids().unwrap().scores[0] - expected).abs() < 1e-6);
+    assert_eq!(
+        *executor.index_batch_sizes.lock().unwrap(),
+        vec![SEARCH_TASK_WINDOW, 2]
+    );
+}
+
+struct WindowSearchExecutor {
+    batch_sizes: std::sync::Mutex<Vec<usize>>,
+    ordinal: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl crate::table::SearchTaskExecutor for WindowSearchExecutor {
+    async fn execute(
+        &self,
+        tasks: Vec<crate::table::SearchTask>,
+    ) -> crate::Result<Vec<crate::table::SearchTaskResult>> {
+        assert!(tasks.len() <= SEARCH_TASK_WINDOW);
+        self.batch_sizes.lock().unwrap().push(tasks.len());
+        let mut results = Vec::new();
+        for task in tasks {
+            let ordinal = self
+                .ordinal
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let wire: serde_json::Value = serde_json::from_slice(&task.serialize()?).unwrap();
+            let payload = VectorTaskScores::capture(
+                vec![ScoredRowIds::new(
+                    vec![ordinal as u64],
+                    vec![ordinal as f32],
+                )],
+                None,
+            );
+            results.push(crate::table::SearchTaskResult::deserialize(
+                &serde_json::to_vec(&serde_json::json!({
+                    "version": 1, "id": wire["id"], "payload": payload
+                }))
+                .unwrap(),
+            )?);
+        }
+        results.reverse();
+        Ok(results)
+    }
+}
+
+#[tokio::test]
+async fn scheduled_raw_vector_merges_bounded_windows_without_losing_late_winners() {
+    let table = de_vector_table().await;
+    let mut builder = table.new_read_builder();
+    builder
+        .with_projection(&["embedding", ROW_ID_FIELD_NAME])
+        .unwrap();
+    let plan = builder.new_scan().plan().await.unwrap();
+    let count = SEARCH_TASK_WINDOW * 3 + 1;
+    let splits = vec![plan.splits()[0].clone(); count];
+    let queries = vec![VectorSearch::new(vec![1.0, 0.0], 3, "embedding".into()).unwrap()];
+    let executor = WindowSearchExecutor {
+        batch_sizes: std::sync::Mutex::new(Vec::new()),
+        ordinal: std::sync::atomic::AtomicUsize::new(0),
+    };
+    let results =
+        execute_raw_vector_tasks(&table, &splits, &queries, RawVectorMetric::L2, &executor)
+            .await
+            .unwrap();
+    assert_eq!(
+        *executor.batch_sizes.lock().unwrap(),
+        vec![
+            SEARCH_TASK_WINDOW,
+            SEARCH_TASK_WINDOW,
+            SEARCH_TASK_WINDOW,
+            1
+        ]
+    );
+    assert_eq!(
+        results[0].row_ids,
+        vec![count as u64 - 1, count as u64 - 2, count as u64 - 3]
+    );
+}
+
+#[tokio::test]
+async fn scheduled_raw_vector_matches_filtered_pinned_stream() {
+    let table = de_vector_table().await;
+    let snapshot = table
+        .snapshot_manager()
+        .get_latest_snapshot()
+        .await
+        .unwrap()
+        .unwrap();
+    let pinned = table.copy_with_pinned_snapshot(Some(&snapshot));
+    let filter = id_gt_filter(&pinned, 1);
+    let queries = vec![
+        VectorSearch::new(vec![1.0, 0.0], 2, "embedding".into()).unwrap(),
+        VectorSearch::new(vec![0.0, 1.0], 2, "embedding".into()).unwrap(),
+    ];
+    let ranges = vec![RowRange::new(0, 2)];
+    let expected = read_raw_batch_vector_search_with_executor(
+        &pinned,
+        &queries,
+        &ranges,
+        RawVectorMetric::L2,
+        Some(&filter),
+        None,
+    )
+    .await
+    .unwrap()
+    .0;
+
+    let element = Arc::new(ArrowField::new("element", ArrowDataType::Float32, true));
+    let mut values =
+        arrow_array::builder::ListBuilder::new(Float32Builder::new()).with_field(element.clone());
+    values.values().append_slice(&[1.0, 0.0]);
+    values.append(true);
+    let batch = RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", ArrowDataType::Int32, false),
+            ArrowField::new("embedding", ArrowDataType::List(element), true),
+        ])),
+        vec![
+            Arc::new(Int32Array::from(vec![4])),
+            Arc::new(values.finish()),
+        ],
+    )
+    .unwrap();
+    let mut write = crate::table::TableWrite::new(&table, "scheduled-test".into()).unwrap();
+    write.write_arrow_batch(&batch).await.unwrap();
+    let messages = write.prepare_commit().await.unwrap();
+    crate::table::TableCommit::new(table.clone(), "scheduled-test".into())
+        .commit(messages)
+        .await
+        .unwrap();
+
+    let executor = WireSearchExecutor {
+        table,
+        kinds: std::sync::Mutex::new(Vec::new()),
+        fail: false,
+    };
+    let actual = read_raw_batch_vector_search_with_executor(
+        &pinned,
+        &queries,
+        &ranges,
+        RawVectorMetric::L2,
+        Some(&filter),
+        Some(&executor),
+    )
+    .await
+    .unwrap()
+    .0;
+    assert_eq!(expected.len(), actual.len());
+    for (expected, actual) in expected.iter().zip(actual) {
+        assert_eq!(expected.row_ids, actual.row_ids);
+        assert_eq!(expected.scores, actual.scores);
+        assert!(actual.row_ids.iter().all(|row| [1, 2].contains(row)));
     }
 }

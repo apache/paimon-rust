@@ -17,12 +17,14 @@
 
 use crate::common::options::{parse_memory_size, CatalogOptions};
 use crate::error::*;
+use lru::LruCache;
 use std::any::Any;
 use std::collections::HashMap;
 use std::future::Future;
+use std::num::NonZeroUsize;
 use std::ops::Range;
 use std::pin::Pin;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll};
 use std::time::SystemTime;
 
@@ -45,6 +47,9 @@ use super::Storage;
 mod cache_routing_tests;
 #[cfg(all(test, feature = "storage-memory"))]
 mod provider_tests;
+
+#[cfg(feature = "storage-fs")]
+mod fuse;
 
 /// An externally managed block cache used by [`FileIO`].
 ///
@@ -128,10 +133,17 @@ pub struct FileIO {
 
 pub(crate) const DEFAULT_FILE_FORMAT_METADATA_CACHE_MAX_BYTES: usize = 50 * 1024 * 1024;
 pub(crate) const DEFAULT_BLOB_INDEX_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
+const ROW_METADATA_CACHE_MAX_BYTES: usize = 32 * 1024 * 1024;
+// Keep the combined parsed Parquet and ROW metadata below the configured limit.
+const ROW_METADATA_CACHE_BUDGET_DIVISOR: usize = 4;
+const ROW_SIDECAR_SIZE_CACHE_MAX_ENTRIES: usize = 4096;
 
 pub(crate) struct FileFormatMetadataCacheContext {
     max_bytes: usize,
     cache: OnceLock<Arc<dyn Any + Send + Sync>>,
+    row_metadata_cache: OnceLock<Arc<dyn Any + Send + Sync>>,
+    process_id: u32,
+    row_sidecar_sizes: OnceLock<Mutex<LruCache<String, u64>>>,
 }
 
 impl std::fmt::Debug for FileFormatMetadataCacheContext {
@@ -162,6 +174,9 @@ impl FileFormatMetadataCacheContext {
         Ok(Arc::new(Self {
             max_bytes,
             cache: OnceLock::new(),
+            row_metadata_cache: OnceLock::new(),
+            process_id: std::process::id(),
+            row_sidecar_sizes: OnceLock::new(),
         }))
     }
 
@@ -169,17 +184,98 @@ impl FileFormatMetadataCacheContext {
         self.max_bytes
     }
 
+    fn row_metadata_max_bytes(&self) -> usize {
+        (self.max_bytes / ROW_METADATA_CACHE_BUDGET_DIVISOR).min(ROW_METADATA_CACHE_MAX_BYTES)
+    }
+
+    fn parquet_metadata_max_bytes(&self) -> usize {
+        self.max_bytes - self.row_metadata_max_bytes()
+    }
+
+    fn row_sidecar_size(&self, key: &str) -> Option<u64> {
+        if self.max_bytes == 0 || self.process_id != std::process::id() {
+            return None;
+        }
+        self.row_sidecar_sizes
+            .get()?
+            .lock()
+            .unwrap()
+            .get(key)
+            .copied()
+    }
+
+    fn cache_row_sidecar_size(&self, key: String, size: u64) {
+        if self.max_bytes == 0 || self.process_id != std::process::id() {
+            return;
+        }
+        self.row_sidecar_sizes
+            .get_or_init(|| {
+                Mutex::new(LruCache::new(
+                    NonZeroUsize::new(ROW_SIDECAR_SIZE_CACHE_MAX_ENTRIES).unwrap(),
+                ))
+            })
+            .lock()
+            .unwrap()
+            .put(key, size);
+    }
+
+    fn invalidate_row_sidecar_size(&self, key: &str) {
+        if self.process_id == std::process::id() {
+            if let Some(sizes) = self.row_sidecar_sizes.get() {
+                sizes.lock().unwrap().pop(key);
+            }
+        }
+    }
+
+    fn invalidate_row_sidecar_prefix(&self, prefix: &str) {
+        if self.process_id != std::process::id() {
+            return;
+        }
+        let Some(sizes) = self.row_sidecar_sizes.get() else {
+            return;
+        };
+        let mut sizes = sizes.lock().unwrap();
+        let keys: Vec<_> = sizes
+            .iter()
+            .filter(|(key, _)| key.starts_with(prefix))
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in keys {
+            sizes.pop(&key);
+        }
+    }
+
     pub(crate) fn get_or_init<T>(&self, init: impl FnOnce(usize) -> T) -> Arc<T>
     where
         T: Send + Sync + 'static,
     {
-        let cache = Arc::clone(
-            self.cache
-                .get_or_init(|| Arc::new(init(self.max_bytes)) as Arc<dyn Any + Send + Sync>),
-        );
+        let cache = Arc::clone(self.cache.get_or_init(|| {
+            Arc::new(init(self.parquet_metadata_max_bytes())) as Arc<dyn Any + Send + Sync>
+        }));
         match cache.downcast::<T>() {
             Ok(cache) => cache,
             Err(_) => panic!("file-format metadata cache type mismatch"),
+        }
+    }
+
+    /// ROW footer and block index metadata has its own typed cache. Keep it
+    /// separate from the Parquet cache, which also uses `get_or_init`.
+    pub(crate) fn row_metadata_get_or_init<T>(
+        &self,
+        init: impl FnOnce(usize) -> T,
+    ) -> Option<Arc<T>>
+    where
+        T: Send + Sync + 'static,
+    {
+        if self.max_bytes == 0 || self.process_id != std::process::id() {
+            return None;
+        }
+        let cache = Arc::clone(self.row_metadata_cache.get_or_init(|| {
+            Arc::new(init(self.row_metadata_max_bytes())) as Arc<dyn Any + Send + Sync>
+        }));
+        match cache.downcast::<T>() {
+            Ok(cache) => Some(cache),
+            Err(_) => panic!("ROW metadata cache type mismatch"),
         }
     }
 }
@@ -283,7 +379,7 @@ impl FileIO {
     /// `block_size` controls the aligned ranges presented to the cache.
     /// `whitelist` uses the same comma-separated values as
     /// `local-cache.whitelist`: `meta`, `global-index`, `bucket-index`, `data`,
-    /// and `file-index`, or `*` for all of them.
+    /// `structured-data`, and `file-index`, or `*` for all of them.
     pub fn with_file_block_cache(
         mut self,
         cache: Arc<dyn FileBlockCache>,
@@ -304,6 +400,19 @@ impl FileIO {
     pub fn with_provider(mut self, provider: Arc<dyn FileIOProvider>) -> Self {
         self.backend = FileIOBackend::Provider(provider);
         self
+    }
+
+    /// Whether both handles retain the same storage or provider instance.
+    pub(crate) fn shares_backend(&self, other: &Self) -> bool {
+        match (&self.backend, &other.backend) {
+            (FileIOBackend::Storage(left), FileIOBackend::Storage(right)) => {
+                Arc::ptr_eq(left, right)
+            }
+            (FileIOBackend::Provider(left), FileIOBackend::Provider(right)) => {
+                Arc::ptr_eq(left, right)
+            }
+            _ => false,
+        }
     }
 
     pub(crate) fn file_format_metadata_cache(&self) -> Arc<FileFormatMetadataCacheContext> {
@@ -380,25 +489,32 @@ impl FileIO {
         }
     }
 
+    async fn create_with_cache_namespace(
+        &self,
+        path: &str,
+    ) -> crate::Result<(Operator, String, Option<String>)> {
+        match &self.backend {
+            FileIOBackend::Provider(provider) => {
+                let (op, relative_path, namespace) =
+                    resolve_provider_with_cache_namespace(provider.as_ref(), path).await?;
+                Ok((op, relative_path, namespace))
+            }
+            FileIOBackend::Storage(_) => {
+                let (op, relative_path) = self.create_static(path)?;
+                Ok((
+                    op,
+                    relative_path,
+                    Some(self.cache_namespace_for_path(path)?),
+                ))
+            }
+        }
+    }
+
     async fn create_with_cache_path(
         &self,
         path: &str,
     ) -> crate::Result<(Operator, String, Option<String>)> {
-        let (op, relative_path, namespace) = match &self.backend {
-            FileIOBackend::Provider(provider) => {
-                let (op, relative_path, namespace) =
-                    resolve_provider_with_cache_namespace(provider.as_ref(), path).await?;
-                (op, relative_path, namespace)
-            }
-            FileIOBackend::Storage(_) => {
-                let (op, relative_path) = self.create_static(path)?;
-                (
-                    op,
-                    relative_path,
-                    Some(self.cache_namespace_for_path(path)?),
-                )
-            }
-        };
+        let (op, relative_path, namespace) = self.create_with_cache_namespace(path).await?;
         let cache_path =
             namespace.map(|namespace| cache_object_path(&namespace, &op, &relative_path));
         Ok((op, relative_path, cache_path))
@@ -571,6 +687,33 @@ impl FileIO {
         })
     }
 
+    /// Return the size of an immutable ROW sidecar without repeating remote
+    /// status requests for subsequent reads through the same cache context.
+    pub(crate) async fn immutable_row_sidecar_size(&self, path: &str) -> Result<u64> {
+        let (op, relative_path, cache_key) = self.create_with_cache_path(path).await?;
+        if let Some(size) = cache_key
+            .as_deref()
+            .and_then(|key| self.file_format_metadata_cache.row_sidecar_size(key))
+        {
+            return Ok(size);
+        }
+        let size = op
+            .stat(relative_path.as_ref())
+            .await
+            .map_err(|error| {
+                Error::from_opendal_with_context(
+                    error,
+                    format!("Failed to get file status for '{path}'"),
+                )
+            })?
+            .content_length();
+        if let Some(key) = cache_key {
+            self.file_format_metadata_cache
+                .cache_row_sidecar_size(key, size);
+        }
+        Ok(size)
+    }
+
     /// List the statuses of the files/directories in the given path if the path is a directory.
     ///
     /// References: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/fs/FileIO.java#L105>
@@ -729,11 +872,15 @@ impl FileIO {
         op.delete(relative_path.as_ref()).await.map_err(|error| {
             Error::from_opendal_with_context(error, format!("Failed to delete file '{path}'"))
         })?;
+        if let Some(ref cache_path) = cache_path {
+            self.file_format_metadata_cache
+                .invalidate_row_sidecar_size(cache_path);
+        }
         if let (Some(cache), Some(cache_path)) = (
             self.cache.as_ref().filter(|cache| cache.is_cacheable(path)),
             cache_path,
         ) {
-            cache.invalidate_path(&cache_path).await;
+            cache.invalidate_path(&cache_path).await?;
         }
 
         Ok(())
@@ -744,8 +891,12 @@ impl FileIO {
     /// Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/fs/FileIO.java#L139>
     pub async fn delete_dir(&self, path: &str) -> Result<()> {
         let (op, relative_path, cache_path) = self.create_with_cache_path(path).await?;
+        // Without a trailing `/`, OpenDAL trims the path's surrounding whitespace,
+        // and a recursive delete it emulates by listing removes every key with
+        // this prefix.
+        let dir_path = normalize_root(relative_path.as_ref());
 
-        op.delete_with(relative_path.as_ref())
+        op.delete_with(&dir_path)
             .recursive(true)
             .await
             .map_err(|error| {
@@ -754,8 +905,12 @@ impl FileIO {
                     format!("Failed to delete directory '{path}'"),
                 )
             })?;
+        if let Some(ref cache_path) = cache_path {
+            self.file_format_metadata_cache
+                .invalidate_row_sidecar_prefix(cache_path);
+        }
         if let (Some(cache), Some(cache_path)) = (&self.cache, cache_path) {
-            cache.invalidate_prefix(&cache_path).await;
+            cache.invalidate_prefix(&cache_path).await?;
         }
 
         Ok(())
@@ -835,7 +990,16 @@ impl FileIO {
                     .to_string(),
             });
         }
-        op_src
+        let shared_invalidation = if cache_path_src.is_some() || cache_path_dst.is_some() {
+            match &self.cache {
+                Some(cache) => cache.begin_shared_invalidation().await?,
+                None => None,
+            }
+        } else {
+            None
+        };
+        let shared_cache_fenced = shared_invalidation.is_some();
+        let rename_result = op_src
             .rename(relative_path_src.as_ref(), relative_path_dst.as_ref())
             .await
             .map_err(|error| {
@@ -843,13 +1007,21 @@ impl FileIO {
                     error,
                     format!("Failed to rename '{src}' to '{dst}'"),
                 )
-            })?;
-        if let Some(cache) = &self.cache {
-            if let Some(cache_path) = cache_path_src {
-                cache.invalidate_prefix(&cache_path).await;
-            }
-            if let Some(cache_path) = cache_path_dst {
-                cache.invalidate_prefix(&cache_path).await;
+            });
+        // A failed rename may still complete remotely. Leave the shared cache
+        // fenced rather than publish data read while its outcome is uncertain.
+        rename_result?;
+        if let Some(invalidation) = shared_invalidation {
+            invalidation.finish().await;
+        }
+        if !shared_cache_fenced {
+            if let Some(cache) = &self.cache {
+                if let Some(cache_path) = cache_path_src {
+                    cache.invalidate_prefix(&cache_path).await?;
+                }
+                if let Some(cache_path) = cache_path_dst {
+                    cache.invalidate_prefix(&cache_path).await?;
+                }
             }
         }
 
@@ -1226,6 +1398,7 @@ struct CacheInvalidatingWriter {
     delegate: Box<dyn FileWrite>,
     cache: Arc<LocalCache>,
     path: String,
+    delegate_closed: bool,
 }
 
 /// OpenDAL's local position writer retains its last write until close. Use a
@@ -1339,13 +1512,16 @@ impl FileWrite for CacheInvalidatingWriter {
 
     async fn flush(&mut self) -> crate::Result<()> {
         self.delegate.flush().await?;
-        self.cache.invalidate_path(&self.path).await;
+        self.cache.invalidate_path(&self.path).await?;
         Ok(())
     }
 
     async fn close(&mut self) -> crate::Result<()> {
-        self.delegate.close().await?;
-        self.cache.invalidate_path(&self.path).await;
+        if !self.delegate_closed {
+            self.delegate.close().await?;
+            self.delegate_closed = true;
+        }
+        self.cache.invalidate_path(&self.path).await?;
         Ok(())
     }
 }
@@ -1360,7 +1536,7 @@ struct CacheInvalidatingAsyncWriter {
     cache: Arc<LocalCache>,
     path: String,
     delegate_shutdown: bool,
-    invalidation: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
+    invalidation: Option<Pin<Box<dyn Future<Output = crate::Result<()>> + Send>>>,
 }
 
 impl tokio::io::AsyncWrite for CacheInvalidatingAsyncWriter {
@@ -1400,7 +1576,16 @@ impl tokio::io::AsyncWrite for CacheInvalidatingAsyncWriter {
         if let Some(invalidation) = &mut self.invalidation {
             match invalidation.as_mut().poll(context) {
                 Poll::Pending => return Poll::Pending,
-                Poll::Ready(()) => self.invalidation = None,
+                Poll::Ready(Ok(())) => self.invalidation = None,
+                Poll::Ready(Err(error)) => {
+                    // A retry must retry invalidation, not report successful
+                    // shutdown merely because the delegate is already closed.
+                    let cache = self.cache.clone();
+                    let path = self.path.clone();
+                    self.invalidation =
+                        Some(Box::pin(async move { cache.invalidate_path(&path).await }));
+                    return Poll::Ready(Err(std::io::Error::other(error)));
+                }
             }
         }
         Poll::Ready(Ok(()))
@@ -1632,6 +1817,7 @@ impl OutputFile {
             delegate: writer,
             cache: cache.clone(),
             path: cache_path,
+            delegate_closed: false,
         })
     }
 
@@ -1686,6 +1872,7 @@ mod file_action_test {
             let service: Servicer = Arc::new(CountingListService {
                 pulls: Arc::clone(&self.pulls),
                 fork_error: None,
+                stat_response: None,
             });
             Ok((
                 Operator::from_parts(OperationContext::default(), service),
@@ -1698,6 +1885,7 @@ mod file_action_test {
     struct CountingListService {
         pulls: Arc<AtomicUsize>,
         fork_error: Option<&'static str>,
+        stat_response: Option<(Arc<AtomicUsize>, u64)>,
     }
 
     impl Service for CountingListService {
@@ -1737,6 +1925,12 @@ mod file_action_test {
         ) -> opendal::Result<RpStat> {
             if let Some(message) = self.fork_error {
                 return Err(fork_test_error(message));
+            }
+            if let Some((calls, size)) = &self.stat_response {
+                calls.fetch_add(1, AtomicOrdering::SeqCst);
+                return Ok(RpStat::new(
+                    Metadata::new(EntryMode::FILE).with_content_length(*size),
+                ));
             }
             Err(unsupported_test_operation())
         }
@@ -1994,6 +2188,7 @@ mod file_action_test {
             let service: Servicer = Arc::new(CountingListService {
                 pulls: Arc::new(AtomicUsize::new(0)),
                 fork_error: Some(message),
+                stat_response: None,
             });
             let operator = Operator::from_parts(OperationContext::default(), service);
             let file_io = setup_memory_file_io().with_provider(Arc::new(FixedProvider(operator)));
@@ -2151,6 +2346,39 @@ mod file_action_test {
         .await;
     }
 
+    #[cfg(all(windows, feature = "storage-fs"))]
+    #[tokio::test]
+    async fn windows_drive_paths_and_file_uris_can_list_the_same_files() {
+        let directory = tempdir().unwrap();
+        let native = directory.path().to_string_lossy().into_owned();
+        let forward = native.replace('\\', "/");
+        let uri = url::Url::from_directory_path(directory.path()).unwrap();
+        let file_io = FileIO::from_path(&native).unwrap().build().unwrap();
+        file_io
+            .new_output(&format!("{forward}/data"))
+            .unwrap()
+            .write(Bytes::from_static(b"value"))
+            .await
+            .unwrap();
+
+        for root in [
+            native,
+            forward.clone(),
+            uri.to_string(),
+            format!("file:/{forward}"),
+        ] {
+            let entries = file_io.list_status(&root).await.unwrap();
+            assert_eq!(entries.len(), 1, "{root}");
+            let contents = file_io
+                .new_input(&entries[0].path)
+                .unwrap()
+                .read()
+                .await
+                .unwrap();
+            assert_eq!(contents, Bytes::from_static(b"value"), "{root}");
+        }
+    }
+
     #[tokio::test]
     async fn test_list_status_fs_should_return_entry_paths() {
         let file_io = setup_fs_file_io();
@@ -2176,6 +2404,121 @@ mod file_action_test {
                 .unwrap();
             assert!(file_io.exists(&path).await.unwrap());
         });
+    }
+
+    #[tokio::test]
+    async fn test_delete_dir_keeps_directories_sharing_its_prefix() {
+        // The memory backend deletes recursively by key prefix, as S3 and OSS do.
+        let file_io = setup_memory_file_io();
+        let partitions = ["month=1", "month=10", "month=2"];
+        for partition in partitions {
+            file_io
+                .new_output(&format!("memory:/delete_dir_prefix/{partition}/data"))
+                .unwrap()
+                .write(Bytes::from("data"))
+                .await
+                .unwrap();
+        }
+
+        file_io
+            .delete_dir("memory:/delete_dir_prefix/month=1")
+            .await
+            .unwrap();
+
+        let mut kept = Vec::new();
+        for partition in partitions {
+            let path = format!("memory:/delete_dir_prefix/{partition}/data");
+            if file_io.exists(&path).await.unwrap() {
+                kept.push(partition);
+            }
+        }
+        assert_eq!(kept, ["month=10", "month=2"]);
+    }
+
+    // Windows drops trailing spaces from file names.
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn test_delete_dir_keeps_the_name_without_its_trailing_space() {
+        let dir = tempdir().unwrap();
+        for name in ["t1", "t1 "] {
+            fs::create_dir(dir.path().join(name)).unwrap();
+            fs::write(dir.path().join(name).join("data"), b"data").unwrap();
+        }
+        let file_io = setup_fs_file_io();
+
+        file_io
+            .delete_dir(&local_file_path(&dir.path().join("t1 ")))
+            .await
+            .unwrap();
+
+        assert!(dir.path().join("t1").exists());
+        assert!(!dir.path().join("t1 ").exists());
+    }
+
+    #[tokio::test]
+    async fn test_immutable_row_sidecar_size_cache_avoids_repeated_stat() {
+        #[derive(Debug)]
+        struct CountingStatProvider(Operator);
+
+        #[async_trait::async_trait]
+        impl FileIOProvider for CountingStatProvider {
+            async fn create(&self, path: &str) -> crate::Result<(Operator, String)> {
+                Ok((
+                    self.0.clone(),
+                    path.strip_prefix("counting:/").unwrap().to_string(),
+                ))
+            }
+
+            async fn create_with_cache_namespace(
+                &self,
+                path: &str,
+            ) -> crate::Result<(Operator, String, Option<String>)> {
+                let (op, relative_path) = self.create(path).await?;
+                Ok((op, relative_path, Some("counting-stat".to_string())))
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let service: Servicer = Arc::new(CountingListService {
+            pulls: Arc::new(AtomicUsize::new(0)),
+            fork_error: None,
+            stat_response: Some((Arc::clone(&calls), 123)),
+        });
+        let provider = Arc::new(CountingStatProvider(Operator::from_parts(
+            OperationContext::default(),
+            service,
+        )));
+        let path = "counting:/objects/sidecar.row";
+
+        let cached = FileIOBuilder::new("memory")
+            .with_provider(provider.clone())
+            .build()
+            .unwrap();
+        assert_eq!(cached.immutable_row_sidecar_size(path).await.unwrap(), 123);
+        assert_eq!(
+            cached
+                .clone()
+                .immutable_row_sidecar_size(path)
+                .await
+                .unwrap(),
+            123
+        );
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 1);
+
+        let uncached = FileIOBuilder::new("memory")
+            .with_provider(provider)
+            .with_prop(CatalogOptions::FILE_FORMAT_METADATA_CACHE_MAX_SIZE, "0")
+            .build()
+            .unwrap();
+        assert_eq!(
+            uncached.immutable_row_sidecar_size(path).await.unwrap(),
+            123
+        );
+        assert_eq!(
+            uncached.immutable_row_sidecar_size(path).await.unwrap(),
+            123
+        );
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 3);
     }
 }
 
@@ -2463,6 +2806,92 @@ mod input_output_test {
         }
     }
 
+    #[tokio::test]
+    async fn test_structured_data_cache_preserves_existing_selectors() {
+        for disk in [false, true] {
+            for whitelist in [
+                "meta,global-index",
+                "data",
+                "structured-data",
+                "meta,global-index,structured-data",
+                "*",
+            ] {
+                let directory = tempfile::tempdir().unwrap();
+                let mut options = Options::new();
+                options.set(CatalogOptions::LOCAL_CACHE_ENABLED, "true");
+                options.set(CatalogOptions::LOCAL_CACHE_WHITELIST, whitelist);
+                options.set(CatalogOptions::LOCAL_CACHE_BLOCK_SIZE, "4");
+                if disk {
+                    options.set(
+                        CatalogOptions::LOCAL_CACHE_DIR,
+                        directory.path().to_string_lossy(),
+                    );
+                }
+                let cache = Arc::new(
+                    LocalCache::new(LocalCacheConfig::from_options(&options).unwrap().unwrap())
+                        .unwrap(),
+                );
+                let file_io = FileIOBuilder::new("memory")
+                    .with_local_cache(cache)
+                    .build()
+                    .unwrap();
+                for name in [
+                    "data.parquet",
+                    "data.blob",
+                    "data.orc",
+                    "data.avro",
+                    "data.row",
+                    "data.mosaic",
+                    "data.vortex",
+                    "data.csv",
+                    "data.json.zst",
+                    "data.text.snappy",
+                    "data.video",
+                    "data.vector.vortex",
+                    "data.PARQUET",
+                    "data.unknown",
+                    "data.parquet.index",
+                    "snapshot-1",
+                    "snapshot-1.blob",
+                ] {
+                    let path = format!("memory:/{name}");
+                    file_io
+                        .new_output(&path)
+                        .unwrap()
+                        .write(Bytes::from_static(b"abcdefgh"))
+                        .await
+                        .unwrap();
+                    let input = file_io.new_input(&path).unwrap();
+                    let reader = input.reader().await.unwrap();
+                    assert_eq!(reader.read(1..7).await.unwrap(), b"bcdefg"[..]);
+                    drop(reader);
+                    let (op, relative_path, _) = input.source.resolve(&path).await.unwrap();
+                    op.origin_operator().delete(&relative_path).await.unwrap();
+                    let data_file = name.starts_with("data.") && !name.ends_with(".index");
+                    let dedicated =
+                        matches!(name, "data.blob" | "data.video" | "data.vector.vortex");
+                    let cached = match whitelist {
+                        "*" => true,
+                        "data" => data_file,
+                        "structured-data" => data_file && !dedicated,
+                        "meta,global-index,structured-data" => {
+                            name.starts_with("snapshot-") || (data_file && !dedicated)
+                        }
+                        _ => name.starts_with("snapshot-"),
+                    };
+                    let result = input.read().await;
+                    if cached {
+                        assert_eq!(result.unwrap(), b"abcdefgh"[..], "{whitelist}: {name}");
+                        let reader = input.reader().await.unwrap();
+                        assert_eq!(reader.read(1..7).await.unwrap(), b"bcdefg"[..]);
+                    } else {
+                        assert!(result.is_err(), "{whitelist}: {name}");
+                    }
+                }
+            }
+        }
+    }
+
     async fn common_test_output_file_write_and_read(file_io: &FileIO, path: &str) {
         let output = file_io.new_output(path).unwrap();
         let mut writer = output.writer().await.unwrap();
@@ -2592,6 +3021,113 @@ mod input_output_test {
         assert_ne!(first_key, second_key);
         assert!(std::ptr::eq(first_cache, clone_cache));
         assert!(!std::ptr::eq(first_cache, second_cache));
+    }
+
+    #[test]
+    fn row_metadata_cache_has_separate_type_and_bypasses_inherited_fork_state() {
+        let mut context = FileFormatMetadataCacheContext::from_props(&HashMap::new()).unwrap();
+        assert_eq!(*context.get_or_init(|_| 7u8), 7);
+        assert_eq!(*context.row_metadata_get_or_init(|_| 11u16).unwrap(), 11);
+        Arc::get_mut(&mut context).unwrap().process_id = 0;
+        assert!(context.row_metadata_get_or_init(|_| 13u16).is_none());
+    }
+
+    #[test]
+    fn row_and_parquet_metadata_share_configured_budget() {
+        let context = FileFormatMetadataCacheContext::from_props(&HashMap::from([(
+            CatalogOptions::FILE_FORMAT_METADATA_CACHE_MAX_SIZE.to_string(),
+            "64 kb".to_string(),
+        )]))
+        .unwrap();
+        let parquet_budget = *context.get_or_init(|bytes| bytes);
+        let row_budget = *context.row_metadata_get_or_init(|bytes| bytes).unwrap();
+        assert_eq!(parquet_budget, 48 * 1024);
+        assert_eq!(row_budget, 16 * 1024);
+        assert_eq!(parquet_budget + row_budget, context.max_bytes());
+
+        let default = FileFormatMetadataCacheContext::from_props(&HashMap::new()).unwrap();
+        assert_eq!(
+            default.parquet_metadata_max_bytes() + default.row_metadata_max_bytes(),
+            DEFAULT_FILE_FORMAT_METADATA_CACHE_MAX_BYTES
+        );
+    }
+
+    #[tokio::test]
+    async fn test_immutable_row_sidecar_size_cache_is_scoped_and_disabled_with_metadata_cache() {
+        let path = "memory:/row-sidecar-size-cache.row";
+        let first = setup_memory_file_io();
+        assert!(first
+            .file_format_metadata_cache
+            .row_sidecar_sizes
+            .get()
+            .is_none());
+        first
+            .new_output(path)
+            .unwrap()
+            .write(Bytes::from_static(b"first"))
+            .await
+            .unwrap();
+        assert!(first
+            .file_format_metadata_cache
+            .row_sidecar_sizes
+            .get()
+            .is_none());
+        assert_eq!(first.immutable_row_sidecar_size(path).await.unwrap(), 5);
+        assert!(first
+            .file_format_metadata_cache
+            .row_sidecar_sizes
+            .get()
+            .is_some());
+
+        // The same context reuses the size. A different FileIO with the same
+        // literal path has its own storage target and must not reuse it.
+        assert_eq!(
+            first
+                .clone()
+                .immutable_row_sidecar_size(path)
+                .await
+                .unwrap(),
+            5
+        );
+        assert!(setup_memory_file_io()
+            .immutable_row_sidecar_size(path)
+            .await
+            .is_err());
+        first.delete_file(path).await.unwrap();
+        assert!(first.immutable_row_sidecar_size(path).await.is_err());
+
+        let nested = "memory:/row-sidecar-size-prefix/sidecar.row";
+        first
+            .new_output(nested)
+            .unwrap()
+            .write(Bytes::from_static(b"nested"))
+            .await
+            .unwrap();
+        assert_eq!(first.immutable_row_sidecar_size(nested).await.unwrap(), 6);
+        first
+            .delete_dir("memory:/row-sidecar-size-prefix")
+            .await
+            .unwrap();
+        assert!(first.immutable_row_sidecar_size(nested).await.is_err());
+
+        let uncached = FileIOBuilder::new("memory")
+            .with_prop(CatalogOptions::FILE_FORMAT_METADATA_CACHE_MAX_SIZE, "0")
+            .build()
+            .unwrap();
+        uncached
+            .new_output(path)
+            .unwrap()
+            .write(Bytes::from_static(b"data"))
+            .await
+            .unwrap();
+        assert_eq!(uncached.immutable_row_sidecar_size(path).await.unwrap(), 4);
+        uncached.delete_file(path).await.unwrap();
+        assert!(uncached.immutable_row_sidecar_size(path).await.is_err());
+        assert!(uncached
+            .file_format_metadata_cache
+            .row_sidecar_sizes
+            .get()
+            .is_none());
     }
 
     #[tokio::test]
@@ -2971,6 +3507,272 @@ mod input_output_test {
             file_io.new_input(&location).unwrap().read().await.unwrap(),
             Bytes::from_static(b"new metadata")
         );
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn test_shared_cache_delete_timeout_and_recreate() {
+        use tokio::io::AsyncWriteExt;
+        let source = tempfile::tempdir().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = source.path().join("snapshot-1");
+        std::fs::write(&path, b"old metadata").unwrap();
+        let location = format!("file:{}", path.display());
+        let mut options = Options::new();
+        options.set(CatalogOptions::LOCAL_CACHE_ENABLED, "true");
+        options.set(CatalogOptions::LOCAL_CACHE_SHARED, "true");
+        options.set(
+            CatalogOptions::LOCAL_CACHE_DIR,
+            directory.path().to_string_lossy(),
+        );
+        options.set(CatalogOptions::LOCAL_CACHE_MAX_SIZE, "1 MiB");
+        let cache = Arc::new(
+            LocalCache::new(LocalCacheConfig::from_options(&options).unwrap().unwrap()).unwrap(),
+        );
+        let file_io = FileIOBuilder::new("file")
+            .with_local_cache(cache)
+            .build()
+            .unwrap();
+        assert_eq!(
+            file_io.new_input(&location).unwrap().read().await.unwrap(),
+            "old metadata"
+        );
+        let gate = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(
+                directory
+                    .path()
+                    .join("paimon-shared-local-cache-v1/directory.lock"),
+            )
+            .unwrap();
+        gate.lock().unwrap();
+        let error = file_io.delete_file(&location).await.unwrap_err();
+        assert!(error.to_string().contains("invalidation failed"));
+        drop(gate);
+        // The underlying delete may already have succeeded. Retrying the
+        // idempotent delete must complete invalidation before path reuse.
+        file_io.delete_file(&location).await.unwrap();
+        std::fs::write(&path, b"new metadata").unwrap();
+        assert_eq!(
+            file_io.new_input(&location).unwrap().read().await.unwrap(),
+            "new metadata"
+        );
+        let mut writer = file_io
+            .new_output(&location)
+            .unwrap()
+            .async_writer()
+            .await
+            .unwrap();
+        writer.write_all(b"replacement!").await.unwrap();
+        let gate = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(
+                directory
+                    .path()
+                    .join("paimon-shared-local-cache-v1/directory.lock"),
+            )
+            .unwrap();
+        gate.lock().unwrap();
+        assert!(writer.shutdown().await.is_err());
+        // A second shutdown cannot silently succeed while invalidation still fails.
+        assert!(writer.shutdown().await.is_err());
+        drop(gate);
+        writer.shutdown().await.unwrap();
+        assert_eq!(
+            file_io.new_input(&location).unwrap().read().await.unwrap(),
+            "replacement!"
+        );
+
+        let gate = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(
+                directory
+                    .path()
+                    .join("paimon-shared-local-cache-v1/directory.lock"),
+            )
+            .unwrap();
+        gate.lock().unwrap();
+        let directory_location = format!("file:{}", source.path().display());
+        assert!(file_io.delete_dir(&directory_location).await.is_err());
+        drop(gate);
+        file_io.delete_dir(&directory_location).await.unwrap();
+        std::fs::create_dir_all(source.path()).unwrap();
+        std::fs::write(&path, b"recreated!!!").unwrap();
+        assert_eq!(
+            file_io.new_input(&location).unwrap().read().await.unwrap(),
+            "recreated!!!"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn test_shared_cache_regular_close_retries_invalidation() {
+        let source = tempfile::tempdir().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = source.path().join("snapshot-1");
+        std::fs::write(&path, b"old").unwrap();
+        let location = format!("file:{}", path.display());
+        let mut options = Options::new();
+        options.set(CatalogOptions::LOCAL_CACHE_ENABLED, "true");
+        options.set(CatalogOptions::LOCAL_CACHE_SHARED, "true");
+        options.set(
+            CatalogOptions::LOCAL_CACHE_DIR,
+            directory.path().to_string_lossy(),
+        );
+        options.set(CatalogOptions::LOCAL_CACHE_MAX_SIZE, "1 MiB");
+        let cache = Arc::new(
+            LocalCache::new(LocalCacheConfig::from_options(&options).unwrap().unwrap()).unwrap(),
+        );
+        let file_io = FileIOBuilder::new("file")
+            .with_local_cache(cache)
+            .build()
+            .unwrap();
+        assert_eq!(
+            file_io.new_input(&location).unwrap().read().await.unwrap(),
+            "old"
+        );
+        let mut writer = file_io
+            .new_output(&location)
+            .unwrap()
+            .writer()
+            .await
+            .unwrap();
+        writer.write(Bytes::from_static(b"new")).await.unwrap();
+        let gate = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(
+                directory
+                    .path()
+                    .join("paimon-shared-local-cache-v1/directory.lock"),
+            )
+            .unwrap();
+        gate.lock().unwrap();
+        assert!(writer.close().await.is_err());
+        assert!(writer.close().await.is_err());
+        drop(gate);
+        writer.close().await.unwrap();
+        assert_eq!(
+            file_io.new_input(&location).unwrap().read().await.unwrap(),
+            "new"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn test_shared_cache_rename_waits_for_invalidation_fence() {
+        let source_directory = tempfile::tempdir().unwrap();
+        let cache_directory = tempfile::tempdir().unwrap();
+        let source_path = source_directory.path().join("snapshot-1");
+        let target_path = source_directory.path().join("snapshot-2");
+        std::fs::write(&source_path, b"source value").unwrap();
+        std::fs::write(&target_path, b"target value").unwrap();
+        let source_location = format!("file:{}", source_path.display());
+        let target_location = format!("file:{}", target_path.display());
+        let mut options = Options::new();
+        options.set(CatalogOptions::LOCAL_CACHE_ENABLED, "true");
+        options.set(CatalogOptions::LOCAL_CACHE_SHARED, "true");
+        options.set(
+            CatalogOptions::LOCAL_CACHE_DIR,
+            cache_directory.path().to_string_lossy(),
+        );
+        options.set(CatalogOptions::LOCAL_CACHE_MAX_SIZE, "1 MiB");
+        let cache = Arc::new(
+            LocalCache::new(LocalCacheConfig::from_options(&options).unwrap().unwrap()).unwrap(),
+        );
+        let file_io = FileIOBuilder::new("file")
+            .with_local_cache(cache)
+            .build()
+            .unwrap();
+        assert_eq!(
+            file_io
+                .new_input(&target_location)
+                .unwrap()
+                .read()
+                .await
+                .unwrap(),
+            "target value"
+        );
+
+        let gate = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(
+                cache_directory
+                    .path()
+                    .join("paimon-shared-local-cache-v1/directory.lock"),
+            )
+            .unwrap();
+        gate.lock().unwrap();
+        let rename_io = file_io.clone();
+        let rename_source = source_location.clone();
+        let rename_target = target_location.clone();
+        let rename =
+            tokio::spawn(async move { rename_io.rename(&rename_source, &rename_target).await });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!rename.is_finished());
+        assert_eq!(std::fs::read(&source_path).unwrap(), b"source value");
+        assert_eq!(std::fs::read(&target_path).unwrap(), b"target value");
+
+        drop(gate);
+        tokio::time::timeout(std::time::Duration::from_secs(5), rename)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(!source_path.exists());
+        assert_eq!(std::fs::read(&target_path).unwrap(), b"source value");
+        assert_eq!(
+            file_io
+                .new_input(&target_location)
+                .unwrap()
+                .read()
+                .await
+                .unwrap(),
+            "source value"
+        );
+
+        let missing_source = format!("file:{}", source_directory.path().join("missing").display());
+        assert!(file_io
+            .rename(&missing_source, &target_location)
+            .await
+            .is_err());
+        assert!(cache_directory
+            .path()
+            .join("paimon-shared-local-cache-v1/mutation-pending")
+            .exists());
+        std::fs::write(&target_path, b"newer value").unwrap();
+        assert_eq!(
+            file_io
+                .new_input(&target_location)
+                .unwrap()
+                .read()
+                .await
+                .unwrap(),
+            "newer value"
+        );
+        let next_path = source_directory.path().join("snapshot-3");
+        let next_location = format!("file:{}", next_path.display());
+        file_io
+            .rename(&target_location, &next_location)
+            .await
+            .unwrap();
+        assert_eq!(
+            file_io
+                .new_input(&next_location)
+                .unwrap()
+                .read()
+                .await
+                .unwrap(),
+            "newer value"
+        );
+        assert!(cache_directory
+            .path()
+            .join("paimon-shared-local-cache-v1/mutation-pending")
+            .exists());
     }
 
     #[cfg(not(windows))]

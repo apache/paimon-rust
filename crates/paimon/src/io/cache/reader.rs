@@ -82,7 +82,8 @@ impl CachedFileReader {
         }
 
         let load_lock = self.cache.block_load_lock(&key).await;
-        let load_guard = load_lock.lock().await;
+        let load_guard = load_lock.clone().lock_owned().await;
+        let shared_guard = self.cache.shared_load_lock(&key).await;
         let result = if let Some(payload) = self
             .cache
             .get_block(&key, expected_len, &self.read_token)
@@ -106,6 +107,20 @@ impl CachedFileReader {
         } else {
             match self.delegate.read(start..end).await {
                 Ok(payload) if payload.len() == expected_len => {
+                    if let Some(slot) = self.cache.background_fill_slot() {
+                        let cache = self.cache.clone();
+                        let token = self.read_token.clone();
+                        let fill_payload = payload.clone();
+                        // Hold download guards until publication completes.
+                        tokio::spawn(async move {
+                            let _slot = slot;
+                            let _shared_guard = shared_guard;
+                            cache.put_block(&key, fill_payload, &token).await;
+                            drop(load_guard);
+                            cache.release_block_load_lock(&key, &load_lock).await;
+                        });
+                        return Ok(payload);
+                    }
                     self.cache
                         .put_block(&key, payload.clone(), &self.read_token)
                         .await;
@@ -124,6 +139,7 @@ impl CachedFileReader {
                 Err(error) => Err(error),
             }
         };
+        drop(shared_guard);
         drop(load_guard);
         self.cache.release_block_load_lock(&key, &load_lock).await;
         result
@@ -140,6 +156,7 @@ impl CachedFileReader {
         let first_key = self.cache.block_key(&self.path, 0);
         let load_lock = self.cache.block_load_lock(&first_key).await;
         let load_guard = load_lock.lock().await;
+        let _shared_guard = self.cache.shared_load_lock(&first_key).await;
         let result = if let Some(payload) = self.read_cached_full().await {
             Ok(payload)
         } else {
@@ -270,6 +287,7 @@ mod tests {
         });
         let cache = Arc::new(
             LocalCache::new(LocalCacheConfig {
+                shared: false,
                 dir: None,
                 namespace: "test".to_string(),
                 max_size: None,
@@ -297,6 +315,47 @@ mod tests {
         assert_eq!(delegate.reads.load(Ordering::SeqCst), 3);
     }
 
+    #[tokio::test]
+    async fn test_data_reads_do_not_evict_cached_snapshot_block() {
+        let delegate = Arc::new(CountingReader {
+            data: Bytes::from_static(b"data"),
+            reads: AtomicUsize::new(0),
+        });
+        let cache = Arc::new(
+            LocalCache::new(LocalCacheConfig {
+                shared: false,
+                dir: None,
+                namespace: "test".to_string(),
+                max_size: Some(16),
+                block_size: 4,
+                whitelist: std::collections::HashSet::from([
+                    FileType::Meta,
+                    FileType::StructuredData,
+                ]),
+            })
+            .unwrap(),
+        );
+        let snapshot = CachedFileReader::new(
+            delegate.clone(),
+            "s3://bucket/table/snapshot/snapshot-1",
+            4,
+            cache.clone(),
+        );
+        snapshot.read(0..4).await.unwrap();
+        for index in 1..=4 {
+            let reader = CachedFileReader::new(
+                delegate.clone(),
+                format!("s3://bucket/table/data/data-{index}.parquet"),
+                4,
+                cache.clone(),
+            );
+            reader.read(0..4).await.unwrap();
+        }
+        snapshot.read(0..4).await.unwrap();
+
+        assert_eq!(delegate.reads.load(Ordering::SeqCst), 5);
+    }
+
     #[derive(Debug)]
     struct SlowCountingReader {
         data: Bytes,
@@ -312,6 +371,104 @@ mod tests {
         }
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shared_fill_returns_before_publication_and_preserves_single_flight() {
+        let directory = tempfile::tempdir().unwrap();
+        let delegate = Arc::new(CountingReader {
+            data: Bytes::from_static(b"abcdefgh"),
+            reads: AtomicUsize::new(0),
+        });
+        let cache = Arc::new(
+            LocalCache::new(LocalCacheConfig {
+                shared: true,
+                dir: Some(directory.path().to_path_buf()),
+                namespace: "test".into(),
+                max_size: Some(4096),
+                block_size: 4,
+                whitelist: std::collections::HashSet::from([FileType::Meta]),
+            })
+            .unwrap(),
+        );
+        let reader = CachedFileReader::new(delegate.clone(), "data.parquet", 8, cache.clone());
+        let gate = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(
+                directory
+                    .path()
+                    .join("paimon-shared-local-cache-v1/directory.lock"),
+            )
+            .unwrap();
+        gate.lock().unwrap();
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_millis(500), reader.read(0..4))
+                .await
+                .unwrap()
+                .unwrap(),
+            "abcd"
+        );
+        assert_eq!(cache.fill_slots.available_permits(), 7);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), reader.read(0..4))
+                .await
+                .is_err()
+        );
+        assert_eq!(delegate.reads.load(Ordering::SeqCst), 1);
+        drop(gate);
+        assert_eq!(reader.read(0..4).await.unwrap(), "abcd");
+        assert_eq!(delegate.reads.load(Ordering::SeqCst), 1);
+        let permits = cache
+            .fill_slots
+            .clone()
+            .acquire_many_owned(8)
+            .await
+            .unwrap();
+        assert!(cache.background_fill_slot().is_none());
+        drop(permits);
+    }
+
+    #[test]
+    fn shared_fill_does_not_block_reads_on_another_runtime() {
+        let directory = tempfile::tempdir().unwrap();
+        let delegate = Arc::new(CountingReader {
+            data: Bytes::from_static(b"abcdefgh"),
+            reads: AtomicUsize::new(0),
+        });
+        let cache = Arc::new(
+            LocalCache::new(LocalCacheConfig {
+                shared: true,
+                dir: Some(directory.path().to_path_buf()),
+                namespace: "test".into(),
+                max_size: Some(4096),
+                block_size: 4,
+                whitelist: std::collections::HashSet::from([FileType::Meta]),
+            })
+            .unwrap(),
+        );
+        let reader = CachedFileReader::new(delegate.clone(), "data.parquet", 8, cache);
+        let first_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        assert_eq!(first_runtime.block_on(reader.read(0..4)).unwrap(), "abcd");
+
+        // Keep the first runtime alive without driving its background tasks.
+        let second_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let second = second_runtime.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_millis(500), reader.read(0..4)).await
+        });
+        assert_eq!(
+            second
+                .expect("read must not wait for an idle runtime")
+                .unwrap(),
+            "abcd"
+        );
+        assert_eq!(delegate.reads.load(Ordering::SeqCst), 1);
+    }
+
     #[tokio::test]
     async fn test_cached_range_single_flight_reads_cold_block_once() {
         let delegate = Arc::new(SlowCountingReader {
@@ -320,6 +477,7 @@ mod tests {
         });
         let cache = Arc::new(
             LocalCache::new(LocalCacheConfig {
+                shared: false,
                 dir: None,
                 namespace: "test".to_string(),
                 max_size: None,
@@ -350,6 +508,7 @@ mod tests {
             reads: AtomicUsize::new(0),
         });
         let config = || LocalCacheConfig {
+            shared: false,
             dir: Some(directory.path().to_path_buf()),
             namespace: "test".to_string(),
             max_size: None,
@@ -397,6 +556,7 @@ mod tests {
         let path = "s3://bucket/table/snapshot/snapshot-1";
         let cache = Arc::new(
             LocalCache::new(LocalCacheConfig {
+                shared: false,
                 dir: None,
                 namespace: "test".to_string(),
                 max_size: None,
@@ -420,7 +580,7 @@ mod tests {
         let old_load = tokio::spawn(async move { old_reader.read(0..4).await });
 
         started.notified().await;
-        cache.invalidate_path(path).await;
+        cache.invalidate_path(path).await.unwrap();
         release.notify_one();
         assert_eq!(
             old_load.await.unwrap().unwrap(),
@@ -446,6 +606,7 @@ mod tests {
         let path = "s3://bucket/table/snapshot/snapshot-1";
         let cache_a = Arc::new(
             LocalCache::new(LocalCacheConfig {
+                shared: false,
                 dir: Some(directory.path().to_path_buf()),
                 namespace: "test".to_string(),
                 max_size: None,
@@ -456,6 +617,7 @@ mod tests {
         );
         let cache_b = Arc::new(
             LocalCache::new(LocalCacheConfig {
+                shared: false,
                 dir: Some(directory.path().to_path_buf()),
                 namespace: "test".to_string(),
                 max_size: None,
@@ -479,7 +641,7 @@ mod tests {
         let old_load = tokio::spawn(async move { old_reader.read(0..4).await });
 
         started.notified().await;
-        cache_b.invalidate_path(path).await;
+        cache_b.invalidate_path(path).await.unwrap();
         release.notify_one();
         assert_eq!(
             old_load.await.unwrap().unwrap(),
@@ -507,6 +669,7 @@ mod tests {
         let observed_path = "s3://bucket/table/snapshot/snapshot-2";
         let blocked_path = "s3://bucket/table/snapshot/snapshot-3";
         let config = || LocalCacheConfig {
+            shared: false,
             dir: Some(directory.path().to_path_buf()),
             namespace: "test".to_string(),
             max_size: None,
@@ -573,7 +736,7 @@ mod tests {
             "file-size lookup completed before prefix invalidation removed the old entry"
         );
         drop(blocked_guard);
-        invalidation.await.unwrap();
+        invalidation.await.unwrap().unwrap();
         assert_eq!(
             current_load.await.unwrap().unwrap(),
             Bytes::from_static(b"new!")
@@ -653,6 +816,7 @@ mod tests {
         });
         let cache = Arc::new(
             LocalCache::new(LocalCacheConfig {
+                shared: false,
                 dir: Some(directory.path().to_path_buf()),
                 namespace: "test".to_string(),
                 max_size: None,
@@ -687,6 +851,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let cache = Arc::new(
             LocalCache::new(LocalCacheConfig {
+                shared: false,
                 dir: Some(directory.path().to_path_buf()),
                 namespace: "test".to_string(),
                 max_size: None,
@@ -708,6 +873,7 @@ mod tests {
         });
         let cache = Arc::new(
             LocalCache::new(LocalCacheConfig {
+                shared: false,
                 dir: None,
                 namespace: "test".to_string(),
                 max_size: None,

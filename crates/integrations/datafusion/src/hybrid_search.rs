@@ -226,7 +226,11 @@ impl TableProvider for HybridSearchTableProvider {
                 .with_limit(self.limit)
                 .with_ranker(&self.ranker)
                 .map_err(to_datafusion_error)?;
-            builder.execute_scored().await.map_err(to_datafusion_error)
+            builder
+                .execute()
+                .await
+                .and_then(|result| result.into_row_ids())
+                .map_err(to_datafusion_error)
         })
         .await?;
 
@@ -289,7 +293,6 @@ impl TableProvider for HybridSearchTableProvider {
             table,
             schema: &input_schema,
             plan,
-            scan_trace: None,
             projection: Some(&input_projection),
             pushed_predicate: None,
             limit: None,

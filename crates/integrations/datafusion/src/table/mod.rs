@@ -68,7 +68,7 @@ pub(crate) fn datafusion_arrow_schema(
     schema_force_view_types: bool,
 ) -> DFResult<ArrowSchemaRef> {
     let paimon_schema =
-        paimon::arrow::build_target_arrow_schema(fields).map_err(to_datafusion_error)?;
+        paimon::arrow::build_read_arrow_schema(fields).map_err(to_datafusion_error)?;
     let fields = paimon_schema
         .fields()
         .iter()
@@ -93,6 +93,24 @@ pub(crate) fn datafusion_arrow_schema(
         fields,
         paimon_schema.metadata().clone(),
     )))
+}
+
+/// The schema visible to SQL before authorization is fetched.
+fn query_auth_output_schema(table: &Table, schema: ArrowSchemaRef) -> ArrowSchemaRef {
+    if !table.schema().core_options().query_auth_enabled() {
+        return schema;
+    }
+    // Authorization is fetched while planning, after logical optimization.
+    // A mask can null a NOT NULL table column, so optimizers must not fold
+    // IS NULL beforehand. Keep physical read fields canonical and unchanged.
+    Arc::new(Schema::new_with_metadata(
+        schema
+            .fields()
+            .iter()
+            .map(|field| field.as_ref().clone().with_nullable(true))
+            .collect::<Vec<_>>(),
+        schema.metadata().clone(),
+    ))
 }
 
 /// Read-only table provider for a Paimon table.
@@ -127,7 +145,7 @@ impl PaimonTableProvider {
         let identifier = table.identifier().clone();
         crate::table_loader::ensure_paimon_served(&table, &identifier)?;
         let fields = datafusion_read_fields(&table);
-        let schema = datafusion_arrow_schema(&fields, true)?;
+        let schema = query_auth_output_schema(&table, datafusion_arrow_schema(&fields, true)?);
         Ok(Self {
             table,
             schema,
@@ -166,7 +184,10 @@ impl PaimonTableProvider {
             return Ok(self);
         }
         let fields = datafusion_read_fields(&self.table);
-        self.schema = datafusion_arrow_schema(&fields, schema_force_view_types)?;
+        self.schema = query_auth_output_schema(
+            &self.table,
+            datafusion_arrow_schema(&fields, schema_force_view_types)?,
+        );
         Ok(self)
     }
 
@@ -338,7 +359,6 @@ pub(crate) struct PaimonScanBuilder<'a> {
     pub(crate) table: &'a Table,
     pub(crate) schema: &'a ArrowSchemaRef,
     pub(crate) plan: paimon::table::Plan,
-    pub(crate) scan_trace: Option<paimon::table::ScanTrace>,
     pub(crate) projection: Option<&'a Vec<usize>>,
     pub(crate) pushed_predicate: Option<paimon::spec::Predicate>,
     pub(crate) limit: Option<usize>,
@@ -379,6 +399,7 @@ impl PaimonScanBuilder<'_> {
             (self.schema.clone(), read_fields)
         };
 
+        let scan_stats = Some(self.plan.stats().clone());
         let splits = self.plan.into_splits();
         let planned_partitions: Vec<Arc<[_]>> = if splits.is_empty() {
             vec![Arc::from(Vec::new())]
@@ -398,7 +419,7 @@ impl PaimonScanBuilder<'_> {
             planned_partitions,
             self.limit,
             self.filter_exact,
-            self.scan_trace,
+            scan_stats,
             None,
             self.case_sensitive,
         )
@@ -463,7 +484,7 @@ impl TableProvider for PaimonTableProvider {
         // Tokio runtime. `scan.plan()` can reach OpenDAL/Tokio filesystem calls while
         // reading Paimon metadata, so we must provide a runtime here instead of
         // assuming the caller already entered one.
-        let (plan, scan_trace) = await_with_runtime(scan.plan_with_trace())
+        let plan = await_with_runtime(scan.plan())
             .await
             .map_err(to_datafusion_error)?;
 
@@ -477,7 +498,6 @@ impl TableProvider for PaimonTableProvider {
             table: &self.table,
             schema: &self.schema,
             plan,
-            scan_trace: Some(scan_trace),
             projection,
             pushed_predicate: filter_analysis.pushed_predicate,
             limit: pushed_limit,
@@ -879,6 +899,28 @@ mod tests {
             panic!("row field should map to an Arrow Struct");
         };
         assert_eq!(row_fields[0].data_type(), &ArrowDataType::Utf8);
+    }
+
+    #[test]
+    fn test_datafusion_read_schema_keeps_cast_nulls_visible_to_optimizers() {
+        let decimal =
+            DataType::Decimal(paimon::spec::DecimalType::with_nullable(false, 3, 2).unwrap());
+        let fields = vec![
+            DataField::new(0, "value".into(), decimal.clone()),
+            DataField::new(1, "values".into(), DataType::Array(ArrayType::new(decimal))),
+        ];
+        let schema = datafusion_arrow_schema(&fields, false).unwrap();
+        assert!(schema.field(0).is_nullable());
+        let ArrowDataType::List(child) = schema.field(1).data_type() else {
+            panic!()
+        };
+        assert!(child.is_nullable());
+        let write_schema = paimon::arrow::build_target_arrow_schema(&fields).unwrap();
+        assert!(!write_schema.field(0).is_nullable());
+        let ArrowDataType::List(child) = write_schema.field(1).data_type() else {
+            panic!()
+        };
+        assert!(!child.is_nullable());
     }
 
     fn planned_file_names(scan: &PaimonTableScan) -> Vec<String> {

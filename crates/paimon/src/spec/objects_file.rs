@@ -16,7 +16,8 @@
 // under the License.
 
 use apache_avro::{
-    from_value, to_value, Codec, DeflateSettings, Reader, Schema, Writer, ZstandardSettings,
+    from_avro_datum, from_value, to_value, Bzip2Settings, Codec, DeflateSettings, Schema, Writer,
+    XzSettings, ZstandardSettings,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -25,12 +26,17 @@ pub(crate) const DEFAULT_AVRO_BLOCK_SIZE: usize = 16_000;
 pub(crate) const DEFAULT_AVRO_COMPRESSION: &str = "zstd";
 
 pub fn from_avro_bytes<T: DeserializeOwned>(bytes: &[u8]) -> crate::Result<Vec<T>> {
-    Reader::new(bytes)?
-        .map(|r| {
-            let value = r?;
-            from_value::<T>(&value).map_err(crate::Error::from)
-        })
-        .collect()
+    let (header, mut blocks) = super::avro::ocf::parse_ocf_streaming(bytes)?;
+    let schema = Schema::parse_str(&header.schema_json)?;
+    let mut records = Vec::new();
+    while let Some(block) = blocks.next_block()? {
+        let mut data = block.data.as_ref();
+        for _ in 0..block.object_count {
+            let value = from_avro_datum(&schema, &mut data, None)?;
+            records.push(from_value::<T>(&value)?);
+        }
+    }
+    Ok(records)
 }
 
 /// Serialize records into Avro Object Container File bytes.
@@ -74,6 +80,10 @@ pub(crate) fn avro_codec(compression: &str) -> crate::Result<Codec> {
         "null" | "none" | "uncompressed" => Ok(Codec::Null),
         "deflate" => Ok(Codec::Deflate(DeflateSettings::default())),
         "snappy" => Ok(Codec::Snappy),
+        "bzip2" => Ok(Codec::Bzip2(Bzip2Settings::default())),
+        // Java's CodecFactory.fromString("xz") uses level 6. The Rust Avro
+        // default is 9, which also needs a much larger compression dictionary.
+        "xz" => Ok(Codec::Xz(XzSettings::new(6))),
         other => Err(crate::Error::Unsupported {
             message: format!("Unsupported Avro compression: {other}"),
         }),
@@ -91,6 +101,7 @@ mod tests {
     use crate::spec::stats::BinaryTableStats;
     use crate::spec::{DataFileMeta, IndexManifestEntry, ManifestFileMeta};
     use apache_avro::types::Value;
+    use apache_avro::Reader;
     use chrono::{DateTime, Utc};
 
     // Check the record decoded from the OCF writer schema, including fields whose
@@ -346,6 +357,21 @@ mod tests {
             to_avro_bytes_with_compression(MANIFEST_ENTRY_SCHEMA, &original, "deflate").unwrap();
         let decoded = from_avro_bytes_fast::<ManifestEntry>(&bytes).unwrap();
         assert_eq!(original, decoded);
+    }
+
+    #[test]
+    fn test_roundtrip_manifest_entry_bzip2_and_xz() {
+        let original = vec![manifest_entry()];
+        for compression in ["bzip2", "xz"] {
+            let bytes =
+                to_avro_bytes_with_compression(MANIFEST_ENTRY_SCHEMA, &original, compression)
+                    .unwrap();
+            assert_eq!(from_avro_bytes::<ManifestEntry>(&bytes).unwrap(), original);
+            assert_eq!(
+                from_avro_bytes_fast::<ManifestEntry>(&bytes).unwrap(),
+                original
+            );
+        }
     }
 
     #[test]

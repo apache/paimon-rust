@@ -147,7 +147,7 @@ impl<'a> SortedGlobalIndexBuildBuilder<'a> {
         let mut resolved_options = self.table.schema().options().clone();
         resolved_options.extend(self.options.clone());
         let core_options = CoreOptions::new(&resolved_options);
-        validate_table_options(self.table, &core_options)?;
+        super::global_index_build_common::validate_build_table(self.table)?;
         let records_per_range = core_options.sorted_index_records_per_range()?;
         let write_options = if index_type == FM_GLOBAL_INDEX_TYPE {
             GlobalIndexWriteOptions::FM(FMOptions::from_options(&resolved_options)?.write)
@@ -200,7 +200,7 @@ impl<'a> SortedGlobalIndexBuildBuilder<'a> {
             self.table.location(),
             self.table.schema().partition_keys(),
             self.table.schema().fields(),
-            &core_options,
+            &self.table.schema().core_options(),
             snapshot.id(),
             manifest_entries,
             records_per_range,
