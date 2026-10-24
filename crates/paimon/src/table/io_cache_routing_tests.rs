@@ -659,3 +659,56 @@ async fn rest_tables_keep_routing_for_prefixes_of_older_schemas() {
     assert_eq!(token_requests.load(Ordering::SeqCst), 1);
     server.abort();
 }
+
+#[tokio::test]
+async fn blob_descriptor_fields_read_their_sources_from_origin() {
+    let origin = TestOss::start().await;
+    let cache = TestOss::start_sharing(&origin).await;
+    let catalog = data_target_catalog(&origin, &cache).await;
+    // The table keeps the descriptors; a ROW sidecar also copies the payloads when writing.
+    for (name, row_sidecar) in [
+        ("descriptor_field", "false"),
+        ("descriptor_sidecar", "true"),
+    ] {
+        let schema = blob_schema()
+            .option("data-evolution.enabled", "true")
+            .option("row-tracking.enabled", "true")
+            .option("blob-descriptor-field", "payload")
+            .option("data-evolution.row-sidecar.enabled", row_sidecar)
+            .build()
+            .unwrap();
+        let table = create_table(&catalog, name, schema).await;
+        let source =
+            format!("oss://bkt/import/{name}/data-123e4567-e89b-12d3-a456-426614174000-1.png");
+        let key = source.strip_prefix("oss://").unwrap();
+        put(&origin, &source, Bytes::from("NEW")).await;
+        cache.retain(key, Bytes::from("OLD"));
+        origin.take_requests();
+        cache.take_requests();
+
+        let descriptor = BlobDescriptor::new(source.clone(), 0, 3).serialize();
+        let files = write_and_commit(&table, &blob_batch(&[1], &[&descriptor])).await;
+        assert_eq!(payloads(&table).await, [b"NEW".to_vec()], "{name}");
+        let (origin_requests, cache_requests) = (origin.take_requests(), cache.take_requests());
+        let source_reads = methods(&origin_requests, key);
+        assert!(
+            source_reads.iter().all(|m| m == "GET"),
+            "{name}: {source_reads:?}"
+        );
+        assert!(!source_reads.is_empty(), "{name}");
+        assert_eq!(
+            methods(&cache_requests, key),
+            Vec::<String>::new(),
+            "{name}"
+        );
+        // The table's own data files keep using the target.
+        for file in &files {
+            assert_reads_and_writes(&cache_requests, file);
+            assert_eq!(
+                methods(&origin_requests, file),
+                Vec::<String>::new(),
+                "{file}"
+            );
+        }
+    }
+}
