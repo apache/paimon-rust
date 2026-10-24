@@ -22,6 +22,7 @@
 //! - `CALL sys.delete_tag(table => '...', tag => '...')`
 //! - `CALL sys.rename_tag(table => '...', tag => '...', target_tag => '...')`
 //! - `CALL sys.reset_consumer(table => '...', consumer_id => '...'[, next_snapshot_id => ...])`
+//! - `CALL sys.clear_consumers(table => '...'[, including_consumers => '...', excluding_consumers => '...'])`
 //! - `CALL sys.rollback_to(table => '...', snapshot_id => ... | tag => '...')`
 //! - `CALL sys.rollback_to_timestamp(table => '...', timestamp => ...)`
 //! - `CALL sys.create_tag_from_timestamp(table => '...', tag => '...', timestamp => ...)`
@@ -206,6 +207,7 @@ fn declared_parameters(proc_name: &str) -> Option<&'static [&'static str]> {
         "delete_tag" => &["table", "tag"],
         "rename_tag" => &["table", "tag", "target_tag"],
         "reset_consumer" => &["table", "consumer_id", "next_snapshot_id"],
+        "clear_consumers" => &["table", "including_consumers", "excluding_consumers"],
         "rollback_to" => &["table", "snapshot_id", "tag"],
         "rollback_to_timestamp" => &["table", "timestamp"],
         "create_tag_from_timestamp" => &["table", "tag", "timestamp"],
@@ -318,6 +320,7 @@ pub async fn execute_call(
         "delete_tag" => proc_delete_tag(ctx, catalog, catalog_name, &args).await,
         "rename_tag" => proc_rename_tag(ctx, catalog, catalog_name, &args).await,
         "reset_consumer" => proc_reset_consumer(ctx, catalog, catalog_name, &args).await,
+        "clear_consumers" => proc_clear_consumers(ctx, catalog, catalog_name, &args).await,
         "rollback_to" => proc_rollback_to(ctx, catalog, catalog_name, &args).await,
         "rollback_to_timestamp" => {
             proc_rollback_to_timestamp(ctx, catalog, catalog_name, &args).await
@@ -515,6 +518,34 @@ async fn proc_reset_consumer(
             .await
             .map_err(to_datafusion_error)?;
     }
+    ok_result(ctx)
+}
+
+async fn proc_clear_consumers(
+    ctx: &SessionContext,
+    catalog: &Arc<dyn Catalog>,
+    catalog_name: &str,
+    args: &HashMap<String, String>,
+) -> DFResult<DataFrame> {
+    let table = get_table(catalog, catalog_name, args).await?;
+    if table.rest_env().is_some() {
+        return Err(DataFusionError::NotImplemented(
+            "clear_consumers is not supported for tables managed by a REST catalog".to_string(),
+        ));
+    }
+    if table.schema().core_options().is_format_table() {
+        return Err(DataFusionError::NotImplemented(
+            "clear_consumers requires a FileStoreTable; format-table is not supported".to_string(),
+        ));
+    }
+    table
+        .consumer_manager()
+        .clear(
+            args.get("including_consumers").map(String::as_str),
+            args.get("excluding_consumers").map(String::as_str),
+        )
+        .await
+        .map_err(to_datafusion_error)?;
     ok_result(ctx)
 }
 
