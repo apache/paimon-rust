@@ -53,6 +53,7 @@ arrow-schema = { workspace = true }
 axum = { version = "0.7", features = ["macros", "tokio", "http1", "http2"] }
 bytes = "1.7.1"
 flate2 = "1"
+opendal = { package = "opendal-core", version = "0.58.0", features = ["services-memory"] }
 paimon-ftindex-core = "0.1.0"
 parquet = { workspace = true }
 tar = "0.4"
