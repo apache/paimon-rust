@@ -81,6 +81,9 @@ pub(crate) struct KeyValueReadConfig {
     /// Full table keys also protect partition-PK fields from aggregation.
     pub table_primary_keys: Vec<String>,
     pub merge_engine: MergeEngine,
+    /// `merge-engine` was set by dynamic options, so files written under
+    /// `table_schema_id` may still hold another engine's output.
+    pub merge_engine_overridden: bool,
     pub sequence_fields: Vec<String>,
     pub read_batch_size: usize,
     /// Merge files from all supplied splits into one globally key-sorted stream.
@@ -777,12 +780,15 @@ impl KeyValueFileReader {
                     if skip_merge {
                         'files: for run in &merge_group {
                             for file in &run.files {
-                                let schema_id = file.file.schema_id;
-                                if schema_id == table_schema_id {
+                                // Dynamic options can override the engine but keep
+                                // the schema ID, so only then check the stored one.
+                                if file.file.schema_id == table_schema_id
+                                    && !config.merge_engine_overridden
+                                {
                                     continue;
                                 }
                                 let schema =
-                                    config.schema_manager.schema(schema_id).await?;
+                                    config.schema_manager.schema(file.file.schema_id).await?;
                                 let engine =
                                     CoreOptions::new(schema.options()).merge_engine()?;
                                 if !matches!(
@@ -2207,6 +2213,7 @@ mod tests {
                 table_options: table.schema().options().clone(),
                 schema_manager: table.schema_manager().clone(),
                 table_schema_id: table.schema().id(),
+                merge_engine_overridden: table.merge_engine_overridden(),
                 table_fields: table.schema().fields().to_vec(),
                 read_type: table.schema().fields().to_vec(),
                 predicates: Vec::new(),
@@ -2328,6 +2335,7 @@ mod tests {
                 table_options: table.schema().options().clone(),
                 schema_manager: table.schema_manager().clone(),
                 table_schema_id: table.schema().id(),
+                merge_engine_overridden: table.merge_engine_overridden(),
                 table_fields: table.schema().fields().to_vec(),
                 read_type: table.schema().fields().to_vec(),
                 predicates: Vec::new(),
@@ -2533,6 +2541,7 @@ mod tests {
                 table_options: table.schema().options().clone(),
                 schema_manager: table.schema_manager().clone(),
                 table_schema_id: table.schema().id(),
+                merge_engine_overridden: table.merge_engine_overridden(),
                 table_fields: table.schema().fields().to_vec(),
                 read_type: table.schema().fields().to_vec(),
                 predicates: Vec::new(),
@@ -2622,6 +2631,7 @@ mod tests {
                     table_options: table.schema().options().clone(),
                     schema_manager: table.schema_manager().clone(),
                     table_schema_id: table.schema().id(),
+                    merge_engine_overridden: table.merge_engine_overridden(),
                     table_fields: table.schema().fields().to_vec(),
                     read_type: table.schema().fields().to_vec(),
                     predicates: Vec::new(),
@@ -2889,6 +2899,7 @@ mod tests {
                     table_options: table.schema().options().clone(),
                     schema_manager: table.schema_manager().clone(),
                     table_schema_id: table.schema().id(),
+                    merge_engine_overridden: table.merge_engine_overridden(),
                     table_fields: table.schema().fields().to_vec(),
                     read_type: table.schema().fields().to_vec(),
                     predicates: Vec::new(),
@@ -2971,6 +2982,37 @@ mod tests {
         file
     }
 
+    async fn read_kv_split(table: &Table, split: DataSplit) -> Vec<RecordBatch> {
+        let core_options = table.schema().core_options();
+        KeyValueFileReader::new(
+            table.file_io().clone(),
+            KeyValueReadConfig {
+                table_name: table.identifier().full_name(),
+                table_options: table.schema().options().clone(),
+                schema_manager: table.schema_manager().clone(),
+                table_schema_id: table.schema().id(),
+                merge_engine_overridden: table.merge_engine_overridden(),
+                table_fields: table.schema().fields().to_vec(),
+                read_type: table.schema().fields().to_vec(),
+                predicates: Vec::new(),
+                primary_keys: table.schema().trimmed_primary_keys(),
+                table_primary_keys: table.schema().primary_keys().to_vec(),
+                merge_engine: core_options.merge_engine().unwrap(),
+                sequence_fields: Vec::new(),
+                read_batch_size: core_options.read_batch_size().unwrap(),
+                merge_splits: false,
+                max_merge_input_streams: None,
+                parquet_read_budget: None,
+                mosaic_prefetch: MosaicPrefetchOptions::default(),
+            },
+        )
+        .read(&[split])
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap()
+    }
+
     #[tokio::test]
     async fn single_run_read_merges_files_written_under_aggregation() {
         // Before #839 the aggregation writer kept several versions of a key in
@@ -3004,33 +3046,48 @@ mod tests {
             .with_data_files(vec![a, b])
             .build()
             .unwrap();
-        let core_options = table.schema().core_options();
-        let batches = KeyValueFileReader::new(
-            table.file_io().clone(),
-            KeyValueReadConfig {
-                table_name: table.identifier().full_name(),
-                table_options: table.schema().options().clone(),
-                schema_manager: table.schema_manager().clone(),
-                table_schema_id: table.schema().id(),
-                table_fields: table.schema().fields().to_vec(),
-                read_type: table.schema().fields().to_vec(),
-                predicates: Vec::new(),
-                primary_keys: table.schema().trimmed_primary_keys(),
-                table_primary_keys: table.schema().primary_keys().to_vec(),
-                merge_engine: core_options.merge_engine().unwrap(),
-                sequence_fields: Vec::new(),
-                read_batch_size: core_options.read_batch_size().unwrap(),
-                merge_splits: false,
-                max_merge_input_streams: None,
-                parquet_read_budget: None,
-                mosaic_prefetch: MosaicPrefetchOptions::default(),
-            },
-        )
-        .read(&[split])
-        .unwrap()
-        .try_collect::<Vec<_>>()
-        .await
-        .unwrap();
+        let batches = read_kv_split(&table, split).await;
+        assert_eq!(int_column(&batches, "id"), vec![1, 2]);
+        assert_eq!(int_column(&batches, "value"), vec![11, 20]);
+    }
+
+    #[tokio::test]
+    async fn single_run_read_merges_when_options_override_the_engine() {
+        // copy_with_options keeps the schema ID, so the files and the read
+        // schema share it while the stored engine is still aggregation.
+        let file_io = test_file_io();
+        let table_path = "memory:/kv_engine_override";
+        let old = pk_table(
+            &file_io,
+            table_path,
+            &[
+                ("merge-engine", "aggregation"),
+                ("fields.value.aggregate-function", "sum"),
+            ],
+        );
+        write_schema_file(&old, old.schema()).await;
+        let table = old.copy_with_options(HashMap::from([(
+            "merge-engine".to_string(),
+            "deduplicate".to_string(),
+        )]));
+        assert_eq!(table.schema().id(), old.schema().id());
+        assert_eq!(
+            table.schema().core_options().merge_engine().unwrap(),
+            MergeEngine::Deduplicate
+        );
+        let a =
+            write_kv_versions(&file_io, table_path, "a.parquet", &[(1, 0, 10), (1, 1, 11)]).await;
+        let b = write_kv_versions(&file_io, table_path, "b.parquet", &[(2, 2, 20)]).await;
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(format!("{table_path}/bucket-0"))
+            .with_total_buckets(1)
+            .with_data_files(vec![a, b])
+            .build()
+            .unwrap();
+        let batches = read_kv_split(&table, split).await;
         assert_eq!(int_column(&batches, "id"), vec![1, 2]);
         assert_eq!(int_column(&batches, "value"), vec![11, 20]);
     }
@@ -3067,6 +3124,7 @@ mod tests {
                     table_options: table.schema().options().clone(),
                     schema_manager: table.schema_manager().clone(),
                     table_schema_id: table.schema().id(),
+                    merge_engine_overridden: table.merge_engine_overridden(),
                     table_fields: table.schema().fields().to_vec(),
                     read_type: table.schema().fields().to_vec(),
                     predicates: Vec::new(),
@@ -3136,6 +3194,7 @@ mod tests {
                 table_options: table.schema().options().clone(),
                 schema_manager: table.schema_manager().clone(),
                 table_schema_id: table.schema().id(),
+                merge_engine_overridden: table.merge_engine_overridden(),
                 table_fields: table.schema().fields().to_vec(),
                 read_type: table.schema().fields().to_vec(),
                 predicates: Vec::new(),
