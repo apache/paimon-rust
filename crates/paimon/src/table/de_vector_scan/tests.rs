@@ -1015,7 +1015,7 @@ async fn top1_after_bitmap_then_btree(
     first_f: Vec<Option<f64>>,
     filter: fn(&crate::spec::PredicateBuilder) -> crate::spec::Predicate,
 ) -> Vec<i32> {
-    use crate::spec::{ArrayType, DataType, Datum, DoubleType, FloatType, IntType};
+    use crate::spec::{ArrayType, DataType, DoubleType, FloatType, IntType};
     use arrow_array::types::Float32Type;
     use arrow_array::{Float64Array, ListArray};
 

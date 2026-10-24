@@ -716,9 +716,10 @@ async fn negated_data_predicate_keeps_null_rows() {
 
 #[tokio::test]
 async fn raw_double_negation_keeps_null_rows_out() {
-    // NOT(NOT(v = 10)) is v = 10, so the NULL row stays out. Widening `v`
-    // makes the read go through the Arrow residual filter.
-    for widened in [false, true] {
+    // NOT(NOT(v = 10)) is v = 10, so the NULL row stays out, also when the
+    // inner NOT sits under AND. Widening `v` makes the read go through the
+    // Arrow residual filter.
+    for (widened, nested) in [(false, false), (true, false), (false, true), (true, true)] {
         let table = table(&[]).await;
         write_batch(
             &table,
@@ -753,14 +754,21 @@ async fn raw_double_negation_keeps_null_rows_out() {
         } else {
             Datum::Int(10)
         };
-        let predicate = Predicate::Not(Box::new(Predicate::Not(Box::new(
-            pb.equal("v", value).unwrap(),
-        ))));
+        let not_v = Predicate::Not(Box::new(pb.equal("v", value).unwrap()));
+        let inner = if nested {
+            Predicate::And(vec![
+                not_v,
+                pb.greater_or_equal("id", Datum::Int(0)).unwrap(),
+            ])
+        } else {
+            not_v
+        };
+        let predicate = Predicate::Not(Box::new(inner));
 
         assert_eq!(
             read_ids(&table, predicate.clone()).await,
             vec![1],
-            "widened={widened}"
+            "widened={widened} nested={nested}"
         );
         let update = table.new_write_builder().new_update().unwrap();
         commit(
@@ -768,7 +776,11 @@ async fn raw_double_negation_keeps_null_rows_out() {
             update.delete_by_predicate(Some(predicate)).await.unwrap(),
         )
         .await;
-        assert_eq!(ids(&table).await, vec![0, 2], "widened={widened}");
+        assert_eq!(
+            ids(&table).await,
+            vec![0, 2],
+            "widened={widened} nested={nested}"
+        );
     }
 }
 

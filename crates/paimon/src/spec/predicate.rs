@@ -586,8 +586,6 @@ impl Predicate {
     /// [`negate`]: Predicate::negate
     pub(crate) fn not_null_guard(&self) -> Option<Predicate> {
         match self {
-            // NOT(NOT(x)) is x, so it is unknown wherever x is.
-            Predicate::Not(inner) => inner.not_null_guard(),
             Predicate::Leaf {
                 column,
                 index,
@@ -2550,10 +2548,7 @@ pub(crate) fn eval_row(predicate: &Predicate, row: &BinaryRow) -> Result<bool> {
             }
             Ok(false)
         }
-        Predicate::Not(inner) => match inner.not_null_guard() {
-            Some(guard) => Ok(eval_row(&guard, row)? && !eval_row(inner, row)?),
-            None => Ok(!eval_row(inner, row)?),
-        },
+        Predicate::Not(inner) => eval_row_negated(inner, row),
         Predicate::Leaf {
             index,
             data_type,
@@ -2564,6 +2559,35 @@ pub(crate) fn eval_row(predicate: &Predicate, row: &BinaryRow) -> Result<bool> {
             let datum = extract_datum(row, *index, data_type)?;
             Ok(eval_leaf(*op, datum.as_ref(), literals))
         }
+    }
+}
+
+/// Evaluates `NOT predicate`. The `NOT` is pushed down to the leaves with
+/// De Morgan first: a leaf yields false for NULL, so negating a compound
+/// result would turn UNKNOWN into true.
+fn eval_row_negated(predicate: &Predicate, row: &BinaryRow) -> Result<bool> {
+    match predicate {
+        Predicate::And(children) => {
+            for child in children {
+                if eval_row_negated(child, row)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        Predicate::Or(children) => {
+            for child in children {
+                if !eval_row_negated(child, row)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        Predicate::Not(inner) => eval_row(inner, row),
+        _ => match predicate.not_null_guard() {
+            Some(guard) => Ok(eval_row(&guard, row)? && !eval_row(predicate, row)?),
+            None => Ok(!eval_row(predicate, row)?),
+        },
     }
 }
 

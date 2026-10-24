@@ -161,22 +161,7 @@ pub(crate) fn evaluate_predicate_mask(
             }
             Ok(Some(combined))
         }
-        Predicate::Not(inner) => {
-            let Some(mask) = evaluate_predicate_mask(batch, inner, file_fields, scan_fields)?
-            else {
-                return Ok(None);
-            };
-            let negated =
-                boolean_mask_from_predicate(mask.len(), |row_index| !mask.value(row_index));
-            if let Some(guard) = inner.not_null_guard() {
-                let Some(guard) = evaluate_predicate_mask(batch, &guard, file_fields, scan_fields)?
-                else {
-                    return Ok(None);
-                };
-                return Ok(Some(combine_filter_masks(&negated, &guard, false)));
-            }
-            Ok(Some(negated))
-        }
+        Predicate::Not(inner) => evaluate_negated_mask(batch, inner, file_fields, scan_fields),
         Predicate::Leaf {
             column,
             index,
@@ -265,6 +250,63 @@ pub(crate) fn evaluate_predicate_mask(
 
 /// Two [`DataField`]s refer to the same logical column when their IDs match, or
 /// (for schemas without stable IDs) their names match.
+/// Evaluates `NOT predicate`. The `NOT` is pushed down to the leaves with
+/// De Morgan first: a leaf masks NULL as false, so negating a combined mask
+/// would turn UNKNOWN into true.
+fn evaluate_negated_mask(
+    batch: &RecordBatch,
+    predicate: &Predicate,
+    file_fields: &[DataField],
+    scan_fields: &[DataField],
+) -> crate::Result<Option<BooleanArray>> {
+    match predicate {
+        // NOT(a AND b) = NOT a OR NOT b, evaluated like the `Or` arm.
+        Predicate::And(children) => {
+            let mut combined = BooleanArray::from(vec![false; batch.num_rows()]);
+            for child in children {
+                let Some(mask) = evaluate_negated_mask(batch, child, file_fields, scan_fields)?
+                else {
+                    return Ok(None);
+                };
+                combined = combine_filter_masks(&combined, &mask, true);
+            }
+            Ok(Some(combined))
+        }
+        // NOT(a OR b) = NOT a AND NOT b, evaluated like the `And` arm.
+        Predicate::Or(children) => {
+            let mut combined = None;
+            for child in children {
+                let Some(mask) = evaluate_negated_mask(batch, child, file_fields, scan_fields)?
+                else {
+                    continue;
+                };
+                combined = Some(match combined {
+                    Some(existing) => combine_filter_masks(&existing, &mask, false),
+                    None => mask,
+                });
+            }
+            Ok(combined)
+        }
+        Predicate::Not(inner) => evaluate_predicate_mask(batch, inner, file_fields, scan_fields),
+        _ => {
+            let Some(mask) = evaluate_predicate_mask(batch, predicate, file_fields, scan_fields)?
+            else {
+                return Ok(None);
+            };
+            let negated =
+                boolean_mask_from_predicate(mask.len(), |row_index| !mask.value(row_index));
+            if let Some(guard) = predicate.not_null_guard() {
+                let Some(guard) = evaluate_predicate_mask(batch, &guard, file_fields, scan_fields)?
+                else {
+                    return Ok(None);
+                };
+                return Ok(Some(combine_filter_masks(&negated, &guard, false)));
+            }
+            Ok(Some(negated))
+        }
+    }
+}
+
 pub(crate) fn same_data_field(left: &DataField, right: &DataField) -> bool {
     left.id() == right.id() || left.name() == right.name()
 }
