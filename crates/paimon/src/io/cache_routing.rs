@@ -170,7 +170,7 @@ impl IoCacheRouting {
             default_endpoint,
             enabled: flag(props, IO_CACHE_ENABLED, false),
             policy: parse_policy(props.get(IO_CACHE_POLICY).map(String::as_str)),
-            whitelist: FileType::parse_whitelist(
+            whitelist: parse_file_types(
                 &props
                     .get(IO_CACHE_WHITELIST)
                     .map_or("*".to_string(), |value| value.to_ascii_lowercase()),
@@ -393,6 +393,21 @@ fn is_valid_target_name(name: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
+/// The contract's file types; unknown names, including local-cache's `structured-data`, are ignored.
+fn parse_file_types(value: &str) -> HashSet<FileType> {
+    value
+        .split(',')
+        .filter(|name| {
+            let local_cache_only = name.trim() == "structured-data";
+            if local_cache_only {
+                log::warn!("Unknown io-cache file type 'structured-data'; use data");
+            }
+            !local_cache_only
+        })
+        .flat_map(FileType::parse_whitelist)
+        .collect()
+}
+
 /// Rules `types=target` separated by `;`; malformed rules are skipped.
 fn parse_routes(value: &str) -> Vec<(HashSet<FileType>, String)> {
     value
@@ -400,7 +415,7 @@ fn parse_routes(value: &str) -> Vec<(HashSet<FileType>, String)> {
         .filter_map(|rule| {
             let (types, target) = rule.trim().split_once('=')?;
             let target = target.trim().to_ascii_lowercase();
-            let types = FileType::parse_whitelist(&types.to_ascii_lowercase());
+            let types = parse_file_types(&types.to_ascii_lowercase());
             (!target.is_empty() && !types.is_empty()).then_some((types, target))
         })
         .collect()
@@ -700,6 +715,23 @@ mod tests {
         let malformed = multi(&["io-cache.routes==cluster;meta=accel;junk"]);
         assert_endpoint(&malformed, OpClass::Read, MANIFEST_PATH, ACCEL);
         assert_endpoint(&malformed, OpClass::Read, DATA_PATH, OSS);
+    }
+
+    #[test]
+    fn test_structured_data_is_not_an_io_cache_file_type() {
+        let blob = "dt=1/bucket-0/data-{uuid}-0.blob";
+        let data = single(&["io-cache.whitelist=data"]);
+        assert_endpoint(&data, OpClass::Read, DATA_PATH, CACHE);
+        assert_endpoint(&data, OpClass::Read, blob, CACHE);
+        let structured = single(&["io-cache.whitelist=structured-data"]);
+        assert_endpoint(&structured, OpClass::Read, DATA_PATH, OSS);
+        assert_endpoint(&structured, OpClass::Read, blob, OSS);
+        let with_meta = single(&["io-cache.whitelist=structured-data,meta"]);
+        assert_endpoint(&with_meta, OpClass::Read, DATA_PATH, OSS);
+        assert_endpoint(&with_meta, OpClass::Read, MANIFEST_PATH, CACHE);
+        // a route of only unknown types is malformed and skipped
+        let route = multi(&["io-cache.routes=structured-data=cluster;*=accel"]);
+        assert_endpoint(&route, OpClass::Read, DATA_PATH, ACCEL);
     }
 
     #[test]
