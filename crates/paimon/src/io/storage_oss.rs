@@ -85,6 +85,11 @@ pub(crate) struct OssTargetRoute {
 }
 
 impl OssStorageConfig {
+    /// Whether some request may use an io-cache target.
+    pub(crate) fn routes_to_io_cache(&self) -> bool {
+        self.cache.is_some()
+    }
+
     /// The io-cache target of `path`, when some request on it may leave origin.
     pub(crate) fn target_route(
         &self,

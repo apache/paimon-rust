@@ -18,20 +18,28 @@
 //! io-cache routing of the files that FileSystemCatalog tables and their writers produce.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use arrow_array::{Array, Int32Array, LargeBinaryArray, RecordBatch};
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+use axum::extract::State;
+use axum::routing::get;
+use axum::{Json, Router};
 use bytes::Bytes;
 use futures::TryStreamExt;
 
 use super::table_write::tests::make_batch;
-use super::{Table, TableCommit, TableWrite};
-use crate::catalog::{Catalog, FileSystemCatalog, Identifier, LoadedTable};
+use super::{RESTEnv, Table, TableCommit, TableWrite};
+use crate::api::rest_api::RESTApi;
+use crate::api::{GetTableResponse, GetTableTokenResponse};
+use crate::catalog::{Catalog, FileSystemCatalog, FusePathResolver, Identifier, LoadedTable};
 use crate::common::{CatalogOptions, Options};
 use crate::io::oss_test_server::TestOss;
-use crate::io::FileIOBuilder;
-use crate::spec::{BlobDescriptor, BlobType, DataType, IntType, Schema, SchemaBuilder};
+use crate::io::{FileIOBuilder, FileIOCacheContext};
+use crate::spec::{
+    BlobDescriptor, BlobType, DataType, IntType, Schema, SchemaBuilder, SchemaChange,
+};
 
 const WAREHOUSE: &str = "bkt/warehouse";
 const FILE_NAME: &str = "data-123e4567-e89b-12d3-a456-426614174000-1.parquet";
@@ -222,13 +230,15 @@ async fn object_table_reads_objects_from_origin() {
     assert_eq!(cache.take_requests(), Vec::<String>::new());
 }
 
+/// Routing that lets data files be written to and read from the target.
+const DATA_TARGET: [(&str, &str); 2] = [
+    ("io-cache.policy", "meta,read,write"),
+    ("io-cache.whitelist", "data"),
+];
+
 /// A catalog whose data files may be written to and read from the target.
 async fn data_target_catalog(origin: &TestOss, cache: &TestOss) -> FileSystemCatalog {
-    let options = [
-        ("io-cache.policy", "meta,read,write"),
-        ("io-cache.whitelist", "data"),
-    ];
-    catalog(origin, cache, &options).await
+    catalog(origin, cache, &DATA_TARGET).await
 }
 
 fn int_schema() -> SchemaBuilder {
@@ -468,4 +478,184 @@ async fn blob_descriptor_sources_are_read_from_origin() {
         let origin_table = origin_catalog.get_table(&identifier).await.unwrap();
         assert_eq!(payloads(&origin_table).await, [b"NEW".to_vec()], "{name}");
     }
+}
+
+/// Creates `name` with `data-file.prefix=older-`, commits a row, then persists `newer-`.
+async fn table_with_altered_prefix(catalog: &FileSystemCatalog, name: &str) -> (Table, String) {
+    let schema = int_schema()
+        .option("data-file.prefix", "older-")
+        .build()
+        .unwrap();
+    let table = create_table(catalog, name, schema).await;
+    let files = write_and_commit(&table, &make_batch(vec![1], vec![10])).await;
+    let [file] = files.as_slice() else {
+        panic!("expected one data file, got {files:?}");
+    };
+    assert!(file.starts_with("older-"), "{file}");
+    let change = SchemaChange::set_option("data-file.prefix".to_string(), "newer-".to_string());
+    catalog
+        .alter_table(table.identifier(), vec![change], false)
+        .await
+        .unwrap();
+    (table, file.clone())
+}
+
+/// The request that lists the schemas of `table`.
+fn schema_listing(table: &Table) -> String {
+    format!(
+        "LIST {}/schema/",
+        table.location().strip_prefix("oss://").unwrap()
+    )
+}
+
+#[tokio::test]
+async fn altered_data_file_prefix_keeps_routing_after_reloads() {
+    let origin = TestOss::start().await;
+    let cache = TestOss::start_sharing(&origin).await;
+    let catalog = data_target_catalog(&origin, &cache).await;
+    let (table, older) = table_with_altered_prefix(&catalog, "altered_prefix").await;
+    let identifier = table.identifier().clone();
+
+    // Fresh loads only see the latest schema in their options, as after a restart.
+    let LoadedTable::Paimon(table) = catalog.load_table(&identifier).await.unwrap() else {
+        panic!("expected a Paimon table");
+    };
+    let newer = write_and_commit(&table, &make_batch(vec![2], vec![20])).await;
+    assert!(
+        newer.iter().all(|file| file.starts_with("newer-")),
+        "{newer:?}"
+    );
+    let restarted =
+        FileSystemCatalog::new(io_cache_options(&origin, &cache, &DATA_TARGET)).unwrap();
+    let table = restarted.get_table(&identifier).await.unwrap();
+    cache.take_requests();
+    origin.take_requests();
+
+    assert_eq!(ids(&table).await, [1, 2]);
+    let (cache_requests, origin_requests) = (cache.take_requests(), origin.take_requests());
+    // The first request that may use io-cache loads the schemas, from origin.
+    let listing = schema_listing(&table);
+    assert!(origin_requests.contains(&listing), "{origin_requests:?}");
+    assert!(!cache_requests.contains(&listing), "{cache_requests:?}");
+    for file in newer.iter().chain([&older]) {
+        let methods_on_target = methods(&cache_requests, file);
+        assert!(
+            methods_on_target.iter().any(|m| m == "GET"),
+            "{file}: {methods_on_target:?}"
+        );
+        assert_eq!(
+            methods(&origin_requests, file),
+            Vec::<String>::new(),
+            "{file}"
+        );
+    }
+
+    // Without io-cache routing a table never loads its schema history.
+    let mut plain = Options::new();
+    plain.set(CatalogOptions::WAREHOUSE, format!("oss://{WAREHOUSE}"));
+    for (key, value) in plain_options(&origin) {
+        plain.set(key, value);
+    }
+    let table = FileSystemCatalog::new(plain)
+        .unwrap()
+        .get_table(&identifier)
+        .await
+        .unwrap();
+    origin.take_requests();
+    assert_eq!(ids(&table).await, [1, 2]);
+    let origin_requests = origin.take_requests();
+    assert!(!origin_requests.contains(&listing), "{origin_requests:?}");
+}
+
+/// The token a REST catalog vends, and the number of token requests it served.
+type TokenState = (Arc<HashMap<String, String>>, Arc<AtomicUsize>);
+
+async fn io_cache_token(
+    State((token, requests)): State<TokenState>,
+) -> Json<GetTableTokenResponse> {
+    requests.fetch_add(1, Ordering::SeqCst);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    Json(GetTableTokenResponse {
+        token: token.as_ref().clone(),
+        expires_at_millis: Some(now + 24 * 3_600_000),
+    })
+}
+
+#[tokio::test]
+async fn rest_tables_keep_routing_for_prefixes_of_older_schemas() {
+    let origin = TestOss::start().await;
+    let cache = TestOss::start_sharing(&origin).await;
+    let catalog = data_target_catalog(&origin, &cache).await;
+    let (table, older) = table_with_altered_prefix(&catalog, "rest_prefix").await;
+    let older = format!("{}/bucket-0/{older}", table.location());
+
+    // The REST catalog vends io-cache routing with the table token and returns the latest schema.
+    let token: HashMap<String, String> = io_cache_options(&origin, &cache, &DATA_TARGET)
+        .to_map()
+        .clone();
+    let token_requests = Arc::new(AtomicUsize::new(0));
+    let app = Router::new()
+        .route(
+            "/v1/databases/db/tables/rest_prefix/token",
+            get(io_cache_token),
+        )
+        .with_state((Arc::new(token), token_requests.clone()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let mut options = Options::new();
+    options.set(CatalogOptions::URI, format!("http://{address}"));
+    options.set(CatalogOptions::TOKEN_PROVIDER, "bear");
+    options.set(CatalogOptions::TOKEN, "test-token");
+    let api = Arc::new(RESTApi::new(options.clone(), false).await.unwrap());
+    let mut response: GetTableResponse = serde_json::from_value(serde_json::json!({
+        "id": "rest-prefix-uuid",
+        "database": "db",
+        "name": "rest_prefix",
+        "path": table.location(),
+        "isExternal": false,
+        "schemaId": 1,
+    }))
+    .unwrap();
+    let latest = int_schema()
+        .option("data-file.prefix", "newer-")
+        .build()
+        .unwrap();
+    response.schema = Some(latest);
+    let fuse_resolver = Arc::new(FusePathResolver::new(api.options()));
+    let file_io_cache = FileIOCacheContext::from_props(options.to_map()).unwrap();
+    origin.take_requests();
+    cache.take_requests();
+    let rest_table = RESTEnv::build_table(
+        table.identifier(),
+        response,
+        api,
+        options,
+        true,
+        None,
+        file_io_cache,
+        fuse_resolver,
+    )
+    .await
+    .unwrap();
+    // Loading reads no schemas; its only token request is the one RESTTokenFileIO makes anyway.
+    assert_eq!(origin.take_requests(), Vec::<String>::new());
+    assert_eq!(cache.take_requests(), Vec::<String>::new());
+    assert_eq!(token_requests.load(Ordering::SeqCst), 1);
+
+    let input = rest_table.file_io().new_input(&older).unwrap();
+    input.read().await.unwrap();
+    let file = older.rsplit('/').next().unwrap();
+    assert_eq!(methods(&cache.take_requests(), file), ["GET"]);
+    let origin_requests = origin.take_requests();
+    assert_eq!(methods(&origin_requests, file), Vec::<String>::new());
+    assert!(
+        origin_requests.contains(&schema_listing(&table)),
+        "{origin_requests:?}"
+    );
+    assert_eq!(token_requests.load(Ordering::SeqCst), 1);
+    server.abort();
 }

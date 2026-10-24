@@ -216,6 +216,10 @@ impl FileIOProvider for RESTTokenFileIO {
         let (op, relative_path) = file_io.create_routed_static(path, file_prefixes)?;
         Ok((op, relative_path, Some(namespace)))
     }
+
+    async fn routes_to_io_cache(&self) -> Result<bool> {
+        self.current_file_io().await?.routes_to_io_cache().await
+    }
 }
 
 #[cfg(test)]

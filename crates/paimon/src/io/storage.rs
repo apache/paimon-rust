@@ -430,6 +430,15 @@ impl Storage {
         }
     }
 
+    /// Whether some request may use an io-cache target.
+    pub(crate) fn routes_to_io_cache(&self) -> bool {
+        #[cfg(feature = "storage-oss")]
+        if let Storage::Oss { config, .. } = self {
+            return config.routes_to_io_cache();
+        }
+        false
+    }
+
     /// Like [`Self::create`], adding the io-cache target when a request on `path` may use one.
     pub(crate) fn create_routed<'a>(
         &self,

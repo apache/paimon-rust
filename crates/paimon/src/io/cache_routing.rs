@@ -57,6 +57,11 @@ static DATA_FILE_SUFFIX: LazyLock<Regex> = LazyLock::new(|| {
     ))
     .expect("valid data file pattern")
 });
+// The name of a data file or its file index, whatever its prefix.
+static ANY_PREFIX_DATA_FILE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(&format!(r"(?:{UUID}-[0-9]+\..+|{UUID}\.managed\.blob)$"))
+        .expect("valid data file pattern")
+});
 // Other types are routed only under the names Paimon writes; Format Table files may be replaced
 // in place. TableCommit names changelog manifests manifest-{uuid}-changelog-{count}.
 static META_FILE: LazyLock<Regex> = LazyLock::new(|| {
@@ -291,6 +296,16 @@ pub(crate) fn routable_type(
         _ => false,
     };
     paimon_name.then_some(file_type)
+}
+
+/// Whether `path` is named like a data file but with none of `prefixes`, so other prefixes of
+/// the table may still make it routable.
+pub(crate) fn has_other_data_file_prefix(path: &str, prefixes: &[String]) -> bool {
+    let path = path.trim_end_matches('/');
+    let name = path.rsplit('/').next().unwrap_or(path);
+    !name.ends_with(MANIFEST_SIDECAR_SUFFIX)
+        && ANY_PREFIX_DATA_FILE.is_match(name)
+        && !is_data_file_name(name, prefixes.iter())
 }
 
 // Manifests, indexes and statistics share the uuid-count shape but have no extension.
@@ -929,6 +944,35 @@ mod tests {
         ] {
             let path = format!("oss://bkt/warehouse/bucket-0/db/t1/{name}");
             assert_type(&path, None, &[prefix]);
+        }
+    }
+
+    #[test]
+    fn test_names_with_other_data_file_prefixes() {
+        let known = ["data-".to_string(), "newer-".to_string()];
+        for path in [
+            "bucket-0/older-{uuid}-0.parquet",
+            "bucket-0/older-{uuid}-0.parquet.index",
+            "bucket-postpone/older--u-user-s-0-w-{uuid}-0.parquet",
+            "bucket-0/older-{uuid}.managed.blob",
+        ] {
+            assert!(has_other_data_file_prefix(&resolve(path), &known), "{path}");
+        }
+        for path in [
+            "bucket-0/newer-{uuid}-0.parquet",
+            "bucket-0/data-{uuid}.managed.blob",
+            "manifest/manifest-{uuid}-0",
+            "manifest/manifest-{uuid}-0.avro.sidecar",
+            "manifest/manifest-list-{uuid}-1",
+            "index/btree-global-index-{uuid}.index",
+            "snapshot/snapshot-1",
+            "snapshot/LATEST",
+            "schema/schema-0",
+        ] {
+            assert!(
+                !has_other_data_file_prefix(&resolve(path), &known),
+                "{path}"
+            );
         }
     }
 
