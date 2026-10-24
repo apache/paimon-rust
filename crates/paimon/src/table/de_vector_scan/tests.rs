@@ -1008,10 +1008,13 @@ async fn transported_vector_sources_keep_pk_positions_separate_from_global_ids()
     assert!(mixed.is_err());
 }
 
-#[tokio::test]
-async fn pruned_null_bitmap_keeps_btree_answer_exact() {
-    // The bitmap shard covers only NULL rows, so `f > 1.5` prunes it and the
-    // BTree answer stays exact even without refinement.
+/// Writes ids 0..2 with `first_f`, builds a bitmap on `f`, then writes
+/// f = [2, 3], builds a BTree on `f` and IVF-flat on `embedding`, and returns
+/// the Top-1 ids for `filter` without refinement from data.
+async fn top1_after_bitmap_then_btree(
+    first_f: Vec<Option<f64>>,
+    filter: fn(&crate::spec::PredicateBuilder) -> crate::spec::Predicate,
+) -> Vec<i32> {
     use crate::spec::{ArrayType, DataType, Datum, DoubleType, FloatType, IntType};
     use arrow_array::types::Float32Type;
     use arrow_array::{Float64Array, ListArray};
@@ -1066,12 +1069,7 @@ async fn pruned_null_bitmap_keeps_btree_answer_exact() {
                 .unwrap();
         }
     };
-    write(
-        vec![0, 1],
-        vec![None, None],
-        vec![vec![0.0, 1.0], vec![0.0, 1.0]],
-    )
-    .await;
+    write(vec![0, 1], first_f, vec![vec![0.0, 1.0], vec![0.0, 1.0]]).await;
     let mut builder = table.new_global_index_build_builder();
     builder.with_index_type("bitmap").with_index_column("f");
     builder.execute().await.unwrap();
@@ -1105,7 +1103,7 @@ async fn pruned_null_bitmap_keeps_btree_answer_exact() {
         .with_vector_column("embedding")
         .with_query_vector(vec![1.0, 0.0])
         .with_limit(1)
-        .with_filter(pb.greater_than("f", Datum::Double(1.5)).unwrap())
+        .with_filter(filter(&pb))
         .execute()
         .await
         .unwrap()
@@ -1116,7 +1114,7 @@ async fn pruned_null_bitmap_keeps_btree_answer_exact() {
         .try_collect()
         .await
         .unwrap();
-    let ids: Vec<i32> = batches
+    batches
         .iter()
         .flat_map(|batch| {
             batch
@@ -1128,7 +1126,33 @@ async fn pruned_null_bitmap_keeps_btree_answer_exact() {
                 .values()
                 .to_vec()
         })
-        .collect();
+        .collect()
+}
+
+#[tokio::test]
+async fn pruned_null_bitmap_keeps_btree_answer_exact() {
+    // The bitmap shard covers only NULL rows, so `f > 1.5` prunes it and the
+    // BTree answer stays exact even without refinement.
+    let ids = top1_after_bitmap_then_btree(vec![None, None], |pb| {
+        pb.greater_than("f", crate::spec::Datum::Double(1.5))
+            .unwrap()
+    })
+    .await;
+    assert_eq!(ids, vec![2]);
+}
+
+#[tokio::test]
+async fn bitmap_pruned_by_another_conjunct_keeps_btree_answer_exact() {
+    // The bitmap shard holds f = [0, 1]. `f = 2` prunes it by metadata, so
+    // only the BTree answers `f > 1.5 AND f = 2`, and it does so exactly.
+    let ids = top1_after_bitmap_then_btree(vec![Some(0.0), Some(1.0)], |pb| {
+        crate::spec::Predicate::and(vec![
+            pb.greater_than("f", crate::spec::Datum::Double(1.5))
+                .unwrap(),
+            pb.equal("f", crate::spec::Datum::Double(2.0)).unwrap(),
+        ])
+    })
+    .await;
     assert_eq!(ids, vec![2]);
 }
 

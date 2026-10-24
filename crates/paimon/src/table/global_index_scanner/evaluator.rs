@@ -388,28 +388,6 @@ impl GlobalIndexScanner {
         entries: &[&GlobalIndexEntry],
         predicates: &[(PredicateOperator, &[Datum], &DataType)],
     ) -> Result<Option<(Vec<RowRange>, Vec<RowRange>, bool)>> {
-        // A bitmap answers floating ranges and negations with every non-null
-        // row (see `bitmap_meta_may_match`), so those results are candidates
-        // only. Sorted indexes answer them exactly.
-        // An all-NULL bitmap shard is pruned before it answers anything.
-        let bitmap_superset = entries.iter().any(|entry| {
-            matches!(entry.index_type, GlobalIndexFileKind::Bitmap)
-                && !sorted_entry_meta(entry).only_nulls()
-        }) && predicates.iter().any(|(op, _, data_type)| {
-            is_floating_point(data_type) && is_bitmap_floating_residual_sensitive_op(*op)
-        });
-        Ok(self.evaluate_leaf_entries(entries, predicates).await?.map(
-            |(row_ranges, coverage, fully_evaluated)| {
-                (row_ranges, coverage, fully_evaluated && !bitmap_superset)
-            },
-        ))
-    }
-
-    async fn evaluate_leaf_entries(
-        &self,
-        entries: &[&GlobalIndexEntry],
-        predicates: &[(PredicateOperator, &[Datum], &DataType)],
-    ) -> Result<Option<(Vec<RowRange>, Vec<RowRange>, bool)>> {
         let Some(normalized_predicates) = predicates
             .iter()
             .map(|(op, literals, data_type)| {
@@ -614,6 +592,14 @@ impl GlobalIndexScanner {
             )
         });
 
+        // A bitmap answers floating ranges and negations with every non-null
+        // row (see `bitmap_meta_may_match`), so its results are candidates
+        // only. Sorted indexes answer them exactly. Only bitmap shards that
+        // survive pruning by every conjunct below contribute rows.
+        let bitmap_superset_ops = predicates.iter().any(|(op, _, data_type)| {
+            is_floating_point(data_type) && is_bitmap_floating_residual_sensitive_op(*op)
+        });
+        let mut bitmap_retained = false;
         let mut query_plans = Vec::with_capacity(entries.len());
         let mut all_matching_ranges = Vec::new();
         let mut fully_evaluated = true;
@@ -623,6 +609,7 @@ impl GlobalIndexScanner {
                     .iter()
                     .all(|matches| matches[entry_idx])
             {
+                bitmap_retained |= matches!(entry.index_type, GlobalIndexFileKind::Bitmap);
                 all_matching_ranges.push(RowRange::new(entry.row_range_start, entry.row_range_end));
                 continue;
             }
@@ -693,9 +680,11 @@ impl GlobalIndexScanner {
                 // Only a proven identity remains (other conjuncts may have
                 // declined their budget). Preserve its indexed domain and
                 // leave the residual filter to the ordinary table reader.
+                bitmap_retained |= matches!(entry.index_type, GlobalIndexFileKind::Bitmap);
                 all_matching_ranges.push(RowRange::new(entry.row_range_start, entry.row_range_end));
                 continue;
             }
+            bitmap_retained |= matches!(entry.index_type, GlobalIndexFileKind::Bitmap);
             query_plans.push(EntryQueryPlan {
                 entry_idx,
                 between_matches,
@@ -771,7 +760,7 @@ impl GlobalIndexScanner {
         Ok(Some((
             crate::table::merge_row_ranges(all_ranges),
             coverage(),
-            fully_evaluated,
+            fully_evaluated && !(bitmap_retained && bitmap_superset_ops),
         )))
     }
 
