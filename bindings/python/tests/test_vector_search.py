@@ -67,6 +67,31 @@ def test_filters_accumulate_and_partition_uses_table_schema(table):
         result.splits()
 
 
+@pytest.mark.parametrize('mode', ['fast', 'full', 'detail'])
+@pytest.mark.parametrize('batch', [False, True])
+def test_indexed_partition_filter_uses_table_field_positions(table, mode, batch):
+    (table.new_global_index_build_builder().with_index_column('embedding')
+     .with_index_type('ivf-flat').with_options({
+         'ivf-flat.dimension': '2', 'ivf-flat.nlist': '1',
+         'ivf-flat.distance.metric': 'l2'}).execute())
+    (table.new_global_index_build_builder().with_index_column('id')
+     .with_index_type('btree').execute())
+    table = table.copy({'vector-index.search-mode': mode,
+                        'global-index.filter.refine-from-data': 'false'})
+    builder = (table.new_batch_vector_search_builder().with_vector_column('embedding')
+               .with_query_vectors([[1, 0], [1, 0]]).with_limit(3) if batch else _single(table))
+    # pt is field 2 in the table and field 0 in the partition row. An exact
+    # scalar lookup must retain the matching indexed vector in either API.
+    builder.with_filter({'method': 'equal', 'field': 'id', 'literals': [3]})
+    builder.with_partition_filter({'method': 'equal', 'field': 'pt', 'literals': [1]})
+    results = builder.execute() if batch else [builder.execute()]
+    for result in results:
+        assert len(result) == 1
+        assert list(result.row_ids().values()) == [1.0]
+        rows = pa.Table.from_batches(result.new_read_builder().with_projection(['id']).read())
+        assert rows.column('id').to_pylist() == [3]
+
+
 @pytest.mark.parametrize('batch', [False, True])
 def test_partition_filter_rejects_data_fields(table, batch):
     builder = table.new_batch_vector_search_builder() if batch else table.new_vector_search_builder()
