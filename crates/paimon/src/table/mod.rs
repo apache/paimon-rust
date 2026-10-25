@@ -718,12 +718,6 @@ impl Table {
         PostponeFixedBucketWriteBuilder::new(self)
     }
 
-    /// Whether dynamic options set `merge-engine`. They keep the schema ID, so
-    /// the stored schema of that ID may name another engine.
-    pub(crate) fn merge_engine_overridden(&self) -> bool {
-        self.applied_dynamic_option_keys.contains("merge-engine")
-    }
-
     /// Create a copy of this table with extra options merged into the schema.
     ///
     /// This never switches the schema version; it corresponds to Java
