@@ -352,6 +352,17 @@ fn table_file_io(file_io: &FileIO, location: &str, schema: &TableSchema) -> File
         .with_file_prefixes([options.data_file_prefix(), options.changelog_file_prefix()])
 }
 
+// The FileIO of a table whose schemas `schema_manager` keeps; every constructor, and every copy
+// that moves to another branch, takes its FileIO from here.
+fn table_view(
+    file_io: &FileIO,
+    location: &str,
+    schema: &TableSchema,
+    schema_manager: &SchemaManager,
+) -> FileIO {
+    with_schema_history(&table_file_io(file_io, location, schema), schema_manager)
+}
+
 // Data files committed before a prefix option changed keep using io-cache; the schemas are read
 // from origin on the first request that may use io-cache.
 fn with_schema_history(file_io: &FileIO, schema_manager: &SchemaManager) -> FileIO {
@@ -378,9 +389,11 @@ impl Table {
         schema: TableSchema,
         rest_env: Option<RESTEnv>,
     ) -> Self {
-        let file_io = table_file_io(&file_io, &location, &schema);
-        let schema_manager = SchemaManager::new(file_io.clone(), location.clone());
-        let file_io = with_schema_history(&file_io, &schema_manager);
+        let schema_manager = SchemaManager::new(
+            table_file_io(&file_io, &location, &schema),
+            location.clone(),
+        );
+        let file_io = table_view(&file_io, &location, &schema, &schema_manager);
         let branch = DEFAULT_MAIN_BRANCH.to_string();
         Self {
             file_io,
@@ -417,14 +430,16 @@ impl Table {
         identifier.validate()?;
         validate_branch_name(&branch)?;
         schema.validate_resolved_structure()?;
-        let file_io = table_file_io(&file_io, &location, &schema);
-        let schema_manager = SchemaManager::new(file_io.clone(), location.clone());
+        let schema_manager = SchemaManager::new(
+            table_file_io(&file_io, &location, &schema),
+            location.clone(),
+        );
         let schema_manager = if branch == DEFAULT_MAIN_BRANCH {
             schema_manager
         } else {
             schema_manager.with_branch(&branch)
         };
-        let file_io = with_schema_history(&file_io, &schema_manager);
+        let file_io = table_view(&file_io, &location, &schema, &schema_manager);
         let branch_reference = branch != DEFAULT_MAIN_BRANCH;
 
         Ok(Self {
@@ -851,11 +866,10 @@ impl Table {
         } else {
             schema_manager.with_branch(branch)
         };
-        let file_io = table_file_io(&self.file_io, &self.location, &schema);
         let file_io = if branch == self.branch {
-            file_io
+            table_file_io(&self.file_io, &self.location, &schema)
         } else {
-            with_schema_history(&file_io, &schema_manager)
+            table_view(&self.file_io, &self.location, &schema, &schema_manager)
         };
         Ok(Self {
             file_io,
@@ -1162,14 +1176,19 @@ impl Table {
                     source: None,
                 });
             }
-            table.file_io = self.file_io.clone();
-            let schema_manager = SchemaManager::new(table.file_io.clone(), table.location.clone());
+            let schema_manager = SchemaManager::new(self.file_io.clone(), table.location.clone());
             table.schema_manager = if branch == DEFAULT_MAIN_BRANCH {
                 schema_manager
             } else {
                 schema_manager.with_branch(&branch)
             };
-            table.file_io = with_schema_history(&table.file_io, &table.schema_manager);
+            // The branch schema may exist only in the catalog, so its prefixes come from it too.
+            table.file_io = table_view(
+                &self.file_io,
+                &table.location,
+                &table.schema,
+                &table.schema_manager,
+            );
             let mut options = table.schema.options().clone();
             options.insert("branch".to_string(), branch);
             table.schema = table.schema.copy_with_replaced_options(options);
@@ -1190,7 +1209,7 @@ impl Table {
         let mut options = schema.options().clone();
         options.insert("branch".to_string(), branch.clone());
         Ok(Self {
-            file_io: with_schema_history(&self.file_io, &schema_manager),
+            file_io: table_view(&self.file_io, &self.location, &schema, &schema_manager),
             identifier: self.identifier.clone(),
             location: self.location.clone(),
             schema: schema.copy_with_replaced_options(options),

@@ -23,14 +23,14 @@ use std::sync::Arc;
 
 use arrow_array::{Array, Int32Array, LargeBinaryArray, RecordBatch};
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::routing::get;
 use axum::{Json, Router};
 use bytes::Bytes;
 use futures::TryStreamExt;
 
 use super::table_write::tests::make_batch;
-use super::{BlobReader, RESTEnv, Table, TableCommit, TableWrite};
+use super::{BlobReader, BranchManager, RESTEnv, Table, TableCommit, TableWrite};
 use crate::api::rest_api::RESTApi;
 use crate::api::{GetTableResponse, GetTableTokenResponse};
 use crate::catalog::{Catalog, FileSystemCatalog, FusePathResolver, Identifier, LoadedTable};
@@ -819,6 +819,258 @@ async fn blob_readers_read_objects_outside_the_table_from_origin() {
     let mut stream = reader.open_blob(&descriptors[1]).unwrap();
     assert_eq!(stream.read(16).await.unwrap(), b"NEW");
     assert_eq!(cache.take_requests(), Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn every_table_copy_routes_files_named_with_the_schema_prefix() {
+    let origin = TestOss::start().await;
+    let cache = TestOss::start_sharing(&origin).await;
+    let catalog = data_target_catalog(&origin, &cache).await;
+    let schema = int_schema()
+        .option("data-file.prefix", "custom-")
+        .build()
+        .unwrap();
+    let table = create_table(&catalog, "copies", schema).await;
+    let files = write_and_commit(&table, &make_batch(vec![1], vec![10])).await;
+    let snapshot = table
+        .snapshot_manager()
+        .get_latest_snapshot()
+        .await
+        .unwrap()
+        .unwrap();
+    table.tag_manager().create("base", &snapshot).await.unwrap();
+    BranchManager::new(table.file_io().clone(), table.location().into())
+        .create_branch_from_tag("dev", "base")
+        .await
+        .unwrap();
+    let option = |key: &str, value: &str| HashMap::from([(key.to_string(), value.to_string())]);
+    let file_io = FileIOBuilder::new("oss")
+        .with_props(
+            io_cache_options(&origin, &cache, &DATA_TARGET)
+                .to_map()
+                .iter(),
+        )
+        .build()
+        .unwrap();
+    let copies = [
+        (
+            "from_resolved_schema",
+            Table::from_resolved_schema(
+                file_io,
+                table.identifier().clone(),
+                table.location().to_string(),
+                table.schema().clone(),
+                "main",
+            )
+            .unwrap(),
+        ),
+        (
+            "copy_with_options",
+            table.copy_with_options(option("read.batch-size", "16")),
+        ),
+        (
+            "snapshot",
+            table
+                .copy_with_time_travel(option("scan.snapshot-id", "1"))
+                .await
+                .unwrap(),
+        ),
+        (
+            "tag",
+            table
+                .copy_with_time_travel(option("scan.tag-name", "base"))
+                .await
+                .unwrap(),
+        ),
+        (
+            "copy_with_resolved_snapshot",
+            table.copy_with_resolved_snapshot(&snapshot).await.unwrap(),
+        ),
+        (
+            "copy_with_pinned_snapshot",
+            table.copy_with_pinned_snapshot(Some(&snapshot)),
+        ),
+        (
+            "copy_with_resolved_schema",
+            table
+                .copy_with_resolved_schema(table.schema().clone(), "main")
+                .unwrap(),
+        ),
+        (
+            "copy_with_resolved_schema on a branch",
+            table
+                .copy_with_resolved_schema(table.schema().clone(), "dev")
+                .unwrap(),
+        ),
+        (
+            "copy_with_branch",
+            table.copy_with_branch("dev").await.unwrap(),
+        ),
+        (
+            "branch option",
+            table
+                .copy_with_time_travel(option("branch", "dev"))
+                .await
+                .unwrap(),
+        ),
+    ];
+    for (name, copy) in copies {
+        origin.take_requests();
+        cache.take_requests();
+        assert_eq!(ids(&copy).await, [1], "{name}");
+        let (origin_requests, cache_requests) = (origin.take_requests(), cache.take_requests());
+        for file in &files {
+            let on_target = methods(&cache_requests, file);
+            assert!(
+                on_target.iter().any(|m| m == "GET"),
+                "{name}: {on_target:?}"
+            );
+            assert_eq!(
+                methods(&origin_requests, file),
+                Vec::<String>::new(),
+                "{name}"
+            );
+        }
+    }
+}
+
+/// Tables a REST catalog serves by name, and the io-cache token it vends for each of them.
+type RestTables = (
+    Arc<HashMap<String, GetTableResponse>>,
+    Arc<HashMap<String, String>>,
+);
+
+async fn rest_table(
+    State((tables, _)): State<RestTables>,
+    Path((_, name)): Path<(String, String)>,
+) -> Json<GetTableResponse> {
+    Json(tables[&name].clone())
+}
+
+async fn rest_token(State((_, token)): State<RestTables>) -> Json<GetTableTokenResponse> {
+    Json(GetTableTokenResponse {
+        token: token.as_ref().clone(),
+        expires_at_millis: Some(i64::MAX / 2),
+    })
+}
+
+fn rest_table_response(id: &str, name: &str, location: &str, prefix: &str) -> GetTableResponse {
+    let mut response: GetTableResponse = serde_json::from_value(serde_json::json!({
+        "id": id,
+        "database": "db",
+        "name": name,
+        "path": location,
+        "isExternal": false,
+        "schemaId": 0,
+    }))
+    .unwrap();
+    response.schema = Some(
+        int_schema()
+            .option("data-file.prefix", prefix)
+            .build()
+            .unwrap(),
+    );
+    response
+}
+
+#[tokio::test]
+async fn rest_branch_copies_route_files_named_with_the_branch_prefix() {
+    let origin = TestOss::start().await;
+    let cache = TestOss::start_sharing(&origin).await;
+    // The catalog keeps the branch schema; storage has no schema directory for it.
+    let location = format!("oss://{WAREHOUSE}/db.db/rest_branch");
+    let file = "branch-123e4567-e89b-12d3-a456-426614174000-1.parquet";
+    let path = format!("{location}/bucket-0/{file}");
+    put(&origin, &path, parquet(&[1])).await;
+    let tables = HashMap::from([
+        (
+            "rest_branch".to_string(),
+            rest_table_response("main-uuid", "rest_branch", &location, "main-"),
+        ),
+        (
+            "rest_branch$branch_dev".to_string(),
+            rest_table_response(
+                "branch-uuid",
+                "rest_branch$branch_dev",
+                &location,
+                "branch-",
+            ),
+        ),
+    ]);
+    let token = io_cache_options(&origin, &cache, &DATA_TARGET)
+        .to_map()
+        .clone();
+    let app = Router::new()
+        .route("/v1/databases/:db/tables/:name", get(rest_table))
+        .route("/v1/databases/:db/tables/:name/token", get(rest_token))
+        .with_state((Arc::new(tables.clone()), Arc::new(token)));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let mut options = Options::new();
+    options.set(CatalogOptions::URI, format!("http://{address}"));
+    options.set(CatalogOptions::TOKEN_PROVIDER, "bear");
+    options.set(CatalogOptions::TOKEN, "test-token");
+    let api = Arc::new(RESTApi::new(options.clone(), false).await.unwrap());
+    let fuse_resolver = Arc::new(FusePathResolver::new(api.options()));
+    let file_io_cache = FileIOCacheContext::from_props(options.to_map()).unwrap();
+    let load = |name: &str, identifier: Identifier| {
+        let (response, api, options) = (tables[name].clone(), api.clone(), options.clone());
+        let (file_io_cache, fuse_resolver) = (file_io_cache.clone(), fuse_resolver.clone());
+        async move {
+            RESTEnv::build_table(
+                &identifier,
+                response,
+                api,
+                options,
+                true,
+                None,
+                file_io_cache,
+                fuse_resolver,
+            )
+            .await
+        }
+    };
+    let main = load("rest_branch", Identifier::new("db", "rest_branch"))
+        .await
+        .unwrap();
+    let branch_identifier = Identifier::new("db", "rest_branch")
+        .with_branch("dev")
+        .unwrap();
+    let loaded_branch = load("rest_branch$branch_dev", branch_identifier)
+        .await
+        .unwrap();
+    let copies = [
+        ("loaded branch", loaded_branch),
+        (
+            "copy_with_branch",
+            main.copy_with_branch("dev").await.unwrap(),
+        ),
+        (
+            "branch option",
+            main.copy_with_time_travel(HashMap::from([("branch".to_string(), "dev".to_string())]))
+                .await
+                .unwrap(),
+        ),
+    ];
+    for (name, branch) in copies {
+        origin.take_requests();
+        cache.take_requests();
+        branch
+            .file_io()
+            .new_input(&path)
+            .unwrap()
+            .read()
+            .await
+            .unwrap();
+        assert_eq!(methods(&cache.take_requests(), file), ["GET"], "{name}");
+        assert_eq!(
+            methods(&origin.take_requests(), file),
+            Vec::<String>::new(),
+            "{name}"
+        );
+    }
+    server.abort();
 }
 
 #[tokio::test]
