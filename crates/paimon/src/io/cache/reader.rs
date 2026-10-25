@@ -164,17 +164,35 @@ impl CachedFileReader {
             if block.is_none() {
                 let lock = self.cache.block_load_lock(&key).await;
                 let guard = lock.clone().lock_owned().await;
-                let shared_guard = self.cache.shared_load_lock(&key).await;
                 block = self.cache.get_block(&key, len, &self.read_token).await;
                 if block.as_ref().is_some_and(|b| b.len() != len) {
                     self.cache.remove_block(&key).await;
                     block = None;
                 }
-                locks.push(Some((key, lock, guard, shared_guard)));
+                locks.push(Some((key, lock, guard)));
             } else {
                 locks.push(None);
             }
             blocks.push(block);
+        }
+        // Deduplicate hash stripes and acquire them in a global order, after local locks.
+        let keys: Vec<_> = locks
+            .iter()
+            .flatten()
+            .map(|(key, _, _)| key.clone())
+            .collect();
+        let shared_guards = Arc::new(self.cache.shared_load_locks(&keys).await);
+        for (index, entry) in locks.iter().enumerate() {
+            if let Some((key, _, _)) = entry {
+                let len = (self.file_size - (first + index as u64) * size).min(size) as usize;
+                let block = self.cache.get_block(key, len, &self.read_token).await;
+                if block.as_ref().is_some_and(|b| b.len() != len) {
+                    self.cache.remove_block(key).await;
+                    blocks[index] = None;
+                } else {
+                    blocks[index] = block;
+                }
+            }
         }
         let result = async {
             let mut i = 0;
@@ -205,13 +223,14 @@ impl CachedFileReader {
                         .cache
                         .block_key(&self.path, first + (begin + offset) as u64);
                     if let Some(fill_slot) = self.cache.background_fill_slot() {
-                        let (_, lock, guard, shared_guard) = locks[begin + offset].take().unwrap();
+                        let (_, lock, guard) = locks[begin + offset].take().unwrap();
+                        let shared_guards = shared_guards.clone();
                         let cache = self.cache.clone();
                         let token = self.read_token.clone();
                         let fill_block = block.clone();
                         tokio::spawn(async move {
                             let _slot = fill_slot;
-                            let _shared_guard = shared_guard;
+                            let _shared_guards = shared_guards;
                             cache.put_block(&key, fill_block, &token).await;
                             drop(guard);
                             cache.release_block_load_lock(&key, &lock).await;
@@ -227,8 +246,7 @@ impl CachedFileReader {
             Ok(blocks.into_iter().map(Option::unwrap).collect())
         }
         .await;
-        for (key, lock, guard, shared_guard) in locks.into_iter().flatten() {
-            drop(shared_guard);
+        for (key, lock, guard) in locks.into_iter().flatten() {
             drop(guard);
             self.cache.release_block_load_lock(&key, &lock).await;
         }
@@ -442,6 +460,57 @@ mod tests {
         }
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn coalesced_shared_stripe_collisions_do_not_wait_on_self() {
+        let directory = tempfile::tempdir().unwrap();
+        let block_size = 256 * 1024;
+        let data = Bytes::from(vec![42; 32 * block_size]);
+        let cache = Arc::new(
+            LocalCache::new(LocalCacheConfig {
+                shared: true,
+                dir: Some(directory.path().to_path_buf()),
+                namespace: "test".into(),
+                max_size: Some(16 * 1024 * 1024),
+                block_size: block_size as u64,
+                whitelist: std::collections::HashSet::from([FileType::Meta]),
+            })
+            .unwrap(),
+        );
+        for (a, b) in [(15, 27), (20, 28), (16, 31)] {
+            let a = cache.block_key("snapshot-1", a).cache_relative_path();
+            let b = cache.block_key("snapshot-1", b).cache_relative_path();
+            assert_eq!(a.components().next(), b.components().next());
+        }
+        let delegate = Arc::new(CountingReader {
+            data: data.clone(),
+            reads: AtomicUsize::new(0),
+        });
+        let reader = CachedFileReader::new(
+            delegate.clone(),
+            "snapshot-1",
+            data.len() as u64,
+            cache.clone(),
+        );
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            reader.read(0..data.len() as u64),
+        )
+        .await
+        .expect("colliding stripes must not wait for their own lock timeout")
+        .unwrap();
+        assert_eq!(result, data);
+        assert_eq!(delegate.reads.load(Ordering::SeqCst), 1);
+        let _fills = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            cache.fill_slots.clone().acquire_many_owned(8),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(reader.read(0..data.len() as u64).await.unwrap(), data);
+        assert_eq!(delegate.reads.load(Ordering::SeqCst), 1);
+    }
+
     #[tokio::test]
     async fn test_coalesced_miss_does_not_republish_after_invalidation() {
         let cache = test_cache();
@@ -459,7 +528,7 @@ mod tests {
         );
         let loading = tokio::spawn(async move { old.read(0..12).await });
         started.notified().await;
-        cache.invalidate_path("snapshot-1").await;
+        cache.invalidate_path("snapshot-1").await.unwrap();
         release.notify_one();
         assert_eq!(
             loading.await.unwrap().unwrap(),

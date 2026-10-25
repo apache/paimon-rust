@@ -305,12 +305,31 @@ impl SharedDiskCache {
     pub(crate) async fn load_lock(&self, key: &BlockKey) -> Option<File> {
         // Best-effort block coalescing; read_full locks only the first block.
         // Publication safety relies on the directory lock and generation checks.
+        lock(self.load_lock_path(key)?).await
+    }
+
+    pub(crate) async fn load_locks(&self, keys: &[BlockKey]) -> Vec<File> {
+        let mut paths: Vec<_> = keys
+            .iter()
+            .filter_map(|key| self.load_lock_path(key))
+            .collect();
+        paths.sort_unstable();
+        paths.dedup();
+        let mut guards = Vec::new();
+        for path in paths {
+            if let Some(guard) = lock(path).await {
+                guards.push(guard);
+            }
+        }
+        guards
+    }
+
+    fn load_lock_path(&self, key: &BlockKey) -> Option<PathBuf> {
         let stripe = key.cache_relative_path();
-        lock(self.root.join(format!(
+        Some(self.root.join(format!(
             "load-{}.lock",
             stripe.components().next()?.as_os_str().to_string_lossy()
         )))
-        .await
     }
 
     pub(crate) async fn get(&self, key: &BlockKey, generation: &Option<String>) -> Option<Bytes> {
@@ -1091,6 +1110,36 @@ mod tests {
                 .is_some()
         );
         drop(other);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn batch_download_locks_deduplicate_and_order_stripes() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = SharedDiskCache::new(directory.path().to_path_buf(), 1024 * 1024).unwrap();
+        let second = SharedDiskCache::new(directory.path().to_path_buf(), 1024 * 1024).unwrap();
+        let a = BlockKey::with_namespace("test", "snapshot-1", 256 * 1024, 15);
+        let b = BlockKey::with_namespace("test", "snapshot-1", 256 * 1024, 20);
+        let collision = BlockKey::with_namespace("test", "snapshot-1", 256 * 1024, 27);
+        assert_eq!(first.load_lock_path(&a), first.load_lock_path(&collision));
+        assert_ne!(first.load_lock_path(&a), first.load_lock_path(&b));
+        let forward = [a.clone(), b.clone(), collision.clone()];
+        let reverse = [collision, b, a];
+        tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(
+                async {
+                    let guards = first.load_locks(&forward).await;
+                    assert_eq!(guards.len(), 2);
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                },
+                async {
+                    let guards = second.load_locks(&reverse).await;
+                    assert_eq!(guards.len(), 2);
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            );
+        })
+        .await
+        .expect("opposite block order must not cause a lock cycle");
     }
 
     #[tokio::test]
