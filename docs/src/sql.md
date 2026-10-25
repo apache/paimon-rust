@@ -1180,6 +1180,47 @@ the tag file. For example, `'1d'` appears as `PT24H` in the `time_retained` colu
 of `$tags`. Omitting `time_retained` creates a tag without these metadata fields.
 This procedure does not automatically delete expired tags.
 
+### replace_tag
+
+Replace an existing manual tag's snapshot and retention without changing its name:
+
+```sql
+CALL sys.replace_tag(
+    table => 'paimon.my_db.my_table',
+    tag => 'release',
+    snapshot_id => 1,
+    time_retained => '2d'
+);
+```
+
+`table` and `tag` are required. The tag must already exist. `snapshot_id` is an
+optional positive BIGINT; omitting it selects the latest live snapshot when the
+operation resolves its target. An explicit ID first resolves a live snapshot,
+then falls back to snapshots preserved by tags in the same branch if the live
+snapshot does not exist. Other snapshot read errors are returned. No suitable
+snapshot causes an error without changing the tag. `snapshot` is not an alias
+for `snapshot_id`. Success returns one row with `result = 'OK'`.
+
+`time_retained` uses the same duration format as `create_tag`. Providing it
+replaces the TTL and resets `tagCreateTime` to the replacement time, even when
+the snapshot ID stays the same. **Omitting it removes the previous TTL and
+creation time**: the tag is written as plain Snapshot JSON. It does not inherit
+the old TTL or apply a table's default tag retention. Argument, name, retention,
+and snapshot resolution errors leave the original tag file unchanged.
+
+Only non-REST FileStore tables and ordinary manual tags are supported. Format
+tables and engine-served table types are rejected. This procedure does not add
+branch-qualified SQL name resolution; an already resolved branch Table uses its
+own snapshot and tag managers. Automatic tag management and external tag
+callbacks are outside its scope.
+
+Replacement overwrites the tag metadata directly. It does not create a snapshot
+or clean up old snapshots, manifests, or data files, and it does not run tag
+expiration. Storage write failures are returned, but atomic replacement and
+rollback are not guaranteed across storage backends. The existence check and
+write are separate operations; concurrent tag modifications are not protected
+by a conditional update or transaction.
+
 ### create_tag_from_timestamp
 
 Create a named tag from a commit timestamp (finds the earliest retained snapshot at or after the given time):

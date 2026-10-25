@@ -685,6 +685,36 @@ async fn test_consumer_procedures_rejected_on_rest_catalog_without_changing_prog
 }
 
 #[tokio::test]
+async fn test_replace_tag_rejected_on_rest_catalog_without_changing_metadata() {
+    let (tmp, server, context) = setup().await;
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .build()
+        .unwrap();
+    let path = format!("file://{}/{DATABASE}.db/{TABLE}", tmp.path().display());
+    server.add_table_with_schema(DATABASE, TABLE, schema, &path);
+    let tag_dir = tmp.path().join(format!("{DATABASE}.db/{TABLE}/tag"));
+    std::fs::create_dir_all(&tag_dir).unwrap();
+    let tag_path = tag_dir.join("tag-release");
+    // Invalid metadata must remain unread: REST rejection precedes storage access.
+    let original = b"{";
+    std::fs::write(&tag_path, original).unwrap();
+
+    for snapshot in ["", ", snapshot_id => 1"] {
+        common::assert_sql_error(
+            &context,
+            &format!(
+                "CALL sys.replace_tag(table => '{DATABASE}.{TABLE}', tag => 'release'{snapshot})"
+            ),
+            "replace_tag is not supported for tables managed by a REST catalog",
+        )
+        .await;
+        assert_eq!(std::fs::read(&tag_path).unwrap(), original);
+        assert_eq!(std::fs::read_dir(&tag_dir).unwrap().count(), 1);
+    }
+}
+
+#[tokio::test]
 async fn test_rename_branch_rejected_on_rest_catalog() {
     // A REST catalog is authoritative for branch metadata and has no rename
     // endpoint, so `rename_branch` must refuse rather than move the physical

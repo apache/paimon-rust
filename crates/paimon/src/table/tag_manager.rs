@@ -262,6 +262,26 @@ impl TagManager {
         output.write(bytes::Bytes::from(json)).await
     }
 
+    /// Replace an existing tag's snapshot and optional retention.
+    ///
+    /// An explicit retention resets the creation time. `None` removes both TTL fields.
+    /// Validation completes before writing. The existence check and overwrite are not
+    /// atomic; concurrent tag changes and rollback after storage failures are not supported.
+    pub async fn replace(
+        &self,
+        tag_name: &str,
+        snapshot: &Snapshot,
+        time_retained: Option<&str>,
+    ) -> crate::Result<()> {
+        if !self.tag_exists(tag_name).await? {
+            return Err(crate::Error::TagNotExist {
+                tag_name: tag_name.to_string(),
+            });
+        }
+        self.create_with_retention(tag_name, snapshot, time_retained)
+            .await
+    }
+
     /// Delete a tag file.
     pub async fn delete(&self, tag_name: &str) -> crate::Result<()> {
         validate_tag_name(tag_name)?;
@@ -450,6 +470,166 @@ mod tests {
                 .unwrap();
             assert_eq!(bytes.as_ref(), serde_json::to_vec(&snapshot).unwrap());
         }
+    }
+
+    #[tokio::test]
+    async fn test_replace_tag_changes_snapshot_and_requires_existing_tag() {
+        let file_io = test_file_io();
+        let tm = TagManager::new(file_io.clone(), "memory:/test_tag_replace".to_string());
+        assert!(matches!(
+            tm.replace("missing", &test_snapshot(2), None).await,
+            Err(crate::Error::TagNotExist { tag_name }) if tag_name == "missing"
+        ));
+        assert!(!file_io.exists(&tm.tag_directory()).await.unwrap());
+
+        tm.create("release", &test_snapshot(1)).await.unwrap();
+        tm.replace("release", &test_snapshot(2), None)
+            .await
+            .unwrap();
+        assert_eq!(tm.get("release").await.unwrap(), Some(test_snapshot(2)));
+        assert_eq!(tm.list_all_names().await.unwrap(), vec!["release"]);
+    }
+
+    #[tokio::test]
+    async fn test_replace_tag_resets_retention_metadata_and_clears_omitted_ttl() {
+        let file_io = test_file_io();
+        let tm = TagManager::new(file_io.clone(), "memory:/test_tag_replace_ttl".to_string());
+        let snapshot = test_snapshot(1);
+        let path = tm.tag_path("release");
+        tm.create("release", &snapshot).await.unwrap();
+        for (retention, seconds) in [("1d", "86400.000000000"), ("2d", "172800.000000000")] {
+            if retention == "2d" {
+                // Seed a known old time so the test does not depend on clock resolution.
+                let bytes = file_io.new_input(&path).unwrap().read().await.unwrap();
+                let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                value[FIELD_TAG_CREATE_TIME] = serde_json::json!([2000, 1, 1, 0, 0, 0, 0]);
+                file_io
+                    .new_output(&path)
+                    .unwrap()
+                    .write(Bytes::from(serde_json::to_vec(&value).unwrap()))
+                    .await
+                    .unwrap();
+            }
+            let before = chrono::Local::now().naive_local();
+            tm.replace("release", &snapshot, Some(retention))
+                .await
+                .unwrap();
+            let after = chrono::Local::now().naive_local();
+            let bytes = file_io.new_input(&path).unwrap().read().await.unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                value[FIELD_TAG_TIME_RETAINED]
+                    .as_number()
+                    .unwrap()
+                    .to_string(),
+                seconds
+            );
+            let created = parse_tag_create_time(&value[FIELD_TAG_CREATE_TIME]).unwrap();
+            assert!(before <= created && created <= after);
+            assert_eq!(serde_json::from_value::<Snapshot>(value).unwrap(), snapshot);
+        }
+        tm.replace("release", &snapshot, None).await.unwrap();
+        let bytes = file_io.new_input(&path).unwrap().read().await.unwrap();
+        assert_eq!(bytes.as_ref(), serde_json::to_vec(&snapshot).unwrap());
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(value.get(FIELD_TAG_CREATE_TIME).is_none());
+        assert!(value.get(FIELD_TAG_TIME_RETAINED).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_replace_tag_validation_preserves_original_bytes() {
+        let file_io = test_file_io();
+        let tm = TagManager::new(
+            file_io.clone(),
+            "memory:/test_tag_replace_invalid".to_string(),
+        );
+        tm.create_with_retention("release", &test_snapshot(1), Some("1d"))
+            .await
+            .unwrap();
+        let path = tm.tag_path("release");
+        let original = file_io.new_input(&path).unwrap().read().await.unwrap();
+        for name in ["", " ", "release ", "../tag-release", "a/b", "a\\b", "a\nb"] {
+            assert!(matches!(
+                tm.replace(name, &test_snapshot(2), None).await,
+                Err(crate::Error::ConfigInvalid { .. })
+            ));
+            assert_eq!(
+                file_io.new_input(&path).unwrap().read().await.unwrap(),
+                original
+            );
+        }
+        for retention in [
+            "",
+            "bad",
+            "-1d",
+            "1.5h",
+            "PT24H",
+            "9223372036854775808ns",
+            "106751991167301d",
+        ] {
+            assert!(matches!(
+                tm.replace("release", &test_snapshot(2), Some(retention))
+                    .await,
+                Err(crate::Error::ConfigInvalid { .. })
+            ));
+            assert_eq!(
+                file_io.new_input(&path).unwrap().read().await.unwrap(),
+                original
+            );
+        }
+        assert_eq!(tm.list_all_names().await.unwrap(), vec!["release"]);
+    }
+
+    #[tokio::test]
+    async fn test_replace_tag_keeps_branch_managers_isolated() {
+        let file_io = test_file_io();
+        let main = TagManager::new(
+            file_io.clone(),
+            "memory:/test_tag_replace_branch".to_string(),
+        );
+        let branch = main.with_branch("dev");
+        main.create("release", &test_snapshot(1)).await.unwrap();
+        branch.create("release", &test_snapshot(10)).await.unwrap();
+        let main_path = main.tag_path("release");
+        let original_main = file_io.new_input(&main_path).unwrap().read().await.unwrap();
+        branch
+            .replace("release", &test_snapshot(20), Some("2d"))
+            .await
+            .unwrap();
+        assert_eq!(
+            file_io.new_input(&main_path).unwrap().read().await.unwrap(),
+            original_main
+        );
+        assert_eq!(
+            branch.get("release").await.unwrap(),
+            Some(test_snapshot(20))
+        );
+        let branch_path = branch.tag_path("release");
+        let original_branch = file_io
+            .new_input(&branch_path)
+            .unwrap()
+            .read()
+            .await
+            .unwrap();
+        main.replace("release", &test_snapshot(2), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            file_io
+                .new_input(&branch_path)
+                .unwrap()
+                .read()
+                .await
+                .unwrap(),
+            original_branch
+        );
+        assert_eq!(main.get("release").await.unwrap(), Some(test_snapshot(2)));
+        main.create("main_only", &test_snapshot(2)).await.unwrap();
+        assert!(matches!(
+            branch.replace("main_only", &test_snapshot(20), None).await,
+            Err(crate::Error::TagNotExist { .. })
+        ));
+        assert!(!branch.tag_exists("main_only").await.unwrap());
     }
 
     #[tokio::test]

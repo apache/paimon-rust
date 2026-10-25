@@ -19,6 +19,7 @@
 //!
 //! Supported procedures:
 //! - `CALL sys.create_tag(table => '...', tag => '...', snapshot_id => ..., time_retained => '...')`
+//! - `CALL sys.replace_tag(table => '...', tag => '...', snapshot_id => ..., time_retained => '...')`
 //! - `CALL sys.delete_tag(table => '...', tag => '...')`
 //! - `CALL sys.rename_tag(table => '...', tag => '...', target_tag => '...')`
 //! - `CALL sys.reset_consumer(table => '...', consumer_id => '...'[, next_snapshot_id => ...])`
@@ -204,6 +205,7 @@ async fn earlier_or_equal_from_all(
 fn declared_parameters(proc_name: &str) -> Option<&'static [&'static str]> {
     Some(match proc_name {
         "create_tag" => &["table", "tag", "snapshot_id", "time_retained"],
+        "replace_tag" => &["table", "tag", "snapshot_id", "time_retained"],
         "delete_tag" => &["table", "tag"],
         "rename_tag" => &["table", "tag", "target_tag"],
         "reset_consumer" => &["table", "consumer_id", "next_snapshot_id"],
@@ -326,6 +328,7 @@ pub async fn execute_procedure(
 
     match proc_name {
         "create_tag" => proc_create_tag(ctx, catalog, catalog_name, &args).await,
+        "replace_tag" => proc_replace_tag(ctx, catalog, catalog_name, &args).await,
         "delete_tag" => proc_delete_tag(ctx, catalog, catalog_name, &args).await,
         "rename_tag" => proc_rename_tag(ctx, catalog, catalog_name, &args).await,
         "reset_consumer" => proc_reset_consumer(ctx, catalog, catalog_name, &args).await,
@@ -590,6 +593,75 @@ async fn proc_create_tag(
             .ok_or_else(|| DataFusionError::Plan("No snapshots exist".to_string()))?
     };
     tm.create_with_retention(tag_name, &snapshot, time_retained)
+        .await
+        .map_err(to_datafusion_error)?;
+    ok_result(ctx)
+}
+
+async fn proc_replace_tag(
+    ctx: &SessionContext,
+    catalog: &Arc<dyn Catalog>,
+    catalog_name: &str,
+    args: &HashMap<String, String>,
+) -> DFResult<DataFrame> {
+    let table = get_table(catalog, catalog_name, args).await?;
+    let tag_name = require_arg(args, "tag")?;
+    let snapshot_id = args
+        .get("snapshot_id")
+        .map(|value| {
+            value
+                .parse::<i64>()
+                .ok()
+                .filter(|id| *id > 0)
+                .ok_or_else(|| {
+                    DataFusionError::Plan(format!(
+                        "Invalid snapshot_id: '{value}'. Expected a positive BIGINT"
+                    ))
+                })
+        })
+        .transpose()?;
+    let time_retained = args.get("time_retained").map(String::as_str);
+
+    if table.rest_env().is_some() {
+        return Err(DataFusionError::NotImplemented(
+            "replace_tag is not supported for tables managed by a REST catalog".to_string(),
+        ));
+    }
+    if table.schema().core_options().is_format_table() {
+        return Err(DataFusionError::NotImplemented(
+            "replace_tag requires a FileStoreTable; format-table is not supported".to_string(),
+        ));
+    }
+
+    let sm = table.snapshot_manager();
+    let tm = table.tag_manager();
+    if !tm.tag_exists(tag_name).await.map_err(to_datafusion_error)? {
+        return Err(to_datafusion_error(paimon::Error::TagNotExist {
+            tag_name: tag_name.to_string(),
+        }));
+    }
+    let snapshot = if let Some(id) = snapshot_id {
+        match sm.get_snapshot(id).await {
+            Ok(snapshot) => snapshot,
+            Err(paimon::Error::SnapshotNotExist { .. }) => tm
+                .list_all()
+                .await
+                .map_err(to_datafusion_error)?
+                .into_iter()
+                .map(|(_, snapshot)| snapshot)
+                .find(|snapshot| snapshot.id() == id)
+                .ok_or_else(|| {
+                    to_datafusion_error(paimon::Error::SnapshotNotExist { snapshot_id: id })
+                })?,
+            Err(error) => return Err(to_datafusion_error(error)),
+        }
+    } else {
+        sm.get_latest_snapshot()
+            .await
+            .map_err(to_datafusion_error)?
+            .ok_or_else(|| DataFusionError::Plan("No snapshots exist".to_string()))?
+    };
+    tm.replace(tag_name, &snapshot, time_retained)
         .await
         .map_err(to_datafusion_error)?;
     ok_result(ctx)
