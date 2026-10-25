@@ -125,7 +125,6 @@ impl<'a> AuditLogRead<'a> {
                     table_options: self.read.table.schema().options().clone(),
                     schema_manager: self.read.table.schema_manager().clone(),
                     table_schema_id: self.read.table.schema().id(),
-                    merge_engine_overridden: self.read.table.merge_engine_overridden(),
                     table_fields: self.read.table.schema.fields().to_vec(),
                     read_type,
                     predicates: self.read.data_predicates.clone(),
