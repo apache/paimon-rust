@@ -145,6 +145,96 @@ impl CachedFileReader {
         result
     }
 
+    async fn read_blocks(&self, first: u64, last: u64) -> crate::Result<Vec<Bytes>> {
+        if first == last {
+            return Ok(vec![self.read_block(first).await?]);
+        }
+        let size = self.cache.block_size();
+        let mut blocks = Vec::new();
+        let mut locks = Vec::new();
+        // Acquire missing-block locks in offset order, including overlapping reads.
+        for index in first..=last {
+            let key = self.cache.block_key(&self.path, index);
+            let len = (self.file_size - index * size).min(size) as usize;
+            let mut block = self.cache.get_block(&key, len, &self.read_token).await;
+            if block.as_ref().is_some_and(|b| b.len() != len) {
+                self.cache.remove_block(&key).await;
+                block = None;
+            }
+            if block.is_none() {
+                let lock = self.cache.block_load_lock(&key).await;
+                let guard = lock.clone().lock_owned().await;
+                let shared_guard = self.cache.shared_load_lock(&key).await;
+                block = self.cache.get_block(&key, len, &self.read_token).await;
+                if block.as_ref().is_some_and(|b| b.len() != len) {
+                    self.cache.remove_block(&key).await;
+                    block = None;
+                }
+                locks.push(Some((key, lock, guard, shared_guard)));
+            } else {
+                locks.push(None);
+            }
+            blocks.push(block);
+        }
+        let result = async {
+            let mut i = 0;
+            while i < blocks.len() {
+                if blocks[i].is_some() {
+                    i += 1;
+                    continue;
+                }
+                let begin = i;
+                while i < blocks.len() && blocks[i].is_none() {
+                    i += 1;
+                }
+                let start = (first + begin as u64) * size;
+                let end = (first + i as u64).saturating_mul(size).min(self.file_size);
+                let payload = self.delegate.read(start..end).await?;
+                if payload.len() as u64 != end - start {
+                    return Err(crate::Error::DataInvalid {
+                        message: "Truncated cache range read".to_string(),
+                        source: None,
+                    });
+                }
+                for (offset, slot) in blocks[begin..i].iter_mut().enumerate() {
+                    let lo = offset * size as usize;
+                    let hi = (lo + size as usize).min(payload.len());
+                    // Each cached block owns only its bytes, not the entire fetched range.
+                    let block = Bytes::copy_from_slice(&payload[lo..hi]);
+                    let key = self
+                        .cache
+                        .block_key(&self.path, first + (begin + offset) as u64);
+                    if let Some(fill_slot) = self.cache.background_fill_slot() {
+                        let (_, lock, guard, shared_guard) = locks[begin + offset].take().unwrap();
+                        let cache = self.cache.clone();
+                        let token = self.read_token.clone();
+                        let fill_block = block.clone();
+                        tokio::spawn(async move {
+                            let _slot = fill_slot;
+                            let _shared_guard = shared_guard;
+                            cache.put_block(&key, fill_block, &token).await;
+                            drop(guard);
+                            cache.release_block_load_lock(&key, &lock).await;
+                        });
+                    } else {
+                        self.cache
+                            .put_block(&key, block.clone(), &self.read_token)
+                            .await;
+                    }
+                    *slot = Some(block);
+                }
+            }
+            Ok(blocks.into_iter().map(Option::unwrap).collect())
+        }
+        .await;
+        for (key, lock, guard, shared_guard) in locks.into_iter().flatten() {
+            drop(shared_guard);
+            drop(guard);
+            self.cache.release_block_load_lock(&key, &lock).await;
+        }
+        result
+    }
+
     pub(crate) async fn read_full(&self) -> crate::Result<Bytes> {
         if self.file_size == 0 {
             return Ok(Bytes::new());
@@ -244,12 +334,18 @@ impl FileRead for CachedFileReader {
             })?;
         let mut output = BytesMut::with_capacity(output_len);
 
-        for block_index in first_block..=last_block {
-            let block = self.read_block(block_index).await?;
-            let block_start = block_index * block_size;
-            let copy_start = range.start.max(block_start) - block_start;
-            let copy_end = end.min(block_start + block.len() as u64) - block_start;
-            output.extend_from_slice(&block[copy_start as usize..copy_end as usize]);
+        // Bound both temporary bytes and the number of held block locks.
+        let batch_size = (8 * 1024 * 1024 / block_size).clamp(1, 32);
+        let mut first = first_block;
+        while first <= last_block {
+            let last = first.saturating_add(batch_size - 1).min(last_block);
+            for (offset, block) in self.read_blocks(first, last).await?.into_iter().enumerate() {
+                let block_start = (first + offset as u64) * block_size;
+                let copy_start = range.start.max(block_start) - block_start;
+                let copy_end = end.min(block_start + block.len() as u64) - block_start;
+                output.extend_from_slice(&block[copy_start as usize..copy_end as usize]);
+            }
+            first = last + 1;
         }
 
         Ok(output.freeze())
@@ -269,6 +365,116 @@ mod tests {
     struct CountingReader {
         data: Bytes,
         reads: AtomicUsize,
+    }
+
+    fn test_cache() -> Arc<LocalCache> {
+        Arc::new(
+            LocalCache::new(LocalCacheConfig {
+                shared: false,
+                dir: None,
+                namespace: "test".into(),
+                max_size: None,
+                block_size: 4,
+                whitelist: std::collections::HashSet::from([FileType::Meta]),
+            })
+            .unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_coalesced_misses_preserve_warm_holes_and_partial_tail() {
+        let delegate = Arc::new(CountingReader {
+            data: Bytes::from_static(b"abcdefghijklmn"),
+            reads: AtomicUsize::new(0),
+        });
+        let reader = CachedFileReader::new(delegate.clone(), "snapshot-1", 14, test_cache());
+        assert_eq!(
+            reader.read(4..8).await.unwrap(),
+            Bytes::from_static(b"efgh")
+        );
+        assert_eq!(
+            reader.read(1..14).await.unwrap(),
+            Bytes::from_static(b"bcdefghijklmn")
+        );
+        assert_eq!(delegate.reads.load(Ordering::SeqCst), 3);
+        reader.read(0..14).await.unwrap();
+        assert_eq!(delegate.reads.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn test_coalesced_misses_bound_batch_size() {
+        let delegate = Arc::new(CountingReader {
+            data: Bytes::from(vec![42; 160]),
+            reads: AtomicUsize::new(0),
+        });
+        let reader = CachedFileReader::new(delegate.clone(), "snapshot-1", 160, test_cache());
+        assert_eq!(reader.read(0..160).await.unwrap(), delegate.data);
+        assert_eq!(delegate.reads.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn test_coalesced_overlapping_reads_share_missing_blocks() {
+        let delegate = Arc::new(SlowCountingReader {
+            data: Bytes::from_static(b"abcdefghijkl"),
+            reads: AtomicUsize::new(0),
+        });
+        let reader = CachedFileReader::new(delegate.clone(), "snapshot-1", 12, test_cache());
+        let (a, b) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::join!(reader.read(0..12), reader.read(4..12))
+        })
+        .await
+        .unwrap();
+        assert_eq!(a.unwrap(), Bytes::from_static(b"abcdefghijkl"));
+        assert_eq!(b.unwrap(), Bytes::from_static(b"efghijkl"));
+        assert_eq!(delegate.reads.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_coalesced_truncated_read_releases_locks() {
+        let reader = CachedFileReader::new(Arc::new(ShortReader), "snapshot-1", 12, test_cache());
+        for _ in 0..2 {
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_secs(2), reader.read(0..12))
+                    .await
+                    .unwrap()
+                    .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_coalesced_miss_does_not_republish_after_invalidation() {
+        let cache = test_cache();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let old = CachedFileReader::new(
+            Arc::new(BlockingReader {
+                data: Bytes::from_static(b"old!old!old!"),
+                started: started.clone(),
+                release: release.clone(),
+            }),
+            "snapshot-1",
+            12,
+            cache.clone(),
+        );
+        let loading = tokio::spawn(async move { old.read(0..12).await });
+        started.notified().await;
+        cache.invalidate_path("snapshot-1").await;
+        release.notify_one();
+        assert_eq!(
+            loading.await.unwrap().unwrap(),
+            Bytes::from_static(b"old!old!old!")
+        );
+        let delegate = Arc::new(CountingReader {
+            data: Bytes::from_static(b"new!new!new!"),
+            reads: AtomicUsize::new(0),
+        });
+        let current = CachedFileReader::new(delegate.clone(), "snapshot-1", 12, cache);
+        assert_eq!(
+            current.read(0..12).await.unwrap(),
+            Bytes::from_static(b"new!new!new!")
+        );
+        assert_eq!(delegate.reads.load(Ordering::SeqCst), 1);
     }
 
     #[async_trait::async_trait]
@@ -307,12 +513,12 @@ mod tests {
             reader.read(2..10).await.unwrap(),
             Bytes::from_static(b"cdefghij")
         );
-        assert_eq!(delegate.reads.load(Ordering::SeqCst), 3);
+        assert_eq!(delegate.reads.load(Ordering::SeqCst), 1);
         assert_eq!(
             reader.read(2..10).await.unwrap(),
             Bytes::from_static(b"cdefghij")
         );
-        assert_eq!(delegate.reads.load(Ordering::SeqCst), 3);
+        assert_eq!(delegate.reads.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -416,6 +622,62 @@ mod tests {
         assert_eq!(delegate.reads.load(Ordering::SeqCst), 1);
         drop(gate);
         assert_eq!(reader.read(0..4).await.unwrap(), "abcd");
+        assert_eq!(delegate.reads.load(Ordering::SeqCst), 1);
+        let permits = cache
+            .fill_slots
+            .clone()
+            .acquire_many_owned(8)
+            .await
+            .unwrap();
+        assert!(cache.background_fill_slot().is_none());
+        drop(permits);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn coalesced_shared_fill_preserves_single_flight() {
+        let directory = tempfile::tempdir().unwrap();
+        let delegate = Arc::new(CountingReader {
+            data: Bytes::from_static(b"abcdefgh"),
+            reads: AtomicUsize::new(0),
+        });
+        let cache = Arc::new(
+            LocalCache::new(LocalCacheConfig {
+                shared: true,
+                dir: Some(directory.path().to_path_buf()),
+                namespace: "test".into(),
+                max_size: Some(4096),
+                block_size: 4,
+                whitelist: std::collections::HashSet::from([FileType::Meta]),
+            })
+            .unwrap(),
+        );
+        let reader = CachedFileReader::new(delegate.clone(), "data.parquet", 8, cache.clone());
+        let gate = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(
+                directory
+                    .path()
+                    .join("paimon-shared-local-cache-v1/directory.lock"),
+            )
+            .unwrap();
+        gate.lock().unwrap();
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_millis(500), reader.read(0..8))
+                .await
+                .unwrap()
+                .unwrap(),
+            "abcdefgh"
+        );
+        assert_eq!(cache.fill_slots.available_permits(), 6);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), reader.read(0..8))
+                .await
+                .is_err()
+        );
+        assert_eq!(delegate.reads.load(Ordering::SeqCst), 1);
+        drop(gate);
+        assert_eq!(reader.read(0..8).await.unwrap(), "abcdefgh");
         assert_eq!(delegate.reads.load(Ordering::SeqCst), 1);
         let permits = cache
             .fill_slots
