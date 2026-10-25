@@ -33,7 +33,6 @@ use std::sync::Arc;
 pub(super) struct RowSidecarWriter {
     pub file_name: String,
     pub writer: Box<dyn FormatFileWriter>,
-    /// Reads descriptor field sources from origin: other writers own them and may replace them.
     io: FileIO,
     descriptor_fields: HashSet<String>,
     view_fields: HashSet<String>,
@@ -65,7 +64,7 @@ impl RowSidecarWriter {
         Ok(Self {
             file_name: format!("{file_name}.row"),
             writer: with_write_resources(writer, resources),
-            io: io.origin_only(),
+            io: io.clone(),
             descriptor_fields: options.blob_descriptor_fields(),
             view_fields: options.blob_view_fields(),
         })

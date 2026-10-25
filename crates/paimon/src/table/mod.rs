@@ -341,13 +341,15 @@ pub struct Table {
 }
 
 // Format Table files may be replaced in place under the same name, so they never use io-cache;
-// other tables tell io-cache routing the prefixes their data files are named with.
-fn table_file_io(file_io: &FileIO, schema: &TableSchema) -> FileIO {
+// other tables tell io-cache routing their location and the prefixes their data files are named with.
+fn table_file_io(file_io: &FileIO, location: &str, schema: &TableSchema) -> FileIO {
     let options = CoreOptions::new(schema.options());
     if options.is_format_table() {
         return file_io.origin_only();
     }
-    file_io.with_file_prefixes([options.data_file_prefix(), options.changelog_file_prefix()])
+    file_io
+        .with_table_location(location)
+        .with_file_prefixes([options.data_file_prefix(), options.changelog_file_prefix()])
 }
 
 // Data files committed before a prefix option changed keep using io-cache; the schemas are read
@@ -376,7 +378,7 @@ impl Table {
         schema: TableSchema,
         rest_env: Option<RESTEnv>,
     ) -> Self {
-        let file_io = table_file_io(&file_io, &schema);
+        let file_io = table_file_io(&file_io, &location, &schema);
         let schema_manager = SchemaManager::new(file_io.clone(), location.clone());
         let file_io = with_schema_history(&file_io, &schema_manager);
         let branch = DEFAULT_MAIN_BRANCH.to_string();
@@ -415,7 +417,7 @@ impl Table {
         identifier.validate()?;
         validate_branch_name(&branch)?;
         schema.validate_resolved_structure()?;
-        let file_io = table_file_io(&file_io, &schema);
+        let file_io = table_file_io(&file_io, &location, &schema);
         let schema_manager = SchemaManager::new(file_io.clone(), location.clone());
         let schema_manager = if branch == DEFAULT_MAIN_BRANCH {
             schema_manager
@@ -776,7 +778,7 @@ impl Table {
         });
         let schema = self.schema.copy_with_options(extra);
         Self {
-            file_io: table_file_io(&self.file_io, &schema),
+            file_io: table_file_io(&self.file_io, &self.location, &schema),
             identifier: self.identifier.clone(),
             location: self.location.clone(),
             schema,
@@ -832,7 +834,7 @@ impl Table {
             .iter()
             .any(|key| schema.options().get(*key) != self.schema.options().get(*key));
             return Ok(Self {
-                file_io: table_file_io(&self.file_io, &schema),
+                file_io: table_file_io(&self.file_io, &self.location, &schema),
                 schema,
                 travel_snapshot: if changed {
                     None
@@ -849,7 +851,7 @@ impl Table {
         } else {
             schema_manager.with_branch(branch)
         };
-        let file_io = table_file_io(&self.file_io, &schema);
+        let file_io = table_file_io(&self.file_io, &self.location, &schema);
         let file_io = if branch == self.branch {
             file_io
         } else {

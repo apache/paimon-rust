@@ -139,6 +139,8 @@ pub struct FileIO {
     file_prefixes: Arc<[String]>,
     /// Prefixes of the table's persisted schemas, loaded once a request may use io-cache.
     schema_file_prefixes: Option<Arc<SchemaFilePrefixes>>,
+    /// Location of the table this view serves; requests for anything outside it use origin.
+    table_location: Option<Arc<str>>,
 }
 
 type LoadFilePrefixes = Box<dyn Fn() -> BoxFuture<'static, Result<Vec<String>>> + Send + Sync>;
@@ -560,6 +562,33 @@ impl FileIO {
         file_io
     }
 
+    /// A view of this FileIO serving the table at `location`.
+    pub(crate) fn with_table_location(&self, location: &str) -> Self {
+        let mut file_io = self.clone();
+        file_io.table_location = Some(location.trim_end_matches('/').into());
+        file_io
+    }
+
+    /// The view to read URIs taken from row data through. A FileIO that serves no table cannot
+    /// tell who owns them, and other writers may replace what they own, so it uses origin.
+    pub(crate) fn for_row_data(&self) -> Self {
+        if self.table_location.is_some() {
+            self.clone()
+        } else {
+            self.origin_only()
+        }
+    }
+
+    /// Whether requests on `path` must use origin: a table's view routes only its own files.
+    fn origin_only_for(&self, path: &str) -> bool {
+        self.origin_only
+            || self.table_location.as_deref().is_some_and(|location| {
+                !path
+                    .strip_prefix(location)
+                    .is_some_and(|rest| rest.starts_with('/'))
+            })
+    }
+
     /// Whether some request through this view may use an io-cache target.
     pub(crate) async fn routes_to_io_cache(&self) -> crate::Result<bool> {
         if self.origin_only {
@@ -592,7 +621,7 @@ impl FileIO {
         file_prefixes: &[String],
     ) -> crate::Result<(RoutedOperator, String)> {
         let (op, relative_path) = self.storage()?.create_routed(path, file_prefixes)?;
-        let op = if self.origin_only {
+        let op = if self.origin_only_for(path) {
             op.without_cache()
         } else {
             op
@@ -645,7 +674,7 @@ impl FileIO {
                 let (op, relative_path, _) = resolve_provider_routed(
                     provider.as_ref(),
                     path,
-                    self.origin_only,
+                    self.origin_only_for(path),
                     &file_prefixes,
                 )
                 .await?;
@@ -666,7 +695,7 @@ impl FileIO {
                 let (op, relative_path, namespace) = resolve_provider_routed(
                     provider.as_ref(),
                     path,
-                    self.origin_only,
+                    self.origin_only_for(path),
                     &file_prefixes,
                 )
                 .await?;
@@ -1426,6 +1455,7 @@ impl FileIOBuilder {
             origin_only: false,
             file_prefixes: Arc::default(),
             schema_file_prefixes: None,
+            table_location: None,
         })
     }
 }

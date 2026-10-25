@@ -30,7 +30,7 @@ use bytes::Bytes;
 use futures::TryStreamExt;
 
 use super::table_write::tests::make_batch;
-use super::{RESTEnv, Table, TableCommit, TableWrite};
+use super::{BlobReader, RESTEnv, Table, TableCommit, TableWrite};
 use crate::api::rest_api::RESTApi;
 use crate::api::{GetTableResponse, GetTableTokenResponse};
 use crate::catalog::{Catalog, FileSystemCatalog, FusePathResolver, Identifier, LoadedTable};
@@ -710,5 +710,147 @@ async fn blob_descriptor_fields_read_their_sources_from_origin() {
                 "{file}"
             );
         }
+    }
+}
+
+#[tokio::test]
+async fn primary_key_descriptor_fields_read_their_sources_from_origin() {
+    let origin = TestOss::start().await;
+    let cache = TestOss::start_sharing(&origin).await;
+    let catalog = data_target_catalog(&origin, &cache).await;
+    // `payload` keeps descriptors of an import job's objects; `picture` is copied into managed packs.
+    let schema = pk_blob_schema()
+        .column("picture", DataType::Blob(BlobType::new()))
+        .option("blob-descriptor-field", "payload")
+        .build()
+        .unwrap();
+    let table = create_table(&catalog, "pk_descriptor_field", schema).await;
+    let source = "oss://bkt/import/pk/data-123e4567-e89b-12d3-a456-426614174000-1.png";
+    let key = source.strip_prefix("oss://").unwrap();
+    put(&origin, source, Bytes::from("NEW")).await;
+    cache.retain(key, Bytes::from("OLD"));
+    let descriptor = BlobDescriptor::new(source.to_string(), 0, 3).serialize();
+    let batch = RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", ArrowDataType::Int32, false),
+            ArrowField::new("payload", ArrowDataType::LargeBinary, true),
+            ArrowField::new("picture", ArrowDataType::LargeBinary, true),
+        ])),
+        vec![
+            Arc::new(Int32Array::from(vec![1])),
+            Arc::new(LargeBinaryArray::from(vec![descriptor.as_slice()])),
+            Arc::new(LargeBinaryArray::from(vec![b"pixels".as_slice()])),
+        ],
+    )
+    .unwrap();
+    write_and_commit(&table, &batch).await;
+    origin.take_requests();
+    cache.take_requests();
+
+    let batches = read(&table).await;
+    let values = |name: &str| {
+        batches
+            .iter()
+            .flat_map(|batch| {
+                let column = batch.column_by_name(name).unwrap();
+                let column = column.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
+                (0..column.len())
+                    .map(|row| column.value(row).to_vec())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(values("payload"), [b"NEW".to_vec()]);
+    assert_eq!(values("picture"), [b"pixels".to_vec()]);
+    let (origin_requests, cache_requests) = (origin.take_requests(), cache.take_requests());
+    assert_eq!(methods(&cache_requests, key), Vec::<String>::new());
+    assert!(methods(&origin_requests, key).iter().any(|m| m == "GET"));
+    // The table's own managed packs keep using the target.
+    assert!(methods(&cache_requests, ".managed.blob")
+        .iter()
+        .any(|m| m == "GET"));
+    assert_eq!(
+        methods(&origin_requests, ".managed.blob"),
+        Vec::<String>::new()
+    );
+}
+
+#[tokio::test]
+async fn blob_readers_read_objects_outside_the_table_from_origin() {
+    let origin = TestOss::start().await;
+    let cache = TestOss::start_sharing(&origin).await;
+    let catalog = data_target_catalog(&origin, &cache).await;
+    let table = create_table(&catalog, "blob_reader", pk_blob_schema().build().unwrap()).await;
+    let owned = format!(
+        "{}/bucket-0/data-123e4567-e89b-12d3-a456-426614174000.managed.blob",
+        table.location()
+    );
+    put(&origin, &owned, Bytes::from("OWN")).await;
+    let external = "oss://bkt/import/reader/data-123e4567-e89b-12d3-a456-426614174000-1.png";
+    let key = external.strip_prefix("oss://").unwrap();
+    put(&origin, external, Bytes::from("NEW")).await;
+    cache.retain(key, Bytes::from("OLD"));
+    let descriptors = [owned.as_str(), external]
+        .map(|uri| BlobDescriptor::new(uri.to_string(), 0, 3).serialize());
+    let expected = [b"OWN".to_vec(), b"NEW".to_vec()];
+    let owned_key = owned.strip_prefix("oss://").unwrap();
+    origin.take_requests();
+    cache.take_requests();
+
+    // The C binding's paimon_table_new_blob_reader reads through the table's FileIO this way.
+    let reader = BlobReader::from_file_io(table.file_io().clone());
+    assert_eq!(reader.read_blobs(&descriptors).await.unwrap(), expected);
+    let mut stream = reader.open_blob(&descriptors[1]).unwrap();
+    assert_eq!(stream.read(16).await.unwrap(), b"NEW");
+    let (origin_requests, cache_requests) = (origin.take_requests(), cache.take_requests());
+    assert_eq!(methods(&cache_requests, key), Vec::<String>::new());
+    assert!(methods(&origin_requests, key).iter().any(|m| m == "GET"));
+    assert!(methods(&cache_requests, owned_key)
+        .iter()
+        .any(|m| m == "GET"));
+    assert_eq!(methods(&origin_requests, owned_key), Vec::<String>::new());
+
+    // A reader built from storage options serves no table, so it never uses the target.
+    let options = io_cache_options(&origin, &cache, &DATA_TARGET)
+        .to_map()
+        .clone();
+    let reader = BlobReader::new(options);
+    assert_eq!(reader.read_blobs(&descriptors).await.unwrap(), expected);
+    let mut stream = reader.open_blob(&descriptors[1]).unwrap();
+    assert_eq!(stream.read(16).await.unwrap(), b"NEW");
+    assert_eq!(cache.take_requests(), Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn data_files_under_external_paths_use_the_origin() {
+    let origin = TestOss::start().await;
+    let cache = TestOss::start_sharing(&origin).await;
+    let catalog = data_target_catalog(&origin, &cache).await;
+    // The target serves the table's location; files the table writes elsewhere stay on origin.
+    let schema = int_schema()
+        .option("data-file.external-paths", "oss://bkt/external")
+        .option("data-file.external-paths.strategy", "round-robin")
+        .build()
+        .unwrap();
+    let table = create_table(&catalog, "external_paths", schema).await;
+    let files = write_and_commit(&table, &make_batch(vec![1], vec![10])).await;
+    assert_eq!(ids(&table).await, [1]);
+    let (origin_requests, cache_requests) = (origin.take_requests(), cache.take_requests());
+    for file in &files {
+        let external = "bkt/external/";
+        let on_origin: Vec<_> = origin_requests
+            .iter()
+            .filter(|request| request.contains(file.as_str()))
+            .collect();
+        assert!(
+            on_origin.iter().all(|request| request.contains(external)),
+            "{on_origin:?}"
+        );
+        assert_reads_and_writes(&origin_requests, file);
+        assert_eq!(
+            methods(&cache_requests, file),
+            Vec::<String>::new(),
+            "{file}"
+        );
     }
 }
