@@ -236,6 +236,13 @@ impl LocalCache {
         }
     }
 
+    async fn shared_load_locks(&self, keys: &[BlockKey]) -> Vec<std::fs::File> {
+        match &self.backend {
+            CacheBackend::SharedDisk(disk) => disk.load_locks(keys).await,
+            _ => Vec::new(),
+        }
+    }
+
     async fn block_load_lock(&self, key: &BlockKey) -> Arc<tokio::sync::Mutex<()>> {
         self.coordinator.block_load_lock(key).await
     }
