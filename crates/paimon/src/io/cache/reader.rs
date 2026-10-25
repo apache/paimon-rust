@@ -175,7 +175,7 @@ impl CachedFileReader {
             }
             blocks.push(block);
         }
-        // Deduplicate hash stripes and acquire them in a global order, after local locks.
+        // Try shared stripes after local locks; collisions must not stall a batch.
         let keys: Vec<_> = locks
             .iter()
             .flatten()
@@ -629,6 +629,69 @@ mod tests {
         snapshot.read(0..4).await.unwrap();
 
         assert_eq!(delegate.reads.load(Ordering::SeqCst), 5);
+    }
+
+    #[derive(Debug)]
+    struct ConcurrentReader {
+        barrier: tokio::sync::Barrier,
+        reads: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl FileRead for ConcurrentReader {
+        async fn read(&self, range: Range<u64>) -> crate::Result<Bytes> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            self.barrier.wait().await;
+            Ok(Bytes::from(vec![42; (range.end - range.start) as usize]))
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn coalesced_disjoint_shared_reads_remain_concurrent() {
+        let directory = tempfile::tempdir().unwrap();
+        let size = 8 * 1024 * 1024;
+        let cache = Arc::new(
+            LocalCache::new(LocalCacheConfig {
+                shared: true,
+                dir: Some(directory.path().to_path_buf()),
+                namespace: "test".into(),
+                max_size: Some(128 * 1024 * 1024),
+                block_size: 256 * 1024,
+                whitelist: std::collections::HashSet::from([FileType::Meta]),
+            })
+            .unwrap(),
+        );
+        let source = Arc::new(ConcurrentReader {
+            barrier: tokio::sync::Barrier::new(8),
+            reads: AtomicUsize::new(0),
+        });
+        let reader = Arc::new(CachedFileReader::new(
+            source.clone(),
+            "snapshot-1",
+            8 * size,
+            cache.clone(),
+        ));
+        let reads = (0..8).map(|i| {
+            let reader = reader.clone();
+            async move {
+                let data = reader.read(i * size..(i + 1) * size).await.unwrap();
+                assert_eq!(data.len(), size as usize);
+                assert!(data.iter().all(|byte| *byte == 42));
+            }
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            futures::future::join_all(reads),
+        )
+        .await
+        .expect("all eight disjoint source reads must overlap");
+        assert_eq!(source.reads.load(Ordering::SeqCst), 8);
+        let _fills = cache
+            .fill_slots
+            .clone()
+            .acquire_many_owned(8)
+            .await
+            .unwrap();
     }
 
     #[derive(Debug)]

@@ -315,13 +315,20 @@ impl SharedDiskCache {
             .collect();
         paths.sort_unstable();
         paths.dedup();
-        let mut guards = Vec::new();
-        for path in paths {
-            if let Some(guard) = lock(path).await {
-                guards.push(guard);
+        // Busy stripes may belong to unrelated blocks; never wait while holding a batch.
+        tokio::task::spawn_blocking(move || {
+            let mut guards = Vec::new();
+            for path in paths {
+                if let Ok(file) = open_lock(&path) {
+                    if file.try_lock().is_ok() {
+                        guards.push(file);
+                    }
+                }
             }
-        }
-        guards
+            guards
+        })
+        .await
+        .unwrap_or_default()
     }
 
     fn load_lock_path(&self, key: &BlockKey) -> Option<PathBuf> {
@@ -1113,7 +1120,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn batch_download_locks_deduplicate_and_order_stripes() {
+    async fn batch_download_locks_deduplicate_and_skip_busy_stripes() {
         let directory = tempfile::tempdir().unwrap();
         let first = SharedDiskCache::new(directory.path().to_path_buf(), 1024 * 1024).unwrap();
         let second = SharedDiskCache::new(directory.path().to_path_buf(), 1024 * 1024).unwrap();
@@ -1124,22 +1131,14 @@ mod tests {
         assert_ne!(first.load_lock_path(&a), first.load_lock_path(&b));
         let forward = [a.clone(), b.clone(), collision.clone()];
         let reverse = [collision, b, a];
-        tokio::time::timeout(Duration::from_secs(1), async {
-            tokio::join!(
-                async {
-                    let guards = first.load_locks(&forward).await;
-                    assert_eq!(guards.len(), 2);
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                },
-                async {
-                    let guards = second.load_locks(&reverse).await;
-                    assert_eq!(guards.len(), 2);
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                }
-            );
-        })
-        .await
-        .expect("opposite block order must not cause a lock cycle");
+        let guards = first.load_locks(&forward).await;
+        assert_eq!(guards.len(), 2);
+        let contended = tokio::time::timeout(Duration::from_secs(1), second.load_locks(&reverse))
+            .await
+            .expect("busy stripes must not block another batch");
+        assert!(contended.is_empty());
+        drop(guards);
+        assert_eq!(second.load_locks(&reverse).await.len(), 2);
     }
 
     #[tokio::test]
