@@ -5794,6 +5794,11 @@ mod tests {
 
     #[tokio::test]
     async fn parquet_metadata_cache_shares_independently_created_contexts() {
+        if !crate::io::run_isolated_metadata_cache_test(
+            "arrow::format::parquet::tests::parquet_metadata_cache_shares_independently_created_contexts",
+        ) {
+            return;
+        }
         let data = Bytes::from(
             write_multi_row_group_parquet(8, 64, EnabledStatistics::Chunk, false).await,
         );
@@ -5831,7 +5836,12 @@ mod tests {
 
     #[tokio::test]
     async fn shared_metadata_rejects_an_unauthorized_reader() {
-        struct DeniedReader(TrackingFileRead, bool);
+        if !crate::io::run_isolated_metadata_cache_test(
+            "arrow::format::parquet::tests::shared_metadata_rejects_an_unauthorized_reader",
+        ) {
+            return;
+        }
+        struct DeniedReader(TrackingFileRead, bool, Arc<AtomicUsize>);
         #[async_trait::async_trait]
         impl crate::io::FileRead for DeniedReader {
             async fn read(&self, _: std::ops::Range<u64>) -> crate::Result<Bytes> {
@@ -5841,6 +5851,7 @@ mod tests {
                 )))
             }
             async fn check_shared_metadata_access(&self) -> crate::Result<bool> {
+                self.2.fetch_add(1, AtomicOrdering::SeqCst);
                 if !self.1 {
                     return Ok(false);
                 }
@@ -5874,9 +5885,10 @@ mod tests {
                 crate::io::FileFormatMetadataCacheContext::from_props(&props).unwrap(),
             );
         for supports_check in [true, false] {
+            let checks = Arc::new(AtomicUsize::new(0));
             let mut denied = super::ArrowFileReader::new(
                 data.len() as u64,
-                Arc::new(DeniedReader(second.clone(), supports_check)),
+                Arc::new(DeniedReader(second.clone(), supports_check, checks.clone())),
             );
             assert!(denied
                 .get_metadata(None)
@@ -5884,6 +5896,7 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("denied"));
+            assert_eq!(checks.load(AtomicOrdering::SeqCst), 1);
         }
     }
 

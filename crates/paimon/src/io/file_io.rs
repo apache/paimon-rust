@@ -140,6 +140,26 @@ fn shared_parquet_metadata_slot(max_bytes: usize) -> Arc<ParquetMetadataSlot> {
     slot
 }
 
+#[cfg(test)]
+pub(crate) fn run_isolated_metadata_cache_test(test_name: &str) -> bool {
+    const CHILD: &str = "PAIMON_TEST_ISOLATED_METADATA_CACHE";
+    if std::env::var(CHILD).as_deref() == Ok(test_name) {
+        return true;
+    }
+    // Registry contention legitimately disables sharing. Tests requiring a
+    // shared slot must not race unrelated tests constructing cache contexts.
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test_name, "--test-threads=1"])
+        .env(CHILD, test_name)
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "isolated test {test_name} failed: {status}"
+    );
+    false
+}
+
 pub(crate) struct FileFormatMetadataCacheContext {
     max_bytes: usize,
     shared: bool,
@@ -3181,6 +3201,11 @@ mod input_output_test {
 
     #[test]
     fn test_shared_metadata_cache_budget_lifetime_and_row_isolation() {
+        if !run_isolated_metadata_cache_test(
+            "io::file_io::input_output_test::test_shared_metadata_cache_budget_lifetime_and_row_isolation",
+        ) {
+            return;
+        }
         let mut props = HashMap::from([
             (
                 CatalogOptions::FILE_FORMAT_METADATA_CACHE_SHARED.to_string(),
@@ -3210,6 +3235,39 @@ mod input_output_test {
     }
 
     #[test]
+    fn test_shared_metadata_cache_falls_back_under_registry_contention() {
+        if !run_isolated_metadata_cache_test(
+            "io::file_io::input_output_test::test_shared_metadata_cache_falls_back_under_registry_contention",
+        ) {
+            return;
+        }
+        let props = HashMap::from([(
+            CatalogOptions::FILE_FORMAT_METADATA_CACHE_SHARED.to_string(),
+            "true".to_string(),
+        )]);
+        let shared = FileFormatMetadataCacheContext::from_props(&props).unwrap();
+        let guard = PARQUET_METADATA_SLOTS.lock().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let concurrent_props = props.clone();
+        let constructor = std::thread::spawn(move || {
+            tx.send(FileFormatMetadataCacheContext::from_props(
+                &concurrent_props,
+            ))
+            .unwrap();
+        });
+        let fallback = rx.recv_timeout(std::time::Duration::from_secs(5));
+        // Release the gate before joining, even if construction incorrectly waited.
+        drop(guard);
+        constructor.join().unwrap();
+        let fallback = fallback
+            .expect("cache construction must not wait for the registry lock")
+            .unwrap();
+        assert!(!Arc::ptr_eq(&shared.cache, &fallback.cache));
+        let available = FileFormatMetadataCacheContext::from_props(&props).unwrap();
+        assert!(Arc::ptr_eq(&shared.cache, &available.cache));
+    }
+
+    #[test]
     fn test_shared_metadata_cache_rejects_invalid_flag() {
         let props = HashMap::from([(
             CatalogOptions::FILE_FORMAT_METADATA_CACHE_SHARED.to_string(),
@@ -3221,14 +3279,9 @@ mod input_output_test {
     #[cfg(unix)]
     #[test]
     fn test_shared_metadata_registry_fork_with_locked_registry() {
-        const CHILD: &str = "PAIMON_TEST_SHARED_METADATA_FORK";
-        if std::env::var_os(CHILD).is_none() {
-            let status = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "io::file_io::input_output_test::test_shared_metadata_registry_fork_with_locked_registry", "--test-threads=1"])
-                .env(CHILD, "1")
-                .status()
-                .unwrap();
-            assert!(status.success());
+        if !run_isolated_metadata_cache_test(
+            "io::file_io::input_output_test::test_shared_metadata_registry_fork_with_locked_registry",
+        ) {
             return;
         }
         // The child must not wait for a lock whose owning thread stayed in the parent.
