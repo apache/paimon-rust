@@ -358,7 +358,7 @@ fn parse_targets(props: &HashMap<String, String>) -> Vec<CacheTarget> {
                 .get(endpoint_key)
                 .map(|endpoint| endpoint.trim())
                 .filter(|endpoint| !endpoint.is_empty())
-                .map(String::from),
+                .map(normalize_target_endpoint),
             path_style_access: flag(props, &path_style_key, false),
             name,
         }
@@ -383,6 +383,15 @@ fn parse_targets(props: &HashMap<String, String>) -> Vec<CacheTarget> {
             target(name, &endpoint_key)
         })
         .collect()
+}
+
+/// Match the Java and Python clients: a target host without a scheme uses HTTPS.
+fn normalize_target_endpoint(endpoint: &str) -> String {
+    if endpoint.contains("://") {
+        endpoint.to_string()
+    } else {
+        format!("https://{endpoint}")
+    }
 }
 
 /// `[a-z][a-z0-9-]*`.
@@ -1037,8 +1046,14 @@ mod tests {
             (IO_CACHE_WHITELIST, "DATA"),
         ]);
         let data = "oss://b/t/bucket-0/data-123e4567-e89b-12d3-a456-426614174000-1.parquet";
-        assert_eq!(route(&routing, OpClass::Read, data).unwrap(), "cache");
-        assert_eq!(route(&routing, OpClass::Meta, data).unwrap(), "cache");
+        assert_eq!(
+            route(&routing, OpClass::Read, data).unwrap(),
+            "https://cache"
+        );
+        assert_eq!(
+            route(&routing, OpClass::Meta, data).unwrap(),
+            "https://cache"
+        );
         assert_eq!(route(&routing, OpClass::Origin, data).unwrap(), "origin");
         assert_eq!(
             route(&routing, OpClass::Read, "oss://b/t/manifest/manifest-1").unwrap(),
@@ -1084,19 +1099,30 @@ mod tests {
 
     #[test]
     fn test_shorthand_target_settings() {
-        let routing = routing(&[
+        let with_scheme = routing(&[
             (OSS_ENDPOINT, "origin"),
             (IO_CACHE_ENABLED, "true"),
             (IO_CACHE_ENDPOINT, "http://cache"),
             ("io-cache.target.default.path-style-access", "true"),
             (IO_CACHE_POLICY, "read"),
         ]);
-        let [target] = routing.targets() else {
+        let [target] = with_scheme.targets() else {
             panic!("expected one target");
         };
         assert_eq!(target.name, DEFAULT_TARGET);
         assert_eq!(target.endpoint.as_deref(), Some("http://cache"));
         assert!(target.path_style_access);
+
+        let routing = routing(&[
+            (OSS_ENDPOINT, "origin"),
+            (IO_CACHE_ENABLED, "true"),
+            (IO_CACHE_ENDPOINT, "cache.example.com"),
+            (IO_CACHE_POLICY, "read"),
+        ]);
+        assert_eq!(
+            routing.targets()[0].endpoint.as_deref(),
+            Some("https://cache.example.com")
+        );
     }
 
     #[test]
