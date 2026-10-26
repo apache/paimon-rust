@@ -166,6 +166,7 @@ pub(crate) struct FileFormatMetadataCacheContext {
     cache: Arc<ParquetMetadataSlot>,
     row_metadata_cache: OnceLock<Arc<dyn Any + Send + Sync>>,
     process_id: u32,
+    memory_identity: uuid::Uuid,
     row_sidecar_sizes: OnceLock<Mutex<LruCache<String, u64>>>,
 }
 
@@ -217,6 +218,7 @@ impl FileFormatMetadataCacheContext {
             cache,
             row_metadata_cache: OnceLock::new(),
             process_id: std::process::id(),
+            memory_identity: uuid::Uuid::new_v4(),
             row_sidecar_sizes: OnceLock::new(),
         }))
     }
@@ -1663,11 +1665,21 @@ impl InputFile {
 
     pub async fn reader(&self) -> crate::Result<impl FileRead> {
         let (op, relative_path, cache_path) = self.source.resolve(&self.path).await?;
+        let cache_key = cache_path.as_ref().map(|path| {
+            if op.info().scheme() == "memory" {
+                // OpenDAL's address-based Memory name can be recycled. Keep
+                // parsed metadata context-local without changing block-cache
+                // keys or invalidation for operators shared by several FileIOs.
+                format!("{}:{path}", self.file_format_metadata_cache.memory_identity)
+            } else {
+                path.clone()
+            }
+        });
         let reader = op.reader(&relative_path).await?;
         let (Some(cache), Some(cache_path)) = (&self.cache, cache_path.as_ref()) else {
             return Ok(InputFileReader::Direct {
                 reader,
-                cache_key: cache_path,
+                cache_key,
                 file_format_metadata_cache: Arc::clone(&self.file_format_metadata_cache),
                 blob_index_cache: Arc::clone(&self.blob_index_cache),
             });
@@ -1688,7 +1700,7 @@ impl InputFile {
                 cache.clone(),
                 read_token,
             ),
-            cache_key: cache_path.clone(),
+            cache_key: cache_key.unwrap(),
             file_format_metadata_cache: Arc::clone(&self.file_format_metadata_cache),
             blob_index_cache: Arc::clone(&self.blob_index_cache),
         })
@@ -2717,6 +2729,38 @@ mod input_output_test {
         assert_ne!(
             storage_cache_namespace(&first),
             storage_cache_namespace(&second)
+        );
+    }
+
+    #[cfg(feature = "storage-memory")]
+    #[tokio::test]
+    async fn test_memory_metadata_keys_are_context_scoped() {
+        let first = setup_memory_file_io();
+        let path = "memory:/metadata.parquet";
+        let first_reader = first.new_input(path).unwrap().reader().await.unwrap();
+        let clone = first.clone();
+        let cloned_reader = clone.new_input(path).unwrap().reader().await.unwrap();
+        assert_eq!(first_reader.cache_key(), cloned_reader.cache_key());
+        let second = setup_memory_file_io();
+        let second_reader = second.new_input(path).unwrap().reader().await.unwrap();
+        assert_ne!(first_reader.cache_key(), second_reader.cache_key());
+
+        let operator = Operator::from_config(opendal::services::MemoryConfig::default()).unwrap();
+        let first = FileIOBuilder::new("file")
+            .with_fs_operator(operator.clone())
+            .build()
+            .unwrap();
+        let second = FileIOBuilder::new("file")
+            .with_fs_operator(operator)
+            .build()
+            .unwrap();
+        let path = "file:/metadata.parquet";
+        let first_reader = first.new_input(path).unwrap().reader().await.unwrap();
+        let second_reader = second.new_input(path).unwrap().reader().await.unwrap();
+        assert_ne!(first_reader.cache_key(), second_reader.cache_key());
+        assert_eq!(
+            first.create_with_cache_path(path).await.unwrap().2,
+            second.create_with_cache_path(path).await.unwrap().2,
         );
     }
 

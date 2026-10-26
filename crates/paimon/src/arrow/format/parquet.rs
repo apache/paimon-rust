@@ -5937,6 +5937,146 @@ mod tests {
         assert!(Arc::ptr_eq(&first_metadata, &second_metadata));
     }
 
+    #[cfg(feature = "storage-memory")]
+    #[tokio::test]
+    async fn shared_metadata_separates_recycled_memory_storage_identities() {
+        if !crate::io::run_isolated_metadata_cache_test(
+            "arrow::format::parquet::tests::shared_metadata_separates_recycled_memory_storage_identities",
+        ) {
+            return;
+        }
+        use crate::io::FileRead;
+
+        struct RecycledMemoryReader {
+            inner: Arc<dyn FileRead>,
+            key: String,
+        }
+        impl RecycledMemoryReader {
+            fn new(inner: impl FileRead) -> Self {
+                let mut parts = inner.cache_key().unwrap().split('\0').collect::<Vec<_>>();
+                assert_eq!(parts.len(), 5);
+                assert_eq!(parts[1], "memory");
+                // Simulate OpenDAL reusing an address-based service name. Keep
+                // the real FileIO namespace, root and path; do not rely on malloc.
+                parts[2] = "recycled-memory-address";
+                let key = parts.join("\0");
+                Self {
+                    inner: Arc::new(inner),
+                    key,
+                }
+            }
+        }
+        #[async_trait::async_trait]
+        impl FileRead for RecycledMemoryReader {
+            async fn read(&self, range: std::ops::Range<u64>) -> crate::Result<Bytes> {
+                self.inner.read(range).await
+            }
+            async fn check_shared_metadata_access(&self) -> crate::Result<bool> {
+                self.inner.check_shared_metadata_access().await
+            }
+            fn cache_key(&self) -> Option<&str> {
+                Some(&self.key)
+            }
+            fn file_format_metadata_cache(&self) -> Option<&(dyn std::any::Any + Send + Sync)> {
+                self.inner.file_format_metadata_cache()
+            }
+        }
+        fn parquet_data(name: &str, value: i32) -> Bytes {
+            let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                name,
+                ArrowDataType::Int32,
+                false,
+            )]));
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int32Array::from(vec![value; 4]))],
+            )
+            .unwrap();
+            let mut data = Vec::new();
+            let mut writer = parquet::arrow::ArrowWriter::try_new(&mut data, schema, None).unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+            Bytes::from(data)
+        }
+
+        let first_data = parquet_data("first", 1);
+        let second_data = parquet_data("other", 9);
+        assert_eq!(first_data.len(), second_data.len());
+        let props = HashMap::from([(
+            crate::common::CatalogOptions::FILE_FORMAT_METADATA_CACHE_SHARED.to_string(),
+            "true".to_string(),
+        )]);
+        let _keep_pool_alive =
+            crate::io::FileFormatMetadataCacheContext::from_props(&props).unwrap();
+        let path = "memory:/recycled-identity.parquet";
+        let first = FileIOBuilder::new("memory")
+            .with_props(props.clone())
+            .build()
+            .unwrap();
+        first
+            .new_output(path)
+            .unwrap()
+            .write(first_data.clone())
+            .await
+            .unwrap();
+        let mut reader = super::ArrowFileReader::new(
+            first_data.len() as u64,
+            Arc::new(RecycledMemoryReader::new(
+                first.new_input(path).unwrap().reader().await.unwrap(),
+            )),
+        );
+        let first_metadata = reader.get_metadata(None).await.unwrap();
+        assert_eq!(
+            first_metadata
+                .file_metadata()
+                .schema_descr()
+                .column(0)
+                .name(),
+            "first"
+        );
+        let clone = first.clone();
+        let mut cloned_reader = super::ArrowFileReader::new(
+            first_data.len() as u64,
+            Arc::new(RecycledMemoryReader::new(
+                clone.new_input(path).unwrap().reader().await.unwrap(),
+            )),
+        );
+        assert!(Arc::ptr_eq(
+            &first_metadata,
+            &cloned_reader.get_metadata(None).await.unwrap()
+        ));
+        drop(cloned_reader);
+        drop(clone);
+        drop(reader);
+        drop(first);
+
+        let second = FileIOBuilder::new("memory")
+            .with_props(props)
+            .build()
+            .unwrap();
+        second
+            .new_output(path)
+            .unwrap()
+            .write(second_data.clone())
+            .await
+            .unwrap();
+        let mut reader = super::ArrowFileReader::new(
+            second_data.len() as u64,
+            Arc::new(RecycledMemoryReader::new(
+                second.new_input(path).unwrap().reader().await.unwrap(),
+            )),
+        );
+        let metadata = reader.get_metadata(None).await.unwrap();
+        assert_eq!(
+            metadata.file_metadata().schema_descr().column(0).name(),
+            "other"
+        );
+        match metadata.row_group(0).column(0).statistics().unwrap() {
+            ParquetStatistics::Int32(stats) => assert_eq!(stats.min_opt(), Some(&9)),
+            _ => panic!("expected Int32 statistics"),
+        }
+    }
+
     #[tokio::test]
     async fn parquet_metadata_cache_can_be_bypassed() {
         let data = Bytes::from(
