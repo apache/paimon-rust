@@ -500,6 +500,61 @@ async fn table_with_altered_prefix(catalog: &FileSystemCatalog, name: &str) -> (
     (table, file.clone())
 }
 
+/// A branch reads the files it inherited under an earlier prefix through the target: creating it
+/// copied the schemas they were written with.
+#[tokio::test]
+async fn branches_route_files_inherited_under_an_earlier_prefix() {
+    let origin = TestOss::start().await;
+    let cache = TestOss::start_sharing(&origin).await;
+    let catalog = data_target_catalog(&origin, &cache).await;
+    let (table, older) = table_with_altered_prefix(&catalog, "inherited_prefix").await;
+    let identifier = table.identifier().clone();
+    let table = catalog.get_table(&identifier).await.unwrap();
+    let newer = write_and_commit(&table, &make_batch(vec![2], vec![20])).await;
+    let snapshot = table
+        .snapshot_manager()
+        .get_latest_snapshot()
+        .await
+        .unwrap()
+        .unwrap();
+    table.tag_manager().create("base", &snapshot).await.unwrap();
+    BranchManager::new(table.file_io().clone(), table.location().into())
+        .create_branch_from_tag("dev", "base")
+        .await
+        .unwrap();
+    let branches = [
+        (
+            "copy_with_branch",
+            table.copy_with_branch("dev").await.unwrap(),
+        ),
+        (
+            "branch option",
+            table
+                .copy_with_time_travel(HashMap::from([("branch".to_string(), "dev".to_string())]))
+                .await
+                .unwrap(),
+        ),
+    ];
+    for (name, branch) in branches {
+        origin.take_requests();
+        cache.take_requests();
+        assert_eq!(ids(&branch).await, [1, 2], "{name}");
+        let (cache_requests, origin_requests) = (cache.take_requests(), origin.take_requests());
+        for file in newer.iter().chain([&older]) {
+            let on_target = methods(&cache_requests, file);
+            assert!(
+                on_target.iter().any(|m| m == "GET"),
+                "{name}: {file}: {on_target:?}"
+            );
+            assert_eq!(
+                methods(&origin_requests, file),
+                Vec::<String>::new(),
+                "{name}: {file}"
+            );
+        }
+    }
+}
+
 /// The request that lists the schemas of `table`.
 fn schema_listing(table: &Table) -> String {
     format!(
