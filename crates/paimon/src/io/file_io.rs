@@ -1942,13 +1942,18 @@ mod file_action_test {
             .with_local_cache(cache)
             .build()
             .unwrap();
-        let path = dir.path().join("snapshot-1").to_string_lossy().into_owned();
-        std::fs::write(&path, b"abcd").unwrap();
+        let source_path = dir.path().join("snapshot-1");
+        let path = local_file_path(&source_path);
+        std::fs::write(&source_path, b"abcd").unwrap();
         let input = io.new_input(&path).unwrap();
+        assert!(
+            input.cache.is_some(),
+            "the regression must exercise caching"
+        );
         let reader = input.reader_with_size(4).await.unwrap();
         assert_eq!(reader.read(0..4).await.unwrap().as_ref(), b"abcd");
         // A hot read must not stat the source again.
-        std::fs::rename(&path, dir.path().join("offline")).unwrap();
+        std::fs::rename(&source_path, dir.path().join("offline")).unwrap();
         assert!(input.reader().await.is_err());
         let reader = input.reader_with_size(4).await.unwrap();
         assert_eq!(reader.read(1..3).await.unwrap().as_ref(), b"bc");
