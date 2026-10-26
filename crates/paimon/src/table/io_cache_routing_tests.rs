@@ -30,7 +30,7 @@ use bytes::Bytes;
 use futures::TryStreamExt;
 
 use super::table_write::tests::make_batch;
-use super::{BlobReader, BranchManager, RESTEnv, Table, TableCommit, TableWrite};
+use super::{BlobReader, BranchManager, RESTEnv, RowRange, Table, TableCommit, TableWrite};
 use crate::api::rest_api::RESTApi;
 use crate::api::{GetTableResponse, GetTableTokenResponse};
 use crate::catalog::{Catalog, FileSystemCatalog, FusePathResolver, Identifier, LoadedTable};
@@ -658,6 +658,55 @@ async fn rest_tables_keep_routing_for_prefixes_of_older_schemas() {
     );
     assert_eq!(token_requests.load(Ordering::SeqCst), 1);
     server.abort();
+}
+
+#[tokio::test]
+async fn row_sidecars_of_selective_reads_use_the_target() {
+    let origin = TestOss::start().await;
+    let cache = TestOss::start_sharing(&origin).await;
+    let catalog = catalog(
+        &origin,
+        &cache,
+        &[
+            ("io-cache.policy", "meta,read"),
+            ("io-cache.whitelist", "data"),
+        ],
+    )
+    .await;
+    let schema = int_schema()
+        .option("row-tracking.enabled", "true")
+        .option("data-evolution.enabled", "true")
+        .option("data-evolution.row-sidecar.enabled", "true")
+        .build()
+        .unwrap();
+    let table = create_table(&catalog, "row_sidecar", schema).await;
+    let ids: Vec<i32> = (0..100).collect();
+    write_and_commit(&table, &make_batch(ids.clone(), ids)).await;
+    origin.take_requests();
+    cache.take_requests();
+
+    // Two of 100 rows: the read takes the sidecar's size, then its rows.
+    let mut builder = table.new_read_builder();
+    builder.with_row_ranges(vec![RowRange::new(5, 6)]);
+    let plan = builder.new_scan().plan().await.unwrap();
+    let batches: Vec<RecordBatch> = builder
+        .new_read()
+        .unwrap()
+        .to_arrow(plan.splits())
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
+    let (origin_requests, cache_requests) = (origin.take_requests(), cache.take_requests());
+    assert_eq!(methods(&origin_requests, ".row"), Vec::<String>::new());
+    let on_target = methods(&cache_requests, ".row");
+    assert_eq!(
+        on_target.first().map(String::as_str),
+        Some("HEAD"),
+        "{on_target:?}"
+    );
+    assert!(on_target.iter().any(|m| m == "GET"), "{on_target:?}");
 }
 
 #[tokio::test]

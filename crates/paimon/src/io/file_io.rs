@@ -868,7 +868,8 @@ impl FileIO {
     /// Return the size of an immutable ROW sidecar without repeating remote
     /// status requests for subsequent reads through the same cache context.
     pub(crate) async fn immutable_row_sidecar_size(&self, path: &str) -> Result<u64> {
-        let (op, relative_path, cache_key) = self.create_with_cache_path(path).await?;
+        // The status request follows the meta rule like `get_status`; the cache key stays origin's.
+        let (op, relative_path, cache_key) = self.resolve_routed(path).await?;
         if let Some(size) = cache_key
             .as_deref()
             .and_then(|key| self.file_format_metadata_cache.row_sidecar_size(key))
@@ -876,6 +877,7 @@ impl FileIO {
             return Ok(size);
         }
         let size = op
+            .operator(OpClass::Meta)
             .stat(relative_path.as_ref())
             .await
             .map_err(|error| {
