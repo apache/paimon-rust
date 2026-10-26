@@ -190,12 +190,23 @@ impl BranchManager {
         let tag_dst = tag_manager.with_branch(branch_name).tag_path(tag_name);
         self.file_io.copy_file(&tag_src, &tag_dst).await?;
 
-        // Copy snapshot file to branch
+        // Copy the live snapshot, or restore an expired snapshot from the tag.
         let snap_src = snapshot_manager.snapshot_path(snapshot.id());
         let snap_dst = snapshot_manager
             .with_branch(branch_name)
             .snapshot_path(snapshot.id());
-        self.file_io.copy_file(&snap_src, &snap_dst).await?;
+        if self.file_io.exists(&snap_src).await? {
+            self.file_io.copy_file(&snap_src, &snap_dst).await?;
+        } else {
+            let json = serde_json::to_string(&snapshot).map_err(|e| crate::Error::DataInvalid {
+                message: format!("failed to serialize snapshot: {e}"),
+                source: Some(Box::new(e)),
+            })?;
+            self.file_io
+                .new_output(&snap_dst)?
+                .write(bytes::Bytes::from(json))
+                .await?;
+        }
 
         // Copy schemas to branch
         self.copy_schemas_to_branch(branch_name, snapshot.schema_id())
