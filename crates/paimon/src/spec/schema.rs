@@ -5147,9 +5147,6 @@ mod tests {
 
     #[test]
     fn test_rename_column_rewrites_sequence_group_options() {
-        // `sequence-group` is rejected by Rust's create-time merge-engine
-        // validation, so the fixture carries the option on a table without
-        // `merge-engine` — the shape in which Java-written metadata arrives.
         let table_schema = TableSchema::new(
             0,
             &Schema::builder()
@@ -5158,10 +5155,16 @@ mod tests {
                 .column("source_order", DataType::Int(IntType::new()))
                 .column("price", DataType::Int(IntType::new()))
                 .column("quantity", DataType::Int(IntType::new()))
+                .column("descending", DataType::Int(IntType::new()))
                 .primary_key(["id"])
+                .option("merge-engine", "partial-update")
                 .option(
                     "fields.version,source_order.sequence-group",
                     "price,quantity",
+                )
+                .option(
+                    "fields.version,source_order.sequence-group.sort-order",
+                    "descending",
                 )
                 .build()
                 .unwrap(),
@@ -5175,6 +5178,11 @@ mod tests {
                     "order_seq".to_string(),
                 ),
                 crate::spec::SchemaChange::rename_column("price".to_string(), "amount".to_string()),
+                // The direction is a literal, even if a column shares its name.
+                crate::spec::SchemaChange::rename_column(
+                    "descending".to_string(),
+                    "direction".to_string(),
+                ),
             ])
             .unwrap();
 
@@ -5191,6 +5199,16 @@ mod tests {
                 .get("fields.version,source_order.sequence-group"),
             None
         );
+        assert_eq!(
+            new_schema
+                .options()
+                .get("fields.version,order_seq.sequence-group.sort-order")
+                .map(String::as_str),
+            Some("descending")
+        );
+        assert!(!new_schema
+            .options()
+            .contains_key("fields.version,source_order.sequence-group.sort-order"));
     }
 
     #[test]

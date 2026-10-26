@@ -17,6 +17,7 @@
 
 use std::collections::HashMap;
 
+use super::partial_update::SEQUENCE_GROUP_SORT_ORDER_SUFFIX;
 use crate::spec::core_options::IGNORE_DELETE_FALLBACK_KEYS;
 use crate::spec::{CoreOptions, DataField, DataType, VarCharType};
 
@@ -318,6 +319,7 @@ const FIELD_SCOPED_FIELD_LIST_SUFFIXES: [&str; 2] = [SEQUENCE_GROUP_SUFFIX, NEST
 /// - case 2: `fields.<old>.<suffix>` -> `fields.<new>.<suffix>`, value kept
 /// - case 3 (`sequence-group`, `nested-key`): every comma-separated entry
 ///   equal to `old` is renamed in BOTH the key's field list and the value
+/// - `sequence-group.sort-order`: rename the key's field list only
 pub(crate) fn rename_field_scoped_options(
     options: &mut HashMap<String, String>,
     old: &str,
@@ -336,13 +338,18 @@ pub(crate) fn rename_field_scoped_options(
     for (key, value) in options.iter() {
         let Some(suffix) = FIELD_SCOPED_FIELD_LIST_SUFFIXES
             .iter()
+            .chain(std::iter::once(&SEQUENCE_GROUP_SORT_ORDER_SUFFIX))
             .find(|suffix| key.starts_with(FIELDS_PREFIX) && key.ends_with(**suffix))
         else {
             continue;
         };
         let key_fields = &key[FIELDS_PREFIX.len()..key.len() - suffix.len()];
         let new_key_fields = rename_in_field_list(key_fields, old, new);
-        let new_value = rename_in_field_list(value, old, new);
+        let new_value = if *suffix == SEQUENCE_GROUP_SORT_ORDER_SUFFIX {
+            value.clone()
+        } else {
+            rename_in_field_list(value, old, new)
+        };
         if new_key_fields != key_fields || new_value != *value {
             rewritten.push((
                 key.clone(),

@@ -3478,6 +3478,116 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn kv_read_partial_update_row_sequence_group_sort_order() {
+        use crate::spec::RowType;
+        use arrow_buffer::NullBuffer;
+
+        // None is a top-level null; Some(None) is a non-null ROW(NULL).
+        // The final two entries select the winning row for ascending/descending.
+        let cases = [
+            (Some(Some(5)), Some(None), 0, 1),
+            (Some(None), Some(Some(5)), 1, 0),
+            (None, Some(Some(5)), 1, 1),
+            (Some(Some(5)), None, 0, 0),
+            (None, Some(None), 1, 1),
+            (Some(None), None, 0, 0),
+            (Some(Some(5)), Some(Some(2)), 0, 1),
+            (Some(None), Some(None), 1, 1),
+            (Some(Some(5)), Some(Some(5)), 1, 1),
+        ];
+        for direction in ["ascending", "descending"] {
+            for separate_commits in [false, true] {
+                for (first, second, ascending_winner, descending_winner) in cases {
+                    let file_io = test_file_io();
+                    let table_path = "memory:/kv_partial_update_row_sequence_group";
+                    setup_dirs(&file_io, table_path).await;
+                    let schema = Schema::builder()
+                        .column("id", DataType::Int(IntType::new()))
+                        .column(
+                            "seq",
+                            DataType::Row(RowType::new(vec![DataField::new(
+                                0,
+                                "version".into(),
+                                DataType::Int(IntType::new()),
+                            )])),
+                        )
+                        .column("value", DataType::Int(IntType::new()))
+                        .primary_key(["id"])
+                        .option("bucket", "1")
+                        .option("merge-engine", "partial-update")
+                        .option("fields.seq.sequence-group", "value")
+                        .option("fields.seq.sequence-group.sort-order", direction)
+                        .build()
+                        .unwrap();
+                    let table = Table::new(
+                        file_io,
+                        Identifier::new("default", "kv_partial_update_row_sequence_group"),
+                        table_path.to_string(),
+                        TableSchema::new(0, &schema),
+                        None,
+                    );
+                    let arrow_schema = build_target_arrow_schema(table.schema().fields()).unwrap();
+                    let ArrowDataType::Struct(sequence_fields) = arrow_schema.field(1).data_type()
+                    else {
+                        panic!("expected a ROW sequence field");
+                    };
+                    let sequences = [first, second];
+                    let sequence_array = StructArray::new(
+                        sequence_fields.clone(),
+                        vec![Arc::new(Int32Array::from(
+                            sequences
+                                .into_iter()
+                                .map(Option::flatten)
+                                .collect::<Vec<_>>(),
+                        ))],
+                        Some(NullBuffer::from(
+                            sequences
+                                .into_iter()
+                                .map(|seq| seq.is_some())
+                                .collect::<Vec<_>>(),
+                        )),
+                    );
+                    // Equal ordering values must allow clearing the protected field.
+                    let values = vec![Some(50), if first == second { None } else { Some(99) }];
+                    let batch = RecordBatch::try_new(
+                        arrow_schema,
+                        vec![
+                            Arc::new(Int32Array::from(vec![1, 1])),
+                            Arc::new(sequence_array),
+                            Arc::new(Int32Array::from(values)),
+                        ],
+                    )
+                    .unwrap();
+                    if separate_commits {
+                        write_commit(&table, &batch.slice(0, 1)).await;
+                        write_commit(&table, &batch.slice(1, 1)).await;
+                    } else {
+                        write_commit(&table, &batch).await;
+                    }
+                    let winner = if direction == "ascending" {
+                        ascending_winner
+                    } else {
+                        descending_winner
+                    };
+                    for projection in [None, Some(["value"].as_slice())] {
+                        let result = read_rows(&table, projection, None).await;
+                        assert_eq!(result.len(), 1);
+                        assert_eq!(result[0].num_rows(), 1);
+                        for field in result[0].schema().fields() {
+                            assert_eq!(
+                                result[0].column_by_name(field.name()).unwrap().as_ref(),
+                                batch.column_by_name(field.name()).unwrap().slice(winner, 1).as_ref(),
+                                "direction={direction}, separate_commits={separate_commits}, sequences={sequences:?}, projection={projection:?}, field={}",
+                                field.name(),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn kv_read_partial_update_sequence_group_aggregation_with_projection() {
         let file_io = test_file_io();
         let table_path = "memory:/kv_partial_update_sequence_group_aggregation";
