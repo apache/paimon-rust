@@ -40,13 +40,22 @@ fn shared_io(root: &Path) -> FileIO {
         .unwrap()
 }
 
+fn file_path(path: &Path) -> String {
+    let normalized = path.to_string_lossy().replace('\\', "/");
+    if normalized.starts_with('/') {
+        format!("file:{normalized}")
+    } else {
+        format!("file:/{normalized}")
+    }
+}
+
 #[tokio::test]
 async fn short_first_block_is_a_complete_file() {
     let root = tempfile::tempdir().unwrap();
     let io = shared_io(root.path());
     let path = root.path().join("snapshot-1");
     std::fs::write(&path, b"abc").unwrap();
-    let input = io.new_input(path.to_str().unwrap()).unwrap();
+    let input = io.new_input(&file_path(&path)).unwrap();
     assert_eq!(input.read().await.unwrap().as_ref(), b"abc");
     std::fs::rename(&path, root.path().join("offline")).unwrap();
     // The cached complete file must not require a source stat.
@@ -60,7 +69,7 @@ async fn full_first_block_does_not_imply_eof() {
     for data in [&b"abcd"[..], &b"abcdef"[..]] {
         let path = root.path().join(format!("snapshot-{}", data.len()));
         std::fs::write(&path, data).unwrap();
-        let input = io.new_input(path.to_str().unwrap()).unwrap();
+        let input = io.new_input(&file_path(&path)).unwrap();
         assert_eq!(input.read().await.unwrap().as_ref(), data);
         std::fs::remove_file(&path).unwrap();
         assert!(input.read().await.is_err());
@@ -74,7 +83,7 @@ async fn replacement_child() {
     };
     let root = Path::new(&root);
     shared_io(root)
-        .new_output(root.join("snapshot-1").to_str().unwrap())
+        .new_output(&file_path(&root.join("snapshot-1")))
         .unwrap()
         .write(Bytes::from_static(b"replacement"))
         .await
@@ -87,7 +96,7 @@ async fn another_process_invalidates_the_small_file() {
     let io = shared_io(root.path());
     let path = root.path().join("snapshot-1");
     std::fs::write(&path, b"abc").unwrap();
-    let input = io.new_input(path.to_str().unwrap()).unwrap();
+    let input = io.new_input(&file_path(&path)).unwrap();
     assert_eq!(input.read().await.unwrap().as_ref(), b"abc");
     assert!(std::process::Command::new(std::env::current_exe().unwrap())
         .args([
