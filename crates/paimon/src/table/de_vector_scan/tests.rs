@@ -1142,6 +1142,21 @@ async fn pruned_null_bitmap_keeps_btree_answer_exact() {
 }
 
 #[tokio::test]
+async fn bitmap_with_empty_posting_keeps_btree_answer_exact() {
+    // The bitmap shard holds f = [1, 3], so its metadata cannot prune `f = 2`,
+    // but its posting for 2 is empty. Only the BTree answers, exactly.
+    let ids = top1_after_bitmap_then_btree(vec![Some(1.0), Some(3.0)], |pb| {
+        crate::spec::Predicate::and(vec![
+            pb.greater_than("f", crate::spec::Datum::Double(1.5))
+                .unwrap(),
+            pb.equal("f", crate::spec::Datum::Double(2.0)).unwrap(),
+        ])
+    })
+    .await;
+    assert_eq!(ids, vec![2]);
+}
+
+#[tokio::test]
 async fn bitmap_pruned_by_another_conjunct_keeps_btree_answer_exact() {
     // The bitmap shard holds f = [0, 1]. `f = 2` prunes it by metadata, so
     // only the BTree answers `f > 1.5 AND f = 2`, and it does so exactly.

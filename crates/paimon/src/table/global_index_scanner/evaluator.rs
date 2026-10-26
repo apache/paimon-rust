@@ -595,7 +595,7 @@ impl GlobalIndexScanner {
         // A bitmap answers floating ranges and negations with every non-null
         // row (see `bitmap_meta_may_match`), so its results are candidates
         // only. Sorted indexes answer them exactly. Only bitmap shards that
-        // survive pruning by every conjunct below contribute rows.
+        // survive pruning by every conjunct below and return rows contribute.
         let bitmap_superset_ops = predicates.iter().any(|(op, _, data_type)| {
             is_floating_point(data_type) && is_bitmap_floating_residual_sensitive_op(*op)
         });
@@ -684,7 +684,6 @@ impl GlobalIndexScanner {
                 all_matching_ranges.push(RowRange::new(entry.row_range_start, entry.row_range_end));
                 continue;
             }
-            bitmap_retained |= matches!(entry.index_type, GlobalIndexFileKind::Bitmap);
             query_plans.push(EntryQueryPlan {
                 entry_idx,
                 between_matches,
@@ -735,18 +734,20 @@ impl GlobalIndexScanner {
                         })
                         .collect::<Vec<_>>()
                 });
-                Ok((ranges, result.declined))
+                let is_bitmap = matches!(entry.index_type, GlobalIndexFileKind::Bitmap);
+                Ok((ranges, result.declined, is_bitmap))
             });
-        let (all_ranges, declined) = try_fold_bounded(
+        let (all_ranges, declined, bitmap_retained) = try_fold_bounded(
             futures,
             self.global_index_thread_num,
-            (all_matching_ranges, false),
-            |(all_ranges, declined), (ranges, file_declined)| {
+            (all_matching_ranges, false, bitmap_retained),
+            |(all_ranges, declined, bitmap_retained), (ranges, file_declined, is_bitmap)| {
                 if file_declined {
                     *declined = true;
                     return;
                 }
                 if let Some(ranges) = ranges {
+                    *bitmap_retained |= is_bitmap && !ranges.is_empty();
                     all_ranges.extend(ranges);
                 }
             },
