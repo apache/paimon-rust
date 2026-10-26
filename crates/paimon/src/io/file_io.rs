@@ -120,9 +120,28 @@ const ROW_METADATA_CACHE_MAX_BYTES: usize = 32 * 1024 * 1024;
 const ROW_METADATA_CACHE_BUDGET_DIVISOR: usize = 4;
 const ROW_SIDECAR_SIZE_CACHE_MAX_ENTRIES: usize = 4096;
 
+type ParquetMetadataSlot = OnceLock<Arc<dyn Any + Send + Sync>>;
+
+fn shared_parquet_metadata_slot(max_bytes: usize) -> Arc<ParquetMetadataSlot> {
+    type Registry = HashMap<(u32, usize), std::sync::Weak<ParquetMetadataSlot>>;
+    static SLOTS: OnceLock<Mutex<Registry>> = OnceLock::new();
+    // Sharing is best-effort; never wait on a registry lock inherited by fork.
+    let Ok(mut slots) = SLOTS.get_or_init(Default::default).try_lock() else {
+        return Arc::new(OnceLock::new());
+    };
+    slots.retain(|_, slot| slot.strong_count() > 0);
+    let key = (std::process::id(), max_bytes);
+    if let Some(slot) = slots.get(&key).and_then(std::sync::Weak::upgrade) {
+        return slot;
+    }
+    let slot = Arc::new(OnceLock::new());
+    slots.insert(key, Arc::downgrade(&slot));
+    slot
+}
+
 pub(crate) struct FileFormatMetadataCacheContext {
     max_bytes: usize,
-    cache: OnceLock<Arc<dyn Any + Send + Sync>>,
+    cache: Arc<ParquetMetadataSlot>,
     row_metadata_cache: OnceLock<Arc<dyn Any + Send + Sync>>,
     process_id: u32,
     row_sidecar_sizes: OnceLock<Mutex<LruCache<String, u64>>>,
@@ -153,9 +172,26 @@ impl FileFormatMetadataCacheContext {
             })
             .transpose()?
             .unwrap_or(DEFAULT_FILE_FORMAT_METADATA_CACHE_MAX_BYTES);
+        let shared = props
+            .get(CatalogOptions::FILE_FORMAT_METADATA_CACHE_SHARED)
+            .map(|value| {
+                value.parse::<bool>().map_err(|_| Error::ConfigInvalid {
+                    message: format!(
+                        "Invalid value for {}: {value}",
+                        CatalogOptions::FILE_FORMAT_METADATA_CACHE_SHARED
+                    ),
+                })
+            })
+            .transpose()?
+            .unwrap_or(false);
+        let cache = if shared && max_bytes > 0 {
+            shared_parquet_metadata_slot(max_bytes)
+        } else {
+            Arc::new(OnceLock::new())
+        };
         Ok(Arc::new(Self {
             max_bytes,
-            cache: OnceLock::new(),
+            cache,
             row_metadata_cache: OnceLock::new(),
             process_id: std::process::id(),
             row_sidecar_sizes: OnceLock::new(),
@@ -231,6 +267,9 @@ impl FileFormatMetadataCacheContext {
     where
         T: Send + Sync + 'static,
     {
+        if self.process_id != std::process::id() {
+            return Arc::new(init(self.parquet_metadata_max_bytes()));
+        }
         let cache = Arc::clone(self.cache.get_or_init(|| {
             Arc::new(init(self.parquet_metadata_max_bytes())) as Arc<dyn Any + Send + Sync>
         }));
@@ -3111,6 +3150,55 @@ mod input_output_test {
         assert!(error
             .to_string()
             .contains(CatalogOptions::FILE_FORMAT_METADATA_CACHE_MAX_SIZE));
+    }
+
+    #[test]
+    fn test_shared_metadata_cache_budget_lifetime_and_row_isolation() {
+        let mut props = HashMap::from([
+            (
+                CatalogOptions::FILE_FORMAT_METADATA_CACHE_SHARED.to_string(),
+                "true".to_string(),
+            ),
+            (
+                CatalogOptions::FILE_FORMAT_METADATA_CACHE_MAX_SIZE.to_string(),
+                "123456".to_string(),
+            ),
+        ]);
+        let first = FileFormatMetadataCacheContext::from_props(&props).unwrap();
+        let second = FileFormatMetadataCacheContext::from_props(&props).unwrap();
+        assert!(Arc::ptr_eq(&first.cache, &second.cache));
+        let row_first = first.row_metadata_get_or_init(|_| 1usize).unwrap();
+        let row_second = second.row_metadata_get_or_init(|_| 2usize).unwrap();
+        assert!(!Arc::ptr_eq(&row_first, &row_second));
+        props.insert(
+            CatalogOptions::FILE_FORMAT_METADATA_CACHE_MAX_SIZE.to_string(),
+            "0".to_string(),
+        );
+        let zero = FileFormatMetadataCacheContext::from_props(&props).unwrap();
+        assert!(!Arc::ptr_eq(&first.cache, &zero.cache));
+        let weak = Arc::downgrade(&first.cache);
+        drop(first);
+        drop(second);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn test_shared_metadata_cache_rejects_invalid_flag() {
+        let props = HashMap::from([(
+            CatalogOptions::FILE_FORMAT_METADATA_CACHE_SHARED.to_string(),
+            "invalid".to_string(),
+        )]);
+        assert!(FileFormatMetadataCacheContext::from_props(&props).is_err());
+    }
+
+    #[test]
+    fn test_metadata_cache_bypasses_inherited_context() {
+        let mut context = FileFormatMetadataCacheContext::from_props(&HashMap::new()).unwrap();
+        let before = context.get_or_init(|_| 1usize);
+        Arc::get_mut(&mut context).unwrap().process_id = 0;
+        let after = context.get_or_init(|_| 2usize);
+        assert_eq!(*after, 2);
+        assert!(!Arc::ptr_eq(&before, &after));
     }
 
     #[test]

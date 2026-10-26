@@ -5769,6 +5769,39 @@ mod tests {
         assert_eq!(tracker.read_count(), 1);
     }
 
+    #[tokio::test]
+    async fn parquet_metadata_cache_shares_independently_created_contexts() {
+        let data = Bytes::from(
+            write_multi_row_group_parquet(8, 64, EnabledStatistics::Chunk, false).await,
+        );
+        let props = HashMap::from([(
+            crate::common::CatalogOptions::FILE_FORMAT_METADATA_CACHE_SHARED.to_string(),
+            "true".to_string(),
+        )]);
+        let mut trackers = Vec::new();
+        let mut metadata = Vec::new();
+        for _ in 0..40 {
+            let context = crate::io::FileFormatMetadataCacheContext::from_props(&props).unwrap();
+            let tracker = TrackingFileRead::new(data.clone())
+                .with_cache_key("process-sharing-test\0data.parquet")
+                .with_metadata_cache(context);
+            let mut reader =
+                super::ArrowFileReader::new(data.len() as u64, Arc::new(tracker.clone()));
+            metadata.push(reader.get_metadata(None).await.unwrap());
+            trackers.push(tracker);
+        }
+        assert_eq!(
+            trackers
+                .iter()
+                .map(TrackingFileRead::read_count)
+                .sum::<usize>(),
+            1
+        );
+        assert!(metadata
+            .iter()
+            .all(|value| Arc::ptr_eq(value, &metadata[0])));
+    }
+
     #[cfg(feature = "storage-fs")]
     #[tokio::test]
     async fn parquet_metadata_cache_reuses_metadata_across_file_io_instances() {

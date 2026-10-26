@@ -442,6 +442,17 @@ Concurrent whole-file and range reads may download overlapping data.
 Allow disk headroom beyond `local-cache.max-size` for up to eight staged writes
 per cache instance; this staging limit is not node-wide.
 
+### Parsed Parquet Metadata Cache
+
+Set `file-format.metadata-cache.shared=true` to share parsed Parquet metadata
+between contexts with the same metadata budget in one process (default `false`).
+Sharing is best-effort under registry contention. File identity and Page Index
+policy remain part of the cache key; unused shared caches are released.
+
+This is separate from `local-cache.shared`, which shares disk blocks across
+processes. ROW metadata and BLOB indexes remain context-local. Different budgets
+use separate pools, so this is not a process-wide memory limit.
+
 ### BLOB Index Cache
 
 Decoded `.blob` indexes are cached per catalog. Set
