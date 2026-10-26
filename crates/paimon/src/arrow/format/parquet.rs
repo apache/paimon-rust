@@ -2902,6 +2902,7 @@ impl ParquetMetadataCache {
         &self,
         reader: &mut ArrowFileReader,
         options: Option<&ArrowReaderOptions>,
+        shared: bool,
     ) -> parquet::errors::Result<Arc<ParquetMetaData>> {
         let column_index = options.map_or(PageIndexPolicy::Skip, |o| o.column_index_policy());
         let offset_index = options.map_or(PageIndexPolicy::Skip, |o| o.offset_index_policy());
@@ -2917,18 +2918,34 @@ impl ParquetMetadataCache {
                 offset_index: page_index_policy_tag(offset_index),
             });
         let key_heap_bytes = key.as_ref().map_or(0, |key| key.file.capacity());
-        self.inner
+        let mut loaded = false;
+        let metadata = self
+            .inner
             .get_or_try_insert_with(
                 key,
                 key_heap_bytes,
-                || reader.load_metadata(options),
+                || {
+                    loaded = true;
+                    reader.load_metadata(options)
+                },
                 |metadata| {
                     metadata
                         .memory_size()
                         .max(PARQUET_METADATA_CACHE_MIN_ENTRY_BYTES)
                 },
             )
-            .await
+            .await?;
+        if shared
+            && !loaded
+            && !reader
+                .r
+                .check_shared_metadata_access()
+                .await
+                .map_err(|error| parquet::errors::ParquetError::External(Box::new(error)))?
+        {
+            return reader.load_metadata(options).await;
+        }
+        Ok(metadata)
     }
 }
 
@@ -3165,9 +3182,10 @@ impl AsyncFileReader for ArrowFileReader {
             if context.max_bytes() == 0 {
                 return self.load_metadata(options.as_ref()).await;
             }
+            let shared = context.parquet_metadata_is_shared();
             context
                 .get_or_init(ParquetMetadataCache::new)
-                .load(self, options.as_ref())
+                .load(self, options.as_ref(), shared)
                 .await
         })
     }
@@ -5724,6 +5742,11 @@ mod tests {
 
     #[async_trait::async_trait]
     impl crate::io::FileRead for TrackingFileRead {
+        async fn check_shared_metadata_access(&self) -> crate::Result<bool> {
+            self.read(0..1).await?;
+            Ok(true)
+        }
+
         async fn read(&self, range: std::ops::Range<u64>) -> crate::Result<Bytes> {
             self.ranges.lock().unwrap().push(range.clone());
             // Count each source allocation until its last slice is dropped, not slice lengths.
@@ -5795,11 +5818,73 @@ mod tests {
                 .iter()
                 .map(TrackingFileRead::read_count)
                 .sum::<usize>(),
-            1
+            40
         );
+        assert!(trackers
+            .iter()
+            .skip(1)
+            .all(|reader| reader.bytes_read() == 1));
         assert!(metadata
             .iter()
             .all(|value| Arc::ptr_eq(value, &metadata[0])));
+    }
+
+    #[tokio::test]
+    async fn shared_metadata_rejects_an_unauthorized_reader() {
+        struct DeniedReader(TrackingFileRead, bool);
+        #[async_trait::async_trait]
+        impl crate::io::FileRead for DeniedReader {
+            async fn read(&self, _: std::ops::Range<u64>) -> crate::Result<Bytes> {
+                Err(crate::Error::from(opendal::Error::new(
+                    opendal::ErrorKind::PermissionDenied,
+                    "denied",
+                )))
+            }
+            async fn check_shared_metadata_access(&self) -> crate::Result<bool> {
+                if !self.1 {
+                    return Ok(false);
+                }
+                self.read(0..1).await?;
+                Ok(true)
+            }
+            fn cache_key(&self) -> Option<&str> {
+                self.0.cache_key()
+            }
+            fn file_format_metadata_cache(&self) -> Option<&(dyn std::any::Any + Send + Sync)> {
+                self.0.file_format_metadata_cache()
+            }
+        }
+        let data = Bytes::from(
+            write_multi_row_group_parquet(8, 64, EnabledStatistics::Chunk, false).await,
+        );
+        let props = HashMap::from([(
+            crate::common::CatalogOptions::FILE_FORMAT_METADATA_CACHE_SHARED.to_string(),
+            "true".to_string(),
+        )]);
+        let first = TrackingFileRead::new(data.clone())
+            .with_cache_key("authorization-test/data.parquet")
+            .with_metadata_cache(
+                crate::io::FileFormatMetadataCacheContext::from_props(&props).unwrap(),
+            );
+        let mut allowed = super::ArrowFileReader::new(data.len() as u64, Arc::new(first));
+        allowed.get_metadata(None).await.unwrap();
+        let second = TrackingFileRead::new(data.clone())
+            .with_cache_key("authorization-test/data.parquet")
+            .with_metadata_cache(
+                crate::io::FileFormatMetadataCacheContext::from_props(&props).unwrap(),
+            );
+        for supports_check in [true, false] {
+            let mut denied = super::ArrowFileReader::new(
+                data.len() as u64,
+                Arc::new(DeniedReader(second.clone(), supports_check)),
+            );
+            assert!(denied
+                .get_metadata(None)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("denied"));
+        }
     }
 
     #[cfg(feature = "storage-fs")]

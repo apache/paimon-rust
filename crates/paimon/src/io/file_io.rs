@@ -121,14 +121,15 @@ const ROW_METADATA_CACHE_BUDGET_DIVISOR: usize = 4;
 const ROW_SIDECAR_SIZE_CACHE_MAX_ENTRIES: usize = 4096;
 
 type ParquetMetadataSlot = OnceLock<Arc<dyn Any + Send + Sync>>;
+type ParquetMetadataRegistry = HashMap<(u32, usize), std::sync::Weak<ParquetMetadataSlot>>;
+static PARQUET_METADATA_SLOTS: Mutex<Option<ParquetMetadataRegistry>> = Mutex::new(None);
 
 fn shared_parquet_metadata_slot(max_bytes: usize) -> Arc<ParquetMetadataSlot> {
-    type Registry = HashMap<(u32, usize), std::sync::Weak<ParquetMetadataSlot>>;
-    static SLOTS: OnceLock<Mutex<Registry>> = OnceLock::new();
     // Sharing is best-effort; never wait on a registry lock inherited by fork.
-    let Ok(mut slots) = SLOTS.get_or_init(Default::default).try_lock() else {
+    let Ok(mut registry) = PARQUET_METADATA_SLOTS.try_lock() else {
         return Arc::new(OnceLock::new());
     };
+    let slots = registry.get_or_insert_with(HashMap::new);
     slots.retain(|_, slot| slot.strong_count() > 0);
     let key = (std::process::id(), max_bytes);
     if let Some(slot) = slots.get(&key).and_then(std::sync::Weak::upgrade) {
@@ -141,6 +142,7 @@ fn shared_parquet_metadata_slot(max_bytes: usize) -> Arc<ParquetMetadataSlot> {
 
 pub(crate) struct FileFormatMetadataCacheContext {
     max_bytes: usize,
+    shared: bool,
     cache: Arc<ParquetMetadataSlot>,
     row_metadata_cache: OnceLock<Arc<dyn Any + Send + Sync>>,
     process_id: u32,
@@ -191,6 +193,7 @@ impl FileFormatMetadataCacheContext {
         };
         Ok(Arc::new(Self {
             max_bytes,
+            shared,
             cache,
             row_metadata_cache: OnceLock::new(),
             process_id: std::process::id(),
@@ -277,6 +280,10 @@ impl FileFormatMetadataCacheContext {
             Ok(cache) => cache,
             Err(_) => panic!("file-format metadata cache type mismatch"),
         }
+    }
+
+    pub(crate) fn parquet_metadata_is_shared(&self) -> bool {
+        self.shared && self.process_id == std::process::id()
     }
 
     /// ROW footer and block index metadata has its own typed cache. Keep it
@@ -1215,6 +1222,14 @@ impl FileIOBuilder {
 pub trait FileRead: Send + Sync + Unpin + 'static {
     async fn read(&self, range: Range<u64>) -> crate::Result<Bytes>;
 
+    /// Check current access before reusing metadata from another context.
+    /// Implementations must bypass data caches and propagate storage errors.
+    /// Returning false disables cross-context metadata reuse for this reader.
+    #[doc(hidden)]
+    async fn check_shared_metadata_access(&self) -> crate::Result<bool> {
+        Ok(false)
+    }
+
     #[doc(hidden)]
     #[deprecated(note = "BLOB index caching no longer uses numeric FileIO namespaces")]
     fn cache_namespace(&self) -> Option<usize> {
@@ -1239,6 +1254,11 @@ pub trait FileRead: Send + Sync + Unpin + 'static {
 
 #[async_trait::async_trait]
 impl FileRead for opendal::Reader {
+    async fn check_shared_metadata_access(&self) -> crate::Result<bool> {
+        self.read(0..1).await?;
+        Ok(true)
+    }
+
     async fn read(&self, range: Range<u64>) -> crate::Result<Bytes> {
         Ok(opendal::Reader::read(self, range).await?.to_bytes())
     }
@@ -1261,6 +1281,13 @@ enum InputFileReader {
 
 #[async_trait::async_trait]
 impl FileRead for InputFileReader {
+    async fn check_shared_metadata_access(&self) -> crate::Result<bool> {
+        match self {
+            Self::Direct { reader, .. } => reader.check_shared_metadata_access().await,
+            Self::Cached { reader, .. } => reader.check_shared_metadata_access().await,
+        }
+    }
+
     async fn read(&self, range: Range<u64>) -> crate::Result<Bytes> {
         match self {
             Self::Direct { reader, .. } => FileRead::read(reader, range).await,
@@ -3189,6 +3216,37 @@ mod input_output_test {
             "invalid".to_string(),
         )]);
         assert!(FileFormatMetadataCacheContext::from_props(&props).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_shared_metadata_registry_fork_with_locked_registry() {
+        const CHILD: &str = "PAIMON_TEST_SHARED_METADATA_FORK";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "io::file_io::input_output_test::test_shared_metadata_registry_fork_with_locked_registry", "--test-threads=1"])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        // The child must not wait for a lock whose owning thread stayed in the parent.
+        let guard = PARQUET_METADATA_SLOTS.lock().unwrap();
+        unsafe {
+            let pid = libc::fork();
+            assert!(pid >= 0);
+            if pid == 0 {
+                libc::alarm(3);
+                let slot = shared_parquet_metadata_slot(123456);
+                libc::_exit(if slot.get().is_none() { 0 } else { 1 });
+            }
+            let mut status = 0;
+            assert_eq!(libc::waitpid(pid, &mut status, 0), pid);
+            assert!(libc::WIFEXITED(status));
+            assert_eq!(libc::WEXITSTATUS(status), 0);
+        }
+        drop(guard);
     }
 
     #[test]

@@ -448,6 +448,8 @@ Set `file-format.metadata-cache.shared=true` to share parsed Parquet metadata
 between contexts with the same metadata budget in one process (default `false`).
 Sharing is best-effort under registry contention. File identity and Page Index
 policy remain part of the cache key; unused shared caches are released.
+Shared hits check current storage access with an uncached one-byte read before
+returning metadata. Custom readers without this check reload metadata instead.
 
 This is separate from `local-cache.shared`, which shares disk blocks across
 processes. ROW metadata and BLOB indexes remain context-local. Different budgets
