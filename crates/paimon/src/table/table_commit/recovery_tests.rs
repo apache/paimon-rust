@@ -36,6 +36,119 @@ async fn empty_unpartitioned_overwrite_clears_old_rows() {
     );
 }
 
+struct RacingTablePublisher {
+    manager: SnapshotManager,
+    barrier: tokio::sync::Barrier,
+}
+
+#[async_trait::async_trait]
+impl SnapshotCommit for RacingTablePublisher {
+    async fn commit(
+        &self,
+        _: Option<&str>,
+        snapshot: &Snapshot,
+        _: &str,
+        _: &[PartitionStatistics],
+    ) -> Result<bool> {
+        if snapshot.id() == 1 {
+            self.barrier.wait().await;
+        }
+        self.manager.commit_snapshot(snapshot).await
+    }
+}
+
+#[tokio::test]
+async fn concurrent_appends_rebase_without_losing_files_or_reusing_row_ids() {
+    let io = test_file_io();
+    let path = "memory:/concurrent-append-publication";
+    setup_dirs(&io, path).await;
+    let table = test_table_with_options(
+        &io,
+        path,
+        HashMap::from([("row-tracking.enabled".into(), "true".into())]),
+    );
+    let publisher = Arc::new(RacingTablePublisher {
+        manager: table.snapshot_manager(),
+        barrier: tokio::sync::Barrier::new(2),
+    });
+    let mut first = TableCommit::new(table.clone(), "writer-a".into());
+    first.snapshot_commit = publisher.clone();
+    first.commit_min_retry_wait_ms = 0;
+    first.commit_max_retry_wait_ms = 0;
+    let mut second = TableCommit::new(table, "writer-b".into());
+    second.snapshot_commit = publisher;
+    second.commit_min_retry_wait_ms = 0;
+    second.commit_max_retry_wait_ms = 0;
+    let mut a = append_message("a.parquet");
+    let mut b = append_message("b.parquet");
+    a.new_files[0].file_source = Some(0);
+    b.new_files[0].file_source = Some(0);
+    let (a, b) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::join!(
+            first.commit_with_identifier(vec![a], 7),
+            second.commit_with_identifier(vec![b], 7)
+        )
+    })
+    .await
+    .expect("concurrent commits must complete");
+    a.unwrap();
+    b.unwrap();
+    let latest = latest_snapshot(&io, path).await.unwrap();
+    assert_eq!(latest.id(), 2);
+    assert_eq!(latest.total_record_count(), Some(20));
+    assert_eq!(latest.next_row_id(), Some(20));
+    let mut entries = active_entries(&io, path, &latest).await;
+    entries.sort_by_key(|entry| entry.file().first_row_id);
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].file().first_row_id, Some(0));
+    assert_eq!(entries[1].file().first_row_id, Some(10));
+    assert_eq!(entries[0].file().row_count, 10);
+    assert_eq!(entries[1].file().row_count, 10);
+    let mut names = entries
+        .iter()
+        .map(|entry| entry.file().file_name.as_str())
+        .collect::<Vec<_>>();
+    names.sort_unstable();
+    assert_eq!(names, ["a.parquet", "b.parquet"]);
+}
+
+#[tokio::test]
+async fn unsupported_publication_preserves_prepared_data() {
+    let op = opendal::Operator::from_config(opendal::services::MemoryConfig::default())
+        .unwrap()
+        .layer(opendal::layers::CapabilityOverrideLayer::new(|mut cap| {
+            cap.write_with_if_not_exists = false;
+            cap
+        }));
+    let io = FileIOBuilder::new("file")
+        .with_fs_operator(op)
+        .build()
+        .unwrap();
+    let path = "/unsupported-publication";
+    setup_dirs(&io, path).await;
+    let data_path = format!("{path}/bucket-0/data.parquet");
+    io.new_output(&data_path)
+        .unwrap()
+        .write(bytes::Bytes::from_static(b"prepared"))
+        .await
+        .unwrap();
+    let mut commit = setup_commit(&io, path);
+    commit.commit_max_retries = 0;
+    let error = commit
+        .commit(vec![append_message("data.parquet")])
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("cannot atomically publish"),
+        "{error}"
+    );
+    assert!(latest_snapshot(&io, path).await.is_none());
+    assert_eq!(
+        io.new_input(&data_path).unwrap().read().await.unwrap(),
+        "prepared"
+    );
+}
+
 #[tokio::test]
 async fn recovery_rejects_duplicate_file_after_identity_expiry() {
     let io = test_file_io();

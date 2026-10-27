@@ -35,6 +35,25 @@ impl FileIOProvider for FuseFileIO {
         self.fallback.create(path).await
     }
 
+    async fn write_atomic_if_not_exists(
+        &self,
+        path: &str,
+        bytes: Bytes,
+    ) -> crate::Result<Option<bool>> {
+        if let Some(relative) = self.relative_path(path) {
+            // Require the mount to implement no-replace publication. An
+            // unsupported hard link must never fall back to copy or rename.
+            FileIO::write_local_atomic_if_not_exists(path, &self.mounted, relative, bytes)
+                .await
+                .map(Some)
+        } else {
+            self.fallback
+                .write_atomic_if_not_exists(path, bytes)
+                .await
+                .map(Some)
+        }
+    }
+
     async fn create_with_cache_namespace(
         &self,
         path: &str,

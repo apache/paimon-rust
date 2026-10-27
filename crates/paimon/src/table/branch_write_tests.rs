@@ -24,14 +24,7 @@ use std::sync::Arc;
 
 async fn table(primary_key: bool, options: &[(&str, &str)]) -> (tempfile::TempDir, Table) {
     let dir = tempfile::tempdir().unwrap();
-    // Scope the real filesystem operator to this temporary directory. OpenDAL's
-    // default root "/" cannot list an absolute path on another Windows drive.
-    let mut config = opendal_service_fs::FsConfig::default();
-    config.root = Some(dir.path().to_str().unwrap().to_string());
-    let file_io = FileIOBuilder::new("file")
-        .with_fs_operator(opendal::Operator::from_config(config).unwrap())
-        .build()
-        .unwrap();
+    let file_io = FileIOBuilder::new("file").build().unwrap();
     let mut builder = Schema::builder()
         .column("id", DataType::Int(IntType::new()))
         .column("value", DataType::Int(IntType::new()));
@@ -44,7 +37,7 @@ async fn table(primary_key: bool, options: &[(&str, &str)]) -> (tempfile::TempDi
     let table = Table::new(
         file_io.clone(),
         Identifier::new("db", "t"),
-        "file:/db.db/t".into(),
+        dir.path().join("db.db/t").to_str().unwrap().into(),
         TableSchema::new(0, &builder.build().unwrap()),
         None,
     );

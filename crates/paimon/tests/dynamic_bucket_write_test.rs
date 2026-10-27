@@ -231,6 +231,20 @@ async fn failed_later_prepare_preserves_returned_and_committed_files() {
         );
         setup_dirs(&io, path).await;
         let builder = table.new_write_builder();
+        // Inject HASH failures only during preparation. Publish the resulting
+        // messages through the built-in filesystem's atomic snapshot primitive.
+        let commit_table = Table::new(
+            FileIOBuilder::new("file").build().unwrap(),
+            table.identifier().clone(),
+            path.into(),
+            table.schema().clone(),
+            None,
+        );
+        let committer = commit_table
+            .new_write_builder()
+            .with_commit_user(builder.commit_user())
+            .unwrap()
+            .new_commit();
         let mut writer = builder.new_write().unwrap();
         writer
             .write_arrow_batch(&make_batch(vec![1], vec![10]))
@@ -247,7 +261,7 @@ async fn failed_later_prepare_preserves_returned_and_committed_files() {
             .collect::<std::collections::HashSet<_>>();
         assert!(!returned.is_empty());
         if publish_first {
-            builder.new_commit().commit(messages.clone()).await.unwrap();
+            committer.commit(messages.clone()).await.unwrap();
         }
         writer
             .write_arrow_batch(&make_batch(vec![2], vec![20]))
@@ -274,7 +288,7 @@ async fn failed_later_prepare_preserves_returned_and_committed_files() {
             );
         }
         if !publish_first {
-            builder.new_commit().commit(messages).await.unwrap();
+            committer.commit(messages).await.unwrap();
         }
         let snapshot = table
             .snapshot_manager()

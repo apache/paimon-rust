@@ -218,6 +218,24 @@ knows those messages are uncommitted and will never be submitted. Never call it
 when the Paimon Table commit outcome is unknown: publication can succeed even when
 its response fails.
 
+Snapshot publication never replaces an existing snapshot. The built-in local
+filesystem stages a complete file before publishing it without replacement;
+memory and supported object stores use conditional creation. A publication
+conflict rebases the commit on the latest snapshot and retries. Backends without
+atomic publication of a complete file must use a catalog-provided `SnapshotCommit`
+with concurrency control; filesystem commits on those backends return an
+unsupported I/O error. This includes COS conditional writes, which do not reliably
+prevent overwrites on buckets that have ever enabled versioning, and position
+writers such as ADLS and custom filesystem operators without conditional rename.
+OSS conditional publication assumes the bucket uses its default versioning
+configuration and has never enabled versioning.
+Application storage providers can implement `FileIOProvider::write_atomic_if_not_exists`
+to supply their own atomic publication primitive. FUSE routes use local staged
+publication and require the mount to support publishing without replacement.
+Storage failures never fall back to an unconditional snapshot write.
+All concurrent writers, including writers from other engines, must use compatible
+concurrency control.
+
 Format Tables follow Java's two-phase publication: validation failures discard
 staging only; append publication or partition-registration failures roll back new
 targets; overwrite failures retain replacement targets after old data is removed.

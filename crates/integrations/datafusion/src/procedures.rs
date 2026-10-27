@@ -823,6 +823,30 @@ async fn clean_larger_than(
     Ok(())
 }
 
+async fn rollback_to_snapshot(
+    sm: &SnapshotManager,
+    tm: &TagManager,
+    snapshot: &Snapshot,
+) -> DFResult<()> {
+    let id = snapshot.id();
+    // Restore expired tagged snapshots before removing any newer history. A
+    // backend may reject publication, in which case rollback must not delete it.
+    if !sm
+        .file_io()
+        .exists(&sm.snapshot_path(id))
+        .await
+        .map_err(to_datafusion_error)?
+    {
+        sm.commit_snapshot(snapshot)
+            .await
+            .map_err(to_datafusion_error)?;
+        sm.write_earliest_hint(id)
+            .await
+            .map_err(to_datafusion_error)?;
+    }
+    clean_larger_than(sm, tm, id).await
+}
+
 async fn proc_rollback_to(
     ctx: &SessionContext,
     catalog: &Arc<dyn Catalog>,
@@ -869,41 +893,14 @@ async fn proc_rollback_to(
                 .parse()
                 .map_err(|_| DataFusionError::Plan(format!("Invalid snapshot_id: '{id_str}'")))?;
             let snapshot = resolve_snapshot_by_id(&sm, &tm, id).await?;
-            clean_larger_than(&sm, &tm, id).await?;
-            if !sm
-                .file_io()
-                .exists(&sm.snapshot_path(id))
-                .await
-                .map_err(to_datafusion_error)?
-            {
-                sm.commit_snapshot(&snapshot)
-                    .await
-                    .map_err(to_datafusion_error)?;
-                sm.write_earliest_hint(id)
-                    .await
-                    .map_err(to_datafusion_error)?;
-            }
+            rollback_to_snapshot(&sm, &tm, &snapshot).await?;
         } else if let Some(tag_name) = args.get("tag") {
             let snapshot = tm
                 .get(tag_name)
                 .await
                 .map_err(to_datafusion_error)?
                 .ok_or_else(|| DataFusionError::Plan(format!("Tag '{tag_name}' does not exist")))?;
-            let snapshot_id = snapshot.id();
-            clean_larger_than(&sm, &tm, snapshot_id).await?;
-            if !sm
-                .file_io()
-                .exists(&sm.snapshot_path(snapshot_id))
-                .await
-                .map_err(to_datafusion_error)?
-            {
-                sm.commit_snapshot(&snapshot)
-                    .await
-                    .map_err(to_datafusion_error)?;
-                sm.write_earliest_hint(snapshot_id)
-                    .await
-                    .map_err(to_datafusion_error)?;
-            }
+            rollback_to_snapshot(&sm, &tm, &snapshot).await?;
         } else {
             return Err(DataFusionError::Plan(
                 "rollback_to requires either 'snapshot_id' or 'tag' argument".to_string(),
@@ -1953,6 +1950,91 @@ mod tests {
         let (_, sm, tm) = setup("memory:/test_resolve_none").await;
         let result = resolve_snapshot_by_id(&sm, &tm, 99).await;
         assert!(result.is_err());
+    }
+
+    #[derive(Debug)]
+    struct RejectSnapshotPublication(opendal::Operator);
+
+    #[async_trait::async_trait]
+    impl paimon::io::FileIOProvider for RejectSnapshotPublication {
+        async fn create(&self, path: &str) -> paimon::Result<(opendal::Operator, String)> {
+            Ok((
+                self.0.clone(),
+                path.strip_prefix("memory:/").unwrap().into(),
+            ))
+        }
+
+        async fn write_atomic_if_not_exists(
+            &self,
+            _path: &str,
+            _bytes: bytes::Bytes,
+        ) -> paimon::Result<Option<bool>> {
+            Err(paimon::Error::IoUnsupported {
+                message: "snapshot publication unavailable".into(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_rollback_publication_failure_preserves_history() {
+        let op = opendal::Operator::new(opendal::services::Memory::default()).unwrap();
+        let file_io = FileIOBuilder::new("memory")
+            .with_provider(Arc::new(RejectSnapshotPublication(op)))
+            .build()
+            .unwrap();
+        let path = "memory:/rollback_failure";
+        let sm = SnapshotManager::new(file_io.clone(), path.into());
+        let tm = TagManager::new(file_io.clone(), path.into());
+        // Snapshot 1 has expired, but a tag still retains it. Seed the newer
+        // history through ordinary writes on a backend rejecting publication.
+        for id in [2, 3] {
+            file_io
+                .new_output(&sm.snapshot_path(id))
+                .unwrap()
+                .write(
+                    serde_json::to_vec(&test_snapshot(id, id as u64 * 1000))
+                        .unwrap()
+                        .into(),
+                )
+                .await
+                .unwrap();
+        }
+        sm.write_latest_hint(3).await.unwrap();
+        tm.create("v1", &test_snapshot(1, 1000)).await.unwrap();
+        tm.create("v3", &test_snapshot(3, 3000)).await.unwrap();
+        let target = resolve_snapshot_by_id(&sm, &tm, 1).await.unwrap();
+
+        let error = rollback_to_snapshot(&sm, &tm, &target).await.unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("snapshot publication unavailable"));
+        assert_eq!(sm.list_all_ids().await.unwrap(), vec![2, 3]);
+        assert_eq!(sm.get_latest_snapshot_id().await.unwrap(), Some(3));
+        assert!(tm.tag_exists("v1").await.unwrap());
+        assert!(tm.tag_exists("v3").await.unwrap());
+        assert!(!file_io.exists(&sm.snapshot_path(1)).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_rollback_restores_expired_snapshot_before_cleaning_history() {
+        let (_, sm, tm) = setup("memory:/rollback_expired").await;
+        for id in [2, 3] {
+            sm.commit_snapshot(&test_snapshot(id, id as u64 * 1000))
+                .await
+                .unwrap();
+        }
+        let target = test_snapshot(1, 1000);
+        tm.create("v1", &target).await.unwrap();
+        tm.create("v3", &test_snapshot(3, 3000)).await.unwrap();
+
+        rollback_to_snapshot(&sm, &tm, &target).await.unwrap();
+
+        assert_eq!(sm.get_snapshot(1).await.unwrap(), target);
+        assert_eq!(sm.list_all_ids().await.unwrap(), vec![1]);
+        assert_eq!(sm.get_latest_snapshot_id().await.unwrap(), Some(1));
+        assert_eq!(sm.earliest_snapshot_id().await.unwrap(), Some(1));
+        assert!(tm.tag_exists("v1").await.unwrap());
+        assert!(!tm.tag_exists("v3").await.unwrap());
     }
 
     #[tokio::test]
