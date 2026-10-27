@@ -36,7 +36,6 @@ pub mod ftindex;
 #[cfg(feature = "fulltext")]
 pub mod full_text;
 pub mod io;
-pub mod lumina;
 mod predicate_stats;
 pub mod resource;
 pub mod spec;

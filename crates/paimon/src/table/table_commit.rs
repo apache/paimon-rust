@@ -4097,7 +4097,7 @@ mod tests {
         row_range_end: i64,
     ) -> IndexFileMeta {
         IndexFileMeta {
-            index_type: "lumina".to_string(),
+            index_type: "diskann".to_string(),
             file_name: name.to_string(),
             file_size: 128,
             row_count: (row_range_end - row_range_start + 1),
@@ -4965,7 +4965,7 @@ mod tests {
             .unwrap();
 
         let mut message = CommitMessage::new(vec![], 0, vec![]);
-        message.new_index_files = vec![test_global_index_file("lumina-0.index", 0, 0, 9)];
+        message.new_index_files = vec![test_global_index_file("diskann-0.index", 0, 0, 9)];
         commit
             .commit_if_latest_snapshot(vec![message], 1)
             .await
@@ -4985,7 +4985,7 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(index_entries.len(), 1);
-        assert_eq!(index_entries[0].index_file.file_name, "lumina-0.index");
+        assert_eq!(index_entries[0].index_file.file_name, "diskann-0.index");
     }
 
     #[tokio::test]
@@ -5002,7 +5002,7 @@ mod tests {
             .await
             .unwrap();
 
-        let index_path = format!("{table_path}/index/lumina-0.index");
+        let index_path = format!("{table_path}/index/diskann-0.index");
         file_io
             .mkdirs(&format!("{table_path}/index/"))
             .await
@@ -5014,7 +5014,7 @@ mod tests {
             .await
             .unwrap();
         let mut message = CommitMessage::new(vec![], 0, vec![]);
-        message.new_index_files = vec![test_global_index_file("lumina-0.index", 0, 0, 9)];
+        message.new_index_files = vec![test_global_index_file("diskann-0.index", 0, 0, 9)];
         let result = commit.commit_if_latest_snapshot(vec![message], 0).await;
 
         assert!(result.is_err());
@@ -5085,11 +5085,11 @@ mod tests {
 
         let commit = setup_commit(&file_io, table_path);
         let mut first = CommitMessage::new(vec![], 0, vec![]);
-        first.new_index_files = vec![test_global_index_file("lumina-0.index", 0, 0, 9)];
+        first.new_index_files = vec![test_global_index_file("diskann-0.index", 0, 0, 9)];
         commit.commit(vec![first]).await.unwrap();
 
         let mut second = CommitMessage::new(vec![], 0, vec![]);
-        second.new_index_files = vec![test_global_index_file("lumina-1.index", 0, 5, 14)];
+        second.new_index_files = vec![test_global_index_file("diskann-1.index", 0, 5, 14)];
 
         let result = commit.commit(vec![second]).await;
         assert!(result.is_err());
@@ -5109,8 +5109,8 @@ mod tests {
         let commit = setup_commit(&file_io, table_path);
         let mut message = CommitMessage::new(vec![], 0, vec![]);
         message.new_index_files = vec![
-            test_global_index_file("lumina-0.index", 0, 0, 9),
-            test_global_index_file("lumina-1.index", 0, 5, 14),
+            test_global_index_file("diskann-0.index", 0, 0, 9),
+            test_global_index_file("diskann-1.index", 0, 5, 14),
         ];
 
         let result = commit.commit(vec![message]).await;
@@ -5130,11 +5130,11 @@ mod tests {
 
         let commit = setup_commit(&file_io, table_path);
         let mut first = CommitMessage::new(vec![], 0, vec![]);
-        first.new_index_files = vec![test_global_index_file("lumina-0.index", 0, 0, 9)];
+        first.new_index_files = vec![test_global_index_file("diskann-0.index", 0, 0, 9)];
         commit.commit(vec![first]).await.unwrap();
 
         let mut second = CommitMessage::new(vec![], 0, vec![]);
-        second.new_index_files = vec![test_global_index_file("lumina-1.index", 0, 10, 19)];
+        second.new_index_files = vec![test_global_index_file("diskann-1.index", 0, 10, 19)];
         commit.commit(vec![second]).await.unwrap();
 
         let snap_manager = SnapshotManager::new(file_io.clone(), table_path.to_string());
@@ -5160,12 +5160,12 @@ mod tests {
     #[test]
     fn test_global_index_overlap_allows_different_index_type() {
         // Same field id (0) and overlapping row ranges, but the retained entry is
-        // a `lumina` index and the added one is `btree`: distinct identities that
+        // a `diskann` index and the added one is `btree`: distinct identities that
         // must coexist rather than trip the overlap guard.
-        let lumina = test_global_index_file("lumina-0.index", 0, 0, 9);
+        let diskann = test_global_index_file("diskann-0.index", 0, 0, 9);
         let mut btree = test_global_index_file("btree-0.index", 0, 5, 14);
         btree.index_type = "btree".to_string();
-        let retained = vec![add_index_entry(lumina)];
+        let retained = vec![add_index_entry(diskann)];
         let added = vec![add_index_entry(btree)];
         TableCommit::validate_global_index_overlap(&retained, &added)
             .expect("different index types on the same field must coexist");
@@ -5176,14 +5176,14 @@ mod tests {
         // Same index type and field id, overlapping ranges, but different
         // `extra_field_ids` -> distinct identities, must coexist.
         let retained = vec![add_index_entry(test_global_index_file_with_extra_fields(
-            "lumina-0.index",
+            "diskann-0.index",
             0,
             vec![1],
             0,
             9,
         ))];
         let added = vec![add_index_entry(test_global_index_file_with_extra_fields(
-            "lumina-1.index",
+            "diskann-1.index",
             0,
             vec![2],
             5,
@@ -5198,13 +5198,13 @@ mod tests {
         // Identical identity (same type + field + extra) with overlapping ranges
         // must still be rejected.
         let retained = vec![add_index_entry(test_global_index_file(
-            "lumina-0.index",
+            "diskann-0.index",
             0,
             0,
             9,
         ))];
         let added = vec![add_index_entry(test_global_index_file(
-            "lumina-1.index",
+            "diskann-1.index",
             0,
             5,
             14,
@@ -5221,12 +5221,12 @@ mod tests {
     #[test]
     fn test_added_global_index_overlap_allows_different_index_type() {
         // Two entries added within the same commit: same field id (0) and
-        // overlapping row ranges, but distinct index types (`lumina` vs `btree`).
+        // overlapping row ranges, but distinct index types (`diskann` vs `btree`).
         // These are distinct global-index identities that must coexist.
-        let lumina = test_global_index_file("lumina-0.index", 0, 0, 9);
+        let diskann = test_global_index_file("diskann-0.index", 0, 0, 9);
         let mut btree = test_global_index_file("btree-0.index", 0, 5, 14);
         btree.index_type = "btree".to_string();
-        let added = vec![add_index_entry(lumina), add_index_entry(btree)];
+        let added = vec![add_index_entry(diskann), add_index_entry(btree)];
         TableCommit::validate_added_global_index_overlap(&added)
             .expect("different index types on the same field must coexist within a commit");
     }
@@ -5238,14 +5238,14 @@ mod tests {
         // identities, must coexist.
         let added = vec![
             add_index_entry(test_global_index_file_with_extra_fields(
-                "lumina-0.index",
+                "diskann-0.index",
                 0,
                 vec![1],
                 0,
                 9,
             )),
             add_index_entry(test_global_index_file_with_extra_fields(
-                "lumina-1.index",
+                "diskann-1.index",
                 0,
                 vec![2],
                 5,
@@ -5261,8 +5261,8 @@ mod tests {
         // Two entries added within the same commit with identical identity
         // (same type + field + extra) and overlapping ranges must be rejected.
         let added = vec![
-            add_index_entry(test_global_index_file("lumina-0.index", 0, 0, 9)),
-            add_index_entry(test_global_index_file("lumina-1.index", 0, 5, 14)),
+            add_index_entry(test_global_index_file("diskann-0.index", 0, 0, 9)),
+            add_index_entry(test_global_index_file("diskann-1.index", 0, 5, 14)),
         ];
         let result = TableCommit::validate_added_global_index_overlap(&added);
         let err_msg = result.expect_err("same-identity overlap must be rejected");
@@ -5280,7 +5280,7 @@ mod tests {
         setup_dirs(&file_io, table_path).await;
 
         let commit = setup_commit(&file_io, table_path);
-        let index_file = test_global_index_file("lumina-0.index", 0, 0, 9);
+        let index_file = test_global_index_file("diskann-0.index", 0, 0, 9);
         let mut first = CommitMessage::new(vec![], 0, vec![]);
         first.new_index_files = vec![index_file.clone()];
         commit.commit(vec![first]).await.unwrap();
@@ -5306,7 +5306,7 @@ mod tests {
 
         let commit = setup_commit(&file_io, table_path);
         let mut first = CommitMessage::new(vec![], 0, vec![]);
-        first.new_index_files = vec![test_global_index_file("lumina-0.index", 0, 0, 9)];
+        first.new_index_files = vec![test_global_index_file("diskann-0.index", 0, 0, 9)];
         commit.commit(vec![first]).await.unwrap();
 
         commit
@@ -5328,7 +5328,7 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(index_entries.len(), 1);
-        assert_eq!(index_entries[0].index_file.file_name, "lumina-0.index");
+        assert_eq!(index_entries[0].index_file.file_name, "diskann-0.index");
     }
 
     #[tokio::test]
@@ -5491,7 +5491,7 @@ mod tests {
 
         let commit = setup_commit(&file_io, table_path);
         let mut first = CommitMessage::new(vec![], 0, vec![]);
-        first.new_index_files = vec![test_global_index_file("lumina-0.index", 0, 0, 9)];
+        first.new_index_files = vec![test_global_index_file("diskann-0.index", 0, 0, 9)];
         commit.commit(vec![first]).await.unwrap();
 
         let mut data_file = test_data_file("data-update-id.parquet", 10);
@@ -5528,7 +5528,7 @@ mod tests {
         let commit = TableCommit::new(table, "test-user".to_string());
 
         let mut first = CommitMessage::new(vec![], 0, vec![]);
-        first.new_index_files = vec![test_global_index_file("lumina-0.index", 0, 0, 9)];
+        first.new_index_files = vec![test_global_index_file("diskann-0.index", 0, 0, 9)];
         commit.commit(vec![first]).await.unwrap();
 
         let mut data_file = test_data_file("data-update-id.parquet", 10);
@@ -5554,7 +5554,7 @@ mod tests {
         let commit = setup_commit(&file_io, table_path);
         let mut first = CommitMessage::new(vec![], 0, vec![]);
         first.new_index_files = vec![test_global_index_file_with_extra_fields(
-            "lumina-id-name.index",
+            "diskann-id-name.index",
             0,
             vec![1],
             0,
@@ -5597,7 +5597,7 @@ mod tests {
 
         let mut first = CommitMessage::new(vec![], 0, vec![]);
         first.new_index_files = vec![test_global_index_file_with_extra_fields(
-            "lumina-id-name.index",
+            "diskann-id-name.index",
             0,
             vec![1],
             0,
@@ -5626,7 +5626,7 @@ mod tests {
 
         let commit = setup_commit(&file_io, table_path);
         let mut first = CommitMessage::new(vec![], 0, vec![]);
-        first.new_index_files = vec![test_global_index_file("lumina-0.index", 0, 0, 9)];
+        first.new_index_files = vec![test_global_index_file("diskann-0.index", 0, 0, 9)];
         commit.commit(vec![first]).await.unwrap();
 
         let mut data_file = test_data_file("data-update-name.parquet", 10);

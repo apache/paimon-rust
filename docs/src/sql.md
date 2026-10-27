@@ -1494,9 +1494,8 @@ CALL sys.create_global_index(
 );
 ```
 
-The vindex `diskann` index is separate from the Lumina index whose
-`lumina.index.type` is `diskann`. Use the `diskann.*` options below with
-`index_type => 'diskann'`; use `lumina.*` options only with a Lumina index.
+For vector search, we recommend vindex DiskANN. Select `index_type => 'diskann'`
+and configure it with the `diskann.*` options below.
 
 The `options` argument is a comma-separated `key=value` string. User options
 override table options. Use keys prefixed by the selected index type, or set
@@ -1596,7 +1595,7 @@ CALL sys.drop_global_index(
 ```
 
 `index_type` accepts every type the create procedures build: `btree`, `bitmap`,
-`multivalue`, `fm`, `full-text`, `lumina` (or `lumina-vector-ann`), and the vindex types
+`multivalue`, `fm`, `full-text`, and the vindex types
 `ivf-flat`, `ivf-pq`, `ivf-sq`, `ivf-rq`, and `diskann`. It defaults to `btree`, is
 case-insensitive and surrounding whitespace is ignored.
 
@@ -1622,36 +1621,6 @@ omitted argument performs the drop and returns `OK`. Other values are rejected.
 The preview uses the latest snapshot at the time of the call; concurrent changes
 can affect the number of files matched by a later drop. Reads retain the usual
 local-cache behavior. Partition filtering is not supported by this procedure.
-
-### create_lumina_index
-
-Build and commit a Lumina global vector index for a table column:
-
-```sql
-CALL sys.create_lumina_index(table => 'paimon.my_db.my_table', index_column => 'embedding');
-```
-
-The optional `index_type` argument selects the Lumina index identifier. It
-defaults to `lumina`, is case-insensitive and surrounding whitespace is ignored.
-Valid values are `lumina` and the legacy-compatible `lumina-vector-ann`.
-
-```sql
-CALL sys.create_lumina_index(
-  table => 'paimon.my_db.my_table',
-  index_column => 'embedding',
-  index_type => 'lumina'
-);
-```
-
-Optional Lumina builder settings can be supplied as comma-separated `key=value` pairs:
-
-```sql
-CALL sys.create_lumina_index(
-  table => 'paimon.my_db.my_table',
-  index_column => 'embedding',
-  options => 'lumina.index.dimension=128,lumina.encoding.type=pq'
-);
-```
 
 ### grant_permission
 
@@ -1905,9 +1874,9 @@ CROSS JOIN LATERAL vector_search(
 
 Paimon supports approximate nearest neighbor (ANN) vector search through global
 vector indexes. DataFusion can search vindex indexes created by
-`CALL sys.create_global_index` and Lumina indexes created by
-`CALL sys.create_lumina_index`. The `vector_search` table-valued function is
-registered as a UDTF on the DataFusion session context.
+`CALL sys.create_global_index`. We recommend vindex DiskANN
+(`index_type => 'diskann'`). The `vector_search` table-valued function is registered
+as a UDTF on the DataFusion session context.
 
 ### Registration
 
@@ -2129,22 +2098,6 @@ These `SET`/`RESET` values are provided by Paimon's `SQLContext`; registering
 that dynamic-option path. Rust callers can pass the same unprefixed keys, such
 as `diskann.l_search`, through `VectorSearchBuilder::with_options` or
 `BatchVectorSearchBuilder::with_options`.
-
-### Lumina Index Options
-
-Lumina index behavior is configured via table options prefixed with `lumina.`:
-
-| Option | Description |
-|---|---|
-| `lumina.index.dimension` | Vector dimension |
-| `lumina.distance.metric` | Distance metric (`inner_product`, `cosine`, `l2`) |
-| `lumina.index.type` | Index type (default: `diskann`) |
-| `lumina.encoding.type` | Encoding type (default: `pq`) |
-| `lumina.search.max-filter-bytes` | Maximum memory used by each active Lumina reader to expand a filtered row-id set (default: `64 MiB`, or 8,388,608 row ids). Queries exceeding it fail with an error; increase it explicitly as a table or vector-search option for unusually large index segments. This Rust-side safety option is not passed to the native Lumina library. |
-
-### Lumina Environment
-
-The Lumina native library must be available at runtime. Set the `LUMINA_LIB_PATH` environment variable to the path of the shared library, or place it in the platform default location.
 
 ## Hybrid Search
 
@@ -2754,7 +2707,7 @@ Columns:
 |---|---|---|
 | `partition` | STRING | Partition spec for the indexed data, formatted as a Java row cast string; `{}` for unpartitioned tables |
 | `bucket` | INT | Bucket id covered by the index file |
-| `index_type` | STRING | Index type, such as `btree`, `bitmap`, `multivalue`, `fm`, `ivf-flat`, `lumina`, or `DELETION_VECTORS` |
+| `index_type` | STRING | Index type, such as `btree`, `bitmap`, `multivalue`, `fm`, `ivf-flat`, `diskann`, or `DELETION_VECTORS` |
 | `file_name` | STRING | Index file name. It resolves to the table `index/` directory, or to the bucket's data-file directory when `index-file-in-data-file-dir` is set; an index file with an external path is read from that path instead |
 | `file_size` | BIGINT | Index file size in bytes |
 | `row_count` | BIGINT | Number of rows covered by the index file |
