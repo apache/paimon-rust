@@ -902,7 +902,10 @@ impl FormatFileReader for ParquetFormatReader {
             Some(fp) => (&fp.predicates, &fp.file_fields),
             None => (&empty_predicates, &[]),
         };
-        let row_filter_factory = predicates.and_then(|fp| fp.row_filter_factory.as_deref());
+        let row_filter_factory = predicates.and_then(|fp| fp.row_filter_factory.clone());
+        let runtime_pruning = row_filter_factory
+            .as_ref()
+            .is_some_and(|factory| factory.supports_row_group_pruning());
 
         // Predicates need both indexes for page-stat pruning. Row selection only
         // needs OffsetIndex so arrow-rs can avoid fetching unselected pages.
@@ -979,7 +982,7 @@ impl FormatFileReader for ParquetFormatReader {
             .map(ParquetRowFilter::into_predicates)
             .unwrap_or_default();
 
-        if let Some(factory) = row_filter_factory {
+        if let Some(factory) = row_filter_factory.as_deref() {
             let file_schema = batch_stream_builder.schema();
             match factory.create(RowFilterContext { file_schema }) {
                 Ok(filters) => {
@@ -1039,14 +1042,15 @@ impl FormatFileReader for ParquetFormatReader {
         // Resource-aware sequential reads build one row-group stream at a time,
         // so admission precedes its data I/O. Preserve stateful decoder filters
         // across those streams instead of recreating the engine's factory.
-        let shared_filters = if self.read_budget.as_ref().is_some_and(|b| b.has_resources()) {
-            std::mem::take(&mut decoder_predicates)
-                .into_iter()
-                .map(SharedParquetPredicate::new)
-                .collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
+        let shared_filters =
+            if runtime_pruning || self.read_budget.as_ref().is_some_and(|b| b.has_resources()) {
+                std::mem::take(&mut decoder_predicates)
+                    .into_iter()
+                    .map(SharedParquetPredicate::new)
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
         if !decoder_predicates.is_empty() {
             batch_stream_builder =
                 batch_stream_builder.with_row_filter(ParquetRowFilter::new(decoder_predicates));
@@ -1103,45 +1107,46 @@ impl FormatFileReader for ParquetFormatReader {
                     .min(batch_stream_builder.metadata().num_row_groups())
             })
             .unwrap_or(1);
-        let selected_row_groups = self
-            .read_budget
-            .as_ref()
-            .filter(|budget| {
+        let selected_row_groups = (runtime_pruning
+            || self.read_budget.as_ref().is_some_and(|budget| {
                 row_group_parallelism > 1 || budget.diagnostics_enabled() || budget.has_resources()
-            })
-            .map(|budget| {
-                let mut row_group_selection = combined_selection;
-                let selected_row_groups = batch_stream_builder
-                    .metadata()
-                    .row_groups()
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(row_group_index, row_group)| {
-                        let selection = row_group_selection
-                            .as_mut()
-                            .map(|selection| selection.split_off(row_group.num_rows() as usize));
-                        if selection
-                            .as_ref()
-                            .is_some_and(|selection| !selection.selects_any())
-                        {
-                            return None;
-                        }
-                        let projection = if budget.has_resources() {
-                            &memory_mask
-                        } else {
-                            &mask
-                        };
-                        let projected_bytes = projected_row_group_bytes(row_group, projection);
-                        Some((row_group_index, selection, projected_bytes))
-                    })
-                    .collect::<Vec<_>>();
-                let projected_bytes = selected_row_groups
-                    .iter()
-                    .map(|(_, _, projected_bytes)| *projected_bytes)
-                    .collect::<Vec<_>>();
+            }))
+        .then(|| {
+            let budget = self.read_budget.as_ref();
+            let mut row_group_selection = combined_selection;
+            let selected_row_groups = batch_stream_builder
+                .metadata()
+                .row_groups()
+                .iter()
+                .enumerate()
+                .filter_map(|(row_group_index, row_group)| {
+                    let selection = row_group_selection
+                        .as_mut()
+                        .map(|selection| selection.split_off(row_group.num_rows() as usize));
+                    if selection
+                        .as_ref()
+                        .is_some_and(|selection| !selection.selects_any())
+                    {
+                        return None;
+                    }
+                    let projection = if budget.is_some_and(|budget| budget.has_resources()) {
+                        &memory_mask
+                    } else {
+                        &mask
+                    };
+                    let projected_bytes = projected_row_group_bytes(row_group, projection);
+                    Some((row_group_index, selection, projected_bytes))
+                })
+                .collect::<Vec<_>>();
+            let projected_bytes = selected_row_groups
+                .iter()
+                .map(|(_, _, projected_bytes)| *projected_bytes)
+                .collect::<Vec<_>>();
+            if let Some(budget) = budget {
                 budget.record_projected_row_groups(&projected_bytes);
-                selected_row_groups
-            });
+            }
+            selected_row_groups
+        });
         if row_group_parallelism > 1 {
             let selected_row_groups =
                 selected_row_groups.expect("parallel row-group reads need a selection plan");
@@ -1241,8 +1246,12 @@ impl FormatFileReader for ParquetFormatReader {
             return Ok(stream.boxed());
         }
 
-        if let Some(budget) = self.read_budget.as_ref().filter(|b| b.has_resources()) {
-            let budget = Arc::clone(budget);
+        let budget = self
+            .read_budget
+            .as_ref()
+            .filter(|budget| budget.has_resources())
+            .cloned();
+        if budget.is_some() || runtime_pruning {
             let selected = selected_row_groups.expect("resource-aware reads need a selection plan");
             let metadata = ArrowReaderMetadata::try_new(
                 batch_stream_builder.metadata().clone(),
@@ -1253,12 +1262,38 @@ impl FormatFileReader for ParquetFormatReader {
                 row_filter_factory: None,
                 file_fields: file_fields.to_vec(),
             });
+            let runtime_fields = file_fields.to_vec();
+            let pruning_metadata = Arc::clone(batch_stream_builder.metadata());
+            let column_indices = pruning_metadata
+                .row_groups()
+                .first()
+                .map(|group| build_row_group_column_indices(group.columns(), &runtime_fields))
+                .unwrap_or_default();
+            let identity_mapping = (0..runtime_fields.len()).map(Some).collect::<Vec<_>>();
             return Ok(async_stream::try_stream! {
                 for (index, selection, estimated_bytes) in selected {
+                    // Refresh immediately before data I/O, never while building the
+                    // whole-file selection: a TopK threshold can tighten after a batch.
+                    if runtime_pruning {
+                        let factory = row_filter_factory.as_ref().expect("runtime pruning has a factory");
+                        let may_match = match factory.pruning_predicates(&runtime_fields) {
+                            Ok(predicates) => predicates_may_match_with_schema(
+                                &predicates,
+                                &ParquetRowGroupStats { row_group: pruning_metadata.row_group(index), column_indices: &column_indices },
+                                &identity_mapping,
+                                &runtime_fields,
+                            ),
+                            Err(error) => {
+                                log::warn!("failed to refresh runtime Parquet pruning: {error}");
+                                true
+                            }
+                        };
+                        if !may_match { continue; }
+                    }
                     // Foreground and merge reads only try memory admission. They
                     // never hold a shared scheduling slot while awaiting another
                     // merge input, nor wait for output buffers owned downstream.
-                    let _permit = budget.reserve_memory(estimated_bytes)?;
+                    let _permit = budget.as_ref().map(|budget| budget.reserve_memory(estimated_bytes)).transpose()?;
                     let mut stream = build_row_group_stream(
                         Arc::clone(&shared_reader), file_size, metadata.clone(), mask.clone(),
                         index, batch_size, selection, shared_filters.clone(),
@@ -7040,6 +7075,130 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(ids, vec![1, 2, 3, 4, 5]);
+    }
+
+    #[tokio::test]
+    async fn runtime_row_group_pruning_refreshes_before_io_and_falls_open() {
+        #[derive(Debug)]
+        struct ThresholdFactory {
+            threshold: Arc<AtomicUsize>,
+            calls: Arc<AtomicUsize>,
+            fail: bool,
+        }
+        impl crate::arrow::RowFilterFactory for ThresholdFactory {
+            fn create(
+                &self,
+                _: crate::arrow::RowFilterContext<'_>,
+            ) -> crate::Result<Vec<Box<dyn crate::arrow::RowFilter>>> {
+                Ok(vec![])
+            }
+            fn supports_row_group_pruning(&self) -> bool {
+                true
+            }
+            fn pruning_predicates(&self, fields: &[DataField]) -> crate::Result<Vec<Predicate>> {
+                self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+                if self.fail {
+                    return Err(Error::DataInvalid {
+                        message: "unavailable runtime threshold".into(),
+                        source: None,
+                    });
+                }
+                let limit = self.threshold.load(AtomicOrdering::SeqCst);
+                if limit == usize::MAX {
+                    return Ok(vec![]);
+                }
+                Ok(vec![PredicateBuilder::new(fields)
+                    .less_than("id", Datum::Int(limit as i32))
+                    .unwrap()])
+            }
+        }
+        for (resources, selected_ranges) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let mut read_bytes = Vec::new();
+            for (statistics, fail) in [
+                (EnabledStatistics::Chunk, false),
+                (EnabledStatistics::None, false),
+                (EnabledStatistics::Chunk, true),
+            ] {
+                let data =
+                    Bytes::from(write_multi_row_group_parquet(64, 512, statistics, true).await);
+                let tracker = TrackingFileRead::new(data.clone());
+                let threshold = Arc::new(AtomicUsize::new(usize::MAX));
+                let calls = Arc::new(AtomicUsize::new(0));
+                let fields = vec![
+                    residual_test_field(0, "id", DataType::Int(IntType::new())),
+                    residual_test_field(1, "value", DataType::Int(IntType::new())),
+                ];
+                let predicates = FilePredicates {
+                    predicates: vec![],
+                    file_fields: fields.clone(),
+                    row_filter_factory: Some(Arc::new(ThresholdFactory {
+                        threshold: Arc::clone(&threshold),
+                        calls: Arc::clone(&calls),
+                        fail,
+                    })),
+                };
+                let reader = if resources {
+                    ParquetFormatReader::with_read_budget(Arc::new(
+                        ReadBudget::default().with_resources(
+                            crate::resource::ResourceContext::builder()
+                                .memory_limit(1024 * 1024)
+                                .build()
+                                .unwrap(),
+                        ),
+                    ))
+                } else {
+                    ParquetFormatReader::default()
+                };
+                let mut stream = reader
+                    .read_batch_stream(
+                        Box::new(tracker.clone()),
+                        data.len() as u64,
+                        &fields,
+                        Some(&predicates),
+                        Some(64),
+                        selected_ranges
+                            .then(|| vec![RowRange::new(3, 68), RowRange::new(130, 260)]),
+                    )
+                    .await
+                    .unwrap();
+                tracker.reset();
+                let first = stream.next().await.unwrap().unwrap();
+                assert_eq!(first.num_rows(), if selected_ranges { 61 } else { 64 });
+                assert_eq!(
+                    first
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .unwrap()
+                        .value(first.num_rows() - 1),
+                    63
+                );
+                threshold.store(64, AtomicOrdering::SeqCst);
+                let rest = stream.try_collect::<Vec<_>>().await.unwrap();
+                let rows: usize = rest.iter().map(RecordBatch::num_rows).sum();
+                assert_eq!(
+                    rows,
+                    if statistics == EnabledStatistics::Chunk && !fail {
+                        0
+                    } else if selected_ranges {
+                        136
+                    } else {
+                        448
+                    }
+                );
+                assert_eq!(
+                    calls.load(AtomicOrdering::SeqCst),
+                    if selected_ranges { 5 } else { 8 }
+                );
+                read_bytes.push(tracker.bytes_read());
+            }
+            assert!(
+                read_bytes[0] < read_bytes[1],
+                "pruning must avoid data I/O: {read_bytes:?}"
+            );
+        }
     }
 
     #[tokio::test]
