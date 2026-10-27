@@ -53,15 +53,13 @@ def golden_warehouse(tmp_path_factory):
     )
     with tarfile.open(archive, "r:gz") as fixture:
         if hasattr(tarfile, "data_filter"):
-            fixture.extractall(warehouse, filter="data")
-        else:
-            # Earlier supported Python patches lack extraction filters.
-            members = fixture.getmembers()
-            for member in members:
-                target = (warehouse / member.name).resolve()
-                if not member.isfile() or not target.is_relative_to(warehouse):
-                    raise ValueError(f"Unexpected golden archive entry: {member.name}")
-            fixture.extractall(warehouse, members=members)
+            fixture.extraction_filter = tarfile.data_filter
+        members = fixture.getmembers()
+        for member in members:
+            target = (warehouse / member.name).resolve()
+            if not member.isfile() or not target.is_relative_to(warehouse):
+                raise ValueError(f"Unexpected golden archive entry: {member.name}")
+        fixture.extractall(warehouse, members=members)
     return str(warehouse)
 
 

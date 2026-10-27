@@ -1058,10 +1058,7 @@ async fn test_pk_dynamic_bucket_partitioned_insert_overwrite() {
 #[tokio::test]
 async fn test_read_golden_dynamic_bucket_and_compare_index() {
     // Read the Java-written table from the golden warehouse.
-    let warehouse = golden_warehouse::test_warehouse();
-    let mut opts = Options::new();
-    opts.set(CatalogOptions::WAREHOUSE, warehouse.path());
-    let golden_catalog = FileSystemCatalog::new(opts).unwrap();
+    let (_warehouse, golden_catalog) = golden_warehouse::test_catalog();
     let golden_table = golden_catalog
         .get_table(&Identifier::new("default", "dynamic_bucket_pk_table"))
         .await

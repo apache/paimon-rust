@@ -19,23 +19,33 @@
 
 use std::sync::{Arc, Mutex, Weak};
 
-pub struct TestWarehouse {
-    path: String,
-    _directory: Option<Arc<tempfile::TempDir>>,
+use paimon::{CatalogOptions, FileSystemCatalog, Options};
+
+pub enum TestWarehouse {
+    External(String),
+    Golden(Arc<tempfile::TempDir>),
 }
 
 impl TestWarehouse {
     pub fn path(&self) -> &str {
-        &self.path
+        match self {
+            Self::External(path) => path,
+            Self::Golden(directory) => directory.path().to_str().expect("UTF-8 warehouse path"),
+        }
     }
+}
+
+pub fn test_catalog() -> (TestWarehouse, FileSystemCatalog) {
+    let warehouse = test_warehouse();
+    let mut options = Options::new();
+    options.set(CatalogOptions::WAREHOUSE, warehouse.path());
+    let catalog = FileSystemCatalog::new(options).expect("Failed to create FileSystemCatalog");
+    (warehouse, catalog)
 }
 
 pub fn test_warehouse() -> TestWarehouse {
     if let Ok(path) = std::env::var("PAIMON_TEST_WAREHOUSE") {
-        return TestWarehouse {
-            path,
-            _directory: None,
-        };
+        return TestWarehouse::External(path);
     }
 
     static WAREHOUSE: Mutex<Weak<tempfile::TempDir>> = Mutex::new(Weak::new());
@@ -54,14 +64,7 @@ fn unpack_warehouse(cache: &Mutex<Weak<tempfile::TempDir>>) -> TestWarehouse {
         *cached = Arc::downgrade(&directory);
         directory
     });
-    TestWarehouse {
-        path: directory
-            .path()
-            .to_str()
-            .expect("UTF-8 warehouse path")
-            .to_string(),
-        _directory: Some(directory),
-    }
+    TestWarehouse::Golden(directory)
 }
 
 #[cfg(test)]

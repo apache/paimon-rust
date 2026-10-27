@@ -26,20 +26,16 @@ use paimon::api::ConfigResponse;
 use paimon::catalog::{Identifier, RESTCatalog};
 use paimon::common::Options;
 use paimon::spec::{DataType, IntType, Predicate, Schema, VarCharType};
-use paimon::{Catalog, CatalogOptions, Error, FileSystemCatalog, Plan, ScanStats};
+use paimon::{Catalog, Error, Plan, ScanStats};
 use std::collections::{HashMap, HashSet};
 
 #[path = "../../integrations/datafusion/testdata/warehouse/mod.rs"]
 mod golden_warehouse;
-use golden_warehouse::TestWarehouse;
+use golden_warehouse::{test_catalog as create_file_system_catalog, test_warehouse, TestWarehouse};
 
 #[path = "../../paimon/tests/mock_server.rs"]
 mod mock_server;
 use mock_server::start_mock_server;
-
-fn get_test_warehouse() -> TestWarehouse {
-    golden_warehouse::test_warehouse()
-}
 
 async fn scan_and_read<C: Catalog + ?Sized>(
     catalog: &C,
@@ -82,14 +78,6 @@ async fn get_table_from_catalog<C: Catalog + ?Sized>(
         .get_table(&identifier)
         .await
         .unwrap_or_else(|err| panic!("Failed to get golden table {table_name}: {err:?}"))
-}
-
-fn create_file_system_catalog() -> (TestWarehouse, FileSystemCatalog) {
-    let warehouse = get_test_warehouse();
-    let mut options = Options::new();
-    options.set(CatalogOptions::WAREHOUSE, warehouse.path());
-    let catalog = FileSystemCatalog::new(options).expect("Failed to create FileSystemCatalog");
-    (warehouse, catalog)
 }
 
 async fn scan_and_read_with_fs_catalog(
@@ -915,7 +903,7 @@ fn simple_log_schema() -> Schema {
 async fn setup_rest_catalog_with_tables(
     table_configs: &[(&str, &str, Schema)],
 ) -> (TestWarehouse, mock_server::RESTServer, RESTCatalog) {
-    let warehouse = get_test_warehouse();
+    let warehouse = test_warehouse();
     let catalog_path = warehouse.path().to_string();
     // Use a simple warehouse name (no slashes) to avoid URL-encoding issues
     let warehouse_name = "test_warehouse";

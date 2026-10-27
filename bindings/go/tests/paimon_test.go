@@ -126,9 +126,6 @@ func openCopiedTable(t *testing.T, tableName string) *paimon.Table {
 
 	warehouse := testWarehouse(t)
 	source := filepath.Join(warehouse, "default.db", tableName)
-	if _, err := os.Stat(source); os.IsNotExist(err) {
-		t.Fatalf("Missing golden table: %s", source)
-	}
 
 	targetWarehouse := t.TempDir()
 	target := filepath.Join(targetWarehouse, "default.db", tableName)
@@ -434,9 +431,6 @@ func TestWriteOverwriteUsesBuilderMode(t *testing.T) {
 func TestOverwriteRetrySameIdentifierIsIdempotent(t *testing.T) {
 	warehouse := testWarehouse(t)
 	source := filepath.Join(warehouse, "default.db", "simple_pk_table")
-	if _, err := os.Stat(source); os.IsNotExist(err) {
-		t.Fatalf("Missing golden table: %s", source)
-	}
 	targetWarehouse := t.TempDir()
 	target := filepath.Join(targetWarehouse, "default.db", "simple_pk_table")
 	if err := copyDirectory(source, target); err != nil {

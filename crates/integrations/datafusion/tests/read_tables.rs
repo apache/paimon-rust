@@ -22,7 +22,7 @@ mod common;
 
 #[path = "../testdata/warehouse/mod.rs"]
 mod golden_warehouse;
-use golden_warehouse::TestWarehouse;
+use golden_warehouse::{test_catalog as create_catalog, TestWarehouse};
 
 use common::string_value;
 use datafusion::arrow::array::{Array, Int32Array};
@@ -34,20 +34,8 @@ use datafusion::logical_expr::{col, lit, TableProviderFilterPushDown};
 use datafusion::physical_plan::{displayable, ExecutionPlan};
 use datafusion::prelude::SessionConfig;
 use paimon::catalog::Identifier;
-use paimon::{Catalog, CatalogOptions, FileSystemCatalog, Options};
+use paimon::Catalog;
 use paimon_datafusion::{PaimonCatalogProvider, PaimonTableProvider, SQLContext};
-
-fn get_test_warehouse() -> TestWarehouse {
-    golden_warehouse::test_warehouse()
-}
-
-fn create_catalog() -> (TestWarehouse, FileSystemCatalog) {
-    let warehouse = get_test_warehouse();
-    let mut options = Options::new();
-    options.set(CatalogOptions::WAREHOUSE, warehouse.path());
-    let catalog = FileSystemCatalog::new(options).expect("Failed to create catalog");
-    (warehouse, catalog)
-}
 
 async fn create_context() -> (TestWarehouse, SQLContext) {
     let (warehouse, catalog) = create_catalog();
@@ -60,15 +48,7 @@ async fn create_context() -> (TestWarehouse, SQLContext) {
 }
 
 async fn create_provider(table_name: &str) -> (TestWarehouse, PaimonTableProvider) {
-    let (warehouse, catalog) = create_catalog();
-    let identifier = Identifier::new("default", table_name);
-    let table = catalog
-        .get_table(&identifier)
-        .await
-        .expect("Failed to get table");
-
-    let provider = PaimonTableProvider::try_new(table).expect("Failed to create table provider");
-    (warehouse, provider)
+    create_provider_with_options(table_name, HashMap::new()).await
 }
 
 async fn create_provider_with_options(
@@ -783,20 +763,9 @@ async fn test_missing_database_returns_no_schema() {
 
 // ======================= Time Travel Tests =======================
 
-/// Helper: create a SQLContext with catalog + relation planner for time travel.
-async fn create_time_travel_context() -> (TestWarehouse, SQLContext) {
-    let (warehouse, catalog) = create_catalog();
-    let catalog: Arc<dyn Catalog> = Arc::new(catalog);
-    let mut ctx = SQLContext::new();
-    ctx.register_catalog("paimon", catalog)
-        .await
-        .expect("Failed to register catalog");
-    (warehouse, ctx)
-}
-
 #[tokio::test]
 async fn test_time_travel_by_snapshot_id() {
-    let (_warehouse, ctx) = create_time_travel_context().await;
+    let (_warehouse, ctx) = create_context().await;
 
     // Snapshot 1: should contain only the first insert (alice, bob)
     let batches = ctx
@@ -840,7 +809,7 @@ async fn test_time_travel_by_snapshot_id() {
 
 #[tokio::test]
 async fn test_time_travel_by_tag_name() {
-    let (_warehouse, ctx) = create_time_travel_context().await;
+    let (_warehouse, ctx) = create_context().await;
 
     // Tag 'snapshot1' points to snapshot 1: should contain only (alice, bob)
     let batches = ctx

@@ -565,8 +565,9 @@ mod tests {
     use datafusion::prelude::{SessionConfig, SessionContext};
     use paimon::catalog::Identifier;
     use paimon::spec::{ArrayType, MapType, RowType, VarCharType};
-    use paimon::{Catalog, CatalogOptions, DataSplit, FileSystemCatalog, Options};
+    use paimon::{Catalog, DataSplit};
 
+    use crate::golden_warehouse::{test_catalog as create_catalog, TestWarehouse};
     use crate::physical_plan::PaimonTableScan;
 
     #[test]
@@ -587,21 +588,7 @@ mod tests {
         assert_eq!(result, vec![vec![1, 2, 3]]);
     }
 
-    fn get_test_warehouse() -> crate::golden_warehouse::TestWarehouse {
-        crate::golden_warehouse::test_warehouse()
-    }
-
-    fn create_catalog() -> (crate::golden_warehouse::TestWarehouse, FileSystemCatalog) {
-        let warehouse = get_test_warehouse();
-        let mut options = Options::new();
-        options.set(CatalogOptions::WAREHOUSE, warehouse.path());
-        let catalog = FileSystemCatalog::new(options).expect("Failed to create catalog");
-        (warehouse, catalog)
-    }
-
-    async fn create_provider(
-        table_name: &str,
-    ) -> (crate::golden_warehouse::TestWarehouse, PaimonTableProvider) {
+    async fn create_provider(table_name: &str) -> (TestWarehouse, PaimonTableProvider) {
         let (warehouse, catalog) = create_catalog();
         let identifier = Identifier::new("default", table_name);
         let table = catalog
