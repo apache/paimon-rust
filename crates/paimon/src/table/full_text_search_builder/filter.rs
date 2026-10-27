@@ -192,8 +192,9 @@ pub(super) async fn matching_indexed_rows(
             None => None,
         };
         match answer {
-            Some((answer, exact)) => {
+            Some((answer, exact, candidate_ranges)) => {
                 let candidates = row_ids(&answer)? & &decided;
+                let exact = exact && (row_ids(&candidate_ranges)? & &candidates).is_empty();
                 if exact {
                     matched |= if core.data_evolution_enabled() {
                         candidates

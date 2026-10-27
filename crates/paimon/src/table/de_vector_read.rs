@@ -639,11 +639,14 @@ async fn scalar_matched_row_ids(
     let Some(scanner) = scanner else {
         return Ok(None);
     };
-    let Some((ranges, exact)) = scanner.matching_ranges_with_exactness(filter).await? else {
+    let Some((ranges, exact, candidate_ranges)) =
+        scanner.matching_ranges_with_exactness(filter).await?
+    else {
         return Ok(None);
     };
     let ranges = intersect_sorted_ranges(&ranges, vector_ranges);
-    if exact {
+    // Candidates outside the rows this search ranks do not make it inexact.
+    if exact && intersect_sorted_ranges(&candidate_ranges, &ranges).is_empty() {
         let mut row_ids = RoaringTreemap::new();
         for range in ranges {
             let start = u64::try_from(range.from()).map_err(|_| crate::Error::DataInvalid {

@@ -1142,6 +1142,134 @@ async fn pruned_null_bitmap_keeps_btree_answer_exact() {
 }
 
 #[tokio::test]
+async fn bitmap_outside_vector_index_keeps_btree_answer_exact() {
+    // Partition id=0 has BTree(f) and IVF; partition id=1 has only a bitmap on
+    // f. The bitmap's candidate row 1 is outside the rows the vector index
+    // ranks, so it must not turn the exact BTree hit on row 0 into a candidate.
+    use crate::spec::{ArrayType, DataType, DoubleType, FloatType, IntType};
+    use arrow_array::types::Float32Type;
+    use arrow_array::{Float64Array, ListArray};
+
+    let schema = crate::spec::Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .column("f", DataType::Double(DoubleType::new()))
+        .column(
+            "embedding",
+            DataType::Array(ArrayType::new(DataType::Float(FloatType::new()))),
+        )
+        .partition_keys(["id"])
+        .options(HashMap::from([
+            ("bucket".into(), "-1".into()),
+            ("row-tracking.enabled".into(), "true".into()),
+            ("data-evolution.enabled".into(), "true".into()),
+            ("global-index.enabled".into(), "true".into()),
+        ]))
+        .build()
+        .unwrap();
+    let table = Table::new(
+        crate::io::FileIOBuilder::new("memory").build().unwrap(),
+        crate::catalog::Identifier::new("default", "bitmap_outside_vector"),
+        format!("memory:/bitmap-outside-vector-{}", uuid::Uuid::new_v4()),
+        crate::spec::TableSchema::new(0, &schema),
+        None,
+    );
+    let write = |id: i32, f: f64| {
+        let table = table.clone();
+        async move {
+            let columns: Vec<ArrayRef> = vec![
+                Arc::new(Int32Array::from(vec![id])),
+                Arc::new(Float64Array::from(vec![f])),
+                Arc::new(ListArray::from_iter_primitive::<Float32Type, _, _>(vec![
+                    Some(vec![Some(1.0f32), Some(0.0)]),
+                ])),
+            ];
+            let arrow_schema = Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("id", ArrowDataType::Int32, true),
+                ArrowField::new("f", ArrowDataType::Float64, true),
+                ArrowField::new("embedding", columns[2].data_type().clone(), true),
+            ]));
+            let mut writer = TableWrite::new(&table, "test".to_string()).unwrap();
+            writer
+                .write_arrow_batch(&RecordBatch::try_new(arrow_schema, columns).unwrap())
+                .await
+                .unwrap();
+            TableCommit::new(table.clone(), "test".to_string())
+                .commit(writer.prepare_commit().await.unwrap())
+                .await
+                .unwrap();
+        }
+    };
+    write(0, 2.0).await;
+    let mut builder = table.new_global_index_build_builder();
+    builder.with_index_type("btree").with_index_column("f");
+    builder.execute().await.unwrap();
+    let mut builder = table.new_global_index_build_builder();
+    builder
+        .with_index_type("ivf-flat")
+        .with_index_column("embedding")
+        .with_options(HashMap::from([
+            ("ivf-flat.dimension".into(), "2".into()),
+            ("ivf-flat.nlist".into(), "1".into()),
+            ("ivf-flat.distance.metric".into(), "l2".into()),
+        ]));
+    builder.execute().await.unwrap();
+    write(1, 0.0).await;
+    let pb = crate::spec::PredicateBuilder::new(table.schema().fields());
+    let mut builder = table.new_global_index_build_builder();
+    builder
+        .with_index_type("bitmap")
+        .with_index_column("f")
+        .with_partition_filter(pb.equal("id", crate::spec::Datum::Int(1)).unwrap())
+        .unwrap();
+    builder.execute().await.unwrap();
+
+    for mode in ["fast", "full", "detail"] {
+        for refine in [false, true] {
+            let table = table.copy_with_options(HashMap::from([
+                ("vector-index.search-mode".to_string(), mode.to_string()),
+                (
+                    "global-index.filter.refine-from-data".to_string(),
+                    refine.to_string(),
+                ),
+            ]));
+            let batches: Vec<RecordBatch> = table
+                .new_vector_search_builder()
+                .with_vector_column("embedding")
+                .with_query_vector(vec![1.0, 0.0])
+                .with_limit(1)
+                .with_filter(
+                    pb.greater_than("f", crate::spec::Datum::Double(1.5))
+                        .unwrap(),
+                )
+                .execute()
+                .await
+                .unwrap()
+                .new_read_builder()
+                .read()
+                .await
+                .unwrap()
+                .try_collect()
+                .await
+                .unwrap();
+            let ids: Vec<i32> = batches
+                .iter()
+                .flat_map(|batch| {
+                    batch
+                        .column_by_name("id")
+                        .unwrap()
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .unwrap()
+                        .values()
+                        .to_vec()
+                })
+                .collect();
+            assert_eq!(ids, vec![0], "{mode}, refine={refine}");
+        }
+    }
+}
+
+#[tokio::test]
 async fn bitmap_with_empty_posting_keeps_btree_answer_exact() {
     // The bitmap shard holds f = [1, 3], so its metadata cannot prune `f = 2`,
     // but its posting for 2 is empty. Only the BTree answers, exactly.

@@ -4026,12 +4026,13 @@ async fn scalar_exactness_keeps_string_candidates_and_dropped_conjuncts_inexact(
     let exact = builder
         .less_than("name", Datum::String("zz".to_string()))
         .unwrap();
-    let (ranges, is_exact) = scanner
+    let (ranges, is_exact, candidates) = scanner
         .matching_ranges_with_exactness(&exact)
         .await
         .unwrap()
         .unwrap();
     assert_eq!(ranges, vec![RowRange::new(100, 109)]);
+    assert!(candidates.is_empty());
     assert!(is_exact);
     for candidate in [
         builder
@@ -4049,12 +4050,13 @@ async fn scalar_exactness_keeps_string_candidates_and_dropped_conjuncts_inexact(
         Predicate::Not(Box::new(exact.clone())),
     ] {
         let filter = Predicate::and(vec![exact.clone(), candidate]);
-        let (ranges, is_exact) = scanner
+        let (ranges, is_exact, candidates) = scanner
             .matching_ranges_with_exactness(&filter)
             .await
             .unwrap()
             .unwrap();
         assert_eq!(ranges, vec![RowRange::new(100, 109)]);
+        assert!(candidates.is_empty());
         assert!(!is_exact, "{filter:?}");
     }
 }
@@ -4096,12 +4098,13 @@ async fn scalar_exactness_detects_unsupported_conjunct_on_same_fm_field() {
         .unwrap();
     let builder = crate::spec::PredicateBuilder::new(&fields);
     let is_null = builder.is_null("name").unwrap();
-    let (ranges, exact) = scanner
+    let (ranges, exact, candidates) = scanner
         .matching_ranges_with_exactness(&is_null)
         .await
         .unwrap()
         .unwrap();
     assert_eq!(ranges, vec![RowRange::new(0, 0)]);
+    assert!(candidates.is_empty());
     assert!(exact);
     let filter = Predicate::and(vec![
         is_null,
@@ -4109,12 +4112,13 @@ async fn scalar_exactness_detects_unsupported_conjunct_on_same_fm_field() {
             .starts_with("name", Datum::String("a".to_string()))
             .unwrap(),
     ]);
-    let (ranges, exact) = scanner
+    let (ranges, exact, candidates) = scanner
         .matching_ranges_with_exactness(&filter)
         .await
         .unwrap()
         .unwrap();
     assert_eq!(ranges, vec![RowRange::new(0, 0)]);
+    assert!(candidates.is_empty());
     assert!(
         !exact,
         "FM must not mark a dropped startsWith conjunct exact"
