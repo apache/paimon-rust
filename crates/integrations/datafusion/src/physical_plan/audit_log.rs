@@ -24,6 +24,7 @@ use datafusion::common::{stats::Precision, Statistics};
 use datafusion::error::Result as DFResult;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_plan::metrics::MetricsSet;
 use datafusion::physical_plan::{
     ChildrenPropertiesMode, DisplayAs, ExecutionPlan, PlanProperties, ReplaceChildrenOptions,
     StatisticsArgs,
@@ -55,6 +56,10 @@ impl ExecutionPlan for PaimonAuditLogScan {
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan + 'static>> {
         vec![]
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        self.inner.metrics()
     }
 
     fn apply_expressions(

@@ -120,6 +120,10 @@ impl Hash for BlobViewFunc {
 }
 
 impl ScalarUDFImpl for BlobViewFunc {
+    fn is_strict(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         FUNCTION_NAME
     }
