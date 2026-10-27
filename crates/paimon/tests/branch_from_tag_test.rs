@@ -30,20 +30,9 @@ use paimon::io::{FileIOBuilder, FileIOProvider};
 use paimon::spec::{DataType, IntType, Schema, TableSchema};
 use paimon::table::{BranchManager, Table};
 
-const TABLE_PATH: &str = "file:/table";
-const SNAPSHOT_PATH: &str = "file:/table/snapshot/snapshot-1";
-const BRANCH_SNAPSHOT_PATH: &str = "file:/table/branch/branch-dev/snapshot/snapshot-1";
-const BRANCH_TAG_PATH: &str = "file:/table/branch/branch-dev/tag/tag-base";
-
-async fn tagged_table() -> (tempfile::TempDir, Table, opendal::Operator) {
+async fn tagged_table() -> (tempfile::TempDir, Table) {
     let dir = tempfile::tempdir().unwrap();
-    let mut config = opendal_service_fs::FsConfig::default();
-    config.root = Some(dir.path().to_str().unwrap().to_string());
-    let operator = opendal::Operator::from_config(config).unwrap();
-    let io = FileIOBuilder::new("file")
-        .with_fs_operator(operator.clone())
-        .build()
-        .unwrap();
+    let io = FileIOBuilder::new("file").build().unwrap();
     let schema = Schema::builder()
         .column("id", DataType::Int(IntType::new()))
         .column("value", DataType::Int(IntType::new()))
@@ -52,22 +41,22 @@ async fn tagged_table() -> (tempfile::TempDir, Table, opendal::Operator) {
     let table = Table::new(
         io.clone(),
         Identifier::new("default", "tagged"),
-        TABLE_PATH.into(),
+        dir.path().join("table").to_str().unwrap().into(),
         TableSchema::new(0, &schema),
         None,
     );
-    persist_table_schema(&io, TABLE_PATH, table.schema()).await;
+    persist_table_schema(&io, table.location(), table.schema()).await;
     write_batch(&table, &make_batch(vec![1, 2], vec![10, 20])).await;
     let snapshot = table.snapshot_manager().get_snapshot(1).await.unwrap();
     table.tag_manager().create("base", &snapshot).await.unwrap();
     // Distinguish copying the live JSON from serializing the tag's Snapshot.
-    io.new_output(SNAPSHOT_PATH)
+    io.new_output(&table.snapshot_manager().snapshot_path(1))
         .unwrap()
         .write(serde_json::to_vec_pretty(&snapshot).unwrap().into())
         .await
         .unwrap();
     write_batch(&table, &make_batch(vec![3], vec![30])).await;
-    (dir, table, operator)
+    (dir, table)
 }
 
 async fn rows(table: &Table) -> Vec<(i32, i32)> {
@@ -121,10 +110,10 @@ fn source_files(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
 
 #[tokio::test]
 async fn live_snapshot_is_copied_verbatim_and_branch_reads_tagged_rows() {
-    let (dir, table, _) = tagged_table().await;
+    let (dir, table) = tagged_table().await;
     let root = dir.path().join("table");
     let before = source_files(&root);
-    BranchManager::new(table.file_io().clone(), TABLE_PATH.into())
+    BranchManager::new(table.file_io().clone(), table.location().into())
         .create_branch_from_tag("dev", "base")
         .await
         .unwrap();
@@ -142,10 +131,11 @@ async fn live_snapshot_is_copied_verbatim_and_branch_reads_tagged_rows() {
 
 #[tokio::test]
 async fn expired_live_snapshot_can_create_branch_from_preserved_tag() {
-    let (dir, table, _) = tagged_table().await;
+    let (dir, table) = tagged_table().await;
     let root = dir.path().join("table");
-    table.file_io().delete_file(SNAPSHOT_PATH).await.unwrap();
-    assert!(!table.file_io().exists(SNAPSHOT_PATH).await.unwrap());
+    let snapshot_path = table.snapshot_manager().snapshot_path(1);
+    table.file_io().delete_file(&snapshot_path).await.unwrap();
+    assert!(!table.file_io().exists(&snapshot_path).await.unwrap());
     let before = source_files(&root);
     let tagged = table
         .copy_with_time_travel_strict(HashMap::from([("scan.tag-name".into(), "base".into())]))
@@ -153,7 +143,7 @@ async fn expired_live_snapshot_can_create_branch_from_preserved_tag() {
         .unwrap();
     assert_eq!(rows(&tagged).await, vec![(1, 10), (2, 20)]);
 
-    let manager = BranchManager::new(table.file_io().clone(), TABLE_PATH.into());
+    let manager = BranchManager::new(table.file_io().clone(), table.location().into());
     let result = manager.create_branch_from_tag("dev", "base").await;
     assert_eq!(source_files(&root), before);
     assert_eq!(rows(&table).await, vec![(1, 10), (2, 20), (3, 30)]);
@@ -177,7 +167,7 @@ async fn expired_live_snapshot_can_create_branch_from_preserved_tag() {
 
 #[tokio::test]
 async fn expired_snapshot_preserves_java_metadata_like_live_copy() {
-    let (dir, table, _) = tagged_table().await;
+    let (dir, table) = tagged_table().await;
     let root = dir.path().join("table");
     table
         .new_write_builder()
@@ -222,7 +212,7 @@ async fn expired_snapshot_preserves_java_metadata_like_live_copy() {
 
     // Keep a newer live snapshot so the source table remains readable after expiry.
     write_batch(&table, &make_batch(vec![4], vec![40])).await;
-    let manager = BranchManager::new(table.file_io().clone(), TABLE_PATH.into());
+    let manager = BranchManager::new(table.file_io().clone(), table.location().into());
     let before_live = source_files(&root);
     manager
         .create_branch_from_tag("live", "truncated")
@@ -268,10 +258,10 @@ async fn expired_snapshot_preserves_java_metadata_like_live_copy() {
 
 #[tokio::test]
 async fn missing_tag_is_rejected_before_creating_branch_files() {
-    let (dir, table, _) = tagged_table().await;
+    let (dir, table) = tagged_table().await;
     let root = dir.path().join("table");
     let before = source_files(&root);
-    let manager = BranchManager::new(table.file_io().clone(), TABLE_PATH.into());
+    let manager = BranchManager::new(table.file_io().clone(), table.location().into());
     let error = manager
         .create_branch_from_tag("dev", "missing")
         .await
@@ -288,7 +278,8 @@ async fn missing_tag_is_rejected_before_creating_branch_files() {
 struct FailingSnapshotProvider {
     operator: opendal::Operator,
     kind: opendal::ErrorKind,
-    path: &'static str,
+    table_path: String,
+    path: String,
     allowed_calls: usize,
     matching_calls: AtomicUsize,
 }
@@ -306,7 +297,10 @@ impl FileIOProvider for FailingSnapshotProvider {
         }
         Ok((
             self.operator.clone(),
-            path.strip_prefix("file:/").unwrap().into(),
+            path.strip_prefix(&self.table_path)
+                .unwrap()
+                .trim_start_matches('/')
+                .into(),
         ))
     }
 }
@@ -319,21 +313,28 @@ async fn snapshot_storage_errors_are_propagated_without_fallback() {
     ] {
         // Fail existence checking, copying, reading the copied tag, or fallback writing.
         for (missing_snapshot, path, allowed_calls) in [
-            (false, SNAPSHOT_PATH, 0),
-            (false, SNAPSHOT_PATH, 1),
-            (true, BRANCH_TAG_PATH, 1),
-            (true, BRANCH_SNAPSHOT_PATH, 0),
+            (false, "snapshot/snapshot-1", 0),
+            (false, "snapshot/snapshot-1", 1),
+            (true, "branch/branch-dev/tag/tag-base", 1),
+            (true, "branch/branch-dev/snapshot/snapshot-1", 0),
         ] {
-            let (dir, table, operator) = tagged_table().await;
+            let (dir, table) = tagged_table().await;
             let root = dir.path().join("table");
             if missing_snapshot {
-                table.file_io().delete_file(SNAPSHOT_PATH).await.unwrap();
+                table
+                    .file_io()
+                    .delete_file(&table.snapshot_manager().snapshot_path(1))
+                    .await
+                    .unwrap();
             }
             let before = source_files(&root);
+            let mut config = opendal_service_fs::FsConfig::default();
+            config.root = Some(table.location().into());
             let provider = Arc::new(FailingSnapshotProvider {
-                operator,
+                operator: opendal::Operator::from_config(config).unwrap(),
                 kind,
-                path,
+                table_path: table.location().into(),
+                path: format!("{}/{path}", table.location()),
                 allowed_calls,
                 matching_calls: AtomicUsize::new(0),
             });
@@ -341,7 +342,7 @@ async fn snapshot_storage_errors_are_propagated_without_fallback() {
                 .with_provider(provider.clone())
                 .build()
                 .unwrap();
-            let error = BranchManager::new(io, TABLE_PATH.into())
+            let error = BranchManager::new(io, table.location().into())
                 .create_branch_from_tag("dev", "base")
                 .await
                 .unwrap_err();
