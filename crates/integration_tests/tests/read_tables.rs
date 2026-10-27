@@ -15,13 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Integration tests for reading Paimon tables provisioned by Spark.
+//! Integration tests for reading the committed Java-written golden warehouse.
 
 use arrow_array::{
     Array, ArrowPrimitiveType, Int32Array, Int64Array, ListArray, MapArray, PrimitiveArray,
     RecordBatch, StringArray, StructArray,
 };
-use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
 use futures::TryStreamExt;
 use paimon::api::ConfigResponse;
 use paimon::catalog::{Identifier, RESTCatalog};
@@ -29,14 +28,16 @@ use paimon::common::Options;
 use paimon::spec::{DataType, IntType, Predicate, Schema, VarCharType};
 use paimon::{Catalog, CatalogOptions, Error, FileSystemCatalog, Plan, ScanStats};
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, OnceLock};
+
+#[path = "../../../testdata/warehouse/mod.rs"]
+mod golden_warehouse;
 
 #[path = "../../paimon/tests/mock_server.rs"]
 mod mock_server;
 use mock_server::start_mock_server;
 
 fn get_test_warehouse() -> String {
-    std::env::var("PAIMON_TEST_WAREHOUSE").unwrap_or_else(|_| "/tmp/paimon-warehouse".to_string())
+    golden_warehouse::test_warehouse()
 }
 
 async fn scan_and_read<C: Catalog + ?Sized>(
@@ -76,158 +77,10 @@ async fn get_table_from_catalog<C: Catalog + ?Sized>(
     table_name: &str,
 ) -> paimon::Table {
     let identifier = Identifier::new("default", table_name);
-    match catalog.get_table(&identifier).await {
-        Ok(table) => table,
-        Err(Error::TableNotExist { .. }) if table_name == "data_evolution_table" => {
-            ensure_data_evolution_table(catalog).await;
-            catalog
-                .get_table(&identifier)
-                .await
-                .expect("Failed to get generated data_evolution_table")
-        }
-        Err(err) => panic!("Failed to get table: {err:?}"),
-    }
-}
-
-const DATA_EVOLUTION_FIXTURE_MARKER: &str = "paimon-rust.integration-fixture";
-const DATA_EVOLUTION_FIXTURE_VERSION: &str = "data-evolution-limit-v2";
-
-static DATA_EVOLUTION_FIXTURE_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
-
-async fn ensure_data_evolution_table<C: Catalog + ?Sized>(catalog: &C) {
-    let lock = DATA_EVOLUTION_FIXTURE_LOCK.get_or_init(|| tokio::sync::Mutex::new(()));
-    let _guard = lock.lock().await;
-
-    let identifier = Identifier::new("default", "data_evolution_table");
-    if let Ok(table) = catalog.get_table(&identifier).await {
-        let options = table.schema().options();
-        let fixture_marker = options
-            .get(DATA_EVOLUTION_FIXTURE_MARKER)
-            .map(String::as_str);
-        if fixture_marker == Some(DATA_EVOLUTION_FIXTURE_VERSION) || fixture_marker.is_none() {
-            return;
-        }
-        catalog
-            .drop_table(&identifier, true)
-            .await
-            .expect("Failed to replace stale generated data_evolution_table fixture");
-    }
-
     catalog
-        .create_database("default", true, HashMap::new())
-        .await
-        .expect("Failed to create default database for data_evolution_table fixture");
-    catalog
-        .create_table(&identifier, data_evolution_fixture_schema(), true)
-        .await
-        .expect("Failed to create data_evolution_table fixture");
-
-    let table = catalog
         .get_table(&identifier)
         .await
-        .expect("Failed to load data_evolution_table fixture");
-
-    append_data_evolution_batch(
-        &table,
-        data_evolution_fixture_batch(
-            vec![1, 2, 3],
-            vec!["alice", "bob", "carol"],
-            vec![100, 200, 300],
-        ),
-    )
-    .await;
-    append_data_evolution_batch(
-        &table,
-        data_evolution_fixture_batch(vec![4, 5], vec!["dave", "eve"], vec![400, 500]),
-    )
-    .await;
-
-    let wb = table.new_write_builder();
-    let mut update = wb
-        .new_data_evolution_writer(vec!["name".to_string()])
-        .expect("Failed to create data-evolution update writer");
-    update
-        .add_matched_batch(data_evolution_update_batch())
-        .expect("Failed to add data-evolution update batch");
-    wb.new_commit()
-        .commit(
-            update
-                .prepare_commit()
-                .await
-                .expect("Failed to prepare data-evolution update commit"),
-        )
-        .await
-        .expect("Failed to commit data-evolution update fixture");
-}
-
-fn data_evolution_fixture_schema() -> Schema {
-    Schema::builder()
-        .column("id", DataType::Int(IntType::new()))
-        .column(
-            "name",
-            DataType::VarChar(VarCharType::new(VarCharType::MAX_LENGTH).unwrap()),
-        )
-        .column("value", DataType::Int(IntType::new()))
-        .option("row-tracking.enabled", "true")
-        .option("data-evolution.enabled", "true")
-        .option("source.split.target-size", "1b")
-        .option("source.split.open-file-cost", "1b")
-        .option(
-            DATA_EVOLUTION_FIXTURE_MARKER,
-            DATA_EVOLUTION_FIXTURE_VERSION,
-        )
-        .build()
-        .unwrap()
-}
-
-fn data_evolution_fixture_batch(ids: Vec<i32>, names: Vec<&str>, values: Vec<i32>) -> RecordBatch {
-    let schema = Arc::new(ArrowSchema::new(vec![
-        ArrowField::new("id", ArrowDataType::Int32, false),
-        ArrowField::new("name", ArrowDataType::Utf8, false),
-        ArrowField::new("value", ArrowDataType::Int32, false),
-    ]));
-    RecordBatch::try_new(
-        schema,
-        vec![
-            Arc::new(Int32Array::from(ids)),
-            Arc::new(StringArray::from(names)),
-            Arc::new(Int32Array::from(values)),
-        ],
-    )
-    .unwrap()
-}
-
-fn data_evolution_update_batch() -> RecordBatch {
-    let schema = Arc::new(ArrowSchema::new(vec![
-        ArrowField::new("_ROW_ID", ArrowDataType::Int64, false),
-        ArrowField::new("name", ArrowDataType::Utf8, false),
-    ]));
-    RecordBatch::try_new(
-        schema,
-        vec![
-            Arc::new(Int64Array::from(vec![0, 2, 3])),
-            Arc::new(StringArray::from(vec!["alice-v2", "carol-v2", "dave"])),
-        ],
-    )
-    .unwrap()
-}
-
-async fn append_data_evolution_batch(table: &paimon::Table, batch: RecordBatch) {
-    let wb = table.new_write_builder();
-    let mut write = wb.new_write().expect("Failed to create fixture writer");
-    write
-        .write_arrow_batch(&batch)
-        .await
-        .expect("Failed to write fixture batch");
-    wb.new_commit()
-        .commit(
-            write
-                .prepare_commit()
-                .await
-                .expect("Failed to prepare fixture commit"),
-        )
-        .await
-        .expect("Failed to commit fixture batch");
+        .unwrap_or_else(|err| panic!("Failed to get golden table {table_name}: {err:?}"))
 }
 
 fn create_file_system_catalog() -> FileSystemCatalog {
@@ -1046,7 +899,7 @@ async fn test_read_partitioned_table_eval_row_error_fails_open() {
 
 // ======================= REST Catalog read tests ===============================
 
-/// Build a simple test schema matching the Spark-provisioned tables (id INT, name VARCHAR).
+/// Build a simple test schema matching the golden tables (id INT, name VARCHAR).
 fn simple_log_schema() -> Schema {
     Schema::builder()
         .column("id", DataType::Int(IntType::new()))
@@ -1055,7 +908,7 @@ fn simple_log_schema() -> Schema {
         .expect("Failed to build schema")
 }
 
-/// Start a mock REST server backed by Spark-provisioned data on disk,
+/// Start a mock REST server backed by golden data on disk,
 /// register the given tables, and return a connected `RESTCatalog`.
 async fn setup_rest_catalog_with_tables(
     table_configs: &[(&str, &str, Schema)],
@@ -1098,7 +951,7 @@ async fn setup_rest_catalog_with_tables(
 
 /// Test reading an append-only (log) table via REST catalog backed by mock server.
 ///
-/// The mock server returns table metadata pointing to Spark-provisioned data on disk.
+/// The mock server returns table metadata pointing to golden data on disk.
 #[tokio::test]
 async fn test_rest_catalog_read_append_table() {
     let table_name = "simple_log_table";
@@ -1135,7 +988,7 @@ async fn test_rest_catalog_read_append_table() {
 
 /// Test reading a data-evolution enabled append-only table.
 ///
-/// The table is provisioned by Spark with `data-evolution.enabled=true` and
+/// The table is stored in the golden warehouse with `data-evolution.enabled=true` and
 /// `row-tracking.enabled=true`. Multiple inserts produce files with `first_row_id`
 /// set, exercising the data evolution scan and read path.
 #[tokio::test]

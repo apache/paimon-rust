@@ -226,31 +226,24 @@ jobs:
       matrix:
         include:
           - suite: rust
-            needs_docker: true
             needs_lumina: false
             needs_uv: false
           - suite: datafusion
-            needs_docker: true
             needs_lumina: true
             needs_uv: false
           - suite: lumina
-            needs_docker: false
             needs_lumina: true
             needs_uv: false
           - suite: python
-            needs_docker: true
             needs_lumina: false
             needs_uv: true
           - suite: go
-            needs_docker: true
             needs_lumina: false
             needs_uv: false
           - suite: jindo
-            needs_docker: false
             needs_lumina: false
             needs_uv: false
           - suite: oss-cpp
-            needs_docker: false
             needs_lumina: false
             needs_uv: false
     env:
@@ -269,10 +262,6 @@ jobs:
           key: integration-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             integration-${{ runner.os }}-
-
-      - name: Start Docker containers
-        if: matrix.needs_docker == true
-        run: make docker-up
 
       - name: Rust Integration Test
         if: matrix.suite == 'rust'
@@ -347,10 +336,6 @@ jobs:
           cargo test --locked -p paimon --features storage-jindo --lib
           io::storage_jindo::tests::test_real_sdk_io_and_failure_mapping
           -- --ignored --exact
-
-      - name: Stop Docker containers
-        if: ${{ always() && matrix.needs_docker }}
-        run: make docker-down
 
       - name: Checkout OSS C++ SDK
         if: matrix.suite == 'oss-cpp'

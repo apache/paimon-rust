@@ -22,6 +22,7 @@ import os
 import re
 import struct
 import sys
+import tarfile
 import tempfile
 import types
 from pathlib import Path
@@ -38,7 +39,20 @@ from pypaimon_rust.datafusion import (
     udf,
 )
 
-WAREHOUSE = os.environ.get("PAIMON_TEST_WAREHOUSE", "/tmp/paimon-warehouse")
+
+@pytest.fixture(scope="module")
+def golden_warehouse(tmp_path_factory):
+    override = os.environ.get("PAIMON_TEST_WAREHOUSE")
+    if override is not None:
+        return override
+
+    warehouse = tmp_path_factory.mktemp("golden-warehouse")
+    archive = Path(__file__).resolve().parents[3] / "testdata/warehouse/warehouse.tar.gz"
+    with tarfile.open(archive, "r:gz") as fixture:
+        fixture.extractall(warehouse, filter="data")
+    return str(warehouse)
+
+
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 BLOB_DESCRIPTOR_MAGIC = 0x424C4F4244455343
 
@@ -544,8 +558,8 @@ def test_vector_json_bridge_functions():
     assert json.loads(row["vector_json"]) == [1.0, 2.5]
 
 
-def test_query_simple_table_via_catalog_provider():
-    catalog = PaimonCatalog({"warehouse": WAREHOUSE})
+def test_query_simple_table_via_catalog_provider(golden_warehouse):
+    catalog = PaimonCatalog({"warehouse": golden_warehouse})
     ctx = SessionContext()
     ctx.register_catalog_provider("paimon", catalog)
 
@@ -980,8 +994,8 @@ def test_register_catalog_discovers_pyjindo(monkeypatch, tmp_path):
     assert str(library) in str(error.value)
 
 
-def test_list_databases_and_tables():
-    catalog = PaimonCatalog({"warehouse": WAREHOUSE})
+def test_list_databases_and_tables(golden_warehouse):
+    catalog = PaimonCatalog({"warehouse": golden_warehouse})
 
     assert "default" in catalog.list_databases()
 
@@ -1000,8 +1014,8 @@ def test_list_databases_and_tables():
     assert schema.partition_keys() == []
 
 # ---------------- #285: observability ----------------
-def test_snapshots_for_simple_table():
-    catalog = PaimonCatalog({"warehouse": WAREHOUSE})
+def test_snapshots_for_simple_table(golden_warehouse):
+    catalog = PaimonCatalog({"warehouse": golden_warehouse})
     table = catalog.get_table("default.simple_log_table")
 
     snap = table.latest_snapshot()
@@ -1016,8 +1030,8 @@ def test_snapshots_for_simple_table():
     assert snaps[0].id() == snap.id()
 
 
-def test_partitions_and_tags_smoke():
-    catalog = PaimonCatalog({"warehouse": WAREHOUSE})
+def test_partitions_and_tags_smoke(golden_warehouse):
+    catalog = PaimonCatalog({"warehouse": golden_warehouse})
     table = catalog.get_table("default.simple_log_table")
 
     # Non-partitioned, non-tagged table: both should be empty but well-typed.

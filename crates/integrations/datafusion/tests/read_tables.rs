@@ -20,6 +20,9 @@ use std::sync::Arc;
 
 mod common;
 
+#[path = "../../../../testdata/warehouse/mod.rs"]
+mod golden_warehouse;
+
 use common::string_value;
 use datafusion::arrow::array::{Array, Int32Array};
 use datafusion::arrow::record_batch::RecordBatch;
@@ -34,7 +37,7 @@ use paimon::{Catalog, CatalogOptions, FileSystemCatalog, Options};
 use paimon_datafusion::{PaimonCatalogProvider, PaimonTableProvider, SQLContext};
 
 fn get_test_warehouse() -> String {
-    std::env::var("PAIMON_TEST_WAREHOUSE").unwrap_or_else(|_| "/tmp/paimon-warehouse".to_string())
+    golden_warehouse::test_warehouse()
 }
 
 fn create_catalog() -> FileSystemCatalog {

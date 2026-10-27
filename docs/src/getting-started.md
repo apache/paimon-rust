@@ -553,8 +553,6 @@ cargo build
 # Unit tests
 cargo test
 
-# Integration tests (requires Docker)
-make docker-up
+# Integration tests (automatically extract the committed golden warehouse)
 cargo test -p paimon-integration-tests
-make docker-down
 ```

@@ -588,8 +588,7 @@ mod tests {
     }
 
     fn get_test_warehouse() -> String {
-        std::env::var("PAIMON_TEST_WAREHOUSE")
-            .unwrap_or_else(|_| "/tmp/paimon-warehouse".to_string())
+        crate::golden_warehouse::test_warehouse()
     }
 
     fn create_catalog() -> FileSystemCatalog {

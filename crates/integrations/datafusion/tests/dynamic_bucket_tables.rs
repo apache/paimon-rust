@@ -19,6 +19,9 @@
 
 mod common;
 
+#[path = "../../../../testdata/warehouse/mod.rs"]
+mod golden_warehouse;
+
 use common::{
     collect_id_name, collect_id_value, create_sql_context, create_test_env, setup_sql_context,
     string_value,
@@ -1047,35 +1050,31 @@ async fn test_pk_dynamic_bucket_partitioned_insert_overwrite() {
     );
 }
 
-/// Read the Spark-provisioned dynamic_bucket_pk_table, write the same data
+/// Read the Java-written golden dynamic_bucket_pk_table, write the same data
 /// into a new dynamic bucket table, and verify the HASH index values are identical.
 ///
 /// Spark may distribute rows across multiple buckets due to parallelism, so we
 /// compare the aggregate set of hash values rather than per-bucket entries.
-///
-/// Requires: `make docker-up` + colima copy (see dev/spark/README.md).
 #[tokio::test]
-#[ignore]
-async fn test_read_spark_dynamic_bucket_and_compare_index() {
-    // --- Read from Spark-provisioned table ---
-    let warehouse =
-        std::env::var("PAIMON_TEST_WAREHOUSE").unwrap_or_else(|_| "/tmp/paimon-warehouse".into());
+async fn test_read_golden_dynamic_bucket_and_compare_index() {
+    // Read the Java-written table from the golden warehouse.
+    let warehouse = golden_warehouse::test_warehouse();
     let mut opts = Options::new();
     opts.set(CatalogOptions::WAREHOUSE, &warehouse);
-    let spark_catalog = FileSystemCatalog::new(opts).unwrap();
-    let spark_table = spark_catalog
+    let golden_catalog = FileSystemCatalog::new(opts).unwrap();
+    let golden_table = golden_catalog
         .get_table(&Identifier::new("default", "dynamic_bucket_pk_table"))
         .await
         .unwrap();
 
-    // Read all rows from the Spark table
-    let plan = spark_table
+    // Read all rows from the golden table
+    let plan = golden_table
         .new_read_builder()
         .new_scan()
         .plan()
         .await
         .unwrap();
-    let reader = spark_table.new_read_builder().new_read().unwrap();
+    let reader = golden_table.new_read_builder().new_read().unwrap();
     let stream = reader.to_arrow(plan.splits()).unwrap();
 
     use arrow_array::RecordBatch;
@@ -1097,7 +1096,7 @@ async fn test_read_spark_dynamic_bucket_and_compare_index() {
     }
     all_rows.sort_by_key(|(id, _)| *id);
 
-    // Verify Spark data: two commits with overlapping keys
+    // Verify golden data: two commits with overlapping keys
     assert_eq!(
         all_rows,
         vec![
@@ -1121,7 +1120,7 @@ async fn test_read_spark_dynamic_bucket_and_compare_index() {
         .await
         .unwrap();
 
-    // Replicate the same two commits as provision.py
+    // Replicate the same two commits as the golden table
     sql_context
         .sql("INSERT INTO paimon.test_db.t_dyn_cmp VALUES (1, 'alice'), (2, 'bob'), (3, 'carol')")
         .await
@@ -1163,11 +1162,11 @@ async fn test_read_spark_dynamic_bucket_and_compare_index() {
         .await
         .unwrap();
 
-    let spark_hashes = collect_all_hashes(&spark_table).await;
+    let golden_hashes = collect_all_hashes(&golden_table).await;
     let rust_hashes = collect_all_hashes(&rust_table).await;
 
     assert_eq!(
-        spark_hashes, rust_hashes,
-        "HASH index values mismatch between Spark and Rust tables"
+        golden_hashes, rust_hashes,
+        "HASH index values mismatch between the golden and Rust tables"
     );
 }
