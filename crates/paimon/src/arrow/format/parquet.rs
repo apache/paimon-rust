@@ -35,7 +35,6 @@ use crate::spec::{
 use crate::table::{ArrowRecordBatchStream, RowRange};
 use crate::Error;
 use arrow_array::{BooleanArray, RecordBatch};
-use arrow_cast::cast;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::future::BoxFuture;
@@ -374,7 +373,8 @@ impl ParquetFormatWriter {
         let max_row_group_bytes = props.max_row_group_bytes();
         let async_write = output.async_writer().await?;
         let input_schema = schema;
-        let schema = timestamp_millis_schema(&input_schema);
+        let schema =
+            crate::arrow::multiset::parquet_schema(&timestamp_millis_schema(&input_schema));
         let inner = create_parquet_arrow_writer(async_write, schema.clone(), props)?;
         let stats_modes = write_fields
             .map(|fields| core_options.metadata_stats_modes(fields.iter().map(DataField::name)))
@@ -792,15 +792,17 @@ fn cast_record_batch_to_schema(
             if column.data_type() == field.data_type() {
                 Ok(column.clone())
             } else {
-                cast(column, field.data_type()).map_err(|error| crate::Error::DataInvalid {
-                    message: format!(
-                        "Failed to convert Parquet column '{}' from {:?} to {:?}: {error}",
-                        field.name(),
-                        column.data_type(),
-                        field.data_type()
-                    ),
-                    source: Some(Box::new(error)),
-                })
+                crate::arrow::multiset::to_parquet_array(column, field.data_type()).map_err(
+                    |error| crate::Error::DataInvalid {
+                        message: format!(
+                            "Failed to convert Parquet column '{}' from {:?} to {:?}: {error}",
+                            field.name(),
+                            column.data_type(),
+                            field.data_type()
+                        ),
+                        source: Some(Box::new(error)),
+                    },
+                )
             }
         })
         .collect::<crate::Result<Vec<_>>>()?;
@@ -4945,10 +4947,10 @@ mod tests {
             assert_eq!(column.physical_type(), parquet::basic::Type::INT64);
             assert_eq!(
                 column.logical_type_ref(),
-                Some(&parquet::basic::LogicalType::Timestamp {
-                    is_adjusted_to_u_t_c: adjusted_to_utc,
-                    unit: parquet::basic::TimeUnit::MILLIS,
-                })
+                Some(&parquet::basic::LogicalType::timestamp(
+                    adjusted_to_utc,
+                    parquet::basic::TimeUnit::MILLIS,
+                ))
             );
             let ParquetStatistics::Int64(stats) =
                 metadata.row_group(0).column(index).statistics().unwrap()

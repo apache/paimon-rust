@@ -39,7 +39,7 @@ futures = "0.3"
 paimon = { path = "../../crates/paimon", features = ["storage-all", "internal-api"] }
 paimon-datafusion = { path = "../../crates/integrations/datafusion" }
 paimon-vindex-core = "0.5.0"
-pyo3 = { version = "0.28", features = ["abi3-py310", "chrono"] }
+pyo3 = { version = "0.29", features = ["abi3-py310", "chrono"] }
 roaring = "0.11"
 serde_json = "1.0"
 tokio = { workspace = true }
@@ -47,4 +47,4 @@ tokio = { workspace = true }
 [dev-dependencies]
 # Enables `Python::attach` to auto-initialize an interpreter for Rust unit tests.
 # Only applied to the test build; the maturin/extension-module build does not pull dev-dependencies.
-pyo3 = { version = "0.28", features = ["abi3-py310", "auto-initialize", "chrono"] }
+pyo3 = { version = "0.29", features = ["abi3-py310", "auto-initialize", "chrono"] }

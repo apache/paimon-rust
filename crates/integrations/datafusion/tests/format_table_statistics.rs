@@ -151,7 +151,7 @@ async fn test_empty_format_table_counts_zero() {
     );
 }
 
-/// The partition-pruned plan reaches `partition_statistics()` too, so a pruned
+/// The partition-pruned plan reaches `statistics_from_inputs()` too, so a pruned
 /// `COUNT(*)` must also come from the data and not from the placeholder.
 ///
 /// Only predicated queries are asserted here. An unfiltered scan over a

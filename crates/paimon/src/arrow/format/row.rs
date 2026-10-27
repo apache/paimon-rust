@@ -550,7 +550,8 @@ fn validate_arrow_type_for_row_field(
             )?;
             true
         }
-        (ArrowDataType::Map(entries, _), DataType::Multiset(m)) => {
+        (ArrowDataType::List(entries), DataType::Multiset(m))
+        | (ArrowDataType::Map(entries, _), DataType::Multiset(m)) => {
             validate_arrow_map_entries(
                 field_name,
                 entries.data_type(),
@@ -828,9 +829,15 @@ fn write_field_value(
             write_map_value(out, map, row_idx, m.key_type(), m.value_type())?;
         }
         DataType::Multiset(m) => {
-            let map = downcast::<MapArray>(array, data_type)?;
-            let count_type = DataType::Int(IntType::new());
-            write_map_value(out, map, row_idx, m.element_type(), &count_type)?;
+            let entries = crate::arrow::multiset::entries(array, row_idx)?;
+            write_array_slice(out, entries.column(0), 0, entries.len(), m.element_type())?;
+            write_array_slice(
+                out,
+                entries.column(1),
+                0,
+                entries.len(),
+                &DataType::Int(IntType::new()),
+            )?;
         }
         DataType::Row(r) => {
             let row = downcast::<StructArray>(array, data_type)?;
@@ -1322,6 +1329,7 @@ enum ColumnBuilder {
         values: Box<ColumnBuilder>,
     },
     Map {
+        multiset: bool,
         entries_field: Arc<Field>,
         offsets: Vec<i32>,
         validities: Vec<bool>,
@@ -1391,6 +1399,7 @@ impl ColumnBuilder {
                 values: Box::new(ColumnBuilder::new(a.element_type(), capacity)?),
             },
             DataType::Map(m) => Self::Map {
+                multiset: false,
                 entries_field: map_entries_field(
                     m.key_type(),
                     m.value_type(),
@@ -1403,22 +1412,21 @@ impl ColumnBuilder {
                 values: Box::new(ColumnBuilder::new(m.value_type(), capacity)?),
                 sorted: false,
             },
-            DataType::Multiset(m) => {
-                let count_type = DataType::Int(IntType::new());
-                Self::Map {
-                    entries_field: map_entries_field(
-                        m.element_type(),
-                        &count_type,
-                        m.element_type().is_nullable(),
-                        false,
-                    )?,
-                    offsets: vec![0],
-                    validities: Vec::with_capacity(capacity),
-                    keys: Box::new(ColumnBuilder::new(m.element_type(), capacity)?),
-                    values: Box::new(ColumnBuilder::new(&count_type, capacity)?),
-                    sorted: false,
-                }
-            }
+            DataType::Multiset(m) => Self::Map {
+                multiset: true,
+                entries_field: crate::arrow::multiset::entries_field(
+                    paimon_type_to_arrow(m.element_type())?,
+                    m.element_type().is_nullable(),
+                ),
+                offsets: vec![0],
+                validities: Vec::with_capacity(capacity),
+                keys: Box::new(ColumnBuilder::new(m.element_type(), capacity)?),
+                values: Box::new(ColumnBuilder::new(
+                    &DataType::Int(IntType::new()),
+                    capacity,
+                )?),
+                sorted: false,
+            },
             DataType::Row(r) => Self::Row {
                 fields: arrow_fields_for_row(r.fields())?,
                 columns: r
@@ -1720,6 +1728,7 @@ impl ColumnBuilder {
                 })?,
             ),
             Self::Map {
+                multiset,
                 entries_field,
                 offsets,
                 validities,
@@ -1747,19 +1756,34 @@ impl ColumnBuilder {
                     message: format!("Failed to build .row Map entries: {e}"),
                     source: Some(Box::new(e)),
                 })?;
-                Arc::new(
-                    MapArray::try_new(
-                        entries_field,
-                        OffsetBuffer::new(ScalarBuffer::from(offsets)),
-                        entries,
-                        Some(null_buffer(validities)),
-                        sorted,
+                if multiset {
+                    Arc::new(
+                        ListArray::try_new(
+                            entries_field,
+                            OffsetBuffer::new(ScalarBuffer::from(offsets)),
+                            Arc::new(entries),
+                            Some(null_buffer(validities)),
+                        )
+                        .map_err(|e| Error::UnexpectedError {
+                            message: format!("Failed to build .row MULTISET: {e}"),
+                            source: Some(Box::new(e)),
+                        })?,
                     )
-                    .map_err(|e| Error::UnexpectedError {
-                        message: format!("Failed to build .row MapArray: {e}"),
-                        source: Some(Box::new(e)),
-                    })?,
-                )
+                } else {
+                    Arc::new(
+                        MapArray::try_new(
+                            entries_field,
+                            OffsetBuffer::new(ScalarBuffer::from(offsets)),
+                            entries,
+                            Some(null_buffer(validities)),
+                            sorted,
+                        )
+                        .map_err(|e| Error::UnexpectedError {
+                            message: format!("Failed to build .row MapArray: {e}"),
+                            source: Some(Box::new(e)),
+                        })?,
+                    )
+                }
             }
             Self::Row {
                 fields,
@@ -3452,11 +3476,30 @@ mod tests {
         let bag = test_map_array(
             vec![0, 2, 2, 3],
             vec![true, false, true],
-            true,
+            false,
             false,
             vec![Some("x"), Some("y"), Some("z")],
             vec![Some(2), Some(1), Some(4)],
         );
+        let ArrowDataType::List(bag_field) = schema.field(2).data_type() else {
+            unreachable!()
+        };
+        let bag_entries = StructArray::try_new(
+            match bag_field.data_type() {
+                ArrowDataType::Struct(fields) => fields.clone(),
+                _ => unreachable!(),
+            },
+            bag.entries().columns().to_vec(),
+            None,
+        )
+        .unwrap();
+        let bag = ListArray::try_new(
+            bag_field.clone(),
+            bag.offsets().clone(),
+            Arc::new(bag_entries),
+            bag.nulls().cloned(),
+        )
+        .unwrap();
 
         let nested = StructArray::try_new(
             vec![
@@ -3542,11 +3585,24 @@ mod tests {
         assert!(label_values.is_null(1));
         assert_eq!(label_values.value(2), 30);
 
-        let bag = batch.column(2).as_any().downcast_ref::<MapArray>().unwrap();
+        let bag = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
         assert_eq!(bag.value_offsets(), &[0, 2, 2, 3]);
         assert!(bag.is_null(1));
-        let bag_keys = bag.keys().as_any().downcast_ref::<StringArray>().unwrap();
-        let bag_counts = bag.values().as_any().downcast_ref::<Int32Array>().unwrap();
+        let entries = bag.values().as_any().downcast_ref::<StructArray>().unwrap();
+        let bag_keys = entries
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let bag_counts = entries
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
         assert_eq!(bag_keys.value(0), "x");
         assert_eq!(bag_keys.value(2), "z");
         assert_eq!(bag_counts.value(0), 2);
@@ -3574,6 +3630,45 @@ mod tests {
         assert_eq!(names.value(0), "seven");
         assert!(names.is_null(1));
         assert_eq!(names.value(2), "nine");
+    }
+
+    #[test]
+    fn decode_java_multiset_with_null_element() {
+        let fields = vec![DataField::new(
+            0,
+            "bag".into(),
+            DataType::Multiset(MultisetType::new(DataType::Int(IntType::new()))),
+        )];
+        // Java RowBlockWriter: one non-null bag, key array [NULL], counts [3],
+        // row offset 0, and row count 1. No Arrow writer participates here.
+        let block = [0, 1, 1, 1, 0, 3, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0];
+        let batch = decode_row_block(
+            &block,
+            &fields,
+            build_target_arrow_schema(&fields).unwrap(),
+            &[0],
+        )
+        .unwrap();
+        let mut writer = RowBlockWriter::new();
+        writer.write_row(&batch, 0, &fields).unwrap();
+        assert_eq!(writer.finish(), block);
+        let bag = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        let entries = bag.value(0);
+        let entries = entries.as_any().downcast_ref::<StructArray>().unwrap();
+        assert!(entries.column(0).is_null(0));
+        assert_eq!(
+            entries
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .value(0),
+            3
+        );
     }
 
     #[test]

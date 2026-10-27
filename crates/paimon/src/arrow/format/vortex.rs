@@ -24,7 +24,7 @@ use crate::spec::{DataField, Predicate};
 use crate::table::{ArrowRecordBatchStream, RowRange};
 use crate::Error;
 use arrow_array::RecordBatch;
-use arrow_schema::{DataType as ArrowDataType, Field, SchemaRef};
+use arrow_schema::{DataType as ArrowDataType, SchemaRef};
 use async_trait::async_trait;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -379,9 +379,9 @@ fn vortex_array_to_record_batch(
     vortex_array: ArrayRef,
     schema: &SchemaRef,
 ) -> crate::Result<RecordBatch> {
-    let target_field = Field::new(
+    let target_field = arrow_schema_58::Field::new(
         "",
-        ArrowDataType::Struct(schema.fields().clone()),
+        crate::arrow::legacy::to_legacy_data_type(&ArrowDataType::Struct(schema.fields().clone()))?,
         vortex_array.dtype().is_nullable(),
     );
     let mut ctx = session.create_execution_ctx();
@@ -393,6 +393,7 @@ fn vortex_array_to_record_batch(
             source: None,
         })?;
 
+    let arrow_array = crate::arrow::legacy::from_legacy_array(&arrow_array)?;
     let struct_array = arrow_array
         .as_any()
         .downcast_ref::<arrow_array::StructArray>()
@@ -445,7 +446,7 @@ pub(crate) struct VortexFormatWriter {
 impl VortexFormatWriter {
     pub(crate) async fn new(output: &OutputFile, schema: SchemaRef) -> crate::Result<Self> {
         validate_vortex_schema(&schema)?;
-        let dtype = DType::from_arrow(schema);
+        let dtype = DType::from_arrow(Arc::new(crate::arrow::legacy::to_legacy_schema(&schema)?));
         let bytes_written = Arc::new(AtomicU64::new(0));
 
         Ok(Self {
@@ -459,9 +460,8 @@ impl VortexFormatWriter {
 }
 
 /// `DType::from_arrow` ends in `unimplemented!` for a type it has no arm for, so screen
-/// the schema first. `Map` is the only such type Paimon builds — it is what
-/// `paimon_type_to_arrow` emits for both `MAP` and `MULTISET` — and it can sit at any
-/// depth, so the walk descends the same containers `DType::from_arrow` does.
+/// the schema first. MAP and MULTISET remain unsupported at any depth, so the
+/// walk also checks the metadata marking the Arrow list used for MULTISET.
 fn validate_vortex_schema(schema: &SchemaRef) -> crate::Result<()> {
     for field in schema.fields() {
         if contains_unconvertible_type(field.data_type()) {
@@ -480,6 +480,7 @@ fn validate_vortex_schema(schema: &SchemaRef) -> crate::Result<()> {
 fn contains_unconvertible_type(data_type: &ArrowDataType) -> bool {
     match data_type {
         ArrowDataType::Map(..) => true,
+        ArrowDataType::List(field) if crate::arrow::multiset::is_multiset(field) => true,
         ArrowDataType::List(field)
         | ArrowDataType::LargeList(field)
         | ArrowDataType::ListView(field)
@@ -498,8 +499,8 @@ fn contains_unconvertible_type(data_type: &ArrowDataType) -> bool {
 impl FormatFileWriter for VortexFormatWriter {
     async fn write(&mut self, batch: &RecordBatch) -> crate::Result<()> {
         let staged_bytes = batch.get_array_memory_size();
-        let vortex_arr =
-            ArrayRef::from_arrow(batch.clone(), false).map_err(|e| Error::DataInvalid {
+        let vortex_arr = ArrayRef::from_arrow(crate::arrow::legacy::to_legacy_batch(batch)?, false)
+            .map_err(|e| Error::DataInvalid {
                 message: format!("Failed to convert RecordBatch to Vortex: {e}"),
                 source: None,
             })?;
@@ -1496,7 +1497,7 @@ mod tests {
             panic!("expected Unsupported, got {err:?}");
         };
         assert!(message.contains("'nested'"), "message: {message}");
-        assert!(message.contains("Map"), "message: {message}");
+        assert!(message.contains("List"), "message: {message}");
     }
 
     /// Positive control: a nested ROW of primitives must still be accepted, so the walk

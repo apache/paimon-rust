@@ -16,6 +16,8 @@
 // under the License.
 
 mod date_extract;
+pub(crate) mod legacy;
+pub(crate) mod multiset;
 pub(crate) use date_extract::evaluate_date_extract;
 mod cast_width;
 pub(crate) use cast_width::apply_declared_width;
@@ -118,23 +120,10 @@ pub fn paimon_type_to_arrow(dt: &PaimonDataType) -> crate::Result<ArrowDataType>
                 false,
             )
         }
-        PaimonDataType::Multiset(m) => {
-            let element_type = paimon_type_to_arrow(m.element_type())?;
-            ArrowDataType::Map(
-                Arc::new(ArrowField::new(
-                    "entries",
-                    ArrowDataType::Struct(
-                        vec![
-                            ArrowField::new("key", element_type, m.element_type().is_nullable()),
-                            ArrowField::new("value", ArrowDataType::Int32, false),
-                        ]
-                        .into(),
-                    ),
-                    false,
-                )),
-                false,
-            )
-        }
+        PaimonDataType::Multiset(m) => ArrowDataType::List(multiset::entries_field(
+            paimon_type_to_arrow(m.element_type())?,
+            m.element_type().is_nullable(),
+        )),
         PaimonDataType::Row(r) => {
             let fields: Vec<ArrowField> = r
                 .fields()
@@ -240,6 +229,22 @@ pub fn arrow_to_paimon_type(
         ArrowDataType::Decimal128(p, s) => Ok(PaimonDataType::Decimal(DecimalType::with_nullable(
             nullable, *p as u32, *s as u32,
         )?)),
+        ArrowDataType::List(field) if multiset::is_multiset(field) => {
+            let ArrowDataType::Struct(entries) = field.data_type() else {
+                return Err(crate::Error::Unsupported {
+                    message: "Invalid MULTISET entries".into(),
+                });
+            };
+            if entries.len() != 2 || entries[1].data_type() != &ArrowDataType::Int32 {
+                return Err(crate::Error::Unsupported {
+                    message: "Invalid MULTISET element/count fields".into(),
+                });
+            }
+            let element = arrow_to_paimon_type(entries[0].data_type(), entries[0].is_nullable())?;
+            Ok(PaimonDataType::Multiset(
+                crate::spec::MultisetType::with_nullable(nullable, element),
+            ))
+        }
         ArrowDataType::List(field) | ArrowDataType::LargeList(field) => {
             let element = arrow_to_paimon_type(field.data_type(), field.is_nullable())?;
             Ok(PaimonDataType::Array(ArrayType::with_nullable(
@@ -427,24 +432,10 @@ pub(crate) fn paimon_type_to_arrow_for_read(dt: &PaimonDataType) -> crate::Resul
             )),
             false,
         ),
-        PaimonDataType::Multiset(multiset) => ArrowDataType::Map(
-            Arc::new(ArrowField::new(
-                "entries",
-                ArrowDataType::Struct(
-                    vec![
-                        ArrowField::new(
-                            "key",
-                            paimon_type_to_arrow_for_read(multiset.element_type())?,
-                            multiset.element_type().is_nullable(),
-                        ),
-                        ArrowField::new("value", ArrowDataType::Int32, false),
-                    ]
-                    .into(),
-                ),
-                false,
-            )),
-            false,
-        ),
+        PaimonDataType::Multiset(multiset) => ArrowDataType::List(self::multiset::entries_field(
+            paimon_type_to_arrow_for_read(multiset.element_type())?,
+            true,
+        )),
         _ => paimon_type_to_arrow(dt)?,
     })
 }
@@ -553,6 +544,34 @@ mod tests {
             ArrowDataType::BinaryView,
         ] {
             assert_arrow_to_paimon(arrow, true, &varbinary);
+        }
+    }
+
+    #[test]
+    fn multiset_schemas_preserve_nullable_elements() {
+        let fields = vec![DataField::new(
+            0,
+            "bag".into(),
+            PaimonDataType::Multiset(crate::spec::MultisetType::new(PaimonDataType::VarChar(
+                VarCharType::string_type(),
+            ))),
+        )];
+        for schema in [
+            build_target_arrow_schema(&fields).unwrap(),
+            build_read_arrow_schema(&fields).unwrap(),
+        ] {
+            let ArrowDataType::List(entries) = schema.field(0).data_type() else {
+                panic!("multiset must use Arrow list storage");
+            };
+            let ArrowDataType::Struct(fields) = entries.data_type() else {
+                panic!("map entries must be a struct");
+            };
+            assert!(fields[0].is_nullable());
+            assert!(!fields[1].is_nullable());
+            assert!(matches!(
+                arrow_to_paimon_type(schema.field(0).data_type(), true).unwrap(),
+                PaimonDataType::Multiset(_)
+            ));
         }
     }
 

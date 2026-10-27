@@ -73,7 +73,7 @@ fn id_batch(ids: Vec<i32>) -> RecordBatch {
 fn write_mosaic(batch: &RecordBatch) -> Bytes {
     let mut writer = MosaicWriter::new(
         MemOutputFile { data: Vec::new() },
-        batch.schema().as_ref(),
+        &crate::arrow::legacy::to_legacy_schema(batch.schema().as_ref()).unwrap(),
         WriterOptions {
             compression: COMPRESSION_NONE,
             num_buckets: 2,
@@ -82,7 +82,9 @@ fn write_mosaic(batch: &RecordBatch) -> Bytes {
         },
     )
     .unwrap();
-    writer.write_batch(batch).unwrap();
+    writer
+        .write_batch(&crate::arrow::legacy::to_legacy_batch(batch).unwrap())
+        .unwrap();
     writer.close().unwrap();
     Bytes::from(writer.output().data.to_vec())
 }

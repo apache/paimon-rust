@@ -55,6 +55,7 @@ use datafusion::catalog::Session;
 use datafusion::common::tree_node::Transformed;
 use datafusion::common::{
     internal_err, project_schema, Column, DataFusionError, Result as DFResult, ScalarValue,
+    TableReference,
 };
 use datafusion::datasource::{provider_as_source, source_as_provider, TableProvider, TableType};
 use datafusion::execution::{SendableRecordBatchStream, SessionState, TaskContext};
@@ -63,13 +64,12 @@ use datafusion::functions_aggregate::count::count_udaf;
 use datafusion::functions_aggregate::expr_fn::{count, sum};
 use datafusion::logical_expr::expr::AggregateFunction;
 use datafusion::logical_expr::{
-    col, lit, Aggregate, Expr, LogicalPlan, LogicalPlanBuilder, TableScan, TableSource,
+    col, lit, Aggregate, Expr, LogicalPlan, LogicalPlanBuilder, TableScanBuilder, TableSource,
 };
 use datafusion::optimizer::{ApplyOrder, OptimizerConfig, OptimizerRule};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::streaming::{PartitionStream, StreamingTableExec};
 use datafusion::physical_plan::ExecutionPlan;
-use datafusion::sql::TableReference;
 use futures::{stream, TryStreamExt};
 use paimon::spec::{CoreOptions, DataField, Datum, Predicate};
 use paimon::table::Table;
@@ -191,13 +191,9 @@ fn rewrite_aggregate(aggregate: &Aggregate) -> DFResult<Option<LogicalPlan>> {
     };
     // Only the synthetic scan changes qualifier; fallback filters still refer
     // to the original scan's table name.
-    let counts_scan = LogicalPlan::TableScan(TableScan::try_new(
-        qualifier.clone(),
-        provider_as_source(Arc::new(counts)),
-        None,
-        vec![],
-        None,
-    )?);
+    let counts_scan = LogicalPlan::TableScan(
+        TableScanBuilder::new(qualifier.clone(), provider_as_source(Arc::new(counts))).build()?,
+    );
 
     let row_count = Expr::Column(Column::new(Some(qualifier.clone()), ROW_COUNT_COLUMN));
     let summed = LogicalPlan::Aggregate(Aggregate::try_new(
@@ -510,13 +506,12 @@ impl PartitionRowCountStream {
             .iter()
             .map(|field| source_schema.index_of(field.name()))
             .collect::<Result<Vec<_>, _>>()?;
-        let scan = LogicalPlan::TableScan(TableScan::try_new(
-            self.table_name.clone(),
-            Arc::clone(source),
-            Some(partition_indices),
-            self.filters.clone(),
-            None,
-        )?);
+        let scan = LogicalPlan::TableScan(
+            TableScanBuilder::new(self.table_name.clone(), Arc::clone(source))
+                .with_projection(Some(partition_indices))
+                .with_filters(self.filters.clone())
+                .build()?,
+        );
 
         let group_by: Vec<Expr> = self
             .partition_fields
@@ -538,7 +533,7 @@ impl PartitionRowCountStream {
         // rewrite its own fallback.
         self.state
             .query_planner()
-            .create_physical_plan(&counted, &self.state)
+            .create_physical_plan(&counted, self.state.as_ref())
             .await
     }
 }
