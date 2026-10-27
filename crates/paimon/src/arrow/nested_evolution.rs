@@ -758,9 +758,9 @@ fn evolve_map(
     )
 }
 
-/// Rebuild a MULTISET whose element type evolved. Arrow renders a MULTISET as a
-/// map of element -> count, so only the key side is reconciled and the counts
-/// carry over untouched.
+/// Rebuild a MULTISET whose element type evolved. Arrow uses a list of
+/// element/count entries; Parquet and historical files can decode as a map.
+/// Only the element side evolves and the counts carry over untouched.
 ///
 /// Java's read-side cast dispatcher has no MULTISET branch and raises "Cannot
 /// cast from type ... to type ..." for such a schema change; going through the
@@ -772,20 +772,46 @@ fn evolve_multiset(
     source_element: &DataType,
     target_element: &DataType,
 ) -> crate::Result<ArrayRef> {
-    let map = visible_map(as_map_array(source, "MULTISET")?)?;
-    let elements = evolve_column(map.keys(), source_element, target_element)?;
-    let counts = map.values().clone();
-    rebuild_map(
-        &map,
-        elements,
-        counts,
-        ArrowField::new(
-            "key",
-            paimon_type_to_arrow_for_read(target_element)?,
-            target_element.is_nullable(),
-        ),
-        ArrowField::new("value", ArrowDataType::Int32, false),
+    let list = if let Some(map) = source.as_any().downcast_ref::<MapArray>() {
+        visible_generic_list(&ListArray::from(map.clone()))?
+    } else {
+        visible_list(source)?
+    };
+    let entries = list
+        .values()
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .filter(|entries| entries.num_columns() == 2)
+        .ok_or_else(|| crate::Error::DataInvalid {
+            message: "MULTISET entries must contain an element and count".into(),
+            source: None,
+        })?;
+    let elements = evolve_column(entries.column(0), source_element, target_element)?;
+    let field =
+        crate::arrow::multiset::entries_field(paimon_type_to_arrow_for_read(target_element)?, true);
+    let ArrowDataType::Struct(fields) = field.data_type() else {
+        unreachable!()
+    };
+    let entries = StructArray::try_new(
+        fields.clone(),
+        vec![elements, entries.column(1).clone()],
+        None,
     )
+    .map_err(|error| crate::Error::DataInvalid {
+        message: format!("failed to build schema-evolved MULTISET: {error}"),
+        source: None,
+    })?;
+    let result = ListArray::try_new(
+        field,
+        list.offsets().clone(),
+        Arc::new(entries),
+        list.nulls().cloned(),
+    )
+    .map_err(|error| crate::Error::DataInvalid {
+        message: format!("failed to build schema-evolved MULTISET: {error}"),
+        source: None,
+    })?;
+    Ok(Arc::new(result))
 }
 
 fn as_map_array<'a>(source: &'a ArrayRef, kind: &str) -> crate::Result<&'a MapArray> {
@@ -1903,15 +1929,15 @@ mod tests {
     #[test]
     fn readded_child_inside_a_multiset_does_not_serve_the_dropped_field_values() {
         // MULTISET<ROW<x>> where `x` was dropped and re-added with a new id.
-        // Arrow renders a MULTISET as a Map of element -> count, so the source
-        // and target Arrow types are identical and only the field ids differ.
+        // A historical Parquet MULTISET decodes as Map<element, count>; the
+        // current list representation must still reconcile the field ids.
         let x: ArrayRef = Arc::new(StringArray::from(vec![Some("old")]));
         let element_fields = Fields::from(vec![ArrowField::new("x", ArrowDataType::Utf8, true)]);
         let elements: ArrayRef =
             Arc::new(StructArray::try_new(element_fields.clone(), vec![x], None).unwrap());
         let counts: ArrayRef = Arc::new(Int32Array::from(vec![Some(1)]));
         let entry_fields = Fields::from(vec![
-            ArrowField::new("key", ArrowDataType::Struct(element_fields.clone()), true),
+            ArrowField::new("key", ArrowDataType::Struct(element_fields.clone()), false),
             ArrowField::new("value", ArrowDataType::Int32, false),
         ]);
         let entries =
@@ -1945,12 +1971,8 @@ mod tests {
 
         let out = evolve_column(&source, &source_type, &target_type).unwrap();
 
-        let map = out
-            .as_any()
-            .downcast_ref::<arrow_array::MapArray>()
-            .unwrap()
-            .clone();
-        let element = as_struct(&map.keys().clone());
+        let entries = crate::arrow::multiset::entries(out.as_ref(), 0).unwrap();
+        let element = as_struct(entries.column(0));
         assert_eq!(
             element.column_by_name("x").unwrap().null_count(),
             1,

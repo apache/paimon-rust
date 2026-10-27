@@ -27,7 +27,7 @@ under the License.
 [dependencies]
 paimon = "0.6.0"
 paimon-datafusion = "0.6.0"
-datafusion = "54.0.0"
+datafusion = "55.2.0"
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -36,7 +36,7 @@ and writes to ordinary Paimon tables can create them with `file.format=mosaic`.
 
 ## SQL Support Scope
 
-`paimon-datafusion` currently targets Apache DataFusion 54.x. The workspace pins `datafusion = "54.0.0"`.
+`paimon-datafusion` currently targets Apache DataFusion 55.x. The workspace uses `datafusion = "55.2.0"`.
 
 SQL support has two layers:
 

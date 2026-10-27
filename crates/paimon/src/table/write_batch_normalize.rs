@@ -327,6 +327,30 @@ fn normalize_visible_array(
                 |row| (!fixed.is_null(row)).then(|| fixed.value(row)),
             ))))
         }
+        (DataType::Map(_, _), DataType::List(expected_child))
+            if crate::arrow::multiset::is_multiset(expected_child) =>
+        {
+            let map = array.as_any().downcast_ref::<MapArray>().unwrap();
+            let nulls = NullBuffer::union(map.nulls(), parent_nulls);
+            let entries: ArrayRef = Arc::new(map.entries().clone());
+            let (entries, offsets) = visible_children(&entries, map.offsets(), nulls.as_ref())?;
+            let entries = entries.as_any().downcast_ref::<StructArray>().unwrap();
+            let DataType::Struct(fields) = expected_child.data_type() else {
+                unreachable!()
+            };
+            let columns = entries
+                .columns()
+                .iter()
+                .zip(fields)
+                .map(|(column, field)| normalize_write_array(column, field.data_type()))
+                .collect::<Result<Vec<_>>>()?;
+            let entries =
+                StructArray::try_new(fields.clone(), columns, None).map_err(normalization_error)?;
+            Ok(Arc::new(
+                ListArray::try_new(expected_child.clone(), offsets, Arc::new(entries), nulls)
+                    .map_err(normalization_error)?,
+            ))
+        }
         (DataType::List(_), DataType::List(expected_child)) => {
             let list = array.as_any().downcast_ref::<ListArray>().unwrap();
             let nulls = NullBuffer::union(list.nulls(), parent_nulls);
@@ -589,6 +613,52 @@ fn normalization_error(error: arrow_schema::ArrowError) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_map_input_normalizes_to_multiset_list() {
+        let fields = arrow_schema::Fields::from(vec![
+            Field::new("old_key", DataType::Int32, false),
+            Field::new("old_count", DataType::Int32, false),
+        ]);
+        let entries = StructArray::try_new(
+            fields.clone(),
+            vec![
+                Arc::new(arrow_array::Int32Array::from(vec![5])),
+                Arc::new(arrow_array::Int32Array::from(vec![3])),
+            ],
+            None,
+        )
+        .unwrap();
+        let source: ArrayRef = Arc::new(MapArray::new(
+            Arc::new(Field::new("entries", DataType::Struct(fields), false)),
+            OffsetBuffer::new(vec![0, 1].into()),
+            entries,
+            None,
+            false,
+        ));
+        let target = DataType::List(crate::arrow::multiset::entries_field(DataType::Int32, true));
+        let normalized = normalize_write_array(&source, &target).unwrap();
+        let entries = crate::arrow::multiset::entries(normalized.as_ref(), 0).unwrap();
+        assert_eq!(normalized.data_type(), &target);
+        assert_eq!(
+            entries
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow_array::Int32Array>()
+                .unwrap()
+                .value(0),
+            5
+        );
+        assert_eq!(
+            entries
+                .column(1)
+                .as_any()
+                .downcast_ref::<arrow_array::Int32Array>()
+                .unwrap()
+                .value(0),
+            3
+        );
+    }
     use arrow_array::{FixedSizeListArray, Int32Array, LargeBinaryArray, StringArray};
     use arrow_buffer::{OffsetBuffer, ScalarBuffer};
     use arrow_schema::Field;
@@ -1548,7 +1618,10 @@ mod tests {
                 let output = normalize_write_array(&input, &expected).unwrap();
                 assert_eq!(output.data_type(), &expected);
                 assert_eq!(output.len(), input.len());
-                assert_eq!(output.nulls(), input.nulls());
+                assert_eq!(output.null_count(), input.null_count());
+                for row in 0..input.len() {
+                    assert_eq!(output.is_null(row), input.is_null(row));
+                }
                 let data = output.to_data();
                 data.validate_full().unwrap();
             }

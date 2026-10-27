@@ -26,7 +26,7 @@ use apache_avro::{Codec, Schema, Writer};
 use arrow_array::{
     Array, BinaryArray, BooleanArray, Date32Array, Decimal128Array, FixedSizeListArray,
     Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, LargeBinaryArray,
-    ListArray, MapArray, RecordBatch, StringArray, StructArray, Time32MillisecondArray,
+    ListArray, RecordBatch, StringArray, StructArray, Time32MillisecondArray,
     TimestampMicrosecondArray, TimestampMillisecondArray, TimestampSecondArray,
 };
 use arrow_schema::SchemaRef;
@@ -447,16 +447,23 @@ fn nonnull_value_at(array: &dyn Array, row: usize, typ: &DataType) -> Result<Val
 }
 
 fn map_value(array: &dyn Array, row: usize, key: &DataType, value: &DataType) -> Result<Value> {
-    let map = downcast::<MapArray>(array)?;
-    let start = map.value_offsets()[row] as usize;
-    let end = map.value_offsets()[row + 1] as usize;
+    let structure = crate::arrow::multiset::entries(array, row)?;
+    let start = 0;
+    let end = structure.len();
     if matches!(key, DataType::Char(_) | DataType::VarChar(_)) {
         let mut entries = HashMap::with_capacity(end - start);
         for index in start..end {
-            let map_key = downcast::<StringArray>(map.keys())?.value(index);
+            if structure.column(0).is_null(index) {
+                return Err(Error::DataInvalid {
+                    message: "Avro string maps cannot contain NULL keys or multiset elements"
+                        .into(),
+                    source: None,
+                });
+            }
+            let map_key = downcast::<StringArray>(structure.column(0))?.value(index);
             entries.insert(
                 map_key.to_string(),
-                value_at(map.values().as_ref(), index, value)?,
+                value_at(structure.column(1).as_ref(), index, value)?,
             );
         }
         Ok(Value::Map(entries))
@@ -464,10 +471,13 @@ fn map_value(array: &dyn Array, row: usize, key: &DataType, value: &DataType) ->
         let mut entries = Vec::with_capacity(end - start);
         for index in start..end {
             entries.push(Value::Record(vec![
-                ("key".into(), value_at(map.keys(), index, key)?),
+                (
+                    "key".into(),
+                    value_at(structure.column(0).as_ref(), index, key)?,
+                ),
                 (
                     "value".into(),
-                    value_at(map.values().as_ref(), index, value)?,
+                    value_at(structure.column(1).as_ref(), index, value)?,
                 ),
             ]));
         }
@@ -529,6 +539,71 @@ mod tests {
         ArrayType, BigIntType, BlobType, FloatType, IntType, MapType, RowType, VarCharType,
         VectorType,
     };
+
+    #[tokio::test]
+    async fn multiset_preserves_null_elements_and_counts_in_avro() {
+        let fields = vec![DataField::new(
+            0,
+            "bag".into(),
+            DataType::Multiset(crate::spec::MultisetType::new(
+                DataType::Int(IntType::new()),
+            )),
+        )];
+        let schema = build_target_arrow_schema(&fields).unwrap();
+        let arrow_schema::DataType::List(child) = schema.field(0).data_type() else {
+            unreachable!()
+        };
+        let arrow_schema::DataType::Struct(entry_fields) = child.data_type() else {
+            unreachable!()
+        };
+        let entries = StructArray::try_new(
+            entry_fields.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![None, Some(5)])),
+                Arc::new(Int32Array::from(vec![3, 2])),
+            ],
+            None,
+        )
+        .unwrap();
+        let bag = ListArray::try_new(
+            child.clone(),
+            arrow_buffer::OffsetBuffer::new(vec![0, 2, 2, 2].into()),
+            Arc::new(entries),
+            Some(NullBuffer::from(vec![true, false, true])),
+        )
+        .unwrap();
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(bag)]).unwrap();
+        let io = FileIOBuilder::new("memory").build().unwrap();
+        let path = "memory:/multiset-null.avro";
+        let mut writer = AvroFormatWriter::new(
+            &io.new_output(path).unwrap(),
+            schema,
+            fields.clone(),
+            "none",
+            1,
+            None,
+        )
+        .await
+        .unwrap();
+        writer.write(&batch).await.unwrap();
+        Box::new(writer).close().await.unwrap();
+        let bytes = io.new_input(path).unwrap().read().await.unwrap();
+        let decoded = AvroFormatReader
+            .read_batch_stream(
+                Box::new(BytesFileRead(bytes.clone())),
+                bytes.len() as u64,
+                &fields,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(decoded, vec![batch]);
+    }
 
     fn fields() -> Vec<DataField> {
         vec![

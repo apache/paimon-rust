@@ -571,7 +571,7 @@ mod read_tests {
         let out = MemOutputFile::new();
         let mut writer = MosaicWriter::new(
             out,
-            batch.schema().as_ref(),
+            &crate::arrow::legacy::to_legacy_schema(batch.schema().as_ref()).unwrap(),
             WriterOptions {
                 compression: COMPRESSION_NONE,
                 num_buckets: 2,
@@ -580,7 +580,9 @@ mod read_tests {
             },
         )
         .unwrap();
-        writer.write_batch(batch).unwrap();
+        writer
+            .write_batch(&crate::arrow::legacy::to_legacy_batch(batch).unwrap())
+            .unwrap();
         writer.close().unwrap();
         Bytes::from(writer.output().data.to_vec())
     }
