@@ -25,11 +25,9 @@
 //! (result reader -> Arrow batches, best-first order, `__paimon_search_score`).
 //!
 //! Why Rust-built rather than a committed cross-language fixture: the Java
-//! primary-key vector ANN segment is an opaque native Lumina format that cannot
-//! be reproduced byte-for-byte here, whereas the Rust read path is backed by the
-//! vindex (IVF) segment format. This test therefore validates the Rust read path
-//! against real vindex IVF segment bytes it produces itself, with no committed
-//! binaries and nothing skipped.
+//! primary-key vector fixture uses a format that this Rust test does not build.
+//! This test validates the Rust read path against real vindex IVF segment bytes
+//! it produces itself, with no external binaries or skipped tests.
 //!
 //! Two constraints the primary-key read path enforces are satisfied by hand
 //! (mirroring Java `PrimaryKeyIndexSourcePolicy` and `PrimaryKeyIndexSourceMeta`):

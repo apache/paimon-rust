@@ -6201,7 +6201,7 @@ pub(in crate::table) mod tests {
             append(&table, 1).await.unwrap();
             let mut message = crate::table::CommitMessage::new(vec![], 0, vec![]);
             message.new_index_files.push(crate::spec::IndexFileMeta {
-                index_type: "lumina".into(),
+                index_type: "diskann".into(),
                 file_name: "audit-index".into(),
                 file_size: 1,
                 row_count: 1,

@@ -17,7 +17,6 @@
 
 //! Resolve and validate PK vector-search parameters before scan planning.
 
-use crate::lumina::{is_lumina_index_type, LuminaVectorIndexOptions};
 use crate::spec::{CoreOptions, DataField, DataType, GlobalIndexSearchMode, Predicate};
 use crate::table::bucket_filter::split_partition_and_data_predicates;
 use crate::table::vector_search_common::{configured_refine_factor, indexed_search_limit};
@@ -176,55 +175,42 @@ fn pk_vector_query_dimension(
             Ok(Some(vector_type.length() as usize))
         }
         DataType::Array(array_type) if matches!(array_type.element_type(), DataType::Float(_)) => {
-            // Resolve the dimension per the configured backend. An `ARRAY<FLOAT>`
-            // column carries no dimension in its type, so it comes from options —
-            // but the option shape differs by backend. Lumina is not a vindex
-            // index type, so routing it through `VindexVectorIndexOptions` would
-            // reject it as unsupported before planning (even on an empty table).
-            if is_lumina_index_type(index_type) {
-                // Lumina reads `lumina.index.dimension` (default 128) from the
-                // merged table+query options, matching `resolve_lumina_options`.
-                let mut merged = table_options.clone();
-                merged.extend(query_options.clone());
-                let dimension = LuminaVectorIndexOptions::new(&merged)?.dimension;
-                Ok(Some(dimension as usize))
-            } else {
-                let mut dimension_options = HashMap::new();
-                for key in [
-                    "dimension".to_string(),
-                    format!("{index_type}.dimension"),
-                    format!("{index_type}.index.dimension"),
-                    format!("fields.{}.dimension", vector_field.name()),
-                    format!("fields.{}.index.dimension", vector_field.name()),
-                ] {
-                    if let Some(value) = query_options.get(&key) {
-                        let key = if key == "dimension" {
-                            format!("{index_type}.dimension")
-                        } else {
-                            key
-                        };
-                        dimension_options.insert(key, value.clone());
-                    }
+            // ARRAY<FLOAT> carries its dimension in the vindex options.
+            let mut dimension_options = HashMap::new();
+            for key in [
+                "dimension".to_string(),
+                format!("{index_type}.dimension"),
+                format!("{index_type}.index.dimension"),
+                format!("fields.{}.dimension", vector_field.name()),
+                format!("fields.{}.index.dimension", vector_field.name()),
+            ] {
+                if let Some(value) = query_options.get(&key) {
+                    let key = if key == "dimension" {
+                        format!("{index_type}.dimension")
+                    } else {
+                        key
+                    };
+                    dimension_options.insert(key, value.clone());
                 }
-                let mut table_dimension_options = table_options.clone();
-                if let Some(value) = table_options.get("dimension") {
-                    if !table_options.contains_key(&format!("{index_type}.dimension"))
-                        && !table_options.contains_key(&format!("{index_type}.index.dimension"))
-                    {
-                        table_dimension_options
-                            .insert(format!("{index_type}.dimension"), value.clone());
-                    }
-                }
-                Ok(Some(
-                    VindexVectorIndexOptions::new(
-                        &table_dimension_options,
-                        &dimension_options,
-                        index_type,
-                        vector_field,
-                    )?
-                    .dimension(),
-                ))
             }
+            let mut table_dimension_options = table_options.clone();
+            if let Some(value) = table_options.get("dimension") {
+                if !table_options.contains_key(&format!("{index_type}.dimension"))
+                    && !table_options.contains_key(&format!("{index_type}.index.dimension"))
+                {
+                    table_dimension_options
+                        .insert(format!("{index_type}.dimension"), value.clone());
+                }
+            }
+            Ok(Some(
+                VindexVectorIndexOptions::new(
+                    &table_dimension_options,
+                    &dimension_options,
+                    index_type,
+                    vector_field,
+                )?
+                .dimension(),
+            ))
         }
         _ => Ok(None),
     }

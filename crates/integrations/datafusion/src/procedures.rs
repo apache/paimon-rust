@@ -31,8 +31,7 @@
 //! - `CALL sys.create_global_index(table => '...', index_column => '...', index_type => 'btree')`
 //! - `CALL sys.create_global_index(table => '...', index_column => '...', index_type => 'bitmap')`
 //! - `CALL sys.create_global_index(table => '...', index_column => '...', index_type => 'ivf-pq')`
-//! - `CALL sys.drop_global_index(table => '...', index_column => '...', index_type => 'btree')` (also 'bitmap', 'multivalue', 'fm', 'lumina', or a vindex type such as 'ivf-pq')
-//! - `CALL sys.create_lumina_index(table => '...', index_column => '...')`
+//! - `CALL sys.drop_global_index(table => '...', index_column => '...', index_type => 'btree')` (also 'bitmap', 'multivalue', 'fm', or a vindex type such as 'diskann')
 //!
 //! REST management procedures (REST catalogs only, mirroring Java's
 //! `RESTCatalog.permissionManagement()` / `policyManagement()`):
@@ -74,7 +73,6 @@ use paimon::api::{
     PermissionColumns, PermissionResource, PolicyType, ResourceType, RowFilter,
 };
 use paimon::catalog::{Catalog, Identifier, RESTCatalog};
-use paimon::lumina::{is_lumina_index_type, LUMINA_IDENTIFIER};
 use paimon::spec::{CoreOptions, DataType, Datum, Predicate, PredicateBuilder, Snapshot};
 use paimon::table::{
     normalize_global_index_type, BranchManager, ConsumerManager, SnapshotManager, Table,
@@ -224,7 +222,6 @@ fn declared_parameters(proc_name: &str) -> Option<&'static [&'static str]> {
             "partitions",
             "dry_run",
         ],
-        "create_lumina_index" => &["table", "index_column", "index_type", "options"],
         "grant_permission" => &[
             "resource_type",
             "access",
@@ -347,7 +344,6 @@ pub async fn execute_procedure(
         "delete_branch" => proc_delete_branch(ctx, catalog, catalog_name, &args).await,
         "create_global_index" => proc_create_global_index(ctx, catalog, catalog_name, &args).await,
         "drop_global_index" => proc_drop_global_index(ctx, catalog, catalog_name, &args).await,
-        "create_lumina_index" => proc_create_lumina_index(ctx, catalog, catalog_name, &args).await,
         "grant_permission" => proc_grant_permission(ctx, catalog, catalog_name, &args).await,
         "revoke_permission" => proc_revoke_permission(ctx, catalog, catalog_name, &args).await,
         "list_permissions" => proc_list_permissions(ctx, catalog, catalog_name, &args).await,
@@ -1015,34 +1011,6 @@ async fn proc_create_tag_from_watermark(
     tm.create_with_retention(tag_name, &snapshot, time_retained)
         .await
         .map_err(to_datafusion_error)?;
-    ok_result(ctx)
-}
-
-async fn proc_create_lumina_index(
-    ctx: &SessionContext,
-    catalog: &Arc<dyn Catalog>,
-    catalog_name: &str,
-    args: &HashMap<String, String>,
-) -> DFResult<DataFrame> {
-    let table = get_table(catalog, catalog_name, args).await?;
-    let index_column = require_arg(args, "index_column")?;
-    let mut builder = table.new_global_index_build_builder();
-    builder.with_index_column(index_column);
-    let index_type = normalize_index_type(
-        args.get("index_type")
-            .map(String::as_str)
-            .unwrap_or(LUMINA_IDENTIFIER),
-    );
-    if !is_lumina_index_type(&index_type) {
-        return Err(DataFusionError::NotImplemented(format!(
-            "Unsupported Lumina index type: {index_type}"
-        )));
-    }
-    builder.with_index_type(&index_type);
-    if let Some(options) = args.get("options") {
-        builder.with_options(parse_key_value_options(options)?);
-    }
-    builder.execute().await.map_err(to_datafusion_error)?;
     ok_result(ctx)
 }
 
@@ -2104,10 +2072,7 @@ mod tests {
         assert_eq!(normalize_index_type(" BitMap\t"), "bitmap");
         assert_eq!(normalize_index_type("IVF-FLAT"), "ivf-flat");
         assert_eq!(normalize_index_type("Ivf-Pq"), "ivf-pq");
-        assert_eq!(
-            normalize_index_type("Lumina-Vector-Ann"),
-            "lumina-vector-ann"
-        );
+        assert_eq!(normalize_index_type("DiskANN"), "diskann");
         // Already canonical values are returned unchanged, and an unknown type
         // is normalized but not rewritten -- the caller still rejects it.
         assert_eq!(normalize_index_type("ivf-flat"), "ivf-flat");

@@ -227,31 +227,21 @@ jobs:
         include:
           - suite: rust
             needs_docker: true
-            needs_lumina: false
             needs_uv: false
           - suite: datafusion
             needs_docker: true
-            needs_lumina: true
-            needs_uv: false
-          - suite: lumina
-            needs_docker: false
-            needs_lumina: true
             needs_uv: false
           - suite: python
             needs_docker: true
-            needs_lumina: false
             needs_uv: true
           - suite: go
             needs_docker: true
-            needs_lumina: false
             needs_uv: false
           - suite: jindo
             needs_docker: false
-            needs_lumina: false
             needs_uv: false
           - suite: oss-cpp
             needs_docker: false
-            needs_lumina: false
             needs_uv: false
     env:
       RUST_LOG: DEBUG
@@ -277,30 +267,6 @@ jobs:
       - name: Rust Integration Test
         if: matrix.suite == 'rust'
         run: cargo test --locked -p paimon-integration-tests --all-targets
-
-      - name: Install lumina native library
-        if: matrix.needs_lumina == true
-        run: |
-          pip install lumina-data
-          echo "LUMINA_LIB_PATH=$(python3 -c 'import lumina_data; print(lumina_data.__path__[0])')/lib/liblumina_py.so" >> $GITHUB_ENV
-
-      - name: Core Lumina Native Build Test
-        if: matrix.suite == 'lumina'
-        run: >
-          cargo test --locked -p paimon --lib
-          table::lumina_index_build_builder::tests::test_execute_writes_lumina_index_manifest
-          --features fulltext,vortex
-          -- --ignored --exact
-
-      # The test filter selects tests, not targets, so without `--test` cargo links all 26
-      # integration binaries with `vortex` enabled just to run one ignored test in one of them.
-      - name: DataFusion Lumina Build Query E2E Test
-        if: matrix.suite == 'lumina'
-        run: >
-          cargo test --locked -p paimon-datafusion --test read_tables
-          --features vortex
-          vector_search_tests::test_lumina_build_then_vector_search_query
-          -- --ignored --exact
 
       - name: DataFusion Integration Test
         if: matrix.suite == 'datafusion'

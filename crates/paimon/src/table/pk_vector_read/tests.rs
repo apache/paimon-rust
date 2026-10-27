@@ -18,7 +18,6 @@
 use super::*;
 use crate::catalog::Identifier;
 use crate::io::{FileIO, FileIOBuilder};
-use crate::lumina::LuminaIndexMeta;
 use crate::spec::stats::BinaryTableStats;
 use crate::spec::{
     BinaryRow, DataField, DataFileMeta, DataType, Datum, FloatType, IntType, Predicate,
@@ -30,7 +29,6 @@ use crate::table::source::DataSplitBuilder;
 use crate::table::vector_scan::Scan;
 use crate::table::vector_search_test_utils::{build_vindex_segment_bytes, pk_vector_table};
 use crate::table::{Table, TableCommit, TableWrite};
-use crate::vindex::pkvector::bucket::BucketAnnSegment;
 use crate::vindex::pkvector::metric::VectorSearchMetric;
 use crate::vindex::IVF_FLAT_IDENTIFIER;
 use arrow_array::builder::{FixedSizeListBuilder, Float32Builder};
@@ -96,22 +94,6 @@ fn pk_data_file(name: &str, row_count: i64, first_row_id: Option<i64>) -> DataFi
         first_row_id,
         write_cols: None,
         column_max_sequence_numbers: None,
-    }
-}
-
-fn pk_search_split(bucket: i32, files: Vec<DataFileMeta>) -> PkVectorSearchSplit {
-    PkVectorSearchSplit {
-        data_split: DataSplitBuilder::new()
-            .with_snapshot(1)
-            .with_partition(BinaryRow::new(0))
-            .with_bucket(bucket)
-            .with_bucket_path(format!("memory:/t/bucket-{bucket}"))
-            .with_total_buckets(1)
-            .with_data_files(files)
-            .build()
-            .unwrap(),
-        ann_segments: Vec::new(),
-        active_files: Vec::new(),
     }
 }
 
@@ -285,26 +267,6 @@ async fn vector_rerank_fixture(
         Vec::new(),
     );
     (reader, split, vector_field)
-}
-
-fn pk_split_with_lumina_segment(path: &str, metric: &str) -> PkVectorSearchSplit {
-    let mut split = pk_search_split(0, vec![pk_data_file("file-a", 3, Some(0))]);
-    let source_meta = crate::spec::PrimaryKeyIndexSourceMeta::new(
-        1,
-        vec![crate::spec::PrimaryKeyIndexSourceFile::new("file-a".to_string(), 3).unwrap()],
-    )
-    .unwrap();
-    let mut segment = BucketAnnSegment::for_test(source_meta);
-    segment.path = path.to_string();
-    // Lumina stores its metric in the serialized index metadata blob, not in
-    // the segment file bytes. `deserialize` requires both keys present.
-    let meta = crate::lumina::LuminaIndexMeta::new(HashMap::from([
-        ("index.dimension".to_string(), "2".to_string()),
-        ("distance.metric".to_string(), metric.to_string()),
-    ]));
-    segment.index_meta = meta.serialize().unwrap();
-    split.ann_segments = vec![segment];
-    split
 }
 
 /// One Java `DataOutput#writeUTF` value (u16-BE length + modified UTF-8), used
@@ -945,47 +907,6 @@ async fn rerank_reads_only_candidate_positions_not_whole_column() {
     assert_eq!(out[0].distance, 0.0);
     assert_eq!(out[1].row_position, 3);
     assert_eq!(out[1].distance, 4.0);
-}
-
-#[test]
-fn verify_segment_metric_accepts_matching_lumina_metric() {
-    // Lumina segment metadata says cosine; configured cosine => Ok. No segment
-    // file bytes are needed on the Lumina path.
-    let split = pk_split_with_lumina_segment("seg-lumina", "cosine");
-    let segment = &split.ann_segments[0];
-    let lumina_metric = LuminaIndexMeta::deserialize(&segment.index_meta)
-        .unwrap()
-        .metric()
-        .unwrap();
-    verify_segment_metric(
-        VectorSearchMetric::Cosine,
-        VectorSearchMetric::from_lumina(lumina_metric),
-    )
-    .expect("matching lumina metric must pass");
-}
-
-#[test]
-fn verify_segment_metric_rejects_mismatched_lumina_metric() {
-    // Lumina segment metadata says l2; configured inner_product => fail loud,
-    // naming both metrics.
-    let split = pk_split_with_lumina_segment("seg-lumina", "l2");
-    let segment = &split.ann_segments[0];
-    let lumina_metric = LuminaIndexMeta::deserialize(&segment.index_meta)
-        .unwrap()
-        .metric()
-        .unwrap();
-    let err = verify_segment_metric(
-        VectorSearchMetric::InnerProduct,
-        VectorSearchMetric::from_lumina(lumina_metric),
-    )
-    .expect_err("mismatched lumina metric must fail loud");
-    assert!(
-        matches!(err, crate::Error::DataInvalid { ref message, .. }
-            if message.contains("does not match configured metric")
-                && message.contains("l2")
-                && message.contains("inner_product")),
-        "unexpected error: {err:?}"
-    );
 }
 
 #[test]

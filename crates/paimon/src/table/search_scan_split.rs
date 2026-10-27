@@ -21,11 +21,12 @@ use super::bucket_filter::split_partition_and_data_predicates;
 use super::global_index_scanner::unindexed_ranges_for_global_index_entries;
 use super::global_index_types::normalize_queryable_global_index_type;
 use super::row_id_predicate::intersect_sorted_ranges;
-use super::vector_search_common::{configured_vector_index_type, VectorIndexBackend};
+use super::vector_search_common::configured_vector_index_type;
 use super::{find_field_id_by_name, merge_row_ranges, DataSplit, RowRange, Table};
 use crate::spec::{
     CoreOptions, FileKind, GlobalIndexSearchMode, IndexFileMeta, IndexManifestEntry, Predicate,
 };
+use crate::vindex::is_vindex_index_type;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -80,7 +81,7 @@ pub(super) async fn global_search_splits(
             && if full_text {
                 file.index_type == "full-text"
             } else {
-                VectorIndexBackend::from_index_type(&file.index_type).is_some()
+                is_vindex_index_type(&file.index_type)
             }
     };
     let selected = entries
@@ -450,7 +451,7 @@ mod tests {
     fn raw_source_scalar_metadata_cannot_add_search_payloads() {
         // A search payload hidden in scalar metadata would otherwise be searched
         // over [0, 2], extending the explicitly selected raw source [1, 1].
-        for index_type in ["ivf-flat", "lumina", "lumina-vector-ann", "full-text"] {
+        for index_type in ["ivf-flat", "diskann", "full-text"] {
             let source = raw_source_with_scalar(index_type);
             let error = VectorScanPlan::new(Some(snapshot()), vec![source.clone()]).unwrap_err();
             assert!(error.to_string().contains("unsupported index type"));

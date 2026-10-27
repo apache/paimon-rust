@@ -748,7 +748,7 @@ async fn vector_build_with_deletion_vectors_preserves_physical_coverage() {
 
 /// Commit a synthetic vindex `IndexFileMeta` covering `[start, end]` for
 /// `field_id` directly into the index manifest, without invoking the native
-/// builder. Mirrors the Lumina/btree tests so the incremental gap logic can
+/// builder. Mirrors the BTree tests so the incremental gap logic can
 /// be exercised without a trained vector index. Writes the same `index_type`
 /// (`ivf-flat`) the builder-under-test uses, so the gap helper matches it.
 async fn commit_synthetic_vindex_index(table: &Table, field_id: i32, start: i64, end: i64) {
@@ -1333,7 +1333,7 @@ async fn vindex_build_cleans_written_shards_when_later_shard_fails() {
         .is_empty());
 }
 
-/// A field that already carries a DIFFERENT index type (`lumina`) over an
+/// A field that already carries a DIFFERENT index type (`diskann`) over an
 /// overlapping row range must not block a vindex (`ivf-flat`) build on the
 /// same field: the two indexes have distinct identities and coexist. Before
 /// the full-identity fix, the overlap guard keyed only on field id + range
@@ -1352,14 +1352,14 @@ async fn vindex_build_coexists_with_different_index_type_on_same_field() {
     )
     .await;
 
-    // Pre-existing `lumina` index covering the full data range on the SAME
+    // Pre-existing `diskann` index covering the full data range on the SAME
     // field the vindex build will target.
     let coverage = data_row_id_coverage(&table).await;
     assert_eq!(coverage.len(), 1, "data must be one contiguous range");
     let field_id = find_index_field(&table, "embedding").unwrap().id();
-    let lumina = IndexFileMeta {
-        index_type: "lumina".to_string(),
-        file_name: "lumina-synthetic-0.index".to_string(),
+    let diskann = IndexFileMeta {
+        index_type: "diskann".to_string(),
+        file_name: "diskann-synthetic-0.index".to_string(),
         file_size: 1,
         row_count: (coverage[0].to() - coverage[0].from() + 1) as i64,
         deletion_vectors_ranges: None,
@@ -1374,7 +1374,7 @@ async fn vindex_build_coexists_with_different_index_type_on_same_field() {
         }),
     };
     let mut message = CommitMessage::new(BinaryRow::new(0).to_serialized_bytes(), 0, vec![]);
-    message.new_index_files = vec![lumina];
+    message.new_index_files = vec![diskann];
     TableCommit::new(table.clone(), "test-user".to_string())
         .commit(vec![message])
         .await
@@ -1427,7 +1427,7 @@ fn vindex_first_build_indexes_full_coverage() {
     );
 }
 
-/// Planner-level mid-coverage hole, mirroring btree/lumina: with a single
+/// Planner-level mid-coverage hole, mirroring BTree: with a single
 /// shard cell (rows_per_shard large enough to hold all data) the grid never
 /// splits, so the only split is the indexed hole itself. An indexed range
 /// strictly inside the data coverage must carve the build into exactly the

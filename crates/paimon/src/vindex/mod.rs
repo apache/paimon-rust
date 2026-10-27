@@ -524,7 +524,6 @@ mod tests {
         assert!(!is_vindex_index_type("ivf-hnsw-sq"));
         assert!(!is_vindex_index_type(""));
         assert!(!is_vindex_index_type("btree"));
-        assert!(!is_vindex_index_type("lumina"));
         assert!(!is_vindex_index_type("IVF-FLAT"));
     }
 

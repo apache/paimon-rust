@@ -26,14 +26,12 @@ use super::global_index_types::{
     normalize_global_index_type, normalize_queryable_global_index_type, BTREE_GLOBAL_INDEX_TYPE,
     FULL_TEXT_GLOBAL_INDEX_TYPE,
 };
-use super::lumina_index_build_builder::LuminaIndexBuildBuilder;
 use super::sorted_global_index_build_builder::SortedGlobalIndexBuildBuilder;
 use super::vindex_index_build_builder::timing::{
     vector_index_build_timing_enabled, VectorIndexBuildTiming,
 };
 use super::vindex_index_build_builder::VindexIndexBuildBuilder;
 use super::{CommitMessage, Table, TableCommit};
-use crate::lumina::LUMINA_IDENTIFIER;
 use crate::spec::{CoreOptions, Predicate};
 use crate::{Error, Result};
 
@@ -241,14 +239,6 @@ impl<'a> GlobalIndexBuildBuilder<'a> {
                 message: "Full-text global index build requires the 'fulltext' feature".into(),
             });
         }
-        if index_type == LUMINA_IDENTIFIER {
-            let mut builder = LuminaIndexBuildBuilder::new(self.table);
-            builder
-                .with_index_column(columns[0])
-                .with_options(self.options.clone());
-            builder.partition_filter = self.partition_filter.clone();
-            return Ok(builder.prepare().await?.into());
-        }
         let mut builder = VindexIndexBuildBuilder::new(self.table, index_type);
         builder
             .with_index_column(columns[0])
@@ -303,8 +293,6 @@ mod tests {
             ("multivalue", "vector"),
             ("fm", "text"),
             ("full-text", "text"),
-            ("lumina", "vector"),
-            ("lumina-vector-ann", "vector"),
             ("ivf-flat", "vector"),
             ("ivf-pq", "vector"),
             ("ivf-sq", "vector"),
@@ -314,17 +302,7 @@ mod tests {
             if !GlobalIndexBuildBuilder::supports_index_type(kind) {
                 continue;
             }
-            let mut options = HashMap::from([(
-                format!(
-                    "{}.dimension",
-                    if kind == "lumina-vector-ann" {
-                        "lumina"
-                    } else {
-                        kind
-                    }
-                ),
-                "2".into(),
-            )]);
+            let mut options = HashMap::from([(format!("{kind}.dimension"), "2".into())]);
             if kind == "ivf-pq" {
                 options.insert("ivf-pq.pq.m".into(), "1".into());
             }
@@ -432,7 +410,7 @@ mod tests {
     #[tokio::test]
     async fn column_validation_precedes_any_index_io() {
         let table = empty_table();
-        for kind in ["bitmap", "fm", "full-text", "ivf-flat", "lumina"] {
+        for kind in ["bitmap", "fm", "full-text", "ivf-flat", "diskann"] {
             let mut builder = table.new_global_index_build_builder();
             builder
                 .with_index_columns(&["id", "text"])

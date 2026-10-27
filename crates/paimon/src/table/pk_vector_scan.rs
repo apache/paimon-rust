@@ -410,9 +410,6 @@ impl Scan for PkVectorScan {
                         file_name: entry.index_file.file_name.clone(),
                         external_path: entry.index_file.external_path.clone(),
                         file_size,
-                        // The Lumina reader consumes this as its serialized index
-                        // metadata; the vindex reader ignores it and loads metadata
-                        // from the segment file bytes. Absent value defaults to empty.
                         index_meta: gim.index_meta.clone().unwrap_or_default(),
                     },
                 ));
@@ -1747,7 +1744,7 @@ mod tests {
         // The chain the two tests above only cover in halves: the committed
         // Java-planned fixture, through planning, into the function that decides
         // whether the ANN backend is handed an `include_row_ids` filter. `None` here
-        // is what makes Lumina call `search` rather than `search_with_filter`.
+        // lets the index search without a row-id filter.
         // Result equality against the manifest route cannot see this difference --
         // both return the same rows for this fixture.
         let split = BucketVectorSearchSplit::deserialize(BUCKET_SPLIT_NO_PREFILTER).unwrap();

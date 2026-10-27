@@ -140,10 +140,7 @@ impl BatchVectorRead {
                             &self.context.column,
                         );
                         if index_files.iter().any(|file| {
-                            super::vector_search_common::VectorIndexBackend::from_index_type(
-                                &file.index_type,
-                            )
-                            .is_none()
+                            !crate::vindex::is_vindex_index_type(&file.index_type)
                                 || file
                                     .global_index_meta
                                     .as_ref()

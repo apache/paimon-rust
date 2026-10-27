@@ -17,13 +17,11 @@
 
 use super::*;
 use crate::io::{FileIO, FileIOBuilder};
-use crate::lumina::{LEGACY_LUMINA_VECTOR_ANN_IDENTIFIER, LUMINA_IDENTIFIER};
 use crate::spec::{
     BinaryRow, CoreOptions, DataField, DataType, FileKind, GlobalIndexMeta, IndexFileMeta,
     IndexManifestEntry, IntType, ROW_ID_FIELD_NAME,
 };
 use crate::table::pk_vector_position_read::{PKEY_VECTOR_POSITION_COLUMN, SEARCH_SCORE_COLUMN};
-use crate::table::vector_search_common::VectorIndexBackend;
 use crate::table::vector_search_common::{collect_ranked_rows, reorder_and_strip_position};
 use crate::table::vector_search_test_utils::{
     build_vindex_segment_bytes, de_vector_table, id_gt_filter, pk_vector_table,
@@ -65,7 +63,7 @@ fn eval_context<'a>(
     }
 }
 
-fn make_lumina_entry(
+fn make_vector_entry(
     file_name: &str,
     index_type: &str,
     kind: FileKind,
@@ -482,8 +480,6 @@ async fn raw_search_without_files_uses_the_configured_indexer_default() {
     for (index_type, expected) in [
         (" IVF-FLAT ", RawVectorMetric::InnerProduct),
         ("diskann", RawVectorMetric::InnerProduct),
-        ("lumina", RawVectorMetric::InnerProduct),
-        ("lumina-vector-ann", RawVectorMetric::InnerProduct),
     ] {
         let options = HashMap::from([(
             "fields.embedding.index-type".to_string(),
@@ -560,8 +556,8 @@ async fn mixed_vector_formats_fail_before_opening_files() {
     let file_io = FileIOBuilder::new("memory").build().unwrap();
     let fields = vec![make_field(2, "embedding")];
     let entries = [
-        make_lumina_entry("missing-flat", IVF_FLAT_IDENTIFIER, FileKind::Add, 2),
-        make_lumina_entry("missing-diskann", "diskann", FileKind::Add, 2),
+        make_vector_entry("missing-flat", IVF_FLAT_IDENTIFIER, FileKind::Add, 2),
+        make_vector_entry("missing-diskann", "diskann", FileKind::Add, 2),
     ];
     let query = VectorSearch::new(vec![1.0, 0.0], 1, "embedding".to_string()).unwrap();
     let error = evaluate_vector_search(
@@ -590,7 +586,7 @@ async fn indexed_vector_metric_ignores_unrelated_column_options() {
         .write(bytes::Bytes::from(index.clone()))
         .await
         .unwrap();
-    let mut entry = make_lumina_entry("test.idx", IVF_FLAT_IDENTIFIER, FileKind::Add, 2);
+    let mut entry = make_vector_entry("test.idx", IVF_FLAT_IDENTIFIER, FileKind::Add, 2);
     entry.index_file.file_size = index.len() as i64;
     let fields = vec![make_field(2, "embedding")];
     let options = HashMap::from([("fields.other.metric".to_string(), "l2".to_string())]);
@@ -624,7 +620,7 @@ async fn indexed_vector_metric_ignores_unrelated_column_options() {
 #[tokio::test]
 async fn test_resolve_raw_vector_metric_uses_vindex_manifest_metadata() {
     let file_io = FileIOBuilder::new("memory").build().unwrap();
-    let mut entry = make_lumina_entry("missing.idx", IVF_FLAT_IDENTIFIER, FileKind::Add, 2);
+    let mut entry = make_vector_entry("missing.idx", IVF_FLAT_IDENTIFIER, FileKind::Add, 2);
     let index_meta = serde_json::to_vec(&HashMap::from([(
         "metric".to_string(),
         "cosine".to_string(),
@@ -667,7 +663,7 @@ async fn test_resolve_raw_vector_metric_falls_back_to_vindex_header() {
         (0, b"{}".to_vec()),
         (-1, b"{}".to_vec()),
     ] {
-        let mut entry = make_lumina_entry("test.idx", IVF_FLAT_IDENTIFIER, FileKind::Add, 2);
+        let mut entry = make_vector_entry("test.idx", IVF_FLAT_IDENTIFIER, FileKind::Add, 2);
         entry.index_file.file_size = file_size;
         entry
             .index_file
@@ -730,7 +726,7 @@ fn test_configured_refine_factor_precedence_and_aliases() {
             &HashMap::new(),
             &global_options,
             "embedding",
-            LUMINA_IDENTIFIER,
+            crate::vindex::DISKANN_IDENTIFIER,
         )
         .unwrap(),
         4
@@ -744,7 +740,7 @@ fn test_configured_refine_factor_rejects_invalid_values() {
         &zero_options,
         &HashMap::new(),
         "embedding",
-        LUMINA_IDENTIFIER,
+        crate::vindex::DISKANN_IDENTIFIER,
     )
     .unwrap_err();
     assert!(err.to_string().contains("must be positive"));
@@ -754,7 +750,7 @@ fn test_configured_refine_factor_rejects_invalid_values() {
         &invalid_options,
         &HashMap::new(),
         "embedding",
-        LUMINA_IDENTIFIER,
+        crate::vindex::DISKANN_IDENTIFIER,
     )
     .unwrap_err();
     assert!(err.to_string().contains("Must be an integer"));
@@ -934,12 +930,7 @@ async fn test_batch_evaluate_no_matching_field_returns_empty_per_query() {
     ];
     let options = HashMap::new();
 
-    let entry = make_lumina_entry(
-        "test.idx",
-        LEGACY_LUMINA_VECTOR_ANN_IDENTIFIER,
-        FileKind::Add,
-        99,
-    );
+    let entry = make_vector_entry("test.idx", IVF_FLAT_IDENTIFIER, FileKind::Add, 99);
 
     let results = evaluate_batch_vector_search(
         eval_context(&file_io, &options, &fields, None),
@@ -993,7 +984,7 @@ async fn test_evaluate_ignores_non_vector_index_type() {
     let vs = VectorSearch::new(vec![1.0], 10, "embedding".to_string()).unwrap();
     let options = HashMap::new();
 
-    let entry = make_lumina_entry("test.idx", "btree", FileKind::Add, 2);
+    let entry = make_vector_entry("test.idx", "btree", FileKind::Add, 2);
 
     let result = evaluate_vector_search(
         eval_context(&file_io, &options, &fields, None),
@@ -1033,12 +1024,7 @@ async fn test_evaluate_no_matching_field() {
     let vs = VectorSearch::new(vec![1.0], 10, "embedding".to_string()).unwrap();
     let options = HashMap::new();
 
-    let entry = make_lumina_entry(
-        "test.idx",
-        LEGACY_LUMINA_VECTOR_ANN_IDENTIFIER,
-        FileKind::Add,
-        99,
-    );
+    let entry = make_vector_entry("test.idx", IVF_FLAT_IDENTIFIER, FileKind::Add, 99);
 
     let result = evaluate_vector_search(
         eval_context(&file_io, &options, &fields, None),
@@ -1057,12 +1043,7 @@ async fn test_evaluate_skips_delete_entries() {
     let vs = VectorSearch::new(vec![1.0], 10, "embedding".to_string()).unwrap();
     let options = HashMap::new();
 
-    let entry = make_lumina_entry(
-        "test.idx",
-        LEGACY_LUMINA_VECTOR_ANN_IDENTIFIER,
-        FileKind::Delete,
-        2,
-    );
+    let entry = make_vector_entry("test.idx", IVF_FLAT_IDENTIFIER, FileKind::Delete, 2);
 
     let result = evaluate_vector_search(
         eval_context(&file_io, &options, &fields, None),
@@ -1075,64 +1056,13 @@ async fn test_evaluate_skips_delete_entries() {
 }
 
 #[tokio::test]
-async fn test_evaluate_accepts_canonical_lumina_index_type() {
-    let file_io = crate::io::FileIOBuilder::new("memory").build().unwrap();
-    let fields = vec![make_field(2, "embedding")];
-    let vs = VectorSearch::new(vec![1.0], 10, "embedding".to_string()).unwrap();
-    let options = HashMap::new();
-
-    let entry = make_lumina_entry("missing.idx", LUMINA_IDENTIFIER, FileKind::Add, 2);
-
-    let err = evaluate_vector_search(
-        eval_context(&file_io, &options, &fields, None),
-        &[entry],
-        &vs,
-    )
-    .await
-    .unwrap_err();
-    assert!(
-        err.to_string()
-            .contains("Failed to read Lumina index file 'missing.idx'"),
-        "unexpected error: {err}"
-    );
-}
-
-#[tokio::test]
-async fn test_evaluate_accepts_legacy_lumina_index_type() {
-    let file_io = crate::io::FileIOBuilder::new("memory").build().unwrap();
-    let fields = vec![make_field(2, "embedding")];
-    let vs = VectorSearch::new(vec![1.0], 10, "embedding".to_string()).unwrap();
-    let options = HashMap::new();
-
-    let entry = make_lumina_entry(
-        "missing.idx",
-        LEGACY_LUMINA_VECTOR_ANN_IDENTIFIER,
-        FileKind::Add,
-        2,
-    );
-
-    let err = evaluate_vector_search(
-        eval_context(&file_io, &options, &fields, None),
-        &[entry],
-        &vs,
-    )
-    .await
-    .unwrap_err();
-    assert!(
-        err.to_string()
-            .contains("Failed to read Lumina index file 'missing.idx'"),
-        "unexpected error: {err}"
-    );
-}
-
-#[tokio::test]
 async fn test_evaluate_accepts_vindex_index_type() {
     let file_io = crate::io::FileIOBuilder::new("memory").build().unwrap();
     let fields = vec![make_field(2, "embedding")];
     let vs = VectorSearch::new(vec![1.0], 10, "embedding".to_string()).unwrap();
     let options = HashMap::new();
 
-    let entry = make_lumina_entry("missing.idx", IVF_FLAT_IDENTIFIER, FileKind::Add, 2);
+    let entry = make_vector_entry("missing.idx", IVF_FLAT_IDENTIFIER, FileKind::Add, 2);
 
     let err = evaluate_vector_search(
         eval_context(&file_io, &options, &fields, None),
@@ -1165,7 +1095,7 @@ fn test_single_vindex_outside_tokio_returns_error() {
         let fields = vec![make_field(2, "embedding")];
         let vs = VectorSearch::new(vec![1.0], 10, "embedding".to_string()).unwrap();
         let options = HashMap::new();
-        let entry = make_lumina_entry("test.idx", IVF_FLAT_IDENTIFIER, FileKind::Add, 2);
+        let entry = make_vector_entry("test.idx", IVF_FLAT_IDENTIFIER, FileKind::Add, 2);
 
         let err = evaluate_vector_search(
             eval_context(&file_io, &options, &fields, None),
@@ -1200,7 +1130,7 @@ fn test_batch_vindex_outside_tokio_uses_buffered_fallback() {
             VectorSearch::new(vec![0.0, 1.0], 2, "embedding".to_string()).unwrap(),
         ];
         let options = HashMap::new();
-        let mut entry = make_lumina_entry("test.idx", IVF_FLAT_IDENTIFIER, FileKind::Add, 2);
+        let mut entry = make_vector_entry("test.idx", IVF_FLAT_IDENTIFIER, FileKind::Add, 2);
         entry.index_file.file_size = index.len() as i64;
         entry.index_file.row_count = 3;
         entry
@@ -1221,28 +1151,6 @@ fn test_batch_vindex_outside_tokio_uses_buffered_fallback() {
         assert_eq!(results.len(), searches.len());
         assert!(results.iter().all(|result| !result.is_empty()));
     });
-}
-
-#[test]
-fn from_index_type_classifies_lumina_and_vindex() {
-    assert_eq!(
-        VectorIndexBackend::from_index_type("lumina"),
-        Some(VectorIndexBackend::Lumina)
-    );
-    assert_eq!(
-        VectorIndexBackend::from_index_type("lumina-vector-ann"),
-        Some(VectorIndexBackend::Lumina)
-    );
-    assert_eq!(
-        VectorIndexBackend::from_index_type("ivf-flat"),
-        Some(VectorIndexBackend::Vindex)
-    );
-    for index_type in ["ivf-sq", "ivf-rq", "diskann"] {
-        assert_eq!(
-            VectorIndexBackend::from_index_type(index_type),
-            Some(VectorIndexBackend::Vindex)
-        );
-    }
 }
 
 #[tokio::test]
@@ -1615,7 +1523,7 @@ async fn indexed_search_rejects_mixed_metrics_and_conflicting_query_metric() {
     for (ordinal, metric) in ["l2", "cosine"].into_iter().enumerate() {
         let bytes = build_vindex_segment_bytes(metric);
         let name = format!("metric-{ordinal}.idx");
-        let mut entry = make_lumina_entry(&name, IVF_FLAT_IDENTIFIER, FileKind::Add, 2);
+        let mut entry = make_vector_entry(&name, IVF_FLAT_IDENTIFIER, FileKind::Add, 2);
         entry.index_file.file_size = bytes.len() as i64;
         let meta = entry.index_file.global_index_meta.as_mut().unwrap();
         meta.row_range_start = ordinal as i64 * 3;
@@ -1750,8 +1658,8 @@ fn scalar_unindexed_coverage_intersects_all_predicate_fields() {
     let options = HashMap::new();
     let fields = vec![make_field(1, "id"), make_field(2, "other")];
     let evaluation = eval_context(&io, &options, &fields, Some(20));
-    let mut id = make_lumina_entry("id.btree", "btree", FileKind::Add, 1);
-    let mut other = make_lumina_entry("other.btree", "btree", FileKind::Add, 2);
+    let mut id = make_vector_entry("id.btree", "btree", FileKind::Add, 1);
+    let mut other = make_vector_entry("other.btree", "btree", FileKind::Add, 2);
     other
         .index_file
         .global_index_meta

@@ -460,11 +460,11 @@ mod tests {
         refused(
             table
                 .new_global_index_build_builder()
-                .with_index_type("lumina")
+                .with_index_type("diskann")
                 .execute()
                 .await
                 .unwrap_err(),
-            "building a lumina index",
+            "building a diskann index",
         );
     }
 
@@ -942,7 +942,6 @@ mod tests {
             "multivalue",
             "fm",
             "full-text",
-            "lumina",
             "ivf-flat",
             "ivf-pq",
             "ivf-sq",
@@ -1193,44 +1192,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_drop_lumina_matches_legacy_alias_entry() {
-        let table = test_table("memory:/test_drop_lumina_legacy");
-        setup_dirs(&table).await;
-
-        let mut message = CommitMessage::new(
-            BinaryRow::new(0).to_serialized_bytes(),
-            0,
-            vec![data_file("data-0.parquet")],
-        );
-        // Stored under the LEGACY identifier; request uses the canonical name.
-        message.new_index_files = vec![
-            global_index_file("lumina-vector-ann", "lumina-id.index", 0, 0, 9),
-            global_index_file(BTREE_GLOBAL_INDEX_TYPE, "btree-id.index", 0, 0, 9),
-        ];
-        TableCommit::new(table.clone(), "test-user".to_string())
-            .commit(vec![message])
-            .await
-            .unwrap();
-
-        let dropped = table
-            .new_global_index_drop_builder()
-            .with_index_column("id")
-            .with_index_type("lumina")
-            .execute()
-            .await
-            .unwrap();
-        assert_eq!(dropped, 1);
-
-        let mut remaining = latest_index_entries(&table)
-            .await
-            .into_iter()
-            .map(|entry| entry.index_file.file_name)
-            .collect::<Vec<_>>();
-        remaining.sort();
-        assert_eq!(remaining, vec!["btree-id.index".to_string()]);
-    }
-
-    #[tokio::test]
     async fn test_drop_vindex_preserves_other_types_case_insensitive() {
         let table = test_table("memory:/test_drop_vindex_identity");
         setup_dirs(&table).await;
@@ -1243,7 +1204,7 @@ mod tests {
         message.new_index_files = vec![
             global_index_file("ivf-flat", "ivf-flat-id.index", 0, 0, 9),
             global_index_file("ivf-pq", "ivf-pq-id.index", 0, 0, 9),
-            global_index_file("lumina", "lumina-id.index", 0, 0, 9),
+            global_index_file("diskann", "diskann-id.index", 0, 0, 9),
             global_index_file(BTREE_GLOBAL_INDEX_TYPE, "btree-id.index", 0, 0, 9),
         ];
         TableCommit::new(table.clone(), "test-user".to_string())
@@ -1271,8 +1232,8 @@ mod tests {
             remaining,
             vec![
                 "btree-id.index".to_string(),
+                "diskann-id.index".to_string(),
                 "ivf-pq-id.index".to_string(),
-                "lumina-id.index".to_string(),
             ]
         );
     }
