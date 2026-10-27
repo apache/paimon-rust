@@ -244,7 +244,6 @@ impl SearchTask {
                 super::de_vector_read::execute_search_task(&pinned, &self.kind, &self.payload)
                     .await?
             }
-            #[cfg(feature = "fulltext")]
             kind if kind.starts_with("fulltext-") => {
                 super::full_text_search_builder::execute_search_task(&pinned, kind, &self.payload)
                     .await?

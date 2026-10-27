@@ -837,7 +837,7 @@ fn build_vector_batch(ids: Vec<i32>, vectors: Vec<Vec<f32>>) -> RecordBatch {
 // Manual run with a local Lumina native library:
 // LUMINA_LIB_PATH=/path/to/liblumina_py.so cargo test -p paimon \
 //     table::lumina_index_build_builder::tests::test_execute_writes_lumina_index_manifest \
-//     --features fulltext,vortex -- --ignored --exact
+//     --features vortex -- --ignored --exact
 #[tokio::test]
 #[ignore = "requires LUMINA_LIB_PATH; see manual run command above"]
 async fn test_execute_writes_lumina_index_manifest() {

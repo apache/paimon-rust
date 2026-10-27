@@ -52,7 +52,6 @@ pub async fn read_batch_vector_with_executor(
     reader.read_with_executor(plan, executor).await
 }
 
-#[cfg(feature = "fulltext")]
 pub async fn read_full_text_with_executor(
     reader: &super::FullTextRead,
     plan: super::FullTextScanPlan,

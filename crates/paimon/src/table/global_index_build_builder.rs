@@ -18,7 +18,6 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
-#[cfg(feature = "fulltext")]
 use super::full_text_index_build_builder::FullTextIndexBuildBuilder;
 use super::global_index_build_common::{resolve_index_fields, IndexColumns};
 use super::global_index_build_plan::{GlobalIndexBuildPlan, GlobalIndexBuildShard};
@@ -80,9 +79,7 @@ impl<'a> GlobalIndexBuildBuilder<'a> {
 
     /// Whether this build includes a writer for the requested index type.
     pub fn supports_index_type(index_type: &str) -> bool {
-        normalize_global_index_type(index_type.trim()).is_some_and(|index_type| {
-            index_type != FULL_TEXT_GLOBAL_INDEX_TYPE || cfg!(feature = "fulltext")
-        })
+        normalize_global_index_type(index_type.trim()).is_some()
     }
 
     pub fn with_index_column(&mut self, column: &str) -> &mut Self {
@@ -227,19 +224,12 @@ impl<'a> GlobalIndexBuildBuilder<'a> {
             return Ok(builder.prepare().await?.into());
         }
         if index_type == FULL_TEXT_GLOBAL_INDEX_TYPE {
-            #[cfg(feature = "fulltext")]
-            {
-                let mut builder = FullTextIndexBuildBuilder::new(self.table);
-                builder
-                    .with_index_column(columns[0])
-                    .with_options(self.options.clone());
-                builder.partition_filter = self.partition_filter.clone();
-                return Ok(builder.prepare().await?.into());
-            }
-            #[cfg(not(feature = "fulltext"))]
-            return Err(Error::Unsupported {
-                message: "Full-text global index build requires the 'fulltext' feature".into(),
-            });
+            let mut builder = FullTextIndexBuildBuilder::new(self.table);
+            builder
+                .with_index_column(columns[0])
+                .with_options(self.options.clone());
+            builder.partition_filter = self.partition_filter.clone();
+            return Ok(builder.prepare().await?.into());
         }
         if index_type == LUMINA_IDENTIFIER {
             let mut builder = LuminaIndexBuildBuilder::new(self.table);
@@ -311,9 +301,7 @@ mod tests {
             ("ivf-rq", "vector"),
             ("diskann", "vector"),
         ] {
-            if !GlobalIndexBuildBuilder::supports_index_type(kind) {
-                continue;
-            }
+            assert!(GlobalIndexBuildBuilder::supports_index_type(kind), "{kind}");
             let mut options = HashMap::from([(
                 format!(
                     "{}.dimension",
@@ -373,9 +361,6 @@ mod tests {
                 ("ivf-rq", "vector"),
                 ("diskann", "vector"),
             ] {
-                if !GlobalIndexBuildBuilder::supports_index_type(kind) {
-                    continue;
-                }
                 let mut build_options = HashMap::from([(format!("{kind}.dimension"), "2".into())]);
                 if kind == "ivf-pq" {
                     build_options.insert("ivf-pq.pq.m".into(), "1".into());
@@ -398,9 +383,6 @@ mod tests {
     #[tokio::test]
     async fn build_options_cannot_enable_row_tracking_or_change_table_bucket() {
         for kind in ["btree", "bitmap", "full-text", "ivf-flat"] {
-            if !GlobalIndexBuildBuilder::supports_index_type(kind) {
-                continue;
-            }
             for (key, value, error) in [
                 ("row-tracking.enabled", "false", "row-tracking.enabled"),
                 ("bucket", "4", "unaware-bucket"),
@@ -466,16 +448,6 @@ mod tests {
             Err(Error::Unsupported { .. })
         ));
         assert!(!GlobalIndexBuildBuilder::supports_index_type("unknown"));
-    }
-
-    #[cfg(not(feature = "fulltext"))]
-    #[tokio::test]
-    async fn full_text_without_feature_is_explicitly_unsupported() {
-        assert!(!GlobalIndexBuildBuilder::supports_index_type("full-text"));
-        assert!(
-            matches!(empty_table().new_global_index_build_builder().with_index_column("text")
-            .with_index_type("full-text").build().await, Err(Error::Unsupported { message }) if message.contains("fulltext"))
-        );
     }
 }
 

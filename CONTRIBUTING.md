@@ -27,8 +27,8 @@ commands CI runs, which are the ones to reproduce locally:
 - `cargo check`: Analyze the current package and report errors. This is a quick way to catch any obvious issues without a full compilation.
 - `cargo fmt --all -- --check`: Verify the code matches the Rust style guidelines. `cargo fmt --all` rewrites the files in place.
 - `cargo build`: Compile the current package. This will build the project and generate executable binaries if applicable.
-- `cargo clippy --locked --all-targets --workspace --features fulltext,vortex -- -D warnings`: Catch common mistakes and improve code quality. CI denies warnings, so anything clippy reports fails the build.
-- `cargo test -p paimon --all-targets --features fulltext,vortex`: Run the unit tests. Prefer this over a bare `cargo test`, which also builds the Python binding and can fail to link `libpython` on some platforms.
+- `cargo clippy --locked --all-targets --workspace --features vortex -- -D warnings`: Catch common mistakes and improve code quality. CI denies warnings, so anything clippy reports fails the build.
+- `cargo test -p paimon --all-targets --features vortex`: Run the unit tests. Prefer this over a bare `cargo test`, which also builds the Python binding and can fail to link `libpython` on some platforms.
 - `cargo test -p paimon-rest-server --all-targets`: Run the REST server tests.
 
 The integration suites additionally need a Paimon warehouse written by Spark, so

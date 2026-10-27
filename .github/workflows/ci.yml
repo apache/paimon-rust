@@ -127,7 +127,7 @@ jobs:
         run: cargo +1.98.0 fmt --all -- --check
 
       - name: Clippy
-        run: cargo +1.98.0 clippy --locked --all-targets --workspace --features fulltext,vortex -- -D warnings
+        run: cargo +1.98.0 clippy --locked --all-targets --workspace --features vortex -- -D warnings
 
   msrv:
     name: msrv (${{ matrix.host }})
@@ -177,7 +177,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Build
-        run: cargo build --locked --features fulltext,vortex
+        run: cargo build --locked --features vortex
 
   unit:
     runs-on: ${{ matrix.os }}
@@ -203,7 +203,7 @@ jobs:
           "CARGO_BUILD_JOBS=2" >> $env:GITHUB_ENV
 
       - name: Test
-        run: cargo test --locked -p paimon --all-targets --features fulltext,vortex
+        run: cargo test --locked -p paimon --all-targets --features vortex
         env:
           RUST_LOG: DEBUG
           RUST_BACKTRACE: full
@@ -289,7 +289,7 @@ jobs:
         run: >
           cargo test --locked -p paimon --lib
           table::lumina_index_build_builder::tests::test_execute_writes_lumina_index_manifest
-          --features fulltext,vortex
+          --features vortex
           -- --ignored --exact
 
       # The test filter selects tests, not targets, so without `--test` cargo links all 26

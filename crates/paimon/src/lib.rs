@@ -31,9 +31,7 @@ pub mod catalog;
 mod deletion_vector;
 pub mod file_index;
 mod fm_index;
-#[cfg(feature = "fulltext")]
 pub mod ftindex;
-#[cfg(feature = "fulltext")]
 pub mod full_text;
 pub mod io;
 pub mod lumina;
