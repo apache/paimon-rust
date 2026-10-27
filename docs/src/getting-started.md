@@ -426,21 +426,23 @@ share LRU, size accounting, and invalidation state; if their configured limits
 differ, the smallest `local-cache.max-size` is used. Restart recovery runs on a
 blocking worker, reads only block headers and file metadata, and validates
 payload CRC lazily on the first hit. Without shared mode, use a separate
-`local-cache.dir` per worker or process.
+`local-cache.dir` per process.
 
-For sharing, set `local-cache.enabled=true` and `local-cache.shared=true` in
-same-UID workers with the same node-local directory and capacity. NFS,
-cross-node sharing, and catalogs inherited across `fork` are unsupported.
-Invalidation clears the shared cache; if it fails after a storage mutation,
-do not reuse the affected path until invalidation succeeds.
-A canceled or failed rename bypasses this cache; after confirming storage state,
-use a new cache directory to resume sharing.
+To share disk blocks, set `local-cache.enabled=true`, `local-cache.shared=true`,
+`local-cache.dir`, and `local-cache.max-size` consistently in same-UID processes
+on one node. NFS, cross-node sharing, and catalog reuse after `fork` are
+unsupported. After failed invalidation or rename, verify storage state and use
+a fresh cache directory before resuming sharing. Allow disk headroom for up to
+eight staged 1-MiB writes per cache instance beyond `local-cache.max-size`.
 
-Shared range reads allow eight background fills per cache instance for blocks
-up to 1 MiB; larger blocks, whole-file reads, or saturated fills stay synchronous.
-Concurrent whole-file and range reads may download overlapping data.
-Allow disk headroom beyond `local-cache.max-size` for up to eight staged writes
-per cache instance; this staging limit is not node-wide.
+### Parsed Parquet Metadata Cache
+
+Set `file-format.metadata-cache.shared=true` to reuse parsed Parquet metadata
+across read contexts in one process (default `false`). Only equal budgets share
+a pool; this is not a process-wide memory limit. Shared hits perform an uncached
+one-byte storage-access check; readers without that check reload metadata.
+ROW metadata and BLOB indexes remain context-local. This is independent of
+`local-cache.shared`, which shares disk blocks across processes.
 
 ### BLOB Index Cache
 

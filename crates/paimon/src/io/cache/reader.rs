@@ -333,6 +333,10 @@ impl CachedFileReader {
 
 #[async_trait::async_trait]
 impl FileRead for CachedFileReader {
+    async fn check_shared_metadata_access(&self) -> crate::Result<bool> {
+        self.delegate.check_shared_metadata_access().await
+    }
+
     async fn read(&self, range: Range<u64>) -> crate::Result<Bytes> {
         if range.start > range.end || range.end > self.file_size {
             return self.delegate.read(range).await;
