@@ -20,6 +20,11 @@ ignore = [
     { id = "RUSTSEC-2023-0071", reason = "No fixed version; reqsign only signs locally generated outbound requests and exposes no remote signing or decryption timing oracle." },
     { id = "RUSTSEC-2026-0176", reason = "The affected PyList and PyTuple iterator APIs are unused." },
     { id = "RUSTSEC-2026-0177", reason = "PyCFunction::new_closure is unused." },
+    # zstd 0.13 is still required by Arrow, DataFusion, Parquet, and other upstream crates.
+    # Revisit these API-specific exceptions as those dependencies adopt zstd 0.14.
+    { id = "RUSTSEC-2026-0391", reason = "No caller uses the affected raw Encoder/Decoder::with_context constructors." },
+    { id = "RUSTSEC-2026-0398", reason = "The affected zstd-safe seekable feature is not enabled." },
+    { id = "RUSTSEC-2026-0403", reason = "No old zstd caller uses write::Decoder or raw streaming decode; compression-codecs now uses patched zstd-safe 8.2." },
 ]
 
 [licenses]
