@@ -47,10 +47,41 @@ def golden_warehouse(tmp_path_factory):
         return override
 
     warehouse = tmp_path_factory.mktemp("golden-warehouse")
-    archive = Path(__file__).resolve().parents[3] / "testdata/warehouse/warehouse.tar.gz"
+    archive = (
+        Path(__file__).resolve().parents[3]
+        / "crates/integrations/datafusion/testdata/warehouse/warehouse.tar.gz"
+    )
     with tarfile.open(archive, "r:gz") as fixture:
-        fixture.extractall(warehouse, filter="data")
+        if hasattr(tarfile, "data_filter"):
+            fixture.extractall(warehouse, filter="data")
+        else:
+            # Earlier supported Python patches lack extraction filters.
+            members = fixture.getmembers()
+            for member in members:
+                target = (warehouse / member.name).resolve()
+                if not member.isfile() or not target.is_relative_to(warehouse):
+                    raise ValueError(f"Unexpected golden archive entry: {member.name}")
+            fixture.extractall(warehouse, members=members)
     return str(warehouse)
+
+
+def test_golden_warehouse_with_legacy_tarfile(monkeypatch, tmp_path_factory):
+    monkeypatch.delenv("PAIMON_TEST_WAREHOUSE", raising=False)
+    if hasattr(tarfile, "data_filter"):
+        original_extractall = tarfile.TarFile.extractall
+        trusted_filter = tarfile.fully_trusted_filter
+
+        def legacy_extractall(self, path=".", members=None, *, numeric_owner=False):
+            return original_extractall(
+                self, path, members, numeric_owner=numeric_owner, filter=trusted_filter
+            )
+
+        monkeypatch.setattr(tarfile.TarFile, "extractall", legacy_extractall)
+        monkeypatch.delattr(tarfile, "data_filter")
+
+    warehouse = golden_warehouse.__wrapped__(tmp_path_factory)
+    catalog = PaimonCatalog({"warehouse": warehouse})
+    assert catalog.get_table("default.simple_log_table").latest_snapshot().id() == 1
 
 
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"

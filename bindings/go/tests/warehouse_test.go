@@ -25,7 +25,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"runtime"
 	"testing"
 )
 
@@ -35,11 +34,8 @@ func testWarehouse(t *testing.T) string {
 		return warehouse
 	}
 
-	_, source, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("Failed to locate golden warehouse archive")
-	}
-	archivePath := filepath.Join(filepath.Dir(source), "../../../testdata/warehouse/warehouse.tar.gz")
+	// go test runs each package in its source directory, including with -trimpath.
+	archivePath := filepath.Join("..", "..", "..", "crates", "integrations", "datafusion", "testdata", "warehouse", "warehouse.tar.gz")
 	file, err := os.Open(archivePath)
 	if err != nil {
 		t.Fatal(err)

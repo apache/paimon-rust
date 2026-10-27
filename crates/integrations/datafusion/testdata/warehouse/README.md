@@ -23,6 +23,8 @@
 Rust, DataFusion, Python, and Go integration tests. Each suite extracts its own
 temporary copy unless `PAIMON_TEST_WAREHOUSE` points to an existing warehouse.
 The tests need no Spark, Java, Docker, network download, or provisioning step.
+Rust readers retain an owned guard until their reads finish; concurrent readers
+share a weakly cached extraction that is deleted after the last guard drops.
 Write tests use private copies and must not modify this archive.
 
 ## Provenance

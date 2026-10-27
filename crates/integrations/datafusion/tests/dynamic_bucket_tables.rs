@@ -19,7 +19,7 @@
 
 mod common;
 
-#[path = "../../../../testdata/warehouse/mod.rs"]
+#[path = "../testdata/warehouse/mod.rs"]
 mod golden_warehouse;
 
 use common::{
@@ -1060,7 +1060,7 @@ async fn test_read_golden_dynamic_bucket_and_compare_index() {
     // Read the Java-written table from the golden warehouse.
     let warehouse = golden_warehouse::test_warehouse();
     let mut opts = Options::new();
-    opts.set(CatalogOptions::WAREHOUSE, &warehouse);
+    opts.set(CatalogOptions::WAREHOUSE, warehouse.path());
     let golden_catalog = FileSystemCatalog::new(opts).unwrap();
     let golden_table = golden_catalog
         .get_table(&Identifier::new("default", "dynamic_bucket_pk_table"))
