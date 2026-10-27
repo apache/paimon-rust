@@ -34,7 +34,6 @@ mod fm_index;
 pub mod ftindex;
 pub mod full_text;
 pub mod io;
-pub mod lumina;
 mod predicate_stats;
 pub mod resource;
 pub mod spec;
