@@ -1757,11 +1757,6 @@ mod vector_search_tests {
         (ctx, catalog, tmp)
     }
 
-    async fn create_lumina_vector_search_context(
-    ) -> (SQLContext, Arc<FileSystemCatalog>, tempfile::TempDir) {
-        create_vector_search_context("test_lumina_vector.tar.gz").await
-    }
-
     async fn create_java_vindex_vector_search_context(
     ) -> (SQLContext, Arc<FileSystemCatalog>, tempfile::TempDir) {
         create_vector_search_context("test_java_vindex_vector.tar.gz").await
@@ -1781,29 +1776,6 @@ mod vector_search_tests {
             .expect("Failed to register catalog");
         register_vector_search(ctx.ctx(), catalog.clone(), "default");
         (ctx, catalog, tmp)
-    }
-
-    fn build_lumina_table_schema() -> Schema {
-        let mut options = std::collections::HashMap::new();
-        options.insert("row-tracking.enabled".to_string(), "true".to_string());
-        options.insert("data-evolution.enabled".to_string(), "true".to_string());
-        options.insert("global-index.enabled".to_string(), "true".to_string());
-        options.insert(
-            "global-index.row-count-per-shard".to_string(),
-            "3".to_string(),
-        );
-        options.insert("lumina.index.dimension".to_string(), "2".to_string());
-        options.insert("lumina.encoding.type".to_string(), "rawf32".to_string());
-
-        Schema::builder()
-            .column("id", DataType::Int(IntType::new()))
-            .column(
-                "embedding",
-                DataType::Array(ArrayType::new(DataType::Float(FloatType::new()))),
-            )
-            .options(options)
-            .build()
-            .expect("Failed to build table schema")
     }
 
     fn build_vindex_table_schema() -> Schema {
@@ -1953,9 +1925,9 @@ mod vector_search_tests {
 
     #[tokio::test]
     async fn test_vector_search_top3() {
-        let (ctx, _catalog, _tmp) = create_lumina_vector_search_context().await;
+        let (ctx, _catalog, _tmp) = create_java_vindex_vector_search_context().await;
         let batches = ctx
-            .sql("SELECT id FROM vector_search('paimon.default.test_lumina_vector', 'embedding', '[1.0, 0.0, 0.0, 0.0]', 3)")
+            .sql("SELECT id FROM vector_search('paimon.default.test_java_vindex_vector', 'embedding', '[1.0, 0.0, 0.0, 0.0]', 3)")
             .await
             .expect("SQL should parse")
             .collect()
@@ -2254,9 +2226,9 @@ mod vector_search_tests {
 
     #[tokio::test]
     async fn test_vector_search_top6_returns_all() {
-        let (ctx, _catalog, _tmp) = create_lumina_vector_search_context().await;
+        let (ctx, _catalog, _tmp) = create_java_vindex_vector_search_context().await;
         let batches = ctx
-            .sql("SELECT id FROM vector_search('paimon.default.test_lumina_vector', 'embedding', '[1.0, 0.0, 0.0, 0.0]', 6)")
+            .sql("SELECT id FROM vector_search('paimon.default.test_java_vindex_vector', 'embedding', '[1.0, 0.0, 0.0, 0.0]', 6)")
             .await
             .expect("SQL should parse")
             .collect()
@@ -2269,15 +2241,15 @@ mod vector_search_tests {
 
     #[tokio::test]
     async fn test_vector_search_without_matching_index_returns_empty() {
-        let (ctx, catalog, _tmp) = create_lumina_vector_search_context().await;
+        let (ctx, catalog, _tmp) = create_java_vindex_vector_search_context().await;
         let table = catalog
-            .get_table(&Identifier::new("default", "test_lumina_vector"))
+            .get_table(&Identifier::new("default", "test_java_vindex_vector"))
             .await
             .expect("load table");
         let dropped = table
             .new_global_index_drop_builder()
             .with_index_column("embedding")
-            .with_index_type("lumina")
+            .with_index_type("ivf-flat")
             .execute()
             .await
             .expect("drop vector indexes");
@@ -2287,7 +2259,7 @@ mod vector_search_tests {
         );
 
         let batches = ctx
-            .sql("SELECT id FROM vector_search('paimon.default.test_lumina_vector', 'embedding', '[1.0, 0.0, 0.0, 0.0]', 10)")
+            .sql("SELECT id FROM vector_search('paimon.default.test_java_vindex_vector', 'embedding', '[1.0, 0.0, 0.0, 0.0]', 10)")
             .await
             .expect("SQL should parse")
             .collect()
@@ -2297,15 +2269,15 @@ mod vector_search_tests {
         let total_rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
         assert_eq!(
             total_rows, 0,
-            "vector_search without a matching Lumina index should not fall back to a full table scan"
+            "vector_search without a matching vindex index should not fall back to a full table scan"
         );
     }
 
     #[tokio::test]
     async fn test_vector_search_rejects_missing_column() {
-        let (ctx, _catalog, _tmp) = create_lumina_vector_search_context().await;
+        let (ctx, _catalog, _tmp) = create_java_vindex_vector_search_context().await;
         let error = ctx
-            .sql("SELECT id FROM vector_search('paimon.default.test_lumina_vector', 'missing_embedding', '[1.0]', 10)")
+            .sql("SELECT id FROM vector_search('paimon.default.test_java_vindex_vector', 'missing_embedding', '[1.0]', 10)")
             .await
             .expect("SQL should parse")
             .collect()
@@ -2557,17 +2529,12 @@ mod vector_search_tests {
         );
     }
 
-    // Manual run with a local Lumina native library:
-    // LUMINA_LIB_PATH=/path/to/liblumina_py.so cargo test -p paimon-datafusion \
-    //     vector_search_tests::test_lumina_build_then_vector_search_query \
-    //     -- --ignored --exact
     #[tokio::test]
-    #[ignore = "requires LUMINA_LIB_PATH"]
-    async fn test_lumina_build_then_vector_search_query() {
+    async fn test_diskann_build_then_vector_search_query() {
         let (ctx, catalog, _tmp) = create_empty_vector_search_context().await;
-        let identifier = Identifier::new("default", "lumina_build_query_e2e");
+        let identifier = Identifier::new("default", "diskann_build_query_e2e");
         catalog
-            .create_table(&identifier, build_lumina_table_schema(), false)
+            .create_table(&identifier, build_vindex_table_schema(), false)
             .await
             .expect("Failed to create table");
         let table = catalog
@@ -2606,15 +2573,15 @@ mod vector_search_tests {
             .await
             .expect("Failed to commit vector data");
 
-        ctx.sql("CALL sys.create_lumina_index(table => 'default.lumina_build_query_e2e', index_column => 'embedding')")
+        ctx.sql("CALL sys.create_global_index(table => 'default.diskann_build_query_e2e', index_column => 'embedding', index_type => 'diskann', options => 'diskann.dimension=2,diskann.distance.metric=cosine,diskann.pq.bits=4,diskann.pq.m=1')")
             .await
-            .expect("Lumina index build SQL should parse")
+            .expect("DiskANN index build SQL should parse")
             .collect()
             .await
-            .expect("Lumina index build SQL should execute");
+            .expect("DiskANN index build SQL should execute");
 
         let index_batches = ctx
-            .sql("SELECT index_type, row_count, row_range_start, row_range_end, index_field_name FROM paimon.default.`lumina_build_query_e2e$table_indexes` WHERE index_type = 'lumina'")
+            .sql("SELECT index_type, row_count, row_range_start, row_range_end, index_field_name FROM paimon.default.`diskann_build_query_e2e$table_indexes` WHERE index_type = 'diskann'")
             .await
             .expect("index metadata SQL should parse")
             .collect()
@@ -2624,13 +2591,13 @@ mod vector_search_tests {
         assert_eq!(
             index_rows,
             vec![
-                ("lumina".to_string(), 3, 0, 2, "embedding".to_string()),
-                ("lumina".to_string(), 3, 3, 5, "embedding".to_string()),
+                ("diskann".to_string(), 3, 0, 2, "embedding".to_string()),
+                ("diskann".to_string(), 3, 3, 5, "embedding".to_string()),
             ]
         );
 
         let search_batches = ctx
-            .sql("SELECT id FROM vector_search('paimon.default.lumina_build_query_e2e', 'embedding', '[1.0, 0.0]', 2)")
+            .sql("SELECT id FROM vector_search('paimon.default.diskann_build_query_e2e', 'embedding', '[1.0, 0.0]', 2)")
             .await
             .expect("vector_search SQL should parse")
             .collect()
