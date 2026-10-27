@@ -780,7 +780,7 @@ impl DataFileReader {
 
             let input_file = file_io.new_input(&read_path)?;
             let open_start = read_timing.as_ref().map(|_| Instant::now());
-            let file_reader = input_file.reader().await?;
+            let file_reader = input_file.reader_with_size(read_size).await?;
             if let (Some(timing), Some(start)) = (read_timing.as_ref(), open_start) {
                 timing.add_file_read(start.elapsed());
             }
@@ -1095,7 +1095,7 @@ impl DataFileReader {
 
         Ok(try_stream! {
             let input_file = file_io.new_input(&path_to_read)?;
-            let file_reader = input_file.reader().await?;
+            let file_reader = input_file.reader_with_size(file_meta.file_size as u64).await?;
 
             let mut batch_stream = format_reader
                 .read_batch_stream(
