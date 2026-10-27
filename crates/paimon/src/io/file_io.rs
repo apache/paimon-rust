@@ -1579,6 +1579,15 @@ impl InputFile {
     }
 
     pub async fn reader(&self) -> crate::Result<impl FileRead> {
+        self.reader_with_size_hint(None).await
+    }
+
+    /// Open an immutable file using the length recorded in its manifest.
+    pub(crate) async fn reader_with_size(&self, size: u64) -> crate::Result<impl FileRead> {
+        self.reader_with_size_hint(Some(size)).await
+    }
+
+    async fn reader_with_size_hint(&self, size: Option<u64>) -> crate::Result<impl FileRead> {
         let (op, relative_path, cache_path) = self.source.resolve(&self.path).await?;
         let reader = op.reader(&relative_path).await?;
         let (Some(cache), Some(cache_path)) = (&self.cache, cache_path.as_ref()) else {
@@ -1590,7 +1599,9 @@ impl InputFile {
             });
         };
         let read_token = cache.read_token(cache_path);
-        let size = if let Some(size) = cache.file_size(cache_path, &read_token).await {
+        let size = if let Some(size) = size {
+            size
+        } else if let Some(size) = cache.file_size(cache_path, &read_token).await {
             size
         } else {
             let size = op.stat(&relative_path).await?.content_length();
@@ -1911,6 +1922,51 @@ mod file_action_test {
 
     fn setup_memory_file_io() -> FileIO {
         FileIOBuilder::new("memory").build().unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_known_size_shared_reader_preserves_invalidation() {
+        use crate::common::Options;
+        use crate::io::cache::LocalCacheConfig;
+        let dir = tempfile::tempdir().unwrap();
+        let mut options = Options::new();
+        options.set(CatalogOptions::LOCAL_CACHE_ENABLED, "true");
+        options.set("local-cache.shared", "true");
+        options.set("local-cache.max-size", "16 mb");
+        options.set(
+            CatalogOptions::LOCAL_CACHE_DIR,
+            dir.path().join("cache").to_string_lossy(),
+        );
+        options.set(CatalogOptions::LOCAL_CACHE_BLOCK_SIZE, "4");
+        let cache = Arc::new(
+            LocalCache::new(LocalCacheConfig::from_options(&options).unwrap().unwrap()).unwrap(),
+        );
+        let io = FileIOBuilder::new("file")
+            .with_local_cache(cache)
+            .build()
+            .unwrap();
+        let source_path = dir.path().join("snapshot-1");
+        let path = local_file_path(&source_path);
+        std::fs::write(&source_path, b"abcd").unwrap();
+        let input = io.new_input(&path).unwrap();
+        assert!(
+            input.cache.is_some(),
+            "the regression must exercise caching"
+        );
+        let reader = input.reader_with_size(4).await.unwrap();
+        assert_eq!(reader.read(0..4).await.unwrap().as_ref(), b"abcd");
+        // A hot read must not stat the source again.
+        std::fs::rename(&source_path, dir.path().join("offline")).unwrap();
+        assert!(input.reader().await.is_err());
+        let reader = input.reader_with_size(4).await.unwrap();
+        assert_eq!(reader.read(1..3).await.unwrap().as_ref(), b"bc");
+        io.new_output(&path)
+            .unwrap()
+            .write(Bytes::from_static(b"wxyz"))
+            .await
+            .unwrap();
+        let reader = input.reader_with_size(4).await.unwrap();
+        assert_eq!(reader.read(1..3).await.unwrap().as_ref(), b"xy");
     }
 
     fn setup_fs_file_io() -> FileIO {
