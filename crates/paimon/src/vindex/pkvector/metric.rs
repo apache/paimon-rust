@@ -16,7 +16,6 @@
 // under the License.
 
 use super::data_invalid;
-use crate::lumina::LuminaVectorMetric;
 use std::cmp::Ordering;
 
 /// Order two distances the way Java `Float.compare` does: every NaN sorts after
@@ -60,17 +59,6 @@ impl VectorSearchMetric {
             paimon_vindex_core::distance::MetricType::L2 => Self::L2,
             paimon_vindex_core::distance::MetricType::Cosine => Self::Cosine,
             paimon_vindex_core::distance::MetricType::InnerProduct => Self::InnerProduct,
-        }
-    }
-
-    /// Map a Lumina metric to this enum, symmetric to `from_vindex`. Lets the
-    /// read path compare the metric a Lumina segment was built with against the
-    /// configured metric.
-    pub(crate) fn from_lumina(metric: LuminaVectorMetric) -> Self {
-        match metric {
-            LuminaVectorMetric::L2 => Self::L2,
-            LuminaVectorMetric::Cosine => Self::Cosine,
-            LuminaVectorMetric::InnerProduct => Self::InnerProduct,
         }
     }
 
@@ -329,23 +317,6 @@ mod tests {
         );
         assert_eq!(
             VectorSearchMetric::from_vindex(MetricType::InnerProduct),
-            VectorSearchMetric::InnerProduct
-        );
-    }
-
-    #[test]
-    fn test_from_lumina_maps_every_variant() {
-        use crate::lumina::LuminaVectorMetric;
-        assert_eq!(
-            VectorSearchMetric::from_lumina(LuminaVectorMetric::L2),
-            VectorSearchMetric::L2
-        );
-        assert_eq!(
-            VectorSearchMetric::from_lumina(LuminaVectorMetric::Cosine),
-            VectorSearchMetric::Cosine
-        );
-        assert_eq!(
-            VectorSearchMetric::from_lumina(LuminaVectorMetric::InnerProduct),
             VectorSearchMetric::InnerProduct
         );
     }
