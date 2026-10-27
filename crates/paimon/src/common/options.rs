@@ -101,6 +101,9 @@ impl CatalogOptions {
     pub const FILE_FORMAT_METADATA_CACHE_MAX_SIZE: &'static str =
         "file-format.metadata-cache.max-size";
 
+    /// Share parsed Parquet metadata across contexts in the same process (default: false).
+    pub const FILE_FORMAT_METADATA_CACHE_SHARED: &'static str = "file-format.metadata-cache.shared";
+
     /// Maximum catalog-local cache size for decoded BLOB indexes.
     pub const BLOB_INDEX_CACHE_MAX_SIZE: &'static str = "cache.blob-index.max-size";
 }

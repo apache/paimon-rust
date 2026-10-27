@@ -31,8 +31,7 @@
 //! - `CALL sys.create_global_index(table => '...', index_column => '...', index_type => 'btree')`
 //! - `CALL sys.create_global_index(table => '...', index_column => '...', index_type => 'bitmap')`
 //! - `CALL sys.create_global_index(table => '...', index_column => '...', index_type => 'ivf-pq')`
-//! - `CALL sys.drop_global_index(table => '...', index_column => '...', index_type => 'btree')` (also 'bitmap', 'multivalue', 'fm', 'lumina', or a vindex type such as 'ivf-pq')
-//! - `CALL sys.create_lumina_index(table => '...', index_column => '...')`
+//! - `CALL sys.drop_global_index(table => '...', index_column => '...', index_type => 'btree')` (also 'bitmap', 'multivalue', 'fm', or a vindex type such as 'diskann')
 //!
 //! REST management procedures (REST catalogs only, mirroring Java's
 //! `RESTCatalog.permissionManagement()` / `policyManagement()`):
@@ -74,7 +73,6 @@ use paimon::api::{
     PermissionColumns, PermissionResource, PolicyType, ResourceType, RowFilter,
 };
 use paimon::catalog::{Catalog, Identifier, RESTCatalog};
-use paimon::lumina::{is_lumina_index_type, LUMINA_IDENTIFIER};
 use paimon::spec::{CoreOptions, DataType, Datum, Predicate, PredicateBuilder, Snapshot};
 use paimon::table::{
     normalize_global_index_type, BranchManager, ConsumerManager, SnapshotManager, Table,
@@ -224,7 +222,6 @@ fn declared_parameters(proc_name: &str) -> Option<&'static [&'static str]> {
             "partitions",
             "dry_run",
         ],
-        "create_lumina_index" => &["table", "index_column", "index_type", "options"],
         "grant_permission" => &[
             "resource_type",
             "access",
@@ -347,7 +344,6 @@ pub async fn execute_procedure(
         "delete_branch" => proc_delete_branch(ctx, catalog, catalog_name, &args).await,
         "create_global_index" => proc_create_global_index(ctx, catalog, catalog_name, &args).await,
         "drop_global_index" => proc_drop_global_index(ctx, catalog, catalog_name, &args).await,
-        "create_lumina_index" => proc_create_lumina_index(ctx, catalog, catalog_name, &args).await,
         "grant_permission" => proc_grant_permission(ctx, catalog, catalog_name, &args).await,
         "revoke_permission" => proc_revoke_permission(ctx, catalog, catalog_name, &args).await,
         "list_permissions" => proc_list_permissions(ctx, catalog, catalog_name, &args).await,
@@ -823,6 +819,30 @@ async fn clean_larger_than(
     Ok(())
 }
 
+async fn rollback_to_snapshot(
+    sm: &SnapshotManager,
+    tm: &TagManager,
+    snapshot: &Snapshot,
+) -> DFResult<()> {
+    let id = snapshot.id();
+    // Restore expired tagged snapshots before removing any newer history. A
+    // backend may reject publication, in which case rollback must not delete it.
+    if !sm
+        .file_io()
+        .exists(&sm.snapshot_path(id))
+        .await
+        .map_err(to_datafusion_error)?
+    {
+        sm.commit_snapshot(snapshot)
+            .await
+            .map_err(to_datafusion_error)?;
+        sm.write_earliest_hint(id)
+            .await
+            .map_err(to_datafusion_error)?;
+    }
+    clean_larger_than(sm, tm, id).await
+}
+
 async fn proc_rollback_to(
     ctx: &SessionContext,
     catalog: &Arc<dyn Catalog>,
@@ -869,41 +889,14 @@ async fn proc_rollback_to(
                 .parse()
                 .map_err(|_| DataFusionError::Plan(format!("Invalid snapshot_id: '{id_str}'")))?;
             let snapshot = resolve_snapshot_by_id(&sm, &tm, id).await?;
-            clean_larger_than(&sm, &tm, id).await?;
-            if !sm
-                .file_io()
-                .exists(&sm.snapshot_path(id))
-                .await
-                .map_err(to_datafusion_error)?
-            {
-                sm.commit_snapshot(&snapshot)
-                    .await
-                    .map_err(to_datafusion_error)?;
-                sm.write_earliest_hint(id)
-                    .await
-                    .map_err(to_datafusion_error)?;
-            }
+            rollback_to_snapshot(&sm, &tm, &snapshot).await?;
         } else if let Some(tag_name) = args.get("tag") {
             let snapshot = tm
                 .get(tag_name)
                 .await
                 .map_err(to_datafusion_error)?
                 .ok_or_else(|| DataFusionError::Plan(format!("Tag '{tag_name}' does not exist")))?;
-            let snapshot_id = snapshot.id();
-            clean_larger_than(&sm, &tm, snapshot_id).await?;
-            if !sm
-                .file_io()
-                .exists(&sm.snapshot_path(snapshot_id))
-                .await
-                .map_err(to_datafusion_error)?
-            {
-                sm.commit_snapshot(&snapshot)
-                    .await
-                    .map_err(to_datafusion_error)?;
-                sm.write_earliest_hint(snapshot_id)
-                    .await
-                    .map_err(to_datafusion_error)?;
-            }
+            rollback_to_snapshot(&sm, &tm, &snapshot).await?;
         } else {
             return Err(DataFusionError::Plan(
                 "rollback_to requires either 'snapshot_id' or 'tag' argument".to_string(),
@@ -1018,34 +1011,6 @@ async fn proc_create_tag_from_watermark(
     tm.create_with_retention(tag_name, &snapshot, time_retained)
         .await
         .map_err(to_datafusion_error)?;
-    ok_result(ctx)
-}
-
-async fn proc_create_lumina_index(
-    ctx: &SessionContext,
-    catalog: &Arc<dyn Catalog>,
-    catalog_name: &str,
-    args: &HashMap<String, String>,
-) -> DFResult<DataFrame> {
-    let table = get_table(catalog, catalog_name, args).await?;
-    let index_column = require_arg(args, "index_column")?;
-    let mut builder = table.new_global_index_build_builder();
-    builder.with_index_column(index_column);
-    let index_type = normalize_index_type(
-        args.get("index_type")
-            .map(String::as_str)
-            .unwrap_or(LUMINA_IDENTIFIER),
-    );
-    if !is_lumina_index_type(&index_type) {
-        return Err(DataFusionError::NotImplemented(format!(
-            "Unsupported Lumina index type: {index_type}"
-        )));
-    }
-    builder.with_index_type(&index_type);
-    if let Some(options) = args.get("options") {
-        builder.with_options(parse_key_value_options(options)?);
-    }
-    builder.execute().await.map_err(to_datafusion_error)?;
     ok_result(ctx)
 }
 
@@ -1955,6 +1920,91 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[derive(Debug)]
+    struct RejectSnapshotPublication(opendal::Operator);
+
+    #[async_trait::async_trait]
+    impl paimon::io::FileIOProvider for RejectSnapshotPublication {
+        async fn create(&self, path: &str) -> paimon::Result<(opendal::Operator, String)> {
+            Ok((
+                self.0.clone(),
+                path.strip_prefix("memory:/").unwrap().into(),
+            ))
+        }
+
+        async fn write_atomic_if_not_exists(
+            &self,
+            _path: &str,
+            _bytes: bytes::Bytes,
+        ) -> paimon::Result<Option<bool>> {
+            Err(paimon::Error::IoUnsupported {
+                message: "snapshot publication unavailable".into(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_rollback_publication_failure_preserves_history() {
+        let op = opendal::Operator::new(opendal::services::Memory::default()).unwrap();
+        let file_io = FileIOBuilder::new("memory")
+            .with_provider(Arc::new(RejectSnapshotPublication(op)))
+            .build()
+            .unwrap();
+        let path = "memory:/rollback_failure";
+        let sm = SnapshotManager::new(file_io.clone(), path.into());
+        let tm = TagManager::new(file_io.clone(), path.into());
+        // Snapshot 1 has expired, but a tag still retains it. Seed the newer
+        // history through ordinary writes on a backend rejecting publication.
+        for id in [2, 3] {
+            file_io
+                .new_output(&sm.snapshot_path(id))
+                .unwrap()
+                .write(
+                    serde_json::to_vec(&test_snapshot(id, id as u64 * 1000))
+                        .unwrap()
+                        .into(),
+                )
+                .await
+                .unwrap();
+        }
+        sm.write_latest_hint(3).await.unwrap();
+        tm.create("v1", &test_snapshot(1, 1000)).await.unwrap();
+        tm.create("v3", &test_snapshot(3, 3000)).await.unwrap();
+        let target = resolve_snapshot_by_id(&sm, &tm, 1).await.unwrap();
+
+        let error = rollback_to_snapshot(&sm, &tm, &target).await.unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("snapshot publication unavailable"));
+        assert_eq!(sm.list_all_ids().await.unwrap(), vec![2, 3]);
+        assert_eq!(sm.get_latest_snapshot_id().await.unwrap(), Some(3));
+        assert!(tm.tag_exists("v1").await.unwrap());
+        assert!(tm.tag_exists("v3").await.unwrap());
+        assert!(!file_io.exists(&sm.snapshot_path(1)).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_rollback_restores_expired_snapshot_before_cleaning_history() {
+        let (_, sm, tm) = setup("memory:/rollback_expired").await;
+        for id in [2, 3] {
+            sm.commit_snapshot(&test_snapshot(id, id as u64 * 1000))
+                .await
+                .unwrap();
+        }
+        let target = test_snapshot(1, 1000);
+        tm.create("v1", &target).await.unwrap();
+        tm.create("v3", &test_snapshot(3, 3000)).await.unwrap();
+
+        rollback_to_snapshot(&sm, &tm, &target).await.unwrap();
+
+        assert_eq!(sm.get_snapshot(1).await.unwrap(), target);
+        assert_eq!(sm.list_all_ids().await.unwrap(), vec![1]);
+        assert_eq!(sm.get_latest_snapshot_id().await.unwrap(), Some(1));
+        assert_eq!(sm.earliest_snapshot_id().await.unwrap(), Some(1));
+        assert!(tm.tag_exists("v1").await.unwrap());
+        assert!(!tm.tag_exists("v3").await.unwrap());
+    }
+
     #[tokio::test]
     async fn test_later_or_equal_exact_live() {
         let (_, sm, tm) = setup("memory:/test_later_exact").await;
@@ -2022,10 +2072,7 @@ mod tests {
         assert_eq!(normalize_index_type(" BitMap\t"), "bitmap");
         assert_eq!(normalize_index_type("IVF-FLAT"), "ivf-flat");
         assert_eq!(normalize_index_type("Ivf-Pq"), "ivf-pq");
-        assert_eq!(
-            normalize_index_type("Lumina-Vector-Ann"),
-            "lumina-vector-ann"
-        );
+        assert_eq!(normalize_index_type("DiskANN"), "diskann");
         // Already canonical values are returned unchanged, and an unknown type
         // is normalized but not rewritten -- the caller still rejects it.
         assert_eq!(normalize_index_type("ivf-flat"), "ivf-flat");

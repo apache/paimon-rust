@@ -16,7 +16,7 @@
 // under the License.
 
 //! Shared helpers for the global-index build builders (btree, full-text,
-//! lumina, vindex).
+//! vindex).
 //!
 //! Mirrors Java `GlobalIndexBuilderUtils`, which exposes a single
 //! `indexedRowRanges` used by both the sorted and vector index builders. The
@@ -25,17 +25,22 @@
 //! `index_type` string, so it lives here once rather than being copied into
 //! each builder.
 
+#[cfg(feature = "fulltext")]
 use crate::io::OutputFile;
 use crate::spec::{DataField, FileKind, IndexManifest};
 use crate::table::{merge_row_ranges, RowRange, Table};
 use crate::{Error, Result};
+#[cfg(feature = "fulltext")]
 use bytes::Bytes;
+#[cfg(feature = "fulltext")]
 use std::path::Path;
+#[cfg(feature = "fulltext")]
 use tokio::io::AsyncReadExt;
 
 pub(crate) mod preparation;
 pub(crate) mod vector;
 
+#[cfg(feature = "fulltext")]
 const COPY_BUFFER_SIZE: usize = 1024 * 1024;
 
 /// Validate the table that owns global row IDs. Procedure options only tune
@@ -65,9 +70,9 @@ pub(crate) fn validate_build_table(table: &Table) -> Result<()> {
     Ok(())
 }
 
-/// Stream a locally built index file to its table location. Native index
-/// builders (Lumina, full-text) serialize to a local temporary file first
-/// because their writers need synchronous I/O.
+/// Stream a locally built full-text index to its table location. The native
+/// writer serializes to a temporary file because it needs synchronous I/O.
+#[cfg(feature = "fulltext")]
 pub(crate) async fn copy_local_file_to_output(
     source_path: &Path,
     output: OutputFile,
