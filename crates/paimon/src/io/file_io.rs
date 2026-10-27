@@ -914,7 +914,8 @@ impl FileIO {
         } else if capability.write_with_if_not_exists
             // Only known whole-object publishers are safe here: position
             // writers can expose incomplete files, and COS ignores conditional
-            // puts on buckets that have ever enabled versioning.
+            // puts on buckets that have ever enabled versioning. OSS requires
+            // the bucket's default, never-enabled versioning configuration.
             && matches!(info.scheme(), "memory" | "s3" | "oss" | "gcs")
         {
             op.write_with(&relative_path, bytes)
@@ -4028,6 +4029,70 @@ mod input_output_test {
         assert_eq!(
             file_io.new_input(&location).unwrap().read().await.unwrap(),
             Bytes::from_static(b"new metadata")
+        );
+    }
+
+    #[cfg(feature = "storage-oss")]
+    #[tokio::test]
+    async fn test_atomic_publication_oss_has_one_winner() {
+        use axum::body::Body;
+        use axum::http::{HeaderMap, Response, StatusCode, Uri};
+        use axum::Router;
+        use opendal::Configurator;
+
+        let objects = Arc::new(Mutex::new(HashMap::<String, Bytes>::new()));
+        let stored = objects.clone();
+        // An OSS bucket with default versioning atomically enforces this header.
+        let app = Router::new().fallback(move |uri: Uri, headers: HeaderMap, body: Bytes| {
+            let stored = stored.clone();
+            async move {
+                let mut objects = stored.lock().unwrap();
+                if headers.get("x-oss-forbid-overwrite").is_some_and(|value| value == "true")
+                    && objects.contains_key(uri.path())
+                {
+                    return Response::builder()
+                        .status(StatusCode::CONFLICT)
+                        .body(Body::from("<Error><Code>FileAlreadyExists</Code><Message>exists</Message></Error>"))
+                        .unwrap();
+                }
+                objects.insert(uri.path().into(), body);
+                Response::builder()
+                    .header("etag", "\"mock-etag\"")
+                    .body(Body::empty())
+                    .unwrap()
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut config = opendal_service_oss::OssConfig::default();
+        config.endpoint = Some(endpoint);
+        config.addressing_style = Some("path".into());
+        config.skip_signature = true;
+        let op = crate::io::with_http_transport(
+            Operator::new(config.into_builder().bucket("bucket")).unwrap(),
+            "paimon-atomic-publication-test",
+        );
+        let io = FileIOBuilder::new("file")
+            .with_fs_operator(op)
+            .build()
+            .unwrap();
+        let path = "/table/snapshot/snapshot-1";
+        let first = Bytes::from_static(b"first snapshot");
+        let second = Bytes::from_static(b"second snapshot");
+        let (a, b) = tokio::join!(
+            io.write_atomic_if_not_exists(path, first.clone()),
+            io.write_atomic_if_not_exists(path, second.clone())
+        );
+        server.abort();
+        let (a, b) = (a.unwrap(), b.unwrap());
+        assert_ne!(a, b, "exactly one conditional OSS PUT must win");
+        assert_eq!(
+            objects
+                .lock()
+                .unwrap()
+                .get("/bucket/table/snapshot/snapshot-1"),
+            Some(if a { &first } else { &second })
         );
     }
 }

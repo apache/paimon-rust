@@ -227,6 +227,8 @@ with concurrency control; filesystem commits on those backends return an
 unsupported I/O error. This includes COS conditional writes, which do not reliably
 prevent overwrites on buckets that have ever enabled versioning, and position
 writers such as ADLS and custom filesystem operators without conditional rename.
+OSS conditional publication assumes the bucket uses its default versioning
+configuration and has never enabled versioning.
 Application storage providers can implement `FileIOProvider::write_atomic_if_not_exists`
 to supply their own atomic publication primitive. FUSE routes use local staged
 publication and require the mount to support publishing without replacement.
