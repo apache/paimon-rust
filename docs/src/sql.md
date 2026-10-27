@@ -2885,13 +2885,28 @@ and an explicit `false` continue to reject these retract rows. Once enabled on
 an existing partial-update table, `ignore-delete` cannot be changed back to
 `false`.
 
-Rust can read existing partial-update tables that define
+Rust supports reading and writing partial-update tables that define
 `fields.<sequence-field>.sequence-group=<protected-fields>`. Single and
 composite sequence fields, multiple independent groups, and projected reads are
 supported. Rows whose sequence tuple is entirely null do not update the group;
-an accepted group update can set protected fields to null. Rust table creation
-and writes still reject sequence-group options because write-side group merging
-is not implemented.
+an accepted group update can set protected fields to null.
+
+Set `fields.<sequence-fields>.sequence-group.sort-order` independently for each
+group: `ascending` (the default) retains larger ordering values, while
+`descending` retains smaller ones. Composite sequence fields are compared
+lexicographically in their declared order, using the same direction for every
+component. Non-null ordering values take precedence over null in both
+directions, and equal ordering tuples still replace protected fields, including
+with null. For example, `fields.first_event_time.sequence-group=channel` with
+`fields.first_event_time.sequence-group.sort-order=descending` retains
+`50/referral` from updates `100/organic` and `50/referral`.
+
+Sort-order options require a corresponding sequence group on a primary-key
+table with `merge-engine=partial-update`. Projected reads and column renames
+preserve the direction. Choose it before writing data: changing the direction
+cannot recover values discarded by earlier merges. All readers, writers, and
+compaction jobs must support the option before using `descending`; older
+clients may ignore it.
 
 Existing partial-update tables may also configure
 `fields.<field>.aggregate-function` or
@@ -2900,13 +2915,10 @@ set as the basic aggregation engine: `sum`, `product`, `min`, `max`,
 `last_value`, `first_value`, `last_non_null_value`,
 `first_non_null_value`, `bool_and`, `bool_or`, and `listagg`.
 `last_non_null_value` may be used without a sequence group; other functions
-require the target field to be protected by a sequence group. When an older
-group sequence arrives after a newer one, order-sensitive functions use Java
+require the target field to be protected by a sequence group. When a
+lower-precedence group sequence arrives, order-sensitive functions use Java
 compatible reversed aggregation. Unknown functions and incompatible
-function/type combinations fail closed. Rust table creation and writes still
-reject partial-update aggregation options.
-
-Partial-update remove-record options and retract semantics are not supported.
+function/type combinations fail closed.
 
 Rust can read fully materialized compacted files from deletion-vector-enabled
 partial-update and aggregation tables. Every split must be raw-convertible,

@@ -32,6 +32,7 @@ const PARTIAL_UPDATE_REMOVE_RECORD_ON_SEQUENCE_GROUP_OPTION: &str =
 const FIELDS_DEFAULT_AGG_FUNCTION_OPTION: &str = "fields.default-aggregate-function";
 const FIELDS_PREFIX: &str = "fields.";
 const SEQUENCE_GROUP_SUFFIX: &str = ".sequence-group";
+pub(super) const SEQUENCE_GROUP_SORT_ORDER_SUFFIX: &str = ".sequence-group.sort-order";
 const AGGREGATION_FUNCTION_SUFFIX: &str = ".aggregate-function";
 const LIST_AGG_DELIMITER_SUFFIX: &str = ".list-agg-delimiter";
 const IGNORE_RETRACT_SUFFIX: &str = ".ignore-retract";
@@ -50,6 +51,7 @@ pub(crate) enum PartialUpdateMode {
 pub(crate) struct SequenceGroup {
     pub(crate) sequence_fields: Vec<String>,
     pub(crate) protected_fields: Vec<String>,
+    pub(crate) ascending: bool,
 }
 
 impl SequenceGroup {
@@ -84,6 +86,7 @@ impl<'a> PartialUpdateConfig<'a> {
         &self,
         has_primary_keys: bool,
     ) -> crate::Result<Option<PartialUpdateMode>> {
+        self.validate_sequence_group_sort_orders(has_primary_keys)?;
         match self.validated_mode(has_primary_keys) {
             Ok(mode) => Ok(mode),
             Err(unsupported_options) => Err(crate::Error::ConfigInvalid {
@@ -114,6 +117,7 @@ impl<'a> PartialUpdateConfig<'a> {
         has_primary_keys: bool,
         table_name: &str,
     ) -> crate::Result<Option<PartialUpdateMode>> {
+        self.validate_sequence_group_sort_orders(has_primary_keys)?;
         match self.validated_mode(has_primary_keys) {
             Ok(mode) => {
                 if mode.is_some() { self.validate_delete_config()?; }
@@ -133,6 +137,7 @@ impl<'a> PartialUpdateConfig<'a> {
         has_primary_keys: bool,
         table_name: &str,
     ) -> crate::Result<Option<PartialUpdateMode>> {
+        self.validate_sequence_group_sort_orders(has_primary_keys)?;
         if !has_primary_keys || !self.is_enabled() {
             return Ok(None);
         }
@@ -156,6 +161,7 @@ impl<'a> PartialUpdateConfig<'a> {
     }
 
     pub(crate) fn sequence_groups(&self) -> crate::Result<Vec<SequenceGroup>> {
+        self.validate_sequence_group_sort_orders(true)?;
         let mut options: Vec<(&String, &String)> = self
             .options
             .iter()
@@ -179,9 +185,46 @@ impl<'a> PartialUpdateConfig<'a> {
                 Ok(SequenceGroup {
                     sequence_fields,
                     protected_fields,
+                    ascending: !self
+                        .options
+                        .get(&format!("{key}.sort-order"))
+                        .is_some_and(|value| value.eq_ignore_ascii_case("descending")),
                 })
             })
             .collect()
+    }
+
+    fn validate_sequence_group_sort_orders(&self, has_primary_keys: bool) -> crate::Result<()> {
+        for (key, value) in self
+            .options
+            .iter()
+            .filter(|(key, _)| is_fields_option_with_suffix(key, SEQUENCE_GROUP_SORT_ORDER_SUFFIX))
+        {
+            if !has_primary_keys || !self.is_enabled() {
+                return Err(crate::Error::ConfigInvalid {
+                    message: format!(
+                        "Option '{key}' is only supported by primary-key tables using merge-engine=partial-update"
+                    ),
+                });
+            }
+            let group_key = key
+                .strip_suffix(".sort-order")
+                .expect("sort-order suffix checked");
+            if !self.options.contains_key(group_key) {
+                return Err(crate::Error::ConfigInvalid {
+                    message: format!(
+                        "Cannot set '{key}' without defining corresponding sequence group '{group_key}'"
+                    ),
+                });
+            }
+            if !value.eq_ignore_ascii_case("ascending") && !value.eq_ignore_ascii_case("descending")
+            {
+                return Err(crate::Error::ConfigInvalid {
+                    message: format!("Invalid value '{value}' for option '{key}': expected ascending or descending"),
+                });
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn remove_record_on_delete(&self) -> bool {
@@ -763,13 +806,71 @@ mod tests {
                 SequenceGroup {
                     sequence_fields: vec!["event_time".to_string(), "source_order".to_string()],
                     protected_fields: vec!["price".to_string(), "quantity".to_string()],
+                    ascending: true,
                 },
                 SequenceGroup {
                     sequence_fields: vec!["profile_version".to_string()],
                     protected_fields: vec!["name".to_string(), "address".to_string()],
+                    ascending: true,
                 },
             ]
         );
+    }
+
+    #[test]
+    fn test_sequence_group_sort_order_validation() {
+        let group_key = "fields.event_time,source_order.sequence-group";
+        let sort_key = "fields.event_time,source_order.sequence-group.sort-order";
+        for (value, ascending) in [
+            ("ascending", true),
+            ("descending", false),
+            ("DeScEnDiNg", false),
+        ] {
+            let options = partial_update_options(&[(group_key, "price"), (sort_key, value)]);
+            let config = PartialUpdateConfig::new(&options);
+            assert_eq!(config.sequence_groups().unwrap()[0].ascending, ascending);
+            assert_eq!(
+                config.validate_create_mode(true).unwrap(),
+                Some(PartialUpdateMode::SequenceGroup)
+            );
+        }
+
+        for (options, has_pk, message) in [
+            (
+                partial_update_options(&[(group_key, "price"), (sort_key, "desc")]),
+                true,
+                "expected ascending or descending",
+            ),
+            (
+                partial_update_options(&[(sort_key, "descending")]),
+                true,
+                "corresponding sequence group",
+            ),
+            (
+                partial_update_options(&[(group_key, "price"), (sort_key, "descending")]),
+                false,
+                "primary-key tables",
+            ),
+            (
+                HashMap::from([
+                    (group_key.to_string(), "price".to_string()),
+                    (sort_key.to_string(), "descending".to_string()),
+                ]),
+                true,
+                "merge-engine=partial-update",
+            ),
+        ] {
+            let config = PartialUpdateConfig::new(&options);
+            for result in [
+                config.validate_create_mode(has_pk),
+                config.validate_read_mode(has_pk, "t"),
+                config.validate_write_mode(has_pk, "t"),
+            ] {
+                assert!(
+                    matches!(result, Err(crate::Error::ConfigInvalid { message: actual }) if actual.contains(message))
+                );
+            }
+        }
     }
 
     #[test]

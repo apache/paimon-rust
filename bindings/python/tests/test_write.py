@@ -64,6 +64,60 @@ def test_write_commit_read_roundtrip():
         assert result == {"id": [1, 2, 3], "name": ["a", "b", "c"]}
 
 
+@pytest.mark.parametrize("direction", [None, "ascending", "descending", "DeScEnDiNg"])
+@pytest.mark.parametrize("separate_commits", [False, True])
+@pytest.mark.parametrize("reverse_input", [False, True])
+def test_partial_update_sequence_group_sort_order(
+        tmp_path, direction, separate_commits, reverse_input):
+    # apache/paimon#10546: retain the latest status and the earliest channel.
+    ctx = SQLContext()
+    ctx.register_catalog("paimon", {"warehouse": str(tmp_path)})
+    ctx.sql("CREATE SCHEMA paimon.wdb")
+    sort_option = ("" if direction is None else
+                   f", 'fields.first_event_time.sequence-group.sort-order' = '{direction}'")
+    ctx.sql(
+        "CREATE TABLE paimon.wdb.t (user_id BIGINT, status STRING, "
+        "status_version BIGINT, channel STRING, first_event_time BIGINT, "
+        "PRIMARY KEY (user_id)) WITH ("
+        "'bucket' = '1', 'merge-engine' = 'partial-update', "
+        "'fields.status_version.sequence-group' = 'status', "
+        "'fields.first_event_time.sequence-group' = 'channel'" + sort_option + ")")
+    schema = pa.schema([
+        ("user_id", pa.int64()), ("status", pa.string()),
+        ("status_version", pa.int64()), ("channel", pa.string()),
+        ("first_event_time", pa.int64())])
+    rows = [dict(zip(schema.names, row)) for row in [
+        (1, "active", 200, "organic", 100),
+        (1, "registered", 100, "referral", 50)]]
+    if reverse_input:
+        rows.reverse()
+    table = _get_table(str(tmp_path))
+    for group in ([[row] for row in rows] if separate_commits else [rows]):
+        builder = table.new_batch_write_builder()
+        writer = builder.new_write()
+        try:
+            writer.write_arrow(pa.RecordBatch.from_pylist(group, schema=schema))
+            builder.new_commit().commit(writer.prepare_commit())
+        finally:
+            writer.close()
+
+    descending = direction is not None and direction.lower() == "descending"
+    channel, event_time = ("referral", 50) if descending else ("organic", 100)
+    expected = [dict(zip(schema.names, (1, "active", 200, channel, event_time)))]
+    assert pa.Table.from_batches(ctx.sql("SELECT * FROM paimon.wdb.t")).to_pylist() == expected
+    # Both the native read builder and SQL projection must retain ordering dependencies.
+    read_builder = _get_table(str(tmp_path)).new_read_builder()
+    read_builder.with_projection(["channel"])
+    batches = read_builder.new_read().read(read_builder.new_scan().plan().splits())
+    assert pa.Table.from_batches(batches).to_pylist() == [{"channel": channel}]
+    assert pa.Table.from_batches(ctx.sql(
+        "SELECT channel FROM paimon.wdb.t")).to_pylist() == [{"channel": channel}]
+    ctx.sql("ALTER TABLE paimon.wdb.t RENAME COLUMN first_event_time TO event_time")
+    assert pa.Table.from_batches(ctx.sql(
+        "SELECT channel, event_time FROM paimon.wdb.t")).to_pylist() == [
+            {"channel": channel, "event_time": event_time}]
+
+
 @pytest.mark.parametrize("streaming", [False, True])
 def test_partial_write_type_roundtrip_and_lifecycle(tmp_path, streaming):
     ctx = SQLContext()
