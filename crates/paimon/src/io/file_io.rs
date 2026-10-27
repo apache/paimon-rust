@@ -1562,6 +1562,9 @@ impl InputFile {
             return Ok(op.read(&relative_path).await?.to_bytes());
         };
         let read_token = cache.read_token(&cache_path);
+        if let Some(bytes) = cache.read_cached_small_file(&cache_path, &read_token).await {
+            return Ok(bytes);
+        }
         let size = if let Some(size) = cache.file_size(&cache_path, &read_token).await {
             size
         } else {
