@@ -120,11 +120,53 @@ const ROW_METADATA_CACHE_MAX_BYTES: usize = 32 * 1024 * 1024;
 const ROW_METADATA_CACHE_BUDGET_DIVISOR: usize = 4;
 const ROW_SIDECAR_SIZE_CACHE_MAX_ENTRIES: usize = 4096;
 
+type ParquetMetadataSlot = OnceLock<Arc<dyn Any + Send + Sync>>;
+type ParquetMetadataRegistry = HashMap<(u32, usize), std::sync::Weak<ParquetMetadataSlot>>;
+static PARQUET_METADATA_SLOTS: Mutex<Option<ParquetMetadataRegistry>> = Mutex::new(None);
+
+fn shared_parquet_metadata_slot(max_bytes: usize) -> Arc<ParquetMetadataSlot> {
+    // Sharing is best-effort; never wait on a registry lock inherited by fork.
+    let Ok(mut registry) = PARQUET_METADATA_SLOTS.try_lock() else {
+        return Arc::new(OnceLock::new());
+    };
+    let slots = registry.get_or_insert_with(HashMap::new);
+    slots.retain(|_, slot| slot.strong_count() > 0);
+    let key = (std::process::id(), max_bytes);
+    if let Some(slot) = slots.get(&key).and_then(std::sync::Weak::upgrade) {
+        return slot;
+    }
+    let slot = Arc::new(OnceLock::new());
+    slots.insert(key, Arc::downgrade(&slot));
+    slot
+}
+
+#[cfg(test)]
+pub(crate) fn run_isolated_metadata_cache_test(test_name: &str) -> bool {
+    const CHILD: &str = "PAIMON_TEST_ISOLATED_METADATA_CACHE";
+    if std::env::var(CHILD).as_deref() == Ok(test_name) {
+        return true;
+    }
+    // Registry contention legitimately disables sharing. Tests requiring a
+    // shared slot must not race unrelated tests constructing cache contexts.
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test_name, "--test-threads=1"])
+        .env(CHILD, test_name)
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "isolated test {test_name} failed: {status}"
+    );
+    false
+}
+
 pub(crate) struct FileFormatMetadataCacheContext {
     max_bytes: usize,
-    cache: OnceLock<Arc<dyn Any + Send + Sync>>,
+    shared: bool,
+    cache: Arc<ParquetMetadataSlot>,
     row_metadata_cache: OnceLock<Arc<dyn Any + Send + Sync>>,
     process_id: u32,
+    memory_identity: uuid::Uuid,
     row_sidecar_sizes: OnceLock<Mutex<LruCache<String, u64>>>,
 }
 
@@ -153,11 +195,30 @@ impl FileFormatMetadataCacheContext {
             })
             .transpose()?
             .unwrap_or(DEFAULT_FILE_FORMAT_METADATA_CACHE_MAX_BYTES);
+        let shared = props
+            .get(CatalogOptions::FILE_FORMAT_METADATA_CACHE_SHARED)
+            .map(|value| {
+                value.parse::<bool>().map_err(|_| Error::ConfigInvalid {
+                    message: format!(
+                        "Invalid value for {}: {value}",
+                        CatalogOptions::FILE_FORMAT_METADATA_CACHE_SHARED
+                    ),
+                })
+            })
+            .transpose()?
+            .unwrap_or(false);
+        let cache = if shared && max_bytes > 0 {
+            shared_parquet_metadata_slot(max_bytes)
+        } else {
+            Arc::new(OnceLock::new())
+        };
         Ok(Arc::new(Self {
             max_bytes,
-            cache: OnceLock::new(),
+            shared,
+            cache,
             row_metadata_cache: OnceLock::new(),
             process_id: std::process::id(),
+            memory_identity: uuid::Uuid::new_v4(),
             row_sidecar_sizes: OnceLock::new(),
         }))
     }
@@ -231,6 +292,9 @@ impl FileFormatMetadataCacheContext {
     where
         T: Send + Sync + 'static,
     {
+        if self.process_id != std::process::id() {
+            return Arc::new(init(self.parquet_metadata_max_bytes()));
+        }
         let cache = Arc::clone(self.cache.get_or_init(|| {
             Arc::new(init(self.parquet_metadata_max_bytes())) as Arc<dyn Any + Send + Sync>
         }));
@@ -238,6 +302,10 @@ impl FileFormatMetadataCacheContext {
             Ok(cache) => cache,
             Err(_) => panic!("file-format metadata cache type mismatch"),
         }
+    }
+
+    pub(crate) fn parquet_metadata_is_shared(&self) -> bool {
+        self.shared && self.process_id == std::process::id()
     }
 
     /// ROW footer and block index metadata has its own typed cache. Keep it
@@ -1176,6 +1244,14 @@ impl FileIOBuilder {
 pub trait FileRead: Send + Sync + Unpin + 'static {
     async fn read(&self, range: Range<u64>) -> crate::Result<Bytes>;
 
+    /// Check current access before reusing metadata from another context.
+    /// Implementations must bypass data caches and propagate storage errors.
+    /// Returning false disables cross-context metadata reuse for this reader.
+    #[doc(hidden)]
+    async fn check_shared_metadata_access(&self) -> crate::Result<bool> {
+        Ok(false)
+    }
+
     #[doc(hidden)]
     #[deprecated(note = "BLOB index caching no longer uses numeric FileIO namespaces")]
     fn cache_namespace(&self) -> Option<usize> {
@@ -1200,6 +1276,11 @@ pub trait FileRead: Send + Sync + Unpin + 'static {
 
 #[async_trait::async_trait]
 impl FileRead for opendal::Reader {
+    async fn check_shared_metadata_access(&self) -> crate::Result<bool> {
+        self.read(0..1).await?;
+        Ok(true)
+    }
+
     async fn read(&self, range: Range<u64>) -> crate::Result<Bytes> {
         Ok(opendal::Reader::read(self, range).await?.to_bytes())
     }
@@ -1222,6 +1303,13 @@ enum InputFileReader {
 
 #[async_trait::async_trait]
 impl FileRead for InputFileReader {
+    async fn check_shared_metadata_access(&self) -> crate::Result<bool> {
+        match self {
+            Self::Direct { reader, .. } => reader.check_shared_metadata_access().await,
+            Self::Cached { reader, .. } => reader.check_shared_metadata_access().await,
+        }
+    }
+
     async fn read(&self, range: Range<u64>) -> crate::Result<Bytes> {
         match self {
             Self::Direct { reader, .. } => FileRead::read(reader, range).await,
@@ -1589,11 +1677,21 @@ impl InputFile {
 
     async fn reader_with_size_hint(&self, size: Option<u64>) -> crate::Result<impl FileRead> {
         let (op, relative_path, cache_path) = self.source.resolve(&self.path).await?;
+        let cache_key = cache_path.as_ref().map(|path| {
+            if op.info().scheme() == "memory" {
+                // OpenDAL's address-based Memory name can be recycled. Keep
+                // parsed metadata context-local without changing block-cache
+                // keys or invalidation for operators shared by several FileIOs.
+                format!("{}:{path}", self.file_format_metadata_cache.memory_identity)
+            } else {
+                path.clone()
+            }
+        });
         let reader = op.reader(&relative_path).await?;
         let (Some(cache), Some(cache_path)) = (&self.cache, cache_path.as_ref()) else {
             return Ok(InputFileReader::Direct {
                 reader,
-                cache_key: cache_path,
+                cache_key,
                 file_format_metadata_cache: Arc::clone(&self.file_format_metadata_cache),
                 blob_index_cache: Arc::clone(&self.blob_index_cache),
             });
@@ -1616,7 +1714,7 @@ impl InputFile {
                 cache.clone(),
                 read_token,
             ),
-            cache_key: cache_path.clone(),
+            cache_key: cache_key.unwrap(),
             file_format_metadata_cache: Arc::clone(&self.file_format_metadata_cache),
             blob_index_cache: Arc::clone(&self.blob_index_cache),
         })
@@ -2693,6 +2791,38 @@ mod input_output_test {
         );
     }
 
+    #[cfg(feature = "storage-memory")]
+    #[tokio::test]
+    async fn test_memory_metadata_keys_are_context_scoped() {
+        let first = setup_memory_file_io();
+        let path = "memory:/metadata.parquet";
+        let first_reader = first.new_input(path).unwrap().reader().await.unwrap();
+        let clone = first.clone();
+        let cloned_reader = clone.new_input(path).unwrap().reader().await.unwrap();
+        assert_eq!(first_reader.cache_key(), cloned_reader.cache_key());
+        let second = setup_memory_file_io();
+        let second_reader = second.new_input(path).unwrap().reader().await.unwrap();
+        assert_ne!(first_reader.cache_key(), second_reader.cache_key());
+
+        let operator = Operator::from_config(opendal::services::MemoryConfig::default()).unwrap();
+        let first = FileIOBuilder::new("file")
+            .with_fs_operator(operator.clone())
+            .build()
+            .unwrap();
+        let second = FileIOBuilder::new("file")
+            .with_fs_operator(operator)
+            .build()
+            .unwrap();
+        let path = "file:/metadata.parquet";
+        let first_reader = first.new_input(path).unwrap().reader().await.unwrap();
+        let second_reader = second.new_input(path).unwrap().reader().await.unwrap();
+        assert_ne!(first_reader.cache_key(), second_reader.cache_key());
+        assert_eq!(
+            first.create_with_cache_path(path).await.unwrap().2,
+            second.create_with_cache_path(path).await.unwrap().2,
+        );
+    }
+
     #[cfg(all(feature = "storage-fs", feature = "storage-memory"))]
     #[test]
     fn test_cache_object_path_distinguishes_storage_schemes() {
@@ -3170,6 +3300,119 @@ mod input_output_test {
         assert!(error
             .to_string()
             .contains(CatalogOptions::FILE_FORMAT_METADATA_CACHE_MAX_SIZE));
+    }
+
+    #[test]
+    fn test_shared_metadata_cache_budget_lifetime_and_row_isolation() {
+        if !run_isolated_metadata_cache_test(
+            "io::file_io::input_output_test::test_shared_metadata_cache_budget_lifetime_and_row_isolation",
+        ) {
+            return;
+        }
+        let mut props = HashMap::from([
+            (
+                CatalogOptions::FILE_FORMAT_METADATA_CACHE_SHARED.to_string(),
+                "true".to_string(),
+            ),
+            (
+                CatalogOptions::FILE_FORMAT_METADATA_CACHE_MAX_SIZE.to_string(),
+                "123456".to_string(),
+            ),
+        ]);
+        let first = FileFormatMetadataCacheContext::from_props(&props).unwrap();
+        let second = FileFormatMetadataCacheContext::from_props(&props).unwrap();
+        assert!(Arc::ptr_eq(&first.cache, &second.cache));
+        let row_first = first.row_metadata_get_or_init(|_| 1usize).unwrap();
+        let row_second = second.row_metadata_get_or_init(|_| 2usize).unwrap();
+        assert!(!Arc::ptr_eq(&row_first, &row_second));
+        props.insert(
+            CatalogOptions::FILE_FORMAT_METADATA_CACHE_MAX_SIZE.to_string(),
+            "0".to_string(),
+        );
+        let zero = FileFormatMetadataCacheContext::from_props(&props).unwrap();
+        assert!(!Arc::ptr_eq(&first.cache, &zero.cache));
+        let weak = Arc::downgrade(&first.cache);
+        drop(first);
+        drop(second);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn test_shared_metadata_cache_falls_back_under_registry_contention() {
+        if !run_isolated_metadata_cache_test(
+            "io::file_io::input_output_test::test_shared_metadata_cache_falls_back_under_registry_contention",
+        ) {
+            return;
+        }
+        let props = HashMap::from([(
+            CatalogOptions::FILE_FORMAT_METADATA_CACHE_SHARED.to_string(),
+            "true".to_string(),
+        )]);
+        let shared = FileFormatMetadataCacheContext::from_props(&props).unwrap();
+        let guard = PARQUET_METADATA_SLOTS.lock().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let concurrent_props = props.clone();
+        let constructor = std::thread::spawn(move || {
+            tx.send(FileFormatMetadataCacheContext::from_props(
+                &concurrent_props,
+            ))
+            .unwrap();
+        });
+        let fallback = rx.recv_timeout(std::time::Duration::from_secs(5));
+        // Release the gate before joining, even if construction incorrectly waited.
+        drop(guard);
+        constructor.join().unwrap();
+        let fallback = fallback
+            .expect("cache construction must not wait for the registry lock")
+            .unwrap();
+        assert!(!Arc::ptr_eq(&shared.cache, &fallback.cache));
+        let available = FileFormatMetadataCacheContext::from_props(&props).unwrap();
+        assert!(Arc::ptr_eq(&shared.cache, &available.cache));
+    }
+
+    #[test]
+    fn test_shared_metadata_cache_rejects_invalid_flag() {
+        let props = HashMap::from([(
+            CatalogOptions::FILE_FORMAT_METADATA_CACHE_SHARED.to_string(),
+            "invalid".to_string(),
+        )]);
+        assert!(FileFormatMetadataCacheContext::from_props(&props).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_shared_metadata_registry_fork_with_locked_registry() {
+        if !run_isolated_metadata_cache_test(
+            "io::file_io::input_output_test::test_shared_metadata_registry_fork_with_locked_registry",
+        ) {
+            return;
+        }
+        // The child must not wait for a lock whose owning thread stayed in the parent.
+        let guard = PARQUET_METADATA_SLOTS.lock().unwrap();
+        unsafe {
+            let pid = libc::fork();
+            assert!(pid >= 0);
+            if pid == 0 {
+                libc::alarm(3);
+                let slot = shared_parquet_metadata_slot(123456);
+                libc::_exit(if slot.get().is_none() { 0 } else { 1 });
+            }
+            let mut status = 0;
+            assert_eq!(libc::waitpid(pid, &mut status, 0), pid);
+            assert!(libc::WIFEXITED(status));
+            assert_eq!(libc::WEXITSTATUS(status), 0);
+        }
+        drop(guard);
+    }
+
+    #[test]
+    fn test_metadata_cache_bypasses_inherited_context() {
+        let mut context = FileFormatMetadataCacheContext::from_props(&HashMap::new()).unwrap();
+        let before = context.get_or_init(|_| 1usize);
+        Arc::get_mut(&mut context).unwrap().process_id = 0;
+        let after = context.get_or_init(|_| 2usize);
+        assert_eq!(*after, 2);
+        assert!(!Arc::ptr_eq(&before, &after));
     }
 
     #[test]

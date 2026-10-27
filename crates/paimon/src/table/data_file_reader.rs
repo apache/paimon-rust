@@ -106,6 +106,13 @@ struct TimedFileRead {
 
 #[async_trait::async_trait]
 impl FileRead for TimedFileRead {
+    async fn check_shared_metadata_access(&self) -> crate::Result<bool> {
+        let start = Instant::now();
+        let result = self.inner.check_shared_metadata_access().await;
+        self.timing.add_file_read(start.elapsed());
+        result
+    }
+
     async fn read(&self, range: Range<u64>) -> crate::Result<bytes::Bytes> {
         let start = Instant::now();
         let result = self.inner.read(range).await;
