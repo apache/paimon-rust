@@ -30,7 +30,7 @@ use std::sync::Arc;
 /// Interface to commit a snapshot atomically.
 ///
 /// Two implementations:
-/// - `RenamingSnapshotCommit` — file system atomic rename
+/// - `RenamingSnapshotCommit` — atomic no-replace file publication
 /// - `RESTSnapshotCommit` — via Catalog API (e.g. REST)
 #[async_trait]
 pub trait SnapshotCommit: Send + Sync {
@@ -46,7 +46,7 @@ pub trait SnapshotCommit: Send + Sync {
     ) -> Result<bool>;
 }
 
-/// A SnapshotCommit using file renaming to commit.
+/// A SnapshotCommit using atomic file publication without replacing an existing snapshot.
 ///
 /// Reference: [Java RenamingSnapshotCommit](https://github.com/apache/paimon/blob/master/paimon-core/src/main/java/org/apache/paimon/catalog/RenamingSnapshotCommit.java)
 pub struct RenamingSnapshotCommit {

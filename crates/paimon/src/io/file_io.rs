@@ -87,6 +87,20 @@ pub trait FileIOProvider: std::fmt::Debug + Send + Sync + 'static {
     /// Rename requires both paths to resolve to the same shared service instance.
     async fn create(&self, path: &str) -> crate::Result<(Operator, String)>;
 
+    /// Optionally publish a complete immutable file without replacing an existing file.
+    ///
+    /// Return `Some(true)` on success or `Some(false)` for a definite conflict.
+    /// Return `None` only if no publication was attempted; FileIO then uses the
+    /// resolved operator's safe publication primitives. An error may have an
+    /// unknown outcome and is propagated without falling back to another write.
+    async fn write_atomic_if_not_exists(
+        &self,
+        _path: &str,
+        _bytes: Bytes,
+    ) -> crate::Result<Option<bool>> {
+        Ok(None)
+    }
+
     /// Return a stable namespace for the resolved storage target. `None`
     /// disables caching; distinct endpoints must use distinct namespaces.
     async fn create_with_cache_namespace(
@@ -855,6 +869,136 @@ impl FileIO {
         Ok(())
     }
 
+    /// Publish a complete immutable file only if the target does not exist.
+    /// Returns `false` only for a definite publication conflict. Other failures
+    /// may have an unknown outcome and must never trigger an unconditional write.
+    pub(crate) async fn write_atomic_if_not_exists(
+        &self,
+        path: &str,
+        bytes: Bytes,
+    ) -> Result<bool> {
+        if let FileIOBackend::Provider(provider) = &self.backend {
+            if let Some(published) = provider
+                .write_atomic_if_not_exists(path, bytes.clone())
+                .await?
+            {
+                return Ok(published);
+            }
+        }
+        let source = self.file_source(path)?;
+        let (op, relative_path, _) = source.resolve(path).await?;
+
+        #[cfg(feature = "storage-fs")]
+        if matches!(source, FileSource::Static { local_fs: true, .. }) {
+            return Self::write_local_atomic_if_not_exists(path, &op, &relative_path, bytes).await;
+        }
+
+        let info = op.info();
+        let capability = info.capability();
+        let result = if capability.rename_with_if_not_exists {
+            let staging_path = format!("{relative_path}.tmp-{}", uuid::Uuid::new_v4());
+            op.write(&staging_path, bytes).await?;
+            let result = op
+                .rename_with(&staging_path, &relative_path)
+                .if_not_exists(true)
+                .await;
+            if result.as_ref().is_err_and(|error| {
+                matches!(
+                    error.kind(),
+                    opendal::ErrorKind::AlreadyExists | opendal::ErrorKind::ConditionNotMatch
+                )
+            }) {
+                let _ = op.delete(&staging_path).await;
+            }
+            result
+        } else if capability.write_with_if_not_exists
+            // Only known whole-object publishers are safe here: position
+            // writers can expose incomplete files, and COS ignores conditional
+            // puts on buckets that have ever enabled versioning.
+            && matches!(info.scheme(), "memory" | "s3" | "oss" | "gcs")
+        {
+            op.write_with(&relative_path, bytes)
+                .if_not_exists(true)
+                .await
+                .map(|_| ())
+        } else {
+            return Err(Error::IoUnsupported {
+                message: format!(
+                    "Storage '{}' cannot atomically publish a complete snapshot without overwriting '{path}'; use a catalog SnapshotCommit with concurrency control",
+                    info.scheme()
+                ),
+            });
+        };
+        match result {
+            Ok(()) => Ok(true),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    opendal::ErrorKind::AlreadyExists | opendal::ErrorKind::ConditionNotMatch
+                ) =>
+            {
+                Ok(false)
+            }
+            Err(error) => Err(Error::from_opendal_with_context(
+                error,
+                format!("Failed to publish '{path}'"),
+            )),
+        }
+    }
+
+    #[cfg(feature = "storage-fs")]
+    async fn write_local_atomic_if_not_exists(
+        path: &str,
+        op: &Operator,
+        relative_path: &str,
+        bytes: Bytes,
+    ) -> Result<bool> {
+        // OpenDAL's filesystem conditional write exposes the target before
+        // its contents are complete. Stage locally, then publish without
+        // replacing another process's snapshot.
+        let relative = normalize_path(relative_path);
+        if std::path::Path::new(&relative)
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            return Err(Error::IoUnsupported {
+                message: format!("Cannot publish a snapshot through a parent path: '{path}'"),
+            });
+        }
+        let target = std::path::Path::new(&op.info().root()).join(relative);
+        tokio::task::spawn_blocking(move || -> opendal::Result<bool> {
+            use std::io::Write;
+
+            let parent = target.parent().ok_or_else(|| {
+                opendal::Error::new(opendal::ErrorKind::IsADirectory, "target has no parent")
+            })?;
+            std::fs::create_dir_all(parent).map_err(new_std_io_error)?;
+            let mut builder = tempfile::Builder::new();
+            builder.prefix(".snapshot-");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                builder.permissions(std::fs::Permissions::from_mode(0o666));
+            }
+            let mut staged = builder.tempfile_in(parent).map_err(new_std_io_error)?;
+            staged.write_all(&bytes).map_err(new_std_io_error)?;
+            staged.as_file().sync_all().map_err(new_std_io_error)?;
+            match staged.persist_noclobber(target) {
+                Ok(_) => Ok(true),
+                Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+                Err(error) => Err(new_std_io_error(error.error)),
+            }
+        })
+        .await
+        .map_err(|error| Error::UnexpectedError {
+            message: format!("Failed to publish '{path}'"),
+            source: Some(Box::new(error)),
+        })?
+        .map_err(|error| {
+            Error::from_opendal_with_context(error, format!("Failed to publish '{path}'"))
+        })
+    }
+
     /// Copy a large file without materializing its entire contents in memory.
     /// Format Table publication uses this when a backend does not support
     /// rename, as is common for object stores and the in-memory test backend.
@@ -1090,6 +1234,9 @@ impl FileIOBuilder {
     /// form, so the operator's root decides what they resolve against. Scheme'd paths
     /// (`s3://…`, `oss://…`) are rejected rather than misresolved: an object-store operator
     /// needs bucket/scheme resolution this hook deliberately does not provide.
+    /// Snapshot publication requires atomic no-replace publication from the operator.
+    /// Filesystem conditional writes alone expose incomplete files; use the built-in
+    /// `file` backend or a catalog SnapshotCommit when conditional rename is unavailable.
     pub fn with_fs_operator(mut self, operator: Operator) -> Self {
         self.operator = Some(operator);
         self
