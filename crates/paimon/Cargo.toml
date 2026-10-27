@@ -57,7 +57,11 @@ storage-oss = [
     "dep:opendal-layer-retry",
     "dep:opendal-service-oss",
 ]
-storage-s3 = ["dep:opendal-http-transport-reqwest", "dep:opendal-service-s3"]
+storage-s3 = [
+    "dep:opendal-http-transport-reqwest",
+    "dep:opendal-service-s3",
+    "dep:opendal-layer-retry",
+]
 storage-cos = ["dep:opendal-http-transport-reqwest", "dep:opendal-service-cos"]
 storage-azdls = [
     "dep:opendal-http-transport-reqwest",

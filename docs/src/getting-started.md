@@ -253,6 +253,9 @@ options.set(CatalogOptions::WAREHOUSE, "s3://bucket/warehouse");
 options.set("s3.access-key-id", "your-access-key-id");
 options.set("s3.secret-access-key", "your-secret-access-key");
 options.set("s3.region", "us-east-1");
+// Optional: configure retries for temporary S3 failures.
+options.set("s3.retry.count", "10");
+options.set("s3.retry.interval.millisecond", "500");
 let catalog = CatalogFactory::create(options).await?;
 
 // Alibaba Cloud OSS

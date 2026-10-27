@@ -16,8 +16,10 @@
 // under the License.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use opendal::{Configurator, Operator};
+use opendal_layer_retry::RetryLayer;
 use opendal_service_s3::S3Config;
 use url::Url;
 
@@ -59,6 +61,23 @@ const S3_PATH_STYLE_ACCESS: &str = "s3.path-style-access";
 /// Compatible with paimon-java's `s3.region`.
 const S3_REGION: &str = "s3.region";
 
+/// Number of retries after an S3 request fails.
+pub(crate) const S3_RETRY_COUNT: &str = "s3.retry.count";
+
+/// Initial exponential retry interval in milliseconds.
+pub(crate) const S3_RETRY_INTERVAL_MILLIS: &str = "s3.retry.interval.millisecond";
+
+const DEFAULT_S3_RETRY_COUNT: usize = 10;
+const DEFAULT_S3_RETRY_INTERVAL_MILLIS: u64 = 500;
+
+#[derive(Debug)]
+pub struct S3StorageConfig {
+    service: S3Config,
+    retry_count: usize,
+    retry_interval: Duration,
+    user_agent: String,
+}
+
 /// Paimon-java config key prefixes that map to S3 configuration.
 ///
 /// Java's `S3FileIO` normalizes all of these prefixes to `fs.s3a.*` before
@@ -78,7 +97,7 @@ const KEY_ALIASES: &[(&str, &str)] = &[
     ("s3.path.style.access", "s3.path-style-access"),
 ];
 
-/// Parse paimon catalog options into an [`S3Config`].
+/// Parse paimon catalog options into an [`S3StorageConfig`].
 ///
 /// Extracts S3-related configuration keys from the provided properties map.
 /// Supports multiple key prefixes for Java compatibility (`s3.`, `s3a.`, `fs.s3a.`).
@@ -87,7 +106,8 @@ const KEY_ALIASES: &[(&str, &str)] = &[
 /// and Java Paimon behavior). Set `s3.path-style-access=true` to switch
 /// to path-style for S3-compatible stores like MinIO.
 #[allow(clippy::field_reassign_with_default)]
-pub(crate) fn s3_config_parse(props: HashMap<String, String>) -> Result<S3Config> {
+pub(crate) fn s3_config_parse(props: HashMap<String, String>) -> Result<S3StorageConfig> {
+    let user_agent = super::user_agent::storage_user_agent(&props);
     let normalized = normalize_storage_config(props, JAVA_CONFIG_PREFIXES, "s3.", KEY_ALIASES);
 
     let mut cfg = S3Config::default();
@@ -126,15 +146,32 @@ pub(crate) fn s3_config_parse(props: HashMap<String, String>) -> Result<S3Config
     // Storage class.
     cfg.default_storage_class = normalized.get("s3.storage.class").cloned();
 
-    Ok(cfg)
+    let retry_count = match normalized.get(S3_RETRY_COUNT) {
+        Some(value) => value.parse().map_err(|_| Error::ConfigInvalid {
+            message: format!("Invalid S3 config {S3_RETRY_COUNT}: {value}"),
+        })?,
+        None => DEFAULT_S3_RETRY_COUNT,
+    };
+    let retry_interval_millis = match normalized.get(S3_RETRY_INTERVAL_MILLIS) {
+        Some(value) => value.parse().map_err(|_| Error::ConfigInvalid {
+            message: format!("Invalid S3 config {S3_RETRY_INTERVAL_MILLIS}: {value}"),
+        })?,
+        None => DEFAULT_S3_RETRY_INTERVAL_MILLIS,
+    };
+    Ok(S3StorageConfig {
+        service: cfg,
+        retry_count,
+        retry_interval: Duration::from_millis(retry_interval_millis),
+        user_agent,
+    })
 }
 
 /// Build an [`Operator`] for the given S3 path.
 ///
 /// Parses the bucket name from the `s3://bucket/key` or `s3a://bucket/key`
-/// URL and combines it with the provided [`S3Config`] to construct an
+/// URL and combines it with the provided [`S3StorageConfig`] to construct an
 /// OpenDAL operator.
-pub(crate) fn s3_config_build(cfg: &S3Config, path: &str, user_agent: &str) -> Result<Operator> {
+pub(crate) fn s3_config_build(cfg: &S3StorageConfig, path: &str) -> Result<Operator> {
     let url = Url::parse(path).map_err(|_| Error::ConfigInvalid {
         message: format!("Invalid S3 url: {path}"),
     })?;
@@ -143,16 +180,35 @@ pub(crate) fn s3_config_build(cfg: &S3Config, path: &str, user_agent: &str) -> R
         message: format!("Invalid S3 url: {path}, missing bucket"),
     })?;
 
-    let builder = cfg.clone().into_builder().bucket(bucket);
-    Ok(super::with_http_transport(
-        Operator::new(builder)?,
-        user_agent,
-    ))
+    let builder = cfg.service.clone().into_builder().bucket(bucket);
+    let retry = RetryLayer::default()
+        .with_min_delay(cfg.retry_interval)
+        .with_max_times(cfg.retry_count)
+        .with_jitter();
+    Ok(super::with_http_transport(Operator::new(builder)?, &cfg.user_agent).layer(retry))
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use axum::body::Body;
+    use axum::extract::State;
+    use axum::http::{header, HeaderMap, Response, StatusCode};
+    use axum::routing::get;
+    use axum::Router;
+
     use super::*;
+
+    fn storage_config(service: S3Config) -> S3StorageConfig {
+        S3StorageConfig {
+            service,
+            retry_count: DEFAULT_S3_RETRY_COUNT,
+            retry_interval: Duration::from_millis(1),
+            user_agent: crate::io::user_agent::default_user_agent(),
+        }
+    }
 
     fn make_props(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         pairs
@@ -168,16 +224,20 @@ mod tests {
             ("s3.access-key", "AKID"),
             ("s3.secret-key", "SECRET"),
             ("s3.region", "us-east-1"),
+            (S3_RETRY_COUNT, "7"),
+            (S3_RETRY_INTERVAL_MILLIS, "250"),
         ]);
 
         let cfg = s3_config_parse(props).unwrap();
         assert_eq!(
-            cfg.endpoint.as_deref(),
+            cfg.service.endpoint.as_deref(),
             Some("https://s3.us-east-1.amazonaws.com")
         );
-        assert_eq!(cfg.access_key_id.as_deref(), Some("AKID"));
-        assert_eq!(cfg.secret_access_key.as_deref(), Some("SECRET"));
-        assert_eq!(cfg.region.as_deref(), Some("us-east-1"));
+        assert_eq!(cfg.service.access_key_id.as_deref(), Some("AKID"));
+        assert_eq!(cfg.service.secret_access_key.as_deref(), Some("SECRET"));
+        assert_eq!(cfg.service.region.as_deref(), Some("us-east-1"));
+        assert_eq!(cfg.retry_count, 7);
+        assert_eq!(cfg.retry_interval, Duration::from_millis(250));
     }
 
     #[test]
@@ -189,7 +249,7 @@ mod tests {
             ("fs.s3a.secret.key", "SECRET2"),
         ]);
 
-        let cfg = s3_config_parse(props).unwrap();
+        let cfg = s3_config_parse(props).unwrap().service;
         assert_eq!(
             cfg.endpoint.as_deref(),
             Some("https://s3.eu-west-1.amazonaws.com")
@@ -207,7 +267,7 @@ mod tests {
             ("s3a.secret-key", "SECRET3"),
         ]);
 
-        let cfg = s3_config_parse(props).unwrap();
+        let cfg = s3_config_parse(props).unwrap().service;
         assert_eq!(
             cfg.endpoint.as_deref(),
             Some("https://s3.ap-southeast-1.amazonaws.com")
@@ -221,7 +281,7 @@ mod tests {
         // Default should be virtual-hosted style (matching AWS behavior).
         let props = make_props(&[("s3.endpoint", "https://s3.amazonaws.com")]);
 
-        let cfg = s3_config_parse(props).unwrap();
+        let cfg = s3_config_parse(props).unwrap().service;
         assert!(cfg.enable_virtual_host_style);
     }
 
@@ -232,7 +292,7 @@ mod tests {
             ("s3.path-style-access", "true"),
         ]);
 
-        let cfg = s3_config_parse(props).unwrap();
+        let cfg = s3_config_parse(props).unwrap().service;
         assert!(!cfg.enable_virtual_host_style);
     }
 
@@ -244,7 +304,7 @@ mod tests {
             ("s3.path-style-access", "false"),
         ]);
 
-        let cfg = s3_config_parse(props).unwrap();
+        let cfg = s3_config_parse(props).unwrap().service;
         assert!(cfg.enable_virtual_host_style);
     }
 
@@ -253,7 +313,7 @@ mod tests {
         // Only endpoint, no credentials — valid for IAM role / env var auth.
         let props = make_props(&[("s3.endpoint", "https://s3.amazonaws.com")]);
 
-        let cfg = s3_config_parse(props).unwrap();
+        let cfg = s3_config_parse(props).unwrap().service;
         assert_eq!(cfg.endpoint.as_deref(), Some("https://s3.amazonaws.com"));
         assert!(cfg.access_key_id.is_none());
         assert!(cfg.secret_access_key.is_none());
@@ -261,7 +321,7 @@ mod tests {
 
     #[test]
     fn test_s3_config_parse_empty_props() {
-        let cfg = s3_config_parse(HashMap::new()).unwrap();
+        let cfg = s3_config_parse(HashMap::new()).unwrap().service;
         assert!(cfg.endpoint.is_none());
         assert!(cfg.access_key_id.is_none());
         // Even with empty props, virtual-hosted style should be the default.
@@ -277,7 +337,7 @@ mod tests {
             ("s3.assumed.role.externalId", "ext-id"),
         ]);
 
-        let cfg = s3_config_parse(props).unwrap();
+        let cfg = s3_config_parse(props).unwrap().service;
         assert_eq!(cfg.session_token.as_deref(), Some("TOKEN"));
         assert_eq!(
             cfg.role_arn.as_deref(),
@@ -297,7 +357,7 @@ mod tests {
             ("fs.s3a.session.token", "TOKEN_B"),
         ]);
 
-        let cfg = s3_config_parse(props).unwrap();
+        let cfg = s3_config_parse(props).unwrap().service;
         assert_eq!(cfg.access_key_id.as_deref(), Some("AK_A"));
         assert_eq!(cfg.secret_access_key.as_deref(), Some("SK_A"));
         assert_eq!(cfg.session_token.as_deref(), Some("TOKEN_A"));
@@ -307,7 +367,7 @@ mod tests {
     fn test_s3_config_parse_hadoop_session_token() {
         let props = make_props(&[("fs.s3a.session.token", "TOKEN")]);
 
-        let cfg = s3_config_parse(props).unwrap();
+        let cfg = s3_config_parse(props).unwrap().service;
         assert_eq!(cfg.session_token.as_deref(), Some("TOKEN"));
     }
 
@@ -315,7 +375,7 @@ mod tests {
     fn test_s3_config_parse_sse() {
         let props = make_props(&[("s3.sse.type", "aws:kms"), ("s3.sse.key", "my-kms-key-id")]);
 
-        let cfg = s3_config_parse(props).unwrap();
+        let cfg = s3_config_parse(props).unwrap().service;
         assert_eq!(cfg.server_side_encryption.as_deref(), Some("aws:kms"));
         assert_eq!(
             cfg.server_side_encryption_aws_kms_key_id.as_deref(),
@@ -332,7 +392,7 @@ mod tests {
             ("s3.endpoint", "https://s3.amazonaws.com"),
         ]);
 
-        let cfg = s3_config_parse(props).unwrap();
+        let cfg = s3_config_parse(props).unwrap().service;
         assert_eq!(cfg.endpoint.as_deref(), Some("https://s3.amazonaws.com"));
     }
 
@@ -343,7 +403,7 @@ mod tests {
         cfg.endpoint = Some("https://s3.us-east-1.amazonaws.com".to_string());
         cfg.region = Some("us-east-1".to_string());
 
-        let op = s3_config_build(&cfg, "s3://my-bucket/some/path", "paimon-rust/test").unwrap();
+        let op = s3_config_build(&storage_config(cfg), "s3://my-bucket/some/path").unwrap();
         assert_eq!(op.info().name(), "my-bucket");
     }
 
@@ -354,21 +414,21 @@ mod tests {
         cfg.endpoint = Some("https://s3.us-east-1.amazonaws.com".to_string());
         cfg.region = Some("us-east-1".to_string());
 
-        let op = s3_config_build(&cfg, "s3a://my-bucket/some/path", "paimon-rust/test").unwrap();
+        let op = s3_config_build(&storage_config(cfg), "s3a://my-bucket/some/path").unwrap();
         assert_eq!(op.info().name(), "my-bucket");
     }
 
     #[test]
     fn test_s3_config_build_invalid_url() {
         let cfg = S3Config::default();
-        let result = s3_config_build(&cfg, "not-a-valid-url", "paimon-rust/test");
+        let result = s3_config_build(&storage_config(cfg), "not-a-valid-url");
         assert!(result.is_err());
     }
 
     #[test]
     fn test_s3_config_build_missing_bucket() {
         let cfg = S3Config::default();
-        let result = s3_config_build(&cfg, "s3:///path/without/bucket", "paimon-rust/test");
+        let result = s3_config_build(&storage_config(cfg), "s3:///path/without/bucket");
         assert!(result.is_err());
     }
 
@@ -394,7 +454,159 @@ mod tests {
             ("s3.endpoint", "https://new.endpoint.com"),
         ]);
 
-        let cfg = s3_config_parse(props).unwrap();
+        let cfg = s3_config_parse(props).unwrap().service;
         assert_eq!(cfg.endpoint.as_deref(), Some("https://new.endpoint.com"));
+    }
+
+    #[test]
+    fn s3_storage_uses_generic_user_agent_keys() {
+        use crate::io::{FileIOBuilder, Storage};
+
+        let storage = Storage::build(FileIOBuilder::new("s3").with_props([
+            ("user-agent.features", "Flink"),
+            ("user-agent.extended", "vvr"),
+            ("dlf.access-tracking.extended-info", "uid/123"),
+        ]))
+        .unwrap();
+        let Storage::S3 { config, .. } = storage else {
+            panic!("expected S3 storage");
+        };
+        assert_eq!(
+            config.user_agent,
+            format!(
+                "paimon-rust/{}(opendal/{};Flink) vvr uid/123",
+                env!("CARGO_PKG_VERSION"),
+                opendal::raw::VERSION
+            )
+        );
+    }
+
+    fn temporary_failure() -> Response<Body> {
+        Response::builder()
+            .status(StatusCode::SERVICE_UNAVAILABLE)
+            .body(Body::from(
+                "<Error><Code>SlowDown</Code><Message>retry</Message></Error>",
+            ))
+            .unwrap()
+    }
+
+    async fn retry_once(State(attempts): State<Arc<AtomicUsize>>) -> Response<Body> {
+        if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+            return temporary_failure();
+        }
+        Response::new(Body::from("ok"))
+    }
+
+    async fn always_fail(State(attempts): State<Arc<AtomicUsize>>) -> Response<Body> {
+        attempts.fetch_add(1, Ordering::SeqCst);
+        temporary_failure()
+    }
+
+    async fn record_user_agent(
+        State(user_agents): State<Arc<Mutex<Vec<String>>>>,
+        headers: HeaderMap,
+    ) -> StatusCode {
+        let user_agent = headers
+            .get(header::USER_AGENT)
+            .map(|value| value.to_str().unwrap().to_string())
+            .unwrap_or_default();
+        user_agents.lock().unwrap().push(user_agent);
+        StatusCode::NOT_FOUND
+    }
+
+    #[test]
+    fn test_s3_retry_defaults_and_validation() {
+        let cfg = s3_config_parse(make_props(&[(S3_REGION, "us-east-1")])).unwrap();
+        assert_eq!(cfg.retry_count, DEFAULT_S3_RETRY_COUNT);
+        assert_eq!(
+            cfg.retry_interval,
+            Duration::from_millis(DEFAULT_S3_RETRY_INTERVAL_MILLIS)
+        );
+
+        let mut props = make_props(&[(S3_REGION, "us-east-1")]);
+        props.insert(S3_RETRY_COUNT.to_string(), "invalid".to_string());
+        assert!(s3_config_parse(props).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_s3_retries_temporary_failure() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .fallback(get(retry_once))
+            .with_state(attempts.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let mut cfg = S3Config::default();
+        cfg.endpoint = Some(format!("http://{address}"));
+        cfg.enable_virtual_host_style = false;
+        cfg.region = Some("us-east-1".to_string());
+        cfg.skip_signature = true;
+
+        let op = s3_config_build(&storage_config(cfg), "s3://bucket/path").unwrap();
+        assert_eq!(op.read("object").await.unwrap().to_bytes(), "ok");
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn test_s3_retry_count_is_additional_attempts() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .fallback(get(always_fail))
+            .with_state(attempts.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let mut props = make_props(&[(S3_REGION, "us-east-1")]);
+        props.insert(S3_ENDPOINT.to_string(), format!("http://{address}"));
+        props.insert(S3_RETRY_COUNT.to_string(), "1".to_string());
+        props.insert(S3_RETRY_INTERVAL_MILLIS.to_string(), "1".to_string());
+        let mut cfg = s3_config_parse(props).unwrap();
+        cfg.service.enable_virtual_host_style = false;
+        cfg.service.skip_signature = true;
+
+        let op = s3_config_build(&cfg, "s3://bucket/path").unwrap();
+        assert!(op.read("object").await.is_err());
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn test_s3_sends_configured_user_agent() {
+        use crate::io::user_agent::{
+            DLF_ACCESS_TRACKING_EXTENDED_INFO, USER_AGENT_EXTENDED, USER_AGENT_FEATURES,
+        };
+
+        let user_agents = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new()
+            .fallback(record_user_agent)
+            .with_state(user_agents.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let mut props = make_props(&[(S3_REGION, "us-east-1")]);
+        props.insert(S3_ENDPOINT.to_string(), format!("http://{address}"));
+        props.insert(USER_AGENT_FEATURES.to_string(), "DataFusion".to_string());
+        props.insert(USER_AGENT_EXTENDED.to_string(), "vvr".to_string());
+        props.insert(
+            DLF_ACCESS_TRACKING_EXTENDED_INFO.to_string(),
+            "uid/123".to_string(),
+        );
+        let mut cfg = s3_config_parse(props).unwrap();
+        cfg.service.enable_virtual_host_style = false;
+        cfg.service.skip_signature = true;
+
+        let op = s3_config_build(&cfg, "s3://bucket/path").unwrap();
+        assert!(!op.exists("object").await.unwrap());
+        assert_eq!(
+            *user_agents.lock().unwrap(),
+            vec![format!(
+                "paimon-rust/{}(opendal/{};DataFusion) vvr uid/123",
+                env!("CARGO_PKG_VERSION"),
+                opendal::raw::VERSION
+            )]
+        );
     }
 }
