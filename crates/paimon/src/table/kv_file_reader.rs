@@ -221,6 +221,48 @@ fn drop_lone_retracts(
     })
 }
 
+/// Whether `batch` repeats a primary key, either in two adjacent rows or in its
+/// first row and the last row of `previous`. A key type the comparison kernel
+/// does not support counts as repeated, so the caller merges.
+fn repeats_a_key(
+    previous: Option<&RecordBatch>,
+    batch: &RecordBatch,
+    key_indices: &[usize],
+) -> bool {
+    let rows = batch.num_rows();
+    if rows == 0 {
+        return false;
+    }
+    let previous = previous.filter(|previous| previous.num_rows() > 0);
+    let mut at_boundary = previous.is_some();
+    let mut adjacent: Option<BooleanArray> = None;
+    for &index in key_indices {
+        let column = batch.column(index);
+        if let Some(previous) = previous.filter(|_| at_boundary) {
+            let last = previous.column(index).slice(previous.num_rows() - 1, 1);
+            match arrow_ord::cmp::eq(&last, &column.slice(0, 1)) {
+                Ok(equal) => at_boundary = equal.true_count() == 1,
+                Err(_) => return true,
+            }
+        }
+        if rows > 1 {
+            let Ok(equal) =
+                arrow_ord::cmp::eq(&column.slice(0, rows - 1), &column.slice(1, rows - 1))
+            else {
+                return true;
+            };
+            adjacent = Some(match adjacent {
+                None => equal,
+                Some(so_far) => match arrow_arith::boolean::and(&so_far, &equal) {
+                    Ok(both) => both,
+                    Err(_) => return true,
+                },
+            });
+        }
+    }
+    at_boundary || adjacent.is_some_and(|equal| equal.true_count() > 0)
+}
+
 /// Java's `KeyValueFieldsExtractor` builds the physical file layout from the
 /// schema that wrote the file, including its historical key names and types.
 pub(super) fn key_value_fields_extractor(
@@ -761,54 +803,17 @@ impl KeyValueFileReader {
                             .map(|budget| Arc::new(budget.without_prefetch()))
                     };
                     let mut file_streams: Vec<ArrowRecordBatchStream> = Vec::new();
-                    // One sorted run never repeats a key, so under these engines
-                    // every key is a lone version and needs no merge. Retract
-                    // rows are still dropped per batch below: older Rust writers
-                    // recorded `delete_row_count = 0` for files holding them.
-                    let mut skip_merge = skip_single_runs
+                    // One sorted run should not repeat a key, so under these
+                    // engines every key is a lone version and needs no merge.
+                    // Retract rows are still dropped per batch below: older Rust
+                    // writers recorded `delete_row_count = 0` for files holding
+                    // them.
+                    let skip_merge = skip_single_runs
                         && input_stream_count == 1
                         && matches!(
                             config.merge_engine,
                             MergeEngine::Deduplicate | MergeEngine::FirstRow
                         );
-                    // A file written under another engine may hold several
-                    // versions of a key (the aggregation writer kept them before
-                    // #839), and ALTER can switch the engine afterwards.
-                    if skip_merge {
-                        'files: for run in &merge_group {
-                            for file in &run.files {
-                                // Always check the stored schema: dynamic options and
-                                // time travel can change the read schema's engine
-                                // without changing its ID. Merging is always correct,
-                                // so a missing schema file under the read schema's ID
-                                // only costs the skip.
-                                let schema = match config
-                                    .schema_manager
-                                    .schema(file.file.schema_id)
-                                    .await
-                                {
-                                    Ok(schema) => schema,
-                                    Err(crate::Error::IoUnexpected { source, .. })
-                                        if source.kind() == opendal::ErrorKind::NotFound
-                                            && file.file.schema_id == table_schema_id =>
-                                    {
-                                        skip_merge = false;
-                                        break 'files;
-                                    }
-                                    Err(err) => Err(err)?,
-                                };
-                                let engine =
-                                    CoreOptions::new(schema.options()).merge_engine()?;
-                                if !matches!(
-                                    engine,
-                                    MergeEngine::Deduplicate | MergeEngine::FirstRow
-                                ) {
-                                    skip_merge = false;
-                                    break 'files;
-                                }
-                            }
-                        }
-                    }
                     let reject_retracts = config.merge_engine == MergeEngine::FirstRow
                         && !CoreOptions::new(&config.table_options).ignore_delete();
 
@@ -915,24 +920,76 @@ impl KeyValueFileReader {
                     }
 
                     let mut merge_stream = if skip_merge {
-                        let input = file_streams.pop().expect("one input stream");
+                        let mut input = file_streams.pop().expect("one input stream");
                         let columns: Vec<usize> =
                             key_indices.iter().chain(&value_indices).copied().collect();
                         let schema = merge_output_schema.clone();
-                        input
-                            .map(move |batch| {
-                                let batch =
-                                    drop_lone_retracts(batch?, value_kind_index, reject_retracts)?;
-                                let columns =
-                                    columns.iter().map(|&i| batch.column(i).clone()).collect();
-                                RecordBatch::try_new(schema.clone(), columns).map_err(|e| {
-                                    Error::UnexpectedError {
-                                        message: format!("Failed to project unmerged batch: {e}"),
-                                        source: Some(Box::new(e)),
-                                    }
-                                })
+                        let project = move |batch: RecordBatch| -> crate::Result<RecordBatch> {
+                            let batch =
+                                drop_lone_retracts(batch, value_kind_index, reject_retracts)?;
+                            let columns =
+                                columns.iter().map(|&i| batch.column(i).clone()).collect();
+                            RecordBatch::try_new(schema.clone(), columns).map_err(|e| {
+                                Error::UnexpectedError {
+                                    message: format!("Failed to project unmerged batch: {e}"),
+                                    source: Some(Box::new(e)),
+                                }
                             })
-                            .boxed()
+                        };
+                        // Files written before #839 can repeat a key inside one
+                        // run, whatever engine the schemas name now. Hold one
+                        // batch back, and once a key repeats, merge from there.
+                        let fallback = SortMergeReaderBuilder::new(
+                            Vec::new(),
+                            internal_schema.clone(),
+                            key_indices.clone(),
+                            seq_index,
+                            value_kind_index,
+                            user_sequence_indices.clone(),
+                            value_indices.clone(),
+                            merge_output_schema.clone(),
+                            merge_function(&config, &merge_output_fields)?,
+                        )
+                        .with_user_sequence_descending(
+                            !CoreOptions::new(&config.table_options)
+                                .sequence_field_sort_order_is_ascending(),
+                        );
+                        let key_indices = key_indices.clone();
+                        let stream: ArrowRecordBatchStream = try_stream! {
+                            let mut held: Option<RecordBatch> = None;
+                            let mut rest: Option<ArrowRecordBatchStream> = None;
+                            while let Some(batch) = input.next().await {
+                                let batch = batch?;
+                                if repeats_a_key(held.as_ref(), &batch, &key_indices) {
+                                    let pending: Vec<crate::Result<RecordBatch>> = held
+                                        .take()
+                                        .into_iter()
+                                        .chain(std::iter::once(batch))
+                                        .map(Ok)
+                                        .collect();
+                                    rest = Some(futures::stream::iter(pending).chain(input).boxed());
+                                    break;
+                                }
+                                if let Some(previous) = held.replace(batch) {
+                                    yield project(previous)?;
+                                }
+                            }
+                            match rest {
+                                Some(rest) => {
+                                    let mut merged = fallback.with_streams(vec![rest]).build()?;
+                                    while let Some(batch) = merged.next().await {
+                                        yield batch?;
+                                    }
+                                }
+                                None => {
+                                    if let Some(previous) = held {
+                                        yield project(previous)?;
+                                    }
+                                }
+                            }
+                        }
+                        .boxed();
+                        stream
                     } else {
                         SortMergeReaderBuilder::new(
                             file_streams,
@@ -3055,6 +3112,61 @@ mod tests {
         let batches = read_kv_split(&table, split).await;
         assert_eq!(int_column(&batches, "id"), vec![1, 2]);
         assert_eq!(int_column(&batches, "value"), vec![11, 20]);
+    }
+
+    #[tokio::test]
+    async fn single_run_read_merges_repeated_keys_under_the_stored_engine() {
+        // Before #839, copy_with_options could switch the writer to aggregation
+        // under the same schema ID, so a file can repeat a key even though every
+        // schema says deduplicate.
+        let file_io = test_file_io();
+        let table_path = "memory:/kv_repeated_keys";
+        let table = pk_table(&file_io, table_path, &[]);
+        write_schema_file(&table, table.schema()).await;
+        let a =
+            write_kv_versions(&file_io, table_path, "a.parquet", &[(1, 0, 10), (1, 1, 11)]).await;
+        let b = write_kv_versions(&file_io, table_path, "b.parquet", &[(2, 2, 20)]).await;
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(format!("{table_path}/bucket-0"))
+            .with_total_buckets(1)
+            .with_data_files(vec![a, b])
+            .build()
+            .unwrap();
+        let batches = read_kv_split(&table, split).await;
+        assert_eq!(int_column(&batches, "id"), vec![1, 2]);
+        assert_eq!(int_column(&batches, "value"), vec![11, 20]);
+    }
+
+    #[tokio::test]
+    async fn single_run_read_merges_a_key_repeated_across_batches() {
+        // One-row batches: key 1 is emitted before key 2 repeats across a batch
+        // boundary, and key 3 comes after the switch to merging.
+        let file_io = test_file_io();
+        let table_path = "memory:/kv_repeated_across_batches";
+        let table = pk_table(&file_io, table_path, &[("read.batch-size", "1")]);
+        write_schema_file(&table, table.schema()).await;
+        let a = write_kv_versions(
+            &file_io,
+            table_path,
+            "a.parquet",
+            &[(1, 0, 10), (2, 1, 20), (2, 2, 21), (3, 3, 30)],
+        )
+        .await;
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(format!("{table_path}/bucket-0"))
+            .with_total_buckets(1)
+            .with_data_files(vec![a])
+            .build()
+            .unwrap();
+        let batches = read_kv_split(&table, split).await;
+        assert_eq!(int_column(&batches, "id"), vec![1, 2, 3]);
+        assert_eq!(int_column(&batches, "value"), vec![10, 21, 30]);
     }
 
     #[tokio::test]

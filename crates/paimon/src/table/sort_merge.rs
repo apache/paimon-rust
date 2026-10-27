@@ -1258,6 +1258,12 @@ impl SortMergeReaderBuilder {
         self
     }
 
+    /// Replace the input streams, for a builder prepared before they exist.
+    pub(crate) fn with_streams(mut self, streams: Vec<ArrowRecordBatchStream>) -> Self {
+        self.streams = streams;
+        self
+    }
+
     pub(crate) fn with_user_sequence_descending(mut self, descending: bool) -> Self {
         self.user_sequence_descending = descending;
         self
