@@ -198,10 +198,20 @@ impl BranchManager {
         if self.file_io.exists(&snap_src).await? {
             self.file_io.copy_file(&snap_src, &snap_dst).await?;
         } else {
-            let json = serde_json::to_string(&snapshot).map_err(|e| crate::Error::DataInvalid {
-                message: format!("failed to serialize snapshot: {e}"),
-                source: Some(Box::new(e)),
-            })?;
+            // Keep snapshot fields unknown to Rust, excluding Java's tag-only metadata.
+            let tag_bytes = self.file_io.new_input(&tag_dst)?.read().await?;
+            let mut snapshot_json: serde_json::Map<String, serde_json::Value> =
+                serde_json::from_slice(&tag_bytes).map_err(|e| crate::Error::DataInvalid {
+                    message: format!("tag '{tag_name}' JSON invalid: {e}"),
+                    source: Some(Box::new(e)),
+                })?;
+            snapshot_json.remove("tagCreateTime");
+            snapshot_json.remove("tagTimeRetained");
+            let json =
+                serde_json::to_vec(&snapshot_json).map_err(|e| crate::Error::DataInvalid {
+                    message: format!("failed to serialize snapshot: {e}"),
+                    source: Some(Box::new(e)),
+                })?;
             self.file_io
                 .new_output(&snap_dst)?
                 .write(bytes::Bytes::from(json))

@@ -33,6 +33,7 @@ use paimon::table::{BranchManager, Table};
 const TABLE_PATH: &str = "file:/table";
 const SNAPSHOT_PATH: &str = "file:/table/snapshot/snapshot-1";
 const BRANCH_SNAPSHOT_PATH: &str = "file:/table/branch/branch-dev/snapshot/snapshot-1";
+const BRANCH_TAG_PATH: &str = "file:/table/branch/branch-dev/tag/tag-base";
 
 async fn tagged_table() -> (tempfile::TempDir, Table, opendal::Operator) {
     let dir = tempfile::tempdir().unwrap();
@@ -175,6 +176,97 @@ async fn expired_live_snapshot_can_create_branch_from_preserved_tag() {
 }
 
 #[tokio::test]
+async fn expired_snapshot_preserves_java_metadata_like_live_copy() {
+    let (dir, table, _) = tagged_table().await;
+    let root = dir.path().join("table");
+    table
+        .new_write_builder()
+        .try_new_commit()
+        .unwrap()
+        .truncate_table()
+        .await
+        .unwrap();
+    assert!(rows(&table).await.is_empty());
+    let snapshot = table
+        .snapshot_manager()
+        .get_latest_snapshot()
+        .await
+        .unwrap()
+        .unwrap();
+    table
+        .tag_manager()
+        .create_with_retention("truncated", &snapshot, Some("1 d"))
+        .await
+        .unwrap();
+
+    let snapshot_file = format!("snapshot/snapshot-{}", snapshot.id());
+    let tag_file = "tag/tag-truncated";
+    let mut expected: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join(&snapshot_file)).unwrap()).unwrap();
+    let mut tag: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join(tag_file)).unwrap()).unwrap();
+    // Current Java records the logical operation; preserve unknown snapshot fields too.
+    for payload in [&mut expected, &mut tag] {
+        payload["operation"] = serde_json::json!("TRUNCATE");
+        payload["futureSnapshotMetadata"] = serde_json::json!({
+            "sequence": u64::MAX,
+            "flags": [true, null]
+        });
+    }
+    std::fs::write(
+        root.join(&snapshot_file),
+        serde_json::to_vec_pretty(&expected).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(root.join(tag_file), serde_json::to_vec(&tag).unwrap()).unwrap();
+
+    // Keep a newer live snapshot so the source table remains readable after expiry.
+    write_batch(&table, &make_batch(vec![4], vec![40])).await;
+    let manager = BranchManager::new(table.file_io().clone(), TABLE_PATH.into());
+    let before_live = source_files(&root);
+    manager
+        .create_branch_from_tag("live", "truncated")
+        .await
+        .unwrap();
+    assert_eq!(source_files(&root), before_live);
+    let live_bytes = std::fs::read(root.join("branch/branch-live").join(&snapshot_file)).unwrap();
+    assert_eq!(live_bytes, before_live[Path::new(&snapshot_file)]);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&live_bytes).unwrap(),
+        expected
+    );
+
+    table
+        .file_io()
+        .delete_file(&table.snapshot_manager().snapshot_path(snapshot.id()))
+        .await
+        .unwrap();
+    let before_expired = source_files(&root);
+    manager
+        .create_branch_from_tag("restored", "truncated")
+        .await
+        .unwrap();
+    assert_eq!(source_files(&root), before_expired);
+    let restored: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(root.join("branch/branch-restored").join(&snapshot_file)).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(restored, expected);
+    assert!(restored.get("tagCreateTime").is_none());
+    assert!(restored.get("tagTimeRetained").is_none());
+    for branch_name in ["live", "restored"] {
+        assert_eq!(
+            std::fs::read(root.join(format!("branch/branch-{branch_name}/{tag_file}"))).unwrap(),
+            before_expired[Path::new(tag_file)]
+        );
+        let branch = table.copy_with_branch(branch_name).await.unwrap();
+        assert!(rows(&branch).await.is_empty());
+    }
+    assert_eq!(rows(&table).await, vec![(4, 40)]);
+    assert_eq!(source_files(&root), before_expired);
+}
+
+#[tokio::test]
 async fn missing_tag_is_rejected_before_creating_branch_files() {
     let (dir, table, _) = tagged_table().await;
     let root = dir.path().join("table");
@@ -225,10 +317,11 @@ async fn snapshot_storage_errors_are_propagated_without_fallback() {
         opendal::ErrorKind::PermissionDenied,
         opendal::ErrorKind::Unexpected,
     ] {
-        // Fail existence checking, copying after a successful check, or fallback writing.
+        // Fail existence checking, copying, reading the copied tag, or fallback writing.
         for (missing_snapshot, path, allowed_calls) in [
             (false, SNAPSHOT_PATH, 0),
             (false, SNAPSHOT_PATH, 1),
+            (true, BRANCH_TAG_PATH, 1),
             (true, BRANCH_SNAPSHOT_PATH, 0),
         ] {
             let (dir, table, operator) = tagged_table().await;
