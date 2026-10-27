@@ -565,8 +565,9 @@ mod tests {
     use datafusion::prelude::{SessionConfig, SessionContext};
     use paimon::catalog::Identifier;
     use paimon::spec::{ArrayType, MapType, RowType, VarCharType};
-    use paimon::{Catalog, CatalogOptions, DataSplit, FileSystemCatalog, Options};
+    use paimon::{Catalog, DataSplit};
 
+    use crate::golden_warehouse::{test_catalog as create_catalog, TestWarehouse};
     use crate::physical_plan::PaimonTableScan;
 
     #[test]
@@ -587,27 +588,17 @@ mod tests {
         assert_eq!(result, vec![vec![1, 2, 3]]);
     }
 
-    fn get_test_warehouse() -> String {
-        std::env::var("PAIMON_TEST_WAREHOUSE")
-            .unwrap_or_else(|_| "/tmp/paimon-warehouse".to_string())
-    }
-
-    fn create_catalog() -> FileSystemCatalog {
-        let warehouse = get_test_warehouse();
-        let mut options = Options::new();
-        options.set(CatalogOptions::WAREHOUSE, warehouse);
-        FileSystemCatalog::new(options).expect("Failed to create catalog")
-    }
-
-    async fn create_provider(table_name: &str) -> PaimonTableProvider {
-        let catalog = create_catalog();
+    async fn create_provider(table_name: &str) -> (TestWarehouse, PaimonTableProvider) {
+        let (warehouse, catalog) = create_catalog();
         let identifier = Identifier::new("default", table_name);
         let table = catalog
             .get_table(&identifier)
             .await
             .expect("Failed to get table");
 
-        PaimonTableProvider::try_new(table).expect("Failed to create table provider")
+        let provider =
+            PaimonTableProvider::try_new(table).expect("Failed to create table provider");
+        (warehouse, provider)
     }
 
     async fn plan_partitions(
@@ -937,7 +928,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_scan_partition_filter_plans_matching_partition_set() {
-        let provider = create_provider("partitioned_log_table").await;
+        let (_warehouse, provider) = create_provider("partitioned_log_table").await;
         let planned_partitions =
             plan_partitions(&provider, vec![col("dt").eq(lit("2024-01-01"))], None).await;
 
@@ -949,7 +940,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_scan_mixed_and_filter_keeps_partition_pruning() {
-        let provider = create_provider("partitioned_log_table").await;
+        let (_warehouse, provider) = create_provider("partitioned_log_table").await;
         let planned_partitions = plan_partitions(
             &provider,
             vec![col("dt").eq(lit("2024-01-01")).and(col("id").gt(lit(1)))],
@@ -965,7 +956,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_scan_multi_partition_filter_plans_exact_partition_set() {
-        let provider = create_provider("multi_partitioned_log_table").await;
+        let (_warehouse, provider) = create_provider("multi_partitioned_log_table").await;
 
         let dt_only_partitions =
             plan_partitions(&provider, vec![col("dt").eq(lit("2024-01-01"))], None).await;
@@ -991,7 +982,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_scan_partially_translated_not_filter_prunes_partitions_but_skips_limit_hint() {
-        let provider = create_provider("multi_partitioned_log_table").await;
+        let (_warehouse, provider) = create_provider("multi_partitioned_log_table").await;
         let filter = col("dt")
             .eq(lit("2024-01-01"))
             .and(Expr::Not(Box::new(col("hr").eq(lit(10)))));
@@ -1020,7 +1011,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_scan_keeps_pushed_predicate_for_execute() {
-        let provider = create_provider("partitioned_log_table").await;
+        let (_warehouse, provider) = create_provider("partitioned_log_table").await;
         let filter = col("id").gt(lit(1));
 
         let config = SessionConfig::new().with_target_partitions(8);
@@ -1093,7 +1084,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_scan_applies_limit_hint_only_when_safe() {
-        let provider = create_provider("partitioned_log_table").await;
+        let (_warehouse, provider) = create_provider("partitioned_log_table").await;
         let full_plan = plan_partitions(&provider, vec![], None).await;
         let plan = plan_scan(&provider, vec![], Some(1)).await;
         let scan = plan
@@ -1115,7 +1106,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_scan_keeps_limit_but_skips_limit_pruning_for_data_filters() {
-        let provider = create_provider("partitioned_log_table").await;
+        let (_warehouse, provider) = create_provider("partitioned_log_table").await;
         let filter = col("id").gt(lit(1));
         let full_plan = plan_partitions(&provider, vec![filter.clone()], None).await;
         let plan = plan_scan(&provider, vec![filter], Some(1)).await;
