@@ -29,7 +29,6 @@ categories = ["database"]
 keywords = ["paimon", "datafusion", "integrations"]
 
 [features]
-fulltext = ["paimon/fulltext"]
 vortex = ["paimon/vortex"]
 
 [dependencies]

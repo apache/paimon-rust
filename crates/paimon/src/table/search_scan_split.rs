@@ -460,13 +460,8 @@ mod tests {
                 "splits": [source.clone()],
             });
             assert!(serde_json::from_value::<VectorScanPlan>(wire.clone()).is_err());
-            #[cfg(feature = "fulltext")]
-            {
-                assert!(
-                    crate::table::FullTextScanPlan::new(Some(snapshot()), vec![source]).is_err()
-                );
-                assert!(serde_json::from_value::<crate::table::FullTextScanPlan>(wire).is_err());
-            }
+            assert!(crate::table::FullTextScanPlan::new(Some(snapshot()), vec![source]).is_err());
+            assert!(serde_json::from_value::<crate::table::FullTextScanPlan>(wire).is_err());
         }
     }
 
@@ -486,13 +481,8 @@ mod tests {
             let plan = VectorScanPlan::new(Some(snapshot()), vec![source.clone()]).unwrap();
             let wire = serde_json::to_value(plan).unwrap();
             assert!(serde_json::from_value::<VectorScanPlan>(wire.clone()).is_ok());
-            #[cfg(feature = "fulltext")]
-            {
-                assert!(
-                    crate::table::FullTextScanPlan::new(Some(snapshot()), vec![source]).is_ok()
-                );
-                assert!(serde_json::from_value::<crate::table::FullTextScanPlan>(wire).is_ok());
-            }
+            assert!(crate::table::FullTextScanPlan::new(Some(snapshot()), vec![source]).is_ok());
+            assert!(serde_json::from_value::<crate::table::FullTextScanPlan>(wire).is_ok());
         }
     }
 }

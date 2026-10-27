@@ -20,8 +20,8 @@ import unittest
 from pathlib import Path
 
 from scripts.release_licenses import (
+    COMMON_MIT_CORRECTIONS,
     LicenseCorrection,
-    PYTHON_MIT_CORRECTIONS,
     Report,
     binary_notice,
     bundled_component_html,
@@ -31,10 +31,10 @@ from scripts.release_licenses import (
 
 
 class LicenseCorrectionsTest(unittest.TestCase):
-    def test_python_corrections_cover_jieba_workspace(self) -> None:
+    def test_common_corrections_cover_jieba_workspace(self) -> None:
         corrections = [
             correction
-            for correction in PYTHON_MIT_CORRECTIONS
+            for correction in COMMON_MIT_CORRECTIONS
             if correction.crates == ("jieba-macros", "jieba-rs")
         ]
         self.assertEqual(len(corrections), 1)
@@ -91,7 +91,7 @@ class LicenseCorrectionsTest(unittest.TestCase):
         root = Path(__file__).resolve().parents[2]
         correction = next(
             correction
-            for correction in PYTHON_MIT_CORRECTIONS
+            for correction in COMMON_MIT_CORRECTIONS
             if correction.crates == ("jieba-macros", "jieba-rs")
         )
         metadata = {

@@ -666,7 +666,8 @@ mod tests {
             .unwrap(),
         );
         let source = Arc::new(ConcurrentReader {
-            barrier: tokio::sync::Barrier::new(8),
+            // Observe all eight source reads before allowing any of them to finish.
+            barrier: tokio::sync::Barrier::new(9),
             reads: AtomicUsize::new(0),
         });
         let reader = Arc::new(CachedFileReader::new(
@@ -675,20 +676,25 @@ mod tests {
             8 * size,
             cache.clone(),
         ));
-        let reads = (0..8).map(|i| {
-            let reader = reader.clone();
-            async move {
-                let data = reader.read(i * size..(i + 1) * size).await.unwrap();
-                assert_eq!(data.len(), size as usize);
-                assert!(data.iter().all(|byte| *byte == 42));
-            }
+        let reads = tokio::spawn(async move {
+            let reads = (0..8).map(|i| {
+                let reader = reader.clone();
+                async move {
+                    let data = reader.read(i * size..(i + 1) * size).await.unwrap();
+                    assert_eq!(data.len(), size as usize);
+                    assert!(data.iter().all(|byte| *byte == 42));
+                }
+            });
+            futures::future::join_all(reads).await;
         });
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            futures::future::join_all(reads),
-        )
-        .await
-        .expect("all eight disjoint source reads must overlap");
+        // Bound deadlock detection, not the subsequent 64 MiB of copying and cache I/O.
+        tokio::time::timeout(std::time::Duration::from_secs(30), source.barrier.wait())
+            .await
+            .expect("all eight disjoint source reads must overlap");
+        tokio::time::timeout(std::time::Duration::from_secs(30), reads)
+            .await
+            .expect("coalesced reads must finish after the source barrier is released")
+            .unwrap();
         assert_eq!(source.reads.load(Ordering::SeqCst), 8);
         let _fills = cache
             .fill_slots

@@ -25,8 +25,8 @@ under the License.
 
 ```toml
 [dependencies]
-paimon = "0.3.0"
-paimon-datafusion = "0.3.0"
+paimon = "0.6.0"
+paimon-datafusion = "0.6.0"
 datafusion = "54.0.0"
 tokio = { version = "1", features = ["full"] }
 ```
@@ -74,9 +74,8 @@ the catalog-independent `path_to_descriptor` and `descriptor_to_string` scalar
 functions pre-registered. Use `register_catalog(...).await` to add one or more
 Paimon catalogs; registering a catalog also registers the built-in scalar
 function `blob_view` (alias `sys.blob_view`) and the built-in table-valued
-functions (`vector_search`, `hybrid_search`, and `full_text_search` when the
-`fulltext` feature is enabled) against it. It also manages session-scoped
-dynamic options internally for `SET`/`RESET` support.
+functions (`vector_search`, `hybrid_search`, and `full_text_search`) against it.
+It also manages session-scoped dynamic options internally for `SET`/`RESET` support.
 
 ### REST Catalog Views and SQL Functions
 
@@ -1421,9 +1420,8 @@ the configured ratio, the FM index safely declines evaluation and the normal
 source scan applies the predicate.
 
 Full-text global indexes support character-string columns and serve the
-[`full_text_search`](#full-text-search) function. They require the `fulltext`
-feature. The build splits the table's row IDs into
-`global-index.row-count-per-shard` shards and writes one Java-compatible
+[`full_text_search`](#full-text-search) function. The build splits the table's
+row IDs into `global-index.row-count-per-shard` shards and writes one Java-compatible
 `full-text` index file per shard, so Java readers can use the files as well.
 Every `full-text.*` option is passed to the native index writer with the prefix
 removed, as in Java; examples are `full-text.tokenizer`, `full-text.lower-case`,
@@ -2103,7 +2101,7 @@ as `diskann.l_search`, through `VectorSearchBuilder::with_options` or
 
 Paimon supports hybrid search by combining multiple search routes and ranking the merged results. The `hybrid_search` table-valued function is registered as a UDTF on the DataFusion session context.
 
-Hybrid search does not require the `fulltext` feature when all routes are vector routes. Enable `fulltext` only when you include full-text routes.
+Vector and full-text routes are built in and can be combined without enabling additional Cargo features.
 
 ### Registration
 
@@ -2163,7 +2161,7 @@ FROM hybrid_search(
 );
 ```
 
-A full-text route accepts `column`, `query`, optional `limit`, and optional `weight`. Full-text routes require the `fulltext` feature:
+A full-text route accepts `column`, `query`, optional `limit`, and optional `weight`:
 
 ```sql
 SELECT *
@@ -2215,17 +2213,17 @@ The metadata column is part of the DataFusion table function schema, so `SELECT 
 
 Paimon supports full-text search via the Tantivy search engine. The `full_text_search` table-valued function is registered as a UDTF on the DataFusion session context.
 
-> **Note:** Full-text search requires the `fulltext` feature flag to be enabled on both `paimon` and `paimon-datafusion` crates.
+Full-text search is built into both `paimon` and `paimon-datafusion`; no Cargo feature flag is required.
 
 ```toml
 [dependencies]
-paimon = { version = "0.3.0", features = ["fulltext"] }
-paimon-datafusion = { version = "0.3.0", features = ["fulltext"] }
+paimon = "0.6.0"
+paimon-datafusion = "0.6.0"
 ```
 
 ### Registration
 
-When you use a `SQLContext`, `full_text_search` is registered automatically for every catalog you register (when the `fulltext` feature is enabled) — no extra setup is needed.
+When you use a `SQLContext`, `full_text_search` is registered automatically for every catalog you register — no extra setup is needed.
 
 With a raw DataFusion `SessionContext`, register it explicitly:
 

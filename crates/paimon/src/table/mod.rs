@@ -74,11 +74,8 @@ mod format_table_scan;
 mod format_table_write_tests;
 mod format_table_writer;
 mod format_write_builder;
-#[cfg(feature = "fulltext")]
 mod full_text_index_adapter;
-#[cfg(feature = "fulltext")]
 mod full_text_index_build_builder;
-#[cfg(feature = "fulltext")]
 mod full_text_search_builder;
 mod global_index_build_builder;
 pub(crate) mod global_index_build_common;
@@ -111,12 +108,9 @@ mod partition_filter;
 mod partition_row_count;
 mod partition_spec;
 mod partition_stat;
-#[cfg(feature = "fulltext")]
 mod pk_full_text_bucket_search;
 mod pk_full_text_bucket_state;
-#[cfg(feature = "fulltext")]
 mod pk_full_text_read;
-#[cfg(feature = "fulltext")]
 mod pk_full_text_scan;
 mod pk_search_position;
 mod pk_search_ranker;
@@ -155,7 +149,6 @@ mod scan_stats;
 pub(crate) mod schema_manager;
 mod search_scan_split;
 mod search_task;
-#[cfg(any(feature = "fulltext", test))]
 pub(crate) use search_task::SearchTask;
 pub(crate) use search_task::SearchTaskExecutor;
 #[cfg(test)]
@@ -224,7 +217,6 @@ pub use format_partition::{
 };
 pub use format_partition_stats::FormatTablePartitionStatsCollector;
 pub use format_partition_truncate::FormatTableTruncator;
-#[cfg(feature = "fulltext")]
 pub use full_text_search_builder::{
     FullTextRead, FullTextScan, FullTextScanPlan, FullTextSearchBuilder,
 };
@@ -674,7 +666,6 @@ impl Table {
     /// Create a full-text search builder.
     ///
     /// Reference: [FullTextSearchBuilderImpl](https://github.com/apache/paimon/blob/master/paimon-core/src/main/java/org/apache/paimon/table/source/FullTextSearchBuilderImpl.java)
-    #[cfg(feature = "fulltext")]
     pub fn new_full_text_search_builder(&self) -> FullTextSearchBuilder<'_> {
         FullTextSearchBuilder::new(self)
     }

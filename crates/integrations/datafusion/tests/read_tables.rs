@@ -1443,7 +1443,6 @@ async fn test_case_insensitive_column_not_supported_via_sql() {
 
 // ======================= Full-Text Search Tests =======================
 
-#[cfg(feature = "fulltext")]
 mod fulltext_tests {
     use std::sync::Arc;
 
@@ -2727,7 +2726,6 @@ mod vector_search_tests {
 mod hybrid_search_tests {
     use std::sync::Arc;
 
-    #[cfg(feature = "fulltext")]
     use datafusion::arrow::array::{Array, Int64Array, StringViewArray};
     use datafusion::arrow::array::{Float32Array, Int32Array};
     use paimon::catalog::Identifier;
@@ -2927,7 +2925,6 @@ mod hybrid_search_tests {
         );
     }
 
-    #[cfg(feature = "fulltext")]
     #[tokio::test]
     async fn test_hybrid_search_score_with_fulltext_definition() {
         let (_tmp, ctx) = super::common::setup_sql_context().await;

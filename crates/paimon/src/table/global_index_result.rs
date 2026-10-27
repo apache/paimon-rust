@@ -123,7 +123,6 @@ impl GlobalIndexResult {
         }
     }
 
-    #[cfg(feature = "fulltext")]
     pub(super) fn from_full_text_primary_key(
         table: Arc<Table>,
         snapshot_id: i64,

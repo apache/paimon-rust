@@ -26,10 +26,13 @@ use std::sync::Arc;
 use arrow_array::RecordBatch;
 use futures::{stream, StreamExt, TryStreamExt};
 
-#[cfg(all(test, feature = "fulltext"))]
+#[cfg(test)]
 use crate::spec::SCAN_SNAPSHOT_ID_OPTION;
-use crate::spec::{CoreOptions, Predicate, Snapshot};
+use crate::spec::{CoreOptions, GlobalIndexSearchMode, Predicate, Snapshot};
 use crate::table::data_file_reader::DataFileReader;
+use crate::table::find_field_id_by_name;
+use crate::table::pk_full_text_read::{build_full_text_indexed_splits, PrimaryKeyFullTextRead};
+use crate::table::pk_full_text_scan::PrimaryKeyFullTextScan;
 use crate::table::pk_search_position::PrimaryKeySearchPosition;
 use crate::table::pk_search_ranker::{self, Ranking};
 use crate::table::pk_vector_indexed_split_read::{PkVectorIndexedSplit, PkVectorIndexedSplitRead};
@@ -40,19 +43,10 @@ use crate::table::vector_search_common::{
 use crate::table::{ArrowRecordBatchStream, GlobalIndexResult, RowRange, Table};
 use crate::vector_search::ScoredRowIds;
 
-#[cfg(feature = "fulltext")]
-use crate::spec::GlobalIndexSearchMode;
-#[cfg(feature = "fulltext")]
-use crate::table::find_field_id_by_name;
-#[cfg(feature = "fulltext")]
-use crate::table::pk_full_text_read::{build_full_text_indexed_splits, PrimaryKeyFullTextRead};
-#[cfg(feature = "fulltext")]
-use crate::table::pk_full_text_scan::PrimaryKeyFullTextScan;
-
 const RRF_K: f32 = 60.0;
 const MAX_ROUTE_WORKERS: usize = 4;
 
-#[cfg(all(test, feature = "fulltext"))]
+#[cfg(test)]
 mod parity_tests;
 
 #[cfg(test)]
@@ -248,7 +242,6 @@ pub struct HybridSearchRouteBuilder {
 #[derive(Clone)]
 enum RouteSearchBuilder {
     Vector(super::VectorSearchBuilder<'static>),
-    #[cfg(feature = "fulltext")]
     FullText(super::FullTextSearchBuilder<'static>),
 }
 
@@ -274,12 +267,10 @@ impl HybridSearchRouteBuilder {
         self.require_kind(HybridSearchRouteKind::Vector)?;
         match &self.builder {
             RouteSearchBuilder::Vector(builder) => Ok(builder.clone()),
-            #[cfg(feature = "fulltext")]
             _ => unreachable!("validated vector route"),
         }
     }
 
-    #[cfg(feature = "fulltext")]
     pub fn full_text_search_builder(&self) -> crate::Result<super::FullTextSearchBuilder<'static>> {
         self.require_kind(HybridSearchRouteKind::FullText)?;
         match &self.builder {
@@ -319,7 +310,6 @@ impl HybridSearchRouteBuilder {
                     builder.execute().await
                 }
             }
-            #[cfg(feature = "fulltext")]
             RouteSearchBuilder::FullText(builder) => {
                 if let Some(executor) = executor {
                     let (scan, read) = builder.new_scan_and_read()?;
@@ -535,7 +525,7 @@ impl<'a> HybridSearchBuilder<'a> {
 
     /// Schedule each route's shard work while preserving one shared snapshot
     /// and the configured core fusion ranker.
-    #[cfg(any(feature = "internal-api", all(test, feature = "fulltext")))]
+    #[cfg(any(feature = "internal-api", test))]
     pub(crate) async fn execute_with_executor(
         &self,
         executor: &dyn super::SearchTaskExecutor,
@@ -611,12 +601,6 @@ impl<'a> HybridSearchBuilder<'a> {
                     message: format!("Vector column '{}' does not exist", route.field_name),
                 });
             }
-            #[cfg(not(feature = "fulltext"))]
-            if route.kind == HybridSearchRouteKind::FullText {
-                return Err(crate::Error::ConfigInvalid {
-                    message: "Full-text hybrid routes require the fulltext feature".into(),
-                });
-            }
         }
         Ok(())
     }
@@ -639,17 +623,12 @@ impl<'a> HybridSearchBuilder<'a> {
                             self.filter.as_ref(),
                         ))
                     }
-                    #[cfg(feature = "fulltext")]
                     HybridSearchRouteKind::FullText => {
                         RouteSearchBuilder::FullText(configure_full_text_route_builder(
                             super::FullTextSearchBuilder::from_owned(table.clone()),
                             route,
                             self.filter.as_ref(),
                         ))
-                    }
-                    #[cfg(not(feature = "fulltext"))]
-                    HybridSearchRouteKind::FullText => {
-                        unreachable!("full-text feature validated before preparing routes")
                     }
                 };
                 HybridSearchRouteBuilder {
@@ -678,17 +657,9 @@ impl<'a> HybridSearchBuilder<'a> {
                     builder.new_read()?;
                 }
                 HybridSearchRouteKind::FullText => {
-                    #[cfg(feature = "fulltext")]
-                    {
-                        let builder =
-                            full_text_route_builder(self.table, route, self.filter.as_ref());
-                        builder.new_scan()?;
-                        builder.new_read()?;
-                    }
-                    #[cfg(not(feature = "fulltext"))]
-                    return Err(crate::Error::ConfigInvalid {
-                        message: "Full-text hybrid routes require the fulltext feature".into(),
-                    });
+                    let builder = full_text_route_builder(self.table, route, self.filter.as_ref());
+                    builder.new_scan()?;
+                    builder.new_read()?;
                 }
             }
         }
@@ -947,7 +918,6 @@ impl<'a> HybridSearchBuilder<'a> {
         Ok(())
     }
 
-    #[cfg(feature = "fulltext")]
     fn pk_full_text_field(
         &self,
         table: &Table,
@@ -991,19 +961,6 @@ impl<'a> HybridSearchBuilder<'a> {
         Ok(field_id)
     }
 
-    #[cfg(not(feature = "fulltext"))]
-    fn pk_full_text_field(
-        &self,
-        _table: &Table,
-        _core: &CoreOptions<'_>,
-        _route: &HybridSearchRoute,
-    ) -> crate::Result<i32> {
-        Err(crate::Error::ConfigInvalid {
-            message: "primary-key full-text hybrid routes require the fulltext feature".into(),
-        })
-    }
-
-    #[cfg(feature = "fulltext")]
     async fn pk_full_text_route(
         &self,
         table: &Table,
@@ -1052,18 +1009,6 @@ impl<'a> HybridSearchBuilder<'a> {
         })
     }
 
-    #[cfg(not(feature = "fulltext"))]
-    async fn pk_full_text_route(
-        &self,
-        _table: &Table,
-        _core: &CoreOptions<'_>,
-        _route: &HybridSearchRoute,
-    ) -> crate::Result<PkRoute> {
-        Err(crate::Error::ConfigInvalid {
-            message: "primary-key full-text hybrid routes require the fulltext feature".to_string(),
-        })
-    }
-
     /// Fuse the per-route physical rankings via the configured ranker. Each route
     /// contributes a weighted ranking only when it has positions (mirrors Java
     /// `rankPhysical`), and the fusion is bounded to the builder limit.
@@ -1106,7 +1051,7 @@ enum HybridAddressSpace {
 /// column is a configured `pk-vector.index.columns` entry (membership via the
 /// non-erroring accessor so a malformed config cannot misclassify an unrelated
 /// route). Full-text: data-evolution disabled AND the column configured in
-/// `pk-full-text.index.columns` (only when the fulltext feature is built).
+/// `pk-full-text.index.columns`.
 fn route_is_primary_key(core: &CoreOptions<'_>, route: &HybridSearchRoute) -> bool {
     match route.kind {
         HybridSearchRouteKind::Vector => {
@@ -1117,19 +1062,11 @@ fn route_is_primary_key(core: &CoreOptions<'_>, route: &HybridSearchRoute) -> bo
                     .is_some_and(|cols| cols.iter().any(|c| c == route.field_name()))
         }
         HybridSearchRouteKind::FullText => {
-            #[cfg(feature = "fulltext")]
-            {
-                !core.data_evolution_enabled()
-                    && core
-                        .primary_key_full_text_index_columns()
-                        .iter()
-                        .any(|c| c == route.field_name())
-            }
-            #[cfg(not(feature = "fulltext"))]
-            {
-                let _ = core;
-                false
-            }
+            !core.data_evolution_enabled()
+                && core
+                    .primary_key_full_text_index_columns()
+                    .iter()
+                    .any(|c| c == route.field_name())
         }
     }
 }
@@ -1306,7 +1243,6 @@ fn configure_vector_route_builder<'t>(
     builder
 }
 
-#[cfg(feature = "fulltext")]
 fn full_text_route_builder<'t>(
     table: &'t Table,
     route: &HybridSearchRoute,
@@ -1315,7 +1251,6 @@ fn full_text_route_builder<'t>(
     configure_full_text_route_builder(table.new_full_text_search_builder(), route, filter)
 }
 
-#[cfg(feature = "fulltext")]
 fn configure_full_text_route_builder<'t>(
     mut builder: super::FullTextSearchBuilder<'t>,
     route: &HybridSearchRoute,
@@ -1550,7 +1485,7 @@ mod tests {
     }
 }
 
-#[cfg(all(test, feature = "fulltext"))]
+#[cfg(test)]
 mod pk_hybrid_tests {
     use super::*;
     use crate::catalog::Identifier;
