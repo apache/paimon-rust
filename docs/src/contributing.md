@@ -41,14 +41,14 @@ cargo build
 
 # Run the unit tests (a bare `cargo test` also builds the Python binding and
 # can fail to link libpython on some platforms)
-cargo test -p paimon --all-targets --features fulltext,vortex
+cargo test -p paimon --all-targets --features vortex
 cargo test -p paimon-rest-server --all-targets
 
 # Format code
 cargo fmt --all
 
 # Lint (matches CI)
-cargo clippy --locked --all-targets --workspace --features fulltext,vortex -- -D warnings
+cargo clippy --locked --all-targets --workspace --features vortex -- -D warnings
 ```
 
 The integration suites automatically extract a committed Java-written golden

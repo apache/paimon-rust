@@ -142,10 +142,14 @@ fn path(table: &Table, file: &crate::spec::IndexFileMeta) -> String {
 
 #[tokio::test]
 async fn parallel_native_writers_match_serial_shards_and_incremental_coverage() {
-    let mut kinds = vec!["ivf-flat", "ivf-pq", "ivf-sq", "ivf-rq", "diskann"];
-    if cfg!(feature = "fulltext") {
-        kinds.push("full-text");
-    }
+    let kinds = [
+        "ivf-flat",
+        "ivf-pq",
+        "ivf-sq",
+        "ivf-rq",
+        "diskann",
+        "full-text",
+    ];
     for kind in kinds {
         for external in [false, true] {
             let serial = table(kind, 1, external);
@@ -243,7 +247,6 @@ async fn parallel_native_writers_match_serial_shards_and_incremental_coverage() 
                 ids.sort_unstable();
                 assert_eq!(ids, vec![5, 7, 9, 11, 13, 15, 17, 19, 21, 23], "{kind}");
             }
-            #[cfg(feature = "fulltext")]
             if kind == "full-text" {
                 let result = parallel
                     .new_full_text_search_builder()
@@ -311,10 +314,14 @@ async fn failed_parallel_shards_clean_private_indexes_and_retain_handed_off_file
 
 #[tokio::test]
 async fn invalid_parallelism_is_rejected_for_every_generic_family_before_snapshot_reads() {
-    let mut kinds = vec!["ivf-flat", "ivf-pq", "ivf-sq", "ivf-rq", "diskann"];
-    if cfg!(feature = "fulltext") {
-        kinds.push("full-text");
-    }
+    let kinds = [
+        "ivf-flat",
+        "ivf-pq",
+        "ivf-sq",
+        "ivf-rq",
+        "diskann",
+        "full-text",
+    ];
     for kind in kinds {
         let table = table(kind, 1, false);
         for value in ["0", "-1", "invalid"] {

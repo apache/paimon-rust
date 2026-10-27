@@ -1192,7 +1192,6 @@ async fn test_create_and_drop_fm_global_index() {
     drop(tmp);
 }
 
-#[cfg(feature = "fulltext")]
 #[tokio::test]
 async fn test_create_and_drop_full_text_global_index() {
     let (tmp, sql_context) = setup_sql_context().await;
@@ -1278,7 +1277,6 @@ async fn test_create_and_drop_full_text_global_index() {
     drop(tmp);
 }
 
-#[cfg(feature = "fulltext")]
 #[tokio::test]
 async fn test_create_full_text_global_index_rejects_non_string_column() {
     let (_tmp, sql_context) = setup_btree_global_index_table("ft_bad_column").await;
