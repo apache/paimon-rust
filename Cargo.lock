@@ -4807,9 +4807,12 @@ dependencies = [
  "arrow-array",
  "arrow-schema",
  "axum",
+ "flate2",
  "futures",
  "paimon",
  "serde_json",
+ "tar",
+ "tempfile",
  "tokio",
 ]
 

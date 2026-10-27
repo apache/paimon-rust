@@ -20,6 +20,10 @@ use std::sync::Arc;
 
 mod common;
 
+#[path = "../testdata/warehouse/mod.rs"]
+mod golden_warehouse;
+use golden_warehouse::{test_catalog as create_catalog, TestWarehouse};
+
 use common::string_value;
 use datafusion::arrow::array::{Array, Int32Array};
 use datafusion::arrow::record_batch::RecordBatch;
@@ -30,46 +34,28 @@ use datafusion::logical_expr::{col, lit, TableProviderFilterPushDown};
 use datafusion::physical_plan::{displayable, ExecutionPlan};
 use datafusion::prelude::SessionConfig;
 use paimon::catalog::Identifier;
-use paimon::{Catalog, CatalogOptions, FileSystemCatalog, Options};
+use paimon::Catalog;
 use paimon_datafusion::{PaimonCatalogProvider, PaimonTableProvider, SQLContext};
 
-fn get_test_warehouse() -> String {
-    std::env::var("PAIMON_TEST_WAREHOUSE").unwrap_or_else(|_| "/tmp/paimon-warehouse".to_string())
-}
-
-fn create_catalog() -> FileSystemCatalog {
-    let warehouse = get_test_warehouse();
-    let mut options = Options::new();
-    options.set(CatalogOptions::WAREHOUSE, warehouse);
-    FileSystemCatalog::new(options).expect("Failed to create catalog")
-}
-
-async fn create_context() -> SQLContext {
-    let catalog = create_catalog();
+async fn create_context() -> (TestWarehouse, SQLContext) {
+    let (warehouse, catalog) = create_catalog();
     let catalog: Arc<dyn Catalog> = Arc::new(catalog);
     let mut ctx = SQLContext::new();
     ctx.register_catalog("paimon", catalog)
         .await
         .expect("Failed to register catalog");
-    ctx
+    (warehouse, ctx)
 }
 
-async fn create_provider(table_name: &str) -> PaimonTableProvider {
-    let catalog = create_catalog();
-    let identifier = Identifier::new("default", table_name);
-    let table = catalog
-        .get_table(&identifier)
-        .await
-        .expect("Failed to get table");
-
-    PaimonTableProvider::try_new(table).expect("Failed to create table provider")
+async fn create_provider(table_name: &str) -> (TestWarehouse, PaimonTableProvider) {
+    create_provider_with_options(table_name, HashMap::new()).await
 }
 
 async fn create_provider_with_options(
     table_name: &str,
     extra_options: HashMap<String, String>,
-) -> PaimonTableProvider {
-    let catalog = create_catalog();
+) -> (TestWarehouse, PaimonTableProvider) {
+    let (warehouse, catalog) = create_catalog();
     let identifier = Identifier::new("default", table_name);
     let table = catalog
         .get_table(&identifier)
@@ -77,7 +63,8 @@ async fn create_provider_with_options(
         .expect("Failed to get table")
         .copy_with_options(extra_options);
 
-    PaimonTableProvider::try_new(table).expect("Failed to create table provider")
+    let provider = PaimonTableProvider::try_new(table).expect("Failed to create table provider");
+    (warehouse, provider)
 }
 
 async fn read_rows(table_name: &str) -> Vec<(i32, String)> {
@@ -97,7 +84,7 @@ async fn read_rows(table_name: &str) -> Vec<(i32, String)> {
 }
 
 async fn collect_query(sql: &str) -> datafusion::error::Result<Vec<RecordBatch>> {
-    let ctx = create_context().await;
+    let (_warehouse, ctx) = create_context().await;
     ctx.sql(sql).await?.collect().await
 }
 
@@ -149,9 +136,12 @@ async fn assert_time_travel_schema_evolution_rows(
     assert_sql_rows(&sql, expected).await;
 }
 
-async fn create_physical_plan(sql: &str) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-    let ctx = create_context().await;
-    ctx.sql(sql).await?.create_physical_plan().await
+async fn create_physical_plan(
+    sql: &str,
+) -> datafusion::error::Result<(TestWarehouse, Arc<dyn ExecutionPlan>)> {
+    let (warehouse, ctx) = create_context().await;
+    let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+    Ok((warehouse, plan))
 }
 
 fn extract_id_name_rows(
@@ -261,7 +251,7 @@ async fn test_projection_via_datafusion() {
 
 #[tokio::test]
 async fn test_supports_partition_filters_pushdown() {
-    let provider = create_provider("multi_partitioned_log_table").await;
+    let (_warehouse, provider) = create_provider("multi_partitioned_log_table").await;
     let partition_filter = col("dt").eq(lit("2024-01-01"));
     let mixed_and_filter = col("dt").eq(lit("2024-01-01")).and(col("id").gt(lit(1)));
     let data_filter = col("id").gt(lit(1));
@@ -285,7 +275,7 @@ async fn test_supports_partition_filters_pushdown() {
 /// partition count is still capped by `target_partitions`.
 #[tokio::test]
 async fn test_scan_partition_count_respects_session_config() {
-    let provider = create_provider("partitioned_log_table").await;
+    let (_warehouse, provider) = create_provider("partitioned_log_table").await;
 
     // With generous target_partitions, the plan should expose more than one partition.
     let config = SessionConfig::new().with_target_partitions(8);
@@ -369,7 +359,7 @@ async fn test_mixed_and_filter_keeps_residual_datafusion_filter() {
 #[tokio::test]
 async fn test_partially_translated_filter_keeps_partition_pruning_and_correctness() {
     let sql = "SELECT id, name FROM paimon.default.multi_partitioned_log_table WHERE dt = '2024-01-01' AND hr + 1 > 20 LIMIT 1";
-    let plan = create_physical_plan(sql)
+    let (_warehouse, plan) = create_physical_plan(sql)
         .await
         .expect("Physical plan creation should succeed");
     let plan_text = format_physical_plan(&plan);
@@ -621,7 +611,7 @@ async fn test_limit_pushdown_on_data_evolution_table_returns_merged_rows() {
 #[tokio::test]
 async fn test_limit_pushdown_marks_safe_scan_limit_hint_and_keeps_correctness() {
     let sql = "SELECT id, name FROM paimon.default.simple_log_table LIMIT 2";
-    let plan = create_physical_plan(sql)
+    let (_warehouse, plan) = create_physical_plan(sql)
         .await
         .expect("Physical plan creation should succeed");
     let plan_text = format_physical_plan(&plan);
@@ -644,7 +634,7 @@ async fn test_limit_pushdown_marks_safe_scan_limit_hint_and_keeps_correctness() 
 #[tokio::test]
 async fn test_offset_limit_pushdown_keeps_correctness_without_fetch_contract() {
     let sql = "SELECT id, name FROM paimon.default.partitioned_log_table OFFSET 1 LIMIT 1";
-    let plan = create_physical_plan(sql)
+    let (_warehouse, plan) = create_physical_plan(sql)
         .await
         .expect("Physical plan creation should succeed");
     let plan_text = format_physical_plan(&plan);
@@ -673,7 +663,7 @@ async fn test_offset_limit_pushdown_keeps_correctness_without_fetch_contract() {
 #[tokio::test]
 async fn test_inexact_filter_limit_keeps_correctness_without_fetch_contract() {
     let sql = "SELECT id, name FROM paimon.default.partitioned_log_table WHERE id > 1 LIMIT 1";
-    let plan = create_physical_plan(sql)
+    let (_warehouse, plan) = create_physical_plan(sql)
         .await
         .expect("Physical plan creation should succeed");
     let plan_text = format_physical_plan(&plan);
@@ -701,7 +691,7 @@ async fn test_inexact_filter_limit_keeps_correctness_without_fetch_contract() {
 #[tokio::test]
 async fn test_residual_filter_limit_keeps_connector_limit_and_correctness() {
     let sql = "SELECT id, name FROM paimon.default.simple_log_table WHERE id + 1 > 3 LIMIT 1";
-    let plan = create_physical_plan(sql)
+    let (_warehouse, plan) = create_physical_plan(sql)
         .await
         .expect("Physical plan creation should succeed");
     let plan_text = format_physical_plan(&plan);
@@ -737,7 +727,7 @@ async fn test_residual_filter_limit_keeps_connector_limit_and_correctness() {
 // ======================= Catalog Provider Tests =======================
 #[tokio::test]
 async fn test_query_via_catalog_provider() {
-    let catalog = create_catalog();
+    let (_warehouse, catalog) = create_catalog();
     let catalog: Arc<dyn Catalog> = Arc::new(catalog);
     let mut ctx = SQLContext::new();
     ctx.register_catalog("paimon", catalog)
@@ -756,7 +746,7 @@ async fn test_query_via_catalog_provider() {
 
 #[tokio::test]
 async fn test_missing_database_returns_no_schema() {
-    let catalog = create_catalog();
+    let (_warehouse, catalog) = create_catalog();
     let provider = PaimonCatalogProvider::new(
         None,
         Arc::new(catalog),
@@ -773,20 +763,9 @@ async fn test_missing_database_returns_no_schema() {
 
 // ======================= Time Travel Tests =======================
 
-/// Helper: create a SQLContext with catalog + relation planner for time travel.
-async fn create_time_travel_context() -> SQLContext {
-    let catalog = create_catalog();
-    let catalog: Arc<dyn Catalog> = Arc::new(catalog);
-    let mut ctx = SQLContext::new();
-    ctx.register_catalog("paimon", catalog)
-        .await
-        .expect("Failed to register catalog");
-    ctx
-}
-
 #[tokio::test]
 async fn test_time_travel_by_snapshot_id() {
-    let ctx = create_time_travel_context().await;
+    let (_warehouse, ctx) = create_context().await;
 
     // Snapshot 1: should contain only the first insert (alice, bob)
     let batches = ctx
@@ -830,7 +809,7 @@ async fn test_time_travel_by_snapshot_id() {
 
 #[tokio::test]
 async fn test_time_travel_by_tag_name() {
-    let ctx = create_time_travel_context().await;
+    let (_warehouse, ctx) = create_context().await;
 
     // Tag 'snapshot1' points to snapshot 1: should contain only (alice, bob)
     let batches = ctx
@@ -1014,7 +993,7 @@ async fn test_time_travel_conflicting_selectors_fail() {
         ("1", "scan.snapshot-id"),
         ("watermark-1", "scan.watermark"),
     ] {
-        let provider = create_provider_with_options(
+        let (_provider_warehouse, provider) = create_provider_with_options(
             "time_travel_table",
             HashMap::from([
                 ("scan.version".to_string(), version.to_string()),
@@ -1023,7 +1002,7 @@ async fn test_time_travel_conflicting_selectors_fail() {
         )
         .await;
 
-        let ctx = create_context().await;
+        let (_warehouse, ctx) = create_context().await;
         ctx.register_temp_table("paimon.default.time_travel_table", Arc::new(provider))
             .expect("Failed to register temp table");
 
@@ -1051,13 +1030,13 @@ async fn test_time_travel_conflicting_selectors_fail() {
 
 #[tokio::test]
 async fn test_time_travel_invalid_version_fails() {
-    let provider = create_provider_with_options(
+    let (_provider_warehouse, provider) = create_provider_with_options(
         "time_travel_table",
         HashMap::from([("scan.version".to_string(), "nonexistent-tag".to_string())]),
     )
     .await;
 
-    let ctx = create_context().await;
+    let (_warehouse, ctx) = create_context().await;
     ctx.register_temp_table("paimon.default.time_travel_table", Arc::new(provider))
         .expect("Failed to register temp table");
 
@@ -1349,7 +1328,7 @@ async fn test_read_complex_type_table_via_datafusion() {
 async fn test_select_row_id_from_data_evolution_table() {
     use datafusion::arrow::array::Int64Array;
 
-    let ctx = create_context().await;
+    let (_warehouse, ctx) = create_context().await;
 
     let batches = ctx
         .sql(r#"SELECT "_ROW_ID", id, name FROM paimon.default.data_evolution_table"#)
@@ -1385,7 +1364,7 @@ async fn test_select_row_id_from_data_evolution_table() {
 async fn test_filter_row_id_from_data_evolution_table() {
     use datafusion::arrow::array::Int64Array;
 
-    let ctx = create_context().await;
+    let (_warehouse, ctx) = create_context().await;
 
     let all_batches = ctx
         .sql(r#"SELECT "_ROW_ID" FROM paimon.default.data_evolution_table"#)

@@ -49,6 +49,9 @@ mod format_partition_repair;
 mod format_table_truncate;
 #[cfg(feature = "fulltext")]
 mod full_text_search;
+#[cfg(test)]
+#[path = "../testdata/warehouse/mod.rs"]
+mod golden_warehouse;
 mod hybrid_search;
 mod lateral_vector_search;
 mod memory;

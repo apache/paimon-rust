@@ -46,14 +46,6 @@ type partitionedRow struct {
 	dt   string
 }
 
-func testWarehouse() string {
-	warehouse := os.Getenv("PAIMON_TEST_WAREHOUSE")
-	if warehouse == "" {
-		return "/tmp/paimon-warehouse"
-	}
-	return warehouse
-}
-
 func copyDirectory(source, target string) error {
 	info, err := os.Stat(source)
 	if err != nil {
@@ -132,11 +124,8 @@ func openCopiedTestTable(t *testing.T) *paimon.Table {
 func openCopiedTable(t *testing.T, tableName string) *paimon.Table {
 	t.Helper()
 
-	warehouse := testWarehouse()
+	warehouse := testWarehouse(t)
 	source := filepath.Join(warehouse, "default.db", tableName)
-	if _, err := os.Stat(source); os.IsNotExist(err) {
-		t.Skipf("Skipping: table %s does not exist (run 'make docker-up' first)", source)
-	}
 
 	targetWarehouse := t.TempDir()
 	target := filepath.Join(targetWarehouse, "default.db", tableName)
@@ -275,14 +264,13 @@ func readRows(t *testing.T, rb *paimon.ReadBuilder) []row {
 }
 
 // openTestTable creates a catalog, opens the simple_log_table, and returns
-// the table along with a cleanup function. Skips the test if the warehouse
-// does not exist.
+// the table along with a cleanup function. Missing fixture data fails the test.
 func openTestTable(t *testing.T) *paimon.Table {
 	t.Helper()
 
-	warehouse := testWarehouse()
+	warehouse := testWarehouse(t)
 	if _, err := os.Stat(warehouse); os.IsNotExist(err) {
-		t.Skipf("Skipping: warehouse %s does not exist (run 'make docker-up' first)", warehouse)
+		t.Fatalf("Missing test warehouse: %s", warehouse)
 	}
 	return openTableAt(t, warehouse, "simple_log_table")
 }
@@ -441,11 +429,8 @@ func TestWriteOverwriteUsesBuilderMode(t *testing.T) {
 }
 
 func TestOverwriteRetrySameIdentifierIsIdempotent(t *testing.T) {
-	warehouse := testWarehouse()
+	warehouse := testWarehouse(t)
 	source := filepath.Join(warehouse, "default.db", "simple_pk_table")
-	if _, err := os.Stat(source); os.IsNotExist(err) {
-		t.Skipf("Skipping: table %s does not exist (run 'make docker-up' first)", source)
-	}
 	targetWarehouse := t.TempDir()
 	target := filepath.Join(targetWarehouse, "default.db", "simple_pk_table")
 	if err := copyDirectory(source, target); err != nil {
