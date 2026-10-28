@@ -17,10 +17,11 @@
 
 use crate::spec::{CoreOptions, DataFileMeta};
 use crate::Result;
+use std::collections::VecDeque;
 
-/// Batch packing from Java AppendCompactCoordinator.SubCoordinator.pack.
-/// Compaction uses file size + open cost; read splits use max(size, open cost).
+/// Unaware batch packing and bucketed best-effort windows from Java.
 pub(super) struct AppendCompactPlanner {
+    bucketed: bool,
     small_file_size: i64,
     target_weight: i128,
     open_file_cost: i64,
@@ -30,6 +31,7 @@ pub(super) struct AppendCompactPlanner {
 impl AppendCompactPlanner {
     pub(super) fn new(options: &CoreOptions<'_>) -> Result<Self> {
         Ok(Self {
+            bucketed: options.bucket() > 0,
             small_file_size: options.compaction_file_size()?,
             target_weight: i128::from(options.target_file_size()) * 2,
             open_file_cost: options.source_split_open_file_cost(),
@@ -38,6 +40,9 @@ impl AppendCompactPlanner {
     }
 
     pub(super) fn plan(&self, mut files: Vec<DataFileMeta>) -> Vec<Vec<DataFileMeta>> {
+        if self.bucketed {
+            return self.plan_bucketed(files);
+        }
         files.retain(|file| file.file_size < self.small_file_size);
         // Size ordering matches Java; sequence/name break ties deterministically
         // so regrouping input read splits cannot change task boundaries.
@@ -61,6 +66,28 @@ impl AppendCompactPlanner {
         }
         if pending.len() >= self.min_file_num {
             tasks.push(pending);
+        }
+        tasks
+    }
+
+    /// Java BucketedAppendCompactManager.pickCompactBefore: a sequence-ordered
+    /// sliding window, without the unaware coordinator's size filter/open cost.
+    fn plan_bucketed(&self, mut files: Vec<DataFileMeta>) -> Vec<Vec<DataFileMeta>> {
+        files.sort_by(|a, b| {
+            (a.min_sequence_number, &a.file_name).cmp(&(b.min_sequence_number, &b.file_name))
+        });
+        let mut tasks = Vec::new();
+        let mut pending = VecDeque::new();
+        let mut size = 0i128;
+        for file in files {
+            size += i128::from(file.file_size);
+            pending.push_back(file);
+            if pending.len() >= self.min_file_num {
+                tasks.push(pending.drain(..).collect());
+                size = 0;
+            } else if size >= self.target_weight {
+                size -= i128::from(pending.pop_front().unwrap().file_size);
+            }
         }
         tasks
     }
@@ -215,5 +242,33 @@ mod tests {
         let groups = planner.plan(files(&[i64::MAX / 2; 5]));
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].len(), 5);
+    }
+
+    #[test]
+    fn bucketed_windows_match_java_and_do_not_pack_across_large_files() {
+        let planner = make_planner(&[
+            ("bucket", "1"),
+            ("target-file-size", "100b"),
+            ("compaction.min.file-num", "3"),
+            ("source.split.open-file-cost", "1mb"),
+        ]);
+        // Open cost cannot force a two-file task; a large file shifts the
+        // contiguous window rather than being filtered out before packing.
+        assert!(planner.plan(files(&[10, 10])).is_empty());
+        let groups = planner.plan(files(&[10, 300, 10, 10, 10, 10, 10, 10]));
+        assert_eq!(
+            groups
+                .iter()
+                .map(|group| group
+                    .iter()
+                    .map(|file| file.min_sequence_number)
+                    .collect::<Vec<_>>())
+                .collect::<Vec<_>>(),
+            vec![vec![2, 3, 4], vec![5, 6, 7]]
+        );
+        // The minimum count check precedes the byte limit, just as in Java.
+        let groups = planner.plan(files(&[10, 10, 300]));
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].len(), 3);
     }
 }

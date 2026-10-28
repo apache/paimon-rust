@@ -489,6 +489,7 @@ impl CompactTask {
 pub(super) struct PreparedCompact {
     pub entries: Vec<ManifestEntry>,
     pub schema_id: i64,
+    pub snapshot_id: i64,
     pub read_snapshot: Option<Box<Snapshot>>,
     pub commit_suffix: String,
     pub metrics: CompactMetrics,
@@ -592,6 +593,7 @@ pub(super) fn prepare_results(table: &Table, results: &[CompactResult]) -> Resul
     Ok(PreparedCompact {
         entries,
         schema_id: first.task.context.schema.id(),
+        snapshot_id: first.task.snapshot_id(),
         read_snapshot: first
             .task
             .is_primary_key()
@@ -605,6 +607,33 @@ pub(super) fn ensure_supported(table: &Table) -> Result<()> {
     ensure_table_write_authorized(table)?;
     table.ensure_not_branch_reference_for_write()?;
     let options = table.schema().core_options();
+    let properties = table.schema().options();
+    if table.schema().primary_keys().is_empty()
+        && options.bucket() > 0
+        && !properties
+            .get("bucket-append-ordered")
+            .is_some_and(|value| value.eq_ignore_ascii_case("false"))
+    {
+        // Ordered append needs contiguous sequence windows and rewrite counters.
+        // Ordinary Rust append writers do not yet restore those counters.
+        return Err(Error::Unsupported {
+            message: "Compaction of ordered bucketed append tables is not supported; bucket-append-ordered=false is required".into(),
+        });
+    }
+    if properties
+        .get("pk-clustering-override")
+        .is_some_and(|value| value.eq_ignore_ascii_case("true"))
+        || properties.contains_key("record-level.expire-time")
+        || (table.schema().primary_keys().is_empty() && options.clustering_incremental_enabled())
+    {
+        // Clustered KV files are not necessarily primary-key ordered; record
+        // expiration must filter versions before merging, as Java does.
+        return Err(Error::Unsupported {
+            message:
+                "Compaction does not support pk-clustering-override, append incremental clustering or record-level.expire-time"
+                    .into(),
+        });
+    }
     if table.is_format_table()
         || options.row_tracking_enabled()
         || options.data_evolution_enabled()

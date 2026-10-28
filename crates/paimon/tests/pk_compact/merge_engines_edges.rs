@@ -17,6 +17,241 @@
 
 use super::*;
 
+async fn assert_unsafe_aggregate_compaction_rejected(table: &Table) {
+    let builder = table.new_compact_builder();
+    let plan = builder.new_planner().unwrap().plan().await.unwrap();
+    let before = table
+        .file_io()
+        .list_status_recursive(table.location())
+        .await
+        .unwrap()
+        .len();
+    let error = builder
+        .new_executor()
+        .unwrap()
+        .execute(&plan.tasks()[0])
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("Compaction cannot preserve"),
+        "{error}"
+    );
+    assert_eq!(
+        table
+            .file_io()
+            .list_status_recursive(table.location())
+            .await
+            .unwrap()
+            .len(),
+        before
+    );
+}
+
+#[tokio::test]
+async fn partial_update_retract_only_aggregate_state_refuses_lossy_compaction() {
+    for aggregate_option in [
+        "fields.value.aggregate-function",
+        "fields.default-aggregate-function",
+    ] {
+        let options = [
+            ("fields.version.sequence-group", "value,other"),
+            (aggregate_option, "sum"),
+        ];
+        let control = partial(&options).await;
+        let rewritten = partial(&options).await;
+        for table in [&control, &rewritten] {
+            write_batch(table, &update(Some(10), Some(10), None, 3)).await;
+            write_batch(table, &update(Some(11), Some(5), None, 3)).await;
+        }
+        let builder = rewritten.new_compact_builder();
+        let plan = builder.new_planner().unwrap().plan().await.unwrap();
+        let paths_before = rewritten
+            .file_io()
+            .list_status_recursive(rewritten.location())
+            .await
+            .unwrap();
+        let error = builder
+            .new_executor()
+            .unwrap()
+            .execute(&plan.tasks()[0])
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("DELETE aggregate state"));
+        assert_eq!(
+            rewritten
+                .file_io()
+                .list_status_recursive(rewritten.location())
+                .await
+                .unwrap()
+                .len(),
+            paths_before.len()
+        );
+        for table in [&control, &rewritten] {
+            write_batch(table, &update(Some(12), Some(3), None, 0)).await;
+        }
+        assert_eq!(state(&control).await, vec![(Some(12), Some(-2), None)]);
+        assert_eq!(state(&rewritten).await, state(&control).await);
+    }
+}
+
+#[tokio::test]
+async fn partial_update_aggregate_delete_state_refuses_lossy_compaction() {
+    let options = [
+        ("fields.version.sequence-group", "value,other"),
+        ("partial-update.remove-record-on-sequence-group", "version"),
+        ("fields.value.aggregate-function", "first_value"),
+    ];
+    let control = partial(&options).await;
+    let rewritten = partial(&options).await;
+    for table in [&control, &rewritten] {
+        write_batch(table, &update(Some(1), Some(10), None, 0)).await;
+        write_batch(table, &update(Some(2), Some(20), None, 3)).await;
+    }
+    assert_unsafe_aggregate_compaction_rejected(&rewritten).await;
+    for table in [&control, &rewritten] {
+        write_batch(table, &update(Some(3), Some(30), None, 0)).await;
+    }
+    assert_eq!(state(&control).await, vec![(Some(3), Some(20), None)]);
+    assert_eq!(state(&rewritten).await, state(&control).await);
+}
+
+#[tokio::test]
+async fn aggregation_delete_state_refuses_lossy_compaction() {
+    let options = [
+        ("merge-engine", "aggregation"),
+        ("fields.value.aggregate-function", "first_value"),
+        ("aggregation.remove-record-on-delete", "true"),
+    ];
+    let control = table(&options).await;
+    let rewritten = table(&options).await;
+    for table in [&control, &rewritten] {
+        write_batch(table, &make_batch(vec![1], vec![10])).await;
+        write_batch(table, &make_batch_with_kinds(vec![1], vec![20], vec![3])).await;
+    }
+    assert_unsafe_aggregate_compaction_rejected(&rewritten).await;
+    for table in [&control, &rewritten] {
+        write_batch(table, &make_batch(vec![1], vec![30])).await;
+    }
+    assert_eq!(rows(&control).await, vec![(1, 20)]);
+    assert_eq!(rows(&rewritten).await, rows(&control).await);
+}
+
+#[tokio::test]
+async fn first_non_null_aggregate_rejects_retract_state_even_when_output_is_insert() {
+    for function in ["first_non_null_value", "first_not_null_value"] {
+        let table = table(&[
+            ("merge-engine", "aggregation"),
+            ("fields.value.aggregate-function", function),
+            ("aggregation.remove-record-on-delete", "true"),
+        ])
+        .await;
+        write_batch(&table, &make_batch_with_kinds(vec![1], vec![20], vec![3])).await;
+        let null_insert = RecordBatch::try_from_iter([
+            (
+                "id",
+                Arc::new(Int32Array::from(vec![1])) as arrow_array::ArrayRef,
+            ),
+            (
+                "value",
+                Arc::new(Int32Array::from(vec![None])) as arrow_array::ArrayRef,
+            ),
+        ])
+        .unwrap();
+        write_batch(&table, &null_insert).await;
+        assert_eq!(rows(&table).await, vec![(1, 20)]);
+        assert_unsafe_aggregate_compaction_rejected(&table).await;
+        write_batch(&table, &make_batch(vec![1], vec![30])).await;
+        assert_eq!(rows(&table).await, vec![(1, 30)]);
+    }
+}
+
+#[tokio::test]
+async fn aggregation_replay_guard_uses_effective_functions() {
+    for ignored in [
+        "fields.default-aggregate-function",
+        "fields.id.aggregate-function",
+    ] {
+        let table = table(&[
+            ("merge-engine", "aggregation"),
+            (ignored, "first_value"),
+            ("fields.value.aggregate-function", "sum"),
+        ])
+        .await;
+        write_batch(&table, &make_batch(vec![1], vec![10])).await;
+        write_batch(&table, &make_batch_with_kinds(vec![1], vec![3], vec![1])).await;
+        compact(&table).await;
+        assert_eq!(rows(&table).await, vec![(1, 7)]);
+        write_batch(&table, &make_batch(vec![1], vec![5])).await;
+        assert_eq!(rows(&table).await, vec![(1, 12)]);
+    }
+}
+
+#[tokio::test]
+async fn listagg_rejects_raw_delete_state_that_an_insert_would_normalize() {
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .column("value", DataType::VarChar(VarCharType::string_type()))
+        .primary_key(["id"])
+        .option("bucket", "1")
+        .option("merge-engine", "aggregation")
+        .option("fields.value.aggregate-function", "listagg")
+        .option("aggregation.remove-record-on-delete", "true")
+        .build()
+        .unwrap();
+    let table = table_with_schema(TableSchema::new(0, &schema)).await;
+    let batch = |value: Option<&str>, kind: i8| {
+        RecordBatch::try_from_iter([
+            (
+                "id",
+                Arc::new(Int32Array::from(vec![1])) as arrow_array::ArrayRef,
+            ),
+            (
+                "value",
+                Arc::new(StringArray::from(vec![value])) as arrow_array::ArrayRef,
+            ),
+            (
+                "_VALUE_KIND",
+                Arc::new(Int8Array::from(vec![kind])) as arrow_array::ArrayRef,
+            ),
+        ])
+        .unwrap()
+    };
+    write_batch(&table, &batch(Some(" "), 3)).await;
+    write_batch(&table, &batch(None, 0)).await;
+    assert_unsafe_aggregate_compaction_rejected(&table).await;
+    write_batch(&table, &batch(None, 0)).await;
+    let output = read(&table, None).await;
+    assert_eq!(
+        output[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(0),
+        " "
+    );
+}
+
+#[tokio::test]
+async fn partial_update_replay_guard_allows_ignored_legacy_retracts() {
+    let table = partial(&[
+        ("fields.version.sequence-group", "value,other"),
+        ("fields.value.aggregate-function", "first_value"),
+        ("ignore-delete", "true"),
+    ])
+    .await;
+    write_batch(&table, &update(Some(1), Some(10), None, 0)).await;
+    let legacy = table.copy_with_options(std::collections::HashMap::from([(
+        "ignore-delete".into(),
+        "false".into(),
+    )]));
+    write_batch(&legacy, &update(Some(2), Some(20), None, 3)).await;
+    compact(&table).await;
+    assert_eq!(state(&table).await, vec![(Some(1), Some(10), None)]);
+    write_batch(&table, &update(Some(3), Some(30), None, 0)).await;
+    assert_eq!(state(&table).await, vec![(Some(3), Some(10), None)]);
+}
+
 #[tokio::test]
 async fn ignored_legacy_retracts_can_compact_to_empty_and_accept_new_records() {
     for engine in ["first-row", "partial-update"] {

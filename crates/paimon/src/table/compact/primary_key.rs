@@ -71,6 +71,8 @@ impl MergeFunction for CompactDeduplicate {
 /// in Java's reducer wrapper; compound records use the existing engine reducer.
 struct CompactReducer {
     inner: Box<dyn MergeFunction>,
+    reject_delete_state: bool,
+    reject_retract_group: bool,
 }
 
 impl MergeFunction for CompactReducer {
@@ -88,7 +90,27 @@ impl MergeFunction for CompactReducer {
                 row_idx: row.row_idx,
             });
         }
+        if self.reject_retract_group && rows.iter().any(|row| matches!(row.value_kind, 1 | 3)) {
+            // Some aggregators preserve flags or raw DELETE payloads that a
+            // single physical INSERT/DELETE cannot encode, even if the final
+            // merged row is an INSERT. Leave this group in its source files.
+            return Err(crate::Error::Unsupported {
+                message: "Compaction cannot preserve aggregate state for this retract group".into(),
+            });
+        }
         Ok(match self.inner.merge(rows, batches, columns, schema)? {
+            MergeResult::MaterializedDeleteRow(_) if self.reject_delete_state => {
+                // A partial-update reducer initializes from the first retract
+                // and then retracts its payload. Replaying an accumulated
+                // DELETE can cancel its own state. First-value aggregators
+                // also carry an initialized flag that DELETE payloads do not
+                // serialize. Keep the sources until replay is safe.
+                return Err(crate::Error::Unsupported {
+                    message:
+                        "Compaction cannot preserve DELETE aggregate state for this merge engine"
+                            .into(),
+                });
+            }
             MergeResult::MaterializedDeleteRow(batch) => MergeResult::MaterializedRow(batch),
             result => result,
         })
@@ -103,11 +125,56 @@ fn new_merge_function(
         return Ok(Box::new(CompactDeduplicate));
     }
     let inner = KeyValueFileReader::new_merge_function(config, fields)?;
+    let aggregate_functions = match config.merge_engine {
+        MergeEngine::PartialUpdate => crate::spec::PartialUpdateConfig::new(&config.table_options)
+            .validated_aggregate_functions(&config.table_fields, &config.primary_keys)?
+            .into_values()
+            .collect::<Vec<_>>(),
+        MergeEngine::Aggregation => {
+            let aggregation = crate::spec::AggregationConfig::new(&config.table_options);
+            config
+                .table_fields
+                .iter()
+                .filter(|field| {
+                    !config
+                        .table_primary_keys
+                        .iter()
+                        .chain(&config.sequence_fields)
+                        .any(|name| name == field.name())
+                })
+                .map(|field| {
+                    aggregation
+                        .agg_function_for_field(field.name())
+                        .or_else(|| aggregation.default_agg_function())
+                        .unwrap_or("last_non_null_value")
+                        .to_string()
+                })
+                .collect()
+        }
+        _ => vec![],
+    };
     Ok(if config.merge_engine == MergeEngine::FirstRow {
         // First-row must still reject retracts unless ignore-delete is enabled.
         inner
     } else {
-        Box::new(CompactReducer { inner })
+        Box::new(CompactReducer {
+            inner,
+            reject_delete_state: config.merge_engine == MergeEngine::PartialUpdate
+                && !aggregate_functions.is_empty(),
+            reject_retract_group: !(config.merge_engine == MergeEngine::PartialUpdate
+                && crate::spec::CoreOptions::new(&config.table_options).ignore_delete())
+                && aggregate_functions.iter().any(|function| {
+                    matches!(
+                        crate::spec::canonical_aggregator_name(function),
+                        "first_value"
+                            | "first_non_null_value"
+                            | "collect"
+                            | "nested_update"
+                            | "nested_partial_update"
+                            | "listagg"
+                    )
+                }),
+        })
     })
 }
 

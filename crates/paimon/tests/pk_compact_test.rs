@@ -113,6 +113,76 @@ async fn execute(table: &Table, plan: &CompactPlan) -> Vec<CompactResult> {
 }
 
 #[tokio::test]
+async fn pk_compaction_rejects_concurrent_overlapping_positive_level_files() {
+    for (key, conflicts) in [(1, true), (256, false)] {
+        let table = table(&[]).await;
+        write_batch(&table, &make_batch(vec![1], vec![10])).await;
+        let builder = table.new_compact_builder();
+        let plan = builder.new_planner().unwrap().plan().await.unwrap();
+        let results = execute(&table, &plan).await;
+        // A Java writer created before our input was committed can compact its
+        // own L0 files locally and publish L1 without replacing our L0 input.
+        let write = table.new_write_builder();
+        let mut writer = write.new_write().unwrap();
+        writer
+            .write_arrow(&[make_batch(vec![key], vec![20])], None)
+            .await
+            .unwrap();
+        let mut messages = writer.prepare_commit().await.unwrap();
+        for file in &mut messages[0].new_files {
+            file.level = 1;
+        }
+        write.new_commit().commit(messages).await.unwrap();
+        let result = builder.new_commit().unwrap().commit_compact(results).await;
+        if conflicts {
+            assert!(result.unwrap_err().to_string().contains("LSM"));
+            assert_eq!(rows(&table).await, vec![(1, 20)]);
+        } else {
+            result.unwrap();
+            assert_eq!(rows(&table).await, vec![(1, 10), (256, 20)]);
+        }
+    }
+}
+
+#[tokio::test]
+async fn pk_compaction_accepts_disjoint_nan_and_finite_output_ranges() {
+    let schema = Schema::builder()
+        .column("id", DataType::Double(paimon::spec::DoubleType::new()))
+        .column("value", DataType::Int(IntType::new()))
+        .primary_key(["id"])
+        .option("bucket", "1")
+        .option("target-file-row-num", "1")
+        .build()
+        .unwrap();
+    let table = table_with_schema(TableSchema::new(0, &schema)).await;
+    let batch = RecordBatch::try_from_iter([
+        (
+            "id",
+            std::sync::Arc::new(arrow_array::Float64Array::from(vec![1.0, f64::NAN]))
+                as arrow_array::ArrayRef,
+        ),
+        (
+            "value",
+            std::sync::Arc::new(Int32Array::from(vec![10, 20])) as arrow_array::ArrayRef,
+        ),
+    ])
+    .unwrap();
+    write_batch(&table, &batch).await;
+    let builder = table.new_compact_builder();
+    let plan = builder.new_planner().unwrap().plan().await.unwrap();
+    let results = execute(&table, &plan).await;
+    assert_eq!(results[0].files().len(), 2);
+    builder
+        .new_commit()
+        .unwrap()
+        .commit_compact(results)
+        .await
+        .unwrap();
+    let batches = read(&table, None).await;
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
+}
+
+#[tokio::test]
 async fn pk_compaction_flushes_small_buffers_without_fragmenting_files() {
     for format in ["parquet", "orc", "avro", "row"] {
         let table = table(&[
@@ -505,6 +575,15 @@ async fn pk_compaction_refuses_partial_buckets_and_unsupported_layouts() {
             ("changelog-producer", "lookup"),
         ],
         vec![("changelog-producer", "full-compaction")],
+        vec![
+            ("merge-engine", "first-row"),
+            ("pk-clustering-override", "true"),
+            ("clustering.columns", "value"),
+        ],
+        vec![
+            ("record-level.expire-time", "1 d"),
+            ("record-level.time-field", "value"),
+        ],
     ] {
         let table = table(&options).await;
         assert!(table.new_compact_builder().new_planner().is_err());

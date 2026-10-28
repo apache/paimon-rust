@@ -441,6 +441,7 @@ impl TableCommit {
                     entries: prepared.entries,
                     schema_id: prepared.schema_id,
                     read_snapshot: prepared.read_snapshot,
+                    planned_snapshot_id: prepared.snapshot_id,
                 },
                 None,
                 BATCH_COMMIT_IDENTIFIER,
@@ -1127,8 +1128,19 @@ impl TableCommit {
             loop {
                 let latest_snapshot = self.snapshot_manager.get_latest_snapshot().await?;
                 if filter_committed {
+                    let recovery_start = match &plan {
+                        CommitEntriesPlan::Compact {
+                            planned_snapshot_id,
+                            ..
+                        } => Some(planned_snapshot_id.saturating_add(1)),
+                        _ => None,
+                    };
                     if self
-                        .is_committed_identifier(&latest_snapshot, commit_identifier)
+                        .is_committed_identifier_since(
+                            &latest_snapshot,
+                            commit_identifier,
+                            recovery_start,
+                        )
                         .await?
                     {
                         break;
@@ -1788,9 +1800,22 @@ impl TableCommit {
         latest_snapshot: &Option<Snapshot>,
         commit_identifier: i64,
     ) -> Result<bool> {
+        self.is_committed_identifier_since(latest_snapshot, commit_identifier, None)
+            .await
+    }
+
+    async fn is_committed_identifier_since(
+        &self,
+        latest_snapshot: &Option<Snapshot>,
+        commit_identifier: i64,
+        start: Option<i64>,
+    ) -> Result<bool> {
         let Some(latest) = latest_snapshot else {
             return Ok(false);
         };
+        if start.is_some_and(|start| start > latest.id()) {
+            return Ok(false);
+        }
         if latest.commit_user() == self.commit_user {
             return Ok(commit_identifier <= latest.commit_identifier());
         }
@@ -1798,7 +1823,8 @@ impl TableCommit {
             .snapshot_manager
             .earliest_snapshot_id()
             .await?
-            .unwrap_or(latest.id());
+            .unwrap_or(latest.id())
+            .max(start.unwrap_or(i64::MIN));
         for snapshot_id in (earliest_snapshot_id..=latest.id()).rev() {
             let snapshot = if snapshot_id == latest.id() {
                 latest.clone()
@@ -1854,7 +1880,17 @@ impl TableCommit {
                 entries,
                 schema_id,
                 read_snapshot,
+                planned_snapshot_id,
             } => {
+                if latest_snapshot
+                    .as_ref()
+                    .is_none_or(|latest| latest.id() < *planned_snapshot_id)
+                {
+                    return Err(crate::Error::DataInvalid {
+                        message: "Table rolled back after compaction was planned".into(),
+                        source: None,
+                    });
+                }
                 if self.latest_schema_id().await? != *schema_id {
                     return Err(crate::Error::DataInvalid {
                         message: "Table schema changed after compaction was planned".into(),
@@ -1949,6 +1985,10 @@ impl TableCommit {
                         });
                     }
                 }
+                self.check_compact_lsm_conflicts(
+                    base_data_files.as_deref().unwrap_or_default(),
+                    entries,
+                )?;
                 Ok(ResolvedCommit {
                     entries: entries.clone(),
                     changelog_entries: vec![],
@@ -2667,6 +2707,55 @@ impl TableCommit {
         )
         .await?;
         Ok(Some(base_data_files))
+    }
+
+    /// Java PrimaryKeyConflictDetection: each positive level is a sorted run
+    /// with strictly disjoint primary-key ranges. Concurrent L0 appends remain
+    /// valid, but a concurrent rewrite into our output level may conflict.
+    fn check_compact_lsm_conflicts(
+        &self,
+        base: &[ManifestEntry],
+        delta: &[ManifestEntry],
+    ) -> Result<()> {
+        if self.table.schema().primary_keys().is_empty() {
+            return Ok(());
+        }
+        let comparator = super::merge_tree_split_generator::KeyComparator::from_table_schema(
+            self.table.schema(),
+        )
+        .map(|comparator| comparator.with_java_nan_order());
+        let active = merge_active_entries(base.iter().chain(delta).cloned().collect());
+        let mut levels = HashMap::<_, Vec<DataFileMeta>>::new();
+        for entry in active {
+            if entry.file().level > 0 {
+                levels
+                    .entry((
+                        entry.partition().to_vec(),
+                        entry.bucket(),
+                        entry.file().level,
+                    ))
+                    .or_default()
+                    .push(entry.file().clone());
+            }
+        }
+        for files in levels.into_values().filter(|files| files.len() > 1) {
+            let overlaps = match &comparator {
+                Some(comparator) => {
+                    super::merge_tree_split_generator::interval_partition(files, comparator)
+                        .iter()
+                        .any(|section| section.len() > 1)
+                }
+                // Empty trimmed keys identify one key in this partition.
+                None => true,
+            };
+            if overlaps {
+                return Err(crate::Error::DataInvalid {
+                    message: "LSM conflicts detected: overlapping or unverifiable key ranges in a positive level".into(),
+                    source: None,
+                });
+            }
+        }
+        Ok(())
     }
 
     async fn resolve_conflict_base_entries(
@@ -3715,6 +3804,7 @@ enum CommitEntriesPlan {
         entries: Vec<ManifestEntry>,
         schema_id: i64,
         read_snapshot: Option<Box<Snapshot>>,
+        planned_snapshot_id: i64,
     },
     /// Caller-provided entries. May contain `FileKind::Delete` entries from CoW
     /// rewrites, in which case `resolve_commit` auto-promotes to `CommitKind::OVERWRITE`.

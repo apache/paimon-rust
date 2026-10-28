@@ -41,7 +41,7 @@ println!("Compacted {} files into {}", metrics.files_removed, metrics.files_adde
 ```
 
 Compaction uses the table's `target-file-size` option for its output size target.
-Append task selection follows the batch packing rules in Java's
+For unaware append tables (`bucket=-1`), task selection follows the batch packing rules in Java's
 [`AppendCompactCoordinator`](https://github.com/apache/paimon/blob/master/paimon-core/src/main/java/org/apache/paimon/append/AppendCompactCoordinator.java):
 
 - Candidate files are strictly smaller than `target-file-size` multiplied by
@@ -57,6 +57,15 @@ Append task selection follows the batch packing rules in Java's
 There is no per-task file-count cap. An underfilled tail remains available for
 planning against a later snapshot. Each plan independently captures a snapshot;
 the API does not maintain a streaming coordinator's aging state.
+
+Unordered bucketed append tables (`bucket>0`, `bucket-append-ordered=false`)
+use Java's `BucketedAppendCompactManager` best-effort selection instead:
+files are visited in minimum-sequence order, and a window is selected once it
+reaches `compaction.min.file-num`. Before that count is reached, a window whose
+physical bytes reach twice `target-file-size` drops its first file and keeps
+sliding. The unaware-table small-file filter and open cost do not apply.
+Ordered bucketed append compaction is unsupported: it requires sequence counters
+that the ordinary Rust append writer does not yet maintain.
 
 Ordinary read splits use a separate strategy, matching Java's
 [`AppendOnlySplitGenerator`](https://github.com/apache/paimon/blob/master/paimon-core/src/main/java/org/apache/paimon/table/source/AppendOnlySplitGenerator.java):
@@ -80,8 +89,13 @@ rejected. Executors stream input batches instead of collecting the whole task.
 Concurrent appends can commit alongside compaction. A rewrite or overwrite of
 an input file, a metadata change to that file, or a table schema change causes
 the compaction commit to fail. Create a new plan after such a conflict.
+PK commits also reject overlapping key ranges within a positive level, including
+ranges introduced by a concurrent compaction. Overlapping L0 appends are allowed.
+If the latest snapshot is below the plan's captured snapshot after a rollback,
+commit rejects the uncommitted plan; create a new plan.
 Retrying the same plan and task subset with the same `commit_user` is
-idempotent, including when result order changes. To retry after restarting
+idempotent, including when result order changes. Recovery searches only snapshots
+created after the plan's captured snapshot. To retry after restarting
 the coordinator, configure `with_commit_user(...)` with the original value
 and retain the serialized results. A commit error can mean publication is
 uncertain: retain submitted files rather than deleting them on error.
@@ -123,6 +137,15 @@ whole-record deletion also apply during compaction. If all records are
 legitimately ignored, compaction can remove the selected files without
 creating an output file. Key bounds, sequence bounds, delete counts and file
 indexes are regenerated, using metadata statistics options for the output level.
+Compound `partial-update` DELETE states with field aggregators are rejected.
+For both reducer engines, compound groups containing retracts are also rejected
+when they use `first_value`, `first_non_null_value`, `collect`, `listagg`,
+`nested_update` or `nested_partial_update`. These states may carry initialization
+flags or raw DELETE payloads that cannot be reconstructed from one output row,
+even when that row is an INSERT. Execution fails without publishing or deleting
+the source files.
+Partial-update retracts ignored by `ignore-delete=true` do not trigger this
+restriction.
 
 The engine's logical merged state remains unchanged. Physical record counts and
 `rows_written` can decrease as older versions are removed; the latter includes
@@ -162,6 +185,9 @@ rebalance buckets or reclaim HASH index capacity.
 Compaction-generated changelogs (`full-compaction` / `lookup`) are unsupported.
 Row tracking, Data Evolution, deletion vectors, query authorization, rowkind
 fields, postpone buckets and dedicated blob/vector storage are unsupported.
+Ordered bucketed append, append incremental clustering, primary-key clustering
+override (`pk-clustering-override`) and record-level expiration
+(`record-level.expire-time`) are also unsupported.
 Snapshot index manifests may contain only dynamic-bucket HASH indexes.
 Embedded and sidecar file indexes are regenerated according to the captured
 table options. Language bindings and

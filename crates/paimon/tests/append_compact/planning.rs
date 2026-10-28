@@ -18,6 +18,80 @@
 use super::*;
 
 #[tokio::test]
+async fn compaction_recovery_does_not_read_snapshots_older_than_its_plan() {
+    let table = table(schema(&[])).await;
+    append_files(&table, 3).await;
+    let builder = table
+        .new_compact_builder()
+        .with_commit_user("bounded-recovery")
+        .unwrap();
+    let plan = builder.new_planner().unwrap().plan().await.unwrap();
+    let results = execute(&table, &plan).await;
+    // Old snapshot contents are irrelevant to a fresh plan's identity. Fail
+    // reads deterministically instead of relying on remote request timings.
+    table
+        .file_io()
+        .new_output(&format!("{}/snapshot/snapshot-1", table.location()))
+        .unwrap()
+        .write(bytes::Bytes::from_static(b"unreadable old snapshot"))
+        .await
+        .unwrap();
+    let commit = builder.new_commit().unwrap();
+    commit.commit_compact(results.clone()).await.unwrap();
+    append_files(&table, 1).await;
+    commit.commit_compact(results).await.unwrap();
+    assert_eq!(
+        table
+            .snapshot_manager()
+            .get_latest_snapshot_id()
+            .await
+            .unwrap(),
+        Some(5)
+    );
+    assert_eq!(rows(&table, None).await.len(), 8);
+}
+
+#[tokio::test]
+async fn rollback_invalidates_a_prepared_compaction_plan() {
+    let table = table(schema(&[])).await;
+    append_files(&table, 2).await;
+    table
+        .new_write_builder()
+        .new_commit()
+        .with_ignore_empty_commit(false)
+        .commit(vec![])
+        .await
+        .unwrap();
+    let builder = table.new_compact_builder();
+    let plan = builder.new_planner().unwrap().plan().await.unwrap();
+    assert_eq!(plan.snapshot_id(), Some(3));
+    let results = execute(&table, &plan).await;
+    // Equivalent to Java rollback: lower LATEST and remove later snapshots.
+    table
+        .file_io()
+        .delete_file(&table.snapshot_manager().snapshot_path(3))
+        .await
+        .unwrap();
+    table.snapshot_manager().write_latest_hint(2).await.unwrap();
+    let error = builder
+        .new_commit()
+        .unwrap()
+        .commit_compact(results)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("rolled back"), "{error}");
+    assert_eq!(
+        table
+            .snapshot_manager()
+            .get_latest_snapshot_id()
+            .await
+            .unwrap(),
+        Some(2)
+    );
+    assert_eq!(rows(&table, None).await.len(), 4);
+}
+
+#[tokio::test]
 async fn append_plan_waits_for_the_default_minimum_and_has_no_file_count_cap() {
     let schema = Schema::builder()
         .column("id", DataType::Int(IntType::new()))

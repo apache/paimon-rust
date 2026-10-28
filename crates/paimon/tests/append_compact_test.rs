@@ -386,6 +386,7 @@ async fn compact_keeps_partitions_and_buckets_separate_and_honors_partition_filt
         .partition_keys(["pt"])
         .option("bucket", "2")
         .option("bucket-key", "id")
+        .option("bucket-append-ordered", "false")
         .option("compaction.min.file-num", "2")
         .build()
         .unwrap();
@@ -472,6 +473,17 @@ async fn compact_refuses_unsupported_tables_invalid_options_and_foreign_tasks() 
             ("row-tracking.enabled", "true"),
         ],
         vec![("deletion-vectors.enabled", "true")],
+        vec![("bucket", "1")],
+        vec![
+            ("bucket", "1"),
+            ("bucket-append-ordered", "false"),
+            ("clustering.incremental", "true"),
+            ("clustering.columns", "value"),
+        ],
+        vec![
+            ("clustering.incremental", "true"),
+            ("clustering.columns", "value"),
+        ],
     ] {
         let table = table(schema(&options)).await;
         assert!(table.new_compact_builder().new_planner().is_err());
