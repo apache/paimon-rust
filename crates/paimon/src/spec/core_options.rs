@@ -1195,20 +1195,21 @@ impl<'a> CoreOptions<'a> {
         Ok(value)
     }
 
-    /// Maximum retained serialized sort keys, excluding the active Arrow batch,
-    /// format-writer buffers and the two keys used by a disk merge.
-    pub fn sorted_index_sort_memory(&self) -> crate::Result<usize> {
+    /// Write buffer budget, matching Java `CoreOptions.WRITE_BUFFER_SIZE`.
+    /// Sorted global-index builds use it for retained serialized sort keys,
+    /// excluding the active Arrow batch, writer buffers and disk-merge keys.
+    pub fn write_buffer_size(&self) -> crate::Result<usize> {
         let raw = self
             .options
-            .get("sorted-index.sort-memory")
+            .get("write-buffer-size")
             .map(String::as_str)
-            .unwrap_or("64mb");
+            .unwrap_or("256mb");
         let bytes = parse_memory_size(raw)
             .and_then(|size| usize::try_from(size).ok())
             .filter(|size| *size > 0);
         bytes.ok_or_else(|| crate::Error::ConfigInvalid {
             message: format!(
-                "Option 'sorted-index.sort-memory' must be a positive memory size, got: {raw}"
+                "Option 'write-buffer-size' must be a positive memory size, got: {raw}"
             ),
         })
     }

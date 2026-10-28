@@ -81,7 +81,7 @@ impl SortedGlobalIndexBuildBuilder<'_> {
         } else {
             let mut options = self.table.schema().options().clone();
             options.extend(self.options.clone());
-            let budget = crate::spec::CoreOptions::new(&options).sorted_index_sort_memory()?;
+            let budget = crate::spec::CoreOptions::new(&options).write_buffer_size()?;
             extract_index_rows(
                 self.table,
                 shard,
