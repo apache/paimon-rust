@@ -3085,7 +3085,7 @@ source = pa.Table.from_pylist([
 invalid = source.slice(0, 1)
 "#
                 ),
-                None,
+                Some(&locals),
                 Some(&locals),
             )
             .unwrap();

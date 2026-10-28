@@ -24,3 +24,9 @@ install:
 
 test:
 	uv run --no-sync pytest
+
+test-rust:
+	PYO3_PYTHON="$(CURDIR)/.venv/bin/python" \
+	PYTHONHOME="$$(uv run --no-sync python -c 'import sys; print(sys.base_prefix)')" \
+	PYTHONPATH="$$(uv run --no-sync python -c 'import sysconfig; print(sysconfig.get_path("purelib"))')" \
+	uv run --no-sync cargo test --locked -p pypaimon_rust --lib
