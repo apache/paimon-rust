@@ -281,6 +281,11 @@ jobs:
         working-directory: bindings/python
         run: make install && make test
 
+      - name: Python Binding Rust Unit Tests
+        if: matrix.suite == 'python'
+        working-directory: bindings/python
+        run: make test-rust
+
       - name: Go Integration Test
         if: matrix.suite == 'go'
         working-directory: bindings/go
