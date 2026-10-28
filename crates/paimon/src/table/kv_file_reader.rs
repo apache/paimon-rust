@@ -832,6 +832,7 @@ impl KeyValueFileReader {
                         !CoreOptions::new(&config.table_options)
                             .sequence_field_sort_order_is_ascending(),
                     )
+                    .with_batch_size(config.read_batch_size)
                     .build()?;
 
                     while let Some(batch) = merge_stream.next().await {
@@ -2393,7 +2394,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn kv_input_decode_honors_read_batch_size_without_changing_merge_batching() {
+    async fn kv_input_decode_and_merge_output_honor_read_batch_size() {
         let file_io = test_file_io();
         let table_path = "memory:/kv_read_batch_size";
         setup_dirs(&file_io, table_path).await;
@@ -2456,8 +2457,12 @@ mod tests {
         let mut decoded_batch_sizes = input_batch_sizes.lock().unwrap().clone();
         decoded_batch_sizes.sort_unstable();
         assert_eq!(decoded_batch_sizes, vec![1, 1, 2, 2, 2, 2]);
-        assert_eq!(batches.len(), 1, "merge output batching stays independent");
-        assert_eq!(batches[0].num_rows(), 5);
+        let output_batch_sizes: Vec<usize> = batches.iter().map(|b| b.num_rows()).collect();
+        assert_eq!(
+            output_batch_sizes,
+            vec![2, 2, 1],
+            "merge output follows read.batch-size"
+        );
         assert_eq!(int_column(&batches, "value"), vec![11, 21, 31, 41, 51]);
     }
 
