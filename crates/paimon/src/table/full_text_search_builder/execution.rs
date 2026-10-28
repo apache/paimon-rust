@@ -30,6 +30,8 @@ const ROWS: &str = "fulltext-rows";
 struct IndexWork {
     entry: IndexManifestEntry,
     query: String,
+    #[serde(default)]
+    top_k: Option<usize>,
     local_filter: Option<Vec<u8>>,
 }
 
@@ -101,6 +103,7 @@ pub(super) async fn search_indexes(
     table: &Table,
     plans: Vec<FullTextIndexSearchPlan>,
     query: &str,
+    top_k: Option<usize>,
     executor: &dyn SearchTaskExecutor,
 ) -> crate::Result<Vec<SearchResult>> {
     let mut plans = plans.into_iter();
@@ -118,6 +121,7 @@ pub(super) async fn search_indexes(
                     encode(IndexWork {
                         entry: plan.entry,
                         query: query.to_string(),
+                        top_k,
                         local_filter: plan.local_filter.as_ref().map(encode_bitmap).transpose()?,
                     })?,
                 )
@@ -193,12 +197,13 @@ pub(crate) async fn execute_search_task(
             );
             let input = table.file_io().new_input(&path)?;
             let reader = Box::new(input.reader().await?);
-            let result = search_full_text_index(
+            let result = search_full_text_index_top_k(
                 reader,
                 work.entry.index_file.file_name.clone(),
                 work.query,
                 limit,
                 work.local_filter.map(decode_bitmap).transpose()?,
+                work.top_k,
             )
             .await?;
             encode(Hits::from_search(

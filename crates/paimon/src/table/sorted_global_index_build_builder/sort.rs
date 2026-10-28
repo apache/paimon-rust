@@ -58,7 +58,10 @@ impl IndexSorter {
             .ok_or_else(|| io_error(std::io::Error::other("index key size overflow")))?;
         if bytes > self.budget {
             return Err(Error::ResourceExhausted {
-                message: format!("Sorted index key requires {bytes} bytes, exceeding sorted-index.sort-memory={}", self.budget),
+                message: format!(
+                    "Sorted index key requires {bytes} bytes, exceeding write-buffer-size={}",
+                    self.budget
+                ),
             });
         }
         if bytes > self.budget - self.bytes {

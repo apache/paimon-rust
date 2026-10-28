@@ -28,12 +28,26 @@ use std::sync::{mpsc, Arc, Mutex};
 
 const FULL_TEXT_RANGE_READ_CONCURRENCY: usize = 8;
 
+#[cfg(test)]
 pub(crate) async fn search_full_text_index(
     reader: Box<dyn FileRead>,
     file_name: String,
     query: String,
     limit: usize,
     include_row_ids: Option<RoaringTreemap>,
+) -> crate::Result<FullTextSearchResult> {
+    search_full_text_index_top_k(reader, file_name, query, limit, include_row_ids, None).await
+}
+
+/// The caller may request bounded candidates only when no later stage removes,
+/// replaces or deduplicates hits across shards. Ties at the boundary fall back.
+pub(crate) async fn search_full_text_index_top_k(
+    reader: Box<dyn FileRead>,
+    file_name: String,
+    query: String,
+    limit: usize,
+    include_row_ids: Option<RoaringTreemap>,
+    top_k: Option<usize>,
 ) -> crate::Result<FullTextSearchResult> {
     let handle =
         tokio::runtime::Handle::try_current().map_err(|error| crate::Error::UnexpectedError {
@@ -48,6 +62,7 @@ pub(crate) async fn search_full_text_index(
             &query,
             limit,
             include_row_ids,
+            top_k,
         )
     })
     .await
@@ -72,6 +87,7 @@ pub(crate) async fn search_full_text_file(
             &query,
             limit,
             include_row_ids,
+            None,
         )
     })
     .await
@@ -87,18 +103,54 @@ fn search_native_index<R: SeekRead + 'static>(
     query: &str,
     limit: usize,
     include_row_ids: Option<RoaringTreemap>,
+    top_k: Option<usize>,
 ) -> crate::Result<FullTextSearchResult> {
     let reader = FullTextArchiveReader::from_seek_read(input)
         .map_err(|error| native_error(file_name, error))?;
-    let hits = match include_row_ids {
-        Some(include) => reader.search_with_include(query, limit, &include),
-        None => reader.search(query, limit),
-    }
-    .map_err(|error| native_error(file_name, error))?;
+    let search = |limit| {
+        match &include_row_ids {
+            Some(include) => reader.search_with_include(query, limit, include),
+            None => reader.search(query, limit),
+        }
+        .map_err(|error| native_error(file_name, error))
+    };
+    let hits = if let Some(k) = top_k.filter(|k| *k > 0 && *k < limit) {
+        let candidate_count = k.saturating_add(1).min(limit);
+        let mut hits = search(candidate_count)?;
+        if certify_top_k(&mut hits, k) {
+            hits
+        } else {
+            search(limit)?
+        }
+    } else {
+        search(limit)?
+    };
     Ok(FullTextSearchResult {
         row_ids: hits.row_ids,
         scores: hits.scores,
     })
+}
+
+fn certify_top_k(hits: &mut crate::ftindex::reader::FullTextHits, k: usize) -> bool {
+    if hits.row_ids.len() <= k {
+        return true;
+    }
+    // Tantivy's tie-break uses document addresses, while Paimon uses row IDs.
+    // Fetch one extra hit to prove that no excluded document can tie the cutoff.
+    // Duplicate row IDs also require the exhaustive path before deduplication.
+    let distinct = hits.row_ids[..k]
+        .iter()
+        .collect::<std::collections::HashSet<_>>();
+    if distinct.len() != k
+        || !hits.scores[k - 1].is_finite()
+        || !hits.scores[k].is_finite()
+        || hits.scores[k - 1] <= hits.scores[k]
+    {
+        return false;
+    }
+    hits.row_ids.truncate(k);
+    hits.scores.truncate(k);
+    true
 }
 
 fn native_error(file_name: &str, error: impl std::fmt::Display) -> crate::Error {
@@ -252,6 +304,81 @@ mod tests {
         let mut bytes = Vec::new();
         writer.write(&mut PosWriter::new(&mut bytes)).unwrap();
         bytes
+    }
+
+    #[test]
+    fn certificate_requires_strict_scores_and_distinct_row_ids() {
+        use crate::ftindex::reader::FullTextHits;
+        let mut strict = FullTextHits {
+            row_ids: vec![9, 3, 1],
+            scores: vec![3.0, 2.0, 1.0],
+        };
+        assert!(certify_top_k(&mut strict, 2));
+        assert_eq!(strict.row_ids, [9, 3]);
+        for (row_ids, scores) in [
+            (vec![9, 3, 1], vec![3.0, 2.0, 2.0]),
+            (vec![9, 9, 1], vec![3.0, 2.0, 1.0]),
+            (vec![9, 3, 1], vec![3.0, f32::NAN, 1.0]),
+        ] {
+            let mut hits = FullTextHits {
+                row_ids: row_ids.clone(),
+                scores,
+            };
+            assert!(!certify_top_k(&mut hits, 2));
+            assert_eq!(hits.row_ids, row_ids);
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_candidates_match_exhaustive_and_ties_fall_back() {
+        for tied in [false, true] {
+            let mut writer = FullTextIndexWriter::new(FullTextIndexConfig::new()).unwrap();
+            // Deliberately reverse row IDs so document-address ties cannot stand
+            // in for the public row-ID tie-break.
+            for (id, text) in [
+                (9, "paimon"),
+                (3, "paimon padding"),
+                (1, "paimon padding padding padding"),
+            ] {
+                writer
+                    .add_document(id, if tied { "paimon" } else { text })
+                    .unwrap();
+            }
+            let mut data = Vec::new();
+            writer.write(&mut PosWriter::new(&mut data)).unwrap();
+            let query = r#"{"match":{"query":"paimon"}}"#.to_string();
+            let search = |top_k| {
+                search_full_text_index_top_k(
+                    Box::new(BytesFileRead {
+                        data: Bytes::from(data.clone()),
+                        ranges: Default::default(),
+                    }),
+                    "bounded.index".into(),
+                    query.clone(),
+                    3,
+                    None,
+                    top_k,
+                )
+            };
+            let exhaustive = search(None).await.unwrap();
+            let bounded = search(Some(1)).await.unwrap();
+            assert_eq!(bounded.row_ids.len(), if tied { 3 } else { 1 });
+            let expected = crate::full_text::SearchResult::new(
+                exhaustive.row_ids.into_iter().map(|id| id as u64).collect(),
+                exhaustive.scores,
+            )
+            .top_k(1);
+            let actual = crate::full_text::SearchResult::new(
+                bounded.row_ids.into_iter().map(|id| id as u64).collect(),
+                bounded.scores,
+            )
+            .top_k(1);
+            assert_eq!(actual.row_ids, expected.row_ids);
+            assert_eq!(actual.scores, expected.scores);
+            if tied {
+                assert_eq!(actual.row_ids, [1]);
+            }
+        }
     }
 
     #[test]
