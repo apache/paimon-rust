@@ -92,6 +92,7 @@ mod incremental_scan;
 pub(crate) mod index_file_path;
 mod inline_blob;
 mod instant;
+mod kv_data_file_writer;
 mod kv_file_reader;
 mod kv_file_writer;
 mod managed_blob_reader;

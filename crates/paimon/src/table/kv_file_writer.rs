@@ -26,21 +26,16 @@
 //!
 //! Reference: [org.apache.paimon.io.KeyValueDataFileWriterImpl](https://github.com/apache/paimon/blob/release-1.3/paimon-core/src/main/java/org/apache/paimon/io/KeyValueDataFileWriterImpl.java)
 
+use super::kv_data_file_writer::KeyValueFileOptions;
 use crate::arrow::arrow_fields_to_paimon;
-use crate::arrow::format::{
-    create_format_writer_factory, with_write_resources, FormatWriterFactory,
-};
+use crate::arrow::format::FormatWriterFactory;
 use crate::io::FileIO;
 use crate::resource::{MemoryReservation, ResourceContext};
-use crate::spec::stats::{compute_column_stats, BinaryTableStats};
 use crate::spec::{
-    data_file_to_file_index_file_name, extract_datum_from_arrow, AggregationConfig, BigIntType,
-    BinaryRowBuilder, CoreOptions, DataField, DataFileMeta, DataType, MergeEngine,
-    PartialUpdateConfig, RowKind, TinyIntType, KEY_FIELD_ID_START, SEQUENCE_NUMBER_FIELD_ID,
-    SEQUENCE_NUMBER_FIELD_NAME, VALUE_KIND_FIELD_ID, VALUE_KIND_FIELD_NAME,
+    AggregationConfig, CoreOptions, DataField, DataFileMeta, DataType, MergeEngine,
+    PartialUpdateConfig, RowKind, SEQUENCE_NUMBER_FIELD_NAME, VALUE_KIND_FIELD_NAME,
 };
 use crate::table::data_file_index_writer::FileIndexOptions;
-use crate::table::managed_blob_reference::ManagedBlobReferences;
 use crate::table::managed_blob_writer::ManagedBlobWriteState;
 use crate::table::prepared_files::PreparedFiles;
 use crate::table::sort_merge::{
@@ -116,34 +111,7 @@ pub(crate) struct KeyValueWriteConfig {
 struct IndexedFileWrite<'a> {
     format_writer_factory: &'a dyn FormatWriterFactory,
     is_changelog: bool,
-    file_prefix: &'a str,
     file_ordinal: usize,
-    file_format: &'a str,
-    file_compression: &'a str,
-    min_sequence_number: i64,
-    max_sequence_number: i64,
-    delete_row_count: i64,
-}
-
-struct RowKeyProjection {
-    schema: Arc<ArrowSchema>,
-    column_indices: Vec<usize>,
-}
-
-impl RowKeyProjection {
-    fn project(&self, batch: &RecordBatch) -> Result<RecordBatch> {
-        let columns = self
-            .column_indices
-            .iter()
-            .map(|&index| Arc::clone(batch.column(index)))
-            .collect();
-        RecordBatch::try_new(Arc::clone(&self.schema), columns).map_err(|error| {
-            crate::Error::DataInvalid {
-                message: format!("Failed to prepend ROW key columns: {error}"),
-                source: None,
-            }
-        })
-    }
 }
 
 impl KeyValueFileWriter {
@@ -210,99 +178,48 @@ impl KeyValueFileWriter {
         self
     }
 
-    /// Construct one reusable factory for this flush's data or changelog output.
-    /// Statistics retain logical value fields independently of the physical KV schema.
+    fn file_options(&self, is_changelog: bool) -> KeyValueFileOptions<'_> {
+        KeyValueFileOptions {
+            file_io: &self.file_io,
+            paths: &self.paths,
+            table_options: &self.config.table_options,
+            value_fields: &self.config.value_fields,
+            primary_key_indices: &self.config.primary_key_indices,
+            primary_key_types: &self.config.primary_key_types,
+            schema_id: self.config.schema_id,
+            file_format: if is_changelog {
+                &self.config.changelog_file_format
+            } else {
+                &self.config.file_format
+            },
+            file_prefix: if is_changelog {
+                &self.config.changelog_file_prefix
+            } else {
+                &self.config.data_file_prefix
+            },
+            file_compression: if is_changelog {
+                &self.config.changelog_file_compression
+            } else {
+                &self.config.file_compression
+            },
+            file_compression_zstd_level: self.config.file_compression_zstd_level,
+            write_buffer_size: self.config.write_buffer_size,
+            level: 0,
+            file_source: 0,
+            is_changelog,
+            index_options: self.config.file_index_options.as_deref(),
+            managed_blob_enabled: self.managed_blob_writer.enabled(),
+            resources: self.resources.as_ref(),
+        }
+    }
+
     fn new_format_writer_factory(
         &self,
         schema: arrow_schema::SchemaRef,
         is_changelog: bool,
     ) -> Result<Arc<dyn FormatWriterFactory>> {
-        self.new_format_writer_factory_for_level(schema, is_changelog, 0)
-    }
-
-    fn new_format_writer_factory_for_level(
-        &self,
-        mut schema: arrow_schema::SchemaRef,
-        is_changelog: bool,
-        level: i32,
-    ) -> Result<Arc<dyn FormatWriterFactory>> {
-        let mut physical_fields = build_physical_fields(&schema, &self.config.value_fields)?;
-        let mut options = self.config.table_options.clone();
-        let mode = CoreOptions::new(&options)
-            .pk_file_metadata_stats_mode(level, is_changelog)?
-            .to_string();
-        options.insert("metadata.stats-mode".to_string(), mode);
-        let file_format = if is_changelog {
-            &self.config.changelog_file_format
-        } else {
-            &self.config.file_format
-        };
-        if file_format.eq_ignore_ascii_case("row") {
-            let projection = self.row_key_projection(&schema)?;
-            let key_count = self.config.primary_key_indices.len();
-            physical_fields = projection
-                .column_indices
-                .iter()
-                .enumerate()
-                .map(|(index, &source)| {
-                    let field = physical_fields[source].clone();
-                    if index < key_count {
-                        let id = field.id() + KEY_FIELD_ID_START;
-                        field
-                            .with_id(id)
-                            .with_name(projection.schema.field(index).name().clone())
-                    } else {
-                        field
-                    }
-                })
-                .collect();
-            schema = projection.schema;
-        }
-        create_format_writer_factory(
-            file_format,
-            schema,
-            self.config.file_compression_zstd_level,
-            None,
-            Some(&physical_fields),
-            Some(&options),
-            Some(&self.config.value_fields),
-        )
-    }
-
-    fn row_key_projection(&self, schema: &Arc<ArrowSchema>) -> Result<RowKeyProjection> {
-        let mut fields = Vec::new();
-        let mut column_indices = Vec::new();
-        // These indices contain only trimmed keys; partition key columns are
-        // stored in the value portion but do not belong in the key prefix.
-        for &index in &self.config.primary_key_indices {
-            let key = &self.config.value_fields[index];
-            let source =
-                schema
-                    .index_of(key.name())
-                    .map_err(|error| crate::Error::DataInvalid {
-                        message: format!(
-                            "ROW key '{}' is absent from the physical schema: {error}",
-                            key.name()
-                        ),
-                        source: None,
-                    })?;
-            let arrow_field = schema.field(source);
-            fields.push(Arc::new(ArrowField::new(
-                format!("_KEY_{}", key.name()),
-                arrow_field.data_type().clone(),
-                arrow_field.is_nullable(),
-            )));
-            column_indices.push(source);
-        }
-        fields.extend(schema.fields().iter().cloned());
-        column_indices.extend(0..schema.fields().len());
-        Ok(RowKeyProjection {
-            schema: Arc::new(ArrowSchema::new_with_metadata(
-                fields,
-                schema.metadata().clone(),
-            )),
-            column_indices,
-        })
+        self.file_options(is_changelog)
+            .new_format_writer_factory(schema)
     }
 
     pub(crate) fn with_resources(mut self, resources: Option<ResourceContext>) -> Self {
@@ -344,109 +261,6 @@ impl KeyValueFileWriter {
 
     /// Number of rows per chunk when writing sorted data to parquet.
     const FLUSH_CHUNK_ROWS: usize = 4096;
-
-    /// Buffer already sorted and merged physical KV rows, retaining their
-    /// sequence numbers and retracts. This writer must not be used for ordinary writes.
-    pub(super) async fn write_compact(&mut self, batch: &RecordBatch, level: i32) -> Result<()> {
-        if batch.num_rows() == 0 {
-            return Ok(());
-        }
-        let bytes = batch
-            .columns()
-            .iter()
-            .map(|c| c.get_buffer_memory_size())
-            .sum();
-        if let Some(reservation) = &mut self.buffer_reservation {
-            reservation.try_grow(bytes)?;
-        }
-        self.buffer.push(batch.clone());
-        self.buffer_bytes += bytes;
-        if self.buffer_bytes as i64 >= self.config.write_buffer_size {
-            self.flush_compact(level).await?;
-        }
-        Ok(())
-    }
-
-    async fn flush_compact(&mut self, level: i32) -> Result<()> {
-        if self.buffer.is_empty() {
-            return Ok(());
-        }
-        let batches = std::mem::take(&mut self.buffer);
-        self.buffer_bytes = 0;
-        let _reservation = self.buffer_reservation.take();
-        self.buffer_reservation = self.resources.as_ref().map(ResourceContext::reservation);
-        let physical = arrow_select::concat::concat_batches(&batches[0].schema(), &batches)
-            .map_err(|error| crate::Error::DataInvalid {
-                message: format!("Failed to combine compacted KV rows: {error}"),
-                source: Some(Box::new(error)),
-            })?;
-        drop(batches);
-        // write_indexed_file expects logical value columns, with RowKind last.
-        // Sequence is supplied separately and must never be reassigned on rewrite.
-        let columns = (2..physical.num_columns()).chain([1]).collect::<Vec<_>>();
-        let logical = physical
-            .project(&columns)
-            .map_err(|error| crate::Error::DataInvalid {
-                message: format!("Invalid compacted KV schema: {error}"),
-                source: Some(Box::new(error)),
-            })?;
-        let sequences = physical
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
-        let kinds = physical
-            .column(1)
-            .as_any()
-            .downcast_ref::<Int8Array>()
-            .unwrap();
-        let factory = self.new_format_writer_factory_for_level(
-            build_physical_schema(&logical.schema()),
-            false,
-            level,
-        )?;
-        for offset in (0..physical.num_rows()).step_by(self.target_file_row_num) {
-            let len = self.target_file_row_num.min(physical.num_rows() - offset);
-            let indices = UInt32Array::from_iter_values((offset..offset + len).map(|i| i as u32));
-            let mut min_sequence = i64::MAX;
-            let mut max_sequence = i64::MIN;
-            let mut deletes = 0;
-            for row in offset..offset + len {
-                min_sequence = min_sequence.min(sequences.value(row));
-                max_sequence = max_sequence.max(sequences.value(row));
-                if !RowKind::from_value(kinds.value(row))?.is_add() {
-                    deletes += 1;
-                }
-            }
-            let mut file = self
-                .write_indexed_file(
-                    &logical,
-                    sequences,
-                    &indices,
-                    IndexedFileWrite {
-                        format_writer_factory: factory.as_ref(),
-                        is_changelog: false,
-                        file_prefix: &self.config.data_file_prefix,
-                        file_ordinal: self.written_files.len(),
-                        file_format: &self.config.file_format,
-                        file_compression: &self.config.file_compression,
-                        min_sequence_number: min_sequence,
-                        max_sequence_number: max_sequence,
-                        delete_row_count: deletes,
-                    },
-                )
-                .await?;
-            file.level = level;
-            file.file_source = Some(1);
-            self.written_files.push(file);
-        }
-        Ok(())
-    }
-
-    pub(super) async fn prepare_compact(&mut self, level: i32) -> Result<Vec<DataFileMeta>> {
-        self.flush_compact(level).await?;
-        Ok(std::mem::take(&mut self.written_files))
-    }
 
     /// Sort buffered data by primary key + sequence fields + auto-seq, deduplicate
     /// by merge engine, prepend _SEQUENCE_NUMBER/_VALUE_KIND, and write to a parquet file.
@@ -562,17 +376,9 @@ impl KeyValueFileWriter {
         // buffer flush. Rolled files share history only within that flush.
         let data_factory =
             self.new_format_writer_factory(build_physical_schema(&data_batch.schema()), false)?;
-        let data_sequences = data_seq.as_any().downcast_ref::<Int64Array>().unwrap();
         for offset in (0..data_indices.len()).step_by(self.target_file_row_num) {
             let len = self.target_file_row_num.min(data_indices.len() - offset);
             let file_indices = data_indices.slice(offset, len);
-            let (min_sequence_number, max_sequence_number) = file_indices
-                .values()
-                .iter()
-                .map(|&idx| data_sequences.value(idx as usize))
-                .fold((i64::MAX, i64::MIN), |(min, max), seq| {
-                    (min.min(seq), max.max(seq))
-                });
             let file = self
                 .write_indexed_file(
                     &data_batch,
@@ -581,16 +387,7 @@ impl KeyValueFileWriter {
                     IndexedFileWrite {
                         format_writer_factory: data_factory.as_ref(),
                         is_changelog: false,
-                        file_prefix: &self.config.data_file_prefix,
                         file_ordinal: self.written_files.len(),
-                        file_format: &self.config.file_format,
-                        file_compression: &self.config.file_compression,
-                        min_sequence_number,
-                        max_sequence_number,
-                        delete_row_count: Self::indexed_delete_row_count(
-                            &data_batch,
-                            &file_indices,
-                        )?,
                     },
                 )
                 .await?;
@@ -600,17 +397,9 @@ impl KeyValueFileWriter {
         if self.config.input_changelog {
             let changelog_factory =
                 self.new_format_writer_factory(build_physical_schema(&combined.schema()), true)?;
-            let input_sequences = seq_array.as_any().downcast_ref::<Int64Array>().unwrap();
             for offset in (0..sorted_indices.len()).step_by(self.target_file_row_num) {
                 let len = self.target_file_row_num.min(sorted_indices.len() - offset);
                 let file_indices = sorted_indices.slice(offset, len);
-                let (min_sequence_number, max_sequence_number) = file_indices
-                    .values()
-                    .iter()
-                    .map(|&idx| input_sequences.value(idx as usize))
-                    .fold((i64::MAX, i64::MIN), |(min, max), seq| {
-                        (min.min(seq), max.max(seq))
-                    });
                 let file = self
                     .write_indexed_file(
                         &combined,
@@ -619,16 +408,7 @@ impl KeyValueFileWriter {
                         IndexedFileWrite {
                             format_writer_factory: changelog_factory.as_ref(),
                             is_changelog: true,
-                            file_prefix: &self.config.changelog_file_prefix,
                             file_ordinal: self.written_changelog_files.len(),
-                            file_format: &self.config.changelog_file_format,
-                            file_compression: &self.config.changelog_file_compression,
-                            min_sequence_number,
-                            max_sequence_number,
-                            delete_row_count: Self::indexed_delete_row_count(
-                                &combined,
-                                &file_indices,
-                            )?,
                         },
                     )
                     .await?;
@@ -676,6 +456,8 @@ impl KeyValueFileWriter {
         })
     }
 
+    /// Materialize sorted selections into thin KV chunks. Physical file metadata,
+    /// format encoding, indexes and cleanup are owned by KeyValueDataFileWriter.
     async fn write_indexed_file(
         &self,
         batch: &RecordBatch,
@@ -685,304 +467,89 @@ impl KeyValueFileWriter {
     ) -> Result<DataFileMeta> {
         if indices.is_empty() {
             return Err(crate::Error::DataInvalid {
-                message: "Cannot write an empty key-value data file".to_string(),
+                message: "Cannot write an empty key-value data file".into(),
                 source: None,
             });
         }
-
-        let user_schema = batch.schema();
-        let first_row = indices.value(0) as usize;
-        let last_row = indices.value(indices.len() - 1) as usize;
-        let min_key = self.extract_key_binary_row(batch, first_row)?;
-        let max_key = self.extract_key_binary_row(batch, last_row)?;
-        let mut file_index = if write.is_changelog {
-            None
-        } else {
-            self.config
-                .file_index_options
-                .as_ref()
-                .map(|options| options.create_writer())
-                .transpose()?
-        };
-        let physical_schema = build_physical_schema(&user_schema);
-        let row_projection = write
-            .file_format
-            .eq_ignore_ascii_case("row")
-            .then(|| self.row_key_projection(&physical_schema))
-            .transpose()?;
-        let mut blob_references = ManagedBlobReferences::new(
-            &self.config.value_fields,
-            &CoreOptions::new(&self.config.table_options),
-            &physical_schema,
-            self.managed_blob_writer.enabled(),
-            write.is_changelog,
-        )?;
-
-        let file_name = format!(
-            "{}{}-{}.{}",
-            write.file_prefix,
-            uuid::Uuid::new_v4(),
-            write.file_ordinal,
-            write.file_format,
-        );
-        let location = self.paths.new_path(&file_name)?;
-        let bucket_dir = location.parent();
-        self.file_io.mkdirs(&format!("{bucket_dir}/")).await?;
-        let file_path = location.path.clone();
-        let output = self.file_io.new_output(&file_path)?;
-        let writer = write
-            .format_writer_factory
-            .create_writer(&output, write.file_compression)
+        let physical_schema = build_physical_schema(&batch.schema());
+        let mut file = self
+            .file_options(write.is_changelog)
+            .open(
+                &physical_schema,
+                write.format_writer_factory,
+                write.file_ordinal,
+            )
             .await?;
-        let mut writer = with_write_resources(writer, self.resources.as_ref());
+        let result = async {
+            let vk_idx = batch
+                .schema()
+                .fields()
+                .iter()
+                .position(|f| f.name() == crate::spec::VALUE_KIND_FIELD_NAME);
 
-        let vk_idx = batch
-            .schema()
-            .fields()
-            .iter()
-            .position(|f| f.name() == crate::spec::VALUE_KIND_FIELD_NAME);
+            for chunk_start in (0..indices.len()).step_by(Self::FLUSH_CHUNK_ROWS) {
+                let chunk_len = Self::FLUSH_CHUNK_ROWS.min(indices.len() - chunk_start);
+                let chunk_indices = indices.slice(chunk_start, chunk_len);
 
-        for chunk_start in (0..indices.len()).step_by(Self::FLUSH_CHUNK_ROWS) {
-            let chunk_len = Self::FLUSH_CHUNK_ROWS.min(indices.len() - chunk_start);
-            let chunk_indices = indices.slice(chunk_start, chunk_len);
-
-            let mut physical_columns: Vec<Arc<dyn Array>> = Vec::new();
-            physical_columns.push(
-                arrow_select::take::take(seq_array, &chunk_indices, None).map_err(|e| {
-                    crate::Error::DataInvalid {
-                        message: format!("Failed to reorder sequence numbers: {e}"),
-                        source: None,
-                    }
-                })?,
-            );
-
-            match vk_idx {
-                Some(vk_idx) => {
-                    physical_columns.push(
-                        arrow_select::take::take(
-                            batch.column(vk_idx).as_ref(),
-                            &chunk_indices,
-                            None,
-                        )
-                        .map_err(|e| crate::Error::DataInvalid {
-                            message: format!("Failed to reorder value kind column: {e}"),
+                let mut physical_columns: Vec<Arc<dyn Array>> = Vec::new();
+                physical_columns.push(
+                    arrow_select::take::take(seq_array, &chunk_indices, None).map_err(|e| {
+                        crate::Error::DataInvalid {
+                            message: format!("Failed to reorder sequence numbers: {e}"),
                             source: None,
-                        })?,
+                        }
+                    })?,
+                );
+
+                match vk_idx {
+                    Some(vk_idx) => {
+                        physical_columns.push(
+                            arrow_select::take::take(
+                                batch.column(vk_idx).as_ref(),
+                                &chunk_indices,
+                                None,
+                            )
+                            .map_err(|e| {
+                                crate::Error::DataInvalid {
+                                    message: format!("Failed to reorder value kind column: {e}"),
+                                    source: None,
+                                }
+                            })?,
+                        );
+                    }
+                    None => {
+                        physical_columns.push(Arc::new(Int8Array::from(vec![0i8; chunk_len])));
+                    }
+                }
+
+                for idx in 0..batch.num_columns() {
+                    if Some(idx) == vk_idx {
+                        continue;
+                    }
+                    physical_columns.push(
+                        arrow_select::take::take(batch.column(idx).as_ref(), &chunk_indices, None)
+                            .map_err(|e| crate::Error::DataInvalid {
+                                message: format!("Failed to reorder by sort indices: {e}"),
+                                source: None,
+                            })?,
                     );
                 }
-                None => {
-                    physical_columns.push(Arc::new(Int8Array::from(vec![0i8; chunk_len])));
-                }
-            }
 
-            for idx in 0..batch.num_columns() {
-                if Some(idx) == vk_idx {
-                    continue;
-                }
-                physical_columns.push(
-                    arrow_select::take::take(batch.column(idx).as_ref(), &chunk_indices, None)
-                        .map_err(|e| crate::Error::DataInvalid {
-                            message: format!("Failed to reorder by sort indices: {e}"),
-                            source: None,
-                        })?,
-                );
-            }
-
-            let chunk_batch = RecordBatch::try_new(physical_schema.clone(), physical_columns)
-                .map_err(|e| crate::Error::DataInvalid {
+                let chunk_batch = RecordBatch::try_new(physical_schema.clone(), physical_columns)
+                    .map_err(|e| crate::Error::DataInvalid {
                     message: format!("Failed to create physical batch: {e}"),
                     source: None,
                 })?;
-            if let Err(error) = ManagedBlobReferences::collect(&mut blob_references, &chunk_batch) {
-                let _ = writer.close().await;
-                let _ = self.file_io.delete_file(&file_path).await;
-                return Err(error);
+                file.write(&chunk_batch).await?;
             }
-            let row_batch = row_projection
-                .as_ref()
-                .map(|projection| projection.project(&chunk_batch))
-                .transpose()?;
-            if let Err(error) = writer
-                .write(row_batch.as_ref().unwrap_or(&chunk_batch))
-                .await
-            {
-                let _ = writer.close().await;
-                let _ = self.file_io.delete_file(&file_path).await;
-                return Err(error);
-            }
-            if let Some(index) = file_index.as_mut() {
-                // The index positions must match the physical file after PK
-                // sorting and flush-time merging. Its field positions refer
-                // to the logical value schema, so omit the two KV metadata
-                // columns from the same output chunk used by the file writer.
-                let logical_indices = (2..chunk_batch.num_columns()).collect::<Vec<_>>();
-                let index_result = chunk_batch
-                    .project(&logical_indices)
-                    .map_err(|error| crate::Error::DataInvalid {
-                        message: format!("Failed to project KV index values: {error}"),
-                        source: None,
-                    })
-                    .and_then(|logical_batch| index.write(&logical_batch));
-                if let Err(error) = index_result {
-                    let _ = writer.close().await;
-                    let _ = self.file_io.delete_file(&file_path).await;
-                    return Err(error);
-                }
-            }
+            Ok(())
         }
-
-        let write_result = match writer.close().await {
-            Ok(result) => result,
-            Err(error) => {
-                let _ = self.file_io.delete_file(&file_path).await;
-                return Err(error);
-            }
-        };
-        let file_size = write_result.file_size as i64;
-        let (value_stats, value_stats_cols) = match write_result.value_stats {
-            Some(stats) => (stats.stats, stats.columns),
-            None => (BinaryTableStats::empty(), Some(Vec::new())),
-        };
-
-        let key_columns: Vec<Arc<dyn Array>> = self
-            .config
-            .primary_key_indices
-            .iter()
-            .map(|&idx| {
-                arrow_select::take::take(batch.column(idx).as_ref(), indices, None).map_err(|e| {
-                    crate::Error::DataInvalid {
-                        message: format!("Failed to take key column for stats: {e}"),
-                        source: None,
-                    }
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let key_batch = RecordBatch::try_new(
-            Arc::new(ArrowSchema::new(
-                self.config
-                    .primary_key_indices
-                    .iter()
-                    .map(|&idx| user_schema.field(idx).clone())
-                    .collect::<Vec<_>>(),
-            )),
-            key_columns,
-        )
-        .map_err(|e| crate::Error::DataInvalid {
-            message: format!("Failed to build key batch for stats: {e}"),
-            source: None,
-        })?;
-        let stats_col_indices: Vec<usize> = (0..self.config.primary_key_indices.len()).collect();
-        let key_stats = compute_column_stats(
-            &key_batch,
-            &stats_col_indices,
-            &self.config.primary_key_types,
-        )?;
-
-        let mut meta = DataFileMeta {
-            file_name,
-            file_size,
-            row_count: indices.len() as i64,
-            min_key,
-            max_key,
-            key_stats,
-            value_stats,
-            min_sequence_number: write.min_sequence_number,
-            max_sequence_number: write.max_sequence_number,
-            schema_id: self.config.schema_id,
-            level: 0,
-            extra_files: vec![],
-            creation_time: None,
-            delete_row_count: Some(write.delete_row_count),
-            embedded_index: None,
-            file_source: Some(0), // FileSource.APPEND
-            value_stats_cols,
-            external_path: location.external_path.clone(),
-            first_row_id: None,
-            write_cols: None,
-            column_max_sequence_numbers: None,
-        };
-        if let Some(index) = file_index {
-            let index_result = index.serialize();
-            let bytes = match index_result {
-                Ok(bytes) => bytes,
-                Err(error) => {
-                    let _ = self.file_io.delete_file(&file_path).await;
-                    return Err(error);
-                }
-            };
-            let threshold = self
-                .config
-                .file_index_options
-                .as_ref()
-                .expect("file index writer must have options")
-                .in_manifest_threshold;
-            if bytes.len() as u64 > threshold as u64 {
-                let name = data_file_to_file_index_file_name(&meta.file_name);
-                let index_path = format!("{bucket_dir}/{name}");
-                let output = match self.file_io.new_output(&index_path) {
-                    Ok(output) => output,
-                    Err(error) => {
-                        let _ = self.file_io.delete_file(&file_path).await;
-                        return Err(error);
-                    }
-                };
-                if let Err(error) = output.write(bytes).await {
-                    let _ = self.file_io.delete_file(&index_path).await;
-                    let _ = self.file_io.delete_file(&file_path).await;
-                    return Err(error);
-                }
-                meta.extra_files.push(name);
-            } else {
-                meta.embedded_index = Some(bytes.to_vec());
-            }
+        .await;
+        if let Err(error) = result {
+            file.abort().await;
+            return Err(error);
         }
-
-        ManagedBlobReferences::finish(
-            blob_references,
-            &self.file_io,
-            &file_path,
-            bucket_dir,
-            &mut meta,
-        )
-        .await?;
-
-        // Java creates file metadata after the index and Blob references finish.
-        meta.creation_time = Some(crate::common::date_time::current_local_timestamp());
-        Ok(meta)
-    }
-
-    fn indexed_delete_row_count(batch: &RecordBatch, indices: &UInt32Array) -> Result<i64> {
-        let Some(vk_idx) = batch
-            .schema()
-            .fields()
-            .iter()
-            .position(|f| f.name() == crate::spec::VALUE_KIND_FIELD_NAME)
-        else {
-            return Ok(0);
-        };
-
-        let column = batch.column(vk_idx);
-        let Some(value_kinds) = column.as_any().downcast_ref::<Int8Array>() else {
-            return Err(crate::Error::DataInvalid {
-                message: "_VALUE_KIND column must be Int8".to_string(),
-                source: None,
-            });
-        };
-
-        let mut delete_count = 0;
-        for idx in 0..indices.len() {
-            let row = indices.value(idx) as usize;
-            let value = if column.is_null(row) {
-                0
-            } else {
-                value_kinds.value(row)
-            };
-            match RowKind::from_value(value)? {
-                RowKind::UpdateBefore | RowKind::Delete => delete_count += 1,
-                RowKind::Insert | RowKind::UpdateAfter => {}
-            }
-        }
-        Ok(delete_count)
+        file.close().await
     }
 
     /// Select output row indices from sorted inputs according to merge engine.
@@ -1410,25 +977,6 @@ impl KeyValueFileWriter {
             changelog_files: std::mem::take(&mut self.written_changelog_files),
         })
     }
-
-    /// Extract primary key columns from a batch at a given row index into a serialized BinaryRow.
-    fn extract_key_binary_row(&self, batch: &RecordBatch, row_idx: usize) -> Result<Vec<u8>> {
-        let num_keys = self.config.primary_key_indices.len();
-        let mut builder = BinaryRowBuilder::new(num_keys as i32);
-        for (pos, (&col_idx, data_type)) in self
-            .config
-            .primary_key_indices
-            .iter()
-            .zip(self.config.primary_key_types.iter())
-            .enumerate()
-        {
-            match extract_datum_from_arrow(batch, row_idx, col_idx, data_type)? {
-                Some(datum) => builder.write_datum(pos, &datum, data_type),
-                None => builder.set_null_at(pos),
-            }
-        }
-        Ok(builder.build_serialized())
-    }
 }
 
 /// Build the physical schema: [_SEQUENCE_NUMBER, _VALUE_KIND, user_cols (excluding _VALUE_KIND)...]
@@ -1452,57 +1000,14 @@ pub(crate) fn build_physical_schema(user_schema: &ArrowSchema) -> Arc<ArrowSchem
     Arc::new(ArrowSchema::new(physical_fields))
 }
 
-/// Describe the actual file columns while retaining logical Paimon types that
-/// Arrow cannot distinguish (for example MULTISET and MAP).
-fn build_physical_fields(
-    physical_schema: &ArrowSchema,
-    value_fields: &[DataField],
-) -> Result<Vec<DataField>> {
-    physical_schema
-        .fields()
-        .iter()
-        .map(|arrow_field| match arrow_field.name().as_str() {
-            SEQUENCE_NUMBER_FIELD_NAME => Ok(DataField::new(
-                SEQUENCE_NUMBER_FIELD_ID,
-                SEQUENCE_NUMBER_FIELD_NAME.into(),
-                DataType::BigInt(BigIntType::new()),
-            )),
-            VALUE_KIND_FIELD_NAME => Ok(DataField::new(
-                VALUE_KIND_FIELD_ID,
-                VALUE_KIND_FIELD_NAME.into(),
-                DataType::TinyInt(TinyIntType::new()),
-            )),
-            name => value_fields
-                .iter()
-                .find(|field| field.name() == name)
-                .ok_or_else(|| crate::Error::DataInvalid {
-                    message: format!(
-                        "Physical file column '{name}' is missing from the table schema"
-                    ),
-                    source: None,
-                })
-                .and_then(|field| {
-                    // The table remains logically NOT NULL, but Java's KV
-                    // value type makes non-key DELETE payloads nullable.
-                    Ok(DataField::new(
-                        field.id(),
-                        field.name().into(),
-                        field
-                            .data_type()
-                            .copy_with_nullable(arrow_field.is_nullable())?,
-                    )
-                    .with_description(field.description().map(str::to_owned))
-                    .with_default_value(field.default_value().map(str::to_owned)))
-                }),
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::io::FileIOBuilder;
-    use crate::spec::IntType;
+    use crate::spec::{
+        BigIntType, IntType, TinyIntType, KEY_FIELD_ID_START, SEQUENCE_NUMBER_FIELD_ID,
+        VALUE_KIND_FIELD_ID,
+    };
     use arrow_array::{Int32Array, RecordBatchReader, StringArray, UInt32Array};
     use std::collections::HashMap;
 
@@ -2867,30 +2372,30 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_indexed_delete_row_count_rejects_invalid_value_kind() {
-        let schema = Arc::new(ArrowSchema::new(vec![
-            Arc::new(ArrowField::new("id", ArrowDataType::Int32, false)),
-            Arc::new(ArrowField::new(
+    #[tokio::test]
+    async fn test_flush_rejects_invalid_value_kind() {
+        let batch = RecordBatch::try_from_iter([
+            ("id", Arc::new(Int32Array::from(vec![1])) as Arc<dyn Array>),
+            (
+                "value",
+                Arc::new(Int32Array::from(vec![10])) as Arc<dyn Array>,
+            ),
+            (
                 VALUE_KIND_FIELD_NAME,
-                ArrowDataType::Int8,
-                false,
-            )),
-        ]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(Int32Array::from(vec![1])) as Arc<dyn arrow_array::Array>,
-                Arc::new(Int8Array::from(vec![4])) as Arc<dyn arrow_array::Array>,
-            ],
+                Arc::new(Int8Array::from(vec![4])) as Arc<dyn Array>,
+            ),
+        ])
+        .unwrap();
+        let mut writer = KeyValueFileWriter::new(
+            FileIOBuilder::new("memory").build().unwrap(),
+            test_write_config(MergeEngine::Deduplicate),
+            0,
         )
         .unwrap();
-        let indices = UInt32Array::from(vec![0]);
-
-        let err = KeyValueFileWriter::indexed_delete_row_count(&batch, &indices).unwrap_err();
-
+        writer.write(&batch).await.unwrap();
+        let error = writer.flush().await.unwrap_err();
         assert!(
-            matches!(err, crate::Error::DataInvalid { message, .. } if message.contains("Invalid RowKind value"))
+            matches!(error, crate::Error::DataInvalid { message, .. } if message.contains("Invalid RowKind value"))
         );
     }
 

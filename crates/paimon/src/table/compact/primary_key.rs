@@ -28,8 +28,9 @@ use crate::spec::{
     VALUE_KIND_FIELD_NAME,
 };
 use crate::table::data_file_index_writer::FileIndexOptions;
+use crate::table::data_file_path_factory::DataFilePathFactory;
+use crate::table::kv_data_file_writer::{KeyValueFileOptions, KeyValueRollingWriter};
 use crate::table::kv_file_reader::{KeyValueFileReader, KeyValueReadConfig};
-use crate::table::kv_file_writer::{KeyValueFileWriter, KeyValueWriteConfig};
 use crate::table::sort_merge::{
     compare_sequence_order, BufferedBatch, MergeFunction, MergeResult, MergeRow,
 };
@@ -178,7 +179,7 @@ pub(super) async fn execute(
     let primary_key_types = primary_key_indices
         .iter()
         .map(|&i| schema.fields()[i].data_type().clone())
-        .collect();
+        .collect::<Vec<_>>();
     let partition_path = if schema.partition_keys().is_empty() {
         String::new()
     } else {
@@ -191,44 +192,42 @@ pub(super) async fn execute(
         .generate_partition_path(split.partition())?
     };
     let index = FileIndexOptions::parse(schema.options(), schema.fields())?;
-    let mut writer = KeyValueFileWriter::new(
-        table.file_io().clone(),
-        KeyValueWriteConfig {
-            table_name: table.identifier().full_name(),
-            table_options: schema.options().clone(),
-            table_location: table.location().to_string(),
-            partition_path,
-            bucket: task.bucket,
+    let paths = DataFilePathFactory::new(
+        table.location(),
+        &partition_path,
+        task.bucket,
+        schema.options(),
+    )?;
+    let file_format = options.file_format();
+    let mut writer = KeyValueRollingWriter::new(
+        KeyValueFileOptions {
+            file_io: table.file_io(),
+            paths: &paths,
+            table_options: schema.options(),
+            value_fields: schema.fields(),
+            primary_key_indices: &primary_key_indices,
+            primary_key_types: &primary_key_types,
             schema_id: schema.id(),
-            file_compression: options.file_compression().to_string(),
+            file_format: &file_format,
+            file_prefix: options.data_file_prefix(),
+            file_compression: options.file_compression(),
             file_compression_zstd_level: options.file_compression_zstd_level(),
-            // Bound staging independently of bucket size. Output remains key ordered
-            // across flushes, and each key group is emitted only once by the merge.
-            write_buffer_size: (options.write_buffer_size()? as i64)
-                .min(options.target_file_size()),
-            file_format: options.file_format(),
-            data_file_prefix: options.data_file_prefix().to_string(),
-            input_changelog: false,
-            changelog_file_prefix: options.changelog_file_prefix().to_string(),
-            changelog_file_compression: options.changelog_file_compression().to_string(),
-            changelog_file_format: options.changelog_file_format(),
-            primary_keys: schema.primary_keys().to_vec(),
-            primary_key_indices,
-            primary_key_types,
-            value_fields: schema.fields().to_vec(),
-            sequence_field_indices: vec![], // Input is already merged; sequence fields are ordinary values.
-            merge_engine,
-            file_index_options: index.map(Arc::new),
+            write_buffer_size: options.write_buffer_size()? as i64,
+            level: task.output_level(),
+            file_source: 1,
+            is_changelog: false,
+            index_options: index.as_ref(),
+            managed_blob_enabled: false,
+            resources: resources.as_ref(),
         },
-        0,
-    )?
-    .with_resources(resources);
-    let level = task.output_level();
+        options.target_file_size(),
+        options.target_file_row_num()?,
+    );
     let result = async {
         while let Some(batch) = batches.try_next().await? {
-            writer.write_compact(&batch, level).await?;
+            writer.write(&batch).await?;
         }
-        writer.prepare_compact(level).await
+        writer.prepare_commit().await
     }
     .await;
     if result.is_err() {

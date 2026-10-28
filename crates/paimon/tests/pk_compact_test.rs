@@ -113,6 +113,98 @@ async fn execute(table: &Table, plan: &CompactPlan) -> Vec<CompactResult> {
 }
 
 #[tokio::test]
+async fn pk_compaction_flushes_small_buffers_without_fragmenting_files() {
+    for format in ["parquet", "orc", "avro", "row"] {
+        let table = table(&[
+            ("file.format", format),
+            ("file.compression", "none"),
+            ("read.batch-size", "1"),
+            ("write-buffer-size", "1b"),
+            ("target-file-size", "256mb"),
+            ("file-index.bitmap.columns", "id"),
+        ])
+        .await;
+        write_batch(
+            &table,
+            &make_batch(vec![1, 2, 3, 4, 5], vec![10, 20, 30, 40, 50]),
+        )
+        .await;
+        let builder = table.new_compact_builder();
+        let plan = builder.new_planner().unwrap().plan().await.unwrap();
+        assert_eq!(plan.tasks()[0].files().len(), 1);
+        let before = sequences(&table).await;
+        let results = execute(&table, &plan).await;
+        assert_eq!(
+            results[0].files().len(),
+            1,
+            "{format}: a buffer flush must not close the file"
+        );
+        let file = &results[0].files()[0];
+        for (bytes, expected) in [
+            (file.key_stats.min_values(), 1),
+            (file.key_stats.max_values(), 5),
+            (file.min_key.as_slice(), 1),
+            (file.max_key.as_slice(), 5),
+        ] {
+            let key = paimon::spec::BinaryRow::from_serialized_bytes(bytes).unwrap();
+            assert_eq!(key.get_int(0).unwrap(), expected, "{format}");
+        }
+        assert_eq!(file.key_stats.null_counts(), &[Some(0)]);
+        assert!(file.embedded_index.is_some());
+        builder
+            .new_commit()
+            .unwrap()
+            .commit_compact(results)
+            .await
+            .unwrap();
+        assert_eq!(
+            rows(&table).await,
+            vec![(1, 10), (2, 20), (3, 30), (4, 40), (5, 50)]
+        );
+        assert_eq!(sequences(&table).await, before);
+        let mut reader = table.new_read_builder();
+        reader.with_filter(
+            PredicateBuilder::new(table.schema().fields())
+                .equal("id", Datum::Int(3))
+                .unwrap(),
+        );
+        let plan = reader.new_scan().plan().await.unwrap();
+        let batches: Vec<RecordBatch> = reader
+            .new_read()
+            .unwrap()
+            .to_arrow(plan.splits())
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(
+            batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+            1,
+            "{format}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn pk_compaction_rolls_by_bytes_without_a_row_limit() {
+    let table = table(&[("target-file-size", "1b"), ("read.batch-size", "1")]).await;
+    write_batch(&table, &make_batch(vec![1, 2, 3], vec![10, 20, 30])).await;
+    let builder = table.new_compact_builder();
+    let plan = builder.new_planner().unwrap().plan().await.unwrap();
+    assert_eq!(plan.tasks()[0].files().len(), 1);
+    let results = execute(&table, &plan).await;
+    assert_eq!(results[0].files().len(), 3);
+    assert!(results[0].files().iter().all(|file| file.row_count == 1));
+    builder
+        .new_commit()
+        .unwrap()
+        .commit_compact(results)
+        .await
+        .unwrap();
+    assert_eq!(rows(&table).await, vec![(1, 10), (2, 20), (3, 30)]);
+}
+
+#[tokio::test]
 async fn pk_compaction_merges_versions_and_preserves_sequences_deletes_and_history() {
     for format in ["parquet", "orc", "avro", "row"] {
         let table = table(&[
@@ -339,9 +431,10 @@ async fn pk_compaction_keeps_writes_committed_after_planning_and_rejects_competi
 async fn pk_compaction_rolls_ordered_files_and_rebuilds_indexes_with_level_stats() {
     let table = table(&[
         ("target-file-row-num", "2"),
-        ("read.batch-size", "2"),
+        ("read.batch-size", "4"),
         ("write-buffer-size", "64 B"),
         ("file-index.bitmap.columns", "id"),
+        ("file-index.in-manifest-threshold", "0"),
         ("metadata.stats-mode-per-level", "0:none,1:full"),
     ])
     .await;
@@ -359,7 +452,7 @@ async fn pk_compaction_rolls_ordered_files_and_rebuilds_indexes_with_level_stats
     let builder = table.new_compact_builder();
     let plan = builder.new_planner().unwrap().plan().await.unwrap();
     let results = execute(&table, &plan).await;
-    assert!(results[0].files().len() >= 3);
+    assert_eq!(results[0].files().len(), 3);
     assert!(results[0].files().iter().all(|file| file.level == 1
         && file.row_count <= 2
         && (file.embedded_index.is_some() || !file.extra_files.is_empty())

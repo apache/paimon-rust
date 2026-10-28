@@ -129,10 +129,18 @@ The engine's logical merged state remains unchanged. Physical record counts and
 retained retract records. Append and input-changelog incremental reads do not
 emit new logical events for a compaction snapshot.
 
-PK rewrites flush merged batches once estimated Arrow bytes reach the smaller
-of `write-buffer-size` and `target-file-size`, then write ordered files subject
-to `target-file-row-num`. Batches stay intact, so this is an approximate staging
-target independent of total bucket size, not an encoded-file-size limit. The merge currently supports
+PK rewrites stream ordered physical KV batches into the same low-level file
+writer used by ordinary PK writes. Sequence allocation and merge buffering stay
+in the ordinary write path. Key bounds, sequence bounds, statistics and indexes
+are collected incrementally without retaining all rows of an output file.
+`write-buffer-size` flushes format buffers. Parquet, ORC, Avro and ROW keep the
+same output file open across these flushes. Formats that retain their pending
+rows after flushing (Mosaic/Vortex) close the file at the buffer threshold to
+preserve bounded memory. Files also roll when the format's approximate byte
+count reaches `target-file-size` or the row count reaches `target-file-row-num`.
+Output chunks are materialized at row limits to avoid retaining and repeatedly
+charging the entire source batch for small slices.
+The merge currently supports
 up to 256 overlapping sorted-run inputs, matching the query reader's limit.
 There is no multipass merge yet; too many overlapping runs fail without
 publishing a snapshot. The captured snapshot must remain available until each
