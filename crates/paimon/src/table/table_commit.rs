@@ -2722,8 +2722,7 @@ impl TableCommit {
         }
         let comparator = super::merge_tree_split_generator::KeyComparator::from_table_schema(
             self.table.schema(),
-        )
-        .map(|comparator| comparator.with_java_nan_order());
+        );
         let active = merge_active_entries(base.iter().chain(delta).cloned().collect());
         let mut levels = HashMap::<_, Vec<DataFileMeta>>::new();
         for entry in active {

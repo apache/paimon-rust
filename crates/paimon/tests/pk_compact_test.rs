@@ -145,44 +145,6 @@ async fn pk_compaction_rejects_concurrent_overlapping_positive_level_files() {
 }
 
 #[tokio::test]
-async fn pk_compaction_accepts_disjoint_nan_and_finite_output_ranges() {
-    let schema = Schema::builder()
-        .column("id", DataType::Double(paimon::spec::DoubleType::new()))
-        .column("value", DataType::Int(IntType::new()))
-        .primary_key(["id"])
-        .option("bucket", "1")
-        .option("target-file-row-num", "1")
-        .build()
-        .unwrap();
-    let table = table_with_schema(TableSchema::new(0, &schema)).await;
-    let batch = RecordBatch::try_from_iter([
-        (
-            "id",
-            std::sync::Arc::new(arrow_array::Float64Array::from(vec![1.0, f64::NAN]))
-                as arrow_array::ArrayRef,
-        ),
-        (
-            "value",
-            std::sync::Arc::new(Int32Array::from(vec![10, 20])) as arrow_array::ArrayRef,
-        ),
-    ])
-    .unwrap();
-    write_batch(&table, &batch).await;
-    let builder = table.new_compact_builder();
-    let plan = builder.new_planner().unwrap().plan().await.unwrap();
-    let results = execute(&table, &plan).await;
-    assert_eq!(results[0].files().len(), 2);
-    builder
-        .new_commit()
-        .unwrap()
-        .commit_compact(results)
-        .await
-        .unwrap();
-    let batches = read(&table, None).await;
-    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
-}
-
-#[tokio::test]
 async fn pk_compaction_flushes_small_buffers_without_fragmenting_files() {
     for format in ["parquet", "orc", "avro", "row"] {
         let table = table(&[

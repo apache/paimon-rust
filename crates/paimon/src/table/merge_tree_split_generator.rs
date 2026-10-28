@@ -38,7 +38,6 @@ use std::cmp::{self, Ordering};
 /// be decoded before comparing.
 pub(crate) struct KeyComparator {
     key_types: Vec<DataType>,
-    java_nan_order: bool,
 }
 
 /// A decoded key: one `Option<Datum>` per trimmed primary-key field
@@ -47,17 +46,7 @@ type DecodedKey = Vec<Option<Datum>>;
 
 impl KeyComparator {
     pub(crate) fn new(key_types: Vec<DataType>) -> Self {
-        Self {
-            key_types,
-            java_nan_order: false,
-        }
-    }
-
-    /// Commit validation follows Java's NaN identity/order. Scan packing keeps
-    /// NaN files separate because Arrow physical key encodings retain payloads.
-    pub(crate) fn with_java_nan_order(mut self) -> Self {
-        self.java_nan_order = true;
-        self
+        Self { key_types }
     }
 
     /// Build a comparator over a table's trimmed primary keys, matching the
@@ -84,9 +73,10 @@ impl KeyComparator {
     }
 
     /// Decode a serialized min/max key. Returns `None` when the key is empty,
-    /// malformed or uses NaN in scan mode, letting callers treat everything as
-    /// overlapping. Commit mode canonicalizes NaN above positive infinity,
-    /// matching Java Float.compare/Double.compare.
+    /// malformed, or contains NaN, letting callers degrade to the safe "treat
+    /// everything as overlapping" path instead of failing the scan. NaN must
+    /// not compare equal to finite values: for composite keys that would let
+    /// later fields separate ranges which actually overlap.
     fn decode(&self, key: &[u8]) -> Option<DecodedKey> {
         if key.is_empty() {
             return None;
@@ -101,12 +91,6 @@ impl KeyComparator {
             .map(|(pos, dt)| {
                 let datum = row.get_datum(pos, dt).ok()?;
                 match datum {
-                    Some(Datum::Float(value)) if value.is_nan() && self.java_nan_order => {
-                        Some(Some(Datum::Float(f32::NAN)))
-                    }
-                    Some(Datum::Double(value)) if value.is_nan() && self.java_nan_order => {
-                        Some(Some(Datum::Double(f64::NAN)))
-                    }
                     Some(Datum::Float(value)) if value.is_nan() => None,
                     Some(Datum::Double(value)) if value.is_nan() => None,
                     _ => Some(datum),
@@ -117,8 +101,8 @@ impl KeyComparator {
 }
 
 /// Compare decoded keys field-by-field. NULL sorts first; floating-point
-/// values preserve the Java key ordering of -0 before +0. NaN keys have already
-/// been canonicalized during decoding.
+/// values preserve the Java key ordering of -0 before +0. NaN keys are rejected
+/// during decoding so unordered values never reach this comparator.
 /// Binary keys use unsigned lexicographic order, matching the generated Java
 /// key comparator and the on-disk row order.
 fn compare_decoded(a: &DecodedKey, b: &DecodedKey) -> Ordering {
@@ -691,31 +675,6 @@ mod tests {
             let runs = pack_sorted_runs(files, &comparator);
             assert_eq!(runs.len(), 2, "overlapping files cannot be concatenated");
         }
-    }
-
-    #[test]
-    fn nan_ranges_use_java_order_and_canonicalize_payloads() {
-        let comparator = KeyComparator::new(vec![DataType::Double(crate::spec::DoubleType::new())])
-            .with_java_nan_order();
-        let file = |name: &str, value: f64| {
-            let mut file = keyed_file(name, 0, 0, 100, 1);
-            let mut key = BinaryRowBuilder::new(1);
-            key.write_double(0, value);
-            file.min_key = key.build_serialized();
-            file.max_key = file.min_key.clone();
-            file
-        };
-        let finite = file("finite", f64::INFINITY);
-        let nan = file("nan", f64::NAN);
-        let negative_nan = file("negative-nan", f64::from_bits(0xfff8_0000_0000_0001));
-        assert_eq!(
-            interval_partition(vec![nan.clone(), finite], &comparator).len(),
-            2
-        );
-        assert_eq!(
-            interval_partition(vec![nan, negative_nan], &comparator)[0].len(),
-            2
-        );
     }
 
     #[test]
