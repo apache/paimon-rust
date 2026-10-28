@@ -16,7 +16,7 @@
 // under the License.
 
 //! Compare certified and exhaustive FTS on the same local table and snapshot.
-//! cargo run --release -p paimon --example full_text_top_k_benchmark -- [rows] [iterations] [k] [rows-per-shard]
+//! cargo run --release -p paimon --features internal-api --example full_text_top_k_benchmark -- [rows] [iterations] [k] [rows-per-shard]
 
 use arrow_array::{RecordBatch, StringArray};
 use arrow_schema::{DataType as ArrowType, Field, Schema as ArrowSchema};
@@ -31,18 +31,19 @@ use std::sync::Arc;
 use std::time::Instant;
 
 async fn search(table: &Table, enabled: bool, k: usize) -> paimon::Result<ScoredRowIds> {
-    table
-        .copy_with_options(HashMap::from([(
-            "full-text-index.top-k.enabled".into(),
-            enabled.to_string(),
-        )]))
-        .new_full_text_search_builder()
+    let mut builder = table.new_full_text_search_builder();
+    builder
         .with_text_column("body")
         .with_query_text("paimon")
-        .with_limit(k)
-        .execute()
-        .await?
-        .into_row_ids()
+        .with_limit(k);
+    let reader = builder.new_read()?;
+    let plan = builder.new_scan()?.scan().await?;
+    let result = if enabled {
+        reader.read(plan).await?
+    } else {
+        paimon::table::internal::read_full_text_exhaustive(&reader, plan).await?
+    };
+    result.into_row_ids()
 }
 
 fn percentile(samples: &mut [f64], percentile: usize) -> f64 {

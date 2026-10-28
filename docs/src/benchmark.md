@@ -312,7 +312,7 @@ snapshot. It checks exact row IDs and scores, alternates execution order, and
 reports latency for distinct-score and boundary-tie corpora. See the
 [benchmark protocol](https://github.com/apache/paimon-rust/tree/main/benchmarks/full-text).
 
-The optimization is enabled by default through `full-text-index.top-k.enabled`.
-It applies only to FAST-mode global searches with disjoint index ranges and no
-raw sources or deletion exclusions. Other paths and boundary ties retain
-exhaustive evaluation. Set the option to `false` to compare the original path.
+The optimization is selected automatically for FAST-mode global searches with
+disjoint index ranges and no raw sources or deletion exclusions. Other paths and boundary ties retain
+exhaustive evaluation. The benchmark uses an internal reference reader to compare
+against exhaustive candidate collection without adding a table option.

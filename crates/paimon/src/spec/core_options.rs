@@ -1061,24 +1061,6 @@ impl<'a> CoreOptions<'a> {
         self.index_search_mode(FULL_TEXT_INDEX_SEARCH_MODE_OPTION)
     }
 
-    /// Allow certified per-shard Top-K when global full-text reads need no
-    /// post-search exclusions. Disable to compare against exhaustive collection.
-    pub fn full_text_index_top_k_enabled(&self) -> crate::Result<bool> {
-        match self
-            .options
-            .get("full-text-index.top-k.enabled")
-            .map(String::as_str)
-        {
-            None | Some("true") => Ok(true),
-            Some("false") => Ok(false),
-            Some(value) => Err(crate::Error::ConfigInvalid {
-                message: format!(
-                    "Option 'full-text-index.top-k.enabled' must be true or false, got: {value}"
-                ),
-            }),
-        }
-    }
-
     fn index_search_mode(&self, family_option: &str) -> crate::Result<GlobalIndexSearchMode> {
         let (option, value) = if let Some(value) = self.options.get(family_option) {
             (family_option, value)
@@ -1213,20 +1195,21 @@ impl<'a> CoreOptions<'a> {
         Ok(value)
     }
 
-    /// Maximum retained serialized sort keys, excluding the active Arrow batch,
-    /// format-writer buffers and the two keys used by a disk merge.
-    pub fn sorted_index_sort_memory(&self) -> crate::Result<usize> {
+    /// Write buffer budget, matching Java `CoreOptions.WRITE_BUFFER_SIZE`.
+    /// Sorted global-index builds use it for retained serialized sort keys,
+    /// excluding the active Arrow batch, writer buffers and disk-merge keys.
+    pub fn write_buffer_size(&self) -> crate::Result<usize> {
         let raw = self
             .options
-            .get("sorted-index.sort-memory")
+            .get("write-buffer-size")
             .map(String::as_str)
-            .unwrap_or("64mb");
+            .unwrap_or("256mb");
         let bytes = parse_memory_size(raw)
             .and_then(|size| usize::try_from(size).ok())
             .filter(|size| *size > 0);
         bytes.ok_or_else(|| crate::Error::ConfigInvalid {
             message: format!(
-                "Option 'sorted-index.sort-memory' must be a positive memory size, got: {raw}"
+                "Option 'write-buffer-size' must be a positive memory size, got: {raw}"
             ),
         })
     }

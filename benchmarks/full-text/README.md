@@ -25,7 +25,8 @@ checks exact row IDs and scores on every run, warms both modes, alternates their
 execution order, and emits JSON with every sample plus p50 and p95 latency.
 
 ```bash
-cargo run --release --locked -p paimon --example full_text_top_k_benchmark -- \
+cargo run --release --locked -p paimon --features internal-api \
+  --example full_text_top_k_benchmark -- \
   10000 10 10 2500
 ```
 
@@ -35,8 +36,9 @@ The `skewed` corpus gives each shard distinct high scores followed by many commo
 low-score matches. The `tied` corpus has identical text in every row and exercises
 the exhaustive fallback required by Paimon's row-ID tie-break.
 
-`full-text-index.top-k.enabled=false` selects exhaustive candidate collection;
-its default is `true`. The fast path is limited to FAST-mode global full-text
+The benchmark uses the `internal-api` feature's exhaustive reference reader for
+the baseline. Production searches select the optimization automatically without
+a table option. The fast path is limited to FAST-mode global full-text
 reads over disjoint index row ranges, with no raw-data sources, deletion vectors
 or later deletion exclusions. Native search still evaluates the complete query
 DSL and applies its allow-list before selecting candidates. A shard requests

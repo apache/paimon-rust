@@ -1120,7 +1120,9 @@ async fn certified_top_k_preserves_local_and_scheduled_filtered_results() {
                             .map(|id| "paimon ".repeat(8 - id % 4))
                             .collect::<Vec<_>>(),
                     )),
-                    Arc::new(StringArray::from(vec!["keep"; 8])),
+                    Arc::new(StringArray::from(vec![
+                        "drop", "keep", "keep", "keep", "drop", "keep", "keep", "keep",
+                    ])),
                     Arc::new(Int32Array::from(vec![0; 8])),
                 ],
             )
@@ -1136,22 +1138,32 @@ async fn certified_top_k_preserves_local_and_scheduled_filtered_results() {
     let filter = PredicateBuilder::new(table.schema().fields())
         .equal("label", Datum::String("keep".into()))
         .unwrap();
-    let exhaustive = table.copy_with_options(HashMap::from([(
-        "full-text-index.top-k.enabled".into(),
-        "false".into(),
-    )]));
-    let expected = query(&exhaustive)
-        .with_filter(filter.clone())
-        .with_limit(2)
-        .execute()
-        .await
-        .unwrap()
-        .into_row_ids()
-        .unwrap();
     let mut builder = query(&table);
     builder.with_filter(filter).with_limit(2);
     let read = builder.new_read().unwrap();
     let plan = builder.new_scan().unwrap().scan().await.unwrap();
+    let exhaustive = CandidateCountExecutor {
+        inner: WireExecutor {
+            table: table.clone(),
+            work: Default::default(),
+            batch_sizes: Default::default(),
+            corrupt_scores: false,
+        },
+        expected_candidates: 3,
+    };
+    let expected = read
+        .read_exhaustive(plan.clone(), Some(&exhaustive))
+        .await
+        .unwrap()
+        .into_row_ids()
+        .unwrap();
+    assert!(exhaustive
+        .inner
+        .work
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|task| task["payload"]["top_k"].is_null()));
     let local = read
         .read(plan.clone())
         .await
@@ -1164,7 +1176,10 @@ async fn certified_top_k_preserves_local_and_scheduled_filtered_results() {
         batch_sizes: Default::default(),
         corrupt_scores: false,
     };
-    let checked = BoundedExecutor { inner: executor };
+    let checked = CandidateCountExecutor {
+        inner: executor,
+        expected_candidates: 2,
+    };
     let remote = read
         .read_with_executor(plan, &checked)
         .await
@@ -1179,12 +1194,13 @@ async fn certified_top_k_preserves_local_and_scheduled_filtered_results() {
     assert!(work.iter().all(|task| task["payload"]["top_k"] == 2));
 }
 
-struct BoundedExecutor {
+struct CandidateCountExecutor {
     inner: WireExecutor,
+    expected_candidates: usize,
 }
 
 #[async_trait::async_trait]
-impl crate::table::SearchTaskExecutor for BoundedExecutor {
+impl crate::table::SearchTaskExecutor for CandidateCountExecutor {
     async fn execute(
         &self,
         tasks: Vec<crate::table::SearchTask>,
@@ -1195,8 +1211,8 @@ impl crate::table::SearchTaskExecutor for BoundedExecutor {
             let value: serde_json::Value = serde_json::from_slice(&result.serialize()?).unwrap();
             assert_eq!(
                 value["payload"]["row_ids"].as_array().unwrap().len(),
-                2,
-                "worker must return bounded hits"
+                self.expected_candidates,
+                "worker must return the expected candidate count"
             );
         }
         Ok(results)

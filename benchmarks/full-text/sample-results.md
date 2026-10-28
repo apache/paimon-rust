@@ -20,7 +20,8 @@ under the License.
 # Local full-text Top-K sample
 
 - Date: 2026-10-28.
-- Source: base `016731e4` plus the accompanying certified Top-K change.
+- Source: `87dc89ca`, before moving the exhaustive comparison to the internal
+  benchmark reader. The raw timings below describe that revision.
 - Compiler: Rust 1.98.0, Cargo release profile.
 - Machine: Apple M4 Pro, 48 GiB RAM, macOS 27.0.1.
 - Storage: temporary local filesystem; both modes warmed before measurement.
@@ -28,9 +29,13 @@ under the License.
   with alternating order. Every run asserts identical IDs and scores.
 
 ```bash
-cargo run --release --locked -p paimon --example full_text_top_k_benchmark -- \
+cargo run --release --locked -p paimon --features internal-api \
+  --example full_text_top_k_benchmark -- \
   100000 20 10 25000
 ```
+
+The command above uses the current internal benchmark entry; the original
+measurement selected the same exhaustive and certified collectors via a table option.
 
 | Corpus | Exhaustive p50 | Certified p50 | Exhaustive p95 | Certified p95 |
 | --- | ---: | ---: | ---: | ---: |

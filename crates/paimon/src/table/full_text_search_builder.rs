@@ -259,6 +259,7 @@ struct FullTextSearchEvaluation<'a> {
     partition_filter: Option<&'a Predicate>,
     row_filter: Option<&'a Predicate>,
     source_splits: Option<&'a [crate::table::SearchScanSplit]>,
+    allow_top_k: bool,
 }
 
 #[cfg(test)]
@@ -364,7 +365,7 @@ async fn evaluate_full_text_search_with_executor(
         )?;
         // Raw fallback can replace indexed hits, and deletion vectors are applied
         // after the shard searches. Those paths require exhaustive candidates.
-        let top_k = (core_options.full_text_index_top_k_enabled()?
+        let top_k = (evaluation.allow_top_k
             && search_mode == GlobalIndexSearchMode::Fast
             && deleted_row_index.is_none()
             && !core_options.deletion_vectors_enabled()
@@ -1039,6 +1040,7 @@ mod tests {
                 partition_filter: None,
                 row_filter: None,
                 source_splits: None,
+                allow_top_k: true,
             },
             &[],
             &search,
@@ -1195,6 +1197,7 @@ mod tests {
                 partition_filter: None,
                 row_filter: None,
                 source_splits: None,
+                allow_top_k: true,
             },
             &[entry],
             &search,
@@ -1282,6 +1285,7 @@ mod tests {
                 partition_filter: None,
                 row_filter: None,
                 source_splits: None,
+                allow_top_k: true,
             },
             &[entry, missing_empty_filter_entry],
             &search,
