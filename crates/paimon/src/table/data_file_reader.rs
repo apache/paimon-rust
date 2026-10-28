@@ -698,23 +698,8 @@ impl DataFileReader {
 
         let target_schema = crate::arrow::build_read_arrow_schema(&read_type)?;
         // What the reader is asked for.
-        let projected_read_fields: Vec<DataField> = if data_fields.is_some()
-            || file_meta.write_cols.is_some()
-            || read_type.iter().any(contains_selected_map)
-        {
-            read_data_fields_for_format(
-                &data_schema_fields,
-                &read_type,
-                self.nested_field_enabled,
-                file_meta.file_name.ends_with(".parquet"),
-            )?
-        } else {
-            read_type
-                .iter()
-                .filter(|field| field.name() != ROW_ID_FIELD_NAME)
-                .cloned()
-                .collect()
-        };
+        let projected_read_fields =
+            read_data_fields(&data_schema_fields, &read_type, self.nested_field_enabled)?;
         let path_to_read = split.data_file_path(&file_meta);
         let configured_reader = create_format_reader_with_budget(
             &path_to_read,
@@ -771,17 +756,9 @@ impl DataFileReader {
             // The decoded batch is described by `format_read_fields`, so map
             // `read_type` onto *that* list: its entries carry the types the columns
             // actually come back as, which is what reconciling them needs.
-            let (index_mapping, source_fields) = if data_fields.is_some()
-                || file_meta.write_cols.is_some()
-                || read_type.iter().any(contains_selected_map)
-            {
-                (
-                    create_index_mapping(&read_type, &format_read_fields),
-                    Some(format_read_fields.clone()),
-                )
-            } else {
-                (None, None)
-            };
+            let source_fields = projected_source_fields(&format_read_fields, &projected_read_fields);
+            let index_mapping = create_index_mapping(&read_type, &source_fields);
+            let source_fields = Some(source_fields);
 
             let input_file = file_io.new_input(&read_path)?;
             let open_start = read_timing.as_ref().map(|_| Instant::now());
@@ -1031,23 +1008,8 @@ impl DataFileReader {
         let file_fields = data_fields.clone().unwrap_or_else(|| table_fields.clone());
         let data_schema_fields = self.physical_data_fields(&file_meta, &file_fields, None)?;
         // What the reader is asked for.
-        let projected_read_fields: Vec<DataField> = if data_fields.is_some()
-            || file_meta.write_cols.is_some()
-            || read_type.iter().any(contains_selected_map)
-        {
-            read_data_fields_for_format(
-                &data_schema_fields,
-                &read_type,
-                self.nested_field_enabled,
-                file_meta.file_name.ends_with(".parquet"),
-            )?
-        } else {
-            read_type
-                .iter()
-                .filter(|field| field.name() != ROW_ID_FIELD_NAME)
-                .cloned()
-                .collect()
-        };
+        let projected_read_fields =
+            read_data_fields(&data_schema_fields, &read_type, self.nested_field_enabled)?;
         let path_to_read = split.data_file_path(&file_meta);
         let configured_reader = create_format_reader_with_budget(
             &path_to_read,
@@ -1066,17 +1028,9 @@ impl DataFileReader {
         // The decoded batch is described by `format_read_fields`, so map
         // `read_type` onto *that* list: its entries carry the types the columns
         // actually come back as, which is what reconciling them needs.
-        let (index_mapping, source_fields) = if data_fields.is_some()
-            || file_meta.write_cols.is_some()
-            || read_type.iter().any(contains_selected_map)
-        {
-            (
-                create_index_mapping(&read_type, &format_read_fields),
-                Some(format_read_fields.clone()),
-            )
-        } else {
-            (None, None)
-        };
+        let source_fields = projected_source_fields(&format_read_fields, &projected_read_fields);
+        let index_mapping = create_index_mapping(&read_type, &source_fields);
+        let source_fields = Some(source_fields);
 
         // Remap predicates from table-level to file-level indices.
         let file_predicates = {
@@ -1297,11 +1251,6 @@ fn project_file_batch(
     })
 }
 
-fn contains_selected_map(field: &DataField) -> bool {
-    crate::spec::is_map_selected_keys_field(field)
-        || matches!(field.data_type(), DataType::Row(row) if row.fields().iter().any(contains_selected_map))
-}
-
 fn row_tracking_sequence_column(
     physical: Option<&Arc<dyn Array>>,
     max_sequence_number: i64,
@@ -1327,25 +1276,55 @@ fn row_tracking_sequence_column(
     ))))
 }
 
-#[cfg(test)]
+/// Fallback formats decode complete roots. Keep the decoder's actual types,
+/// but do not resurrect descendants omitted by Java-compatible schema pruning.
+fn projected_source_fields(decoded: &[DataField], projected: &[DataField]) -> Vec<DataField> {
+    decoded
+        .iter()
+        .filter_map(|source| {
+            let projected = projected.iter().find(|field| field.id() == source.id())?;
+            Some(data_field_with_type(
+                source,
+                projected_source_type(source.data_type(), projected.data_type()),
+            ))
+        })
+        .collect()
+}
+
+fn projected_source_type(decoded: &DataType, projected: &DataType) -> DataType {
+    // Synthetic ROW children describe extraction instructions, not physical
+    // field IDs. Reconciliation must see the decoder's VARIANT/MAP context.
+    if is_variant_extraction_row_type(projected) {
+        return decoded.clone();
+    }
+    match (decoded, projected) {
+        (DataType::Row(source), DataType::Row(target)) => {
+            DataType::Row(crate::spec::RowType::with_nullable(
+                decoded.is_nullable(),
+                projected_source_fields(source.fields(), target.fields()),
+            ))
+        }
+        (DataType::Array(source), DataType::Array(target)) => {
+            DataType::Array(crate::spec::ArrayType::with_nullable(
+                decoded.is_nullable(),
+                projected_source_type(source.element_type(), target.element_type()),
+            ))
+        }
+        (DataType::Map(source), DataType::Map(target)) => {
+            DataType::Map(crate::spec::MapType::with_nullable(
+                decoded.is_nullable(),
+                projected_source_type(source.key_type(), target.key_type()),
+                projected_source_type(source.value_type(), target.value_type()),
+            ))
+        }
+        _ => decoded.clone(),
+    }
+}
+
 fn read_data_fields(
     all_data_fields: &[DataField],
     expected_fields: &[DataField],
     nested_field_enabled: bool,
-) -> crate::Result<Vec<DataField>> {
-    read_data_fields_for_format(
-        all_data_fields,
-        expected_fields,
-        nested_field_enabled,
-        false,
-    )
-}
-
-fn read_data_fields_for_format(
-    all_data_fields: &[DataField],
-    expected_fields: &[DataField],
-    nested_field_enabled: bool,
-    prune_map_values: bool,
 ) -> crate::Result<Vec<DataField>> {
     let mut read_fields = Vec::new();
     for data_field in all_data_fields {
@@ -1353,11 +1332,10 @@ fn read_data_fields_for_format(
             .iter()
             .find(|field| field.id() == data_field.id())
         {
-            if let Some(pruned_type) = prune_data_type_for_format(
+            if let Some(pruned_type) = prune_data_type(
                 expected.data_type(),
                 data_field.data_type(),
                 nested_field_enabled,
-                prune_map_values,
             )? {
                 let mut field = data_field_with_type(data_field, pruned_type);
                 if crate::spec::is_map_selected_keys_field(expected) {
@@ -1393,39 +1371,49 @@ fn is_physical_system_field(field: &DataField) -> bool {
     )
 }
 
-#[cfg(test)]
 fn prune_data_type(
     read_type: &DataType,
     data_type: &DataType,
     nested_field_enabled: bool,
 ) -> crate::Result<Option<DataType>> {
-    prune_data_type_for_format(read_type, data_type, nested_field_enabled, false)
-}
-
-fn prune_data_type_for_format(
-    read_type: &DataType,
-    data_type: &DataType,
-    nested_field_enabled: bool,
-    prune_map_values: bool,
-) -> crate::Result<Option<DataType>> {
     match read_type {
-        DataType::Map(read_map) if prune_map_values => {
+        DataType::Array(read_array) => {
+            let DataType::Array(data_array) = data_type else {
+                return Ok(Some(data_type.clone()));
+            };
+            Ok(prune_data_type(
+                read_array.element_type(),
+                data_array.element_type(),
+                nested_field_enabled,
+            )?
+            .map(|element| {
+                DataType::Array(crate::spec::ArrayType::with_nullable(
+                    data_type.is_nullable(),
+                    element,
+                ))
+            }))
+        }
+        DataType::Map(read_map) => {
             let DataType::Map(data_map) = data_type else {
                 return Ok(Some(data_type.clone()));
             };
-            // Keep file field IDs and ordering; reconciliation handles renames.
-            let value = prune_data_type_for_format(
+            let key = prune_data_type(
+                read_map.key_type(),
+                data_map.key_type(),
+                nested_field_enabled,
+            )?;
+            let value = prune_data_type(
                 read_map.value_type(),
                 data_map.value_type(),
-                true,
-                true,
-            )?
-            .unwrap_or_else(|| data_map.value_type().clone());
-            Ok(Some(DataType::Map(crate::spec::MapType::with_nullable(
-                data_type.is_nullable(),
-                data_map.key_type().clone(),
-                value,
-            ))))
+                nested_field_enabled,
+            )?;
+            Ok(key.zip(value).map(|(key, value)| {
+                DataType::Map(crate::spec::MapType::with_nullable(
+                    data_type.is_nullable(),
+                    key,
+                    value,
+                ))
+            }))
         }
         DataType::Row(read_row) if is_variant_extraction_row_type(read_type) => {
             Ok(Some(DataType::Row(read_row.clone())))
@@ -1434,12 +1422,8 @@ fn prune_data_type_for_format(
             let DataType::Row(data_row) = data_type else {
                 return Ok(Some(data_type.clone()));
             };
-            let mut fields = read_data_fields_for_format(
-                data_row.fields(),
-                read_row.fields(),
-                nested_field_enabled,
-                prune_map_values,
-            )?;
+            let mut fields =
+                read_data_fields(data_row.fields(), read_row.fields(), nested_field_enabled)?;
             if fields.is_empty() {
                 if !nested_field_enabled {
                     return Ok(None);
@@ -1451,17 +1435,10 @@ fn prune_data_type_for_format(
                 }
             }
             Ok(Some(DataType::Row(crate::spec::RowType::with_nullable(
-                read_type.is_nullable(),
+                data_type.is_nullable(),
                 fields,
             ))))
         }
-        // ARRAY and MAP are deliberately NOT descended, even though Java's
-        // `pruneDataType` does: the pruned type is also what the Vortex reader is
-        // asked for, and it projects top-level columns only, then reinterprets a
-        // decoded nested struct against the requested Arrow type positionally, so
-        // a container pruned into read order would silently relabel its children.
-        // Nested containers are reconciled after decoding instead, by
-        // `arrow::nested_evolution::evolve_column`, which pairs by field id.
         _ => Ok(Some(data_type.clone())),
     }
 }
@@ -1469,6 +1446,7 @@ fn prune_data_type_for_format(
 fn data_field_with_type(field: &DataField, data_type: DataType) -> DataField {
     DataField::new(field.id(), field.name().to_string(), data_type)
         .with_description(field.description().map(ToString::to_string))
+        .with_default_value(field.default_value().map(ToString::to_string))
 }
 
 fn data_schema_fields_for_file(
@@ -4628,6 +4606,9 @@ mod vector_parquet_tests {
 }
 
 #[cfg(test)]
+mod nested_projection_tests;
+
+#[cfg(test)]
 mod prune_container_tests {
     use super::*;
     use crate::spec::{ArrayType, DataType, MapType, RowType, VarCharType};
@@ -4645,28 +4626,25 @@ mod prune_container_tests {
     }
 
     #[test]
-    fn keeps_an_array_element_type_verbatim() {
-        // Not descended on purpose — see the comment in `prune_data_type`: the
-        // Vortex reader would relabel a reordered container positionally. The
-        // element is reconciled after decoding instead.
+    fn prunes_an_array_element_by_field_id() {
         let data = DataType::Array(ArrayType::new(row(vec![
             f(2, "name", str_t()),
             f(3, "lang", str_t()),
         ])));
         let read = DataType::Array(ArrayType::new(row(vec![f(3, "lang", str_t())])));
 
-        assert_eq!(prune_data_type(&read, &data, false).unwrap().unwrap(), data);
+        assert_eq!(prune_data_type(&read, &data, false).unwrap().unwrap(), read);
     }
 
     #[test]
-    fn keeps_a_map_value_type_verbatim() {
+    fn prunes_a_map_value_by_field_id() {
         let data = DataType::Map(MapType::new(
             str_t(),
             row(vec![f(5, "v", str_t()), f(6, "unit", str_t())]),
         ));
         let read = DataType::Map(MapType::new(str_t(), row(vec![f(5, "v", str_t())])));
 
-        assert_eq!(prune_data_type(&read, &data, false).unwrap().unwrap(), data);
+        assert_eq!(prune_data_type(&read, &data, false).unwrap().unwrap(), read);
     }
 
     #[test]
@@ -4688,11 +4666,8 @@ mod prune_container_tests {
             row(vec![f(5, "old_name", str_t()), f(7, "last", str_t())]),
         ));
         assert_eq!(
-            prune_data_type_for_format(&read, &data, false, true)
-                .unwrap()
-                .unwrap(),
+            prune_data_type(&read, &data, false).unwrap().unwrap(),
             expected
         );
-        assert_eq!(prune_data_type(&read, &data, false).unwrap().unwrap(), data);
     }
 }
