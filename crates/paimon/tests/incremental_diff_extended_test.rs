@@ -118,12 +118,14 @@ fn nested_schema() -> TableSchema {
     TableSchema::new(0, &schema)
 }
 
-fn map_array(arrow_type: &ArrowDataType, values: &[StringMap]) -> MapArray {
-    let ArrowDataType::Map(entries_field, sorted) = arrow_type else {
-        panic!("expected Arrow Map")
+fn map_or_multiset_array(arrow_type: &ArrowDataType, values: &[StringMap]) -> ArrayRef {
+    let (entries_field, sorted) = match arrow_type {
+        ArrowDataType::Map(entries_field, sorted) => (entries_field, Some(*sorted)),
+        ArrowDataType::List(entries_field) => (entries_field, None),
+        _ => panic!("expected Arrow Map or multiset List"),
     };
     let ArrowDataType::Struct(entry_fields) = entries_field.data_type() else {
-        panic!("expected Map entries struct")
+        panic!("expected entries struct")
     };
     let mut offsets = vec![0_i32];
     let mut keys = Vec::new();
@@ -148,14 +150,17 @@ fn map_array(arrow_type: &ArrowDataType, values: &[StringMap]) -> MapArray {
         None,
     )
     .unwrap();
-    MapArray::try_new(
-        Arc::clone(entries_field),
-        OffsetBuffer::new(ScalarBuffer::from(offsets)),
-        entries,
-        Some(NullBuffer::from(valid)),
-        *sorted,
-    )
-    .unwrap()
+    let offsets = OffsetBuffer::new(ScalarBuffer::from(offsets));
+    let nulls = Some(NullBuffer::from(valid));
+    match sorted {
+        Some(sorted) => Arc::new(
+            MapArray::try_new(Arc::clone(entries_field), offsets, entries, nulls, sorted).unwrap(),
+        ),
+        None => Arc::new(
+            ListArray::try_new(Arc::clone(entries_field), offsets, Arc::new(entries), nulls)
+                .unwrap(),
+        ),
+    }
 }
 
 fn nested_batch(table: &Table, rows: &[NestedRow]) -> RecordBatch {
@@ -222,8 +227,8 @@ fn nested_batch(table: &Table, rows: &[NestedRow]) -> RecordBatch {
             )),
             Arc::new(payload),
             Arc::new(items),
-            Arc::new(map_array(schema.field(3).data_type(), &attributes)),
-            Arc::new(map_array(schema.field(4).data_type(), &bag)),
+            map_or_multiset_array(schema.field(3).data_type(), &attributes),
+            map_or_multiset_array(schema.field(4).data_type(), &bag),
         ],
     )
     .unwrap()
