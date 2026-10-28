@@ -26,7 +26,8 @@ use futures::TryStreamExt;
 use paimon::spec::{
     CommitKind, DataType, Datum, IntType, PredicateBuilder, Schema, TableSchema, VarCharType,
 };
-use paimon::table::{CompactOptions, CompactPlan, CompactResult, IncrementalScanMode, Table};
+use paimon::table::{CompactPlan, CompactResult, IncrementalScanMode, Table};
+use std::collections::HashMap;
 
 fn schema(options: &[(&str, &str)]) -> TableSchema {
     let mut builder = Schema::builder()
@@ -98,13 +99,10 @@ async fn append_files(table: &Table, count: i32) {
 }
 
 async fn execute(table: &Table, plan: &CompactPlan) -> Vec<CompactResult> {
-    // A worker's builder settings must not replace the task's output settings.
+    // A worker's input limit must not split an already planned task.
     let executor = table
         .new_compact_builder()
-        .with_options(CompactOptions {
-            target_file_size: Some(1),
-            max_files_per_task: 2,
-        })
+        .with_max_files_per_task(2)
         .new_executor()
         .unwrap();
     let mut results = Vec::new();
@@ -333,11 +331,7 @@ async fn compact_skips_empty_single_and_target_sized_files_and_bounds_tasks() {
         .tasks()
         .is_empty());
     append_files(&table, 4).await;
-    let options = CompactOptions {
-        max_files_per_task: 2,
-        ..Default::default()
-    };
-    let compact = table.new_compact_builder().with_options(options);
+    let compact = table.new_compact_builder().with_max_files_per_task(2);
     let plan = compact.new_planner().unwrap().plan().await.unwrap();
     assert_eq!(plan.tasks().len(), 2);
     assert!(plan.tasks().iter().all(|task| task.files().len() == 2));
@@ -348,11 +342,12 @@ async fn compact_skips_empty_single_and_target_sized_files_and_bounds_tasks() {
         .map(|f| f.file_size)
         .min()
         .unwrap();
-    let small = table.new_compact_builder().with_options(CompactOptions {
-        target_file_size: Some(min_size),
-        ..Default::default()
-    });
+    let small = table.copy_with_options(HashMap::from([(
+        "target-file-size".into(),
+        format!("{min_size}b"),
+    )]));
     assert!(small
+        .new_compact_builder()
         .new_planner()
         .unwrap()
         .plan()
@@ -480,19 +475,13 @@ async fn compact_refuses_unsupported_tables_invalid_options_and_foreign_tasks() 
     let pk = table(pk_schema(&[("changelog-producer", "full-compaction")])).await;
     assert!(pk.new_compact_builder().new_planner().is_err());
     let table = table(schema(&[])).await;
-    for options in [
-        CompactOptions {
-            target_file_size: Some(0),
-            ..Default::default()
-        },
-        CompactOptions {
-            max_files_per_task: 1,
-            ..Default::default()
-        },
-    ] {
+    let invalid_size =
+        table.copy_with_options(HashMap::from([("target-file-size".into(), "0b".into())]));
+    assert!(invalid_size.new_compact_builder().new_planner().is_err());
+    for max_files_per_task in [0, 1] {
         assert!(table
             .new_compact_builder()
-            .with_options(options)
+            .with_max_files_per_task(max_files_per_task)
             .new_planner()
             .is_err());
     }

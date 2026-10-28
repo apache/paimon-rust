@@ -205,7 +205,7 @@ pub(super) async fn execute(
             // Bound staging independently of bucket size. Output remains key ordered
             // across flushes, and each key group is emitted only once by the merge.
             write_buffer_size: (options.write_buffer_size()? as i64)
-                .min(task.context.target_file_size),
+                .min(options.target_file_size()),
             file_format: options.file_format(),
             data_file_prefix: options.data_file_prefix().to_string(),
             input_changelog: false,

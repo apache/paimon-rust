@@ -32,9 +32,7 @@ use futures::TryStreamExt;
 use paimon::spec::{
     CommitKind, DataType, Datum, IntType, PredicateBuilder, Schema, TableSchema, VarCharType,
 };
-use paimon::table::{
-    CompactOptions, CompactPlan, CompactResult, CompactTask, IncrementalScanMode, Table,
-};
+use paimon::table::{CompactPlan, CompactResult, CompactTask, IncrementalScanMode, Table};
 
 async fn table_with_schema(schema: TableSchema) -> Table {
     let path = format!("memory:/pk_compact/{}", uuid::Uuid::new_v4());
@@ -270,12 +268,9 @@ async fn pk_compaction_keeps_tombstones_against_later_out_of_order_user_sequence
 
 #[tokio::test]
 async fn pk_compaction_includes_large_files_and_whole_buckets_and_upgrades_single_l0() {
-    let table = table(&[]).await;
+    let table = table(&[("target-file-size", "1b")]).await;
     write_batch(&table, &make_batch(vec![1], vec![10])).await;
-    let builder = table.new_compact_builder().with_options(CompactOptions {
-        target_file_size: Some(1),
-        max_files_per_task: 2,
-    });
+    let builder = table.new_compact_builder().with_max_files_per_task(2);
     let plan = builder.new_planner().unwrap().plan().await.unwrap();
     assert_eq!(plan.tasks().len(), 1);
     assert_eq!(plan.tasks()[0].files().len(), 1);

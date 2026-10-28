@@ -39,32 +39,15 @@ use crate::spec::{
 };
 use crate::{Error, Result};
 
-/// Options for merging small files. File sizes are targets, not hard limits.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CompactOptions {
-    /// Output size and small-file threshold in bytes. Defaults to `target-file-size`.
-    pub target_file_size: Option<i64>,
-    /// Maximum append input files per task. Defaults to 32.
-    /// PK tasks include a complete bucket and are not split by this limit.
-    pub max_files_per_task: usize,
-}
-
-impl Default for CompactOptions {
-    fn default() -> Self {
-        Self {
-            target_file_size: None,
-            max_files_per_task: 32,
-        }
-    }
-}
-
 /// Creates planners, executors and a committer with one shared configuration.
+/// Output size and the append small-file threshold use the table's
+/// `target-file-size` option.
 /// Supports ordinary append tables and fixed or dynamic bucket PK tables,
 /// without row tracking, deletion vectors, data evolution, query authorization
 /// or dedicated blob/vector storage.
 pub struct CompactBuilder<'a> {
     table: &'a Table,
-    options: CompactOptions,
+    max_files_per_task: usize,
     partition_filter: Option<Predicate>,
     resources: Option<ResourceContext>,
     commit_user: String,
@@ -74,15 +57,17 @@ impl<'a> CompactBuilder<'a> {
     pub(super) fn new(table: &'a Table) -> Self {
         Self {
             table,
-            options: CompactOptions::default(),
+            max_files_per_task: 32,
             partition_filter: None,
             resources: None,
             commit_user: uuid::Uuid::new_v4().to_string(),
         }
     }
 
-    pub fn with_options(mut self, options: CompactOptions) -> Self {
-        self.options = options;
+    /// Maximum append input files per task. Defaults to 32 and must be at least 2.
+    /// PK tasks include a complete bucket and are not split by this limit.
+    pub fn with_max_files_per_task(mut self, max_files_per_task: usize) -> Self {
+        self.max_files_per_task = max_files_per_task;
         self
     }
 
@@ -110,21 +95,18 @@ impl<'a> CompactBuilder<'a> {
 
     pub fn new_planner(&self) -> Result<CompactPlanner> {
         ensure_supported(self.table)?;
-        let target_file_size = self
-            .options
-            .target_file_size
-            .unwrap_or_else(|| self.table.schema().core_options().target_file_size());
-        if target_file_size <= 0 || self.options.max_files_per_task < 2 {
+        let target_file_size = self.table.schema().core_options().target_file_size();
+        if target_file_size <= 0 || self.max_files_per_task < 2 {
             return Err(Error::ConfigInvalid {
                 message:
-                    "Compaction requires a positive target_file_size and max_files_per_task >= 2"
+                    "Compaction requires a positive target-file-size and max_files_per_task >= 2"
                         .into(),
             });
         }
         Ok(CompactPlanner {
             table: self.table.clone(),
             target_file_size,
-            max_files_per_task: self.options.max_files_per_task,
+            max_files_per_task: self.max_files_per_task,
             partition_filter: self.partition_filter.clone(),
         })
     }
@@ -163,7 +145,6 @@ struct CompactContext {
     branch: String,
     schema: TableSchema,
     snapshot: Snapshot,
-    target_file_size: i64,
 }
 
 /// An immutable, serializable set of independently executable compaction tasks.
@@ -240,7 +221,6 @@ impl CompactPlanner {
             branch: self.table.branch().to_string(),
             schema: self.table.schema().clone(),
             snapshot,
-            target_file_size: self.target_file_size,
         };
         let mut groups = BTreeMap::<_, Vec<DataFileMeta>>::new();
         let primary_key = !self.table.schema().primary_keys().is_empty();
@@ -414,7 +394,7 @@ impl CompactExecutor {
             partition_path,
             task.bucket,
             table.schema().id(),
-            task.context.target_file_size,
+            options.target_file_size(),
             options.file_compression().to_string(),
             options.file_compression_zstd_level(),
             options.write_buffer_size()? as i64,
@@ -517,7 +497,9 @@ impl CompactTask {
         }
         ensure_snapshot_supported(table, &self.context.snapshot)?;
         let minimum_files = if self.is_primary_key() { 1 } else { 2 };
-        if self.context.target_file_size <= 0 || self.files.len() < minimum_files || self.bucket < 0
+        if table.schema().core_options().target_file_size() <= 0
+            || self.files.len() < minimum_files
+            || self.bucket < 0
         {
             return Err(invalid("Invalid compaction task"));
         }

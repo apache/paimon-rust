@@ -26,12 +26,7 @@ execution do not publish snapshots; `commit_compact` atomically publishes the
 selected results in a `COMPACT` snapshot.
 
 ```rust
-use paimon::table::CompactOptions;
-
-let builder = table.new_compact_builder().with_options(CompactOptions {
-    target_file_size: Some(128 * 1024 * 1024),
-    max_files_per_task: 32,
-});
+let builder = table.new_compact_builder().with_max_files_per_task(32);
 let planner = builder.new_planner()?;
 let executor = builder.new_executor()?;
 let committer = builder.new_commit()?;
@@ -45,12 +40,14 @@ let metrics = committer.commit_compact(results).await?;
 println!("Compacted {} files into {}", metrics.files_removed, metrics.files_added);
 ```
 
-For append tables, `target_file_size` defaults to `target-file-size`. Files strictly
-smaller than this threshold are candidates. Each task contains at least two
-files from one partition and bucket, and is closed when its accumulated input
-size reaches the target or `max_files_per_task` is reached. A remaining single
-file is skipped. File sizes are approximate targets; normal writer rolling
-and `target-file-row-num` still apply. An empty plan or result list publishes
+Compaction uses the table's `target-file-size` option for its output size target
+and append small-file threshold. For append tables, files strictly smaller than
+this threshold are candidates. Each task contains at least two files from one
+partition and bucket, and is closed when its accumulated input size reaches the
+target or the limit set by `with_max_files_per_task(...)` is reached (default 32,
+minimum 2). A remaining single file is skipped. File sizes are approximate targets;
+normal writer rolling and `target-file-row-num` still apply. An empty plan or
+result list publishes
 no snapshot. Use `with_partition_filter(predicate)` to restrict planning to
 partitions and `with_resources(context)` to share read/write memory budgets.
 
@@ -81,8 +78,8 @@ The same API compacts primary-key tables with `deduplicate`,
 `first-row`, `partial-update` or `aggregation` merge engines. Changelog producers
 `none` and `input` are supported; `first-row` requires `none`.
 The planner includes every active file of each selected partition/bucket,
-including large files. `max_files_per_task` does not split PK buckets. A single
-level-0 file is also eligible. A bucket whose files already form one sorted
+including large files. `with_max_files_per_task(...)` does not split PK buckets.
+A single level-0 file is also eligible. A bucket whose files already form one sorted
 run at a single positive level needs no rewrite, including when the previous
 compaction rolled multiple output files. Output is key ordered at the highest input level, or level 1
 when all inputs are level 0.
@@ -114,7 +111,7 @@ retained retract records. Append and input-changelog incremental reads do not
 emit new logical events for a compaction snapshot.
 
 PK rewrites flush merged batches once estimated Arrow bytes reach the smaller
-of `write-buffer-size` and `target_file_size`, then write ordered files subject
+of `write-buffer-size` and `target-file-size`, then write ordered files subject
 to `target-file-row-num`. Batches stay intact, so this is an approximate staging
 target independent of total bucket size, not an encoded-file-size limit. The merge currently supports
 up to 256 overlapping sorted-run inputs, matching the query reader's limit.

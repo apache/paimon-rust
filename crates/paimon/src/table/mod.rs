@@ -206,8 +206,8 @@ pub use bucket_router::BucketRouter;
 pub use commit_callback::{CommitCallback, CommitCallbackContext};
 pub use commit_message::{CommitMessage, COMMIT_MESSAGE_SERIALIZER_VERSION};
 pub use compact::{
-    CompactBuilder, CompactExecutor, CompactMetrics, CompactOptions, CompactPlan, CompactPlanner,
-    CompactResult, CompactTask,
+    CompactBuilder, CompactExecutor, CompactMetrics, CompactPlan, CompactPlanner, CompactResult,
+    CompactTask,
 };
 pub use consumer_manager::ConsumerManager;
 pub use cow_writer::{CopyOnWriteMergeWriter, FileInfo};
