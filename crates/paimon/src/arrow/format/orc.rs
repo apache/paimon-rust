@@ -386,7 +386,11 @@ impl FormatFileReader for OrcFormatReader {
 
         let mut builder = builder.with_projection(projection);
 
-        if let Some(predicate) = orc_predicate {
+        // orc-rust 0.8 composes stripe predicates with row selections using
+        // and_then(), which expects already-filtered coordinates and can panic
+        // for skipped rows. Positional reads use the selection and the exact
+        // residual below; ordinary scans retain predicate pruning.
+        if let Some(predicate) = orc_predicate.filter(|_| row_selection.is_none()) {
             builder = builder.with_predicate(predicate);
         }
 
