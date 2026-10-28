@@ -702,7 +702,12 @@ impl DataFileReader {
             || file_meta.write_cols.is_some()
             || read_type.iter().any(contains_selected_map)
         {
-            read_data_fields(&data_schema_fields, &read_type, self.nested_field_enabled)?
+            read_data_fields_for_format(
+                &data_schema_fields,
+                &read_type,
+                self.nested_field_enabled,
+                file_meta.file_name.ends_with(".parquet"),
+            )?
         } else {
             read_type
                 .iter()
@@ -1030,7 +1035,12 @@ impl DataFileReader {
             || file_meta.write_cols.is_some()
             || read_type.iter().any(contains_selected_map)
         {
-            read_data_fields(&data_schema_fields, &read_type, self.nested_field_enabled)?
+            read_data_fields_for_format(
+                &data_schema_fields,
+                &read_type,
+                self.nested_field_enabled,
+                file_meta.file_name.ends_with(".parquet"),
+            )?
         } else {
             read_type
                 .iter()
@@ -1317,10 +1327,25 @@ fn row_tracking_sequence_column(
     ))))
 }
 
+#[cfg(test)]
 fn read_data_fields(
     all_data_fields: &[DataField],
     expected_fields: &[DataField],
     nested_field_enabled: bool,
+) -> crate::Result<Vec<DataField>> {
+    read_data_fields_for_format(
+        all_data_fields,
+        expected_fields,
+        nested_field_enabled,
+        false,
+    )
+}
+
+fn read_data_fields_for_format(
+    all_data_fields: &[DataField],
+    expected_fields: &[DataField],
+    nested_field_enabled: bool,
+    prune_map_values: bool,
 ) -> crate::Result<Vec<DataField>> {
     let mut read_fields = Vec::new();
     for data_field in all_data_fields {
@@ -1328,10 +1353,11 @@ fn read_data_fields(
             .iter()
             .find(|field| field.id() == data_field.id())
         {
-            if let Some(pruned_type) = prune_data_type(
+            if let Some(pruned_type) = prune_data_type_for_format(
                 expected.data_type(),
                 data_field.data_type(),
                 nested_field_enabled,
+                prune_map_values,
             )? {
                 let mut field = data_field_with_type(data_field, pruned_type);
                 if crate::spec::is_map_selected_keys_field(expected) {
@@ -1367,12 +1393,40 @@ fn is_physical_system_field(field: &DataField) -> bool {
     )
 }
 
+#[cfg(test)]
 fn prune_data_type(
     read_type: &DataType,
     data_type: &DataType,
     nested_field_enabled: bool,
 ) -> crate::Result<Option<DataType>> {
+    prune_data_type_for_format(read_type, data_type, nested_field_enabled, false)
+}
+
+fn prune_data_type_for_format(
+    read_type: &DataType,
+    data_type: &DataType,
+    nested_field_enabled: bool,
+    prune_map_values: bool,
+) -> crate::Result<Option<DataType>> {
     match read_type {
+        DataType::Map(read_map) if prune_map_values => {
+            let DataType::Map(data_map) = data_type else {
+                return Ok(Some(data_type.clone()));
+            };
+            // Keep file field IDs and ordering; reconciliation handles renames.
+            let value = prune_data_type_for_format(
+                read_map.value_type(),
+                data_map.value_type(),
+                true,
+                true,
+            )?
+            .unwrap_or_else(|| data_map.value_type().clone());
+            Ok(Some(DataType::Map(crate::spec::MapType::with_nullable(
+                data_type.is_nullable(),
+                data_map.key_type().clone(),
+                value,
+            ))))
+        }
         DataType::Row(read_row) if is_variant_extraction_row_type(read_type) => {
             Ok(Some(DataType::Row(read_row.clone())))
         }
@@ -1380,8 +1434,12 @@ fn prune_data_type(
             let DataType::Row(data_row) = data_type else {
                 return Ok(Some(data_type.clone()));
             };
-            let mut fields =
-                read_data_fields(data_row.fields(), read_row.fields(), nested_field_enabled)?;
+            let mut fields = read_data_fields_for_format(
+                data_row.fields(),
+                read_row.fields(),
+                nested_field_enabled,
+                prune_map_values,
+            )?;
             if fields.is_empty() {
                 if !nested_field_enabled {
                     return Ok(None);
@@ -4608,6 +4666,33 @@ mod prune_container_tests {
         ));
         let read = DataType::Map(MapType::new(str_t(), row(vec![f(5, "v", str_t())])));
 
+        assert_eq!(prune_data_type(&read, &data, false).unwrap().unwrap(), data);
+    }
+
+    #[test]
+    fn parquet_map_value_pruning_keeps_file_names_ids_and_order() {
+        let data = DataType::Map(MapType::new(
+            str_t(),
+            row(vec![
+                f(5, "old_name", str_t()),
+                f(6, "unused", str_t()),
+                f(7, "last", str_t()),
+            ]),
+        ));
+        let read = DataType::Map(MapType::new(
+            str_t(),
+            row(vec![f(7, "last", str_t()), f(5, "renamed", str_t())]),
+        ));
+        let expected = DataType::Map(MapType::new(
+            str_t(),
+            row(vec![f(5, "old_name", str_t()), f(7, "last", str_t())]),
+        ));
+        assert_eq!(
+            prune_data_type_for_format(&read, &data, false, true)
+                .unwrap()
+                .unwrap(),
+            expected
+        );
         assert_eq!(prune_data_type(&read, &data, false).unwrap().unwrap(), data);
     }
 }
