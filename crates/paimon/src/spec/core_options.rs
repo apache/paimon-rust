@@ -92,6 +92,8 @@ const ROW_TRACKING_ENABLED_OPTION: &str = "row-tracking.enabled";
 const ROW_TRACKING_PARTITION_GROUP_ON_COMMIT_OPTION: &str =
     "row-tracking.partition-group-on-commit";
 const CLUSTERING_INCREMENTAL_OPTION: &str = "clustering.incremental";
+const COMPACTION_MIN_FILE_NUM_OPTION: &str = "compaction.min.file-num";
+const COMPACTION_SMALL_FILE_RATIO_OPTION: &str = "compaction.small-file-ratio";
 pub(crate) const TABLE_TYPE_OPTION: &str = "type";
 
 pub(crate) const PATH_OPTION: &str = "path";
@@ -1635,6 +1637,35 @@ impl<'a> CoreOptions<'a> {
             .get("target-file-size")
             .and_then(|v| parse_memory_size(v))
             .unwrap_or(DEFAULT_TARGET_FILE_SIZE)
+    }
+
+    /// Minimum append input files for an underfilled compaction task. Default is 5.
+    pub fn compaction_min_file_num(&self) -> crate::Result<usize> {
+        self.options
+            .get(COMPACTION_MIN_FILE_NUM_OPTION)
+            .map_or(Ok(5), |raw| {
+                raw.parse::<i32>()
+                    .ok()
+                    .filter(|count| *count >= 2)
+                    .map(|count| count as usize)
+                    .ok_or_else(|| crate::Error::ConfigInvalid {
+                        message: format!("compaction.min.file-num must be at least 2, got '{raw}'"),
+                    })
+            })
+    }
+
+    /// Strict append small-file threshold: target size times the configured ratio.
+    /// `compaction.small-file-ratio` defaults to 0.7, matching Java.
+    pub fn compaction_file_size(&self) -> crate::Result<i64> {
+        let ratio = self
+            .options
+            .get(COMPACTION_SMALL_FILE_RATIO_OPTION)
+            .map_or(Some(0.7), |raw| raw.parse::<f64>().ok())
+            .filter(|ratio| ratio.is_finite() && *ratio >= 0.0)
+            .ok_or_else(|| crate::Error::ConfigInvalid {
+                message: "compaction.small-file-ratio must be a finite nonnegative number".into(),
+            })?;
+        Ok((self.target_file_size() as f64 * ratio) as i64)
     }
 
     /// Maximum automatically inferred postpone bucket count (Java default: 2048).

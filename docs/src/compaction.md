@@ -26,7 +26,7 @@ execution do not publish snapshots; `commit_compact` atomically publishes the
 selected results in a `COMPACT` snapshot.
 
 ```rust
-let builder = table.new_compact_builder().with_max_files_per_task(32);
+let builder = table.new_compact_builder();
 let planner = builder.new_planner()?;
 let executor = builder.new_executor()?;
 let committer = builder.new_commit()?;
@@ -40,15 +40,34 @@ let metrics = committer.commit_compact(results).await?;
 println!("Compacted {} files into {}", metrics.files_removed, metrics.files_added);
 ```
 
-Compaction uses the table's `target-file-size` option for its output size target
-and append small-file threshold. For append tables, files strictly smaller than
-this threshold are candidates. Each task contains at least two files from one
-partition and bucket, and is closed when its accumulated input size reaches the
-target or the limit set by `with_max_files_per_task(...)` is reached (default 32,
-minimum 2). A remaining single file is skipped. File sizes are approximate targets;
-normal writer rolling and `target-file-row-num` still apply. An empty plan or
-result list publishes
-no snapshot. Use `with_partition_filter(predicate)` to restrict planning to
+Compaction uses the table's `target-file-size` option for its output size target.
+Append task selection follows the batch packing rules in Java's
+[`AppendCompactCoordinator`](https://github.com/apache/paimon/blob/master/paimon-core/src/main/java/org/apache/paimon/append/AppendCompactCoordinator.java):
+
+- Candidate files are strictly smaller than `target-file-size` multiplied by
+  `compaction.small-file-ratio` (default 0.7). This avoids repeatedly rewriting
+  output files that are slightly below the target after compression.
+- Within each partition and bucket, candidates are sorted by file size.
+  Each file contributes `file_size + source.split.open-file-cost` to the task
+  weight. The open cost defaults to 4 MiB.
+- A task is emitted once it contains at least two files and its weight reaches
+  twice `target-file-size`. A remaining group is emitted only when it has at
+  least `compaction.min.file-num` files (default 5, minimum 2).
+
+There is no per-task file-count cap. An underfilled tail remains available for
+planning against a later snapshot. Each plan independently captures a snapshot;
+the API does not maintain a streaming coordinator's aging state.
+
+Ordinary read splits use a separate strategy, matching Java's
+[`AppendOnlySplitGenerator`](https://github.com/apache/paimon/blob/master/paimon-core/src/main/java/org/apache/paimon/table/source/AppendOnlySplitGenerator.java):
+sort by minimum sequence number, then pack up to `source.split.target-size`
+using `max(file_size, source.split.open-file-cost)` per file. Read split boundaries
+do not determine compaction tasks, and changing `source.split.target-size` does
+not change compaction grouping.
+
+File sizes are approximate targets; normal writer rolling and
+`target-file-row-num` still apply. An empty plan or result list publishes no
+snapshot. Use `with_partition_filter(predicate)` to restrict planning to
 partitions and `with_resources(context)` to share read/write memory budgets.
 
 `CompactPlan`, `CompactTask` and `CompactResult` support Serde serialization.
@@ -78,8 +97,8 @@ The same API compacts primary-key tables with `deduplicate`,
 `first-row`, `partial-update` or `aggregation` merge engines. Changelog producers
 `none` and `input` are supported; `first-row` requires `none`.
 The planner includes every active file of each selected partition/bucket,
-including large files. `with_max_files_per_task(...)` does not split PK buckets.
-A single level-0 file is also eligible. A bucket whose files already form one sorted
+including large files. Append size and count selection options do not split PK
+buckets. A single level-0 file is also eligible. A bucket whose files already form one sorted
 run at a single positive level needs no rewrite, including when the previous
 compaction rolled multiple output files. Output is key ordered at the highest input level, or level 1
 when all inputs are level 0.

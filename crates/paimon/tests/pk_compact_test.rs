@@ -270,7 +270,7 @@ async fn pk_compaction_keeps_tombstones_against_later_out_of_order_user_sequence
 async fn pk_compaction_includes_large_files_and_whole_buckets_and_upgrades_single_l0() {
     let table = table(&[("target-file-size", "1b")]).await;
     write_batch(&table, &make_batch(vec![1], vec![10])).await;
-    let builder = table.new_compact_builder().with_max_files_per_task(2);
+    let builder = table.new_compact_builder();
     let plan = builder.new_planner().unwrap().plan().await.unwrap();
     assert_eq!(plan.tasks().len(), 1);
     assert_eq!(plan.tasks()[0].files().len(), 1);

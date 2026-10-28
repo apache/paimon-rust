@@ -17,6 +17,9 @@
 
 mod common;
 
+#[path = "append_compact/planning.rs"]
+mod planning_tests;
+
 use arrow_array::{Array, Int32Array, RecordBatch, StringArray};
 use common::incremental_helpers::{
     make_batch, make_partitioned_batch, memory_table, persist_table_schema, pk_schema, setup_dirs,
@@ -34,7 +37,9 @@ fn schema(options: &[(&str, &str)]) -> TableSchema {
         .column("id", DataType::Int(IntType::new()))
         .column("value", DataType::Int(IntType::new()))
         .option("bucket", "-1")
-        .option("file.format", "parquet");
+        .option("file.format", "parquet")
+        // Most behavioral cases deliberately compact tiny fixtures.
+        .option("compaction.min.file-num", "2");
     for (key, value) in options {
         builder = builder.option(*key, *value);
     }
@@ -99,12 +104,7 @@ async fn append_files(table: &Table, count: i32) {
 }
 
 async fn execute(table: &Table, plan: &CompactPlan) -> Vec<CompactResult> {
-    // A worker's input limit must not split an already planned task.
-    let executor = table
-        .new_compact_builder()
-        .with_max_files_per_task(2)
-        .new_executor()
-        .unwrap();
+    let executor = table.new_compact_builder().new_executor().unwrap();
     let mut results = Vec::new();
     for task in plan.tasks() {
         results.push(executor.execute(task).await.unwrap());
@@ -297,7 +297,11 @@ async fn compact_after_overwrite_does_not_resurrect_old_rows() {
 
 #[tokio::test]
 async fn compact_skips_empty_single_and_target_sized_files_and_bounds_tasks() {
-    let table = table(schema(&[])).await;
+    let table = table(schema(&[
+        ("target-file-size", "4mb"),
+        ("source.split.open-file-cost", "4mb"),
+    ]))
+    .await;
     let builder = table.new_compact_builder();
     assert!(builder
         .new_planner()
@@ -331,7 +335,7 @@ async fn compact_skips_empty_single_and_target_sized_files_and_bounds_tasks() {
         .tasks()
         .is_empty());
     append_files(&table, 4).await;
-    let compact = table.new_compact_builder().with_max_files_per_task(2);
+    let compact = table.new_compact_builder();
     let plan = compact.new_planner().unwrap().plan().await.unwrap();
     assert_eq!(plan.tasks().len(), 2);
     assert!(plan.tasks().iter().all(|task| task.files().len() == 2));
@@ -382,6 +386,7 @@ async fn compact_keeps_partitions_and_buckets_separate_and_honors_partition_filt
         .partition_keys(["pt"])
         .option("bucket", "2")
         .option("bucket-key", "id")
+        .option("compaction.min.file-num", "2")
         .build()
         .unwrap();
     let table = table(TableSchema::new(0, &schema)).await;
@@ -478,12 +483,21 @@ async fn compact_refuses_unsupported_tables_invalid_options_and_foreign_tasks() 
     let invalid_size =
         table.copy_with_options(HashMap::from([("target-file-size".into(), "0b".into())]));
     assert!(invalid_size.new_compact_builder().new_planner().is_err());
-    for max_files_per_task in [0, 1] {
-        assert!(table
-            .new_compact_builder()
-            .with_max_files_per_task(max_files_per_task)
-            .new_planner()
-            .is_err());
+    for value in ["0", "1", "-1", "invalid", "2147483648"] {
+        let invalid = table.copy_with_options(HashMap::from([(
+            "compaction.min.file-num".into(),
+            value.into(),
+        )]));
+        let error = invalid.new_compact_builder().new_planner().err().unwrap();
+        assert!(error.to_string().contains("compaction.min.file-num"));
+    }
+    for value in ["-0.1", "NaN", "inf", "invalid"] {
+        let invalid = table.copy_with_options(HashMap::from([(
+            "compaction.small-file-ratio".into(),
+            value.into(),
+        )]));
+        let error = invalid.new_compact_builder().new_planner().err().unwrap();
+        assert!(error.to_string().contains("compaction.small-file-ratio"));
     }
     append_files(&table, 2).await;
     let builder = table.new_compact_builder();

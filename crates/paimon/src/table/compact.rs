@@ -17,6 +17,7 @@
 
 //! Snapshot-bound append compaction and full-bucket primary-key compaction.
 
+mod append;
 mod primary_key;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -40,14 +41,12 @@ use crate::spec::{
 use crate::{Error, Result};
 
 /// Creates planners, executors and a committer with one shared configuration.
-/// Output size and the append small-file threshold use the table's
-/// `target-file-size` option.
+/// Output size and append task selection use the captured table options.
 /// Supports ordinary append tables and fixed or dynamic bucket PK tables,
 /// without row tracking, deletion vectors, data evolution, query authorization
 /// or dedicated blob/vector storage.
 pub struct CompactBuilder<'a> {
     table: &'a Table,
-    max_files_per_task: usize,
     partition_filter: Option<Predicate>,
     resources: Option<ResourceContext>,
     commit_user: String,
@@ -57,18 +56,10 @@ impl<'a> CompactBuilder<'a> {
     pub(super) fn new(table: &'a Table) -> Self {
         Self {
             table,
-            max_files_per_task: 32,
             partition_filter: None,
             resources: None,
             commit_user: uuid::Uuid::new_v4().to_string(),
         }
-    }
-
-    /// Maximum append input files per task. Defaults to 32 and must be at least 2.
-    /// PK tasks include a complete bucket and are not split by this limit.
-    pub fn with_max_files_per_task(mut self, max_files_per_task: usize) -> Self {
-        self.max_files_per_task = max_files_per_task;
-        self
     }
 
     /// Restrict planning to partitions. Repeated calls combine filters with AND.
@@ -95,18 +86,20 @@ impl<'a> CompactBuilder<'a> {
 
     pub fn new_planner(&self) -> Result<CompactPlanner> {
         ensure_supported(self.table)?;
-        let target_file_size = self.table.schema().core_options().target_file_size();
-        if target_file_size <= 0 || self.max_files_per_task < 2 {
+        let options = self.table.schema().core_options();
+        if options.target_file_size() <= 0 {
             return Err(Error::ConfigInvalid {
-                message:
-                    "Compaction requires a positive target-file-size and max_files_per_task >= 2"
-                        .into(),
+                message: "Compaction requires a positive target-file-size".into(),
             });
         }
+        let append = if self.table.schema().primary_keys().is_empty() {
+            Some(append::AppendCompactPlanner::new(&options)?)
+        } else {
+            None
+        };
         Ok(CompactPlanner {
             table: self.table.clone(),
-            target_file_size,
-            max_files_per_task: self.max_files_per_task,
+            append,
             partition_filter: self.partition_filter.clone(),
         })
     }
@@ -132,8 +125,7 @@ impl<'a> CompactBuilder<'a> {
 /// Selects append small files or whole PK buckets from each captured snapshot.
 pub struct CompactPlanner {
     table: Table,
-    target_file_size: i64,
-    max_files_per_task: usize,
+    append: Option<append::AppendCompactPlanner>,
     partition_filter: Option<Predicate>,
 }
 
@@ -234,9 +226,7 @@ impl CompactPlanner {
                 .or_default();
             for file in split.data_files() {
                 validate_file(file, primary_key)?;
-                if primary_key || file.file_size < self.target_file_size {
-                    group.push(file.clone());
-                }
+                group.push(file.clone());
             }
         }
         let mut tasks = Vec::new();
@@ -261,33 +251,14 @@ impl CompactPlanner {
                 }
                 continue;
             }
-            let mut pending = Vec::new();
-            let mut bytes = 0i64;
-            for file in files {
-                bytes = bytes.saturating_add(file.file_size);
-                pending.push(file);
-                if pending.len() >= 2
-                    && (bytes >= self.target_file_size || pending.len() >= self.max_files_per_task)
-                {
-                    tasks.push(CompactTask {
-                        context: context.clone(),
-                        task_id: tasks.len(),
-                        partition: partition.clone(),
-                        bucket,
-                        total_buckets,
-                        files: std::mem::take(&mut pending),
-                    });
-                    bytes = 0;
-                }
-            }
-            if pending.len() >= 2 {
+            for files in self.append.as_ref().unwrap().plan(files) {
                 tasks.push(CompactTask {
                     context: context.clone(),
                     task_id: tasks.len(),
-                    partition,
+                    partition: partition.clone(),
                     bucket,
                     total_buckets,
-                    files: pending,
+                    files,
                 });
             }
         }
