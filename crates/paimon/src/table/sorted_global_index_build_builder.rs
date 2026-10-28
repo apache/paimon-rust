@@ -17,6 +17,7 @@
 
 mod extraction;
 mod planning;
+mod sort;
 mod validation;
 mod writer;
 
@@ -149,6 +150,9 @@ impl<'a> SortedGlobalIndexBuildBuilder<'a> {
         let core_options = CoreOptions::new(&resolved_options);
         super::global_index_build_common::validate_build_table(self.table)?;
         let records_per_range = core_options.sorted_index_records_per_range()?;
+        if index_type != FM_GLOBAL_INDEX_TYPE {
+            core_options.sorted_index_sort_memory()?;
+        }
         let write_options = if index_type == FM_GLOBAL_INDEX_TYPE {
             GlobalIndexWriteOptions::FM(FMOptions::from_options(&resolved_options)?.write)
         } else {

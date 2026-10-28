@@ -1195,6 +1195,24 @@ impl<'a> CoreOptions<'a> {
         Ok(value)
     }
 
+    /// Maximum retained serialized sort keys, excluding the active Arrow batch,
+    /// format-writer buffers and the two keys used by a disk merge.
+    pub fn sorted_index_sort_memory(&self) -> crate::Result<usize> {
+        let raw = self
+            .options
+            .get("sorted-index.sort-memory")
+            .map(String::as_str)
+            .unwrap_or("64mb");
+        let bytes = parse_memory_size(raw)
+            .and_then(|size| usize::try_from(size).ok())
+            .filter(|size| *size > 0);
+        bytes.ok_or_else(|| crate::Error::ConfigInvalid {
+            message: format!(
+                "Option 'sorted-index.sort-memory' must be a positive memory size, got: {raw}"
+            ),
+        })
+    }
+
     pub fn btree_index_fallback_scan_max_size(&self) -> crate::Result<i64> {
         self.fallback_scan_max_size(BTREE_INDEX_FALLBACK_SCAN_MAX_SIZE_OPTION)
     }

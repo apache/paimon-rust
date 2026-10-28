@@ -249,6 +249,24 @@ ordinary writer creation rejects supported index configuration on these paths.
 COW and partial DataEvolution rewrites do not generate indexes. Nested indexes
 and additional index types are not supported.
 
+## Scalar Global Index Build Memory
+
+BTree, Bitmap, and Multivalue global index builds stream projected Arrow batches
+and sort serialized keys within `sorted-index.sort-memory` (default `64mb`).
+This is a Rust build setting and does not change index files or shard boundaries.
+Set it as a table property or pass it through the index builder's `with_options`.
+
+When keys exceed the sort buffer, the build writes temporary runs to the system
+temporary directory and merges them pairwise. Temporary files are removed on
+success, failure, or when cancelled work finishes. Allow local disk space for
+serialized keys and merge output; a merge can temporarily retain both its inputs
+and output. A single key larger than the sort budget returns `ResourceExhausted`.
+
+The budget covers retained serialized sort keys and their row slots, not total
+process RSS. The active Arrow batch, reader prefetch, format-writer state, two
+merge keys and fixed I/O buffers have additional memory costs. FM indexes keep
+their existing streaming writer and do not use this sort setting.
+
 ## Catalog Management
 
 Paimon supports multiple catalog types. The `CatalogFactory` provides a unified way to create catalogs based on configuration options.

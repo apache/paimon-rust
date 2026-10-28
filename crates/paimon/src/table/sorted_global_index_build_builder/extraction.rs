@@ -38,9 +38,10 @@ pub(super) async fn extract_index_rows(
     index_fields: &[&DataField],
     index_type: &str,
     serialize_key: SerializeKeyFn,
-) -> Result<Vec<SortedIndexKeyRow>> {
+    budget: usize,
+    cmp: crate::btree::key_serde::KeyComparator,
+) -> Result<super::sort::SortedRows> {
     let splits = build_read_splits_for_shard(shard)?;
-
     let mut read_builder = table.new_read_builder();
     let mut projection = index_fields
         .iter()
@@ -49,55 +50,111 @@ pub(super) async fn extract_index_rows(
     projection.push(ROW_ID_FIELD_NAME);
     read_builder.with_projection(&projection)?;
     let read = read_builder.new_read()?;
-    let batches = read.to_arrow(&splits)?.try_collect::<Vec<_>>().await?;
-    let expected_row_count = checked_row_count(shard.row_range_start, shard.row_range_end)?;
-    let index_field = index_fields[0];
-    let index_column = index_field.name();
-    if index_fields.len() > 1 {
-        return extract_composite_index_rows_from_batches(
-            &batches,
-            index_fields,
-            shard.row_range_start,
-            expected_row_count,
-        );
+    let mut batches = read.to_arrow(&splits)?;
+    let fields = std::sync::Arc::new(
+        index_fields
+            .iter()
+            .map(|field| (*field).clone())
+            .collect::<Vec<_>>(),
+    );
+    let mut sorter = super::sort::IndexSorter::new(budget, cmp);
+    let mut next_row_id = shard.row_range_start;
+    while let Some(batch) = batches.try_next().await? {
+        let fields = fields.clone();
+        let index_type = index_type.to_string();
+        let row_range_start = shard.row_range_start;
+        let row_count = i64::try_from(batch.num_rows()).map_err(|_| Error::DataInvalid {
+            message: "Index batch row count overflow".into(),
+            source: None,
+        })?;
+        // Sorting and local scratch-file I/O must not block the async reader.
+        sorter = tokio::task::spawn_blocking(move || {
+            let refs = fields.iter().collect::<Vec<_>>();
+            let mut emit = |row| sorter.push(row);
+            let batches = std::slice::from_ref(&batch);
+            if refs.len() > 1 {
+                emit_composite_rows(
+                    batches,
+                    &refs,
+                    row_range_start,
+                    row_count,
+                    next_row_id,
+                    &mut emit,
+                )?;
+            } else if index_type == MULTIVALUE_GLOBAL_INDEX_TYPE {
+                let DataType::Array(array_type) = refs[0].data_type() else {
+                    unreachable!("validated multivalue type")
+                };
+                emit_multivalue_rows(
+                    batches,
+                    refs[0].name(),
+                    array_type.element_type(),
+                    row_range_start,
+                    row_count,
+                    serialize_key,
+                    next_row_id,
+                    &mut emit,
+                )?;
+            } else {
+                emit_scalar_rows(
+                    batches,
+                    refs[0].name(),
+                    refs[0].data_type(),
+                    row_range_start,
+                    row_count,
+                    serialize_key,
+                    next_row_id,
+                    &mut emit,
+                )?;
+            }
+            Ok::<_, Error>(sorter)
+        })
+        .await
+        .map_err(sort_task_error)??;
+        next_row_id = next_row_id
+            .checked_add(row_count)
+            .ok_or_else(|| Error::DataInvalid {
+                message: "Index row ID overflow".into(),
+                source: None,
+            })?;
     }
-    if index_type == MULTIVALUE_GLOBAL_INDEX_TYPE {
-        let DataType::Array(array_type) = index_field.data_type() else {
-            unreachable!("multivalue field was validated before extraction")
-        };
-        extract_multivalue_index_rows_from_batches(
-            &batches,
-            index_column,
-            array_type.element_type(),
-            shard.row_range_start,
-            expected_row_count,
-            serialize_key,
-        )
-    } else {
-        extract_index_rows_from_batches(
-            &batches,
-            index_column,
-            index_field.data_type(),
-            shard.row_range_start,
-            expected_row_count,
-            serialize_key,
-        )
+    let expected = checked_row_count(shard.row_range_start, shard.row_range_end)?;
+    if next_row_id - shard.row_range_start != expected {
+        return Err(Error::DataInvalid {
+            message: format!(
+                "Sorted index expected {expected} source rows, got {}",
+                next_row_id - shard.row_range_start
+            ),
+            source: None,
+        });
+    }
+    tokio::task::spawn_blocking(move || sorter.finish())
+        .await
+        .map_err(sort_task_error)?
+}
+
+fn sort_task_error(error: tokio::task::JoinError) -> Error {
+    Error::UnexpectedError {
+        message: format!("Sorted index sort task failed: {error}"),
+        source: None,
     }
 }
 
-fn extract_composite_index_rows_from_batches(
+#[allow(clippy::too_many_arguments)]
+fn emit_composite_rows(
     batches: &[RecordBatch],
     fields: &[&DataField],
     row_range_start: i64,
     expected_row_count: i64,
-) -> Result<Vec<SortedIndexKeyRow>> {
+    next_row_id: i64,
+    emit: &mut dyn FnMut(SortedIndexKeyRow) -> Result<()>,
+) -> Result<()> {
     let fields = fields
         .iter()
         .map(|field| (*field).clone())
         .collect::<Vec<_>>();
     let codec = crate::btree::CompositeKeyCodec::new(&fields);
-    let mut expected_row_id = row_range_start;
-    let mut rows = Vec::new();
+    let mut expected_row_id = next_row_id;
     for batch in batches {
         let indices = fields
             .iter()
@@ -136,10 +193,10 @@ fn extract_composite_index_rows_from_batches(
                     extract_datum_from_arrow(batch, row, *index, field.data_type())
                 })
                 .collect::<Result<Vec<_>>>()?;
-            rows.push((
+            emit((
                 Some(codec.serialize(&values)?),
                 expected_row_id - row_range_start,
-            ));
+            ))?;
             expected_row_id = expected_row_id
                 .checked_add(1)
                 .ok_or_else(|| Error::DataInvalid {
@@ -148,16 +205,16 @@ fn extract_composite_index_rows_from_batches(
                 })?;
         }
     }
-    if expected_row_id - row_range_start != expected_row_count {
+    if expected_row_id - next_row_id != expected_row_count {
         return Err(Error::DataInvalid {
             message: format!(
                 "Composite index expected {expected_row_count} rows, got {}",
-                rows.len()
+                expected_row_id - next_row_id
             ),
             source: None,
         });
     }
-    Ok(rows)
+    Ok(())
 }
 
 pub(super) fn build_read_splits_for_shard(
@@ -198,17 +255,18 @@ pub(super) fn build_read_splits_for_shard(
         .collect()
 }
 
-pub(super) fn extract_index_rows_from_batches(
+#[allow(clippy::too_many_arguments)]
+fn emit_scalar_rows(
     batches: &[RecordBatch],
     index_column: &str,
     data_type: &DataType,
     row_range_start: i64,
     expected_row_count: i64,
     serialize_key: SerializeKeyFn,
-) -> Result<Vec<SortedIndexKeyRow>> {
-    let row_count = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
-    let mut rows = Vec::with_capacity(row_count);
-    let mut expected_row_id = row_range_start;
+    next_row_id: i64,
+    emit: &mut dyn FnMut(SortedIndexKeyRow) -> Result<()>,
+) -> Result<()> {
+    let mut expected_row_id = next_row_id;
     for batch in batches {
         let value_index =
             batch
@@ -256,10 +314,10 @@ pub(super) fn extract_index_rows_from_batches(
 
             let key = extract_datum_from_arrow(batch, row, value_index, data_type)?
                 .map(|datum| serialize_key(&datum, data_type));
-            rows.push((key, row_id - row_range_start));
+            emit((key, row_id - row_range_start))?;
         }
     }
-    let actual_row_count = expected_row_id - row_range_start;
+    let actual_row_count = expected_row_id - next_row_id;
     if actual_row_count != expected_row_count {
         return Err(Error::DataInvalid {
             message: format!(
@@ -269,19 +327,21 @@ pub(super) fn extract_index_rows_from_batches(
             source: None,
         });
     }
-    Ok(rows)
+    Ok(())
 }
 
-pub(super) fn extract_multivalue_index_rows_from_batches(
+#[allow(clippy::too_many_arguments)]
+fn emit_multivalue_rows(
     batches: &[RecordBatch],
     index_column: &str,
     element_type: &DataType,
     row_range_start: i64,
     expected_row_count: i64,
     serialize_key: SerializeKeyFn,
-) -> Result<Vec<SortedIndexKeyRow>> {
-    let mut rows = Vec::new();
-    let mut expected_row_id = row_range_start;
+    next_row_id: i64,
+    emit: &mut dyn FnMut(SortedIndexKeyRow) -> Result<()>,
+) -> Result<()> {
+    let mut expected_row_id = next_row_id;
     for batch in batches {
         let value_index =
             batch
@@ -399,16 +459,16 @@ pub(super) fn extract_multivalue_index_rows_from_batches(
                 if let Some(datum) =
                     extract_datum_from_array(values, element_index, value_index, element_type)?
                 {
-                    rows.push((
+                    emit((
                         Some(serialize_key(&datum, element_type)),
                         row_id - row_range_start,
-                    ));
+                    ))?;
                 }
             }
         }
     }
 
-    let actual_row_count = expected_row_id - row_range_start;
+    let actual_row_count = expected_row_id - next_row_id;
     if actual_row_count != expected_row_count {
         return Err(Error::DataInvalid {
             message: format!(
@@ -418,7 +478,7 @@ pub(super) fn extract_multivalue_index_rows_from_batches(
             source: None,
         });
     }
-    Ok(rows)
+    Ok(())
 }
 
 /// Sort the extracted rows with the index's key comparator.
@@ -431,7 +491,7 @@ pub(super) fn sort_index_rows(
     cmp: &DynKeyComparator<'_>,
 ) -> Result<()> {
     let mut failure = None;
-    rows.sort_by(|left, right| match (&left.0, &right.0) {
+    rows.sort_unstable_by(|left, right| match (&left.0, &right.0) {
         (None, None) => left.1.cmp(&right.1),
         (None, Some(_)) => Ordering::Less,
         (Some(_), None) => Ordering::Greater,
@@ -447,4 +507,56 @@ pub(super) fn sort_index_rows(
         Some(error) => Err(error),
         None => Ok(()),
     }
+}
+
+#[cfg(test)]
+pub(super) fn extract_index_rows_from_batches(
+    batches: &[RecordBatch],
+    column: &str,
+    data_type: &DataType,
+    start: i64,
+    count: i64,
+    serialize: SerializeKeyFn,
+) -> Result<Vec<SortedIndexKeyRow>> {
+    let mut rows = Vec::new();
+    emit_scalar_rows(
+        batches,
+        column,
+        data_type,
+        start,
+        count,
+        serialize,
+        start,
+        &mut |row| {
+            rows.push(row);
+            Ok(())
+        },
+    )?;
+    Ok(rows)
+}
+
+#[cfg(test)]
+pub(super) fn extract_multivalue_index_rows_from_batches(
+    batches: &[RecordBatch],
+    column: &str,
+    data_type: &DataType,
+    start: i64,
+    count: i64,
+    serialize: SerializeKeyFn,
+) -> Result<Vec<SortedIndexKeyRow>> {
+    let mut rows = Vec::new();
+    emit_multivalue_rows(
+        batches,
+        column,
+        data_type,
+        start,
+        count,
+        serialize,
+        start,
+        &mut |row| {
+            rows.push(row);
+            Ok(())
+        },
+    )?;
+    Ok(rows)
 }
