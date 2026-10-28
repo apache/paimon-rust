@@ -17,7 +17,7 @@
 
 //! Type-specific index-file writing and failure cleanup.
 
-use super::extraction::{build_read_splits_for_shard, extract_index_rows, sort_index_rows};
+use super::extraction::{build_read_splits_for_shard, extract_index_rows};
 use super::planning::SortedGlobalIndexShard;
 use super::validation::{checked_i64, checked_row_count, index_key_type};
 use super::{
@@ -77,13 +77,22 @@ impl SortedGlobalIndexBuildBuilder<'_> {
         };
         let (cmp, serialize_key) = make_index_key_codec(codec_type, key_type);
         let mut rows = if index_type == FM_GLOBAL_INDEX_TYPE {
-            Vec::new()
+            super::sort::SortedRows::Memory(Vec::new().into_iter())
         } else {
-            extract_index_rows(self.table, shard, index_fields, index_type, serialize_key).await?
+            let mut options = self.table.schema().options().clone();
+            options.extend(self.options.clone());
+            let budget = crate::spec::CoreOptions::new(&options).sorted_index_sort_memory()?;
+            extract_index_rows(
+                self.table,
+                shard,
+                index_fields,
+                index_type,
+                serialize_key,
+                budget,
+                make_index_key_codec(codec_type, key_type).0,
+            )
+            .await?
         };
-        if !rows.is_empty() {
-            sort_index_rows(&mut rows, &cmp)?;
-        }
 
         let file_name = format!("{index_type}-global-index-{}.index", uuid::Uuid::new_v4());
         // Global index placement is a table property, as in Java GlobalIndexFileFactory.
@@ -124,9 +133,9 @@ impl SortedGlobalIndexBuildBuilder<'_> {
                         message: "Invalid BTree file version".to_string(),
                         source: Some(Box::new(error)),
                     })?;
-                    for (key, local_row_id) in &rows {
+                    while let Some((key, local_row_id)) = rows.next().await? {
                         writer
-                            .write(key.as_deref(), *local_row_id)
+                            .write(key.as_deref(), local_row_id)
                             .await
                             .map_err(|e| Error::DataInvalid {
                                 message: format!(
@@ -152,8 +161,8 @@ impl SortedGlobalIndexBuildBuilder<'_> {
                         write_options.compression_level,
                         cmp,
                     );
-                    for (key, local_row_id) in &rows {
-                        writer.write(key.as_deref(), *local_row_id).map_err(|e| {
+                    while let Some((key, local_row_id)) = rows.next().await? {
+                        writer.write(key.as_deref(), local_row_id).map_err(|e| {
                             Error::DataInvalid {
                                 message: format!(
                                     "Failed to write bitmap global index file '{file_name}'"
@@ -182,11 +191,11 @@ impl SortedGlobalIndexBuildBuilder<'_> {
                         write_options.compression_level,
                         cmp,
                     );
-                    for (key, local_row_id) in &rows {
+                    while let Some((key, local_row_id)) = rows.next().await? {
                         let key = key
                             .as_deref()
                             .expect("multivalue extraction skips null keys");
-                        writer.write_posting(key, *local_row_id).map_err(|e| {
+                        writer.write_posting(key, local_row_id).map_err(|e| {
                             Error::DataInvalid {
                                 message: format!(
                                     "Failed to write multivalue global index file '{file_name}'"
