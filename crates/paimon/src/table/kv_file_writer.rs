@@ -214,13 +214,22 @@ impl KeyValueFileWriter {
     /// Statistics retain logical value fields independently of the physical KV schema.
     fn new_format_writer_factory(
         &self,
+        schema: arrow_schema::SchemaRef,
+        is_changelog: bool,
+    ) -> Result<Arc<dyn FormatWriterFactory>> {
+        self.new_format_writer_factory_for_level(schema, is_changelog, 0)
+    }
+
+    fn new_format_writer_factory_for_level(
+        &self,
         mut schema: arrow_schema::SchemaRef,
         is_changelog: bool,
+        level: i32,
     ) -> Result<Arc<dyn FormatWriterFactory>> {
         let mut physical_fields = build_physical_fields(&schema, &self.config.value_fields)?;
         let mut options = self.config.table_options.clone();
         let mode = CoreOptions::new(&options)
-            .pk_file_metadata_stats_mode(0, is_changelog)?
+            .pk_file_metadata_stats_mode(level, is_changelog)?
             .to_string();
         options.insert("metadata.stats-mode".to_string(), mode);
         let file_format = if is_changelog {
@@ -335,6 +344,109 @@ impl KeyValueFileWriter {
 
     /// Number of rows per chunk when writing sorted data to parquet.
     const FLUSH_CHUNK_ROWS: usize = 4096;
+
+    /// Buffer already sorted and merged physical KV rows, retaining their
+    /// sequence numbers and retracts. This writer must not be used for ordinary writes.
+    pub(super) async fn write_compact(&mut self, batch: &RecordBatch, level: i32) -> Result<()> {
+        if batch.num_rows() == 0 {
+            return Ok(());
+        }
+        let bytes = batch
+            .columns()
+            .iter()
+            .map(|c| c.get_buffer_memory_size())
+            .sum();
+        if let Some(reservation) = &mut self.buffer_reservation {
+            reservation.try_grow(bytes)?;
+        }
+        self.buffer.push(batch.clone());
+        self.buffer_bytes += bytes;
+        if self.buffer_bytes as i64 >= self.config.write_buffer_size {
+            self.flush_compact(level).await?;
+        }
+        Ok(())
+    }
+
+    async fn flush_compact(&mut self, level: i32) -> Result<()> {
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+        let batches = std::mem::take(&mut self.buffer);
+        self.buffer_bytes = 0;
+        let _reservation = self.buffer_reservation.take();
+        self.buffer_reservation = self.resources.as_ref().map(ResourceContext::reservation);
+        let physical = arrow_select::concat::concat_batches(&batches[0].schema(), &batches)
+            .map_err(|error| crate::Error::DataInvalid {
+                message: format!("Failed to combine compacted KV rows: {error}"),
+                source: Some(Box::new(error)),
+            })?;
+        drop(batches);
+        // write_indexed_file expects logical value columns, with RowKind last.
+        // Sequence is supplied separately and must never be reassigned on rewrite.
+        let columns = (2..physical.num_columns()).chain([1]).collect::<Vec<_>>();
+        let logical = physical
+            .project(&columns)
+            .map_err(|error| crate::Error::DataInvalid {
+                message: format!("Invalid compacted KV schema: {error}"),
+                source: Some(Box::new(error)),
+            })?;
+        let sequences = physical
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let kinds = physical
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int8Array>()
+            .unwrap();
+        let factory = self.new_format_writer_factory_for_level(
+            build_physical_schema(&logical.schema()),
+            false,
+            level,
+        )?;
+        for offset in (0..physical.num_rows()).step_by(self.target_file_row_num) {
+            let len = self.target_file_row_num.min(physical.num_rows() - offset);
+            let indices = UInt32Array::from_iter_values((offset..offset + len).map(|i| i as u32));
+            let mut min_sequence = i64::MAX;
+            let mut max_sequence = i64::MIN;
+            let mut deletes = 0;
+            for row in offset..offset + len {
+                min_sequence = min_sequence.min(sequences.value(row));
+                max_sequence = max_sequence.max(sequences.value(row));
+                if !RowKind::from_value(kinds.value(row))?.is_add() {
+                    deletes += 1;
+                }
+            }
+            let mut file = self
+                .write_indexed_file(
+                    &logical,
+                    sequences,
+                    &indices,
+                    IndexedFileWrite {
+                        format_writer_factory: factory.as_ref(),
+                        is_changelog: false,
+                        file_prefix: &self.config.data_file_prefix,
+                        file_ordinal: self.written_files.len(),
+                        file_format: &self.config.file_format,
+                        file_compression: &self.config.file_compression,
+                        min_sequence_number: min_sequence,
+                        max_sequence_number: max_sequence,
+                        delete_row_count: deletes,
+                    },
+                )
+                .await?;
+            file.level = level;
+            file.file_source = Some(1);
+            self.written_files.push(file);
+        }
+        Ok(())
+    }
+
+    pub(super) async fn prepare_compact(&mut self, level: i32) -> Result<Vec<DataFileMeta>> {
+        self.flush_compact(level).await?;
+        Ok(std::mem::take(&mut self.written_files))
+    }
 
     /// Sort buffered data by primary key + sequence fields + auto-seq, deduplicate
     /// by merge engine, prepend _SEQUENCE_NUMBER/_VALUE_KIND, and write to a parquet file.
@@ -719,7 +831,13 @@ impl KeyValueFileWriter {
             }
         }
 
-        let write_result = writer.close().await?;
+        let write_result = match writer.close().await {
+            Ok(result) => result,
+            Err(error) => {
+                let _ = self.file_io.delete_file(&file_path).await;
+                return Err(error);
+            }
+        };
         let file_size = write_result.file_size as i64;
         let (value_stats, value_stats_cols) = match write_result.value_stats {
             Some(stats) => (stats.stats, stats.columns),

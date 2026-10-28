@@ -44,6 +44,7 @@ mod bucket_router;
 mod chunk_shuffle;
 mod commit_callback;
 mod commit_message;
+mod compact;
 mod consumer_manager;
 pub(crate) mod cow_writer;
 mod data_evolution_fields;
@@ -204,6 +205,10 @@ pub use branch_manager::BranchManager;
 pub use bucket_router::BucketRouter;
 pub use commit_callback::{CommitCallback, CommitCallbackContext};
 pub use commit_message::{CommitMessage, COMMIT_MESSAGE_SERIALIZER_VERSION};
+pub use compact::{
+    CompactBuilder, CompactExecutor, CompactMetrics, CompactOptions, CompactPlan, CompactPlanner,
+    CompactResult, CompactTask,
+};
 pub use consumer_manager::ConsumerManager;
 pub use cow_writer::{CopyOnWriteMergeWriter, FileInfo};
 pub use data_evolution_writer::{DataEvolutionDeleteWriter, DataEvolutionWriter};
@@ -699,6 +704,11 @@ impl Table {
     /// Reference: [pypaimon FileStoreTable.new_write_builder](https://github.com/apache/paimon/blob/master/paimon-python/pypaimon/table/file_store_table.py).
     pub fn new_write_builder(&self) -> WriteBuilder<'_> {
         WriteBuilder::new(self)
+    }
+
+    /// Plan and execute append or fixed/dynamic bucket PK compaction.
+    pub fn new_compact_builder(&self) -> CompactBuilder<'_> {
+        CompactBuilder::new(self)
     }
 
     /// Create a one-shot fixed-bucket builder for a postpone table.

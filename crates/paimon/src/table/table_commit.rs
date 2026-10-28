@@ -418,6 +418,38 @@ impl TableCommit {
             .await
     }
 
+    /// Publish prepared compaction results in one COMPACT snapshot.
+    /// Results must belong to one plan; independent subsets may be submitted separately.
+    /// Retrying the same tasks with this commit user is idempotent, regardless of order.
+    /// Never abort prepared files merely because publication returned an error.
+    pub async fn commit_compact(
+        &self,
+        results: Vec<super::CompactResult>,
+    ) -> Result<super::CompactMetrics> {
+        super::compact::ensure_supported(&self.table)?;
+        if results.is_empty() {
+            return Ok(super::CompactMetrics::default());
+        }
+        let prepared = super::compact::prepare_results(&self.table, &results)?;
+        let mut commit = self.clone();
+        // One stable identity per plan and task subset, allowing repeated plans
+        // and idempotent retry without consuming the caller's checkpoint sequence.
+        commit.commit_user = format!("{}-compact-{}", self.commit_user, prepared.commit_suffix);
+        commit
+            .try_commit(
+                CommitEntriesPlan::Compact {
+                    entries: prepared.entries,
+                    schema_id: prepared.schema_id,
+                    read_snapshot: prepared.read_snapshot,
+                },
+                None,
+                BATCH_COMMIT_IDENTIFIER,
+                true,
+            )
+            .await?;
+        Ok(prepared.metrics)
+    }
+
     /// Commit new files with a caller-provided commit identifier.
     ///
     /// Identifiers must increase monotonically for a given `commit_user`.
@@ -1205,6 +1237,9 @@ impl TableCommit {
                 new_index_entries,
                 ..
             } => (new_entries.as_slice(), &[][..], new_index_entries),
+            CommitEntriesPlan::Compact { entries, .. } => {
+                return self.check_recovery_entries(entries, &[], &[]).await;
+            }
         };
         self.check_recovery_entries(entries, changelog_entries, index_entries)
             .await
@@ -1815,6 +1850,115 @@ impl TableCommit {
         let manifest_dir = self.snapshot_manager.manifest_dir();
 
         match plan {
+            CommitEntriesPlan::Compact {
+                entries,
+                schema_id,
+                read_snapshot,
+            } => {
+                if self.latest_schema_id().await? != *schema_id {
+                    return Err(crate::Error::DataInvalid {
+                        message: "Table schema changed after compaction was planned".into(),
+                        source: None,
+                    });
+                }
+                // Concurrent writes may replace the HASH index after planning.
+                // Reuse the latest manifest on every retry, never the captured one.
+                let index_manifest_name = match latest_snapshot {
+                    Some(snapshot) => {
+                        super::compact::validate_snapshot_indexes(&self.table, snapshot).await?
+                    }
+                    None => None,
+                };
+                validate_file_entries(entries.iter())?;
+                // This runs after duplicate-commit filtering: an uncertain commit
+                // can be retried even after the captured read snapshot expires.
+                if let Some(captured) = read_snapshot {
+                    let snapshot = self.snapshot_manager.get_snapshot(captured.id()).await?;
+                    if !captured.has_same_read_metadata(&snapshot) {
+                        return Err(crate::Error::DataInvalid {
+                            message: "Compaction snapshot was replaced".into(),
+                            source: None,
+                        });
+                    }
+                    let captured_files = super::snapshot_manifest::read_snapshot_entries(
+                        &self.snapshot_manager,
+                        &snapshot,
+                        None,
+                    )
+                    .await?;
+                    let deletes = entries
+                        .iter()
+                        .filter(|e| *e.kind() == FileKind::Delete)
+                        .collect::<Vec<_>>();
+                    let buckets = deletes
+                        .iter()
+                        .map(|e| (e.partition(), e.bucket()))
+                        .collect::<HashSet<_>>();
+                    let captured_files = captured_files
+                        .iter()
+                        .filter(|e| buckets.contains(&(e.partition(), e.bucket())))
+                        .map(|entry| (commit_file_identifier(entry), entry))
+                        .collect::<HashMap<_, _>>();
+                    if captured_files.len() != deletes.len()
+                        || deletes.iter().any(|deleted| {
+                            !captured_files
+                                .get(&commit_file_identifier(deleted))
+                                .is_some_and(|file| {
+                                    file.file() == deleted.file()
+                                        && file.total_buckets() == deleted.total_buckets()
+                                })
+                        })
+                    {
+                        return Err(crate::Error::DataInvalid {
+                            message: "PK compaction must include the complete captured bucket"
+                                .into(),
+                            source: None,
+                        });
+                    }
+                }
+                let base_data_files = self
+                    .detect_commit_conflicts(
+                        latest_snapshot,
+                        retry_state,
+                        entries,
+                        &CommitKind::COMPACT,
+                        None,
+                    )
+                    .await?;
+                // File identity alone does not detect metadata-only changes.
+                let active_files = base_data_files
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|entry| (commit_file_identifier(entry), entry))
+                    .collect::<HashMap<_, _>>();
+                for deleted in entries.iter().filter(|e| *e.kind() == FileKind::Delete) {
+                    if !active_files
+                        .get(&commit_file_identifier(deleted))
+                        .is_some_and(|entry| {
+                            entry.file() == deleted.file()
+                                && entry.total_buckets() == deleted.total_buckets()
+                        })
+                    {
+                        return Err(crate::Error::DataInvalid {
+                            message: format!(
+                                "Compaction input '{}' metadata changed",
+                                deleted.file().file_name
+                            ),
+                            source: None,
+                        });
+                    }
+                }
+                Ok(ResolvedCommit {
+                    entries: entries.clone(),
+                    changelog_entries: vec![],
+                    kind: CommitKind::COMPACT,
+                    index_manifest_name,
+                    index_manifest_changed: false,
+                    new_index_manifest_entries: None,
+                    base_data_files,
+                })
+            }
             CommitEntriesPlan::Direct {
                 entries,
                 changelog_entries,
@@ -1905,7 +2049,9 @@ impl TableCommit {
                         new_index_entries.clone(),
                         *check_from_snapshot,
                     ),
-                    CommitEntriesPlan::Direct { .. } => unreachable!(),
+                    CommitEntriesPlan::Direct { .. } | CommitEntriesPlan::Compact { .. } => {
+                        unreachable!()
+                    }
                 };
                 let base_data_files = self
                     .detect_commit_conflicts(
@@ -3564,6 +3710,12 @@ fn build_partition_stats_row(datums: &[Option<Datum>], data_types: &[DataType]) 
 
 /// Plan for resolving commit entries.
 enum CommitEntriesPlan {
+    /// Replace unchanged data files without publishing logical row changes.
+    Compact {
+        entries: Vec<ManifestEntry>,
+        schema_id: i64,
+        read_snapshot: Option<Box<Snapshot>>,
+    },
     /// Caller-provided entries. May contain `FileKind::Delete` entries from CoW
     /// rewrites, in which case `resolve_commit` auto-promotes to `CommitKind::OVERWRITE`.
     Direct {
@@ -3588,6 +3740,7 @@ enum CommitEntriesPlan {
 impl CommitEntriesPlan {
     fn commit_kind_hint(&self) -> CommitKind {
         match self {
+            CommitEntriesPlan::Compact { .. } => CommitKind::COMPACT,
             CommitEntriesPlan::Direct {
                 entries,
                 new_index_entries,
@@ -4328,7 +4481,7 @@ mod tests {
                 delta_probe_count,
                 ..
             } => (*full_scan_count, *delta_probe_count),
-            CommitEntriesPlan::Direct { .. } => unreachable!(),
+            CommitEntriesPlan::Direct { .. } | CommitEntriesPlan::Compact { .. } => unreachable!(),
         }
     }
 
