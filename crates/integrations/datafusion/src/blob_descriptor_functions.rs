@@ -58,6 +58,10 @@ impl PathToDescriptorFunc {
 }
 
 impl ScalarUDFImpl for PathToDescriptorFunc {
+    fn is_strict(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         PATH_TO_DESCRIPTOR
     }
@@ -104,6 +108,10 @@ impl DescriptorToStringFunc {
 }
 
 impl ScalarUDFImpl for DescriptorToStringFunc {
+    fn is_strict(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         DESCRIPTOR_TO_STRING
     }

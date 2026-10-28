@@ -409,15 +409,13 @@ fn build_column(
         DataType::Map(map_type) => build_map_column(records, name, map_type, num_rows)?,
         // Java encodes MULTISET<T> as a map from the element to an INT count,
         // sharing the MAP path (`AvroSchemaConverter#extractValueTypeToAvroMap`
-        // returns IntType). Unlike MAP, `paimon_type_to_arrow` lets the key here
-        // follow the element's nullability and pins the count non-nullable.
+        // returns IntType). A list preserves NULL elements; counts are non-nullable.
         DataType::Multiset(multiset_type) => build_map_like_column(
             records,
             name,
             multiset_type.element_type(),
             &DataType::Int(IntType::new()),
-            multiset_type.element_type().is_nullable(),
-            false,
+            true,
             num_rows,
         )?,
         DataType::Row(row_type) => build_row_column(records, name, row_type, num_rows)?,
@@ -588,36 +586,32 @@ fn build_map_column(
         name,
         map_type.key_type(),
         map_type.value_type(),
-        // `paimon_type_to_arrow` declares a MAP key non-nullable and lets the
-        // value follow its own type. Mirror that exactly or `RecordBatch::try_new`
-        // rejects the column.
         false,
-        map_type.value_type().is_nullable(),
         num_rows,
     )
 }
 
-/// Build a Map array from either Avro map encoding Paimon can produce.
+/// Build MAP or MULTISET values from either Java Avro map encoding.
 ///
 /// Avro maps natively support string keys only, so Java writes a map with any
 /// other key type as an array of `{key, value}` records instead
 /// (`AvroSchemaConverter#isArrayMap`). Both shapes decode into the same Arrow
-/// `Map` array here.
+/// key/value entries here.
 ///
 /// The key and value types are passed separately rather than taken from a
 /// `MapType` so `MULTISET<T>` can reuse this with an implicit `INT` count as the
-/// value. The two nullability flags must match what `paimon_type_to_arrow`
-/// declares for the same type -- MAP and MULTISET differ here -- or
-/// `RecordBatch::try_new` rejects the column.
+/// value. MULTISET uses a list because its elements can be NULL; ordinary MAP
+/// keys remain non-nullable.
 fn build_map_like_column(
     records: &[Value],
     name: &str,
     key_type: &DataType,
     value_type: &DataType,
-    key_nullable: bool,
-    value_nullable: bool,
+    multiset: bool,
     num_rows: usize,
 ) -> crate::Result<Arc<dyn arrow_array::Array>> {
+    let key_nullable = multiset && key_type.is_nullable();
+    let value_nullable = !multiset && value_type.is_nullable();
     let arrow_key_type = crate::arrow::paimon_type_to_arrow(key_type)?;
     let arrow_value_type = crate::arrow::paimon_type_to_arrow(value_type)?;
 
@@ -701,6 +695,18 @@ fn build_map_like_column(
             .collect::<Vec<_>>(),
     ));
 
+    if multiset {
+        let field = crate::arrow::multiset::entries_field(
+            crate::arrow::paimon_type_to_arrow(key_type)?,
+            key_nullable,
+        );
+        let list = ListArray::try_new(field, offsets_buf, Arc::new(struct_arr), Some(nulls))
+            .map_err(|e| Error::UnexpectedError {
+                message: format!("Failed to build MULTISET: {e}"),
+                source: Some(Box::new(e)),
+            })?;
+        return Ok(Arc::new(list));
+    }
     let map_arr = MapArray::try_new(
         Arc::new(entries_field),
         offsets_buf,
@@ -1092,6 +1098,7 @@ mod tests {
         );
         let col = build_map_column(&records, "m", &map_type, 2).unwrap();
         let arr = col.as_any().downcast_ref::<MapArray>().unwrap();
+        assert!(!arr.entries().fields()[0].is_nullable());
         assert_eq!(arr.len(), 2);
         // First row has 2 entries, second row is null.
         assert!(!arr.is_null(0));
@@ -1216,9 +1223,15 @@ mod tests {
             VarCharType::new(10).unwrap(),
         )));
         let col = build_column(&records, "ms", &multiset, 1).unwrap();
-        let arr = col.as_any().downcast_ref::<MapArray>().unwrap();
+        let arr = col.as_any().downcast_ref::<ListArray>().unwrap();
+        let entries = arr.values().as_any().downcast_ref::<StructArray>().unwrap();
+        assert!(entries.fields()[0].is_nullable());
         assert_eq!(arr.value(0).len(), 1);
-        let values = arr.values().as_any().downcast_ref::<Int32Array>().unwrap();
+        let values = entries
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
         assert_eq!(values.value(0), 2);
     }
 
@@ -1228,19 +1241,36 @@ mod tests {
     fn test_build_column_multiset_int_element() {
         let records = vec![Value::Record(vec![(
             "ms".to_string(),
-            Value::Array(vec![Value::Record(vec![
-                ("key".to_string(), Value::Int(5)),
-                ("value".to_string(), Value::Int(3)),
-            ])]),
+            Value::Array(vec![
+                Value::Record(vec![
+                    ("key".to_string(), Value::Int(5)),
+                    ("value".to_string(), Value::Int(3)),
+                ]),
+                Value::Record(vec![
+                    ("key".to_string(), av_null()),
+                    ("value".to_string(), Value::Int(2)),
+                ]),
+            ]),
         )])];
         let multiset = DataType::Multiset(MultisetType::new(DataType::Int(IntType::new())));
         let col = build_column(&records, "ms", &multiset, 1).unwrap();
-        let arr = col.as_any().downcast_ref::<MapArray>().unwrap();
-        assert_eq!(arr.value(0).len(), 1);
-        let keys = arr.keys().as_any().downcast_ref::<Int32Array>().unwrap();
+        let arr = col.as_any().downcast_ref::<ListArray>().unwrap();
+        let entries = arr.values().as_any().downcast_ref::<StructArray>().unwrap();
+        assert_eq!(arr.value(0).len(), 2);
+        let keys = entries
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
         assert_eq!(keys.value(0), 5);
-        let values = arr.values().as_any().downcast_ref::<Int32Array>().unwrap();
+        assert!(keys.is_null(1));
+        let values = entries
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
         assert_eq!(values.value(0), 3);
+        assert_eq!(values.value(1), 2);
     }
 
     /// Going through `build_target_arrow_schema` is what catches a field-level

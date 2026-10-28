@@ -249,6 +249,9 @@ impl<'a> FilterTranslator<'a> {
         let field = self.resolve_field(column_expr)?;
         let scalar = extract_scalar_literal(literal_expr)?;
         let datum = scalar_to_datum(scalar, field.data_type())?;
+        if is_float_zero(&datum) {
+            return None;
+        }
 
         match op {
             Operator::Eq => self.predicate_builder.equal(field.name(), datum).ok(),
@@ -281,6 +284,9 @@ impl<'a> FilterTranslator<'a> {
             })
             .collect();
         let literals = literals?;
+        if literals.iter().any(is_float_zero) {
+            return None;
+        }
 
         self.exact(if in_list.negated {
             self.predicate_builder
@@ -301,6 +307,9 @@ impl<'a> FilterTranslator<'a> {
             extract_scalar_literal(between.high.as_ref())?,
             field.data_type(),
         )?;
+        if is_float_zero(&low) || is_float_zero(&high) {
+            return None;
+        }
 
         // Native Between / NotBetween leaf: lets the planner / b-tree
         // recognize the range as a single op (see `btree::query::extract_between`).
@@ -637,6 +646,19 @@ fn reverse_comparison_operator(op: Operator) -> Option<Operator> {
     }
 }
 
+/// Scalar comparisons in DataFusion 55 normalize signed zeroes, while Paimon's
+/// partition and row predicates distinguish them. Reject zero boundaries instead
+/// of dropping the other zero before DataFusion's residual can evaluate it.
+/// Array membership still follows Arrow's total ordering, so it must retain its
+/// own literal conversion without this restriction.
+pub(crate) fn is_float_zero(datum: &Datum) -> bool {
+    match datum {
+        Datum::Float(value) => *value == 0.0,
+        Datum::Double(value) => *value == 0.0,
+        _ => false,
+    }
+}
+
 pub(crate) fn scalar_to_datum(scalar: &ScalarValue, data_type: &DataType) -> Option<Datum> {
     match data_type {
         DataType::Boolean(_) => match scalar {
@@ -773,8 +795,8 @@ mod tests {
     use paimon::catalog::Identifier;
     use paimon::io::FileIOBuilder;
     use paimon::spec::{
-        ArrayType, BigIntType, FloatType, IntType, LocalZonedTimestampType, PredicateOperator,
-        Schema, SmallIntType, TableSchema, TimeType, TimestampType, VarCharType,
+        ArrayType, BigIntType, DoubleType, FloatType, IntType, LocalZonedTimestampType,
+        PredicateOperator, Schema, SmallIntType, TableSchema, TimeType, TimestampType, VarCharType,
     };
     use paimon::table::Table;
 
@@ -832,6 +854,93 @@ mod tests {
                 literals.remove(0)
             }
             other => panic!("expected Leaf, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_float_zero_filters_fall_open_without_disabling_array_membership() {
+        use datafusion::functions_nested::expr_fn::array_has;
+
+        for (data_type, zeroes) in [
+            (
+                DataType::Float(FloatType::new()),
+                [lit(0.0_f32), lit(-0.0_f32)],
+            ),
+            (
+                DataType::Double(DoubleType::new()),
+                [lit(0.0_f64), lit(-0.0_f64)],
+            ),
+        ] {
+            let fields = vec![
+                DataField::new(0, "id".into(), DataType::Int(IntType::new())),
+                DataField::new(1, "value".into(), data_type.clone()),
+                DataField::new(
+                    2,
+                    "items".into(),
+                    DataType::Array(ArrayType::new(data_type)),
+                ),
+            ];
+            let column = Expr::Column(Column::from_name("value"));
+            let id_filter = Expr::Column(Column::from_name("id")).eq(lit(1));
+            for zero in zeroes {
+                let mut filters = [
+                    Operator::Eq,
+                    Operator::NotEq,
+                    Operator::Lt,
+                    Operator::LtEq,
+                    Operator::Gt,
+                    Operator::GtEq,
+                ]
+                .map(|op| {
+                    Expr::BinaryExpr(BinaryExpr::new(
+                        Box::new(column.clone()),
+                        op,
+                        Box::new(zero.clone()),
+                    ))
+                })
+                .to_vec();
+                for negated in [false, true] {
+                    filters.push(Expr::InList(InList::new(
+                        Box::new(column.clone()),
+                        vec![zero.clone()],
+                        negated,
+                    )));
+                    filters.push(Expr::Between(Between::new(
+                        Box::new(column.clone()),
+                        negated,
+                        Box::new(zero.clone()),
+                        Box::new(zero.clone()),
+                    )));
+                }
+                for filter in filters {
+                    for filter in [filter.clone(), Expr::Not(Box::new(filter))] {
+                        assert_eq!(
+                            classify_filter_pushdown(&filter, &fields, true, |_| true),
+                            TableProviderFilterPushDown::Unsupported,
+                            "zero comparison must retain DataFusion semantics: {filter}"
+                        );
+                        let conjunction = analyze_filters(
+                            &[filter.clone().and(id_filter.clone())],
+                            &fields,
+                            true,
+                        );
+                        assert!(conjunction.requires_residual);
+                        assert_eq!(
+                            conjunction.pushed_predicate,
+                            build_pushed_predicate(std::slice::from_ref(&id_filter), &fields)
+                        );
+                        assert!(
+                            build_pushed_predicate(&[filter.or(id_filter.clone())], &fields)
+                                .is_none()
+                        );
+                    }
+                }
+                assert!(build_pushed_predicate(
+                    &[array_has(Expr::Column(Column::from_name("items")), zero)],
+                    &fields,
+                )
+                .is_some());
+            }
         }
     }
 

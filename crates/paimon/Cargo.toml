@@ -127,10 +127,13 @@ bzip2 = "0.6"
 liblzma = { version = "0.4", default-features = false, features = ["static"] }
 lzokay-native = { version = "0.1", default-features = false, features = ["decompress"] }
 arrow-array = { workspace = true }
+# Mosaic and Vortex still expose Arrow 58; bridge their arrays through the C Data Interface.
+arrow-array-58 = { package = "arrow-array", version = "58.4", features = ["ffi"] }
+arrow-schema-58 = { package = "arrow-schema", version = "58.4" }
 arrow-arith = { workspace = true }
 arrow-buffer = { workspace = true }
 arrow-cast = { workspace = true }
-arrow-json = "58.0"
+arrow-json = "59.2"
 arrow-ord = { workspace = true }
 arrow-row = { workspace = true }
 arrow-schema = { workspace = true }
@@ -140,7 +143,7 @@ futures = "0.3"
 crossbeam-channel = "0.5"
 tokio-util = { workspace = true, features = ["compat", "io-util"] }
 parquet = { workspace = true, features = ["async", "zstd", "lz4", "snap"] }
-orc-rust = "0.8.0"
+orc-rust = "0.9.0"
 async-stream = "0.3.6"
 reqwest = { version = "0.12", features = ["json", "gzip", "deflate"] }
 # Already in the tree via `reqwest`; direct dep for the object storage User-Agent transport.

@@ -50,4 +50,22 @@ pub trait RowFilter: Send + 'static {
 /// particular file.
 pub trait RowFilterFactory: Debug + Send + Sync {
     fn create(&self, context: RowFilterContext<'_>) -> crate::Result<Vec<Box<dyn RowFilter>>>;
+
+    /// Whether to refresh pruning predicates before reading each Parquet row group.
+    fn supports_row_group_pruning(&self) -> bool {
+        false
+    }
+
+    /// A conservative snapshot of this filter, expressed against the historical
+    /// file fields. Called before fetching a row group's data, so changing TopK
+    /// thresholds can skip unread groups. Unsupported expressions must return
+    /// no predicates; errors fall back to reading the group. Exact row filtering
+    /// remains the caller's responsibility. Once a snapshot excludes a row,
+    /// later snapshots must not admit it again: skipped groups cannot be replayed.
+    fn pruning_predicates(
+        &self,
+        _file_fields: &[crate::spec::DataField],
+    ) -> crate::Result<Vec<crate::spec::Predicate>> {
+        Ok(Vec::new())
+    }
 }

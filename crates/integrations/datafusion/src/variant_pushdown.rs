@@ -25,13 +25,14 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use datafusion::catalog::default_table_source::source_as_provider;
+use datafusion::catalog::Session;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{
     internal_err, plan_err, Column, DFSchema, DFSchemaRef, Result as DFResult, ScalarValue,
 };
-use datafusion::execution::context::SessionState;
 use datafusion::functions::core::expr_fn::get_field;
 use datafusion::logical_expr::expr::{InList, ScalarFunction};
+use datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext;
 use datafusion::logical_expr::{
     Between, BinaryExpr, Case, Cast, Expr, Extension, Filter, Like, LogicalPlan, Projection,
     TableScan, TryCast, UserDefinedLogicalNode,
@@ -199,7 +200,8 @@ impl ExtensionPlanner for VariantExtractionExtensionPlanner {
         node: &dyn UserDefinedLogicalNode,
         logical_inputs: &[&LogicalPlan],
         physical_inputs: &[Arc<dyn ExecutionPlan>],
-        session_state: &SessionState,
+        session_state: &dyn Session,
+        _planning_ctx: &PhysicalPlanningContext,
     ) -> DFResult<Option<Arc<dyn ExecutionPlan>>> {
         let Some(node) = node.as_any().downcast_ref::<VariantExtractionScanNode>() else {
             return Ok(None);

@@ -28,17 +28,19 @@ use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use datafusion::catalog::Session;
 use datafusion::catalog::TableFunctionImpl;
 use datafusion::common::stats::Precision;
+use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::common::{internal_err, project_schema, Statistics};
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
-use datafusion::physical_expr::EquivalenceProperties;
+use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
 use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
+    ChildrenPropertiesMode, DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning,
+    PlanProperties, ReplaceChildrenOptions, StatisticsArgs,
 };
 use datafusion::prelude::SessionContext;
 use futures::{stream, TryStreamExt};
@@ -475,9 +477,27 @@ impl ExecutionPlan for VectorSearchExec {
         vec![]
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DFResult<TreeNodeRecursion>,
+    ) -> DFResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        self.replace_children(
+            children,
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )
+    }
+
+    fn replace_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+        _options: ReplaceChildrenOptions,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         if !children.is_empty() {
             return internal_err!("VectorSearchExec is a leaf and takes no children");
@@ -503,7 +523,11 @@ impl ExecutionPlan for VectorSearchExec {
         )))
     }
 
-    fn partition_statistics(&self, _partition: Option<usize>) -> DFResult<Arc<Statistics>> {
+    fn statistics_from_inputs(
+        &self,
+        _input_stats: &[Arc<Statistics>],
+        _args: &StatisticsArgs,
+    ) -> DFResult<Arc<Statistics>> {
         Ok(Arc::new(Statistics {
             num_rows: Precision::Absent,
             total_byte_size: Precision::Absent,

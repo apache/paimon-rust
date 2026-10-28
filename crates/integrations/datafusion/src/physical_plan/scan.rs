@@ -24,6 +24,7 @@ use datafusion::arrow::datatypes::{
 };
 use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion::common::stats::Precision;
+use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::common::{ColumnStatistics, ScalarValue, Statistics};
 use datafusion::config::ConfigOptions;
 use datafusion::datasource::physical_plan::parquet::can_expr_be_pushed_down_with_schemas;
@@ -46,9 +47,13 @@ use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::filter_pushdown::{
     ChildPushdownResult, FilterPushdownPhase, FilterPushdownPropagation, PushedDown,
 };
+use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::physical_plan::{DisplayAs, ExecutionPlan, Partitioning, PlanProperties};
-use futures::{FutureExt, StreamExt, TryStreamExt};
+use datafusion::physical_plan::{
+    ChildrenPropertiesMode, DisplayAs, ExecutionPlan, Partitioning, PlanProperties,
+    ReplaceChildrenOptions, StatisticsArgs,
+};
+use futures::{FutureExt, Stream, StreamExt, TryStreamExt};
 use paimon::arrow::ReadBudget;
 use paimon::spec::{
     CoreOptions, DataField, Datum, MergeEngine, Predicate, PredicateBuilder, PredicateOperator,
@@ -57,7 +62,7 @@ use paimon::table::{ArrowRecordBatchStream, ScanStats, Table, TableRead};
 use paimon::DataSplit;
 
 use crate::error::to_datafusion_error;
-use crate::filter_pushdown::scalar_to_datum;
+use crate::filter_pushdown::{is_float_zero, scalar_to_datum};
 
 fn to_datafusion_batch(batch: RecordBatch, schema: &ArrowSchemaRef) -> DFResult<RecordBatch> {
     if batch.num_columns() != schema.fields().len() {
@@ -139,6 +144,39 @@ impl paimon::arrow::RowFilter for DataFusionRowFilter {
 }
 
 impl paimon::arrow::RowFilterFactory for DataFusionRowFilterFactory {
+    fn supports_row_group_pruning(&self) -> bool {
+        datafusion::physical_expr::DynamicFilterTracking::classify(&self.predicate)
+            .contains_dynamic_filter()
+    }
+
+    fn pruning_predicates(&self, file_fields: &[DataField]) -> paimon::Result<Vec<Predicate>> {
+        let snapshot = datafusion::physical_expr_common::physical_expr::snapshot_physical_expr(
+            Arc::clone(&self.predicate),
+        )
+        .map_err(datafusion_row_filter_error)?;
+        let builder = PredicateBuilder::new(file_fields);
+        Ok(split_conjunction(&snapshot)
+            .into_iter()
+            .filter(|expr| {
+                // Parquet min/max exclude NaN, whereas DataFusion compares floats
+                // using Arrow's total order. A finite bound cannot rule out NaN.
+                !collect_columns(expr).iter().any(|column| {
+                    file_fields.iter().any(|field| {
+                        field.name() == column.name()
+                            && matches!(
+                                field.data_type(),
+                                paimon::spec::DataType::Float(_)
+                                    | paimon::spec::DataType::Double(_)
+                            )
+                    })
+                })
+            })
+            .filter_map(|expr| {
+                translate_physical_predicate(expr.as_ref(), file_fields, &builder, true)
+            })
+            .collect())
+    }
+
     fn create(
         &self,
         context: paimon::arrow::RowFilterContext<'_>,
@@ -359,6 +397,9 @@ fn translate_physical_predicate(
                 scalar_to_datum(literal.value(), field.data_type())
             })
             .collect::<Option<Vec<_>>>()?;
+        if literals.iter().any(is_float_zero) {
+            return None;
+        }
         return if in_list.negated() {
             predicate_builder.is_not_in(field.name(), literals).ok()
         } else {
@@ -512,6 +553,12 @@ fn translate_physical_comparison(
             reverse_physical_comparison(*binary.op()).map(|op| (op, field, datum))
         })
     })?;
+
+    // DataFusion equates signed zeros, while the native reader orders them separately.
+    // Keep zero boundaries in DataFusion so native pruning cannot discard matches.
+    if is_float_zero(&datum) {
+        return None;
+    }
 
     if matches!(
         field.data_type(),
@@ -784,6 +831,7 @@ pub struct PaimonTableScan {
     /// Wrapped in `Arc` to avoid deep-cloning `DataSplit` metadata in `execute()`.
     planned_partitions: Vec<Arc<[DataSplit]>>,
     plan_properties: Arc<PlanProperties>,
+    metrics: ExecutionPlanMetricsSet,
     /// Optional limit hint pushed to paimon-core planning.
     limit: Option<usize>,
     /// Whether the pushed predicate is exact (no residual filtering needed).
@@ -903,6 +951,7 @@ impl PaimonTableScan {
             pushed_predicate,
             planned_partitions,
             plan_properties,
+            metrics: ExecutionPlanMetricsSet::new(),
             limit,
             filter_exact,
             scan_stats,
@@ -1089,9 +1138,15 @@ impl PaimonTableScan {
             ))
         };
 
+        let mut stream = Box::pin(futures::stream::once(fut).try_flatten());
+        let metrics = BaselineMetrics::new(&self.metrics, partition);
+        let measured = futures::stream::poll_fn(move |cx| {
+            let _timer = metrics.elapsed_compute().timer();
+            metrics.record_poll(stream.as_mut().poll_next(cx))
+        });
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             self.schema(),
-            futures::stream::once(fut).try_flatten(),
+            measured,
         )))
     }
 }
@@ -1105,13 +1160,38 @@ impl ExecutionPlan for PaimonTableScan {
         &self.plan_properties
     }
 
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
+    }
+
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan + 'static>> {
         vec![]
     }
 
+    fn apply_expressions(
+        &self,
+        f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DFResult<TreeNodeRecursion>,
+    ) -> DFResult<TreeNodeRecursion> {
+        datafusion::physical_plan::apply_expression_roots(
+            self.runtime_filters.iter().chain(&self.decoder_filters),
+            f,
+        )
+    }
+
     fn with_new_children(
         self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        self.replace_children(
+            children,
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )
+    }
+
+    fn replace_children(
+        self: Arc<Self>,
         _children: Vec<Arc<dyn ExecutionPlan>>,
+        _options: ReplaceChildrenOptions,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         Ok(self)
     }
@@ -1192,12 +1272,16 @@ impl ExecutionPlan for PaimonTableScan {
         self.execute_with(partition, context, |read, splits| read.to_arrow(splits))
     }
 
-    fn partition_statistics(&self, partition: Option<usize>) -> DFResult<Arc<Statistics>> {
+    fn statistics_from_inputs(
+        &self,
+        _input_stats: &[Arc<Statistics>],
+        args: &StatisticsArgs,
+    ) -> DFResult<Arc<Statistics>> {
         // Statistics include hidden rows and unmasked values.
         if self.has_query_auth_rules() {
             return Ok(Arc::new(Statistics::new_unknown(&self.schema())));
         }
-        let partitions: &[Arc<[DataSplit]>] = match partition {
+        let partitions: &[Arc<[DataSplit]>] = match args.partition() {
             Some(idx) => std::slice::from_ref(&self.planned_partitions[idx]),
             None => &self.planned_partitions,
         };
@@ -1341,12 +1425,194 @@ mod tests {
         )]))
     }
 
+    #[test]
+    fn runtime_pruning_refreshes_incomplete_topk_thresholds() {
+        use paimon::arrow::RowFilterFactory;
+        let column: Arc<dyn PhysicalExpr> = Arc::new(Column::new("id", 0));
+        let dynamic = Arc::new(DynamicFilterPhysicalExpr::new(
+            vec![Arc::clone(&column)],
+            lit(true),
+        ));
+        let filter: Arc<dyn PhysicalExpr> = dynamic.clone();
+        let factory = DataFusionRowFilterFactory::new(filter, test_schema());
+        let fields = test_read_type();
+        assert!(factory.pruning_predicates(&fields).unwrap().is_empty());
+        for threshold in [100, 5] {
+            dynamic
+                .update(Arc::new(BinaryExpr::new(
+                    Arc::clone(&column),
+                    Operator::Lt,
+                    lit(threshold),
+                )))
+                .unwrap();
+            assert_eq!(
+                factory.pruning_predicates(&fields).unwrap(),
+                vec![PredicateBuilder::new(&fields)
+                    .less_than("id", Datum::Int(threshold))
+                    .unwrap()]
+            );
+        }
+        dynamic.update(lit(true)).unwrap();
+        assert!(factory.pruning_predicates(&fields).unwrap().is_empty());
+    }
+
     fn test_read_type() -> Vec<DataField> {
         vec![DataField::new(
             0,
             "id".to_string(),
             DataType::Int(IntType::new()),
         )]
+    }
+
+    #[tokio::test]
+    async fn runtime_row_group_pruning_preserves_nan_after_threshold_updates() {
+        use datafusion::arrow::array::{ArrayRef, Float32Array, Float64Array};
+        use paimon::spec::{DoubleType, FloatType};
+        use parquet::arrow::ArrowWriter;
+        use parquet::file::properties::WriterProperties;
+
+        for single_precision in [false, true] {
+            for descending in [false, true] {
+                let dir = tempdir().unwrap();
+                let bucket = dir.path().join("bucket-0");
+                fs::create_dir_all(&bucket).unwrap();
+                let file = bucket.join("data.parquet");
+                let sign = if descending { 1.0 } else { -1.0 };
+                // Floating-point arithmetic may canonicalize NaN's sign. Build
+                // explicit bit patterns so ascending tests really use negative NaN.
+                let nan = f64::from_bits(if descending {
+                    0x7ff8_0000_0000_0000
+                } else {
+                    0xfff8_0000_0000_0000
+                });
+                let values = vec![sign * 100.0, sign * 100.0, sign, nan];
+                let (data_type, array): (_, ArrayRef) = if single_precision {
+                    (
+                        DataType::Float(FloatType::new()),
+                        Arc::new(Float32Array::from(
+                            values
+                                .iter()
+                                .map(|v| {
+                                    if v.is_nan() {
+                                        f32::from_bits(if descending {
+                                            0x7fc0_0000
+                                        } else {
+                                            0xffc0_0000
+                                        })
+                                    } else {
+                                        *v as f32
+                                    }
+                                })
+                                .collect::<Vec<_>>(),
+                        )),
+                    )
+                } else {
+                    (
+                        DataType::Double(DoubleType::new()),
+                        Arc::new(Float64Array::from(values)),
+                    )
+                };
+                let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+                    "value",
+                    array.data_type().clone(),
+                    true,
+                )]));
+                let batch = RecordBatch::try_new(Arc::clone(&arrow_schema), vec![array]).unwrap();
+                let mut writer = ArrowWriter::try_new(
+                    fs::File::create(&file).unwrap(),
+                    Arc::clone(&arrow_schema),
+                    Some(
+                        WriterProperties::builder()
+                            .set_max_row_group_row_count(Some(2))
+                            .build(),
+                    ),
+                )
+                .unwrap();
+                writer.write(&batch).unwrap();
+                writer.close().unwrap();
+                let schema = PaimonSchema::builder()
+                    .column("value", data_type)
+                    .option("read.batch-size", "2")
+                    .build()
+                    .unwrap();
+                let table = Table::new(
+                    FileIOBuilder::new("file").build().unwrap(),
+                    Identifier::new("default", "nan_topk"),
+                    local_file_path(dir.path()),
+                    TableSchema::new(0, &schema),
+                    None,
+                );
+                let split = paimon::DataSplitBuilder::new()
+                    .with_snapshot(1)
+                    .with_partition(BinaryRow::new(0))
+                    .with_bucket(0)
+                    .with_bucket_path(local_file_path(&bucket))
+                    .with_total_buckets(1)
+                    .with_data_files(vec![test_data_file(
+                        "data.parquet",
+                        4,
+                        fs::metadata(file).unwrap().len() as i64,
+                    )])
+                    .build()
+                    .unwrap();
+                let column: Arc<dyn PhysicalExpr> = Arc::new(Column::new("value", 0));
+                let dynamic = Arc::new(DynamicFilterPhysicalExpr::new(
+                    vec![Arc::clone(&column)],
+                    lit(true),
+                ));
+                let filter: Arc<dyn PhysicalExpr> = dynamic.clone();
+                let read = table
+                    .new_read_builder()
+                    .new_read()
+                    .unwrap()
+                    .with_row_filter_factory(Arc::new(DataFusionRowFilterFactory::new(
+                        filter,
+                        arrow_schema,
+                    )));
+                let mut stream = read.to_arrow(&[split]).unwrap();
+                assert_eq!(stream.try_next().await.unwrap().unwrap().num_rows(), 2);
+                let threshold = if single_precision {
+                    ScalarValue::Float32(Some((sign * 100.0) as f32))
+                } else {
+                    ScalarValue::Float64(Some(sign * 100.0))
+                };
+                dynamic
+                    .update(Arc::new(BinaryExpr::new(
+                        column,
+                        if descending {
+                            Operator::Gt
+                        } else {
+                            Operator::Lt
+                        },
+                        lit(threshold),
+                    )))
+                    .unwrap();
+                let expected = dynamic.evaluate(&batch).unwrap().into_array(4).unwrap();
+                assert_eq!(
+                    expected.as_any().downcast_ref::<BooleanArray>().unwrap(),
+                    &BooleanArray::from(vec![false, false, false, true])
+                );
+                let rest = stream.try_collect::<Vec<_>>().await.unwrap();
+                assert_eq!(rest.iter().map(RecordBatch::num_rows).sum::<usize>(), 1,
+                    "a finite Parquet bound must not discard NaN: single_precision={single_precision}, descending={descending}");
+                let value = rest.iter().find(|b| b.num_rows() > 0).unwrap().column(0);
+                assert!(if single_precision {
+                    value
+                        .as_any()
+                        .downcast_ref::<Float32Array>()
+                        .unwrap()
+                        .value(0)
+                        .is_nan()
+                } else {
+                    value
+                        .as_any()
+                        .downcast_ref::<Float64Array>()
+                        .unwrap()
+                        .value(0)
+                        .is_nan()
+                });
+            }
+        }
     }
 
     #[test]
@@ -1465,24 +1731,38 @@ mod tests {
 
     #[test]
     fn test_partition_statistics_include_manifest_column_bounds() {
-        let split = paimon::DataSplitBuilder::new()
-            .with_snapshot(1)
-            .with_partition(BinaryRow::new(0))
-            .with_bucket(0)
-            .with_bucket_path("file:/tmp/test-table/bucket-0".to_string())
-            .with_total_buckets(1)
-            .with_data_files(vec![
-                data_file_with_int_stats("a.parquet", 4, 2, 8, 1),
-                data_file_with_int_stats("b.parquet", 6, 1, 10, 2),
-            ])
-            .build()
-            .unwrap();
+        let split = |file| {
+            paimon::DataSplitBuilder::new()
+                .with_snapshot(1)
+                .with_partition(BinaryRow::new(0))
+                .with_bucket(0)
+                .with_bucket_path("file:/tmp/test-table/bucket-0".to_string())
+                .with_total_buckets(1)
+                .with_data_files(vec![file])
+                .build()
+                .unwrap()
+        };
         let scan = PaimonTableScan::new(
             test_schema(),
             dummy_table(),
             test_read_type(),
             None,
-            vec![Arc::from(vec![split])],
+            vec![
+                Arc::from(vec![split(data_file_with_int_stats(
+                    "a.parquet",
+                    4,
+                    2,
+                    8,
+                    1,
+                ))]),
+                Arc::from(vec![split(data_file_with_int_stats(
+                    "b.parquet",
+                    6,
+                    1,
+                    10,
+                    2,
+                ))]),
+            ],
             None,
             true,
             None,
@@ -1490,7 +1770,8 @@ mod tests {
             true,
         );
 
-        let statistics = scan.partition_statistics(None).unwrap();
+        let context = datafusion::physical_plan::StatisticsContext::new();
+        let statistics = context.compute(&scan, &StatisticsArgs::new()).unwrap();
         let id = &statistics.column_statistics[0];
 
         assert_eq!(
@@ -1502,6 +1783,24 @@ mod tests {
             Precision::Inexact(ScalarValue::Int32(Some(10)))
         );
         assert_eq!(id.null_count, Precision::Exact(3));
+        for (partition, min, max, nulls) in [(0, 2, 8, 1), (1, 1, 10, 2)] {
+            let statistics = context
+                .compute(
+                    &scan,
+                    &StatisticsArgs::new().with_partition(Some(partition)),
+                )
+                .unwrap();
+            let id = &statistics.column_statistics[0];
+            assert_eq!(
+                id.min_value,
+                Precision::Inexact(ScalarValue::Int32(Some(min)))
+            );
+            assert_eq!(
+                id.max_value,
+                Precision::Inexact(ScalarValue::Int32(Some(max)))
+            );
+            assert_eq!(id.null_count, Precision::Exact(nulls));
+        }
     }
 
     #[test]
@@ -1528,7 +1827,9 @@ mod tests {
             true,
         );
 
-        let statistics = scan.partition_statistics(None).unwrap();
+        let statistics = scan
+            .statistics_from_inputs(&[], &StatisticsArgs::new())
+            .unwrap();
 
         assert_eq!(statistics.num_rows, Precision::Exact(4));
         assert_eq!(statistics.total_byte_size, Precision::Absent);
@@ -1572,7 +1873,10 @@ mod tests {
                 true,
             );
             assert_eq!(
-                scan.partition_statistics(None).unwrap().column_statistics[0].null_count,
+                scan.statistics_from_inputs(&[], &StatisticsArgs::new())
+                    .unwrap()
+                    .column_statistics[0]
+                    .null_count,
                 Precision::Absent
             );
         }
@@ -1628,7 +1932,10 @@ mod tests {
             true,
         );
 
-        let value_stats = &scan.partition_statistics(None).unwrap().column_statistics[0];
+        let value_stats = &scan
+            .statistics_from_inputs(&[], &StatisticsArgs::new())
+            .unwrap()
+            .column_statistics[0];
         assert_eq!(value_stats.min_value, Precision::Absent);
         assert_eq!(value_stats.max_value, Precision::Absent);
         assert_eq!(value_stats.null_count, Precision::Absent);
@@ -1667,7 +1974,17 @@ mod tests {
         let updated = result
             .updated_node
             .expect("the scan must retain physical filters so dynamic join filters remain active");
-        let statistics = updated.partition_statistics(None).unwrap();
+        let mut found_dynamic_filter = false;
+        updated
+            .apply_expressions(&mut |expr| {
+                found_dynamic_filter |= expr.downcast_ref::<DynamicFilterPhysicalExpr>().is_some();
+                Ok(TreeNodeRecursion::Continue)
+            })
+            .unwrap();
+        assert!(found_dynamic_filter);
+        let statistics = updated
+            .statistics_from_inputs(&[], &StatisticsArgs::new())
+            .unwrap();
         assert_eq!(statistics.num_rows, Precision::Inexact(0));
         assert_eq!(
             statistics.column_statistics[0].null_count,
@@ -2095,7 +2412,14 @@ mod tests {
             datafusion::logical_expr::col("name"),
             datafusion::logical_expr::lit("ab"),
         );
-        let physical = create_physical_expr(&logical, &df_schema, &ExecutionProps::new()).unwrap();
+        let physical = create_physical_expr(
+            &logical,
+            &df_schema,
+            &ExecutionProps::new(),
+            &datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext::default(
+            ),
+        )
+        .unwrap();
 
         assert!(paimon_predicate_covers_filter(
             Some(&pushed),
@@ -2226,6 +2550,138 @@ mod tests {
             &fields,
             true,
         ));
+    }
+
+    #[test]
+    fn test_completed_dynamic_float_zero_filter_keeps_both_signed_zeros() {
+        use datafusion::arrow::array::{ArrayRef, Float32Array, Float64Array};
+        use paimon::spec::{DoubleType, FloatType};
+
+        type FilterCase = (Arc<dyn PhysicalExpr>, Vec<Option<bool>>);
+
+        for zero in [
+            ScalarValue::Float32(Some(0.0)),
+            ScalarValue::Float32(Some(-0.0)),
+            ScalarValue::Float64(Some(0.0)),
+            ScalarValue::Float64(Some(-0.0)),
+        ] {
+            let (data_type, values): (_, ArrayRef) = match zero {
+                ScalarValue::Float32(_) => (
+                    paimon::spec::DataType::Float(FloatType::new()),
+                    Arc::new(Float32Array::from(vec![
+                        Some(-1.0),
+                        Some(-0.0),
+                        Some(0.0),
+                        Some(1.0),
+                        None,
+                    ])),
+                ),
+                _ => (
+                    paimon::spec::DataType::Double(DoubleType::new()),
+                    Arc::new(Float64Array::from(vec![
+                        Some(-1.0),
+                        Some(-0.0),
+                        Some(0.0),
+                        Some(1.0),
+                        None,
+                    ])),
+                ),
+            };
+            let fields = vec![DataField::new(0, "value".to_string(), data_type)];
+            let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+                "value",
+                values.data_type().clone(),
+                true,
+            )]));
+            let batch = RecordBatch::try_new(Arc::clone(&schema), vec![values]).unwrap();
+            let column: Arc<dyn PhysicalExpr> = Arc::new(Column::new("value", 0));
+            let is_negative_zero = match &zero {
+                ScalarValue::Float32(Some(value)) => value.is_sign_negative(),
+                ScalarValue::Float64(Some(value)) => value.is_sign_negative(),
+                _ => unreachable!(),
+            };
+            let literal = lit(zero);
+            let mut cases: Vec<FilterCase> = Vec::new();
+            for (op, expected) in [
+                (Operator::Eq, [false, true, true, false]),
+                (Operator::NotEq, [true, false, false, true]),
+                (Operator::Lt, [true, false, false, false]),
+                (Operator::LtEq, [true, true, true, false]),
+                (Operator::Gt, [false, false, false, true]),
+                (Operator::GtEq, [false, true, true, true]),
+            ] {
+                let expected = expected.into_iter().map(Some).chain([None]).collect();
+                cases.push((
+                    Arc::new(BinaryExpr::new(
+                        Arc::clone(&column),
+                        op,
+                        Arc::clone(&literal),
+                    )),
+                    expected,
+                ));
+            }
+            cases.push((
+                Arc::new(BinaryExpr::new(
+                    Arc::clone(&literal),
+                    Operator::LtEq,
+                    Arc::clone(&column),
+                )),
+                vec![Some(false), Some(true), Some(true), Some(true), None],
+            ));
+            // Physical IN retains total-order equality even though BinaryExpr
+            // comparisons normalize signed zeros. Preserve each expression's semantics.
+            for negated in [false, true] {
+                cases.push((
+                    Arc::new(
+                        InListExpr::try_new(
+                            Arc::clone(&column),
+                            vec![Arc::clone(&literal)],
+                            negated,
+                            schema.as_ref(),
+                        )
+                        .unwrap(),
+                    ),
+                    [false, is_negative_zero, !is_negative_zero, false]
+                        .into_iter()
+                        .map(|matched| Some(matched != negated))
+                        .chain([None])
+                        .collect(),
+                ));
+            }
+            cases.push((
+                Arc::new(NotExpr::new(Arc::clone(&cases[0].0))),
+                vec![Some(true), Some(false), Some(false), Some(true), None],
+            ));
+
+            for (snapshot, expected) in cases {
+                let dynamic = Arc::new(DynamicFilterPhysicalExpr::new(
+                    vec![Arc::clone(&column)],
+                    lit(true),
+                ));
+                dynamic.update(Arc::clone(&snapshot)).unwrap();
+                dynamic.mark_complete();
+                let dynamic: Arc<dyn PhysicalExpr> = dynamic;
+                let plan = partition_runtime_decoder_filters(&[dynamic], &fields, true);
+                assert!(
+                    plan.paimon_predicates.is_empty(),
+                    "native total-order comparisons cannot implement {snapshot}"
+                );
+                assert_eq!(plan.datafusion_filters.len(), 1);
+                let factory = DataFusionRowFilterFactory::new(
+                    conjunction(plan.datafusion_filters),
+                    Arc::clone(&schema),
+                );
+                let mut filters = paimon::arrow::RowFilterFactory::create(
+                    &factory,
+                    paimon::arrow::RowFilterContext {
+                        file_schema: &schema,
+                    },
+                )
+                .unwrap();
+                let actual = filters[0].evaluate(batch.clone()).unwrap();
+                assert_eq!(actual.iter().collect::<Vec<_>>(), expected, "{snapshot}");
+            }
+        }
     }
 
     #[test]

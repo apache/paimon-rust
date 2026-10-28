@@ -25,8 +25,8 @@ use crate::spec::{
 use crate::table::{PostponeBucketPlan, Table};
 use crate::Result;
 use arrow_array::{
-    Array, ArrayRef, FixedSizeListArray, Int64Array, LargeListArray, ListArray, MapArray,
-    RecordBatch, StructArray,
+    Array, ArrayRef, FixedSizeListArray, Int64Array, LargeListArray, ListArray, RecordBatch,
+    StructArray,
 };
 use arrow_schema::{DataType as ArrowType, Field, Schema};
 use std::collections::{HashMap, HashSet};
@@ -635,11 +635,7 @@ fn variable_size(array: &ArrayRef, row: usize, data_type: &DataType) -> Result<u
 }
 
 fn map_size(array: &ArrayRef, row: usize, key: &DataType, value: &DataType) -> Result<usize> {
-    let entries = array
-        .as_any()
-        .downcast_ref::<MapArray>()
-        .ok_or_else(|| data_invalid("Expected MAP input while sizing postpone data"))?
-        .value(row);
+    let entries = crate::arrow::multiset::entries(array.as_ref(), row)?;
     let keys = array_size(entries.column(0), key)?;
     let values = array_size(entries.column(1), value)?;
     round_word(checked_size(
@@ -822,6 +818,52 @@ mod tests {
             HashMap::from([(Some("old".into()), 3), (Some("new".into()), 4), (None, 2),])
         );
         assert_eq!(planner.input_statistics(&batch).unwrap().num_rows(), 0);
+    }
+
+    #[test]
+    fn input_statistics_rejects_malformed_multiset_entries() {
+        let schema = TableSchema::new(
+            0,
+            &crate::spec::Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column(
+                    "bag",
+                    DataType::Multiset(crate::spec::MultisetType::new(DataType::Int(
+                        IntType::new(),
+                    ))),
+                )
+                .primary_key(["id"])
+                .option("bucket", "-2")
+                .option("postpone.target-size-per-bucket", "20 b")
+                .build()
+                .unwrap(),
+        );
+        let planner = PostponeBucketPlanner::new(&schema, PostponeBucketPlan::default()).unwrap();
+        let entries = StructArray::try_new(
+            vec![Arc::new(Field::new("key", ArrowType::Int32, true))].into(),
+            vec![Arc::new(Int32Array::from(vec![5]))],
+            None,
+        )
+        .unwrap();
+        let bag = ListArray::try_new(
+            Arc::new(Field::new("entries", entries.data_type().clone(), false)),
+            arrow_buffer::OffsetBuffer::new(vec![0, 1].into()),
+            Arc::new(entries),
+            None,
+        )
+        .unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "bag",
+                bag.data_type().clone(),
+                true,
+            )])),
+            vec![Arc::new(bag)],
+        )
+        .unwrap();
+        let error = planner.input_statistics(&batch).unwrap_err();
+        assert!(matches!(&error, crate::Error::DataInvalid { .. }));
+        assert!(error.to_string().contains("exactly two fields"));
     }
 
     #[test]
