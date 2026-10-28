@@ -26,7 +26,7 @@ use crate::spec::{
     IndexManifestEntry, Predicate, ROW_ID_FIELD_NAME,
 };
 use crate::table::data_file_reader::DataFileReader;
-use crate::table::full_text_index_adapter::{search_full_text_file, search_full_text_index};
+use crate::table::full_text_index_adapter::{search_full_text_file, search_full_text_index_top_k};
 use crate::table::global_index_scanner::{
     deleted_row_ranges_for_data_evolution_dvs, unindexed_ranges_for_global_index_entries,
     RowRangeIndex,
@@ -362,12 +362,25 @@ async fn evaluate_full_text_search_with_executor(
             fulltext_entries,
             indexed_search.include_row_ids.as_ref(),
         )?;
+        // Raw fallback can replace indexed hits, and deletion vectors are applied
+        // after the shard searches. Those paths require exhaustive candidates.
+        let top_k = (core_options.full_text_index_top_k_enabled()?
+            && search_mode == GlobalIndexSearchMode::Fast
+            && deleted_row_index.is_none()
+            && !core_options.deletion_vectors_enabled()
+            && evaluation.source_splits.is_none_or(|splits| {
+                splits
+                    .iter()
+                    .all(|split| !matches!(split, crate::table::SearchScanSplit::Raw { .. }))
+            })
+            && disjoint_full_text_ranges(&plans))
+        .then_some(search.limit);
         let results = if let Some(executor) = executor {
             let table = evaluation.table.ok_or_else(|| crate::Error::DataInvalid {
                 message: "Scheduled full-text search requires table context".into(),
                 source: None,
             })?;
-            execution::search_indexes(table, plans, &search.query_text, executor).await?
+            execution::search_indexes(table, plans, &search.query_text, top_k, executor).await?
         } else {
             let results = plans
                 .into_iter()
@@ -383,18 +396,18 @@ async fn evaluate_full_text_search_with_executor(
                     let local_filter = plan.local_filter;
                     let row_range_start = global_meta.row_range_start;
                     let row_range_end = global_meta.row_range_end;
-                    // Compound query leaves must see every candidate in the shard
-                    // before Boolean/boost composition and the final global Top-K.
+                    // The native engine evaluates the complete query before selecting hits.
                     let limit = candidate_limit(row_range_start, row_range_end)?;
                     Ok::<_, crate::Error>(async move {
                         let input = evaluation.file_io.new_input(&path)?;
                         let reader = Box::new(input.reader().await?);
-                        let result = search_full_text_index(
+                        let result = search_full_text_index_top_k(
                             reader,
                             file_name,
                             query_text,
                             limit,
                             local_filter,
+                            top_k,
                         )
                         .await?;
                         Ok::<_, crate::Error>(
@@ -496,6 +509,16 @@ async fn evaluate_full_text_search_with_executor(
 struct FullTextIndexSearchPlan {
     entry: IndexManifestEntry,
     local_filter: Option<RoaringTreemap>,
+}
+
+fn disjoint_full_text_ranges(plans: &[FullTextIndexSearchPlan]) -> bool {
+    let mut ranges = plans
+        .iter()
+        .filter_map(|plan| plan.entry.index_file.global_index_meta.as_ref())
+        .map(|meta| (meta.row_range_start, meta.row_range_end))
+        .collect::<Vec<_>>();
+    ranges.sort_unstable();
+    ranges.windows(2).all(|pair| pair[0].1 < pair[1].0)
 }
 
 fn plan_full_text_index_searches(
@@ -1370,6 +1393,22 @@ mod tests {
         let mut bytes = Vec::new();
         writer.write(&mut PosWriter::new(&mut bytes)).unwrap();
         bytes
+    }
+
+    #[test]
+    fn top_k_requires_disjoint_inclusive_shard_ranges() {
+        let entries = [
+            full_text_index_entry("a", 0, 9),
+            full_text_index_entry("b", 10, 19),
+        ];
+        let plans = plan_full_text_index_searches(entries.iter().collect(), None).unwrap();
+        assert!(disjoint_full_text_ranges(&plans));
+        let entries = [
+            full_text_index_entry("a", 0, 9),
+            full_text_index_entry("b", 9, 19),
+        ];
+        let plans = plan_full_text_index_searches(entries.iter().collect(), None).unwrap();
+        assert!(!disjoint_full_text_ranges(&plans));
     }
 
     #[test]

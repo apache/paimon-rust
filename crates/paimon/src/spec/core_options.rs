@@ -1061,6 +1061,24 @@ impl<'a> CoreOptions<'a> {
         self.index_search_mode(FULL_TEXT_INDEX_SEARCH_MODE_OPTION)
     }
 
+    /// Allow certified per-shard Top-K when global full-text reads need no
+    /// post-search exclusions. Disable to compare against exhaustive collection.
+    pub fn full_text_index_top_k_enabled(&self) -> crate::Result<bool> {
+        match self
+            .options
+            .get("full-text-index.top-k.enabled")
+            .map(String::as_str)
+        {
+            None | Some("true") => Ok(true),
+            Some("false") => Ok(false),
+            Some(value) => Err(crate::Error::ConfigInvalid {
+                message: format!(
+                    "Option 'full-text-index.top-k.enabled' must be true or false, got: {value}"
+                ),
+            }),
+        }
+    }
+
     fn index_search_mode(&self, family_option: &str) -> crate::Result<GlobalIndexSearchMode> {
         let (option, value) = if let Some(value) = self.options.get(family_option) {
             (family_option, value)
