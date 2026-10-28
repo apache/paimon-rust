@@ -1393,6 +1393,34 @@ fn read_type_projection_mask(
             return;
         }
         let data_type = field.data_type();
+        if let DataType::Map(map) = data_type {
+            if !physical.is_primitive() && physical.get_fields().len() == 1 {
+                let entries = &physical.get_fields()[0];
+                if !entries.is_primitive()
+                    && entries.get_fields().len() == 2
+                    && entries.get_fields()[0].name() == "key"
+                    && entries.get_fields()[1].name() == "value"
+                {
+                    path.push(entries.name().to_string());
+                    let key = &entries.get_fields()[0];
+                    path.push(key.name().to_string());
+                    super::variant_projection::all_leaves(key, path, output);
+                    path.pop();
+                    let value = &entries.get_fields()[1];
+                    path.push(value.name().to_string());
+                    requested_paths(
+                        &DataField::new(field.id(), "value".into(), map.value_type().clone()),
+                        value,
+                        path,
+                        output,
+                        null_residuals,
+                    );
+                    path.pop();
+                    path.pop();
+                    return;
+                }
+            }
+        }
         if let DataType::Row(row) = data_type {
             if crate::spec::is_variant_extraction_row_type(data_type) {
                 let projected = super::variant_projection::projected_paths(row, physical);
@@ -3337,6 +3365,49 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::mpsc;
+
+    #[test]
+    fn map_value_read_type_prunes_children_and_keeps_predicate_inputs() {
+        use crate::spec::RowType;
+        let descriptor = SchemaDescriptor::new(Arc::new(
+            parse_message_type(
+                "message schema { optional group attrs (MAP) {
+                repeated group key_value { required binary key (STRING);
+                    optional group value { optional int32 wanted; optional int64 unused; }
+                }
+            } }",
+            )
+            .unwrap(),
+        ));
+        let fields = vec![DataField::new(
+            10,
+            "attrs".into(),
+            DataType::Map(MapType::new(
+                DataType::VarChar(VarCharType::string_type()),
+                DataType::Row(RowType::new(vec![DataField::new(
+                    11,
+                    "wanted".into(),
+                    DataType::Int(IntType::new()),
+                )])),
+            )),
+        )];
+        let mask =
+            super::read_type_projection_mask(&descriptor, &fields, None, &[], &Default::default());
+        assert!(mask.leaf_included(0));
+        assert!(mask.leaf_included(1));
+        assert!(!mask.leaf_included(2));
+        let predicate = PredicateBuilder::new(&fields).is_null("attrs").unwrap();
+        let widened = super::read_type_projection_mask(
+            &descriptor,
+            &fields,
+            None,
+            &[predicate],
+            &Default::default(),
+        );
+        for index in 0..3 {
+            assert!(widened.leaf_included(index));
+        }
+    }
 
     #[test]
     fn selected_map_rows_keep_all_map_leaves_without_a_shredding_plan() {
@@ -7608,6 +7679,106 @@ mod tests {
         writer.write(&batch).await.unwrap();
         let file_size = writer.close().await.unwrap().file_size;
         (path, file_io, file_size, fields)
+    }
+
+    #[tokio::test]
+    async fn map_value_projection_preserves_nulls_empty_maps_and_duplicate_keys() {
+        use crate::spec::RowType;
+        let wanted = DataField::new(11, "wanted".into(), DataType::Int(IntType::new()));
+        let unused = DataField::new(12, "unused".into(), DataType::BigInt(BigIntType::new()));
+        let map_field = |children| {
+            DataField::new(
+                10,
+                "attrs".into(),
+                DataType::Map(MapType::new(
+                    DataType::VarChar(VarCharType::string_type()),
+                    DataType::Row(RowType::new(children)),
+                )),
+            )
+        };
+        let fields = vec![map_field(vec![wanted.clone(), unused])];
+        let requested = vec![map_field(vec![wanted])];
+        let schema = build_target_arrow_schema(&fields).unwrap();
+        let ArrowDataType::Map(entries_field, ordered) = schema.field(0).data_type() else {
+            panic!("expected map");
+        };
+        let ArrowDataType::Struct(entry_fields) = entries_field.data_type() else {
+            panic!("expected entries");
+        };
+        let ArrowDataType::Struct(value_fields) = entry_fields[1].data_type() else {
+            panic!("expected struct values");
+        };
+        let values = StructArray::new(
+            value_fields.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![Some(7), None, Some(9), Some(10)])),
+                Arc::new(Int64Array::from(vec![70, 80, 90, 100])),
+            ],
+            Some(NullBuffer::from(vec![true, true, false, true])),
+        );
+        let entries = StructArray::new(
+            entry_fields.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["a", "a", "b", "c"])),
+                Arc::new(values),
+            ],
+            None,
+        );
+        let input = MapArray::new(
+            entries_field.clone(),
+            OffsetBuffer::new(ScalarBuffer::from(vec![0, 0, 0, 2, 3, 4])),
+            entries,
+            Some(NullBuffer::from(vec![false, true, true, true, true])),
+            *ordered,
+        );
+        let original: Arc<dyn Array> = Arc::new(input);
+        let expected =
+            crate::arrow::nested_evolution::evolve_field(&original, &fields[0], &requested[0])
+                .unwrap();
+        let batch = RecordBatch::try_new(schema.clone(), vec![original]).unwrap();
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let path = "memory:/map_value_projection.parquet";
+        let output = file_io.new_output(path).unwrap();
+        let mut writer =
+            create_format_writer(&output, schema, "zstd", 1, None, Some(&fields), None)
+                .await
+                .unwrap();
+        writer.write(&batch).await.unwrap();
+        let size = writer.close().await.unwrap().file_size;
+        let batches = create_format_reader(path, false, &requested)
+            .unwrap()
+            .read_batch_stream(
+                Box::new(file_io.new_input(path).unwrap().reader().await.unwrap()),
+                size,
+                &requested,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(batches.len(), 1);
+        let decoded = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .unwrap();
+        let values = decoded
+            .values()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        assert_eq!(values.column_names(), vec!["wanted"]);
+        let actual = crate::arrow::nested_evolution::evolve_field(
+            batches[0].column(0),
+            &fields[0],
+            &requested[0],
+        )
+        .unwrap();
+        assert_eq!(actual.to_data(), expected.to_data());
     }
 
     #[tokio::test]
