@@ -368,7 +368,7 @@ impl KeyValueFileReader {
         self
     }
 
-    fn new_merge_function(
+    pub(super) fn new_merge_function(
         config: &KeyValueReadConfig,
         merge_output_fields: &[DataField],
     ) -> crate::Result<Box<dyn MergeFunction>> {
