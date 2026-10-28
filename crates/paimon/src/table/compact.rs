@@ -15,9 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Snapshot-bound append compaction and full-bucket primary-key compaction.
+//! Snapshot-bound append, data-evolution and primary-key compaction.
 
 mod append;
+pub(super) mod data_evolution;
 mod primary_key;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -42,9 +43,8 @@ use crate::{Error, Result};
 
 /// Creates planners, executors and a committer with one shared configuration.
 /// Output size and append task selection use the captured table options.
-/// Supports ordinary append tables and fixed or dynamic bucket PK tables,
-/// without row tracking, deletion vectors, data evolution, query authorization
-/// or dedicated blob/vector storage.
+/// Supports ordinary append, data-evolution normal files, and fixed or dynamic
+/// bucket PK tables. Data evolution preserves row IDs and logical deletions.
 pub struct CompactBuilder<'a> {
     table: &'a Table,
     partition_filter: Option<Predicate>,
@@ -92,11 +92,15 @@ impl<'a> CompactBuilder<'a> {
                 message: "Compaction requires a positive target-file-size".into(),
             });
         }
-        let append = if self.table.schema().primary_keys().is_empty() {
-            Some(append::AppendCompactPlanner::new(&options)?)
-        } else {
-            None
-        };
+        let append =
+            if self.table.schema().primary_keys().is_empty() && !options.data_evolution_enabled() {
+                Some(append::AppendCompactPlanner::new(&options)?)
+            } else {
+                None
+            };
+        if options.data_evolution_enabled() {
+            options.compaction_min_file_num()?;
+        }
         Ok(CompactPlanner {
             table: self.table.clone(),
             append,
@@ -122,7 +126,7 @@ impl<'a> CompactBuilder<'a> {
     }
 }
 
-/// Selects append small files or whole PK buckets from each captured snapshot.
+/// Selects append files, contiguous data-evolution ranges or whole PK buckets.
 pub struct CompactPlanner {
     table: Table,
     append: Option<append::AppendCompactPlanner>,
@@ -168,6 +172,10 @@ pub struct CompactTask {
 }
 
 impl CompactTask {
+    fn needs_captured_inputs(&self) -> bool {
+        self.is_primary_key() || self.is_data_evolution()
+    }
+
     pub fn snapshot_id(&self) -> i64 {
         self.context.snapshot.id()
     }
@@ -193,7 +201,8 @@ impl CompactPlanner {
         if let Some(filter) = &self.partition_filter {
             reader.with_filter(filter.clone());
         }
-        let source = reader.new_scan().plan_all().await?;
+        let scan = reader.new_scan().with_scan_all_files();
+        let source = scan.plan_all().await?;
         let Some(snapshot_id) = source.snapshot_id() else {
             return Ok(CompactPlan {
                 snapshot_id: None,
@@ -216,21 +225,55 @@ impl CompactPlanner {
         };
         let mut groups = BTreeMap::<_, Vec<DataFileMeta>>::new();
         let primary_key = !self.table.schema().primary_keys().is_empty();
-        for split in source.splits() {
-            let group = groups
-                .entry((
-                    split.partition().to_serialized_bytes(),
-                    split.bucket(),
-                    split.total_buckets(),
-                ))
-                .or_default();
-            for file in split.data_files() {
-                validate_file(file, primary_key)?;
-                group.push(file.clone());
+        let data_evolution = self.table.schema().core_options().data_evolution_enabled();
+        if data_evolution {
+            // Query planning may discard shadowed column providers. A rewrite
+            // must remove every normal file in each captured row-ID group.
+            for entry in scan.plan_manifest_entries(&context.snapshot).await? {
+                if !super::source::is_data_evolution_normal_file(entry.file()) {
+                    continue;
+                }
+                data_evolution::validate_file(entry.file())?;
+                groups
+                    .entry((
+                        entry.partition().to_vec(),
+                        entry.bucket(),
+                        entry.total_buckets(),
+                    ))
+                    .or_default()
+                    .push(entry.file().clone());
+            }
+        } else {
+            for split in source.splits() {
+                let group = groups
+                    .entry((
+                        split.partition().to_serialized_bytes(),
+                        split.bucket(),
+                        split.total_buckets(),
+                    ))
+                    .or_default();
+                for file in split.data_files() {
+                    validate_file(file, primary_key)?;
+                    group.push(file.clone());
+                }
             }
         }
         let mut tasks = Vec::new();
         for ((partition, bucket, total_buckets), files) in groups {
+            if data_evolution {
+                for files in data_evolution::plan(files, &self.table.schema().core_options())? {
+                    data_evolution::validate_storage_layout(&self.table, &files).await?;
+                    tasks.push(CompactTask {
+                        context: context.clone(),
+                        task_id: tasks.len(),
+                        partition: partition.clone(),
+                        bucket,
+                        total_buckets,
+                        files,
+                    });
+                }
+                continue;
+            }
             if primary_key {
                 // L0 requires upgrading; multiple levels require merging. Files
                 // at one positive level already form a non-overlapping sorted
@@ -346,6 +389,20 @@ impl CompactExecutor {
             .with_bucket_path(bucket_path)
             .with_data_files(task.files.clone())
             .build()?;
+        if task.is_data_evolution() {
+            let files = data_evolution::execute(
+                &table,
+                task,
+                &split,
+                partition_path,
+                self.resources.clone(),
+            )
+            .await?;
+            return Ok(CompactResult {
+                task: task.clone(),
+                files,
+            });
+        }
         if task.is_primary_key() {
             let files = primary_key::execute(&table, task, &split, self.resources.clone()).await?;
             return Ok(CompactResult {
@@ -411,6 +468,10 @@ impl CompactExecutor {
 }
 
 impl CompactTask {
+    fn is_data_evolution(&self) -> bool {
+        self.context.schema.core_options().data_evolution_enabled()
+    }
+
     fn is_primary_key(&self) -> bool {
         !self.context.schema.primary_keys().is_empty()
     }
@@ -429,6 +490,9 @@ impl CompactTask {
     }
 
     fn validate_inputs(&self, active: &[ManifestEntry]) -> Result<()> {
+        if self.is_data_evolution() {
+            data_evolution::validate_inputs(&self.partition, self.bucket, &self.files, active)?;
+        }
         let bucket_files = active
             .iter()
             .filter(|entry| {
@@ -467,7 +531,11 @@ impl CompactTask {
             ));
         }
         ensure_snapshot_supported(table, &self.context.snapshot)?;
-        let minimum_files = if self.is_primary_key() { 1 } else { 2 };
+        let minimum_files = if self.is_primary_key() || self.is_data_evolution() {
+            1
+        } else {
+            2
+        };
         if table.schema().core_options().target_file_size() <= 0
             || self.files.len() < minimum_files
             || self.bucket < 0
@@ -476,10 +544,17 @@ impl CompactTask {
         }
         let mut names = HashSet::new();
         for file in &self.files {
-            validate_file(file, self.is_primary_key())?;
+            if self.is_data_evolution() {
+                data_evolution::validate_file(file)?;
+            } else {
+                validate_file(file, self.is_primary_key())?;
+            }
             if !names.insert(&file.file_name) {
                 return Err(invalid("Duplicate compaction input file"));
             }
+        }
+        if self.is_data_evolution() {
+            data_evolution::row_range(&self.files)?;
         }
         Ok(())
     }
@@ -537,7 +612,11 @@ pub(super) fn prepare_results(table: &Table, results: &[CompactResult]) -> Resul
             .sum::<u64>();
         let mut output_rows = 0u64;
         for file in &result.files {
-            validate_file(file, task.is_primary_key())?;
+            if task.is_data_evolution() {
+                data_evolution::validate_file(file)?;
+            } else {
+                validate_file(file, task.is_primary_key())?;
+            }
             if file.schema_id != task.context.schema.id()
                 || file.file_source != Some(1)
                 || file.level != task.output_level()
@@ -556,7 +635,9 @@ pub(super) fn prepare_results(table: &Table, results: &[CompactResult]) -> Resul
                 2,
             ));
         }
-        if !task.is_primary_key() && input_rows != output_rows {
+        if task.is_data_evolution() {
+            data_evolution::validate_outputs(task, &result.files)?;
+        } else if !task.is_primary_key() && input_rows != output_rows {
             return Err(invalid("Compaction must preserve the input row count"));
         }
         let options = task.context.schema.core_options();
@@ -596,7 +677,7 @@ pub(super) fn prepare_results(table: &Table, results: &[CompactResult]) -> Resul
         snapshot_id: first.task.snapshot_id(),
         read_snapshot: first
             .task
-            .is_primary_key()
+            .needs_captured_inputs()
             .then(|| Box::new(first.task.context.snapshot.clone())),
         commit_suffix: hex::encode(digest.finalize()),
         metrics,
@@ -608,6 +689,10 @@ pub(super) fn ensure_supported(table: &Table) -> Result<()> {
     table.ensure_not_branch_reference_for_write()?;
     let options = table.schema().core_options();
     let properties = table.schema().options();
+    if options.data_evolution_enabled() {
+        data_evolution::ensure_supported(table)?;
+        return options.validate_data_file_path_directory();
+    }
     if table.schema().primary_keys().is_empty()
         && options.bucket() > 0
         && !properties
@@ -671,6 +756,7 @@ pub(super) fn ensure_supported(table: &Table) -> Result<()> {
 
 fn ensure_snapshot_supported(table: &Table, snapshot: &Snapshot) -> Result<()> {
     if snapshot.index_manifest().is_some()
+        && !table.schema().core_options().data_evolution_enabled()
         && (table.schema().primary_keys().is_empty()
             || table.schema().core_options().bucket() != -1)
     {
@@ -694,6 +780,10 @@ pub(super) async fn validate_snapshot_indexes(
     };
     let path = table.snapshot_manager().manifest_path(name);
     let entries = IndexManifest::read(table.file_io(), &path).await?;
+    if table.schema().core_options().data_evolution_enabled() {
+        data_evolution::validate_indexes(&entries)?;
+        return Ok(Some(name.to_string()));
+    }
     if entries.iter().any(|entry| {
         entry.index_file.index_type != "HASH"
             || entry.index_file.deletion_vectors_ranges.is_some()

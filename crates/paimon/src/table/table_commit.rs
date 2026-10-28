@@ -1360,6 +1360,29 @@ impl TableCommit {
     ) -> Result<(Snapshot, Vec<PartitionStatistics>)> {
         let new_snapshot_id = latest_snapshot.as_ref().map(|s| s.id() + 1).unwrap_or(1);
 
+        if self.data_evolution_enabled
+            && resolved.kind == CommitKind::COMPACT
+            && self
+                .table
+                .schema()
+                .core_options()
+                .deletion_vectors_enabled()
+        {
+            if let Some(snapshot) = latest_snapshot {
+                if let Some(indexes) = super::compact::data_evolution::rewrite_deletion_vectors(
+                    &self.table,
+                    snapshot,
+                    &resolved.entries,
+                    created_files,
+                )
+                .await?
+                {
+                    resolved.index_manifest_changed = true;
+                    resolved.new_index_manifest_entries = Some(indexes);
+                }
+            }
+        }
+
         // Row tracking
         let mut next_row_id: Option<i64> = None;
         if self.row_tracking_enabled {
@@ -1897,8 +1920,8 @@ impl TableCommit {
                         source: None,
                     });
                 }
-                // Concurrent writes may replace the HASH index after planning.
-                // Reuse the latest manifest on every retry, never the captured one.
+                // Concurrent writes may replace HASH indexes, deletion vectors
+                // or global indexes. Rebase on the latest manifest every retry.
                 let index_manifest_name = match latest_snapshot {
                     Some(snapshot) => {
                         super::compact::validate_snapshot_indexes(&self.table, snapshot).await?
@@ -1930,9 +1953,31 @@ impl TableCommit {
                         .iter()
                         .map(|e| (e.partition(), e.bucket()))
                         .collect::<HashSet<_>>();
+                    let deleted_ids = deletes
+                        .iter()
+                        .map(|entry| commit_file_identifier(entry))
+                        .collect::<HashSet<_>>();
+                    if self.data_evolution_enabled {
+                        super::compact::data_evolution::validate_replacement_inputs(
+                            entries,
+                            &captured_files,
+                        )?;
+                        super::compact::data_evolution::validate_storage_layout(
+                            &self.table,
+                            &deletes
+                                .iter()
+                                .map(|entry| entry.file().clone())
+                                .collect::<Vec<_>>(),
+                        )
+                        .await?;
+                    }
                     let captured_files = captured_files
                         .iter()
-                        .filter(|e| buckets.contains(&(e.partition(), e.bucket())))
+                        .filter(|e| {
+                            buckets.contains(&(e.partition(), e.bucket()))
+                                && (!self.data_evolution_enabled
+                                    || deleted_ids.contains(&commit_file_identifier(e)))
+                        })
                         .map(|entry| (commit_file_identifier(entry), entry))
                         .collect::<HashMap<_, _>>();
                     if captured_files.len() != deletes.len()
@@ -1946,8 +1991,11 @@ impl TableCommit {
                         })
                     {
                         return Err(crate::Error::DataInvalid {
-                            message: "PK compaction must include the complete captured bucket"
-                                .into(),
+                            message: if self.data_evolution_enabled {
+                                "Data-evolution compaction inputs must match the captured row-ID groups"
+                            } else {
+                                "PK compaction must include the complete captured bucket"
+                            }.into(),
                             source: None,
                         });
                     }
@@ -1984,6 +2032,12 @@ impl TableCommit {
                             source: None,
                         });
                     }
+                }
+                if self.data_evolution_enabled {
+                    super::compact::data_evolution::validate_replacement_inputs(
+                        entries,
+                        base_data_files.as_deref().unwrap_or_default(),
+                    )?;
                 }
                 self.check_compact_lsm_conflicts(
                     base_data_files.as_deref().unwrap_or_default(),
@@ -2818,7 +2872,7 @@ impl TableCommit {
         }
 
         let next_row_id = latest_snapshot.and_then(Snapshot::next_row_id);
-        self.check_row_id_existence(base_entries, delta_entries, next_row_id)?;
+        self.check_row_id_existence(base_entries, delta_entries, next_row_id, commit_kind)?;
 
         self.check_row_id_range_conflicts(commit_kind, check_from_snapshot, &merged_entries)?;
         self.check_row_id_from_snapshot(latest_snapshot, delta_entries, check_from_snapshot)
@@ -3053,6 +3107,7 @@ impl TableCommit {
         base_entries: &[ManifestEntry],
         delta_entries: &[ManifestEntry],
         next_row_id: Option<i64>,
+        commit_kind: &CommitKind,
     ) -> Result<()> {
         // File identity deliberately excludes row IDs. Check DELETE metadata
         // before identifier-based merging can cancel a reassigned current ADD.
@@ -3120,14 +3175,30 @@ impl TableCommit {
 
         for entry in files_to_check {
             let first_row_id = entry.file().first_row_id.unwrap();
-            if is_dedicated_storage_file(entry.file()) {
+            if is_dedicated_storage_file(entry.file()) || commit_kind == &CommitKind::COMPACT {
                 if let Some((start, end)) = entry.file().row_id_range() {
                     let covered_by_existing = existing_ranges
                         .get(&(entry.partition().to_vec(), entry.bucket()))
                         .is_some_and(|ranges| {
-                            ranges.iter().any(|&(base_start, base_end)| {
-                                base_start <= start && end <= base_end
-                            })
+                            if commit_kind == &CommitKind::COMPACT {
+                                let mut ranges = ranges.clone();
+                                ranges.sort_unstable();
+                                let mut cursor = start;
+                                for (base_start, base_end) in ranges {
+                                    if base_start > cursor {
+                                        break;
+                                    }
+                                    if base_end >= end {
+                                        return true;
+                                    }
+                                    cursor = cursor.max(base_end.saturating_add(1));
+                                }
+                                false
+                            } else {
+                                ranges.iter().any(|&(base_start, base_end)| {
+                                    base_start <= start && end <= base_end
+                                })
+                            }
                         });
                     if covered_by_existing {
                         continue;

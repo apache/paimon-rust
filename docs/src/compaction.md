@@ -19,8 +19,9 @@ under the License.
 
 # Table Compaction
 
-Rust supports small-file compaction for ordinary append tables and full-bucket
-compaction for primary-key tables with fixed or dynamic buckets. `CompactBuilder` creates
+Rust supports small-file compaction for ordinary append tables, normal-file
+compaction for Data Evolution tables, and full-bucket compaction for primary-key
+tables with fixed or dynamic buckets. `CompactBuilder` creates
 a `CompactPlanner`, a `CompactExecutor`, and a `TableCommit`. Planning and
 execution do not publish snapshots; `commit_compact` atomically publishes the
 selected results in a `COMPACT` snapshot.
@@ -40,7 +41,7 @@ let metrics = committer.commit_compact(results).await?;
 println!("Compacted {} files into {}", metrics.files_removed, metrics.files_added);
 ```
 
-Compaction uses the table's `target-file-size` option for its output size target.
+Ordinary append and PK compaction use `target-file-size` as the output size target.
 For unaware append tables (`bucket=-1`), task selection follows the batch packing rules in Java's
 [`AppendCompactCoordinator`](https://github.com/apache/paimon/blob/master/paimon-core/src/main/java/org/apache/paimon/append/AppendCompactCoordinator.java):
 
@@ -180,15 +181,67 @@ Cross-partition dynamic buckets are also supported: subsequent writers rebuild
 their key-location index from the compacted data as usual. Compaction does not
 rebalance buckets or reclaim HASH index capacity.
 
+## Data Evolution compaction
+
+The same API compacts normal structured files in unaware append tables with
+`data-evolution.enabled=true` and `row-tracking.enabled=true`, following Java's
+`DataEvolutionCompactCoordinator` and `DataEvolutionNormalCompactTask`.
+
+Within each partition, planning keeps every version of an aligned row-ID group
+together, including shadowed column files. Adjacent groups are packed using
+`sum(max(file_size, source.split.open-file-cost))` as the weight. A bin is drained
+when its weight strictly exceeds `target-file-size`; a group that alone exceeds
+the target is isolated. A row-ID gap also drains the bin. A drained bin produces
+a task only when it contains at least `compaction.min.file-num` physical files.
+The ordinary append small-file ratio does not apply.
+Data Evolution permits `compaction.min.file-num=1` to force a single-file
+rewrite, for example to materialize the current schema.
+
+Each task streams the latest normal-column values into one file covering the
+same contiguous row-ID range. Like Java's default normal compaction, write-time
+size and row limits do not roll this output; `target-file-size` guides planning.
+The minimum and maximum input sequence numbers and per-column maximum sequence
+numbers are retained. Blob and Vector files remain attached to their stable row
+IDs and are not rewritten by these tasks.
+
+Deleted physical slots are retained. When deletion vectors are enabled, commit
+preparation moves their positions from the previous normal anchor files to the
+new files. This uses the latest snapshot on every commit attempt, preserving
+concurrent deletions and vectors belonging to untouched groups. Global indexes
+remain valid because row IDs and values are preserved. Historical snapshots
+continue to reference their original data and deletion vectors.
+
+Concurrent normal-column writes in a selected row-ID range cause commit to fail;
+plan again from the latest snapshot. Disjoint appends can commit alongside the
+rewrite. Subsets, serialization and idempotent retries use the same compaction
+API as append and PK tables. `rows_written` counts physical slots, including
+deleted rows; it counts overlapping column versions only once.
+
+Changing storage options does not migrate values in existing files. If selected
+normal files still provide a field that the current schema stores in dedicated
+files, compaction is rejected before writing or publishing output. Migrate those
+historical inline values first; otherwise omitting the field would lose data.
+With deletion vectors enabled, one output file is limited to 4,294,967,296
+physical row slots so every local position remains deletable by the current
+Rust writer. Wider rewrites are rejected before execution; 64-bit deletion-vector
+writing is not yet supported.
+
+Dedicated Blob/Vector compaction, splitting large normal files, and materializing
+deletions into reassigned row IDs are not provided. Setting
+`data-evolution.compaction.split-large-files=true` or
+`data-evolution.compaction.rewrite-row-ids=true` is rejected.
+
 ## Current scope
 
 Compaction-generated changelogs (`full-compaction` / `lookup`) are unsupported.
-Row tracking, Data Evolution, deletion vectors, query authorization, rowkind
-fields, postpone buckets and dedicated blob/vector storage are unsupported.
+Outside Data Evolution mode, row tracking, deletion vectors and dedicated
+blob/vector storage are unsupported. Query authorization, rowkind fields and
+postpone buckets are unsupported in all modes.
 Ordered bucketed append, append incremental clustering, primary-key clustering
 override (`pk-clustering-override`) and record-level expiration
 (`record-level.expire-time`) are also unsupported.
-Snapshot index manifests may contain only dynamic-bucket HASH indexes.
+Snapshot index manifests may contain dynamic-bucket HASH indexes, or deletion
+vectors and global indexes in Data Evolution mode.
 Embedded and sidecar file indexes are regenerated according to the captured
 table options. Language bindings and
 background compaction scheduling are not yet provided.

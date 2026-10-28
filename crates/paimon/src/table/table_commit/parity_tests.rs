@@ -358,6 +358,91 @@ async fn publication_errors_retry_without_duplicate_snapshots() {
 }
 
 #[tokio::test]
+async fn data_evolution_compact_retries_preserve_concurrent_deletes_and_published_vectors() {
+    use arrow_array::{Int32Array, RecordBatch};
+    use futures::TryStreamExt;
+
+    struct RacingCompactCommit {
+        table: Table,
+        calls: std::sync::atomic::AtomicUsize,
+        publish_first: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl SnapshotCommit for RacingCompactCommit {
+        async fn commit(
+            &self,
+            _: Option<&str>,
+            snapshot: &Snapshot,
+            _: &str,
+            _: &[PartitionStatistics],
+        ) -> Result<bool> {
+            if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                if self.publish_first {
+                    assert!(self.table.snapshot_manager().commit_snapshot(snapshot).await?);
+                    return Err(crate::Error::IoUnsupported { message: "lost compact response".into() });
+                }
+                // Commit another DELETE after compact prepared its DV file,
+                // then force its CAS to lose. Retry must remap the newer DV.
+                let mut delete = crate::table::DataEvolutionDeleteWriter::new(&self.table)?;
+                delete.add_row_ids([2])?;
+                self.table.new_write_builder().new_commit().commit(delete.prepare_commit().await?).await?;
+                return Ok(false);
+            }
+            self.table.snapshot_manager().commit_snapshot(snapshot).await
+        }
+    }
+
+    for publish_first in [false, true] {
+        let io = test_file_io();
+        let path = format!("memory:/de-compact-cas-{publish_first}");
+        setup_dirs(&io, &path).await;
+        let schema = crate::spec::Schema::builder()
+            .column("id", DataType::Int(crate::spec::IntType::new()))
+            .option("row-tracking.enabled", "true")
+            .option("data-evolution.enabled", "true")
+            .option("deletion-vectors.enabled", "true")
+            .option("compaction.min.file-num", "2")
+            .build().unwrap();
+        let table = Table::new(io.clone(), Identifier::new("default", "de_compact_cas"), path.clone(), TableSchema::new(0, &schema), None);
+        io.mkdirs(&format!("{path}/schema")).await.unwrap();
+        io.new_output(&format!("{path}/schema/schema-0")).unwrap().write(serde_json::to_vec(table.schema()).unwrap().into()).await.unwrap();
+        for ids in [vec![0, 1], vec![2, 3]] {
+            let builder = table.new_write_builder();
+            let mut write = builder.new_write().unwrap();
+            write.write_arrow_batch(&RecordBatch::try_from_iter([("id", Arc::new(Int32Array::from(ids)) as arrow_array::ArrayRef)]).unwrap()).await.unwrap();
+            builder.new_commit().commit(write.prepare_commit().await.unwrap()).await.unwrap();
+        }
+        let mut delete = crate::table::DataEvolutionDeleteWriter::new(&table).unwrap();
+        delete.add_row_ids([1]).unwrap();
+        table.new_write_builder().new_commit().commit(delete.prepare_commit().await.unwrap()).await.unwrap();
+        let builder = table.new_compact_builder();
+        let plan = builder.new_planner().unwrap().plan().await.unwrap();
+        let result = builder.new_executor().unwrap().execute(&plan.tasks()[0]).await.unwrap();
+        let publisher = Arc::new(RacingCompactCommit {
+            table: table.clone(), calls: std::sync::atomic::AtomicUsize::new(0), publish_first,
+        });
+        let mut commit = builder.new_commit().unwrap();
+        commit.snapshot_commit = publisher.clone();
+        commit.commit_min_retry_wait_ms = 0;
+        commit.commit_max_retry_wait_ms = 0;
+        let metrics = commit.commit_compact(vec![result.clone()]).await.unwrap();
+        assert_eq!(publisher.calls.load(std::sync::atomic::Ordering::SeqCst), if publish_first { 1 } else { 2 });
+        let after = table.snapshot_manager().get_latest_snapshot().await.unwrap().unwrap();
+        assert_eq!(after.id(), if publish_first { 4 } else { 5 });
+        assert_eq!(after.commit_kind(), &CommitKind::COMPACT);
+        assert_eq!(commit.commit_compact(vec![result]).await.unwrap(), metrics);
+        assert_eq!(table.snapshot_manager().get_latest_snapshot_id().await.unwrap(), Some(after.id()));
+        let read = table.new_read_builder();
+        let scan = read.new_scan().plan().await.unwrap();
+        let batches: Vec<RecordBatch> = read.new_read().unwrap().to_arrow(scan.splits()).unwrap().try_collect().await.unwrap();
+        let mut ids = batches.iter().flat_map(|batch| batch.column(0).as_any().downcast_ref::<Int32Array>().unwrap().values().iter().copied()).collect::<Vec<_>>();
+        ids.sort_unstable();
+        assert_eq!(ids, if publish_first { vec![0, 2, 3] } else { vec![0, 3] });
+    }
+}
+
+#[tokio::test]
 async fn mixed_append_cannot_bypass_stale_dv_check() {
     let io = test_file_io();
     let path = "memory:/mixed-stale-dv";

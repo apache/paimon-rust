@@ -393,7 +393,7 @@ fn row_tracking_dedicated_file_cannot_supply_normal_range_existence() {
     for name in ["update.blob", "update.parquet"] {
         let delta = vec![entry(name, 0, 10)];
         assert!(commit
-            .check_row_id_existence(&base, &delta, Some(10))
+            .check_row_id_existence(&base, &delta, Some(10), &CommitKind::APPEND)
             .is_err());
     }
     // The merged-layout check must also catch an older dedicated file that
