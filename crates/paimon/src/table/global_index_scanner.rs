@@ -367,17 +367,19 @@ impl GlobalIndexScanner {
     }
 
     /// Scalar candidates and Java's exactness contract for searches which rank
-    /// rows before applying the row predicate.
+    /// rows before applying the row predicate. The third value lists the rows
+    /// that are only candidates; the answer is exact for the rows a caller
+    /// keeps only if `exact` is true and none of them fall in those ranges.
     pub(super) async fn matching_ranges_with_exactness(
         &self,
         predicate: &Predicate,
-    ) -> Result<Option<(Vec<RowRange>, bool)>> {
+    ) -> Result<Option<(Vec<RowRange>, bool, Vec<RowRange>)>> {
         let Some(result) = self.evaluate(predicate).await? else {
             return Ok(None);
         };
         let exact = result.fully_evaluated
             && self.is_exact_predicate(predicate, &result.evaluated_field_ids);
-        Ok(Some((result.row_ranges, exact)))
+        Ok(Some((result.row_ranges, exact, result.candidate_ranges)))
     }
 
     fn is_exact_predicate(

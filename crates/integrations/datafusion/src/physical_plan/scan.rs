@@ -452,11 +452,10 @@ fn predicate_covers_candidate(predicate: &Predicate, candidate: &Predicate) -> b
                 op: PredicateOperator::NotBetween,
                 literals,
             },
-            Predicate::Not(inner),
+            // `Predicate::negate` turns NOT(x >= lo AND x <= hi) into
+            // x < lo OR x > hi.
+            Predicate::Or(children),
         ) if literals.len() == 2 => {
-            let Predicate::And(children) = inner.as_ref() else {
-                return false;
-            };
             let matches_bound = |candidate: &Predicate,
                                  expected_op: PredicateOperator,
                                  expected_literal: &Datum| {
@@ -476,12 +475,13 @@ fn predicate_covers_candidate(predicate: &Predicate, candidate: &Predicate) -> b
                         && candidate_literals[0] == *expected_literal
                 )
             };
-            children
-                .iter()
-                .any(|child| matches_bound(child, PredicateOperator::GtEq, &literals[0]))
+            children.len() == 2
                 && children
                     .iter()
-                    .any(|child| matches_bound(child, PredicateOperator::LtEq, &literals[1]))
+                    .any(|child| matches_bound(child, PredicateOperator::Lt, &literals[0]))
+                && children
+                    .iter()
+                    .any(|child| matches_bound(child, PredicateOperator::Gt, &literals[1]))
         }
         _ => false,
     }
