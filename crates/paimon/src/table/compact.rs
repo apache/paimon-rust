@@ -19,8 +19,9 @@
 
 mod append;
 pub(super) mod data_evolution;
+pub(super) mod deletion_vectors;
 pub(super) mod primary_key;
-use primary_key::deletion_vectors::DeletionVectorUpdate;
+use deletion_vectors::DeletionVectorUpdate;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;

@@ -1353,10 +1353,7 @@ impl TableCommit {
                 return Ok(CommitAttemptResult::Success);
             }
             Ok(false) => {
-                if !self.data_evolution_enabled
-                    && self.deletion_vectors_enabled
-                    && resolved.kind == CommitKind::COMPACT
-                {
+                if self.deletion_vectors_enabled && resolved.kind == CommitKind::COMPACT {
                     // Only this attempt's generated DV files are definitely
                     // unpublished. Prepared data/changelogs and old shared
                     // containers still belong to the caller or prior snapshots.
@@ -1407,39 +1404,16 @@ impl TableCommit {
     ) -> Result<(Snapshot, Vec<PartitionStatistics>)> {
         let new_snapshot_id = latest_snapshot.as_ref().map(|s| s.id() + 1).unwrap_or(1);
 
-        if self.data_evolution_enabled
-            && resolved.kind == CommitKind::COMPACT
-            && self.deletion_vectors_enabled
-        {
+        if self.deletion_vectors_enabled && resolved.kind == CommitKind::COMPACT {
             if let Some(snapshot) = latest_snapshot {
-                if let Some(indexes) = super::compact::data_evolution::rewrite_deletion_vectors(
+                if let Some(indexes) = super::compact::deletion_vectors::rewrite_indexes(
                     &self.table,
                     snapshot,
                     &resolved.entries,
+                    &resolved.deletion_vector_updates,
                     created_files,
                 )
                 .await?
-                {
-                    resolved.index_manifest_changed = true;
-                    resolved.new_index_manifest_entries = Some(indexes);
-                }
-            }
-        }
-
-        if !self.data_evolution_enabled
-            && self.deletion_vectors_enabled
-            && resolved.kind == CommitKind::COMPACT
-        {
-            if let Some(snapshot) = latest_snapshot {
-                if let Some(indexes) =
-                    super::compact::primary_key::deletion_vectors::rewrite_indexes(
-                        &self.table,
-                        snapshot,
-                        &resolved.entries,
-                        &resolved.deletion_vector_updates,
-                        created_files,
-                    )
-                    .await?
                 {
                     resolved.index_manifest_changed = true;
                     resolved.new_index_manifest_entries = Some(indexes);
@@ -3983,7 +3957,7 @@ enum CommitEntriesPlan {
         entries: Vec<ManifestEntry>,
         changelog_entries: Vec<ManifestEntry>,
         deletion_vector_updates:
-            Option<Vec<super::compact::primary_key::deletion_vectors::DeletionVectorUpdate>>,
+            Option<Vec<super::compact::deletion_vectors::DeletionVectorUpdate>>,
         schema_id: i64,
         read_snapshot: Option<Box<Snapshot>>,
         planned_snapshot_id: i64,
@@ -4044,8 +4018,7 @@ fn direct_commit_kind(
 struct ResolvedCommit {
     entries: Vec<ManifestEntry>,
     changelog_entries: Vec<ManifestEntry>,
-    deletion_vector_updates:
-        Vec<super::compact::primary_key::deletion_vectors::DeletionVectorUpdate>,
+    deletion_vector_updates: Vec<super::compact::deletion_vectors::DeletionVectorUpdate>,
     kind: CommitKind,
     index_manifest_name: Option<String>,
     index_manifest_changed: bool,

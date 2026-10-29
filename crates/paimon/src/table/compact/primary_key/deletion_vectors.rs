@@ -17,33 +17,22 @@
 
 //! Captured physical deletions and atomic retirement of compacted DV ranges.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 
 use indexmap::IndexMap;
 use roaring::RoaringBitmap;
-use serde::{Deserialize, Serialize};
 
+use super::super::deletion_vectors::DeletionVectorUpdate;
 use crate::deletion_vector::DeletionVectorFactory;
 use crate::spec::{
-    BinaryRow, DeletionVectorMeta, FileKind, IndexFileMeta, IndexManifest, IndexManifestEntry,
+    BinaryRow, DataFileMeta, DeletionVectorMeta, FileKind, IndexManifest, IndexManifestEntry,
     ManifestEntry, PartitionComputer, Snapshot,
 };
-use crate::table::deletion_vector_index;
-use crate::table::index_file_path::{committed_index_file_path, IndexFileLocation};
+use crate::table::index_file_path::IndexFileLocation;
 use crate::table::{DataSplit, Table};
 use crate::{DeletionFile, Result};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(in crate::table) struct DeletionVectorUpdate {
-    pub partition: Vec<u8>,
-    pub bucket: i32,
-    pub file_name: String,
-    #[serde(with = "serde_bytes")]
-    pub bitmap: Vec<u8>,
-}
-
 type FileId = (Vec<u8>, i32, String);
-type Bucket = (Vec<u8>, i32);
 type VectorReference = (String, Option<String>, DeletionVectorMeta);
 
 async fn read_indexes(table: &Table, snapshot: &Snapshot) -> Result<Vec<IndexManifestEntry>> {
@@ -297,109 +286,20 @@ pub(in crate::table) async fn validate_dependencies(
     Ok(())
 }
 
-/// Rebase changes on the latest index manifest once per CAS attempt. Rewriting
-/// an affected bucket produces one container, including all its retained ranges.
-pub(in crate::table) async fn rewrite_indexes(
-    table: &Table,
-    latest: &Snapshot,
-    delta: &[ManifestEntry],
-    updates: &[DeletionVectorUpdate],
-    created_files: &mut Vec<String>,
-) -> Result<Option<Vec<IndexManifestEntry>>> {
-    let mut buckets = BTreeMap::<
-        Bucket,
-        (
-            HashSet<String>,
-            IndexMap<String, Vec<&DeletionVectorUpdate>>,
-        ),
-    >::new();
-    for entry in delta
-        .iter()
-        .filter(|entry| *entry.kind() == FileKind::Delete)
-    {
-        buckets
-            .entry((entry.partition().to_vec(), entry.bucket()))
-            .or_default()
-            .0
-            .insert(entry.file().file_name.clone());
+/// Retire rewritten files' masks and merge physical point-lookup deletions into
+/// the retained files' latest masks.
+pub(in crate::table::compact) fn apply_deletion_vectors(
+    before: &[DataFileMeta],
+    updates: &[&DeletionVectorUpdate],
+    vectors: &mut IndexMap<String, RoaringBitmap>,
+) -> Result<()> {
+    for file in before {
+        vectors.shift_remove(&file.file_name);
     }
     for update in updates {
-        buckets
-            .entry((update.partition.clone(), update.bucket))
-            .or_default()
-            .1
-            .entry(update.file_name.clone())
-            .or_default()
-            .push(update);
+        let bitmap = RoaringBitmap::deserialize_from(update.bitmap.as_slice())
+            .map_err(|error| super::super::invalid(&error.to_string()))?;
+        *vectors.entry(update.file_name.clone()).or_default() |= bitmap;
     }
-    let mut retained = Vec::new();
-    // Group only small index metadata here. Decoding all affected buckets
-    // together would multiply the commit's working memory by its task count.
-    let mut containers = BTreeMap::<Bucket, Vec<IndexManifestEntry>>::new();
-    for entry in read_indexes(table, latest).await? {
-        let key = (entry.partition.clone(), entry.bucket);
-        let touched = entry.kind == FileKind::Add
-            && entry.index_file.index_type == "DELETION_VECTORS"
-            && buckets.contains_key(&key);
-        if !touched {
-            retained.push(entry);
-            continue;
-        }
-        containers.entry(key).or_default().push(entry);
-    }
-    let mut changed = false;
-    for (key, (rewritten, additions)) in buckets {
-        let previous = containers.remove(&key);
-        if previous.is_none() && additions.is_empty() {
-            continue;
-        }
-        let path = bucket_path(table, &key.0, key.1)?;
-        let mut vectors = IndexMap::<String, RoaringBitmap>::new();
-        for entry in previous.into_iter().flatten() {
-            for (name, meta) in entry.index_file.deletion_vectors_ranges.iter().flatten() {
-                let reference = (
-                    entry.index_file.file_name.clone(),
-                    entry.index_file.external_path.clone(),
-                    meta.clone(),
-                );
-                let bitmap = DeletionVectorFactory::read(
-                    table.file_io(),
-                    &resolve_vector(table, &path, &reference),
-                )
-                .await?
-                .to_bitmap();
-                *vectors.entry(name.clone()).or_default() |= bitmap;
-            }
-        }
-        for name in rewritten {
-            vectors.shift_remove(&name);
-        }
-        for (name, updates) in additions {
-            let target = vectors.entry(name).or_default();
-            for update in updates {
-                let bitmap = RoaringBitmap::deserialize_from(update.bitmap.as_slice())
-                    .map_err(|error| super::super::invalid(&error.to_string()))?;
-                *target |= bitmap;
-            }
-        }
-        if vectors.values().any(|bitmap| !bitmap.is_empty()) {
-            let file: IndexFileMeta =
-                deletion_vector_index::write_bucket(table, &key.0, key.1, vectors).await?;
-            created_files.push(committed_index_file_path(
-                table.location(),
-                &path,
-                table.schema().core_options().index_file_in_data_file_dir(),
-                &file,
-            ));
-            retained.push(IndexManifestEntry {
-                version: 1,
-                kind: FileKind::Add,
-                partition: key.0,
-                bucket: key.1,
-                index_file: file,
-            });
-        }
-        changed = true;
-    }
-    Ok(changed.then_some(retained))
+    Ok(())
 }

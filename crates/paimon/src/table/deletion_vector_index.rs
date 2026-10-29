@@ -27,7 +27,7 @@ use uuid::Uuid;
 use crate::deletion_vector::{DeletionVector, DeletionVectorFactory};
 use crate::spec::{
     bucket_path, BinaryRow, CoreOptions, DeletionVectorMeta, FileKind, IndexFileMeta,
-    IndexManifest, PartitionComputer, Snapshot, EMPTY_BINARY_ROW,
+    IndexManifest, IndexManifestEntry, PartitionComputer, Snapshot, EMPTY_BINARY_ROW,
 };
 use crate::table::index_file_path::IndexFileLocation;
 use crate::table::Table;
@@ -117,33 +117,46 @@ pub(super) async fn read_bucket(
     let Some(index_manifest_name) = snapshot.index_manifest() else {
         return Ok((IndexMap::new(), Vec::new()));
     };
-    let layout = deletion_vector_layout(table, partition, bucket)?;
-
     let manifest_path = format!(
         "{}/{MANIFEST_DIR}/{}",
         table.location().trim_end_matches('/'),
         index_manifest_name
     );
     let index_entries = IndexManifest::read(table.file_io(), &manifest_path).await?;
-    let mut bitmaps = IndexMap::new();
-    let mut deleted_index_files = Vec::new();
+    let containers = index_entries
+        .into_iter()
+        .filter(|entry| {
+            entry.kind == FileKind::Add
+                && entry.bucket == bucket
+                && entry.partition == partition
+                && entry.index_file.index_type == DELETION_VECTORS_INDEX_TYPE
+                && selected_files.is_none_or(|files| {
+                    entry
+                        .index_file
+                        .deletion_vectors_ranges
+                        .as_ref()
+                        .is_some_and(|ranges| ranges.keys().any(|name| files.contains(name)))
+                })
+        })
+        .collect::<Vec<_>>();
+    let bitmaps = read_containers(table, partition, bucket, &containers).await?;
+    let deleted_index_files = containers
+        .into_iter()
+        .map(|entry| entry.index_file)
+        .collect();
+    Ok((bitmaps, deleted_index_files))
+}
 
-    for entry in index_entries {
-        if entry.kind != FileKind::Add
-            || entry.bucket != bucket
-            || entry.partition != partition
-            || entry.index_file.index_type != DELETION_VECTORS_INDEX_TYPE
-            || selected_files.is_some_and(|files| {
-                entry
-                    .index_file
-                    .deletion_vectors_ranges
-                    .as_ref()
-                    .is_none_or(|ranges| !ranges.keys().any(|name| files.contains(name)))
-            })
-        {
-            continue;
-        }
-        deleted_index_files.push(entry.index_file.clone());
+/// Decode already selected containers without rereading their index manifest.
+pub(super) async fn read_containers(
+    table: &Table,
+    partition: &[u8],
+    bucket: i32,
+    containers: &[IndexManifestEntry],
+) -> Result<IndexMap<String, RoaringBitmap>> {
+    let layout = deletion_vector_layout(table, partition, bucket)?;
+    let mut bitmaps = IndexMap::new();
+    for entry in containers {
         let Some(ranges) = entry.index_file.deletion_vectors_ranges.as_ref() else {
             continue;
         };
@@ -165,7 +178,18 @@ pub(super) async fn read_bucket(
         }
     }
 
-    Ok((bitmaps, deleted_index_files))
+    Ok(bitmaps)
+}
+
+pub(super) fn file_path(
+    table: &Table,
+    partition: &[u8],
+    bucket: i32,
+    file: &IndexFileMeta,
+) -> Result<String> {
+    Ok(deletion_vector_layout(table, partition, bucket)?
+        .location()
+        .resolve(&file.file_name, file.external_path.as_deref()))
 }
 
 /// Write one immutable container. The caller decides which masks to combine.
