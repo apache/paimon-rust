@@ -719,19 +719,30 @@ async fn compact_partition_filter_and_subsets_keep_unselected_files_and_deletion
     .await;
     append(&table, 0).await;
     append(&table, 2).await;
+    append(&table, 4).await;
     update(&table, 0, Some(7)).await;
     update(&table, 2, Some(8)).await;
-    delete(&table, &[1, 3]).await;
+    update(&table, 4, Some(9)).await;
+    delete(&table, &[1, 3, 5]).await;
     let (plan, mut results) = execute(&table).await;
-    assert_eq!(plan.tasks().len(), 2);
+    assert_eq!(plan.tasks().len(), 3);
     let expected = rows(&table).await;
     let commit = table.new_compact_builder().new_commit().unwrap();
+    let last = results.remove(2);
     let first = results.remove(0);
-    commit.commit_compact(vec![first.clone()]).await.unwrap();
+    // A subset may leave a gap occupied by an unsubmitted task. Its shared
+    // index must retain that middle group's original anchor and deletions.
+    commit
+        .commit_compact(vec![last.clone(), first.clone()])
+        .await
+        .unwrap();
     assert_eq!(rows(&table).await, expected);
+    delete(&table, &[2]).await;
+    let after_delete = rows(&table).await;
+    assert_eq!(after_delete, vec![(0, 0, Some(7)), (4, 4, Some(9))]);
     commit.commit_compact(results).await.unwrap();
-    commit.commit_compact(vec![first]).await.unwrap();
-    assert_eq!(rows(&table).await, expected);
+    commit.commit_compact(vec![first, last]).await.unwrap();
+    assert_eq!(rows(&table).await, after_delete);
 }
 
 #[tokio::test]

@@ -366,6 +366,7 @@ async fn data_evolution_compact_retries_preserve_concurrent_deletes_and_publishe
         table: Table,
         calls: std::sync::atomic::AtomicUsize,
         publish_first: bool,
+        delete_after_publish: bool,
     }
 
     #[async_trait::async_trait]
@@ -380,6 +381,13 @@ async fn data_evolution_compact_retries_preserve_concurrent_deletes_and_publishe
             if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
                 if self.publish_first {
                     assert!(self.table.snapshot_manager().commit_snapshot(snapshot).await?);
+                    if self.delete_after_publish {
+                        // The retry must find its successful COMPACT even when
+                        // a newer DELETE has already replaced the migrated DV.
+                        let mut delete = crate::table::DataEvolutionDeleteWriter::new(&self.table)?;
+                        delete.add_row_ids([2])?;
+                        self.table.new_write_builder().new_commit().commit(delete.prepare_commit().await?).await?;
+                    }
                     return Err(crate::Error::IoUnsupported { message: "lost compact response".into() });
                 }
                 // Commit another DELETE after compact prepared its DV file,
@@ -393,9 +401,9 @@ async fn data_evolution_compact_retries_preserve_concurrent_deletes_and_publishe
         }
     }
 
-    for publish_first in [false, true] {
+    for (publish_first, delete_after_publish) in [(false, false), (true, false), (true, true)] {
         let io = test_file_io();
-        let path = format!("memory:/de-compact-cas-{publish_first}");
+        let path = format!("memory:/de-compact-cas-{publish_first}-{delete_after_publish}");
         setup_dirs(&io, &path).await;
         let schema = crate::spec::Schema::builder()
             .column("id", DataType::Int(crate::spec::IntType::new()))
@@ -420,7 +428,7 @@ async fn data_evolution_compact_retries_preserve_concurrent_deletes_and_publishe
         let plan = builder.new_planner().unwrap().plan().await.unwrap();
         let result = builder.new_executor().unwrap().execute(&plan.tasks()[0]).await.unwrap();
         let publisher = Arc::new(RacingCompactCommit {
-            table: table.clone(), calls: std::sync::atomic::AtomicUsize::new(0), publish_first,
+            table: table.clone(), calls: std::sync::atomic::AtomicUsize::new(0), publish_first, delete_after_publish,
         });
         let mut commit = builder.new_commit().unwrap();
         commit.snapshot_commit = publisher.clone();
@@ -429,16 +437,21 @@ async fn data_evolution_compact_retries_preserve_concurrent_deletes_and_publishe
         let metrics = commit.commit_compact(vec![result.clone()]).await.unwrap();
         assert_eq!(publisher.calls.load(std::sync::atomic::Ordering::SeqCst), if publish_first { 1 } else { 2 });
         let after = table.snapshot_manager().get_latest_snapshot().await.unwrap().unwrap();
-        assert_eq!(after.id(), if publish_first { 4 } else { 5 });
-        assert_eq!(after.commit_kind(), &CommitKind::COMPACT);
-        assert_eq!(commit.commit_compact(vec![result]).await.unwrap(), metrics);
+        assert_eq!(after.id(), if publish_first && !delete_after_publish { 4 } else { 5 });
+        assert_eq!(after.commit_kind(), if delete_after_publish { &CommitKind::OVERWRITE } else { &CommitKind::COMPACT });
+        assert_eq!(commit.commit_compact(vec![result.clone()]).await.unwrap(), metrics);
+        // Recovery after coordinator restart must not need the captured source
+        // snapshot once the COMPACT identity is already present in history.
+        io.delete_file(&table.snapshot_manager().snapshot_path(plan.snapshot_id().unwrap())).await.unwrap();
+        let recovered = table.new_compact_builder().with_commit_user(commit.commit_user.clone()).unwrap().new_commit().unwrap();
+        assert_eq!(recovered.commit_compact(vec![result]).await.unwrap(), metrics);
         assert_eq!(table.snapshot_manager().get_latest_snapshot_id().await.unwrap(), Some(after.id()));
         let read = table.new_read_builder();
         let scan = read.new_scan().plan().await.unwrap();
         let batches: Vec<RecordBatch> = read.new_read().unwrap().to_arrow(scan.splits()).unwrap().try_collect().await.unwrap();
         let mut ids = batches.iter().flat_map(|batch| batch.column(0).as_any().downcast_ref::<Int32Array>().unwrap().values().iter().copied()).collect::<Vec<_>>();
         ids.sort_unstable();
-        assert_eq!(ids, if publish_first { vec![0, 2, 3] } else { vec![0, 3] });
+        assert_eq!(ids, if publish_first && !delete_after_publish { vec![0, 2, 3] } else { vec![0, 3] });
     }
 }
 

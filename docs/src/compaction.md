@@ -215,6 +215,10 @@ concurrent deletions and vectors belonging to untouched groups. Global indexes
 remain valid because row IDs and values are preserved. Historical snapshots
 continue to reference their original data and deletion vectors.
 
+If compaction publishes before a prepared DELETE, that DELETE fails when it
+references replaced anchor files or DV indexes. Prepare the DELETE again from
+the latest snapshot; replaying the same stale messages does not rebase it.
+
 Concurrent normal-column writes in a selected row-ID range cause commit to fail;
 plan again from the latest snapshot. Disjoint appends can commit alongside the
 rewrite. Subsets, serialization and idempotent retries use the same compaction
