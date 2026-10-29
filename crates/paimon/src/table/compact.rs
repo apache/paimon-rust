@@ -19,7 +19,8 @@
 
 mod append;
 pub(super) mod data_evolution;
-mod primary_key;
+pub(super) mod primary_key;
+use primary_key::deletion_vectors::DeletionVectorUpdate;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -112,12 +113,14 @@ impl<'a> CompactBuilder<'a> {
     pub fn new_executor(&self) -> Result<CompactExecutor> {
         ensure_supported(self.table)?;
         let options = self.table.schema().core_options();
-        let lookup = options.try_changelog_producer()? == ChangelogProducer::Lookup;
+        let lookup = options.try_changelog_producer()? == ChangelogProducer::Lookup
+            || (options.deletion_vectors_enabled()
+                && !self.table.schema().primary_keys().is_empty());
         let local_cache = self.table.file_io().local_cache();
         if lookup && local_cache.is_none() {
             return Err(Error::ConfigInvalid {
                 message:
-                    "Lookup compaction requires local-cache.enabled=true on the catalog/FileIO"
+                    "Lookup or deletion-vector compaction requires local-cache.enabled=true on the catalog/FileIO"
                         .into(),
             });
         }
@@ -260,6 +263,11 @@ impl CompactPlanner {
             .get_snapshot(snapshot_id)
             .await?;
         validate_snapshot_indexes(&self.table, &snapshot).await?;
+        validate_dv_schemas(
+            &self.table,
+            source.splits().iter().flat_map(|split| split.data_files()),
+        )
+        .await?;
         let context = CompactContext {
             plan_id: uuid::Uuid::new_v4().to_string(),
             location: self.table.location().to_string(),
@@ -297,6 +305,8 @@ pub struct CompactResult {
     files: Vec<DataFileMeta>,
     #[serde(default)]
     changelog_files: Vec<DataFileMeta>,
+    #[serde(default)]
+    deletion_vector_updates: Option<Vec<DeletionVectorUpdate>>,
 }
 
 impl CompactResult {
@@ -355,6 +365,7 @@ impl CompactExecutor {
         }
         validate_snapshot_indexes(&self.table, &snapshot).await?;
         let active = read_snapshot_entries(&manager, &snapshot, None).await?;
+        validate_dv_schemas(&self.table, active.iter().map(|entry| entry.file())).await?;
         task.validate_inputs(&active)?;
         let table = self
             .table
@@ -383,6 +394,11 @@ impl CompactExecutor {
             .with_bucket_path(bucket_path)
             .with_data_files(task.files.clone())
             .build()?;
+        let split = if options.deletion_vectors_enabled() && task.is_primary_key() {
+            primary_key::deletion_vectors::with_deletion_files(&table, &split, &snapshot).await?
+        } else {
+            split
+        };
         if task.is_data_evolution() {
             let files = data_evolution::execute(
                 &table,
@@ -396,9 +412,11 @@ impl CompactExecutor {
                 task: task.clone(),
                 files,
                 changelog_files: vec![],
+                deletion_vector_updates: None,
             });
         }
         if task.is_primary_key() {
+            let mut deletions = None;
             let lookup = if let Some(cache) = &self.lookup_cache {
                 let history = active
                     .iter()
@@ -413,26 +431,44 @@ impl CompactExecutor {
                 if history.is_empty() {
                     None
                 } else {
-                    Some(
-                        primary_key::lookup_store::provider(
-                            &table,
-                            &split,
-                            history,
-                            cache.clone(),
-                            self.resources.clone(),
-                        )
-                        .await?,
+                    let (provider, collected) = primary_key::lookup_store::provider(
+                        &table,
+                        &split,
+                        history,
+                        cache.clone(),
+                        self.resources.clone(),
                     )
+                    .await?;
+                    deletions = collected;
+                    Some(provider)
                 }
             } else {
                 None
             };
             let (files, changelog_files) =
                 primary_key::execute(&table, task, &split, self.resources.clone(), lookup).await?;
+            let mut deletion_vector_updates = Vec::new();
+            if let Some(deletions) = deletions {
+                for (name, bitmap) in deletions.lock().unwrap().iter() {
+                    let mut bytes = Vec::new();
+                    bitmap
+                        .serialize_into(&mut bytes)
+                        .map_err(|error| invalid(&error.to_string()))?;
+                    deletion_vector_updates.push(DeletionVectorUpdate {
+                        partition: task.partition.clone(),
+                        bucket: task.bucket,
+                        file_name: name.clone(),
+                        bitmap: bytes,
+                    });
+                }
+            }
             return Ok(CompactResult {
                 task: task.clone(),
                 files,
                 changelog_files,
+                deletion_vector_updates: options
+                    .deletion_vectors_enabled()
+                    .then_some(deletion_vector_updates),
             });
         }
         let mut read = table.new_read_builder().new_read()?.with_ordered(true);
@@ -484,6 +520,7 @@ impl CompactExecutor {
                 task: task.clone(),
                 files,
                 changelog_files: vec![],
+                deletion_vector_updates: None,
             }),
             Err(error) => {
                 writer.abort().await;
@@ -618,6 +655,7 @@ impl CompactTask {
 pub(super) fn validate_primary_key_changes(
     schema: &TableSchema,
     changes: &[ManifestEntry],
+    changelog: &[ManifestEntry],
     captured: &[ManifestEntry],
 ) -> Result<()> {
     fn group(entry: &ManifestEntry) -> (&[u8], i32, i32) {
@@ -678,6 +716,7 @@ pub(super) fn validate_primary_key_changes(
     if changes
         .iter()
         .filter(|entry| *entry.kind() == FileKind::Add)
+        .chain(changelog.iter())
         .any(|entry| output_levels.get(&group(entry)) != Some(&entry.file().level))
     {
         return Err(invalid(
@@ -691,6 +730,7 @@ pub(super) fn validate_primary_key_changes(
 pub(super) struct PreparedCompact {
     pub entries: Vec<ManifestEntry>,
     pub changelog_entries: Vec<ManifestEntry>,
+    pub deletion_vector_updates: Option<Vec<DeletionVectorUpdate>>,
     pub schema_id: i64,
     pub snapshot_id: i64,
     pub read_snapshot: Option<Box<Snapshot>>,
@@ -708,6 +748,7 @@ pub(super) fn prepare_results(table: &Table, results: &[CompactResult]) -> Resul
     let mut outputs = HashSet::new();
     let mut entries = Vec::new();
     let mut changelog_entries = Vec::new();
+    let mut deletion_vector_updates = Some(Vec::new());
     let mut metrics = CompactMetrics::default();
     for result in results {
         let task = &result.task;
@@ -777,12 +818,39 @@ pub(super) fn prepare_results(table: &Table, results: &[CompactResult]) -> Resul
             return Err(invalid("Compaction must preserve the input row count"));
         }
         let options = task.context.schema.core_options();
-        let ignores_retracts = task.is_primary_key()
-            && options.ignore_delete()
-            && matches!(
-                options.merge_engine()?,
-                MergeEngine::FirstRow | MergeEngine::PartialUpdate
-            );
+        let dv = task.is_primary_key() && options.deletion_vectors_enabled();
+        let ignores_retracts = dv
+            || (task.is_primary_key()
+                && options.ignore_delete()
+                && matches!(
+                    options.merge_engine()?,
+                    MergeEngine::FirstRow | MergeEngine::PartialUpdate
+                ));
+        if dv
+            && result.files.iter().any(|file| {
+                file.delete_row_count != Some(0) || file.row_count > i64::from(u32::MAX) + 1
+            })
+        {
+            return Err(invalid(
+                "Deletion-vector compaction data must contain only add records",
+            ));
+        }
+        let updates = result
+            .deletion_vector_updates
+            .as_deref()
+            .unwrap_or_default();
+        if dv && result.deletion_vector_updates.is_none() {
+            // Require this only after already-committed results are recovered.
+            deletion_vector_updates = None;
+        }
+        if !dv && !updates.is_empty() {
+            return Err(invalid(
+                "Only deletion-vector compaction may publish row deletions",
+            ));
+        }
+        if let Some(collected) = &mut deletion_vector_updates {
+            collected.extend(updates.iter().cloned());
+        }
         if task.is_primary_key()
             && (output_rows > input_rows
                 || (input_rows > 0 && output_rows == 0 && !ignores_retracts))
@@ -798,17 +866,12 @@ pub(super) fn prepare_results(table: &Table, results: &[CompactResult]) -> Resul
             ));
         }
         let mut changelog_rows = 0u64;
-        let changelog_level = output_level.unwrap_or_else(|| {
-            result
-                .files
-                .first()
-                .map_or_else(|| task.output_level(), |file| file.level)
-        });
+        let changelog_level = output_level.or_else(|| result.files.first().map(|file| file.level));
         for file in &result.changelog_files {
             validate_file(file, true)?;
             if file.schema_id != task.context.schema.id()
                 || file.file_source != Some(1)
-                || file.level != changelog_level
+                || changelog_level.is_some_and(|level| file.level != level)
                 || file
                     .delete_row_count
                     .is_none_or(|count| count > file.row_count)
@@ -860,6 +923,7 @@ pub(super) fn prepare_results(table: &Table, results: &[CompactResult]) -> Resul
     Ok(PreparedCompact {
         entries,
         changelog_entries,
+        deletion_vector_updates,
         schema_id: first.task.context.schema.id(),
         snapshot_id: first.task.snapshot_id(),
         read_snapshot: first
@@ -909,7 +973,7 @@ pub(super) fn ensure_supported(table: &Table) -> Result<()> {
     if table.is_format_table()
         || options.row_tracking_enabled()
         || options.data_evolution_enabled()
-        || options.deletion_vectors_enabled()
+        || (options.deletion_vectors_enabled() && table.schema().primary_keys().is_empty())
         || options.query_auth_enabled()
         || !options.blob_fields().is_empty()
         || table
@@ -941,15 +1005,55 @@ pub(super) fn ensure_supported(table: &Table) -> Result<()> {
             message: "PK compaction requires fixed or dynamic buckets and changelog-producer=none, input or lookup; first-row requires changelog-producer=none or lookup".into(),
         });
     }
+    if options.deletion_vectors_enabled() && options.merge_engine()? != MergeEngine::Deduplicate {
+        return Err(Error::Unsupported {
+            message: "Primary-key deletion-vector compaction requires deduplicate".into(),
+        });
+    }
     if options.try_changelog_producer()? == ChangelogProducer::Lookup {
         primary_key::lookup::validate_options(properties)?;
     }
     options.validate_data_file_path_directory()
 }
 
+/// Dropping DV tombstones relies on every historical version having used DV.
+/// Switching an existing non-DV table requires a migration Rust does not offer.
+pub(super) async fn validate_dv_schemas<'a>(
+    table: &Table,
+    files: impl Iterator<Item = &'a DataFileMeta>,
+) -> Result<()> {
+    if table.schema().primary_keys().is_empty()
+        || !table.schema().core_options().deletion_vectors_enabled()
+    {
+        return Ok(());
+    }
+    let mut schemas = HashSet::new();
+    for file in files {
+        if file.row_count > i64::from(u32::MAX) + 1 {
+            return Err(invalid(
+                "Deletion-vector compaction file exceeds u32 physical positions",
+            ));
+        }
+        if schemas.insert(file.schema_id)
+            && !table
+                .schema_manager()
+                .schema(file.schema_id)
+                .await?
+                .core_options()
+                .deletion_vectors_enabled()
+        {
+            return Err(Error::Unsupported {
+                message: "Deletion-vector compaction cannot migrate files written without deletion vectors".into(),
+            });
+        }
+    }
+    Ok(())
+}
+
 fn ensure_snapshot_supported(table: &Table, snapshot: &Snapshot) -> Result<()> {
     if snapshot.index_manifest().is_some()
         && !table.schema().core_options().data_evolution_enabled()
+        && !table.schema().core_options().deletion_vectors_enabled()
         && (table.schema().primary_keys().is_empty()
             || table.schema().core_options().bucket() != -1)
     {
@@ -978,8 +1082,11 @@ pub(super) async fn validate_snapshot_indexes(
         return Ok(Some(name.to_string()));
     }
     if entries.iter().any(|entry| {
-        entry.index_file.index_type != "HASH"
-            || entry.index_file.deletion_vectors_ranges.is_some()
+        !(entry.index_file.index_type == "HASH"
+            || (table.schema().core_options().deletion_vectors_enabled()
+                && entry.index_file.index_type == "DELETION_VECTORS"))
+            || (entry.index_file.index_type == "HASH"
+                && entry.index_file.deletion_vectors_ranges.is_some())
             || entry.index_file.global_index_meta.is_some()
     }) {
         return Err(Error::Unsupported {

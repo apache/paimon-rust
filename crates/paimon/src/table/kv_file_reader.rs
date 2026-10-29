@@ -377,6 +377,49 @@ impl KeyValueFileReader {
         self
     }
 
+    /// Decode an immutable file without filtering or merging physical rows.
+    /// Lookup files need these ordinals even when a snapshot deletes some rows.
+    pub(super) fn read_physical_file(
+        self,
+        split: DataSplit,
+        file: DataFileMeta,
+    ) -> crate::Result<ArrowRecordBatchStream> {
+        Ok(Box::pin(try_stream! {
+            let config = self.config;
+            let old = if file.schema_id != config.table_schema_id {
+                Some(config.schema_manager.schema(file.schema_id).await?)
+            } else { None };
+            let fields = old.as_ref().map_or(config.table_fields.as_slice(), |s| s.fields());
+            let keys = old.as_ref().map(|s| s.trimmed_primary_keys());
+            let data_schema = key_value_data_schema_fields(
+                fields, keys.as_deref().unwrap_or(&config.primary_keys),
+            )?;
+            let reader = DataFileReader::new(
+                self.file_io, config.schema_manager.clone(), config.table_schema_id,
+                config.table_fields.clone(),
+                key_value_fields_extractor(&config.table_fields, &config.primary_keys),
+                config.read_type, vec![],
+            )
+            .with_batch_size(Some(config.read_batch_size))
+            .with_parquet_read_budget(config.parquet_read_budget)
+            .with_table_options(config.table_options)
+            .with_mosaic_prefetch(config.mosaic_prefetch);
+            let expected = file.row_count;
+            let mut stream = reader.read_single_file_stream_with_schema_and_local_ranges(
+                &split, file, old.map(|s| s.fields().to_vec()), data_schema, None, None,
+            )?;
+            let mut rows = 0i64;
+            while let Some(batch) = stream.next().await {
+                let batch = batch?;
+                rows += batch.num_rows() as i64;
+                yield batch;
+            }
+            if rows != expected {
+                Err(Error::DataInvalid { message: "Lookup physical row count differs from file metadata".into(), source: None })?;
+            }
+        }))
+    }
+
     #[cfg(test)]
     fn with_input_batch_sizes(
         mut self,

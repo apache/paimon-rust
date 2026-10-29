@@ -542,6 +542,14 @@ pub struct DataEvolutionDeleteWriter {
 }
 
 impl DataEvolutionDeleteWriter {
+    /// Reuse bucket-local DV index I/O without enabling the public row-ID DELETE API.
+    pub(in crate::table) fn for_primary_key_compaction(table: &Table) -> Self {
+        Self {
+            table: table.clone(),
+            row_ids: vec![],
+        }
+    }
+
     pub fn new(table: &Table) -> Result<Self> {
         let schema = table.schema();
         let core_options = CoreOptions::new(schema.options());
