@@ -715,6 +715,45 @@ async fn test_replace_tag_rejected_on_rest_catalog_without_changing_metadata() {
 }
 
 #[tokio::test]
+async fn test_create_branch_rejects_rest_tables_even_when_target_exists() {
+    let (tmp, server, context) = setup().await;
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .build()
+        .unwrap();
+    let root = tmp.path().join(format!("{DATABASE}.db/{TABLE}"));
+    let schema_path = root.join("schema/schema-0");
+    let branch_path = root.join("branch/branch-existing/schema/schema-0");
+    let schema_bytes = serde_json::to_vec(&paimon::spec::TableSchema::new(0, &schema)).unwrap();
+    for path in [&schema_path, &branch_path] {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, &schema_bytes).unwrap();
+    }
+    server.add_table_with_schema(
+        DATABASE,
+        TABLE,
+        schema,
+        &format!("file://{}", root.display()),
+    );
+
+    for branch in ["new", "existing"] {
+        for tag in ["", ", tag => 'missing'"] {
+            common::assert_sql_error(
+                &context,
+                &format!(
+                    "CALL sys.create_branch(table => '{DATABASE}.{TABLE}', branch => '{branch}'{tag}, ignore_if_exists => true)"
+                ),
+                "create_branch is not supported for tables managed by a REST catalog",
+            )
+            .await;
+            assert_eq!(std::fs::read(&schema_path).unwrap(), schema_bytes);
+            assert_eq!(std::fs::read(&branch_path).unwrap(), schema_bytes);
+            assert_eq!(std::fs::read_dir(root.join("branch")).unwrap().count(), 1);
+        }
+    }
+}
+
+#[tokio::test]
 async fn test_rename_branch_rejected_on_rest_catalog() {
     // A REST catalog is authoritative for branch metadata and has no rename
     // endpoint, so `rename_branch` must refuse rather than move the physical
