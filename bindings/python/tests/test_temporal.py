@@ -17,6 +17,7 @@
 
 import bisect
 import random
+import struct
 
 import pyarrow as pa
 import pytest
@@ -97,6 +98,25 @@ def test_sliced_arrays_and_group_bounds():
     ends = pa.array([2, 4, 0], type=pa.int64())
     assert temporal_match(times, targets, starts, ends, "nearest").column(0).to_pylist() == [0, 2, -1]
     assert call([], [], "nearest") == {"first": [], "second": []}
+
+
+@pytest.mark.parametrize("unaligned_input", range(4))
+def test_unaligned_int64_buffers(unaligned_input):
+    values = ([1, 3, 5], [1], [0], [3])
+    arrays = [pa.array(items, type=pa.int64()) for items in values]
+    items = values[unaligned_input]
+    raw = bytearray(8 + 8 * len(items))
+    buffer = pa.py_buffer(raw)
+    offset = 1 if buffer.address % 8 == 0 else 0
+    struct.pack_into("<{}q".format(len(items)), raw, offset, *items)
+    buffer = buffer.slice(offset, 8 * len(items))
+    assert buffer.address % 8 != 0
+    arrays[unaligned_input] = pa.Array.from_buffers(
+        pa.int64(), len(items), [None, buffer])
+    arrays[unaligned_input].validate(full=True)
+
+    result = temporal_match(*arrays, "nearest").to_pydict()
+    assert result == {"first": [0], "second": [-1]}
 
 
 @pytest.mark.parametrize("kwargs", [dict(starts=[-1]), dict(ends=[2]), dict(starts=[1], ends=[0]),

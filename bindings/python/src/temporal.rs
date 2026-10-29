@@ -139,12 +139,13 @@ fn match_one(
 }
 
 fn int64_array(value: &Bound<'_, PyAny>) -> PyResult<Int64Array> {
-    let data = ArrayData::from_pyarrow_bound(value)?;
+    let mut data = ArrayData::from_pyarrow_bound(value)?;
     if data.data_type() != &arrow::datatypes::DataType::Int64 || data.null_count() != 0 {
         return Err(PyValueError::new_err(
             "Expected a non-null int64 Arrow array",
         ));
     }
+    data.align_buffers();
     Ok(Int64Array::from(data))
 }
 
