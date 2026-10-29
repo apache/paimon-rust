@@ -882,6 +882,10 @@ fn dictionary_variant_metadata_schema(
 
 #[async_trait]
 impl FormatFileReader for ParquetFormatReader {
+    fn supports_nested_projection(&self) -> bool {
+        true
+    }
+
     async fn read_batch_stream(
         &self,
         reader: Box<dyn FileRead>,
@@ -1378,6 +1382,15 @@ fn read_type_projection_mask(
     predicates: &[Predicate],
     null_residuals: &std::collections::HashSet<Vec<String>>,
 ) -> ProjectionMask {
+    fn is_list(physical: &parquet::schema::types::Type) -> bool {
+        let info = physical.get_basic_info();
+        !physical.is_primitive()
+            && match info.logical_type_ref() {
+                Some(logical) => logical == &parquet::basic::LogicalType::List,
+                None => info.converted_type() == parquet::basic::ConvertedType::LIST,
+            }
+    }
+
     fn requested_paths(
         field: &DataField,
         physical: &parquet::schema::types::Type,
@@ -1393,6 +1406,70 @@ fn read_type_projection_mask(
             return;
         }
         let data_type = field.data_type();
+        if let DataType::Array(array) = data_type {
+            let element =
+                DataField::new(field.id(), "element".into(), array.element_type().clone());
+            if is_list(physical) && physical.get_fields().len() == 1 {
+                // Follow arrow-rs's LIST conversion rules, including legacy
+                // two-level lists of ROWs named `array` or `<name>_tuple`.
+                let repeated = &physical.get_fields()[0];
+                path.push(repeated.name().to_string());
+                if !repeated.is_primitive()
+                    && repeated.get_fields().len() == 1
+                    && (is_list(repeated)
+                        || repeated.get_fields()[0].get_basic_info().repetition()
+                            == parquet::basic::Repetition::REPEATED
+                        || (repeated.name() != "array"
+                            && repeated.name() != format!("{}_tuple", physical.name())))
+                {
+                    let child = &repeated.get_fields()[0];
+                    path.push(child.name().to_string());
+                    requested_paths(&element, child, path, output, null_residuals);
+                    path.pop();
+                } else {
+                    requested_paths(&element, repeated, path, output, null_residuals);
+                }
+                path.pop();
+                return;
+            }
+            if physical.get_basic_info().has_repetition()
+                && physical.get_basic_info().repetition() == parquet::basic::Repetition::REPEATED
+            {
+                // Unannotated repeated fields are also decoded as lists.
+                requested_paths(&element, physical, path, output, null_residuals);
+                return;
+            }
+        }
+        if let DataType::Map(map) = data_type {
+            if !physical.is_primitive() && physical.get_fields().len() == 1 {
+                let entries = &physical.get_fields()[0];
+                if !entries.is_primitive() && entries.get_fields().len() == 2 {
+                    path.push(entries.name().to_string());
+                    let key = &entries.get_fields()[0];
+                    path.push(key.name().to_string());
+                    requested_paths(
+                        &DataField::new(field.id(), key.name().into(), map.key_type().clone()),
+                        key,
+                        path,
+                        output,
+                        null_residuals,
+                    );
+                    path.pop();
+                    let value = &entries.get_fields()[1];
+                    path.push(value.name().to_string());
+                    requested_paths(
+                        &DataField::new(field.id(), "value".into(), map.value_type().clone()),
+                        value,
+                        path,
+                        output,
+                        null_residuals,
+                    );
+                    path.pop();
+                    path.pop();
+                    return;
+                }
+            }
+        }
         if let DataType::Row(row) = data_type {
             if crate::spec::is_variant_extraction_row_type(data_type) {
                 let projected = super::variant_projection::projected_paths(row, physical);
@@ -1448,18 +1525,16 @@ fn read_type_projection_mask(
             .any(|(column, _)| *column == field.name())
         {
             super::variant_projection::all_leaves(root, &mut path, &mut selected);
-        } else if let Some(children) =
-            map_plan.and_then(|plan| plan.projected_physical_children(field.name()))
+        } else if let Some(physical_field) =
+            map_plan.and_then(|plan| plan.projected_physical_field(field.name()))
         {
-            for child in root
-                .get_fields()
-                .iter()
-                .filter(|child| children.contains(child.name()))
-            {
-                path.push(child.name().to_string());
-                super::variant_projection::all_leaves(child, &mut path, &mut selected);
-                path.pop();
-            }
+            requested_paths(
+                &physical_field,
+                root,
+                &mut path,
+                &mut selected,
+                null_residuals,
+            );
         } else {
             requested_paths(field, root, &mut path, &mut selected, null_residuals);
         }
@@ -2902,6 +2977,7 @@ impl ParquetMetadataCache {
         &self,
         reader: &mut ArrowFileReader,
         options: Option<&ArrowReaderOptions>,
+        shared: bool,
     ) -> parquet::errors::Result<Arc<ParquetMetaData>> {
         let column_index = options.map_or(PageIndexPolicy::Skip, |o| o.column_index_policy());
         let offset_index = options.map_or(PageIndexPolicy::Skip, |o| o.offset_index_policy());
@@ -2917,18 +2993,34 @@ impl ParquetMetadataCache {
                 offset_index: page_index_policy_tag(offset_index),
             });
         let key_heap_bytes = key.as_ref().map_or(0, |key| key.file.capacity());
-        self.inner
+        let mut loaded = false;
+        let metadata = self
+            .inner
             .get_or_try_insert_with(
                 key,
                 key_heap_bytes,
-                || reader.load_metadata(options),
+                || {
+                    loaded = true;
+                    reader.load_metadata(options)
+                },
                 |metadata| {
                     metadata
                         .memory_size()
                         .max(PARQUET_METADATA_CACHE_MIN_ENTRY_BYTES)
                 },
             )
-            .await
+            .await?;
+        if shared
+            && !loaded
+            && !reader
+                .r
+                .check_shared_metadata_access()
+                .await
+                .map_err(|error| parquet::errors::ParquetError::External(Box::new(error)))?
+        {
+            return reader.load_metadata(options).await;
+        }
+        Ok(metadata)
     }
 }
 
@@ -3165,9 +3257,10 @@ impl AsyncFileReader for ArrowFileReader {
             if context.max_bytes() == 0 {
                 return self.load_metadata(options.as_ref()).await;
             }
+            let shared = context.parquet_metadata_is_shared();
             context
                 .get_or_init(ParquetMetadataCache::new)
-                .load(self, options.as_ref())
+                .load(self, options.as_ref(), shared)
                 .await
         })
     }
@@ -3319,6 +3412,74 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::mpsc;
+
+    #[test]
+    fn map_value_read_type_prunes_children_and_keeps_predicate_inputs() {
+        use crate::spec::RowType;
+        let descriptor = SchemaDescriptor::new(Arc::new(
+            parse_message_type(
+                "message schema { optional group attrs (MAP) {
+                repeated group key_value { required binary key (STRING);
+                    optional group value { optional int32 wanted; optional int64 unused; }
+                }
+            } }",
+            )
+            .unwrap(),
+        ));
+        let fields = vec![DataField::new(
+            10,
+            "attrs".into(),
+            DataType::Map(MapType::new(
+                DataType::VarChar(VarCharType::string_type()),
+                DataType::Row(RowType::new(vec![DataField::new(
+                    11,
+                    "wanted".into(),
+                    DataType::Int(IntType::new()),
+                )])),
+            )),
+        )];
+        let mask =
+            super::read_type_projection_mask(&descriptor, &fields, None, &[], &Default::default());
+        assert!(mask.leaf_included(0));
+        assert!(mask.leaf_included(1));
+        assert!(!mask.leaf_included(2));
+        let predicate = PredicateBuilder::new(&fields).is_null("attrs").unwrap();
+        let widened = super::read_type_projection_mask(
+            &descriptor,
+            &fields,
+            None,
+            &[predicate],
+            &Default::default(),
+        );
+        for index in 0..3 {
+            assert!(widened.leaf_included(index));
+        }
+    }
+
+    #[test]
+    fn array_read_type_masks_standard_and_legacy_list_leaves() {
+        use crate::spec::RowType;
+        let requested = vec![DataField::new(
+            0,
+            "items".into(),
+            DataType::Array(ArrayType::new(DataType::Row(RowType::new(vec![
+                DataField::new(2, "wanted".into(), DataType::Int(IntType::new())),
+            ])))),
+        )];
+        for layout in [
+            "optional group items (LIST) { repeated group list { optional group element { optional int32 unused; optional int32 wanted; } } }",
+            "optional group items (LIST) { repeated group array { optional int32 unused; optional int32 wanted; } }",
+            "optional group items (LIST) { repeated group items_tuple { optional int32 unused; optional int32 wanted; } }",
+            "repeated group items { optional int32 unused; optional int32 wanted; }",
+        ] {
+            let descriptor = SchemaDescriptor::new(Arc::new(
+                parse_message_type(&format!("message schema {{ {layout} }}")).unwrap()));
+            let mask = super::read_type_projection_mask(
+                &descriptor, &requested, None, &[], &Default::default());
+            assert!(!mask.leaf_included(0), "{layout}");
+            assert!(mask.leaf_included(1), "{layout}");
+        }
+    }
 
     #[test]
     fn selected_map_rows_keep_all_map_leaves_without_a_shredding_plan() {
@@ -5724,6 +5885,11 @@ mod tests {
 
     #[async_trait::async_trait]
     impl crate::io::FileRead for TrackingFileRead {
+        async fn check_shared_metadata_access(&self) -> crate::Result<bool> {
+            self.read(0..1).await?;
+            Ok(true)
+        }
+
         async fn read(&self, range: std::ops::Range<u64>) -> crate::Result<Bytes> {
             self.ranges.lock().unwrap().push(range.clone());
             // Count each source allocation until its last slice is dropped, not slice lengths.
@@ -5769,6 +5935,114 @@ mod tests {
         assert_eq!(tracker.read_count(), 1);
     }
 
+    #[tokio::test]
+    async fn parquet_metadata_cache_shares_independently_created_contexts() {
+        if !crate::io::run_isolated_metadata_cache_test(
+            "arrow::format::parquet::tests::parquet_metadata_cache_shares_independently_created_contexts",
+        ) {
+            return;
+        }
+        let data = Bytes::from(
+            write_multi_row_group_parquet(8, 64, EnabledStatistics::Chunk, false).await,
+        );
+        let props = HashMap::from([(
+            crate::common::CatalogOptions::FILE_FORMAT_METADATA_CACHE_SHARED.to_string(),
+            "true".to_string(),
+        )]);
+        let mut trackers = Vec::new();
+        let mut metadata = Vec::new();
+        for _ in 0..40 {
+            let context = crate::io::FileFormatMetadataCacheContext::from_props(&props).unwrap();
+            let tracker = TrackingFileRead::new(data.clone())
+                .with_cache_key("process-sharing-test\0data.parquet")
+                .with_metadata_cache(context);
+            let mut reader =
+                super::ArrowFileReader::new(data.len() as u64, Arc::new(tracker.clone()));
+            metadata.push(reader.get_metadata(None).await.unwrap());
+            trackers.push(tracker);
+        }
+        assert_eq!(
+            trackers
+                .iter()
+                .map(TrackingFileRead::read_count)
+                .sum::<usize>(),
+            40
+        );
+        assert!(trackers
+            .iter()
+            .skip(1)
+            .all(|reader| reader.bytes_read() == 1));
+        assert!(metadata
+            .iter()
+            .all(|value| Arc::ptr_eq(value, &metadata[0])));
+    }
+
+    #[tokio::test]
+    async fn shared_metadata_rejects_an_unauthorized_reader() {
+        if !crate::io::run_isolated_metadata_cache_test(
+            "arrow::format::parquet::tests::shared_metadata_rejects_an_unauthorized_reader",
+        ) {
+            return;
+        }
+        struct DeniedReader(TrackingFileRead, bool, Arc<AtomicUsize>);
+        #[async_trait::async_trait]
+        impl crate::io::FileRead for DeniedReader {
+            async fn read(&self, _: std::ops::Range<u64>) -> crate::Result<Bytes> {
+                Err(crate::Error::from(opendal::Error::new(
+                    opendal::ErrorKind::PermissionDenied,
+                    "denied",
+                )))
+            }
+            async fn check_shared_metadata_access(&self) -> crate::Result<bool> {
+                self.2.fetch_add(1, AtomicOrdering::SeqCst);
+                if !self.1 {
+                    return Ok(false);
+                }
+                self.read(0..1).await?;
+                Ok(true)
+            }
+            fn cache_key(&self) -> Option<&str> {
+                self.0.cache_key()
+            }
+            fn file_format_metadata_cache(&self) -> Option<&(dyn std::any::Any + Send + Sync)> {
+                self.0.file_format_metadata_cache()
+            }
+        }
+        let data = Bytes::from(
+            write_multi_row_group_parquet(8, 64, EnabledStatistics::Chunk, false).await,
+        );
+        let props = HashMap::from([(
+            crate::common::CatalogOptions::FILE_FORMAT_METADATA_CACHE_SHARED.to_string(),
+            "true".to_string(),
+        )]);
+        let first = TrackingFileRead::new(data.clone())
+            .with_cache_key("authorization-test/data.parquet")
+            .with_metadata_cache(
+                crate::io::FileFormatMetadataCacheContext::from_props(&props).unwrap(),
+            );
+        let mut allowed = super::ArrowFileReader::new(data.len() as u64, Arc::new(first));
+        allowed.get_metadata(None).await.unwrap();
+        let second = TrackingFileRead::new(data.clone())
+            .with_cache_key("authorization-test/data.parquet")
+            .with_metadata_cache(
+                crate::io::FileFormatMetadataCacheContext::from_props(&props).unwrap(),
+            );
+        for supports_check in [true, false] {
+            let checks = Arc::new(AtomicUsize::new(0));
+            let mut denied = super::ArrowFileReader::new(
+                data.len() as u64,
+                Arc::new(DeniedReader(second.clone(), supports_check, checks.clone())),
+            );
+            assert!(denied
+                .get_metadata(None)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("denied"));
+            assert_eq!(checks.load(AtomicOrdering::SeqCst), 1);
+        }
+    }
+
     #[cfg(feature = "storage-fs")]
     #[tokio::test]
     async fn parquet_metadata_cache_reuses_metadata_across_file_io_instances() {
@@ -5804,6 +6078,146 @@ mod tests {
         let second_metadata = second_reader.get_metadata(None).await.unwrap();
 
         assert!(Arc::ptr_eq(&first_metadata, &second_metadata));
+    }
+
+    #[cfg(feature = "storage-memory")]
+    #[tokio::test]
+    async fn shared_metadata_separates_recycled_memory_storage_identities() {
+        if !crate::io::run_isolated_metadata_cache_test(
+            "arrow::format::parquet::tests::shared_metadata_separates_recycled_memory_storage_identities",
+        ) {
+            return;
+        }
+        use crate::io::FileRead;
+
+        struct RecycledMemoryReader {
+            inner: Arc<dyn FileRead>,
+            key: String,
+        }
+        impl RecycledMemoryReader {
+            fn new(inner: impl FileRead) -> Self {
+                let mut parts = inner.cache_key().unwrap().split('\0').collect::<Vec<_>>();
+                assert_eq!(parts.len(), 5);
+                assert_eq!(parts[1], "memory");
+                // Simulate OpenDAL reusing an address-based service name. Keep
+                // the real FileIO namespace, root and path; do not rely on malloc.
+                parts[2] = "recycled-memory-address";
+                let key = parts.join("\0");
+                Self {
+                    inner: Arc::new(inner),
+                    key,
+                }
+            }
+        }
+        #[async_trait::async_trait]
+        impl FileRead for RecycledMemoryReader {
+            async fn read(&self, range: std::ops::Range<u64>) -> crate::Result<Bytes> {
+                self.inner.read(range).await
+            }
+            async fn check_shared_metadata_access(&self) -> crate::Result<bool> {
+                self.inner.check_shared_metadata_access().await
+            }
+            fn cache_key(&self) -> Option<&str> {
+                Some(&self.key)
+            }
+            fn file_format_metadata_cache(&self) -> Option<&(dyn std::any::Any + Send + Sync)> {
+                self.inner.file_format_metadata_cache()
+            }
+        }
+        fn parquet_data(name: &str, value: i32) -> Bytes {
+            let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                name,
+                ArrowDataType::Int32,
+                false,
+            )]));
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int32Array::from(vec![value; 4]))],
+            )
+            .unwrap();
+            let mut data = Vec::new();
+            let mut writer = parquet::arrow::ArrowWriter::try_new(&mut data, schema, None).unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+            Bytes::from(data)
+        }
+
+        let first_data = parquet_data("first", 1);
+        let second_data = parquet_data("other", 9);
+        assert_eq!(first_data.len(), second_data.len());
+        let props = HashMap::from([(
+            crate::common::CatalogOptions::FILE_FORMAT_METADATA_CACHE_SHARED.to_string(),
+            "true".to_string(),
+        )]);
+        let _keep_pool_alive =
+            crate::io::FileFormatMetadataCacheContext::from_props(&props).unwrap();
+        let path = "memory:/recycled-identity.parquet";
+        let first = FileIOBuilder::new("memory")
+            .with_props(props.clone())
+            .build()
+            .unwrap();
+        first
+            .new_output(path)
+            .unwrap()
+            .write(first_data.clone())
+            .await
+            .unwrap();
+        let mut reader = super::ArrowFileReader::new(
+            first_data.len() as u64,
+            Arc::new(RecycledMemoryReader::new(
+                first.new_input(path).unwrap().reader().await.unwrap(),
+            )),
+        );
+        let first_metadata = reader.get_metadata(None).await.unwrap();
+        assert_eq!(
+            first_metadata
+                .file_metadata()
+                .schema_descr()
+                .column(0)
+                .name(),
+            "first"
+        );
+        let clone = first.clone();
+        let mut cloned_reader = super::ArrowFileReader::new(
+            first_data.len() as u64,
+            Arc::new(RecycledMemoryReader::new(
+                clone.new_input(path).unwrap().reader().await.unwrap(),
+            )),
+        );
+        assert!(Arc::ptr_eq(
+            &first_metadata,
+            &cloned_reader.get_metadata(None).await.unwrap()
+        ));
+        drop(cloned_reader);
+        drop(clone);
+        drop(reader);
+        drop(first);
+
+        let second = FileIOBuilder::new("memory")
+            .with_props(props)
+            .build()
+            .unwrap();
+        second
+            .new_output(path)
+            .unwrap()
+            .write(second_data.clone())
+            .await
+            .unwrap();
+        let mut reader = super::ArrowFileReader::new(
+            second_data.len() as u64,
+            Arc::new(RecycledMemoryReader::new(
+                second.new_input(path).unwrap().reader().await.unwrap(),
+            )),
+        );
+        let metadata = reader.get_metadata(None).await.unwrap();
+        assert_eq!(
+            metadata.file_metadata().schema_descr().column(0).name(),
+            "other"
+        );
+        match metadata.row_group(0).column(0).statistics().unwrap() {
+            ParquetStatistics::Int32(stats) => assert_eq!(stats.min_opt(), Some(&9)),
+            _ => panic!("expected Int32 statistics"),
+        }
     }
 
     #[tokio::test]
@@ -7337,6 +7751,106 @@ mod tests {
         writer.write(&batch).await.unwrap();
         let file_size = writer.close().await.unwrap().file_size;
         (path, file_io, file_size, fields)
+    }
+
+    #[tokio::test]
+    async fn map_value_projection_preserves_nulls_empty_maps_and_duplicate_keys() {
+        use crate::spec::RowType;
+        let wanted = DataField::new(11, "wanted".into(), DataType::Int(IntType::new()));
+        let unused = DataField::new(12, "unused".into(), DataType::BigInt(BigIntType::new()));
+        let map_field = |children| {
+            DataField::new(
+                10,
+                "attrs".into(),
+                DataType::Map(MapType::new(
+                    DataType::VarChar(VarCharType::string_type()),
+                    DataType::Row(RowType::new(children)),
+                )),
+            )
+        };
+        let fields = vec![map_field(vec![wanted.clone(), unused])];
+        let requested = vec![map_field(vec![wanted])];
+        let schema = build_target_arrow_schema(&fields).unwrap();
+        let ArrowDataType::Map(entries_field, ordered) = schema.field(0).data_type() else {
+            panic!("expected map");
+        };
+        let ArrowDataType::Struct(entry_fields) = entries_field.data_type() else {
+            panic!("expected entries");
+        };
+        let ArrowDataType::Struct(value_fields) = entry_fields[1].data_type() else {
+            panic!("expected struct values");
+        };
+        let values = StructArray::new(
+            value_fields.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![Some(7), None, Some(9), Some(10)])),
+                Arc::new(Int64Array::from(vec![70, 80, 90, 100])),
+            ],
+            Some(NullBuffer::from(vec![true, true, false, true])),
+        );
+        let entries = StructArray::new(
+            entry_fields.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["a", "a", "b", "c"])),
+                Arc::new(values),
+            ],
+            None,
+        );
+        let input = MapArray::new(
+            entries_field.clone(),
+            OffsetBuffer::new(ScalarBuffer::from(vec![0, 0, 0, 2, 3, 4])),
+            entries,
+            Some(NullBuffer::from(vec![false, true, true, true, true])),
+            *ordered,
+        );
+        let original: Arc<dyn Array> = Arc::new(input);
+        let expected =
+            crate::arrow::nested_evolution::evolve_field(&original, &fields[0], &requested[0])
+                .unwrap();
+        let batch = RecordBatch::try_new(schema.clone(), vec![original]).unwrap();
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let path = "memory:/map_value_projection.parquet";
+        let output = file_io.new_output(path).unwrap();
+        let mut writer =
+            create_format_writer(&output, schema, "zstd", 1, None, Some(&fields), None)
+                .await
+                .unwrap();
+        writer.write(&batch).await.unwrap();
+        let size = writer.close().await.unwrap().file_size;
+        let batches = create_format_reader(path, false, &requested)
+            .unwrap()
+            .read_batch_stream(
+                Box::new(file_io.new_input(path).unwrap().reader().await.unwrap()),
+                size,
+                &requested,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(batches.len(), 1);
+        let decoded = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .unwrap();
+        let values = decoded
+            .values()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        assert_eq!(values.column_names(), vec!["wanted"]);
+        let actual = crate::arrow::nested_evolution::evolve_field(
+            batches[0].column(0),
+            &fields[0],
+            &requested[0],
+        )
+        .unwrap();
+        assert_eq!(actual.to_data(), expected.to_data());
     }
 
     #[tokio::test]

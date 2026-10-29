@@ -18,7 +18,9 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use arrow::datatypes::Schema as ArrowSchema;
+use arrow::array::{Array, Int64Array};
+use arrow::compute::{cast_with_options, CastOptions};
+use arrow::datatypes::{DataType as ArrowDataType, Schema as ArrowSchema};
 use arrow::pyarrow::{FromPyArrow, ToPyArrow};
 use arrow::record_batch::RecordBatch;
 use paimon::spec::{BlobConsumer, BlobDescriptor, CoreOptions, DataType, Datum, RowType};
@@ -28,7 +30,7 @@ use paimon::table::{
     COMMIT_MESSAGE_SERIALIZER_VERSION,
 };
 use paimon_datafusion::runtime::runtime;
-use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
+use pyo3::exceptions::{PyModuleNotFoundError, PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyString};
 use pyo3::{PyTraverseError, PyVisit};
@@ -40,6 +42,75 @@ use crate::predicate::{dict_to_table_predicate, py_to_datum};
 
 type PartitionSpec = HashMap<String, Option<Datum>>;
 type PythonPartitionSpec = HashMap<String, Py<PyAny>>;
+
+fn delete_row_id_arrays(row_ids: &Bound<'_, PyAny>) -> PyResult<Vec<Int64Array>> {
+    let py = row_ids.py();
+    let pa = match py.import("pyarrow") {
+        Ok(pa) => pa,
+        // Plain sequence deletes do not require the optional PyArrow package.
+        // Preserve errors from a broken installation or its dependencies.
+        Err(error)
+            if error.is_instance_of::<PyModuleNotFoundError>(py)
+                && error
+                    .value(py)
+                    .getattr("name")?
+                    .extract::<Option<String>>()?
+                    .as_deref()
+                    == Some("pyarrow") =>
+        {
+            return Ok(vec![Int64Array::from(row_ids.extract::<Vec<i64>>()?)]);
+        }
+        Err(error) => return Err(error),
+    };
+    let is_array = row_ids.is_instance(&pa.getattr("Array")?)?;
+    let is_chunked = row_ids.is_instance(&pa.getattr("ChunkedArray")?)?;
+    if !is_array && !is_chunked {
+        return Ok(vec![Int64Array::from(row_ids.extract::<Vec<i64>>()?)]);
+    }
+    // Check the declared type even when a ChunkedArray contains no chunks.
+    if !ArrowDataType::from_pyarrow_bound(&row_ids.getattr("type")?)?.is_integer() {
+        return Err(PyTypeError::new_err(
+            "_ROW_ID input must be an integer Arrow array",
+        ));
+    }
+    let arrays = if is_array {
+        vec![crate::arrow_input::array_from_pyarrow(row_ids)?]
+    } else {
+        row_ids
+            .getattr("chunks")?
+            .try_iter()?
+            .map(|chunk| crate::arrow_input::array_from_pyarrow(&chunk?))
+            .collect::<PyResult<Vec<_>>>()?
+    };
+    py.detach(|| {
+        arrays
+            .into_iter()
+            .map(|array| {
+                if array.null_count() != 0 {
+                    return Err(PyValueError::new_err("_ROW_ID must not be null"));
+                }
+                let converted = cast_with_options(
+                    array.as_ref(),
+                    &ArrowDataType::Int64,
+                    &CastOptions {
+                        safe: false,
+                        ..Default::default()
+                    },
+                )
+                .map_err(|error| {
+                    PyValueError::new_err(format!(
+                        "_ROW_ID cannot be represented as Int64: {error}"
+                    ))
+                })?;
+                Ok(converted
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("cast to Int64 returned an Int64Array")
+                    .clone())
+            })
+            .collect()
+    })
+}
 
 /// Shared implementation state; public builders keep batch and stream contracts separate.
 struct WriteContext {
@@ -427,7 +498,7 @@ impl PyPostponeFixedBucketWriteBuilder {
         let plan = py
             .detach(|| runtime().block_on(builder.resolve_bucket_plan()))
             .map_err(to_py_err)?;
-        plan.to_arrow(table)
+        plan.to_arrow(table.schema())
             .map_err(to_py_err)?
             .to_pyarrow(py)
             .map(Bound::unbind)
@@ -454,7 +525,8 @@ impl PyPostponeFixedBucketWriteBuilder {
     ) -> PyResult<PyRefMut<'py, Self>> {
         let plan = RecordBatch::from_pyarrow_bound(plan)?;
         slf.plan = Some(
-            PostponeBucketPlan::from_arrow(&slf.batch.context.table, &plan).map_err(to_py_err)?,
+            PostponeBucketPlan::from_arrow(slf.batch.context.table.schema(), &plan)
+                .map_err(to_py_err)?,
         );
         Ok(slf)
     }
@@ -879,10 +951,19 @@ impl UpdateContext {
     fn delete_by_row_id(
         &self,
         py: Python<'_>,
-        row_ids: Vec<i64>,
+        row_ids: &Bound<'_, PyAny>,
     ) -> PyResult<Vec<PyCommitMessage>> {
+        let arrays = delete_row_id_arrays(row_ids)?;
         let messages = py
-            .detach(|| runtime().block_on(self.inner.delete_by_row_id(row_ids)))
+            .detach(|| {
+                runtime().block_on(
+                    self.inner.delete_by_row_id(
+                        arrays
+                            .iter()
+                            .flat_map(|array| array.values().iter().copied()),
+                    ),
+                )
+            })
             .map_err(to_py_err)?;
         Ok(wrap_messages(
             messages,
@@ -1192,7 +1273,7 @@ impl PyStreamTableUpdate {
     fn delete_by_row_id(
         &self,
         py: Python<'_>,
-        row_ids: Vec<i64>,
+        row_ids: &Bound<'_, PyAny>,
         commit_identifier: i64,
     ) -> PyResult<Vec<PyCommitMessage>> {
         // The stream committer applies the identifier to the returned messages.
@@ -1326,7 +1407,7 @@ impl PyBatchTableUpdate {
     fn delete_by_row_id(
         &self,
         py: Python<'_>,
-        row_ids: Vec<i64>,
+        row_ids: &Bound<'_, PyAny>,
     ) -> PyResult<Vec<PyCommitMessage>> {
         self.context.delete_by_row_id(py, row_ids)
     }
@@ -1846,6 +1927,112 @@ mod tests {
     use paimon::io::FileIOBuilder;
     use paimon::spec::{BigIntType, IntType, Schema, TableSchema, VarCharType};
     use pyo3::ffi::c_str;
+
+    fn merge_locals(py: Python<'_>) -> Bound<'_, PyDict> {
+        let locals = PyDict::new(py);
+        locals
+            .set_item(
+                "MergeAssignment",
+                py.get_type::<crate::merge_types::PyMergeAssignment>(),
+            )
+            .unwrap();
+        locals
+            .set_item(
+                "WhenMatched",
+                py.get_type::<crate::merge_types::PyWhenMatched>(),
+            )
+            .unwrap();
+        locals
+            .set_item(
+                "WhenNotMatched",
+                py.get_type::<crate::merge_types::PyWhenNotMatched>(),
+            )
+            .unwrap();
+        locals
+    }
+
+    #[test]
+    fn row_id_delete_inputs_preserve_arrow_chunks_and_integer_values() {
+        Python::attach(|py| {
+            let locals = PyDict::new(py);
+            py.run(
+                c_str!(
+                    r#"
+import pyarrow as pa
+valid = [
+    ([2, 1], [2, 1], [2]),
+    ((2, 1), [2, 1], [2]),
+    (pa.array([None, 2, 1, None], type=pa.int64()).slice(1, 2), [2, 1], [2]),
+    (pa.chunked_array([[999, 2], [1, 999]], type=pa.int16()).slice(1, 2), [2, 1], [1, 1]),
+    (pa.array([2 ** 63 - 1], type=pa.uint64()), [2 ** 63 - 1], [1]),
+    (pa.array([], type=pa.uint32()), [], [0]),
+    (pa.chunked_array([], type=pa.int64()), [], []),
+]
+invalid = [
+    (pa.array([None], type=pa.int64()), 'value'),
+    (pa.chunked_array([[0], [None]], type=pa.int64()), 'value'),
+    (pa.array([2 ** 63], type=pa.uint64()), 'value'),
+    (pa.chunked_array([[0], [2 ** 63]], type=pa.uint64()), 'value'),
+    (pa.array([1.5]), 'type'),
+    (pa.array([True]), 'type'),
+    (pa.array([], type=pa.bool_()), 'type'),
+    (pa.array([], type=pa.string()), 'type'),
+    (pa.chunked_array([], type=pa.float64()), 'type'),
+    ([1.5], 'type'),
+    ([None], 'type'),
+    ([2 ** 63], 'overflow'),
+]
+"#
+                ),
+                Some(&locals),
+                Some(&locals),
+            )
+            .unwrap();
+            for case in locals
+                .get_item("valid")
+                .unwrap()
+                .unwrap()
+                .try_iter()
+                .unwrap()
+            {
+                let case = case.unwrap();
+                let arrays = delete_row_id_arrays(&case.get_item(0).unwrap()).unwrap();
+                let values: Vec<i64> = arrays
+                    .iter()
+                    .flat_map(|array| array.values().iter().copied())
+                    .collect();
+                let lengths: Vec<usize> = arrays.iter().map(Int64Array::len).collect();
+                assert_eq!(
+                    values,
+                    case.get_item(1).unwrap().extract::<Vec<i64>>().unwrap()
+                );
+                assert_eq!(
+                    lengths,
+                    case.get_item(2).unwrap().extract::<Vec<usize>>().unwrap()
+                );
+            }
+            for case in locals
+                .get_item("invalid")
+                .unwrap()
+                .unwrap()
+                .try_iter()
+                .unwrap()
+            {
+                let case = case.unwrap();
+                let error = delete_row_id_arrays(&case.get_item(0).unwrap()).unwrap_err();
+                let kind: String = case.get_item(1).unwrap().extract().unwrap();
+                assert!(
+                    match kind.as_str() {
+                        "type" => error.is_instance_of::<PyTypeError>(py),
+                        "value" => error.is_instance_of::<PyValueError>(py),
+                        "overflow" => error.is_instance_of::<pyo3::exceptions::PyOverflowError>(py),
+                        _ => false,
+                    },
+                    "unexpected {kind} error: {error}"
+                );
+            }
+        });
+    }
 
     #[test]
     fn captured_plan_rejects_other_operations_before_python_input_consumption() {
@@ -2407,6 +2594,174 @@ first = install('first')
     }
 
     #[test]
+    fn merge_into_rejects_legacy_dictionary_clauses() {
+        Python::attach(|py| {
+            let schema = Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .option("row-tracking.enabled", "true")
+                .option("data-evolution.enabled", "true")
+                .build()
+                .unwrap();
+            let table = Arc::new(Table::new(
+                FileIOBuilder::new("memory").build().unwrap(),
+                Identifier::new("default", "typed_merge_clauses"),
+                "memory:/typed-merge-clauses".into(),
+                TableSchema::new(0, &schema),
+                None,
+            ));
+            let update = Py::new(py, PyBatchWriteBuilder::new(table))
+                .unwrap()
+                .bind(py)
+                .call_method0("new_update")
+                .unwrap();
+            let locals = PyDict::new(py);
+            locals.set_item("update", update).unwrap();
+            py.run(
+                c_str!(
+                    r#"
+import pyarrow as pa
+source = pa.table({'id': pa.array([], pa.int32())})
+for matched, unmatched in [
+    ([dict(condition=None, delete=False, assignments=[('id', 'source', 'id')])], []),
+    ([], [dict(condition=None, assignments=[('id', 'source', 'id')])]),
+]:
+    try:
+        update.merge_into(source, on=[('id', 'id')],
+                          when_matched=matched, when_not_matched=unmatched)
+    except TypeError:
+        pass
+    else:
+        raise AssertionError('MERGE accepted a legacy dictionary clause')
+"#
+                ),
+                Some(&locals),
+                Some(&locals),
+            )
+            .unwrap();
+        });
+    }
+
+    #[test]
+    fn typed_merge_into_preserves_literal_and_callback_evaluation() {
+        use arrow::array::Int32Array;
+        use futures::TryStreamExt;
+
+        Python::attach(|py| {
+            let schema = Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("value", DataType::Int(IntType::new()))
+                .option("row-tracking.enabled", "true")
+                .option("data-evolution.enabled", "true")
+                .build()
+                .unwrap();
+            let table = Arc::new(Table::new(
+                FileIOBuilder::new("memory").build().unwrap(),
+                Identifier::new("default", "typed_merge_lazy_values"),
+                "memory:/typed-merge-lazy-values".into(),
+                TableSchema::new(0, &schema),
+                None,
+            ));
+            let locals = merge_locals(py);
+            locals
+                .set_item(
+                    "builder",
+                    Py::new(py, PyBatchWriteBuilder::new(table.clone())).unwrap(),
+                )
+                .unwrap();
+            py.run(
+                c_str!(
+                    r#"
+import pyarrow as pa
+source = pa.table({'id': pa.array([1, 2], pa.int32()),
+                   'value': pa.array([10, 20], pa.int32())})
+update = builder.new_update()
+literal_calls = []
+def literal_value(rows):
+    literal_calls.append(rows.num_rows)
+    return pa.array([99, 99], pa.int32())
+unused = WhenNotMatched({'id': MergeAssignment.source_column('id'),
+                         'value': MergeAssignment.literal(literal_value)},
+                        condition='"s.id" < 0')
+assert update.merge_into(source, on=[('id', 'id')], when_matched=[],
+                         when_not_matched=[unused]) == []
+assert literal_calls == []
+selected = WhenNotMatched({'id': MergeAssignment.source_column('id'),
+                           'value': MergeAssignment.literal(literal_value)})
+try:
+    update.merge_into(source, on=[('id', 'id')], when_matched=[],
+                      when_not_matched=[selected])
+except (TypeError, ValueError):
+    pass
+else:
+    raise AssertionError('callable literal was evaluated as an assignment function')
+assert literal_calls == []
+
+failure = LookupError('typed MERGE callback failed')
+callback_rows = []
+def assignment(rows):
+    callback_rows.append(rows['s.id'].to_pylist())
+    if len(callback_rows) == 1:
+        raise failure
+    return pa.chunked_array([pa.array([21], pa.int32())])
+assignments = {'id': MergeAssignment.source_column('id'),
+               'value': MergeAssignment.function(function=assignment)}
+clause = WhenNotMatched(assignments, condition='"s.id" = 2')
+assignments.clear()
+for attempt in [1, 2]:
+    try:
+        messages = update.merge_into(source, on=[('id', 'id')], when_matched=[],
+                                     when_not_matched=[unused, clause])
+    except LookupError as error:
+        assert attempt == 1
+        assert error is failure
+    else:
+        assert attempt == 2
+        builder.new_commit().commit(messages)
+assert callback_rows == [[2], [2]]
+assert literal_calls == []
+"#
+                ),
+                Some(&locals),
+                Some(&locals),
+            )
+            .unwrap();
+            let batches = py.detach(|| {
+                runtime().block_on(async {
+                    let builder = table.new_read_builder();
+                    let plan = builder.new_scan().plan().await.unwrap();
+                    builder
+                        .new_read()
+                        .unwrap()
+                        .to_arrow(plan.splits())
+                        .unwrap()
+                        .try_collect::<Vec<_>>()
+                        .await
+                        .unwrap()
+                })
+            });
+            assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+            assert_eq!(
+                batches[0]
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .value(0),
+                2
+            );
+            assert_eq!(
+                batches[0]
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .value(0),
+                21
+            );
+        });
+    }
+
+    #[test]
     fn merge_table_source_conditions_resolve_read_metadata() {
         Python::attach(|py| {
             for metadata in ["_ROW_ID", "_SEQUENCE_NUMBER"] {
@@ -2434,15 +2789,15 @@ first = install('first')
                 ));
                 let source = Py::new(py, crate::table::PyTable::new(source)).unwrap();
                 let context = UpdateContext::new(&WriteContext::new(table)).unwrap();
-                let locals = PyDict::new(py);
+                let locals = merge_locals(py);
                 locals.set_item("metadata", metadata).unwrap();
                 py.run(
                     c_str!(
                         r#"
-condition = dict(sql='"s.' + metadata + '" >= 0')
-matched = [dict(assignments=[('value', 'source', 'value')], condition=condition, delete=False)]
-not_matched = [dict(assignments=[('id', 'source', metadata), ('value', 'source', 'value')],
-                    condition=condition)]
+condition = '"s.' + metadata + '" >= 0'
+matched = [WhenMatched.update({'value': MergeAssignment.source_column('value')}, condition=condition)]
+not_matched = [WhenNotMatched({'id': MergeAssignment.source_column(metadata),
+                              'value': MergeAssignment.source_column('value')}, condition=condition)]
 "#
                     ),
                     Some(&locals),
@@ -2558,17 +2913,18 @@ not_matched = [dict(assignments=[('id', 'source', metadata), ('value', 'source',
                 });
                 let source = Py::new(py, crate::table::PyTable::new(source)).unwrap();
                 let context = UpdateContext::new(&WriteContext::new(target.clone())).unwrap();
-                let locals = PyDict::new(py);
+                let locals = merge_locals(py);
                 locals.set_item("metadata", metadata).unwrap();
                 locals.set_item("first", first).unwrap();
                 locals.set_item("second", second).unwrap();
                 py.run(
                     c_str!(
                         r#"
-matched = [dict(assignments=[('value', 'source', 'value')],
-                condition=dict(sql='"s.' + metadata + '" = ' + str(first)), delete=False)]
-not_matched = [dict(assignments=[('id', 'source', metadata), ('value', 'source', 'value')],
-                    condition=dict(sql='"s.' + metadata + '" = ' + str(second)))]
+matched = [WhenMatched.update({'value': MergeAssignment.source_column('value')},
+                              condition='"s.' + metadata + '" = ' + str(first))]
+not_matched = [WhenNotMatched({'id': MergeAssignment.source_column(metadata),
+                              'value': MergeAssignment.source_column('value')},
+                             condition='"s.' + metadata + '" = ' + str(second))]
 "#
                     ),
                     Some(&locals),
@@ -2729,7 +3085,7 @@ source = pa.Table.from_pylist([
 invalid = source.slice(0, 1)
 "#
                 ),
-                None,
+                Some(&locals),
                 Some(&locals),
             )
             .unwrap();
@@ -2794,7 +3150,7 @@ invalid = source.slice(0, 1)
                     })
                 });
                 let context = UpdateContext::new(&WriteContext::new(table)).unwrap();
-                let locals = PyDict::new(py);
+                let locals = merge_locals(py);
                 locals.set_item("reverse", reverse).unwrap();
                 py.run(
                     c_str!(
@@ -2817,7 +3173,7 @@ encoded = pa.chunked_array([pa.DictionaryArray.from_arrays(
 source = source.append_column(pa.field('encoded_unused', encoded.type, nullable=False), encoded)
 assert source.column('encoded_unused').null_count == 0
 assert source.column('encoded_unused').to_pylist() == [None, None, None]
-matched = [dict(assignments=[('value', 'source', 'value')], condition=None, delete=False)]
+matched = [WhenMatched.update({'value': MergeAssignment.source_column('value')})]
 not_matched = []
 "#
                     ),

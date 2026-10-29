@@ -86,8 +86,8 @@ cmake@0.1.58		X									X
 cmov@0.5.4		X									X							
 combine@4.6.7											X							
 comfy-table@7.2.2											X							
-compression-codecs@0.4.38		X									X							
-compression-core@0.4.32		X									X							
+compression-codecs@0.4.46		X									X							
+compression-core@0.4.34		X									X							
 concurrent-queue@2.5.0		X									X							
 const-oid@0.10.2		X									X							
 const-random@0.1.18		X									X							
@@ -110,7 +110,7 @@ crypto-common@0.1.7		X									X
 crypto-common@0.2.2		X									X							
 csv@1.4.0											X				X			
 csv-core@0.1.13											X				X			
-ctutils@0.4.2		X									X							
+ctutils@0.4.4		X									X							
 custom-labels@0.4.6		X																
 darling@0.23.0											X							
 darling_core@0.23.0											X							
@@ -344,8 +344,8 @@ ordered-float@2.10.1											X
 ordered-float@5.3.0											X							
 ordered-multimap@0.7.3											X							
 ownedbytes@0.9.0											X							
-paimon@0.5.0		X																
-paimon-datafusion@0.5.0		X																
+paimon@0.6.0		X																
+paimon-datafusion@0.6.0		X																
 paimon-ftindex-core@0.1.0		X																
 paimon-mosaic-core@0.2.0		X																
 paimon-vindex-core@0.5.0		X																
@@ -509,7 +509,7 @@ time@0.3.54		X									X
 time-core@0.1.9		X									X							
 tiny-keccak@2.0.2							X											
 tinystr@0.8.3														X				
-tokio@1.53.0											X							
+tokio@1.53.3											X							
 tokio-macros@2.7.1											X							
 tokio-native-tls@0.3.1											X							
 tokio-rustls@0.26.4		X									X							
@@ -636,5 +636,7 @@ zigzag@0.1.0											X
 zlib-rs@0.6.6																X		
 zmij@1.0.23											X							
 zstd@0.13.3											X							
+zstd@0.14.3					X													
 zstd-safe@7.2.4		X									X							
-zstd-sys@2.0.16+zstd.1.5.7		X									X							
+zstd-safe@8.2.0					X													
+zstd-sys@2.1.2+zstd.1.5.7					X													

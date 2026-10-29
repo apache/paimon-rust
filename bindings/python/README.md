@@ -106,6 +106,25 @@ results expose physical positions and Java-compatible scored split bytes;
 `new_read_builder()` reads both result types from their source snapshot and
 returns projected columns plus `__paimon_search_score` in relevance order.
 
+Hybrid searches return the same `GlobalIndexResult` from `execute()`. To run
+routes separately, call `route_builders()` once and configure each route through
+its `search_builder()`:
+
+```python
+hybrid = (table.new_hybrid_search_builder()
+          .add_vector_route("embedding", [1.0, 0.0], 10)
+          .with_limit(5))
+route = hybrid.route_builders()[0]
+route.search_builder().with_query_vector([0.0, 1.0]).with_limit(3)
+result = route.execute()
+fused = hybrid.rank([hybrid.to_route_result(route, result)])
+```
+
+Each route returns the same live search builder on repeated calls. Query,
+limit, option and filter changes affect later `route.execute()` calls. All
+returned routes keep the snapshot captured by `route_builders()`, including
+a captured empty table, even if later writes publish a newer snapshot.
+
 ### Native Read / Write
 
 Beyond SQL, you can use the lower-level read and write APIs directly from Python.
@@ -184,6 +203,33 @@ record the work performed; skipped entries are not decoded to reconstruct totals
 Combined incremental scans expose
 the same API for their selected Delta or Changelog window. Snapshot metadata is
 available from `plan.snapshot_id()`.
+
+### Captured row-ID routing
+
+`RowIdPlan` provides pure routing for distributed Data Evolution operations:
+
+```python
+from pypaimon_rust.datafusion import RowIdPlan
+
+routing = RowIdPlan(table.new_read_builder().new_scan().plan_all())
+first_row_ids = routing.route(row_ids)  # row_ids is an Arrow Int64Array
+delete_groups = routing.route_by_bucket(row_ids)
+selected = routing.select(row_ids)
+```
+
+Routing preserves input order and duplicates, and rejects null or foreign IDs.
+Read/update groups use their anchor's first row ID. Delete groups share one
+routing ID per partition and bucket so each worker can publish a complete
+deletion-vector index. These IDs are local to the captured plan.
+
+`select` retains complete normal and dedicated file groups, deletion metadata,
+authorization and the captured snapshot, and adds sorted, deduplicated row ranges
+for reading. It does not check row liveness or authorize file access; readers
+and mutation workers retain those checks. The selected plan is only for reading.
+
+Batch and stream updates accept integer Arrow arrays and chunked arrays through
+`delete_by_row_id`, as well as integer sequences. Arrow chunks and slices are
+imported directly; nulls and values outside Int64 are rejected before writing.
 
 ### Shard column updates
 
@@ -317,6 +363,61 @@ Spark's temporary-file measurement, automatic rescaling or compaction.
 Deletion-vector tables are rejected by this writer.
 A failed write cannot be prepared, and close deletes only unprepared output.
 
+Engines can compute buckets before creating writers. `BucketRouter` uses the
+table schema's bucket keys and Java hashing rules, and returns an Arrow `int32`
+array in input order. It accepts reordered columns and ignores unused payload
+fields. It performs no catalog access or file writes:
+
+```python
+from pypaimon_rust.datafusion import BucketRouter, PostponeBucketPlanner
+
+buckets = BucketRouter(table.schema()).route(batch)  # Fixed-bucket table
+```
+
+For POSTPONE inputs, resolve the known layouts through the write builder, then
+collect statistics across the complete distributed input before inferring new
+counts. The planner retains no input batches:
+
+```python
+builder = table.new_postpone_fixed_bucket_write_builder()
+known = builder.resolve_bucket_plan()
+planner = PostponeBucketPlanner(table.schema(), known)
+statistics = planner.input_statistics(batch)
+plan = planner.plan(statistics)
+buckets = BucketRouter(table.schema()).with_bucket_plan(plan).route(batch)
+```
+
+Each worker may call `input_statistics` independently. Concatenate its results
+before calling `plan`; duplicate partition rows are summed before inference.
+Statistics contain partition columns followed by `row_count: int64` and
+`data_size: int64`. These columns are interpreted by position, so partition names
+may coincide with statistics names. Existing layouts remain unchanged. The
+shared result can configure every worker with `with_bucket_plan(plan)`.
+
+For HASH_DYNAMIC primary-key inputs (`bucket=-1`), route rows to assigners
+before allocating buckets:
+
+```python
+from pypaimon_rust.datafusion import DynamicBucketAssigner, DynamicBucketAssignerRouter
+
+routing = DynamicBucketAssignerRouter(table.schema(), num_channels=4, num_assigners=4).route(batch)
+# Group rows and key_hash by routing's assigner column, then on that worker:
+assigner = DynamicBucketAssigner(table, num_channels=4, num_assigners=4, assign_id=worker_id,
+                                restore_snapshot_id=base_snapshot_id)
+buckets = assigner.assign(worker_batch, worker_key_hashes)
+```
+
+The assigner captures the latest write snapshot when none is supplied; zero
+selects an empty base. `overwrite=True` starts with empty assignments. Every worker
+must use the same baseline, available as `assigner.restore_snapshot_id`.
+Configure the eventual file writers with that restore snapshot and the same
+overwrite mode.
+Assignment reads HASH indexes without creating files. Regroup its output by
+partition and bucket before writing, so one writer publishes the complete
+HASH index for each bucket. Key hashes can be omitted for Core to compute
+them; when supplied, the batch only needs partition columns. Existing keys
+retain their original buckets even when assigner parallelism changes.
+
 Configure overwrite on the batch builder:
 
 ```python
@@ -427,11 +528,11 @@ make build
 
 ## Test
 
-Python integration tests expect the shared Paimon test warehouse to be prepared
-first from the repository root:
+Python integration tests automatically extract the committed golden warehouse
+into a temporary directory. Set `PAIMON_TEST_WAREHOUSE` to use an existing
+warehouse instead. Spark and Docker are not required.
 
 ```shell
-make docker-up
 cd bindings/python
 ```
 

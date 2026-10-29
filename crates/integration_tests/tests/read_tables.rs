@@ -15,29 +15,27 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Integration tests for reading Paimon tables provisioned by Spark.
+//! Integration tests for reading the committed Java-written golden warehouse.
 
 use arrow_array::{
     Array, ArrowPrimitiveType, Int32Array, Int64Array, ListArray, MapArray, PrimitiveArray,
     RecordBatch, StringArray, StructArray,
 };
-use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
 use futures::TryStreamExt;
 use paimon::api::ConfigResponse;
 use paimon::catalog::{Identifier, RESTCatalog};
 use paimon::common::Options;
 use paimon::spec::{DataType, IntType, Predicate, Schema, VarCharType};
-use paimon::{Catalog, CatalogOptions, Error, FileSystemCatalog, Plan, ScanStats};
+use paimon::{Catalog, Error, Plan, ScanStats};
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, OnceLock};
+
+#[path = "../../integrations/datafusion/testdata/warehouse/mod.rs"]
+mod golden_warehouse;
+use golden_warehouse::{test_catalog as create_file_system_catalog, test_warehouse, TestWarehouse};
 
 #[path = "../../paimon/tests/mock_server.rs"]
 mod mock_server;
 use mock_server::start_mock_server;
-
-fn get_test_warehouse() -> String {
-    std::env::var("PAIMON_TEST_WAREHOUSE").unwrap_or_else(|_| "/tmp/paimon-warehouse".to_string())
-}
 
 async fn scan_and_read<C: Catalog + ?Sized>(
     catalog: &C,
@@ -76,172 +74,17 @@ async fn get_table_from_catalog<C: Catalog + ?Sized>(
     table_name: &str,
 ) -> paimon::Table {
     let identifier = Identifier::new("default", table_name);
-    match catalog.get_table(&identifier).await {
-        Ok(table) => table,
-        Err(Error::TableNotExist { .. }) if table_name == "data_evolution_table" => {
-            ensure_data_evolution_table(catalog).await;
-            catalog
-                .get_table(&identifier)
-                .await
-                .expect("Failed to get generated data_evolution_table")
-        }
-        Err(err) => panic!("Failed to get table: {err:?}"),
-    }
-}
-
-const DATA_EVOLUTION_FIXTURE_MARKER: &str = "paimon-rust.integration-fixture";
-const DATA_EVOLUTION_FIXTURE_VERSION: &str = "data-evolution-limit-v2";
-
-static DATA_EVOLUTION_FIXTURE_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
-
-async fn ensure_data_evolution_table<C: Catalog + ?Sized>(catalog: &C) {
-    let lock = DATA_EVOLUTION_FIXTURE_LOCK.get_or_init(|| tokio::sync::Mutex::new(()));
-    let _guard = lock.lock().await;
-
-    let identifier = Identifier::new("default", "data_evolution_table");
-    if let Ok(table) = catalog.get_table(&identifier).await {
-        let options = table.schema().options();
-        let fixture_marker = options
-            .get(DATA_EVOLUTION_FIXTURE_MARKER)
-            .map(String::as_str);
-        if fixture_marker == Some(DATA_EVOLUTION_FIXTURE_VERSION) || fixture_marker.is_none() {
-            return;
-        }
-        catalog
-            .drop_table(&identifier, true)
-            .await
-            .expect("Failed to replace stale generated data_evolution_table fixture");
-    }
-
     catalog
-        .create_database("default", true, HashMap::new())
-        .await
-        .expect("Failed to create default database for data_evolution_table fixture");
-    catalog
-        .create_table(&identifier, data_evolution_fixture_schema(), true)
-        .await
-        .expect("Failed to create data_evolution_table fixture");
-
-    let table = catalog
         .get_table(&identifier)
         .await
-        .expect("Failed to load data_evolution_table fixture");
-
-    append_data_evolution_batch(
-        &table,
-        data_evolution_fixture_batch(
-            vec![1, 2, 3],
-            vec!["alice", "bob", "carol"],
-            vec![100, 200, 300],
-        ),
-    )
-    .await;
-    append_data_evolution_batch(
-        &table,
-        data_evolution_fixture_batch(vec![4, 5], vec!["dave", "eve"], vec![400, 500]),
-    )
-    .await;
-
-    let wb = table.new_write_builder();
-    let mut update = wb
-        .new_data_evolution_writer(vec!["name".to_string()])
-        .expect("Failed to create data-evolution update writer");
-    update
-        .add_matched_batch(data_evolution_update_batch())
-        .expect("Failed to add data-evolution update batch");
-    wb.new_commit()
-        .commit(
-            update
-                .prepare_commit()
-                .await
-                .expect("Failed to prepare data-evolution update commit"),
-        )
-        .await
-        .expect("Failed to commit data-evolution update fixture");
-}
-
-fn data_evolution_fixture_schema() -> Schema {
-    Schema::builder()
-        .column("id", DataType::Int(IntType::new()))
-        .column(
-            "name",
-            DataType::VarChar(VarCharType::new(VarCharType::MAX_LENGTH).unwrap()),
-        )
-        .column("value", DataType::Int(IntType::new()))
-        .option("row-tracking.enabled", "true")
-        .option("data-evolution.enabled", "true")
-        .option("source.split.target-size", "1b")
-        .option("source.split.open-file-cost", "1b")
-        .option(
-            DATA_EVOLUTION_FIXTURE_MARKER,
-            DATA_EVOLUTION_FIXTURE_VERSION,
-        )
-        .build()
-        .unwrap()
-}
-
-fn data_evolution_fixture_batch(ids: Vec<i32>, names: Vec<&str>, values: Vec<i32>) -> RecordBatch {
-    let schema = Arc::new(ArrowSchema::new(vec![
-        ArrowField::new("id", ArrowDataType::Int32, false),
-        ArrowField::new("name", ArrowDataType::Utf8, false),
-        ArrowField::new("value", ArrowDataType::Int32, false),
-    ]));
-    RecordBatch::try_new(
-        schema,
-        vec![
-            Arc::new(Int32Array::from(ids)),
-            Arc::new(StringArray::from(names)),
-            Arc::new(Int32Array::from(values)),
-        ],
-    )
-    .unwrap()
-}
-
-fn data_evolution_update_batch() -> RecordBatch {
-    let schema = Arc::new(ArrowSchema::new(vec![
-        ArrowField::new("_ROW_ID", ArrowDataType::Int64, false),
-        ArrowField::new("name", ArrowDataType::Utf8, false),
-    ]));
-    RecordBatch::try_new(
-        schema,
-        vec![
-            Arc::new(Int64Array::from(vec![0, 2, 3])),
-            Arc::new(StringArray::from(vec!["alice-v2", "carol-v2", "dave"])),
-        ],
-    )
-    .unwrap()
-}
-
-async fn append_data_evolution_batch(table: &paimon::Table, batch: RecordBatch) {
-    let wb = table.new_write_builder();
-    let mut write = wb.new_write().expect("Failed to create fixture writer");
-    write
-        .write_arrow_batch(&batch)
-        .await
-        .expect("Failed to write fixture batch");
-    wb.new_commit()
-        .commit(
-            write
-                .prepare_commit()
-                .await
-                .expect("Failed to prepare fixture commit"),
-        )
-        .await
-        .expect("Failed to commit fixture batch");
-}
-
-fn create_file_system_catalog() -> FileSystemCatalog {
-    let warehouse = get_test_warehouse();
-    let mut options = Options::new();
-    options.set(CatalogOptions::WAREHOUSE, warehouse);
-    FileSystemCatalog::new(options).expect("Failed to create FileSystemCatalog")
+        .unwrap_or_else(|err| panic!("Failed to get golden table {table_name}: {err:?}"))
 }
 
 async fn scan_and_read_with_fs_catalog(
     table_name: &str,
     projection: Option<&[&str]>,
 ) -> (Plan, Vec<RecordBatch>) {
-    let catalog = create_file_system_catalog();
+    let (_warehouse, catalog) = create_file_system_catalog();
     scan_and_read(&catalog, table_name, projection).await
 }
 
@@ -636,7 +479,7 @@ async fn test_read_with_column_projection() {
 
 #[tokio::test]
 async fn test_read_projection_empty() {
-    let catalog = create_file_system_catalog();
+    let (_warehouse, catalog) = create_file_system_catalog();
     let table = get_table_from_catalog(&catalog, "simple_log_table").await;
 
     let mut read_builder = table.new_read_builder();
@@ -680,7 +523,7 @@ async fn test_read_projection_empty() {
 
 #[tokio::test]
 async fn test_read_projection_unknown_column() {
-    let catalog = create_file_system_catalog();
+    let (_warehouse, catalog) = create_file_system_catalog();
     let table = get_table_from_catalog(&catalog, "simple_log_table").await;
 
     let mut read_builder = table.new_read_builder();
@@ -702,7 +545,7 @@ async fn test_read_projection_unknown_column() {
 
 #[tokio::test]
 async fn test_read_projection_all_invalid() {
-    let catalog = create_file_system_catalog();
+    let (_warehouse, catalog) = create_file_system_catalog();
     let table = get_table_from_catalog(&catalog, "simple_log_table").await;
 
     let mut read_builder = table.new_read_builder();
@@ -724,7 +567,7 @@ async fn test_read_projection_all_invalid() {
 
 #[tokio::test]
 async fn test_read_projection_duplicate_column() {
-    let catalog = create_file_system_catalog();
+    let (_warehouse, catalog) = create_file_system_catalog();
     let table = get_table_from_catalog(&catalog, "simple_log_table").await;
 
     // `id` exists, so with_projection passes its best-effort early check; the
@@ -752,7 +595,7 @@ async fn test_read_projection_duplicate_column() {
 async fn test_read_partitioned_table_with_filter() {
     use paimon::spec::{Datum, PredicateBuilder};
 
-    let catalog = create_file_system_catalog();
+    let (_warehouse, catalog) = create_file_system_catalog();
     let table = get_table_from_catalog(&catalog, "partitioned_log_table").await;
     let schema = table.schema();
     let pb = PredicateBuilder::new(schema.fields());
@@ -782,7 +625,7 @@ async fn test_read_partitioned_table_with_filter() {
 async fn test_read_multi_partitioned_table_with_filter() {
     use paimon::spec::{Datum, Predicate, PredicateBuilder};
 
-    let catalog = create_file_system_catalog();
+    let (_warehouse, catalog) = create_file_system_catalog();
     let table = get_table_from_catalog(&catalog, "multi_partitioned_log_table").await;
     let schema = table.schema();
     let pb = PredicateBuilder::new(schema.fields());
@@ -812,7 +655,7 @@ async fn test_read_multi_partitioned_table_with_filter() {
 async fn test_read_partitioned_table_data_only_filter_prunes_all_files() {
     use paimon::spec::{Datum, PredicateBuilder};
 
-    let catalog = create_file_system_catalog();
+    let (_warehouse, catalog) = create_file_system_catalog();
     let table = get_table_from_catalog(&catalog, "partitioned_log_table").await;
     let schema = table.schema();
     let pb = PredicateBuilder::new(schema.fields());
@@ -841,7 +684,7 @@ async fn test_read_partitioned_table_data_only_filter_prunes_all_files() {
 async fn test_read_partitioned_table_mixed_and_filter() {
     use paimon::spec::{Datum, Predicate, PredicateBuilder};
 
-    let catalog = create_file_system_catalog();
+    let (_warehouse, catalog) = create_file_system_catalog();
     let table = get_table_from_catalog(&catalog, "partitioned_log_table").await;
     let schema = table.schema();
     let pb = PredicateBuilder::new(schema.fields());
@@ -871,7 +714,7 @@ async fn test_read_partitioned_table_mixed_and_filter() {
 async fn test_read_partitioned_table_data_only_filter_keeps_matching_partition() {
     use paimon::spec::{Datum, PredicateBuilder};
 
-    let catalog = create_file_system_catalog();
+    let (_warehouse, catalog) = create_file_system_catalog();
     let table = get_table_from_catalog(&catalog, "partitioned_log_table").await;
     let schema = table.schema();
     let pb = PredicateBuilder::new(schema.fields());
@@ -902,7 +745,7 @@ async fn test_read_partitioned_table_data_only_filter_keeps_matching_partition()
 async fn test_read_multi_partitioned_table_or_of_mixed_ands_prunes_partitions() {
     use paimon::spec::{Datum, Predicate, PredicateBuilder};
 
-    let catalog = create_file_system_catalog();
+    let (_warehouse, catalog) = create_file_system_catalog();
     let table = get_table_from_catalog(&catalog, "multi_partitioned_log_table").await;
     let schema = table.schema();
     let pb = PredicateBuilder::new(schema.fields());
@@ -946,7 +789,7 @@ async fn test_read_multi_partitioned_table_or_of_mixed_ands_prunes_partitions() 
 async fn test_read_partitioned_table_mixed_or_filter_preserves_all() {
     use paimon::spec::{Datum, Predicate, PredicateBuilder};
 
-    let catalog = create_file_system_catalog();
+    let (_warehouse, catalog) = create_file_system_catalog();
     let table = get_table_from_catalog(&catalog, "partitioned_log_table").await;
     let schema = table.schema();
     let pb = PredicateBuilder::new(schema.fields());
@@ -981,7 +824,7 @@ async fn test_read_partitioned_table_mixed_or_filter_preserves_all() {
 async fn test_read_partitioned_table_filter_matches_no_partition() {
     use paimon::spec::{Datum, PredicateBuilder};
 
-    let catalog = create_file_system_catalog();
+    let (_warehouse, catalog) = create_file_system_catalog();
     let table = get_table_from_catalog(&catalog, "partitioned_log_table").await;
     let schema = table.schema();
     let pb = PredicateBuilder::new(schema.fields());
@@ -1007,7 +850,7 @@ async fn test_read_partitioned_table_filter_matches_no_partition() {
 async fn test_read_partitioned_table_eval_row_error_fails_open() {
     use paimon::spec::{ArrayType, DataType, Datum, IntType, PredicateOperator};
 
-    let catalog = create_file_system_catalog();
+    let (_warehouse, catalog) = create_file_system_catalog();
     let table = get_table_from_catalog(&catalog, "partitioned_log_table").await;
     let dt_index = table
         .schema()
@@ -1046,7 +889,7 @@ async fn test_read_partitioned_table_eval_row_error_fails_open() {
 
 // ======================= REST Catalog read tests ===============================
 
-/// Build a simple test schema matching the Spark-provisioned tables (id INT, name VARCHAR).
+/// Build a simple test schema matching the golden tables (id INT, name VARCHAR).
 fn simple_log_schema() -> Schema {
     Schema::builder()
         .column("id", DataType::Int(IntType::new()))
@@ -1055,12 +898,13 @@ fn simple_log_schema() -> Schema {
         .expect("Failed to build schema")
 }
 
-/// Start a mock REST server backed by Spark-provisioned data on disk,
+/// Start a mock REST server backed by golden data on disk,
 /// register the given tables, and return a connected `RESTCatalog`.
 async fn setup_rest_catalog_with_tables(
     table_configs: &[(&str, &str, Schema)],
-) -> (mock_server::RESTServer, RESTCatalog) {
-    let catalog_path = get_test_warehouse();
+) -> (TestWarehouse, mock_server::RESTServer, RESTCatalog) {
+    let warehouse = test_warehouse();
+    let catalog_path = warehouse.path().to_string();
     // Use a simple warehouse name (no slashes) to avoid URL-encoding issues
     let warehouse_name = "test_warehouse";
     let prefix = "mock-test";
@@ -1093,16 +937,16 @@ async fn setup_rest_catalog_with_tables(
         .await
         .expect("Failed to create RESTCatalog");
 
-    (server, catalog)
+    (warehouse, server, catalog)
 }
 
 /// Test reading an append-only (log) table via REST catalog backed by mock server.
 ///
-/// The mock server returns table metadata pointing to Spark-provisioned data on disk.
+/// The mock server returns table metadata pointing to golden data on disk.
 #[tokio::test]
 async fn test_rest_catalog_read_append_table() {
     let table_name = "simple_log_table";
-    let (_server, catalog) =
+    let (_warehouse, _server, catalog) =
         setup_rest_catalog_with_tables(&[("default", table_name, simple_log_schema())]).await;
 
     let (plan, batches) = scan_and_read(&catalog, table_name, None).await;
@@ -1135,7 +979,7 @@ async fn test_rest_catalog_read_append_table() {
 
 /// Test reading a data-evolution enabled append-only table.
 ///
-/// The table is provisioned by Spark with `data-evolution.enabled=true` and
+/// The table is stored in the golden warehouse with `data-evolution.enabled=true` and
 /// `row-tracking.enabled=true`. Multiple inserts produce files with `first_row_id`
 /// set, exercising the data evolution scan and read path.
 #[tokio::test]
@@ -1254,7 +1098,7 @@ async fn plan_table_with_stats(table: &paimon::Table, limit: Option<usize>) -> (
 /// Test limit pushdown: when limit is smaller than total rows, fewer data files may be generated.
 #[tokio::test]
 async fn test_limit_pushdown() {
-    let catalog = create_file_system_catalog();
+    let (_warehouse, catalog) = create_file_system_catalog();
 
     // Test limit pushdown for data evolution table
     let table = get_table_from_catalog(&catalog, "data_evolution_table").await;
@@ -1424,7 +1268,7 @@ async fn test_read_format_schema_evolution_add_column() {
     use paimon::spec::{Datum, PredicateBuilder};
 
     let table_name = "format_schema_evolution_add_column";
-    let catalog = create_file_system_catalog();
+    let (_warehouse, catalog) = create_file_system_catalog();
     let table = get_table_from_catalog(&catalog, table_name).await;
     let (plan, batches) = scan_and_read(&catalog, table_name, None).await;
     assert_plan_file_formats(&plan, &["avro", "orc", "parquet"], table_name);
@@ -1494,7 +1338,7 @@ async fn test_read_partitioned_format_schema_evolution_add_column() {
     use paimon::spec::{Datum, Predicate, PredicateBuilder};
 
     let table_name = "partitioned_format_schema_evolution_add_column";
-    let catalog = create_file_system_catalog();
+    let (_warehouse, catalog) = create_file_system_catalog();
     let table = get_table_from_catalog(&catalog, table_name).await;
     let (plan, batches) = scan_and_read(&catalog, table_name, None).await;
     assert_plan_file_formats(&plan, &["avro", "orc", "parquet"], table_name);
@@ -1626,7 +1470,7 @@ async fn test_read_format_schema_evolution_type_promotion() {
     use paimon::spec::{Datum, PredicateBuilder};
 
     let table_name = "format_schema_evolution_type_promotion";
-    let catalog = create_file_system_catalog();
+    let (_warehouse, catalog) = create_file_system_catalog();
     let table = get_table_from_catalog(&catalog, table_name).await;
     let (plan, batches) = scan_and_read(&catalog, table_name, None).await;
     assert_plan_file_formats(&plan, &["avro", "orc", "parquet"], table_name);
@@ -1688,7 +1532,7 @@ async fn test_read_format_schema_evolution_type_promotion() {
 async fn test_stats_pruning_schema_evolution_added_column_eq_prunes_old_files() {
     use paimon::spec::{Datum, PredicateBuilder};
 
-    let catalog = create_file_system_catalog();
+    let (_warehouse, catalog) = create_file_system_catalog();
     let table = get_table_from_catalog(&catalog, "schema_evolution_add_column").await;
     let pb = PredicateBuilder::new(table.schema().fields());
     let filter = pb
@@ -1715,7 +1559,7 @@ async fn test_stats_pruning_schema_evolution_added_column_eq_prunes_old_files() 
 async fn test_stats_pruning_schema_evolution_added_column_is_null_prunes_new_files() {
     use paimon::spec::PredicateBuilder;
 
-    let catalog = create_file_system_catalog();
+    let (_warehouse, catalog) = create_file_system_catalog();
     let table = get_table_from_catalog(&catalog, "schema_evolution_add_column").await;
     let pb = PredicateBuilder::new(table.schema().fields());
     let filter = pb.is_null("age").expect("Failed to build predicate");
@@ -1740,7 +1584,7 @@ async fn test_stats_pruning_schema_evolution_added_column_is_null_prunes_new_fil
 async fn test_stats_pruning_schema_evolution_type_promotion_prunes_old_int_files() {
     use paimon::spec::{Datum, PredicateBuilder};
 
-    let catalog = create_file_system_catalog();
+    let (_warehouse, catalog) = create_file_system_catalog();
     let table = get_table_from_catalog(&catalog, "schema_evolution_type_promotion").await;
     let pb = PredicateBuilder::new(table.schema().fields());
     let filter = pb
@@ -2008,7 +1852,7 @@ async fn test_read_schema_evolution_drop_column() {
 async fn test_read_schema_evolution_rename_column() {
     use paimon::spec::{Datum, PredicateBuilder};
 
-    let catalog = create_file_system_catalog();
+    let (_warehouse, catalog) = create_file_system_catalog();
     let table_name = "schema_evolution_rename_column";
     let table = get_table_from_catalog(&catalog, table_name).await;
     let (plan, batches) = scan_and_read(&catalog, table_name, None).await;
@@ -2096,7 +1940,7 @@ async fn test_read_mixed_format_schema_evolution_drop_column() {
     use paimon::spec::{Datum, PredicateBuilder};
 
     let table_name = "mixed_format_schema_evolution_drop_column";
-    let catalog = create_file_system_catalog();
+    let (_warehouse, catalog) = create_file_system_catalog();
     let table = get_table_from_catalog(&catalog, table_name).await;
     let (plan, batches) = scan_and_read(&catalog, table_name, None).await;
     assert_plan_file_formats(&plan, &["avro", "orc", "parquet"], table_name);
@@ -2200,7 +2044,7 @@ async fn test_read_mixed_format_schema_evolution_reorder_move_column() {
     use paimon::spec::{Datum, PredicateBuilder};
 
     let table_name = "mixed_format_schema_evolution_reorder_move_column";
-    let catalog = create_file_system_catalog();
+    let (_warehouse, catalog) = create_file_system_catalog();
     let table = get_table_from_catalog(&catalog, table_name).await;
     let (plan, batches) = scan_and_read(&catalog, table_name, None).await;
 
@@ -2431,7 +2275,7 @@ async fn test_read_complex_type_table() {
 /// Reading a primary-key table without deletion vectors should work via sort-merge reader.
 #[tokio::test]
 async fn test_read_pk_table_without_dv_via_sort_merge() {
-    let catalog = create_file_system_catalog();
+    let (_warehouse, catalog) = create_file_system_catalog();
     let table = get_table_from_catalog(&catalog, "simple_pk_table").await;
 
     let read_builder = table.new_read_builder();
@@ -2472,7 +2316,7 @@ async fn test_read_pk_table_without_dv_via_sort_merge() {
 /// The table has been compacted so all files are level > 0, and the scan skips level-0 files.
 #[tokio::test]
 async fn test_read_first_row_pk_table() {
-    let catalog = create_file_system_catalog();
+    let (_warehouse, catalog) = create_file_system_catalog();
     let table = get_table_from_catalog(&catalog, "first_row_pk_table").await;
 
     let read_builder = table.new_read_builder();
@@ -2534,7 +2378,7 @@ async fn test_read_non_pk_table_with_dv() {
 /// and should NOT be visible to batch readers. The plan should produce no splits.
 #[tokio::test]
 async fn test_read_postpone_bucket_pk_table_returns_empty() {
-    let catalog = create_file_system_catalog();
+    let (_warehouse, catalog) = create_file_system_catalog();
     let table = get_table_from_catalog(&catalog, "postpone_bucket_pk_table").await;
 
     let read_builder = table.new_read_builder();
@@ -2557,7 +2401,7 @@ async fn test_read_postpone_bucket_pk_table_returns_empty() {
 async fn test_data_evolution_table_with_filter() {
     use paimon::spec::{Datum, PredicateBuilder};
 
-    let catalog = create_file_system_catalog();
+    let (_warehouse, catalog) = create_file_system_catalog();
     let table = get_table_from_catalog(&catalog, "data_evolution_table").await;
     let pb = PredicateBuilder::new(table.schema().fields());
 
@@ -2616,7 +2460,7 @@ async fn test_data_evolution_table_with_filter() {
 async fn test_bucket_predicate_filtering() {
     use paimon::spec::{Datum, PredicateBuilder};
 
-    let catalog = create_file_system_catalog();
+    let (_warehouse, catalog) = create_file_system_catalog();
     let table = get_table_from_catalog(&catalog, "multi_bucket_pk_table").await;
     let schema = table.schema();
     let pb = PredicateBuilder::new(schema.fields());
@@ -2668,7 +2512,7 @@ async fn test_bucket_predicate_filtering() {
 async fn test_bucket_predicate_filtering_in() {
     use paimon::spec::{Datum, PredicateBuilder};
 
-    let catalog = create_file_system_catalog();
+    let (_warehouse, catalog) = create_file_system_catalog();
     let table = get_table_from_catalog(&catalog, "multi_bucket_pk_table").await;
     let schema = table.schema();
     let pb = PredicateBuilder::new(schema.fields());
@@ -2701,7 +2545,7 @@ async fn test_bucket_predicate_filtering_in() {
 /// Time travel by snapshot id: snapshot 1 should return only the first batch.
 #[tokio::test]
 async fn test_time_travel_by_snapshot_id() {
-    let catalog = create_file_system_catalog();
+    let (_warehouse, catalog) = create_file_system_catalog();
     let table = get_table_from_catalog(&catalog, "time_travel_table").await;
 
     // Snapshot 1: (1, 'alice'), (2, 'bob')
@@ -2755,7 +2599,7 @@ async fn test_time_travel_by_snapshot_id() {
 /// Time travel by tag name.
 #[tokio::test]
 async fn test_time_travel_by_tag_name() {
-    let catalog = create_file_system_catalog();
+    let (_warehouse, catalog) = create_file_system_catalog();
     let table = get_table_from_catalog(&catalog, "time_travel_table").await;
 
     // Tag 'snapshot1' -> snapshot 1: (1, 'alice'), (2, 'bob')
@@ -2808,7 +2652,7 @@ async fn test_time_travel_by_tag_name() {
 
 #[tokio::test]
 async fn time_travel_schema_evolution() {
-    let catalog = create_file_system_catalog();
+    let (_warehouse, catalog) = create_file_system_catalog();
     let table = get_table_from_catalog(&catalog, "time_travel_schema_evolution").await;
 
     for (tag, expected_fields, expected_rows) in [
@@ -2957,7 +2801,7 @@ async fn time_travel_schema_evolution() {
 
 #[tokio::test]
 async fn test_time_travel_conflicting_selectors_fail() {
-    let catalog = create_file_system_catalog();
+    let (_warehouse, catalog) = create_file_system_catalog();
     let table = get_table_from_catalog(&catalog, "time_travel_table").await;
 
     // Java resolves scan.version before validating conflicts with other selectors.
@@ -2998,7 +2842,7 @@ async fn test_time_travel_conflicting_selectors_fail() {
 
 #[tokio::test]
 async fn test_time_travel_invalid_version_fails() {
-    let catalog = create_file_system_catalog();
+    let (_warehouse, catalog) = create_file_system_catalog();
     let table = get_table_from_catalog(&catalog, "time_travel_table").await;
 
     let invalid = table.copy_with_options(HashMap::from([(
@@ -3090,7 +2934,7 @@ async fn test_read_data_evolution_drop_column() {
 async fn test_limit_pushdown_disabled_with_data_predicates() {
     use paimon::spec::{Datum, PredicateBuilder};
 
-    let catalog = create_file_system_catalog();
+    let (_warehouse, catalog) = create_file_system_catalog();
     let table = get_table_from_catalog(&catalog, "data_evolution_table").await;
     let pb = PredicateBuilder::new(table.schema().fields());
 
@@ -3147,7 +2991,7 @@ fn extract_code_value(batches: &[RecordBatch]) -> Vec<(String, i32)> {
 async fn test_bucket_predicate_filtering_short_string_key() {
     use paimon::spec::{Datum, PredicateBuilder};
 
-    let catalog = create_file_system_catalog();
+    let (_warehouse, catalog) = create_file_system_catalog();
     let table = get_table_from_catalog(&catalog, "string_bucket_short_key").await;
     let pb = PredicateBuilder::new(table.schema().fields());
 
@@ -3189,7 +3033,7 @@ async fn test_bucket_predicate_filtering_short_string_key() {
 async fn test_bucket_predicate_filtering_long_string_key() {
     use paimon::spec::{Datum, PredicateBuilder};
 
-    let catalog = create_file_system_catalog();
+    let (_warehouse, catalog) = create_file_system_catalog();
     let table = get_table_from_catalog(&catalog, "string_bucket_long_key").await;
     let pb = PredicateBuilder::new(table.schema().fields());
 
@@ -3278,7 +3122,7 @@ fn extract_id_name_value(batches: &[RecordBatch]) -> Vec<(i32, String, i32)> {
 async fn test_read_data_evolution_table_with_row_ranges() {
     use paimon::RowRange;
 
-    let catalog = create_file_system_catalog();
+    let (_warehouse, catalog) = create_file_system_catalog();
     let table = get_table_from_catalog(&catalog, "data_evolution_table").await;
 
     let (full_plan, full_batches) = scan_and_read(&catalog, "data_evolution_table", None).await;
@@ -3322,7 +3166,7 @@ async fn test_read_data_evolution_table_with_row_ranges() {
 async fn test_read_data_evolution_table_with_empty_row_ranges() {
     use paimon::RowRange;
 
-    let catalog = create_file_system_catalog();
+    let (_warehouse, catalog) = create_file_system_catalog();
     let table = get_table_from_catalog(&catalog, "data_evolution_table").await;
 
     let (plan, batches) =
@@ -3337,7 +3181,7 @@ async fn test_read_data_evolution_table_with_empty_row_ranges() {
 async fn test_read_data_evolution_table_with_full_row_ranges() {
     use paimon::RowRange;
 
-    let catalog = create_file_system_catalog();
+    let (_warehouse, catalog) = create_file_system_catalog();
     let table = get_table_from_catalog(&catalog, "data_evolution_table").await;
 
     let (_, full_batches) = scan_and_read(&catalog, "data_evolution_table", None).await;
@@ -3354,7 +3198,7 @@ async fn test_read_data_evolution_table_with_full_row_ranges() {
 async fn test_limit_pushdown_disabled_with_row_ranges() {
     use paimon::RowRange;
 
-    let catalog = create_file_system_catalog();
+    let (_warehouse, catalog) = create_file_system_catalog();
     let table = get_table_from_catalog(&catalog, "data_evolution_table").await;
 
     let mut row_range_reader = table.new_read_builder();
@@ -3393,7 +3237,7 @@ async fn test_limit_pushdown_disabled_with_row_ranges() {
 
 #[tokio::test]
 async fn test_read_data_evolution_table_with_row_id_projection() {
-    let catalog = create_file_system_catalog();
+    let (_warehouse, catalog) = create_file_system_catalog();
     let table = get_table_from_catalog(&catalog, "data_evolution_table").await;
 
     // Project _ROW_ID along with regular columns
@@ -3449,7 +3293,7 @@ async fn test_read_data_evolution_table_with_row_id_projection() {
 async fn test_read_data_evolution_table_only_row_id_with_row_ranges() {
     use paimon::RowRange;
 
-    let catalog = create_file_system_catalog();
+    let (_warehouse, catalog) = create_file_system_catalog();
     let table = get_table_from_catalog(&catalog, "data_evolution_table").await;
 
     // Get full row ID range
@@ -3501,7 +3345,7 @@ async fn test_read_data_evolution_table_only_row_id_with_row_ranges() {
 
 #[tokio::test]
 async fn test_read_data_evolution_mixed_format_row_id_projection() {
-    let catalog = create_file_system_catalog();
+    let (_warehouse, catalog) = create_file_system_catalog();
     let table = get_table_from_catalog(&catalog, "data_evolution_mixed_format_add_column").await;
 
     let mut read_builder = table.new_read_builder();
@@ -3851,7 +3695,7 @@ async fn test_read_full_types_table() {
 async fn test_read_orc_with_filter_only_column_projection() {
     use paimon::spec::{Datum, PredicateBuilder};
 
-    let catalog = create_file_system_catalog();
+    let (_warehouse, catalog) = create_file_system_catalog();
     let table = get_table_from_catalog(&catalog, "full_types_table").await;
     let pb = PredicateBuilder::new(table.schema().fields());
     let filter = pb
@@ -3880,7 +3724,7 @@ async fn assert_full_types_orc_filter_matches(
     projected_column: &str,
     expected_string_values: &[&str],
 ) {
-    let catalog = create_file_system_catalog();
+    let (_warehouse, catalog) = create_file_system_catalog();
     let table = get_table_from_catalog(&catalog, "full_types_table").await;
 
     let (_, batches) =
@@ -3904,7 +3748,7 @@ async fn assert_full_types_orc_filter_matches(
 async fn test_read_orc_with_supported_predicate_pushdown_types() {
     use paimon::spec::{Datum, PredicateBuilder};
 
-    let catalog = create_file_system_catalog();
+    let (_warehouse, catalog) = create_file_system_catalog();
     let table = get_table_from_catalog(&catalog, "full_types_table").await;
     let pb = PredicateBuilder::new(table.schema().fields());
 
@@ -3976,7 +3820,7 @@ async fn test_read_orc_with_supported_predicate_pushdown_types() {
 async fn test_read_orc_with_unsupported_date_predicate_remains_residual() {
     use paimon::spec::{Datum, PredicateBuilder};
 
-    let catalog = create_file_system_catalog();
+    let (_warehouse, catalog) = create_file_system_catalog();
     let table = get_table_from_catalog(&catalog, "full_types_table").await;
     let pb = PredicateBuilder::new(table.schema().fields());
     let filter = pb
@@ -3990,7 +3834,7 @@ async fn test_read_orc_with_unsupported_date_predicate_remains_residual() {
 async fn test_read_orc_predicate_pushdown_remains_conservative() {
     use paimon::spec::{Datum, PredicateBuilder};
 
-    let catalog = create_file_system_catalog();
+    let (_warehouse, catalog) = create_file_system_catalog();
     let table = get_table_from_catalog(&catalog, "full_types_table").await;
     let pb = PredicateBuilder::new(table.schema().fields());
     let filter = pb.equal("id", Datum::Int(2)).expect("build id predicate");

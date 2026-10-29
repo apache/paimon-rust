@@ -69,15 +69,24 @@ pub(crate) struct FilePredicates {
 /// - Row range selection
 #[async_trait]
 pub(crate) trait FormatFileReader: Send + Sync {
+    /// Whether the decoder can prune fields inside ROW, ARRAY and MAP types.
+    /// Other formats read complete top-level fields and let the caller project.
+    fn supports_nested_projection(&self) -> bool {
+        false
+    }
+
     /// Choose the fields the decoder must actually read. Most columnar formats
     /// can read the projection, while positional formats need the complete
     /// physical data schema to decode each row.
     fn select_read_fields(
         &self,
-        _data_schema_fields: &[DataField],
+        data_schema_fields: &[DataField],
         projected_fields: &[DataField],
     ) -> Vec<DataField> {
-        projected_fields.to_vec()
+        if self.supports_nested_projection() {
+            return projected_fields.to_vec();
+        }
+        top_level_read_fields(data_schema_fields, projected_fields)
     }
 
     /// Read a single data file, returning a stream of RecordBatches containing
@@ -367,6 +376,29 @@ pub(crate) fn create_format_reader(
     .map(|configured| configured.reader)
 }
 
+/// Expand nested projections for readers that only select whole root fields.
+/// Keep selected-key instructions so the outer reader can assemble their ROW.
+fn top_level_read_fields(
+    data_schema_fields: &[DataField],
+    projected_fields: &[DataField],
+) -> Vec<DataField> {
+    projected_fields
+        .iter()
+        .map(|projected| {
+            let Some(source) = data_schema_fields.iter().find(|f| f.id() == projected.id()) else {
+                return projected.clone();
+            };
+            let mut source = source.clone();
+            if projected.description().is_some_and(|description| {
+                description.starts_with(crate::spec::MAP_SELECTED_KEYS_METADATA_KEY)
+            }) {
+                source = source.with_description(projected.description().map(str::to_string));
+            }
+            source
+        })
+        .collect()
+}
+
 pub(crate) struct ConfiguredFormatReader {
     pub reader: Box<dyn FormatFileReader>,
     pub read_fields: Vec<DataField>,
@@ -411,7 +443,7 @@ pub(crate) fn create_format_reader_with_budget(
     } else if lower.ends_with(".avro") {
         Box::new(avro::AvroFormatReader)
     } else if lower.ends_with(".row") {
-        Box::new(row::RowFormatReader)
+        Box::new(row::RowFormatReader::with_options(table_options))
     } else if lower.ends_with(".mosaic") {
         Box::new(mosaic::MosaicFormatReader::with_prefetch(mosaic_prefetch))
     } else {
@@ -770,6 +802,52 @@ mod tests {
             )
             .unwrap();
             assert_eq!(configured.read_fields.as_slice(), expected, "{path}");
+        }
+    }
+
+    #[test]
+    fn nested_projection_is_expanded_for_formats_without_support() {
+        use crate::spec::{ArrayType, RowType};
+        let child = |id, name: &str| DataField::new(id, name.into(), DataType::Int(IntType::new()));
+        let field = |children| {
+            DataField::new(
+                0,
+                "items".into(),
+                DataType::Array(ArrayType::new(DataType::Row(RowType::new(children)))),
+            )
+        };
+        let physical = vec![field(vec![child(1, "first"), child(2, "second")])];
+        let projected = vec![field(vec![child(2, "second")])];
+        for path in [
+            "data.parquet",
+            "data.orc",
+            "data.avro",
+            "data.json",
+            "data.row",
+        ] {
+            let configured = create_format_reader_with_budget(
+                path,
+                false,
+                FormatReadFields {
+                    data_schema: &physical,
+                    projected: &projected,
+                },
+                &HashMap::new(),
+                None,
+                blob::DEFAULT_BLOB_READ_PARALLELISM,
+                MosaicPrefetchOptions::default(),
+            )
+            .unwrap();
+            assert_eq!(
+                configured.read_fields,
+                if path.ends_with("parquet") {
+                    &projected
+                } else {
+                    &physical
+                }
+                .clone(),
+                "{path}"
+            );
         }
     }
 

@@ -18,8 +18,6 @@
 //! Reads global vector indexes, scores raw vectors, and materializes global-row-ID results.
 
 use crate::io::{FileIO, FileRead};
-use crate::lumina::reader::LuminaVectorGlobalIndexReader;
-use crate::lumina::{LuminaIndexMeta, LuminaVectorMetric};
 use crate::spec::{
     row_id_data_field, CoreOptions, DataField, DataType, FileKind, GlobalIndexSearchMode,
     IndexFileMeta, IndexManifestEntry, Predicate, ROW_ID_FIELD_NAME,
@@ -41,7 +39,7 @@ use crate::table::vector_read::Read;
 use crate::table::vector_search_common::{
     configured_refine_factor, configured_vector_index_type, indexed_search_limit,
     log_vindex_range_io_stats, normalize_metric, resolve_materialize_read_type,
-    validate_global_vector_index_types, vindex_concurrency_limits, VectorIndexBackend,
+    validate_global_vector_index_types, vindex_concurrency_limits,
 };
 use crate::table::{
     find_field_id_by_name, merge_row_ranges, ArrowRecordBatchStream, RowRange, Table,
@@ -299,7 +297,7 @@ async fn execute_vector_index_work(
     evaluation: VectorSearchEvaluation<'_>,
     work: VectorIndexWork,
     metric_check: VectorMetricCheck,
-    range_read_limiter: Option<RangeReadLimiter>,
+    range_read_limiter: RangeReadLimiter,
     batch_index_parallelism: usize,
 ) -> crate::Result<(Vec<ScoredRowIds>, IndexSearchTiming)> {
     let timing_enabled = vector_search_timing_enabled();
@@ -312,8 +310,11 @@ async fn execute_vector_index_work(
         .ok_or_else(|| {
             crate::table::search_task::invalid("Vector task is missing index metadata")
         })?;
-    let backend = VectorIndexBackend::from_index_type(&work.entry.index_file.index_type)
-        .ok_or_else(|| crate::table::search_task::invalid("Unsupported vector task index"))?;
+    if !is_vindex_index_type(&work.entry.index_file.index_type) {
+        return Err(crate::table::search_task::invalid(
+            "Unsupported vector task index",
+        ));
+    }
     let table_path = evaluation.table_path.trim_end_matches('/');
     let path = IndexFileLocation::Global { table_path }.resolve(
         &work.entry.index_file.file_name,
@@ -345,110 +346,81 @@ async fn execute_vector_index_work(
     let mut file_reader_open = Duration::ZERO;
     let mut full_file_read = None;
     let io_meta = GlobalIndexIOMeta::new(file_name.clone(), file_size, index_meta_bytes);
-    let results = match backend {
-        VectorIndexBackend::Lumina => {
+    let results = match tokio::runtime::Handle::try_current() {
+        Ok(runtime) => {
+            let file_reader_open_start = timing_enabled.then(Instant::now);
+            let file_reader = input
+                .reader()
+                .await
+                .map_err(|e| crate::Error::DataInvalid {
+                    message: format!(
+                        "Failed to open vindex file '{}' for range reads: {}",
+                        file_name, e
+                    ),
+                    source: None,
+                })?;
+            file_reader_open =
+                file_reader_open_start.map_or(Duration::ZERO, |start| start.elapsed());
+            let source = VindexFileReader::new_with_limiter(
+                Arc::new(file_reader),
+                runtime,
+                range_read_limiter,
+                file_size,
+                file_name.clone(),
+            );
+            let range_io_stats = source.range_io_stats();
+            let results = execute_vindex_searches(
+                io_meta,
+                options,
+                vector_searches,
+                source,
+                file_name.clone(),
+                VectorIndexSearchContext {
+                    parallelism: batch_index_parallelism,
+                    metrics: metric_check,
+                },
+                permit,
+            )
+            .await?;
+            if let Some(stats) = range_io_stats {
+                log_vindex_range_io_stats(&file_name, query_count, &stats);
+            }
+            results
+        }
+        Err(_) if query_count > 1 => {
             let read_start = timing_enabled.then(Instant::now);
             let data = input.read().await.map_err(|e| crate::Error::DataInvalid {
-                message: format!(
-                    "Failed to read {} index file '{}': {}",
-                    backend.error_name(),
-                    file_name,
-                    e
-                ),
+                message: format!("Failed to read vindex index file '{}': {}", file_name, e),
                 source: None,
             })?;
             if let Some(start) = read_start {
                 full_file_read = Some((start.elapsed(), data.len()));
             }
-            let metric = LuminaIndexMeta::deserialize(&io_meta.metadata)?.metric()?;
-            metric_check.check(RawVectorMetric::from_lumina(metric))?;
-            execute_global_index_with_guard(
-                "Lumina global-index batch search task failed",
-                permit,
-                move || {
-                    let mut reader = LuminaVectorGlobalIndexReader::new(io_meta, options);
-                    reader.visit_batch_vector_search(&vector_searches, |_| Ok(Cursor::new(data)))
+            execute_vindex_searches(
+                io_meta,
+                options,
+                vector_searches,
+                Cursor::new(data),
+                file_name.clone(),
+                VectorIndexSearchContext {
+                    parallelism: batch_index_parallelism,
+                    metrics: metric_check,
                 },
+                permit,
             )
             .await?
         }
-        VectorIndexBackend::Vindex => match tokio::runtime::Handle::try_current() {
-            Ok(runtime) => {
-                let file_reader_open_start = timing_enabled.then(Instant::now);
-                let file_reader = input
-                    .reader()
-                    .await
-                    .map_err(|e| crate::Error::DataInvalid {
-                        message: format!(
-                            "Failed to open vindex file '{}' for range reads: {}",
-                            file_name, e
-                        ),
-                        source: None,
-                    })?;
-                file_reader_open =
-                    file_reader_open_start.map_or(Duration::ZERO, |start| start.elapsed());
-                let source = VindexFileReader::new_with_limiter(
-                    Arc::new(file_reader),
-                    runtime,
-                    range_read_limiter.expect("Vindex range-read limiter"),
-                    file_size,
-                    file_name.clone(),
-                );
-                let range_io_stats = source.range_io_stats();
-                let results = execute_vindex_searches(
-                    io_meta,
-                    options,
-                    vector_searches,
-                    source,
-                    file_name.clone(),
-                    VectorIndexSearchContext {
-                        parallelism: batch_index_parallelism,
-                        metrics: metric_check,
-                    },
-                    permit,
-                )
-                .await?;
-                if let Some(stats) = range_io_stats {
-                    log_vindex_range_io_stats(&file_name, query_count, &stats);
-                }
-                results
-            }
-            Err(_) if query_count > 1 => {
-                let read_start = timing_enabled.then(Instant::now);
-                let data = input.read().await.map_err(|e| crate::Error::DataInvalid {
-                    message: format!("Failed to read vindex index file '{}': {}", file_name, e),
-                    source: None,
-                })?;
-                if let Some(start) = read_start {
-                    full_file_read = Some((start.elapsed(), data.len()));
-                }
-                execute_vindex_searches(
-                    io_meta,
-                    options,
-                    vector_searches,
-                    Cursor::new(data),
-                    file_name.clone(),
-                    VectorIndexSearchContext {
-                        parallelism: batch_index_parallelism,
-                        metrics: metric_check,
-                    },
-                    permit,
-                )
-                .await?
-            }
-            Err(error) => {
-                return Err(crate::Error::UnexpectedError {
-                    message: "Vector index range reader requires a Tokio runtime".to_string(),
-                    source: Some(Box::new(error)),
-                });
-            }
-        },
+        Err(error) => {
+            return Err(crate::Error::UnexpectedError {
+                message: "Vector index range reader requires a Tokio runtime".to_string(),
+                source: Some(Box::new(error)),
+            });
+        }
     };
     if let Some((read, returned_bytes)) = full_file_read {
         log::debug!(
             target: "paimon::vector_search",
-            "event=paimon_vector_full_file_io backend={} file={} nq={} requested_bytes={} returned_bytes={} read_ms={:.3}",
-            backend.error_name(),
+            "event=paimon_vector_full_file_io backend=vindex file={} nq={} requested_bytes={} returned_bytes={} read_ms={:.3}",
             file_name,
             query_count,
             file_size,
@@ -744,7 +716,7 @@ async fn evaluate_batch_vector_search_with_executor(
         .iter()
         .filter(|e| {
             e.kind == FileKind::Add
-                && VectorIndexBackend::from_index_type(&e.index_file.index_type).is_some()
+                && is_vindex_index_type(&e.index_file.index_type)
                 && e.index_file
                     .global_index_meta
                     .as_ref()
@@ -782,6 +754,26 @@ async fn evaluate_batch_vector_search_with_executor(
                 table.schema().partition_keys(),
             );
             if let Some(partition) = partition {
+                // The split helper projects onto the partition row, while the
+                // source scan expects positions in the complete table schema.
+                let mapping = table
+                    .schema()
+                    .partition_keys()
+                    .iter()
+                    .map(|name| {
+                        table
+                            .schema()
+                            .fields()
+                            .iter()
+                            .position(|field| field.name() == name)
+                    })
+                    .collect::<Vec<_>>();
+                let partition = partition.remap_field_index(&mapping).ok_or_else(|| {
+                    crate::Error::DataInvalid {
+                        message: "Cannot map source partition filter to table fields".into(),
+                        source: None,
+                    }
+                })?;
                 let partition_ids = Arc::new(
                     super::search_scan_split::partition_row_ids_for_search_sources(
                         table,
@@ -937,20 +929,9 @@ async fn evaluate_batch_vector_search_with_executor(
             });
         }
         ensure_global_index_executor_capacity(concurrency);
-        let vindex_entry_count = vector_entries
-            .iter()
-            .filter(|entry| is_vindex_index_type(&entry.index_file.index_type))
-            .count();
-        let (batch_index_parallelism, range_read_limiter) = if vindex_entry_count == 0 {
-            (1, None)
-        } else {
-            let (index_parallelism, range_read_concurrency) =
-                vindex_concurrency_limits(&core_options, vindex_entry_count, concurrency)?;
-            (
-                index_parallelism,
-                Some(RangeReadLimiter::new(range_read_concurrency)),
-            )
-        };
+        let (batch_index_parallelism, range_read_concurrency) =
+            vindex_concurrency_limits(&core_options, vector_entries.len(), concurrency)?;
+        let range_read_limiter = RangeReadLimiter::new(range_read_concurrency);
         let mut works = vector_search_plans
             .into_iter()
             .map(|(entry, shared_local_filter)| {
@@ -1287,7 +1268,7 @@ pub(super) fn scalar_unindexed_ranges(
 }
 
 fn is_vector_global_index_file(index_file: &IndexFileMeta) -> bool {
-    VectorIndexBackend::from_index_type(&index_file.index_type).is_some()
+    is_vindex_index_type(&index_file.index_type)
 }
 
 /// Collect materialized DE rows, join each row's `(rank, score)` by its global
@@ -1674,14 +1655,6 @@ impl RawVectorMetric {
         }
     }
 
-    fn from_lumina(metric: LuminaVectorMetric) -> Self {
-        match metric {
-            LuminaVectorMetric::L2 => Self::L2,
-            LuminaVectorMetric::Cosine => Self::Cosine,
-            LuminaVectorMetric::InnerProduct => Self::InnerProduct,
-        }
-    }
-
     fn from_vindex(metric: MetricType) -> Self {
         match metric {
             MetricType::L2 => Self::L2,
@@ -1705,7 +1678,7 @@ async fn resolve_raw_vector_metric(
         .iter()
         .filter(|entry| entry.kind == FileKind::Add)
         .find(|entry| {
-            VectorIndexBackend::from_index_type(&entry.index_file.index_type).is_some()
+            is_vindex_index_type(&entry.index_file.index_type)
                 && entry
                     .index_file
                     .global_index_meta
@@ -1745,14 +1718,12 @@ async fn resolve_raw_vector_metric(
         return Ok(metric);
     }
     // Before files exist, Java creates the configured indexer for raw search.
-    // NativeVectorGlobalIndexer and LuminaVectorIndexOptions both default to IP.
-    Ok(
-        if index_type.is_some_and(|kind| VectorIndexBackend::from_index_type(kind).is_some()) {
-            RawVectorMetric::InnerProduct
-        } else {
-            RawVectorMetric::L2
-        },
-    )
+    // The vindex option resolver defaults to inner product.
+    Ok(if index_type.is_some_and(is_vindex_index_type) {
+        RawVectorMetric::InnerProduct
+    } else {
+        RawVectorMetric::L2
+    })
 }
 
 /// Rerouted raw searches still validate each shard's persisted metric.
@@ -1764,66 +1735,50 @@ async fn read_index_vector_metric(
     let Some(global_meta) = entry.index_file.global_index_meta.as_ref() else {
         return Ok(None);
     };
-    let Some(backend) = VectorIndexBackend::from_index_type(&entry.index_file.index_type) else {
+    if !is_vindex_index_type(&entry.index_file.index_type) {
         return Ok(None);
-    };
-    match backend {
-        VectorIndexBackend::Lumina => {
-            if let Some(index_meta) = global_meta.index_meta.as_ref() {
-                if !index_meta.is_empty() {
-                    let metric = LuminaIndexMeta::deserialize(index_meta)?.metric()?;
-                    return Ok(Some(RawVectorMetric::from_lumina(metric)));
+    }
+    if let Some(index_meta) = global_meta.index_meta.as_ref() {
+        if let Ok(options) = serde_json::from_slice::<HashMap<String, String>>(index_meta) {
+            if let Some(metric) = options.get("metric") {
+                if let Some(metric) = RawVectorMetric::parse_normalized(&normalize_metric(metric)) {
+                    return Ok(Some(metric));
                 }
             }
-        }
-        VectorIndexBackend::Vindex => {
-            if let Some(index_meta) = global_meta.index_meta.as_ref() {
-                if let Ok(options) = serde_json::from_slice::<HashMap<String, String>>(index_meta) {
-                    if let Some(metric) = options.get("metric") {
-                        if let Some(metric) =
-                            RawVectorMetric::parse_normalized(&normalize_metric(metric))
-                        {
-                            return Ok(Some(metric));
-                        }
-                    }
-                }
-            }
-            let path = IndexFileLocation::Global { table_path }.resolve(
-                &entry.index_file.file_name,
-                entry.index_file.external_path.as_deref(),
-            );
-            let input = file_io.new_input(&path)?;
-            let read_error = |e| crate::Error::DataInvalid {
-                message: format!(
-                    "Failed to read vindex index file '{}' for raw search metric: {}",
-                    entry.index_file.file_name, e
-                ),
-                source: Some(Box::new(e)),
-            };
-            let header_size = if entry.index_file.file_size > 0 {
-                (entry.index_file.file_size as u64).min(DISKANN_HEADER_SIZE as u64)
-            } else {
-                input
-                    .metadata()
-                    .await
-                    .map_err(&read_error)?
-                    .size
-                    .min(DISKANN_HEADER_SIZE as u64)
-            };
-            let file_reader = input.reader().await.map_err(&read_error)?;
-            let bytes = file_reader.read(0..header_size).await.map_err(read_error)?;
-            let reader =
-                VIndexReader::open(Cursor::new(bytes)).map_err(|e| crate::Error::DataInvalid {
-                    message: format!(
-                        "Failed to open paimon-vindex-core reader for raw search metric: {}",
-                        e
-                    ),
-                    source: Some(Box::new(e)),
-                })?;
-            return Ok(Some(RawVectorMetric::from_vindex(reader.metadata().metric)));
         }
     }
-    Ok(None)
+    let path = IndexFileLocation::Global { table_path }.resolve(
+        &entry.index_file.file_name,
+        entry.index_file.external_path.as_deref(),
+    );
+    let input = file_io.new_input(&path)?;
+    let read_error = |e| crate::Error::DataInvalid {
+        message: format!(
+            "Failed to read vindex index file '{}' for raw search metric: {}",
+            entry.index_file.file_name, e
+        ),
+        source: Some(Box::new(e)),
+    };
+    let header_size = if entry.index_file.file_size > 0 {
+        (entry.index_file.file_size as u64).min(DISKANN_HEADER_SIZE as u64)
+    } else {
+        input
+            .metadata()
+            .await
+            .map_err(&read_error)?
+            .size
+            .min(DISKANN_HEADER_SIZE as u64)
+    };
+    let file_reader = input.reader().await.map_err(&read_error)?;
+    let bytes = file_reader.read(0..header_size).await.map_err(read_error)?;
+    let reader = VIndexReader::open(Cursor::new(bytes)).map_err(|e| crate::Error::DataInvalid {
+        message: format!(
+            "Failed to open paimon-vindex-core reader for raw search metric: {}",
+            e
+        ),
+        source: Some(Box::new(e)),
+    })?;
+    Ok(Some(RawVectorMetric::from_vindex(reader.metadata().metric)))
 }
 
 fn vector_metric_override(
@@ -1882,7 +1837,6 @@ fn direct_raw_vector_metric_override(
     }
     direct_keys.extend([
         "test.vector.metric".to_string(),
-        "lumina.distance.metric".to_string(),
         "distance.metric".to_string(),
         "metric".to_string(),
     ]);
@@ -2879,7 +2833,7 @@ pub(super) async fn execute_search_task(
                     queries: work.queries.restore()?,
                 },
                 metric_check.clone(),
-                Some(RangeReadLimiter::new(range_concurrency)),
+                RangeReadLimiter::new(range_concurrency),
                 parallelism,
             )
             .await?;

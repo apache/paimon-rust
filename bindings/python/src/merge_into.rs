@@ -15,75 +15,126 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Language transport and DataFusion expression compilation for core MERGE.
+//! Python MERGE descriptions and DataFusion expression compilation for core MERGE.
 
 use std::sync::{Arc, Mutex};
 
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use paimon::table::{MergeAssignment, MergeCondition, WhenMatched, WhenNotMatched};
 use paimon_datafusion::runtime::runtime;
-use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
 
 use crate::error::to_py_err;
+use crate::merge_types::{AssignmentValue, Assignments, PyWhenMatched, PyWhenNotMatched};
 
 type CallbackError = Arc<Mutex<Option<PyErr>>>;
 
-fn condition(
+pub(crate) fn condition(
     py: Python<'_>,
-    clause: &Bound<'_, PyDict>,
+    sql: Option<&str>,
     schema: SchemaRef,
 ) -> PyResult<Option<MergeCondition>> {
-    let Some(value) = clause
-        .get_item("condition")?
-        .filter(|value| !value.is_none())
-    else {
-        return Ok(None);
-    };
-    let value = value.cast::<PyDict>()?;
-    let sql: String = value
-        .get_item("sql")?
-        .ok_or_else(|| PyValueError::new_err("MERGE condition needs SQL"))?
-        .extract()?;
-    py.detach(|| runtime().block_on(paimon_datafusion::compile_merge_condition(sql, schema)))
-        .map(Some)
+    sql.map(|sql| {
+        py.detach(|| {
+            runtime().block_on(paimon_datafusion::compile_merge_condition(
+                sql.to_owned(),
+                schema,
+            ))
+        })
         .map_err(to_py_err)
+    })
+    .transpose()
 }
 
-fn assignments(
+pub(crate) fn assignments(
     py: Python<'_>,
-    clause: &Bound<'_, PyDict>,
-    fields: &[paimon::spec::DataField],
+    values: &Assignments,
+    schema: SchemaRef,
     errors: CallbackError,
 ) -> PyResult<Vec<(String, MergeAssignment)>> {
-    let values = clause
-        .get_item("assignments")?
-        .ok_or_else(|| PyValueError::new_err("MERGE clause needs assignments"))?;
     values
+        .iter()
+        .map(|(name, value)| {
+            let value = value.borrow(py);
+            let assignment = match &value.value {
+                AssignmentValue::SourceColumn(column) => {
+                    MergeAssignment::SourceColumn(column.clone())
+                }
+                AssignmentValue::TargetColumn(column) => {
+                    MergeAssignment::TargetColumn(column.clone())
+                }
+                AssignmentValue::Literal(value) => {
+                    MergeAssignment::Value(crate::update_assignment::literal(
+                        py,
+                        name.clone(),
+                        value.clone_ref(py),
+                        schema.clone(),
+                        errors.clone(),
+                    )?)
+                }
+                AssignmentValue::Function(value) => MergeAssignment::Value(
+                    crate::update_assignment::function(value.clone_ref(py), errors.clone()),
+                ),
+            };
+            Ok((name.clone(), assignment))
+        })
+        .collect()
+}
+
+pub(crate) fn matched(
+    py: Python<'_>,
+    clauses: &Bound<'_, PyAny>,
+    condition_schema: SchemaRef,
+    target_schema: SchemaRef,
+    errors: CallbackError,
+    include_assignments: bool,
+) -> PyResult<Vec<WhenMatched>> {
+    clauses
         .try_iter()?
         .map(|item| {
-            let (name, kind, value): (String, String, Py<PyAny>) = item?.extract()?;
-            let assignment = match kind.as_str() {
-                "source" => MergeAssignment::SourceColumn(value.bind(py).extract()?),
-                "target" => MergeAssignment::TargetColumn(value.bind(py).extract()?),
-                "literal" | "callable" => {
-                    if kind == "callable" && !value.bind(py).is_callable() {
-                        return Err(PyValueError::new_err(
-                            "MERGE callable assignment must be callable",
-                        ));
-                    }
-                    let values = PyDict::new(py);
-                    values.set_item(&name, value)?;
-                    let assignment =
-                        crate::update_assignment::from_python(py, &values, fields, errors.clone())?
-                            .remove(0)
-                            .1;
-                    MergeAssignment::Value(assignment)
-                }
-                _ => return Err(PyValueError::new_err("Unknown MERGE assignment kind")),
-            };
-            Ok((name, assignment))
+            let item = item?;
+            let clause = item.extract::<PyRef<PyWhenMatched>>()?;
+            Ok(WhenMatched {
+                condition: condition(py, clause.condition.as_deref(), condition_schema.clone())?,
+                delete: clause.delete,
+                assignments: if include_assignments {
+                    assignments(
+                        py,
+                        &clause.assignments,
+                        target_schema.clone(),
+                        errors.clone(),
+                    )?
+                } else {
+                    // DELETE output consumes preceding UPDATE conditions without
+                    // inspecting values that this route will never materialize.
+                    Vec::new()
+                },
+            })
+        })
+        .collect()
+}
+
+pub(crate) fn not_matched(
+    py: Python<'_>,
+    clauses: &Bound<'_, PyAny>,
+    condition_schema: SchemaRef,
+    target_schema: SchemaRef,
+    errors: CallbackError,
+) -> PyResult<Vec<WhenNotMatched>> {
+    clauses
+        .try_iter()?
+        .map(|item| {
+            let item = item?;
+            let clause = item.extract::<PyRef<PyWhenNotMatched>>()?;
+            Ok(WhenNotMatched {
+                condition: condition(py, clause.condition.as_deref(), condition_schema.clone())?,
+                assignments: assignments(
+                    py,
+                    &clause.assignments,
+                    target_schema.clone(),
+                    errors.clone(),
+                )?,
+            })
         })
         .collect()
 }
@@ -92,8 +143,8 @@ pub(crate) fn from_python(
     py: Python<'_>,
     table: &paimon::table::Table,
     source_schema: SchemaRef,
-    matched: &Bound<'_, PyAny>,
-    not_matched: &Bound<'_, PyAny>,
+    when_matched: &Bound<'_, PyAny>,
+    when_not_matched: &Bound<'_, PyAny>,
     errors: CallbackError,
 ) -> PyResult<(Vec<WhenMatched>, Vec<WhenNotMatched>)> {
     let target_schema =
@@ -111,22 +162,14 @@ pub(crate) fn from_python(
             .clone()
             .with_name(format!("s.{}", field.name()))
     }));
-    let schema = Arc::new(Schema::new(fields));
-    let matched = matched
-        .try_iter()?
-        .map(|item| {
-            let item = item?;
-            let clause = item.cast::<PyDict>()?;
-            Ok(WhenMatched {
-                condition: condition(py, clause, schema.clone())?,
-                delete: clause
-                    .get_item("delete")?
-                    .ok_or_else(|| PyValueError::new_err("MERGE matched clause needs action"))?
-                    .extract()?,
-                assignments: assignments(py, clause, table.schema().fields(), errors.clone())?,
-            })
-        })
-        .collect::<PyResult<Vec<_>>>()?;
+    let matched = matched(
+        py,
+        when_matched,
+        Arc::new(Schema::new(fields)),
+        target_schema.clone(),
+        errors.clone(),
+        true,
+    )?;
     let schema = Arc::new(Schema::new(
         source_schema
             .fields()
@@ -139,16 +182,6 @@ pub(crate) fn from_python(
             })
             .collect::<Vec<_>>(),
     ));
-    let not_matched = not_matched
-        .try_iter()?
-        .map(|item| {
-            let item = item?;
-            let clause = item.cast::<PyDict>()?;
-            Ok(WhenNotMatched {
-                condition: condition(py, clause, schema.clone())?,
-                assignments: assignments(py, clause, table.schema().fields(), errors.clone())?,
-            })
-        })
-        .collect::<PyResult<Vec<_>>>()?;
+    let not_matched = not_matched(py, when_not_matched, schema, target_schema, errors)?;
     Ok((matched, not_matched))
 }

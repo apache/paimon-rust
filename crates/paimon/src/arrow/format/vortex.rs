@@ -42,6 +42,8 @@ use vortex::scan::selection::Selection;
 use vortex::session::VortexSession;
 use vortex::VortexSessionDefault;
 
+mod nested;
+
 async fn acquire_vortex_io_permit() -> crate::Result<tokio::sync::SemaphorePermit<'static>> {
     static SEMAPHORE: OnceLock<tokio::sync::Semaphore> = OnceLock::new();
     SEMAPHORE
@@ -172,6 +174,49 @@ fn read_vortex_batches(
             source: None,
         })?;
         return Ok(vec![batch]);
+    }
+
+    if scan_schema
+        .fields()
+        .iter()
+        .any(|field| matches!(field.data_type(), ArrowDataType::Struct(_)))
+    {
+        // Vortex 0.75 can apply a child ROW's validity to its parent while
+        // projecting recursive struct layouts. Read complete ROWs and their
+        // independent validity before applying selection and outer projection.
+        let names = scan_schema
+            .fields()
+            .iter()
+            .map(|field| field.name().clone())
+            .collect::<Vec<_>>();
+        let mut array = nested::read_array(runtime, &session, &vortex_file, &names)?;
+        if let Some(ranges) = row_selection.as_ref() {
+            let Selection::IncludeRoaring(rows) =
+                row_ranges_to_selection(ranges, vortex_file.row_count())
+            else {
+                unreachable!()
+            };
+            let indices = arrow_array::UInt64Array::from_iter_values(rows.iter());
+            let indices =
+                ArrayRef::from_arrow(&indices, false).map_err(|error| Error::DataInvalid {
+                    message: format!("Failed to build Vortex row selection: {error}"),
+                    source: None,
+                })?;
+            // Take before Arrow export so sparse reads do not expand every
+            // unselected ROW into Arrow buffers.
+            array = array.take(indices).map_err(|error| Error::DataInvalid {
+                message: format!("Failed to select Vortex rows: {error}"),
+                source: None,
+            })?;
+        }
+        let batch = vortex_array_to_record_batch(&session, array, &scan_schema)?;
+        return Ok(vec![filter_and_project_batch(
+            batch,
+            &target_schema,
+            &read_fields,
+            &scan_fields,
+            predicates.as_ref(),
+        )?]);
     }
 
     // Build projection expression for requested fields.
@@ -612,6 +657,113 @@ mod tests {
             ArrowField::new("id", ArrowDataType::Int32, false),
             ArrowField::new("value", ArrowDataType::Int32, false),
         ]))
+    }
+
+    #[tokio::test]
+    async fn nullable_single_child_row_preserves_parent_validity() {
+        use crate::spec::{IntType, RowType};
+        use arrow_array::{Array, StructArray};
+        use arrow_buffer::NullBuffer;
+        use futures::TryStreamExt;
+        let fields = vec![DataField::new(
+            0,
+            "profile".into(),
+            DataType::Row(RowType::new(vec![DataField::new(
+                1,
+                "detail".into(),
+                DataType::Row(RowType::new(vec![DataField::new(
+                    2,
+                    "keep".into(),
+                    DataType::Int(IntType::new()),
+                )])),
+            )])),
+        )];
+        let schema = crate::arrow::build_target_arrow_schema(&fields).unwrap();
+        let ArrowDataType::Struct(profile_fields) = schema.field(0).data_type() else {
+            unreachable!()
+        };
+        let ArrowDataType::Struct(detail_fields) = profile_fields[0].data_type() else {
+            unreachable!()
+        };
+        let detail = StructArray::new(
+            detail_fields.clone(),
+            vec![Arc::new(Int32Array::from(vec![Some(7), None, None]))],
+            Some(NullBuffer::from(vec![true, false, false])),
+        );
+        let profile = StructArray::new(
+            profile_fields.clone(),
+            vec![Arc::new(detail)],
+            Some(NullBuffer::from(vec![true, true, false])),
+        );
+        let original = RecordBatch::try_new(schema.clone(), vec![Arc::new(profile)]).unwrap();
+        let memory = vortex_array_to_record_batch(
+            &VortexSession::default(),
+            ArrayRef::from_arrow(original.clone(), false).unwrap(),
+            &schema,
+        )
+        .unwrap();
+        assert!(memory.column(0).is_valid(1), "in-memory conversion");
+        for repeats in [1, 3000] {
+            let input =
+                arrow_select::concat::concat_batches(&schema, (0..repeats).map(|_| &original))
+                    .unwrap();
+            let io = FileIOBuilder::new("memory").build().unwrap();
+            let path = format!("memory:/nullable_single_child_{repeats}.vortex");
+            let output = io.new_output(&path).unwrap();
+            let mut writer = VortexFormatWriter::new(&output, schema.clone())
+                .await
+                .unwrap();
+            writer.write(&input).await.unwrap();
+            let size = Box::new(writer).close().await.unwrap().file_size;
+            let reader = VortexFormatReader;
+            let batches = reader
+                .read_batch_stream(
+                    Box::new(io.new_input(&path).unwrap().reader().await.unwrap()),
+                    size,
+                    &fields,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            let actual = arrow_select::concat::concat_batches(&schema, &batches).unwrap();
+            assert_eq!(actual, input, "{repeats} repeats");
+            if repeats == 3000 {
+                let ranges = vec![
+                    RowRange::new(-2, 1),
+                    RowRange::new(1, 1),
+                    RowRange::new(8191, 8192),
+                    RowRange::new(8999, 10000),
+                ];
+                let batches = reader
+                    .read_batch_stream(
+                        Box::new(io.new_input(&path).unwrap().reader().await.unwrap()),
+                        size,
+                        &fields,
+                        None,
+                        None,
+                        Some(ranges),
+                    )
+                    .await
+                    .unwrap()
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .unwrap();
+                let expected = arrow_select::take::take_record_batch(
+                    &input,
+                    &arrow_array::UInt64Array::from(vec![0, 1, 8191, 8192, 8999]),
+                )
+                .unwrap();
+                assert_eq!(
+                    arrow_select::concat::concat_batches(&schema, &batches).unwrap(),
+                    expected
+                );
+            }
+        }
     }
 
     fn test_batch(schema: &Arc<ArrowSchema>, ids: Vec<i32>, values: Vec<i32>) -> RecordBatch {

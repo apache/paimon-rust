@@ -16,7 +16,7 @@
 // under the License.
 
 //! Shared helpers for the global-index build builders (btree, full-text,
-//! lumina, vindex).
+//! vindex).
 //!
 //! Mirrors Java `GlobalIndexBuilderUtils`, which exposes a single
 //! `indexedRowRanges` used by both the sorted and vector index builders. The
@@ -65,9 +65,8 @@ pub(crate) fn validate_build_table(table: &Table) -> Result<()> {
     Ok(())
 }
 
-/// Stream a locally built index file to its table location. Native index
-/// builders (Lumina, full-text) serialize to a local temporary file first
-/// because their writers need synchronous I/O.
+/// Stream a locally built full-text index to its table location. The native
+/// writer serializes to a temporary file because it needs synchronous I/O.
 pub(crate) async fn copy_local_file_to_output(
     source_path: &Path,
     output: OutputFile,

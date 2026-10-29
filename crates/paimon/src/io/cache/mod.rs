@@ -20,6 +20,8 @@ mod file_type;
 mod memory;
 mod priority_lru;
 mod reader;
+#[cfg(test)]
+mod small_file_tests;
 mod state;
 
 use self::file_type::FileType;
@@ -229,10 +231,32 @@ impl LocalCache {
         token
     }
 
+    pub(super) async fn read_cached_small_file(
+        &self,
+        path: &str,
+        token: &CacheReadToken,
+    ) -> Option<bytes::Bytes> {
+        if !matches!(self.backend, CacheBackend::SharedDisk(_)) {
+            return None;
+        }
+        let block_size = usize::try_from(self.block_size).ok()?;
+        let key = self.block_key(path, 0);
+        let payload = self.get_block(&key, block_size, token).await?;
+        // Native fills publish complete blocks; a short first block is the whole file.
+        (payload.len() < block_size).then_some(payload)
+    }
+
     async fn shared_load_lock(&self, key: &BlockKey) -> Option<std::fs::File> {
         match &self.backend {
             CacheBackend::SharedDisk(disk) => disk.load_lock(key).await,
             _ => None,
+        }
+    }
+
+    async fn shared_load_locks(&self, keys: &[BlockKey]) -> Vec<std::fs::File> {
+        match &self.backend {
+            CacheBackend::SharedDisk(disk) => disk.load_locks(keys).await,
+            _ => Vec::new(),
         }
     }
 

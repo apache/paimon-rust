@@ -17,15 +17,172 @@
 
 mod common;
 
-use arrow_array::{Array, ArrayRef, Int32Array, Int8Array, RecordBatch};
+use arrow_array::{
+    new_null_array, Array, ArrayRef, Decimal128Array, Int32Array, Int8Array, RecordBatch,
+    StringArray,
+};
 use common::incremental_helpers::{memory_table, persist_table_schema, setup_dirs, write_batch};
 use futures::TryStreamExt;
-use paimon::spec::{DataType, IntType, Predicate, PredicateBuilder, Schema, TableSchema};
-use paimon::table::{MergeAssignment, MergeSource, Table, WhenMatched, WhenNotMatched};
+use paimon::spec::{
+    DataType, DecimalType, IntType, LocalZonedTimestampType, Predicate, PredicateBuilder, Schema,
+    TableSchema, TimestampType, VarCharType,
+};
+use paimon::table::{
+    BucketRouter, MergeAssignment, MergeSource, Table, WhenMatched, WhenNotMatched,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
 
 type Row = (Option<i32>, Option<i32>, Option<i32>);
+
+#[tokio::test]
+async fn null_non_compact_partitions_survive_exact_read_filters() {
+    let cases = [
+        (
+            "decimal18",
+            DataType::Decimal(DecimalType::new(18, 2).unwrap()),
+        ),
+        (
+            "decimal19",
+            DataType::Decimal(DecimalType::new(19, 2).unwrap()),
+        ),
+        (
+            "timestamp3",
+            DataType::Timestamp(TimestampType::new(3).unwrap()),
+        ),
+        (
+            "timestamp4",
+            DataType::Timestamp(TimestampType::new(4).unwrap()),
+        ),
+        (
+            "ltz3",
+            DataType::LocalZonedTimestamp(LocalZonedTimestampType::new(3).unwrap()),
+        ),
+        (
+            "ltz4",
+            DataType::LocalZonedTimestamp(LocalZonedTimestampType::new(4).unwrap()),
+        ),
+    ];
+    for (name, data_type) in cases {
+        let schema = Schema::builder()
+            .column("pt", data_type)
+            .column("code", DataType::VarChar(VarCharType::string_type()))
+            .column("id", DataType::Int(IntType::new()))
+            .partition_keys(["pt", "code"])
+            .option("bucket", "1")
+            .option("bucket-key", "id")
+            .build()
+            .unwrap();
+        let path = format!("memory:/nullable/partition-{name}");
+        let (io, table) = memory_table(&path, TableSchema::new(0, &schema));
+        setup_dirs(&io, &path).await;
+        persist_table_schema(&io, &path, table.schema()).await;
+        let arrow_schema =
+            paimon::arrow::build_target_arrow_schema(table.schema().fields()).unwrap();
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![
+                new_null_array(arrow_schema.field(0).data_type(), 2),
+                Arc::new(StringArray::from(vec!["abcdefghijk", "other"])),
+                Arc::new(Int32Array::from(vec![1, 2])),
+            ],
+        )
+        .unwrap();
+        write_batch(&table, &batch).await;
+        let pb = PredicateBuilder::new(table.schema().fields());
+        let mut builder = table.new_read_builder();
+        builder.with_filter(Predicate::and(vec![
+            pb.is_null("pt").unwrap(),
+            pb.equal("code", paimon::spec::Datum::String("abcdefghijk".into()))
+                .unwrap(),
+        ]));
+        let plan = builder.new_scan().plan().await.unwrap();
+        assert_eq!(plan.splits().len(), 1, "{name}");
+        let batches: Vec<RecordBatch> = builder
+            .new_read()
+            .unwrap()
+            .to_arrow(plan.splits())
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let ids = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column_by_name("id")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec![1], "{name}");
+    }
+}
+
+#[tokio::test]
+async fn nullable_decimal_key_uses_java_bucket_across_writer_restarts() {
+    let schema = Schema::builder()
+        .column("id", DataType::Decimal(DecimalType::new(20, 2).unwrap()))
+        .column("value", DataType::Int(IntType::new()))
+        .primary_key(["id"])
+        .option("primary-key.nullable", "true")
+        .option("bucket", "100")
+        .build()
+        .unwrap();
+    let path = "memory:/nullable/decimal-bucket";
+    let (io, table) = memory_table(path, TableSchema::new(0, &schema));
+    setup_dirs(&io, path).await;
+    persist_table_schema(&io, path, table.schema()).await;
+    let router = BucketRouter::new(table.schema()).unwrap();
+    for value in [10, 20] {
+        let batch = RecordBatch::try_from_iter(vec![
+            (
+                "id",
+                Arc::new(
+                    Decimal128Array::from(vec![None])
+                        .with_precision_and_scale(20, 2)
+                        .unwrap(),
+                ) as ArrayRef,
+            ),
+            ("value", Arc::new(Int32Array::from(vec![value])) as ArrayRef),
+        ])
+        .unwrap();
+        assert_eq!(router.route(&batch).unwrap().value(0), 60);
+        let builder = table.new_write_builder();
+        let mut writer = builder.new_write().unwrap();
+        writer.write_arrow_batch(&batch).await.unwrap();
+        let messages = writer.prepare_commit().await.unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].bucket, 60);
+        builder.new_commit().commit(messages).await.unwrap();
+    }
+    let read = table.new_read_builder();
+    let plan = read.new_scan().with_scan_all_files().plan().await.unwrap();
+    let batches: Vec<RecordBatch> = read
+        .new_read()
+        .unwrap()
+        .to_arrow(plan.splits())
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+    let result = batches.iter().find(|batch| batch.num_rows() > 0).unwrap();
+    assert!(result.column(0).is_null(0));
+    assert_eq!(
+        result
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .value(0),
+        20
+    );
+}
 
 async fn table(name: &str, options: &[(&str, &str)], primary_key: bool) -> Table {
     let mut schema = Schema::builder()

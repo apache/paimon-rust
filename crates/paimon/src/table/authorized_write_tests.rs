@@ -320,7 +320,7 @@ async fn rest_postpone_resolve_bucket_plan_requires_write_identity_without_selec
         .resolve_bucket_plan()
         .await
         .unwrap()
-        .to_arrow(&table)
+        .to_arrow(table.schema())
         .unwrap();
     assert_eq!(exported.num_rows(), 2);
     assert_eq!(exported.schema().field(0).name(), "p");

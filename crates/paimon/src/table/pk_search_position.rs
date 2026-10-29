@@ -123,7 +123,6 @@ impl PrimaryKeySearchPosition {
         )
     }
 
-    #[cfg(feature = "fulltext")]
     pub(crate) fn from_full_text_candidate(
         candidate: &crate::table::pk_full_text_read::PrimaryKeyFullTextCandidate,
     ) -> crate::Result<Self> {
@@ -237,7 +236,6 @@ mod tests {
         assert!(PrimaryKeySearchPosition::from_vector_position(&hit).is_err());
     }
 
-    #[cfg(feature = "fulltext")]
     #[test]
     fn from_full_text_candidate_preserves_raw_score() {
         use crate::table::pk_full_text_read::PrimaryKeyFullTextCandidate;

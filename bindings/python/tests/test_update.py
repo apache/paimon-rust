@@ -19,7 +19,154 @@ import pyarrow as pa
 import pytest
 import pypaimon_rust.datafusion as datafusion
 
-from pypaimon_rust.datafusion import PaimonCatalog, SQLContext
+from pypaimon_rust.datafusion import (
+    MergeAssignment, PaimonCatalog, SQLContext, WhenMatched, WhenNotMatched,
+)
+
+
+@pytest.mark.parametrize('stream', [False, True])
+def test_arrow_row_id_deletes_preserve_captured_bucket_vectors(tmp_path, stream):
+    context = SQLContext()
+    context.register_catalog('paimon', {'warehouse': str(tmp_path)})
+    context.sql('CREATE SCHEMA paimon.arrow_deletes')
+    context.sql("""CREATE TABLE paimon.arrow_deletes.t (id INT) WITH (
+        'bucket' = '-1', 'row-tracking.enabled' = 'true',
+        'data-evolution.enabled' = 'true', 'deletion-vectors.enabled' = 'true')""")
+    for values in ['(10), (11)', '(20), (21)']:
+        context.sql('INSERT INTO paimon.arrow_deletes.t (id) VALUES ' + values)
+    table = PaimonCatalog({'warehouse': str(tmp_path)}).get_table('arrow_deletes.t')
+    builder = (table.new_stream_write_builder().with_commit_user('arrow-deletes')
+               if stream else table.new_batch_write_builder())
+
+    def delete(update, row_ids, identifier):
+        return (update.delete_by_row_id(row_ids, identifier) if stream
+                else update.delete_by_row_id(row_ids))
+
+    def commit(messages, identifier):
+        committer = builder.new_commit()
+        committer.commit(identifier, messages) if stream else committer.commit(messages)
+
+    def rows():
+        return pa.Table.from_batches(context.sql(
+            'SELECT id FROM paimon.arrow_deletes.t ORDER BY id')).column('id').to_pylist()
+
+    # Keep the legacy sequence input and seed a DV for a different anchor.
+    commit(delete(builder.new_update(), [0], 40), 40)
+    plan = table.new_read_builder().new_scan().plan_all()
+    groups = datafusion.RowIdPlan(plan).groups()
+    selected = datafusion.Plan(plan.snapshot_id(), [split for first, _, split in groups if first >= 2])
+    update = builder.new_update().with_plan(selected)
+    context.sql('INSERT INTO paimon.arrow_deletes.t (id) VALUES (30)')
+
+    ids = pa.chunked_array([
+        pa.array([999, 2, 2], type=pa.uint64()).slice(1),
+        pa.array([3, 999], type=pa.uint64()).slice(0, 1),
+    ])
+    messages = delete(update, ids, 41)
+    stale = delete(update, pa.array([3], type=pa.int16()), 42)
+    assert rows() == [11, 20, 21, 30]
+    commit(messages, 41)
+    assert rows() == [11, 30]
+    # A second preparation from the captured snapshot cannot replace its old
+    # index again after the first publication.
+    snapshot = table.latest_snapshot().id()
+    with pytest.raises(ValueError, match='missing deletion vector index'):
+        commit(stale, 42)
+    assert table.latest_snapshot().id() == snapshot
+    assert rows() == [11, 30]
+
+
+@pytest.mark.parametrize('stream', [False, True])
+def test_arrow_row_id_delete_input_validation(tmp_path, stream):
+    from pathlib import Path
+
+    context = SQLContext()
+    context.register_catalog('paimon', {'warehouse': str(tmp_path)})
+    context.sql('CREATE SCHEMA paimon.delete_inputs')
+    context.sql("""CREATE TABLE paimon.delete_inputs.t (id INT) WITH (
+        'row-tracking.enabled' = 'true', 'data-evolution.enabled' = 'true',
+        'deletion-vectors.enabled' = 'true')""")
+    context.sql('INSERT INTO paimon.delete_inputs.t (id) VALUES (10)')
+    table = PaimonCatalog({'warehouse': str(tmp_path)}).get_table('delete_inputs.t')
+    builder = table.new_stream_write_builder() if stream else table.new_batch_write_builder()
+    update = builder.new_update().with_plan(table.new_read_builder().new_scan().plan_all())
+    options = {'commit_identifier': 7} if stream else {}
+
+    for empty in [[], pa.array([], type=pa.int8()), pa.chunked_array([], type=pa.uint64())]:
+        assert update.delete_by_row_id(empty, **options) == []
+    for ids in [
+        (0,),
+        pa.array([0], type=pa.int8()),
+        pa.array([0], type=pa.uint32()),
+        pa.array([None, 0, None], type=pa.int64()).slice(1, 1),
+        pa.chunked_array([pa.array([], type=pa.uint64()), pa.array([0], type=pa.uint64())]),
+    ]:
+        assert update.delete_by_row_id(ids, **options)
+
+    def index_files():
+        return {path for path in Path(table.location()).rglob('index-*') if path.is_file()}
+
+    prepared_indexes = index_files()
+    assert prepared_indexes
+    for ids, error in [
+        (pa.array([None], type=pa.int64()), ValueError),
+        (pa.chunked_array([[0], [None]], type=pa.int64()), ValueError),
+        (pa.array([1.5], type=pa.float64()), TypeError),
+        (pa.chunked_array([], type=pa.float64()), TypeError),
+        (pa.array([], type=pa.bool_()), TypeError),
+        (pa.array([], type=pa.string()), TypeError),
+        (pa.array([2 ** 63], type=pa.uint64()), ValueError),
+        (pa.chunked_array([[0], [2 ** 63]], type=pa.uint64()), ValueError),
+        (pa.array([-1], type=pa.int64()), ValueError),
+        ([1.5], TypeError),
+        ([None], TypeError),
+        ([2 ** 63], OverflowError),
+    ]:
+        with pytest.raises(error):
+            update.delete_by_row_id(ids, **options)
+    assert index_files() == prepared_indexes
+    assert table.latest_snapshot().id() == 1
+
+
+@pytest.mark.parametrize('stream', [False, True])
+def test_sequence_row_id_deletes_do_not_require_pyarrow(tmp_path, stream, monkeypatch):
+    import builtins
+
+    context = SQLContext()
+    context.register_catalog('paimon', {'warehouse': str(tmp_path)})
+    context.sql('CREATE SCHEMA paimon.sequence_deletes')
+    context.sql("""CREATE TABLE paimon.sequence_deletes.t (id INT) WITH (
+        'row-tracking.enabled' = 'true', 'data-evolution.enabled' = 'true',
+        'deletion-vectors.enabled' = 'true')""")
+    context.sql('INSERT INTO paimon.sequence_deletes.t (id) VALUES (10), (20), (30)')
+
+    original_import = builtins.__import__
+
+    def without_pyarrow(name, *args, **kwargs):
+        if name == 'pyarrow' or name.startswith('pyarrow.'):
+            raise ModuleNotFoundError("No module named 'pyarrow'", name='pyarrow')
+        return original_import(name, *args, **kwargs)
+
+    # PyArrow is optional for the SDK. Plain sequence deletes and commits
+    # must remain usable against existing tables without that dependency.
+    with monkeypatch.context() as patched:
+        patched.setattr(builtins, '__import__', without_pyarrow)
+        table = PaimonCatalog({'warehouse': str(tmp_path)}).get_table('sequence_deletes.t')
+        builder = (table.new_stream_write_builder().with_commit_user('sequence-deletes')
+                   if stream else table.new_batch_write_builder())
+        for identifier, row_ids in enumerate([[], [0], (1,)]):
+            update = builder.new_update()
+            messages = (update.delete_by_row_id(row_ids, identifier) if stream
+                        else update.delete_by_row_id(row_ids))
+            if not row_ids:
+                assert messages == []
+                continue
+            assert messages
+            commit = builder.new_commit()
+            commit.commit(identifier, messages) if stream else commit.commit(messages)
+
+    assert pa.Table.from_batches(context.sql(
+        'SELECT id FROM paimon.sequence_deletes.t')).column('id').to_pylist() == [30]
 
 
 def test_upsert_batches_preserve_missing_fields_nulls_and_stream_updates(tmp_path):
@@ -449,13 +596,14 @@ def test_prepared_merge_conditions_chunks_and_lazy_literals(tmp_path, stream):
         ('id', pa.int32()), ('value', pa.int32())]))
     update = builder.new_update()
     kwargs = dict(commit_identifier=42) if stream else {}
-    false_clause = dict(delete=False, condition=dict(sql='"s.value" < 0'),
-                        assignments=[('value', 'literal', 'invalid int')])
+    false_clause = WhenMatched.update(
+        {'value': MergeAssignment.literal('invalid int')}, condition='"s.value" < 0')
     assert update.merge_into(source, on=[('id', 'id')], when_matched=[false_clause],
                              when_not_matched=[], **kwargs) == []
     messages = update.merge_into(source, on=[('id', 'id')], when_matched=[
-        dict(delete=False, condition=dict(sql='"s.value" IN (SELECT v FROM (VALUES (11), (22)) AS m(v))'),
-             assignments=[('value', 'literal', pa.chunked_array([[100], [200]]))])],
+        WhenMatched.update(
+            {'value': MergeAssignment.literal(pa.chunked_array([[100], [200]]))},
+            condition='"s.value" IN (SELECT v FROM (VALUES (11), (22)) AS m(v))')],
         when_not_matched=[], **kwargs)
     # Preparation leaves the visible snapshot unchanged.
 
@@ -495,12 +643,14 @@ def test_prepared_merge_accepts_native_table_sources(tmp_path, stream, historica
     builder = (target.new_stream_write_builder().with_commit_user('source-merge')
                if stream else target.new_batch_write_builder())
     kwargs = dict(commit_identifier=42) if stream else {}
-    condition = dict(sql='"s.flag" = 1')
+    condition = '"s.flag" = 1'
     messages = builder.new_update().merge_into(
         source, on=[('id', 'source_id')], when_matched=[
-            dict(delete=False, condition=condition, assignments=[('value', 'source', 'amount')])],
-        when_not_matched=[dict(condition=condition, assignments=[
-            ('id', 'source', 'source_id'), ('value', 'source', 'amount')])], **kwargs)
+            WhenMatched.update({'value': MergeAssignment.source_column('amount')}, condition)],
+        when_not_matched=[WhenNotMatched({
+            'id': MergeAssignment.source_column('source_id'),
+            'value': MergeAssignment.source_column('amount'),
+        }, condition)], **kwargs)
     assert target.latest_snapshot().id() == target_snapshot
     assert source.latest_snapshot().id() == source_snapshot
     commit = builder.new_commit()
@@ -533,8 +683,9 @@ def test_prepared_merge_callable_uses_complete_clause_and_preserves_exception(tm
         return pa.chunked_array([[100], [200]], type=pa.int32())
 
     messages = update.merge_into(source, on=[('id', 'id')], when_matched=[
-        dict(delete=False, assignments=[('value', 'callable', values)])], when_not_matched=[
-        dict(assignments=[('id', 'source', 'id'), ('value', 'callable', lambda batch: batch['s.delta'])])],
+        WhenMatched.update({'value': MergeAssignment.function(values)})], when_not_matched=[
+        WhenNotMatched({'id': MergeAssignment.source_column('id'),
+                        'value': MergeAssignment.function(lambda batch: batch['s.delta'])})],
         **kwargs)
     assert calls == [2]
     commit = builder.new_commit()
@@ -547,7 +698,7 @@ def test_prepared_merge_callable_uses_complete_clause_and_preserves_exception(tm
     def fail(batch):
         raise error
 
-    clause = [dict(delete=False, assignments=[('value', 'callable', fail)])]
+    clause = [WhenMatched.update({'value': MergeAssignment.function(fail)})]
     update = builder.new_update()
     assert update.merge_into(pa.table({'id': pa.array([99], pa.int32())}), on=[('id', 'id')],
                              when_matched=clause, when_not_matched=[], **kwargs) == []

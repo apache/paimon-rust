@@ -133,6 +133,10 @@ async fn search(table: &Table, query: &str) -> Vec<RowRange> {
         .execute()
         .await
         .unwrap()
+        .row_ids()
+        .unwrap()
+        .to_row_ranges()
+        .unwrap()
 }
 
 fn text_batch(row_ids: Vec<i64>, names: Vec<Option<&str>>) -> RecordBatch {

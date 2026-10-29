@@ -289,6 +289,7 @@ fn merged_metadata_column(
 struct RuntimeSequenceGroup {
     sequence_indices: Vec<usize>,
     protected_indices: Vec<usize>,
+    ascending: bool,
 }
 
 impl PartialUpdateMergeFunction {
@@ -405,6 +406,7 @@ impl PartialUpdateMergeFunction {
                 Ok(RuntimeSequenceGroup {
                     sequence_indices,
                     protected_indices,
+                    ascending: group.ascending,
                 })
             })
             .collect::<crate::Result<Vec<_>>>()?;
@@ -546,7 +548,7 @@ impl PartialUpdateMergeFunction {
                                 row.row_idx,
                                 current_batch,
                                 current_row,
-                                &group.sequence_indices,
+                                group,
                                 batch_buffer,
                                 source_output_col_indices,
                             )?,
@@ -654,7 +656,7 @@ impl PartialUpdateMergeFunction {
                         row.row_idx,
                         current_batch_idx,
                         current_row_idx,
-                        &group.sequence_indices,
+                        group,
                         batch_buffer,
                         source_output_col_indices,
                     )?,
@@ -756,11 +758,11 @@ fn compare_sequence_group_rows(
     incoming_row_idx: usize,
     current_batch_idx: usize,
     current_row_idx: usize,
-    sequence_indices: &[usize],
+    group: &RuntimeSequenceGroup,
     batch_buffer: &[BufferedBatch],
     source_output_col_indices: &[usize],
 ) -> crate::Result<Ordering> {
-    for &output_col_idx in sequence_indices {
+    for &output_col_idx in &group.sequence_indices {
         let incoming = batch_buffer[incoming_batch_idx]
             .column_for_output(output_col_idx, source_output_col_indices);
         let current = batch_buffer[current_batch_idx]
@@ -777,7 +779,15 @@ fn compare_sequence_group_rows(
             message: format!("Failed to compare partial-update sequence-group fields: {e}"),
             source: Some(Box::new(e)),
         })?;
-        let ordering = comparator(incoming_row_idx, current_row_idx);
+        let mut ordering = comparator(incoming_row_idx, current_row_idx);
+        // Top-level nulls have lower precedence in either direction. Descending
+        // order reverses non-null value comparisons, including nulls inside ROWs.
+        if !group.ascending
+            && !incoming.is_null(incoming_row_idx)
+            && !current.is_null(current_row_idx)
+        {
+            ordering = ordering.reverse();
+        }
         if !ordering.is_eq() {
             return Ok(ordering);
         }
@@ -1242,7 +1252,6 @@ impl SortMergeReaderBuilder {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn with_batch_size(mut self, batch_size: usize) -> Self {
         self.batch_size = batch_size;
         self
@@ -2863,6 +2872,145 @@ mod tests {
                 .value(0),
             2000
         );
+    }
+
+    #[tokio::test]
+    async fn test_partial_update_descending_composite_sequence_group() {
+        let output_schema = Arc::new(Schema::new(vec![
+            Field::new("pk", DataType::Int32, false),
+            Field::new("major", DataType::Int32, true),
+            Field::new("minor", DataType::Int32, true),
+            Field::new("value", DataType::Int32, true),
+        ]));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("pk", DataType::Int32, false),
+            Field::new("_SEQUENCE_NUMBER", DataType::Int64, false),
+            Field::new("_VALUE_KIND", DataType::Int8, false),
+            Field::new("major", DataType::Int32, true),
+            Field::new("minor", DataType::Int32, true),
+            Field::new("value", DataType::Int32, true),
+        ]));
+        let fields = ["pk", "major", "minor", "value"]
+            .iter()
+            .enumerate()
+            .map(|(id, name)| {
+                DataField::new(
+                    id as i32,
+                    (*name).into(),
+                    PaimonDataType::Int(IntType::new()),
+                )
+            })
+            .collect::<Vec<_>>();
+        let options = HashMap::from([
+            ("merge-engine".into(), "partial-update".into()),
+            ("fields.major,minor.sequence-group".into(), "value".into()),
+            (
+                "fields.major,minor.sequence-group.sort-order".into(),
+                "descending".into(),
+            ),
+        ]);
+        // Each case contains two arrival-ordered rows and the winning tuple/value.
+        let cases = [
+            // Lexicographic order: each non-null component sorts descending.
+            (
+                [(Some(2), Some(0), Some(10)), (Some(1), Some(9), Some(20))],
+                (Some(1), Some(9), Some(20)),
+            ),
+            (
+                [(Some(1), Some(9), Some(10)), (Some(1), Some(2), Some(20))],
+                (Some(1), Some(2), Some(20)),
+            ),
+            (
+                [(Some(1), Some(2), Some(10)), (Some(1), Some(9), Some(20))],
+                (Some(1), Some(2), Some(10)),
+            ),
+            // Non-null wins over null in either position, regardless of direction.
+            (
+                [(None, Some(0), Some(10)), (Some(1), None, Some(20))],
+                (Some(1), None, Some(20)),
+            ),
+            (
+                [(Some(1), None, Some(10)), (None, Some(0), Some(20))],
+                (Some(1), None, Some(10)),
+            ),
+            (
+                [(Some(1), None, Some(10)), (Some(1), Some(9), Some(20))],
+                (Some(1), Some(9), Some(20)),
+            ),
+            (
+                [(Some(1), Some(9), Some(10)), (Some(1), None, Some(20))],
+                (Some(1), Some(9), Some(10)),
+            ),
+            // All-null tuples skip updates; ties can clear protected fields.
+            (
+                [(Some(1), Some(2), Some(10)), (None, None, Some(20))],
+                (Some(1), Some(2), Some(10)),
+            ),
+            (
+                [(Some(1), Some(2), Some(10)), (Some(1), Some(2), None)],
+                (Some(1), Some(2), None),
+            ),
+        ];
+        for (rows, expected) in cases {
+            // Separate streams exercise read-time merging of separate files.
+            let streams = rows
+                .iter()
+                .enumerate()
+                .map(|(index, &(major, minor, value))| {
+                    stream_from_batches(vec![RecordBatch::try_new(
+                        schema.clone(),
+                        vec![
+                            Arc::new(Int32Array::from(vec![1])),
+                            Arc::new(Int64Array::from(vec![index as i64])),
+                            Arc::new(Int8Array::from(vec![0])),
+                            Arc::new(Int32Array::from(vec![major])),
+                            Arc::new(Int32Array::from(vec![minor])),
+                            Arc::new(Int32Array::from(vec![value])),
+                        ],
+                    )
+                    .unwrap()])
+                })
+                .collect();
+            let result = SortMergeReaderBuilder::new(
+                streams,
+                schema.clone(),
+                vec![0],
+                1,
+                2,
+                vec![],
+                vec![3, 4, 5],
+                output_schema.clone(),
+                Box::new(
+                    PartialUpdateMergeFunction::new_with_schema(
+                        &options,
+                        "t",
+                        &fields,
+                        &fields,
+                        &["pk".into()],
+                    )
+                    .unwrap(),
+                ),
+            )
+            .build()
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+            assert_eq!(result.len(), 1);
+            assert_eq!(result[0].num_rows(), 1);
+            for (index, value) in [expected.0, expected.1, expected.2].into_iter().enumerate() {
+                let actual = result[0]
+                    .column(index + 1)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap();
+                assert_eq!(
+                    actual.iter().collect::<Vec<_>>(),
+                    vec![value],
+                    "rows: {rows:?}"
+                );
+            }
+        }
     }
 
     #[tokio::test]

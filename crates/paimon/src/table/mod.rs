@@ -37,13 +37,14 @@ mod branch_write_tests;
 mod bucket_assigner;
 mod bucket_assigner_constant;
 mod bucket_assigner_cross;
-mod bucket_assigner_dynamic;
 mod bucket_assigner_fixed;
 mod bucket_filter;
 mod bucket_function;
+mod bucket_router;
 mod chunk_shuffle;
 mod commit_callback;
 mod commit_message;
+mod compact;
 mod consumer_manager;
 pub(crate) mod cow_writer;
 mod data_evolution_fields;
@@ -57,6 +58,9 @@ mod data_file_writer;
 mod de_vector_read;
 mod de_vector_scan;
 mod dedicated_format_file_writer;
+mod dynamic_bucket_assigner;
+mod dynamic_bucket_assigner_router;
+mod dynamic_bucket_index;
 mod external_path;
 mod format_partition;
 mod format_partition_location;
@@ -71,11 +75,8 @@ mod format_table_scan;
 mod format_table_write_tests;
 mod format_table_writer;
 mod format_write_builder;
-#[cfg(feature = "fulltext")]
 mod full_text_index_adapter;
-#[cfg(feature = "fulltext")]
 mod full_text_index_build_builder;
-#[cfg(feature = "fulltext")]
 mod full_text_search_builder;
 mod global_index_build_builder;
 pub(crate) mod global_index_build_common;
@@ -91,9 +92,9 @@ mod incremental_scan;
 pub(crate) mod index_file_path;
 mod inline_blob;
 mod instant;
+mod kv_data_file_writer;
 mod kv_file_reader;
 mod kv_file_writer;
-mod lumina_index_build_builder;
 mod managed_blob_reader;
 mod managed_blob_reference;
 #[cfg(test)]
@@ -109,12 +110,9 @@ mod partition_filter;
 mod partition_row_count;
 mod partition_spec;
 mod partition_stat;
-#[cfg(feature = "fulltext")]
 mod pk_full_text_bucket_search;
 mod pk_full_text_bucket_state;
-#[cfg(feature = "fulltext")]
 mod pk_full_text_read;
-#[cfg(feature = "fulltext")]
 mod pk_full_text_scan;
 mod pk_search_position;
 mod pk_search_ranker;
@@ -153,7 +151,6 @@ mod scan_stats;
 pub(crate) mod schema_manager;
 mod search_scan_split;
 mod search_task;
-#[cfg(any(feature = "fulltext", test))]
 pub(crate) use search_task::SearchTask;
 pub(crate) use search_task::SearchTaskExecutor;
 #[cfg(test)]
@@ -206,18 +203,26 @@ pub use audit_log_table::AuditLogTable;
 pub use batch_vector_search_builder::BatchVectorSearchBuilder;
 pub use blob_resolver::{BlobReader, BlobStream};
 pub use branch_manager::BranchManager;
+pub use bucket_router::BucketRouter;
 pub use commit_callback::{CommitCallback, CommitCallbackContext};
 pub use commit_message::{CommitMessage, COMMIT_MESSAGE_SERIALIZER_VERSION};
+pub use compact::{
+    CompactBuilder, CompactExecutor, CompactMetrics, CompactPlan, CompactPlanner, CompactResult,
+    CompactTask,
+};
 pub use consumer_manager::ConsumerManager;
 pub use cow_writer::{CopyOnWriteMergeWriter, FileInfo};
 pub use data_evolution_writer::{DataEvolutionDeleteWriter, DataEvolutionWriter};
 pub use de_vector_scan::PreparedVectorSearchFilter;
+pub use dynamic_bucket_assigner::{DynamicBucketAssigner, DynamicBucketAssignerBuilder};
+pub use dynamic_bucket_assigner_router::{
+    DynamicBucketAssignerRouter, DynamicBucketAssignerRouting,
+};
 pub use format_partition::{
     format_partition_value, parse_format_partition_value, FormatTablePartitionPaths,
 };
 pub use format_partition_stats::FormatTablePartitionStatsCollector;
 pub use format_partition_truncate::FormatTableTruncator;
-#[cfg(feature = "fulltext")]
 pub use full_text_search_builder::{
     FullTextRead, FullTextScan, FullTextScanPlan, FullTextSearchBuilder,
 };
@@ -230,7 +235,8 @@ pub use global_index_result::{
 };
 pub use global_index_types::{normalize_global_index_type, SUPPORTED_GLOBAL_INDEX_TYPES_FOR_DROP};
 pub use hybrid_search_builder::{
-    HybridSearchBuilder, HybridSearchRanker, HybridSearchRoute, HybridSearchRouteKind,
+    HybridSearchBuilder, HybridSearchRanker, HybridSearchRoute, HybridSearchRouteBuilder,
+    HybridSearchRouteKind, HybridSearchRouteResult, HybridSearchWeightedResult,
 };
 pub use incremental_scan::{
     IncrementalPlan, IncrementalScan, IncrementalScanMode, IncrementalSplit,
@@ -242,6 +248,9 @@ pub use partition_spec::parse_partition_spec_value;
 pub use partition_stat::PartitionStat;
 pub use pk_vector_bucket_split::{BucketVectorPayload, BucketVectorSearchSplit};
 pub use postpone_bucket_plan::{PostponeBucketPlan, POSTPONE_BUCKET_PLAN_TOTAL_BUCKETS_FIELD};
+pub use postpone_bucket_planner::{
+    PostponeBucketPlanner, POSTPONE_STATISTICS_DATA_SIZE_FIELD, POSTPONE_STATISTICS_ROW_COUNT_FIELD,
+};
 pub use postpone_fixed_bucket_write::{
     PostponeFixedBucketTableCommit, PostponeFixedBucketTableWrite,
 };
@@ -260,7 +269,8 @@ pub use source::{
 pub use stream_table_scan::StreamTableScan;
 pub use table_commit::TableCommit;
 pub use table_merge_into::{
-    MergeAssignment, MergeCondition, MergeSource, WhenMatched, WhenNotMatched,
+    evaluate_merge_actions, MergeActionOutput, MergeActions, MergeAssignment, MergeCondition,
+    MergeSource, WhenMatched, WhenNotMatched,
 };
 pub use table_read::{AuditLogRead, TableRead};
 pub use table_scan::{AuditLogScan, FileScanPlan, TableScan};
@@ -662,7 +672,6 @@ impl Table {
     /// Create a full-text search builder.
     ///
     /// Reference: [FullTextSearchBuilderImpl](https://github.com/apache/paimon/blob/master/paimon-core/src/main/java/org/apache/paimon/table/source/FullTextSearchBuilderImpl.java)
-    #[cfg(feature = "fulltext")]
     pub fn new_full_text_search_builder(&self) -> FullTextSearchBuilder<'_> {
         FullTextSearchBuilder::new(self)
     }
@@ -696,6 +705,11 @@ impl Table {
     /// Reference: [pypaimon FileStoreTable.new_write_builder](https://github.com/apache/paimon/blob/master/paimon-python/pypaimon/table/file_store_table.py).
     pub fn new_write_builder(&self) -> WriteBuilder<'_> {
         WriteBuilder::new(self)
+    }
+
+    /// Plan and execute append, data-evolution or fixed/dynamic bucket PK compaction.
+    pub fn new_compact_builder(&self) -> CompactBuilder<'_> {
+        CompactBuilder::new(self)
     }
 
     /// Create a one-shot fixed-bucket builder for a postpone table.

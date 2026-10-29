@@ -32,13 +32,13 @@ use crate::spec::{
 use crate::table::bucket_assigner::{BatchAssignOutput, BucketAssignerEnum, PartitionBucketKey};
 use crate::table::bucket_assigner_constant::ConstantBucketAssigner;
 use crate::table::bucket_assigner_cross::CrossPartitionAssigner;
-use crate::table::bucket_assigner_dynamic::DynamicBucketAssigner;
 use crate::table::bucket_assigner_fixed::FixedBucketAssigner;
 use crate::table::bucket_function::validate_bucket_function;
 use crate::table::commit_message::CommitMessage;
 use crate::table::data_file_index_writer::FileIndexOptions;
 use crate::table::data_file_writer::DataFileWriter;
 use crate::table::dedicated_format_file_writer::AppendDedicatedFormatFileWriter;
+use crate::table::dynamic_bucket_index::DynamicBucketIndex;
 use crate::table::format_table_writer::FormatTableWriter;
 use crate::table::kv_file_writer::{KeyValueFileWriter, KeyValueWriteConfig};
 use crate::table::partition_filter::PartitionFilter;
@@ -470,7 +470,7 @@ impl TableWrite {
                 merge_engine,
             )?))
         } else if is_dynamic_bucket {
-            BucketAssignerEnum::Dynamic(Box::new(DynamicBucketAssigner::new(
+            BucketAssignerEnum::Dynamic(Box::new(DynamicBucketIndex::new(
                 table.clone(),
                 partition_field_indices,
                 primary_key_indices.clone(),
@@ -4407,10 +4407,20 @@ pub(in crate::table) mod tests {
     async fn test_non_compact_null_bucket_key() {
         let file_io = test_file_io();
 
-        let bucket_cols = ["d", "ltz", "ntz"];
+        // Current Java InternalRowSerializer(type).toBinaryRow(GenericRow.of(null)):
+        // DECIMAL(38,18) reserves 16 variable bytes; TIMESTAMP/LTZ(6) reserve 8.
+        // Keep independent golden hashes and buckets instead of deriving the
+        // expectation from an untyped NULL, which omits those reserved slots.
+        let bucket_cases = [
+            ("d", -1_380_280_760, 8),
+            ("ltz", -340_882_661, 5),
+            ("ntz", -340_882_661, 5),
+        ];
         let total_buckets = 16;
 
-        for bucket_col in &bucket_cols {
+        for (column_index, &(bucket_col, java_hash, expected_bucket)) in
+            bucket_cases.iter().enumerate()
+        {
             let table_path = format!("memory:/test_null_bk_{bucket_col}");
             setup_dirs(&file_io, &table_path).await;
 
@@ -4423,7 +4433,7 @@ pub(in crate::table) mod tests {
                 .column("ntz", DataType::Timestamp(TimestampType::new(6).unwrap()))
                 .column("k", DataType::Int(IntType::new()))
                 .option("bucket", total_buckets.to_string())
-                .option("bucket-key", *bucket_col)
+                .option("bucket-key", bucket_col)
                 .build()
                 .unwrap();
             let table_schema = TableSchema::new(0, &schema);
@@ -4480,10 +4490,8 @@ pub(in crate::table) mod tests {
                 .unwrap();
             let bucket = batch_output.buckets[0];
 
-            // Expected: BinaryRow with 1 field, null at pos 0
-            let mut builder = BinaryRowBuilder::new(1);
-            builder.set_null_at(0);
-            let expected_bucket = (builder.build().hash_code() % total_buckets).wrapping_abs();
+            let key = BinaryRow::from_arrow(&batch, 0, &[column_index], &fields).unwrap();
+            assert_eq!(key.hash_code(), java_hash, "NULL bucket-key '{bucket_col}'");
 
             assert_eq!(
                 bucket, expected_bucket,
@@ -6193,7 +6201,7 @@ pub(in crate::table) mod tests {
             append(&table, 1).await.unwrap();
             let mut message = crate::table::CommitMessage::new(vec![], 0, vec![]);
             message.new_index_files.push(crate::spec::IndexFileMeta {
-                index_type: "lumina".into(),
+                index_type: "diskann".into(),
                 file_name: "audit-index".into(),
                 file_size: 1,
                 row_count: 1,

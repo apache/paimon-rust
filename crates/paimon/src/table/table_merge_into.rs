@@ -69,6 +69,218 @@ pub struct WhenNotMatched {
     pub assignments: Vec<(String, MergeAssignment)>,
 }
 
+/// Which MERGE outputs to materialize from already joined input.
+/// Other actions still consume their rows, without evaluating their assignments.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MergeActionOutput {
+    All,
+    Updates,
+    Deletes,
+    Inserts,
+}
+
+/// Materialized MERGE actions, grouped by clause and then input batch order.
+#[derive(Debug, Default)]
+pub struct MergeActions {
+    pub updates: Vec<RecordBatch>,
+    pub deletes: Vec<i64>,
+    pub inserts: Vec<RecordBatch>,
+    pub update_columns: Vec<String>,
+}
+
+/// Apply ordered clauses to prejoined matched and unmatched Arrow batches.
+/// Matched input has `_ROW_ID` and qualified `t.`/`s.` columns; unmatched input
+/// has qualified `s.` columns. Assignment callbacks see the complete selection
+/// of one clause, even when that selection spans several input batches.
+/// Updates contain `_ROW_ID` and the union of assigned columns in clause order,
+/// preserving target values for assignments omitted by a selected clause.
+/// Inserts contain every schema field, with typed NULLs for omitted assignments.
+pub async fn evaluate_merge_actions(
+    schema: SchemaRef,
+    matched_batches: Vec<RecordBatch>,
+    unmatched_batches: Vec<RecordBatch>,
+    matched: &[WhenMatched],
+    not_matched: &[WhenNotMatched],
+    output: MergeActionOutput,
+) -> crate::Result<MergeActions> {
+    let materialize_updates = matches!(output, MergeActionOutput::All | MergeActionOutput::Updates);
+    let materialize_deletes = matches!(output, MergeActionOutput::All | MergeActionOutput::Deletes);
+    let materialize_inserts = matches!(output, MergeActionOutput::All | MergeActionOutput::Inserts);
+    let mut actions = MergeActions::default();
+    for clause in matched {
+        if clause.delete && !clause.assignments.is_empty() {
+            return Err(invalid("MERGE DELETE cannot have assignments"));
+        }
+        if materialize_updates {
+            validate_assignments(&schema, &clause.assignments, false)?;
+            for (name, _) in &clause.assignments {
+                if !actions.update_columns.contains(name) {
+                    actions.update_columns.push(name.clone());
+                }
+            }
+        }
+    }
+    if materialize_inserts {
+        for clause in not_matched {
+            validate_assignments(&schema, &clause.assignments, true)?;
+            if clause
+                .condition
+                .as_ref()
+                .is_some_and(|condition| !condition.target_columns.is_empty())
+            {
+                return Err(invalid("WHEN NOT MATCHED cannot reference target columns"));
+            }
+        }
+    }
+    for conditions in [
+        matched
+            .iter()
+            .map(|clause| &clause.condition)
+            .collect::<Vec<_>>(),
+        not_matched.iter().map(|clause| &clause.condition).collect(),
+    ] {
+        if conditions
+            .iter()
+            .take(conditions.len().saturating_sub(1))
+            .any(|condition| condition.is_none())
+        {
+            return Err(invalid("Only the last MERGE clause may omit its condition"));
+        }
+    }
+    if materialize_updates || materialize_deletes {
+        let mut pending = matched_batches
+            .into_iter()
+            .filter(|batch| batch.num_rows() > 0)
+            .collect::<Vec<_>>();
+        for batch in &pending {
+            let ids = batch
+                .column_by_name(ROW_ID)
+                .and_then(|array| array.as_any().downcast_ref::<Int64Array>())
+                .ok_or_else(|| {
+                    invalid("Matched MERGE input must contain an Int64 _ROW_ID column")
+                })?;
+            if ids.null_count() != 0 {
+                return Err(invalid("Matched MERGE _ROW_ID must not contain NULL"));
+            }
+        }
+        for clause in matched {
+            let mut remaining = Vec::new();
+            let mut clause_rows = Vec::new();
+            for batch in pending {
+                let (selected, rest) = select_clause(batch, &clause.condition).await?;
+                if rest.num_rows() > 0 {
+                    remaining.push(rest);
+                }
+                if selected.num_rows() == 0 {
+                    continue;
+                }
+                if clause.delete {
+                    if materialize_deletes {
+                        let ids = selected
+                            .column_by_name(ROW_ID)
+                            .unwrap()
+                            .as_any()
+                            .downcast_ref::<Int64Array>()
+                            .unwrap();
+                        actions.deletes.extend(ids.values().iter().copied());
+                    }
+                } else if materialize_updates && !actions.update_columns.is_empty() {
+                    clause_rows.push(selected);
+                }
+            }
+            // Assignment cursors and callbacks cover the complete clause selection,
+            // independent of physical input and result chunk boundaries.
+            if !clause_rows.is_empty() {
+                actions.updates.extend(assigned(
+                    &clause_rows,
+                    &clause.assignments,
+                    &actions.update_columns,
+                    schema.clone(),
+                    false,
+                )?);
+            }
+            pending = remaining;
+        }
+    }
+    if materialize_inserts {
+        let mut pending = unmatched_batches
+            .into_iter()
+            .filter(|batch| batch.num_rows() > 0)
+            .map(with_insert_row_ids)
+            .collect::<crate::Result<Vec<_>>>()?;
+        let columns = schema
+            .fields()
+            .iter()
+            .map(|field| field.name().clone())
+            .collect::<Vec<_>>();
+        for clause in not_matched {
+            let mut remaining = Vec::new();
+            let mut clause_rows = Vec::new();
+            for batch in pending {
+                let (selected, rest) = select_clause(batch, &clause.condition).await?;
+                if rest.num_rows() > 0 {
+                    remaining.push(rest);
+                }
+                if selected.num_rows() > 0 {
+                    clause_rows.push(selected);
+                }
+            }
+            if !clause_rows.is_empty() {
+                for batch in assigned(
+                    &clause_rows,
+                    &clause.assignments,
+                    &columns,
+                    schema.clone(),
+                    true,
+                )? {
+                    actions.inserts.push(
+                        batch
+                            .project(&(1..batch.num_columns()).collect::<Vec<_>>())
+                            .map_err(|error| invalid(error.to_string()))?,
+                    );
+                }
+            }
+            pending = remaining;
+        }
+    }
+    Ok(actions)
+}
+
+fn validate_assignments(
+    schema: &SchemaRef,
+    assignments: &[(String, MergeAssignment)],
+    insert: bool,
+) -> crate::Result<()> {
+    let mut names = HashSet::new();
+    for (name, value) in assignments {
+        if name == ROW_ID || !names.insert(name) {
+            return Err(invalid(format!(
+                "Invalid or duplicate MERGE assignment {name}"
+            )));
+        }
+        schema
+            .field_with_name(name)
+            .map_err(|error| invalid(error.to_string()))?;
+        if insert && matches!(value, MergeAssignment::TargetColumn(_)) {
+            return Err(invalid("WHEN NOT MATCHED cannot reference target columns"));
+        }
+    }
+    Ok(())
+}
+
+fn with_insert_row_ids(batch: RecordBatch) -> crate::Result<RecordBatch> {
+    if batch.column_by_name(ROW_ID).is_some() {
+        return Ok(batch);
+    }
+    let mut fields = vec![Arc::new(Field::new(ROW_ID, DataType::Int64, false))];
+    fields.extend(batch.schema().fields().iter().cloned());
+    let mut columns =
+        vec![Arc::new(Int64Array::from(vec![0; batch.num_rows()])) as arrow_array::ArrayRef];
+    columns.extend(batch.columns().iter().cloned());
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+        .map_err(|error| invalid(error.to_string()))
+}
+
 /// Materialized input, a Paimon source table, or the target joined on its row ID.
 pub enum MergeSource {
     Batches(Vec<RecordBatch>),
@@ -516,93 +728,32 @@ pub(super) async fn merge_into(
             joined.push(aliases(Some(&target), &target)?);
         }
     }
-    let mut updates = Vec::new();
-    let mut deletes = Vec::new();
-    let mut pending = joined;
-    for clause in matched {
-        let mut remaining = Vec::new();
-        let mut clause_rows = Vec::new();
-        for batch in pending {
-            let (selected, rest) = select_clause(batch, &clause.condition).await?;
-            if rest.num_rows() > 0 {
-                remaining.push(rest);
-            }
-            if selected.num_rows() == 0 {
-                continue;
-            }
-            if clause.delete {
-                let ids = selected
-                    .column_by_name(ROW_ID)
-                    .unwrap()
-                    .as_any()
-                    .downcast_ref::<Int64Array>()
-                    .unwrap();
-                deletes.extend(ids.values().iter().copied());
-            } else if !update_columns.is_empty() {
-                clause_rows.push(selected);
-            }
-        }
-        // Array/function assignments cover the complete clause selection, not
-        // each physical target batch. Shared assignment cursors consume chunks
-        // across these batches while preserving row IDs and scan order.
-        if !clause_rows.is_empty() {
-            updates.extend(assigned(
-                &clause_rows,
-                &clause.assignments,
-                &update_columns,
-                schema.clone(),
-                false,
-            )?);
-        }
-        pending = remaining;
-    }
-    let mut inserts = Vec::new();
+    let mut unmatched = Vec::new();
     if let Some(source) = source {
-        let mut pending = Vec::new();
         for (chunk, batch) in source.batches.iter().enumerate() {
             let offset = source.row_offset(chunk);
-            let unmatched = (0..batch.num_rows())
+            let rows = (0..batch.num_rows())
                 .filter(|row| !seen_source[offset + row])
                 .collect::<Vec<_>>();
-            if !unmatched.is_empty() {
-                pending.push(aliases(None, &gather(batch, &unmatched)?)?);
+            if !rows.is_empty() {
+                unmatched.push(aliases(None, &gather(batch, &rows)?)?);
             }
-        }
-        let columns = schema
-            .fields()
-            .iter()
-            .map(|field| field.name().clone())
-            .collect::<Vec<_>>();
-        for clause in not_matched {
-            let mut remaining = Vec::new();
-            let mut clause_rows = Vec::new();
-            for batch in pending {
-                let (selected, rest) = select_clause(batch, &clause.condition).await?;
-                if rest.num_rows() > 0 {
-                    remaining.push(rest);
-                }
-                if selected.num_rows() > 0 {
-                    clause_rows.push(selected);
-                }
-            }
-            if !clause_rows.is_empty() {
-                for batch in assigned(
-                    &clause_rows,
-                    &clause.assignments,
-                    &columns,
-                    schema.clone(),
-                    true,
-                )? {
-                    inserts.push(
-                        batch
-                            .project(&(1..batch.num_columns()).collect::<Vec<_>>())
-                            .map_err(|error| invalid(error.to_string()))?,
-                    );
-                }
-            }
-            pending = remaining;
         }
     }
+    let MergeActions {
+        updates,
+        deletes,
+        inserts,
+        update_columns,
+    } = evaluate_merge_actions(
+        schema,
+        joined,
+        unmatched,
+        &matched,
+        &not_matched,
+        MergeActionOutput::All,
+    )
+    .await?;
     // Materialize/validate every action before staging. Once prepared, messages
     // may already be referenced by publication; a later error must retain their files.
     let mut messages = Vec::new();
@@ -634,3 +785,7 @@ pub(super) async fn merge_into(
     }
     Ok(messages)
 }
+
+#[cfg(test)]
+#[path = "table_merge_actions_tests.rs"]
+mod tests;

@@ -29,7 +29,9 @@ mod full_text_search;
 mod global_index_result;
 mod hybrid_search;
 mod index_build;
+mod merge_execution;
 mod merge_into;
+mod merge_types;
 mod oss_cpp;
 mod predicate;
 mod read;
@@ -45,6 +47,7 @@ mod variant;
 mod vector_search;
 mod vindex;
 mod write;
+mod write_routing;
 // ---- #285: observability ----
 mod partition;
 mod snapshot;

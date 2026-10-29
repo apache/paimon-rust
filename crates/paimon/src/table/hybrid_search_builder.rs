@@ -20,15 +20,19 @@
 //! Reference: `org.apache.paimon.table.source.HybridSearchBuilder`.
 
 use std::collections::{BTreeMap, HashMap};
+use std::fmt;
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use futures::{stream, StreamExt, TryStreamExt};
 
-#[cfg(all(test, feature = "fulltext"))]
+#[cfg(test)]
 use crate::spec::SCAN_SNAPSHOT_ID_OPTION;
-use crate::spec::{CoreOptions, Predicate, Snapshot};
+use crate::spec::{CoreOptions, GlobalIndexSearchMode, Predicate, Snapshot};
 use crate::table::data_file_reader::DataFileReader;
+use crate::table::find_field_id_by_name;
+use crate::table::pk_full_text_read::{build_full_text_indexed_splits, PrimaryKeyFullTextRead};
+use crate::table::pk_full_text_scan::PrimaryKeyFullTextScan;
 use crate::table::pk_search_position::PrimaryKeySearchPosition;
 use crate::table::pk_search_ranker::{self, Ranking};
 use crate::table::pk_vector_indexed_split_read::{PkVectorIndexedSplit, PkVectorIndexedSplitRead};
@@ -36,23 +40,17 @@ use crate::table::source::DataSplit;
 use crate::table::vector_search_common::{
     collect_ranked_rows, ensure_no_reserved_read_columns, reorder_and_strip_position, RankedRow,
 };
-use crate::table::{ArrowRecordBatchStream, RowRange, Table};
+use crate::table::{ArrowRecordBatchStream, GlobalIndexResult, RowRange, Table};
 use crate::vector_search::ScoredRowIds;
-
-#[cfg(feature = "fulltext")]
-use crate::spec::GlobalIndexSearchMode;
-#[cfg(feature = "fulltext")]
-use crate::table::find_field_id_by_name;
-#[cfg(feature = "fulltext")]
-use crate::table::pk_full_text_read::{build_full_text_indexed_splits, PrimaryKeyFullTextRead};
-#[cfg(feature = "fulltext")]
-use crate::table::pk_full_text_scan::PrimaryKeyFullTextScan;
 
 const RRF_K: f32 = 60.0;
 const MAX_ROUTE_WORKERS: usize = 4;
 
-#[cfg(all(test, feature = "fulltext"))]
+#[cfg(test)]
 mod parity_tests;
+
+#[cfg(test)]
+mod phased_tests;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HybridSearchRanker {
@@ -84,6 +82,35 @@ impl HybridSearchRanker {
             Self::Mrr => Self::MRR,
         }
     }
+
+    /// Fuse scored global results without resolving a table or executing queries.
+    /// A shared captured table remains attached when every nonempty input uses
+    /// the same read view. External or conflicting views retain only scores.
+    pub fn rank(
+        &self,
+        results: &[HybridSearchWeightedResult],
+        limit: usize,
+    ) -> crate::Result<GlobalIndexResult> {
+        if limit == 0 {
+            return Err(crate::Error::ConfigInvalid {
+                message: "Limit must be positive".into(),
+            });
+        }
+        let weighted = results
+            .iter()
+            .map(|result| {
+                Ok(WeightedRouteResult {
+                    result: result.result.row_ids()?.clone(),
+                    weight: result.weight,
+                })
+            })
+            .collect::<crate::Result<Vec<_>>>()?;
+        let hits = rank_results(*self, &weighted, limit);
+        Ok(match rank_read_table(results) {
+            Some(table) => GlobalIndexResult::from_global_search(Arc::new(table.clone()), hits),
+            None => GlobalIndexResult::from_scored_row_ids(hits),
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -113,12 +140,6 @@ impl HybridSearchRoute {
     ) -> crate::Result<Self> {
         let field_name = field_name.into();
         Self::validate_common(&field_name, limit, weight)?;
-        if vector.is_empty() {
-            return Err(crate::Error::DataInvalid {
-                message: "Search vector cannot be empty".to_string(),
-                source: None,
-            });
-        }
         Ok(Self {
             kind: HybridSearchRouteKind::Vector,
             field_name,
@@ -146,11 +167,6 @@ impl HybridSearchRoute {
         let field_name = field_name.into();
         let query = query.into();
         Self::validate_common(&field_name, limit, weight)?;
-        if query.is_empty() {
-            return Err(crate::Error::ConfigInvalid {
-                message: "Full-text route query cannot be empty".to_string(),
-            });
-        }
 
         Ok(Self {
             kind: HybridSearchRouteKind::FullText,
@@ -209,6 +225,163 @@ impl HybridSearchRoute {
 
     pub fn options(&self) -> &HashMap<String, String> {
         &self.options
+    }
+}
+
+/// An independently executable route retaining the hybrid search's captured view.
+///
+/// Typed builder handles share each route's live configuration and captured
+/// table, so edits through a getter affect later executions of the route.
+#[derive(Clone)]
+pub struct HybridSearchRouteBuilder {
+    table: Arc<Table>,
+    route: HybridSearchRoute,
+    builder: RouteSearchBuilder,
+}
+
+#[derive(Clone)]
+enum RouteSearchBuilder {
+    Vector(super::VectorSearchBuilder<'static>),
+    FullText(super::FullTextSearchBuilder<'static>),
+}
+
+impl fmt::Debug for HybridSearchRouteBuilder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HybridSearchRouteBuilder")
+            .field("table", &self.table)
+            .field("route", &self.route)
+            .finish()
+    }
+}
+
+impl HybridSearchRouteBuilder {
+    pub fn route(&self) -> &HybridSearchRoute {
+        &self.route
+    }
+
+    pub fn table(&self) -> &Arc<Table> {
+        &self.table
+    }
+
+    pub fn vector_search_builder(&self) -> crate::Result<super::VectorSearchBuilder<'static>> {
+        self.require_kind(HybridSearchRouteKind::Vector)?;
+        match &self.builder {
+            RouteSearchBuilder::Vector(builder) => Ok(builder.clone()),
+            _ => unreachable!("validated vector route"),
+        }
+    }
+
+    pub fn full_text_search_builder(&self) -> crate::Result<super::FullTextSearchBuilder<'static>> {
+        self.require_kind(HybridSearchRouteKind::FullText)?;
+        match &self.builder {
+            RouteSearchBuilder::FullText(builder) => Ok(builder.clone()),
+            _ => unreachable!("validated full-text route"),
+        }
+    }
+
+    /// Execute this route against the same view as every sibling route.
+    pub async fn execute(&self) -> crate::Result<GlobalIndexResult> {
+        self.execute_internal(None).await
+    }
+
+    fn require_kind(&self, expected: HybridSearchRouteKind) -> crate::Result<()> {
+        if self.route.kind != expected {
+            return Err(crate::Error::ConfigInvalid {
+                message: format!(
+                    "Hybrid route is {:?}, expected {expected:?}",
+                    self.route.kind
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    async fn execute_internal(
+        &self,
+        executor: Option<&dyn super::SearchTaskExecutor>,
+    ) -> crate::Result<GlobalIndexResult> {
+        match &self.builder {
+            RouteSearchBuilder::Vector(builder) => {
+                if let Some(executor) = executor {
+                    let (scan, read) = builder.new_scan_and_read()?;
+                    let plan = scan.plan().await?;
+                    read.read_with_executor(plan, executor).await
+                } else {
+                    builder.execute().await
+                }
+            }
+            RouteSearchBuilder::FullText(builder) => {
+                if let Some(executor) = executor {
+                    let (scan, read) = builder.new_scan_and_read()?;
+                    let plan = scan.scan().await?;
+                    read.read_with_executor(plan, executor).await
+                } else {
+                    builder.execute().await
+                }
+            }
+        }
+    }
+}
+
+/// A scored global selection and its positive fusion weight.
+#[derive(Clone, Debug)]
+pub struct HybridSearchWeightedResult {
+    result: GlobalIndexResult,
+    weight: f32,
+}
+
+impl HybridSearchWeightedResult {
+    pub fn new(result: GlobalIndexResult, weight: f32) -> crate::Result<Self> {
+        if !weight.is_finite() || weight <= 0.0 {
+            return Err(crate::Error::ConfigInvalid {
+                message: format!("Weight must be finite and positive, got: {weight}"),
+            });
+        }
+        if result.is_split_result() {
+            return Err(crate::Error::Unsupported {
+                message: "Hybrid route ranking requires global row-ID results; primary-key physical results are unsupported".into(),
+            });
+        }
+        let result = if result.row_ids().is_ok() {
+            result
+        } else if result.is_empty() {
+            GlobalIndexResult::from_scored_row_ids(ScoredRowIds::empty())
+        } else {
+            return Err(crate::Error::Unsupported {
+                message: "Hybrid search requires scored index results".into(),
+            });
+        };
+        Ok(Self { result, weight })
+    }
+
+    pub fn weight(&self) -> f32 {
+        self.weight
+    }
+
+    pub fn result(&self) -> &GlobalIndexResult {
+        &self.result
+    }
+}
+
+/// A checked scored global result with its route's configuration.
+#[derive(Clone, Debug)]
+pub struct HybridSearchRouteResult {
+    route: HybridSearchRoute,
+    weighted: HybridSearchWeightedResult,
+}
+
+impl HybridSearchRouteResult {
+    pub fn new(route: HybridSearchRoute, result: GlobalIndexResult) -> crate::Result<Self> {
+        let weighted = HybridSearchWeightedResult::new(result, route.weight)?;
+        Ok(Self { route, weighted })
+    }
+
+    pub fn route(&self) -> &HybridSearchRoute {
+        &self.route
+    }
+
+    pub fn result(&self) -> &GlobalIndexResult {
+        self.weighted.result()
     }
 }
 
@@ -311,25 +484,56 @@ impl<'a> HybridSearchBuilder<'a> {
         self
     }
 
-    pub async fn execute(&self) -> crate::Result<Vec<RowRange>> {
-        self.execute_scored().await?.row_ids()?.to_row_ranges()
+    /// Configure every global route against one captured snapshot, including an
+    /// explicitly empty view. Queries may be completed on the returned builders;
+    /// routes remain usable after this builder is dropped.
+    pub async fn route_builders(&self) -> crate::Result<Vec<HybridSearchRouteBuilder>> {
+        self.validate_global_configuration()?;
+        let table = self
+            .resolve_pinned_route_table()
+            .await?
+            .unwrap_or_else(|| self.table.copy_with_pinned_snapshot(None));
+        Ok(self.owned_route_builders(Arc::new(table)))
     }
 
-    pub async fn execute_scored(&self) -> crate::Result<super::GlobalIndexResult> {
-        self.execute_scored_internal(None).await
+    pub fn to_route_result(
+        &self,
+        route: &HybridSearchRouteBuilder,
+        result: GlobalIndexResult,
+    ) -> crate::Result<HybridSearchRouteResult> {
+        HybridSearchRouteResult::new(route.route.clone(), result)
+    }
+
+    /// Fuse already evaluated global routes without reading table metadata or
+    /// re-running a search. Preserve the shared captured read context, if any.
+    pub fn rank(
+        &self,
+        route_results: &[HybridSearchRouteResult],
+    ) -> crate::Result<GlobalIndexResult> {
+        let limit = self.validate_search()?;
+        let weighted = route_results
+            .iter()
+            .map(|route| route.weighted.clone())
+            .collect::<Vec<_>>();
+        self.ranker.rank(&weighted, limit)
+    }
+
+    /// Execute and fuse global routes, retaining scores and the captured read view.
+    pub async fn execute(&self) -> crate::Result<super::GlobalIndexResult> {
+        self.execute_internal(None).await
     }
 
     /// Schedule each route's shard work while preserving one shared snapshot
     /// and the configured core fusion ranker.
-    #[cfg(any(feature = "internal-api", all(test, feature = "fulltext")))]
+    #[cfg(any(feature = "internal-api", test))]
     pub(crate) async fn execute_with_executor(
         &self,
         executor: &dyn super::SearchTaskExecutor,
     ) -> crate::Result<super::GlobalIndexResult> {
-        self.execute_scored_internal(Some(executor)).await
+        self.execute_internal(Some(executor)).await
     }
 
-    async fn execute_scored_internal(
+    async fn execute_internal(
         &self,
         executor: Option<&dyn super::SearchTaskExecutor>,
     ) -> crate::Result<super::GlobalIndexResult> {
@@ -340,31 +544,12 @@ impl<'a> HybridSearchBuilder<'a> {
                 message: "Scheduled hybrid search requires a data-evolution table".into(),
             });
         }
-        let limit = self.validate_search()?;
-
-        // A primary-key hybrid fuses PHYSICAL positions, not global row ids, so a
-        // scored/row-range result is unsupported on it: fail loud and direct callers
-        // to the materialized `execute_read`. A mixed PK/global set of routes cannot
-        // be fused at all (different address spaces) and also fails loud. The
-        // append/data-evolution global path is unchanged (mirrors Java `rank`).
-        match self.classify_routes(&core)? {
-            HybridAddressSpace::PrimaryKey => {
-                return Err(crate::Error::DataInvalid {
-                    message: "primary-key hybrid search does not produce global row ids; use the \
-                              materialized read (execute_read) instead"
-                        .to_string(),
-                    source: None,
-                });
-            }
-            HybridAddressSpace::Global => {}
-        }
-
-        self.validate_global_routes()?;
+        self.validate_global_search()?;
         // Resolve once even for an empty table or a retained tag. Re-resolving
         // selectors independently in the routes can observe different versions.
         let (table, hits) = match self.resolve_pinned_route_table().await? {
             Some(table) => {
-                let hits = self.execute_global_routes(&table, limit, executor).await?;
+                let hits = self.execute_global_routes(&table, executor).await?;
                 (table, hits)
             }
             None => (
@@ -391,54 +576,90 @@ impl<'a> HybridSearchBuilder<'a> {
             })
     }
 
+    fn validate_global_configuration(&self) -> crate::Result<()> {
+        let core = CoreOptions::new(self.table.schema().options());
+        core.ensure_read_authorized()?;
+        self.validate_search()?;
+        if self.classify_routes(&core)? == HybridAddressSpace::PrimaryKey {
+            return Err(crate::Error::DataInvalid {
+                message: "primary-key hybrid search does not produce global row ids; use the \
+                          materialized read (execute_read) instead"
+                    .to_string(),
+                source: None,
+            });
+        }
+        for route in &self.routes {
+            if route.kind == HybridSearchRouteKind::Vector
+                && !self
+                    .table
+                    .schema()
+                    .fields()
+                    .iter()
+                    .any(|field| field.name() == route.field_name)
+            {
+                return Err(crate::Error::ConfigInvalid {
+                    message: format!("Vector column '{}' does not exist", route.field_name),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_global_search(&self) -> crate::Result<()> {
+        self.validate_global_configuration()?;
+        self.validate_global_routes()?;
+        Ok(())
+    }
+
+    fn owned_route_builders(&self, table: Arc<Table>) -> Vec<HybridSearchRouteBuilder> {
+        self.routes
+            .iter()
+            .map(|route| {
+                let builder = match route.kind {
+                    HybridSearchRouteKind::Vector => {
+                        RouteSearchBuilder::Vector(configure_vector_route_builder(
+                            super::VectorSearchBuilder::from_owned(table.clone()),
+                            route,
+                            self.filter.as_ref(),
+                        ))
+                    }
+                    HybridSearchRouteKind::FullText => {
+                        RouteSearchBuilder::FullText(configure_full_text_route_builder(
+                            super::FullTextSearchBuilder::from_owned(table.clone()),
+                            route,
+                            self.filter.as_ref(),
+                        ))
+                    }
+                };
+                HybridSearchRouteBuilder {
+                    table: table.clone(),
+                    route: route.clone(),
+                    builder,
+                }
+            })
+            .collect()
+    }
+
     fn vector_route_builder<'t>(
         &self,
         table: &'t Table,
         route: &HybridSearchRoute,
     ) -> super::VectorSearchBuilder<'t> {
-        let mut builder = table.new_vector_search_builder();
-        builder
-            .with_vector_column(&route.field_name)
-            .with_query_vector(route.vector.clone().expect("validated vector route"))
-            .with_limit(route.limit)
-            .with_options(route.options.clone());
-        if let Some(filter) = &self.filter {
-            builder.with_filter(filter.clone());
-        }
-        builder
+        vector_route_builder(table, route, self.filter.as_ref())
     }
 
     fn validate_global_routes(&self) -> crate::Result<()> {
         for route in &self.routes {
             match route.kind {
                 HybridSearchRouteKind::Vector => {
-                    if !self
-                        .table
-                        .schema()
-                        .fields()
-                        .iter()
-                        .any(|field| field.name() == route.field_name)
-                    {
-                        return Err(crate::Error::ConfigInvalid {
-                            message: format!("Vector column '{}' does not exist", route.field_name),
-                        });
-                    }
                     let builder = self.vector_route_builder(self.table, route);
                     builder.new_scan()?;
                     builder.new_read()?;
                 }
                 HybridSearchRouteKind::FullText => {
-                    #[cfg(feature = "fulltext")]
-                    {
-                        let builder =
-                            full_text_route_builder(self.table, route, self.filter.as_ref());
-                        builder.new_scan()?;
-                        builder.new_read()?;
-                    }
-                    #[cfg(not(feature = "fulltext"))]
-                    return Err(crate::Error::ConfigInvalid {
-                        message: "Full-text hybrid routes require the fulltext feature".into(),
-                    });
+                    let builder = full_text_route_builder(self.table, route, self.filter.as_ref());
+                    builder.new_scan()?;
+                    builder.new_read()?;
                 }
             }
         }
@@ -448,41 +669,19 @@ impl<'a> HybridSearchBuilder<'a> {
     async fn execute_global_routes(
         &self,
         table: &Table,
-        limit: usize,
         executor: Option<&dyn super::SearchTaskExecutor>,
     ) -> crate::Result<ScoredRowIds> {
         // Bound concurrent route work while retaining input order for float
         // accumulation and keeping each route's weight and limit attached to it.
-        let route_results = stream::iter(self.routes.clone())
+        let route_results = stream::iter(self.owned_route_builders(Arc::new(table.clone())))
             .map(|route| async move {
-                let result = match route.kind {
-                    HybridSearchRouteKind::Vector => {
-                        let builder = self.vector_route_builder(table, &route);
-                        let result = if let Some(executor) = executor {
-                            let plan = builder.new_scan()?.plan().await?;
-                            builder
-                                .new_read()?
-                                .read_with_executor(plan, executor)
-                                .await?
-                        } else {
-                            builder.execute().await?
-                        };
-                        result.into_row_ids()?
-                    }
-                    HybridSearchRouteKind::FullText => {
-                        execute_full_text_route(table, &route, self.filter.as_ref(), executor)
-                            .await?
-                    }
-                };
-                Ok::<_, crate::Error>(WeightedRouteResult {
-                    result,
-                    weight: route.weight,
-                })
+                let result = route.execute_internal(executor).await?;
+                self.to_route_result(&route, result)
             })
             .buffered(MAX_ROUTE_WORKERS)
             .try_collect::<Vec<_>>()
             .await?;
-        Ok(rank_results(self.ranker, &route_results, limit))
+        self.rank(&route_results)?.into_row_ids()
     }
 
     /// Materialize the fused hybrid search hits into Arrow rows, best-fused-score
@@ -492,7 +691,7 @@ impl<'a> HybridSearchBuilder<'a> {
     /// full-text column in `pk-full-text.index.columns` with data-evolution
     /// disabled). A mixed PK/global set of routes fails loud, and an all-global
     /// (append/data-evolution) hybrid is unsupported here — those use
-    /// `execute`/`execute_scored`. Mirrors Java `HybridSearchBuilderImpl` PK path.
+    /// `execute`. Mirrors Java `HybridSearchBuilderImpl` PK path.
     pub async fn execute_read(&self) -> crate::Result<ArrowRecordBatchStream> {
         let core = CoreOptions::new(self.table.schema().options());
         core.ensure_read_authorized()?;
@@ -504,7 +703,7 @@ impl<'a> HybridSearchBuilder<'a> {
             }
             HybridAddressSpace::Global => Err(crate::Error::Unsupported {
                 message: "materialized hybrid read (execute_read) is only supported on the \
-                          primary-key hybrid path; use execute/execute_scored for the \
+                          primary-key hybrid path; use execute for the \
                           append/data-evolution path"
                     .to_string(),
             }),
@@ -719,7 +918,6 @@ impl<'a> HybridSearchBuilder<'a> {
         Ok(())
     }
 
-    #[cfg(feature = "fulltext")]
     fn pk_full_text_field(
         &self,
         table: &Table,
@@ -763,19 +961,6 @@ impl<'a> HybridSearchBuilder<'a> {
         Ok(field_id)
     }
 
-    #[cfg(not(feature = "fulltext"))]
-    fn pk_full_text_field(
-        &self,
-        _table: &Table,
-        _core: &CoreOptions<'_>,
-        _route: &HybridSearchRoute,
-    ) -> crate::Result<i32> {
-        Err(crate::Error::ConfigInvalid {
-            message: "primary-key full-text hybrid routes require the fulltext feature".into(),
-        })
-    }
-
-    #[cfg(feature = "fulltext")]
     async fn pk_full_text_route(
         &self,
         table: &Table,
@@ -824,18 +1009,6 @@ impl<'a> HybridSearchBuilder<'a> {
         })
     }
 
-    #[cfg(not(feature = "fulltext"))]
-    async fn pk_full_text_route(
-        &self,
-        _table: &Table,
-        _core: &CoreOptions<'_>,
-        _route: &HybridSearchRoute,
-    ) -> crate::Result<PkRoute> {
-        Err(crate::Error::ConfigInvalid {
-            message: "primary-key full-text hybrid routes require the fulltext feature".to_string(),
-        })
-    }
-
     /// Fuse the per-route physical rankings via the configured ranker. Each route
     /// contributes a weighted ranking only when it has positions (mirrors Java
     /// `rankPhysical`), and the fusion is bounded to the builder limit.
@@ -878,7 +1051,7 @@ enum HybridAddressSpace {
 /// column is a configured `pk-vector.index.columns` entry (membership via the
 /// non-erroring accessor so a malformed config cannot misclassify an unrelated
 /// route). Full-text: data-evolution disabled AND the column configured in
-/// `pk-full-text.index.columns` (only when the fulltext feature is built).
+/// `pk-full-text.index.columns`.
 fn route_is_primary_key(core: &CoreOptions<'_>, route: &HybridSearchRoute) -> bool {
     match route.kind {
         HybridSearchRouteKind::Vector => {
@@ -889,19 +1062,11 @@ fn route_is_primary_key(core: &CoreOptions<'_>, route: &HybridSearchRoute) -> bo
                     .is_some_and(|cols| cols.iter().any(|c| c == route.field_name()))
         }
         HybridSearchRouteKind::FullText => {
-            #[cfg(feature = "fulltext")]
-            {
-                !core.data_evolution_enabled()
-                    && core
-                        .primary_key_full_text_index_columns()
-                        .iter()
-                        .any(|c| c == route.field_name())
-            }
-            #[cfg(not(feature = "fulltext"))]
-            {
-                let _ = core;
-                false
-            }
+            !core.data_evolution_enabled()
+                && core
+                    .primary_key_full_text_index_columns()
+                    .iter()
+                    .any(|c| c == route.field_name())
         }
     }
 }
@@ -1054,13 +1219,43 @@ fn build_hybrid_indexed_splits(
     Ok(out)
 }
 
-#[cfg(feature = "fulltext")]
+fn vector_route_builder<'t>(
+    table: &'t Table,
+    route: &HybridSearchRoute,
+    filter: Option<&Predicate>,
+) -> super::VectorSearchBuilder<'t> {
+    configure_vector_route_builder(table.new_vector_search_builder(), route, filter)
+}
+
+fn configure_vector_route_builder<'t>(
+    mut builder: super::VectorSearchBuilder<'t>,
+    route: &HybridSearchRoute,
+    filter: Option<&Predicate>,
+) -> super::VectorSearchBuilder<'t> {
+    builder
+        .with_vector_column(&route.field_name)
+        .with_query_vector(route.vector.clone().expect("validated vector route"))
+        .with_limit(route.limit)
+        .with_options(route.options.clone());
+    if let Some(filter) = filter {
+        builder.with_filter(filter.clone());
+    }
+    builder
+}
+
 fn full_text_route_builder<'t>(
     table: &'t Table,
     route: &HybridSearchRoute,
     filter: Option<&Predicate>,
 ) -> super::FullTextSearchBuilder<'t> {
-    let mut builder = table.new_full_text_search_builder();
+    configure_full_text_route_builder(table.new_full_text_search_builder(), route, filter)
+}
+
+fn configure_full_text_route_builder<'t>(
+    mut builder: super::FullTextSearchBuilder<'t>,
+    route: &HybridSearchRoute,
+    filter: Option<&Predicate>,
+) -> super::FullTextSearchBuilder<'t> {
     builder
         .with_query(
             &route.field_name,
@@ -1076,39 +1271,38 @@ fn full_text_route_builder<'t>(
     builder
 }
 
-#[cfg(feature = "fulltext")]
-async fn execute_full_text_route(
-    table: &Table,
-    route: &HybridSearchRoute,
-    filter: Option<&Predicate>,
-    executor: Option<&dyn super::SearchTaskExecutor>,
-) -> crate::Result<ScoredRowIds> {
-    let builder = full_text_route_builder(table, route, filter);
-    let result = if let Some(executor) = executor {
-        let read = builder.new_read()?;
-        let plan = builder.new_scan()?.scan().await?;
-        read.read_with_executor(plan, executor).await?
-    } else {
-        builder.execute_scored().await?
-    };
-    result.into_row_ids()
-}
-
-#[cfg(not(feature = "fulltext"))]
-async fn execute_full_text_route(
-    _table: &Table,
-    _route: &HybridSearchRoute,
-    _filter: Option<&Predicate>,
-    _executor: Option<&dyn super::SearchTaskExecutor>,
-) -> crate::Result<ScoredRowIds> {
-    Err(crate::Error::ConfigInvalid {
-        message: "Full-text hybrid routes require the fulltext feature".to_string(),
-    })
-}
-
 struct WeightedRouteResult {
     result: ScoredRowIds,
     weight: f32,
+}
+
+fn rank_read_table(results: &[HybridSearchWeightedResult]) -> Option<&Table> {
+    let mut nonempty = results.iter().filter(|result| !result.result.is_empty());
+    let Some(first) = nonempty.next() else {
+        return results
+            .iter()
+            .filter_map(|result| result.result.table())
+            .find(|table| table.is_time_traveled());
+    };
+    let table = first.result.table()?;
+    if !table.is_time_traveled() {
+        return None;
+    }
+    for result in nonempty {
+        let other = result.result.table()?;
+        if table.identifier() != other.identifier()
+            || table.location() != other.location()
+            || !table.file_io().shares_backend(other.file_io())
+            || table.branch() != other.branch()
+            || table.schema() != other.schema()
+            || first.result.snapshot_id() != result.result.snapshot_id()
+            || table.travel_snapshot() != other.travel_snapshot()
+            || !other.is_time_traveled()
+        {
+            return None;
+        }
+    }
+    Some(table)
 }
 
 fn rank_results(
@@ -1291,7 +1485,7 @@ mod tests {
     }
 }
 
-#[cfg(all(test, feature = "fulltext"))]
+#[cfg(test)]
 mod pk_hybrid_tests {
     use super::*;
     use crate::catalog::Identifier;
@@ -1834,9 +2028,9 @@ mod pk_hybrid_tests {
     }
 
     // (d) The PK hybrid path produces physical positions, not global row ids:
-    // execute / execute_scored must fail loud and point at execute_read.
+    // execute must fail loud and point at execute_read.
     #[tokio::test]
-    async fn pk_hybrid_execute_and_scored_fail_loud() {
+    async fn pk_hybrid_execute_fails_loud() {
         let table = build_hybrid_table(
             "memory:/pk_hybrid_guard",
             &[100, 101],
@@ -1866,11 +2060,6 @@ mod pk_hybrid_tests {
             .unwrap();
         builder.with_limit(2);
 
-        let scored_err = builder.execute_scored().await.unwrap_err();
-        assert!(
-            format!("{scored_err:?}").contains("execute_read"),
-            "PK hybrid execute_scored must point at execute_read, got: {scored_err:?}"
-        );
         let execute_err = builder.execute().await.unwrap_err();
         assert!(
             format!("{execute_err:?}").contains("execute_read"),
@@ -1950,10 +2139,10 @@ mod pk_hybrid_tests {
     }
 
     // (e) DE regression: a hybrid over non-PK routes (no PK configs) still takes the
-    // global-row-id execute_scored path unchanged. An empty table yields an empty
+    // global-row-id execute path unchanged. An empty table yields an empty
     // result without hitting the PK guard.
     #[tokio::test]
-    async fn global_hybrid_execute_scored_unchanged() {
+    async fn global_hybrid_execute_retains_global_result() {
         // A table without any PK index configuration: both routes resolve to the
         // append/data-evolution global path.
         let file_io = FileIOBuilder::new("memory").build().unwrap();
@@ -2002,10 +2191,7 @@ mod pk_hybrid_tests {
 
         // No snapshot -> both routes empty -> fused empty; the DE path must NOT hit
         // the PK fail-loud guard.
-        let result = builder
-            .execute_scored()
-            .await
-            .expect("DE hybrid path failed");
+        let result = builder.execute().await.expect("DE hybrid path failed");
         assert!(
             result.is_empty(),
             "empty table yields empty DE hybrid result"

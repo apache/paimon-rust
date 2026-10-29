@@ -148,6 +148,19 @@ impl ShreddingFormatReader {
 
 #[async_trait]
 impl FormatFileReader for ShreddingFormatReader {
+    fn supports_nested_projection(&self) -> bool {
+        self.inner.supports_nested_projection()
+    }
+
+    fn select_read_fields(
+        &self,
+        data_schema_fields: &[DataField],
+        projected_fields: &[DataField],
+    ) -> Vec<DataField> {
+        self.inner
+            .select_read_fields(data_schema_fields, projected_fields)
+    }
+
     async fn read_batch_stream(
         &self,
         reader: Box<dyn FileRead>,

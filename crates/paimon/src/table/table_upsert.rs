@@ -1739,57 +1739,75 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upsert_finds_java_padded_null_timestamp_partition() {
-        let schema = PaimonSchema::builder()
-            .column(
-                "part",
+    async fn upsert_finds_java_null_non_compact_partitions() {
+        // Current Java BinaryRowWriter bodies for a single NULL DECIMAL(20,2)
+        // or TIMESTAMP/LTZ(6). The ordinary writer must produce these bytes;
+        // upsert must then match the same partition instead of appending a row.
+        let decimal = "0001000000000000000000001000000000000000000000000000000000000000";
+        let timestamp = "000100000000000000000000100000000000000000000000";
+        for (name, data_type, expected) in [
+            (
+                "decimal",
+                PaimonType::Decimal(crate::spec::DecimalType::new(20, 2).unwrap()),
+                decimal,
+            ),
+            (
+                "timestamp",
                 PaimonType::Timestamp(TimestampType::new(6).unwrap()),
-            )
-            .column("key", PaimonType::Int(IntType::new()))
-            .column("value", PaimonType::Int(IntType::new()))
-            .partition_keys(["part"])
-            .option("data-evolution.enabled", "true")
-            .option("row-tracking.enabled", "true")
-            .build()
-            .unwrap();
-        let table = Table::new(
-            FileIOBuilder::new("memory").build().unwrap(),
-            Identifier::new("db", "padded_null_partition"),
-            "memory:/upsert_padded_null_partition".into(),
-            TableSchema::new(0, &schema),
-            None,
-        );
-        let batch = |value| {
-            RecordBatch::try_from_iter([
-                (
-                    "part",
-                    Arc::new(arrow_array::TimestampMicrosecondArray::from(vec![
-                        None::<i64>,
-                    ])) as ArrayRef,
+                timestamp,
+            ),
+            (
+                "ltz",
+                PaimonType::LocalZonedTimestamp(
+                    crate::spec::LocalZonedTimestampType::new(6).unwrap(),
                 ),
-                ("key", Arc::new(Int32Array::from(vec![7])) as ArrayRef),
-                ("value", Arc::new(Int32Array::from(vec![value])) as ArrayRef),
-            ])
-            .unwrap()
-        };
-        let mut write = table.new_write_builder().new_write().unwrap();
-        write.write_arrow_batch(&batch(10)).await.unwrap();
-        let mut messages = write.prepare_commit().await.unwrap();
-        for message in &mut messages {
-            let row = BinaryRow::from_serialized_bytes(&message.partition).unwrap();
-            let mut padded = row.data().to_vec();
-            // Java reserves a variable slot for NULL TIMESTAMP(6), although
-            // the null bit makes its offset irrelevant to the logical value.
-            padded.extend_from_slice(&[0; 8]);
-            padded[8..16].copy_from_slice(&(16_u64 << 32).to_le_bytes());
-            message.partition = BinaryRow::from_bytes(1, padded).to_serialized_bytes();
+                timestamp,
+            ),
+        ] {
+            let schema = PaimonSchema::builder()
+                .column("part", data_type)
+                .column("key", PaimonType::Int(IntType::new()))
+                .column("value", PaimonType::Int(IntType::new()))
+                .partition_keys(["part"])
+                .option("data-evolution.enabled", "true")
+                .option("row-tracking.enabled", "true")
+                .build()
+                .unwrap();
+            let table = Table::new(
+                FileIOBuilder::new("memory").build().unwrap(),
+                Identifier::new("db", name),
+                format!("memory:/upsert_null_partition_{name}"),
+                TableSchema::new(0, &schema),
+                None,
+            );
+            let arrow_schema =
+                crate::arrow::build_target_arrow_schema(table.schema().fields()).unwrap();
+            let batch = |value| {
+                RecordBatch::try_new(
+                    arrow_schema.clone(),
+                    vec![
+                        arrow_array::new_null_array(arrow_schema.field(0).data_type(), 1),
+                        Arc::new(Int32Array::from(vec![7])),
+                        Arc::new(Int32Array::from(vec![value])),
+                    ],
+                )
+                .unwrap()
+            };
+            let mut write = table.new_write_builder().new_write().unwrap();
+            write.write_arrow_batch(&batch(10)).await.unwrap();
+            let messages = write.prepare_commit().await.unwrap();
+            assert_eq!(messages.len(), 1);
+            let partition = BinaryRow::from_serialized_bytes(&messages[0].partition).unwrap();
+            assert_eq!(partition.data(), hex::decode(expected).unwrap(), "{name}");
+            TableCommit::new(table.clone(), "seed".into())
+                .commit(messages)
+                .await
+                .unwrap();
+            write.close().await;
+            for value in [42, 43] {
+                commit_upsert(&table, vec![batch(value)], vec!["key".into()]).await;
+                assert_eq!(values_by_row_id(&table).await, vec![(0, value)], "{name}");
+            }
         }
-        TableCommit::new(table.clone(), "seed".into())
-            .commit(messages)
-            .await
-            .unwrap();
-        write.close().await;
-        commit_upsert(&table, vec![batch(42)], vec!["key".into()]).await;
-        assert_eq!(values_by_row_id(&table).await, vec![(0, 42)]);
     }
 }

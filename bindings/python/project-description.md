@@ -85,6 +85,98 @@ updates, including incremental row-ID updaters, expose the same chainable setter
 `with_commit_user` is available on batch, stream, and postpone fixed bucket write
 builders, and the identity applies to both writers and committers from that builder.
 
+`BucketRouter(table.schema()).route(batch)` assigns fixed buckets in Rust and
+returns an Arrow array without creating a writer. POSTPONE engines can use
+`PostponeBucketPlanner` to collect mergeable per-partition statistics, infer a
+shared plan, and configure that router with `with_bucket_plan(plan)`. Collect
+statistics across all input batches before planning; the planner stores schema
+and counts only. Existing layouts are resolved separately by the write builder
+using write authorization, without requiring SELECT.
+
+### Typed MERGE Actions
+
+Batch and stream `merge_into` accept ordered `WhenMatched` and `WhenNotMatched`
+objects. Assignments use `MergeAssignment.source_column`, `target_column`,
+`literal`, or `function`. A function receives the selected clause's Arrow table
+and returns an Array or ChunkedArray with the same number of rows.
+
+Execution engines that already joined target and source data can reuse these
+types through the batch execution factories:
+
+```python
+import pyarrow as pa
+from pypaimon_rust.datafusion import MergeAssignment, MergeBatchExecution, WhenMatched
+
+joined = pa.table({
+    "t._ROW_ID": [10, 11],
+    "t.value": pa.array([20, 30], type=pa.int32()),
+    "s.value": pa.array([40, 10], type=pa.int32()),
+})
+matched = [
+    WhenMatched.update(
+        {"value": MergeAssignment.source_column("value")},
+        condition='"s.value" > "t.value"',
+    ),
+    WhenMatched.delete(),
+]
+update_schema = pa.schema([
+    pa.field("_ROW_ID", pa.int64(), nullable=False),
+    pa.field("value", pa.int32()),
+])
+updates = MergeBatchExecution.for_updates(joined.schema, update_schema, matched)
+deletes = MergeBatchExecution.for_deletes(joined.schema, matched)
+assert updates.execute(joined).to_pylist() == [{"_ROW_ID": 10, "value": 40}]
+assert deletes.execute(joined).to_pylist() == [{"_ROW_ID": 11}]
+```
+
+Both matched factories consume the complete ordered branch list. The delete
+factory skips UPDATE assignments and callbacks while preserving their conditions.
+For unmatched source batches, use `for_inserts(source_schema, target_schema,
+when_not_matched)` with `WhenNotMatched` objects. The factories compile conditions
+once and return an executor with `execute(Table | RecordBatch) -> Table`.
+The calling engine owns joins, authorization and table writes.
+
+### Hybrid Search Phases
+
+Hybrid queries can execute routes separately and then fuse their results:
+
+```python
+hybrid = (table.new_hybrid_search_builder()
+          .add_vector_route("embedding", [1.0, 0.0], 20)
+          .with_limit(10))
+routes = hybrid.route_builders()
+results = [hybrid.to_route_result(route, route.search_builder().execute())
+           for route in routes]
+ranked = hybrid.rank(results)
+```
+
+`route_builders()` checks read authorization and captures one snapshot for all
+routes, including an empty view. Each route retains its search builder: repeated
+`search_builder()` calls return the same object, and configuring it changes later
+`route.execute()` calls. Returned builders retain their snapshot after later
+commits. `to_route_result()` accepts scored
+global results and normalizes empty unscored selections; nonempty unscored or
+physical primary-key selections cannot participate in global row-ID fusion.
+
+For externally evaluated scores, `HybridSearchWeightedResult` and
+`HybridSearchRanker.RRF`, `.WEIGHTED_SCORE`, or `.MRR` provide the same fusion
+without a table or query:
+
+```python
+from pypaimon_rust.datafusion import (
+    GlobalIndexResult, HybridSearchRanker, HybridSearchWeightedResult,
+)
+
+hits = GlobalIndexResult.from_scored_row_ids({7: 0.9, 8: 0.5})
+ranked = HybridSearchRanker.MRR.rank([HybridSearchWeightedResult(hits, 2.0)], 1)
+assert ranked.row_ids() == {7: 2.0}
+```
+
+Rankers use Java's float32 scores, weights and arithmetic. A shared captured read
+context is retained only when every nonempty input belongs to the same table
+view. Fusing external scores or different views returns scores without attaching
+an unrelated table or snapshot.
+
 ### Multimodal SQL Helpers
 
 `SQLContext` also registers Python scalar UDFs for common BLOB media and vector

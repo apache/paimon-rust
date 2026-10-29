@@ -22,51 +22,32 @@ use crate::global_index_result::PyGlobalIndexResult;
 use crate::predicate::dict_to_table_predicate;
 use crate::search_plan::{full_text_splits_from_python, full_text_splits_to_python};
 use crate::snapshot::PySnapshot;
-use paimon::spec::Predicate;
-use paimon::table::{FullTextRead, FullTextScan, FullTextScanPlan, Table};
+use paimon::table::{
+    FullTextRead, FullTextScan, FullTextScanPlan, FullTextSearchBuilder, HybridSearchRouteBuilder,
+    Table,
+};
 use paimon_datafusion::runtime::runtime;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyTuple};
 use std::sync::Arc;
 
-#[derive(Default)]
-struct Config {
-    query: Option<(String, String)>,
-    limit: Option<usize>,
-    filters: Vec<Predicate>,
-}
-
-impl Config {
-    fn builder<'a>(
-        &self,
-        table: &'a Table,
-    ) -> paimon::Result<paimon::table::FullTextSearchBuilder<'a>> {
-        let mut builder = table.new_full_text_search_builder();
-        if let Some((column, query)) = &self.query {
-            builder.with_query(column, query);
-        }
-        if let Some(limit) = self.limit {
-            builder.with_limit(limit);
-        }
-        for filter in &self.filters {
-            builder.with_filter(filter.clone());
-        }
-        Ok(builder)
-    }
-}
-
 #[pyclass(name = "FullTextSearchBuilder", module = "pypaimon_rust.datafusion")]
 pub struct PyFullTextSearchBuilder {
     table: Arc<Table>,
-    config: Config,
+    inner: FullTextSearchBuilder<'static>,
 }
 
 impl PyFullTextSearchBuilder {
     pub(crate) fn new(table: Arc<Table>) -> Self {
-        Self {
-            table,
-            config: Config::default(),
-        }
+        let inner = table.new_full_text_search_builder().into_owned();
+        Self { table, inner }
+    }
+
+    pub(crate) fn from_hybrid_route(route: &HybridSearchRouteBuilder) -> PyResult<Self> {
+        Ok(Self {
+            table: Arc::clone(route.table()),
+            inner: route.full_text_search_builder().map_err(to_py_err)?,
+        })
     }
 }
 
@@ -77,11 +58,11 @@ impl PyFullTextSearchBuilder {
         field_name: String,
         query: String,
     ) -> PyRefMut<'_, Self> {
-        slf.config.query = Some((field_name, query));
+        slf.inner.with_query(&field_name, &query);
         slf
     }
     fn with_limit(mut slf: PyRefMut<'_, Self>, limit: usize) -> PyRefMut<'_, Self> {
-        slf.config.limit = Some(limit);
+        slf.inner.with_limit(limit);
         slf
     }
     fn with_filter<'py>(
@@ -89,7 +70,7 @@ impl PyFullTextSearchBuilder {
         predicate: &Bound<'_, PyDict>,
     ) -> PyResult<PyRefMut<'py, Self>> {
         let filter = dict_to_table_predicate(predicate, slf.table.schema(), true)?;
-        slf.config.filters.push(filter);
+        slf.inner.with_filter(filter);
         Ok(slf)
     }
     fn with_partition_filter<'py>(
@@ -97,37 +78,21 @@ impl PyFullTextSearchBuilder {
         predicate: &Bound<'_, PyDict>,
     ) -> PyResult<PyRefMut<'py, Self>> {
         let filter = dict_to_table_predicate(predicate, slf.table.schema(), true)?;
-        slf.config
-            .builder(&slf.table)
-            .map_err(to_py_err)?
-            .with_partition_filter(filter.clone())
-            .map_err(to_py_err)?;
-        slf.config.filters.push(filter);
+        slf.inner.with_partition_filter(filter).map_err(to_py_err)?;
         Ok(slf)
     }
     fn new_full_text_scan(&self) -> PyResult<PyFullTextScan> {
         Ok(PyFullTextScan {
-            inner: self
-                .config
-                .builder(&self.table)
-                .map_err(to_py_err)?
-                .new_scan()
-                .map_err(to_py_err)?,
+            inner: self.inner.new_scan().map_err(to_py_err)?,
         })
     }
     fn new_full_text_read(&self) -> PyResult<PyFullTextRead> {
         Ok(PyFullTextRead {
-            inner: self
-                .config
-                .builder(&self.table)
-                .map_err(to_py_err)?
-                .new_read()
-                .map_err(to_py_err)?,
+            inner: self.inner.new_read().map_err(to_py_err)?,
         })
     }
     fn execute(&self, py: Python<'_>) -> PyResult<PyGlobalIndexResult> {
-        let builder = self.config.builder(&self.table).map_err(to_py_err)?;
-        py.detach(|| runtime().block_on(builder.execute_scored()))
+        py.detach(|| runtime().block_on(self.inner.execute()))
             .map(PyGlobalIndexResult::new)
             .map_err(to_py_err)
     }

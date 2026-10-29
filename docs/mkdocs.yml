@@ -49,6 +49,7 @@ nav:
   - Home: index.md
   - Getting Started: getting-started.md
   - Batch Incremental Reading: incremental-reading.md
+  - Table Compaction: compaction.md
   - SQL Integration: sql.md
   - Performance: benchmark.md
   - C Integration: c-binding.md

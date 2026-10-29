@@ -121,9 +121,6 @@ COMMON_MIT_CORRECTIONS = (
         license_name="MIT License (libm)",
         anchor="mit-libm",
     ),
-)
-
-PYTHON_MIT_CORRECTIONS = (
     LicenseCorrection(
         crates=("jieba-macros", "jieba-rs"),
         license_crate="jieba-rs",
@@ -595,11 +592,8 @@ def complete_report(
     result = replace_placeholder_entry(
         root, base_report, metadata, ALLOC_PLACEHOLDER, ALLOC_CORRECTIONS
     )
-    mit_corrections = COMMON_MIT_CORRECTIONS
-    if report.component == "python":
-        mit_corrections += PYTHON_MIT_CORRECTIONS
     result = replace_placeholder_entry(
-        root, result, metadata, MIT_PLACEHOLDER, mit_corrections
+        root, result, metadata, MIT_PLACEHOLDER, COMMON_MIT_CORRECTIONS
     )
 
     for placeholder in LICENSE_PLACEHOLDERS:

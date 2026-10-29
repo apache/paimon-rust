@@ -303,3 +303,16 @@ useful as a reproducible engineering checkpoint, not a universal performance
 ranking. A broader study should repeat complete benchmark processes, separate
 cold and warm cache states, and include object storage and multi-node
 environments.
+
+## Full-text Top-K
+
+The repository also includes a synthetic full-text benchmark comparing certified
+per-shard Top-K with exhaustive candidate collection on the same local table and
+snapshot. It checks exact row IDs and scores, alternates execution order, and
+reports latency for distinct-score and boundary-tie corpora. See the
+[benchmark protocol](https://github.com/apache/paimon-rust/tree/main/benchmarks/full-text).
+
+The optimization is selected automatically for FAST-mode global searches with
+disjoint index ranges and no raw sources or deletion exclusions. Other paths and boundary ties retain
+exhaustive evaluation. The benchmark uses an internal reference reader to compare
+against exhaustive candidate collection without adding a table option.

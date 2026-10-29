@@ -353,8 +353,12 @@ impl TableUpdate {
     }
 
     /// Delete rows by row ID using deletion vectors.
-    pub async fn delete_by_row_id(&self, row_ids: Vec<i64>) -> crate::Result<Vec<CommitMessage>> {
-        if row_ids.is_empty() {
+    pub async fn delete_by_row_id(
+        &self,
+        row_ids: impl IntoIterator<Item = i64>,
+    ) -> crate::Result<Vec<CommitMessage>> {
+        let mut row_ids = row_ids.into_iter().peekable();
+        if row_ids.peek().is_none() {
             return Ok(Vec::new());
         }
         // The high-level updater selects a read snapshot; the low-level

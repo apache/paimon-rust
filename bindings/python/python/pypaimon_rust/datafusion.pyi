@@ -18,7 +18,7 @@
 from datetime import datetime
 from os import PathLike
 from typing import (
-    Any, Callable, Dict, Iterable, List, Literal, Optional, Sequence, Tuple,
+    Any, Callable, ClassVar, Dict, Iterable, List, Literal, Mapping, Optional, Sequence, Tuple,
     TypeAlias, Union,
 )
 
@@ -78,6 +78,88 @@ class RowIdPlan:
         """Inclusive row-ID bounds and all physical files of each logical group."""
         ...
     def plan(self) -> Plan: ...
+    def route(self, row_ids: pyarrow.Int64Array) -> pyarrow.Int64Array:
+        """Return each row's owning file-group first row ID, preserving input order."""
+        ...
+    def route_by_bucket(self, row_ids: pyarrow.Int64Array) -> pyarrow.Int64Array:
+        """Return one opaque routing ID per captured partition/bucket.
+
+        IDs are stable within this plan. Multiple file groups in the same
+        partition/bucket share an ID so one worker can publish their DV index.
+        """
+        ...
+    def select(self, row_ids: pyarrow.Int64Array) -> Plan:
+        """Build a read-only plan with sorted, deduplicated row selections.
+
+        Complete file groups, deletion metadata, grants, paths and the captured
+        snapshot are retained. Readers authorize execution independently. This
+        selected plan must not be used as a mutation plan.
+        """
+        ...
+
+class MergeAssignment:
+    """An immutable source reference, target reference, literal or callback."""
+    @staticmethod
+    def source_column(name: str) -> "MergeAssignment": ...
+    @staticmethod
+    def target_column(name: str) -> "MergeAssignment": ...
+    @staticmethod
+    def literal(value: Any) -> "MergeAssignment":
+        """Defer scalar conversion; Arrow arrays provide values for selected rows."""
+        ...
+    @staticmethod
+    def function(
+        function: Callable[[pyarrow.Table], Union[pyarrow.Array, pyarrow.ChunkedArray]],
+    ) -> "MergeAssignment": ...
+
+class WhenMatched:
+    """An immutable, ordered UPDATE or DELETE clause with an optional SQL condition.
+
+    Conditions reference quoted Arrow names, such as ``"s.value" > "t.value"``.
+    The first matching clause consumes a row; NULL conditions fall through.
+    """
+    @staticmethod
+    def update(
+        assignments: Mapping[str, MergeAssignment], condition: Optional[str] = None,
+    ) -> "WhenMatched": ...
+    @staticmethod
+    def delete(condition: Optional[str] = None) -> "WhenMatched": ...
+
+class WhenNotMatched:
+    """An immutable, ordered INSERT clause."""
+    def __init__(
+        self, assignments: Mapping[str, MergeAssignment], condition: Optional[str] = None,
+    ) -> None: ...
+
+class MergeBatchExecution:
+    """Evaluate ordered MERGE actions over already joined Arrow batches.
+
+    Input fields use the ``t.<column>`` and ``s.<column>`` aliases. This
+    operator evaluates expressions and assignments without reading or writing
+    a table; callers retain responsibility for joins and authorization.
+    Matched input carries ``t._ROW_ID`` or ``_ROW_ID``, never both. Update
+    output contains ``_ROW_ID`` and the requested target columns; delete output
+    contains only ``_ROW_ID``. Insert output uses the target schema.
+    """
+    @staticmethod
+    def for_updates(
+        input_schema: pyarrow.Schema, update_schema: pyarrow.Schema,
+        when_matched: Sequence[WhenMatched],
+    ) -> "MergeBatchExecution": ...
+    @staticmethod
+    def for_deletes(
+        input_schema: pyarrow.Schema, when_matched: Sequence[WhenMatched],
+    ) -> "MergeBatchExecution":
+        """Keep all matched conditions; skip UPDATE assignment conversion and evaluation."""
+        ...
+    @staticmethod
+    def for_inserts(
+        input_schema: pyarrow.Schema, target_schema: pyarrow.Schema,
+        when_not_matched: Sequence[WhenNotMatched],
+    ) -> "MergeBatchExecution": ...
+    def execute(self, batch: Union[pyarrow.Table, pyarrow.RecordBatch]) -> pyarrow.Table:
+        """Return selected actions; unselected assignments are never evaluated."""
+        ...
 
 class ScanStats:
     """Read-only counters from normal metadata planning."""
@@ -524,15 +606,14 @@ class BatchTableUpdate:
     ) -> "BatchTableUpdate": ...
     def merge_into(
         self, source: Optional[Union[pyarrow.Table, Table]], *, on: Sequence[Tuple[str, str]],
-        when_matched: Sequence[Dict[str, Any]], when_not_matched: Sequence[Dict[str, Any]]
+        when_matched: Sequence[WhenMatched], when_not_matched: Sequence[WhenNotMatched]
     ) -> List[CommitMessage]:
         """Prepare MERGE against one target snapshot. None selects self-merge on _ROW_ID.
 
         A Table source reads its selected snapshot or numeric timestamp window
         in core, independently of the target. Arrow input preserves batches and source row order.
 
-        Clauses carry assignments as (column, source/target/literal/callable, value)
-        tuples, a delete flag, and optional SQL condition metadata. Callables
+        Typed clauses carry MergeAssignment values and optional SQL conditions. Callables
         consume the complete clause's qualified t./s. Arrow columns and return
         an Array or ChunkedArray with the same row count; empty clauses are lazy.
         Commit returned messages through the matching builder's committer.
@@ -557,7 +638,14 @@ class BatchTableUpdate:
         """
         ...
     def with_update_type(self, update_cols: List[str]) -> "BatchTableUpdate": ...
-    def delete_by_row_id(self, row_ids: Sequence[int]) -> List[CommitMessage]: ...
+    def delete_by_row_id(
+        self, row_ids: Union[Sequence[int], pyarrow.Array, pyarrow.ChunkedArray]
+    ) -> List[CommitMessage]:
+        """Prepare row deletes from integer IDs; Arrow inputs retain chunks and slices.
+
+        Nulls and values outside Int64 are rejected. Duplicate IDs are deleted once.
+        """
+        ...
     def delete_by_predicate(
         self, predicate: Optional[Dict[str, Any]]
     ) -> List[CommitMessage]:
@@ -598,7 +686,7 @@ class StreamTableUpdate:
     ) -> "StreamTableUpdate": ...
     def merge_into(
         self, source: Optional[Union[pyarrow.Table, Table]], *, on: Sequence[Tuple[str, str]],
-        when_matched: Sequence[Dict[str, Any]], when_not_matched: Sequence[Dict[str, Any]],
+        when_matched: Sequence[WhenMatched], when_not_matched: Sequence[WhenNotMatched],
         commit_identifier: int
     ) -> List[CommitMessage]:
         """Prepare MERGE against one target snapshot. None selects self-merge on _ROW_ID.
@@ -606,8 +694,7 @@ class StreamTableUpdate:
         A Table source reads its selected snapshot or numeric timestamp window
         in core, independently of the target. Arrow input preserves batches and source row order.
 
-        Clauses carry assignments as (column, source/target/literal/callable, value)
-        tuples, a delete flag, and optional SQL condition metadata. Callables
+        Typed clauses carry MergeAssignment values and optional SQL conditions. Callables
         consume the complete clause's qualified t./s. Arrow columns and return
         an Array or ChunkedArray with the same row count; empty clauses are lazy.
         Commit returned messages through the matching builder's committer.
@@ -632,7 +719,7 @@ class StreamTableUpdate:
         ...
     def with_update_type(self, update_cols: List[str]) -> "StreamTableUpdate": ...
     def delete_by_row_id(
-        self, row_ids: Sequence[int], commit_identifier: int
+        self, row_ids: Union[Sequence[int], pyarrow.Array, pyarrow.ChunkedArray], commit_identifier: int
     ) -> List[CommitMessage]: ...
     def delete_by_predicate(
         self, predicate: Optional[Dict[str, Any]], commit_identifier: int
@@ -818,6 +905,61 @@ class BatchWriteBuilder:
     def new_write(self) -> BatchTableWrite: ...
     def new_update(self) -> BatchTableUpdate: ...
     def new_commit(self) -> BatchTableCommit: ...
+
+class BucketRouter:
+    """Pure input-order bucket assignment using the table schema's Java rules.
+
+    No catalog access or file writes occur. POSTPONE routing requires a known
+    plan or a configured default; an explicit plan replaces that default.
+    """
+    def __init__(self, schema: TableSchema) -> None: ...
+    def with_bucket_plan(self, plan: pyarrow.RecordBatch) -> BucketRouter: ...
+    def route(self, batch: pyarrow.RecordBatch) -> pyarrow.Int32Array: ...
+
+class DynamicBucketAssignerRouter:
+    """Pure Java HASH_DYNAMIC routing before grouping input by assigner."""
+    def __init__(self, schema: TableSchema, num_channels: int, num_assigners: int) -> None: ...
+    def route(self, batch: pyarrow.RecordBatch) -> pyarrow.RecordBatch:
+        """Return non-null assigner and key_hash Int32 columns in input order."""
+        ...
+
+class DynamicBucketAssigner:
+    """Stateful bucket assignment for distributed HASH_DYNAMIC inputs.
+
+    Existing mappings remain stable across assigner parallelism changes.
+    New keys use buckets owned by this assigner. Input must already be
+    grouped by the DynamicBucketAssignerRouter's assigner column.
+    """
+    def __init__(self, table: Table, num_channels: int, num_assigners: int, assign_id: int,
+                 *, restore_snapshot_id: Optional[int] = None, overwrite: bool = False) -> None:
+        """Capture one write-authorized restore point; None is latest and zero is empty.
+
+        Overwrite starts empty. This stage creates no data or index files;
+        group its output by partition and bucket before writing.
+        """
+        ...
+    @property
+    def restore_snapshot_id(self) -> int:
+        """Captured restore snapshot; zero denotes an empty base."""
+        ...
+    def assign(self, batch: pyarrow.RecordBatch,
+               key_hashes: Optional[pyarrow.Int32Array] = None) -> pyarrow.Int32Array:
+        """Return buckets in input order, optionally reusing routed key hashes."""
+        ...
+
+class PostponeBucketPlanner:
+    """Pure per-partition statistics and bucket-count inference.
+
+    Statistics contain partition columns in schema order followed by
+    row_count: int64 and data_size: int64, interpreted positionally. Combine
+    statistics for each input partition before calling plan(). Input batches
+    are never retained. Known bucket counts are preserved.
+    """
+    def __init__(self, schema: TableSchema,
+                 known_plan: Optional[pyarrow.RecordBatch] = None) -> None: ...
+    def current_plan(self) -> pyarrow.RecordBatch: ...
+    def input_statistics(self, batch: pyarrow.RecordBatch) -> pyarrow.RecordBatch: ...
+    def plan(self, statistics: pyarrow.RecordBatch) -> pyarrow.RecordBatch: ...
 
 class PostponeFixedBucketWriteBuilder:
     """Real-bucket batch writes for a bucket=-2 primary-key table.
@@ -1078,6 +1220,52 @@ class GlobalIndexResultReadBuilder:
         """Read user columns and scores in relevance order from the search snapshot."""
         ...
 
+class HybridSearchWeightedResult:
+    def __init__(self, result: GlobalIndexResult, weight: float = 1.0) -> None:
+        """Capture a scored global result and a finite positive fusion weight."""
+        ...
+    def result(self) -> GlobalIndexResult: ...
+    def weight(self) -> float: ...
+
+class HybridSearchRanker:
+    RRF: ClassVar[HybridSearchRanker]
+    WEIGHTED_SCORE: ClassVar[HybridSearchRanker]
+    MRR: ClassVar[HybridSearchRanker]
+    def rank(self, results: Sequence[HybridSearchWeightedResult], limit: int) -> GlobalIndexResult:
+        """Fuse evaluated results without table access or authorization calls."""
+        ...
+
+class HybridSearchRoute:
+    @staticmethod
+    def vector(field_name: str, vector: Sequence[float], limit: int,
+               weight: float = 1.0, options: Optional[Dict[str, str]] = None) -> HybridSearchRoute: ...
+    @staticmethod
+    def full_text(field_name: str, query: str, limit: int,
+                  weight: float = 1.0, options: Optional[Dict[str, str]] = None) -> HybridSearchRoute: ...
+    def kind(self) -> Literal["vector", "full_text"]: ...
+    def field_name(self) -> str: ...
+    def vector_value(self) -> Optional[List[float]]: ...
+    def full_text_query(self) -> Optional[str]: ...
+    def limit(self) -> int: ...
+    def weight(self) -> float: ...
+    def options(self) -> Dict[str, str]: ...
+
+class HybridSearchRouteBuilder:
+    def route(self) -> HybridSearchRoute: ...
+    def snapshot(self) -> Optional[Snapshot]: ...
+    def search_builder(self) -> Union[VectorSearchBuilder, FullTextSearchBuilder]:
+        """Return this route's live builder; mutations affect subsequent route execution.
+
+        Repeated calls return the same object on the captured snapshot.
+        """
+        ...
+    def execute(self) -> GlobalIndexResult: ...
+
+class HybridSearchRouteResult:
+    def __init__(self, route: HybridSearchRoute, result: GlobalIndexResult) -> None: ...
+    def route(self) -> HybridSearchRoute: ...
+    def result(self) -> GlobalIndexResult: ...
+
 class HybridSearchBuilder:
     def with_limit(self, limit: int) -> HybridSearchBuilder: ...
     def with_snapshot(self, snapshot: Optional[Snapshot]) -> HybridSearchBuilder:
@@ -1092,6 +1280,12 @@ class HybridSearchBuilder:
                          weight: float = 1.0, options: Optional[Dict[str, str]] = None) -> HybridSearchBuilder: ...
     def add_full_text_route(self, field_name: str, query: str, limit: int,
                             weight: float = 1.0, options: Optional[Dict[str, str]] = None) -> HybridSearchBuilder: ...
+    def route_builders(self) -> List[HybridSearchRouteBuilder]:
+        """Capture one snapshot and return configured routes with live search builders."""
+        ...
+    def to_route_result(self, route_builder: HybridSearchRouteBuilder,
+                        result: GlobalIndexResult) -> HybridSearchRouteResult: ...
+    def rank(self, route_results: Sequence[HybridSearchRouteResult]) -> GlobalIndexResult: ...
     def execute(self) -> GlobalIndexResult: ...
 
 class FullTextSearchBuilder:

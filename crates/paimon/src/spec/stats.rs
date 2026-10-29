@@ -149,63 +149,97 @@ impl Display for BinaryTableStats {
     }
 }
 
-/// Compute per-column independent min/max/null_count for the specified columns
-/// in a RecordBatch. Each entry in `col_indices` is the column index in the batch,
-/// and the corresponding entry in `col_types` is its Paimon DataType.
-pub fn compute_column_stats(
-    batch: &RecordBatch,
-    col_indices: &[usize],
-    col_types: &[DataType],
-) -> crate::Result<BinaryTableStats> {
-    let num_cols = col_indices.len();
-    let num_rows = batch.num_rows();
-    let mut min_datums: Vec<Option<Datum>> = vec![None; num_cols];
-    let mut max_datums: Vec<Option<Datum>> = vec![None; num_cols];
-    let mut null_counts: Vec<Option<i64>> = vec![Some(0); num_cols];
+/// Incremental full column statistics without retaining the input batches.
+pub(crate) struct ColumnStatsCollector<'a> {
+    types: &'a [DataType],
+    min_datums: Vec<Option<Datum>>,
+    max_datums: Vec<Option<Datum>>,
+    null_counts: Vec<Option<i64>>,
+}
 
-    for row_idx in 0..num_rows {
-        for (pos, (&col_idx, data_type)) in col_indices.iter().zip(col_types.iter()).enumerate() {
-            let datum = extract_datum_from_arrow(batch, row_idx, col_idx, data_type)?;
-            match datum {
-                Some(d) => {
-                    if min_datums[pos].as_ref().is_none_or(|m| d < *m) {
-                        min_datums[pos] = Some(d.clone());
+impl<'a> ColumnStatsCollector<'a> {
+    pub(crate) fn new(types: &'a [DataType]) -> Self {
+        Self {
+            types,
+            min_datums: vec![None; types.len()],
+            max_datums: vec![None; types.len()],
+            null_counts: vec![Some(0); types.len()],
+        }
+    }
+
+    pub(crate) fn collect(&mut self, batch: &RecordBatch, indices: &[usize]) -> crate::Result<()> {
+        for row_idx in 0..batch.num_rows() {
+            for (pos, (&col_idx, data_type)) in indices.iter().zip(self.types.iter()).enumerate() {
+                let datum = extract_datum_from_arrow(batch, row_idx, col_idx, data_type)?;
+                match datum {
+                    Some(d) => {
+                        if self.min_datums[pos].as_ref().is_none_or(|m| d < *m) {
+                            self.min_datums[pos] = Some(d.clone());
+                        }
+                        if self.max_datums[pos].as_ref().is_none_or(|m| d > *m) {
+                            self.max_datums[pos] = Some(d);
+                        }
                     }
-                    if max_datums[pos].as_ref().is_none_or(|m| d > *m) {
-                        max_datums[pos] = Some(d);
+                    None => {
+                        *self.null_counts[pos].as_mut().unwrap() += 1;
                     }
-                }
-                None => {
-                    *null_counts[pos].as_mut().unwrap() += 1;
                 }
             }
         }
+        Ok(())
     }
 
-    let mut min_builder = BinaryRowBuilder::new(num_cols as i32);
-    let mut max_builder = BinaryRowBuilder::new(num_cols as i32);
-    for (pos, data_type) in col_types.iter().enumerate() {
-        match &min_datums[pos] {
-            Some(d) => min_builder.write_datum(pos, d, data_type),
-            None => min_builder.set_null_at(pos),
+    pub(crate) fn finish(&self) -> BinaryTableStats {
+        let mut min_builder = BinaryRowBuilder::new(self.types.len() as i32);
+        let mut max_builder = BinaryRowBuilder::new(self.types.len() as i32);
+        for (pos, data_type) in self.types.iter().enumerate() {
+            match &self.min_datums[pos] {
+                Some(d) => min_builder.write_datum(pos, d, data_type),
+                None => min_builder.set_null_at(pos),
+            }
+            match &self.max_datums[pos] {
+                Some(d) => max_builder.write_datum(pos, d, data_type),
+                None => max_builder.set_null_at(pos),
+            }
         }
-        match &max_datums[pos] {
-            Some(d) => max_builder.write_datum(pos, d, data_type),
-            None => max_builder.set_null_at(pos),
-        }
-    }
 
-    Ok(BinaryTableStats::new(
-        min_builder.build_serialized(),
-        max_builder.build_serialized(),
-        null_counts,
-    ))
+        BinaryTableStats::new(
+            min_builder.build_serialized(),
+            max_builder.build_serialized(),
+            self.null_counts.clone(),
+        )
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::spec::BinaryRow;
+
+    #[test]
+    fn streaming_stats_keep_projected_bounds_and_nulls_across_batches() {
+        use arrow_array::Int32Array;
+        use std::sync::Arc;
+        let types = vec![DataType::Int(crate::spec::IntType::new()); 2];
+        let mut collector = ColumnStatsCollector::new(&types);
+        for (x, y) in [
+            (vec![Some(5), None], vec![Some(100), Some(20)]),
+            (vec![Some(-3), Some(9)], vec![None, Some(200)]),
+        ] {
+            let batch = RecordBatch::try_from_iter([
+                ("x", Arc::new(Int32Array::from(x)) as arrow_array::ArrayRef),
+                ("y", Arc::new(Int32Array::from(y)) as arrow_array::ArrayRef),
+            ])
+            .unwrap();
+            collector.collect(&batch, &[1, 0]).unwrap();
+        }
+        let stats = collector.finish();
+        let min = BinaryRow::from_serialized_bytes(stats.min_values()).unwrap();
+        let max = BinaryRow::from_serialized_bytes(stats.max_values()).unwrap();
+        assert_eq!((min.get_int(0).unwrap(), min.get_int(1).unwrap()), (20, -3));
+        assert_eq!((max.get_int(0).unwrap(), max.get_int(1).unwrap()), (200, 9));
+        assert_eq!(stats.null_counts(), &[Some(1), Some(1)]);
+    }
 
     /// Empty stats must produce min/max bytes that the Java side's
     /// `SerializationUtils.deserializeBinaryRow` accepts: at minimum a 4-byte BE
