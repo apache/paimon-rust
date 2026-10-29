@@ -60,6 +60,7 @@ impl AppendCompactPlanner {
                     bucket,
                     total_buckets,
                     files,
+                    primary_key: None,
                 });
             }
         }

@@ -208,6 +208,8 @@ pub struct CompactTask {
     bucket: i32,
     total_buckets: i32,
     files: Vec<DataFileMeta>,
+    #[serde(default)]
+    primary_key: Option<primary_key::planner::PrimaryKeyTask>,
 }
 
 impl CompactTask {
@@ -468,6 +470,9 @@ impl CompactTask {
     }
 
     fn output_level(&self) -> i32 {
+        if let Some(selection) = &self.primary_key {
+            return selection.output_level;
+        }
         if self.is_primary_key() {
             self.files
                 .iter()
@@ -480,7 +485,7 @@ impl CompactTask {
         }
     }
 
-    fn validate_inputs(&self, active: &[ManifestEntry]) -> Result<()> {
+    pub(super) fn validate_inputs(&self, active: &[ManifestEntry]) -> Result<()> {
         if self.is_data_evolution() {
             data_evolution::validate_inputs(&self.partition, self.bucket, &self.files, active)?;
         }
@@ -493,7 +498,21 @@ impl CompactTask {
             })
             .map(|entry| (entry.file().file_name.as_str(), entry))
             .collect::<HashMap<_, _>>();
-        if self.is_primary_key() && bucket_files.len() != self.files.len() {
+        if self.is_primary_key() && primary_key::planner::enabled(&self.context.schema)? {
+            let selected = primary_key::planner::select(
+                bucket_files
+                    .values()
+                    .map(|entry| entry.file().clone())
+                    .collect(),
+                self.context.schema.options(),
+            )?
+            .ok_or_else(|| invalid("No incremental PK compaction is eligible"))?;
+            if selected.0 != self.files || Some(&selected.1) != self.primary_key.as_ref() {
+                return Err(invalid(
+                    "PK compaction inputs do not match incremental run selection",
+                ));
+            }
+        } else if self.is_primary_key() && bucket_files.len() != self.files.len() {
             return Err(invalid(
                 "PK compaction must include the complete captured bucket",
             ));
@@ -522,6 +541,18 @@ impl CompactTask {
             ));
         }
         ensure_snapshot_supported(table, &self.context.snapshot)?;
+        let incremental =
+            self.is_primary_key() && primary_key::planner::enabled(&self.context.schema)?;
+        // Legacy results may be recovered as already committed before their
+        // captured inputs are validated. Uncommitted tasks still need the
+        // exact incremental selection in validate_inputs.
+        if self
+            .primary_key
+            .as_ref()
+            .is_some_and(|task| !incremental || task.output_level <= 0)
+        {
+            return Err(invalid("Invalid incremental PK compaction selection"));
+        }
         let minimum_files = if self.is_primary_key() || self.is_data_evolution() {
             1
         } else {
@@ -560,6 +591,7 @@ pub(super) struct PreparedCompact {
     pub read_snapshot: Option<Box<Snapshot>>,
     pub commit_suffix: String,
     pub metrics: CompactMetrics,
+    pub pk_tasks: Vec<CompactTask>,
 }
 
 pub(super) fn prepare_results(table: &Table, results: &[CompactResult]) -> Result<PreparedCompact> {
@@ -573,9 +605,13 @@ pub(super) fn prepare_results(table: &Table, results: &[CompactResult]) -> Resul
     let mut entries = Vec::new();
     let mut changelog_entries = Vec::new();
     let mut metrics = CompactMetrics::default();
+    let mut pk_tasks = Vec::new();
     for result in results {
         let task = &result.task;
         task.validate_target(table)?;
+        if task.is_primary_key() {
+            pk_tasks.push(task.clone());
+        }
         if task.context.plan_id != first.task.context.plan_id
             || !task
                 .context
@@ -719,6 +755,7 @@ pub(super) fn prepare_results(table: &Table, results: &[CompactResult]) -> Resul
             .then(|| Box::new(first.task.context.snapshot.clone())),
         commit_suffix: hex::encode(digest.finalize()),
         metrics,
+        pk_tasks,
     })
 }
 

@@ -115,12 +115,34 @@ snapshot expiration and storage reclamation are separate maintenance work.
 The same API compacts primary-key tables with `deduplicate`,
 `first-row`, `partial-update` or `aggregation` merge engines. Changelog producers
 `none`, `input` and `lookup` are supported; `first-row` supports `none` or `lookup`.
-The planner includes every active file of each selected partition/bucket,
-including large files. Append size and count selection options do not split PK
-buckets. A single level-0 file is also eligible. A bucket whose files already form one sorted
-run at a single positive level needs no rewrite, including when the previous
-compaction rolled multiple output files. Output is key ordered at the highest input level, or level 1
-when all inputs are level 0.
+For `deduplicate` with `none` or `input`, the planner chooses incremental sorted
+runs using Java's universal-compaction size and count policy. Each L0 file is a
+run; all files at one positive level form a single run. Explicit compaction
+includes every L0 run and absorbs adjacent runs according to their sizes. A
+large higher-level run can remain in place while smaller runs are rewritten.
+Without L0, positive-level maintenance requires the configured run-count and
+size triggers. A single positive run needs no rewrite, even when it spans
+several files.
+
+The policy uses `num-sorted-run.compaction-trigger` (default `5`), `num-levels`
+(default trigger plus one), `compaction.size-ratio` (default `1` percent), and
+`compaction.max-size-amplification-percent` (default `200`). When selected runs
+reach the oldest run, output goes to the highest configured or existing level;
+otherwise it goes immediately below the next unselected run. Explicit full
+compaction is not exposed. Outputs retain winning retracts, so older values
+in untouched files do not reappear after a delete or out-of-order update.
+
+`lookup`, `first-row`, `partial-update` and `aggregation` retain their current
+selection behavior: every active file in a selected bucket participates, and
+output uses the highest input level or level 1 for all-L0 inputs. Their state
+and changelog generation must see history before incremental selection can be
+enabled. Append size and count options do not control PK selection.
+
+Tasks capture their selected runs and output level. Executors and committers
+recompute the selection against the captured snapshot and reject altered or
+incomplete inputs. Older serialized deduplicate tasks without this selection
+must be replanned before execution or publication; already committed results
+remain recoverable through the existing idempotent retry path.
 
 Compaction uses each engine's existing merge function and persists its merge
 state, including original sequence metadata and synthesized DELETE records:

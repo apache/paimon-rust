@@ -16,6 +16,7 @@
 // under the License.
 
 pub(super) mod lookup;
+pub(in crate::table) mod planner;
 
 use std::sync::Arc;
 
@@ -43,7 +44,7 @@ use crate::table::table_read::{
 use crate::table::{DataSplit, Plan, Table};
 use crate::Result;
 
-/// Select files using the existing primary-key bucket compaction policy.
+/// Use incremental sorted runs when merging subsets does not need history lookup.
 pub(super) struct PrimaryKeyCompactPlanner;
 
 impl PrimaryKeyCompactPlanner {
@@ -56,6 +57,22 @@ impl PrimaryKeyCompactPlanner {
         for ((partition, bucket, total_buckets), files) in split_files_by_bucket(source) {
             for file in &files {
                 validate_file(file, true)?;
+            }
+            if planner::enabled(&context.schema)? {
+                if let Some((files, primary_key)) =
+                    planner::select(files, context.schema.options())?
+                {
+                    tasks.push(CompactTask {
+                        context: context.clone(),
+                        task_id: tasks.len(),
+                        partition,
+                        bucket,
+                        total_buckets,
+                        files,
+                        primary_key: Some(primary_key),
+                    });
+                }
+                continue;
             }
             // One positive level is already a non-overlapping sorted run,
             // including when the previous compaction rolled several files.
@@ -71,6 +88,7 @@ impl PrimaryKeyCompactPlanner {
                     bucket,
                     total_buckets,
                     files,
+                    primary_key: None,
                 });
             }
         }

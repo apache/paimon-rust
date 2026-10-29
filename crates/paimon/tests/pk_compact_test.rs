@@ -23,6 +23,9 @@ mod engine_tests;
 #[path = "pk_compact/lookup_changelog.rs"]
 mod lookup_changelog_tests;
 
+#[path = "pk_compact/incremental_planning.rs"]
+mod incremental_planning_tests;
+
 #[path = "pk_compact/dynamic_bucket.rs"]
 mod dynamic_tests;
 
@@ -151,7 +154,7 @@ async fn pk_compaction_rejects_concurrent_overlapping_positive_level_files() {
             .unwrap();
         let mut messages = writer.prepare_commit().await.unwrap();
         for file in &mut messages[0].new_files {
-            file.level = 1;
+            file.level = results[0].files()[0].level;
         }
         write.new_commit().commit(messages).await.unwrap();
         let result = builder.new_commit().unwrap().commit_compact(results).await;
@@ -283,7 +286,7 @@ async fn pk_compaction_merges_versions_and_preserves_sequences_deletes_and_histo
         let results = execute(&table, &plan).await;
         assert_eq!(results[0].files().len(), 1, "{format}");
         let file = &results[0].files()[0];
-        assert_eq!(file.level, 1);
+        assert_eq!(file.level, 5);
         assert_eq!(file.delete_row_count, Some(1));
         assert_eq!((file.min_sequence_number, file.max_sequence_number), (2, 5));
         assert_eq!(file.file_source, Some(1));
@@ -506,7 +509,7 @@ async fn pk_compaction_rolls_ordered_files_and_rebuilds_indexes_with_level_stats
     let plan = builder.new_planner().unwrap().plan().await.unwrap();
     let results = execute(&table, &plan).await;
     assert_eq!(results[0].files().len(), 3);
-    assert!(results[0].files().iter().all(|file| file.level == 1
+    assert!(results[0].files().iter().all(|file| file.level == 5
         && file.row_count <= 2
         && (file.embedded_index.is_some() || !file.extra_files.is_empty())
         && !file.value_stats.null_counts().is_empty()));
@@ -582,7 +585,7 @@ async fn pk_compaction_refuses_partial_buckets_and_unsupported_layouts() {
         .await
         .unwrap_err()
         .to_string()
-        .contains("complete captured bucket"));
+        .contains("incremental run selection"));
     let results = execute(&table, &plan).await;
     let mut encoded = serde_json::to_value(&results).unwrap();
     encoded[0]["task"]["files"].as_array_mut().unwrap().pop();

@@ -443,6 +443,7 @@ impl TableCommit {
                 CommitEntriesPlan::Compact {
                     entries: prepared.entries,
                     changelog_entries: prepared.changelog_entries,
+                    pk_tasks: prepared.pk_tasks,
                     schema_id: prepared.schema_id,
                     read_snapshot: prepared.read_snapshot,
                     planned_snapshot_id: prepared.snapshot_id,
@@ -1911,6 +1912,7 @@ impl TableCommit {
                 schema_id,
                 read_snapshot,
                 planned_snapshot_id,
+                pk_tasks,
             } => {
                 if latest_snapshot
                     .as_ref()
@@ -1953,6 +1955,9 @@ impl TableCommit {
                         None,
                     )
                     .await?;
+                    for task in pk_tasks {
+                        task.validate_inputs(&captured_files)?;
+                    }
                     let deletes = entries
                         .iter()
                         .filter(|e| *e.kind() == FileKind::Delete)
@@ -1983,8 +1988,7 @@ impl TableCommit {
                         .iter()
                         .filter(|e| {
                             buckets.contains(&(e.partition(), e.bucket()))
-                                && (!self.data_evolution_enabled
-                                    || deleted_ids.contains(&commit_file_identifier(e)))
+                                && deleted_ids.contains(&commit_file_identifier(e))
                         })
                         .map(|entry| (commit_file_identifier(entry), entry))
                         .collect::<HashMap<_, _>>();
@@ -2002,7 +2006,7 @@ impl TableCommit {
                             message: if self.data_evolution_enabled {
                                 "Data-evolution compaction inputs must match the captured row-ID groups"
                             } else {
-                                "PK compaction must include the complete captured bucket"
+                                "PK compaction must match its captured incremental inputs"
                             }.into(),
                             source: None,
                         });
@@ -3929,6 +3933,7 @@ enum CommitEntriesPlan {
         schema_id: i64,
         read_snapshot: Option<Box<Snapshot>>,
         planned_snapshot_id: i64,
+        pk_tasks: Vec<super::CompactTask>,
     },
     /// Caller-provided entries. May contain `FileKind::Delete` entries from CoW
     /// rewrites, in which case `resolve_commit` auto-promotes to `CommitKind::OVERWRITE`.
