@@ -268,18 +268,26 @@ impl DataEvolutionReader {
     }
 
     /// Whether a row-id group of change events merges into rows: its files
-    /// are column slices of one row range, and each VECTOR field is written
-    /// by files of one layout. Other groups are read file by file.
+    /// are column slices of one row range, and the source plan reads each
+    /// field from a file that holds it, in the one layout the group stores it
+    /// in. Other groups are read file by file.
     async fn merges_change_events(&self, files: &[DataFileMeta]) -> crate::Result<bool> {
         if !is_data_evolution_column_slice_group(files) {
             return Ok(false);
         }
-        if !files
+        // The source plan reads a BLOB field from dedicated files only, or,
+        // for descriptor and view fields, from normal files only, whichever
+        // layout the field had when the files were written.
+        let dedicated_blobs: HashSet<i32> = self
+            .table_fields
             .iter()
-            .any(|file| is_vector_store_file_name(&file.file_name))
-        {
-            return Ok(true);
-        }
+            .filter(|field| {
+                field.data_type().is_blob_file_field()
+                    && !self.blob_descriptor_fields.contains(field.name())
+                    && !self.blob_view_fields.contains(field.name())
+            })
+            .map(DataField::id)
+            .collect();
         let (infos, _) = load_file_infos(
             &self.schema_manager,
             self.table_schema_id,
@@ -287,7 +295,130 @@ impl DataEvolutionReader {
             files,
         )
         .await?;
-        Ok(!vector_field_has_two_layouts(files, &infos))
+        let mut layouts = Vec::with_capacity(files.len());
+        // Normal files with the fields their write columns name.
+        let mut normal_files = Vec::new();
+        for (file, info) in files.iter().zip(infos) {
+            if is_vector_store_file_name(&file.file_name) {
+                let columns = info.normalized_write_cols.unwrap_or_default();
+                layouts.push((
+                    FieldLayout::Vector(vector_bunch_key(file, &columns)),
+                    info.field_ids,
+                ));
+            } else if is_blob_or_video_file_name(&file.file_name) {
+                layouts.push((FieldLayout::Blob, info.field_ids));
+            } else {
+                normal_files.push((file, info.field_ids));
+            }
+        }
+        // Only the layouts of the table's BLOB and VECTOR fields can decide:
+        // the merge reads any other field from normal files alone, a field
+        // retyped from VECTOR to text too, and does not read a field dropped
+        // since. So normal layouts list only those fields, while dedicated
+        // layouts keep every field, as the source plan rejects a field of two
+        // vector bunches, read or not. A normal file without write columns
+        // leaves out the fields its own schema stores in dedicated files; that
+        // schema is read only where the answer can decide: for a BLOB or
+        // VECTOR field that a dedicated file of the group also holds or that
+        // the table now stores in BLOB files.
+        let maybe_dedicated: HashSet<i32> = self
+            .table_fields
+            .iter()
+            .filter(|field| {
+                field.data_type().is_blob_file_field()
+                    || matches!(field.data_type(), DataType::Vector(_))
+            })
+            .map(DataField::id)
+            .collect();
+        let in_dedicated_files: HashSet<i32> = layouts
+            .iter()
+            .flat_map(|(_, field_ids)| field_ids.iter().copied())
+            .collect();
+        for (file, written) in &normal_files {
+            let decides = file.write_cols.is_none()
+                && written.iter().any(|id| {
+                    maybe_dedicated.contains(id)
+                        && (in_dedicated_files.contains(id) || dedicated_blobs.contains(id))
+                });
+            let held = if decides {
+                self.fields_without_write_cols(file).await?
+            } else {
+                written.clone()
+            };
+            let held = held.into_iter().filter(|id| maybe_dedicated.contains(id));
+            layouts.push((FieldLayout::Normal, held.collect()));
+        }
+        let blob_fields: HashSet<i32> = self
+            .table_fields
+            .iter()
+            .filter(|field| field.data_type().is_blob_file_field())
+            .map(DataField::id)
+            .collect();
+        let read_where_stored = layouts.iter().all(|(layout, field_ids)| {
+            field_ids.iter().all(|id| {
+                !blob_fields.contains(id)
+                    || (*layout == FieldLayout::Blob) == dedicated_blobs.contains(id)
+            })
+        });
+        if !read_where_stored || field_has_two_layouts(&layouts) {
+            return Ok(false);
+        }
+        // Like the source plan, the newest normal file that writes a field,
+        // as its write columns say, provides it. One without write columns
+        // that leaves the field out would hide an older file that holds it;
+        // files of one schema hold such a field alike, so only files of more
+        // than one schema need their schemas read. Only the table's BLOB and
+        // VECTOR fields can be left out: a field typed otherwise now was at
+        // most a VECTOR before an ALTER to text, whose old values no read can
+        // decode.
+        normal_files.sort_by_key(|(file, _)| std::cmp::Reverse(file.max_sequence_number));
+        let vector_provided: HashSet<i32> = layouts
+            .iter()
+            .filter(|(layout, _)| matches!(layout, FieldLayout::Vector(_)))
+            .flat_map(|(_, field_ids)| field_ids.iter().copied())
+            .collect();
+        let fields = self.table_fields.iter().map(DataField::id);
+        for id in fields.filter(|id| maybe_dedicated.contains(id)) {
+            if dedicated_blobs.contains(&id) || vector_provided.contains(&id) {
+                continue;
+            }
+            let mut writers = normal_files
+                .iter()
+                .filter(|(_, written)| written.contains(&id))
+                .map(|(file, _)| *file);
+            let Some(newest) = writers.next() else {
+                continue;
+            };
+            let older: Vec<_> = writers.collect();
+            if newest.write_cols.is_some()
+                || older.iter().all(|file| file.schema_id == newest.schema_id)
+                || self.fields_without_write_cols(newest).await?.contains(&id)
+            {
+                continue;
+            }
+            for file in older {
+                if file.write_cols.is_some()
+                    || self.fields_without_write_cols(file).await?.contains(&id)
+                {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    /// The fields a normal file without write columns holds: those its
+    /// schema keeps in normal files, which with the write-cols optimization
+    /// leave out the fields the schema stores in dedicated files. Like Java,
+    /// the schema the file was written with decides, not the options of this
+    /// read.
+    async fn fields_without_write_cols(&self, file: &DataFileMeta) -> crate::Result<Vec<i32>> {
+        let schema = self.schema_manager.schema(file.schema_id).await?;
+        Ok(schema
+            .data_file_fields(None)
+            .iter()
+            .map(DataField::id)
+            .collect())
     }
 
     /// Managed BLOB payloads are fetched by the format reader, before the
@@ -482,7 +613,12 @@ impl DataEvolutionReader {
             // LIMIT reads resolve views only after the surviving batch has
             // been selected. Eagerly scanning every split here can fail on a
             // reference beyond the quota and load unrelated upstream blobs.
-            let mut blob_view_lookup = if resolve_blob_views && (self.limit.is_some() || splits.iter().any(|split|
+            // Change events resolve them per batch too when they hold BLOB or
+            // video files: one they read on its own holds payloads, not views.
+            let lazy_views = self.limit.is_some()
+                || splits.iter().any(|split| split.is_streaming()
+                    && split.data_files().iter().any(|file| is_blob_or_video_file_name(&file.file_name)));
+            let mut blob_view_lookup = if resolve_blob_views && (lazy_views || splits.iter().any(|split|
                 split.data_files().iter().any(|file| file.extra_files.iter().any(|name| name.ends_with(".row"))))) {
                 Some(BlobViewLookup::default())
             } else {
@@ -492,6 +628,8 @@ impl DataEvolutionReader {
             let descriptor_fields = self.descriptor_fields_to_resolve(blob_view_lookup.is_some());
             let filter_before_blob_resolution =
                 self.can_filter_before_blob_resolution(blob_view_lookup.is_some(), &descriptor_fields);
+            let mut no_view_lookup = None;
+            let no_descriptor_fields = HashSet::new();
 
             // A raw-convertible split consists only of independent files: every
             // row-id segment has a single column provider, so predicates can be
@@ -577,6 +715,11 @@ impl DataEvolutionReader {
                             .await?;
 
                             let has_row_id = file_meta.first_row_id.is_some();
+                            // A BLOB or video file holds payloads, also for a
+                            // field the table now stores as descriptors or views
+                            // inline; change events read them as written.
+                            let read_as_written = split.is_streaming()
+                                && is_blob_or_video_file_name(&file_meta.file_name);
                             let requested_row_ranges = if has_row_id { row_ranges.clone() } else { None };
                             let mut effective_row_ranges = requested_row_ranges.clone();
                             let mut has_bitmap_selection = false;
@@ -702,10 +845,15 @@ impl DataEvolutionReader {
                                 } else {
                                     batch
                                 };
+                                let (lookup, fields) = if read_as_written {
+                                    (&mut no_view_lookup, &no_descriptor_fields)
+                                } else {
+                                    (&mut blob_view_lookup, &descriptor_fields)
+                                };
                                 yield self.finish_wide_batch(
                                     batch,
-                                    &mut blob_view_lookup,
-                                    &descriptor_fields,
+                                    lookup,
+                                    fields,
                                     filter_before_blob_resolution,
                                     &mut remaining,
                                 ).await?;
@@ -2533,22 +2681,27 @@ fn vector_bunch_key(
     )
 }
 
-/// Whether some VECTOR field is written by files of two vector bunch keys,
-/// such as a rewrite after `ALTER TABLE`; the source plan cannot combine
-/// their bunches.
-fn vector_field_has_two_layouts(files: &[DataFileMeta], infos: &[ResolvedFileInfo]) -> bool {
+/// Where a data-evolution file stores the fields it writes.
+#[derive(PartialEq)]
+enum FieldLayout {
+    /// Inline in a normal data file.
+    Normal,
+    /// In dedicated BLOB or video files.
+    Blob,
+    /// In dedicated vector files of one vector bunch key.
+    Vector((i64, String, Vec<String>)),
+}
+
+/// Whether some field is stored in two layouts, given each file's layout and
+/// field ids: inline and in dedicated BLOB or VECTOR files, as after the
+/// table changed the field's storage, or in VECTOR files of two vector bunch
+/// keys, as after `ALTER TABLE`. The source plan reads such a field from one
+/// layout only, so it would drop the other's values.
+fn field_has_two_layouts(files: &[(FieldLayout, Vec<i32>)]) -> bool {
     let mut layouts = HashMap::new();
-    for (file, info) in files.iter().zip(infos) {
-        let Some(columns) = info
-            .normalized_write_cols
-            .as_deref()
-            .filter(|_| is_vector_store_file_name(&file.file_name))
-        else {
-            continue;
-        };
-        let layout = vector_bunch_key(file, columns);
-        for field_id in &info.field_ids {
-            if layouts.entry(*field_id).or_insert_with(|| layout.clone()) != &layout {
+    for (layout, field_ids) in files {
+        for field_id in field_ids {
+            if *layouts.entry(*field_id).or_insert(layout) != layout {
                 return true;
             }
         }
@@ -6617,6 +6770,165 @@ mod tests {
             snapshot.is_err(),
             "a snapshot read keeps the coverage checks"
         );
+    }
+
+    /// Change events read a row-id group file by file when a BLOB or VECTOR
+    /// field of it is stored both inline in a normal file and in dedicated
+    /// files, as after the table changed the field's storage. The source plan
+    /// reads such a field from one layout only, so merging the group would
+    /// drop the newer inline values.
+    #[tokio::test]
+    async fn change_events_read_a_field_of_two_layouts_file_by_file() {
+        use arrow_array::LargeBinaryArray;
+        use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+        use parquet::arrow::ArrowWriter;
+
+        let tempdir = tempdir().unwrap();
+        let bucket_dir = tempdir.path().join("bucket-0");
+        fs::create_dir_all(&bucket_dir).unwrap();
+        let size = |path: &Path| path.metadata().unwrap().len() as i64;
+        let normal_path = bucket_dir.join("data.parquet");
+        write_int_parquet_file(&normal_path, vec![("id", vec![1, 2])], None);
+        let vectors = [Some(vec![1.0, 0.0]), Some(vec![0.0, 1.0])];
+        write_fixed_size_list_parquet(
+            &bucket_dir.join("emb.vector.parquet"),
+            "embedding",
+            2,
+            &vectors,
+        );
+        let updated = [Some(vec![9.0, 9.0]), Some(vec![0.0, 1.0])];
+        write_fixed_size_list_parquet(
+            &bucket_dir.join("emb-inline.parquet"),
+            "embedding",
+            2,
+            &updated,
+        );
+        write_blob_file(
+            &bucket_dir.join("payload.blob"),
+            &[Some(&b"aaa"[..]), Some(&b"bb"[..])],
+        );
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "payload",
+            ArrowDataType::LargeBinary,
+            true,
+        )]));
+        let payloads = LargeBinaryArray::from(vec![Some(&b"zzzz"[..]), None]);
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(payloads)]).unwrap();
+        let file = fs::File::create(bucket_dir.join("payload-inline.parquet")).unwrap();
+        let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        let meta = |name: &str, sequence, columns: Vec<&str>| {
+            data_file_meta_with_path(
+                name,
+                0,
+                2,
+                sequence,
+                size(&bucket_dir.join(name)),
+                Some(columns),
+            )
+        };
+
+        let table_with = |options: &[(&str, &str)]| {
+            let mut schema = Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("embedding", vector_float_type(2))
+                .column("payload", DataType::Blob(BlobType::new()))
+                .option("data-evolution.enabled", "true")
+                .option("row-tracking.enabled", "true");
+            for (key, value) in options {
+                schema = schema.option(*key, *value);
+            }
+            Table::new(
+                FileIOBuilder::new("file").build().unwrap(),
+                Identifier::new("default", "change_event_layouts_t"),
+                local_file_path(tempdir.path()),
+                TableSchema::new(0, &schema.build().unwrap()),
+                None,
+            )
+        };
+        let read_events = |table: Table, files: Vec<DataFileMeta>| {
+            let split = DataSplitBuilder::new()
+                .with_snapshot(2)
+                .with_partition(BinaryRow::new(0))
+                .with_bucket(0)
+                .with_bucket_path(local_file_path(&bucket_dir))
+                .with_total_buckets(1)
+                .with_data_files(files)
+                .with_streaming(true)
+                .build()
+                .unwrap();
+            async move {
+                let read = TableRead::new(&table, table.schema().fields().to_vec(), Vec::new());
+                read.to_arrow(&[split])
+                    .unwrap()
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .unwrap()
+            }
+        };
+
+        // The embeddings of the insert in a vector file, then of a rewrite of
+        // row 0 inline, after the table stopped using vector files.
+        let batches = read_events(
+            table_with(&[]),
+            vec![
+                meta("data.parquet", 1, vec!["id"]),
+                meta("emb.vector.parquet", 1, vec!["embedding"]),
+                meta("emb-inline.parquet", 2, vec!["embedding"]),
+            ],
+        )
+        .await;
+        let mut rows = vec![None, None];
+        rows.extend(vectors.iter().cloned());
+        rows.extend(updated.iter().cloned());
+        assert_fixed_size_list(&batches, "embedding", 2, &rows);
+
+        // The pictures of the insert in a BLOB file, then of a rewrite of
+        // row 0 inline, after the table started storing them inline.
+        let batches = read_events(
+            table_with(&[]),
+            vec![
+                meta("data.parquet", 1, vec!["id"]),
+                meta("payload.blob", 1, vec!["payload"]),
+                meta("payload-inline.parquet", 2, vec!["payload"]),
+            ],
+        )
+        .await;
+        let pictures = [
+            None,
+            None,
+            Some(b"aaa".to_vec()),
+            Some(b"bb".to_vec()),
+            Some(b"zzzz".to_vec()),
+            None,
+        ];
+        assert_eq!(collect_binary_values(&batches, "payload"), pictures);
+
+        // One layout per field, but not the one the table now reads: inline
+        // pictures of a table that now stores them in BLOB files, and BLOB
+        // files of a table that now stores them inline as descriptors, read
+        // as written rather than as descriptors.
+        let batches = read_events(
+            table_with(&[]),
+            vec![
+                meta("data.parquet", 1, vec!["id"]),
+                meta("payload-inline.parquet", 1, vec!["payload"]),
+            ],
+        )
+        .await;
+        let pictures = [None, None, Some(b"zzzz".to_vec()), None];
+        assert_eq!(collect_binary_values(&batches, "payload"), pictures);
+        let batches = read_events(
+            table_with(&[("blob-descriptor-field", "payload")]),
+            vec![
+                meta("data.parquet", 1, vec!["id"]),
+                meta("payload.blob", 1, vec!["payload"]),
+            ],
+        )
+        .await;
+        let pictures = [None, None, Some(b"aaa".to_vec()), Some(b"bb".to_vec())];
+        assert_eq!(collect_binary_values(&batches, "payload"), pictures);
     }
 
     /// (1) Provider priority: the normal data file ALSO advertises the embedding write_col,

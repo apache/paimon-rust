@@ -2387,17 +2387,25 @@ The optional fourth argument selects the mode:
   A data-evolution table's range is read as one batch, as Java's `incremental-between`
   scan reads it: the files it wrote for the same rows merge into rows when they are
   column slices of one row range, that is, its normal data files cover the same rows,
-  its BLOB and VECTOR files lie within them, and each VECTOR column has one layout.
-  For rows written before the range it returns every row of the files the updates
-  rewrote, unchanged rows included, with only the updated columns set and the others
-  NULL, NOT NULL columns included. (Java's reader instead fails when two such updates
-  of the same rows leave a NOT NULL column unwritten.) Other files are returned as
-  written, one row per row of each file. These include BLOB or VECTOR files alone, such
-  as recomputed embeddings, so two embedding updates of the same rows return both
-  versions where Java returns the latest; every file of rows whose VECTOR column the
-  range wrote in two layouts (before and after an `ALTER TABLE`, or with and without
-  another VECTOR column); and every file of rows whose files are no longer column
-  slices because a compaction in the range merged some of them.
+  its BLOB and VECTOR files lie within them, and each BLOB or VECTOR column has one
+  layout, for BLOB the one the table now uses, and the merge would read each column
+  where it is stored. For rows written before the range it returns every row of the
+  files the updates rewrote, unchanged rows included, with only the updated columns set
+  and the others NULL, NOT NULL columns included. (Java's reader instead fails when two
+  such updates of the same rows leave a NOT NULL column unwritten.) Other files are
+  returned as written, one row per row of each file. These include BLOB or VECTOR files
+  alone, such as recomputed embeddings, so two embedding updates of the same rows return
+  both versions where Java returns the latest; every file of rows whose BLOB or VECTOR
+  column the range wrote in two layouts (inline and in dedicated files, after a change
+  of the column's storage, or in VECTOR files before and after an `ALTER TABLE`, or with
+  and without another VECTOR column), whose BLOB column it wrote in a layout the table
+  no longer uses, or whose BLOB or VECTOR column an older file holds inline and the
+  newest file writing it leaves out, written with
+  `data-evolution.write-cols-optimization.enabled` after the column moved to dedicated
+  files; and every file of rows whose files are no longer column slices because a
+  compaction in the range merged some of them. A column the table has since dropped, or
+  changed from VECTOR to a string type, keeps rows from merging only when the range
+  wrote it in VECTOR files of two layouts.
 - `changelog` returns the changelog rows of each commit.
 - `diff` compares the table at the two snapshots and returns the added and changed
   rows (`$audit_log` adds `-U` and `-D` rows). It requires a primary-key table with
