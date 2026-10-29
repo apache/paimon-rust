@@ -16,8 +16,11 @@
 // under the License.
 
 use crate::spec::{CoreOptions, DataFileMeta};
+use crate::table::Plan;
 use crate::Result;
 use std::collections::VecDeque;
+
+use super::{split_files_by_bucket, validate_file, CompactContext, CompactTask};
 
 /// Unaware batch packing and bucketed best-effort windows from Java.
 pub(super) struct AppendCompactPlanner {
@@ -37,6 +40,30 @@ impl AppendCompactPlanner {
             open_file_cost: options.source_split_open_file_cost(),
             min_file_num: options.compaction_min_file_num()?,
         })
+    }
+
+    pub(super) fn plan_tasks(
+        &self,
+        source: &Plan,
+        context: &CompactContext,
+    ) -> Result<Vec<CompactTask>> {
+        let mut tasks = Vec::new();
+        for ((partition, bucket, total_buckets), files) in split_files_by_bucket(source) {
+            for file in &files {
+                validate_file(file, false)?;
+            }
+            for files in self.plan(files) {
+                tasks.push(CompactTask {
+                    context: context.clone(),
+                    task_id: tasks.len(),
+                    partition: partition.clone(),
+                    bucket,
+                    total_buckets,
+                    files,
+                });
+            }
+        }
+        Ok(tasks)
     }
 
     pub(super) fn plan(&self, mut files: Vec<DataFileMeta>) -> Vec<Vec<DataFileMeta>> {

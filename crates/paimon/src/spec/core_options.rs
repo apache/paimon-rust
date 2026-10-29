@@ -1639,17 +1639,21 @@ impl<'a> CoreOptions<'a> {
             .unwrap_or(DEFAULT_TARGET_FILE_SIZE)
     }
 
-    /// Minimum append input files for an underfilled compaction task. Default is 5.
+    /// Minimum input files for a compaction task. Default is 5. Data evolution
+    /// permits one file for a forced rewrite; ordinary append requires two.
     pub fn compaction_min_file_num(&self) -> crate::Result<usize> {
+        let minimum = if self.data_evolution_enabled() { 1 } else { 2 };
         self.options
             .get(COMPACTION_MIN_FILE_NUM_OPTION)
             .map_or(Ok(5), |raw| {
                 raw.parse::<i32>()
                     .ok()
-                    .filter(|count| *count >= 2)
+                    .filter(|count| *count >= minimum)
                     .map(|count| count as usize)
                     .ok_or_else(|| crate::Error::ConfigInvalid {
-                        message: format!("compaction.min.file-num must be at least 2, got '{raw}'"),
+                        message: format!(
+                            "compaction.min.file-num must be at least {minimum}, got '{raw}'"
+                        ),
                     })
             })
     }

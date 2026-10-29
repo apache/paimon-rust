@@ -747,7 +747,7 @@ impl DataEvolutionDeleteWriter {
         snapshot: &Snapshot,
     ) -> Result<Option<CommitMessage>> {
         let (mut bitmaps, deleted_index_files) = self
-            .read_existing_bucket_deletion_vectors(&partition, bucket, snapshot)
+            .read_existing_bucket_deletion_vectors(&partition, bucket, snapshot, None)
             .await?;
         let mut changed = false;
 
@@ -820,11 +820,12 @@ impl DataEvolutionDeleteWriter {
         })
     }
 
-    async fn read_existing_bucket_deletion_vectors(
+    pub(in crate::table) async fn read_existing_bucket_deletion_vectors(
         &self,
         partition: &[u8],
         bucket: i32,
         snapshot: &Snapshot,
+        selected_anchors: Option<&HashSet<String>>,
     ) -> Result<(IndexMap<String, RoaringBitmap>, Vec<IndexFileMeta>)> {
         let Some(index_manifest_name) = snapshot.index_manifest() else {
             return Ok((IndexMap::new(), Vec::new()));
@@ -845,6 +846,13 @@ impl DataEvolutionDeleteWriter {
                 || entry.bucket != bucket
                 || entry.partition != partition
                 || entry.index_file.index_type != DELETION_VECTORS_INDEX_TYPE
+                || selected_anchors.is_some_and(|anchors| {
+                    entry
+                        .index_file
+                        .deletion_vectors_ranges
+                        .as_ref()
+                        .is_none_or(|ranges| !ranges.keys().any(|name| anchors.contains(name)))
+                })
             {
                 continue;
             }
@@ -873,7 +881,7 @@ impl DataEvolutionDeleteWriter {
         Ok((bitmaps, deleted_index_files))
     }
 
-    async fn write_deletion_vector_index_file(
+    pub(in crate::table) async fn write_deletion_vector_index_file(
         &self,
         partition: &[u8],
         bucket: i32,

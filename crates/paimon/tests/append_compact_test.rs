@@ -468,10 +468,6 @@ async fn compact_keeps_partitions_and_buckets_separate_and_honors_partition_filt
 async fn compact_refuses_unsupported_tables_invalid_options_and_foreign_tasks() {
     for options in [
         vec![("row-tracking.enabled", "true")],
-        vec![
-            ("data-evolution.enabled", "true"),
-            ("row-tracking.enabled", "true"),
-        ],
         vec![("deletion-vectors.enabled", "true")],
         vec![("bucket", "1")],
         vec![

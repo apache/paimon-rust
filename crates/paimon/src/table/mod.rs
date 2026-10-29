@@ -707,7 +707,7 @@ impl Table {
         WriteBuilder::new(self)
     }
 
-    /// Plan and execute append or fixed/dynamic bucket PK compaction.
+    /// Plan and execute append, data-evolution or fixed/dynamic bucket PK compaction.
     pub fn new_compact_builder(&self) -> CompactBuilder<'_> {
         CompactBuilder::new(self)
     }
