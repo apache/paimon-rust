@@ -65,30 +65,34 @@ mod pk_dv_retry {
             .await
             .unwrap()
             .unwrap();
-        crate::table::DataEvolutionDeleteWriter::for_primary_key_compaction(table)
-            .read_existing_bucket_deletion_vectors(&EMPTY_SERIALIZED_ROW, 0, &snapshot, None)
-            .await
-            .unwrap()
+        crate::table::deletion_vector_index::read_bucket(
+            table,
+            &EMPTY_SERIALIZED_ROW,
+            0,
+            &snapshot,
+            None,
+        )
+        .await
+        .unwrap()
     }
 
     async fn replace_vectors(table: &Table, masks: &[(&str, &[u32])]) {
-        let writer = crate::table::DataEvolutionDeleteWriter::for_primary_key_compaction(table);
         let mut message = CommitMessage::new(EMPTY_SERIALIZED_ROW.to_vec(), 0, vec![]);
         message.deleted_index_files = vectors(table).await.1;
         message.new_index_files.push(
-            writer
-                .write_deletion_vector_index_file(
-                    &message.partition,
-                    0,
-                    masks
-                        .iter()
-                        .map(|(name, positions)| {
-                            (name.to_string(), positions.iter().copied().collect())
-                        })
-                        .collect(),
-                )
-                .await
-                .unwrap(),
+            crate::table::deletion_vector_index::write_bucket(
+                table,
+                &message.partition,
+                0,
+                masks
+                    .iter()
+                    .map(|(name, positions)| {
+                        (name.to_string(), positions.iter().copied().collect())
+                    })
+                    .collect(),
+            )
+            .await
+            .unwrap(),
         );
         table
             .new_write_builder()

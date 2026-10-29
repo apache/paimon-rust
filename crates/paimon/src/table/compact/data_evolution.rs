@@ -32,10 +32,11 @@ use crate::spec::{
 };
 use crate::table::data_file_index_writer::FileIndexOptions;
 use crate::table::data_file_writer::DataFileWriter;
+use crate::table::deletion_vector_index;
 use crate::table::index_file_path::committed_index_file_path;
 use crate::table::source::{data_evolution_anchor_file, is_data_evolution_normal_file};
 use crate::table::stats_filter::group_by_overlapping_row_id;
-use crate::table::{DataEvolutionDeleteWriter, DataSplit, Table, TableScan};
+use crate::table::{DataSplit, Table, TableScan};
 use crate::{Error, Result};
 
 pub(super) fn ensure_supported(table: &Table) -> Result<()> {
@@ -553,7 +554,6 @@ pub(in crate::table) async fn rewrite_deletion_vectors(
             FileKind::Add => files.1.push(entry.file().clone()),
         }
     }
-    let writer = DataEvolutionDeleteWriter::new(table)?;
     let mut changed = false;
     for ((partition, bucket), (before, after)) in buckets {
         let groups = group_by_overlapping_row_id(before);
@@ -563,9 +563,9 @@ pub(in crate::table) async fn rewrite_deletion_vectors(
             .collect::<Result<HashSet<_>>>()?;
         // Like Java AppendDeleteFileMaintainer, replace only index files
         // touched by selected anchors. Untouched files remain independent.
-        let (mut bitmaps, removed) = writer
-            .read_existing_bucket_deletion_vectors(&partition, bucket, snapshot, Some(&anchors))
-            .await?;
+        let (mut bitmaps, removed) =
+            deletion_vector_index::read_bucket(table, &partition, bucket, snapshot, Some(&anchors))
+                .await?;
         let mut moved = false;
         for group in groups {
             let anchor = data_evolution_anchor_file(&group)?;
@@ -599,9 +599,7 @@ pub(in crate::table) async fn rewrite_deletion_vectors(
         if !moved {
             continue;
         }
-        let file = writer
-            .write_deletion_vector_index_file(&partition, bucket, bitmaps)
-            .await?;
+        let file = deletion_vector_index::write_bucket(table, &partition, bucket, bitmaps).await?;
         let computer = PartitionComputer::new(
             table.schema().partition_keys(),
             table.schema().fields(),

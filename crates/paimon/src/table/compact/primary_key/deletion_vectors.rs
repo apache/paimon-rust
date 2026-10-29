@@ -28,7 +28,7 @@ use crate::spec::{
     BinaryRow, DeletionVectorMeta, FileKind, IndexFileMeta, IndexManifest, IndexManifestEntry,
     ManifestEntry, PartitionComputer, Snapshot,
 };
-use crate::table::data_evolution_writer::DataEvolutionDeleteWriter;
+use crate::table::deletion_vector_index;
 use crate::table::index_file_path::{committed_index_file_path, IndexFileLocation};
 use crate::table::{DataSplit, Table};
 use crate::{DeletionFile, Result};
@@ -347,7 +347,6 @@ pub(in crate::table) async fn rewrite_indexes(
         }
         containers.entry(key).or_default().push(entry);
     }
-    let writer = DataEvolutionDeleteWriter::for_primary_key_compaction(table);
     let mut changed = false;
     for (key, (rewritten, additions)) in buckets {
         let previous = containers.remove(&key);
@@ -384,9 +383,8 @@ pub(in crate::table) async fn rewrite_indexes(
             }
         }
         if vectors.values().any(|bitmap| !bitmap.is_empty()) {
-            let file: IndexFileMeta = writer
-                .write_deletion_vector_index_file(&key.0, key.1, vectors)
-                .await?;
+            let file: IndexFileMeta =
+                deletion_vector_index::write_bucket(table, &key.0, key.1, vectors).await?;
             created_files.push(committed_index_file_path(
                 table.location(),
                 &path,
