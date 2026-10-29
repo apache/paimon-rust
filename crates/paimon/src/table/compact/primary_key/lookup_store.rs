@@ -26,18 +26,25 @@ use crate::{Error, Result};
 use arrow_array::RecordBatch;
 use arrow_row::{RowConverter, SortField};
 use sha2::{Digest, Sha256};
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 struct HistoryFile {
     meta: DataFileMeta,
+    range_compatible: bool,
     identity: tokio::sync::OnceCell<String>,
+}
+
+struct HistoryLevel {
+    files: Vec<HistoryFile>,
+    indexed: bool,
 }
 
 struct LevelLookup {
     table: Table,
     split: DataSplit,
-    levels: BTreeMap<i32, Vec<HistoryFile>>,
+    levels: BTreeMap<i32, HistoryLevel>,
     cache: Arc<LookupFileCache>,
     keys: Vec<usize>,
     key_fields: Vec<DataField>,
@@ -47,7 +54,7 @@ struct LevelLookup {
     schema_identity: Vec<u8>,
 }
 
-pub(in crate::table::compact) fn provider(
+pub(in crate::table::compact) async fn provider(
     table: &Table,
     split: &DataSplit,
     files: Vec<DataFileMeta>,
@@ -79,12 +86,59 @@ pub(in crate::table::compact) fn provider(
             .collect(),
     )
     .map_err(invalid)?;
-    let mut levels = BTreeMap::<_, Vec<_>>::new();
+    let comparator = KeyComparator::from_table_schema(table.schema());
+    let mut schemas = BTreeMap::from([(table.schema().id(), true)]);
+    let mut levels = BTreeMap::<_, HistoryLevel>::new();
     for meta in files {
-        levels.entry(meta.level).or_default().push(HistoryFile {
-            meta,
-            identity: tokio::sync::OnceCell::new(),
-        });
+        let compatible = if let Some(&compatible) = schemas.get(&meta.schema_id) {
+            compatible
+        } else {
+            let schema = table.schema_manager().schema(meta.schema_id).await?;
+            let old_keys = schema.trimmed_primary_keys();
+            let compatible = old_keys.len() == key_fields.len()
+                && old_keys.iter().zip(&key_fields).all(|(name, current)| {
+                    schema
+                        .fields()
+                        .iter()
+                        .find(|field| field.name() == name)
+                        .is_some_and(|old| {
+                            old.id() == current.id()
+                                && old.data_type().equals_ignore_nullable(current.data_type())
+                        })
+                });
+            schemas.insert(meta.schema_id, compatible);
+            compatible
+        };
+        let range_compatible = compatible
+            && comparator.as_ref().is_some_and(|compare| {
+                compare
+                    .compare(&meta.min_key, &meta.max_key)
+                    .is_some_and(|order| !order.is_gt())
+            });
+        levels
+            .entry(meta.level)
+            .or_insert_with(|| HistoryLevel {
+                files: Vec::new(),
+                indexed: false,
+            })
+            .files
+            .push(HistoryFile {
+                meta,
+                range_compatible,
+                identity: tokio::sync::OnceCell::new(),
+            });
+    }
+    for level in levels.values_mut() {
+        if level.files.iter().all(|file| file.range_compatible) {
+            let compare = comparator.as_ref().unwrap();
+            level
+                .files
+                .sort_by(|a, b| compare.compare(&a.meta.min_key, &b.meta.min_key).unwrap());
+            level.indexed = level.files.windows(2).all(|pair| {
+                compare.compare(&pair[0].meta.max_key, &pair[1].meta.min_key)
+                    == Some(Ordering::Less)
+            });
+        }
     }
     let options = table.schema().options().iter().collect::<BTreeMap<_, _>>();
     let schema_identity = serde_json::to_vec(&(
@@ -102,7 +156,7 @@ pub(in crate::table::compact) fn provider(
         keys,
         key_fields,
         converter: Mutex::new(converter),
-        comparator: KeyComparator::from_table_schema(table.schema()),
+        comparator,
         resources,
         schema_identity,
     }))
@@ -131,19 +185,37 @@ impl LookupProvider for LevelLookup {
             }
             row.build_serialized()
         };
-        for files in self.levels.values() {
+        let key_comparable = self
+            .comparator
+            .as_ref()
+            .is_some_and(|compare| compare.compare(&binary_key, &binary_key).is_some());
+        for level in self.levels.values() {
+            let files = if level.indexed && key_comparable {
+                let compare = self.comparator.as_ref().unwrap();
+                let index = level.files.partition_point(|file| {
+                    compare.compare(&file.meta.max_key, &binary_key) == Some(Ordering::Less)
+                });
+                level
+                    .files
+                    .get(index)
+                    .map(std::slice::from_ref)
+                    .unwrap_or_default()
+            } else {
+                level.files.as_slice()
+            };
             let mut found = None;
             for file in files {
                 // Old key types may have been promoted. Unverifiable ranges
                 // must not prune a possible history match.
-                if file.meta.schema_id == self.table.schema().id() {
+                if file.range_compatible {
                     if let Some(compare) = &self.comparator {
-                        if compare.compare(&file.meta.max_key, &binary_key)
-                            == Some(std::cmp::Ordering::Less)
-                            || compare.compare(&file.meta.min_key, &binary_key)
-                                == Some(std::cmp::Ordering::Greater)
-                        {
-                            continue;
+                        if let (Some(min), Some(max)) = (
+                            compare.compare(&file.meta.min_key, &binary_key),
+                            compare.compare(&file.meta.max_key, &binary_key),
+                        ) {
+                            if min.is_gt() || max.is_lt() {
+                                continue;
+                            }
                         }
                     }
                 }

@@ -23,6 +23,7 @@ use arrow_array::{
 use opendal::Operator;
 use paimon::io::FileIOProvider;
 use paimon::table::CommitMessage;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -31,11 +32,20 @@ struct HistoryProbe {
     operator: Operator,
     history: Mutex<String>,
     opens: AtomicUsize,
+    data_opens: Mutex<HashMap<String, usize>>,
 }
 
 #[async_trait::async_trait]
 impl FileIOProvider for HistoryProbe {
     async fn create(&self, path: &str) -> paimon::Result<(Operator, String)> {
+        if path.ends_with(".parquet") {
+            *self
+                .data_opens
+                .lock()
+                .unwrap()
+                .entry(path.into())
+                .or_default() += 1;
+        }
         if path.rsplit('/').next() == Some(self.history.lock().unwrap().as_str()) {
             self.opens.fetch_add(1, Ordering::SeqCst);
         }
@@ -56,6 +66,10 @@ impl FileIOProvider for HistoryProbe {
 }
 
 async fn probed_table() -> (Table, Arc<HistoryProbe>) {
+    probed_table_with_options(&[]).await
+}
+
+async fn probed_table_with_options(properties: &[(&str, &str)]) -> (Table, Arc<HistoryProbe>) {
     let path = format!("memory:/incremental_lookup/{}", uuid::Uuid::new_v4());
     let mut options = paimon::Options::new();
     options.set("warehouse", &path);
@@ -67,13 +81,16 @@ async fn probed_table() -> (Table, Arc<HistoryProbe>) {
         operator: Operator::from_config(opendal::services::MemoryConfig::default()).unwrap(),
         history: Mutex::new(String::new()),
         opens: AtomicUsize::new(0),
+        data_opens: Mutex::new(HashMap::new()),
     });
     let io = catalog.file_io().clone().with_provider(probe.clone());
+    let mut configured = vec![("changelog-producer", "lookup")];
+    configured.extend_from_slice(properties);
     let table = Table::new(
         io.clone(),
         paimon::catalog::Identifier::new("default", "incremental_lookup"),
         path.clone(),
-        pk_schema(&[("changelog-producer", "lookup")]),
+        pk_schema(&configured),
         None,
     );
     setup_dirs(&io, &path).await;
@@ -112,10 +129,11 @@ async fn latest(table: &Table) -> i64 {
 }
 
 async fn events(table: &Table, start: i64, end: i64) -> Vec<(String, i32, i64, i64)> {
+    let id_name = table.schema().fields()[0].name();
     let value_name = table.schema().fields()[1].name();
     let mut reader = table.new_read_builder();
     reader
-        .with_projection(&["id", value_name, "_SEQUENCE_NUMBER"])
+        .with_projection(&[id_name, value_name, "_SEQUENCE_NUMBER"])
         .unwrap();
     let plan = reader
         .new_incremental_scan(IncrementalScanMode::Auto, start, end)
@@ -134,7 +152,7 @@ async fn events(table: &Table, start: i64, end: i64) -> Vec<(String, i32, i64, i
     for batch in batches {
         let kinds = batch.column(0).as_string::<i32>();
         let column = |name| batch.column_by_name(name).unwrap();
-        let ids = column("id").as_primitive::<Int32Type>();
+        let ids = column(id_name).as_primitive::<Int32Type>();
         let values = arrow_cast::cast(column(value_name), &arrow_schema::DataType::Int64).unwrap();
         let values = values.as_primitive::<Int64Type>();
         let seqs = column("_SEQUENCE_NUMBER").as_primitive::<Int64Type>();
@@ -397,6 +415,75 @@ async fn incremental_lookup_allows_safe_rewrites_of_unselected_history() {
         assert_eq!(
             expected.iter().find(|(key, _)| *key == 42),
             Some(&(42, 9000))
+        );
+    }
+}
+
+#[tokio::test]
+async fn incremental_lookup_prunes_old_schema_history_by_unchanged_keys() {
+    use paimon::spec::SchemaChange;
+    for change in [
+        SchemaChange::rename_column("value".into(), "renamed".into()),
+        SchemaChange::add_column("extra".into(), DataType::Int(IntType::new())),
+        SchemaChange::rename_column("id".into(), "renamed_id".into()),
+    ] {
+        let (original, probe) = probed_table_with_options(&[("target-file-row-num", "100")]).await;
+        let keys = (0..1000).collect::<Vec<_>>();
+        write_batch(&original, &make_batch(keys.clone(), keys)).await;
+        let history = compact(&original).await[0].files().to_vec();
+        assert!(
+            history.len() >= 5,
+            "regression requires rolled positive-level files"
+        );
+        assert!(history.iter().all(|file| file.level == 5));
+        let start = latest(&original).await;
+        let schema = original.schema().apply_changes(vec![change]).unwrap();
+        persist_table_schema(original.file_io(), original.location(), &schema).await;
+        let table = original.copy_with_resolved_schema(schema, "main").unwrap();
+        let mut columns = vec![
+            (
+                table.schema().fields()[0].name(),
+                Arc::new(Int32Array::from(vec![42])) as arrow_array::ArrayRef,
+            ),
+            (
+                table.schema().fields()[1].name(),
+                Arc::new(Int32Array::from(vec![9000])) as arrow_array::ArrayRef,
+            ),
+        ];
+        for field in &table.schema().fields()[2..] {
+            columns.push((
+                field.name(),
+                Arc::new(Int32Array::from(vec![None])) as arrow_array::ArrayRef,
+            ));
+        }
+        write_batch(&table, &RecordBatch::try_from_iter(columns).unwrap()).await;
+        let builder = table.new_compact_builder();
+        let plan = builder.new_planner().unwrap().plan().await.unwrap();
+        assert!(plan.tasks()[0].files().iter().all(|file| file.level == 0));
+        probe.data_opens.lock().unwrap().clear();
+        let results = execute(&table, &plan).await;
+        let touched = {
+            let opens = probe.data_opens.lock().unwrap();
+            history
+                .iter()
+                .filter(|file| {
+                    opens.contains_key(&format!("{}/bucket-0/{}", table.location(), file.file_name))
+                })
+                .count()
+        };
+        assert_eq!(
+            touched, 1,
+            "unchanged key layouts must only read the candidate history file"
+        );
+        builder
+            .new_commit()
+            .unwrap()
+            .commit_compact(results)
+            .await
+            .unwrap();
+        assert_eq!(
+            events(&table, start, latest(&table).await).await,
+            vec![("+U".into(), 42, 9000, 1000), ("-U".into(), 42, 42, 42)]
         );
     }
 }

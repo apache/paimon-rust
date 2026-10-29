@@ -413,13 +413,16 @@ impl CompactExecutor {
                 if history.is_empty() {
                     None
                 } else {
-                    Some(primary_key::lookup_store::provider(
-                        &table,
-                        &split,
-                        history,
-                        cache.clone(),
-                        self.resources.clone(),
-                    )?)
+                    Some(
+                        primary_key::lookup_store::provider(
+                            &table,
+                            &split,
+                            history,
+                            cache.clone(),
+                            self.resources.clone(),
+                        )
+                        .await?,
+                    )
                 }
             } else {
                 None
