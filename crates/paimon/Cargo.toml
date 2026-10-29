@@ -127,6 +127,7 @@ bzip2 = "0.6"
 liblzma = { version = "0.4", default-features = false, features = ["static"] }
 lzokay-native = { version = "0.1", default-features = false, features = ["decompress"] }
 arrow-array = { workspace = true }
+arrow-ipc = "58.0"
 arrow-arith = { workspace = true }
 arrow-buffer = { workspace = true }
 arrow-cast = { workspace = true }

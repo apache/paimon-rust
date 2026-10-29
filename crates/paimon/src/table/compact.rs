@@ -19,8 +19,9 @@
 
 mod append;
 pub(super) mod data_evolution;
-mod primary_key;
+pub(super) mod primary_key;
 
+pub use primary_key::lookup_store::LookupCacheMetrics;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
@@ -114,6 +115,18 @@ impl<'a> CompactBuilder<'a> {
         Ok(CompactExecutor {
             table: self.table.clone(),
             resources: self.resources.clone(),
+            lookup_cache: if !self.table.schema().primary_keys().is_empty()
+                && primary_key::lookup_store::needed(self.table)?
+            {
+                Some(primary_key::lookup_store::LookupCache::open(
+                    self.table.file_io().local_cache().ok_or_else(|| Error::ConfigInvalid {
+                        message: "Lookup compaction requires local-cache.enabled=true on the catalog/FileIO".into(),
+                    })?,
+                    self.table.schema().options(),
+                )?)
+            } else {
+                None
+            },
         })
     }
 
@@ -194,6 +207,8 @@ pub struct CompactTask {
     bucket: i32,
     total_buckets: i32,
     files: Vec<DataFileMeta>,
+    #[serde(default)]
+    primary_key: Option<primary_key::planner::PrimaryKeyTask>,
 }
 
 impl CompactTask {
@@ -211,6 +226,12 @@ impl CompactTask {
 
     pub fn bucket(&self) -> i32 {
         self.bucket
+    }
+
+    pub(super) fn primary_key_files(&self) -> impl Iterator<Item = &DataFileMeta> {
+        self.primary_key
+            .iter()
+            .flat_map(|selection| selection.lookup_files.iter())
     }
 
     pub fn files(&self) -> &[DataFileMeta] {
@@ -266,6 +287,7 @@ impl CompactPlanner {
 pub struct CompactExecutor {
     table: Table,
     resources: Option<ResourceContext>,
+    lookup_cache: Option<Arc<primary_key::lookup_store::LookupCache>>,
 }
 
 /// Prepared files owned by the caller until submitted to `TableCommit::commit_compact`.
@@ -274,11 +296,19 @@ pub struct CompactExecutor {
 pub struct CompactResult {
     task: CompactTask,
     files: Vec<DataFileMeta>,
+    #[serde(default)]
+    changelog_files: Vec<DataFileMeta>,
+    #[serde(default)]
+    lookup_deletions: Vec<primary_key::lookup_store::LookupDeletion>,
 }
 
 impl CompactResult {
     pub fn files(&self) -> &[DataFileMeta] {
         &self.files
+    }
+
+    pub fn changelog_files(&self) -> &[DataFileMeta] {
+        &self.changelog_files
     }
 
     pub fn metrics(&self) -> CompactMetrics {
@@ -287,6 +317,17 @@ impl CompactResult {
             files_added: self.files.len(),
             rows_written: self.files.iter().map(|file| file.row_count as u64).sum(),
             bytes_written: self.files.iter().map(|file| file.file_size as u64).sum(),
+            changelog_files_added: self.changelog_files.len(),
+            changelog_rows_written: self
+                .changelog_files
+                .iter()
+                .map(|file| file.row_count as u64)
+                .sum(),
+            changelog_bytes_written: self
+                .changelog_files
+                .iter()
+                .map(|file| file.file_size as u64)
+                .sum(),
         }
     }
 }
@@ -298,9 +339,21 @@ pub struct CompactMetrics {
     pub files_added: usize,
     pub rows_written: u64,
     pub bytes_written: u64,
+    #[serde(default)]
+    pub changelog_files_added: usize,
+    #[serde(default)]
+    pub changelog_rows_written: u64,
+    #[serde(default)]
+    pub changelog_bytes_written: u64,
 }
 
 impl CompactExecutor {
+    pub fn lookup_cache_metrics(&self) -> LookupCacheMetrics {
+        self.lookup_cache
+            .as_ref()
+            .map_or_else(LookupCacheMetrics::default, |cache| cache.metrics())
+    }
+
     pub async fn execute(&self, task: &CompactTask) -> Result<CompactResult> {
         ensure_supported(&self.table)?;
         task.validate_target(&self.table)?;
@@ -351,13 +404,24 @@ impl CompactExecutor {
             return Ok(CompactResult {
                 task: task.clone(),
                 files,
+                changelog_files: vec![],
+                lookup_deletions: vec![],
             });
         }
         if task.is_primary_key() {
-            let files = primary_key::execute(&table, task, &split, self.resources.clone()).await?;
+            let (files, changelog_files, lookup_deletions) = primary_key::execute(
+                &table,
+                task,
+                &split,
+                self.resources.clone(),
+                self.lookup_cache.clone(),
+            )
+            .await?;
             return Ok(CompactResult {
                 task: task.clone(),
                 files,
+                changelog_files,
+                lookup_deletions,
             });
         }
         let mut read = table.new_read_builder().new_read()?.with_ordered(true);
@@ -408,6 +472,8 @@ impl CompactExecutor {
             Ok(files) => Ok(CompactResult {
                 task: task.clone(),
                 files,
+                changelog_files: vec![],
+                lookup_deletions: vec![],
             }),
             Err(error) => {
                 writer.abort().await;
@@ -427,19 +493,12 @@ impl CompactTask {
     }
 
     fn output_level(&self) -> i32 {
-        if self.is_primary_key() {
-            self.files
-                .iter()
-                .map(|file| file.level)
-                .max()
-                .unwrap_or(0)
-                .max(1)
-        } else {
-            0
-        }
+        self.primary_key
+            .as_ref()
+            .map_or(0, |task| task.output_level)
     }
 
-    fn validate_inputs(&self, active: &[ManifestEntry]) -> Result<()> {
+    pub(super) fn validate_inputs(&self, active: &[ManifestEntry]) -> Result<()> {
         if self.is_data_evolution() {
             data_evolution::validate_inputs(&self.partition, self.bucket, &self.files, active)?;
         }
@@ -452,10 +511,18 @@ impl CompactTask {
             })
             .map(|entry| (entry.file().file_name.as_str(), entry))
             .collect::<HashMap<_, _>>();
-        if self.is_primary_key() && bucket_files.len() != self.files.len() {
-            return Err(invalid(
-                "PK compaction must include the complete captured bucket",
-            ));
+        if self.is_primary_key() {
+            let files = bucket_files
+                .values()
+                .map(|entry| entry.file().clone())
+                .collect();
+            let selected = primary_key::planner::select(files, self.context.schema.options())?
+                .ok_or_else(|| invalid("No incremental PK compaction is eligible"))?;
+            if selected.0 != self.files || Some(&selected.1) != self.primary_key.as_ref() {
+                return Err(invalid(
+                    "PK compaction inputs do not match incremental run selection",
+                ));
+            }
         }
         for file in &self.files {
             if !bucket_files
@@ -481,6 +548,16 @@ impl CompactTask {
             ));
         }
         ensure_snapshot_supported(table, &self.context.snapshot)?;
+        if self.is_primary_key()
+            && self
+                .primary_key
+                .as_ref()
+                .is_none_or(|task| task.output_level <= 0)
+        {
+            return Err(invalid(
+                "PK compaction requires an incremental run selection",
+            ));
+        }
         let minimum_files = if self.is_primary_key() || self.is_data_evolution() {
             1
         } else {
@@ -513,11 +590,14 @@ impl CompactTask {
 /// Validated inputs for the existing atomic snapshot publication machinery.
 pub(super) struct PreparedCompact {
     pub entries: Vec<ManifestEntry>,
+    pub changelog_entries: Vec<ManifestEntry>,
     pub schema_id: i64,
     pub snapshot_id: i64,
     pub read_snapshot: Option<Box<Snapshot>>,
     pub commit_suffix: String,
     pub metrics: CompactMetrics,
+    pub pk_tasks: Vec<CompactTask>,
+    pub lookup_deletions: Vec<primary_key::lookup_store::LookupDeletion>,
 }
 
 pub(super) fn prepare_results(table: &Table, results: &[CompactResult]) -> Result<PreparedCompact> {
@@ -529,7 +609,10 @@ pub(super) fn prepare_results(table: &Table, results: &[CompactResult]) -> Resul
     let mut inputs = HashSet::new();
     let mut outputs = HashSet::new();
     let mut entries = Vec::new();
+    let mut changelog_entries = Vec::new();
     let mut metrics = CompactMetrics::default();
+    let mut pk_tasks = Vec::new();
+    let mut lookup_deletions = Vec::new();
     for result in results {
         let task = &result.task;
         task.validate_target(table)?;
@@ -570,6 +653,13 @@ pub(super) fn prepare_results(table: &Table, results: &[CompactResult]) -> Resul
             if file.schema_id != task.context.schema.id()
                 || file.file_source != Some(1)
                 || file.level != task.output_level()
+                || (task.is_primary_key()
+                    && task
+                        .context
+                        .schema
+                        .core_options()
+                        .deletion_vectors_enabled()
+                    && file.delete_row_count != Some(0))
                 || !outputs.insert(file.file_name.clone())
                 || task.files.iter().any(|old| old.file_name == file.file_name)
             {
@@ -599,17 +689,86 @@ pub(super) fn prepare_results(table: &Table, results: &[CompactResult]) -> Resul
             );
         if task.is_primary_key()
             && (output_rows > input_rows
-                || (input_rows > 0 && output_rows == 0 && !ignores_retracts))
+                || (input_rows > 0
+                    && output_rows == 0
+                    && !ignores_retracts
+                    && !options.deletion_vectors_enabled()
+                    && options.merge_engine()? != MergeEngine::FirstRow))
         {
             return Err(invalid(
-                "PK compaction must retain each key's merged state unless retracts are ignored",
+                "PK compaction must retain each key's merged state unless retracts are ignored or deletion vectors are enabled",
             ));
+        }
+        let lookup = options.try_changelog_producer()? == ChangelogProducer::Lookup;
+        if !lookup && !result.changelog_files.is_empty() {
+            return Err(invalid(
+                "Only lookup compaction may produce changelog files",
+            ));
+        }
+        let mut changelog_rows = 0u64;
+        for file in &result.changelog_files {
+            validate_file(file, true)?;
+            if file.schema_id != task.context.schema.id()
+                || file.file_source != Some(1)
+                || file.level != task.output_level()
+                || file
+                    .delete_row_count
+                    .is_none_or(|count| count > file.row_count)
+                || !outputs.insert(file.file_name.clone())
+                || task.files.iter().any(|old| old.file_name == file.file_name)
+            {
+                return Err(invalid("Invalid compaction changelog file"));
+            }
+            changelog_rows += file.row_count as u64;
+            changelog_entries.push(ManifestEntry::new(
+                FileKind::Add,
+                task.partition.clone(),
+                task.bucket,
+                task.total_buckets,
+                file.clone(),
+                2,
+            ));
+        }
+        let l0_rows = task
+            .files
+            .iter()
+            .filter(|file| file.level == 0)
+            .map(|file| file.row_count as u64)
+            .sum::<u64>();
+        if changelog_rows > l0_rows.saturating_mul(2) {
+            return Err(invalid(
+                "Lookup changelogs must be generated by level-0 records",
+            ));
+        }
+        if task.is_primary_key() {
+            pk_tasks.push(task.clone());
+        }
+        for deletion in &result.lookup_deletions {
+            let bitmap = roaring::RoaringBitmap::deserialize_from(deletion.bitmap.as_slice())
+                .map_err(|error| invalid(&error.to_string()))?;
+            if !options.deletion_vectors_enabled()
+                || deletion.partition != task.partition
+                || deletion.bucket != task.bucket
+                || bitmap.is_empty()
+                || !task.primary_key.as_ref().is_some_and(|selection| {
+                    selection.lookup_files.iter().any(|file| {
+                        file.file_name == deletion.file_name
+                            && u64::from(bitmap.max().unwrap()) < file.row_count as u64
+                    })
+                })
+            {
+                return Err(invalid("Invalid lookup deletion dependency"));
+            }
+            lookup_deletions.push(deletion.clone());
         }
         let part = result.metrics();
         metrics.files_removed += part.files_removed;
         metrics.files_added += part.files_added;
         metrics.rows_written += part.rows_written;
         metrics.bytes_written += part.bytes_written;
+        metrics.changelog_files_added += part.changelog_files_added;
+        metrics.changelog_rows_written += part.changelog_rows_written;
+        metrics.changelog_bytes_written += part.changelog_bytes_written;
     }
     ids.sort_unstable();
     if ids.windows(2).any(|pair| pair[0] == pair[1]) {
@@ -623,6 +782,7 @@ pub(super) fn prepare_results(table: &Table, results: &[CompactResult]) -> Resul
     }
     Ok(PreparedCompact {
         entries,
+        changelog_entries,
         schema_id: first.task.context.schema.id(),
         snapshot_id: first.task.snapshot_id(),
         read_snapshot: first
@@ -631,6 +791,8 @@ pub(super) fn prepare_results(table: &Table, results: &[CompactResult]) -> Resul
             .then(|| Box::new(first.task.context.snapshot.clone())),
         commit_suffix: hex::encode(digest.finalize()),
         metrics,
+        pk_tasks,
+        lookup_deletions,
     })
 }
 
@@ -672,7 +834,7 @@ pub(super) fn ensure_supported(table: &Table) -> Result<()> {
     if table.is_format_table()
         || options.row_tracking_enabled()
         || options.data_evolution_enabled()
-        || options.deletion_vectors_enabled()
+        || (options.deletion_vectors_enabled() && table.schema().primary_keys().is_empty())
         || options.query_auth_enabled()
         || !options.blob_fields().is_empty()
         || table
@@ -685,21 +847,27 @@ pub(super) fn ensure_supported(table: &Table) -> Result<()> {
         || options.bucket() < -1
     {
         return Err(Error::Unsupported {
-            message: "Compaction does not support row tracking, data evolution, deletion vectors, query authorization, rowkind fields, postpone buckets or dedicated blob/vector storage".into(),
+            message: "Compaction does not support row tracking, data evolution, append deletion vectors, query authorization, rowkind fields, postpone buckets or dedicated blob/vector storage".into(),
         });
     }
     if !table.schema().primary_keys().is_empty()
         && (options.bucket() == 0
             || !matches!(
                 options.try_changelog_producer()?,
-                ChangelogProducer::None | ChangelogProducer::Input
+                ChangelogProducer::None | ChangelogProducer::Input | ChangelogProducer::Lookup
             )
             || (options.merge_engine()? == MergeEngine::FirstRow
-                && options.try_changelog_producer()? != ChangelogProducer::None))
+                && !matches!(
+                    options.try_changelog_producer()?,
+                    ChangelogProducer::None | ChangelogProducer::Lookup
+                )))
     {
         return Err(Error::Unsupported {
-            message: "PK compaction requires fixed or dynamic buckets and changelog-producer=none or input; first-row requires changelog-producer=none".into(),
+            message: "PK compaction requires fixed or dynamic buckets and changelog-producer=none, input or lookup; first-row requires changelog-producer=none or lookup".into(),
         });
+    }
+    if options.try_changelog_producer()? == ChangelogProducer::Lookup {
+        primary_key::lookup::validate_options(properties)?;
     }
     options.validate_data_file_path_directory()
 }
@@ -707,6 +875,7 @@ pub(super) fn ensure_supported(table: &Table) -> Result<()> {
 fn ensure_snapshot_supported(table: &Table, snapshot: &Snapshot) -> Result<()> {
     if snapshot.index_manifest().is_some()
         && !table.schema().core_options().data_evolution_enabled()
+        && !table.schema().core_options().deletion_vectors_enabled()
         && (table.schema().primary_keys().is_empty()
             || table.schema().core_options().bucket() != -1)
     {
@@ -718,7 +887,8 @@ fn ensure_snapshot_supported(table: &Table, snapshot: &Snapshot) -> Result<()> {
 }
 
 /// HASH indexes contain key-to-bucket assignments, independent of data files.
-/// Preserve their manifest verbatim, including hashes of deleted keys. Other
+/// Preserve their entries, including hashes of deleted keys. PK deletion-vector
+/// ranges are retired atomically when their data files are rewritten. Other
 /// index types may address rewritten files or row positions and cannot be reused.
 pub(super) async fn validate_snapshot_indexes(
     table: &Table,
@@ -734,13 +904,23 @@ pub(super) async fn validate_snapshot_indexes(
         data_evolution::validate_indexes(&entries)?;
         return Ok(Some(name.to_string()));
     }
+    let options = table.schema().core_options();
     if entries.iter().any(|entry| {
-        entry.index_file.index_type != "HASH"
-            || entry.index_file.deletion_vectors_ranges.is_some()
-            || entry.index_file.global_index_meta.is_some()
+        let file = &entry.index_file;
+        let hash = options.bucket() == -1
+            && file.index_type == "HASH"
+            && file.deletion_vectors_ranges.is_none();
+        let deletion_vector = options.deletion_vectors_enabled()
+            && file.index_type == "DELETION_VECTORS"
+            && file.deletion_vectors_ranges.as_ref().is_some_and(|ranges| {
+                ranges.values().all(|meta| {
+                    meta.offset >= 0 && meta.length > 0 && meta.cardinality.is_none_or(|n| n >= 0)
+                })
+            });
+        file.global_index_meta.is_some() || !(hash || deletion_vector)
     }) {
         return Err(Error::Unsupported {
-            message: "Compaction only supports dynamic-bucket HASH index manifests".into(),
+            message: "PK compaction only supports dynamic-bucket HASH indexes and enabled deletion vectors".into(),
         });
     }
     Ok(Some(name.to_string()))

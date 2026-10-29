@@ -450,6 +450,12 @@ Use `local-cache.whitelist=meta,global-index,structured-data` to cache data
 blocks without dedicated BLOB, video, or vector-store files. `data` and `*`
 retain their broader behavior.
 
+Primary-key compaction with deletion vectors, lookup changelog production or
+`first-row` requires an enabled catalog cache. Its generated Lookup File blocks
+share this backend's total capacity and regular LRU with cached reads; they do
+not require an entry in the remote-read whitelist. Set `local-cache.dir` for disk
+storage. See [Local Lookup File cache](compaction.md#local-lookup-file-cache).
+
 The protected and regular LRUs share one total budget; either can use idle
 capacity. Catalogs or processes sharing a disk cache must use the same ratio.
 

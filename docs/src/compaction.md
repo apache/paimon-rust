@@ -20,7 +20,7 @@ under the License.
 # Table Compaction
 
 Rust supports small-file compaction for ordinary append tables, normal-file
-compaction for Data Evolution tables, and full-bucket compaction for primary-key
+compaction for Data Evolution tables, and incremental compaction for primary-key
 tables with fixed or dynamic buckets. `CompactBuilder` creates
 a `CompactPlanner`, a `CompactExecutor`, and a `TableCommit`. Planning and
 execution do not publish snapshots; `commit_compact` atomically publishes the
@@ -114,16 +114,28 @@ snapshot expiration and storage reclamation are separate maintenance work.
 
 The same API compacts primary-key tables with `deduplicate`,
 `first-row`, `partial-update` or `aggregation` merge engines. Changelog producers
-`none` and `input` are supported; `first-row` requires `none`.
-The planner includes every active file of each selected partition/bucket,
-including large files. Append size and count selection options do not split PK
-buckets. A single level-0 file is also eligible. A bucket whose files already form one sorted
-run at a single positive level needs no rewrite, including when the previous
-compaction rolled multiple output files. Output is key ordered at the highest input level, or level 1
-when all inputs are level 0.
+`none`, `input` and `lookup` are supported; `first-row` supports `none` or `lookup`.
+The planner follows Java's `UniversalCompaction` sorted-run selection. Each L0
+file is a run; all files at the same positive level form one run. An explicit
+compact drains the captured L0 files, including a single L0 file, and extends
+the selection through adjacent runs while their sizes are comparable. L1 is
+included when necessary to avoid writing L0 output. Large higher-level runs
+remain untouched and supply point-lookup history when required.
 
-Compaction uses each engine's existing merge function and persists its merge
-state, including original sequence metadata and synthesized DELETE records:
+Without L0 input, sorted-run count, size ratio and size amplification trigger
+maintenance. The Java-compatible defaults are `num-sorted-run.compaction-trigger=5`,
+`compaction.size-ratio=1` (percent), `compaction.max-size-amplification-percent=200`,
+and `num-levels=compaction-trigger + 1`. Output is key ordered at the level below
+the first untouched run, or the highest configured level when every run was
+selected. The configured level count expands to accommodate existing files.
+A bucket containing just one positive-level run needs no rewrite, even if that
+run spans multiple files or carries deletion vectors. Append small-file packing
+options do not control PK selection. There is no separate full-compact path;
+the incremental policy may naturally select every run based on their sizes.
+
+Without deletion vectors, compaction uses each engine's existing merge function
+and persists its merge state, including original sequence metadata and synthesized
+DELETE records:
 
 - `deduplicate` retains the winning record, including retracts that must still
   suppress later out-of-order values.
@@ -142,8 +154,9 @@ whole-record deletion also apply during compaction. If all records are
 legitimately ignored, compaction can remove the selected files without
 creating an output file. Key bounds, sequence bounds, delete counts and file
 indexes are regenerated, using metadata statistics options for the output level.
-Compound `partial-update` DELETE states with field aggregators are rejected.
-For both reducer engines, compound groups containing retracts are also rejected
+Without deletion vectors, compound `partial-update` DELETE states with field
+aggregators are rejected. In that mode, both reducer engines also reject
+compound groups containing retracts
 when they use `first_value`, `first_non_null_value`, `collect`, `listagg`,
 `nested_update` or `nested_partial_update`. These states may carry initialization
 flags or raw DELETE payloads that cannot be reconstructed from one output row,
@@ -174,6 +187,158 @@ There is no multipass merge yet; too many overlapping runs fail without
 publishing a snapshot. The captured snapshot must remain available until each
 task subset is successfully committed; retries of an already committed subset remain
 idempotent after its read snapshot expires.
+
+## Primary-key deletion vectors
+
+Primary-key tables with `deletion-vectors.enabled=true` use the same incremental
+compaction API with `deduplicate`, `partial-update` or `aggregation` and
+`changelog-producer=none`, `input` or `lookup`. Schema validation excludes `first-row`
+with deletion vectors.
+
+Planning includes L0 files even when normal batch scans hide them. Execution
+reads the captured snapshot's vectors and filters physical
+row positions before merging keys. This prevents a previously materialized
+aggregate from being counted together with the older row it replaced.
+
+The output contains only live merged values, with a known zero delete-row count.
+Winning retracts and fully deleted keys produce no output; a task may remove
+all its input files without adding a data file. This follows Java's deletion-vector
+lookup compaction semantics. When a key has no history in the selected runs,
+point lookup searches the untouched levels and materializes the previous value
+with its updates. The previous physical position is marked deleted in that
+historical file. With
+`changelog-producer=lookup`, it also writes the logical changes described below.
+
+Commit atomically removes vector ranges belonging to rewritten files and unions
+new position bitmaps into untouched files' vectors. If an affected index also
+contains untouched ranges, those vectors are retained when writing its replacement.
+Unrelated indexes and the latest dynamic-bucket HASH entries are retained.
+Historical snapshots retain their original data and vector metadata.
+
+A concurrent change to an input or lookup dependency's deletion-vector reference rejects the
+commit, including a new vector on a previously undeleted file. Plan again from
+the latest snapshot to avoid resurrecting deleted rows. Independent L0 appends,
+new vectors on those appends, and changes in other buckets can commit alongside
+the rewrite. Serialized results, task subsets and idempotent retries follow the
+same rules as ordinary PK compaction.
+
+## Lookup changelog producer
+
+Set `changelog-producer=lookup` and run the same compaction API to publish data
+and changelog files atomically in a `COMPACT` snapshot. Ordinary writes produce
+L0 data files; changelogs become available when those files are compacted.
+Batch incremental `Changelog` / `Auto` scans and streaming follow-up scans read
+the resulting changelog manifest. `Delta` scans continue to skip compaction.
+
+For each key, the lowest positive level is its latest materialized history.
+Older positive levels already contributed to that state and are not reduced
+again. Compaction merges this history with the captured L0 records and emits
+changes only for keys with L0 input:
+
+- No live history and a live result: `INSERT`.
+- Live history and a deleted result: `DELETE` carrying the history's values.
+- Live history and a live result: `UPDATE_BEFORE` followed by `UPDATE_AFTER`.
+- No live history and no live result: no changelog.
+
+Before images retain the historical sequence metadata; after images carry the
+merged result's metadata. `first-row` emits only inserts for previously unseen
+keys. `partial-update` and `aggregation` use their existing reducers and state
+preservation restrictions. Deletion vectors are applied before history selection
+and merging, with deleted keys omitted from DV data output.
+
+Java-compatible options have these defaults:
+
+| Option | Default | Behavior |
+| --- | --- | --- |
+| `changelog-producer.row-deduplicate` | `false` | When true, skip update pairs whose user values are equal. |
+| `changelog-producer.row-deduplicate-ignore-fields` | unset | Comma-separated fields excluded from that comparison. |
+| `changelog-producer.ignore-update-before` | `false` | Omit `UPDATE_BEFORE` events. |
+| `changelog-producer.ignore-delete` | `false` | Omit `DELETE` events. |
+
+With default options, even an unchanged value produces an update pair when its
+key has L0 input. Ignoring changelog events does not change compacted table data.
+`changelog-file.format`, `changelog-file.compression`, `changelog-file.prefix`
+and changelog statistics options apply independently of data-file settings.
+Changelog files roll at the ordinary size and row limits. `CompactResult` exposes
+`changelog_files()`; `CompactMetrics` reports their file, row and byte counts in
+`changelog_files_added`, `changelog_rows_written` and `changelog_bytes_written`.
+The existing data metrics continue to count data files and rows only.
+
+The executor streams both outputs and aborts both writers on execution failure.
+Prepared results include both file lists for serialization, subset commits and
+idempotent retries. A concurrent positive-level addition in a selected bucket
+rejects the commit because it may change the changelog's history. Concurrent L0
+appends remain eligible for a later compaction and produce no premature events.
+
+### Local Lookup File cache
+
+DV compaction, lookup changelog production and `first-row` require
+`local-cache.enabled=true` on the catalog's FileIO. Setting this flag only in
+table properties does not attach a cache and is rejected when creating an
+executor. Ordinary PK compaction without these features does not require a cache.
+Lookup visits positive levels from lowest to highest, uses
+file key bounds to select a candidate, and stops at the first matching physical
+key, including a tombstone. A missing key continues to the next level. Rows
+deleted by the captured snapshot's DV are skipped. A historical key rejected by
+`first-row` stays in its untouched file; no duplicate data row is written.
+
+The first lookup into an uncached file streams that immutable file once into a
+local SST key/position index and Arrow IPC value blocks. Later lookups use the
+local index and decoded-block LRU; they do not scan the source again. Bloom
+filters avoid unnecessary local reads. Complete KV state, sequence metadata and
+physical row positions are retained. Snapshot DVs are applied after lookup, so
+the same physical cache can be reused across snapshots with different vectors.
+Cache identities include storage namespace, physical file metadata and schema;
+a level-only change does not invalidate the bytes.
+
+```rust
+let mut options = Options::new();
+options.set(CatalogOptions::WAREHOUSE, "s3://bucket/warehouse");
+options.set(CatalogOptions::LOCAL_CACHE_ENABLED, "true");
+options.set(CatalogOptions::LOCAL_CACHE_DIR, "/local/paimon-cache");
+options.set(CatalogOptions::LOCAL_CACHE_MAX_SIZE, "20 GiB");
+let catalog = CatalogFactory::create(options).await?;
+let table = catalog.get_table(&identifier).await?;
+let executor = table.new_compact_builder().new_executor()?;
+let cache_metrics = executor.lookup_cache_metrics();
+```
+
+Generated SST and value blocks use the existing `local-cache` backend and share
+its directory, byte accounting, CRC validation and LRU with ordinary cached
+reads. `local-cache.max-size` bounds their combined encoded bytes on disk, or
+payload bytes for the memory backend. There is no independent Lookup File
+directory or disk quota; `lookup.cache-max-disk-size` is rejected. Configure
+`local-cache.dir` to use disk; without it, enabled local-cache uses memory.
+The remote-read whitelist does not disable generated Lookup File blocks.
+They use the regular LRU, preserving the existing protection for metadata and
+global-index reads. `local-cache.shared=true` also shares generated blocks
+through the existing shared disk backend.
+
+Completed files survive executor recreation, and the disk backend can reopen
+them after its cache manager restarts. Concurrent misses in one lookup manager
+build a file once. Each build uses immutable versioned block names and publishes
+its descriptor last. Incomplete builds have no published descriptor;
+partial blocks remain subject to the same bounded LRU. Evicted, corrupt or
+incompatible blocks cause a rebuild from the source file, with one retry per
+lookup. Table data and snapshots never depend on disposable cache blocks.
+
+| Option | Default | Behavior |
+| --- | --- | --- |
+| `lookup.cache-max-memory-size` | `256mb` | Shared budget for local index metadata, SST blocks and decoded value blocks. |
+| `lookup.cache-file-retention` | `1h` | Idle retention for loaded lookup readers; recovered descriptors older than this are rebuilt. |
+| `lookup.cache-spill-compression` | `zstd` | SST compression: `zstd`, `lz4`, `lzo` or `none`. |
+
+Loaded readers are retained while in use; backend blocks can still be evicted
+by other cache users. A block that cannot be retained causes `ResourceExhausted`
+without publishing compact output. Repeated misses also fail the task; increase
+`local-cache.max-size` to retain the needed Lookup Files. Increase the decoded
+memory budget or reduce `read.batch-size` for large value blocks. Source
+reads and lookup DV state also use the task's resource context. Metrics expose
+`file_builds`, `file_hits` and `file_evictions` (expired or invalidated lookup
+readers, rather than all backend block evictions). The cache is disposable and uses
+a Rust-private versioned format; table snapshots never depend on its paths.
+Java's remote prebuilt `.lookup` files and a background compaction scheduler are
+not implemented.
 
 ## Dynamic buckets
 
@@ -241,15 +406,17 @@ deletions into reassigned row IDs are not provided. Setting
 
 ## Current scope
 
-Compaction-generated changelogs (`full-compaction` / `lookup`) are unsupported.
-Outside Data Evolution mode, row tracking, deletion vectors and dedicated
-blob/vector storage are unsupported. Query authorization, rowkind fields and
-postpone buckets are unsupported in all modes.
+The `full-compaction` changelog producer and full compact are unsupported;
+`lookup` is supported through incremental primary-key compaction.
+Outside Data Evolution mode, row tracking and dedicated blob/vector storage
+are unsupported. Deletion vectors are supported for primary-key compaction;
+ordinary append deletion-vector compaction is unsupported. Query authorization,
+rowkind fields and postpone buckets are unsupported in all modes.
 Ordered bucketed append, append incremental clustering, primary-key clustering
 override (`pk-clustering-override`) and record-level expiration
 (`record-level.expire-time`) are also unsupported.
-Snapshot index manifests may contain dynamic-bucket HASH indexes, or deletion
-vectors and global indexes in Data Evolution mode.
+Snapshot index manifests may contain dynamic-bucket HASH indexes and primary-key
+deletion vectors, or deletion vectors and global indexes in Data Evolution mode.
 Embedded and sidecar file indexes are regenerated according to the captured
 table options. Language bindings and
 background compaction scheduling are not yet provided.

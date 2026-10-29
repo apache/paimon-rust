@@ -159,6 +159,11 @@ impl<F: Fn(&[u8], &[u8]) -> crate::Result<Ordering>> BTreeIndexWriter<F> {
         Ok(self)
     }
 
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.sst_writer
+            .retained_bytes()
+            .saturating_add(self.current_row_ids.capacity() * 8)
+    }
     /// Write a key and its associated row id.
     /// If key is None, the row id is added to the null bitmap.
     /// Keys must be written in sorted order; entries with the same key are combined.

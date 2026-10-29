@@ -584,6 +584,10 @@ impl FileIO {
         Ok(self.cache_namespace.to_string())
     }
 
+    pub(crate) fn local_cache(&self) -> Option<Arc<LocalCache>> {
+        self.cache.clone()
+    }
+
     #[cfg(test)]
     pub(crate) fn has_local_cache(&self) -> bool {
         self.cache.is_some()

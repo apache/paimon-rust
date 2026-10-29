@@ -20,13 +20,22 @@ mod common;
 #[path = "pk_compact/merge_engines.rs"]
 mod engine_tests;
 
+#[path = "pk_compact/incremental_lookup.rs"]
+mod incremental_lookup_tests;
+
+#[path = "pk_compact/lookup_changelog.rs"]
+mod lookup_changelog_tests;
+
+#[path = "pk_compact/deletion_vectors.rs"]
+mod deletion_vector_tests;
+
 #[path = "pk_compact/dynamic_bucket.rs"]
 mod dynamic_tests;
 
 use arrow_array::{Array, Int32Array, Int64Array, RecordBatch, StringArray};
 use common::incremental_helpers::{
-    make_batch, make_batch_with_kinds, make_partitioned_batch, memory_table, persist_table_schema,
-    pk_schema, setup_dirs, write_batch,
+    make_batch, make_batch_with_kinds, make_partitioned_batch, persist_table_schema, pk_schema,
+    setup_dirs, write_batch,
 };
 use futures::TryStreamExt;
 use paimon::spec::{
@@ -35,15 +44,38 @@ use paimon::spec::{
 use paimon::table::{CompactPlan, CompactResult, CompactTask, IncrementalScanMode, Table};
 
 async fn table_with_schema(schema: TableSchema) -> Table {
+    table_with_cache(schema, &[]).await
+}
+
+async fn table_with_cache(schema: TableSchema, cache_options: &[(&str, &str)]) -> Table {
     let path = format!("memory:/pk_compact/{}", uuid::Uuid::new_v4());
-    let (io, table) = memory_table(&path, schema);
+    let mut options = paimon::Options::new();
+    options.set("warehouse", &path);
+    options.set("local-cache.enabled", "true");
+    for (name, value) in cache_options {
+        options.set(*name, *value);
+    }
+    let catalog = paimon::catalog::FileSystemCatalog::new(options).unwrap();
+    let io = catalog.file_io().clone();
+    let table = Table::new(
+        io.clone(),
+        paimon::catalog::Identifier::new("default", "pk_compact"),
+        path.clone(),
+        schema,
+        None,
+    );
     setup_dirs(&io, &path).await;
     persist_table_schema(&io, &path, table.schema()).await;
     table
 }
 
 async fn table(options: &[(&str, &str)]) -> Table {
-    table_with_schema(pk_schema(options)).await
+    let mut configured = vec![
+        ("num-levels", "2"),
+        ("num-sorted-run.compaction-trigger", "2"),
+    ];
+    configured.extend_from_slice(options);
+    table_with_schema(pk_schema(&configured)).await
 }
 
 async fn read(table: &Table, projection: Option<&[&str]>) -> Vec<RecordBatch> {
@@ -391,7 +423,7 @@ async fn pk_compaction_keeps_tombstones_against_later_out_of_order_user_sequence
 }
 
 #[tokio::test]
-async fn pk_compaction_includes_large_files_and_whole_buckets_and_upgrades_single_l0() {
+async fn pk_compaction_selects_l0_runs_including_large_files_and_upgrades_single_l0() {
     let table = table(&[("target-file-size", "1b")]).await;
     write_batch(&table, &make_batch(vec![1], vec![10])).await;
     let builder = table.new_compact_builder();
@@ -530,12 +562,8 @@ async fn pk_compaction_rolls_ordered_files_and_rebuilds_indexes_with_level_stats
 }
 
 #[tokio::test]
-async fn pk_compaction_refuses_partial_buckets_and_unsupported_layouts() {
+async fn pk_compaction_refuses_tampered_incremental_inputs_and_unsupported_layouts() {
     for options in [
-        vec![
-            ("merge-engine", "first-row"),
-            ("changelog-producer", "lookup"),
-        ],
         vec![("changelog-producer", "full-compaction")],
         vec![
             ("merge-engine", "first-row"),
@@ -565,7 +593,7 @@ async fn pk_compaction_refuses_partial_buckets_and_unsupported_layouts() {
         .await
         .unwrap_err()
         .to_string()
-        .contains("complete captured bucket"));
+        .contains("incremental run selection"));
     let results = execute(&table, &plan).await;
     let mut encoded = serde_json::to_value(&results).unwrap();
     encoded[0]["task"]["files"].as_array_mut().unwrap().pop();

@@ -2299,7 +2299,7 @@ fn parse_memory_size(value: &str) -> Option<i64> {
 /// does. Returns `None` for an empty string, a missing or non-numeric number,
 /// an unrecognized unit, or a value that would overflow `u64`, matching the
 /// inputs on which Java throws.
-fn parse_duration_millis(value: &str) -> Option<u64> {
+pub(crate) fn parse_duration_millis(value: &str) -> Option<u64> {
     let value = value.trim();
     if value.is_empty() {
         return None;

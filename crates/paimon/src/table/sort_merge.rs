@@ -40,7 +40,7 @@ use futures::StreamExt;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 // ---------------------------------------------------------------------------
 // MergeFunction
@@ -57,7 +57,7 @@ pub(crate) enum BufferedBatch {
 }
 
 impl BufferedBatch {
-    fn column_for_output<'a>(
+    pub(super) fn column_for_output<'a>(
         &'a self,
         output_col_idx: usize,
         source_output_col_indices: &[usize],
@@ -72,6 +72,7 @@ impl BufferedBatch {
 }
 
 /// A row reference as an index into the batch buffer.
+#[derive(Clone)]
 pub(crate) struct MergeRow {
     /// Index into the shared batch buffer.
     pub batch_idx: usize,
@@ -150,6 +151,87 @@ pub(crate) trait MergeFunction: Send + Sync {
         source_output_col_indices: &[usize],
         output_schema: &SchemaRef,
     ) -> crate::Result<MergeResult>;
+
+    /// Emit at most one key's changelog alongside its merged state. The reader
+    /// drains it before advancing to the next key, keeping memory bounded even
+    /// when all data rows are deleted.
+    fn merge_with_changelog(
+        &self,
+        rows: &[MergeRow],
+        batches: &[BufferedBatch],
+        columns: &[usize],
+        schema: &SchemaRef,
+    ) -> crate::Result<(MergeResult, Option<RecordBatch>)> {
+        Ok((self.merge(rows, batches, columns, schema)?, None))
+    }
+}
+
+#[async_trait::async_trait]
+pub(crate) trait LookupProvider: Send + Sync {
+    /// Return a single physical KV row from an unselected higher-level file.
+    async fn lookup(&self, key: &[u8]) -> crate::Result<Option<RecordBatch>>;
+}
+
+/// Internal batch metadata used only by lookup compaction. Source levels
+/// survive physical reads; changelog batches are routed to a separate writer.
+pub(super) const FILE_LEVEL_METADATA_KEY: &str = "paimon.compact.file-level";
+pub(super) const CHANGELOG_BATCH_METADATA_KEY: &str = "paimon.compact.changelog";
+
+/// Lookup states at positive levels are already materialized. The lowest
+/// positive level is the latest state; older levels must not be reduced again.
+/// Mirrors Java LookupMergeFunction#pickHighLevel/getResult.
+pub(super) fn lookup_rows(
+    rows: &[MergeRow],
+    batches: &[BufferedBatch],
+) -> crate::Result<(Option<MergeRow>, bool, Vec<MergeRow>)> {
+    let mut base = None;
+    let mut base_level = i32::MAX;
+    let mut levels = Vec::with_capacity(rows.len());
+    for (index, row) in rows.iter().enumerate() {
+        let BufferedBatch::Source(batch) = &batches[row.batch_idx] else {
+            return Err(Error::UnexpectedError {
+                message: "Lookup input must be a source batch".into(),
+                source: None,
+            });
+        };
+        let level = batch
+            .schema()
+            .metadata()
+            .get(FILE_LEVEL_METADATA_KEY)
+            .and_then(|level| level.parse::<i32>().ok())
+            .ok_or_else(|| Error::DataInvalid {
+                message: "Lookup input is missing its file level".into(),
+                source: None,
+            })?;
+        if level > 0 && (base.is_none() || level < base_level) {
+            base = Some(index);
+            base_level = level;
+        }
+        levels.push(level);
+    }
+    let has_l0 = levels.contains(&0);
+    let selected = rows
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| levels[*index] <= 0 || base == Some(*index))
+        .map(|(_, row)| row.clone())
+        .collect();
+    Ok((base.map(|index| rows[index].clone()), has_l0, selected))
+}
+
+pub(super) struct LookupMergeFunction(pub Box<dyn MergeFunction>);
+
+impl MergeFunction for LookupMergeFunction {
+    fn merge(
+        &self,
+        rows: &[MergeRow],
+        batches: &[BufferedBatch],
+        columns: &[usize],
+        schema: &SchemaRef,
+    ) -> crate::Result<MergeResult> {
+        let (_, _, selected) = lookup_rows(rows, batches)?;
+        self.0.merge(&selected, batches, columns, schema)
+    }
 }
 
 /// Deduplicate merge: keeps the row with the highest sequence.
@@ -1222,6 +1304,7 @@ pub(crate) struct SortMergeReaderBuilder {
     output_schema: SchemaRef,
     merge_function: Box<dyn MergeFunction>,
     batch_size: usize,
+    lookup: Option<Arc<dyn LookupProvider>>,
 }
 
 impl SortMergeReaderBuilder {
@@ -1249,7 +1332,13 @@ impl SortMergeReaderBuilder {
             output_schema,
             merge_function,
             batch_size: 1024,
+            lookup: None,
         }
+    }
+
+    pub(crate) fn with_lookup(mut self, lookup: Option<Arc<dyn LookupProvider>>) -> Self {
+        self.lookup = lookup;
+        self
     }
 
     pub(crate) fn with_batch_size(mut self, batch_size: usize) -> Self {
@@ -1309,6 +1398,7 @@ impl SortMergeReaderBuilder {
             self.output_schema,
             self.merge_function,
             self.batch_size,
+            self.lookup,
         )
     }
 }
@@ -1382,6 +1472,7 @@ fn sort_merge_stream(
     output_schema: SchemaRef,
     merge_function: Box<dyn MergeFunction>,
     batch_size: usize,
+    lookup: Option<Arc<dyn LookupProvider>>,
 ) -> crate::Result<ArrowRecordBatchStream> {
     let num_streams = streams.len();
     if num_streams == 0 {
@@ -1518,12 +1609,30 @@ fn sort_merge_stream(
                 tree.update(|a, b| compare_cursors(&cursors, a, b).then_with(|| a.cmp(&b)).is_gt());
             }
 
-            match merge_function.merge(
-                &same_key_rows,
-                &batch_buffer,
-                &source_output_col_indices,
-                &output_schema,
-            )? {
+            if let Some(lookup) = &lookup {
+                let has_base = same_key_rows.iter().any(|row| match &batch_buffer[row.batch_idx] {
+                    BufferedBatch::Source(batch) => batch.schema().metadata().get(FILE_LEVEL_METADATA_KEY)
+                        .and_then(|level| level.parse::<i32>().ok()).is_some_and(|level| level > 0),
+                    _ => false,
+                });
+                if !has_base {
+                    if let Some(batch) = lookup.lookup(&winner_key).await? {
+                        if batch.num_rows() != 1 { Err(Error::DataInvalid { message: "Lookup must return one KV row".into(), source: None })?; }
+                        let keys = convert_batch_keys(&batch, &key_indices, &mut row_converter)?;
+                        if keys.row(0).as_ref() != winner_key.as_slice() { Err(Error::DataInvalid { message: "Lookup returned a different primary key".into(), source: None })?; }
+                        let user = convert_batch_user_sequences(&batch, &user_sequence_indices, user_sequence_converter.as_mut())?;
+                        let sequence_number = batch.column(seq_index).as_any().downcast_ref::<Int64Array>().ok_or_else(|| Error::DataInvalid { message: "Invalid lookup sequence".into(), source: None })?.value(0);
+                        let value_kind = batch.column(value_kind_index).as_any().downcast_ref::<Int8Array>().ok_or_else(|| Error::DataInvalid { message: "Invalid lookup row kind".into(), source: None })?.value(0);
+                        let batch_idx = batch_buffer.len(); batch_buffer.push(BufferedBatch::Source(batch));
+                        same_key_rows.insert(0, MergeRow { batch_idx, row_idx: 0, sequence_number, value_kind, user_sequence: user.map(|rows| rows.row(0).owned()) });
+                    }
+                }
+            }
+
+            let (merged, changelog) = merge_function.merge_with_changelog(
+                &same_key_rows, &batch_buffer, &source_output_col_indices, &output_schema,
+            )?;
+            match merged {
                 MergeResult::SourceRow { batch_idx, row_idx } => {
                     output_indices.push((batch_idx, row_idx));
                 }
@@ -1548,6 +1657,20 @@ fn sort_merge_stream(
                     output_indices.push((batch_idx, 0));
                 }
                 MergeResult::Omit | MergeResult::MaterializedDeleteRow(_) => {}
+            }
+
+            if let Some(changelog) = changelog {
+                if changelog.schema().as_ref() != output_schema.as_ref() {
+                    Err(Error::UnexpectedError { message: "Changelog merge result schema does not match merge output schema".into(), source: None })?;
+                }
+                let mut metadata = output_schema.metadata().clone();
+                metadata.insert(CHANGELOG_BATCH_METADATA_KEY.into(), "true".into());
+                yield RecordBatch::try_new(
+                    Arc::new(output_schema.as_ref().clone().with_metadata(metadata)), changelog.columns().to_vec(),
+                ).map_err(|error| Error::DataInvalid { message: format!("Invalid changelog batch: {error}"), source: Some(Box::new(error)) })?;
+            }
+            if output_indices.is_empty() {
+                compact_batch_buffer(&mut batch_buffer, &mut stream_batch_idx, &cursors);
             }
 
             // Yield a batch when we've accumulated enough rows.

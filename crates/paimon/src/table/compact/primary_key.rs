@@ -15,6 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
+pub(in crate::table) mod deletion_vectors;
+pub(super) mod lookup;
+pub(in crate::table) mod lookup_store;
+pub(in crate::table) mod planner;
+
 use std::sync::Arc;
 
 use arrow_schema::SchemaRef;
@@ -23,8 +28,8 @@ use futures::TryStreamExt;
 use super::{split_files_by_bucket, validate_file, CompactContext, CompactTask};
 use crate::resource::ResourceContext;
 use crate::spec::{
-    BigIntType, DataField, DataFileMeta, DataType, MergeEngine, RowKind, TinyIntType,
-    SEQUENCE_NUMBER_FIELD_ID, SEQUENCE_NUMBER_FIELD_NAME, VALUE_KIND_FIELD_ID,
+    BigIntType, ChangelogProducer, DataField, DataFileMeta, DataType, MergeEngine, RowKind,
+    TinyIntType, SEQUENCE_NUMBER_FIELD_ID, SEQUENCE_NUMBER_FIELD_NAME, VALUE_KIND_FIELD_ID,
     VALUE_KIND_FIELD_NAME,
 };
 use crate::table::data_file_index_writer::FileIndexOptions;
@@ -33,6 +38,7 @@ use crate::table::kv_data_file_writer::{KeyValueFileOptions, KeyValueRollingWrit
 use crate::table::kv_file_reader::{KeyValueFileReader, KeyValueReadConfig};
 use crate::table::sort_merge::{
     compare_sequence_order, BufferedBatch, MergeFunction, MergeResult, MergeRow,
+    CHANGELOG_BATCH_METADATA_KEY,
 };
 use crate::table::table_read::{
     configured_mosaic_prefetch, configured_parquet_read_budget, MAX_MERGE_INPUT_STREAMS,
@@ -40,9 +46,8 @@ use crate::table::table_read::{
 use crate::table::{DataSplit, Plan, Table};
 use crate::Result;
 
-/// Select complete captured buckets that need an L0 upgrade or level merge.
+/// Select incremental sorted runs using Java's universal size/run policy.
 pub(super) struct PrimaryKeyCompactPlanner;
-
 impl PrimaryKeyCompactPlanner {
     pub(super) fn plan_tasks(
         &self,
@@ -54,13 +59,7 @@ impl PrimaryKeyCompactPlanner {
             for file in &files {
                 validate_file(file, true)?;
             }
-            // One positive level is already a non-overlapping sorted run,
-            // including when the previous compaction rolled several files.
-            let first_level = files.first().map(|file| file.level);
-            if files
-                .iter()
-                .any(|file| file.level == 0 || Some(file.level) != first_level)
-            {
+            if let Some((files, primary_key)) = planner::select(files, context.schema.options())? {
                 tasks.push(CompactTask {
                     context: context.clone(),
                     task_id: tasks.len(),
@@ -68,6 +67,7 @@ impl PrimaryKeyCompactPlanner {
                     bucket,
                     total_buckets,
                     files,
+                    primary_key: Some(primary_key),
                 });
             }
         }
@@ -76,8 +76,8 @@ impl PrimaryKeyCompactPlanner {
 }
 
 /// Keep the same winner as a deduplicate query, including DELETE/UPDATE_BEFORE.
-/// A later write may carry a lower user sequence, so even full compaction
-/// must retain a winning retract rather than resurrect an older value.
+/// A later write may carry a lower user sequence, so compaction must retain
+/// a winning retract rather than resurrect an older value.
 struct CompactDeduplicate;
 
 impl MergeFunction for CompactDeduplicate {
@@ -152,14 +152,46 @@ impl MergeFunction for CompactReducer {
     }
 }
 
+struct CompactFirstRow(Box<dyn MergeFunction>);
+impl MergeFunction for CompactFirstRow {
+    fn merge(
+        &self,
+        rows: &[MergeRow],
+        batches: &[BufferedBatch],
+        columns: &[usize],
+        schema: &SchemaRef,
+    ) -> Result<MergeResult> {
+        let result = self.0.merge(rows, batches, columns, schema)?;
+        if rows.iter().any(|row| match &batches[row.batch_idx] {
+            BufferedBatch::Source(batch) => batch
+                .schema()
+                .metadata()
+                .contains_key("paimon.compact.lookup-base"),
+            _ => false,
+        }) {
+            Ok(MergeResult::Omit)
+        } else {
+            Ok(result)
+        }
+    }
+}
+
 fn new_merge_function(
     config: &KeyValueReadConfig,
     fields: &[DataField],
 ) -> Result<Box<dyn MergeFunction>> {
+    if crate::spec::CoreOptions::new(&config.table_options).deletion_vectors_enabled() {
+        // Like Java's DV lookup rewriter, materialize live values and drop
+        // retracts. History comes from selected runs or local point lookup;
+        // both apply the captured physical deletion vectors before merging.
+        return Ok(Box::new(crate::table::sort_merge::LookupMergeFunction(
+            KeyValueFileReader::new_unwrapped_merge_function(config, fields)?,
+        )));
+    }
     if config.merge_engine == MergeEngine::Deduplicate {
         return Ok(Box::new(CompactDeduplicate));
     }
-    let inner = KeyValueFileReader::new_merge_function(config, fields)?;
+    let inner = KeyValueFileReader::new_unwrapped_merge_function(config, fields)?;
     let aggregate_functions = match config.merge_engine {
         MergeEngine::PartialUpdate => crate::spec::PartialUpdateConfig::new(&config.table_options)
             .validated_aggregate_functions(&config.table_fields, &config.primary_keys)?
@@ -190,7 +222,7 @@ fn new_merge_function(
     };
     Ok(if config.merge_engine == MergeEngine::FirstRow {
         // First-row must still reject retracts unless ignore-delete is enabled.
-        inner
+        Box::new(CompactFirstRow(inner)) as Box<dyn MergeFunction>
     } else {
         Box::new(CompactReducer {
             inner,
@@ -213,16 +245,8 @@ fn new_merge_function(
     })
 }
 
-pub(super) async fn execute(
-    table: &Table,
-    task: &CompactTask,
-    split: &DataSplit,
-    resources: Option<ResourceContext>,
-) -> Result<Vec<DataFileMeta>> {
-    let schema = table.schema();
-    let options = schema.core_options();
-    let merge_engine = options.merge_engine()?;
-    let mut read_type = vec![
+fn read_type(table: &Table) -> Vec<DataField> {
+    let mut fields = vec![
         DataField::new(
             SEQUENCE_NUMBER_FIELD_ID,
             SEQUENCE_NUMBER_FIELD_NAME.into(),
@@ -234,11 +258,50 @@ pub(super) async fn execute(
             DataType::TinyInt(TinyIntType::new()),
         ),
     ];
-    read_type.extend_from_slice(schema.fields());
+    fields.extend_from_slice(table.schema().fields());
+    fields
+}
+
+pub(super) async fn execute(
+    table: &Table,
+    task: &CompactTask,
+    split: &DataSplit,
+    resources: Option<ResourceContext>,
+    cache: Option<Arc<lookup_store::LookupCache>>,
+) -> Result<(
+    Vec<DataFileMeta>,
+    Vec<DataFileMeta>,
+    Vec<lookup_store::LookupDeletion>,
+)> {
+    let schema = table.schema();
+    let options = schema.core_options();
+    let merge_engine = options.merge_engine()?;
+    let lookup_changelog = options.try_changelog_producer()? == ChangelogProducer::Lookup;
+    let read_type = read_type(table);
     let budget = configured_parquet_read_budget(table)?;
     let budget = match &resources {
         Some(resources) => Arc::new(budget.with_resources(resources.clone()).without_prefetch()),
         None => Arc::new(budget.without_prefetch()),
+    };
+    let (provider, deletions) = if let Some(cache) = cache {
+        let selection = task
+            .primary_key
+            .as_ref()
+            .ok_or_else(|| super::invalid("Missing incremental PK selection"))?;
+        let (provider, deletions) = lookup_store::provider(
+            table,
+            split,
+            &selection.lookup_files,
+            cache,
+            resources.clone(),
+        )
+        .await?;
+        (Some(provider), deletions)
+    } else {
+        (
+            None,
+            Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        )
     };
     let reader = KeyValueFileReader::new(
         table.file_io().clone(),
@@ -265,8 +328,21 @@ pub(super) async fn execute(
             mosaic_prefetch: configured_mosaic_prefetch(table)?,
         },
     );
+    let reader = reader.with_lookup(provider);
+    let deletion_split = if options.deletion_vectors_enabled() {
+        Some(deletion_vectors::with_deletion_files(table, split, &task.context.snapshot).await?)
+    } else {
+        None
+    };
+    let split = deletion_split.as_ref().unwrap_or(split);
     let mut batches =
-        reader.read_with_merge_function(std::slice::from_ref(split), new_merge_function)?;
+        reader.read_with_merge_function(std::slice::from_ref(split), move |config, fields| {
+            if lookup_changelog {
+                lookup::new_merge_function(config, fields)
+            } else {
+                new_merge_function(config, fields)
+            }
+        })?;
     let keys = schema.trimmed_primary_keys();
     let primary_key_indices = keys
         .iter()
@@ -301,39 +377,94 @@ pub(super) async fn execute(
         schema.options(),
     )?;
     let file_format = options.file_format();
+    let file_options = KeyValueFileOptions {
+        file_io: table.file_io(),
+        paths: &paths,
+        table_options: schema.options(),
+        value_fields: schema.fields(),
+        primary_key_indices: &primary_key_indices,
+        primary_key_types: &primary_key_types,
+        schema_id: schema.id(),
+        file_format: &file_format,
+        file_prefix: options.data_file_prefix(),
+        file_compression: options.file_compression(),
+        file_compression_zstd_level: options.file_compression_zstd_level(),
+        write_buffer_size: options.write_buffer_size()? as i64,
+        level: task.output_level(),
+        file_source: 1,
+        is_changelog: false,
+        index_options: index.as_ref(),
+        managed_blob_enabled: false,
+        resources: resources.as_ref(),
+    };
     let mut writer = KeyValueRollingWriter::new(
+        file_options,
+        options.target_file_size(),
+        options.target_file_row_num()?,
+    );
+    let changelog_format = options.changelog_file_format();
+    let mut changelog_writer = KeyValueRollingWriter::new(
         KeyValueFileOptions {
-            file_io: table.file_io(),
-            paths: &paths,
-            table_options: schema.options(),
-            value_fields: schema.fields(),
-            primary_key_indices: &primary_key_indices,
-            primary_key_types: &primary_key_types,
-            schema_id: schema.id(),
-            file_format: &file_format,
-            file_prefix: options.data_file_prefix(),
-            file_compression: options.file_compression(),
-            file_compression_zstd_level: options.file_compression_zstd_level(),
-            write_buffer_size: options.write_buffer_size()? as i64,
-            level: task.output_level(),
-            file_source: 1,
-            is_changelog: false,
-            index_options: index.as_ref(),
-            managed_blob_enabled: false,
-            resources: resources.as_ref(),
+            file_format: &changelog_format,
+            file_prefix: options.changelog_file_prefix(),
+            file_compression: options.changelog_file_compression(),
+            is_changelog: true,
+            index_options: None,
+            ..file_options
         },
         options.target_file_size(),
         options.target_file_row_num()?,
     );
+
     let result = async {
         while let Some(batch) = batches.try_next().await? {
-            writer.write(&batch).await?;
+            if batch
+                .schema()
+                .metadata()
+                .contains_key(CHANGELOG_BATCH_METADATA_KEY)
+            {
+                let mut metadata = batch.schema().metadata().clone();
+                metadata.remove(CHANGELOG_BATCH_METADATA_KEY);
+                let batch = arrow_array::RecordBatch::try_new(
+                    Arc::new(batch.schema().as_ref().clone().with_metadata(metadata)),
+                    batch.columns().to_vec(),
+                )
+                .map_err(|error| {
+                    super::invalid(&format!("Invalid changelog output batch: {error}"))
+                })?;
+                changelog_writer.write(&batch).await?;
+            } else {
+                writer.write(&batch).await?;
+            }
         }
-        writer.prepare_commit().await
+        // Keep both prepared file lists owned by their writers until both have
+        // closed successfully, so either failure can clean up the whole task.
+        writer.finish().await?;
+        changelog_writer.finish().await?;
+        Ok((
+            writer.prepare_commit().await?,
+            changelog_writer.prepare_commit().await?,
+            std::mem::take(&mut *deletions.lock().unwrap())
+                .into_iter()
+                .map(|(file_name, bitmap)| {
+                    let mut bytes = Vec::new();
+                    bitmap
+                        .serialize_into(&mut bytes)
+                        .map_err(|error| super::invalid(&error.to_string()))?;
+                    Ok(lookup_store::LookupDeletion {
+                        partition: task.partition.clone(),
+                        bucket: task.bucket,
+                        file_name,
+                        bitmap: bytes,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?,
+        ))
     }
     .await;
     if result.is_err() {
         writer.abort().await;
+        changelog_writer.abort().await;
     }
     result
 }

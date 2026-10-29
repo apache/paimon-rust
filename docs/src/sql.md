@@ -2820,8 +2820,9 @@ Set via `WITH ('key' = 'value')` at table creation time, or dynamically via `SET
 | `'merge-engine' = 'partial-update'` | Basic partial-update engine for PK tables |
 | `'merge-engine' = 'aggregation'` | Basic aggregation engine for PK tables |
 
-For deletion-vector-enabled primary-key tables using the default `deduplicate`
-engine, batch scans hide uncompacted level-0 files by default. Set
+For deletion-vector-enabled primary-key tables using `deduplicate`,
+`partial-update` or `aggregation`, batch scans hide uncompacted level-0 files by
+default. Set
 `'deletion-vectors.merge-on-read' = 'true'` to include those files and merge
 their key versions on read. Existing deletion vectors are applied before the
 key merge. This option affects batch snapshot reads only; it does not change
@@ -2871,12 +2872,12 @@ lower-precedence group sequence arrives, order-sensitive functions use Java
 compatible reversed aggregation. Unknown functions and incompatible
 function/type combinations fail closed.
 
-Rust can read fully materialized compacted files from deletion-vector-enabled
-partial-update and aggregation tables. Every split must be raw-convertible,
-every file must have a known zero delete-row count, and
-`deletion-vectors.merge-on-read` must remain disabled. Writing these table
-combinations and reading plans that still require per-key merging are not
-supported.
+Rust supports writing deletion-vector-enabled partial-update and aggregation
+tables and merging their uncompacted files with
+`deletion-vectors.merge-on-read=true`. Use the Rust table compaction API to
+materialize live rows for ordinary batch reads; see
+[Primary-key deletion vectors](compaction.md#primary-key-deletion-vectors).
+Compaction applies existing vectors before merging and drops deleted keys.
 
 Rust currently supports `merge-engine=aggregation` in basic mode only. It works
 with fixed buckets and ordinary dynamic buckets (`'bucket' = '-1'`) when the
@@ -2890,11 +2891,14 @@ Sequence fields are always merged with `last_value`. Defining
 `fields.<sequence-field>.aggregate-function` is rejected, matching Java schema
 validation.
 
-This is not full Java feature parity. Aggregation tables do not support retract
-rows (`DELETE` / `UPDATE_BEFORE`), deletion-vector writes or merge-on-read
-plans, cross-partition dynamic bucket writes, or advanced aggregation options
-such as `ignore-retract`, `distinct`, `nested-key`, `count-limit`, and sequence
-groups.
+Incremental primary-key compaction supports `changelog-producer=lookup` with or without
+deletion vectors and reuses local Lookup Files for untouched historical levels.
+These compact modes require `local-cache.enabled=true` on the catalog, using
+the same `local-cache.dir` and `local-cache.max-size` as other cached reads.
+It publishes INSERT, UPDATE_BEFORE, UPDATE_AFTER and DELETE
+changelogs when L0 files are compacted. Incremental and streaming scans then read
+the persisted changes; see [Lookup changelog producer](compaction.md#lookup-changelog-producer).
+`first-row` emits inserts for new keys only.
 
 ### Global Index Options
 
@@ -2972,8 +2976,9 @@ the normal physical format without wrapping the writer.
 | `'manifest.sidecar.enabled' = 'true'` | Write and read manifest block sidecars for partition, row-id, and bucket pruning; when unset, inherits `manifest-sort.enabled` |
 | `'global-index.enabled' = 'true'` | Enable global index metadata and reads |
 | `'deletion-vectors.enabled' = 'true'` | Enable deletion vectors |
-| `'deletion-vectors.merge-on-read' = 'true'` | Include and key-merge uncompacted level-0 files in DV-enabled deduplicate batch reads |
-| `'changelog-producer' = 'input'` | Changelog producer; primary-key tables support reads and writes in this mode |
+| `'deletion-vectors.merge-on-read' = 'true'` | Include and key-merge uncompacted level-0 files in DV-enabled primary-key batch reads |
+| `'changelog-producer' = 'input'` | Persist original write events for primary-key tables |
+| `'changelog-producer' = 'lookup'` | Generate logical before/after events through primary-key compaction |
 
 Manifest sidecars use the Java-compatible `<manifest-name>.avro.sidecar`
 format and are published through the manifest metadata's `_EXTRA_FILES` list.

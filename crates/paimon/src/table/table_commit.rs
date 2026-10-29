@@ -442,6 +442,9 @@ impl TableCommit {
             .try_commit(
                 CommitEntriesPlan::Compact {
                     entries: prepared.entries,
+                    changelog_entries: prepared.changelog_entries,
+                    pk_tasks: prepared.pk_tasks,
+                    lookup_deletions: prepared.lookup_deletions,
                     schema_id: prepared.schema_id,
                     read_snapshot: prepared.read_snapshot,
                     planned_snapshot_id: prepared.snapshot_id,
@@ -1252,8 +1255,14 @@ impl TableCommit {
                 new_index_entries,
                 ..
             } => (new_entries.as_slice(), &[][..], new_index_entries),
-            CommitEntriesPlan::Compact { entries, .. } => {
-                return self.check_recovery_entries(entries, &[], &[]).await;
+            CommitEntriesPlan::Compact {
+                entries,
+                changelog_entries,
+                ..
+            } => {
+                return self
+                    .check_recovery_entries(entries, changelog_entries, &[])
+                    .await;
             }
         };
         self.check_recovery_entries(entries, changelog_entries, index_entries)
@@ -1375,6 +1384,27 @@ impl TableCommit {
                     created_files,
                 )
                 .await?
+                {
+                    resolved.index_manifest_changed = true;
+                    resolved.new_index_manifest_entries = Some(indexes);
+                }
+            }
+        }
+
+        if !self.data_evolution_enabled
+            && self.deletion_vectors_enabled
+            && resolved.kind == CommitKind::COMPACT
+        {
+            if let Some(snapshot) = latest_snapshot {
+                if let Some(indexes) =
+                    super::compact::primary_key::deletion_vectors::rewrite_indexes(
+                        &self.table,
+                        snapshot,
+                        &resolved.entries,
+                        &resolved.lookup_deletions,
+                        created_files,
+                    )
+                    .await?
                 {
                     resolved.index_manifest_changed = true;
                     resolved.new_index_manifest_entries = Some(indexes);
@@ -1900,9 +1930,12 @@ impl TableCommit {
         match plan {
             CommitEntriesPlan::Compact {
                 entries,
+                changelog_entries,
                 schema_id,
                 read_snapshot,
                 planned_snapshot_id,
+                pk_tasks,
+                lookup_deletions,
             } => {
                 if latest_snapshot
                     .as_ref()
@@ -1928,6 +1961,7 @@ impl TableCommit {
                     None => None,
                 };
                 validate_file_entries(entries.iter())?;
+                validate_file_entries(changelog_entries.iter())?;
                 // This runs after duplicate-commit filtering: an uncertain commit
                 // can be retried even after the captured read snapshot expires.
                 if let Some(captured) = read_snapshot {
@@ -1944,6 +1978,9 @@ impl TableCommit {
                         None,
                     )
                     .await?;
+                    for task in pk_tasks.iter() {
+                        task.validate_inputs(&captured_files)?;
+                    }
                     let deletes = entries
                         .iter()
                         .filter(|e| *e.kind() == FileKind::Delete)
@@ -1974,8 +2011,7 @@ impl TableCommit {
                         .iter()
                         .filter(|e| {
                             buckets.contains(&(e.partition(), e.bucket()))
-                                && (!self.data_evolution_enabled
-                                    || deleted_ids.contains(&commit_file_identifier(e)))
+                                && deleted_ids.contains(&commit_file_identifier(e))
                         })
                         .map(|entry| (commit_file_identifier(entry), entry))
                         .collect::<HashMap<_, _>>();
@@ -1993,7 +2029,7 @@ impl TableCommit {
                             message: if self.data_evolution_enabled {
                                 "Data-evolution compaction inputs must match the captured row-ID groups"
                             } else {
-                                "PK compaction must include the complete captured bucket"
+                                "PK compaction must match its captured incremental inputs"
                             }.into(),
                             source: None,
                         });
@@ -2042,14 +2078,66 @@ impl TableCommit {
                     base_data_files.as_deref().unwrap_or_default(),
                     entries,
                 )?;
+                // Pin the whole positive-level lookup view, including negative
+                // lookups. Concurrent L0 appends do not change historical state.
+                if super::compact::primary_key::lookup_store::needed(&self.table)? {
+                    for task in pk_tasks.iter() {
+                        let expected = task
+                            .files()
+                            .iter()
+                            .chain(task.primary_key_files())
+                            .filter(|file| file.level > 0)
+                            .collect::<Vec<_>>();
+                        let current = base_data_files
+                            .as_deref()
+                            .unwrap_or_default()
+                            .iter()
+                            .filter(|entry| {
+                                entry.partition() == task.partition()
+                                    && entry.bucket() == task.bucket()
+                                    && entry.file().level > 0
+                            })
+                            .collect::<Vec<_>>();
+                        if expected.len() != current.len()
+                            || expected
+                                .iter()
+                                .any(|file| !current.iter().any(|entry| entry.file() == *file))
+                        {
+                            return Err(crate::Error::DataInvalid {
+                                message: "Lookup compaction history changed; create a new plan"
+                                    .into(),
+                                source: None,
+                            });
+                        }
+                    }
+                }
+                if self.deletion_vectors_enabled && !self.data_evolution_enabled {
+                    let captured =
+                        read_snapshot
+                            .as_deref()
+                            .ok_or_else(|| crate::Error::DataInvalid {
+                                message:
+                                    "PK deletion-vector compaction requires its captured snapshot"
+                                        .into(),
+                                source: None,
+                            })?;
+                    super::compact::primary_key::deletion_vectors::validate_dependencies(
+                        &self.table,
+                        captured,
+                        latest_snapshot.as_ref().expect("validated latest snapshot"),
+                        pk_tasks,
+                    )
+                    .await?;
+                }
                 Ok(ResolvedCommit {
                     entries: entries.clone(),
-                    changelog_entries: vec![],
+                    changelog_entries: changelog_entries.clone(),
                     kind: CommitKind::COMPACT,
                     index_manifest_name,
                     index_manifest_changed: false,
                     new_index_manifest_entries: None,
                     base_data_files,
+                    lookup_deletions: lookup_deletions.clone(),
                 })
             }
             CommitEntriesPlan::Direct {
@@ -2123,6 +2211,7 @@ impl TableCommit {
                     index_manifest_changed,
                     new_index_manifest_entries,
                     base_data_files,
+                    lookup_deletions: vec![],
                 })
             }
             CommitEntriesPlan::Overwrite { .. } => {
@@ -2195,6 +2284,7 @@ impl TableCommit {
                     index_manifest_changed,
                     new_index_manifest_entries,
                     base_data_files,
+                    lookup_deletions: vec![],
                 })
             }
         }
@@ -3868,12 +3958,15 @@ fn build_partition_stats_row(datums: &[Option<Datum>], data_types: &[DataType]) 
 
 /// Plan for resolving commit entries.
 enum CommitEntriesPlan {
-    /// Replace unchanged data files without publishing logical row changes.
+    /// Replace unchanged data files and atomically publish generated changelogs.
     Compact {
         entries: Vec<ManifestEntry>,
+        changelog_entries: Vec<ManifestEntry>,
         schema_id: i64,
         read_snapshot: Option<Box<Snapshot>>,
         planned_snapshot_id: i64,
+        pk_tasks: Vec<super::CompactTask>,
+        lookup_deletions: Vec<super::compact::primary_key::lookup_store::LookupDeletion>,
     },
     /// Caller-provided entries. May contain `FileKind::Delete` entries from CoW
     /// rewrites, in which case `resolve_commit` auto-promotes to `CommitKind::OVERWRITE`.
@@ -3929,6 +4022,7 @@ fn direct_commit_kind(
 
 /// Fully resolved commit ready for writing.
 struct ResolvedCommit {
+    lookup_deletions: Vec<super::compact::primary_key::lookup_store::LookupDeletion>,
     entries: Vec<ManifestEntry>,
     changelog_entries: Vec<ManifestEntry>,
     kind: CommitKind,

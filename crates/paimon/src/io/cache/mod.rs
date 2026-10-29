@@ -17,6 +17,7 @@
 
 mod disk;
 mod file_type;
+pub(crate) mod generated;
 mod memory;
 mod priority_lru;
 mod reader;
@@ -37,7 +38,7 @@ use std::sync::Arc;
 
 use disk::shared::SharedDiskCache;
 use disk::DiskCache;
-pub(super) use reader::CachedFileReader;
+pub(crate) use reader::CachedFileReader;
 
 const CACHE_DIRECTORY_NAME: &str = "paimon-local-cache-v2";
 const DEFAULT_FILE_SIZE_CAPACITY: usize = 65_536;

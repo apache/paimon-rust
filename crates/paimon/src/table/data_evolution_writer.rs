@@ -542,6 +542,15 @@ pub struct DataEvolutionDeleteWriter {
 }
 
 impl DataEvolutionDeleteWriter {
+    /// Shared bucket-local index I/O used by incremental PK compaction. Row-ID
+    /// DELETE operations still enter through the validated public constructor.
+    pub(in crate::table) fn for_primary_key_compaction(table: &Table) -> Self {
+        Self {
+            table: table.clone(),
+            row_ids: vec![],
+        }
+    }
+
     pub fn new(table: &Table) -> Result<Self> {
         let schema = table.schema();
         let core_options = CoreOptions::new(schema.options());

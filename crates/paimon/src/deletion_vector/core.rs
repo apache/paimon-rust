@@ -65,6 +65,13 @@ impl DeletionVector {
         (*self.bitmap).clone()
     }
 
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.bitmap
+            .serialized_size()
+            .saturating_mul(2)
+            .saturating_add(64)
+    }
+
     /// Number of deleted positions in this vector.
     pub fn cardinality(&self) -> u64 {
         self.bitmap.len()
