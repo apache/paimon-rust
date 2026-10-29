@@ -86,7 +86,7 @@ impl FullTextRead {
         &self,
         plan: FullTextScanPlan,
     ) -> crate::Result<crate::table::GlobalIndexResult> {
-        self.read_internal(plan, None).await
+        self.read_internal(plan, None, true).await
     }
 
     /// Execute shard work through a scheduler while retaining the plan's
@@ -96,13 +96,24 @@ impl FullTextRead {
         plan: FullTextScanPlan,
         executor: &dyn crate::table::SearchTaskExecutor,
     ) -> crate::Result<crate::table::GlobalIndexResult> {
-        self.read_internal(plan, Some(executor)).await
+        self.read_internal(plan, Some(executor), true).await
+    }
+
+    /// Exhaustive reference path for internal benchmarks and parity tests.
+    #[cfg(any(feature = "internal-api", test))]
+    pub(crate) async fn read_exhaustive(
+        &self,
+        plan: FullTextScanPlan,
+        executor: Option<&dyn crate::table::SearchTaskExecutor>,
+    ) -> crate::Result<crate::table::GlobalIndexResult> {
+        self.read_internal(plan, executor, false).await
     }
 
     async fn read_internal(
         &self,
         plan: FullTextScanPlan,
         executor: Option<&dyn crate::table::SearchTaskExecutor>,
+        allow_top_k: bool,
     ) -> crate::Result<crate::table::GlobalIndexResult> {
         CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
         if executor.is_some() && !self.table.schema().core_options().data_evolution_enabled() {
@@ -268,6 +279,7 @@ impl FullTextRead {
                 partition_filter: partition_filter.as_ref(),
                 row_filter: row_filter.as_ref(),
                 source_splits: Some(plan.splits()),
+                allow_top_k,
             },
             &entries,
             &search,

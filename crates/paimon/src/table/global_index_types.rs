@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::lumina::{is_lumina_index_type, LUMINA_IDENTIFIER};
 use crate::vindex::{
     is_vindex_index_type, DISKANN_IDENTIFIER, IVF_FLAT_IDENTIFIER, IVF_PQ_IDENTIFIER,
     IVF_RQ_IDENTIFIER, IVF_SQ_IDENTIFIER,
@@ -52,14 +51,13 @@ pub(crate) fn normalize_queryable_global_index_type(index_type: &str) -> Option<
 /// Used verbatim in the unsupported-type error of both the builder and the
 /// DataFusion procedure so the two messages stay in sync.
 pub const SUPPORTED_GLOBAL_INDEX_TYPES_FOR_DROP: &str =
-    "btree, bitmap, multivalue, fm, full-text, lumina, lumina-vector-ann, ivf-flat, ivf-pq, ivf-sq, ivf-rq, diskann";
+    "btree, bitmap, multivalue, fm, full-text, ivf-flat, ivf-pq, ivf-sq, ivf-rq, diskann";
 
 /// Canonicalize any supported global index type to a stable `&'static str`, or
 /// `None` if unsupported. Case-insensitive and shared by build and drop.
-/// Order: scalar -> full-text -> lumina -> vindex.
+/// Order: scalar -> full-text -> vindex.
 ///
-/// Both lumina aliases (`lumina`, `lumina-vector-ann`) canonicalize to
-/// `"lumina"`; each vindex type keeps its own identity so dropping one vindex
+/// Each vindex type keeps its own identity so dropping one vindex
 /// type never matches another on the same column. Callers should compare the
 /// canonical form of BOTH the request and each stored entry's `index_type`.
 pub fn normalize_global_index_type(index_type: &str) -> Option<&'static str> {
@@ -69,12 +67,9 @@ pub fn normalize_global_index_type(index_type: &str) -> Option<&'static str> {
     if index_type.eq_ignore_ascii_case(FULL_TEXT_GLOBAL_INDEX_TYPE) {
         return Some(FULL_TEXT_GLOBAL_INDEX_TYPE);
     }
-    // is_lumina_index_type / is_vindex_index_type match case-sensitively, so
+    // is_vindex_index_type matches case-sensitively, so
     // lowercase first (normalize_sorted_global_index_type is already case-insensitive).
     let lowered = index_type.to_ascii_lowercase();
-    if is_lumina_index_type(&lowered) {
-        return Some(LUMINA_IDENTIFIER);
-    }
     if is_vindex_index_type(&lowered) {
         return canonical_vindex_identifier(&lowered);
     }
@@ -118,16 +113,6 @@ mod tests {
     }
 
     #[test]
-    fn lumina_aliases_canonicalize_to_lumina() {
-        assert_eq!(normalize_global_index_type("lumina"), Some("lumina"));
-        assert_eq!(
-            normalize_global_index_type("lumina-vector-ann"),
-            Some("lumina")
-        );
-        assert_eq!(normalize_global_index_type("LUMINA"), Some("lumina"));
-    }
-
-    #[test]
     fn vindex_types_keep_distinct_identity() {
         assert_eq!(normalize_global_index_type("ivf-flat"), Some("ivf-flat"));
         assert_eq!(normalize_global_index_type("IVF-PQ"), Some("ivf-pq"));
@@ -139,6 +124,8 @@ mod tests {
     #[test]
     fn unsupported_types_return_none() {
         assert_eq!(normalize_global_index_type("hash"), None);
+        assert_eq!(normalize_global_index_type("lumina"), None);
+        assert_eq!(normalize_global_index_type("lumina-vector-ann"), None);
         assert_eq!(normalize_global_index_type("ivf-hnsw-flat"), None);
         assert_eq!(normalize_global_index_type("ivf-hnsw-sq"), None);
         assert_eq!(normalize_global_index_type(""), None);

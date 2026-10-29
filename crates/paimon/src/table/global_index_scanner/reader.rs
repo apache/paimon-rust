@@ -258,7 +258,7 @@ impl GlobalIndexScanner {
         } else {
             input.metadata().await?.size
         };
-        let file_reader = input.reader().await?;
+        let file_reader = input.reader_with_size(file_size).await?;
 
         let cmp = make_key_comparator(data_type);
         BTreeIndexReader::open_with_data_block_cache(

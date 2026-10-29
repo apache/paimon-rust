@@ -47,8 +47,10 @@ mod format_partition_analyze;
 mod format_partition_ddl;
 mod format_partition_repair;
 mod format_table_truncate;
-#[cfg(feature = "fulltext")]
 mod full_text_search;
+#[cfg(test)]
+#[path = "../testdata/warehouse/mod.rs"]
+mod golden_warehouse;
 mod hybrid_search;
 mod lateral_vector_search;
 mod memory;
@@ -86,11 +88,11 @@ pub use catalog::{
     TableEngineResolver,
 };
 pub use error::to_datafusion_error;
-#[cfg(feature = "fulltext")]
 pub use full_text_search::{register_full_text_search, FullTextSearchFunction};
 pub use hybrid_search::{register_hybrid_search, HybridSearchFunction};
 pub use merge_condition::compile_merge_condition;
 pub use physical_plan::PaimonTableScan;
+pub use procedures::execute_procedure;
 pub use relation_planner::PaimonRelationPlanner;
 pub use sql_context::{SQLContext, SQLContextBuilder};
 pub use table::PaimonTableProvider;

@@ -44,7 +44,6 @@ storage-all = [
     "storage-jindo",
     "storage-oss-cpp",
 ]
-fulltext = ["dep:paimon-ftindex-core"]
 # Unstable bridge used by the repository's language bindings. It is not part
 # of the public table API or the default crate surface.
 internal-api = []
@@ -57,7 +56,11 @@ storage-oss = [
     "dep:opendal-layer-retry",
     "dep:opendal-service-oss",
 ]
-storage-s3 = ["dep:opendal-http-transport-reqwest", "dep:opendal-service-s3"]
+storage-s3 = [
+    "dep:opendal-http-transport-reqwest",
+    "dep:opendal-service-s3",
+    "dep:opendal-layer-retry",
+]
 storage-cos = ["dep:opendal-http-transport-reqwest", "dep:opendal-service-cos"]
 storage-azdls = [
     "dep:opendal-http-transport-reqwest",
@@ -128,6 +131,7 @@ arrow-arith = { workspace = true }
 arrow-buffer = { workspace = true }
 arrow-cast = { workspace = true }
 arrow-json = "58.0"
+arrow-ipc = "58.0"
 arrow-ord = { workspace = true }
 arrow-row = { workspace = true }
 arrow-schema = { workspace = true }
@@ -153,7 +157,7 @@ md-5 = "0.10"
 regex = "1"
 uuid = { version = "1", features = ["v4"] }
 paimon-mosaic-core = "0.2.0"
-paimon-ftindex-core = { version = "0.1.0", optional = true }
+paimon-ftindex-core = "0.1.0"
 tempfile = "3"
 paimon-vindex-core = "0.5.0"
 vortex = { version = "0.75.0", features = ["tokio"], optional = true }
@@ -169,3 +173,7 @@ cc = "1"
 [dev-dependencies]
 axum = { version = "0.7", features = ["macros", "tokio", "http1", "http2"] }
 libc = "0.2"
+
+[[example]]
+name = "full_text_top_k_benchmark"
+required-features = ["internal-api"]

@@ -305,12 +305,38 @@ impl SharedDiskCache {
     pub(crate) async fn load_lock(&self, key: &BlockKey) -> Option<File> {
         // Best-effort block coalescing; read_full locks only the first block.
         // Publication safety relies on the directory lock and generation checks.
+        lock(self.load_lock_path(key)?).await
+    }
+
+    pub(crate) async fn load_locks(&self, keys: &[BlockKey]) -> Vec<File> {
+        let mut paths: Vec<_> = keys
+            .iter()
+            .filter_map(|key| self.load_lock_path(key))
+            .collect();
+        paths.sort_unstable();
+        paths.dedup();
+        // Busy stripes may belong to unrelated blocks; never wait while holding a batch.
+        tokio::task::spawn_blocking(move || {
+            let mut guards = Vec::new();
+            for path in paths {
+                if let Ok(file) = open_lock(&path) {
+                    if file.try_lock().is_ok() {
+                        guards.push(file);
+                    }
+                }
+            }
+            guards
+        })
+        .await
+        .unwrap_or_default()
+    }
+
+    fn load_lock_path(&self, key: &BlockKey) -> Option<PathBuf> {
         let stripe = key.cache_relative_path();
-        lock(self.root.join(format!(
+        Some(self.root.join(format!(
             "load-{}.lock",
             stripe.components().next()?.as_os_str().to_string_lossy()
         )))
-        .await
     }
 
     pub(crate) async fn get(&self, key: &BlockKey, generation: &Option<String>) -> Option<Bytes> {
@@ -452,6 +478,45 @@ impl SharedDiskCache {
         if !matches!(result, Ok(Ok(()))) {
             log::debug!("Shared cache publication failed");
         }
+    }
+
+    /// Remove only one unpublished generated file, without rotating the shared epoch.
+    pub(crate) async fn remove_generated(&self, mut key: BlockKey, blocks: u64) -> io::Result<()> {
+        let gate = lock(self.root.join("directory.lock"))
+            .await
+            .ok_or_else(|| {
+                io::Error::other("Shared generated-file cleanup could not acquire directory lock")
+            })?;
+        let root = self.root.clone();
+        let max_size = self.max_size;
+        let ratio = self.high_priority_ratio;
+        tokio::task::spawn_blocking(move || -> io::Result<()> {
+            let _gate = gate;
+            let Some(generation) = read_generation(&root) else {
+                return Ok(());
+            };
+            let mut used = clean_usage(&root, max_size)
+                .map(Ok)
+                .unwrap_or_else(|| recover_usage(&root, max_size, ratio))?;
+            std::fs::write(root.join("dirty"), b"")?;
+            for index in 0..blocks {
+                key.block_index = index;
+                let path = root.join(generation_key(&key, &generation).cache_relative_path());
+                let size = match std::fs::metadata(&path) {
+                    Ok(meta) => meta.len(),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(error),
+                };
+                match std::fs::remove_file(path) {
+                    Ok(()) => used = used.saturating_sub(size),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => (),
+                    Err(error) => return Err(error),
+                }
+            }
+            finish_usage(&root, used)
+        })
+        .await
+        .map_err(io::Error::other)?
     }
 
     pub(crate) async fn invalidate(&self) -> io::Result<()> {
@@ -1091,6 +1156,28 @@ mod tests {
                 .is_some()
         );
         drop(other);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn batch_download_locks_deduplicate_and_skip_busy_stripes() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = SharedDiskCache::new(directory.path().to_path_buf(), 1024 * 1024).unwrap();
+        let second = SharedDiskCache::new(directory.path().to_path_buf(), 1024 * 1024).unwrap();
+        let a = BlockKey::with_namespace("test", "snapshot-1", 256 * 1024, 15);
+        let b = BlockKey::with_namespace("test", "snapshot-1", 256 * 1024, 20);
+        let collision = BlockKey::with_namespace("test", "snapshot-1", 256 * 1024, 27);
+        assert_eq!(first.load_lock_path(&a), first.load_lock_path(&collision));
+        assert_ne!(first.load_lock_path(&a), first.load_lock_path(&b));
+        let forward = [a.clone(), b.clone(), collision.clone()];
+        let reverse = [collision, b, a];
+        let guards = first.load_locks(&forward).await;
+        assert_eq!(guards.len(), 2);
+        let contended = tokio::time::timeout(Duration::from_secs(1), second.load_locks(&reverse))
+            .await
+            .expect("busy stripes must not block another batch");
+        assert!(contended.is_empty());
+        drop(guards);
+        assert_eq!(second.load_locks(&reverse).await.len(), 2);
     }
 
     #[tokio::test]

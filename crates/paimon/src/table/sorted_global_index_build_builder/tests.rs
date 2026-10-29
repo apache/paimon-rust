@@ -833,14 +833,18 @@ async fn scalar_build_with_deletion_vectors_preserves_physical_coverage() {
 #[tokio::test]
 async fn test_execute_writes_btree_index_manifest_and_file() {
     for version in [1, 2] {
-        assert_btree_build_version(version).await;
+        for budget in ["128b", "64mb"] {
+            assert_btree_build_version(version, budget).await;
+        }
     }
 }
 
-async fn assert_btree_build_version(version: u32) {
+async fn assert_btree_build_version(version: u32, budget: &str) {
     let table_path = "memory:/test_btree_global_index_builder_e2e";
     let mut options = table_options("10");
+    options.insert("read.batch-size".into(), "1".into());
     options.insert("btree-index.file-version".into(), version.to_string());
+    options.insert("write-buffer-size".into(), budget.to_string());
     options.insert(
         "btree-index.bloom-filter.enabled".to_string(),
         "true".to_string(),
@@ -1632,7 +1636,9 @@ async fn test_detail_mode_defers_manifest_pruning_for_unindexed_ranges() {
 #[tokio::test]
 async fn test_execute_writes_bitmap_index_manifest_and_java_file() {
     let table_path = "memory:/test_bitmap_global_index_builder_e2e";
-    let table = test_table_with_path(table_path, table_options("10"));
+    let mut options = table_options("10");
+    options.insert("write-buffer-size".into(), "128b".into());
+    let table = test_table_with_path(table_path, options);
     setup_dirs(&table).await;
 
     let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
@@ -1735,7 +1741,10 @@ async fn test_execute_writes_bitmap_index_manifest_and_java_file() {
 #[tokio::test]
 async fn test_execute_multivalue_index_and_array_queries_end_to_end() {
     let table_path = "memory:/test_multivalue_global_index_builder_e2e";
-    let table = multivalue_table(table_path);
+    let table = multivalue_table(table_path).copy_with_options(HashMap::from([
+        ("write-buffer-size".into(), "128b".into()),
+        ("read.batch-size".into(), "1".into()),
+    ]));
     setup_dirs(&table).await;
 
     let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
@@ -2797,6 +2806,7 @@ async fn composite_ranges(
 async fn test_composite_btree_build_query_coverage_and_drop() {
     for version in [1, 2] {
         let mut options = table_options("2");
+        options.insert("write-buffer-size".into(), "128b".into());
         options.insert("btree-index.file-version".into(), version.to_string());
         options.insert("btree-index.bloom-filter.enabled".into(), "true".into());
         let table =
@@ -3626,4 +3636,77 @@ async fn test_composite_btree_preserves_exact_column_names() {
         .execute()
         .await
         .is_err());
+}
+
+#[tokio::test]
+async fn invalid_write_buffer_size_is_rejected_before_an_empty_build() {
+    for value in ["0", "-1mb", "invalid"] {
+        let mut options = table_options("10");
+        options.insert("write-buffer-size".into(), value.into());
+        let table = test_table(options);
+        let error = table
+            .new_global_index_build_builder()
+            .with_index_column("name")
+            .build()
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::ConfigInvalid { .. }));
+        assert!(error.to_string().contains("write-buffer-size"));
+    }
+}
+
+#[tokio::test]
+async fn write_buffer_size_limits_keys_and_builder_options_override_table() {
+    let table = test_table_with_path(
+        "memory:/index_build_write_buffer_override",
+        table_options("10"),
+    );
+    setup_dirs(&table).await;
+    let builder = table.new_write_builder();
+    let mut writer = builder.new_write().unwrap();
+    writer
+        .write_arrow_batch(&data_batch(vec![1, 2, 3], vec!["alice", "bob", "alice"]))
+        .await
+        .unwrap();
+    builder
+        .new_commit()
+        .commit(writer.prepare_commit().await.unwrap())
+        .await
+        .unwrap();
+    let table = table.copy_with_options(HashMap::from([("write-buffer-size".into(), "1b".into())]));
+    let before = table
+        .snapshot_manager()
+        .get_latest_snapshot_id()
+        .await
+        .unwrap();
+    let error = table
+        .new_global_index_build_builder()
+        .with_index_column("name")
+        .build()
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::ResourceExhausted { .. }));
+    assert!(error.to_string().contains("write-buffer-size"));
+    assert_eq!(
+        table
+            .snapshot_manager()
+            .get_latest_snapshot_id()
+            .await
+            .unwrap(),
+        before
+    );
+    assert_eq!(
+        table
+            .new_global_index_build_builder()
+            .with_index_column("name")
+            .with_options(HashMap::from([("write-buffer-size".into(), "128b".into())]))
+            .execute()
+            .await
+            .unwrap(),
+        1
+    );
+    let predicate = PredicateBuilder::new(table.schema().fields())
+        .equal("name", Datum::String("alice".into()))
+        .unwrap();
+    assert_eq!(scan_ids(&table, predicate).await, vec![1, 3]);
 }

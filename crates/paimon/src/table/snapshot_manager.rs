@@ -268,10 +268,9 @@ impl SnapshotManager {
     /// Writes the snapshot JSON to the target path. Returns `false` if the
     /// target already exists (another writer won the race).
     ///
-    /// On file systems that support atomic rename, we write to a temp file
-    /// first then rename. On backends where rename is not supported (e.g.
-    /// memory, object stores), we fall back to a direct write after an
-    /// existence check.
+    /// Uses atomic no-replace publication: a staged file on the local filesystem,
+    /// conditional rename, or a conditional object write. Backends without a
+    /// safe primitive must use a catalog-provided SnapshotCommit instead.
     pub async fn commit_snapshot(&self, snapshot: &Snapshot) -> crate::Result<bool> {
         let target_path = self.snapshot_path(snapshot.id());
 
@@ -280,35 +279,12 @@ impl SnapshotManager {
             source: Some(Box::new(e)),
         })?;
 
-        // Try rename-based atomic commit first, fall back to check-and-write.
-        //
-        // TODO: opendal's rename uses POSIX semantics which silently overwrites the target.
-        //  The exists() check below narrows the race window but does not eliminate it.
-        //  Java Paimon uses `lock.runWithLock(() -> !fileIO.exists(newPath) && callable.call())`
-        //  for full mutual exclusion. We need an external lock mechanism (like Java's Lock
-        //  interface) for backends without atomic rename-no-replace support.
-        let tmp_path = format!("{}.tmp-{}", target_path, uuid::Uuid::new_v4());
-        let output = self.file_io.new_output(&tmp_path)?;
-        output.write(bytes::Bytes::from(json.clone())).await?;
-
-        // Check before rename to avoid silent overwrite (opendal uses POSIX rename semantics)
-        if self.file_io.exists(&target_path).await? {
-            let _ = self.file_io.delete_file(&tmp_path).await;
+        if !self
+            .file_io
+            .write_atomic_if_not_exists(&target_path, bytes::Bytes::from(json))
+            .await?
+        {
             return Ok(false);
-        }
-
-        match self.file_io.rename(&tmp_path, &target_path).await {
-            Ok(()) => {}
-            Err(_) => {
-                // Rename not supported (e.g. memory/object store).
-                // Clean up temp file, then check-and-write.
-                let _ = self.file_io.delete_file(&tmp_path).await;
-                if self.file_io.exists(&target_path).await? {
-                    return Ok(false);
-                }
-                let output = self.file_io.new_output(&target_path)?;
-                output.write(bytes::Bytes::from(json)).await?;
-            }
         }
 
         // Update LATEST hint (best-effort)
@@ -864,6 +840,218 @@ mod tests {
         // Second commit to same id should return false
         let result = sm.commit_snapshot(&snap).await.unwrap();
         assert!(!result);
+    }
+
+    #[derive(Debug)]
+    struct SnapshotPublicationProvider {
+        op: opendal::Operator,
+        barrier: tokio::sync::Barrier,
+        synchronize: std::sync::atomic::AtomicBool,
+        reject: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::io::FileIOProvider for SnapshotPublicationProvider {
+        async fn create(&self, path: &str) -> crate::Result<(opendal::Operator, String)> {
+            let relative = path.strip_prefix("memory:/").unwrap();
+            // Synchronize every resolution of the publication path. In the old
+            // check-then-write implementation both writers pass each check
+            // before either reaches its unconditional write.
+            if relative.ends_with("/snapshot-1")
+                && self.synchronize.load(std::sync::atomic::Ordering::SeqCst)
+            {
+                self.barrier.wait().await;
+            }
+            Ok((self.op.clone(), relative.to_string()))
+        }
+
+        async fn write_atomic_if_not_exists(
+            &self,
+            _: &str,
+            _: bytes::Bytes,
+        ) -> crate::Result<Option<bool>> {
+            if self.reject {
+                return Err(crate::Error::IoUnsupported {
+                    message: "provider rejected snapshot publication".into(),
+                });
+            }
+            Ok(None)
+        }
+    }
+
+    #[tokio::test]
+    async fn test_commit_snapshot_concurrent_publication_has_one_winner() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let provider = Arc::new(SnapshotPublicationProvider {
+            op: opendal::Operator::from_config(opendal::services::MemoryConfig::default()).unwrap(),
+            barrier: tokio::sync::Barrier::new(2),
+            synchronize: AtomicBool::new(true),
+            reject: false,
+        });
+        let io = FileIOBuilder::new("memory")
+            .with_provider(provider.clone())
+            .build()
+            .unwrap();
+        let manager = SnapshotManager::new(io, "memory:/racing-snapshot".into());
+        let first = test_snapshot(1);
+        let mut json = serde_json::to_value(&first).unwrap();
+        json["commitUser"] = "other-writer".into();
+        let second: Snapshot = serde_json::from_value(json).unwrap();
+        let (a, b) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(
+                manager.commit_snapshot(&first),
+                manager.commit_snapshot(&second)
+            )
+        })
+        .await
+        .expect("publication must not deadlock");
+        provider.synchronize.store(false, Ordering::SeqCst);
+        let (a, b) = (a.unwrap(), b.unwrap());
+        assert_ne!(a, b, "exactly one writer must win the same snapshot ID");
+        assert_eq!(
+            manager.get_snapshot(1).await.unwrap(),
+            if a { first } else { second }
+        );
+        assert_eq!(manager.get_latest_snapshot_id().await.unwrap(), Some(1));
+        let files = manager
+            .file_io
+            .list_status(&manager.snapshot_dir())
+            .await
+            .unwrap();
+        assert!(files.iter().all(|file| !file.path.contains(".tmp-")));
+    }
+
+    #[tokio::test]
+    async fn test_commit_snapshot_provider_error_never_falls_back_to_operator() {
+        let provider = std::sync::Arc::new(SnapshotPublicationProvider {
+            op: opendal::Operator::from_config(opendal::services::MemoryConfig::default()).unwrap(),
+            barrier: tokio::sync::Barrier::new(2),
+            synchronize: std::sync::atomic::AtomicBool::new(false),
+            reject: true,
+        });
+        let io = FileIOBuilder::new("memory")
+            .with_provider(provider.clone())
+            .build()
+            .unwrap();
+        let manager = SnapshotManager::new(io, "memory:/provider-error".into());
+        let error = manager
+            .commit_snapshot(&test_snapshot(1))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, crate::Error::IoUnsupported { ref message } if message == "provider rejected snapshot publication")
+        );
+        assert!(provider.op.list("/").await.unwrap().is_empty());
+    }
+
+    #[cfg(feature = "storage-fs")]
+    #[tokio::test]
+    async fn test_commit_snapshot_local_concurrent_independent_writers() {
+        let dir = tempfile::tempdir().unwrap();
+        let table_path = dir.path().to_str().unwrap().to_string();
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(16));
+        let results = futures::future::join_all((0..16).map(|writer| {
+            let table_path = table_path.clone();
+            let barrier = barrier.clone();
+            async move {
+                // Separate FileIO instances also cover writers in other processes:
+                // publication must not rely on a mutex owned by a committer.
+                let io = FileIOBuilder::new("file").build().unwrap();
+                let manager = SnapshotManager::new(io, table_path);
+                let mut json = serde_json::to_value(test_snapshot(1)).unwrap();
+                json["commitUser"] = format!("writer-{writer}").into();
+                let snapshot: Snapshot = serde_json::from_value(json).unwrap();
+                barrier.wait().await;
+                let won = manager.commit_snapshot(&snapshot).await.unwrap();
+                (snapshot, won)
+            }
+        }))
+        .await;
+        let winners = results.iter().filter(|(_, won)| *won).collect::<Vec<_>>();
+        assert_eq!(winners.len(), 1);
+        let io = FileIOBuilder::new("file").build().unwrap();
+        let manager = SnapshotManager::new(io.clone(), table_path);
+        assert_eq!(manager.get_snapshot(1).await.unwrap(), winners[0].0);
+        assert_eq!(manager.get_latest_snapshot_id().await.unwrap(), Some(1));
+        assert_eq!(
+            io.list_status(&manager.snapshot_dir()).await.unwrap().len(),
+            2
+        );
+        assert!(!manager.commit_snapshot(&test_snapshot(1)).await.unwrap());
+        assert_eq!(manager.get_snapshot(1).await.unwrap(), winners[0].0);
+    }
+
+    #[tokio::test]
+    async fn test_commit_snapshot_refuses_non_atomic_backend_without_writing() {
+        let op = opendal::Operator::from_config(opendal::services::MemoryConfig::default())
+            .unwrap()
+            .layer(opendal::layers::CapabilityOverrideLayer::new(|mut cap| {
+                cap.write_with_if_not_exists = false;
+                cap
+            }));
+        let io = FileIOBuilder::new("file")
+            .with_fs_operator(op.clone())
+            .build()
+            .unwrap();
+        let manager = SnapshotManager::new(io, "/unsafe-snapshot".into());
+        let error = manager
+            .commit_snapshot(&test_snapshot(1))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, crate::Error::IoUnsupported { .. }));
+        assert!(error.to_string().contains("SnapshotCommit"), "{error}");
+        assert!(
+            op.list("/").await.unwrap().is_empty(),
+            "unsafe backends must not receive even a staging write"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_commit_snapshot_rename_error_never_falls_back_to_overwrite() {
+        let op = opendal::Operator::from_config(opendal::services::MemoryConfig::default())
+            .unwrap()
+            .layer(opendal::layers::CapabilityOverrideLayer::new(|mut cap| {
+                // Advertise rename but inject an Unsupported error from the
+                // underlying memory service. Conditional put remains available.
+                cap.rename = true;
+                cap.rename_with_if_not_exists = true;
+                cap
+            }));
+        let io = FileIOBuilder::new("file")
+            .with_fs_operator(op.clone())
+            .build()
+            .unwrap();
+        let manager = SnapshotManager::new(io.clone(), "/failed-rename".into());
+        let error = manager
+            .commit_snapshot(&test_snapshot(1))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, crate::Error::IoUnexpected { ref source, .. } if source.kind() == opendal::ErrorKind::Unsupported)
+        );
+        assert!(!io.exists(&manager.snapshot_path(1)).await.unwrap());
+        assert!(!io.exists(&manager.latest_hint_path()).await.unwrap());
+    }
+
+    #[cfg(feature = "storage-fs")]
+    #[tokio::test]
+    async fn test_commit_snapshot_refuses_custom_fs_without_conditional_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = opendal_service_fs::FsConfig::default();
+        config.root = Some(dir.path().to_str().unwrap().into());
+        let io = FileIOBuilder::new("file")
+            .with_fs_operator(opendal::Operator::from_config(config).unwrap())
+            .build()
+            .unwrap();
+        let manager = SnapshotManager::new(io, "file:/custom-table".into());
+        let error = manager
+            .commit_snapshot(&test_snapshot(1))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, crate::Error::IoUnsupported { .. }));
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 
     #[tokio::test]

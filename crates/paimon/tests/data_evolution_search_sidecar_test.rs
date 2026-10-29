@@ -366,7 +366,6 @@ fn vector_options() -> HashMap<String, String> {
     ])
 }
 
-#[cfg(feature = "fulltext")]
 #[tokio::test]
 async fn full_text_and_hybrid_hits_read_latest_variant_sidecars_with_ranked_scores() {
     let table = fixture("full_text_hybrid", true).await;

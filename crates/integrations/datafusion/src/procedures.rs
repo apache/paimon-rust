@@ -18,7 +18,9 @@
 //! CALL procedure support for Paimon tables.
 //!
 //! Supported procedures:
+//! - `CALL sys.create_branch(table => '...', branch => '...'[, tag => '...', ignore_if_exists => true])`
 //! - `CALL sys.create_tag(table => '...', tag => '...', snapshot_id => ..., time_retained => '...')`
+//! - `CALL sys.replace_tag(table => '...', tag => '...', snapshot_id => ..., time_retained => '...')`
 //! - `CALL sys.delete_tag(table => '...', tag => '...')`
 //! - `CALL sys.rename_tag(table => '...', tag => '...', target_tag => '...')`
 //! - `CALL sys.reset_consumer(table => '...', consumer_id => '...'[, next_snapshot_id => ...])`
@@ -30,8 +32,7 @@
 //! - `CALL sys.create_global_index(table => '...', index_column => '...', index_type => 'btree')`
 //! - `CALL sys.create_global_index(table => '...', index_column => '...', index_type => 'bitmap')`
 //! - `CALL sys.create_global_index(table => '...', index_column => '...', index_type => 'ivf-pq')`
-//! - `CALL sys.drop_global_index(table => '...', index_column => '...', index_type => 'btree')` (also 'bitmap', 'multivalue', 'fm', 'lumina', or a vindex type such as 'ivf-pq')
-//! - `CALL sys.create_lumina_index(table => '...', index_column => '...')`
+//! - `CALL sys.drop_global_index(table => '...', index_column => '...', index_type => 'btree')` (also 'bitmap', 'multivalue', 'fm', or a vindex type such as 'diskann')
 //!
 //! REST management procedures (REST catalogs only, mirroring Java's
 //! `RESTCatalog.permissionManagement()` / `policyManagement()`):
@@ -73,7 +74,6 @@ use paimon::api::{
     PermissionColumns, PermissionResource, PolicyType, ResourceType, RowFilter,
 };
 use paimon::catalog::{Catalog, Identifier, RESTCatalog};
-use paimon::lumina::{is_lumina_index_type, LUMINA_IDENTIFIER};
 use paimon::spec::{CoreOptions, DataType, Datum, Predicate, PredicateBuilder, Snapshot};
 use paimon::table::{
     normalize_global_index_type, BranchManager, ConsumerManager, SnapshotManager, Table,
@@ -203,7 +203,9 @@ async fn earlier_or_equal_from_all(
 /// a misspelled `index_type` on `create_global_index` would build the default index.
 fn declared_parameters(proc_name: &str) -> Option<&'static [&'static str]> {
     Some(match proc_name {
+        "create_branch" => &["table", "branch", "tag", "ignore_if_exists"],
         "create_tag" => &["table", "tag", "snapshot_id", "time_retained"],
+        "replace_tag" => &["table", "tag", "snapshot_id", "time_retained"],
         "delete_tag" => &["table", "tag"],
         "rename_tag" => &["table", "tag", "target_tag"],
         "reset_consumer" => &["table", "consumer_id", "next_snapshot_id"],
@@ -222,7 +224,6 @@ fn declared_parameters(proc_name: &str) -> Option<&'static [&'static str]> {
             "partitions",
             "dry_run",
         ],
-        "create_lumina_index" => &["table", "index_column", "index_type", "options"],
         "grant_permission" => &[
             "resource_type",
             "access",
@@ -311,12 +312,23 @@ pub async fn execute_call(
     let catalog = catalogs
         .get(catalog_name)
         .ok_or_else(|| DataFusionError::Plan(format!("Unknown catalog '{catalog_name}'")))?;
-    let args = extract_named_args(&func.args)?;
+    execute_procedure(ctx, catalog, catalog_name, &proc_name, &func.args).await
+}
 
-    reject_unknown_args(&proc_name, &args)?;
+pub async fn execute_procedure(
+    ctx: &SessionContext,
+    catalog: &Arc<dyn Catalog>,
+    catalog_name: &str,
+    proc_name: &str,
+    arguments: &FunctionArguments,
+) -> DFResult<DataFrame> {
+    let args = extract_named_args(arguments)?;
+    reject_unknown_args(proc_name, &args)?;
 
-    match proc_name.as_str() {
+    match proc_name {
+        "create_branch" => proc_create_branch(ctx, catalog, catalog_name, &args).await,
         "create_tag" => proc_create_tag(ctx, catalog, catalog_name, &args).await,
+        "replace_tag" => proc_replace_tag(ctx, catalog, catalog_name, &args).await,
         "delete_tag" => proc_delete_tag(ctx, catalog, catalog_name, &args).await,
         "rename_tag" => proc_rename_tag(ctx, catalog, catalog_name, &args).await,
         "reset_consumer" => proc_reset_consumer(ctx, catalog, catalog_name, &args).await,
@@ -335,7 +347,6 @@ pub async fn execute_call(
         "delete_branch" => proc_delete_branch(ctx, catalog, catalog_name, &args).await,
         "create_global_index" => proc_create_global_index(ctx, catalog, catalog_name, &args).await,
         "drop_global_index" => proc_drop_global_index(ctx, catalog, catalog_name, &args).await,
-        "create_lumina_index" => proc_create_lumina_index(ctx, catalog, catalog_name, &args).await,
         "grant_permission" => proc_grant_permission(ctx, catalog, catalog_name, &args).await,
         "revoke_permission" => proc_revoke_permission(ctx, catalog, catalog_name, &args).await,
         "list_permissions" => proc_list_permissions(ctx, catalog, catalog_name, &args).await,
@@ -586,6 +597,125 @@ async fn proc_create_tag(
     ok_result(ctx)
 }
 
+async fn proc_replace_tag(
+    ctx: &SessionContext,
+    catalog: &Arc<dyn Catalog>,
+    catalog_name: &str,
+    args: &HashMap<String, String>,
+) -> DFResult<DataFrame> {
+    let table = get_table(catalog, catalog_name, args).await?;
+    let tag_name = require_arg(args, "tag")?;
+    let snapshot_id = args
+        .get("snapshot_id")
+        .map(|value| {
+            value
+                .parse::<i64>()
+                .ok()
+                .filter(|id| *id > 0)
+                .ok_or_else(|| {
+                    DataFusionError::Plan(format!(
+                        "Invalid snapshot_id: '{value}'. Expected a positive BIGINT"
+                    ))
+                })
+        })
+        .transpose()?;
+    let time_retained = args.get("time_retained").map(String::as_str);
+
+    if table.rest_env().is_some() {
+        return Err(DataFusionError::NotImplemented(
+            "replace_tag is not supported for tables managed by a REST catalog".to_string(),
+        ));
+    }
+    if table.schema().core_options().is_format_table() {
+        return Err(DataFusionError::NotImplemented(
+            "replace_tag requires a FileStoreTable; format-table is not supported".to_string(),
+        ));
+    }
+
+    let sm = table.snapshot_manager();
+    let tm = table.tag_manager();
+    if !tm.tag_exists(tag_name).await.map_err(to_datafusion_error)? {
+        return Err(to_datafusion_error(paimon::Error::TagNotExist {
+            tag_name: tag_name.to_string(),
+        }));
+    }
+    let snapshot = if let Some(id) = snapshot_id {
+        match sm.get_snapshot(id).await {
+            Ok(snapshot) => snapshot,
+            Err(paimon::Error::SnapshotNotExist { .. }) => tm
+                .list_all()
+                .await
+                .map_err(to_datafusion_error)?
+                .into_iter()
+                .map(|(_, snapshot)| snapshot)
+                .find(|snapshot| snapshot.id() == id)
+                .ok_or_else(|| {
+                    to_datafusion_error(paimon::Error::SnapshotNotExist { snapshot_id: id })
+                })?,
+            Err(error) => return Err(to_datafusion_error(error)),
+        }
+    } else {
+        sm.get_latest_snapshot()
+            .await
+            .map_err(to_datafusion_error)?
+            .ok_or_else(|| DataFusionError::Plan("No snapshots exist".to_string()))?
+    };
+    tm.replace(tag_name, &snapshot, time_retained)
+        .await
+        .map_err(to_datafusion_error)?;
+    ok_result(ctx)
+}
+
+async fn proc_create_branch(
+    ctx: &SessionContext,
+    catalog: &Arc<dyn Catalog>,
+    catalog_name: &str,
+    args: &HashMap<String, String>,
+) -> DFResult<DataFrame> {
+    let branch = require_arg(args, "branch")?;
+    let ignore_if_exists = bool_arg(args, "ignore_if_exists")?;
+    // Validate before the existence check: an invalid name must not become a
+    // successful no-op just because it resolves to an existing directory.
+    BranchManager::validate_branch_name(branch).map_err(to_datafusion_error)?;
+    if branch.contains('$') {
+        return Err(DataFusionError::Plan(format!(
+            "Branch name '{branch}' cannot contain the SQL suffix delimiter '$'"
+        )));
+    }
+    let table = get_table(catalog, catalog_name, args).await?;
+    if table.rest_env().is_some() {
+        return Err(DataFusionError::NotImplemented(
+            "create_branch is not supported for tables managed by a REST catalog".to_string(),
+        ));
+    }
+    if table.schema().core_options().is_format_table() {
+        return Err(DataFusionError::NotImplemented(
+            "create_branch requires a FileStoreTable; format-table is not supported".to_string(),
+        ));
+    }
+    if !table.is_main_branch() {
+        return Err(DataFusionError::NotImplemented(
+            "create_branch requires a main-branch source table".to_string(),
+        ));
+    }
+
+    let manager = BranchManager::new(table.file_io().clone(), table.location().to_string());
+    if ignore_if_exists
+        && manager
+            .branch_exists(branch)
+            .await
+            .map_err(to_datafusion_error)?
+    {
+        return ok_result(ctx);
+    }
+    match args.get("tag") {
+        Some(tag) => manager.create_branch_from_tag(branch, tag).await,
+        None => manager.create_branch(branch).await,
+    }
+    .map_err(to_datafusion_error)?;
+    ok_result(ctx)
+}
+
 async fn proc_rename_branch(
     ctx: &SessionContext,
     catalog: &Arc<dyn Catalog>,
@@ -742,6 +872,30 @@ async fn clean_larger_than(
     Ok(())
 }
 
+async fn rollback_to_snapshot(
+    sm: &SnapshotManager,
+    tm: &TagManager,
+    snapshot: &Snapshot,
+) -> DFResult<()> {
+    let id = snapshot.id();
+    // Restore expired tagged snapshots before removing any newer history. A
+    // backend may reject publication, in which case rollback must not delete it.
+    if !sm
+        .file_io()
+        .exists(&sm.snapshot_path(id))
+        .await
+        .map_err(to_datafusion_error)?
+    {
+        sm.commit_snapshot(snapshot)
+            .await
+            .map_err(to_datafusion_error)?;
+        sm.write_earliest_hint(id)
+            .await
+            .map_err(to_datafusion_error)?;
+    }
+    clean_larger_than(sm, tm, id).await
+}
+
 async fn proc_rollback_to(
     ctx: &SessionContext,
     catalog: &Arc<dyn Catalog>,
@@ -788,41 +942,14 @@ async fn proc_rollback_to(
                 .parse()
                 .map_err(|_| DataFusionError::Plan(format!("Invalid snapshot_id: '{id_str}'")))?;
             let snapshot = resolve_snapshot_by_id(&sm, &tm, id).await?;
-            clean_larger_than(&sm, &tm, id).await?;
-            if !sm
-                .file_io()
-                .exists(&sm.snapshot_path(id))
-                .await
-                .map_err(to_datafusion_error)?
-            {
-                sm.commit_snapshot(&snapshot)
-                    .await
-                    .map_err(to_datafusion_error)?;
-                sm.write_earliest_hint(id)
-                    .await
-                    .map_err(to_datafusion_error)?;
-            }
+            rollback_to_snapshot(&sm, &tm, &snapshot).await?;
         } else if let Some(tag_name) = args.get("tag") {
             let snapshot = tm
                 .get(tag_name)
                 .await
                 .map_err(to_datafusion_error)?
                 .ok_or_else(|| DataFusionError::Plan(format!("Tag '{tag_name}' does not exist")))?;
-            let snapshot_id = snapshot.id();
-            clean_larger_than(&sm, &tm, snapshot_id).await?;
-            if !sm
-                .file_io()
-                .exists(&sm.snapshot_path(snapshot_id))
-                .await
-                .map_err(to_datafusion_error)?
-            {
-                sm.commit_snapshot(&snapshot)
-                    .await
-                    .map_err(to_datafusion_error)?;
-                sm.write_earliest_hint(snapshot_id)
-                    .await
-                    .map_err(to_datafusion_error)?;
-            }
+            rollback_to_snapshot(&sm, &tm, &snapshot).await?;
         } else {
             return Err(DataFusionError::Plan(
                 "rollback_to requires either 'snapshot_id' or 'tag' argument".to_string(),
@@ -937,34 +1064,6 @@ async fn proc_create_tag_from_watermark(
     tm.create_with_retention(tag_name, &snapshot, time_retained)
         .await
         .map_err(to_datafusion_error)?;
-    ok_result(ctx)
-}
-
-async fn proc_create_lumina_index(
-    ctx: &SessionContext,
-    catalog: &Arc<dyn Catalog>,
-    catalog_name: &str,
-    args: &HashMap<String, String>,
-) -> DFResult<DataFrame> {
-    let table = get_table(catalog, catalog_name, args).await?;
-    let index_column = require_arg(args, "index_column")?;
-    let mut builder = table.new_global_index_build_builder();
-    builder.with_index_column(index_column);
-    let index_type = normalize_index_type(
-        args.get("index_type")
-            .map(String::as_str)
-            .unwrap_or(LUMINA_IDENTIFIER),
-    );
-    if !is_lumina_index_type(&index_type) {
-        return Err(DataFusionError::NotImplemented(format!(
-            "Unsupported Lumina index type: {index_type}"
-        )));
-    }
-    builder.with_index_type(&index_type);
-    if let Some(options) = args.get("options") {
-        builder.with_options(parse_key_value_options(options)?);
-    }
-    builder.execute().await.map_err(to_datafusion_error)?;
     ok_result(ctx)
 }
 
@@ -1874,6 +1973,91 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[derive(Debug)]
+    struct RejectSnapshotPublication(opendal::Operator);
+
+    #[async_trait::async_trait]
+    impl paimon::io::FileIOProvider for RejectSnapshotPublication {
+        async fn create(&self, path: &str) -> paimon::Result<(opendal::Operator, String)> {
+            Ok((
+                self.0.clone(),
+                path.strip_prefix("memory:/").unwrap().into(),
+            ))
+        }
+
+        async fn write_atomic_if_not_exists(
+            &self,
+            _path: &str,
+            _bytes: bytes::Bytes,
+        ) -> paimon::Result<Option<bool>> {
+            Err(paimon::Error::IoUnsupported {
+                message: "snapshot publication unavailable".into(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_rollback_publication_failure_preserves_history() {
+        let op = opendal::Operator::new(opendal::services::Memory::default()).unwrap();
+        let file_io = FileIOBuilder::new("memory")
+            .with_provider(Arc::new(RejectSnapshotPublication(op)))
+            .build()
+            .unwrap();
+        let path = "memory:/rollback_failure";
+        let sm = SnapshotManager::new(file_io.clone(), path.into());
+        let tm = TagManager::new(file_io.clone(), path.into());
+        // Snapshot 1 has expired, but a tag still retains it. Seed the newer
+        // history through ordinary writes on a backend rejecting publication.
+        for id in [2, 3] {
+            file_io
+                .new_output(&sm.snapshot_path(id))
+                .unwrap()
+                .write(
+                    serde_json::to_vec(&test_snapshot(id, id as u64 * 1000))
+                        .unwrap()
+                        .into(),
+                )
+                .await
+                .unwrap();
+        }
+        sm.write_latest_hint(3).await.unwrap();
+        tm.create("v1", &test_snapshot(1, 1000)).await.unwrap();
+        tm.create("v3", &test_snapshot(3, 3000)).await.unwrap();
+        let target = resolve_snapshot_by_id(&sm, &tm, 1).await.unwrap();
+
+        let error = rollback_to_snapshot(&sm, &tm, &target).await.unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("snapshot publication unavailable"));
+        assert_eq!(sm.list_all_ids().await.unwrap(), vec![2, 3]);
+        assert_eq!(sm.get_latest_snapshot_id().await.unwrap(), Some(3));
+        assert!(tm.tag_exists("v1").await.unwrap());
+        assert!(tm.tag_exists("v3").await.unwrap());
+        assert!(!file_io.exists(&sm.snapshot_path(1)).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_rollback_restores_expired_snapshot_before_cleaning_history() {
+        let (_, sm, tm) = setup("memory:/rollback_expired").await;
+        for id in [2, 3] {
+            sm.commit_snapshot(&test_snapshot(id, id as u64 * 1000))
+                .await
+                .unwrap();
+        }
+        let target = test_snapshot(1, 1000);
+        tm.create("v1", &target).await.unwrap();
+        tm.create("v3", &test_snapshot(3, 3000)).await.unwrap();
+
+        rollback_to_snapshot(&sm, &tm, &target).await.unwrap();
+
+        assert_eq!(sm.get_snapshot(1).await.unwrap(), target);
+        assert_eq!(sm.list_all_ids().await.unwrap(), vec![1]);
+        assert_eq!(sm.get_latest_snapshot_id().await.unwrap(), Some(1));
+        assert_eq!(sm.earliest_snapshot_id().await.unwrap(), Some(1));
+        assert!(tm.tag_exists("v1").await.unwrap());
+        assert!(!tm.tag_exists("v3").await.unwrap());
+    }
+
     #[tokio::test]
     async fn test_later_or_equal_exact_live() {
         let (_, sm, tm) = setup("memory:/test_later_exact").await;
@@ -1941,10 +2125,7 @@ mod tests {
         assert_eq!(normalize_index_type(" BitMap\t"), "bitmap");
         assert_eq!(normalize_index_type("IVF-FLAT"), "ivf-flat");
         assert_eq!(normalize_index_type("Ivf-Pq"), "ivf-pq");
-        assert_eq!(
-            normalize_index_type("Lumina-Vector-Ann"),
-            "lumina-vector-ann"
-        );
+        assert_eq!(normalize_index_type("DiskANN"), "diskann");
         // Already canonical values are returned unchanged, and an unknown type
         // is normalized but not rewritten -- the caller still rejects it.
         assert_eq!(normalize_index_type("ivf-flat"), "ivf-flat");

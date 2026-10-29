@@ -92,6 +92,20 @@ pub trait FileIOProvider: std::fmt::Debug + Send + Sync + 'static {
     /// Rename requires both paths to resolve to the same shared service instance.
     async fn create(&self, path: &str) -> crate::Result<(Operator, String)>;
 
+    /// Optionally publish a complete immutable file without replacing an existing file.
+    ///
+    /// Return `Some(true)` on success or `Some(false)` for a definite conflict.
+    /// Return `None` only if no publication was attempted; FileIO then uses the
+    /// resolved operator's safe publication primitives. An error may have an
+    /// unknown outcome and is propagated without falling back to another write.
+    async fn write_atomic_if_not_exists(
+        &self,
+        _path: &str,
+        _bytes: Bytes,
+    ) -> crate::Result<Option<bool>> {
+        Ok(None)
+    }
+
     /// Return a stable namespace for the resolved storage target. `None`
     /// disables caching; distinct endpoints must use distinct namespaces.
     async fn create_with_cache_namespace(
@@ -205,11 +219,53 @@ const ROW_METADATA_CACHE_MAX_BYTES: usize = 32 * 1024 * 1024;
 const ROW_METADATA_CACHE_BUDGET_DIVISOR: usize = 4;
 const ROW_SIDECAR_SIZE_CACHE_MAX_ENTRIES: usize = 4096;
 
+type ParquetMetadataSlot = OnceLock<Arc<dyn Any + Send + Sync>>;
+type ParquetMetadataRegistry = HashMap<(u32, usize), std::sync::Weak<ParquetMetadataSlot>>;
+static PARQUET_METADATA_SLOTS: Mutex<Option<ParquetMetadataRegistry>> = Mutex::new(None);
+
+fn shared_parquet_metadata_slot(max_bytes: usize) -> Arc<ParquetMetadataSlot> {
+    // Sharing is best-effort; never wait on a registry lock inherited by fork.
+    let Ok(mut registry) = PARQUET_METADATA_SLOTS.try_lock() else {
+        return Arc::new(OnceLock::new());
+    };
+    let slots = registry.get_or_insert_with(HashMap::new);
+    slots.retain(|_, slot| slot.strong_count() > 0);
+    let key = (std::process::id(), max_bytes);
+    if let Some(slot) = slots.get(&key).and_then(std::sync::Weak::upgrade) {
+        return slot;
+    }
+    let slot = Arc::new(OnceLock::new());
+    slots.insert(key, Arc::downgrade(&slot));
+    slot
+}
+
+#[cfg(test)]
+pub(crate) fn run_isolated_metadata_cache_test(test_name: &str) -> bool {
+    const CHILD: &str = "PAIMON_TEST_ISOLATED_METADATA_CACHE";
+    if std::env::var(CHILD).as_deref() == Ok(test_name) {
+        return true;
+    }
+    // Registry contention legitimately disables sharing. Tests requiring a
+    // shared slot must not race unrelated tests constructing cache contexts.
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test_name, "--test-threads=1"])
+        .env(CHILD, test_name)
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "isolated test {test_name} failed: {status}"
+    );
+    false
+}
+
 pub(crate) struct FileFormatMetadataCacheContext {
     max_bytes: usize,
-    cache: OnceLock<Arc<dyn Any + Send + Sync>>,
+    shared: bool,
+    cache: Arc<ParquetMetadataSlot>,
     row_metadata_cache: OnceLock<Arc<dyn Any + Send + Sync>>,
     process_id: u32,
+    memory_identity: uuid::Uuid,
     row_sidecar_sizes: OnceLock<Mutex<LruCache<String, u64>>>,
 }
 
@@ -238,11 +294,30 @@ impl FileFormatMetadataCacheContext {
             })
             .transpose()?
             .unwrap_or(DEFAULT_FILE_FORMAT_METADATA_CACHE_MAX_BYTES);
+        let shared = props
+            .get(CatalogOptions::FILE_FORMAT_METADATA_CACHE_SHARED)
+            .map(|value| {
+                value.parse::<bool>().map_err(|_| Error::ConfigInvalid {
+                    message: format!(
+                        "Invalid value for {}: {value}",
+                        CatalogOptions::FILE_FORMAT_METADATA_CACHE_SHARED
+                    ),
+                })
+            })
+            .transpose()?
+            .unwrap_or(false);
+        let cache = if shared && max_bytes > 0 {
+            shared_parquet_metadata_slot(max_bytes)
+        } else {
+            Arc::new(OnceLock::new())
+        };
         Ok(Arc::new(Self {
             max_bytes,
-            cache: OnceLock::new(),
+            shared,
+            cache,
             row_metadata_cache: OnceLock::new(),
             process_id: std::process::id(),
+            memory_identity: uuid::Uuid::new_v4(),
             row_sidecar_sizes: OnceLock::new(),
         }))
     }
@@ -316,6 +391,9 @@ impl FileFormatMetadataCacheContext {
     where
         T: Send + Sync + 'static,
     {
+        if self.process_id != std::process::id() {
+            return Arc::new(init(self.parquet_metadata_max_bytes()));
+        }
         let cache = Arc::clone(self.cache.get_or_init(|| {
             Arc::new(init(self.parquet_metadata_max_bytes())) as Arc<dyn Any + Send + Sync>
         }));
@@ -323,6 +401,10 @@ impl FileFormatMetadataCacheContext {
             Ok(cache) => cache,
             Err(_) => panic!("file-format metadata cache type mismatch"),
         }
+    }
+
+    pub(crate) fn parquet_metadata_is_shared(&self) -> bool {
+        self.shared && self.process_id == std::process::id()
     }
 
     /// ROW footer and block index metadata has its own typed cache. Keep it
@@ -761,6 +843,10 @@ impl FileIO {
         Ok(self.cache_namespace.to_string())
     }
 
+    pub(crate) fn local_cache(&self) -> Option<Arc<LocalCache>> {
+        self.cache.clone()
+    }
+
     #[cfg(test)]
     pub(crate) fn has_local_cache(&self) -> bool {
         self.cache.is_some()
@@ -1124,6 +1210,140 @@ impl FileIO {
         Ok(())
     }
 
+    /// Publish a complete immutable file only if the target does not exist.
+    /// Returns `false` only for a definite publication conflict. Other failures
+    /// may have an unknown outcome and must never trigger an unconditional write.
+    pub(crate) async fn write_atomic_if_not_exists(
+        &self,
+        path: &str,
+        bytes: Bytes,
+    ) -> Result<bool> {
+        if let FileIOBackend::Provider(provider) = &self.backend {
+            if let Some(published) = provider
+                .write_atomic_if_not_exists(path, bytes.clone())
+                .await?
+            {
+                return Ok(published);
+            }
+        }
+        let source = self.file_source(path)?;
+        let (op, relative_path, _) = source.resolve(path).await?;
+        let origin = op.origin_operator();
+
+        #[cfg(feature = "storage-fs")]
+        if matches!(source, FileSource::Static { local_fs: true, .. }) {
+            return Self::write_local_atomic_if_not_exists(path, origin, &relative_path, bytes)
+                .await;
+        }
+
+        let info = origin.info();
+        let capability = info.capability();
+        let result = if capability.rename_with_if_not_exists {
+            let staging_path = format!("{relative_path}.tmp-{}", uuid::Uuid::new_v4());
+            origin.write(&staging_path, bytes).await?;
+            let result = origin
+                .rename_with(&staging_path, &relative_path)
+                .if_not_exists(true)
+                .await;
+            if result.as_ref().is_err_and(|error| {
+                matches!(
+                    error.kind(),
+                    opendal::ErrorKind::AlreadyExists | opendal::ErrorKind::ConditionNotMatch
+                )
+            }) {
+                let _ = origin.delete(&staging_path).await;
+            }
+            result
+        } else if capability.write_with_if_not_exists
+            // Only known whole-object publishers are safe here: position
+            // writers can expose incomplete files, and COS ignores conditional
+            // puts on buckets that have ever enabled versioning. OSS requires
+            // the bucket's default, never-enabled versioning configuration.
+            && matches!(info.scheme(), "memory" | "s3" | "oss" | "gcs")
+        {
+            origin
+                .write_with(&relative_path, bytes)
+                .if_not_exists(true)
+                .await
+                .map(|_| ())
+        } else {
+            return Err(Error::IoUnsupported {
+                message: format!(
+                    "Storage '{}' cannot atomically publish a complete snapshot without overwriting '{path}'; use a catalog SnapshotCommit with concurrency control",
+                    info.scheme()
+                ),
+            });
+        };
+        match result {
+            Ok(()) => Ok(true),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    opendal::ErrorKind::AlreadyExists | opendal::ErrorKind::ConditionNotMatch
+                ) =>
+            {
+                Ok(false)
+            }
+            Err(error) => Err(Error::from_opendal_with_context(
+                error,
+                format!("Failed to publish '{path}'"),
+            )),
+        }
+    }
+
+    #[cfg(feature = "storage-fs")]
+    async fn write_local_atomic_if_not_exists(
+        path: &str,
+        op: &Operator,
+        relative_path: &str,
+        bytes: Bytes,
+    ) -> Result<bool> {
+        // OpenDAL's filesystem conditional write exposes the target before
+        // its contents are complete. Stage locally, then publish without
+        // replacing another process's snapshot.
+        let relative = normalize_path(relative_path);
+        if std::path::Path::new(&relative)
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            return Err(Error::IoUnsupported {
+                message: format!("Cannot publish a snapshot through a parent path: '{path}'"),
+            });
+        }
+        let target = std::path::Path::new(&op.info().root()).join(relative);
+        tokio::task::spawn_blocking(move || -> opendal::Result<bool> {
+            use std::io::Write;
+
+            let parent = target.parent().ok_or_else(|| {
+                opendal::Error::new(opendal::ErrorKind::IsADirectory, "target has no parent")
+            })?;
+            std::fs::create_dir_all(parent).map_err(new_std_io_error)?;
+            let mut builder = tempfile::Builder::new();
+            builder.prefix(".snapshot-");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                builder.permissions(std::fs::Permissions::from_mode(0o666));
+            }
+            let mut staged = builder.tempfile_in(parent).map_err(new_std_io_error)?;
+            staged.write_all(&bytes).map_err(new_std_io_error)?;
+            staged.as_file().sync_all().map_err(new_std_io_error)?;
+            match staged.persist_noclobber(target) {
+                Ok(_) => Ok(true),
+                Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+                Err(error) => Err(new_std_io_error(error.error)),
+            }
+        })
+        .await
+        .map_err(|error| Error::UnexpectedError {
+            message: format!("Failed to publish '{path}'"),
+            source: Some(Box::new(error)),
+        })?
+        .map_err(|error| {
+            Error::from_opendal_with_context(error, format!("Failed to publish '{path}'"))
+        })
+    }
+
     /// Copy a large file without materializing its entire contents in memory.
     /// Format Table publication uses this when a backend does not support
     /// rename, as is common for object stores and the in-memory test backend.
@@ -1376,6 +1596,9 @@ impl FileIOBuilder {
     /// form, so the operator's root decides what they resolve against. Scheme'd paths
     /// (`s3://…`, `oss://…`) are rejected rather than misresolved: an object-store operator
     /// needs bucket/scheme resolution this hook deliberately does not provide.
+    /// Snapshot publication requires atomic no-replace publication from the operator.
+    /// Filesystem conditional writes alone expose incomplete files; use the built-in
+    /// `file` backend or a catalog SnapshotCommit when conditional rename is unavailable.
     pub fn with_fs_operator(mut self, operator: Operator) -> Self {
         self.operator = Some(operator);
         self
@@ -1466,6 +1689,14 @@ impl FileIOBuilder {
 pub trait FileRead: Send + Sync + Unpin + 'static {
     async fn read(&self, range: Range<u64>) -> crate::Result<Bytes>;
 
+    /// Check current access before reusing metadata from another context.
+    /// Implementations must bypass data caches and propagate storage errors.
+    /// Returning false disables cross-context metadata reuse for this reader.
+    #[doc(hidden)]
+    async fn check_shared_metadata_access(&self) -> crate::Result<bool> {
+        Ok(false)
+    }
+
     #[doc(hidden)]
     #[deprecated(note = "BLOB index caching no longer uses numeric FileIO namespaces")]
     fn cache_namespace(&self) -> Option<usize> {
@@ -1490,6 +1721,11 @@ pub trait FileRead: Send + Sync + Unpin + 'static {
 
 #[async_trait::async_trait]
 impl FileRead for opendal::Reader {
+    async fn check_shared_metadata_access(&self) -> crate::Result<bool> {
+        self.read(0..1).await?;
+        Ok(true)
+    }
+
     async fn read(&self, range: Range<u64>) -> crate::Result<Bytes> {
         Ok(opendal::Reader::read(self, range).await?.to_bytes())
     }
@@ -1512,6 +1748,13 @@ enum InputFileReader {
 
 #[async_trait::async_trait]
 impl FileRead for InputFileReader {
+    async fn check_shared_metadata_access(&self) -> crate::Result<bool> {
+        match self {
+            Self::Direct { reader, .. } => reader.check_shared_metadata_access().await,
+            Self::Cached { reader, .. } => reader.check_shared_metadata_access().await,
+        }
+    }
+
     async fn read(&self, range: Range<u64>) -> crate::Result<Bytes> {
         match self {
             Self::Direct { reader, .. } => FileRead::read(reader, range).await,
@@ -1851,6 +2094,9 @@ impl InputFile {
                 .to_bytes());
         };
         let read_token = cache.read_token(&cache_path);
+        if let Some(bytes) = cache.read_cached_small_file(&cache_path, &read_token).await {
+            return Ok(bytes);
+        }
         let size = if let Some(size) = cache.file_size(&cache_path, &read_token).await {
             size
         } else {
@@ -1869,18 +2115,40 @@ impl InputFile {
     }
 
     pub async fn reader(&self) -> crate::Result<impl FileRead> {
+        self.reader_with_size_hint(None).await
+    }
+
+    /// Open an immutable file using the length recorded in its manifest.
+    pub(crate) async fn reader_with_size(&self, size: u64) -> crate::Result<impl FileRead> {
+        self.reader_with_size_hint(Some(size)).await
+    }
+
+    async fn reader_with_size_hint(&self, size: Option<u64>) -> crate::Result<impl FileRead> {
         let (op, relative_path, cache_path) = self.source.resolve(&self.path).await?;
-        let reader = op.operator(OpClass::Read).reader(&relative_path).await?;
+        let read_operator = op.operator(OpClass::Read);
+        let cache_key = cache_path.as_ref().map(|path| {
+            if read_operator.info().scheme() == "memory" {
+                // OpenDAL's address-based Memory name can be recycled. Keep
+                // parsed metadata context-local without changing block-cache
+                // keys or invalidation for operators shared by several FileIOs.
+                format!("{}:{path}", self.file_format_metadata_cache.memory_identity)
+            } else {
+                path.clone()
+            }
+        });
+        let reader = read_operator.reader(&relative_path).await?;
         let (Some(cache), Some(cache_path)) = (&self.cache, cache_path.as_ref()) else {
             return Ok(InputFileReader::Direct {
                 reader,
-                cache_key: cache_path,
+                cache_key,
                 file_format_metadata_cache: Arc::clone(&self.file_format_metadata_cache),
                 blob_index_cache: Arc::clone(&self.blob_index_cache),
             });
         };
         let read_token = cache.read_token(cache_path);
-        let size = if let Some(size) = cache.file_size(cache_path, &read_token).await {
+        let size = if let Some(size) = size {
+            size
+        } else if let Some(size) = cache.file_size(cache_path, &read_token).await {
             size
         } else {
             let size = op
@@ -1899,7 +2167,7 @@ impl InputFile {
                 cache.clone(),
                 read_token,
             ),
-            cache_key: cache_path.clone(),
+            cache_key: cache_key.unwrap(),
             file_format_metadata_cache: Arc::clone(&self.file_format_metadata_cache),
             blob_index_cache: Arc::clone(&self.blob_index_cache),
         })
@@ -2208,6 +2476,51 @@ mod file_action_test {
 
     fn setup_memory_file_io() -> FileIO {
         FileIOBuilder::new("memory").build().unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_known_size_shared_reader_preserves_invalidation() {
+        use crate::common::Options;
+        use crate::io::cache::LocalCacheConfig;
+        let dir = tempfile::tempdir().unwrap();
+        let mut options = Options::new();
+        options.set(CatalogOptions::LOCAL_CACHE_ENABLED, "true");
+        options.set("local-cache.shared", "true");
+        options.set("local-cache.max-size", "16 mb");
+        options.set(
+            CatalogOptions::LOCAL_CACHE_DIR,
+            dir.path().join("cache").to_string_lossy(),
+        );
+        options.set(CatalogOptions::LOCAL_CACHE_BLOCK_SIZE, "4");
+        let cache = Arc::new(
+            LocalCache::new(LocalCacheConfig::from_options(&options).unwrap().unwrap()).unwrap(),
+        );
+        let io = FileIOBuilder::new("file")
+            .with_local_cache(cache)
+            .build()
+            .unwrap();
+        let source_path = dir.path().join("snapshot-1");
+        let path = local_file_path(&source_path);
+        std::fs::write(&source_path, b"abcd").unwrap();
+        let input = io.new_input(&path).unwrap();
+        assert!(
+            input.cache.is_some(),
+            "the regression must exercise caching"
+        );
+        let reader = input.reader_with_size(4).await.unwrap();
+        assert_eq!(reader.read(0..4).await.unwrap().as_ref(), b"abcd");
+        // A hot read must not stat the source again.
+        std::fs::rename(&source_path, dir.path().join("offline")).unwrap();
+        assert!(input.reader().await.is_err());
+        let reader = input.reader_with_size(4).await.unwrap();
+        assert_eq!(reader.read(1..3).await.unwrap().as_ref(), b"bc");
+        io.new_output(&path)
+            .unwrap()
+            .write(Bytes::from_static(b"wxyz"))
+            .await
+            .unwrap();
+        let reader = input.reader_with_size(4).await.unwrap();
+        assert_eq!(reader.read(1..3).await.unwrap().as_ref(), b"xy");
     }
 
     fn setup_fs_file_io() -> FileIO {
@@ -2934,6 +3247,38 @@ mod input_output_test {
         );
     }
 
+    #[cfg(feature = "storage-memory")]
+    #[tokio::test]
+    async fn test_memory_metadata_keys_are_context_scoped() {
+        let first = setup_memory_file_io();
+        let path = "memory:/metadata.parquet";
+        let first_reader = first.new_input(path).unwrap().reader().await.unwrap();
+        let clone = first.clone();
+        let cloned_reader = clone.new_input(path).unwrap().reader().await.unwrap();
+        assert_eq!(first_reader.cache_key(), cloned_reader.cache_key());
+        let second = setup_memory_file_io();
+        let second_reader = second.new_input(path).unwrap().reader().await.unwrap();
+        assert_ne!(first_reader.cache_key(), second_reader.cache_key());
+
+        let operator = Operator::from_config(opendal::services::MemoryConfig::default()).unwrap();
+        let first = FileIOBuilder::new("file")
+            .with_fs_operator(operator.clone())
+            .build()
+            .unwrap();
+        let second = FileIOBuilder::new("file")
+            .with_fs_operator(operator)
+            .build()
+            .unwrap();
+        let path = "file:/metadata.parquet";
+        let first_reader = first.new_input(path).unwrap().reader().await.unwrap();
+        let second_reader = second.new_input(path).unwrap().reader().await.unwrap();
+        assert_ne!(first_reader.cache_key(), second_reader.cache_key());
+        assert_eq!(
+            first.create_with_cache_path(path).await.unwrap().2,
+            second.create_with_cache_path(path).await.unwrap().2,
+        );
+    }
+
     #[cfg(all(feature = "storage-fs", feature = "storage-memory"))]
     #[test]
     fn test_cache_object_path_distinguishes_storage_schemes() {
@@ -3411,6 +3756,119 @@ mod input_output_test {
         assert!(error
             .to_string()
             .contains(CatalogOptions::FILE_FORMAT_METADATA_CACHE_MAX_SIZE));
+    }
+
+    #[test]
+    fn test_shared_metadata_cache_budget_lifetime_and_row_isolation() {
+        if !run_isolated_metadata_cache_test(
+            "io::file_io::input_output_test::test_shared_metadata_cache_budget_lifetime_and_row_isolation",
+        ) {
+            return;
+        }
+        let mut props = HashMap::from([
+            (
+                CatalogOptions::FILE_FORMAT_METADATA_CACHE_SHARED.to_string(),
+                "true".to_string(),
+            ),
+            (
+                CatalogOptions::FILE_FORMAT_METADATA_CACHE_MAX_SIZE.to_string(),
+                "123456".to_string(),
+            ),
+        ]);
+        let first = FileFormatMetadataCacheContext::from_props(&props).unwrap();
+        let second = FileFormatMetadataCacheContext::from_props(&props).unwrap();
+        assert!(Arc::ptr_eq(&first.cache, &second.cache));
+        let row_first = first.row_metadata_get_or_init(|_| 1usize).unwrap();
+        let row_second = second.row_metadata_get_or_init(|_| 2usize).unwrap();
+        assert!(!Arc::ptr_eq(&row_first, &row_second));
+        props.insert(
+            CatalogOptions::FILE_FORMAT_METADATA_CACHE_MAX_SIZE.to_string(),
+            "0".to_string(),
+        );
+        let zero = FileFormatMetadataCacheContext::from_props(&props).unwrap();
+        assert!(!Arc::ptr_eq(&first.cache, &zero.cache));
+        let weak = Arc::downgrade(&first.cache);
+        drop(first);
+        drop(second);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn test_shared_metadata_cache_falls_back_under_registry_contention() {
+        if !run_isolated_metadata_cache_test(
+            "io::file_io::input_output_test::test_shared_metadata_cache_falls_back_under_registry_contention",
+        ) {
+            return;
+        }
+        let props = HashMap::from([(
+            CatalogOptions::FILE_FORMAT_METADATA_CACHE_SHARED.to_string(),
+            "true".to_string(),
+        )]);
+        let shared = FileFormatMetadataCacheContext::from_props(&props).unwrap();
+        let guard = PARQUET_METADATA_SLOTS.lock().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let concurrent_props = props.clone();
+        let constructor = std::thread::spawn(move || {
+            tx.send(FileFormatMetadataCacheContext::from_props(
+                &concurrent_props,
+            ))
+            .unwrap();
+        });
+        let fallback = rx.recv_timeout(std::time::Duration::from_secs(5));
+        // Release the gate before joining, even if construction incorrectly waited.
+        drop(guard);
+        constructor.join().unwrap();
+        let fallback = fallback
+            .expect("cache construction must not wait for the registry lock")
+            .unwrap();
+        assert!(!Arc::ptr_eq(&shared.cache, &fallback.cache));
+        let available = FileFormatMetadataCacheContext::from_props(&props).unwrap();
+        assert!(Arc::ptr_eq(&shared.cache, &available.cache));
+    }
+
+    #[test]
+    fn test_shared_metadata_cache_rejects_invalid_flag() {
+        let props = HashMap::from([(
+            CatalogOptions::FILE_FORMAT_METADATA_CACHE_SHARED.to_string(),
+            "invalid".to_string(),
+        )]);
+        assert!(FileFormatMetadataCacheContext::from_props(&props).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_shared_metadata_registry_fork_with_locked_registry() {
+        if !run_isolated_metadata_cache_test(
+            "io::file_io::input_output_test::test_shared_metadata_registry_fork_with_locked_registry",
+        ) {
+            return;
+        }
+        // The child must not wait for a lock whose owning thread stayed in the parent.
+        let guard = PARQUET_METADATA_SLOTS.lock().unwrap();
+        unsafe {
+            let pid = libc::fork();
+            assert!(pid >= 0);
+            if pid == 0 {
+                libc::alarm(3);
+                let slot = shared_parquet_metadata_slot(123456);
+                libc::_exit(if slot.get().is_none() { 0 } else { 1 });
+            }
+            let mut status = 0;
+            assert_eq!(libc::waitpid(pid, &mut status, 0), pid);
+            assert!(libc::WIFEXITED(status));
+            assert_eq!(libc::WEXITSTATUS(status), 0);
+        }
+        drop(guard);
+    }
+
+    #[test]
+    fn test_metadata_cache_bypasses_inherited_context() {
+        let mut context = FileFormatMetadataCacheContext::from_props(&HashMap::new()).unwrap();
+        let before = context.get_or_init(|_| 1usize);
+        Arc::get_mut(&mut context).unwrap().process_id = 0;
+        let after = context.get_or_init(|_| 2usize);
+        assert_eq!(*after, 2);
+        assert!(!Arc::ptr_eq(&before, &after));
     }
 
     #[test]
@@ -4181,6 +4639,70 @@ mod input_output_test {
         assert_eq!(
             file_io.new_input(&location).unwrap().read().await.unwrap(),
             Bytes::from_static(b"new metadata")
+        );
+    }
+
+    #[cfg(feature = "storage-oss")]
+    #[tokio::test]
+    async fn test_atomic_publication_oss_has_one_winner() {
+        use axum::body::Body;
+        use axum::http::{HeaderMap, Response, StatusCode, Uri};
+        use axum::Router;
+        use opendal::Configurator;
+
+        let objects = Arc::new(Mutex::new(HashMap::<String, Bytes>::new()));
+        let stored = objects.clone();
+        // An OSS bucket with default versioning atomically enforces this header.
+        let app = Router::new().fallback(move |uri: Uri, headers: HeaderMap, body: Bytes| {
+            let stored = stored.clone();
+            async move {
+                let mut objects = stored.lock().unwrap();
+                if headers.get("x-oss-forbid-overwrite").is_some_and(|value| value == "true")
+                    && objects.contains_key(uri.path())
+                {
+                    return Response::builder()
+                        .status(StatusCode::CONFLICT)
+                        .body(Body::from("<Error><Code>FileAlreadyExists</Code><Message>exists</Message></Error>"))
+                        .unwrap();
+                }
+                objects.insert(uri.path().into(), body);
+                Response::builder()
+                    .header("etag", "\"mock-etag\"")
+                    .body(Body::empty())
+                    .unwrap()
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut config = opendal_service_oss::OssConfig::default();
+        config.endpoint = Some(endpoint);
+        config.addressing_style = Some("path".into());
+        config.skip_signature = true;
+        let op = crate::io::with_http_transport(
+            Operator::new(config.into_builder().bucket("bucket")).unwrap(),
+            "paimon-atomic-publication-test",
+        );
+        let io = FileIOBuilder::new("file")
+            .with_fs_operator(op)
+            .build()
+            .unwrap();
+        let path = "/table/snapshot/snapshot-1";
+        let first = Bytes::from_static(b"first snapshot");
+        let second = Bytes::from_static(b"second snapshot");
+        let (a, b) = tokio::join!(
+            io.write_atomic_if_not_exists(path, first.clone()),
+            io.write_atomic_if_not_exists(path, second.clone())
+        );
+        server.abort();
+        let (a, b) = (a.unwrap(), b.unwrap());
+        assert_ne!(a, b, "exactly one conditional OSS PUT must win");
+        assert_eq!(
+            objects
+                .lock()
+                .unwrap()
+                .get("/bucket/table/snapshot/snapshot-1"),
+            Some(if a { &first } else { &second })
         );
     }
 }

@@ -17,7 +17,6 @@
 
 //! Shared vector-search option validation, index I/O helpers, and result ordering.
 
-use crate::lumina::is_lumina_index_type;
 use crate::spec::{
     CoreOptions, DataField, FileKind, IndexManifestEntry, Predicate, ROW_ID_FIELD_NAME,
 };
@@ -39,31 +38,6 @@ pub(super) fn add_filter(current: &mut Option<Predicate>, filter: Predicate) {
     });
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum VectorIndexBackend {
-    Lumina,
-    Vindex,
-}
-
-impl VectorIndexBackend {
-    pub(super) fn from_index_type(index_type: &str) -> Option<Self> {
-        if is_lumina_index_type(index_type) {
-            Some(Self::Lumina)
-        } else if is_vindex_index_type(index_type) {
-            Some(Self::Vindex)
-        } else {
-            None
-        }
-    }
-
-    pub(super) fn error_name(self) -> &'static str {
-        match self {
-            Self::Lumina => "Lumina",
-            Self::Vindex => "vindex",
-        }
-    }
-}
-
 /// A search column selects one persisted vector format, as in Java's scan.
 /// Different columns, removed entries and scalar indexes do not participate.
 pub(super) fn validate_global_vector_index_types(
@@ -75,7 +49,7 @@ pub(super) fn validate_global_vector_index_types(
     for entry in entries {
         let file = &entry.index_file;
         if entry.kind != FileKind::Add
-            || VectorIndexBackend::from_index_type(&file.index_type).is_none()
+            || !is_vindex_index_type(&file.index_type)
             || !file
                 .global_index_meta
                 .as_ref()

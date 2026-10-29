@@ -24,7 +24,7 @@ fn row_id_delete_must_match_the_current_file_layout() {
     file.first_row_id = Some(0);
     let stale_delete = ManifestEntry::new(FileKind::Delete, vec![], 0, -1, file, 2);
     let error = commit
-        .check_row_id_existence(&[current], &[stale_delete], Some(20))
+        .check_row_id_existence(&[current], &[stale_delete], Some(20), &CommitKind::APPEND)
         .expect_err("a DELETE must not cancel the current file after row-ID reassignment");
     assert!(error.to_string().contains("Row ID existence conflict"));
     assert!(matches!(
@@ -47,12 +47,28 @@ fn row_id_existence_preserves_missing_range_details() {
     file.first_row_id = Some(7);
     let entry = ManifestEntry::new(FileKind::Add, vec![], 3, -1, file, 2);
     let error = commit
-        .check_row_id_existence(&[], &[entry], Some(20))
+        .check_row_id_existence(&[], &[entry], Some(20), &CommitKind::APPEND)
         .unwrap_err();
     assert!(matches!(error, crate::Error::RowIdExistenceConflict {
         ref file_name, first_row_id: Some(7), row_count: 4, bucket: 3,
         current_first_row_id: None, current_row_count: None
     } if file_name == "opaque '(4): file.parquet"));
+}
+
+#[test]
+fn compact_row_id_existence_requires_contiguous_normal_coverage() {
+    let commit = setup_data_evolution_commit(&test_file_io(), "memory:/compact_range_existence");
+    let entry = |name: &str, first: i64, count: i64| {
+        let mut file = test_data_file(name, count);
+        file.first_row_id = Some(first);
+        ManifestEntry::new(FileKind::Add, vec![], 0, -1, file, 2)
+    };
+    let output = entry("compact.parquet", 0, 10);
+    let contiguous = [entry("a.parquet", 0, 5), entry("b.parquet", 5, 5)];
+    commit.check_row_id_existence(&contiguous, std::slice::from_ref(&output), Some(10), &CommitKind::COMPACT).unwrap();
+    assert!(commit.check_row_id_existence(&contiguous, std::slice::from_ref(&output), Some(10), &CommitKind::APPEND).is_err(), "DML must still match an exact source range");
+    let gap = [entry("a.parquet", 0, 4), entry("b.parquet", 5, 5), entry("stale.blob", 0, 10)];
+    assert!(commit.check_row_id_existence(&gap, &[output], Some(10), &CommitKind::COMPACT).is_err(), "neither a gap nor a dedicated file can supply normal row slots");
 }
 
 #[test]
@@ -66,7 +82,7 @@ fn row_id_delete_metadata_check_does_not_require_next_row_id() {
         old.first_row_id = Some(0);
         let old = ManifestEntry::new(FileKind::Delete, vec![], 0, -1, old, 2);
         assert!(
-            matches!(commit.check_row_id_existence(&[current], &[old], None),
+            matches!(commit.check_row_id_existence(&[current], &[old], None, &CommitKind::APPEND),
             Err(crate::Error::RowIdExistenceConflict { current_first_row_id, current_row_count: Some(count), .. })
             if current_first_row_id == current_id && count == current_count)
         );
@@ -75,9 +91,9 @@ fn row_id_delete_metadata_check_does_not_require_next_row_id() {
     let current = ManifestEntry::new(FileKind::Add, vec![], 0, -1, file.clone(), 2);
     let delete = ManifestEntry::new(FileKind::Delete, vec![], 0, -1, file, 2);
     commit
-        .check_row_id_existence(&[current], &[delete], None)
+        .check_row_id_existence(&[current], &[delete], None, &CommitKind::APPEND)
         .unwrap();
-    commit.check_row_id_existence(&[], &[], None).unwrap();
+    commit.check_row_id_existence(&[], &[], None, &CommitKind::APPEND).unwrap();
 }
 
 fn row_id_check_message(name: &str, column: &str) -> CommitMessage {

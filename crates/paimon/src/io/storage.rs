@@ -57,6 +57,8 @@ use std::sync::Mutex;
 ))]
 use std::sync::MutexGuard;
 
+#[cfg(feature = "storage-s3")]
+use super::storage_s3::S3StorageConfig;
 #[cfg(feature = "storage-azdls")]
 use super::AzdlsStorageConfig;
 #[cfg(feature = "storage-jindo")]
@@ -74,8 +76,6 @@ use opendal_service_gcs::GcsConfig;
 use opendal_service_hdfs_native::HdfsNativeConfig;
 #[cfg(feature = "storage-obs")]
 use opendal_service_obs::ObsConfig;
-#[cfg(feature = "storage-s3")]
-use opendal_service_s3::S3Config;
 #[cfg(any(
     feature = "storage-cos",
     feature = "storage-gcs",
@@ -121,8 +121,7 @@ pub enum Storage {
     },
     #[cfg(feature = "storage-s3")]
     S3 {
-        config: Box<S3Config>,
-        user_agent: String,
+        config: Box<S3StorageConfig>,
         operators: Mutex<HashMap<String, Operator>>,
     },
     #[cfg(feature = "storage-cos")]
@@ -215,11 +214,9 @@ impl Storage {
             }
             #[cfg(feature = "storage-s3")]
             "s3" | "s3a" => {
-                let user_agent = super::user_agent::storage_user_agent(&props);
                 let config = super::s3_config_parse(props)?;
                 Ok(Self::S3 {
                     config: Box::new(config),
-                    user_agent,
                     operators: Mutex::new(HashMap::new()),
                 })
             }
@@ -346,14 +343,10 @@ impl Storage {
                 Ok((op, Cow::Borrowed(relative_path)))
             }
             #[cfg(feature = "storage-s3")]
-            Storage::S3 {
-                config,
-                user_agent,
-                operators,
-            } => {
+            Storage::S3 { config, operators } => {
                 let (bucket, relative_path) =
                     Self::bucket_and_relative_path(path, "S3", &["s3", "s3a"])?;
-                let op = Self::cached_s3_operator(config, user_agent, operators, path, &bucket)?;
+                let op = Self::cached_s3_operator(config, operators, path, &bucket)?;
                 Ok((op, Cow::Borrowed(relative_path)))
             }
             #[cfg(feature = "storage-cos")]
@@ -613,14 +606,13 @@ impl Storage {
 
     #[cfg(feature = "storage-s3")]
     fn cached_s3_operator(
-        config: &S3Config,
-        user_agent: &str,
+        config: &S3StorageConfig,
         operators: &Mutex<HashMap<String, Operator>>,
         path: &str,
         bucket: &str,
     ) -> crate::Result<Operator> {
         Self::cached_operator(operators, "S3", bucket, || {
-            super::s3_config_build(config, path, user_agent)
+            super::s3_config_build(config, path)
         })
     }
 }
@@ -678,28 +670,6 @@ mod scheme_tests {
         for scheme in ["s3", "S3", "s3a", "S3A"] {
             assert!(matches!(build(scheme), Storage::S3 { .. }), "{scheme}");
         }
-    }
-
-    #[cfg(feature = "storage-s3")]
-    #[test]
-    fn s3_storage_uses_generic_user_agent_keys() {
-        let storage = Storage::build(FileIOBuilder::new("s3").with_props([
-            ("user-agent.features", "Flink"),
-            ("user-agent.extended", "vvr"),
-            ("dlf.access-tracking.extended-info", "uid/123"),
-        ]))
-        .unwrap();
-        let Storage::S3 { user_agent, .. } = storage else {
-            panic!("expected S3 storage");
-        };
-        assert_eq!(
-            user_agent,
-            format!(
-                "paimon-rust/{}(opendal/{};Flink) vvr uid/123",
-                env!("CARGO_PKG_VERSION"),
-                opendal::raw::VERSION
-            )
-        );
     }
 
     #[cfg(feature = "storage-cos")]

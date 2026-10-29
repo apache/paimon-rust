@@ -460,7 +460,8 @@ async fn execute_cow_merge_inner(
             // Build WHERE clause: exclude rows consumed by previous clauses, then apply this predicate
             let mut conditions: Vec<String> = Vec::new();
             for prev in &consumed_predicates {
-                conditions.push(format!("NOT ({prev})"));
+                // Only TRUE consumes a row; FALSE and NULL fall through.
+                conditions.push(format!("({prev}) IS NOT TRUE"));
             }
             if let Some(ref pred) = mc.predicate {
                 conditions.push(pred.clone());
@@ -892,7 +893,8 @@ async fn build_insert_batches_inner(
     for ins in inserts {
         let mut conditions = Vec::new();
         for prev in &consumed_predicates {
-            conditions.push(format!("NOT ({prev})"));
+            // Only TRUE consumes a row; FALSE and NULL fall through.
+            conditions.push(format!("({prev}) IS NOT TRUE"));
         }
         if let Some(ref pred) = ins.predicate {
             conditions.push(pred.clone());
@@ -2377,6 +2379,119 @@ mod tests {
                 (4, "dave".to_string(), 40),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn test_cow_merge_matched_null_predicates_fall_through() {
+        for delete_fallback in [false, true] {
+            let (_tmp, sql_context, table) = setup_append_only_table("t_null_matched").await;
+            for sql in [
+                "CREATE TABLE paimon.test_db.source (id INT, flag INT)",
+                "INSERT INTO paimon.test_db.source VALUES (1, NULL), (2, 1), (3, 0)",
+            ] {
+                sql_context.sql(sql).await.unwrap().collect().await.unwrap();
+            }
+
+            let fallback = if delete_fallback {
+                "DELETE"
+            } else {
+                "UPDATE SET name = 'fallback'"
+            };
+            let merge = parse_merge(&format!(
+                "MERGE INTO paimon.test_db.t_null_matched t USING paimon.test_db.source s \
+                 ON t.id = s.id \
+                 WHEN MATCHED AND s.flag = 1 THEN UPDATE SET name = 'first' \
+                 WHEN MATCHED AND s.flag = 0 THEN UPDATE SET name = 'second' \
+                 WHEN MATCHED THEN {fallback}"
+            ));
+            let result = execute_merge_into(&sql_context, &merge, table, true)
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+            assert_eq!(
+                result[0]
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .unwrap()
+                    .value(0),
+                3,
+            );
+
+            let batches = sql_context
+                .sql("SELECT id, name, value FROM paimon.test_db.t_null_matched ORDER BY id")
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+            let mut expected = vec![(2, "first".to_string(), 20), (3, "second".to_string(), 30)];
+            if !delete_fallback {
+                expected.insert(0, (1, "fallback".to_string(), 10));
+            }
+            assert_eq!(collect_rows(&batches), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_merge_insert_null_predicates_fall_through() {
+        for data_evolution in [false, true] {
+            let (_tmp, sql_context, table) = if data_evolution {
+                setup_data_evolution_table("t_null_insert").await
+            } else {
+                setup_append_only_table("t_null_insert").await
+            };
+            for sql in [
+                "CREATE TABLE paimon.test_db.source (id INT, flag INT)",
+                "INSERT INTO paimon.test_db.source VALUES (4, NULL), (5, 1), (6, 0)",
+            ] {
+                sql_context.sql(sql).await.unwrap().collect().await.unwrap();
+            }
+
+            let merge = parse_merge(
+                "MERGE INTO paimon.test_db.t_null_insert t USING paimon.test_db.source s \
+                 ON t.id = s.id \
+                 WHEN NOT MATCHED AND s.flag = 1 THEN INSERT (id, name, value) VALUES (s.id, 'first', 100) \
+                 WHEN NOT MATCHED AND s.flag = 0 THEN INSERT (id, name, value) VALUES (s.id, 'second', 100) \
+                 WHEN NOT MATCHED THEN INSERT (id, name, value) VALUES (s.id, 'fallback', 100)",
+            );
+            let result = execute_merge_into(&sql_context, &merge, table, true)
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+            assert_eq!(
+                result[0]
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .unwrap()
+                    .value(0),
+                3,
+            );
+
+            let batches = sql_context
+                .sql("SELECT id, name, value FROM paimon.test_db.t_null_insert ORDER BY id")
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+            assert_eq!(
+                collect_rows(&batches),
+                vec![
+                    (1, "alice".to_string(), 10),
+                    (2, "bob".to_string(), 20),
+                    (3, "charlie".to_string(), 30),
+                    (4, "fallback".to_string(), 100),
+                    (5, "first".to_string(), 100),
+                    (6, "second".to_string(), 100),
+                ],
+            );
+        }
     }
 
     #[tokio::test]

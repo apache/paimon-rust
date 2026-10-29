@@ -25,8 +25,8 @@ under the License.
 
 ```toml
 [dependencies]
-paimon = "0.3.0"
-paimon-datafusion = "0.3.0"
+paimon = "0.6.0"
+paimon-datafusion = "0.6.0"
 datafusion = "54.0.0"
 tokio = { version = "1", features = ["full"] }
 ```
@@ -74,9 +74,8 @@ the catalog-independent `path_to_descriptor` and `descriptor_to_string` scalar
 functions pre-registered. Use `register_catalog(...).await` to add one or more
 Paimon catalogs; registering a catalog also registers the built-in scalar
 function `blob_view` (alias `sys.blob_view`) and the built-in table-valued
-functions (`vector_search`, `hybrid_search`, and `full_text_search` when the
-`fulltext` feature is enabled) against it. It also manages session-scoped
-dynamic options internally for `SET`/`RESET` support.
+functions (`vector_search`, `hybrid_search`, and `full_text_search`) against it.
+It also manages session-scoped dynamic options internally for `SET`/`RESET` support.
 
 ### REST Catalog Views and SQL Functions
 
@@ -1154,6 +1153,59 @@ consumers before cleanup: running scans retain their loaded positions, and check
 completion can recreate deleted records. A fresh scan without an explicit checkpoint
 follows its existing initial scan behavior after its consumer record is deleted.
 
+### create_branch
+
+Create a branch from the main source table:
+
+```sql
+-- Copy the latest schema without inheriting data, snapshots, or tags.
+CALL sys.create_branch(table => 'paimon.my_db.my_table', branch => 'empty_branch');
+
+-- Start from a tag's historical schema and data.
+CALL sys.create_branch(
+    table => 'paimon.my_db.my_table',
+    branch => 'release_branch',
+    tag => 'release',
+    ignore_if_exists => true
+);
+```
+
+`table` and `branch` are required. `table` accepts `database.table` or
+`catalog.database.table`. Omitting `tag` creates a branch containing schema
+metadata only, even when the source table has data. A specified tag must exist;
+its retained snapshot can be used even after the live snapshot file has expired,
+provided the referenced schemas, manifests, and data files remain available.
+The source table is not modified. Query the new branch through `$branch_<name>`
+and list it through [`$branches`](#branches).
+
+`ignore_if_exists` defaults to `false`: an existing branch causes an error.
+With `true`, an existing branch is left unchanged and the tag is not resolved,
+even if the supplied tag does not exist. Both creation and an ignored request
+return one row with `result = 'OK'`. Boolean literals and case-insensitive
+`'true'` / `'false'` strings are accepted; other values are rejected. This
+parameter uses the Rust SQL name `ignore_if_exists`, rather than Java Spark's
+`ignoreIfExists`.
+
+Branch names must pass the Core name validator: `main`, empty or whitespace-only
+names, pure ASCII numeric names, `.`, `..`, path separators, and control
+characters are rejected. SQL also rejects `$` in target branch names because it
+separates branch and system-table suffixes in object names. Branch names preserve
+leading and trailing spaces.
+When creating a branch, tag names are passed unchanged to Core; trailing
+whitespace is invalid.
+Branch-name and source-table validation also apply when `ignore_if_exists` is
+`true`.
+
+Only non-REST FileStore tables resolved on `main` are supported. REST tables,
+format tables, external engine tables, and already resolved non-main source
+tables are rejected. The procedure does not resolve `$branch_<name>` or system
+table suffixes in its `table` argument and does not create from another branch.
+
+Creation reuses the Core metadata-copy path. Existence checks and file copies
+are not transactional; storage errors are returned and can leave partial branch
+metadata. `ignore_if_exists` checks name existence and does not repair a partial
+creation.
+
 ### create_tag
 
 Create a named tag from a snapshot:
@@ -1179,6 +1231,47 @@ When `time_retained` is specified, retention and tag creation time are persisted
 the tag file. For example, `'1d'` appears as `PT24H` in the `time_retained` column
 of `$tags`. Omitting `time_retained` creates a tag without these metadata fields.
 This procedure does not automatically delete expired tags.
+
+### replace_tag
+
+Replace an existing manual tag's snapshot and retention without changing its name:
+
+```sql
+CALL sys.replace_tag(
+    table => 'paimon.my_db.my_table',
+    tag => 'release',
+    snapshot_id => 1,
+    time_retained => '2d'
+);
+```
+
+`table` and `tag` are required. The tag must already exist. `snapshot_id` is an
+optional positive BIGINT; omitting it selects the latest live snapshot when the
+operation resolves its target. An explicit ID first resolves a live snapshot,
+then falls back to snapshots preserved by tags in the same branch if the live
+snapshot does not exist. Other snapshot read errors are returned. No suitable
+snapshot causes an error without changing the tag. `snapshot` is not an alias
+for `snapshot_id`. Success returns one row with `result = 'OK'`.
+
+`time_retained` uses the same duration format as `create_tag`. Providing it
+replaces the TTL and resets `tagCreateTime` to the replacement time, even when
+the snapshot ID stays the same. **Omitting it removes the previous TTL and
+creation time**: the tag is written as plain Snapshot JSON. It does not inherit
+the old TTL or apply a table's default tag retention. Argument, name, retention,
+and snapshot resolution errors leave the original tag file unchanged.
+
+Only non-REST FileStore tables and ordinary manual tags are supported. Format
+tables and engine-served table types are rejected. This procedure does not add
+branch-qualified SQL name resolution; an already resolved branch Table uses its
+own snapshot and tag managers. Automatic tag management and external tag
+callbacks are outside its scope.
+
+Replacement overwrites the tag metadata directly. It does not create a snapshot
+or clean up old snapshots, manifests, or data files, and it does not run tag
+expiration. Storage write failures are returned, but atomic replacement and
+rollback are not guaranteed across storage backends. The existence check and
+write are separate operations; concurrent tag modifications are not protected
+by a conditional update or transaction.
 
 ### create_tag_from_timestamp
 
@@ -1380,9 +1473,8 @@ the configured ratio, the FM index safely declines evaluation and the normal
 source scan applies the predicate.
 
 Full-text global indexes support character-string columns and serve the
-[`full_text_search`](#full-text-search) function. They require the `fulltext`
-feature. The build splits the table's row IDs into
-`global-index.row-count-per-shard` shards and writes one Java-compatible
+[`full_text_search`](#full-text-search) function. The build splits the table's
+row IDs into `global-index.row-count-per-shard` shards and writes one Java-compatible
 `full-text` index file per shard, so Java readers can use the files as well.
 Every `full-text.*` option is passed to the native index writer with the prefix
 removed, as in Java; examples are `full-text.tokenizer`, `full-text.lower-case`,
@@ -1453,9 +1545,8 @@ CALL sys.create_global_index(
 );
 ```
 
-The vindex `diskann` index is separate from the Lumina index whose
-`lumina.index.type` is `diskann`. Use the `diskann.*` options below with
-`index_type => 'diskann'`; use `lumina.*` options only with a Lumina index.
+For vector search, we recommend vindex DiskANN. Select `index_type => 'diskann'`
+and configure it with the `diskann.*` options below.
 
 The `options` argument is a comma-separated `key=value` string. User options
 override table options. Use keys prefixed by the selected index type, or set
@@ -1555,7 +1646,7 @@ CALL sys.drop_global_index(
 ```
 
 `index_type` accepts every type the create procedures build: `btree`, `bitmap`,
-`multivalue`, `fm`, `full-text`, `lumina` (or `lumina-vector-ann`), and the vindex types
+`multivalue`, `fm`, `full-text`, and the vindex types
 `ivf-flat`, `ivf-pq`, `ivf-sq`, `ivf-rq`, and `diskann`. It defaults to `btree`, is
 case-insensitive and surrounding whitespace is ignored.
 
@@ -1581,36 +1672,6 @@ omitted argument performs the drop and returns `OK`. Other values are rejected.
 The preview uses the latest snapshot at the time of the call; concurrent changes
 can affect the number of files matched by a later drop. Reads retain the usual
 local-cache behavior. Partition filtering is not supported by this procedure.
-
-### create_lumina_index
-
-Build and commit a Lumina global vector index for a table column:
-
-```sql
-CALL sys.create_lumina_index(table => 'paimon.my_db.my_table', index_column => 'embedding');
-```
-
-The optional `index_type` argument selects the Lumina index identifier. It
-defaults to `lumina`, is case-insensitive and surrounding whitespace is ignored.
-Valid values are `lumina` and the legacy-compatible `lumina-vector-ann`.
-
-```sql
-CALL sys.create_lumina_index(
-  table => 'paimon.my_db.my_table',
-  index_column => 'embedding',
-  index_type => 'lumina'
-);
-```
-
-Optional Lumina builder settings can be supplied as comma-separated `key=value` pairs:
-
-```sql
-CALL sys.create_lumina_index(
-  table => 'paimon.my_db.my_table',
-  index_column => 'embedding',
-  options => 'lumina.index.dimension=128,lumina.encoding.type=pq'
-);
-```
 
 ### grant_permission
 
@@ -1864,9 +1925,9 @@ CROSS JOIN LATERAL vector_search(
 
 Paimon supports approximate nearest neighbor (ANN) vector search through global
 vector indexes. DataFusion can search vindex indexes created by
-`CALL sys.create_global_index` and Lumina indexes created by
-`CALL sys.create_lumina_index`. The `vector_search` table-valued function is
-registered as a UDTF on the DataFusion session context.
+`CALL sys.create_global_index`. We recommend vindex DiskANN
+(`index_type => 'diskann'`). The `vector_search` table-valued function is registered
+as a UDTF on the DataFusion session context.
 
 ### Registration
 
@@ -2089,27 +2150,11 @@ that dynamic-option path. Rust callers can pass the same unprefixed keys, such
 as `diskann.l_search`, through `VectorSearchBuilder::with_options` or
 `BatchVectorSearchBuilder::with_options`.
 
-### Lumina Index Options
-
-Lumina index behavior is configured via table options prefixed with `lumina.`:
-
-| Option | Description |
-|---|---|
-| `lumina.index.dimension` | Vector dimension |
-| `lumina.distance.metric` | Distance metric (`inner_product`, `cosine`, `l2`) |
-| `lumina.index.type` | Index type (default: `diskann`) |
-| `lumina.encoding.type` | Encoding type (default: `pq`) |
-| `lumina.search.max-filter-bytes` | Maximum memory used by each active Lumina reader to expand a filtered row-id set (default: `64 MiB`, or 8,388,608 row ids). Queries exceeding it fail with an error; increase it explicitly as a table or vector-search option for unusually large index segments. This Rust-side safety option is not passed to the native Lumina library. |
-
-### Lumina Environment
-
-The Lumina native library must be available at runtime. Set the `LUMINA_LIB_PATH` environment variable to the path of the shared library, or place it in the platform default location.
-
 ## Hybrid Search
 
 Paimon supports hybrid search by combining multiple search routes and ranking the merged results. The `hybrid_search` table-valued function is registered as a UDTF on the DataFusion session context.
 
-Hybrid search does not require the `fulltext` feature when all routes are vector routes. Enable `fulltext` only when you include full-text routes.
+Vector and full-text routes are built in and can be combined without enabling additional Cargo features.
 
 ### Registration
 
@@ -2169,7 +2214,7 @@ FROM hybrid_search(
 );
 ```
 
-A full-text route accepts `column`, `query`, optional `limit`, and optional `weight`. Full-text routes require the `fulltext` feature:
+A full-text route accepts `column`, `query`, optional `limit`, and optional `weight`:
 
 ```sql
 SELECT *
@@ -2221,17 +2266,17 @@ The metadata column is part of the DataFusion table function schema, so `SELECT 
 
 Paimon supports full-text search via the Tantivy search engine. The `full_text_search` table-valued function is registered as a UDTF on the DataFusion session context.
 
-> **Note:** Full-text search requires the `fulltext` feature flag to be enabled on both `paimon` and `paimon-datafusion` crates.
+Full-text search is built into both `paimon` and `paimon-datafusion`; no Cargo feature flag is required.
 
 ```toml
 [dependencies]
-paimon = { version = "0.3.0", features = ["fulltext"] }
-paimon-datafusion = { version = "0.3.0", features = ["fulltext"] }
+paimon = "0.6.0"
+paimon-datafusion = "0.6.0"
 ```
 
 ### Registration
 
-When you use a `SQLContext`, `full_text_search` is registered automatically for every catalog you register (when the `fulltext` feature is enabled) — no extra setup is needed.
+When you use a `SQLContext`, `full_text_search` is registered automatically for every catalog you register — no extra setup is needed.
 
 With a raw DataFusion `SessionContext`, register it explicitly:
 
@@ -2713,7 +2758,7 @@ Columns:
 |---|---|---|
 | `partition` | STRING | Partition spec for the indexed data, formatted as a Java row cast string; `{}` for unpartitioned tables |
 | `bucket` | INT | Bucket id covered by the index file |
-| `index_type` | STRING | Index type, such as `btree`, `bitmap`, `multivalue`, `fm`, `ivf-flat`, `lumina`, or `DELETION_VECTORS` |
+| `index_type` | STRING | Index type, such as `btree`, `bitmap`, `multivalue`, `fm`, `ivf-flat`, `diskann`, or `DELETION_VECTORS` |
 | `file_name` | STRING | Index file name. It resolves to the table `index/` directory, or to the bucket's data-file directory when `index-file-in-data-file-dir` is set; an index file with an external path is read from that path instead |
 | `file_size` | BIGINT | Index file size in bytes |
 | `row_count` | BIGINT | Number of rows covered by the index file |
@@ -2844,13 +2889,28 @@ and an explicit `false` continue to reject these retract rows. Once enabled on
 an existing partial-update table, `ignore-delete` cannot be changed back to
 `false`.
 
-Rust can read existing partial-update tables that define
+Rust supports reading and writing partial-update tables that define
 `fields.<sequence-field>.sequence-group=<protected-fields>`. Single and
 composite sequence fields, multiple independent groups, and projected reads are
 supported. Rows whose sequence tuple is entirely null do not update the group;
-an accepted group update can set protected fields to null. Rust table creation
-and writes still reject sequence-group options because write-side group merging
-is not implemented.
+an accepted group update can set protected fields to null.
+
+Set `fields.<sequence-fields>.sequence-group.sort-order` independently for each
+group: `ascending` (the default) retains larger ordering values, while
+`descending` retains smaller ones. Composite sequence fields are compared
+lexicographically in their declared order, using the same direction for every
+component. Non-null ordering values take precedence over null in both
+directions, and equal ordering tuples still replace protected fields, including
+with null. For example, `fields.first_event_time.sequence-group=channel` with
+`fields.first_event_time.sequence-group.sort-order=descending` retains
+`50/referral` from updates `100/organic` and `50/referral`.
+
+Sort-order options require a corresponding sequence group on a primary-key
+table with `merge-engine=partial-update`. Projected reads and column renames
+preserve the direction. Choose it before writing data: changing the direction
+cannot recover values discarded by earlier merges. All readers, writers, and
+compaction jobs must support the option before using `descending`; older
+clients may ignore it.
 
 Existing partial-update tables may also configure
 `fields.<field>.aggregate-function` or
@@ -2859,13 +2919,10 @@ set as the basic aggregation engine: `sum`, `product`, `min`, `max`,
 `last_value`, `first_value`, `last_non_null_value`,
 `first_non_null_value`, `bool_and`, `bool_or`, and `listagg`.
 `last_non_null_value` may be used without a sequence group; other functions
-require the target field to be protected by a sequence group. When an older
-group sequence arrives after a newer one, order-sensitive functions use Java
+require the target field to be protected by a sequence group. When a
+lower-precedence group sequence arrives, order-sensitive functions use Java
 compatible reversed aggregation. Unknown functions and incompatible
-function/type combinations fail closed. Rust table creation and writes still
-reject partial-update aggregation options.
-
-Partial-update remove-record options and retract semantics are not supported.
+function/type combinations fail closed.
 
 Rust can read fully materialized compacted files from deletion-vector-enabled
 partial-update and aggregation tables. Every split must be raw-convertible,
@@ -2891,6 +2948,11 @@ rows (`DELETE` / `UPDATE_BEFORE`), deletion-vector writes or merge-on-read
 plans, cross-partition dynamic bucket writes, or advanced aggregation options
 such as `ignore-retract`, `distinct`, `nested-key`, `count-limit`, and sequence
 groups.
+
+Primary-key compaction supports `changelog-producer=lookup` without deletion
+vectors, generating INSERT, UPDATE_BEFORE, UPDATE_AFTER and DELETE events when
+L0 files are compacted. The executor requires `local-cache.enabled=true` on the
+catalog/FileIO. See [Lookup changelog producer](compaction.md#lookup-changelog-producer).
 
 ### Global Index Options
 
