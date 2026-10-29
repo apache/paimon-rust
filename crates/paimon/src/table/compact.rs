@@ -111,6 +111,20 @@ impl<'a> CompactBuilder<'a> {
     /// Executor resources are local; input files and output settings come from each task.
     pub fn new_executor(&self) -> Result<CompactExecutor> {
         ensure_supported(self.table)?;
+        if self
+            .table
+            .schema()
+            .core_options()
+            .try_changelog_producer()?
+            == ChangelogProducer::Lookup
+            && self.table.file_io().local_cache().is_none()
+        {
+            return Err(Error::ConfigInvalid {
+                message:
+                    "Lookup compaction requires local-cache.enabled=true on the catalog/FileIO"
+                        .into(),
+            });
+        }
         Ok(CompactExecutor {
             table: self.table.clone(),
             resources: self.resources.clone(),
@@ -274,11 +288,17 @@ pub struct CompactExecutor {
 pub struct CompactResult {
     task: CompactTask,
     files: Vec<DataFileMeta>,
+    #[serde(default)]
+    changelog_files: Vec<DataFileMeta>,
 }
 
 impl CompactResult {
     pub fn files(&self) -> &[DataFileMeta] {
         &self.files
+    }
+
+    pub fn changelog_files(&self) -> &[DataFileMeta] {
+        &self.changelog_files
     }
 
     pub fn metrics(&self) -> CompactMetrics {
@@ -287,6 +307,17 @@ impl CompactResult {
             files_added: self.files.len(),
             rows_written: self.files.iter().map(|file| file.row_count as u64).sum(),
             bytes_written: self.files.iter().map(|file| file.file_size as u64).sum(),
+            changelog_files_added: self.changelog_files.len(),
+            changelog_rows_written: self
+                .changelog_files
+                .iter()
+                .map(|file| file.row_count as u64)
+                .sum(),
+            changelog_bytes_written: self
+                .changelog_files
+                .iter()
+                .map(|file| file.file_size as u64)
+                .sum(),
         }
     }
 }
@@ -298,6 +329,12 @@ pub struct CompactMetrics {
     pub files_added: usize,
     pub rows_written: u64,
     pub bytes_written: u64,
+    #[serde(default)]
+    pub changelog_files_added: usize,
+    #[serde(default)]
+    pub changelog_rows_written: u64,
+    #[serde(default)]
+    pub changelog_bytes_written: u64,
 }
 
 impl CompactExecutor {
@@ -351,13 +388,16 @@ impl CompactExecutor {
             return Ok(CompactResult {
                 task: task.clone(),
                 files,
+                changelog_files: vec![],
             });
         }
         if task.is_primary_key() {
-            let files = primary_key::execute(&table, task, &split, self.resources.clone()).await?;
+            let (files, changelog_files) =
+                primary_key::execute(&table, task, &split, self.resources.clone()).await?;
             return Ok(CompactResult {
                 task: task.clone(),
                 files,
+                changelog_files,
             });
         }
         let mut read = table.new_read_builder().new_read()?.with_ordered(true);
@@ -408,6 +448,7 @@ impl CompactExecutor {
             Ok(files) => Ok(CompactResult {
                 task: task.clone(),
                 files,
+                changelog_files: vec![],
             }),
             Err(error) => {
                 writer.abort().await;
@@ -513,6 +554,7 @@ impl CompactTask {
 /// Validated inputs for the existing atomic snapshot publication machinery.
 pub(super) struct PreparedCompact {
     pub entries: Vec<ManifestEntry>,
+    pub changelog_entries: Vec<ManifestEntry>,
     pub schema_id: i64,
     pub snapshot_id: i64,
     pub read_snapshot: Option<Box<Snapshot>>,
@@ -529,6 +571,7 @@ pub(super) fn prepare_results(table: &Table, results: &[CompactResult]) -> Resul
     let mut inputs = HashSet::new();
     let mut outputs = HashSet::new();
     let mut entries = Vec::new();
+    let mut changelog_entries = Vec::new();
     let mut metrics = CompactMetrics::default();
     for result in results {
         let task = &result.task;
@@ -605,11 +648,55 @@ pub(super) fn prepare_results(table: &Table, results: &[CompactResult]) -> Resul
                 "PK compaction must retain each key's merged state unless retracts are ignored",
             ));
         }
+        let lookup = options.try_changelog_producer()? == ChangelogProducer::Lookup;
+        if !lookup && !result.changelog_files.is_empty() {
+            return Err(invalid(
+                "Only lookup compaction may produce changelog files",
+            ));
+        }
+        let mut changelog_rows = 0u64;
+        for file in &result.changelog_files {
+            validate_file(file, true)?;
+            if file.schema_id != task.context.schema.id()
+                || file.file_source != Some(1)
+                || file.level != task.output_level()
+                || file
+                    .delete_row_count
+                    .is_none_or(|count| count > file.row_count)
+                || !outputs.insert(file.file_name.clone())
+                || task.files.iter().any(|old| old.file_name == file.file_name)
+            {
+                return Err(invalid("Invalid compaction changelog file"));
+            }
+            changelog_rows += file.row_count as u64;
+            changelog_entries.push(ManifestEntry::new(
+                FileKind::Add,
+                task.partition.clone(),
+                task.bucket,
+                task.total_buckets,
+                file.clone(),
+                2,
+            ));
+        }
+        let l0_rows = task
+            .files
+            .iter()
+            .filter(|file| file.level == 0)
+            .map(|file| file.row_count as u64)
+            .sum::<u64>();
+        if changelog_rows > l0_rows.saturating_mul(2) {
+            return Err(invalid(
+                "Lookup changelogs must be generated by level-0 records",
+            ));
+        }
         let part = result.metrics();
         metrics.files_removed += part.files_removed;
         metrics.files_added += part.files_added;
         metrics.rows_written += part.rows_written;
         metrics.bytes_written += part.bytes_written;
+        metrics.changelog_files_added += part.changelog_files_added;
+        metrics.changelog_rows_written += part.changelog_rows_written;
+        metrics.changelog_bytes_written += part.changelog_bytes_written;
     }
     ids.sort_unstable();
     if ids.windows(2).any(|pair| pair[0] == pair[1]) {
@@ -623,6 +710,7 @@ pub(super) fn prepare_results(table: &Table, results: &[CompactResult]) -> Resul
     }
     Ok(PreparedCompact {
         entries,
+        changelog_entries,
         schema_id: first.task.context.schema.id(),
         snapshot_id: first.task.snapshot_id(),
         read_snapshot: first
@@ -692,14 +780,20 @@ pub(super) fn ensure_supported(table: &Table) -> Result<()> {
         && (options.bucket() == 0
             || !matches!(
                 options.try_changelog_producer()?,
-                ChangelogProducer::None | ChangelogProducer::Input
+                ChangelogProducer::None | ChangelogProducer::Input | ChangelogProducer::Lookup
             )
             || (options.merge_engine()? == MergeEngine::FirstRow
-                && options.try_changelog_producer()? != ChangelogProducer::None))
+                && !matches!(
+                    options.try_changelog_producer()?,
+                    ChangelogProducer::None | ChangelogProducer::Lookup
+                )))
     {
         return Err(Error::Unsupported {
-            message: "PK compaction requires fixed or dynamic buckets and changelog-producer=none or input; first-row requires changelog-producer=none".into(),
+            message: "PK compaction requires fixed or dynamic buckets and changelog-producer=none, input or lookup; first-row requires changelog-producer=none or lookup".into(),
         });
+    }
+    if options.try_changelog_producer()? == ChangelogProducer::Lookup {
+        primary_key::lookup::validate_options(properties)?;
     }
     options.validate_data_file_path_directory()
 }

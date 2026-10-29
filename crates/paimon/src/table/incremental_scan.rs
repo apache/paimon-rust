@@ -63,8 +63,8 @@ pub enum IncrementalScanMode {
     /// Read existing changelog manifest files in the range.
     ///
     /// Skips [`OVERWRITE`](crate::spec::CommitKind::OVERWRITE) snapshots and
-    /// snapshots without a `changelog_manifest_list`. Does not generate
-    /// changelogs (no compact/lookup producer path).
+    /// snapshots without a `changelog_manifest_list`. Reads persisted input or
+    /// compaction-generated changelogs; it does not generate events during reads.
     Changelog,
     /// Resolve to [`Delta`](Self::Delta) when `changelog-producer=none`,
     /// otherwise to [`Changelog`](Self::Changelog).
