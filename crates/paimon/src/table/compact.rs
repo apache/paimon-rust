@@ -33,7 +33,7 @@ use super::data_file_writer::DataFileWriter;
 use super::partition_filter::validate_partition_filter;
 use super::snapshot_manifest::read_snapshot_entries;
 use super::write_builder::{ensure_table_write_authorized, validate_commit_user};
-use super::{DataSplit, Table, TableCommit};
+use super::{DataSplit, Plan, Table, TableCommit};
 use crate::resource::ResourceContext;
 use crate::spec::{
     bucket_path_under, BinaryRow, ChangelogProducer, DataFileMeta, FileKind, IndexManifest,
@@ -92,18 +92,18 @@ impl<'a> CompactBuilder<'a> {
                 message: "Compaction requires a positive target-file-size".into(),
             });
         }
-        let append =
-            if self.table.schema().primary_keys().is_empty() && !options.data_evolution_enabled() {
-                Some(append::AppendCompactPlanner::new(&options)?)
-            } else {
-                None
-            };
-        if options.data_evolution_enabled() {
-            options.compaction_min_file_num()?;
-        }
+        let kind = if options.data_evolution_enabled() {
+            CompactPlannerKind::DataEvolution(data_evolution::DataEvolutionCompactPlanner::new(
+                &options,
+            )?)
+        } else if self.table.schema().primary_keys().is_empty() {
+            CompactPlannerKind::Append(append::AppendCompactPlanner::new(&options)?)
+        } else {
+            CompactPlannerKind::PrimaryKey(primary_key::PrimaryKeyCompactPlanner)
+        };
         Ok(CompactPlanner {
             table: self.table.clone(),
-            append,
+            kind,
             partition_filter: self.partition_filter.clone(),
         })
     }
@@ -126,11 +126,36 @@ impl<'a> CompactBuilder<'a> {
     }
 }
 
-/// Selects append files, contiguous data-evolution ranges or whole PK buckets.
+/// Captures a shared snapshot boundary and delegates to the table-mode planner.
 pub struct CompactPlanner {
     table: Table,
-    append: Option<append::AppendCompactPlanner>,
+    kind: CompactPlannerKind,
     partition_filter: Option<Predicate>,
+}
+
+enum CompactPlannerKind {
+    Append(append::AppendCompactPlanner),
+    PrimaryKey(primary_key::PrimaryKeyCompactPlanner),
+    DataEvolution(data_evolution::DataEvolutionCompactPlanner),
+}
+
+type BucketFiles = BTreeMap<(Vec<u8>, i32, i32), Vec<DataFileMeta>>;
+
+/// Append and PK planners share the split-to-bucket metadata representation.
+/// Eligibility and task selection remain with each table-mode planner.
+fn split_files_by_bucket(source: &Plan) -> BucketFiles {
+    let mut groups = BucketFiles::new();
+    for split in source.splits() {
+        groups
+            .entry((
+                split.partition().to_serialized_bytes(),
+                split.bucket(),
+                split.total_buckets(),
+            ))
+            .or_default()
+            .extend_from_slice(split.data_files());
+    }
+    groups
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -223,88 +248,13 @@ impl CompactPlanner {
             schema: self.table.schema().clone(),
             snapshot,
         };
-        let mut groups = BTreeMap::<_, Vec<DataFileMeta>>::new();
-        let primary_key = !self.table.schema().primary_keys().is_empty();
-        let data_evolution = self.table.schema().core_options().data_evolution_enabled();
-        if data_evolution {
-            // Query planning may discard shadowed column providers. A rewrite
-            // must remove every normal file in each captured row-ID group.
-            for entry in scan.plan_manifest_entries(&context.snapshot).await? {
-                if !super::source::is_data_evolution_normal_file(entry.file()) {
-                    continue;
-                }
-                data_evolution::validate_file(entry.file())?;
-                groups
-                    .entry((
-                        entry.partition().to_vec(),
-                        entry.bucket(),
-                        entry.total_buckets(),
-                    ))
-                    .or_default()
-                    .push(entry.file().clone());
+        let tasks = match &self.kind {
+            CompactPlannerKind::Append(planner) => planner.plan_tasks(&source, &context)?,
+            CompactPlannerKind::PrimaryKey(planner) => planner.plan_tasks(&source, &context)?,
+            CompactPlannerKind::DataEvolution(planner) => {
+                planner.plan_tasks(&self.table, &scan, &context).await?
             }
-        } else {
-            for split in source.splits() {
-                let group = groups
-                    .entry((
-                        split.partition().to_serialized_bytes(),
-                        split.bucket(),
-                        split.total_buckets(),
-                    ))
-                    .or_default();
-                for file in split.data_files() {
-                    validate_file(file, primary_key)?;
-                    group.push(file.clone());
-                }
-            }
-        }
-        let mut tasks = Vec::new();
-        for ((partition, bucket, total_buckets), files) in groups {
-            if data_evolution {
-                for files in data_evolution::plan(files, &self.table.schema().core_options())? {
-                    data_evolution::validate_storage_layout(&self.table, &files).await?;
-                    tasks.push(CompactTask {
-                        context: context.clone(),
-                        task_id: tasks.len(),
-                        partition: partition.clone(),
-                        bucket,
-                        total_buckets,
-                        files,
-                    });
-                }
-                continue;
-            }
-            if primary_key {
-                // L0 requires upgrading; multiple levels require merging. Files
-                // at one positive level already form a non-overlapping sorted
-                // run, including when the previous compaction rolled files.
-                let first_level = files.first().map(|file| file.level);
-                if files
-                    .iter()
-                    .any(|file| file.level == 0 || Some(file.level) != first_level)
-                {
-                    tasks.push(CompactTask {
-                        context: context.clone(),
-                        task_id: tasks.len(),
-                        partition,
-                        bucket,
-                        total_buckets,
-                        files,
-                    });
-                }
-                continue;
-            }
-            for files in self.append.as_ref().unwrap().plan(files) {
-                tasks.push(CompactTask {
-                    context: context.clone(),
-                    task_id: tasks.len(),
-                    partition: partition.clone(),
-                    bucket,
-                    total_buckets,
-                    files,
-                });
-            }
-        }
+        };
         Ok(CompactPlan {
             snapshot_id: Some(snapshot_id),
             tasks,

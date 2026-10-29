@@ -20,7 +20,7 @@ use std::sync::Arc;
 use arrow_schema::SchemaRef;
 use futures::TryStreamExt;
 
-use super::CompactTask;
+use super::{split_files_by_bucket, validate_file, CompactContext, CompactTask};
 use crate::resource::ResourceContext;
 use crate::spec::{
     BigIntType, DataField, DataFileMeta, DataType, MergeEngine, RowKind, TinyIntType,
@@ -37,8 +37,43 @@ use crate::table::sort_merge::{
 use crate::table::table_read::{
     configured_mosaic_prefetch, configured_parquet_read_budget, MAX_MERGE_INPUT_STREAMS,
 };
-use crate::table::{DataSplit, Table};
+use crate::table::{DataSplit, Plan, Table};
 use crate::Result;
+
+/// Select complete captured buckets that need an L0 upgrade or level merge.
+pub(super) struct PrimaryKeyCompactPlanner;
+
+impl PrimaryKeyCompactPlanner {
+    pub(super) fn plan_tasks(
+        &self,
+        source: &Plan,
+        context: &CompactContext,
+    ) -> Result<Vec<CompactTask>> {
+        let mut tasks = Vec::new();
+        for ((partition, bucket, total_buckets), files) in split_files_by_bucket(source) {
+            for file in &files {
+                validate_file(file, true)?;
+            }
+            // One positive level is already a non-overlapping sorted run,
+            // including when the previous compaction rolled several files.
+            let first_level = files.first().map(|file| file.level);
+            if files
+                .iter()
+                .any(|file| file.level == 0 || Some(file.level) != first_level)
+            {
+                tasks.push(CompactTask {
+                    context: context.clone(),
+                    task_id: tasks.len(),
+                    partition,
+                    bucket,
+                    total_buckets,
+                    files,
+                });
+            }
+        }
+        Ok(tasks)
+    }
+}
 
 /// Keep the same winner as a deduplicate query, including DELETE/UPDATE_BEFORE.
 /// A later write may carry a lower user sequence, so even full compaction

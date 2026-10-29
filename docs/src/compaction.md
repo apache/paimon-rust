@@ -26,6 +26,10 @@ a `CompactPlanner`, a `CompactExecutor`, and a `TableCommit`. Planning and
 execution do not publish snapshots; `commit_compact` atomically publishes the
 selected results in a `COMPACT` snapshot.
 
+The builder selects a dedicated append, primary-key or Data Evolution planner
+for the table mode. They share snapshot capture and the public plan/task types;
+each planner owns its file eligibility, grouping and task-selection rules.
+
 ```rust
 let builder = table.new_compact_builder();
 let planner = builder.new_planner()?;

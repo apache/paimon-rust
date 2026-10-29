@@ -24,7 +24,7 @@ use std::sync::Arc;
 use futures::TryStreamExt;
 use roaring::RoaringBitmap;
 
-use super::{invalid, CompactTask};
+use super::{invalid, BucketFiles, CompactContext, CompactTask};
 use crate::resource::ResourceContext;
 use crate::spec::{
     bucket_path, BinaryRow, CoreOptions, DataField, DataFileMeta, DataType, FileKind,
@@ -35,7 +35,7 @@ use crate::table::data_file_writer::DataFileWriter;
 use crate::table::index_file_path::committed_index_file_path;
 use crate::table::source::{data_evolution_anchor_file, is_data_evolution_normal_file};
 use crate::table::stats_filter::group_by_overlapping_row_id;
-use crate::table::{DataEvolutionDeleteWriter, DataSplit, Table};
+use crate::table::{DataEvolutionDeleteWriter, DataSplit, Table, TableScan};
 use crate::{Error, Result};
 
 pub(super) fn ensure_supported(table: &Table) -> Result<()> {
@@ -129,11 +129,11 @@ pub(super) fn row_range(files: &[DataFileMeta]) -> Result<(i64, i64)> {
     range.ok_or_else(|| invalid("Empty data-evolution compaction range"))
 }
 
-fn output_range(files: &[DataFileMeta], options: &CoreOptions<'_>) -> Result<(i64, i64)> {
+fn output_range(files: &[DataFileMeta], deletion_vectors_enabled: bool) -> Result<(i64, i64)> {
     let (first, last) = row_range(files)?;
     // The current Rust DV writer addresses local positions with u32. Merging
     // otherwise deletable groups must not make later DELETEs unrepresentable.
-    if options.deletion_vectors_enabled() && last - first > i64::from(u32::MAX) {
+    if deletion_vectors_enabled && last - first > i64::from(u32::MAX) {
         return Err(Error::Unsupported {
             message: "Data-evolution compaction with deletion vectors cannot produce more than 4294967296 physical row slots in one file; 64-bit deletion-vector writing is not supported".into(),
         });
@@ -141,49 +141,103 @@ fn output_range(files: &[DataFileMeta], options: &CoreOptions<'_>) -> Result<(i6
     Ok((first, last))
 }
 
-/// Java packs whole aligned groups by sum(max(file_size, open_file_cost)).
-/// A heavy group is isolated; adjacent groups fill bins until weight > target.
-pub(super) fn plan(
-    files: Vec<DataFileMeta>,
-    options: &CoreOptions<'_>,
-) -> Result<Vec<Vec<DataFileMeta>>> {
-    let min_files = options.compaction_min_file_num()?;
-    let target = i128::from(options.target_file_size());
-    let mut tasks = Vec::new();
-    let mut pending = Vec::new();
-    let mut weight = 0i128;
-    let mut previous_end: Option<i64> = None;
-    let drain = |pending: &mut Vec<DataFileMeta>, tasks: &mut Vec<Vec<DataFileMeta>>| {
-        let files = std::mem::take(pending);
-        if files.len() >= min_files {
-            tasks.push(files);
-        }
-    };
-    for group in group_by_overlapping_row_id(files) {
-        let (first, last) = row_range(&group)?;
-        let group_weight = group
-            .iter()
-            .map(|file| i128::from(file.file_size.max(options.source_split_open_file_cost())))
-            .sum::<i128>();
-        if previous_end.is_some_and(|end| end.checked_add(1) != Some(first))
-            || group_weight > target
-        {
-            drain(&mut pending, &mut tasks);
-            weight = 0;
-        }
-        pending.extend(group);
-        weight += group_weight;
-        if weight > target {
-            drain(&mut pending, &mut tasks);
-            weight = 0;
-        }
-        previous_end = Some(last);
+/// Select complete normal-file groups and pack adjacent row-ID ranges.
+pub(super) struct DataEvolutionCompactPlanner {
+    min_file_num: usize,
+    target_file_size: i128,
+    open_file_cost: i64,
+    deletion_vectors_enabled: bool,
+}
+
+impl DataEvolutionCompactPlanner {
+    pub(super) fn new(options: &CoreOptions<'_>) -> Result<Self> {
+        Ok(Self {
+            min_file_num: options.compaction_min_file_num()?,
+            target_file_size: i128::from(options.target_file_size()),
+            open_file_cost: options.source_split_open_file_cost(),
+            deletion_vectors_enabled: options.deletion_vectors_enabled(),
+        })
     }
-    drain(&mut pending, &mut tasks);
-    for task in &tasks {
-        output_range(task, options)?;
+
+    pub(super) async fn plan_tasks(
+        &self,
+        table: &Table,
+        scan: &TableScan<'_>,
+        context: &CompactContext,
+    ) -> Result<Vec<CompactTask>> {
+        let mut groups = BucketFiles::new();
+        // Read captured manifests rather than query providers so shadowed
+        // column versions are also included in each normal-file rewrite.
+        for entry in scan.plan_manifest_entries(&context.snapshot).await? {
+            if !is_data_evolution_normal_file(entry.file()) {
+                continue;
+            }
+            validate_file(entry.file())?;
+            groups
+                .entry((
+                    entry.partition().to_vec(),
+                    entry.bucket(),
+                    entry.total_buckets(),
+                ))
+                .or_default()
+                .push(entry.file().clone());
+        }
+        let mut tasks = Vec::new();
+        for ((partition, bucket, total_buckets), files) in groups {
+            for files in self.plan(files)? {
+                validate_storage_layout(table, &files).await?;
+                tasks.push(CompactTask {
+                    context: context.clone(),
+                    task_id: tasks.len(),
+                    partition: partition.clone(),
+                    bucket,
+                    total_buckets,
+                    files,
+                });
+            }
+        }
+        Ok(tasks)
     }
-    Ok(tasks)
+
+    /// Java packs whole groups by sum(max(file_size, open_file_cost)). A heavy
+    /// group is isolated; adjacent groups fill bins until weight > target.
+    fn plan(&self, files: Vec<DataFileMeta>) -> Result<Vec<Vec<DataFileMeta>>> {
+        let mut tasks = Vec::new();
+        let mut pending = Vec::new();
+        let mut weight = 0i128;
+        let mut previous_end: Option<i64> = None;
+        let drain = |pending: &mut Vec<DataFileMeta>, tasks: &mut Vec<Vec<DataFileMeta>>| {
+            let files = std::mem::take(pending);
+            if files.len() >= self.min_file_num {
+                tasks.push(files);
+            }
+        };
+        for group in group_by_overlapping_row_id(files) {
+            let (first, last) = row_range(&group)?;
+            let group_weight = group
+                .iter()
+                .map(|file| i128::from(file.file_size.max(self.open_file_cost)))
+                .sum::<i128>();
+            if previous_end.is_some_and(|end| end.checked_add(1) != Some(first))
+                || group_weight > self.target_file_size
+            {
+                drain(&mut pending, &mut tasks);
+                weight = 0;
+            }
+            pending.extend(group);
+            weight += group_weight;
+            if weight > self.target_file_size {
+                drain(&mut pending, &mut tasks);
+                weight = 0;
+            }
+            previous_end = Some(last);
+        }
+        drain(&mut pending, &mut tasks);
+        for task in &tasks {
+            output_range(task, self.deletion_vectors_enabled)?;
+        }
+        Ok(tasks)
+    }
 }
 
 pub(super) fn validate_inputs(
@@ -336,7 +390,10 @@ pub(super) async fn execute(
     resources: Option<ResourceContext>,
 ) -> Result<Vec<DataFileMeta>> {
     validate_storage_layout(table, task.files()).await?;
-    let (first, last) = output_range(task.files(), &table.schema().core_options())?;
+    let (first, last) = output_range(
+        task.files(),
+        table.schema().core_options().deletion_vectors_enabled(),
+    )?;
     let fields = normal_fields(table.schema());
     let min_sequence = task
         .files
@@ -418,7 +475,13 @@ pub(super) async fn execute(
 }
 
 pub(super) fn validate_outputs(task: &CompactTask, files: &[DataFileMeta]) -> Result<()> {
-    let expected = output_range(&task.files, &task.context.schema.core_options())?;
+    let expected = output_range(
+        &task.files,
+        task.context
+            .schema
+            .core_options()
+            .deletion_vectors_enabled(),
+    )?;
     let min_sequence = task
         .files
         .iter()
@@ -618,7 +681,9 @@ mod tests {
             ),
             ("compaction.min.file-num".into(), min.to_string()),
         ]);
-        plan(files, &CoreOptions::new(&options))
+        DataEvolutionCompactPlanner::new(&CoreOptions::new(&options))
+            .unwrap()
+            .plan(files)
             .unwrap()
             .into_iter()
             .map(|group| group.into_iter().map(|file| file.file_name).collect())
@@ -683,17 +748,19 @@ mod tests {
         ]);
         let max_rows = i64::from(u32::MAX) + 1;
         let too_wide = vec![file("a", 0, max_rows, 1), file("b", max_rows, 1, 1)];
-        let error = plan(too_wide.clone(), &CoreOptions::new(&options)).unwrap_err();
+        let planner = DataEvolutionCompactPlanner::new(&CoreOptions::new(&options)).unwrap();
+        let error = planner.plan(too_wide.clone()).unwrap_err();
         assert!(matches!(error, Error::Unsupported { .. }));
         assert!(error.to_string().contains("64-bit deletion-vector writing"));
         let at_limit = vec![file("a", 0, max_rows - 1, 1), file("b", max_rows - 1, 1, 1)];
-        assert_eq!(
-            plan(at_limit, &CoreOptions::new(&options)).unwrap().len(),
-            1
-        );
+        assert_eq!(planner.plan(at_limit).unwrap().len(), 1);
         options.insert("deletion-vectors.enabled".into(), "false".into());
         assert_eq!(
-            plan(too_wide, &CoreOptions::new(&options)).unwrap().len(),
+            DataEvolutionCompactPlanner::new(&CoreOptions::new(&options))
+                .unwrap()
+                .plan(too_wide)
+                .unwrap()
+                .len(),
             1
         );
     }
