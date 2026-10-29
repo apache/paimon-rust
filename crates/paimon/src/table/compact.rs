@@ -485,18 +485,12 @@ impl CompactTask {
         }
     }
 
-    pub(super) fn validate_inputs(&self, active: &[ManifestEntry]) -> Result<()> {
+    fn validate_inputs(&self, active: &[ManifestEntry]) -> Result<()> {
         if self.is_data_evolution() {
             data_evolution::validate_inputs(&self.partition, self.bucket, &self.files, active)?;
         }
-        self.validate_bucket_inputs(active.iter())
-    }
-
-    pub(super) fn validate_bucket_inputs<'a>(
-        &self,
-        active: impl Iterator<Item = &'a ManifestEntry>,
-    ) -> Result<()> {
         let bucket_files = active
+            .iter()
             .filter(|entry| {
                 entry.partition() == self.partition
                     && entry.bucket() == self.bucket
@@ -587,6 +581,79 @@ impl CompactTask {
     }
 }
 
+/// Validate published PK file changes without depending on executor task metadata.
+pub(super) fn validate_primary_key_changes(
+    schema: &TableSchema,
+    changes: &[ManifestEntry],
+    captured: &[ManifestEntry],
+) -> Result<()> {
+    fn group(entry: &ManifestEntry) -> (&[u8], i32, i32) {
+        (entry.partition(), entry.bucket(), entry.total_buckets())
+    }
+    let mut inputs = HashMap::<_, Vec<&ManifestEntry>>::new();
+    for entry in changes
+        .iter()
+        .filter(|entry| *entry.kind() == FileKind::Delete)
+    {
+        inputs.entry(group(entry)).or_default().push(entry);
+    }
+    let mut active = HashMap::<_, Vec<&DataFileMeta>>::new();
+    for entry in captured {
+        let key = group(entry);
+        if inputs.contains_key(&key) {
+            active.entry(key).or_default().push(entry.file());
+        }
+    }
+    let incremental = primary_key::planner::enabled(schema)?;
+    let mut output_levels = HashMap::new();
+    for (key, removed) in inputs {
+        let files = active
+            .remove(&key)
+            .unwrap_or_default()
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        let (selected, output_level) = if incremental {
+            primary_key::planner::select(files, schema.options())?
+                .ok_or_else(|| invalid("No incremental PK compaction is eligible"))?
+        } else {
+            let level = files
+                .iter()
+                .map(|file| file.level)
+                .max()
+                .unwrap_or(0)
+                .max(1);
+            (files, level)
+        };
+        let expected = selected
+            .iter()
+            .map(|file| (file.file_name.as_str(), file))
+            .collect::<HashMap<_, _>>();
+        if expected.len() != removed.len()
+            || removed.iter().any(|entry| {
+                expected
+                    .get(entry.file().file_name.as_str())
+                    .is_none_or(|file| **file != *entry.file())
+            })
+        {
+            return Err(invalid(
+                "PK compaction inputs do not match captured run selection",
+            ));
+        }
+        output_levels.insert(key, output_level);
+    }
+    if changes
+        .iter()
+        .filter(|entry| *entry.kind() == FileKind::Add)
+        .any(|entry| output_levels.get(&group(entry)) != Some(&entry.file().level))
+    {
+        return Err(invalid(
+            "PK compaction output level does not match captured run selection",
+        ));
+    }
+    Ok(())
+}
+
 /// Validated inputs for the existing atomic snapshot publication machinery.
 pub(super) struct PreparedCompact {
     pub entries: Vec<ManifestEntry>,
@@ -596,7 +663,6 @@ pub(super) struct PreparedCompact {
     pub read_snapshot: Option<Box<Snapshot>>,
     pub commit_suffix: String,
     pub metrics: CompactMetrics,
-    pub pk_tasks: Vec<CompactTask>,
 }
 
 pub(super) fn prepare_results(table: &Table, results: &[CompactResult]) -> Result<PreparedCompact> {
@@ -610,13 +676,9 @@ pub(super) fn prepare_results(table: &Table, results: &[CompactResult]) -> Resul
     let mut entries = Vec::new();
     let mut changelog_entries = Vec::new();
     let mut metrics = CompactMetrics::default();
-    let mut pk_tasks = Vec::new();
     for result in results {
         let task = &result.task;
         task.validate_target(table)?;
-        if task.is_primary_key() {
-            pk_tasks.push(task.clone());
-        }
         if task.context.plan_id != first.task.context.plan_id
             || !task
                 .context
@@ -644,6 +706,13 @@ pub(super) fn prepare_results(table: &Table, results: &[CompactResult]) -> Resul
             .iter()
             .map(|file| file.row_count as u64)
             .sum::<u64>();
+        // Missing PK task metadata must not block valid prepared file changes;
+        // their output level is checked against the captured selection at commit.
+        let output_level = if task.is_primary_key() {
+            task.output_level
+        } else {
+            Some(0)
+        };
         let mut output_rows = 0u64;
         for file in &result.files {
             if task.is_data_evolution() {
@@ -653,7 +722,7 @@ pub(super) fn prepare_results(table: &Table, results: &[CompactResult]) -> Resul
             }
             if file.schema_id != task.context.schema.id()
                 || file.file_source != Some(1)
-                || file.level != task.output_level()
+                || output_level.is_some_and(|level| file.level != level)
                 || !outputs.insert(file.file_name.clone())
                 || task.files.iter().any(|old| old.file_name == file.file_name)
             {
@@ -760,7 +829,6 @@ pub(super) fn prepare_results(table: &Table, results: &[CompactResult]) -> Resul
             .then(|| Box::new(first.task.context.snapshot.clone())),
         commit_suffix: hex::encode(digest.finalize()),
         metrics,
-        pk_tasks,
     })
 }
 

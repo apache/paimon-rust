@@ -443,7 +443,6 @@ impl TableCommit {
                 CommitEntriesPlan::Compact {
                     entries: prepared.entries,
                     changelog_entries: prepared.changelog_entries,
-                    pk_tasks: prepared.pk_tasks,
                     schema_id: prepared.schema_id,
                     read_snapshot: prepared.read_snapshot,
                     planned_snapshot_id: prepared.snapshot_id,
@@ -1912,7 +1911,6 @@ impl TableCommit {
                 schema_id,
                 read_snapshot,
                 planned_snapshot_id,
-                pk_tasks,
             } => {
                 if latest_snapshot
                     .as_ref()
@@ -1963,25 +1961,12 @@ impl TableCommit {
                         .iter()
                         .map(|e| (e.partition(), e.bucket()))
                         .collect::<HashSet<_>>();
-                    if !pk_tasks.is_empty() {
-                        // Index once for the submitted buckets instead of
-                        // rescanning the whole snapshot for every PK task.
-                        let mut by_bucket = HashMap::<_, Vec<&ManifestEntry>>::new();
-                        for entry in &captured_files {
-                            let key = (entry.partition(), entry.bucket());
-                            if buckets.contains(&key) {
-                                by_bucket.entry(key).or_default().push(entry);
-                            }
-                        }
-                        for task in pk_tasks {
-                            task.validate_bucket_inputs(
-                                by_bucket
-                                    .get(&(task.partition(), task.bucket()))
-                                    .into_iter()
-                                    .flatten()
-                                    .copied(),
-                            )?;
-                        }
+                    if !self.table.schema().primary_keys().is_empty() {
+                        super::compact::validate_primary_key_changes(
+                            self.table.schema(),
+                            entries,
+                            &captured_files,
+                        )?;
                     }
                     let deleted_ids = deletes
                         .iter()
@@ -3950,7 +3935,6 @@ enum CommitEntriesPlan {
         schema_id: i64,
         read_snapshot: Option<Box<Snapshot>>,
         planned_snapshot_id: i64,
-        pk_tasks: Vec<super::CompactTask>,
     },
     /// Caller-provided entries. May contain `FileKind::Delete` entries from CoW
     /// rewrites, in which case `resolve_commit` auto-promotes to `CommitKind::OVERWRITE`.

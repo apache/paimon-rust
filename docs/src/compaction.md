@@ -139,11 +139,13 @@ output uses the highest input level or level 1 for all-L0 inputs. Their state
 and changelog generation must see history before incremental selection can be
 enabled. Append size and count options do not control PK selection.
 
-Tasks capture their selected runs and output level. Executors and committers
-recompute the selection against the captured snapshot and reject altered or
-incomplete inputs. Older serialized deduplicate tasks without this selection
-must be replanned before execution or publication; already committed results
-remain recoverable through the existing idempotent retry path.
+Tasks capture their selected runs and output level. Executors validate the task
+against the captured snapshot. Committers independently recompute the selection
+from that snapshot and validate the files being removed and the output levels.
+Older serialized deduplicate tasks without an output level must be replanned
+before execution. Prepared results can still be published if their file changes
+match the captured selection; already committed results remain recoverable
+through the existing idempotent retry path.
 
 Compaction uses each engine's existing merge function and persists its merge
 state, including original sequence metadata and synthesized DELETE records:

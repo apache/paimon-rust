@@ -207,7 +207,7 @@ async fn incremental_selection_is_validated_for_execution_and_commit() {
         "omit-input",
         "include-history",
         "output-level",
-        "missing-selection",
+        "legacy-output-level",
     ] {
         let mutate = |task: &mut serde_json::Value| match mutation {
             "omit-input" => {
@@ -218,7 +218,7 @@ async fn incremental_selection_is_validated_for_execution_and_commit() {
                 .unwrap()
                 .push(serde_json::to_value(&anchor).unwrap()),
             "output-level" => task["output_level"] = 5.into(),
-            "missing-selection" => {
+            "legacy-output-level" => {
                 task.as_object_mut().unwrap().remove("output_level");
             }
             _ => unreachable!(),
@@ -239,19 +239,28 @@ async fn incremental_selection_is_validated_for_execution_and_commit() {
         mutate(&mut encoded[0]["task"]);
         if mutation == "output-level" {
             for file in encoded[0]["files"].as_array_mut().unwrap() {
-                file["level"] = 5.into();
+                file["_LEVEL"] = 5.into();
+            }
+        }
+        if mutation == "legacy-output-level" {
+            for file in encoded[0]["files"].as_array_mut().unwrap() {
+                file["_LEVEL"] = 1.into();
             }
         }
         let changed: Vec<CompactResult> = serde_json::from_value(encoded).unwrap();
-        assert!(
-            builder
-                .new_commit()
-                .unwrap()
-                .commit_compact(changed)
-                .await
-                .is_err(),
-            "commit {mutation}"
-        );
+        if matches!(mutation, "output-level" | "legacy-output-level") {
+            let expected = if mutation == "output-level" { 5 } else { 1 };
+            assert!(changed[0].files().iter().all(|file| file.level == expected));
+        }
+        let error = builder
+            .new_commit()
+            .unwrap()
+            .commit_compact(changed)
+            .await
+            .expect_err(&format!("commit {mutation}"));
+        if mutation == "legacy-output-level" {
+            assert!(error.to_string().contains("output level"), "{error}");
+        }
         assert_eq!(
             table
                 .snapshot_manager()
@@ -354,47 +363,78 @@ async fn order_sensitive_aggregation_keeps_its_history_in_the_merge() {
 }
 
 #[tokio::test]
-async fn legacy_completed_results_recover_but_uncommitted_tasks_require_replanning() {
-    let table = table(&[("bucket", "1")]).await;
-    write_batch(&table, &make_batch(vec![1], vec![10])).await;
-    compact_once(&table).await;
-    write_batch(
-        &table,
-        &make_batch((0..1000).collect(), (0..1000).collect()),
-    )
-    .await;
-    let builder = table.new_compact_builder();
-    let plan = builder.new_planner().unwrap().plan().await.unwrap();
-    assert_eq!(plan.tasks()[0].files().len(), 2);
-    let results = execute(&table, &plan).await;
-    assert!(results[0].files().iter().all(|file| file.level == 5));
-    // Older serialized tasks have no selection metadata. Their full-bucket
-    // outputs are recoverable once committed, but must never execute anew.
-    let mut legacy = serde_json::to_value(&results).unwrap();
-    legacy[0]["task"]
-        .as_object_mut()
-        .unwrap()
-        .remove("output_level");
-    let legacy: Vec<CompactResult> = serde_json::from_value(legacy).unwrap();
-    let committer = builder.new_commit().unwrap();
-    assert!(committer.commit_compact(legacy.clone()).await.is_err());
-    committer.commit_compact(results).await.unwrap();
-    let snapshot = table
-        .snapshot_manager()
-        .get_latest_snapshot_id()
-        .await
-        .unwrap();
-    committer.commit_compact(legacy).await.unwrap();
-    assert_eq!(
-        table
+async fn legacy_results_validate_file_changes_and_recover_idempotently() {
+    for keep_history in [false, true] {
+        let table = table(&[("bucket", "1")]).await;
+        let initial = if keep_history {
+            make_batch((0..1000).collect(), (0..1000).collect())
+        } else {
+            make_batch(vec![1], vec![10])
+        };
+        write_batch(&table, &initial).await;
+        compact_once(&table).await;
+        let update = if keep_history {
+            make_batch(vec![42], vec![4200])
+        } else {
+            make_batch((0..1000).collect(), (0..1000).collect())
+        };
+        write_batch(&table, &update).await;
+        let mut expected = (0..1000).map(|key| (key, key)).collect::<Vec<_>>();
+        if keep_history {
+            expected[42].1 = 4200;
+        }
+        assert_eq!(rows(&table).await, expected);
+        let builder = table.new_compact_builder();
+        let plan = builder.new_planner().unwrap().plan().await.unwrap();
+        assert_eq!(
+            plan.tasks()[0].files().len(),
+            if keep_history { 1 } else { 2 }
+        );
+        let results = execute(&table, &plan).await;
+        assert!(results[0]
+            .files()
+            .iter()
+            .all(|file| file.level == if keep_history { 4 } else { 5 }));
+        // Older tasks cannot execute without their output level. Prepared results
+        // can still be published when their file changes match the captured policy.
+        let mut legacy = serde_json::to_value(&results).unwrap();
+        legacy[0]["task"]
+            .as_object_mut()
+            .unwrap()
+            .remove("output_level");
+        let legacy: Vec<CompactResult> = serde_json::from_value(legacy).unwrap();
+        let task =
+            serde_json::from_value(serde_json::to_value(&legacy).unwrap()[0]["task"].clone())
+                .unwrap();
+        assert!(builder
+            .new_executor()
+            .unwrap()
+            .execute(&task)
+            .await
+            .is_err());
+        let committer = builder.new_commit().unwrap();
+        committer.commit_compact(legacy.clone()).await.unwrap();
+        let published = table
             .snapshot_manager()
             .get_latest_snapshot_id()
             .await
-            .unwrap(),
-        snapshot
-    );
-    assert_eq!(
-        rows(&table).await,
-        (0..1000).map(|key| (key, key)).collect::<Vec<_>>()
-    );
+            .unwrap();
+        committer.commit_compact(results).await.unwrap();
+        let snapshot = table
+            .snapshot_manager()
+            .get_latest_snapshot_id()
+            .await
+            .unwrap();
+        assert_eq!(snapshot, published);
+        committer.commit_compact(legacy).await.unwrap();
+        assert_eq!(
+            table
+                .snapshot_manager()
+                .get_latest_snapshot_id()
+                .await
+                .unwrap(),
+            snapshot
+        );
+        assert_eq!(rows(&table).await, expected);
+    }
 }
