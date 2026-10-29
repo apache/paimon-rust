@@ -22,7 +22,7 @@ use crate::btree::{
     BlockHandle, BlockReader, SstFileWriter,
 };
 use crate::common::options::parse_memory_size;
-use crate::io::cache::generated::{GeneratedFileRead, GeneratedFileWrite};
+use crate::io::cache::generated::{GeneratedFile, GeneratedFileRead};
 use crate::io::cache::LocalCache;
 use crate::io::FileRead;
 use crate::table::ArrowRecordBatchStream;
@@ -46,6 +46,13 @@ struct Payload {
     batch: Arc<RecordBatch>,
 }
 
+struct ParsedIndex {
+    path: String,
+    size: u64,
+    footer_start: u64,
+    block: BlockReader,
+}
+
 pub(in crate::table::compact) struct LookupFileCache {
     local: Arc<LocalCache>,
     limit: usize,
@@ -53,6 +60,8 @@ pub(in crate::table::compact) struct LookupFileCache {
     // One executor cache owns this working budget. Serialize both builds and
     // warm index/IPC reads so different files cannot multiply that budget.
     working: tokio::sync::Mutex<()>,
+    // One parsed index, charged to the same working budget as the IPC payload.
+    index: Mutex<Option<Arc<ParsedIndex>>>,
     // One decoded IPC batch across all files, never one cache per file/key.
     payload: Mutex<Option<Payload>>,
 }
@@ -104,6 +113,7 @@ impl LookupFileCache {
             limit,
             compression,
             working: tokio::sync::Mutex::new(()),
+            index: Mutex::new(None),
             payload: Mutex::new(None),
         })
     }
@@ -136,6 +146,7 @@ impl LookupFileCache {
                 Err(error) if attempt == 1 => return Err(error),
                 Err(_) => {
                     *self.payload.lock().unwrap() = None;
+                    *self.index.lock().unwrap() = None;
                     // A new immutable generation replaces the head only after
                     // close. Do not invalidate a shared backend's global epoch.
                 }
@@ -147,13 +158,33 @@ impl LookupFileCache {
     async fn build(
         &self,
         head: &str,
-        mut input: ArrowRecordBatchStream,
+        input: ArrowRecordBatchStream,
         keys: &[usize],
     ) -> Result<Bytes> {
+        *self.index.lock().unwrap() = None;
+        *self.payload.lock().unwrap() = None;
         let generation = uuid::Uuid::new_v4();
         let path = format!("{}/{generation}", head.strip_suffix("/head").unwrap());
+        let mut file = GeneratedFile::new(self.local.clone(), path);
+        let result = self.build_file(head, input, keys, &file, generation).await;
+        if result.is_ok() {
+            file.published();
+        } else {
+            file.cleanup().await;
+        }
+        result
+    }
+
+    async fn build_file(
+        &self,
+        head: &str,
+        mut input: ArrowRecordBatchStream,
+        keys: &[usize],
+        file: &GeneratedFile,
+        generation: uuid::Uuid,
+    ) -> Result<Bytes> {
         let mut writer = SstFileWriter::with_compression_level(
-            Box::new(GeneratedFileWrite::new(self.local.clone(), path)),
+            Box::new(file.writer()),
             32 * 1024,
             self.compression,
             1,
@@ -305,18 +336,46 @@ impl LookupFileCache {
         read_block_from_bytes(&bytes, handle.size).map_err(invalid)
     }
 
-    async fn read(&self, path: &str, size: u64, key: &[u8]) -> Result<Option<RecordBatch>> {
+    async fn parsed_index(&self, path: &str, size: u64) -> Result<Arc<ParsedIndex>> {
+        {
+            let mut cached = self.index.lock().unwrap();
+            if let Some(index) = cached
+                .as_ref()
+                .filter(|index| index.path == path && index.size == size)
+            {
+                return Ok(index.clone());
+            }
+            // Drop the previous file before allocating its replacement.
+            *cached = None;
+        }
         let footer_start = size
             .checked_sub(BTreeFileFooter::ENCODED_LENGTH as u64)
             .ok_or_else(|| invalid("Truncated Lookup File"))?;
         let reader = GeneratedFileRead::new(self.local.clone(), path.into(), size);
         let footer = BTreeFileFooter::read_footer(&reader.read(footer_start..size).await?)
             .map_err(invalid)?;
-        let index = self
+        let block = self
             .block(&reader, footer_start, footer.index_block_handle)
             .await?;
+        if block.retained_bytes() > self.limit {
+            return Err(exhausted("Lookup parsed index exceeds the memory budget"));
+        }
+        let index = Arc::new(ParsedIndex {
+            path: path.into(),
+            size,
+            footer_start,
+            block,
+        });
+        *self.index.lock().unwrap() = Some(index.clone());
+        Ok(index)
+    }
+
+    async fn read(&self, path: &str, size: u64, key: &[u8]) -> Result<Option<RecordBatch>> {
+        let index = self.parsed_index(path, size).await?;
+        let footer_start = index.footer_start;
+        let reader = GeneratedFileRead::new(self.local.clone(), path.into(), size);
         let cmp = |a: &[u8], b: &[u8]| Ok(a.cmp(b));
-        let (_, mut candidates) = index.seek_and_iter(key, &cmp).map_err(invalid)?;
+        let (_, mut candidates) = index.block.seek_and_iter(key, &cmp).map_err(invalid)?;
         let Some((_, bytes)) = candidates.next() else {
             return Ok(None);
         };
@@ -459,9 +518,93 @@ fn exhausted(message: impl ToString) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::io::{FileBlockCache, FileIOBuilder};
     use arrow_array::{ArrayRef, Int32Array, Int64Array, Int8Array, StringArray};
     use futures::{stream, StreamExt};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    #[derive(Debug, Default)]
+    struct CountingBlocks {
+        blocks: Arc<Mutex<HashMap<(String, u64), Bytes>>>,
+        gets: AtomicUsize,
+        invalidations: AtomicUsize,
+        invalidated: tokio::sync::Notify,
+        reject_head: AtomicBool,
+        delay_put: AtomicBool,
+        put_started: Arc<tokio::sync::Notify>,
+        resume_put: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl FileBlockCache for CountingBlocks {
+        async fn get(&self, path: &str, range: std::ops::Range<u64>) -> Option<Bytes> {
+            self.gets.fetch_add(1, Ordering::SeqCst);
+            self.blocks
+                .lock()
+                .unwrap()
+                .get(&(path.into(), range.start))
+                .cloned()
+                .filter(|bytes| bytes.len() as u64 == range.end - range.start)
+        }
+        async fn put(&self, path: &str, offset: u64, data: Bytes) {
+            if path.ends_with("/head") && self.reject_head.load(Ordering::SeqCst) {
+                return;
+            }
+            if self.delay_put.swap(false, Ordering::SeqCst) {
+                let blocks = self.blocks.clone();
+                let key = (path.to_owned(), offset);
+                let started = self.put_started.clone();
+                let resume = self.resume_put.clone();
+                // Model a backend write that survives cancellation of its caller.
+                tokio::spawn(async move {
+                    started.notify_one();
+                    resume.notified().await;
+                    blocks.lock().unwrap().insert(key, data);
+                })
+                .await
+                .unwrap();
+            } else {
+                self.blocks
+                    .lock()
+                    .unwrap()
+                    .insert((path.into(), offset), data);
+            }
+        }
+        async fn invalidate_path(&self, path: &str) {
+            self.blocks
+                .lock()
+                .unwrap()
+                .retain(|(stored, _), _| stored != path);
+            self.invalidations.fetch_add(1, Ordering::SeqCst);
+            self.invalidated.notify_one();
+        }
+        async fn invalidate_prefix(&self, prefix: &str) {
+            self.blocks
+                .lock()
+                .unwrap()
+                .retain(|(stored, _), _| !stored.starts_with(prefix));
+        }
+    }
+
+    fn external() -> (Arc<LocalCache>, Arc<CountingBlocks>) {
+        let blocks = Arc::new(CountingBlocks::default());
+        let io = FileIOBuilder::new("memory")
+            .build()
+            .unwrap()
+            .with_file_block_cache(blocks.clone(), 8192, "meta")
+            .unwrap();
+        (io.local_cache().unwrap(), blocks)
+    }
+
+    async fn wait_for_cleanup(blocks: &CountingBlocks, count: usize) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while blocks.invalidations.load(Ordering::SeqCst) < count {
+                blocks.invalidated.notified().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
 
     fn local(directory: Option<&std::path::Path>, shared: bool, capacity: &str) -> Arc<LocalCache> {
         local_with_whitelist(directory, shared, capacity, "meta")
@@ -540,6 +683,44 @@ mod tests {
             .local
             .generated_get(&format!("{PREFIX}/{identity}/head"), 0, HEAD_LEN)
             .await
+    }
+
+    #[tokio::test]
+    async fn parsed_index_is_reused_and_missing_data_still_rebuilds_its_generation() {
+        let (local, blocks) = external();
+        let cache = LookupFileCache::new(local, &HashMap::new()).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let input = source(calls.clone());
+        cache.lookup("index", &key(1), &[2], &input).await.unwrap();
+        let before = descriptor(&cache, "index").await.unwrap();
+        for rebuilt in [false, true] {
+            blocks.gets.store(0, Ordering::SeqCst);
+            for value in [2, 3, 1] {
+                assert_eq!(
+                    cache
+                        .lookup("index", &key(value), &[2], &input)
+                        .await
+                        .unwrap(),
+                    Some(batch().slice((value - 1) as usize, 1))
+                );
+            }
+            // Only the head and target data block are read for each key; the
+            // footer/index and decoded IPC payload remain resident.
+            assert_eq!(blocks.gets.load(Ordering::SeqCst), 6);
+            if !rebuilt {
+                blocks
+                    .blocks
+                    .lock()
+                    .unwrap()
+                    .retain(|(path, _), _| path.ends_with("/head"));
+                assert_eq!(
+                    cache.lookup("index", &key(1), &[2], &input).await.unwrap(),
+                    Some(batch().slice(0, 1))
+                );
+                assert_ne!(descriptor(&cache, "index").await.unwrap(), before);
+            }
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
@@ -755,16 +936,71 @@ mod tests {
 
     #[tokio::test]
     async fn source_failure_and_cancellation_never_publish_partial_files() {
-        let local = local(None, false, "4mb");
-        let cache = LookupFileCache::new(local, &HashMap::new()).unwrap();
-        let failed = || Ok(stream::iter(vec![Ok(batch()), Err(invalid("source failed"))]).boxed());
-        assert!(cache.lookup("failed", &key(1), &[2], failed).await.is_err());
-        assert!(descriptor(&cache, "failed").await.is_none());
+        let (local, blocks) = external();
+        let cache = LookupFileCache::new(
+            local,
+            &HashMap::from([("lookup.cache-spill-compression".into(), "none".into())]),
+        )
+        .unwrap();
+        let input = source(Arc::new(AtomicUsize::new(0)));
+        cache
+            .lookup("survivor", &key(1), &[2], &input)
+            .await
+            .unwrap();
+        let survivor = descriptor(&cache, "survivor").await.unwrap();
+        let large = RecordBatch::try_from_iter([
+            (
+                "id",
+                Arc::new(Int32Array::from((0..4096).collect::<Vec<_>>())) as ArrayRef,
+            ),
+            (
+                "value",
+                Arc::new(StringArray::from(vec!["x".repeat(64); 4096])) as ArrayRef,
+            ),
+        ])
+        .unwrap();
+        let failed =
+            || Ok(stream::iter(vec![Ok(large.clone()), Err(invalid("source failed"))]).boxed());
+        let only_survivor = || {
+            assert!(blocks
+                .blocks
+                .lock()
+                .unwrap()
+                .keys()
+                .all(|(path, _)| path.starts_with(&format!("{PREFIX}/survivor/"))))
+        };
+        for _ in 0..2 {
+            assert!(cache
+                .lookup("failed", &key(1), &[0], &failed)
+                .await
+                .is_err());
+            assert!(descriptor(&cache, "failed").await.is_none());
+            only_survivor();
+        }
+        // Closing the SST is insufficient: a rejected head must reclaim it too.
+        blocks.reject_head.store(true, Ordering::SeqCst);
+        assert!(cache
+            .lookup("head-failed", &key(1), &[2], &input)
+            .await
+            .is_err());
+        blocks.reject_head.store(false, Ordering::SeqCst);
+        only_survivor();
         let ready = Arc::new(tokio::sync::Notify::new());
         let stalled = || {
             let ready = ready.clone();
-            Ok(stream::iter(vec![Ok(batch())])
+            let blocks = blocks.clone();
+            Ok(stream::iter(vec![Ok(large.clone())])
                 .chain(stream::once(async move {
+                    assert!(
+                        blocks
+                            .blocks
+                            .lock()
+                            .unwrap()
+                            .keys()
+                            .filter(|(path, _)| path.starts_with(&format!("{PREFIX}/cancelled/")))
+                            .count()
+                            > 2
+                    );
                     ready.notify_one();
                     futures::future::pending::<Result<RecordBatch>>().await
                 }))
@@ -772,17 +1008,28 @@ mod tests {
         };
         let lookup_key = key(1);
         tokio::select! {
-            result = cache.lookup("cancelled", &lookup_key, &[2], stalled) => panic!("unexpected completion: {result:?}"),
+            result = cache.lookup("cancelled", &lookup_key, &[0], stalled) => panic!("unexpected completion: {result:?}"),
             _ = ready.notified() => {}
         }
+        wait_for_cleanup(&blocks, 4).await;
         assert!(descriptor(&cache, "cancelled").await.is_none());
-        let calls = Arc::new(AtomicUsize::new(0));
-        assert!(cache
-            .lookup("cancelled", &key(1), &[2], source(calls.clone()))
-            .await
-            .unwrap()
-            .is_some());
-        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        only_survivor();
+        blocks.delay_put.store(true, Ordering::SeqCst);
+        tokio::select! {
+            result = cache.lookup("late-put", &lookup_key, &[0], || Ok(stream::iter(vec![Ok(large.clone())]).boxed())) => panic!("unexpected completion: {result:?}"),
+            _ = blocks.put_started.notified() => {}
+        }
+        blocks.resume_put.notify_one();
+        wait_for_cleanup(&blocks, 5).await;
+        only_survivor();
+        assert_eq!(descriptor(&cache, "survivor").await.unwrap(), survivor);
+        assert_eq!(
+            cache
+                .lookup("survivor", &key(2), &[2], &input)
+                .await
+                .unwrap(),
+            Some(batch().slice(1, 1))
+        );
     }
 
     #[tokio::test]

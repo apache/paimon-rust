@@ -252,6 +252,10 @@ rows, including row kinds and sequence metadata. The first access builds it by
 streaming the source through the normal schema-evolution decoder. Later keys and
 executors reuse it; a missing or corrupt cache block causes a bounded rebuild
 instead of being treated as a missing key. Only selected runs are rewritten.
+Lookup selects candidate files by key range, retaining range pruning across
+schema changes that preserve the primary-key field IDs, order and types. The
+reader retains one bounded parsed SST index and one decoded IPC batch.
+Failed or cancelled builds clean up their unpublished cache blocks.
 
 The executor streams both outputs and aborts both writers on execution failure.
 Prepared results include both file lists for serialization, subset commits and

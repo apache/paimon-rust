@@ -17,11 +17,12 @@
 
 //! Disposable immutable files stored in the ordinary cache backend and budget.
 
-use super::LocalCache;
+use super::{CacheBackend, LocalCache};
 use crate::io::{FileRead, FileWrite};
 use crate::{Error, Result};
 use bytes::{Bytes, BytesMut};
 use std::ops::Range;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 impl LocalCache {
@@ -61,6 +62,106 @@ impl LocalCache {
         // here, and another publisher cannot overwrite before verification.
         let _guard = self.shared_load_lock(&self.block_key(path, 0)).await;
         self.generated_put(path, 0, descriptor).await
+    }
+
+    async fn generated_remove(&self, path: &str, blocks: u64) {
+        let _guard = self
+            .coordinator
+            .begin_path_invalidation(&self.namespace, path)
+            .await;
+        match &self.backend {
+            CacheBackend::Memory(cache) => cache.invalidate_path(&self.namespace, path),
+            CacheBackend::Disk(cache) => {
+                // Retry by exact key: path invalidation drops its in-memory
+                // index before unlinking, so cancelling it could hide orphans.
+                for index in 0..blocks {
+                    cache.remove_block(&self.block_key(path, index)).await;
+                }
+            }
+            CacheBackend::SharedDisk(cache) => {
+                if let Err(error) = cache
+                    .remove_generated(self.block_key(path, 0), blocks)
+                    .await
+                {
+                    log::debug!("Failed to remove unpublished Lookup File: {error}");
+                }
+            }
+            CacheBackend::External(cache) => cache.invalidate_path(path).await,
+        }
+    }
+}
+
+struct GeneratedFileState {
+    cache: Arc<LocalCache>,
+    path: String,
+    write_gate: Arc<tokio::sync::Mutex<()>>,
+    attempted_blocks: AtomicU64,
+    #[cfg(test)]
+    cleaned: Arc<tokio::sync::Notify>,
+}
+
+impl GeneratedFileState {
+    async fn cleanup(&self) {
+        // A cancelled caller must wait for any already-started backend put.
+        let _guard = self.write_gate.lock().await;
+        self.cache
+            .generated_remove(&self.path, self.attempted_blocks.load(Ordering::SeqCst))
+            .await;
+        #[cfg(test)]
+        self.cleaned.notify_one();
+    }
+}
+
+/// Owns an unpublished generation until its head has been published.
+pub(crate) struct GeneratedFile {
+    state: Arc<GeneratedFileState>,
+    runtime: Option<tokio::runtime::Handle>,
+    settled: bool,
+}
+
+impl GeneratedFile {
+    pub(crate) fn new(cache: Arc<LocalCache>, path: String) -> Self {
+        Self {
+            state: Arc::new(GeneratedFileState {
+                cache,
+                path,
+                write_gate: Arc::new(tokio::sync::Mutex::new(())),
+                attempted_blocks: AtomicU64::new(0),
+                #[cfg(test)]
+                cleaned: Arc::new(tokio::sync::Notify::new()),
+            }),
+            runtime: tokio::runtime::Handle::try_current().ok(),
+            settled: false,
+        }
+    }
+
+    pub(crate) fn writer(&self) -> GeneratedFileWrite {
+        GeneratedFileWrite {
+            state: self.state.clone(),
+            buffer: BytesMut::new(),
+            index: 0,
+            length: 0,
+        }
+    }
+
+    pub(crate) fn published(&mut self) {
+        self.settled = true;
+    }
+
+    pub(crate) async fn cleanup(&mut self) {
+        self.state.cleanup().await;
+        self.settled = true;
+    }
+}
+
+impl Drop for GeneratedFile {
+    fn drop(&mut self) {
+        if !self.settled {
+            let state = self.state.clone();
+            if let Some(runtime) = &self.runtime {
+                runtime.spawn(async move { state.cleanup().await });
+            }
+        }
     }
 }
 
@@ -145,30 +246,47 @@ impl FileRead for GeneratedFileRead {
 }
 
 pub(crate) struct GeneratedFileWrite {
-    cache: Arc<LocalCache>,
-    path: String,
+    state: Arc<GeneratedFileState>,
     buffer: BytesMut,
     index: u64,
     length: u64,
 }
 
 impl GeneratedFileWrite {
-    pub(crate) fn new(cache: Arc<LocalCache>, path: String) -> Self {
-        Self {
-            cache,
-            path,
-            buffer: BytesMut::new(),
-            index: 0,
-            length: 0,
-        }
-    }
-
     async fn flush_block(&mut self) -> Result<()> {
         if !self.buffer.is_empty() {
-            self.cache
-                .generated_put(&self.path, self.index, self.buffer.split().freeze())
-                .await?;
+            let index = self.index;
             self.index += 1;
+            // Include the in-flight block even if cancellation happens before
+            // the backend's publication/verification returns.
+            self.state
+                .attempted_blocks
+                .store(self.index, Ordering::SeqCst);
+            let data = self.buffer.split().freeze();
+            let state = self.state.clone();
+            // Cancelled callers may leave their current backend put running.
+            // Reuse the cache's bounded fill slots instead of accumulating tasks.
+            let slot = state
+                .cache
+                .fill_slots
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|error| Error::UnexpectedError {
+                    message: "Lookup File write capacity was closed".into(),
+                    source: Some(Box::new(error)),
+                })?;
+            let gate = state.write_gate.clone().lock_owned().await;
+            tokio::spawn(async move {
+                let _slot = slot;
+                let _gate = gate;
+                state.cache.generated_put(&state.path, index, data).await
+            })
+            .await
+            .map_err(|error| Error::UnexpectedError {
+                message: "Lookup File cache write task failed".into(),
+                source: Some(Box::new(error)),
+            })??;
         }
         Ok(())
     }
@@ -181,7 +299,7 @@ impl FileWrite for GeneratedFileWrite {
             .length
             .checked_add(bytes.len() as u64)
             .ok_or_else(|| invalid("Generated cache file length overflow"))?;
-        let size = usize::try_from(self.cache.block_size)
+        let size = usize::try_from(self.state.cache.block_size)
             .map_err(|_| invalid("Generated cache block exceeds the address space"))?;
         while !bytes.is_empty() {
             let take = (size - self.buffer.len()).min(bytes.len());
@@ -196,11 +314,12 @@ impl FileWrite for GeneratedFileWrite {
     async fn close(&mut self) -> Result<()> {
         self.flush_block().await?;
         for index in 0..self.index {
-            let length =
-                (self.length - index * self.cache.block_size).min(self.cache.block_size) as usize;
+            let length = (self.length - index * self.state.cache.block_size)
+                .min(self.state.cache.block_size) as usize;
             if self
+                .state
                 .cache
-                .generated_get(&self.path, index, length)
+                .generated_get(&self.state.path, index, length)
                 .await
                 .is_none()
             {
@@ -219,5 +338,88 @@ fn invalid(message: &str) -> Error {
     Error::DataInvalid {
         message: message.into(),
         source: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn unpublished_blocks_are_reclaimed_without_invalidating_other_files_or_the_epoch() {
+        for backend in ["memory", "disk", "shared"] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut options = crate::Options::new();
+            options.set("local-cache.enabled", "true");
+            options.set("local-cache.block-size", "8kb");
+            if backend != "memory" {
+                options.set("local-cache.dir", directory.path().to_str().unwrap());
+            }
+            if backend == "shared" {
+                options.set("local-cache.shared", "true");
+                options.set("local-cache.max-size", "4mb");
+            }
+            // Memory and ordinary disk deliberately have no capacity limit.
+            let local = super::super::create_local_cache(&options).unwrap().unwrap();
+            let bytes = Bytes::from(vec![7; 8192]);
+            let mut published = GeneratedFile::new(local.clone(), "published".into());
+            let mut writer = published.writer();
+            writer.write(bytes.clone()).await.unwrap();
+            writer.close().await.unwrap();
+            local
+                .generated_publish("published/head", Bytes::from(vec![0; 24]))
+                .await
+                .unwrap();
+            published.published();
+            drop(published);
+            let epoch = local.read_token("published").shared_generation;
+            let usage = directory.path().join("paimon-shared-local-cache-v1/usage");
+            let used = std::fs::read_to_string(&usage).ok();
+            for attempt in 0..3 {
+                let path = format!("unpublished-{attempt}");
+                let mut file = GeneratedFile::new(local.clone(), path.clone());
+                let cleaned = file.state.cleaned.clone();
+                let mut writer = file.writer();
+                writer
+                    .write(Bytes::from(vec![9; 3 * 8192 + 1]))
+                    .await
+                    .unwrap();
+                for index in 0..3 {
+                    assert!(local.generated_get(&path, index, 8192).await.is_some());
+                }
+                drop(writer);
+                if attempt == 1 {
+                    // Cancellation drops the generation owner after full blocks
+                    // have already reached its backend.
+                    std::thread::spawn(move || drop(file)).join().unwrap();
+                    tokio::time::timeout(std::time::Duration::from_secs(5), cleaned.notified())
+                        .await
+                        .unwrap();
+                } else {
+                    file.cleanup().await;
+                }
+                for index in 0..3 {
+                    assert!(
+                        local.generated_get(&path, index, 8192).await.is_none(),
+                        "{backend}"
+                    );
+                    if backend == "disk" {
+                        assert!(!directory
+                            .path()
+                            .join("paimon-local-cache-v2")
+                            .join(local.block_key(&path, index).cache_relative_path())
+                            .exists());
+                    }
+                }
+                assert_eq!(
+                    local.generated_get("published", 0, 8192).await,
+                    Some(bytes.clone())
+                );
+                assert!(local.generated_get("published/head", 0, 24).await.is_some());
+                assert_eq!(local.read_token("published").shared_generation, epoch);
+                assert_eq!(std::fs::read_to_string(&usage).ok(), used);
+                assert_eq!(local.fill_slots.available_permits(), 8);
+            }
+        }
     }
 }
