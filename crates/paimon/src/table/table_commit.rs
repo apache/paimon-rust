@@ -207,6 +207,7 @@ pub struct TableCommit {
     manifest_sidecar_enabled: bool,
     row_tracking_enabled: bool,
     data_evolution_enabled: bool,
+    deletion_vectors_enabled: bool,
     partition_default_name: String,
     snapshot_properties: Option<HashMap<String, String>>,
     commit_callbacks: Vec<Arc<dyn CommitCallback>>,
@@ -233,6 +234,7 @@ impl TableCommit {
         let manifest_sidecar_enabled = core_options.manifest_sidecar_enabled();
         let row_tracking_enabled = core_options.row_tracking_enabled();
         let data_evolution_enabled = core_options.data_evolution_enabled();
+        let deletion_vectors_enabled = core_options.deletion_vectors_enabled();
         let partition_default_name = core_options.partition_default_name().to_string();
         Self {
             table,
@@ -250,6 +252,7 @@ impl TableCommit {
             manifest_sidecar_enabled,
             row_tracking_enabled,
             data_evolution_enabled,
+            deletion_vectors_enabled,
             partition_default_name,
             snapshot_properties: None,
             commit_callbacks: Vec::new(),
@@ -1362,11 +1365,7 @@ impl TableCommit {
 
         if self.data_evolution_enabled
             && resolved.kind == CommitKind::COMPACT
-            && self
-                .table
-                .schema()
-                .core_options()
-                .deletion_vectors_enabled()
+            && self.deletion_vectors_enabled
         {
             if let Some(snapshot) = latest_snapshot {
                 if let Some(indexes) = super::compact::data_evolution::rewrite_deletion_vectors(
