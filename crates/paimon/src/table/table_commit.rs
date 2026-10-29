@@ -1937,13 +1937,6 @@ impl TableCommit {
                 };
                 validate_file_entries(entries.iter())?;
                 validate_file_entries(changelog_entries.iter())?;
-                let lookup = self
-                    .table
-                    .schema()
-                    .core_options()
-                    .try_changelog_producer()?
-                    == crate::spec::ChangelogProducer::Lookup;
-                let mut lookup_history = Vec::new();
                 // This runs after duplicate-commit filtering: an uncertain commit
                 // can be retried even after the captured read snapshot expires.
                 if let Some(captured) = read_snapshot {
@@ -1954,7 +1947,7 @@ impl TableCommit {
                             source: None,
                         });
                     }
-                    let mut captured_files = super::snapshot_manifest::read_snapshot_entries(
+                    let captured_files = super::snapshot_manifest::read_snapshot_entries(
                         &self.snapshot_manager,
                         &snapshot,
                         None,
@@ -1993,7 +1986,7 @@ impl TableCommit {
                         )
                         .await?;
                     }
-                    let captured_inputs = captured_files
+                    let captured_files = captured_files
                         .iter()
                         .filter(|e| {
                             buckets.contains(&(e.partition(), e.bucket()))
@@ -2001,9 +1994,9 @@ impl TableCommit {
                         })
                         .map(|entry| (commit_file_identifier(entry), entry))
                         .collect::<HashMap<_, _>>();
-                    if captured_inputs.len() != deletes.len()
+                    if captured_files.len() != deletes.len()
                         || deletes.iter().any(|deleted| {
-                            !captured_inputs
+                            !captured_files
                                 .get(&commit_file_identifier(deleted))
                                 .is_some_and(|file| {
                                     file.file() == deleted.file()
@@ -2019,14 +2012,6 @@ impl TableCommit {
                             }.into(),
                             source: None,
                         });
-                    }
-                    drop(captured_inputs);
-                    if lookup {
-                        captured_files.retain(|entry| {
-                            entry.file().level > 0
-                                && buckets.contains(&(entry.partition(), entry.bucket()))
-                        });
-                        lookup_history = captured_files;
                     }
                 }
                 let base_data_files = self
@@ -2072,51 +2057,6 @@ impl TableCommit {
                     base_data_files.as_deref().unwrap_or_default(),
                     entries,
                 )?;
-                if lookup {
-                    let buckets = entries
-                        .iter()
-                        .filter(|entry| *entry.kind() == FileKind::Delete)
-                        .map(|entry| (entry.partition(), entry.bucket()))
-                        .collect::<HashSet<_>>();
-                    let current = base_data_files
-                        .as_deref()
-                        .unwrap_or_default()
-                        .iter()
-                        .filter(|entry| {
-                            buckets.contains(&(entry.partition(), entry.bucket()))
-                                && entry.file().level > 0
-                        })
-                        .map(|entry| {
-                            (
-                                (
-                                    entry.partition(),
-                                    entry.bucket(),
-                                    entry.file().file_name.as_str(),
-                                ),
-                                entry,
-                            )
-                        })
-                        .collect::<HashMap<_, _>>();
-                    if lookup_history.len() != current.len()
-                        || lookup_history.iter().any(|file| {
-                            current
-                                .get(&(
-                                    file.partition(),
-                                    file.bucket(),
-                                    file.file().file_name.as_str(),
-                                ))
-                                .is_none_or(|entry| {
-                                    entry.file() != file.file()
-                                        || entry.total_buckets() != file.total_buckets()
-                                })
-                        })
-                    {
-                        return Err(crate::Error::DataInvalid {
-                            message: "Lookup compaction history changed; create a new plan".into(),
-                            source: None,
-                        });
-                    }
-                }
                 Ok(ResolvedCommit {
                     entries: entries.clone(),
                     changelog_entries: changelog_entries.clone(),

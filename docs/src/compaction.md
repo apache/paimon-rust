@@ -255,10 +255,11 @@ instead of being treated as a missing key. Only selected runs are rewritten.
 
 The executor streams both outputs and aborts both writers on execution failure.
 Prepared results include both file lists for serialization, subset commits and
-idempotent retries. Any concurrent positive-level file addition, removal or
-metadata change in a selected bucket rejects the commit because it may change
-the changelog's history, including previous lookup misses. Concurrent L0
-appends remain eligible for a later compaction and produce no premature events.
+idempotent retries. Commit validation checks that selected inputs remain valid
+and that files in each positive level have disjoint key ranges, matching Java's
+LSM conflict checks. Concurrent L0 appends and changes to unselected files are
+allowed when these checks pass. New L0 files remain eligible for a later
+compaction and produce no premature events.
 
 The executor requires an actual catalog/FileIO cache (`local-cache.enabled=true`);
 setting the flag in table properties alone does not attach a cache.

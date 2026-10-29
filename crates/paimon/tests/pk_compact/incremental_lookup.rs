@@ -341,70 +341,62 @@ async fn incremental_lookup_casts_old_history_after_rename_and_type_promotion() 
 }
 
 #[tokio::test]
-async fn incremental_lookup_fences_positive_history_for_hits_and_absent_keys() {
-    for key in [42, 43] {
-        for mutation in ["add", "remove", "metadata"] {
-            let table = table(&[("changelog-producer", "lookup")]).await;
-            let anchor = seed(&table).await;
-            write_batch(&table, &make_batch(vec![key], vec![9000])).await;
-            let builder = table.new_compact_builder();
-            let plan = builder.new_planner().unwrap().plan().await.unwrap();
-            assert!(plan.tasks()[0].files().iter().all(|file| file.level == 0));
-            let results = execute(&table, &plan).await;
-            let writer_builder = table.new_write_builder();
-            let mut changes = Vec::new();
-            if mutation == "add" {
-                let mut writer = writer_builder.new_write().unwrap();
-                writer
-                    .write_arrow_batch(&make_batch(vec![key], vec![7777]))
-                    .await
-                    .unwrap();
-                changes = writer.prepare_commit().await.unwrap();
-                for file in changes
-                    .iter_mut()
-                    .flat_map(|message| &mut message.new_files)
-                {
-                    file.level = 3;
-                }
-                writer.close().await;
-            } else {
-                let mut removal =
-                    CommitMessage::new(plan.tasks()[0].partition().to_vec(), 0, vec![]);
-                removal.deleted_files.push(anchor.clone());
-                changes.push(removal);
-                if mutation == "metadata" {
-                    // The public writer API rejects same-identity DELETE+ADD
-                    // in one commit. Remove and re-add across two snapshots so
-                    // the latest state contains the same file with new metadata.
-                    table
-                        .new_write_builder()
-                        .new_commit()
-                        .commit(std::mem::take(&mut changes))
-                        .await
-                        .unwrap();
-                    let mut modified = anchor.clone();
-                    assert!(modified.creation_time.take().is_some());
-                    changes.push(CommitMessage::new(
-                        plan.tasks()[0].partition().to_vec(),
-                        0,
-                        vec![modified],
-                    ));
-                }
-            }
-            writer_builder.new_commit().commit(changes).await.unwrap();
-            let before = latest(&table).await;
-            assert!(
-                builder
-                    .new_commit()
-                    .unwrap()
-                    .commit_compact(results)
-                    .await
-                    .unwrap_err()
-                    .to_string()
-                    .contains("history changed"),
-                "{mutation}, key {key}"
-            );
-            assert_eq!(latest(&table).await, before, "{mutation}, key {key}");
+async fn incremental_lookup_allows_safe_rewrites_of_unselected_history() {
+    for metadata_only in [false, true] {
+        let table = table(&[("changelog-producer", "lookup")]).await;
+        let anchor = seed(&table).await;
+        write_batch(&table, &make_batch(vec![42], vec![9000])).await;
+        let builder = table.new_compact_builder();
+        let plan = builder.new_planner().unwrap().plan().await.unwrap();
+        assert!(plan.tasks()[0].files().iter().all(|file| file.level == 0));
+        let results = execute(&table, &plan).await;
+        assert!(results[0].files().iter().all(|file| file.level == 4));
+        let mut replacement = anchor.clone();
+        let mut change = CommitMessage::new(plan.tasks()[0].partition().to_vec(), 0, vec![]);
+        if metadata_only {
+            // Same-identity replacement uses two snapshots with the public API.
+            change.deleted_files.push(anchor.clone());
+            table
+                .new_write_builder()
+                .new_commit()
+                .commit(vec![change])
+                .await
+                .unwrap();
+            change = CommitMessage::new(plan.tasks()[0].partition().to_vec(), 0, vec![]);
+            assert!(replacement.creation_time.take().is_some());
+        } else {
+            replacement.file_name = format!("data-{}-0.parquet", uuid::Uuid::new_v4());
+            let bucket = format!("{}/bucket-0", table.location());
+            table
+                .file_io()
+                .copy_file(
+                    &format!("{bucket}/{}", anchor.file_name),
+                    &format!("{bucket}/{}", replacement.file_name),
+                )
+                .await
+                .unwrap();
+            change.deleted_files.push(anchor);
         }
+        change.new_files.push(replacement);
+        table
+            .new_write_builder()
+            .new_commit()
+            .commit(vec![change])
+            .await
+            .unwrap();
+        let expected = rows(&table).await;
+        let before = latest(&table).await;
+        builder
+            .new_commit()
+            .unwrap()
+            .commit_compact(results)
+            .await
+            .unwrap();
+        assert_eq!(latest(&table).await, before + 1);
+        assert_eq!(rows(&table).await, expected);
+        assert_eq!(
+            expected.iter().find(|(key, _)| *key == 42),
+            Some(&(42, 9000))
+        );
     }
 }
