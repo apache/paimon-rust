@@ -1153,6 +1153,59 @@ consumers before cleanup: running scans retain their loaded positions, and check
 completion can recreate deleted records. A fresh scan without an explicit checkpoint
 follows its existing initial scan behavior after its consumer record is deleted.
 
+### create_branch
+
+Create a branch from the main source table:
+
+```sql
+-- Copy the latest schema without inheriting data, snapshots, or tags.
+CALL sys.create_branch(table => 'paimon.my_db.my_table', branch => 'empty_branch');
+
+-- Start from a tag's historical schema and data.
+CALL sys.create_branch(
+    table => 'paimon.my_db.my_table',
+    branch => 'release_branch',
+    tag => 'release',
+    ignore_if_exists => true
+);
+```
+
+`table` and `branch` are required. `table` accepts `database.table` or
+`catalog.database.table`. Omitting `tag` creates a branch containing schema
+metadata only, even when the source table has data. A specified tag must exist;
+its retained snapshot can be used even after the live snapshot file has expired,
+provided the referenced schemas, manifests, and data files remain available.
+The source table is not modified. Query the new branch through `$branch_<name>`
+and list it through [`$branches`](#branches).
+
+`ignore_if_exists` defaults to `false`: an existing branch causes an error.
+With `true`, an existing branch is left unchanged and the tag is not resolved,
+even if the supplied tag does not exist. Both creation and an ignored request
+return one row with `result = 'OK'`. Boolean literals and case-insensitive
+`'true'` / `'false'` strings are accepted; other values are rejected. This
+parameter uses the Rust SQL name `ignore_if_exists`, rather than Java Spark's
+`ignoreIfExists`.
+
+Branch names must pass the Core name validator: `main`, empty or whitespace-only
+names, pure ASCII numeric names, `.`, `..`, path separators, and control
+characters are rejected. SQL also rejects `$` in target branch names because it
+separates branch and system-table suffixes in object names. Branch names preserve
+leading and trailing spaces.
+When creating a branch, tag names are passed unchanged to Core; trailing
+whitespace is invalid.
+Branch-name and source-table validation also apply when `ignore_if_exists` is
+`true`.
+
+Only non-REST FileStore tables resolved on `main` are supported. REST tables,
+format tables, external engine tables, and already resolved non-main source
+tables are rejected. The procedure does not resolve `$branch_<name>` or system
+table suffixes in its `table` argument and does not create from another branch.
+
+Creation reuses the Core metadata-copy path. Existence checks and file copies
+are not transactional; storage errors are returned and can leave partial branch
+metadata. `ignore_if_exists` checks name existence and does not repair a partial
+creation.
+
 ### create_tag
 
 Create a named tag from a snapshot:
