@@ -2057,51 +2057,6 @@ impl TableCommit {
                     base_data_files.as_deref().unwrap_or_default(),
                     entries,
                 )?;
-                if self
-                    .table
-                    .schema()
-                    .core_options()
-                    .try_changelog_producer()?
-                    == crate::spec::ChangelogProducer::Lookup
-                {
-                    let buckets = entries
-                        .iter()
-                        .filter(|entry| *entry.kind() == FileKind::Delete)
-                        .map(|entry| (entry.partition(), entry.bucket()))
-                        .collect::<HashSet<_>>();
-                    for (partition, bucket) in buckets {
-                        let expected = entries
-                            .iter()
-                            .filter(|entry| {
-                                *entry.kind() == FileKind::Delete
-                                    && entry.partition() == partition
-                                    && entry.bucket() == bucket
-                                    && entry.file().level > 0
-                            })
-                            .collect::<Vec<_>>();
-                        let current = base_data_files
-                            .as_deref()
-                            .unwrap_or_default()
-                            .iter()
-                            .filter(|entry| {
-                                entry.partition() == partition
-                                    && entry.bucket() == bucket
-                                    && entry.file().level > 0
-                            })
-                            .collect::<Vec<_>>();
-                        if expected.len() != current.len()
-                            || expected.iter().any(|file| {
-                                !current.iter().any(|entry| entry.file() == file.file())
-                            })
-                        {
-                            return Err(crate::Error::DataInvalid {
-                                message: "Lookup compaction history changed; create a new plan"
-                                    .into(),
-                                source: None,
-                            });
-                        }
-                    }
-                }
                 Ok(ResolvedCommit {
                     entries: entries.clone(),
                     changelog_entries: changelog_entries.clone(),

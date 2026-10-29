@@ -166,6 +166,12 @@ pub(crate) trait MergeFunction: Send + Sync {
     }
 }
 
+/// Point lookup into retained sorted runs during incremental compaction.
+#[async_trait::async_trait]
+pub(crate) trait LookupProvider: Send + Sync {
+    async fn lookup(&self, key: &[u8]) -> crate::Result<Option<RecordBatch>>;
+}
+
 /// Internal batch metadata used only by lookup compaction. Source levels
 /// survive physical reads; changelog batches are routed to a separate writer.
 pub(super) const FILE_LEVEL_METADATA_KEY: &str = "paimon.compact.file-level";
@@ -1344,6 +1350,7 @@ pub(crate) struct SortMergeReaderBuilder {
     output_schema: SchemaRef,
     merge_function: Box<dyn MergeFunction>,
     batch_size: usize,
+    lookup: Option<Arc<dyn LookupProvider>>,
 }
 
 impl SortMergeReaderBuilder {
@@ -1371,7 +1378,13 @@ impl SortMergeReaderBuilder {
             output_schema,
             merge_function,
             batch_size: 1024,
+            lookup: None,
         }
+    }
+
+    pub(crate) fn with_lookup(mut self, lookup: Option<Arc<dyn LookupProvider>>) -> Self {
+        self.lookup = lookup;
+        self
     }
 
     pub(crate) fn with_batch_size(mut self, batch_size: usize) -> Self {
@@ -1431,6 +1444,7 @@ impl SortMergeReaderBuilder {
             self.output_schema,
             self.merge_function,
             self.batch_size,
+            self.lookup.map(|lookup| (lookup, self.input_schema)),
         )
     }
 }
@@ -1504,6 +1518,7 @@ fn sort_merge_stream(
     output_schema: SchemaRef,
     merge_function: Box<dyn MergeFunction>,
     batch_size: usize,
+    lookup: Option<(Arc<dyn LookupProvider>, SchemaRef)>,
 ) -> crate::Result<ArrowRecordBatchStream> {
     let num_streams = streams.len();
     if num_streams == 0 {
@@ -1640,6 +1655,33 @@ fn sort_merge_stream(
                 tree.update(|a, b| compare_cursors(&cursors, a, b).then_with(|| a.cmp(&b)).is_gt());
             }
 
+            if let Some((lookup, schema)) = &lookup {
+                let has_base = same_key_rows.iter().any(|row| match &batch_buffer[row.batch_idx] {
+                    BufferedBatch::Source(batch) => batch.schema().metadata().get(FILE_LEVEL_METADATA_KEY)
+                        .and_then(|level| level.parse::<i32>().ok()).is_some_and(|level| level > 0),
+                    _ => false,
+                });
+                if !has_base {
+                    if let Some(batch) = lookup.lookup(&winner_key).await? {
+                        if batch.num_rows() != 1 || batch.schema().fields() != schema.fields() {
+                            Err(Error::DataInvalid { message: "Lookup must return one KV row matching the merge schema".into(), source: None })?;
+                        }
+                        let keys = convert_batch_keys(&batch, &key_indices, &mut row_converter)?;
+                        if keys.row(0).as_ref() != winner_key.as_slice() {
+                            Err(Error::DataInvalid { message: "Lookup returned a different primary key".into(), source: None })?;
+                        }
+                        let user = convert_batch_user_sequences(&batch, &user_sequence_indices, user_sequence_converter.as_mut())?;
+                        let sequence_number = batch.column(seq_index).as_any().downcast_ref::<Int64Array>()
+                            .ok_or_else(|| Error::DataInvalid { message: "Invalid lookup sequence".into(), source: None })?.value(0);
+                        let value_kind = batch.column(value_kind_index).as_any().downcast_ref::<Int8Array>()
+                            .ok_or_else(|| Error::DataInvalid { message: "Invalid lookup row kind".into(), source: None })?.value(0);
+                        let batch_idx = batch_buffer.len();
+                        batch_buffer.push(BufferedBatch::Source(batch));
+                        same_key_rows.insert(0, MergeRow { batch_idx, row_idx: 0, sequence_number, value_kind,
+                            user_sequence: user.map(|rows| rows.row(0).owned()) });
+                    }
+                }
+            }
             let (merged, changelog) = merge_function.merge_with_changelog(
                 &same_key_rows, &batch_buffer, &source_output_col_indices, &output_schema,
             )?;

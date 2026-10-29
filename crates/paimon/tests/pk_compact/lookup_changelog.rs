@@ -736,36 +736,57 @@ async fn lookup_compaction_subsets_and_retries_publish_each_changelog_once_with_
 }
 
 #[tokio::test]
-async fn lookup_compaction_rejects_concurrent_positive_level_history_at_another_level() {
-    let table = lookup_table(&[]).await;
-    write_batch(&table, &make_batch(vec![1], vec![10])).await;
-    compact(&table).await;
-    write_batch(&table, &make_batch(vec![1], vec![11])).await;
-    let builder = table.new_compact_builder();
-    let plan = builder.new_planner().unwrap().plan().await.unwrap();
-    let results = execute(&table, &plan).await;
-    append_at_level(&table, 12, 3).await;
-    let snapshot = table
-        .snapshot_manager()
-        .get_latest_snapshot_id()
-        .await
-        .unwrap();
-    assert!(builder
-        .new_commit()
-        .unwrap()
-        .commit_compact(results)
-        .await
-        .unwrap_err()
-        .to_string()
-        .contains("history changed"));
-    assert_eq!(
-        table
+async fn lookup_compaction_allows_disjoint_history_and_rejects_output_level_overlap() {
+    for overlaps in [false, true] {
+        let table = lookup_table(&[]).await;
+        write_batch(&table, &make_batch(vec![1], vec![10])).await;
+        compact(&table).await;
+        write_batch(&table, &make_batch(vec![1], vec![11])).await;
+        let builder = table.new_compact_builder();
+        let plan = builder.new_planner().unwrap().plan().await.unwrap();
+        let results = execute(&table, &plan).await;
+        let output_level = results[0].files()[0].level;
+        assert!(output_level > 1);
+        let write = table.new_write_builder();
+        let mut writer = write.new_write().unwrap();
+        writer
+            .write_arrow_batch(&make_batch(vec![if overlaps { 1 } else { 256 }], vec![12]))
+            .await
+            .unwrap();
+        let mut messages = writer.prepare_commit().await.unwrap();
+        for file in messages
+            .iter_mut()
+            .flat_map(|message| &mut message.new_files)
+        {
+            file.level = if overlaps {
+                output_level
+            } else {
+                output_level - 1
+            };
+        }
+        write.new_commit().commit(messages).await.unwrap();
+        writer.close().await;
+        let snapshot = table
             .snapshot_manager()
             .get_latest_snapshot_id()
             .await
-            .unwrap(),
-        snapshot
-    );
+            .unwrap();
+        let result = builder.new_commit().unwrap().commit_compact(results).await;
+        if overlaps {
+            assert!(result.unwrap_err().to_string().contains("LSM"));
+            assert_eq!(
+                table
+                    .snapshot_manager()
+                    .get_latest_snapshot_id()
+                    .await
+                    .unwrap(),
+                snapshot
+            );
+        } else {
+            result.unwrap();
+            assert_eq!(rows(&table).await, vec![(1, 11), (256, 12)]);
+        }
+    }
 }
 
 #[tokio::test]

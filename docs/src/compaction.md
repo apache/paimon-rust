@@ -20,7 +20,7 @@ under the License.
 # Table Compaction
 
 Rust supports small-file compaction for ordinary append tables, normal-file
-compaction for Data Evolution tables, and full-bucket compaction for primary-key
+compaction for Data Evolution tables, and sorted-run compaction for primary-key
 tables with fixed or dynamic buckets. `CompactBuilder` creates
 a `CompactPlanner`, a `CompactExecutor`, and a `TableCommit`. Planning and
 execution do not publish snapshots; `commit_compact` atomically publishes the
@@ -115,8 +115,8 @@ snapshot expiration and storage reclamation are separate maintenance work.
 The same API compacts primary-key tables with `deduplicate`,
 `first-row`, `partial-update` or `aggregation` merge engines. Changelog producers
 `none`, `input` and `lookup` are supported; `first-row` supports `none` or `lookup`.
-For `deduplicate` with `none` or `input`, the planner chooses incremental sorted
-runs using Java's universal-compaction size and count policy. Each L0 file is a
+For `deduplicate` with `none`, `input` or `lookup`, the planner chooses incremental
+sorted runs using Java's universal-compaction size and count policy. Each L0 file is a
 run; all files at one positive level form a single run. Normal size and run-count
 triggers take precedence. If they select no work, explicit compaction forces
 progress on every L0 run and absorbs adjacent runs according to their sizes. A
@@ -133,7 +133,7 @@ otherwise it goes immediately below the next unselected run. Explicit full
 compaction is not exposed. Outputs retain winning retracts, so older values
 in untouched files do not reappear after a delete or out-of-order update.
 
-`lookup`, `first-row`, `partial-update` and `aggregation` retain their current
+`first-row`, `partial-update` and `aggregation` retain their current
 selection behavior: every active file in a selected bucket participates, and
 output uses the highest input level or level 1 for all-L0 inputs. Their state
 and changelog generation must see history before incremental selection can be
@@ -246,14 +246,39 @@ Changelog files roll at the ordinary size and row limits. `CompactResult` expose
 `changelog_files_added`, `changelog_rows_written` and `changelog_bytes_written`.
 The existing data metrics continue to count data files and rows only.
 
+For `deduplicate`, unselected higher-level history is read through point lookups
+in disposable local Lookup Files. Each file stores ordered keys and complete KV
+rows, including row kinds and sequence metadata. The first access builds it by
+streaming the source through the normal schema-evolution decoder. Later keys and
+executors reuse it; a missing or corrupt cache block causes a bounded rebuild
+instead of being treated as a missing key. Only selected runs are rewritten.
+Lookup selects candidate files by key range, retaining range pruning across
+schema changes that preserve the primary-key field IDs, order and types. The
+reader retains one bounded parsed SST index and one decoded IPC batch.
+Failed or cancelled builds clean up their unpublished cache blocks.
+
 The executor streams both outputs and aborts both writers on execution failure.
 Prepared results include both file lists for serialization, subset commits and
-idempotent retries. A concurrent positive-level addition in a selected bucket
-rejects the commit because it may change the changelog's history. Concurrent L0
-appends remain eligible for a later compaction and produce no premature events.
+idempotent retries. Commit validation checks that selected inputs remain valid
+and that files in each positive level have disjoint key ranges, matching Java's
+LSM conflict checks. Concurrent L0 appends and changes to unselected files are
+allowed when these checks pass. New L0 files remain eligible for a later
+compaction and produce no premature events.
 
 The executor requires an actual catalog/FileIO cache (`local-cache.enabled=true`);
 setting the flag in table properties alone does not attach a cache.
+Deduplicate Lookup Files use that cache's memory, disk or shared-disk backend,
+namespace, eviction policy and `local-cache.max-size` budget. Set `local-cache.dir` to keep
+them on disk. They do not require `data` in `local-cache.whitelist`.
+`lookup.cache-max-disk-size` is rejected; use `local-cache.max-size` instead.
+
+For deduplicate lookup caching, `lookup.cache-max-memory-size` defaults to
+`256 MiB` per executor and bounds working components such as input batches,
+IPC payloads and SST indexes. Oversized inputs or indexes,
+or a cache unable to retain the generated file, fail execution without publishing
+a snapshot. Reduce `read.batch-size` for oversized input batches or increase the
+appropriate budget. Cache storage is charged separately to `local-cache.max-size`.
+`lookup.cache-spill-compression` accepts `none`, `zstd` (default), `lz4` or `lzo`.
 
 ## Dynamic buckets
 

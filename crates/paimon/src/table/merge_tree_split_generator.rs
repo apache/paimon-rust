@@ -72,6 +72,10 @@ impl KeyComparator {
         Some(Self::new(key_types))
     }
 
+    pub(crate) fn compare(&self, left: &[u8], right: &[u8]) -> Option<Ordering> {
+        Some(compare_decoded(&self.decode(left)?, &self.decode(right)?))
+    }
+
     /// Decode a serialized min/max key. Returns `None` when the key is empty,
     /// malformed, or contains NaN, letting callers degrade to the safe "treat
     /// everything as overlapping" path instead of failing the scan. NaN must
