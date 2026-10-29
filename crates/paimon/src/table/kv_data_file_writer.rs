@@ -507,8 +507,12 @@ impl<'a> KeyValueRollingWriter<'a> {
         Ok(())
     }
 
+    pub(super) async fn finish(&mut self) -> Result<()> {
+        self.close_current().await
+    }
+
     pub(super) async fn prepare_commit(&mut self) -> Result<Vec<DataFileMeta>> {
-        self.close_current().await?;
+        self.finish().await?;
         Ok(std::mem::take(&mut self.files))
     }
 

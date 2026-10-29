@@ -114,7 +114,7 @@ snapshot expiration and storage reclamation are separate maintenance work.
 
 The same API compacts primary-key tables with `deduplicate`,
 `first-row`, `partial-update` or `aggregation` merge engines. Changelog producers
-`none` and `input` are supported; `first-row` requires `none`.
+`none`, `input` and `lookup` are supported; `first-row` supports `none` or `lookup`.
 The planner includes every active file of each selected partition/bucket,
 including large files. Append size and count selection options do not split PK
 buckets. A single level-0 file is also eligible. A bucket whose files already form one sorted
@@ -133,9 +133,9 @@ state, including original sequence metadata and synthesized DELETE records:
 - `partial-update` combines sparse columns using the configured sequence
   groups and field aggregators. Delete payloads and group sequence values are
   preserved so subsequent sparse updates can continue from that state.
-- `aggregation` writes the engine's field accumulators. Singleton records
-  remain unreduced, including retracts; compound DELETE states are preserved
-  rather than being discarded as they are by the query reader.
+- `aggregation` writes the engine's field accumulators. With `none` or `input`,
+  singleton records remain unreduced, including retracts; compound DELETE states
+  are preserved rather than being discarded as they are by the query reader.
 
 The existing engine rules for ignored deletes, unsupported retracts and
 whole-record deletion also apply during compaction. If all records are
@@ -174,6 +174,61 @@ There is no multipass merge yet; too many overlapping runs fail without
 publishing a snapshot. The captured snapshot must remain available until each
 task subset is successfully committed; retries of an already committed subset remain
 idempotent after its read snapshot expires.
+
+## Lookup changelog producer
+
+Set `changelog-producer=lookup` and run the same compaction API to publish data
+and changelog files atomically in a `COMPACT` snapshot. Ordinary writes produce
+L0 data files; changelogs become available when those files are compacted.
+Batch incremental `Changelog` / `Auto` scans and streaming follow-up scans read
+the resulting changelog manifest. `Delta` scans continue to skip compaction.
+
+For each key, the lowest positive level is its latest materialized history.
+Older positive levels already contributed to that state and are not reduced
+again. Compaction merges this history with the captured L0 records and emits
+changes only for keys with L0 input:
+
+- No live history and a live result: `INSERT`.
+- Live history and a deleted result: `DELETE` carrying the history's values.
+- Live history and a live result: `UPDATE_BEFORE` followed by `UPDATE_AFTER`.
+- No live history and no live result: no changelog.
+
+Before images retain the historical sequence metadata; after images carry the
+merged result's metadata. `first-row` emits the first accepted add for previously
+unseen keys, preserving its `INSERT` or `UPDATE_AFTER` kind. It considers all
+input levels when choosing the earliest record. `partial-update` and `aggregation`
+always run the reducer in lookup mode, including singleton retracts, as Java does.
+For example, lookup compaction turns a lone `DELETE(value=5)` with `sum` into
+live state `-5` when `aggregation.remove-record-on-delete=false`; an ordinary
+query still omits that singleton retract before compaction. Existing state
+preservation restrictions still apply. History selection precedes merging.
+
+Java-compatible options have these defaults:
+
+| Option | Default | Behavior |
+| --- | --- | --- |
+| `changelog-producer.row-deduplicate` | `false` | When true, skip update pairs whose user values are equal. |
+| `changelog-producer.row-deduplicate-ignore-fields` | unset | Comma-separated fields excluded from that comparison. |
+| `changelog-producer.ignore-update-before` | `false` | Omit `UPDATE_BEFORE` events. |
+| `changelog-producer.ignore-delete` | `false` | Omit `DELETE` events. |
+
+With default options, even an unchanged value produces an update pair when its
+key has L0 input. Ignoring changelog events does not change compacted table data.
+`changelog-file.format`, `changelog-file.compression`, `changelog-file.prefix`
+and changelog statistics options apply independently of data-file settings.
+Changelog files roll at the ordinary size and row limits. `CompactResult` exposes
+`changelog_files()`; `CompactMetrics` reports their file, row and byte counts in
+`changelog_files_added`, `changelog_rows_written` and `changelog_bytes_written`.
+The existing data metrics continue to count data files and rows only.
+
+The executor streams both outputs and aborts both writers on execution failure.
+Prepared results include both file lists for serialization, subset commits and
+idempotent retries. A concurrent positive-level addition in a selected bucket
+rejects the commit because it may change the changelog's history. Concurrent L0
+appends remain eligible for a later compaction and produce no premature events.
+
+The executor requires an actual catalog/FileIO cache (`local-cache.enabled=true`);
+setting the flag in table properties alone does not attach a cache.
 
 ## Dynamic buckets
 
@@ -241,7 +296,8 @@ deletions into reassigned row IDs are not provided. Setting
 
 ## Current scope
 
-Compaction-generated changelogs (`full-compaction` / `lookup`) are unsupported.
+The `full-compaction` changelog producer is unsupported; `lookup` is supported
+for primary-key compaction without deletion vectors.
 Outside Data Evolution mode, row tracking, deletion vectors and dedicated
 blob/vector storage are unsupported. Query authorization, rowkind fields and
 postpone buckets are unsupported in all modes.

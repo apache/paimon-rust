@@ -442,6 +442,7 @@ impl TableCommit {
             .try_commit(
                 CommitEntriesPlan::Compact {
                     entries: prepared.entries,
+                    changelog_entries: prepared.changelog_entries,
                     schema_id: prepared.schema_id,
                     read_snapshot: prepared.read_snapshot,
                     planned_snapshot_id: prepared.snapshot_id,
@@ -1252,8 +1253,14 @@ impl TableCommit {
                 new_index_entries,
                 ..
             } => (new_entries.as_slice(), &[][..], new_index_entries),
-            CommitEntriesPlan::Compact { entries, .. } => {
-                return self.check_recovery_entries(entries, &[], &[]).await;
+            CommitEntriesPlan::Compact {
+                entries,
+                changelog_entries,
+                ..
+            } => {
+                return self
+                    .check_recovery_entries(entries, changelog_entries, &[])
+                    .await;
             }
         };
         self.check_recovery_entries(entries, changelog_entries, index_entries)
@@ -1900,6 +1907,7 @@ impl TableCommit {
         match plan {
             CommitEntriesPlan::Compact {
                 entries,
+                changelog_entries,
                 schema_id,
                 read_snapshot,
                 planned_snapshot_id,
@@ -1928,6 +1936,7 @@ impl TableCommit {
                     None => None,
                 };
                 validate_file_entries(entries.iter())?;
+                validate_file_entries(changelog_entries.iter())?;
                 // This runs after duplicate-commit filtering: an uncertain commit
                 // can be retried even after the captured read snapshot expires.
                 if let Some(captured) = read_snapshot {
@@ -2042,9 +2051,54 @@ impl TableCommit {
                     base_data_files.as_deref().unwrap_or_default(),
                     entries,
                 )?;
+                if self
+                    .table
+                    .schema()
+                    .core_options()
+                    .try_changelog_producer()?
+                    == crate::spec::ChangelogProducer::Lookup
+                {
+                    let buckets = entries
+                        .iter()
+                        .filter(|entry| *entry.kind() == FileKind::Delete)
+                        .map(|entry| (entry.partition(), entry.bucket()))
+                        .collect::<HashSet<_>>();
+                    for (partition, bucket) in buckets {
+                        let expected = entries
+                            .iter()
+                            .filter(|entry| {
+                                *entry.kind() == FileKind::Delete
+                                    && entry.partition() == partition
+                                    && entry.bucket() == bucket
+                                    && entry.file().level > 0
+                            })
+                            .collect::<Vec<_>>();
+                        let current = base_data_files
+                            .as_deref()
+                            .unwrap_or_default()
+                            .iter()
+                            .filter(|entry| {
+                                entry.partition() == partition
+                                    && entry.bucket() == bucket
+                                    && entry.file().level > 0
+                            })
+                            .collect::<Vec<_>>();
+                        if expected.len() != current.len()
+                            || expected.iter().any(|file| {
+                                !current.iter().any(|entry| entry.file() == file.file())
+                            })
+                        {
+                            return Err(crate::Error::DataInvalid {
+                                message: "Lookup compaction history changed; create a new plan"
+                                    .into(),
+                                source: None,
+                            });
+                        }
+                    }
+                }
                 Ok(ResolvedCommit {
                     entries: entries.clone(),
-                    changelog_entries: vec![],
+                    changelog_entries: changelog_entries.clone(),
                     kind: CommitKind::COMPACT,
                     index_manifest_name,
                     index_manifest_changed: false,
@@ -3868,9 +3922,10 @@ fn build_partition_stats_row(datums: &[Option<Datum>], data_types: &[DataType]) 
 
 /// Plan for resolving commit entries.
 enum CommitEntriesPlan {
-    /// Replace unchanged data files without publishing logical row changes.
+    /// Replace unchanged data files and atomically publish generated changelogs.
     Compact {
         entries: Vec<ManifestEntry>,
+        changelog_entries: Vec<ManifestEntry>,
         schema_id: i64,
         read_snapshot: Option<Box<Snapshot>>,
         planned_snapshot_id: i64,

@@ -20,13 +20,16 @@ mod common;
 #[path = "pk_compact/merge_engines.rs"]
 mod engine_tests;
 
+#[path = "pk_compact/lookup_changelog.rs"]
+mod lookup_changelog_tests;
+
 #[path = "pk_compact/dynamic_bucket.rs"]
 mod dynamic_tests;
 
 use arrow_array::{Array, Int32Array, Int64Array, RecordBatch, StringArray};
 use common::incremental_helpers::{
-    make_batch, make_batch_with_kinds, make_partitioned_batch, memory_table, persist_table_schema,
-    pk_schema, setup_dirs, write_batch,
+    make_batch, make_batch_with_kinds, make_partitioned_batch, persist_table_schema, pk_schema,
+    setup_dirs, write_batch,
 };
 use futures::TryStreamExt;
 use paimon::spec::{
@@ -35,8 +38,26 @@ use paimon::spec::{
 use paimon::table::{CompactPlan, CompactResult, CompactTask, IncrementalScanMode, Table};
 
 async fn table_with_schema(schema: TableSchema) -> Table {
+    table_with_cache(schema, &[]).await
+}
+
+async fn table_with_cache(schema: TableSchema, cache_options: &[(&str, &str)]) -> Table {
     let path = format!("memory:/pk_compact/{}", uuid::Uuid::new_v4());
-    let (io, table) = memory_table(&path, schema);
+    let mut options = paimon::Options::new();
+    options.set("warehouse", &path);
+    options.set("local-cache.enabled", "true");
+    for (name, value) in cache_options {
+        options.set(*name, *value);
+    }
+    let catalog = paimon::catalog::FileSystemCatalog::new(options).unwrap();
+    let io = catalog.file_io().clone();
+    let table = Table::new(
+        io.clone(),
+        paimon::catalog::Identifier::new("default", "pk_compact"),
+        path.clone(),
+        schema,
+        None,
+    );
     setup_dirs(&io, &path).await;
     persist_table_schema(&io, &path, table.schema()).await;
     table
@@ -532,10 +553,6 @@ async fn pk_compaction_rolls_ordered_files_and_rebuilds_indexes_with_level_stats
 #[tokio::test]
 async fn pk_compaction_refuses_partial_buckets_and_unsupported_layouts() {
     for options in [
-        vec![
-            ("merge-engine", "first-row"),
-            ("changelog-producer", "lookup"),
-        ],
         vec![("changelog-producer", "full-compaction")],
         vec![
             ("merge-engine", "first-row"),
