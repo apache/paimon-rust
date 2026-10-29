@@ -882,6 +882,10 @@ fn dictionary_variant_metadata_schema(
 
 #[async_trait]
 impl FormatFileReader for ParquetFormatReader {
+    fn supports_nested_projection(&self) -> bool {
+        true
+    }
+
     async fn read_batch_stream(
         &self,
         reader: Box<dyn FileRead>,
@@ -1378,6 +1382,15 @@ fn read_type_projection_mask(
     predicates: &[Predicate],
     null_residuals: &std::collections::HashSet<Vec<String>>,
 ) -> ProjectionMask {
+    fn is_list(physical: &parquet::schema::types::Type) -> bool {
+        let info = physical.get_basic_info();
+        !physical.is_primitive()
+            && match info.logical_type_ref() {
+                Some(logical) => logical == &parquet::basic::LogicalType::List,
+                None => info.converted_type() == parquet::basic::ConvertedType::LIST,
+            }
+    }
+
     fn requested_paths(
         field: &DataField,
         physical: &parquet::schema::types::Type,
@@ -1393,18 +1406,54 @@ fn read_type_projection_mask(
             return;
         }
         let data_type = field.data_type();
+        if let DataType::Array(array) = data_type {
+            let element =
+                DataField::new(field.id(), "element".into(), array.element_type().clone());
+            if is_list(physical) && physical.get_fields().len() == 1 {
+                // Follow arrow-rs's LIST conversion rules, including legacy
+                // two-level lists of ROWs named `array` or `<name>_tuple`.
+                let repeated = &physical.get_fields()[0];
+                path.push(repeated.name().to_string());
+                if !repeated.is_primitive()
+                    && repeated.get_fields().len() == 1
+                    && (is_list(repeated)
+                        || repeated.get_fields()[0].get_basic_info().repetition()
+                            == parquet::basic::Repetition::REPEATED
+                        || (repeated.name() != "array"
+                            && repeated.name() != format!("{}_tuple", physical.name())))
+                {
+                    let child = &repeated.get_fields()[0];
+                    path.push(child.name().to_string());
+                    requested_paths(&element, child, path, output, null_residuals);
+                    path.pop();
+                } else {
+                    requested_paths(&element, repeated, path, output, null_residuals);
+                }
+                path.pop();
+                return;
+            }
+            if physical.get_basic_info().has_repetition()
+                && physical.get_basic_info().repetition() == parquet::basic::Repetition::REPEATED
+            {
+                // Unannotated repeated fields are also decoded as lists.
+                requested_paths(&element, physical, path, output, null_residuals);
+                return;
+            }
+        }
         if let DataType::Map(map) = data_type {
             if !physical.is_primitive() && physical.get_fields().len() == 1 {
                 let entries = &physical.get_fields()[0];
-                if !entries.is_primitive()
-                    && entries.get_fields().len() == 2
-                    && entries.get_fields()[0].name() == "key"
-                    && entries.get_fields()[1].name() == "value"
-                {
+                if !entries.is_primitive() && entries.get_fields().len() == 2 {
                     path.push(entries.name().to_string());
                     let key = &entries.get_fields()[0];
                     path.push(key.name().to_string());
-                    super::variant_projection::all_leaves(key, path, output);
+                    requested_paths(
+                        &DataField::new(field.id(), key.name().into(), map.key_type().clone()),
+                        key,
+                        path,
+                        output,
+                        null_residuals,
+                    );
                     path.pop();
                     let value = &entries.get_fields()[1];
                     path.push(value.name().to_string());
@@ -1476,18 +1525,16 @@ fn read_type_projection_mask(
             .any(|(column, _)| *column == field.name())
         {
             super::variant_projection::all_leaves(root, &mut path, &mut selected);
-        } else if let Some(children) =
-            map_plan.and_then(|plan| plan.projected_physical_children(field.name()))
+        } else if let Some(physical_field) =
+            map_plan.and_then(|plan| plan.projected_physical_field(field.name()))
         {
-            for child in root
-                .get_fields()
-                .iter()
-                .filter(|child| children.contains(child.name()))
-            {
-                path.push(child.name().to_string());
-                super::variant_projection::all_leaves(child, &mut path, &mut selected);
-                path.pop();
-            }
+            requested_paths(
+                &physical_field,
+                root,
+                &mut path,
+                &mut selected,
+                null_residuals,
+            );
         } else {
             requested_paths(field, root, &mut path, &mut selected, null_residuals);
         }
@@ -3406,6 +3453,31 @@ mod tests {
         );
         for index in 0..3 {
             assert!(widened.leaf_included(index));
+        }
+    }
+
+    #[test]
+    fn array_read_type_masks_standard_and_legacy_list_leaves() {
+        use crate::spec::RowType;
+        let requested = vec![DataField::new(
+            0,
+            "items".into(),
+            DataType::Array(ArrayType::new(DataType::Row(RowType::new(vec![
+                DataField::new(2, "wanted".into(), DataType::Int(IntType::new())),
+            ])))),
+        )];
+        for layout in [
+            "optional group items (LIST) { repeated group list { optional group element { optional int32 unused; optional int32 wanted; } } }",
+            "optional group items (LIST) { repeated group array { optional int32 unused; optional int32 wanted; } }",
+            "optional group items (LIST) { repeated group items_tuple { optional int32 unused; optional int32 wanted; } }",
+            "repeated group items { optional int32 unused; optional int32 wanted; }",
+        ] {
+            let descriptor = SchemaDescriptor::new(Arc::new(
+                parse_message_type(&format!("message schema {{ {layout} }}")).unwrap()));
+            let mask = super::read_type_projection_mask(
+                &descriptor, &requested, None, &[], &Default::default());
+            assert!(!mask.leaf_included(0), "{layout}");
+            assert!(mask.leaf_included(1), "{layout}");
         }
     }
 
