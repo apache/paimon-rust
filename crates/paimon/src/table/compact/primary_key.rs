@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+pub(super) mod lookup;
+
 use std::sync::Arc;
 
 use arrow_schema::SchemaRef;
@@ -23,8 +25,8 @@ use futures::TryStreamExt;
 use super::{split_files_by_bucket, validate_file, CompactContext, CompactTask};
 use crate::resource::ResourceContext;
 use crate::spec::{
-    BigIntType, DataField, DataFileMeta, DataType, MergeEngine, RowKind, TinyIntType,
-    SEQUENCE_NUMBER_FIELD_ID, SEQUENCE_NUMBER_FIELD_NAME, VALUE_KIND_FIELD_ID,
+    BigIntType, ChangelogProducer, DataField, DataFileMeta, DataType, MergeEngine, RowKind,
+    TinyIntType, SEQUENCE_NUMBER_FIELD_ID, SEQUENCE_NUMBER_FIELD_NAME, VALUE_KIND_FIELD_ID,
     VALUE_KIND_FIELD_NAME,
 };
 use crate::table::data_file_index_writer::FileIndexOptions;
@@ -33,6 +35,7 @@ use crate::table::kv_data_file_writer::{KeyValueFileOptions, KeyValueRollingWrit
 use crate::table::kv_file_reader::{KeyValueFileReader, KeyValueReadConfig};
 use crate::table::sort_merge::{
     compare_sequence_order, BufferedBatch, MergeFunction, MergeResult, MergeRow,
+    CHANGELOG_BATCH_METADATA_KEY,
 };
 use crate::table::table_read::{
     configured_mosaic_prefetch, configured_parquet_read_budget, MAX_MERGE_INPUT_STREAMS,
@@ -40,7 +43,7 @@ use crate::table::table_read::{
 use crate::table::{DataSplit, Plan, Table};
 use crate::Result;
 
-/// Select complete captured buckets that need an L0 upgrade or level merge.
+/// Select files using the existing primary-key bucket compaction policy.
 pub(super) struct PrimaryKeyCompactPlanner;
 
 impl PrimaryKeyCompactPlanner {
@@ -76,8 +79,8 @@ impl PrimaryKeyCompactPlanner {
 }
 
 /// Keep the same winner as a deduplicate query, including DELETE/UPDATE_BEFORE.
-/// A later write may carry a lower user sequence, so even full compaction
-/// must retain a winning retract rather than resurrect an older value.
+/// A later write may carry a lower user sequence, so compaction must retain
+/// a winning retract rather than resurrect an older value.
 struct CompactDeduplicate;
 
 impl MergeFunction for CompactDeduplicate {
@@ -100,12 +103,12 @@ impl MergeFunction for CompactDeduplicate {
     }
 }
 
-/// The query reader omits singleton retracts and materialized DELETE rows.
-/// Compaction persists these states so later inserts/retractions merge exactly
-/// as they would against the original files. Singletons remain unreduced, as
-/// in Java's reducer wrapper; compound records use the existing engine reducer.
+/// Ordinary compaction preserves singleton states as Java's reducer wrapper
+/// does. Lookup compaction always runs the reducer, including for one retract.
+/// Persist synthesized DELETEs when their state can safely be replayed.
 struct CompactReducer {
     inner: Box<dyn MergeFunction>,
+    reduce_singletons: bool,
     reject_delete_state: bool,
     reject_retract_group: bool,
 }
@@ -118,14 +121,19 @@ impl MergeFunction for CompactReducer {
         columns: &[usize],
         schema: &SchemaRef,
     ) -> Result<MergeResult> {
-        if let [row] = rows {
-            RowKind::from_value(row.value_kind)?;
-            return Ok(MergeResult::SourceRow {
-                batch_idx: row.batch_idx,
-                row_idx: row.row_idx,
-            });
+        if !self.reduce_singletons {
+            if let [row] = rows {
+                RowKind::from_value(row.value_kind)?;
+                return Ok(MergeResult::SourceRow {
+                    batch_idx: row.batch_idx,
+                    row_idx: row.row_idx,
+                });
+            }
         }
-        if self.reject_retract_group && rows.iter().any(|row| matches!(row.value_kind, 1 | 3)) {
+        if rows.len() > 1
+            && self.reject_retract_group
+            && rows.iter().any(|row| matches!(row.value_kind, 1 | 3))
+        {
             // Some aggregators preserve flags or raw DELETE payloads that a
             // single physical INSERT/DELETE cannot encode, even if the final
             // merged row is an INSERT. Leave this group in its source files.
@@ -134,7 +142,7 @@ impl MergeFunction for CompactReducer {
             });
         }
         Ok(match self.inner.merge(rows, batches, columns, schema)? {
-            MergeResult::MaterializedDeleteRow(_) if self.reject_delete_state => {
+            MergeResult::MaterializedDeleteRow(_) if self.reject_delete_state && rows.len() > 1 => {
                 // A partial-update reducer initializes from the first retract
                 // and then retracts its payload. Replaying an accumulated
                 // DELETE can cancel its own state. First-value aggregators
@@ -159,7 +167,7 @@ fn new_merge_function(
     if config.merge_engine == MergeEngine::Deduplicate {
         return Ok(Box::new(CompactDeduplicate));
     }
-    let inner = KeyValueFileReader::new_merge_function(config, fields)?;
+    let inner = KeyValueFileReader::new_unwrapped_merge_function(config, fields)?;
     let aggregate_functions = match config.merge_engine {
         MergeEngine::PartialUpdate => crate::spec::PartialUpdateConfig::new(&config.table_options)
             .validated_aggregate_functions(&config.table_fields, &config.primary_keys)?
@@ -194,7 +202,14 @@ fn new_merge_function(
     } else {
         Box::new(CompactReducer {
             inner,
+            // LookupMergeFunction always invokes the underlying reducer, even
+            // for one retract. The ordinary reducer wrapper keeps singletons.
+            reduce_singletons: config
+                .table_options
+                .get("changelog-producer")
+                .is_some_and(|value| value.eq_ignore_ascii_case("lookup")),
             reject_delete_state: config.merge_engine == MergeEngine::PartialUpdate
+                && !crate::spec::CoreOptions::new(&config.table_options).ignore_delete()
                 && !aggregate_functions.is_empty(),
             reject_retract_group: !(config.merge_engine == MergeEngine::PartialUpdate
                 && crate::spec::CoreOptions::new(&config.table_options).ignore_delete())
@@ -213,16 +228,8 @@ fn new_merge_function(
     })
 }
 
-pub(super) async fn execute(
-    table: &Table,
-    task: &CompactTask,
-    split: &DataSplit,
-    resources: Option<ResourceContext>,
-) -> Result<Vec<DataFileMeta>> {
-    let schema = table.schema();
-    let options = schema.core_options();
-    let merge_engine = options.merge_engine()?;
-    let mut read_type = vec![
+fn read_type(table: &Table) -> Vec<DataField> {
+    let mut fields = vec![
         DataField::new(
             SEQUENCE_NUMBER_FIELD_ID,
             SEQUENCE_NUMBER_FIELD_NAME.into(),
@@ -234,7 +241,21 @@ pub(super) async fn execute(
             DataType::TinyInt(TinyIntType::new()),
         ),
     ];
-    read_type.extend_from_slice(schema.fields());
+    fields.extend_from_slice(table.schema().fields());
+    fields
+}
+
+pub(super) async fn execute(
+    table: &Table,
+    task: &CompactTask,
+    split: &DataSplit,
+    resources: Option<ResourceContext>,
+) -> Result<(Vec<DataFileMeta>, Vec<DataFileMeta>)> {
+    let schema = table.schema();
+    let options = schema.core_options();
+    let merge_engine = options.merge_engine()?;
+    let lookup_changelog = options.try_changelog_producer()? == ChangelogProducer::Lookup;
+    let read_type = read_type(table);
     let budget = configured_parquet_read_budget(table)?;
     let budget = match &resources {
         Some(resources) => Arc::new(budget.with_resources(resources.clone()).without_prefetch()),
@@ -266,7 +287,13 @@ pub(super) async fn execute(
         },
     );
     let mut batches =
-        reader.read_with_merge_function(std::slice::from_ref(split), new_merge_function)?;
+        reader.read_with_merge_function(std::slice::from_ref(split), move |config, fields| {
+            if lookup_changelog {
+                lookup::new_merge_function(config, fields)
+            } else {
+                new_merge_function(config, fields)
+            }
+        })?;
     let keys = schema.trimmed_primary_keys();
     let primary_key_indices = keys
         .iter()
@@ -301,39 +328,79 @@ pub(super) async fn execute(
         schema.options(),
     )?;
     let file_format = options.file_format();
+    let file_options = KeyValueFileOptions {
+        file_io: table.file_io(),
+        paths: &paths,
+        table_options: schema.options(),
+        value_fields: schema.fields(),
+        primary_key_indices: &primary_key_indices,
+        primary_key_types: &primary_key_types,
+        schema_id: schema.id(),
+        file_format: &file_format,
+        file_prefix: options.data_file_prefix(),
+        file_compression: options.file_compression(),
+        file_compression_zstd_level: options.file_compression_zstd_level(),
+        write_buffer_size: options.write_buffer_size()? as i64,
+        level: task.output_level(),
+        file_source: 1,
+        is_changelog: false,
+        index_options: index.as_ref(),
+        managed_blob_enabled: false,
+        resources: resources.as_ref(),
+    };
     let mut writer = KeyValueRollingWriter::new(
+        file_options,
+        options.target_file_size(),
+        options.target_file_row_num()?,
+    );
+    let changelog_format = options.changelog_file_format();
+    let mut changelog_writer = KeyValueRollingWriter::new(
         KeyValueFileOptions {
-            file_io: table.file_io(),
-            paths: &paths,
-            table_options: schema.options(),
-            value_fields: schema.fields(),
-            primary_key_indices: &primary_key_indices,
-            primary_key_types: &primary_key_types,
-            schema_id: schema.id(),
-            file_format: &file_format,
-            file_prefix: options.data_file_prefix(),
-            file_compression: options.file_compression(),
-            file_compression_zstd_level: options.file_compression_zstd_level(),
-            write_buffer_size: options.write_buffer_size()? as i64,
-            level: task.output_level(),
-            file_source: 1,
-            is_changelog: false,
-            index_options: index.as_ref(),
-            managed_blob_enabled: false,
-            resources: resources.as_ref(),
+            file_format: &changelog_format,
+            file_prefix: options.changelog_file_prefix(),
+            file_compression: options.changelog_file_compression(),
+            is_changelog: true,
+            index_options: None,
+            ..file_options
         },
         options.target_file_size(),
         options.target_file_row_num()?,
     );
+
     let result = async {
         while let Some(batch) = batches.try_next().await? {
-            writer.write(&batch).await?;
+            if batch
+                .schema()
+                .metadata()
+                .contains_key(CHANGELOG_BATCH_METADATA_KEY)
+            {
+                let mut metadata = batch.schema().metadata().clone();
+                metadata.remove(CHANGELOG_BATCH_METADATA_KEY);
+                let batch = arrow_array::RecordBatch::try_new(
+                    Arc::new(batch.schema().as_ref().clone().with_metadata(metadata)),
+                    batch.columns().to_vec(),
+                )
+                .map_err(|error| {
+                    super::invalid(&format!("Invalid changelog output batch: {error}"))
+                })?;
+                changelog_writer.write(&batch).await?;
+            } else {
+                writer.write(&batch).await?;
+            }
         }
-        writer.prepare_commit().await
+        // Keep both prepared file lists owned by their writers until both have
+        // closed successfully, so either failure can clean up the whole task.
+        writer.finish().await?;
+        changelog_writer.finish().await?;
+        Ok((
+            writer.prepare_commit().await?,
+            changelog_writer.prepare_commit().await?,
+        ))
     }
     .await;
     if result.is_err() {
         writer.abort().await;
+        changelog_writer.abort().await;
     }
     result
 }

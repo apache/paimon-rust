@@ -40,7 +40,7 @@ use futures::StreamExt;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 // ---------------------------------------------------------------------------
 // MergeFunction
@@ -57,7 +57,7 @@ pub(crate) enum BufferedBatch {
 }
 
 impl BufferedBatch {
-    fn column_for_output<'a>(
+    pub(super) fn column_for_output<'a>(
         &'a self,
         output_col_idx: usize,
         source_output_col_indices: &[usize],
@@ -72,6 +72,7 @@ impl BufferedBatch {
 }
 
 /// A row reference as an index into the batch buffer.
+#[derive(Clone)]
 pub(crate) struct MergeRow {
     /// Index into the shared batch buffer.
     pub batch_idx: usize,
@@ -150,6 +151,101 @@ pub(crate) trait MergeFunction: Send + Sync {
         source_output_col_indices: &[usize],
         output_schema: &SchemaRef,
     ) -> crate::Result<MergeResult>;
+
+    /// Emit at most one key's changelog alongside its merged state. The reader
+    /// drains it before advancing to the next key, keeping memory bounded even
+    /// when all data rows are deleted.
+    fn merge_with_changelog(
+        &self,
+        rows: &[MergeRow],
+        batches: &[BufferedBatch],
+        columns: &[usize],
+        schema: &SchemaRef,
+    ) -> crate::Result<(MergeResult, Option<RecordBatch>)> {
+        Ok((self.merge(rows, batches, columns, schema)?, None))
+    }
+}
+
+/// Internal batch metadata used only by lookup compaction. Source levels
+/// survive physical reads; changelog batches are routed to a separate writer.
+pub(super) const FILE_LEVEL_METADATA_KEY: &str = "paimon.compact.file-level";
+pub(super) const CHANGELOG_BATCH_METADATA_KEY: &str = "paimon.compact.changelog";
+
+/// Lookup states at positive levels are already materialized. The lowest
+/// positive level is the latest state; older levels must not be reduced again.
+/// Mirrors Java LookupMergeFunction#pickHighLevel/getResult.
+pub(super) fn lookup_rows(
+    rows: &[MergeRow],
+    batches: &[BufferedBatch],
+) -> crate::Result<(Option<MergeRow>, bool, Vec<MergeRow>)> {
+    let mut base = None;
+    let mut base_level = i32::MAX;
+    let mut levels = Vec::with_capacity(rows.len());
+    for (index, row) in rows.iter().enumerate() {
+        let BufferedBatch::Source(batch) = &batches[row.batch_idx] else {
+            return Err(Error::UnexpectedError {
+                message: "Lookup input must be a source batch".into(),
+                source: None,
+            });
+        };
+        let level = batch
+            .schema()
+            .metadata()
+            .get(FILE_LEVEL_METADATA_KEY)
+            .and_then(|level| level.parse::<i32>().ok())
+            .ok_or_else(|| Error::DataInvalid {
+                message: "Lookup input is missing its file level".into(),
+                source: None,
+            })?;
+        if level > 0 && (base.is_none() || level < base_level) {
+            base = Some(index);
+            base_level = level;
+        }
+        levels.push(level);
+    }
+    let has_l0 = levels.contains(&0);
+    let selected = rows
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| levels[*index] <= 0 || base == Some(*index))
+        .map(|(_, row)| row.clone())
+        .collect();
+    Ok((base.map(|index| rows[index].clone()), has_l0, selected))
+}
+
+pub(super) struct LookupMergeFunction(pub Box<dyn MergeFunction>);
+
+impl MergeFunction for LookupMergeFunction {
+    fn merge(
+        &self,
+        rows: &[MergeRow],
+        batches: &[BufferedBatch],
+        columns: &[usize],
+        schema: &SchemaRef,
+    ) -> crate::Result<MergeResult> {
+        let (_, _, selected) = lookup_rows(rows, batches)?;
+        self.0.merge(&selected, batches, columns, schema)
+    }
+}
+
+/// Java queries wrap LookupMergeFunction in ReducerMergeFunctionWrapper, then
+/// drop retract results. The shortcut counts the original inputs, before
+/// lookup discards superseded high-level states. Compaction has no such wrapper.
+pub(super) struct QueryReducerMergeFunction(pub Box<dyn MergeFunction>);
+
+impl MergeFunction for QueryReducerMergeFunction {
+    fn merge(
+        &self,
+        rows: &[MergeRow],
+        batches: &[BufferedBatch],
+        columns: &[usize],
+        schema: &SchemaRef,
+    ) -> crate::Result<MergeResult> {
+        if let Some(result) = singleton_reducer_result(rows)? {
+            return Ok(result);
+        }
+        self.0.merge(rows, batches, columns, schema)
+    }
 }
 
 /// Deduplicate merge: keeps the row with the highest sequence.
@@ -249,6 +345,7 @@ impl MergeFunction for FirstRowMergeFunction {
 #[derive(Debug)]
 pub(crate) struct PartialUpdateMergeFunction {
     ignore_delete: bool,
+    reduce_singletons: bool,
     remove_record_on_delete: bool,
     sequence_group_partial_delete: HashSet<usize>,
     sequence_group_enabled: bool,
@@ -325,6 +422,9 @@ impl PartialUpdateMergeFunction {
         PartialUpdateConfig::new(table_options).validate_write_mode(true, table_name)?;
         Ok(Self {
             ignore_delete: CoreOptions::new(table_options).ignore_delete(),
+            reduce_singletons: table_options
+                .get("changelog-producer")
+                .is_some_and(|value| value.eq_ignore_ascii_case("lookup")),
             remove_record_on_delete: PartialUpdateConfig::new(table_options)
                 .remove_record_on_delete(),
             sequence_group_partial_delete: HashSet::new(),
@@ -437,6 +537,9 @@ impl PartialUpdateMergeFunction {
 
         Ok(Self {
             ignore_delete: CoreOptions::new(table_options).ignore_delete(),
+            reduce_singletons: table_options
+                .get("changelog-producer")
+                .is_some_and(|value| value.eq_ignore_ascii_case("lookup")),
             remove_record_on_delete: config.remove_record_on_delete(),
             sequence_group_partial_delete,
             sequence_group_enabled,
@@ -458,8 +561,10 @@ impl MergeFunction for PartialUpdateMergeFunction {
         source_output_col_indices: &[usize],
         output_schema: &SchemaRef,
     ) -> crate::Result<MergeResult> {
-        if let Some(result) = singleton_reducer_result(rows)? {
-            return Ok(result);
+        if !self.reduce_singletons {
+            if let Some(result) = singleton_reducer_result(rows)? {
+                return Ok(result);
+            }
         }
         self.merge_unreduced(rows, batch_buffer, source_output_col_indices, output_schema)
     }
@@ -504,21 +609,20 @@ impl PartialUpdateMergeFunction {
         }
         let mut saw_add = false;
         let mut current_delete_row = false;
-        let mut saw_retract = false;
+        let mut initialized = false;
         let mut latest_row = None;
 
         for row_idx in ordered_row_indices {
             let row = &rows[row_idx];
             let kind = RowKind::from_value(row.value_kind)?;
             if !kind.is_add() {
-                if self.ignore_delete {
+                if self.ignore_delete && !self.reduce_singletons {
                     continue;
                 }
-                latest_row = Some(row);
-                if !saw_add && !saw_retract {
+                if !initialized {
                     // Java initializes the row from the first retract before
-                    // applying sequence-group retractions. That row also
-                    // becomes the DELETE payload when no insert follows.
+                    // checking ignore-delete or applying sequence-group
+                    // retractions. Keep that payload for later sparse updates.
                     Self::replace_with_source(
                         &mut selected_by_col,
                         aggregators.as_mut().map(|guard| guard.as_mut_slice()),
@@ -528,8 +632,12 @@ impl PartialUpdateMergeFunction {
                         source_output_col_indices,
                     )?;
                     group_sequence_rows.fill(Some((row.batch_idx, row.row_idx)));
+                    initialized = true;
                 }
-                saw_retract = true;
+                if self.ignore_delete {
+                    continue;
+                }
+                latest_row = Some(row);
                 if self.sequence_group_enabled {
                     let mut full_delete = false;
                     for (group_idx, group) in self.sequence_groups.iter().enumerate() {
@@ -617,6 +725,7 @@ impl PartialUpdateMergeFunction {
                 });
             }
             saw_add = true;
+            initialized = true;
             if !self.sequence_group_enabled {
                 current_delete_row = false;
             }
@@ -699,17 +808,24 @@ impl PartialUpdateMergeFunction {
             }
         }
 
-        if !saw_add && !saw_retract {
+        if !initialized {
             return Ok(MergeResult::Omit);
         }
         let deleted = current_delete_row || !saw_add;
+        // Ignored legacy retracts seed the value but do not advance Java's
+        // latestSequenceNumber, whose reset value is zero.
+        let ignored_retract_metadata = latest_row.is_none().then(|| MergeRow {
+            sequence_number: 0,
+            ..rows[0].clone()
+        });
+        let latest_row = latest_row.or(ignored_retract_metadata.as_ref()).unwrap();
 
         let output_columns: Vec<ArrayRef> = output_schema
             .fields()
             .iter()
             .enumerate()
             .map(|(output_col_idx, field)| {
-                if let Some(column) = merged_metadata_column(field, latest_row.unwrap(), deleted) {
+                if let Some(column) = merged_metadata_column(field, latest_row, deleted) {
                     return Ok(column);
                 }
                 let column = match aggregators
@@ -834,6 +950,7 @@ pub(crate) struct AggregateMergeFunction {
     /// `Some` holds the aggregator that owns a user value column.
     aggregators: Mutex<Vec<Option<Box<dyn FieldAggregator>>>>,
     remove_record_on_delete: bool,
+    reduce_singletons: bool,
 }
 
 impl AggregateMergeFunction {
@@ -892,6 +1009,9 @@ impl AggregateMergeFunction {
         Ok(Self {
             aggregators: Mutex::new(aggregators),
             remove_record_on_delete: config.remove_record_on_delete(),
+            reduce_singletons: table_options
+                .get("changelog-producer")
+                .is_some_and(|value| value.eq_ignore_ascii_case("lookup")),
         })
     }
 
@@ -1027,8 +1147,10 @@ impl MergeFunction for AggregateMergeFunction {
         source_output_col_indices: &[usize],
         output_schema: &SchemaRef,
     ) -> crate::Result<MergeResult> {
-        if let Some(result) = singleton_reducer_result(rows)? {
-            return Ok(result);
+        if !self.reduce_singletons {
+            if let Some(result) = singleton_reducer_result(rows)? {
+                return Ok(result);
+            }
         }
         let mut ordered: Vec<_> = rows.iter().collect();
         // Stable sorting keeps input order for equal sequences.
@@ -1518,12 +1640,10 @@ fn sort_merge_stream(
                 tree.update(|a, b| compare_cursors(&cursors, a, b).then_with(|| a.cmp(&b)).is_gt());
             }
 
-            match merge_function.merge(
-                &same_key_rows,
-                &batch_buffer,
-                &source_output_col_indices,
-                &output_schema,
-            )? {
+            let (merged, changelog) = merge_function.merge_with_changelog(
+                &same_key_rows, &batch_buffer, &source_output_col_indices, &output_schema,
+            )?;
+            match merged {
                 MergeResult::SourceRow { batch_idx, row_idx } => {
                     output_indices.push((batch_idx, row_idx));
                 }
@@ -1548,6 +1668,20 @@ fn sort_merge_stream(
                     output_indices.push((batch_idx, 0));
                 }
                 MergeResult::Omit | MergeResult::MaterializedDeleteRow(_) => {}
+            }
+
+            if let Some(changelog) = changelog {
+                if changelog.schema().as_ref() != output_schema.as_ref() {
+                    Err(Error::UnexpectedError { message: "Changelog merge result schema does not match merge output schema".into(), source: None })?;
+                }
+                let mut metadata = output_schema.metadata().clone();
+                metadata.insert(CHANGELOG_BATCH_METADATA_KEY.into(), "true".into());
+                yield RecordBatch::try_new(
+                    Arc::new(output_schema.as_ref().clone().with_metadata(metadata)), changelog.columns().to_vec(),
+                ).map_err(|error| Error::DataInvalid { message: format!("Invalid changelog batch: {error}"), source: Some(Box::new(error)) })?;
+            }
+            if output_indices.is_empty() {
+                compact_batch_buffer(&mut batch_buffer, &mut stream_batch_idx, &cursors);
             }
 
             // Yield a batch when we've accumulated enough rows.
