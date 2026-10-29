@@ -28,7 +28,7 @@
 use super::data_file_reader::{file_index_selection_to_local_ranges, DataFileReader};
 use super::sort_merge::{
     AggregateMergeFunction, DeduplicateMergeFunction, FirstRowMergeFunction, LookupMergeFunction,
-    MergeFunction, PartialUpdateMergeFunction, SortMergeReaderBuilder,
+    MergeFunction, PartialUpdateMergeFunction, QueryReducerMergeFunction, SortMergeReaderBuilder,
     CHANGELOG_BATCH_METADATA_KEY, FILE_LEVEL_METADATA_KEY,
 };
 use crate::arrow::format::MosaicPrefetchOptions;
@@ -387,7 +387,9 @@ impl KeyValueFileReader {
                     .get("changelog-producer")
                     .is_some_and(|value| value.eq_ignore_ascii_case("lookup"))
             {
-                Box::new(LookupMergeFunction(inner))
+                Box::new(QueryReducerMergeFunction(Box::new(LookupMergeFunction(
+                    inner,
+                ))))
             } else {
                 inner
             },

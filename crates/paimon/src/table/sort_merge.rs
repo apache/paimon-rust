@@ -228,6 +228,26 @@ impl MergeFunction for LookupMergeFunction {
     }
 }
 
+/// Java queries wrap LookupMergeFunction in ReducerMergeFunctionWrapper, then
+/// drop retract results. The shortcut counts the original inputs, before
+/// lookup discards superseded high-level states. Compaction has no such wrapper.
+pub(super) struct QueryReducerMergeFunction(pub Box<dyn MergeFunction>);
+
+impl MergeFunction for QueryReducerMergeFunction {
+    fn merge(
+        &self,
+        rows: &[MergeRow],
+        batches: &[BufferedBatch],
+        columns: &[usize],
+        schema: &SchemaRef,
+    ) -> crate::Result<MergeResult> {
+        if let Some(result) = singleton_reducer_result(rows)? {
+            return Ok(result);
+        }
+        self.0.merge(rows, batches, columns, schema)
+    }
+}
+
 /// Deduplicate merge: keeps the row with the highest sequence.
 /// When `sequence.field` is configured, compares its typed Arrow row encoding
 /// first, then falls back to system `_SEQUENCE_NUMBER` as tie-breaker.
@@ -325,6 +345,7 @@ impl MergeFunction for FirstRowMergeFunction {
 #[derive(Debug)]
 pub(crate) struct PartialUpdateMergeFunction {
     ignore_delete: bool,
+    reduce_singletons: bool,
     remove_record_on_delete: bool,
     sequence_group_partial_delete: HashSet<usize>,
     sequence_group_enabled: bool,
@@ -401,6 +422,9 @@ impl PartialUpdateMergeFunction {
         PartialUpdateConfig::new(table_options).validate_write_mode(true, table_name)?;
         Ok(Self {
             ignore_delete: CoreOptions::new(table_options).ignore_delete(),
+            reduce_singletons: table_options
+                .get("changelog-producer")
+                .is_some_and(|value| value.eq_ignore_ascii_case("lookup")),
             remove_record_on_delete: PartialUpdateConfig::new(table_options)
                 .remove_record_on_delete(),
             sequence_group_partial_delete: HashSet::new(),
@@ -513,6 +537,9 @@ impl PartialUpdateMergeFunction {
 
         Ok(Self {
             ignore_delete: CoreOptions::new(table_options).ignore_delete(),
+            reduce_singletons: table_options
+                .get("changelog-producer")
+                .is_some_and(|value| value.eq_ignore_ascii_case("lookup")),
             remove_record_on_delete: config.remove_record_on_delete(),
             sequence_group_partial_delete,
             sequence_group_enabled,
@@ -534,8 +561,10 @@ impl MergeFunction for PartialUpdateMergeFunction {
         source_output_col_indices: &[usize],
         output_schema: &SchemaRef,
     ) -> crate::Result<MergeResult> {
-        if let Some(result) = singleton_reducer_result(rows)? {
-            return Ok(result);
+        if !self.reduce_singletons {
+            if let Some(result) = singleton_reducer_result(rows)? {
+                return Ok(result);
+            }
         }
         self.merge_unreduced(rows, batch_buffer, source_output_col_indices, output_schema)
     }
@@ -580,21 +609,20 @@ impl PartialUpdateMergeFunction {
         }
         let mut saw_add = false;
         let mut current_delete_row = false;
-        let mut saw_retract = false;
+        let mut initialized = false;
         let mut latest_row = None;
 
         for row_idx in ordered_row_indices {
             let row = &rows[row_idx];
             let kind = RowKind::from_value(row.value_kind)?;
             if !kind.is_add() {
-                if self.ignore_delete {
+                if self.ignore_delete && !self.reduce_singletons {
                     continue;
                 }
-                latest_row = Some(row);
-                if !saw_add && !saw_retract {
+                if !initialized {
                     // Java initializes the row from the first retract before
-                    // applying sequence-group retractions. That row also
-                    // becomes the DELETE payload when no insert follows.
+                    // checking ignore-delete or applying sequence-group
+                    // retractions. Keep that payload for later sparse updates.
                     Self::replace_with_source(
                         &mut selected_by_col,
                         aggregators.as_mut().map(|guard| guard.as_mut_slice()),
@@ -604,8 +632,12 @@ impl PartialUpdateMergeFunction {
                         source_output_col_indices,
                     )?;
                     group_sequence_rows.fill(Some((row.batch_idx, row.row_idx)));
+                    initialized = true;
                 }
-                saw_retract = true;
+                if self.ignore_delete {
+                    continue;
+                }
+                latest_row = Some(row);
                 if self.sequence_group_enabled {
                     let mut full_delete = false;
                     for (group_idx, group) in self.sequence_groups.iter().enumerate() {
@@ -693,6 +725,7 @@ impl PartialUpdateMergeFunction {
                 });
             }
             saw_add = true;
+            initialized = true;
             if !self.sequence_group_enabled {
                 current_delete_row = false;
             }
@@ -775,17 +808,24 @@ impl PartialUpdateMergeFunction {
             }
         }
 
-        if !saw_add && !saw_retract {
+        if !initialized {
             return Ok(MergeResult::Omit);
         }
         let deleted = current_delete_row || !saw_add;
+        // Ignored legacy retracts seed the value but do not advance Java's
+        // latestSequenceNumber, whose reset value is zero.
+        let ignored_retract_metadata = latest_row.is_none().then(|| MergeRow {
+            sequence_number: 0,
+            ..rows[0].clone()
+        });
+        let latest_row = latest_row.or(ignored_retract_metadata.as_ref()).unwrap();
 
         let output_columns: Vec<ArrayRef> = output_schema
             .fields()
             .iter()
             .enumerate()
             .map(|(output_col_idx, field)| {
-                if let Some(column) = merged_metadata_column(field, latest_row.unwrap(), deleted) {
+                if let Some(column) = merged_metadata_column(field, latest_row, deleted) {
                     return Ok(column);
                 }
                 let column = match aggregators
@@ -910,6 +950,7 @@ pub(crate) struct AggregateMergeFunction {
     /// `Some` holds the aggregator that owns a user value column.
     aggregators: Mutex<Vec<Option<Box<dyn FieldAggregator>>>>,
     remove_record_on_delete: bool,
+    reduce_singletons: bool,
 }
 
 impl AggregateMergeFunction {
@@ -968,6 +1009,9 @@ impl AggregateMergeFunction {
         Ok(Self {
             aggregators: Mutex::new(aggregators),
             remove_record_on_delete: config.remove_record_on_delete(),
+            reduce_singletons: table_options
+                .get("changelog-producer")
+                .is_some_and(|value| value.eq_ignore_ascii_case("lookup")),
         })
     }
 
@@ -1103,8 +1147,10 @@ impl MergeFunction for AggregateMergeFunction {
         source_output_col_indices: &[usize],
         output_schema: &SchemaRef,
     ) -> crate::Result<MergeResult> {
-        if let Some(result) = singleton_reducer_result(rows)? {
-            return Ok(result);
+        if !self.reduce_singletons {
+            if let Some(result) = singleton_reducer_result(rows)? {
+                return Ok(result);
+            }
         }
         let mut ordered: Vec<_> = rows.iter().collect();
         // Stable sorting keeps input order for equal sequences.

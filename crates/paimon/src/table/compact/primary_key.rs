@@ -103,12 +103,12 @@ impl MergeFunction for CompactDeduplicate {
     }
 }
 
-/// The query reader omits singleton retracts and materialized DELETE rows.
-/// Compaction persists these states so later inserts/retractions merge exactly
-/// as they would against the original files. Singletons remain unreduced, as
-/// in Java's reducer wrapper; compound records use the existing engine reducer.
+/// Ordinary compaction preserves singleton states as Java's reducer wrapper
+/// does. Lookup compaction always runs the reducer, including for one retract.
+/// Persist synthesized DELETEs when their state can safely be replayed.
 struct CompactReducer {
     inner: Box<dyn MergeFunction>,
+    reduce_singletons: bool,
     reject_delete_state: bool,
     reject_retract_group: bool,
 }
@@ -121,14 +121,19 @@ impl MergeFunction for CompactReducer {
         columns: &[usize],
         schema: &SchemaRef,
     ) -> Result<MergeResult> {
-        if let [row] = rows {
-            RowKind::from_value(row.value_kind)?;
-            return Ok(MergeResult::SourceRow {
-                batch_idx: row.batch_idx,
-                row_idx: row.row_idx,
-            });
+        if !self.reduce_singletons {
+            if let [row] = rows {
+                RowKind::from_value(row.value_kind)?;
+                return Ok(MergeResult::SourceRow {
+                    batch_idx: row.batch_idx,
+                    row_idx: row.row_idx,
+                });
+            }
         }
-        if self.reject_retract_group && rows.iter().any(|row| matches!(row.value_kind, 1 | 3)) {
+        if rows.len() > 1
+            && self.reject_retract_group
+            && rows.iter().any(|row| matches!(row.value_kind, 1 | 3))
+        {
             // Some aggregators preserve flags or raw DELETE payloads that a
             // single physical INSERT/DELETE cannot encode, even if the final
             // merged row is an INSERT. Leave this group in its source files.
@@ -137,7 +142,7 @@ impl MergeFunction for CompactReducer {
             });
         }
         Ok(match self.inner.merge(rows, batches, columns, schema)? {
-            MergeResult::MaterializedDeleteRow(_) if self.reject_delete_state => {
+            MergeResult::MaterializedDeleteRow(_) if self.reject_delete_state && rows.len() > 1 => {
                 // A partial-update reducer initializes from the first retract
                 // and then retracts its payload. Replaying an accumulated
                 // DELETE can cancel its own state. First-value aggregators
@@ -197,7 +202,14 @@ fn new_merge_function(
     } else {
         Box::new(CompactReducer {
             inner,
+            // LookupMergeFunction always invokes the underlying reducer, even
+            // for one retract. The ordinary reducer wrapper keeps singletons.
+            reduce_singletons: config
+                .table_options
+                .get("changelog-producer")
+                .is_some_and(|value| value.eq_ignore_ascii_case("lookup")),
             reject_delete_state: config.merge_engine == MergeEngine::PartialUpdate
+                && !crate::spec::CoreOptions::new(&config.table_options).ignore_delete()
                 && !aggregate_functions.is_empty(),
             reject_retract_group: !(config.merge_engine == MergeEngine::PartialUpdate
                 && crate::spec::CoreOptions::new(&config.table_options).ignore_delete())

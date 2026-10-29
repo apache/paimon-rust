@@ -133,9 +133,9 @@ state, including original sequence metadata and synthesized DELETE records:
 - `partial-update` combines sparse columns using the configured sequence
   groups and field aggregators. Delete payloads and group sequence values are
   preserved so subsequent sparse updates can continue from that state.
-- `aggregation` writes the engine's field accumulators. Singleton records
-  remain unreduced, including retracts; compound DELETE states are preserved
-  rather than being discarded as they are by the query reader.
+- `aggregation` writes the engine's field accumulators. With `none` or `input`,
+  singleton records remain unreduced, including retracts; compound DELETE states
+  are preserved rather than being discarded as they are by the query reader.
 
 The existing engine rules for ignored deletes, unsupported retracts and
 whole-record deletion also apply during compaction. If all records are
@@ -194,9 +194,14 @@ changes only for keys with L0 input:
 - No live history and no live result: no changelog.
 
 Before images retain the historical sequence metadata; after images carry the
-merged result's metadata. `first-row` emits only inserts for previously unseen
-keys. `partial-update` and `aggregation` use their existing reducers and state
-preservation restrictions. History selection precedes merging.
+merged result's metadata. `first-row` emits the first accepted add for previously
+unseen keys, preserving its `INSERT` or `UPDATE_AFTER` kind. It considers all
+input levels when choosing the earliest record. `partial-update` and `aggregation`
+always run the reducer in lookup mode, including singleton retracts, as Java does.
+For example, lookup compaction turns a lone `DELETE(value=5)` with `sum` into
+live state `-5` when `aggregation.remove-record-on-delete=false`; an ordinary
+query still omits that singleton retract before compaction. Existing state
+preservation restrictions still apply. History selection precedes merging.
 
 Java-compatible options have these defaults:
 
