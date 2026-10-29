@@ -26,6 +26,9 @@ mod lookup_changelog_tests;
 #[path = "pk_compact/incremental_planning.rs"]
 mod incremental_planning_tests;
 
+#[path = "pk_compact/incremental_lookup.rs"]
+mod incremental_lookup_tests;
+
 #[path = "pk_compact/dynamic_bucket.rs"]
 mod dynamic_tests;
 

@@ -4654,6 +4654,7 @@ dependencies = [
  "arrow-array",
  "arrow-buffer",
  "arrow-cast",
+ "arrow-ipc",
  "arrow-json",
  "arrow-ord",
  "arrow-row",

@@ -16,6 +16,8 @@
 // under the License.
 
 pub(super) mod lookup;
+pub(super) mod lookup_file;
+pub(super) mod lookup_store;
 pub(in crate::table) mod planner;
 
 use std::sync::Arc;
@@ -35,7 +37,7 @@ use crate::table::data_file_path_factory::DataFilePathFactory;
 use crate::table::kv_data_file_writer::{KeyValueFileOptions, KeyValueRollingWriter};
 use crate::table::kv_file_reader::{KeyValueFileReader, KeyValueReadConfig};
 use crate::table::sort_merge::{
-    compare_sequence_order, BufferedBatch, MergeFunction, MergeResult, MergeRow,
+    compare_sequence_order, BufferedBatch, LookupProvider, MergeFunction, MergeResult, MergeRow,
     CHANGELOG_BATCH_METADATA_KEY,
 };
 use crate::table::table_read::{
@@ -44,7 +46,7 @@ use crate::table::table_read::{
 use crate::table::{DataSplit, Plan, Table};
 use crate::Result;
 
-/// Use incremental sorted runs when merging subsets does not need history lookup.
+/// Select incremental sorted runs for supported merge modes.
 pub(super) struct PrimaryKeyCompactPlanner;
 
 impl PrimaryKeyCompactPlanner {
@@ -263,23 +265,17 @@ fn read_type(table: &Table) -> Vec<DataField> {
     fields
 }
 
-pub(super) async fn execute(
-    table: &Table,
-    task: &CompactTask,
-    split: &DataSplit,
-    resources: Option<ResourceContext>,
-) -> Result<(Vec<DataFileMeta>, Vec<DataFileMeta>)> {
+fn new_reader(table: &Table, resources: Option<ResourceContext>) -> Result<KeyValueFileReader> {
     let schema = table.schema();
     let options = schema.core_options();
     let merge_engine = options.merge_engine()?;
-    let lookup_changelog = options.try_changelog_producer()? == ChangelogProducer::Lookup;
     let read_type = read_type(table);
     let budget = configured_parquet_read_budget(table)?;
     let budget = match &resources {
         Some(resources) => Arc::new(budget.with_resources(resources.clone()).without_prefetch()),
         None => Arc::new(budget.without_prefetch()),
     };
-    let reader = KeyValueFileReader::new(
+    Ok(KeyValueFileReader::new(
         table.file_io().clone(),
         KeyValueReadConfig {
             table_name: table.identifier().full_name(),
@@ -303,7 +299,20 @@ pub(super) async fn execute(
             parquet_read_budget: Some(budget),
             mosaic_prefetch: configured_mosaic_prefetch(table)?,
         },
-    );
+    ))
+}
+
+pub(super) async fn execute(
+    table: &Table,
+    task: &CompactTask,
+    split: &DataSplit,
+    resources: Option<ResourceContext>,
+    lookup: Option<Arc<dyn LookupProvider>>,
+) -> Result<(Vec<DataFileMeta>, Vec<DataFileMeta>)> {
+    let schema = table.schema();
+    let options = schema.core_options();
+    let lookup_changelog = options.try_changelog_producer()? == ChangelogProducer::Lookup;
+    let reader = new_reader(table, resources.clone())?.with_lookup(lookup);
     let mut batches =
         reader.read_with_merge_function(std::slice::from_ref(split), move |config, fields| {
             if lookup_changelog {

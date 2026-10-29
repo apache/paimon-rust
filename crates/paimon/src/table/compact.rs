@@ -111,14 +111,10 @@ impl<'a> CompactBuilder<'a> {
     /// Executor resources are local; input files and output settings come from each task.
     pub fn new_executor(&self) -> Result<CompactExecutor> {
         ensure_supported(self.table)?;
-        if self
-            .table
-            .schema()
-            .core_options()
-            .try_changelog_producer()?
-            == ChangelogProducer::Lookup
-            && self.table.file_io().local_cache().is_none()
-        {
+        let options = self.table.schema().core_options();
+        let lookup = options.try_changelog_producer()? == ChangelogProducer::Lookup;
+        let local_cache = self.table.file_io().local_cache();
+        if lookup && local_cache.is_none() {
             return Err(Error::ConfigInvalid {
                 message:
                     "Lookup compaction requires local-cache.enabled=true on the catalog/FileIO"
@@ -128,6 +124,14 @@ impl<'a> CompactBuilder<'a> {
         Ok(CompactExecutor {
             table: self.table.clone(),
             resources: self.resources.clone(),
+            lookup_cache: if lookup && options.merge_engine()? == MergeEngine::Deduplicate {
+                Some(Arc::new(primary_key::lookup_file::LookupFileCache::new(
+                    local_cache.expect("lookup cache validated above"),
+                    self.table.schema().options(),
+                )?))
+            } else {
+                None
+            },
         })
     }
 
@@ -282,6 +286,7 @@ impl CompactPlanner {
 pub struct CompactExecutor {
     table: Table,
     resources: Option<ResourceContext>,
+    lookup_cache: Option<Arc<primary_key::lookup_file::LookupFileCache>>,
 }
 
 /// Prepared files owned by the caller until submitted to `TableCommit::commit_compact`.
@@ -394,8 +399,33 @@ impl CompactExecutor {
             });
         }
         if task.is_primary_key() {
+            let lookup = if let Some(cache) = &self.lookup_cache {
+                let history = active
+                    .iter()
+                    .filter(|entry| {
+                        entry.partition() == task.partition
+                            && entry.bucket() == task.bucket
+                            && entry.total_buckets() == task.total_buckets
+                            && entry.file().level > task.output_level()
+                    })
+                    .map(|entry| entry.file().clone())
+                    .collect::<Vec<_>>();
+                if history.is_empty() {
+                    None
+                } else {
+                    Some(primary_key::lookup_store::provider(
+                        &table,
+                        &split,
+                        history,
+                        cache.clone(),
+                        self.resources.clone(),
+                    )?)
+                }
+            } else {
+                None
+            };
             let (files, changelog_files) =
-                primary_key::execute(&table, task, &split, self.resources.clone()).await?;
+                primary_key::execute(&table, task, &split, self.resources.clone(), lookup).await?;
             return Ok(CompactResult {
                 task: task.clone(),
                 files,
@@ -765,11 +795,17 @@ pub(super) fn prepare_results(table: &Table, results: &[CompactResult]) -> Resul
             ));
         }
         let mut changelog_rows = 0u64;
+        let changelog_level = output_level.unwrap_or_else(|| {
+            result
+                .files
+                .first()
+                .map_or_else(|| task.output_level(), |file| file.level)
+        });
         for file in &result.changelog_files {
             validate_file(file, true)?;
             if file.schema_id != task.context.schema.id()
                 || file.file_source != Some(1)
-                || file.level != task.output_level()
+                || file.level != changelog_level
                 || file
                     .delete_row_count
                     .is_none_or(|count| count > file.row_count)

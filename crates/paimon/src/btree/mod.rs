@@ -54,6 +54,7 @@ mod writer;
 pub use block::BlockCompressionType;
 pub(crate) use block::{
     compress_block, compress_codec_block, compute_crc32, decompress_block, decompress_codec_block,
+    BlockHandle, BlockReader,
 };
 pub use composite_key::serialize_composite_key;
 pub(crate) use composite_key::CompositeKeyCodec;
@@ -64,6 +65,7 @@ pub use key_serde::{make_key_comparator, serialize_datum};
 pub use meta::BTreeIndexMeta;
 pub use query::IndexQuery;
 pub use reader::BTreeIndexReader;
+pub(crate) use sst_file::{read_block_from_bytes, SstFileWriter};
 pub use writer::BTreeIndexWriter;
 
 #[cfg(test)]
