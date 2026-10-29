@@ -193,7 +193,7 @@ impl DataEvolutionCompactPlanner {
                     bucket,
                     total_buckets,
                     files,
-                    primary_key: None,
+                    output_level: None,
                 });
             }
         }

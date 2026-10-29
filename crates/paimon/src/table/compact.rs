@@ -209,7 +209,7 @@ pub struct CompactTask {
     total_buckets: i32,
     files: Vec<DataFileMeta>,
     #[serde(default)]
-    primary_key: Option<primary_key::planner::PrimaryKeyTask>,
+    output_level: Option<i32>,
 }
 
 impl CompactTask {
@@ -470,8 +470,8 @@ impl CompactTask {
     }
 
     fn output_level(&self) -> i32 {
-        if let Some(selection) = &self.primary_key {
-            return selection.output_level;
+        if let Some(output_level) = self.output_level {
+            return output_level;
         }
         if self.is_primary_key() {
             self.files
@@ -513,7 +513,7 @@ impl CompactTask {
                 self.context.schema.options(),
             )?
             .ok_or_else(|| invalid("No incremental PK compaction is eligible"))?;
-            if selected.0 != self.files || Some(&selected.1) != self.primary_key.as_ref() {
+            if selected.0 != self.files || Some(selected.1) != self.output_level {
                 return Err(invalid(
                     "PK compaction inputs do not match incremental run selection",
                 ));
@@ -553,9 +553,8 @@ impl CompactTask {
         // captured inputs are validated. Uncommitted tasks still need the
         // exact incremental selection in validate_inputs.
         if self
-            .primary_key
-            .as_ref()
-            .is_some_and(|task| !incremental || task.output_level <= 0)
+            .output_level
+            .is_some_and(|output_level| !incremental || output_level <= 0)
         {
             return Err(invalid("Invalid incremental PK compaction selection"));
         }

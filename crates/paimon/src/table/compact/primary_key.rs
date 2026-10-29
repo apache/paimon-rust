@@ -59,7 +59,7 @@ impl PrimaryKeyCompactPlanner {
                 validate_file(file, true)?;
             }
             if planner::enabled(&context.schema)? {
-                if let Some((files, primary_key)) =
+                if let Some((files, output_level)) =
                     planner::select(files, context.schema.options())?
                 {
                     tasks.push(CompactTask {
@@ -69,7 +69,7 @@ impl PrimaryKeyCompactPlanner {
                         bucket,
                         total_buckets,
                         files,
-                        primary_key: Some(primary_key),
+                        output_level: Some(output_level),
                     });
                 }
                 continue;
@@ -88,7 +88,7 @@ impl PrimaryKeyCompactPlanner {
                     bucket,
                     total_buckets,
                     files,
-                    primary_key: None,
+                    output_level: None,
                 });
             }
         }

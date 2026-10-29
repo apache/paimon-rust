@@ -21,13 +21,7 @@
 
 use crate::spec::{ChangelogProducer, DataFileMeta, MergeEngine, TableSchema};
 use crate::{Error, Result};
-use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(in crate::table) struct PrimaryKeyTask {
-    pub output_level: i32,
-}
 
 pub(in crate::table::compact) fn enabled(schema: &TableSchema) -> Result<bool> {
     let options = schema.core_options();
@@ -64,7 +58,7 @@ fn number(
 pub(in crate::table::compact) fn select(
     files: Vec<DataFileMeta>,
     properties: &std::collections::HashMap<String, String>,
-) -> Result<Option<(Vec<DataFileMeta>, PrimaryKeyTask)>> {
+) -> Result<Option<(Vec<DataFileMeta>, i32)>> {
     let trigger = number(properties, "num-sorted-run.compaction-trigger", 5, 1)?;
     let configured_levels = number(properties, "num-levels", trigger.saturating_add(1), 2)?;
     let levels = configured_levels.max(
@@ -158,7 +152,7 @@ pub(in crate::table::compact) fn select(
     if selected.len() == 1 && selected[0].level == output_level {
         return Ok(None);
     }
-    Ok(Some((selected, PrimaryKeyTask { output_level })))
+    Ok(Some((selected, output_level)))
 }
 
 fn pick_for_size_ratio(
@@ -217,7 +211,7 @@ mod tests {
     }
     #[test]
     fn java_force_l0_stops_before_a_large_higher_level_and_outputs_below_it() {
-        let (selected, task) = select(
+        let (selected, output_level) = select(
             vec![file("new", 0, 1), file("anchor", 5, 1000)],
             &HashMap::new(),
         )
@@ -230,8 +224,8 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["new"]
         );
-        assert_eq!(task.output_level, 4);
-        let (selected, task) = select(
+        assert_eq!(output_level, 4);
+        let (selected, output_level) = select(
             vec![
                 file("new", 0, 1),
                 file("l1", 1, 100),
@@ -246,7 +240,7 @@ mod tests {
             2,
             "Java always consumes L1 rather than outputting L0"
         );
-        assert_eq!(task.output_level, 4);
+        assert_eq!(output_level, 4);
     }
     #[test]
     fn positive_run_count_and_size_amplification_trigger_incremental_maintenance() {
@@ -259,7 +253,7 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        let (selected, task) = select(
+        let (selected, output_level) = select(
             vec![
                 file("small", 3, 1),
                 file("medium", 4, 10),
@@ -270,8 +264,8 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(selected.len(), 2);
-        assert_eq!(task.output_level, 4);
-        let (selected, task) = select(
+        assert_eq!(output_level, 4);
+        let (selected, output_level) = select(
             vec![
                 file("large", 1, 1000),
                 file("other", 3, 1000),
@@ -282,7 +276,7 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(selected.len(), 3);
-        assert_eq!(task.output_level, 5);
+        assert_eq!(output_level, 5);
     }
 
     #[test]
@@ -307,7 +301,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["newer-l0", "older-l0", "a", "b"]
         );
-        assert_eq!(expected.1.output_level, 4);
+        assert_eq!(expected.1, 4);
         let reversed = files.into_iter().rev().collect();
         assert_eq!(
             select(reversed, &HashMap::new()).unwrap().unwrap(),
@@ -362,22 +356,22 @@ mod tests {
             )
             .unwrap();
             if merge {
-                let (files, task) = selected.unwrap();
+                let (files, output_level) = selected.unwrap();
                 assert_eq!(files.len(), 2);
-                assert_eq!(task.output_level, 4);
+                assert_eq!(output_level, 4);
             } else {
                 assert!(selected.is_none());
             }
         }
         // Arithmetic must not overflow when byte sizes exceed i64 percentages.
-        let (files, task) = select(
+        let (files, output_level) = select(
             vec![file("first", 0, i64::MAX), file("old", 5, i64::MAX)],
             &HashMap::new(),
         )
         .unwrap()
         .unwrap();
         assert_eq!(files.len(), 2);
-        assert_eq!(task.output_level, 5);
+        assert_eq!(output_level, 5);
     }
 
     #[test]
@@ -387,12 +381,12 @@ mod tests {
             .unwrap()
             .is_none());
         let options = HashMap::from([("num-levels".into(), "3".into())]);
-        let (_, task) = select(vec![file("new", 0, 1)], &options).unwrap().unwrap();
-        assert_eq!(task.output_level, 2);
-        let (_, task) = select(vec![file("new", 0, 100), file("old", 8, 1)], &options)
+        let (_, output_level) = select(vec![file("new", 0, 1)], &options).unwrap().unwrap();
+        assert_eq!(output_level, 2);
+        let (_, output_level) = select(vec![file("new", 0, 100), file("old", 8, 1)], &options)
             .unwrap()
             .unwrap();
-        assert_eq!(task.output_level, 8, "existing higher levels remain valid");
+        assert_eq!(output_level, 8, "existing higher levels remain valid");
     }
 
     #[test]
@@ -416,7 +410,7 @@ mod tests {
 
     #[test]
     fn normal_maintenance_takes_precedence_over_forcing_l0() {
-        let (files, task) = select(
+        let (files, output_level) = select(
             vec![
                 file("new", 0, 1),
                 file("l2", 2, 1000),
@@ -433,10 +427,10 @@ mod tests {
             5,
             "space amplification must run even when L0 exists"
         );
-        assert_eq!(task.output_level, 5);
+        assert_eq!(output_level, 5);
 
         let options = HashMap::from([("num-sorted-run.compaction-trigger".into(), "2".into())]);
-        let (files, task) = select(
+        let (files, output_level) = select(
             vec![
                 file("new", 0, 1),
                 file("small", 3, 100),
@@ -451,13 +445,13 @@ mod tests {
             2,
             "run-count maintenance must precede forced L0 progress"
         );
-        assert_eq!(task.output_level, 4);
+        assert_eq!(output_level, 4);
     }
 
     #[test]
     fn large_run_size_ratio_matches_java_double_threshold() {
         let options = HashMap::from([("num-sorted-run.compaction-trigger".into(), "2".into())]);
-        let (files, task) = select(
+        let (files, output_level) = select(
             vec![
                 file("newer", 2, 100_000_000_000_099),
                 file("older", 5, 101_000_000_000_100),
@@ -467,6 +461,6 @@ mod tests {
         .unwrap()
         .expect("Java rounds the 1% threshold up to the older run's size");
         assert_eq!(files.len(), 2);
-        assert_eq!(task.output_level, 5);
+        assert_eq!(output_level, 5);
     }
 }

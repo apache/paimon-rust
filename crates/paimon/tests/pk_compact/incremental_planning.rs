@@ -200,6 +200,9 @@ async fn incremental_selection_is_validated_for_execution_and_commit() {
     let plan = builder.new_planner().unwrap().plan().await.unwrap();
     let captured = plan.snapshot_id();
     let results = execute(&table, &plan).await;
+    let task_json = serde_json::to_value(&plan.tasks()[0]).unwrap();
+    assert_eq!(task_json["output_level"], 4);
+    assert!(task_json.get("primary_key").is_none());
     for mutation in [
         "omit-input",
         "include-history",
@@ -214,13 +217,13 @@ async fn incremental_selection_is_validated_for_execution_and_commit() {
                 .as_array_mut()
                 .unwrap()
                 .push(serde_json::to_value(&anchor).unwrap()),
-            "output-level" => task["primary_key"]["output_level"] = 5.into(),
+            "output-level" => task["output_level"] = 5.into(),
             "missing-selection" => {
-                task.as_object_mut().unwrap().remove("primary_key");
+                task.as_object_mut().unwrap().remove("output_level");
             }
             _ => unreachable!(),
         };
-        let mut encoded = serde_json::to_value(&plan.tasks()[0]).unwrap();
+        let mut encoded = task_json.clone();
         mutate(&mut encoded);
         let task: CompactTask = serde_json::from_value(encoded).unwrap();
         assert!(
@@ -371,7 +374,7 @@ async fn legacy_completed_results_recover_but_uncommitted_tasks_require_replanni
     legacy[0]["task"]
         .as_object_mut()
         .unwrap()
-        .remove("primary_key");
+        .remove("output_level");
     let legacy: Vec<CompactResult> = serde_json::from_value(legacy).unwrap();
     let committer = builder.new_commit().unwrap();
     assert!(committer.commit_compact(legacy.clone()).await.is_err());
