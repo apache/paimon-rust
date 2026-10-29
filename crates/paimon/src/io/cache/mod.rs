@@ -17,6 +17,7 @@
 
 mod disk;
 mod file_type;
+pub(crate) mod generated;
 mod memory;
 mod priority_lru;
 mod reader;

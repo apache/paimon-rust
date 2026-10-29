@@ -29,7 +29,7 @@ pub(in crate::table::compact) fn enabled(schema: &TableSchema) -> Result<bool> {
         && !options.deletion_vectors_enabled()
         && matches!(
             options.try_changelog_producer()?,
-            ChangelogProducer::None | ChangelogProducer::Input
+            ChangelogProducer::None | ChangelogProducer::Input | ChangelogProducer::Lookup
         ))
 }
 

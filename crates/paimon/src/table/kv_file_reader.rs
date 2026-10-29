@@ -64,6 +64,7 @@ pub(crate) struct KeyValueFileReader {
     /// filter using the full `config.predicates` instead.
     pushdown_predicates: Vec<Predicate>,
     include_file_levels: bool,
+    lookup: Option<Arc<dyn super::sort_merge::LookupProvider>>,
     #[cfg(test)]
     input_batch_sizes: Option<std::sync::Arc<std::sync::Mutex<Vec<usize>>>>,
 }
@@ -360,10 +361,20 @@ impl KeyValueFileReader {
             file_io,
             config,
             include_file_levels,
+            lookup: None,
             pushdown_predicates,
             #[cfg(test)]
             input_batch_sizes: None,
         }
+    }
+
+    pub(super) fn with_lookup(
+        mut self,
+        lookup: Option<Arc<dyn super::sort_merge::LookupProvider>>,
+    ) -> Self {
+        self.include_file_levels |= lookup.is_some();
+        self.lookup = lookup;
+        self
     }
 
     #[cfg(test)]
@@ -680,6 +691,7 @@ impl KeyValueFileReader {
         };
         let file_io = self.file_io;
         let include_file_levels = self.include_file_levels;
+        let lookup = self.lookup;
         let config = self.config;
         let table_schema_id = config.table_schema_id;
         let pushdown_predicates = self.pushdown_predicates;
@@ -865,6 +877,7 @@ impl KeyValueFileReader {
                         merge_output_schema.clone(),
                         merge_function(&config, &merge_output_fields)?,
                     )
+                    .with_lookup(lookup.clone())
                     .with_user_sequence_descending(
                         !CoreOptions::new(&config.table_options)
                             .sequence_field_sort_order_is_ascending(),

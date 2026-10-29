@@ -92,6 +92,18 @@ impl SstFileWriter {
         writer
     }
 
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.data_block_writer
+            .memory()
+            .saturating_add(self.index_block_writer.memory())
+            .saturating_add(
+                self.bloom_hashes
+                    .as_ref()
+                    .map_or(0, |hashes| hashes.capacity() * 4),
+            )
+            .saturating_add(self.last_key.as_ref().map_or(0, Vec::capacity))
+    }
+
     /// Current write position in the output.
     pub fn position(&self) -> u64 {
         self.bytes_written
