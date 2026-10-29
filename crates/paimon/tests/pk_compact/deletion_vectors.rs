@@ -522,3 +522,71 @@ async fn dv_planning_checks_persisted_schema_even_when_its_id_matches_current_op
         "{error}"
     );
 }
+
+#[tokio::test]
+async fn dv_repeated_updates_keep_one_bucket_container_and_old_snapshot_masks() {
+    for bucket in ["1", "-1"] {
+        let table = dv_table(&[("bucket", bucket)]).await;
+        let anchor = seed(&table).await;
+        // Keep this intermediate run larger than the next L0 file, so the
+        // planner looks it up rather than selecting it for a rewrite.
+        write_batch(
+            &table,
+            &make_batch((0..256).collect(), (4200..4456).collect()),
+        )
+        .await;
+        let first = compact(&table).await;
+        let intermediate = first[0].files()[0].clone();
+        assert_eq!(intermediate.row_count, 256);
+        let previous = latest(&table).await;
+        let previous_rows = rows(&table).await;
+        write_batch(&table, &make_batch(vec![42], vec![4201])).await;
+        compact(&table).await;
+
+        let vectors = indexes(&table)
+            .await
+            .into_iter()
+            .filter(|entry| entry.index_file.index_type == "DELETION_VECTORS")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            vectors.len(),
+            1,
+            "Java combines DV entries by bucket: {bucket}"
+        );
+        assert_eq!(
+            positions(&table, &anchor.file_name)
+                .await
+                .iter()
+                .collect::<Vec<_>>(),
+            (0..256).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            positions(&table, &intermediate.file_name)
+                .await
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![42]
+        );
+        assert_eq!(
+            rows(&table).await,
+            (0..1000)
+                .map(|key| {
+                    (
+                        key,
+                        if key == 42 {
+                            4201
+                        } else if key < 256 {
+                            key + 4200
+                        } else {
+                            key
+                        },
+                    )
+                })
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            rows(&table.copy_with_pinned_snapshot(Some(&previous))).await,
+            previous_rows
+        );
+    }
+}

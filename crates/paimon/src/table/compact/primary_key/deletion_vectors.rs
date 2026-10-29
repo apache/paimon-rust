@@ -103,6 +103,22 @@ fn resolve_vector(table: &Table, bucket_path: &str, reference: &VectorReference)
     )
 }
 
+async fn read_bitmap(
+    table: &Table,
+    path: &str,
+    reference: Option<&VectorReference>,
+) -> Result<RoaringBitmap> {
+    match reference {
+        Some(reference) => Ok(DeletionVectorFactory::read(
+            table.file_io(),
+            &resolve_vector(table, path, reference),
+        )
+        .await?
+        .to_bitmap()),
+        None => Ok(RoaringBitmap::new()),
+    }
+}
+
 fn bucket_path(table: &Table, partition: &[u8], bucket: i32) -> Result<String> {
     let schema = table.schema();
     let options = schema.core_options();
@@ -176,13 +192,20 @@ pub(in crate::table) async fn validate_dependencies(
             )
         })
         .collect::<HashSet<_>>();
-    if selected
-        .iter()
-        .any(|id| captured_vectors.get(id) != latest_vectors.get(id))
-    {
-        return Err(super::super::invalid(
-            "Compaction input deletion vectors changed; create a new plan",
-        ));
+    for id in &selected {
+        let before = captured_vectors.get(id);
+        let after = latest_vectors.get(id);
+        if before == after {
+            continue;
+        }
+        // Updating another range can repack this mask into a new immutable
+        // container without changing any selected physical row.
+        let path = bucket_path(table, &id.0, id.1)?;
+        if read_bitmap(table, &path, before).await? != read_bitmap(table, &path, after).await? {
+            return Err(super::super::invalid(
+                "Compaction input deletion vectors changed; create a new plan",
+            ));
+        }
     }
     let manager = table.snapshot_manager();
     let captured_files =
@@ -275,7 +298,7 @@ pub(in crate::table) async fn validate_dependencies(
 }
 
 /// Rebase changes on the latest index manifest once per CAS attempt. Rewriting
-/// one range also preserves every other range sharing its immutable container.
+/// an affected bucket produces one container, including all its retained ranges.
 pub(in crate::table) async fn rewrite_indexes(
     table: &Table,
     latest: &Snapshot,
@@ -317,17 +340,7 @@ pub(in crate::table) async fn rewrite_indexes(
         let key = (entry.partition.clone(), entry.bucket);
         let touched = entry.kind == FileKind::Add
             && entry.index_file.index_type == "DELETION_VECTORS"
-            && buckets.get(&key).is_some_and(|(rewritten, additions)| {
-                entry
-                    .index_file
-                    .deletion_vectors_ranges
-                    .as_ref()
-                    .is_some_and(|ranges| {
-                        ranges
-                            .keys()
-                            .any(|name| rewritten.contains(name) || additions.contains_key(name))
-                    })
-            });
+            && buckets.contains_key(&key);
         if !touched {
             retained.push(entry);
             continue;
@@ -344,7 +357,7 @@ pub(in crate::table) async fn rewrite_indexes(
         let path = bucket_path(table, &key.0, key.1)?;
         let mut vectors = IndexMap::<String, RoaringBitmap>::new();
         for entry in previous.into_iter().flatten() {
-            for (name, meta) in entry.index_file.deletion_vectors_ranges.as_ref().unwrap() {
+            for (name, meta) in entry.index_file.deletion_vectors_ranges.iter().flatten() {
                 let reference = (
                     entry.index_file.file_name.clone(),
                     entry.index_file.external_path.clone(),

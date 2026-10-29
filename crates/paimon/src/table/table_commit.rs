@@ -1352,7 +1352,43 @@ impl TableCommit {
                 }
                 return Ok(CommitAttemptResult::Success);
             }
-            Ok(false) => None,
+            Ok(false) => {
+                if !self.data_evolution_enabled
+                    && self.deletion_vectors_enabled
+                    && resolved.kind == CommitKind::COMPACT
+                {
+                    // Only this attempt's generated DV files are definitely
+                    // unpublished. Prepared data/changelogs and old shared
+                    // containers still belong to the caller or prior snapshots.
+                    let created = created_files
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<HashSet<_>>();
+                    for entry in resolved
+                        .new_index_manifest_entries
+                        .iter()
+                        .flatten()
+                        .filter(|entry| entry.index_file.index_type == DELETION_VECTORS_INDEX_TYPE)
+                    {
+                        let Ok(bucket) = self.bucket_path(&entry.partition, entry.bucket) else {
+                            continue;
+                        };
+                        let path = committed_index_file_path(
+                            self.table.location(),
+                            &bucket,
+                            self.table
+                                .schema()
+                                .core_options()
+                                .index_file_in_data_file_dir(),
+                            &entry.index_file,
+                        );
+                        if created.contains(path.as_str()) {
+                            let _ = self.table.file_io().delete_file(&path).await;
+                        }
+                    }
+                }
+                None
+            }
             Err(error) => Some(error),
         };
         Ok(CommitAttemptResult::Retry(Box::new(RetryState {
@@ -4184,6 +4220,7 @@ mod tests {
     mod parity {
         use super::*;
         include!("table_commit/parity_tests.rs");
+        include!("table_commit/pk_dv_retry_tests.rs");
         include!("table_commit/recovery_tests.rs");
         include!("table_commit/row_tracking_tests.rs");
         include!("table_commit/abort_tests.rs");
