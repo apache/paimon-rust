@@ -208,6 +208,8 @@ pub struct CompactTask {
     bucket: i32,
     total_buckets: i32,
     files: Vec<DataFileMeta>,
+    #[serde(default)]
+    output_level: Option<i32>,
 }
 
 impl CompactTask {
@@ -468,6 +470,9 @@ impl CompactTask {
     }
 
     fn output_level(&self) -> i32 {
+        if let Some(output_level) = self.output_level {
+            return output_level;
+        }
         if self.is_primary_key() {
             self.files
                 .iter()
@@ -493,7 +498,21 @@ impl CompactTask {
             })
             .map(|entry| (entry.file().file_name.as_str(), entry))
             .collect::<HashMap<_, _>>();
-        if self.is_primary_key() && bucket_files.len() != self.files.len() {
+        if self.is_primary_key() && primary_key::planner::enabled(&self.context.schema)? {
+            let selected = primary_key::planner::select(
+                bucket_files
+                    .values()
+                    .map(|entry| entry.file().clone())
+                    .collect(),
+                self.context.schema.options(),
+            )?
+            .ok_or_else(|| invalid("No incremental PK compaction is eligible"))?;
+            if selected.0 != self.files || Some(selected.1) != self.output_level {
+                return Err(invalid(
+                    "PK compaction inputs do not match incremental run selection",
+                ));
+            }
+        } else if self.is_primary_key() && bucket_files.len() != self.files.len() {
             return Err(invalid(
                 "PK compaction must include the complete captured bucket",
             ));
@@ -522,6 +541,17 @@ impl CompactTask {
             ));
         }
         ensure_snapshot_supported(table, &self.context.snapshot)?;
+        let incremental =
+            self.is_primary_key() && primary_key::planner::enabled(&self.context.schema)?;
+        // Legacy results may be recovered as already committed before their
+        // captured inputs are validated. Uncommitted tasks still need the
+        // exact incremental selection in validate_inputs.
+        if self
+            .output_level
+            .is_some_and(|output_level| !incremental || output_level <= 0)
+        {
+            return Err(invalid("Invalid incremental PK compaction selection"));
+        }
         let minimum_files = if self.is_primary_key() || self.is_data_evolution() {
             1
         } else {
@@ -549,6 +579,79 @@ impl CompactTask {
         }
         Ok(())
     }
+}
+
+/// Validate published PK file changes without depending on executor task metadata.
+pub(super) fn validate_primary_key_changes(
+    schema: &TableSchema,
+    changes: &[ManifestEntry],
+    captured: &[ManifestEntry],
+) -> Result<()> {
+    fn group(entry: &ManifestEntry) -> (&[u8], i32, i32) {
+        (entry.partition(), entry.bucket(), entry.total_buckets())
+    }
+    let mut inputs = HashMap::<_, Vec<&ManifestEntry>>::new();
+    for entry in changes
+        .iter()
+        .filter(|entry| *entry.kind() == FileKind::Delete)
+    {
+        inputs.entry(group(entry)).or_default().push(entry);
+    }
+    let mut active = HashMap::<_, Vec<&DataFileMeta>>::new();
+    for entry in captured {
+        let key = group(entry);
+        if inputs.contains_key(&key) {
+            active.entry(key).or_default().push(entry.file());
+        }
+    }
+    let incremental = primary_key::planner::enabled(schema)?;
+    let mut output_levels = HashMap::new();
+    for (key, removed) in inputs {
+        let files = active
+            .remove(&key)
+            .unwrap_or_default()
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        let (selected, output_level) = if incremental {
+            primary_key::planner::select(files, schema.options())?
+                .ok_or_else(|| invalid("No incremental PK compaction is eligible"))?
+        } else {
+            let level = files
+                .iter()
+                .map(|file| file.level)
+                .max()
+                .unwrap_or(0)
+                .max(1);
+            (files, level)
+        };
+        let expected = selected
+            .iter()
+            .map(|file| (file.file_name.as_str(), file))
+            .collect::<HashMap<_, _>>();
+        if expected.len() != removed.len()
+            || removed.iter().any(|entry| {
+                expected
+                    .get(entry.file().file_name.as_str())
+                    .is_none_or(|file| **file != *entry.file())
+            })
+        {
+            return Err(invalid(
+                "PK compaction inputs do not match captured run selection",
+            ));
+        }
+        output_levels.insert(key, output_level);
+    }
+    if changes
+        .iter()
+        .filter(|entry| *entry.kind() == FileKind::Add)
+        .any(|entry| output_levels.get(&group(entry)) != Some(&entry.file().level))
+    {
+        return Err(invalid(
+            "PK compaction output level does not match captured run selection",
+        ));
+    }
+    Ok(())
 }
 
 /// Validated inputs for the existing atomic snapshot publication machinery.
@@ -603,6 +706,13 @@ pub(super) fn prepare_results(table: &Table, results: &[CompactResult]) -> Resul
             .iter()
             .map(|file| file.row_count as u64)
             .sum::<u64>();
+        // Missing PK task metadata must not block valid prepared file changes;
+        // their output level is checked against the captured selection at commit.
+        let output_level = if task.is_primary_key() {
+            task.output_level
+        } else {
+            Some(0)
+        };
         let mut output_rows = 0u64;
         for file in &result.files {
             if task.is_data_evolution() {
@@ -612,7 +722,7 @@ pub(super) fn prepare_results(table: &Table, results: &[CompactResult]) -> Resul
             }
             if file.schema_id != task.context.schema.id()
                 || file.file_source != Some(1)
-                || file.level != task.output_level()
+                || output_level.is_some_and(|level| file.level != level)
                 || !outputs.insert(file.file_name.clone())
                 || task.files.iter().any(|old| old.file_name == file.file_name)
             {

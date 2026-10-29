@@ -1961,6 +1961,13 @@ impl TableCommit {
                         .iter()
                         .map(|e| (e.partition(), e.bucket()))
                         .collect::<HashSet<_>>();
+                    if !self.table.schema().primary_keys().is_empty() {
+                        super::compact::validate_primary_key_changes(
+                            self.table.schema(),
+                            entries,
+                            &captured_files,
+                        )?;
+                    }
                     let deleted_ids = deletes
                         .iter()
                         .map(|entry| commit_file_identifier(entry))
@@ -1983,8 +1990,7 @@ impl TableCommit {
                         .iter()
                         .filter(|e| {
                             buckets.contains(&(e.partition(), e.bucket()))
-                                && (!self.data_evolution_enabled
-                                    || deleted_ids.contains(&commit_file_identifier(e)))
+                                && deleted_ids.contains(&commit_file_identifier(e))
                         })
                         .map(|entry| (commit_file_identifier(entry), entry))
                         .collect::<HashMap<_, _>>();
@@ -2002,7 +2008,7 @@ impl TableCommit {
                             message: if self.data_evolution_enabled {
                                 "Data-evolution compaction inputs must match the captured row-ID groups"
                             } else {
-                                "PK compaction must include the complete captured bucket"
+                                "PK compaction must match its captured incremental inputs"
                             }.into(),
                             source: None,
                         });
