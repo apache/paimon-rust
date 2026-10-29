@@ -443,6 +443,189 @@ async fn data_evolution_compact_retries_preserve_concurrent_deletes_and_publishe
 }
 
 #[tokio::test]
+async fn stale_delete_after_compact_cas_loss_requires_repreparation() {
+    use arrow_array::{Int32Array, RecordBatch};
+    use futures::TryStreamExt;
+
+    struct CompactBeforeDeleteCommit {
+        table: Table,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl SnapshotCommit for CompactBeforeDeleteCommit {
+        async fn commit(
+            &self,
+            _: Option<&str>,
+            snapshot: &Snapshot,
+            _: &str,
+            _: &[PartitionStatistics],
+        ) -> Result<bool> {
+            if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                // DELETE has finished preparing its snapshot. Let COMPACT win
+                // publication, so DELETE must validate its old DV again.
+                let builder = self.table.new_compact_builder();
+                let plan = builder.new_planner()?.plan().await?;
+                assert_eq!(plan.tasks().len(), 1);
+                let result = builder.new_executor()?.execute(&plan.tasks()[0]).await?;
+                builder.new_commit()?.commit_compact(vec![result]).await?;
+                return Ok(false);
+            }
+            self.table
+                .snapshot_manager()
+                .commit_snapshot(snapshot)
+                .await
+        }
+    }
+
+    async fn visible_ids(table: &Table) -> Vec<i32> {
+        let read = table.new_read_builder();
+        let scan = read.new_scan().plan().await.unwrap();
+        let batches: Vec<RecordBatch> = read
+            .new_read()
+            .unwrap()
+            .to_arrow(scan.splits())
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let mut ids = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids
+    }
+
+    for existing_dv in [false, true] {
+        let io = test_file_io();
+        let path = format!("memory:/de-delete-after-compact-{existing_dv}");
+        setup_dirs(&io, &path).await;
+        let schema = crate::spec::Schema::builder()
+            .column("id", DataType::Int(crate::spec::IntType::new()))
+            .option("row-tracking.enabled", "true")
+            .option("data-evolution.enabled", "true")
+            .option("deletion-vectors.enabled", "true")
+            .option("compaction.min.file-num", "2")
+            .build()
+            .unwrap();
+        let table = Table::new(
+            io.clone(),
+            Identifier::new("default", "de_delete_after_compact"),
+            path.clone(),
+            TableSchema::new(0, &schema),
+            None,
+        );
+        io.mkdirs(&format!("{path}/schema")).await.unwrap();
+        io.new_output(&format!("{path}/schema/schema-0"))
+            .unwrap()
+            .write(serde_json::to_vec(table.schema()).unwrap().into())
+            .await
+            .unwrap();
+        for ids in [vec![0, 1], vec![2, 3]] {
+            let builder = table.new_write_builder();
+            let mut write = builder.new_write().unwrap();
+            let batch = RecordBatch::try_from_iter([(
+                "id",
+                Arc::new(Int32Array::from(ids)) as arrow_array::ArrayRef,
+            )])
+            .unwrap();
+            write.write_arrow_batch(&batch).await.unwrap();
+            builder
+                .new_commit()
+                .commit(write.prepare_commit().await.unwrap())
+                .await
+                .unwrap();
+        }
+        if existing_dv {
+            let mut delete = crate::table::DataEvolutionDeleteWriter::new(&table).unwrap();
+            delete.add_row_ids([1]).unwrap();
+            table
+                .new_write_builder()
+                .new_commit()
+                .commit(delete.prepare_commit().await.unwrap())
+                .await
+                .unwrap();
+        }
+
+        let mut delete = crate::table::DataEvolutionDeleteWriter::new(&table).unwrap();
+        delete.add_row_ids([2]).unwrap();
+        let messages = delete.prepare_commit().await.unwrap();
+        let publisher = Arc::new(CompactBeforeDeleteCommit {
+            table: table.clone(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let mut commit = table.new_write_builder().new_commit();
+        commit.snapshot_commit = publisher.clone();
+        commit.commit_min_retry_wait_ms = 0;
+        commit.commit_max_retry_wait_ms = 0;
+        let error = commit.commit(messages.clone()).await.unwrap_err();
+        let expected_error = if existing_dv {
+            "Cannot replace missing deletion vector index"
+        } else {
+            "Deletion vector references missing data file"
+        };
+        assert!(error.to_string().contains(expected_error), "{error}");
+        assert_eq!(publisher.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let compact_snapshot = table
+            .snapshot_manager()
+            .get_latest_snapshot()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(compact_snapshot.commit_kind(), &CommitKind::COMPACT);
+        assert_eq!(
+            visible_ids(&table).await,
+            if existing_dv {
+                vec![0, 2, 3]
+            } else {
+                vec![0, 1, 2, 3]
+            }
+        );
+
+        // Replaying the same stale messages cannot repair their old anchors.
+        let error = commit.commit(messages).await.unwrap_err();
+        assert!(error.to_string().contains(expected_error), "{error}");
+        assert_eq!(
+            table
+                .snapshot_manager()
+                .get_latest_snapshot_id()
+                .await
+                .unwrap(),
+            Some(compact_snapshot.id())
+        );
+
+        // Reprepare from current files instead. Stable row IDs still identify
+        // the requested row, and the already committed deletion is retained.
+        let mut delete = crate::table::DataEvolutionDeleteWriter::new(&table).unwrap();
+        delete.add_row_ids([2]).unwrap();
+        table
+            .new_write_builder()
+            .new_commit()
+            .commit(delete.prepare_commit().await.unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            visible_ids(&table).await,
+            if existing_dv {
+                vec![0, 3]
+            } else {
+                vec![0, 1, 3]
+            }
+        );
+    }
+}
+
+#[tokio::test]
 async fn mixed_append_cannot_bypass_stale_dv_check() {
     let io = test_file_io();
     let path = "memory:/mixed-stale-dv";
