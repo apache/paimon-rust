@@ -117,8 +117,9 @@ The same API compacts primary-key tables with `deduplicate`,
 `none`, `input` and `lookup` are supported; `first-row` supports `none` or `lookup`.
 For `deduplicate` with `none` or `input`, the planner chooses incremental sorted
 runs using Java's universal-compaction size and count policy. Each L0 file is a
-run; all files at one positive level form a single run. Explicit compaction
-includes every L0 run and absorbs adjacent runs according to their sizes. A
+run; all files at one positive level form a single run. Normal size and run-count
+triggers take precedence. If they select no work, explicit compaction forces
+progress on every L0 run and absorbs adjacent runs according to their sizes. A
 large higher-level run can remain in place while smaller runs are rewritten.
 Without L0, positive-level maintenance requires the configured run-count and
 size triggers. A single positive run needs no rewrite, even when it spans

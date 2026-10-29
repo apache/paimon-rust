@@ -489,8 +489,14 @@ impl CompactTask {
         if self.is_data_evolution() {
             data_evolution::validate_inputs(&self.partition, self.bucket, &self.files, active)?;
         }
+        self.validate_bucket_inputs(active.iter())
+    }
+
+    pub(super) fn validate_bucket_inputs<'a>(
+        &self,
+        active: impl Iterator<Item = &'a ManifestEntry>,
+    ) -> Result<()> {
         let bucket_files = active
-            .iter()
             .filter(|entry| {
                 entry.partition() == self.partition
                     && entry.bucket() == self.bucket

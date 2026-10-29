@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Java UniversalCompaction run selection. Explicit compact drains L0 using
-//! forcePickL0; positive-level maintenance uses size/run triggers, never a full
-//! bucket override.
+//! Java UniversalCompaction run selection. Apply normal size/run triggers
+//! before forcing L0 progress, as ForceUpLevel0Compaction does, without a
+//! full-bucket override.
 
 use crate::spec::{ChangelogProducer, DataFileMeta, MergeEngine, TableSchema};
 use crate::{Error, Result};
@@ -122,46 +122,30 @@ pub(in crate::table::compact) fn select(
                 .sum::<u128>()
         })
         .collect::<Vec<_>>();
-    let mut count;
-    if l0_count > 0 {
-        // Java prepare-commit forces L0 progress for lookup; the explicit Rust
-        // compact API requests the same bounded incremental progress here.
-        count = l0_count;
-    } else {
-        if runs.len() < trigger as usize {
-            return Ok(None);
-        }
+    let mut count = None;
+    if runs.len() >= trigger as usize {
         let additional = sizes[..sizes.len() - 1].iter().sum::<u128>();
         if additional * 100 > amplification as u128 * sizes[sizes.len() - 1] {
-            count = runs.len();
+            count = Some(runs.len());
         } else {
-            count = 1;
+            count = pick_for_size_ratio(&runs, &sizes, ratio, 1, false);
+        }
+        if count.is_none() && runs.len() > trigger as usize {
+            count = pick_for_size_ratio(
+                &runs,
+                &sizes,
+                ratio,
+                runs.len() - trigger as usize + 1,
+                false,
+            );
         }
     }
-    let mut size = sizes[..count].iter().sum::<u128>();
-    while count < runs.len() {
-        let next = &runs[count];
-        if size * (100 + ratio as u128) < sizes[count] * 100
-            && (count <= 1 && l0_count == 0 || next.0 > 1)
-        {
-            break;
-        }
-        size += sizes[count];
-        count += 1;
+    if count.is_none() && l0_count > 0 {
+        count = pick_for_size_ratio(&runs, &sizes, ratio, l0_count, true);
     }
-    if l0_count == 0 && count == 1 {
-        if runs.len() <= trigger as usize {
-            return Ok(None);
-        }
-        count = runs.len() - trigger as usize + 1;
-        size = sizes[..count].iter().sum();
-        while count < runs.len()
-            && (size * (100 + ratio as u128) >= sizes[count] * 100 || runs[count].0 <= 1)
-        {
-            size += sizes[count];
-            count += 1;
-        }
-    }
+    let Some(count) = count else {
+        return Ok(None);
+    };
     let output_level = if count == runs.len() {
         levels - 1
     } else {
@@ -175,6 +159,30 @@ pub(in crate::table::compact) fn select(
         return Ok(None);
     }
     Ok(Some((selected, PrimaryKeyTask { output_level })))
+}
+
+fn pick_for_size_ratio(
+    runs: &[(i32, Vec<DataFileMeta>)],
+    sizes: &[u128],
+    ratio: i32,
+    mut count: usize,
+    force: bool,
+) -> Option<usize> {
+    let mut size = sizes[..count].iter().sum::<u128>();
+    let mut triggered = force || count > 1;
+    while count < runs.len() {
+        // Match Java's double arithmetic, including threshold rounding for
+        // large runs, rather than comparing exact integer cross-products.
+        if size as f64 * (100.0 + f64::from(ratio)) / 100.0 < sizes[count] as f64
+            && (!triggered || runs[count].0 > 1)
+        {
+            break;
+        }
+        size += sizes[count];
+        count += 1;
+        triggered = true;
+    }
+    triggered.then_some(count)
 }
 
 #[cfg(test)]
@@ -404,5 +412,61 @@ mod tests {
             let options = HashMap::from([(name.into(), minimum.into())]);
             assert!(select(vec![file("new", 0, 1)], &options).unwrap().is_some());
         }
+    }
+
+    #[test]
+    fn normal_maintenance_takes_precedence_over_forcing_l0() {
+        let (files, task) = select(
+            vec![
+                file("new", 0, 1),
+                file("l2", 2, 1000),
+                file("l3", 3, 1000),
+                file("l4", 4, 1000),
+                file("old", 5, 100),
+            ],
+            &HashMap::new(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            files.len(),
+            5,
+            "space amplification must run even when L0 exists"
+        );
+        assert_eq!(task.output_level, 5);
+
+        let options = HashMap::from([("num-sorted-run.compaction-trigger".into(), "2".into())]);
+        let (files, task) = select(
+            vec![
+                file("new", 0, 1),
+                file("small", 3, 100),
+                file("old", 5, 100000),
+            ],
+            &options,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            files.len(),
+            2,
+            "run-count maintenance must precede forced L0 progress"
+        );
+        assert_eq!(task.output_level, 4);
+    }
+
+    #[test]
+    fn large_run_size_ratio_matches_java_double_threshold() {
+        let options = HashMap::from([("num-sorted-run.compaction-trigger".into(), "2".into())]);
+        let (files, task) = select(
+            vec![
+                file("newer", 2, 100_000_000_000_099),
+                file("older", 5, 101_000_000_000_100),
+            ],
+            &options,
+        )
+        .unwrap()
+        .expect("Java rounds the 1% threshold up to the older run's size");
+        assert_eq!(files.len(), 2);
+        assert_eq!(task.output_level, 5);
     }
 }

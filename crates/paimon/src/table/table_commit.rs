@@ -1955,9 +1955,6 @@ impl TableCommit {
                         None,
                     )
                     .await?;
-                    for task in pk_tasks {
-                        task.validate_inputs(&captured_files)?;
-                    }
                     let deletes = entries
                         .iter()
                         .filter(|e| *e.kind() == FileKind::Delete)
@@ -1966,6 +1963,26 @@ impl TableCommit {
                         .iter()
                         .map(|e| (e.partition(), e.bucket()))
                         .collect::<HashSet<_>>();
+                    if !pk_tasks.is_empty() {
+                        // Index once for the submitted buckets instead of
+                        // rescanning the whole snapshot for every PK task.
+                        let mut by_bucket = HashMap::<_, Vec<&ManifestEntry>>::new();
+                        for entry in &captured_files {
+                            let key = (entry.partition(), entry.bucket());
+                            if buckets.contains(&key) {
+                                by_bucket.entry(key).or_default().push(entry);
+                            }
+                        }
+                        for task in pk_tasks {
+                            task.validate_bucket_inputs(
+                                by_bucket
+                                    .get(&(task.partition(), task.bucket()))
+                                    .into_iter()
+                                    .flatten()
+                                    .copied(),
+                            )?;
+                        }
+                    }
                     let deleted_ids = deletes
                         .iter()
                         .map(|entry| commit_file_identifier(entry))
