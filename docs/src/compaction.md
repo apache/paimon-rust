@@ -167,12 +167,12 @@ nearest positive-level state, so retained older levels are not aggregated again.
 With `none` or `input`, these engines use incremental selection only when every
 value field can be merged again independently of row order: `min`, `max`,
 `bool_and`, `bool_or`, or integer `sum` without checked overflow. Aggregation must
-have `aggregation.remove-record-on-delete=false`; its sequence fields keep their
-normal metadata role. Partial update must use `ignore-delete=true`, no global
-sequence fields, and protect every value field with a sequence group and one of
-these aggregate functions. Each group's ordering fields retain its winning
-sequence. These modes merge only selected inputs, leaving retained history to
-ordinary query merging, and do not require local-cache.
+have `aggregation.remove-record-on-delete=false` and no global sequence fields.
+Partial update must use `ignore-delete=true`, no global sequence fields, and
+protect every value field with a sequence group and one of these aggregate
+functions. Each group's ordering fields retain its winning sequence and must
+not also be protected fields. These modes merge only selected inputs, leaving
+retained history to ordinary query merging, and do not require local-cache.
 
 Other `none`/`input` configurations retain their previous selection: every active
 file in the selected bucket participates, and output uses the highest input level

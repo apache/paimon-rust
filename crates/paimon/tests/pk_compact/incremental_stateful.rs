@@ -19,7 +19,13 @@ use super::lookup_changelog_tests::events;
 use super::*;
 use std::sync::Arc;
 
-fn schema(engine: &str, producer: &str, function: &str, checked: bool) -> TableSchema {
+fn schema(
+    engine: &str,
+    producer: &str,
+    function: &str,
+    checked: bool,
+    global_sequence: bool,
+) -> TableSchema {
     let mut schema = Schema::builder()
         .column("id", DataType::Int(IntType::new()))
         .column("value", DataType::Int(IntType::new()))
@@ -34,8 +40,10 @@ fn schema(engine: &str, producer: &str, function: &str, checked: bool) -> TableS
         if producer != "lookup" {
             schema = schema.option("ignore-delete", "true");
         }
-    } else {
+    } else if global_sequence {
         schema = schema.option("sequence.field", "seq");
+    } else {
+        schema = schema.option("fields.seq.aggregate-function", "max");
     }
     if checked {
         schema = schema.option("fields.value.sum.fail-on-overflow", "true");
@@ -90,10 +98,122 @@ async fn active_files(table: &Table) -> Vec<paimon::spec::DataFileMeta> {
         .collect()
 }
 
+async fn int_rows(table: &Table) -> Vec<Vec<Option<i32>>> {
+    let mut rows = Vec::new();
+    for batch in read(table, None).await {
+        let columns = batch
+            .columns()
+            .iter()
+            .map(|column| column.as_any().downcast_ref::<Int32Array>().unwrap())
+            .collect::<Vec<_>>();
+        rows.extend((0..batch.num_rows()).map(|row| {
+            columns
+                .iter()
+                .map(|column| (!column.is_null(row)).then(|| column.value(row)))
+                .collect()
+        }));
+    }
+    rows.sort();
+    rows
+}
+
+#[tokio::test]
+async fn stateful_plain_global_sequence_retract_keeps_the_null_sequence() {
+    for producer in ["none", "input", "lookup"] {
+        for kind in [1, 3] {
+            let table =
+                table_with_schema(schema("aggregation", producer, "sum", false, true)).await;
+            write_batch(&table, &batch((0..1000).collect(), 20, 20)).await;
+            let anchor = compact(&table).await[0].files()[0].clone();
+            write_batch(&table, &batch(vec![42], 30, 30)).await;
+            let retract = batch(vec![42], 10, 40);
+            let retract = RecordBatch::try_from_iter(
+                retract
+                    .schema()
+                    .fields()
+                    .iter()
+                    .zip(retract.columns())
+                    .map(|(field, column)| (field.name().as_str(), column.clone()))
+                    .chain(std::iter::once((
+                        "_VALUE_KIND",
+                        Arc::new(arrow_array::Int8Array::from(vec![kind])) as arrow_array::ArrayRef,
+                    ))),
+            )
+            .unwrap();
+            write_batch(&table, &retract).await;
+            let expected = int_rows(&table).await;
+            assert_eq!(expected[42], vec![Some(42), Some(40), None]);
+            compact(&table).await;
+            let actual = int_rows(&table).await;
+            assert_eq!(actual[42], expected[42], "{producer}/{kind}");
+            assert_eq!(actual, expected);
+            assert_eq!(
+                active_files(&table).await.contains(&anchor),
+                producer == "lookup"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn stateful_plain_cross_group_ordering_keeps_all_history() {
+    for producer in ["none", "input"] {
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("value", DataType::Int(IntType::new()))
+            .column("s1", DataType::Int(IntType::new()))
+            .column("s2", DataType::Int(IntType::new()))
+            .primary_key(["id"])
+            .option("bucket", "1")
+            .option("merge-engine", "partial-update")
+            .option("changelog-producer", producer)
+            .option("ignore-delete", "true")
+            .option("fields.s1.sequence-group", "s2")
+            .option("fields.s2.sequence-group", "value")
+            .option("fields.value.aggregate-function", "sum")
+            .build()
+            .unwrap();
+        let table = table_with_schema(TableSchema::new(0, &schema)).await;
+        let batch = |keys: Vec<i32>, value, s1, s2: Option<i32>| {
+            let len = keys.len();
+            RecordBatch::try_from_iter([
+                (
+                    "id",
+                    Arc::new(Int32Array::from(keys)) as arrow_array::ArrayRef,
+                ),
+                (
+                    "value",
+                    Arc::new(Int32Array::from(vec![value; len])) as arrow_array::ArrayRef,
+                ),
+                (
+                    "s1",
+                    Arc::new(Int32Array::from(vec![s1; len])) as arrow_array::ArrayRef,
+                ),
+                (
+                    "s2",
+                    Arc::new(Int32Array::from(vec![s2; len])) as arrow_array::ArrayRef,
+                ),
+            ])
+            .unwrap()
+        };
+        write_batch(&table, &batch((0..1000).collect(), 20, 0, Some(1))).await;
+        let anchor = compact(&table).await[0].files()[0].clone();
+        write_batch(&table, &batch(vec![42], 1, 1, Some(10))).await;
+        write_batch(&table, &batch(vec![42], 2, 2, None)).await;
+        let expected = int_rows(&table).await;
+        assert_eq!(expected[42], vec![Some(42), Some(21), Some(2), None]);
+        compact(&table).await;
+        let actual = int_rows(&table).await;
+        assert_eq!(actual[42], expected[42], "{producer}");
+        assert_eq!(actual, expected);
+        assert!(!active_files(&table).await.contains(&anchor));
+    }
+}
+
 #[tokio::test]
 async fn stateful_lookup_inserts_history_in_sequence_order_and_does_not_apply_it_twice() {
     for engine in ["partial-update", "aggregation"] {
-        let table = table_with_schema(schema(engine, "lookup", "first_value", false)).await;
+        let table = table_with_schema(schema(engine, "lookup", "first_value", false, true)).await;
         write_batch(&table, &batch((0..1000).collect(), 20, 20)).await;
         let anchor = compact(&table).await[0].files()[0].clone();
         assert_eq!(anchor.level, 5);
@@ -144,7 +264,7 @@ async fn stateful_plain_mergeable_fields_leave_history_out_of_the_output_state()
         for producer in ["none", "input"] {
             for (function, expected_value) in [("sum", 60), ("min", 10), ("max", 30)] {
                 let table = table_with_cache(
-                    schema(engine, producer, function, false),
+                    schema(engine, producer, function, false, false),
                     &[("local-cache.enabled", "false")],
                 )
                 .await;
@@ -189,7 +309,12 @@ async fn stateful_plain_order_sensitive_and_checked_sum_configs_keep_all_history
                 ("first_value", false, 20, 10, 30, 10),
                 ("sum", true, -i32::MAX, i32::MAX, 1, 1),
             ] {
-                let table = table_with_schema(schema(engine, producer, function, checked)).await;
+                // Exercise checked overflow independently of the global
+                // sequence fallback; first_value needs interleaved sequences.
+                let global_sequence = function == "first_value";
+                let table =
+                    table_with_schema(schema(engine, producer, function, checked, global_sequence))
+                        .await;
                 write_batch(&table, &batch((0..1000).collect(), initial, 20)).await;
                 let anchor = compact(&table).await[0].files()[0].clone();
                 write_batch(&table, &batch(vec![42], earlier, 10)).await;
@@ -297,7 +422,7 @@ async fn stateful_plain_boolean_fields_are_mergeable_for_both_engines() {
                         .option("fields.seq.sequence-group", "value")
                         .option("ignore-delete", "true");
                 } else {
-                    schema = schema.option("sequence.field", "seq");
+                    schema = schema.option("fields.seq.aggregate-function", "max");
                 }
                 let table = table_with_cache(
                     TableSchema::new(0, &schema.build().unwrap()),

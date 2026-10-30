@@ -62,17 +62,16 @@ fn plain_state_mergeable(schema: &TableSchema) -> Result<bool> {
     match options.merge_engine()? {
         MergeEngine::Aggregation => {
             let config = AggregationConfig::new(schema.options());
-            if config.remove_record_on_delete() {
+            // Global sequence fields use last_value, whose retract clears the
+            // sequence tuple. A materialized subset can then sort before older
+            // retained states and change the visible sequence fields.
+            if config.remove_record_on_delete() || !options.sequence_fields().is_empty() {
                 return Ok(false);
             }
-            let sequence = options.sequence_fields();
             Ok(schema
                 .fields()
                 .iter()
-                .filter(|field| {
-                    !keys.iter().any(|key| key == field.name())
-                        && !sequence.iter().any(|name| name == &field.name())
-                })
+                .filter(|field| !keys.iter().any(|key| key == field.name()))
                 .all(|field| {
                     mergeable_field(
                         schema,
@@ -90,11 +89,21 @@ fn plain_state_mergeable(schema: &TableSchema) -> Result<bool> {
             }
             let config = PartialUpdateConfig::new(schema.options());
             let functions = config.validated_aggregate_functions(schema.fields(), keys)?;
-            let ordering = config
-                .validated_sequence_groups(schema.fields(), keys)?
-                .into_iter()
-                .flat_map(|group| group.sequence_fields)
+            let groups = config.validated_sequence_groups(schema.fields(), keys)?;
+            let ordering = groups
+                .iter()
+                .flat_map(|group| group.sequence_fields.iter().cloned())
                 .collect::<HashSet<_>>();
+            // Another group can overwrite an ordering field with NULL, making
+            // its aggregate state impossible to replay into retained history.
+            if groups.iter().any(|group| {
+                group
+                    .protected_fields
+                    .iter()
+                    .any(|field| ordering.contains(field))
+            }) {
+                return Ok(false);
+            }
             Ok(schema
                 .fields()
                 .iter()
