@@ -18,9 +18,9 @@
 use super::lookup_file::LookupFileCache;
 use crate::io::FileRead;
 use crate::resource::ResourceContext;
-use crate::spec::{BinaryRowBuilder, DataField, DataFileMeta, MergeEngine};
+use crate::spec::{BinaryRowBuilder, DataField, DataFileMeta};
 use crate::table::merge_tree_split_generator::KeyComparator;
-use crate::table::sort_merge::{LookupProvider, FILE_LEVEL_METADATA_KEY};
+use crate::table::sort_merge::{with_level, LookupProvider};
 use crate::table::{DataSplit, Table};
 use crate::{Error, Result};
 use arrow_array::RecordBatch;
@@ -53,7 +53,6 @@ struct LevelLookup {
     comparator: Option<KeyComparator>,
     resources: Option<ResourceContext>,
     schema_identity: Vec<u8>,
-    first_row: bool,
     deletions: Option<LookupDeletions>,
 }
 
@@ -192,7 +191,6 @@ pub(in crate::table::compact) async fn provider(
             comparator,
             resources,
             schema_identity,
-            first_row: table.schema().core_options().merge_engine()? == MergeEngine::FirstRow,
             deletions: deletions.clone(),
         }),
         deletions,
@@ -333,18 +331,7 @@ impl LookupProvider for LevelLookup {
                             .or_default()
                             .insert(position);
                     }
-                    let mut metadata = batch.schema().metadata().clone();
-                    metadata.insert(FILE_LEVEL_METADATA_KEY.into(), file.meta.level.to_string());
-                    if self.first_row {
-                        metadata.insert(super::LOOKUP_BASE_METADATA_KEY.into(), String::new());
-                    }
-                    found = Some(
-                        RecordBatch::try_new(
-                            Arc::new(batch.schema().as_ref().clone().with_metadata(metadata)),
-                            batch.columns().to_vec(),
-                        )
-                        .map_err(invalid)?,
-                    );
+                    found = Some(with_level(batch, file.meta.level)?);
                 }
             }
             if found.is_some() {
