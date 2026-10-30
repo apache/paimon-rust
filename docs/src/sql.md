@@ -2414,11 +2414,15 @@ The optional fourth argument selects the mode:
   `changelog` otherwise.
 
 A `$audit_log` suffix puts `rowkind` first, followed by `_SEQUENCE_NUMBER` when
-`table-read.sequence-number.enabled=true`.
+`table-read.sequence-number.enabled=true`. Without it the columns are those of a
+query on the table, `_ROW_ID` included on a data-evolution table, so a column update
+returned without the row's other columns can be matched to its row.
 
-The table name resolves as in a `FROM` clause of the same session: `my_table` and
-`my_db.my_table` use the current catalog (and database), and
-`my_catalog.my_db.my_table` names the catalog. Dynamic options set with
+The table name resolves in the calling session: `my_table` and `my_db.my_table`
+use the current catalog (and database), as in a `FROM` clause, and
+`my_catalog.my_db.my_table` names the catalog. As in the other Paimon table
+functions, the name is split at dots, and the catalog, database and table names are
+used as written, without SQL quoting or case folding. Dynamic options set with
 `SET 'paimon.…'` apply as they do to a query on the table, except options that
 choose another range to read (time-travel selectors, `incremental-between*`, file
 creation-time filters and a `scan.mode` other than `default`), which are rejected

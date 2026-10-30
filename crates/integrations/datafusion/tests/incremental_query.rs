@@ -179,6 +179,13 @@ async fn test_audit_log_suffix_prepends_rowkind() {
     for i in 0..rowkind.len() {
         assert_eq!(rowkind.value(i), "+I");
     }
+    // As in a `FROM` clause, the system-table name is case-insensitive.
+    let upper = run(
+        &ctx,
+        "SELECT * FROM paimon_incremental_query('default.t$AUDIT_LOG', 0, 3, 'delta')",
+    )
+    .await;
+    assert_eq!(upper, batches);
 }
 
 async fn expect_error(ctx: &SQLContext, sql: &str) -> String {
@@ -665,6 +672,85 @@ async fn test_data_evolution_range_of_column_updates_reads_unwritten_columns_as_
             assert_eq!(rows, expected, "{name}{mode}");
         }
     }
+}
+
+#[tokio::test]
+async fn test_columns_match_a_query_on_the_table() {
+    use datafusion::arrow::util::pretty::pretty_format_batches;
+    // The function returns the columns a query on the table returns, `_ROW_ID`
+    // included on a data-evolution table, so a column update returned without
+    // the row's other columns can be matched to its row.
+    let tmp = TempDir::new().unwrap();
+    let ctx = context(&tmp).await;
+    run(
+        &ctx,
+        "CREATE TABLE paimon.default.de (id INT NOT NULL, name STRING) WITH (
+            'row-tracking.enabled' = 'true',
+            'data-evolution.enabled' = 'true'
+        )",
+    )
+    .await;
+    run(
+        &ctx,
+        "INSERT INTO paimon.default.de (id, name) VALUES (1, 'alice'), (2, 'bob')",
+    )
+    .await;
+    run(
+        &ctx,
+        "CREATE TEMPORARY TABLE paimon.default.renames AS
+            SELECT * FROM (VALUES (2, 'BOB')) AS t(id, name)",
+    )
+    .await;
+    run(
+        &ctx,
+        "MERGE INTO paimon.default.de t USING paimon.default.renames s ON t.id = s.id
+            WHEN MATCHED THEN UPDATE SET name = s.name",
+    )
+    .await;
+    for name in ["de", "de$audit_log"] {
+        let mut columns = Vec::new();
+        for from in [
+            format!("paimon.default.{name}"),
+            format!("paimon_incremental_query('default.{name}', 0, 2)"),
+        ] {
+            let frame = ctx.sql(&format!("SELECT * FROM {from}")).await.unwrap();
+            let fields = frame.schema().fields().iter();
+            columns.push(fields.map(|field| field.name().clone()).collect::<Vec<_>>());
+        }
+        assert_eq!(columns[1], columns[0], "{name}");
+    }
+    let format = |batches: Vec<RecordBatch>| pretty_format_batches(&batches).unwrap().to_string();
+    let read = |from: &str| format!(r#"SELECT "_ROW_ID", id, name FROM {from} ORDER BY "_ROW_ID""#);
+    let table = format(run(&ctx, &read("paimon.default.de")).await);
+    assert_eq!(
+        table,
+        [
+            "+---------+----+-------+",
+            "| _ROW_ID | id | name  |",
+            "+---------+----+-------+",
+            "| 0       | 1  | alice |",
+            "| 1       | 2  | BOB   |",
+            "+---------+----+-------+",
+        ]
+        .join("\n")
+    );
+    // The update rewrote `name` of both rows, so read alone they come back
+    // without `id`; read with the insert, they are the rows of the table.
+    let update = read("paimon_incremental_query('default.de', 1, 2)");
+    assert_eq!(
+        format(run(&ctx, &update).await),
+        [
+            "+---------+----+-------+",
+            "| _ROW_ID | id | name  |",
+            "+---------+----+-------+",
+            "| 0       |    | alice |",
+            "| 1       |    | BOB   |",
+            "+---------+----+-------+",
+        ]
+        .join("\n")
+    );
+    let range = read("paimon_incremental_query('default.de', 0, 2)");
+    assert_eq!(format(run(&ctx, &range).await), table);
 }
 
 /// Asserts that, for `name`, the function reads the rows a `FROM` clause in

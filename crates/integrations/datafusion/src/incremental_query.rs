@@ -27,10 +27,13 @@
 //! ```
 //!
 //! A `$audit_log` table-name suffix prepends the `rowkind` audit column (and the
-//! optional `_SEQUENCE_NUMBER`), mirroring the core audit-log read.
+//! optional `_SEQUENCE_NUMBER`), mirroring the core audit-log read. Without it,
+//! the columns are those of a query on the table, so a data-evolution table's
+//! rows carry `_ROW_ID`.
 //!
-//! The table name resolves as in a `FROM` clause, in the calling session, and
-//! the session's dynamic options apply as they do to an ordinary read of the
+//! The table name resolves in the calling session, whose current catalog and
+//! database complete it as they complete a name in a `FROM` clause, and the
+//! session's dynamic options apply as they do to an ordinary read of the
 //! table, except those that choose another range to read.
 
 use std::collections::HashMap;
@@ -69,7 +72,7 @@ use crate::memory::reader_resources;
 use crate::physical_plan::scan::to_datafusion_batch;
 use crate::runtime::{await_with_runtime, block_on_with_runtime};
 use crate::system_tables::ensure_audit_log_dynamic_options;
-use crate::table::datafusion_arrow_schema;
+use crate::table::{datafusion_arrow_schema, datafusion_read_fields};
 use crate::table_function_args::{
     extract_int_literal, extract_string_literal, resolve_table_argument,
 };
@@ -138,10 +141,14 @@ impl TableFunctionImpl for IncrementalQueryFunction {
             )));
         }
 
-        // `db.t$audit_log` selects the audit-log projection of `db.t`.
-        let (base_name, audit_log) = match table_name.strip_suffix(AUDIT_LOG_SUFFIX) {
-            Some(base) => (base.to_string(), true),
-            None => (table_name.clone(), false),
+        // `db.t$audit_log` selects the audit-log projection of `db.t`; as in a
+        // `FROM` clause, the system-table name is case-insensitive.
+        let split = table_name.len().saturating_sub(AUDIT_LOG_SUFFIX.len());
+        let (base_name, audit_log) = match table_name.get(split..) {
+            Some(suffix) if suffix.eq_ignore_ascii_case(AUDIT_LOG_SUFFIX) => {
+                (table_name[..split].to_string(), true)
+            }
+            _ => (table_name.clone(), false),
         };
         // The calling session resolves the name, so `USE` applies here as it
         // does to a `FROM` clause.
@@ -240,6 +247,9 @@ struct IncrementalQueryTableProvider {
     start_exclusive: i64,
     end_inclusive: i64,
     fields: Vec<DataField>,
+    /// The leading audit columns of `fields`, which core's audit-log batches
+    /// put before the read fields.
+    audit_columns: usize,
     schema: ArrowSchemaRef,
 }
 
@@ -251,14 +261,17 @@ impl IncrementalQueryTableProvider {
         start_exclusive: i64,
         end_inclusive: i64,
     ) -> DFResult<Self> {
-        // Audit-log output leads with `rowkind` (+ optional `_SEQUENCE_NUMBER`);
-        // the plain projection is the table's own fields.
-        let fields = if audit_log {
-            AuditLogTable::new(table.clone())
+        // Audit-log output leads with `rowkind` (+ optional `_SEQUENCE_NUMBER`),
+        // as the `$audit_log` table does; the plain output has the columns of a
+        // query on the table, `_ROW_ID` of a data-evolution table included.
+        let (fields, audit_columns) = if audit_log {
+            let fields = AuditLogTable::new(table.clone())
                 .fields()
-                .map_err(to_datafusion_error)?
+                .map_err(to_datafusion_error)?;
+            let audit_columns = fields.len() - table.schema().fields().len();
+            (fields, audit_columns)
         } else {
-            table.schema().fields().to_vec()
+            (datafusion_read_fields(&table), 0)
         };
         // Core streams raw Arrow (`Utf8`, not `Utf8View`), so declare the schema
         // the reader actually yields rather than the view-forced scan schema.
@@ -270,24 +283,24 @@ impl IncrementalQueryTableProvider {
             start_exclusive,
             end_inclusive,
             fields,
+            audit_columns,
             schema,
         })
     }
 
-    /// Splits a projection into the table fields core reads and the column of
+    /// Splits a projection into the fields core reads and the column of
     /// core's batches each output column comes from. Core's audit-log batches
     /// lead with the same audit columns as `fields`, then the read fields.
     fn read_projection(&self, indices: &[usize]) -> ReadProjection {
-        let audit_columns = self.fields.len() - self.table.schema().fields().len();
         let mut read_type = Vec::new();
         let columns = indices
             .iter()
             .map(|&index| {
-                if index < audit_columns {
+                if index < self.audit_columns {
                     return index;
                 }
                 read_type.push(self.fields[index].clone());
-                audit_columns + read_type.len() - 1
+                self.audit_columns + read_type.len() - 1
             })
             .collect();
         ReadProjection { read_type, columns }
@@ -316,20 +329,30 @@ impl TableProvider for IncrementalQueryTableProvider {
         if limit == Some(0) {
             return Ok(Arc::new(EmptyExec::new(projected_schema)));
         }
+        // Without a projection every column is read, `_ROW_ID` included, which
+        // core's default read type would leave out.
+        let all_columns: Vec<usize>;
+        let indices = match projection {
+            Some(indices) => indices,
+            None => {
+                all_columns = (0..self.fields.len()).collect();
+                &all_columns
+            }
+        };
         Ok(Arc::new(IncrementalQueryExec::new(
             self.table.clone(),
             self.audit_log,
             self.mode,
             self.start_exclusive,
             self.end_inclusive,
-            projection.map(|indices| self.read_projection(indices)),
+            self.read_projection(indices),
             projected_schema,
         )))
     }
 }
 
-/// The table fields to read, and per output column the column of core's
-/// batches it comes from.
+/// The fields to read, and per output column the column of core's batches it
+/// comes from.
 #[derive(Debug, Clone)]
 struct ReadProjection {
     read_type: Vec<DataField>,
@@ -345,7 +368,7 @@ struct IncrementalQueryExec {
     mode: IncrementalScanMode,
     start_exclusive: i64,
     end_inclusive: i64,
-    projection: Option<ReadProjection>,
+    projection: ReadProjection,
     output_schema: ArrowSchemaRef,
     plan_properties: Arc<PlanProperties>,
 }
@@ -357,7 +380,7 @@ impl IncrementalQueryExec {
         mode: IncrementalScanMode,
         start_exclusive: i64,
         end_inclusive: i64,
-        projection: Option<ReadProjection>,
+        projection: ReadProjection,
         output_schema: ArrowSchemaRef,
     ) -> Self {
         let plan_properties = Arc::new(PlanProperties::new(
@@ -387,9 +410,7 @@ impl IncrementalQueryExec {
     async fn open(&self, resources: ResourceContext) -> DFResult<ArrowRecordBatchStream> {
         let mut read_builder = self.table.new_read_builder();
         read_builder.with_resources(resources);
-        if let Some(projection) = &self.projection {
-            read_builder.with_read_type(projection.read_type.clone());
-        }
+        read_builder.with_read_type(self.projection.read_type.clone());
         let scan =
             read_builder.new_incremental_scan(self.mode, self.start_exclusive, self.end_inclusive);
         let plan = if self.plans_range_as_one_batch() {
@@ -483,14 +504,10 @@ impl ExecutionPlan for IncrementalQueryExec {
             let batches = await_with_runtime(exec.open(resources)).await?;
             // Batches are forwarded as core emits them, projected, and rebuilt
             // against the declared schema as the ordinary scan does.
-            let columns = exec.projection.map(|projection| projection.columns);
+            let columns = exec.projection.columns;
             let schema = exec.output_schema;
             Ok::<_, DataFusionError>(batches.map(move |batch| {
-                let batch = batch.map_err(to_datafusion_error)?;
-                let batch = match &columns {
-                    Some(columns) => batch.project(columns)?,
-                    None => batch,
-                };
+                let batch = batch.map_err(to_datafusion_error)?.project(&columns)?;
                 to_datafusion_batch(batch, &schema)
             }))
         })
