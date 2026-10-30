@@ -753,6 +753,102 @@ async fn test_columns_match_a_query_on_the_table() {
     assert_eq!(format(run(&ctx, &range).await), table);
 }
 
+#[tokio::test]
+async fn test_a_read_of_the_range_as_its_window_counts_the_rows_it_returns() {
+    use datafusion::arrow::array::Int64Array;
+    use datafusion::prelude::SessionContext;
+    use paimon_datafusion::PaimonTableProvider;
+    // Two inserts, a compaction of their files and an update of every row:
+    // the update covers the compacted file's rows, not those of one insert,
+    // so the range is read file by file, eight rows. A read of the table with
+    // the range as its incremental window returns them too, and its scan's
+    // row count, from which `COUNT(*)` is answered, counts them.
+    let tmp = TempDir::new().unwrap();
+    let ctx = context(&tmp).await;
+    run(
+        &ctx,
+        "CREATE TABLE paimon.default.de (id INT, v INT) WITH (
+            'row-tracking.enabled' = 'true',
+            'data-evolution.enabled' = 'true',
+            'compaction.min.file-num' = '2',
+            'write-only' = 'true'
+        )",
+    )
+    .await;
+    for values in ["(1, 1), (2, 2)", "(3, 3), (4, 4)"] {
+        run(
+            &ctx,
+            &format!("INSERT INTO paimon.default.de (id, v) VALUES {values}"),
+        )
+        .await;
+    }
+    let warehouse = catalog(&tmp);
+    let identifier = Identifier::new("default", "de");
+    let table = warehouse.get_table(&identifier).await.unwrap();
+    let compaction = table.new_compact_builder();
+    let plan = compaction.new_planner().unwrap().plan().await.unwrap();
+    let executor = compaction.new_executor().unwrap();
+    let mut results = Vec::new();
+    for task in plan.tasks() {
+        results.push(executor.execute(task).await.unwrap());
+    }
+    let commit = compaction.new_commit().unwrap();
+    commit.commit_compact(results).await.unwrap();
+    run(&ctx, "UPDATE paimon.default.de SET v = 50").await;
+
+    let latest = table.snapshot_manager().get_latest_snapshot().await;
+    let latest = latest.unwrap().unwrap().id();
+    // (rows of `SELECT *`, the `COUNT(*)`) from the batches of both queries.
+    let read = |all: Vec<RecordBatch>, count: Vec<RecordBatch>| {
+        let count = count[0].column(0).as_any().downcast_ref::<Int64Array>();
+        (total_rows(&all), count.unwrap().value(0) as usize)
+    };
+    let queries = |from: &str| {
+        [
+            format!("SELECT * FROM {from}"),
+            format!("SELECT COUNT(*) FROM {from}"),
+        ]
+    };
+    let [all, count] = queries(&format!(
+        "paimon_incremental_query('default.de', 0, {latest})"
+    ));
+    let function = read(run(&ctx, &all).await, run(&ctx, &count).await);
+    assert_eq!(function, (8, 8), "function");
+
+    // The same range as the incremental window of a query on the table: set
+    // for the session, where `COUNT(*)` is not answered from the manifests,
+    // and on the table a bare session reads, whose scan counts the rows.
+    let window = "0,9999999999999";
+    run(
+        &ctx,
+        &format!("SET 'paimon.incremental-between-timestamp' = '{window}'"),
+    )
+    .await;
+    let [all, count] = queries("paimon.default.de");
+    let set = read(run(&ctx, &all).await, run(&ctx, &count).await);
+    assert_eq!(set, (8, 8), "SET");
+
+    let options = std::collections::HashMap::from([(
+        "incremental-between-timestamp".to_string(),
+        window.to_string(),
+    )]);
+    let table = warehouse.get_table(&identifier).await.unwrap();
+    let table = table.copy_with_time_travel(options).await.unwrap();
+    let session = SessionContext::new();
+    let provider = PaimonTableProvider::try_new(table).unwrap();
+    session
+        .register_table("changes", Arc::new(provider))
+        .unwrap();
+    let [all, count] = queries("changes");
+    let session = &session;
+    let collect = |sql: String| async move {
+        let frame = session.sql(&sql).await.unwrap();
+        frame.collect().await.unwrap()
+    };
+    let provider = read(collect(all).await, collect(count).await);
+    assert_eq!(provider, (8, 8), "provider");
+}
+
 /// Asserts that, for `name`, the function reads the rows a `FROM` clause in
 /// the same session reads.
 async fn assert_reads_as_from(ctx: &SQLContext, name: &str) {

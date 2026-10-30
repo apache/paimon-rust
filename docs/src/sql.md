@@ -2403,7 +2403,8 @@ The optional fourth argument selects the mode:
   newest file writing it leaves out, written with
   `data-evolution.write-cols-optimization.enabled` after the column moved to dedicated
   files; and every file of rows whose files are no longer column slices because a
-  compaction in the range merged some of them. A column the table has since dropped, or
+  compaction in the range, such as the one a write runs after its commit unless
+  `write-only=true`, merged some of them. A column the table has since dropped, or
   changed from VECTOR to a string type, keeps rows from merging only when the range
   wrote it in VECTOR files of two layouts.
 - `changelog` returns the changelog rows of each commit.

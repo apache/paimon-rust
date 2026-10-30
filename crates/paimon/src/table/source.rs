@@ -775,6 +775,10 @@ impl DataSplit {
     /// Also `None` under a query-auth row filter, which drops rows the count
     /// includes, as Java `QueryAuthSplit` does.
     ///
+    /// Also `None` for change events of a split that is not raw convertible:
+    /// they may decode a row-id group file by file, returning each file's own
+    /// rows rather than the merged rows counted here.
+    ///
     /// Reference: [DataSplit.mergedRowCount()](https://github.com/apache/paimon/blob/release-1.3/paimon-core/src/main/java/org/apache/paimon/table/source/DataSplit.java#L133)
     pub fn merged_row_count(&self) -> Option<i64> {
         if self
@@ -790,6 +794,9 @@ impl DataSplit {
                 })
             })
         {
+            return None;
+        }
+        if self.is_streaming && !self.raw_convertible {
             return None;
         }
         if let Some(ranges) = &self.row_ranges {

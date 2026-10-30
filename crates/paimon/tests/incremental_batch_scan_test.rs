@@ -3513,3 +3513,41 @@ async fn delta_filters_each_file_of_rows_read_file_by_file() {
     let filtered = read_evolved_range_where(&table, 0, 2, None, Some(bob())).await;
     assert_eq!(filtered, expected);
 }
+
+/// A split that gives a merged row count reads that many rows. After the
+/// VECTOR column moved inline, the insert and the rewrite of bob's name and
+/// embedding are read file by file: eight rows, one per row of each of their
+/// four files, where merged rows would be two. Their split gives no count.
+#[tokio::test]
+async fn combined_delta_row_counts_match_the_rows_read() {
+    use paimon::spec::SchemaChange;
+    let path = "memory:/incremental_batch/row_counts";
+    let table = evolved_table(path, &[]).await;
+    let change = SchemaChange::remove_option("vector.file.format".into());
+    let schema = table.schema().apply_changes(vec![change]).unwrap();
+    persist_table_schema(table.file_io(), path, &schema).await;
+    let table = paimon::table::Table::new(
+        table.file_io().clone(),
+        table.identifier().clone(),
+        path.to_string(),
+        schema,
+        None,
+    );
+    rewrite(&table, 1, vec![new_name("BOB"), new_embedding([9.0, 9.0])]).await;
+
+    let builder = table.new_read_builder();
+    let read = builder.new_read().unwrap();
+    let scan = builder.new_incremental_scan(IncrementalScanMode::Delta, 0, 2);
+    let mut counts = Vec::new();
+    for split in scan.plan_combined_delta().await.unwrap().into_splits() {
+        let batches: Vec<RecordBatch> = read
+            .to_arrow(std::slice::from_ref(&split))
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let rows = batches.iter().map(RecordBatch::num_rows).sum::<usize>() as i64;
+        counts.push((split.merged_row_count(), rows));
+    }
+    assert_eq!(counts, [(None, 8)]);
+}
