@@ -16,6 +16,7 @@
 // under the License.
 
 use super::*;
+use sha2::{Digest, Sha256};
 
 impl TableCommit {
     pub(super) fn auto_compaction_enabled(&self, has_new_files: bool) -> Result<bool> {
@@ -28,11 +29,35 @@ impl TableCommit {
             Err(crate::Error::Unsupported { .. }) => return Ok(false),
             Err(error) => return Err(error),
         }
-        // Reject invalid compaction configuration before publishing data.
+        // Validate planner configuration before publishing data. Executor
+        // resources are created only when this write has eligible work.
         let builder = self.table.new_compact_builder();
         builder.new_planner()?;
-        builder.new_executor()?;
+        self.validate_auto_compaction_policy()?;
         Ok(true)
+    }
+
+    fn validate_auto_compaction_policy(&self) -> Result<()> {
+        if !self.table.schema().primary_keys().is_empty() {
+            let options = self.table.schema().core_options();
+            options.compaction_force_up_level0()?;
+            let lookup = options.try_changelog_producer()?
+                == crate::spec::ChangelogProducer::Lookup
+                || options.merge_engine()? == crate::spec::MergeEngine::FirstRow
+                || options.deletion_vectors_enabled();
+            if lookup {
+                match self.table.schema().options().get("lookup-compact").map(|value| value.to_ascii_lowercase()).as_deref() {
+                    None | Some("radical") => {}
+                    Some("gentle") => return Err(crate::Error::Unsupported {
+                        message: "Automatic compaction does not support lookup-compact=gentle trigger intervals; use write-only=true with dedicated compaction".into(),
+                    }),
+                    Some(value) => return Err(crate::Error::ConfigInvalid {
+                        message: format!("Invalid lookup-compact: {value}"),
+                    }),
+                }
+            }
+        }
+        Ok(())
     }
 
     pub(super) async fn commit_with_auto_compact(
@@ -83,7 +108,18 @@ impl TableCommit {
                 return Ok(());
             };
             let mut compact = self.clone();
-            compact.commit_user = format!("{}-auto-compact", self.commit_user);
+            // Manifest names contain the data commit's random identity. A
+            // digest keeps our recovery user stable without occupying a common,
+            // otherwise legal application name such as `job-auto-compact`.
+            let mut identity = Sha256::new();
+            identity.update(self.table.location().as_bytes());
+            identity.update(self.table.branch().as_bytes());
+            identity.update(written.delta_manifest_list().as_bytes());
+            compact.commit_user = format!(
+                "{}-auto-compact-{}",
+                self.commit_user,
+                hex::encode(identity.finalize())
+            );
             // Snapshot IDs also distinguish repeated batch commits using i64::MAX.
             if compact
                 .is_committed_identifier_since(&latest, written.id(), Some(written.id() + 1))
@@ -93,11 +129,39 @@ impl TableCommit {
             }
             // A historical writer can publish old-schema files against a newer
             // schema. Compaction must read and write the current field layout.
-            let schema_id = self.latest_schema_id().await?;
-            let table = if schema_id == self.table.schema().id() {
-                self.table.clone()
+            let current_schema = if let Some(env) = &self.table.rest_env {
+                let response = env.current_table_identity_checked().await?;
+                let schema_id = response
+                    .schema_id
+                    .ok_or_else(|| crate::Error::DataInvalid {
+                        message: "REST table response is missing schemaId".into(),
+                        source: None,
+                    })?;
+                let schema = response.schema.ok_or_else(|| crate::Error::DataInvalid {
+                    message: "REST table response is missing schema".into(),
+                    source: None,
+                })?;
+                let schema = crate::spec::TableSchema::new(schema_id, &schema);
+                self.table
+                    .schema_manager()
+                    .cache_resolved_schema(schema.clone());
+                (schema_id != self.table.schema().id()).then_some(schema)
             } else {
-                let schema = self.table.schema_manager().schema(schema_id).await?;
+                let schema_id = self.latest_schema_id().await?;
+                if schema_id == self.table.schema().id() {
+                    None
+                } else {
+                    Some(
+                        self.table
+                            .schema_manager()
+                            .schema(schema_id)
+                            .await?
+                            .as_ref()
+                            .clone(),
+                    )
+                }
+            };
+            let table = if let Some(schema) = current_schema {
                 let overrides = self
                     .table
                     .applied_dynamic_option_keys
@@ -114,20 +178,59 @@ impl TableCommit {
                     schema.copy_with_options(overrides),
                     self.table.branch(),
                 )?
+            } else {
+                self.table.clone()
             };
-            // Capture latest on the same branch, clearing historical read selectors.
-            let table = table.copy_with_pinned_snapshot(latest.as_ref());
+            // Overwrite changelog suppression applies only to that write's
+            // files. In recovery, a later APPEND may already have published
+            // L0 records in this bucket whose changelog must remain pending.
+            let overwrite = *kind == CommitKind::OVERWRITE;
+            let snapshot = if overwrite {
+                Some(&written)
+            } else {
+                latest.as_ref()
+            };
+            let table = table.copy_with_pinned_snapshot(snapshot);
             compact = Self::new(table, compact.commit_user);
             compact.snapshot_commit = self.snapshot_commit.clone();
             compact.snapshot_properties = self.snapshot_properties.clone();
             compact.commit_callbacks = self.commit_callbacks.clone();
+            if self.table.rest_env.is_some() {
+                compact
+                    .table
+                    .schema_manager()
+                    .inherit_cached_schemas(self.table.schema_manager())?;
+            }
             match crate::table::compact::ensure_supported(&compact.table) {
                 Ok(()) => {}
                 Err(crate::Error::Unsupported { .. }) => return Ok(()),
                 Err(error) => return Err(error),
             }
+            compact.validate_auto_compaction_policy()?;
+            // Restore the exact writer ownership scope even when recovery was
+            // given messages whose files have since been compacted or expired.
+            let buckets = self
+                .read_delta_entries(None, &written)
+                .await?
+                .into_iter()
+                .filter(|entry| *entry.kind() == FileKind::Add)
+                .map(|entry| {
+                    (
+                        if self.table.schema().partition_keys().is_empty() {
+                            EMPTY_SERIALIZED_ROW.clone()
+                        } else {
+                            entry.partition().to_vec()
+                        },
+                        entry.bucket(),
+                        entry.total_buckets(),
+                    )
+                })
+                .collect::<crate::table::compact::CompactBuckets>();
+            if buckets.is_empty() {
+                return Ok(());
+            }
             let builder = compact.table.new_compact_builder();
-            let plan = match builder.new_planner()?.plan().await {
+            let plan = match builder.new_planner()?.for_write(buckets).plan().await {
                 Ok(plan) => plan,
                 // Some limitations depend on snapshot metadata, for example
                 // global indexes outside Data Evolution mode.
@@ -137,12 +240,105 @@ impl TableCommit {
             if plan.tasks().is_empty() {
                 return Ok(());
             }
-            let executor = builder.new_executor()?;
-            let mut results = Vec::with_capacity(plan.tasks().len());
-            for task in plan.tasks() {
-                results.push(executor.execute(task).await?);
+            if overwrite
+                && latest
+                    .as_ref()
+                    .is_some_and(|snapshot| snapshot.id() != written.id())
+            {
+                let active = crate::table::snapshot_manifest::read_snapshot_entries(
+                    &self.snapshot_manager,
+                    latest.as_ref().expect("latest contains the data snapshot"),
+                    None,
+                )
+                .await?;
+                let active = active
+                    .iter()
+                    .map(|entry| {
+                        (
+                            (
+                                if compact.table.schema().partition_keys().is_empty() {
+                                    EMPTY_SERIALIZED_ROW.clone()
+                                } else {
+                                    entry.partition().to_vec()
+                                },
+                                entry.bucket(),
+                                entry.total_buckets(),
+                                entry.file().file_name.clone(),
+                            ),
+                            entry.file(),
+                        )
+                    })
+                    .collect::<HashMap<_, _>>();
+                if plan.tasks().iter().any(|task| {
+                    task.files().iter().any(|file| {
+                        active
+                            .get(&(
+                                task.partition().to_vec(),
+                                task.bucket(),
+                                task.total_buckets(),
+                                file.file_name.clone(),
+                            ))
+                            .is_none_or(|current| *current != file)
+                    })
+                }) {
+                    // Another rewrite already replaced these inputs. Replaying
+                    // old overwrite work must not resurrect them or consume
+                    // newer records while trying to suppress their changelog.
+                    return Ok(());
+                }
             }
-            let prepared = crate::table::compact::prepare_results(&compact.table, &results)?;
+            let executor = builder.new_auto_executor()?;
+            let executor = if *kind == CommitKind::OVERWRITE {
+                executor.without_changelog()
+            } else {
+                executor
+            };
+            let options = compact.table.schema().core_options();
+            let plain_stateful = !compact.table.schema().primary_keys().is_empty()
+                && matches!(
+                    options.merge_engine()?,
+                    crate::spec::MergeEngine::PartialUpdate | crate::spec::MergeEngine::Aggregation
+                )
+                && options.try_changelog_producer()? != crate::spec::ChangelogProducer::Lookup;
+            let mut results = Vec::with_capacity(plan.tasks().len());
+            let prepared = async {
+                for task in plan.tasks() {
+                    results.push(executor.execute(task).await?);
+                }
+                crate::table::compact::prepare_results(&compact.table, &results)
+            }
+            .await;
+            let prepared = match prepared {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    // No publication has been attempted. Only completed task
+                    // outputs are ours to discard; the failed executor cleans
+                    // its own partial files. Retain outputs after try_commit.
+                    let messages = plan
+                        .tasks()
+                        .iter()
+                        .zip(&results)
+                        .map(|(task, result)| {
+                            let mut message = CommitMessage::new(
+                                task.partition().to_vec(),
+                                task.bucket(),
+                                result.files().to_vec(),
+                            );
+                            message.new_changelog_files = result.changelog_files().to_vec();
+                            message
+                        })
+                        .collect::<Vec<_>>();
+                    let _ = compact.abort(&messages).await;
+                    // Some valid raw retract states have no lossless compact
+                    // encoding yet. Keep those source files instead of making
+                    // an ordinary write fail. Lookup errors still propagate:
+                    // silently skipping those would lose required changelogs.
+                    if plain_stateful && matches!(error, crate::Error::Unsupported { .. }) {
+                        return Ok(());
+                    }
+                    return Err(error);
+                }
+            };
             compact
                 .try_commit(
                     CommitEntriesPlan::Compact {

@@ -166,6 +166,16 @@ pub(in crate::table::compact) fn select(
     files: Vec<DataFileMeta>,
     properties: &std::collections::HashMap<String, String>,
 ) -> Result<Option<(Vec<DataFileMeta>, i32)>> {
+    select_with_force_level_zero(files, properties, true)
+}
+
+/// Automatic writes honor Java's normal triggers; explicit compaction can
+/// always force L0 progress. Both paths choose normal triggered runs first.
+pub(in crate::table::compact) fn select_with_force_level_zero(
+    files: Vec<DataFileMeta>,
+    properties: &std::collections::HashMap<String, String>,
+    force_level_zero: bool,
+) -> Result<Option<(Vec<DataFileMeta>, i32)>> {
     let trigger = number(properties, "num-sorted-run.compaction-trigger", 5, 1)?;
     let configured_levels = number(properties, "num-levels", trigger.saturating_add(1), 2)?;
     let levels = configured_levels.max(
@@ -241,7 +251,7 @@ pub(in crate::table::compact) fn select(
             );
         }
     }
-    if count.is_none() && l0_count > 0 {
+    if count.is_none() && l0_count > 0 && force_level_zero {
         count = pick_for_size_ratio(&runs, &sizes, ratio, l0_count, true);
     }
     let Some(count) = count else {

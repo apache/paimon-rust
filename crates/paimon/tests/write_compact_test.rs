@@ -158,7 +158,11 @@ async fn append_compacts_by_default_and_explicit_false_but_true_only_writes() {
 #[tokio::test]
 async fn primary_key_compaction_preserves_updates_and_reuses_batch_committer() {
     for bucket in ["1", "-1"] {
-        let table = table(true, &[("bucket", bucket)]).await;
+        let table = table(
+            true,
+            &[("bucket", bucket), ("compaction.force-up-level-0", "true")],
+        )
+        .await;
         let commit = table.new_write_builder().new_commit();
         for value in [10, 20] {
             commit.commit(messages(&table, value).await).await.unwrap();
@@ -315,8 +319,12 @@ async fn historical_read_selectors_do_not_hide_newly_committed_files() {
 
 #[tokio::test]
 async fn invalid_compaction_configuration_fails_before_data_publication() {
-    for (key, value) in [("write-only", "invalid"), ("compaction.min.file-num", "1")] {
-        let table = table(false, &[(key, value)]).await;
+    for (primary_key, key, value) in [
+        (false, "write-only", "invalid"),
+        (false, "compaction.min.file-num", "1"),
+        (true, "compaction.force-up-level-0", "invalid"),
+    ] {
+        let table = table(primary_key, &[(key, value)]).await;
         let error = table
             .new_write_builder()
             .new_commit()

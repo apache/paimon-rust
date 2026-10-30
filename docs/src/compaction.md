@@ -50,14 +50,30 @@ Writers also run one synchronous compaction round after a successful data commit
 dedicated job. The legacy `write.compaction-skip` alias is accepted, with
 `write-only` taking precedence. Automatic compaction uses the existing planner's
 thresholds and selects eligible files from the latest snapshot on the same branch,
-using the current schema even when the writer retains a historical schema.
-For primary-key tables, the batch planner can advance L0 files even below the
-normal sorted-run count trigger.
+restricted to the partitions and buckets changed by this write. It uses the current
+schema even when the writer retains a historical schema, including schemas resolved
+through a REST catalog. Primary-key writes honor normal sorted-run count and size
+triggers. Lookup, first-row and deletion-vector compaction, or an explicit
+`compaction.force-up-level-0=true`, can advance L0 files below those triggers.
+Overwrite compaction is pinned to its own committed data snapshot, so suppressing
+overwrite changelogs cannot consume a later append's pending lookup events.
+As in Java, overwriting partitions being consumed by streaming readers is unsupported;
+lookup changelogs do not describe the overwrite operation itself.
+Automatic lookup compaction supports the default `lookup-compact=radical` policy.
+`gentle` requires writer-lifetime trigger intervals and is explicitly unsupported
+here; use `write-only=true` and schedule dedicated compaction separately.
 An empty plan publishes no extra snapshot. Append, overwrite and state-dependent
 data commits use this behavior; empty commits and truncation do not trigger it.
 Table modes unsupported by the compaction API retain their write behavior without
-automatic compaction. Supported modes require valid compaction configuration,
-including the local cache required for lookup and first-row compaction.
+automatic compaction. Automatic lookup, first-row and deletion-vector compaction
+use the configured catalog cache when available, otherwise a temporary disk cache
+owned by the writer's compaction work. `lookup.cache-max-disk-size` bounds that
+temporary cache when configured. Temporary files remain alive until the last cache
+reader is released. Explicit manual compaction still requires
+`local-cache.enabled=true` on the catalog/FileIO for these modes.
+For plain partial-update and aggregation tables, an unsupported lossless retract
+rewrite also leaves the raw source files in place. I/O, resource and data errors,
+and lookup changelog failures, are still returned to the caller.
 
 Data publication and compaction are separate transactions. A compaction failure
 leaves the data committed and returns an error retaining the underlying cause.

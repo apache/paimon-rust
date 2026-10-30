@@ -5971,3 +5971,7 @@ mod merge_sources;
 
 #[path = "rest_catalog/read_path_completion.rs"]
 mod read_path_completion;
+
+#[cfg(not(windows))]
+#[path = "rest_catalog/auto_compact_review.rs"]
+mod auto_compact_review;

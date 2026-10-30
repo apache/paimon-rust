@@ -1656,6 +1656,18 @@ impl<'a> CoreOptions<'a> {
         }
     }
 
+    /// Include L0 files below normal compaction triggers. Java defaults to false.
+    pub fn compaction_force_up_level0(&self) -> crate::Result<bool> {
+        match self.options.get("compaction.force-up-level-0") {
+            None => Ok(false),
+            Some(raw) if raw.eq_ignore_ascii_case("true") => Ok(true),
+            Some(raw) if raw.eq_ignore_ascii_case("false") => Ok(false),
+            Some(raw) => Err(crate::Error::ConfigInvalid {
+                message: format!("compaction.force-up-level-0 must be true or false, got '{raw}'"),
+            }),
+        }
+    }
+
     /// Minimum input files for a compaction task. Default is 5. Data evolution
     /// permits one file for a forced rewrite; ordinary append requires two.
     pub fn compaction_min_file_num(&self) -> crate::Result<usize> {
