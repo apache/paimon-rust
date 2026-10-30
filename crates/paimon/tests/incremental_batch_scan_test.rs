@@ -3562,6 +3562,21 @@ async fn combined_delta_row_counts_match_the_rows_read() {
     );
     rewrite(&table, 1, vec![new_name("BOB"), new_embedding([9.0, 9.0])]).await;
     assert_eq!(combined_delta_row_counts(&table, 0, 2).await, [(None, 8)]);
+    // A limit plans on the rows the split returns at least, its merged rows.
+    let mut builder = table.new_read_builder();
+    builder.with_limit(1);
+    let scan = builder.new_incremental_scan(IncrementalScanMode::Delta, 0, 2);
+    let plan = scan.plan_combined_delta().await.unwrap();
+    let batches: Vec<RecordBatch> = builder
+        .new_read()
+        .unwrap()
+        .to_arrow(plan.splits())
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    let rows = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
+    assert_eq!((plan.stats().limit_early_stopped, rows), (true, 1));
 
     // An update of the first insert's values merges into its rows; the
     // second insert is one file.
@@ -3586,9 +3601,10 @@ async fn combined_delta_row_counts_match_the_rows_read() {
 }
 
 /// A limit stops planning once the splits planned return enough rows, also
-/// for change events that may decode a row-id group file by file and so give
-/// no merged row count: such a group returns at least its merged rows. Each
-/// insert of the table writes a normal, a BLOB and a VECTOR file.
+/// for change events that give no merged row count because their row-id
+/// groups may be decoded file by file: a group returns at least its merged
+/// rows either way. Each insert of the table writes a normal, a BLOB and a
+/// VECTOR file, which merge.
 #[tokio::test]
 async fn combined_delta_limit_stops_at_the_rows_splits_return_at_least() {
     let path = "memory:/incremental_batch/limit_lower_bound";
@@ -3623,5 +3639,48 @@ async fn combined_delta_limit_stops_at_the_rows_splits_return_at_least() {
         let rows = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
         let early = plan.stats().limit_early_stopped;
         assert_eq!((splits.len(), early, rows), expected, "{limit:?}");
+    }
+}
+
+/// Chunk shuffle slices a range of BLOB or VECTOR rewrites alone as it slices
+/// other row ranges: change events load no deletion vectors, so their groups
+/// need no normal file to anchor them. Together the chunks return the rows of
+/// the range, each chunk the selected rows of every file of its group.
+#[tokio::test]
+async fn combined_delta_chunk_shuffle_slices_rewrites_of_dedicated_files_alone() {
+    let path = "memory:/incremental_batch/chunks_of_rewrites";
+    let table = evolved_table(path, &[]).await;
+    // Snapshot 2 recomputes an embedding; snapshot 3 rewrites a picture and
+    // an embedding, a BLOB and a VECTOR file of the same rows.
+    rewrite(&table, 0, vec![new_embedding([9.0, 9.0])]).await;
+    let picture_and_embedding = vec![new_picture(b"zz"), new_embedding([7.0, 7.0])];
+    rewrite(&table, 1, picture_and_embedding).await;
+    let builder = table.new_read_builder();
+    let read = builder.new_read().unwrap();
+    for (start, end) in [(1, 2), (2, 3), (1, 3)] {
+        let scan = || builder.new_incremental_scan(IncrementalScanMode::Delta, start, end);
+        let range = scan().plan_combined_delta().await.unwrap();
+        let batches: Vec<RecordBatch> = read
+            .to_arrow(range.splits())
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let expected = evolved_rows(&batches);
+        let chunks = scan().with_chunk_shuffle("7", 1).unwrap();
+        let chunks = chunks.plan_combined_delta().await.unwrap();
+        assert_eq!(chunks.splits().len(), 2, "({start},{end}]");
+        let mut rows = Vec::new();
+        for chunk in chunks.splits() {
+            let batches: Vec<RecordBatch> = read
+                .to_arrow(std::slice::from_ref(chunk))
+                .unwrap()
+                .try_collect()
+                .await
+                .unwrap();
+            rows.extend(evolved_rows(&batches));
+        }
+        rows.sort();
+        assert_eq!(rows, expected, "({start},{end}]");
     }
 }

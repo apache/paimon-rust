@@ -77,8 +77,8 @@ pub(crate) fn parse_table_identifier(
 
 /// Resolves a table-name argument in the calling session: `table` and
 /// `database.table` take the session's current catalog (and database), as in
-/// a `FROM` clause, and `catalog.database.table` names the catalog. As in
-/// `parse_table_identifier`, the name is split at dots and its parts are
+/// a `FROM` clause, and `catalog.database.table` names the catalog. The name
+/// is split at dots, as `parse_table_identifier` splits it, and its parts are
 /// used as written. Returns the catalog's name and the table's identifier in
 /// that catalog.
 pub(crate) fn resolve_table_argument(

@@ -2426,9 +2426,9 @@ table.
 
 The table name resolves in the calling session: `my_table` and `my_db.my_table`
 use the current catalog (and database), as in a `FROM` clause, and
-`my_catalog.my_db.my_table` names the catalog. As in the other Paimon table
-functions, the name is split at dots, and the catalog, database and table names are
-used as written, without SQL quoting or case folding. Dynamic options set with
+`my_catalog.my_db.my_table` names the catalog. The name is split at dots, as in
+the other Paimon table functions, and its parts are used as written, without SQL
+quoting or case folding. Dynamic options set with
 `SET 'paimon.…'` apply as they do to a query on the table, except options that
 choose another range to read (time-travel selectors, `incremental-between*`, file
 creation-time filters and a `scan.mode` other than `default`), which are rejected
