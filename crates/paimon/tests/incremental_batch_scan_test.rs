@@ -2482,8 +2482,20 @@ async fn read_evolved_range(
     end: i64,
     columns: Option<&[&str]>,
 ) -> (Vec<EvolvedRow>, Vec<EvolvedRow>) {
+    read_evolved_range_where(table, start, end, columns, None).await
+}
+
+/// [`read_evolved_range`] with `filter` set on the read builder, so that it
+/// applies when the range is planned as well as to the rows read.
+async fn read_evolved_range_where(
+    table: &paimon::table::Table,
+    start: i64,
+    end: i64,
+    columns: Option<&[&str]>,
+    filter: Option<paimon::spec::Predicate>,
+) -> (Vec<EvolvedRow>, Vec<EvolvedRow>) {
     use paimon::table::{IncrementalPlan, IncrementalSplit};
-    let label = format!("({start},{end}] {columns:?}");
+    let label = format!("({start},{end}] {columns:?} {filter:?}");
     let mut builder = table.new_read_builder();
     if let Some(columns) = columns {
         let fields = table.schema().fields().iter();
@@ -2493,6 +2505,9 @@ async fn read_evolved_range(
                 .cloned()
                 .collect(),
         );
+    }
+    if let Some(filter) = filter {
+        builder.with_filter(filter);
     }
     let read = builder.new_read().unwrap();
     let scan = builder.new_incremental_scan(IncrementalScanMode::Delta, start, end);
@@ -3451,4 +3466,50 @@ async fn delta_merges_rows_whose_vector_column_became_a_string() {
         }
         assert_eq!(read_evolved_snapshot(&table).await, current);
     }
+}
+
+/// A filter keeps every row of a range it matches. After the table stops
+/// keeping the VECTOR column in vector files, a rewrite of bob's name and
+/// embedding stores both inline, so the range of the insert and the rewrite is
+/// read file by file and returns the insert's `bob` as well as the rewrite's
+/// `BOB`. The rewrite's newer file no longer holds `bob`; planning still keeps
+/// the rows' files, as reading the range and then filtering it would.
+#[tokio::test]
+async fn delta_filters_each_file_of_rows_read_file_by_file() {
+    use paimon::spec::{Datum, PredicateBuilder, SchemaChange};
+    let row = evolved_row;
+    let path = "memory:/incremental_batch/filter_by_file";
+    let table = evolved_table(path, &[]).await;
+    let change = SchemaChange::remove_option("vector.file.format".into());
+    let schema = table.schema().apply_changes(vec![change]).unwrap();
+    persist_table_schema(table.file_io(), path, &schema).await;
+    let table = paimon::table::Table::new(
+        table.file_io().clone(),
+        table.identifier().clone(),
+        path.to_string(),
+        schema,
+        None,
+    );
+    rewrite(&table, 1, vec![new_name("BOB"), new_embedding([9.0, 9.0])]).await;
+
+    let bob = || {
+        PredicateBuilder::new(table.schema().fields())
+            .equal("name", Datum::String("bob".into()))
+            .unwrap()
+    };
+    let (per_commit, by_file) = read_evolved_range(&table, 0, 2, None).await;
+    let named_bob = |rows: Vec<EvolvedRow>| -> Vec<EvolvedRow> {
+        let bob = |row: &EvolvedRow| row.1.as_deref() == Some("bob");
+        rows.into_iter().filter(bob).collect()
+    };
+    let expected = (named_bob(per_commit), named_bob(by_file));
+    assert_eq!(
+        expected,
+        (
+            vec![row(Some(2), Some("bob"), Some("bb"), Some([0, 1]))],
+            vec![row(Some(2), Some("bob"), None, None)],
+        )
+    );
+    let filtered = read_evolved_range_where(&table, 0, 2, None, Some(bob())).await;
+    assert_eq!(filtered, expected);
 }

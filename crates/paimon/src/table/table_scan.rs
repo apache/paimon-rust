@@ -3145,21 +3145,39 @@ impl<'a> PaimonTableScan<'a> {
                 scan_stats.data_evolution_groups_pruned_by_row_ranges +=
                     groups_pruned_by_row_ranges;
 
-                // Filter groups by merged stats before splitting.
+                // Filter groups by merged stats before splitting. Change events
+                // may decode a group file by file, returning each file's own
+                // rows rather than the merged rows these stats describe, so
+                // such a group also stays when one of its files may match.
                 let row_id_groups: Vec<Vec<DataFileMeta>> = if self.data_predicates.is_empty() {
                     row_id_groups
                 } else {
                     let before = row_id_groups.len();
                     let mut groups = Vec::with_capacity(before);
                     for group in row_id_groups {
-                        if data_evolution_group_matches_predicates_for_table(
+                        let mut keep = data_evolution_group_matches_predicates_for_table(
                             &self.table,
                             &group,
                             &self.data_predicates,
                             &mut stats_schema_cache,
                         )
-                        .await
-                        {
+                        .await;
+                        if !keep && self.is_streaming() && group.len() > 1 {
+                            for file in &group {
+                                if data_evolution_group_matches_predicates_for_table(
+                                    &self.table,
+                                    std::slice::from_ref(file),
+                                    &self.data_predicates,
+                                    &mut stats_schema_cache,
+                                )
+                                .await
+                                {
+                                    keep = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if keep {
                             groups.push(group);
                         }
                     }
