@@ -193,6 +193,7 @@ impl DataEvolutionCompactPlanner {
                     total_buckets,
                     files,
                     output_level: None,
+                    input_buckets: vec![],
                 });
             }
         }

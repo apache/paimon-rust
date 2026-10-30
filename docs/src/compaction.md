@@ -21,12 +21,12 @@ under the License.
 
 Rust supports small-file compaction for ordinary append tables, normal-file
 compaction for Data Evolution tables, and sorted-run compaction for primary-key
-tables with fixed or dynamic buckets. `CompactBuilder` creates
+tables with fixed, dynamic or postpone buckets. `CompactBuilder` creates
 a `CompactPlanner`, a `CompactExecutor`, and a `TableCommit`. Planning and
 execution do not publish snapshots; `commit_compact` atomically publishes the
 selected results in a `COMPACT` snapshot.
 
-The builder selects a dedicated append, primary-key or Data Evolution planner
+The builder selects a dedicated append, primary-key, postpone or Data Evolution planner
 for the table mode. They share snapshot capture and the public plan/task types;
 each planner owns its file eligibility, grouping and task-selection rules.
 
@@ -115,8 +115,8 @@ snapshot expiration and storage reclamation are separate maintenance work.
 The same API compacts primary-key tables with `deduplicate`,
 `first-row`, `partial-update` or `aggregation` merge engines. Changelog producers
 `none`, `input` and `lookup` are supported; `first-row` supports `none` or `lookup`.
-For `deduplicate` with `none`, `input` or `lookup`, and non-DV `first-row` with
-`none` or `lookup`, the planner chooses incremental sorted runs using Java's
+For fixed or dynamic buckets, `deduplicate` with `none`, `input` or `lookup`, and
+non-DV `first-row` with `none` or `lookup`, the planner chooses incremental sorted runs using Java's
 universal-compaction size and count policy. Each L0 file is a
 run; all files at one positive level form a single run. Normal size and run-count
 triggers take precedence. If they select no work, explicit compaction forces
@@ -332,6 +332,61 @@ Cross-partition dynamic buckets are also supported: subsequent writers rebuild
 their key-location index from the compacted data as usual. Compaction does not
 rebalance buckets or reclaim HASH index capacity.
 
+## Postpone buckets
+
+The same API publishes pending data in primary-key tables with `bucket=-2`.
+The planner captures both unsorted `bucket-postpone` files and real-bucket files,
+including Level-0 files produced by the fixed-bucket postpone writer. A partition
+with pending or Level-0 files becomes one task. The task rewrites that partition's
+complete captured data into real buckets at a positive level; a partition with
+only positive-level files needs no work. Partition filters and committing subsets
+of partition tasks are supported.
+
+Existing per-partition bucket counts take precedence. For a new partition,
+`postpone.default-bucket-num` supplies an exact count. Otherwise the count is
+the ceiling of pending row count divided by `postpone.target-row-num-per-bucket`,
+or pending physical file bytes divided by `postpone.target-size-per-bucket`
+(default 1 GiB). The minimum count is one. Compaction does not rescale existing
+partitions or apply the batch writer's power-of-two rounding and parallelism cap.
+
+Pending files are replayed serially within each writer by creation time, using
+writer-local sequence bounds and file counters to break millisecond ties.
+Different writers have no arrival ordering guarantee. Replay allocates sequences
+after the captured real-bucket history and retains row kinds and configured user
+sequence fields. Bounded input
+batches are routed and sorted into temporary Parquet KV runs. Additional passes
+merge at most 128 temporary runs at a time while preserving every physical row,
+so small read batches do not exhaust the final merge's input limit. The ordinary
+PK compactor then applies the merge engine and generates lookup changelogs when
+enabled. Temporary runs are removed on completion or execution error. The
+existing limit of 256 overlapping final inputs, including real-bucket history,
+still applies; exceeding it fails execution without publishing a snapshot.
+
+Publication atomically removes the captured inputs and adds all real-bucket
+outputs in a `COMPACT` snapshot. Concurrent new postpone files remain pending
+for the next plan. A concurrent real-bucket write in a rewritten partition,
+overwritten input or changed input metadata makes the commit fail; plan again
+from the latest snapshot. Serialized task/results retain their input and output
+bucket mappings for distributed execution, subset commits and idempotent retries.
+Postpone compaction requires partition keys to be included in the primary key.
+
+With deletion vectors, postpone compaction supports `deduplicate` with `none`,
+`input` or `lookup` changelog producers and requires actual catalog/FileIO
+local-cache, as other PK DV compaction does. Captured masks filter pending
+physical rows before routing and filter real-bucket L0 and historical files
+before merging. Winning retracts are omitted from data after lookup changelog
+generation. A task can publish no data files when all keys are deleted.
+
+Commit atomically retires the rewritten files' DV ranges, preserving masks on
+unselected partitions and concurrently appended pending files, including ranges
+in shared containers. Changes to a selected input's captured mask reject the
+commit; unchanged masks repacked into a different container are permitted.
+Serialized results must retain their `deletion_vector_updates` metadata, even
+when the list is empty, for first publication. Retries of an already committed
+subset remain idempotent. Enabling DV only through temporary table options does
+not migrate historical files written without DV. Other merge engines and global
+index manifests remain unsupported for postpone DV compaction.
+
 ## Data Evolution compaction
 
 The same API compacts normal structured files in unaware append tables with
@@ -391,8 +446,9 @@ deletions into reassigned row IDs are not provided. Setting
 The `full-compaction` changelog producer is unsupported. Primary-key deletion-vector
 compaction supports `deduplicate` with `none`, `input` or `lookup`.
 Outside Data Evolution mode, row tracking and dedicated
-blob/vector storage are unsupported. Query authorization, rowkind fields and
-postpone buckets are unsupported in all modes.
+blob/vector storage are unsupported. Query authorization and rowkind fields
+are unsupported in all modes. Postpone deletion-vector compaction supports only
+`deduplicate` with `none`, `input` or `lookup`, as described above.
 Ordered bucketed append, append incremental clustering, primary-key clustering
 override (`pk-clustering-override`) and record-level expiration
 (`record-level.expire-time`) are also unsupported.

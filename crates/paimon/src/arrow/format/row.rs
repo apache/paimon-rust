@@ -1116,6 +1116,11 @@ fn decode_row_block(
             });
         }
         let offset = read_i32_le(data, offset_array_start + local_idx * 4)? as usize;
+        let row_end = if local_idx + 1 < row_count {
+            read_i32_le(data, offset_array_start + (local_idx + 1) * 4)? as usize
+        } else {
+            offset_array_start
+        };
         let header_end = offset + header_size;
         if header_end > offset_array_start {
             return Err(Error::DataInvalid {
@@ -1128,7 +1133,7 @@ fn decode_row_block(
         let mut input = BlockInput {
             data,
             position: header_end,
-            data_end: offset_array_start,
+            data_end: row_end.min(offset_array_start),
         };
         for (field_idx, field) in fields.iter().enumerate() {
             if (data[offset + field_idx / 8] & (1 << (field_idx % 8))) != 0 {
@@ -1136,6 +1141,12 @@ fn decode_row_block(
             } else {
                 builders[field_idx].read_append(&mut input, field.data_type())?;
             }
+        }
+        if input.position != row_end {
+            return Err(Error::DataInvalid {
+                message: ".row physical schema does not consume the complete row".into(),
+                source: None,
+            });
         }
     }
 

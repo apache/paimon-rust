@@ -23,7 +23,7 @@ use indexmap::IndexMap;
 use roaring::RoaringBitmap;
 
 use super::super::deletion_vectors::DeletionVectorUpdate;
-use crate::deletion_vector::DeletionVectorFactory;
+use crate::deletion_vector::{DeletionVector, DeletionVectorFactory};
 use crate::spec::{
     BinaryRow, DataFileMeta, DeletionVectorMeta, FileKind, IndexManifest, IndexManifestEntry,
     ManifestEntry, PartitionComputer, Snapshot,
@@ -125,32 +125,78 @@ fn bucket_path(table: &Table, partition: &[u8], bucket: i32) -> Result<String> {
     )
 }
 
+/// Resolve one captured index manifest for all buckets in a partition rewrite.
+pub(in crate::table::compact) struct CapturedDeletionVectors {
+    references: HashMap<FileId, VectorReference>,
+}
+
+impl CapturedDeletionVectors {
+    pub(in crate::table::compact) async fn new(table: &Table, snapshot: &Snapshot) -> Result<Self> {
+        Ok(Self {
+            references: vector_references(&read_indexes(table, snapshot).await?)?,
+        })
+    }
+
+    fn deletion_file(
+        &self,
+        table: &Table,
+        split: &DataSplit,
+        file: &DataFileMeta,
+    ) -> Option<DeletionFile> {
+        self.references
+            .get(&(
+                split.partition().to_serialized_bytes(),
+                split.bucket(),
+                file.file_name.clone(),
+            ))
+            .map(|reference| resolve_vector(table, split.bucket_path(), reference))
+    }
+
+    pub(in crate::table::compact) async fn read_vector(
+        &self,
+        table: &Table,
+        split: &DataSplit,
+        file: &DataFileMeta,
+    ) -> Result<Option<DeletionVector>> {
+        match self.deletion_file(table, split, file) {
+            Some(file) => DeletionVectorFactory::read(table.file_io(), &file)
+                .await
+                .map(Some),
+            None => Ok(None),
+        }
+    }
+
+    pub(in crate::table::compact) fn with_deletion_files(
+        &self,
+        table: &Table,
+        split: &DataSplit,
+    ) -> Result<DataSplit> {
+        let files = split
+            .data_files()
+            .iter()
+            .map(|file| self.deletion_file(table, split, file))
+            .collect();
+        DataSplit::builder()
+            .with_snapshot(split.snapshot_id())
+            .with_partition(split.partition().clone())
+            .with_bucket(split.bucket())
+            .with_total_buckets(split.total_buckets())
+            .with_bucket_path(split.bucket_path().to_string())
+            .with_data_files(split.data_files().to_vec())
+            .with_data_deletion_files(files)
+            .build()
+    }
+}
+
 /// Apply captured physical masks before merging, including masks on L0 files.
 pub(in crate::table::compact) async fn with_deletion_files(
     table: &Table,
     split: &DataSplit,
     snapshot: &Snapshot,
 ) -> Result<DataSplit> {
-    let references = vector_references(&read_indexes(table, snapshot).await?)?;
-    let partition = split.partition().to_serialized_bytes();
-    let files = split
-        .data_files()
-        .iter()
-        .map(|file| {
-            references
-                .get(&(partition.clone(), split.bucket(), file.file_name.clone()))
-                .map(|reference| resolve_vector(table, split.bucket_path(), reference))
-        })
-        .collect();
-    DataSplit::builder()
-        .with_snapshot(split.snapshot_id())
-        .with_partition(split.partition().clone())
-        .with_bucket(split.bucket())
-        .with_total_buckets(split.total_buckets())
-        .with_bucket_path(split.bucket_path().to_string())
-        .with_data_files(split.data_files().to_vec())
-        .with_data_deletion_files(files)
-        .build()
+    CapturedDeletionVectors::new(table, snapshot)
+        .await?
+        .with_deletion_files(table, split)
 }
 
 /// Selected masks must be unchanged. Actual point-lookup hits must still be

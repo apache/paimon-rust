@@ -78,7 +78,7 @@ async fn all_files(table: &Table) -> Vec<DataFileMeta> {
         .collect()
 }
 
-async fn indexes(table: &Table) -> Vec<IndexManifestEntry> {
+pub(super) async fn indexes(table: &Table) -> Vec<IndexManifestEntry> {
     match latest(table).await.index_manifest() {
         Some(name) => IndexManifest::read(
             table.file_io(),
@@ -92,14 +92,23 @@ async fn indexes(table: &Table) -> Vec<IndexManifestEntry> {
 
 fn index_path(table: &Table, bucket: i32, file: &IndexFileMeta) -> String {
     if table.schema().core_options().index_file_in_data_file_dir() {
-        format!("{}/bucket-{bucket}/{}", table.location(), file.file_name)
+        let directory = if bucket == -2 {
+            "bucket-postpone".into()
+        } else {
+            format!("bucket-{bucket}")
+        };
+        format!("{}/{directory}/{}", table.location(), file.file_name)
     } else {
         format!("{}/index/{}", table.location(), file.file_name)
     }
 }
 
 // Java v1 envelope: version, then [length, magic+roaring, checksum] per file.
-async fn write_vectors(table: &Table, bucket: i32, deletions: &[(&str, &[u32])]) -> IndexFileMeta {
+pub(super) async fn write_vectors(
+    table: &Table,
+    bucket: i32,
+    deletions: &[(&str, &[u32])],
+) -> IndexFileMeta {
     let mut bytes = vec![1];
     let mut ranges = IndexMap::new();
     for (name, positions) in deletions {
@@ -169,7 +178,7 @@ async fn set_vectors(table: &Table, task: &CompactTask, deletions: &[(&str, &[u3
         .unwrap();
 }
 
-async fn positions(table: &Table, name: &str) -> RoaringBitmap {
+pub(super) async fn positions(table: &Table, name: &str) -> RoaringBitmap {
     for entry in indexes(table).await {
         let ranges = entry.index_file.deletion_vectors_ranges.as_ref();
         if let Some(meta) = ranges.and_then(|ranges| ranges.get(name)) {

@@ -35,6 +35,12 @@ mod incremental_stateful_tests;
 #[path = "pk_compact/dynamic_bucket.rs"]
 mod dynamic_tests;
 
+#[path = "pk_compact/postpone.rs"]
+mod postpone_tests;
+
+#[path = "pk_compact/postpone_deletion_vectors.rs"]
+mod postpone_dv_tests;
+
 #[path = "pk_compact/deletion_vectors.rs"]
 mod deletion_vector_tests;
 

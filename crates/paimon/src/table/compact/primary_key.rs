@@ -74,6 +74,7 @@ impl PrimaryKeyCompactPlanner {
                         total_buckets,
                         files,
                         output_level: Some(output_level),
+                        input_buckets: vec![],
                     });
                 }
                 continue;
@@ -93,6 +94,7 @@ impl PrimaryKeyCompactPlanner {
                     total_buckets,
                     files,
                     output_level: None,
+                    input_buckets: vec![],
                 });
             }
         }
@@ -282,7 +284,11 @@ fn new_merge_function(
     })
 }
 
-fn read_type(table: &Table) -> Vec<DataField> {
+pub(super) fn read_type(table: &Table) -> Vec<DataField> {
+    read_type_fields(table.schema().fields())
+}
+
+pub(super) fn read_type_fields(value_fields: &[DataField]) -> Vec<DataField> {
     let mut fields = vec![
         DataField::new(
             SEQUENCE_NUMBER_FIELD_ID,
@@ -295,11 +301,14 @@ fn read_type(table: &Table) -> Vec<DataField> {
             DataType::TinyInt(TinyIntType::new()),
         ),
     ];
-    fields.extend_from_slice(table.schema().fields());
+    fields.extend_from_slice(value_fields);
     fields
 }
 
-fn new_reader(table: &Table, resources: Option<ResourceContext>) -> Result<KeyValueFileReader> {
+pub(super) fn new_reader(
+    table: &Table,
+    resources: Option<ResourceContext>,
+) -> Result<KeyValueFileReader> {
     let schema = table.schema();
     let options = schema.core_options();
     let merge_engine = options.merge_engine()?;

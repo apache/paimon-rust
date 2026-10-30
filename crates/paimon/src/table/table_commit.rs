@@ -2100,6 +2100,12 @@ impl TableCommit {
                         base_data_files.as_deref().unwrap_or_default(),
                     )?;
                 }
+                if self.table.schema().core_options().bucket() == crate::spec::POSTPONE_BUCKET {
+                    super::compact::postpone::validate_concurrent_changes(
+                        entries,
+                        base_data_files.as_deref().unwrap_or_default(),
+                    )?;
+                }
                 self.check_compact_lsm_conflicts(
                     base_data_files.as_deref().unwrap_or_default(),
                     entries,
