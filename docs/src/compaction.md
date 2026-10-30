@@ -158,11 +158,28 @@ retain their physical deletion metadata, including an empty list when appropriat
 Each output file is limited to 4,294,967,296 physical rows. Migrating files written
 without DV is unsupported, including enabling DV through temporary table options.
 
-`partial-update` and `aggregation` retain their current
-selection behavior: every active file in a selected bucket participates, and
-output uses the highest input level or level 1 for all-L0 inputs. Their state
-and changelog generation must see history before incremental selection can be
-enabled. Append size and count options do not control PK selection.
+Non-DV `partial-update` and `aggregation` with `lookup` use the same incremental
+policy and require actual catalog/FileIO local-cache. The executor inserts the
+nearest retained positive-level state into each changed key's merge, in sequence
+order. The output contains the materialized state; lookup scans use only the
+nearest positive-level state, so retained older levels are not aggregated again.
+
+With `none` or `input`, these engines use incremental selection only when every
+value field can be merged again independently of row order: `min`, `max`,
+`bool_and`, `bool_or`, or integer `sum` without checked overflow. Aggregation must
+have `aggregation.remove-record-on-delete=false`; its sequence fields keep their
+normal metadata role. Partial update must use `ignore-delete=true`, no global
+sequence fields, and protect every value field with a sequence group and one of
+these aggregate functions. Each group's ordering fields retain its winning
+sequence. These modes merge only selected inputs, leaving retained history to
+ordinary query merging, and do not require local-cache.
+
+Other `none`/`input` configurations retain their previous selection: every active
+file in the selected bucket participates, and output uses the highest input level
+or level 1 for all-L0 inputs. This preserves sparse overwrite and order-sensitive
+state such as `first_value`, finite floating-point summation, checked-overflow
+behavior and reset-on-delete semantics. Existing retract/state restrictions still
+apply. Append size and count options do not control PK selection.
 
 Tasks capture their selected runs and output level. Executors validate the task
 against the captured snapshot. Committers independently recompute the selection

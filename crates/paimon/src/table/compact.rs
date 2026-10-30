@@ -130,11 +130,7 @@ impl<'a> CompactBuilder<'a> {
         Ok(CompactExecutor {
             table: self.table.clone(),
             resources: self.resources.clone(),
-            lookup_cache: if lookup
-                && matches!(
-                    options.merge_engine()?,
-                    MergeEngine::Deduplicate | MergeEngine::FirstRow
-                ) {
+            lookup_cache: if lookup {
                 Some(Arc::new(primary_key::lookup_file::LookupFileCache::new(
                     local_cache.expect("lookup cache validated above"),
                     self.table.schema().options(),

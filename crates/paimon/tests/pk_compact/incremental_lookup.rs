@@ -687,3 +687,63 @@ async fn incremental_first_row_rewrites_selected_history_and_looks_up_retained_h
         ("+I", 45, 4500)
     );
 }
+
+#[tokio::test]
+async fn stateful_lookup_reuses_cached_history_for_sparse_rows_and_changelog() {
+    for engine in ["partial-update", "aggregation"] {
+        for bucket in ["1", "-1"] {
+            let mut options = vec![
+                ("merge-engine", engine),
+                ("bucket", bucket),
+                ("read.batch-size", "7"),
+            ];
+            if engine == "aggregation" {
+                options.push(("fields.value.aggregate-function", "sum"));
+            }
+            let (table, probe) = probed_table_with_options(&options).await;
+            let anchor = seed(&table).await;
+            let start = latest(&table).await;
+            *probe.history.lock().unwrap() = anchor.file_name.clone();
+            let input = RecordBatch::try_from_iter([
+                (
+                    "id",
+                    Arc::new(Int32Array::from(vec![42, 44, 43])) as arrow_array::ArrayRef,
+                ),
+                (
+                    "value",
+                    Arc::new(Int32Array::from(vec![Some(4200), None, Some(4300)]))
+                        as arrow_array::ArrayRef,
+                ),
+            ])
+            .unwrap();
+            write_batch(&table, &input).await;
+            let expected = rows(&table).await;
+            let new_value = if engine == "aggregation" { 4242 } else { 4200 };
+            assert!(expected.contains(&(42, new_value)) && expected.contains(&(44, 44)));
+            let builder = table.new_compact_builder();
+            let plan = builder.new_planner().unwrap().plan().await.unwrap();
+            assert!(plan.tasks()[0].files().iter().all(|file| file.level == 0));
+            let (cold, hot) = cold_and_hot(&table, &plan, &probe, &anchor).await;
+            assert_eq!(hot[0].metrics().rows_written, 3);
+            let commit = builder.new_commit().unwrap();
+            commit.commit_compact(hot).await.unwrap();
+            let end = latest(&table).await;
+            commit.commit_compact(cold).await.unwrap();
+            assert_eq!(latest(&table).await, end);
+            assert_eq!(rows(&table).await, expected);
+            let mut changes = vec![
+                ("-U".into(), 42, 42, 21),
+                ("+U".into(), 42, i64::from(new_value), 1000),
+                ("-U".into(), 44, 44, 22),
+                ("+U".into(), 44, 44, 1001),
+                ("+I".into(), 43, 4300, 1002),
+            ];
+            changes.sort();
+            assert_eq!(events(&table, start, end).await, changes);
+            write_batch(&table, &make_batch(vec![42], vec![1])).await;
+            let next_expected = rows(&table).await;
+            compact(&table).await;
+            assert_eq!(rows(&table).await, next_expected);
+        }
+    }
+}
