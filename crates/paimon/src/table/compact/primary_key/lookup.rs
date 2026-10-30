@@ -26,9 +26,7 @@ use arrow_schema::{DataType as ArrowType, SchemaRef};
 
 use crate::spec::{DataField, MergeEngine, RowKind, VALUE_KIND_FIELD_NAME};
 use crate::table::kv_file_reader::KeyValueReadConfig;
-use crate::table::sort_merge::{
-    lookup_rows, BufferedBatch, MergeFunction, MergeResult, MergeRow, FILE_LEVEL_METADATA_KEY,
-};
+use crate::table::sort_merge::{lookup_rows, BufferedBatch, MergeFunction, MergeResult, MergeRow};
 use crate::{Error, Result};
 
 struct ChangelogOptions {
@@ -81,10 +79,11 @@ struct LookupChangelogMergeFunction {
 pub(super) fn new_merge_function(
     config: &KeyValueReadConfig,
     fields: &[DataField],
+    output_level: i32,
 ) -> Result<Box<dyn MergeFunction>> {
     let options = ChangelogOptions::parse(&config.table_options)?;
     Ok(Box::new(LookupChangelogMergeFunction {
-        inner: super::new_merge_function(config, fields)?,
+        inner: super::new_merge_function(config, fields, output_level)?,
         first_row: config.merge_engine == MergeEngine::FirstRow,
         value_columns: fields
             .iter()
@@ -317,13 +316,13 @@ impl MergeFunction for LookupChangelogMergeFunction {
             return Ok((result, None));
         }
         if self.first_row {
-            let contains_history = rows.iter().any(|row| {
-                matches!(row.value_kind, 0 | 2)
-                    && matches!(&batches[row.batch_idx], BufferedBatch::Source(batch)
-                        if batch.schema().metadata().get(FILE_LEVEL_METADATA_KEY)
-                            .and_then(|level| level.parse::<i32>().ok())
-                            .is_some_and(|level| level > 0))
-            });
+            let mut contains_history = false;
+            for row in rows {
+                if matches!(row.value_kind, 0 | 2) && row.level(batches)? > 0 {
+                    contains_history = true;
+                    break;
+                }
+            }
             // FirstRowMergeFunctionWrapper emits the first add unchanged,
             // including UPDATE_AFTER; an existing accepted history emits none.
             let changelog = if contains_history {

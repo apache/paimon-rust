@@ -363,7 +363,12 @@ async fn lookup_compaction_first_row_only_emits_new_keys() {
 #[tokio::test]
 async fn lookup_first_row_preserves_the_earliest_record_across_positive_levels() {
     for with_l0 in [false, true] {
-        let table = lookup_table(&[("merge-engine", "first-row")]).await;
+        let table = lookup_table(&[
+            ("merge-engine", "first-row"),
+            ("num-sorted-run.compaction-trigger", "2"),
+            ("num-levels", "6"),
+        ])
+        .await;
         append_at_level(&table, 10, 3).await;
         append_at_level(&table, 20, 2).await;
         let history = table
@@ -376,6 +381,16 @@ async fn lookup_first_row_preserves_the_earliest_record_across_positive_levels()
             write_batch(&table, &make_batch(vec![1], vec![30])).await;
         }
         let end = compact(&table).await;
+        assert_eq!(
+            table
+                .snapshot_manager()
+                .get_latest_snapshot()
+                .await
+                .unwrap()
+                .unwrap()
+                .commit_kind(),
+            &CommitKind::COMPACT
+        );
         assert_eq!(rows(&table).await, vec![(1, 10)]);
         assert!(events(&table, history, end).await.is_empty());
     }
@@ -864,46 +879,75 @@ async fn lookup_compaction_validates_changelog_flags_before_execution() {
 
 #[tokio::test]
 async fn lookup_compaction_requires_the_catalog_cache() {
-    let table = table_with_cache(
-        pk_schema(&[
-            ("changelog-producer", "lookup"),
-            ("local-cache.enabled", "true"),
-        ]),
-        &[("local-cache.enabled", "false")],
-    )
-    .await;
-    assert!(table
-        .new_compact_builder()
-        .new_executor()
-        .err()
-        .unwrap()
-        .to_string()
-        .contains("local-cache.enabled=true"));
+    for (engine, producer) in [
+        ("deduplicate", "lookup"),
+        ("first-row", "lookup"),
+        ("first-row", "none"),
+        ("partial-update", "lookup"),
+        ("aggregation", "lookup"),
+    ] {
+        let table = table_with_cache(
+            pk_schema(&[
+                ("merge-engine", engine),
+                ("changelog-producer", producer),
+                ("local-cache.enabled", "true"),
+            ]),
+            &[("local-cache.enabled", "false")],
+        )
+        .await;
+        assert!(table
+            .new_compact_builder()
+            .new_executor()
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("local-cache.enabled=true"));
+    }
 }
 
 #[tokio::test]
 async fn lookup_compaction_selects_the_lowest_positive_level_as_materialized_history() {
-    let table = lookup_table(&[
-        ("merge-engine", "aggregation"),
-        ("fields.value.aggregate-function", "sum"),
-    ])
-    .await;
-    // Simulate Java lookup states: L2 already includes L3. Reducing both would
-    // produce 30 rather than 20 when the L0 delta is applied.
-    append_at_level(&table, 10, 3).await;
-    append_at_level(&table, 15, 2).await;
-    let history = table
-        .snapshot_manager()
-        .get_latest_snapshot_id()
-        .await
-        .unwrap()
-        .unwrap();
-    write_batch(&table, &make_batch(vec![1], vec![5])).await;
-    assert_eq!(rows(&table).await, vec![(1, 20)]);
-    let end = compact(&table).await;
-    assert_eq!(
-        events(&table, history, end).await,
-        expected(&[("-U", 1, 15), ("+U", 1, 20)])
-    );
-    assert_eq!(rows(&table).await, vec![(1, 20)]);
+    for with_l0 in [false, true] {
+        let table = lookup_table(&[
+            ("merge-engine", "aggregation"),
+            ("fields.value.aggregate-function", "sum"),
+            ("num-sorted-run.compaction-trigger", "2"),
+            ("num-levels", "6"),
+        ])
+        .await;
+        // L2 already includes L3. Reducing both would count the history twice.
+        append_at_level(&table, 10, 3).await;
+        append_at_level(&table, 15, 2).await;
+        let history = table
+            .snapshot_manager()
+            .get_latest_snapshot_id()
+            .await
+            .unwrap()
+            .unwrap();
+        if with_l0 {
+            write_batch(&table, &make_batch(vec![1], vec![5])).await;
+        }
+        let expected_value = if with_l0 { 20 } else { 15 };
+        assert_eq!(rows(&table).await, vec![(1, expected_value)]);
+        let end = compact(&table).await;
+        assert_eq!(
+            table
+                .snapshot_manager()
+                .get_latest_snapshot()
+                .await
+                .unwrap()
+                .unwrap()
+                .commit_kind(),
+            &CommitKind::COMPACT
+        );
+        assert_eq!(
+            events(&table, history, end).await,
+            if with_l0 {
+                expected(&[("-U", 1, 15), ("+U", 1, 20)])
+            } else {
+                vec![]
+            }
+        );
+        assert_eq!(rows(&table).await, vec![(1, expected_value)]);
+    }
 }

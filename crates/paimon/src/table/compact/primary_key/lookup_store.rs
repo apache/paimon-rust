@@ -20,7 +20,7 @@ use crate::io::FileRead;
 use crate::resource::ResourceContext;
 use crate::spec::{BinaryRowBuilder, DataField, DataFileMeta};
 use crate::table::merge_tree_split_generator::KeyComparator;
-use crate::table::sort_merge::{LookupProvider, FILE_LEVEL_METADATA_KEY};
+use crate::table::sort_merge::{with_level, LookupProvider};
 use crate::table::{DataSplit, Table};
 use crate::{Error, Result};
 use arrow_array::RecordBatch;
@@ -331,15 +331,7 @@ impl LookupProvider for LevelLookup {
                             .or_default()
                             .insert(position);
                     }
-                    let mut metadata = batch.schema().metadata().clone();
-                    metadata.insert(FILE_LEVEL_METADATA_KEY.into(), file.meta.level.to_string());
-                    found = Some(
-                        RecordBatch::try_new(
-                            Arc::new(batch.schema().as_ref().clone().with_metadata(metadata)),
-                            batch.columns().to_vec(),
-                        )
-                        .map_err(invalid)?,
-                    );
+                    found = Some(with_level(batch, file.meta.level)?);
                 }
             }
             if found.is_some() {

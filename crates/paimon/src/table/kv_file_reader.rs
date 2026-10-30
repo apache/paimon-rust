@@ -27,9 +27,9 @@
 
 use super::data_file_reader::{file_index_selection_to_local_ranges, DataFileReader};
 use super::sort_merge::{
-    AggregateMergeFunction, DeduplicateMergeFunction, FirstRowMergeFunction, LookupMergeFunction,
-    MergeFunction, PartialUpdateMergeFunction, QueryReducerMergeFunction, SortMergeReaderBuilder,
-    CHANGELOG_BATCH_METADATA_KEY, FILE_LEVEL_METADATA_KEY,
+    schema_with_level, with_level, AggregateMergeFunction, DeduplicateMergeFunction,
+    FirstRowMergeFunction, LookupMergeFunction, MergeFunction, PartialUpdateMergeFunction,
+    QueryReducerMergeFunction, SortMergeReaderBuilder, CHANGELOG_BATCH_METADATA_KEY,
 };
 use crate::arrow::format::MosaicPrefetchOptions;
 use crate::arrow::shredding::variant::assemble_variant_extraction_array;
@@ -353,10 +353,11 @@ impl KeyValueFileReader {
             &config.table_fields,
             &config.primary_keys,
         );
-        let include_file_levels = config
-            .table_options
-            .get("changelog-producer")
-            .is_some_and(|value| value.eq_ignore_ascii_case("lookup"));
+        let include_file_levels = config.merge_engine == MergeEngine::FirstRow
+            || config
+                .table_options
+                .get("changelog-producer")
+                .is_some_and(|value| value.eq_ignore_ascii_case("lookup"));
         Self {
             file_io,
             config,
@@ -642,6 +643,11 @@ impl KeyValueFileReader {
         internal_read_type.extend(user_fields.clone());
 
         let internal_schema = crate::arrow::build_read_arrow_schema(&internal_read_type)?;
+        let merge_input_schema = if self.include_file_levels {
+            schema_with_level(internal_schema.as_ref())?
+        } else {
+            internal_schema
+        };
 
         // Output schema: user's read_type order
         let output_schema = crate::arrow::build_read_arrow_schema(&self.config.read_type)?;
@@ -882,11 +888,7 @@ impl KeyValueFileReader {
                                 while let Some(batch) = file_stream.next().await {
                                     let batch = batch?;
                                     if include_file_levels {
-                                        let mut metadata = batch.schema().metadata().clone();
-                                        metadata.insert(FILE_LEVEL_METADATA_KEY.into(), file_level.to_string());
-                                        yield RecordBatch::try_new(
-                                            Arc::new(batch.schema().as_ref().clone().with_metadata(metadata)), batch.columns().to_vec(),
-                                        ).map_err(|error| Error::DataInvalid { message: format!("Invalid lookup input batch: {error}"), source: Some(Box::new(error)) })?;
+                                        yield with_level(batch, file_level)?;
                                     } else { yield batch; }
                                 }
                             }
@@ -911,7 +913,7 @@ impl KeyValueFileReader {
                     // still contain duplicate keys.
                     let mut merge_stream = SortMergeReaderBuilder::new(
                         file_streams,
-                        internal_schema.clone(),
+                        merge_input_schema.clone(),
                         key_indices.clone(),
                         seq_index,
                         value_kind_index,

@@ -30,10 +30,12 @@ use crate::spec::{AggregationConfig, CoreOptions, DataField, PartialUpdateConfig
 use crate::table::aggregator::{new_aggregator, FieldAggregator};
 use crate::table::ArrowRecordBatchStream;
 use crate::Error;
-use arrow_array::{new_null_array, Array, ArrayRef, Int64Array, Int8Array, RecordBatch};
+use arrow_array::{
+    new_null_array, Array, ArrayRef, Int32Array, Int64Array, Int8Array, RecordBatch,
+};
 use arrow_ord::ord::make_comparator;
 use arrow_row::{OwnedRow, RowConverter, Rows, SortField};
-use arrow_schema::{SchemaRef, SortOptions};
+use arrow_schema::{Schema, SchemaRef, SortOptions};
 use arrow_select::interleave::interleave;
 use async_stream::try_stream;
 use futures::StreamExt;
@@ -84,7 +86,6 @@ pub(crate) struct MergeRow {
     pub user_sequence: Option<OwnedRow>,
 }
 
-#[cfg(test)]
 impl MergeRow {
     fn source_batch<'a>(
         &self,
@@ -107,6 +108,19 @@ impl MergeRow {
                 source: None,
             }),
         }
+    }
+
+    pub(super) fn level(&self, batches: &[BufferedBatch]) -> crate::Result<i32> {
+        let batch = self.source_batch(batches)?;
+        let levels = batch
+            .column_by_name(LEVEL_FIELD_NAME)
+            .and_then(|column| column.as_any().downcast_ref::<Int32Array>())
+            .filter(|levels| self.row_idx < levels.len() && levels.is_valid(self.row_idx))
+            .ok_or_else(|| Error::DataInvalid {
+                message: "Merge input must contain a non-null INT _LEVEL for each row".into(),
+                source: None,
+            })?;
+        Ok(levels.value(self.row_idx))
     }
 }
 
@@ -172,9 +186,36 @@ pub(crate) trait LookupProvider: Send + Sync {
     async fn lookup(&self, key: &[u8]) -> crate::Result<Option<RecordBatch>>;
 }
 
-/// Internal batch metadata used only by lookup compaction. Source levels
-/// survive physical reads; changelog batches are routed to a separate writer.
-pub(super) const FILE_LEVEL_METADATA_KEY: &str = "paimon.compact.file-level";
+const LEVEL_FIELD_NAME: &str = "_LEVEL";
+
+/// Java KeyValue.schemaWithLevel appends the non-null INT SpecialFields.LEVEL.
+/// This column carries each input row's file level through merging; it is not
+/// part of the data-file schema or the merge output.
+pub(super) fn schema_with_level(schema: &Schema) -> crate::Result<SchemaRef> {
+    let level = crate::arrow::build_target_arrow_schema(&[DataField::new(
+        i32::MAX - 3,
+        LEVEL_FIELD_NAME.to_string(),
+        crate::spec::DataType::Int(crate::spec::IntType::with_nullable(false)),
+    )])?;
+    let mut fields = schema.fields().to_vec();
+    fields.push(level.field(0).clone().into());
+    Ok(Arc::new(Schema::new_with_metadata(
+        fields,
+        schema.metadata().clone(),
+    )))
+}
+
+pub(super) fn with_level(batch: RecordBatch, level: i32) -> crate::Result<RecordBatch> {
+    let schema = schema_with_level(batch.schema().as_ref())?;
+    let mut columns = batch.columns().to_vec();
+    columns.push(Arc::new(Int32Array::from(vec![level; batch.num_rows()])));
+    RecordBatch::try_new(schema, columns).map_err(|error| Error::DataInvalid {
+        message: format!("Invalid merge input with level: {error}"),
+        source: Some(Box::new(error)),
+    })
+}
+
+/// Route changelog batches to a separate writer.
 pub(super) const CHANGELOG_BATCH_METADATA_KEY: &str = "paimon.compact.changelog";
 
 /// Lookup states at positive levels are already materialized. The lowest
@@ -188,21 +229,7 @@ pub(super) fn lookup_rows(
     let mut base_level = i32::MAX;
     let mut levels = Vec::with_capacity(rows.len());
     for (index, row) in rows.iter().enumerate() {
-        let BufferedBatch::Source(batch) = &batches[row.batch_idx] else {
-            return Err(Error::UnexpectedError {
-                message: "Lookup input must be a source batch".into(),
-                source: None,
-            });
-        };
-        let level = batch
-            .schema()
-            .metadata()
-            .get(FILE_LEVEL_METADATA_KEY)
-            .and_then(|level| level.parse::<i32>().ok())
-            .ok_or_else(|| Error::DataInvalid {
-                message: "Lookup input is missing its file level".into(),
-                source: None,
-            })?;
+        let level = row.level(batches)?;
         if level > 0 && (base.is_none() || level < base_level) {
             base = Some(index);
             base_level = level;
@@ -1656,11 +1683,13 @@ fn sort_merge_stream(
             }
 
             if let Some((lookup, schema)) = &lookup {
-                let has_base = same_key_rows.iter().any(|row| match &batch_buffer[row.batch_idx] {
-                    BufferedBatch::Source(batch) => batch.schema().metadata().get(FILE_LEVEL_METADATA_KEY)
-                        .and_then(|level| level.parse::<i32>().ok()).is_some_and(|level| level > 0),
-                    _ => false,
-                });
+                let mut has_base = false;
+                for row in &same_key_rows {
+                    if row.level(&batch_buffer)? > 0 {
+                        has_base = true;
+                        break;
+                    }
+                }
                 if !has_base {
                     if let Some(batch) = lookup.lookup(&winner_key).await? {
                         if batch.num_rows() != 1 || batch.schema().fields() != schema.fields() {
@@ -1842,6 +1871,82 @@ mod tests {
     use futures::TryStreamExt;
     use std::collections::HashMap;
     use std::sync::Arc;
+
+    #[test]
+    fn level_column_survives_concatenation_and_serialization() {
+        let input = RecordBatch::try_from_iter([(
+            "value",
+            Arc::new(Int64Array::from(vec![10, 20])) as ArrayRef,
+        )])
+        .unwrap();
+        let inputs = [
+            with_level(input.clone(), 0).unwrap(),
+            with_level(input, 3).unwrap(),
+        ];
+        let schema = inputs[0].schema();
+        let field = schema.fields().last().unwrap();
+        assert_eq!(field.name(), "_LEVEL");
+        assert_eq!(field.data_type(), &DataType::Int32);
+        assert!(!field.is_nullable());
+        assert_eq!(
+            field.metadata()["PARQUET:field_id"],
+            (i32::MAX - 3).to_string()
+        );
+        let batch = arrow_select::concat::concat_batches(&schema, &inputs).unwrap();
+        let mut bytes = Vec::new();
+        {
+            let mut writer = arrow_ipc::writer::StreamWriter::try_new(&mut bytes, &schema).unwrap();
+            writer.write(&batch).unwrap();
+            writer.finish().unwrap();
+        }
+        let restored = arrow_ipc::reader::StreamReader::try_new(bytes.as_slice(), None)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.schema(), schema);
+        let batches = vec![BufferedBatch::Source(restored)];
+        let levels = (0..4)
+            .map(|row_idx| {
+                MergeRow {
+                    batch_idx: 0,
+                    row_idx,
+                    sequence_number: row_idx as i64,
+                    value_kind: 0,
+                    user_sequence: None,
+                }
+                .level(&batches)
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(levels, vec![0, 0, 3, 3]);
+    }
+
+    #[test]
+    fn lookup_uses_each_rows_level_in_a_mixed_batch() {
+        let batch = RecordBatch::try_from_iter([(
+            "_LEVEL",
+            Arc::new(Int32Array::from(vec![-1, 0, 5, 2])) as ArrayRef,
+        )])
+        .unwrap();
+        let batches = vec![BufferedBatch::Source(batch)];
+        let rows = (0..4)
+            .map(|row_idx| MergeRow {
+                batch_idx: 0,
+                row_idx,
+                sequence_number: row_idx as i64,
+                value_kind: 0,
+                user_sequence: None,
+            })
+            .collect::<Vec<_>>();
+        let (base, has_l0, selected) = lookup_rows(&rows, &batches).unwrap();
+        assert_eq!(base.unwrap().row_idx, 3);
+        assert!(has_l0);
+        assert_eq!(
+            selected.iter().map(|row| row.row_idx).collect::<Vec<_>>(),
+            vec![0, 1, 3]
+        );
+    }
 
     #[test]
     fn first_row_merge_keeps_earliest_sequence_and_first_tie() {

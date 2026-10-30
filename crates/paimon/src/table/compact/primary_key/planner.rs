@@ -19,17 +19,125 @@
 //! before forcing L0 progress, as ForceUpLevel0Compaction does, without a
 //! full-bucket override.
 
-use crate::spec::{ChangelogProducer, DataFileMeta, MergeEngine, TableSchema};
+use crate::spec::{
+    AggregationConfig, ChangelogProducer, DataField, DataFileMeta, DataType, MergeEngine,
+    PartialUpdateConfig, TableSchema,
+};
 use crate::{Error, Result};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 pub(in crate::table::compact) fn enabled(schema: &TableSchema) -> Result<bool> {
     let options = schema.core_options();
-    Ok(options.merge_engine()? == MergeEngine::Deduplicate
-        && matches!(
-            options.try_changelog_producer()?,
+    let producer = options.try_changelog_producer()?;
+    Ok(match options.merge_engine()? {
+        MergeEngine::Deduplicate => matches!(
+            producer,
             ChangelogProducer::None | ChangelogProducer::Input | ChangelogProducer::Lookup
-        ))
+        ),
+        MergeEngine::FirstRow => {
+            !options.deletion_vectors_enabled()
+                && matches!(
+                    producer,
+                    ChangelogProducer::None | ChangelogProducer::Lookup
+                )
+        }
+        MergeEngine::PartialUpdate | MergeEngine::Aggregation => {
+            !options.deletion_vectors_enabled()
+                && match producer {
+                    ChangelogProducer::Lookup => true,
+                    ChangelogProducer::None | ChangelogProducer::Input => {
+                        plain_state_mergeable(schema)?
+                    }
+                    _ => false,
+                }
+        }
+    })
+}
+
+// Plain queries combine all positive levels. Only states that can be folded
+// again without depending on the original row order may leave history behind.
+fn plain_state_mergeable(schema: &TableSchema) -> Result<bool> {
+    let options = schema.core_options();
+    let keys = schema.primary_keys();
+    match options.merge_engine()? {
+        MergeEngine::Aggregation => {
+            let config = AggregationConfig::new(schema.options());
+            // Global sequence fields use last_value, whose retract clears the
+            // sequence tuple. A materialized subset can then sort before older
+            // retained states and change the visible sequence fields.
+            if config.remove_record_on_delete() || !options.sequence_fields().is_empty() {
+                return Ok(false);
+            }
+            Ok(schema
+                .fields()
+                .iter()
+                .filter(|field| !keys.iter().any(|key| key == field.name()))
+                .all(|field| {
+                    mergeable_field(
+                        schema,
+                        field,
+                        config
+                            .agg_function_for_field(field.name())
+                            .or_else(|| config.default_agg_function())
+                            .unwrap_or("last_non_null_value"),
+                    )
+                }))
+        }
+        MergeEngine::PartialUpdate => {
+            if !options.ignore_delete() || !options.sequence_fields().is_empty() {
+                return Ok(false);
+            }
+            let config = PartialUpdateConfig::new(schema.options());
+            let functions = config.validated_aggregate_functions(schema.fields(), keys)?;
+            let groups = config.validated_sequence_groups(schema.fields(), keys)?;
+            let ordering = groups
+                .iter()
+                .flat_map(|group| group.sequence_fields.iter().cloned())
+                .collect::<HashSet<_>>();
+            // Another group can overwrite an ordering field with NULL, making
+            // its aggregate state impossible to replay into retained history.
+            if groups.iter().any(|group| {
+                group
+                    .protected_fields
+                    .iter()
+                    .any(|field| ordering.contains(field))
+            }) {
+                return Ok(false);
+            }
+            Ok(schema
+                .fields()
+                .iter()
+                .filter(|field| !keys.iter().any(|key| key == field.name()))
+                .all(|field| {
+                    ordering.contains(field.name())
+                        || functions
+                            .get(field.name())
+                            .is_some_and(|function| mergeable_field(schema, field, function))
+                }))
+        }
+        _ => Ok(false),
+    }
+}
+
+fn mergeable_field(schema: &TableSchema, field: &DataField, function: &str) -> bool {
+    match crate::spec::canonical_aggregator_name(function) {
+        "min" | "max" | "bool_and" | "bool_or" => true,
+        // Floating sums can round differently when regrouped. Checked integer
+        // sums can fail in a subset even if the complete merge does not overflow.
+        "sum" => {
+            matches!(
+                field.data_type(),
+                DataType::TinyInt(_)
+                    | DataType::SmallInt(_)
+                    | DataType::Int(_)
+                    | DataType::BigInt(_)
+            ) && !schema
+                .options()
+                .get(&format!("fields.{}.sum.fail-on-overflow", field.name()))
+                .is_some_and(|value| value.eq_ignore_ascii_case("true"))
+        }
+        _ => false,
+    }
 }
 
 fn number(
