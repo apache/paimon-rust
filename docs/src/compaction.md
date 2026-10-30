@@ -21,14 +21,15 @@ under the License.
 
 Rust supports small-file compaction for ordinary append tables, normal-file
 compaction for Data Evolution tables, and sorted-run compaction for primary-key
-tables with fixed, dynamic or postpone buckets. `CompactBuilder` creates
+tables with fixed, dynamic or postpone buckets. For ordinary bucket compaction,
+`CompactBuilder` creates
 a `CompactPlanner`, a `CompactExecutor`, and a `TableCommit`. Planning and
 execution do not publish snapshots; `commit_compact` atomically publishes the
 selected results in a `COMPACT` snapshot.
 
-The builder selects a dedicated append, primary-key, postpone or Data Evolution planner
-for the table mode. They share snapshot capture and the public plan/task types;
-each planner owns its file eligibility, grouping and task-selection rules.
+The builder selects an append, primary-key or Data Evolution planner for the table
+mode. Each `CompactTask` rewrites one partition/bucket. Postpone tables use the
+separate partition-wide API described below.
 
 ```rust
 let builder = table.new_compact_builder();
@@ -334,13 +335,33 @@ rebalance buckets or reclaim HASH index capacity.
 
 ## Postpone buckets
 
-The same API publishes pending data in primary-key tables with `bucket=-2`.
+`PostponeCompactBuilder` publishes pending data in primary-key tables with `bucket=-2`.
 The planner captures both unsorted `bucket-postpone` files and real-bucket files,
 including Level-0 files produced by the fixed-bucket postpone writer. A partition
 with pending or Level-0 files becomes one task. The task rewrites that partition's
 complete captured data into real buckets at a positive level; a partition with
 only positive-level files needs no work. Partition filters and committing subsets
 of partition tasks are supported.
+
+```rust
+let builder = table.new_postpone_compact_builder();
+let plan = builder.new_planner()?.plan().await?;
+let executor = builder.new_executor()?;
+let mut results = Vec::new();
+for task in plan.tasks() {
+    results.push(executor.execute(task).await?);
+}
+let metrics = builder.new_commit()?.commit_postpone_compact(results).await?;
+```
+
+`PostponeCompactPlan`, `PostponeCompactTask` and `PostponeCompactResult` are
+separate serializable types. A task has no single bucket: `inputs()` keeps each
+file with its source bucket and bucket count in captured encounter order.
+`total_buckets()` is the target partition bucket count. A result's `buckets()`
+groups data and changelog outputs by real target bucket. The ordinary
+`new_compact_builder` and `commit_compact` reject postpone tables; the postpone
+builder and committer reject ordinary tables. Both APIs share metrics, physical
+PK merging and atomic snapshot publication.
 
 Existing per-partition bucket counts take precedence. For a new partition,
 `postpone.default-bucket-num` supplies an exact count. Otherwise the count is
@@ -369,8 +390,9 @@ Publication atomically removes the captured inputs and adds all real-bucket
 outputs in a `COMPACT` snapshot. Concurrent new postpone files remain pending
 for the next plan. A concurrent real-bucket write in a rewritten partition,
 overwritten input or changed input metadata makes the commit fail; plan again
-from the latest snapshot. Serialized task/results retain their input and output
-bucket mappings for distributed execution, subset commits and idempotent retries.
+from the latest snapshot. Serialized tasks retain source bucket metadata and
+results retain output bucket groups for distributed execution, subset commits
+and idempotent retries.
 Postpone compaction requires partition keys to be included in the primary key.
 ROW pending layout is selected from the writing schema and key-stat metadata,
 including Java full and thin physical layouts; decoding success is not used to

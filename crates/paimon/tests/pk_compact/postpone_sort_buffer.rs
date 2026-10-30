@@ -81,14 +81,14 @@ async fn postpone_sort_spills_by_buffer_size_instead_of_read_batch_boundaries() 
             &make_batch((0..600).rev().collect(), (0..600).rev().collect()),
         )
         .await;
-        let builder = table.new_compact_builder();
+        let builder = table.new_postpone_compact_builder();
         let plan = builder.new_planner().unwrap().plan().await.unwrap();
         let resources = ResourceContext::builder()
             .memory_limit(16 * 1024 * 1024)
             .build()
             .unwrap();
         let executor = table
-            .new_compact_builder()
+            .new_postpone_compact_builder()
             .with_resources(resources.clone())
             .new_executor()
             .unwrap();
@@ -103,7 +103,7 @@ async fn postpone_sort_spills_by_buffer_size_instead_of_read_batch_boundaries() 
         builder
             .new_commit()
             .unwrap()
-            .commit_compact(vec![result])
+            .commit_postpone_compact(vec![result])
             .await
             .unwrap();
         assert_eq!(
@@ -124,7 +124,7 @@ async fn postpone_sort_spills_by_buffer_size_instead_of_read_batch_boundaries() 
 async fn postpone_sort_buffer_failure_releases_retained_memory_and_creates_no_output() {
     let (table, probe) = probed_table(&[("file.format", "row")]).await;
     write_batch(&table, &make_batch(vec![1, 2], vec![10, 20])).await;
-    let builder = table.new_compact_builder();
+    let builder = table.new_postpone_compact_builder();
     let plan = builder.new_planner().unwrap().plan().await.unwrap();
     let before = table
         .file_io()
@@ -134,7 +134,7 @@ async fn postpone_sort_buffer_failure_releases_retained_memory_and_creates_no_ou
         .len();
     let resources = ResourceContext::builder().memory_limit(1).build().unwrap();
     let executor = table
-        .new_compact_builder()
+        .new_postpone_compact_builder()
         .with_resources(resources.clone())
         .new_executor()
         .unwrap();

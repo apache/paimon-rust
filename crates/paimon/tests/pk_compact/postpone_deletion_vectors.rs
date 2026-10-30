@@ -16,9 +16,11 @@
 // under the License.
 
 use super::deletion_vector_tests::{indexes, positions, write_vectors};
+use super::postpone_tests::execute;
 use super::*;
 use paimon::spec::{DataFileMeta, Snapshot};
 use paimon::table::CommitMessage;
+use paimon::table::PostponeCompactResult;
 
 async fn dv_table(options: &[(&str, &str)]) -> Table {
     let mut configured = vec![
@@ -39,14 +41,14 @@ async fn latest(table: &Table) -> Snapshot {
         .unwrap()
 }
 
-async fn compact(table: &Table) -> Vec<CompactResult> {
-    let builder = table.new_compact_builder();
+async fn compact(table: &Table) -> Vec<PostponeCompactResult> {
+    let builder = table.new_postpone_compact_builder();
     let plan = builder.new_planner().unwrap().plan().await.unwrap();
     let results = execute(table, &plan).await;
     builder
         .new_commit()
         .unwrap()
-        .commit_compact(results.clone())
+        .commit_postpone_compact(results.clone())
         .await
         .unwrap();
     results
@@ -233,7 +235,7 @@ async fn postpone_dv_rejects_changed_selected_masks() {
             compact(&table).await;
         }
         write_batch(&table, &make_batch(vec![2], vec![20])).await;
-        let builder = table.new_compact_builder();
+        let builder = table.new_postpone_compact_builder();
         let plan = builder.new_planner().unwrap().plan().await.unwrap();
         let result = execute(&table, &plan).await;
         let selected = files(&table)
@@ -255,7 +257,7 @@ async fn postpone_dv_rejects_changed_selected_masks() {
         let error = builder
             .new_commit()
             .unwrap()
-            .commit_compact(result)
+            .commit_postpone_compact(result)
             .await
             .unwrap_err();
         assert!(error.to_string().contains("deletion vectors changed"));
@@ -281,7 +283,7 @@ async fn postpone_dv_preserves_concurrent_pending_masks_and_validates_serialized
         false,
     )
     .await;
-    let builder = table.new_compact_builder();
+    let builder = table.new_postpone_compact_builder();
     let plan = builder.new_planner().unwrap().plan().await.unwrap();
     let result = execute(&table, &plan).await;
     let mut missing = serde_json::to_value(&result).unwrap();
@@ -289,9 +291,12 @@ async fn postpone_dv_preserves_concurrent_pending_masks_and_validates_serialized
         .as_object_mut()
         .unwrap()
         .remove("deletion_vector_updates");
-    let missing: Vec<CompactResult> = serde_json::from_value(missing).unwrap();
+    let missing: Vec<PostponeCompactResult> = serde_json::from_value(missing).unwrap();
     let commit = builder.new_commit().unwrap();
-    assert!(commit.commit_compact(missing.clone()).await.is_err());
+    assert!(commit
+        .commit_postpone_compact(missing.clone())
+        .await
+        .is_err());
     write_batch(&table, &make_batch(vec![99, 100], vec![990, 1000])).await;
     let pending = files(&table)
         .await
@@ -308,8 +313,14 @@ async fn postpone_dv_preserves_concurrent_pending_masks_and_validates_serialized
         false,
     )
     .await;
-    let metrics = commit.commit_compact(result.clone()).await.unwrap();
-    assert_eq!(commit.commit_compact(missing).await.unwrap(), metrics);
+    let metrics = commit
+        .commit_postpone_compact(result.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        commit.commit_postpone_compact(missing).await.unwrap(),
+        metrics
+    );
     assert_eq!(rows(&table).await, vec![(1, 10)]);
     assert_eq!(
         positions(&table, &pending).await.iter().collect::<Vec<_>>(),
@@ -339,20 +350,20 @@ async fn postpone_dv_can_publish_empty_data_after_delete_or_mask() {
             &make_batch_with_kinds(vec![1], vec![10], vec![if mask { 0 } else { 3 }]),
         )
         .await;
-        let builder = table.new_compact_builder();
+        let builder = table.new_postpone_compact_builder();
         if mask {
             let plan = builder.new_planner().unwrap().plan().await.unwrap();
             set_vectors(
                 &table,
                 plan.tasks()[0].partition(),
                 -2,
-                &[(&plan.tasks()[0].files()[0].file_name, &[0])],
+                &[(&plan.tasks()[0].inputs()[0].file().file_name, &[0])],
                 false,
             )
             .await;
         }
         let result = compact(&table).await;
-        assert!(result[0].files().is_empty());
+        assert!(result[0].files().next().is_none());
         assert!(rows(&table).await.is_empty());
         assert!(files(&table).await.is_empty());
         assert!(indexes(&table).await.is_empty());
@@ -434,7 +445,7 @@ async fn postpone_dv_cannot_enable_dv_only_through_temporary_options() {
         "true".into(),
     )]));
     let error = dv
-        .new_compact_builder()
+        .new_postpone_compact_builder()
         .new_planner()
         .unwrap()
         .plan()
@@ -482,7 +493,7 @@ async fn postpone_dv_partition_subset_keeps_unselected_partition_vectors() {
         .equal("pt", Datum::String("a".into()))
         .unwrap();
     let builder = table
-        .new_compact_builder()
+        .new_postpone_compact_builder()
         .with_partition_filter(filter)
         .unwrap();
     let plan = builder.new_planner().unwrap().plan().await.unwrap();
@@ -499,7 +510,7 @@ async fn postpone_dv_partition_subset_keeps_unselected_partition_vectors() {
     builder
         .new_commit()
         .unwrap()
-        .commit_compact(result)
+        .commit_postpone_compact(result)
         .await
         .unwrap();
     assert_eq!(

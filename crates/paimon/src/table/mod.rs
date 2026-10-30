@@ -207,6 +207,11 @@ pub use branch_manager::BranchManager;
 pub use bucket_router::BucketRouter;
 pub use commit_callback::{CommitCallback, CommitCallbackContext};
 pub use commit_message::{CommitMessage, COMMIT_MESSAGE_SERIALIZER_VERSION};
+pub use compact::postpone::{
+    PostponeCompactBucketResult, PostponeCompactBuilder, PostponeCompactExecutor,
+    PostponeCompactInput, PostponeCompactPlan, PostponeCompactPlanner, PostponeCompactResult,
+    PostponeCompactTask,
+};
 pub use compact::{
     CompactBuilder, CompactExecutor, CompactMetrics, CompactPlan, CompactPlanner, CompactResult,
     CompactTask,
@@ -711,6 +716,11 @@ impl Table {
     /// Plan and execute append, data-evolution or fixed/dynamic bucket PK compaction.
     pub fn new_compact_builder(&self) -> CompactBuilder<'_> {
         CompactBuilder::new(self)
+    }
+
+    /// Plan and execute partition-wide routing and rewriting for postpone PK tables.
+    pub fn new_postpone_compact_builder(&self) -> PostponeCompactBuilder<'_> {
+        PostponeCompactBuilder::new(self)
     }
 
     /// Create a one-shot fixed-bucket builder for a postpone table.

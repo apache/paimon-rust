@@ -16,16 +16,92 @@
 // under the License.
 
 use super::*;
+use paimon::table::{PostponeCompactPlan, PostponeCompactResult, PostponeCompactTask};
+
+pub(super) async fn execute(
+    table: &Table,
+    plan: &PostponeCompactPlan,
+) -> Vec<PostponeCompactResult> {
+    let plan: PostponeCompactPlan =
+        serde_json::from_slice(&serde_json::to_vec(plan).unwrap()).unwrap();
+    let executor = table.new_postpone_compact_builder().new_executor().unwrap();
+    let mut results = Vec::new();
+    for task in plan.tasks() {
+        let task: PostponeCompactTask =
+            serde_json::from_slice(&serde_json::to_vec(task).unwrap()).unwrap();
+        results.push(executor.execute(&task).await.unwrap());
+    }
+    serde_json::from_slice(&serde_json::to_vec(&results).unwrap()).unwrap()
+}
+
+#[tokio::test]
+async fn postpone_compaction_and_bucket_compaction_reject_each_others_tables() {
+    let postpone = table(&[("bucket", "-2")]).await;
+    let bucket = table(&[]).await;
+    let ordinary = postpone.new_compact_builder();
+    assert!(ordinary.new_planner().is_err());
+    assert!(ordinary.new_executor().is_err());
+    assert!(ordinary.new_commit().is_err());
+    let partition = bucket.new_postpone_compact_builder();
+    assert!(partition.new_planner().is_err());
+    assert!(partition.new_executor().is_err());
+    assert!(partition.new_commit().is_err());
+    // TableCommit is also obtainable through a normal write builder. It must
+    // enforce the mode at the publication boundary, including empty results.
+    assert!(postpone
+        .new_write_builder()
+        .new_commit()
+        .commit_compact(vec![])
+        .await
+        .is_err());
+    assert!(bucket
+        .new_write_builder()
+        .new_commit()
+        .commit_postpone_compact(vec![])
+        .await
+        .is_err());
+}
 
 async fn compact(table: &Table) {
-    let builder = table.new_compact_builder();
+    let builder = table.new_postpone_compact_builder();
     let plan = builder.new_planner().unwrap().plan().await.unwrap();
     builder
         .new_commit()
         .unwrap()
-        .commit_compact(execute(table, &plan).await)
+        .commit_postpone_compact(execute(table, &plan).await)
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn postpone_compaction_rejects_invalid_output_counts_before_collecting_metrics() {
+    let table = table(&[
+        ("bucket", "-2"),
+        ("postpone.default-bucket-num", "1"),
+        ("target-file-row-num", "1"),
+        ("changelog-producer", "lookup"),
+    ])
+    .await;
+    write_batch(&table, &make_batch(vec![1, 2, 3], vec![10, 20, 30])).await;
+    let builder = table.new_postpone_compact_builder();
+    let plan = builder.new_planner().unwrap().plan().await.unwrap();
+    let results = execute(&table, &plan).await;
+    let encoded = serde_json::to_value(&results).unwrap();
+    let commit = builder.new_commit().unwrap();
+    for output in ["files", "changelog_files"] {
+        assert!(encoded[0]["buckets"][0][output].as_array().unwrap().len() >= 2);
+        for count in ["_ROW_COUNT", "_FILE_SIZE"] {
+            let mut invalid = encoded.clone();
+            invalid[0]["buckets"][0][output][0][count] = serde_json::json!(-1);
+            let invalid: Vec<PostponeCompactResult> = serde_json::from_value(invalid).unwrap();
+            assert!(
+                commit.commit_postpone_compact(invalid).await.is_err(),
+                "{output}/{count}"
+            );
+        }
+    }
+    commit.commit_postpone_compact(results).await.unwrap();
+    assert_eq!(rows(&table).await, vec![(1, 10), (2, 20), (3, 30)]);
 }
 
 #[tokio::test]
@@ -46,16 +122,30 @@ async fn postpone_compaction_routes_unsorted_rows_and_publishes_atomically() {
     )
     .await;
     assert!(rows(&table).await.is_empty());
-    let builder = table.new_compact_builder();
+    let builder = table.new_postpone_compact_builder();
     let plan = builder.new_planner().unwrap().plan().await.unwrap();
     assert_eq!(plan.tasks().len(), 1);
+    assert!(plan.tasks()[0]
+        .inputs()
+        .iter()
+        .all(|input| input.bucket() == -2 && input.total_buckets() == -2));
     let results = execute(&table, &plan).await;
+    assert!(results[0]
+        .buckets()
+        .iter()
+        .all(|bucket| (0..3).contains(&bucket.bucket())));
     assert!(rows(&table).await.is_empty());
     let commit = builder.new_commit().unwrap();
-    let metrics = commit.commit_compact(results.clone()).await.unwrap();
+    let metrics = commit
+        .commit_postpone_compact(results.clone())
+        .await
+        .unwrap();
     assert_eq!(metrics.files_removed, 1);
     assert_eq!(rows(&table).await, vec![(1, 11), (5, 50)]);
-    assert_eq!(commit.commit_compact(results).await.unwrap(), metrics);
+    assert_eq!(
+        commit.commit_postpone_compact(results).await.unwrap(),
+        metrics
+    );
     let plan = table.new_read_builder().new_scan().plan().await.unwrap();
     assert!(plan
         .splits()
@@ -85,12 +175,12 @@ async fn postpone_compaction_replays_after_existing_state_and_keeps_new_pending_
         .commit(writer.prepare_commit().await.unwrap())
         .await
         .unwrap();
-    let builder = table.new_compact_builder();
+    let builder = table.new_postpone_compact_builder();
     let plan = builder.new_planner().unwrap().plan().await.unwrap();
     builder
         .new_commit()
         .unwrap()
-        .commit_compact(execute(&table, &plan).await)
+        .commit_postpone_compact(execute(&table, &plan).await)
         .await
         .unwrap();
     assert_eq!(rows(&table).await, vec![(1, 10), (2, 20)]);
@@ -100,12 +190,23 @@ async fn postpone_compaction_replays_after_existing_state_and_keeps_new_pending_
     )
     .await;
     let plan = builder.new_planner().unwrap().plan().await.unwrap();
+    let source_buckets = plan.tasks()[0]
+        .inputs()
+        .iter()
+        .map(|input| input.bucket())
+        .collect::<std::collections::HashSet<_>>();
+    assert!(source_buckets.contains(&-2));
+    assert!(source_buckets.iter().any(|bucket| *bucket >= 0));
+    assert!(plan.tasks()[0]
+        .inputs()
+        .iter()
+        .all(|input| { input.total_buckets() == if input.bucket() == -2 { -2 } else { 2 } }));
     let results = execute(&table, &plan).await;
     write_batch(&table, &make_batch(vec![4], vec![40])).await;
     builder
         .new_commit()
         .unwrap()
-        .commit_compact(results)
+        .commit_postpone_compact(results)
         .await
         .unwrap();
     assert_eq!(rows(&table).await, vec![(1, 11)]);
@@ -113,7 +214,7 @@ async fn postpone_compaction_replays_after_existing_state_and_keeps_new_pending_
     builder
         .new_commit()
         .unwrap()
-        .commit_compact(execute(&table, &next).await)
+        .commit_postpone_compact(execute(&table, &next).await)
         .await
         .unwrap();
     assert_eq!(rows(&table).await, vec![(1, 11), (4, 40)]);
@@ -224,7 +325,7 @@ async fn postpone_compaction_rejects_concurrent_real_bucket_writes_and_overwrite
     for overwrite in [false, true] {
         let table = table(&[("bucket", "-2"), ("postpone.default-bucket-num", "1")]).await;
         write_batch(&table, &make_batch(vec![1], vec![10])).await;
-        let builder = table.new_compact_builder();
+        let builder = table.new_postpone_compact_builder();
         let plan = builder.new_planner().unwrap().plan().await.unwrap();
         let results = execute(&table, &plan).await;
         let fixed = table.new_postpone_fixed_bucket_write_builder().unwrap();
@@ -251,7 +352,7 @@ async fn postpone_compaction_rejects_concurrent_real_bucket_writes_and_overwrite
         assert!(builder
             .new_commit()
             .unwrap()
-            .commit_compact(results)
+            .commit_postpone_compact(results)
             .await
             .is_err());
         assert_eq!(
@@ -275,7 +376,7 @@ async fn postpone_compaction_rejects_concurrent_real_bucket_writes_and_overwrite
 }
 
 #[tokio::test]
-async fn postpone_partition_tasks_support_subsets_and_reject_incomplete_mappings() {
+async fn postpone_partition_tasks_support_subsets_and_reject_incomplete_inputs() {
     let schema = Schema::builder()
         .column("pt", DataType::VarChar(VarCharType::string_type()))
         .column("id", DataType::Int(IntType::new()))
@@ -292,31 +393,31 @@ async fn postpone_partition_tasks_support_subsets_and_reject_incomplete_mappings
         &make_partitioned_batch(vec!["a", "b"], vec![1, 2], vec![10, 20]),
     )
     .await;
-    let builder = table.new_compact_builder();
+    let builder = table.new_postpone_compact_builder();
     let plan = builder.new_planner().unwrap().plan().await.unwrap();
     assert_eq!(plan.tasks().len(), 2);
     let mut results = execute(&table, &plan).await;
     let mut invalid = serde_json::to_value(&results).unwrap();
-    invalid[0].as_object_mut().unwrap().remove("file_buckets");
-    let invalid: Vec<CompactResult> = serde_json::from_value(invalid).unwrap();
+    invalid[0]["buckets"][0]["bucket"] = serde_json::json!(-2);
+    let invalid: Vec<PostponeCompactResult> = serde_json::from_value(invalid).unwrap();
     assert!(builder
         .new_commit()
         .unwrap()
-        .commit_compact(invalid)
+        .commit_postpone_compact(invalid)
         .await
         .is_err());
     let first = results.remove(0);
     builder
         .new_commit()
         .unwrap()
-        .commit_compact(vec![first])
+        .commit_postpone_compact(vec![first])
         .await
         .unwrap();
     assert_eq!(rows(&table).await, vec![(1, 10)]);
     builder
         .new_commit()
         .unwrap()
-        .commit_compact(results)
+        .commit_postpone_compact(results)
         .await
         .unwrap();
     assert_eq!(rows(&table).await, vec![(1, 10), (2, 20)]);
@@ -329,15 +430,14 @@ async fn postpone_partition_tasks_support_subsets_and_reject_incomplete_mappings
         .equal("pt", Datum::String("b".into()))
         .unwrap();
     let filtered = table
-        .new_compact_builder()
+        .new_postpone_compact_builder()
         .with_partition_filter(filter)
         .unwrap();
     let plan = filtered.new_planner().unwrap().plan().await.unwrap();
     assert_eq!(plan.tasks().len(), 1);
     let mut task = serde_json::to_value(&plan.tasks()[0]).unwrap();
-    task["files"].as_array_mut().unwrap().pop();
-    task["input_buckets"].as_array_mut().unwrap().pop();
-    let task: CompactTask = serde_json::from_value(task).unwrap();
+    task["inputs"].as_array_mut().unwrap().pop();
+    let task: PostponeCompactTask = serde_json::from_value(task).unwrap();
     assert!(filtered
         .new_executor()
         .unwrap()
@@ -347,7 +447,7 @@ async fn postpone_partition_tasks_support_subsets_and_reject_incomplete_mappings
     filtered
         .new_commit()
         .unwrap()
-        .commit_compact(execute(&table, &plan).await)
+        .commit_postpone_compact(execute(&table, &plan).await)
         .await
         .unwrap();
     assert_eq!(rows(&table).await, vec![(1, 10), (2, 21)]);
@@ -393,7 +493,7 @@ async fn postpone_compaction_aborts_staged_and_output_files_on_merge_failure() {
         .await
         .unwrap()
         .len();
-    let builder = table.new_compact_builder();
+    let builder = table.new_postpone_compact_builder();
     let plan = builder.new_planner().unwrap().plan().await.unwrap();
     let error = builder
         .new_executor()
@@ -490,7 +590,11 @@ async fn postpone_dv_compaction_rejects_other_merge_engines() {
         ("merge-engine", "aggregation"),
     ])
     .await;
-    let error = table.new_compact_builder().new_planner().err().unwrap();
+    let error = table
+        .new_postpone_compact_builder()
+        .new_planner()
+        .err()
+        .unwrap();
     assert!(error
         .to_string()
         .contains("Primary-key deletion-vector compaction requires deduplicate"));
@@ -700,13 +804,16 @@ async fn postpone_reads_java_generated_null_row_fixtures() {
 async fn postpone_rejects_unsupported_thin_row_output_and_real_history() {
     for real_bucket in [false, true] {
         let original = java_null_row_fixture(true, real_bucket).await;
-        assert!(original.new_compact_builder().new_planner().is_err());
+        assert!(original
+            .new_postpone_compact_builder()
+            .new_planner()
+            .is_err());
         // A temporary option must not make Java read full KV output as thin ROW.
         let temporary = original.copy_with_options(std::collections::HashMap::from([(
             "data-file.thin-mode".into(),
             "false".into(),
         )]));
-        let builder = temporary.new_compact_builder();
+        let builder = temporary.new_postpone_compact_builder();
         let plan = builder.new_planner().unwrap().plan().await.unwrap();
         let error = builder
             .new_executor()
@@ -717,7 +824,7 @@ async fn postpone_rejects_unsupported_thin_row_output_and_real_history() {
         assert!(error.to_string().contains("cannot write thin-mode ROW"));
         if real_bucket {
             let changed = disable_thin_mode(&original).await;
-            let builder = changed.new_compact_builder();
+            let builder = changed.new_postpone_compact_builder();
             let plan = builder.new_planner().unwrap().plan().await.unwrap();
             let error = builder
                 .new_executor()
@@ -750,14 +857,17 @@ async fn postpone_mixed_row_changelog_obeys_persisted_thin_layout() {
     .await;
     write_batch(&original, &make_batch(vec![1], vec![10])).await;
     assert!(
-        original.new_compact_builder().new_planner().is_err(),
+        original
+            .new_postpone_compact_builder()
+            .new_planner()
+            .is_err(),
         "ROW changelog must use the same layout guard as ROW data"
     );
     let temporary = original.copy_with_options(std::collections::HashMap::from([(
         "data-file.thin-mode".into(),
         "false".into(),
     )]));
-    let builder = temporary.new_compact_builder();
+    let builder = temporary.new_postpone_compact_builder();
     let plan = builder.new_planner().unwrap().plan().await.unwrap();
     let error = builder
         .new_executor()
@@ -775,17 +885,16 @@ async fn postpone_mixed_row_changelog_obeys_persisted_thin_layout() {
         Some(1)
     );
     let changed = disable_thin_mode(&original).await;
-    let builder = changed.new_compact_builder();
+    let builder = changed.new_postpone_compact_builder();
     let plan = builder.new_planner().unwrap().plan().await.unwrap();
     let results = execute(&changed, &plan).await;
     assert!(results[0]
         .changelog_files()
-        .iter()
         .all(|file| file.file_name.ends_with(".row")));
     builder
         .new_commit()
         .unwrap()
-        .commit_compact(results)
+        .commit_postpone_compact(results)
         .await
         .unwrap();
     assert_eq!(

@@ -155,6 +155,35 @@ async fn execute(table: &Table, plan: &CompactPlan) -> Vec<CompactResult> {
 }
 
 #[tokio::test]
+async fn pk_compaction_rejects_invalid_output_counts_before_collecting_metrics() {
+    let table = table(&[
+        ("target-file-row-num", "1"),
+        ("changelog-producer", "lookup"),
+    ])
+    .await;
+    write_batch(&table, &make_batch(vec![1, 2, 3], vec![10, 20, 30])).await;
+    let builder = table.new_compact_builder();
+    let plan = builder.new_planner().unwrap().plan().await.unwrap();
+    let results = execute(&table, &plan).await;
+    let encoded = serde_json::to_value(&results).unwrap();
+    let commit = builder.new_commit().unwrap();
+    for output in ["files", "changelog_files"] {
+        assert!(encoded[0][output].as_array().unwrap().len() >= 2);
+        for count in ["_ROW_COUNT", "_FILE_SIZE"] {
+            let mut invalid = encoded.clone();
+            invalid[0][output][0][count] = serde_json::json!(-1);
+            let invalid: Vec<CompactResult> = serde_json::from_value(invalid).unwrap();
+            assert!(
+                commit.commit_compact(invalid).await.is_err(),
+                "{output}/{count}"
+            );
+        }
+    }
+    commit.commit_compact(results).await.unwrap();
+    assert_eq!(rows(&table).await, vec![(1, 10), (2, 20), (3, 30)]);
+}
+
+#[tokio::test]
 async fn pk_compaction_rejects_concurrent_overlapping_positive_level_files() {
     for (key, conflicts) in [(1, true), (256, false)] {
         let table = table(&[]).await;

@@ -429,11 +429,33 @@ impl TableCommit {
         &self,
         results: Vec<super::CompactResult>,
     ) -> Result<super::CompactMetrics> {
-        super::compact::ensure_supported(&self.table)?;
+        super::compact::ensure_bucket_compaction_supported(&self.table)?;
         if results.is_empty() {
             return Ok(super::CompactMetrics::default());
         }
         let prepared = super::compact::prepare_results(&self.table, &results)?;
+        self.commit_prepared_compact(prepared).await
+    }
+
+    /// Publish complete postpone partition rewrites atomically.
+    /// Subsets of partitions can commit independently; retries are idempotent.
+    /// Retain prepared files after a failed or uncertain commit for retry.
+    pub async fn commit_postpone_compact(
+        &self,
+        results: Vec<super::PostponeCompactResult>,
+    ) -> Result<super::CompactMetrics> {
+        super::compact::postpone::ensure_supported(&self.table)?;
+        if results.is_empty() {
+            return Ok(super::CompactMetrics::default());
+        }
+        let prepared = super::compact::postpone::prepare_results(&self.table, &results)?;
+        self.commit_prepared_compact(prepared).await
+    }
+
+    async fn commit_prepared_compact(
+        &self,
+        prepared: super::compact::PreparedCompact,
+    ) -> Result<super::CompactMetrics> {
         let mut commit = self.clone();
         // One stable identity per plan and task subset, allowing repeated plans
         // and idempotent retry without consuming the caller's checkpoint sequence.

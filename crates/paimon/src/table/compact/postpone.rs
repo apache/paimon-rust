@@ -26,7 +26,14 @@ use arrow_array::{BooleanArray, Int64Array, RecordBatch};
 use arrow_ord::sort::{lexsort_to_indices, SortColumn};
 use futures::{StreamExt, TryStreamExt};
 
-use super::{invalid, primary_key, validate_file, CompactContext, CompactResult, CompactTask};
+mod api;
+pub use api::{
+    PostponeCompactBucketResult, PostponeCompactBuilder, PostponeCompactExecutor,
+    PostponeCompactInput, PostponeCompactPlan, PostponeCompactPlanner, PostponeCompactResult,
+    PostponeCompactTask,
+};
+
+use super::{invalid, primary_key, validate_file, CompactContext, CompactRewrite, PreparedCompact};
 use crate::resource::{MemoryReservation, ResourceContext};
 use crate::spec::{
     bucket_path_under, BinaryRow, ChangelogProducer, DataFileMeta, FileKind, ManifestEntry,
@@ -167,7 +174,7 @@ fn layout(entries: &[&ManifestEntry], schema: &TableSchema) -> Result<i32> {
 pub(super) fn plan_tasks(
     entries: &[ManifestEntry],
     context: &CompactContext,
-) -> Result<Vec<CompactTask>> {
+) -> Result<Vec<PostponeCompactTask>> {
     let mut partitions = BTreeMap::<_, Vec<_>>::new();
     for entry in entries {
         partitions
@@ -181,48 +188,49 @@ pub(super) fn plan_tasks(
             continue;
         }
         let total_buckets = layout(&entries, &context.schema)?;
-        tasks.push(CompactTask {
+        tasks.push(PostponeCompactTask {
             context: context.clone(),
             task_id: tasks.len(),
             partition,
-            bucket: POSTPONE_BUCKET,
             total_buckets,
-            output_level: Some(
-                entries
-                    .iter()
-                    .map(|entry| entry.file().level)
-                    .max()
-                    .unwrap_or(0)
-                    .max(1),
-            ),
-            files: entries.iter().map(|entry| entry.file().clone()).collect(),
-            input_buckets: entries.iter().map(|entry| entry.bucket()).collect(),
+            output_level: entries
+                .iter()
+                .map(|entry| entry.file().level)
+                .max()
+                .unwrap_or(0)
+                .max(1),
+            inputs: entries
+                .iter()
+                .map(|entry| PostponeCompactInput {
+                    bucket: entry.bucket(),
+                    total_buckets: entry.total_buckets(),
+                    file: entry.file().clone(),
+                })
+                .collect(),
         });
     }
     Ok(tasks)
 }
 
-pub(super) fn validate_task(task: &CompactTask) -> Result<()> {
-    if task.is_postpone() {
-        if task.bucket != POSTPONE_BUCKET
-            || task.total_buckets <= 0
-            || task.input_buckets.len() != task.files.len()
-            || task.output_level.is_none()
-            || task.input_buckets.iter().any(|&bucket| {
-                bucket != POSTPONE_BUCKET && !(0..task.total_buckets).contains(&bucket)
-            })
-        {
-            return Err(invalid("Invalid postpone compaction task"));
-        }
-    } else if !task.input_buckets.is_empty() {
-        return Err(invalid(
-            "Only postpone tasks may contain source bucket mappings",
-        ));
+pub(super) fn validate_task(task: &PostponeCompactTask) -> Result<()> {
+    if task.total_buckets <= 0
+        || task.inputs.is_empty()
+        || task.output_level <= 0
+        || task.inputs.iter().any(|input| {
+            if input.bucket == POSTPONE_BUCKET {
+                input.total_buckets != POSTPONE_BUCKET || input.file.level != 0
+            } else {
+                !(0..task.total_buckets).contains(&input.bucket)
+                    || input.total_buckets != task.total_buckets
+            }
+        })
+    {
+        return Err(invalid("Invalid postpone compaction task"));
     }
     Ok(())
 }
 
-pub(super) fn validate_inputs(task: &CompactTask, entries: &[ManifestEntry]) -> Result<()> {
+pub(super) fn validate_inputs(task: &PostponeCompactTask, entries: &[ManifestEntry]) -> Result<()> {
     let entries = entries
         .iter()
         .filter(|entry| entry.partition() == task.partition)
@@ -232,8 +240,7 @@ pub(super) fn validate_inputs(task: &CompactTask, entries: &[ManifestEntry]) -> 
         .into_iter()
         .find(|candidate| candidate.partition == task.partition)
         .ok_or_else(|| invalid("No postpone compaction is eligible"))?;
-    if expected.files != task.files
-        || expected.input_buckets != task.input_buckets
+    if expected.inputs != task.inputs
         || expected.total_buckets != task.total_buckets
         || expected.output_level != task.output_level
     {
@@ -244,25 +251,67 @@ pub(super) fn validate_inputs(task: &CompactTask, entries: &[ManifestEntry]) -> 
     Ok(())
 }
 
-pub(super) fn validate_result(result: &CompactResult) -> Result<()> {
-    let task = &result.task;
-    if task.is_postpone() {
-        if result.file_buckets.len() != result.files.len()
-            || result.changelog_buckets.len() != result.changelog_files.len()
-            || result
-                .file_buckets
-                .iter()
-                .chain(&result.changelog_buckets)
-                .any(|bucket| !(0..task.total_buckets).contains(bucket))
-        {
-            return Err(invalid("Invalid postpone compaction output buckets"));
-        }
-    } else if !result.file_buckets.is_empty() || !result.changelog_buckets.is_empty() {
-        return Err(invalid(
-            "Only postpone results may contain output bucket mappings",
-        ));
+fn validate_result(result: &PostponeCompactResult) -> Result<()> {
+    let mut buckets = HashSet::new();
+    if result.buckets.iter().any(|bucket| {
+        !(0..result.task.total_buckets).contains(&bucket.bucket) || !buckets.insert(bucket.bucket)
+    }) {
+        return Err(invalid("Invalid postpone compaction output buckets"));
     }
     Ok(())
+}
+
+pub(in crate::table) fn ensure_supported(table: &Table) -> Result<()> {
+    api::ensure_postpone_supported(table)
+}
+
+pub(in crate::table) fn prepare_results(
+    table: &Table,
+    results: &[PostponeCompactResult],
+) -> Result<PreparedCompact> {
+    ensure_supported(table)?;
+    let rewrites = results
+        .iter()
+        .map(|result| {
+            let task = &result.task;
+            task.validate_target(table)?;
+            validate_result(result)?;
+            Ok(CompactRewrite {
+                context: &task.context,
+                task_id: task.task_id,
+                partition: &task.partition,
+                inputs: task
+                    .inputs
+                    .iter()
+                    .map(|input| (input.bucket, input.total_buckets, &input.file))
+                    .collect(),
+                files: result
+                    .buckets
+                    .iter()
+                    .flat_map(|bucket| {
+                        bucket
+                            .files
+                            .iter()
+                            .map(move |file| (bucket.bucket, task.total_buckets, file))
+                    })
+                    .collect(),
+                changelog_files: result
+                    .buckets
+                    .iter()
+                    .flat_map(|bucket| {
+                        bucket
+                            .changelog_files
+                            .iter()
+                            .map(move |file| (bucket.bucket, task.total_buckets, file))
+                    })
+                    .collect(),
+                output_level: Some(task.output_level),
+                data_evolution_task: None,
+                deletion_vector_updates: result.deletion_vector_updates.as_ref(),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    super::prepare_rewrites(table, &rewrites)
 }
 
 pub(super) fn validate_changes(
@@ -375,7 +424,7 @@ pub(in crate::table) fn validate_concurrent_changes(
 
 fn split(
     table: &Table,
-    task: &CompactTask,
+    task: &PostponeCompactTask,
     partition_path: &str,
     bucket: i32,
     files: Vec<DataFileMeta>,
@@ -396,7 +445,7 @@ fn split(
 
 async fn cleanup(
     table: &Table,
-    task: &CompactTask,
+    task: &PostponeCompactTask,
     partition_path: &str,
     files: &[(i32, DataFileMeta)],
 ) {
@@ -548,7 +597,7 @@ impl MergeFunction for PreserveRow {
 
 async fn merge_staged(
     table: &Table,
-    task: &CompactTask,
+    task: &PostponeCompactTask,
     partition_path: &str,
     bucket: i32,
     files: &[DataFileMeta],
@@ -613,9 +662,9 @@ async fn merge_staged(
 
 pub(super) async fn execute(
     table: &Table,
-    task: &CompactTask,
+    task: &PostponeCompactTask,
     resources: Option<ResourceContext>,
-) -> Result<CompactResult> {
+) -> Result<PostponeCompactResult> {
     let schema = table.schema();
     let options = schema.core_options();
     let mut row_schemas = HashMap::new();
@@ -647,7 +696,9 @@ pub(super) async fn execute(
     let mut buckets = BTreeMap::<i32, Vec<DataFileMeta>>::new();
     let mut pending = Vec::new();
     let mut next_sequence = 0i64;
-    for (file, &bucket) in task.files.iter().zip(&task.input_buckets) {
+    for input in &task.inputs {
+        let file = &input.file;
+        let bucket = input.bucket;
         if bucket == POSTPONE_BUCKET {
             let (writer, _) = file
                 .file_name
@@ -848,11 +899,9 @@ pub(super) async fn execute(
                 Some(deletions) => deletions.with_deletion_files(table, &source)?,
                 None => source,
             };
-            let mut bucket_task = task.clone();
-            bucket_task.bucket = bucket;
-            bucket_task.files = files;
             let (files, changelog) =
-                primary_key::execute(table, &bucket_task, &source, resources.clone(), None).await?;
+                primary_key::execute(table, &source, task.output_level, resources.clone(), None)
+                    .await?;
             output.extend(files.into_iter().map(|file| (bucket, file)));
             changelog_output.extend(changelog.into_iter().map(|file| (bucket, file)));
         }
@@ -865,12 +914,32 @@ pub(super) async fn execute(
         cleanup(table, task, &partition_path, &changelog_output).await;
         return Err(error);
     }
-    Ok(CompactResult {
+    let mut results = BTreeMap::<i32, PostponeCompactBucketResult>::new();
+    for (bucket, file) in output {
+        results
+            .entry(bucket)
+            .or_insert_with(|| PostponeCompactBucketResult {
+                bucket,
+                files: vec![],
+                changelog_files: vec![],
+            })
+            .files
+            .push(file);
+    }
+    for (bucket, file) in changelog_output {
+        results
+            .entry(bucket)
+            .or_insert_with(|| PostponeCompactBucketResult {
+                bucket,
+                files: vec![],
+                changelog_files: vec![],
+            })
+            .changelog_files
+            .push(file);
+    }
+    Ok(PostponeCompactResult {
         task: task.clone(),
-        file_buckets: output.iter().map(|(bucket, _)| *bucket).collect(),
-        files: output.into_iter().map(|(_, file)| file).collect(),
-        changelog_buckets: changelog_output.iter().map(|(bucket, _)| *bucket).collect(),
-        changelog_files: changelog_output.into_iter().map(|(_, file)| file).collect(),
+        buckets: results.into_values().collect(),
         // Every captured history file is rewritten, so there are no retained
         // lookup targets. Commit still needs explicit DV metadata to validate
         // captured masks and atomically retire their index ranges.
