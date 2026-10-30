@@ -1145,6 +1145,7 @@ mod tests {
         setup_dirs(&file_io, table_path).await;
         let schema = |name: &str| {
             Schema::builder()
+                .option("write-only", "true")
                 .column("id", DataType::Int(IntType::new()))
                 .column(name, DataType::Variant(VariantType::new()))
                 .primary_key(["id"])
@@ -1532,6 +1533,7 @@ mod tests {
 
     fn pk_table(file_io: &FileIO, table_path: &str, options: &[(&str, &str)]) -> Table {
         let mut builder = Schema::builder()
+            .option("write-only", "true")
             .column("id", DataType::Int(IntType::new()))
             .column("value", DataType::Int(IntType::new()))
             .primary_key(["id"])
@@ -1596,6 +1598,7 @@ mod tests {
     /// line up across versions exactly as a real ADD COLUMN produces.
     fn evo_user_schema(with_score: bool) -> Schema {
         let mut builder = Schema::builder()
+            .option("write-only", "true")
             .column("id", DataType::Int(IntType::new()))
             .column("value", DataType::Int(IntType::new()));
         if with_score {
@@ -3488,6 +3491,7 @@ mod tests {
         setup_dirs(&file_io, table_path).await;
 
         let schema = Schema::builder()
+            .option("write-only", "true")
             .column("id", DataType::Int(IntType::new()))
             .column("seq_a", DataType::Int(IntType::new()))
             .column("value_a", DataType::Int(IntType::new()))
@@ -3698,6 +3702,7 @@ mod tests {
         setup_dirs(&file_io, table_path).await;
 
         let schema = Schema::builder()
+            .option("write-only", "true")
             .column("id", DataType::Int(IntType::new()))
             .column("version", DataType::Int(IntType::new()))
             .column("value", DataType::VarChar(VarCharType::string_type()))

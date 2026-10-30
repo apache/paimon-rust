@@ -33,6 +33,7 @@ fn table() -> Table {
 
 fn table_at(name: &str) -> Table {
     let schema = Schema::builder()
+        .option("write-only", "true")
         .column("id", DataType::Int(IntType::new()))
         .column("value", DataType::Int(IntType::new()))
         .option("data-evolution.enabled", "true")

@@ -1639,6 +1639,23 @@ impl<'a> CoreOptions<'a> {
             .unwrap_or(DEFAULT_TARGET_FILE_SIZE)
     }
 
+    /// Skip automatic compaction after a data commit. Defaults to false.
+    /// `write.compaction-skip` is the legacy alias; `write-only` takes precedence.
+    pub fn write_only(&self) -> crate::Result<bool> {
+        match self
+            .options
+            .get("write-only")
+            .or_else(|| self.options.get("write.compaction-skip"))
+        {
+            None => Ok(false),
+            Some(raw) if raw.eq_ignore_ascii_case("true") => Ok(true),
+            Some(raw) if raw.eq_ignore_ascii_case("false") => Ok(false),
+            Some(raw) => Err(crate::Error::ConfigInvalid {
+                message: format!("write-only must be true or false, got '{raw}'"),
+            }),
+        }
+    }
+
     /// Minimum input files for a compaction task. Default is 5. Data evolution
     /// permits one file for a forced rewrite; ordinary append requires two.
     pub fn compaction_min_file_num(&self) -> crate::Result<usize> {

@@ -45,6 +45,30 @@ let metrics = committer.commit_compact(results).await?;
 println!("Compacted {} files into {}", metrics.files_removed, metrics.files_added);
 ```
 
+Writers also run one synchronous compaction round after a successful data commit.
+`write-only` defaults to `false`; set it to `true` to leave compaction to a
+dedicated job. The legacy `write.compaction-skip` alias is accepted, with
+`write-only` taking precedence. Automatic compaction uses the existing planner's
+thresholds and selects eligible files from the latest snapshot on the same branch,
+using the current schema even when the writer retains a historical schema.
+For primary-key tables, the batch planner can advance L0 files even below the
+normal sorted-run count trigger.
+An empty plan publishes no extra snapshot. Append, overwrite and state-dependent
+data commits use this behavior; empty commits and truncation do not trigger it.
+Table modes unsupported by the compaction API retain their write behavior without
+automatic compaction. Supported modes require valid compaction configuration,
+including the local cache required for lookup and first-row compaction.
+
+Data publication and compaction are separate transactions. A compaction failure
+leaves the data committed and returns an error retaining the underlying cause.
+For recoverable writes, use a stable commit user and caller-provided identifier,
+then retry with `filter_and_commit_with_identifier` (or `filter_and_commit`) for
+append, or `overwrite_with_identifier` for overwrite.
+Recovery finishes an interrupted compaction round without repeating the data
+commit or a completed automatic `COMPACT` snapshot. A single round can leave
+additional work for a later write or a dedicated compaction job. This option does
+not schedule background work or expire snapshots.
+
 Ordinary append and PK compaction use `target-file-size` as the output size target.
 For unaware append tables (`bucket=-1`), task selection follows the batch packing rules in Java's
 [`AppendCompactCoordinator`](https://github.com/apache/paimon/blob/master/paimon-core/src/main/java/org/apache/paimon/append/AppendCompactCoordinator.java):
@@ -399,5 +423,6 @@ override (`pk-clustering-override`) and record-level expiration
 Snapshot index manifests may contain dynamic-bucket HASH indexes and primary-key
 deletion vectors, or deletion vectors and global indexes in Data Evolution mode.
 Embedded and sidecar file indexes are regenerated according to the captured
-table options. Language bindings and
-background compaction scheduling are not yet provided.
+table options. The automatic behavior also applies to language bindings using the
+table committer. The manual compaction API and background compaction scheduling
+are not yet exposed through language bindings.

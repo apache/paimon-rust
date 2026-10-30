@@ -154,6 +154,12 @@ async fn historical_writers_and_committers_use_latest_publication_state() {
                 mode,
             )
             .await;
+            let before = latest
+                .snapshot_manager()
+                .get_latest_snapshot_id()
+                .await
+                .unwrap()
+                .unwrap();
             let mut expected = rows(&latest).await;
             if operation == "truncate" {
                 historical
@@ -215,7 +221,17 @@ async fn historical_writers_and_committers_use_latest_publication_state() {
                 .await
                 .unwrap()
                 .unwrap();
-            assert_eq!(snapshot.id(), 3);
+            // One data transaction, optionally followed by automatic COMPACT.
+            let data_snapshot = if snapshot.commit_kind() == &paimon::spec::CommitKind::COMPACT {
+                latest
+                    .snapshot_manager()
+                    .get_snapshot(snapshot.id() - 1)
+                    .await
+                    .unwrap()
+            } else {
+                snapshot.clone()
+            };
+            assert_eq!(data_snapshot.id(), before + 1);
             assert_eq!(snapshot.schema_id(), 1);
             // Publication does not change the writer handle's selected read view.
             assert_eq!(

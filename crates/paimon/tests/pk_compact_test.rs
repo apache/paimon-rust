@@ -54,6 +54,11 @@ async fn table_with_schema(schema: TableSchema) -> Table {
 }
 
 async fn table_with_cache(schema: TableSchema, cache_options: &[(&str, &str)]) -> Table {
+    // These tests explicitly control planning, execution and publication.
+    let schema = schema.copy_with_options(std::collections::HashMap::from([(
+        "write-only".into(),
+        "true".into(),
+    )]));
     let path = format!("memory:/pk_compact/{}", uuid::Uuid::new_v4());
     let mut options = paimon::Options::new();
     options.set("warehouse", &path);

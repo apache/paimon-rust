@@ -4394,7 +4394,7 @@ async fn written(
         .unwrap();
     let identifier = Identifier::new("default", name);
     fs_catalog
-        .create_table(&identifier, schema(&[]), false)
+        .create_table(&identifier, schema(&[("write-only", "true")]), false)
         .await
         .unwrap();
     let plain = fs_catalog.get_table(&identifier).await.unwrap();

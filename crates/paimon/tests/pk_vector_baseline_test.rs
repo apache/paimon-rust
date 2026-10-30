@@ -116,6 +116,7 @@ fn analytic_topk(query: &[f32], vectors: &[[f32; DIM]], k: usize) -> Vec<(u64, f
 /// is built on read).
 fn table_options() -> Vec<(String, String)> {
     vec![
+        ("write-only".to_string(), "true".to_string()),
         ("bucket".to_string(), "1".to_string()),
         ("deletion-vectors.enabled".to_string(), "true".to_string()),
         (

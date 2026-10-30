@@ -49,6 +49,7 @@ const BATCH_COMMIT_IDENTIFIER: i64 = i64::MAX;
 /// Java RollingFileWriter.CHECK_ROLLING_RECORD_CNT.
 const CHECK_ROLLING_RECORD_COUNT: usize = 1000;
 
+mod auto_compact;
 mod global_index_source_check;
 mod row_tracking;
 
@@ -388,9 +389,18 @@ impl TableCommit {
         }
         let latest = self.snapshot_manager.get_latest_snapshot().await?;
         let mut pending = Vec::new();
+        let mut recovered = Vec::new();
         for (id, messages) in commits {
             if !self.is_committed_identifier(&latest, id).await? {
                 pending.push((id, messages));
+            } else if self
+                .auto_compaction_enabled(messages.iter().any(|m| !m.new_files.is_empty()))?
+            {
+                let kind = direct_commit_kind(
+                    &self.messages_to_entries(&messages),
+                    &self.messages_to_index_entries(&messages),
+                );
+                recovered.push((id, kind));
             }
         }
         // Java checks every pending checkpoint before publishing any snapshot.
@@ -399,6 +409,9 @@ impl TableCommit {
             self.check_recovery_files(messages).await?;
         }
         let count = pending.len();
+        for (id, kind) in recovered {
+            self.compact_after_write(id, &kind).await?;
+        }
         for (id, messages) in pending {
             self.filter_and_commit_with_identifier(messages, id).await?;
         }
@@ -520,7 +533,7 @@ impl TableCommit {
         let check_from_snapshot = Self::check_from_snapshot(&commit_messages)?;
         // Never delete CommitMessage files on failure. A previous attempt may
         // have published them even when the caller received an exception.
-        self.try_commit(
+        self.commit_with_auto_compact(
             CommitEntriesPlan::Direct {
                 entries,
                 changelog_entries,
@@ -567,7 +580,7 @@ impl TableCommit {
         let changelog_entries = self.messages_to_changelog_entries(&commit_messages);
         let new_index_entries = self.messages_to_index_entries(&commit_messages);
         let check_from_snapshot = Self::check_from_snapshot(&commit_messages)?;
-        self.try_commit(
+        self.commit_with_auto_compact(
             CommitEntriesPlan::Direct {
                 entries,
                 changelog_entries,
@@ -676,7 +689,7 @@ impl TableCommit {
 
         let check_from_snapshot = Self::check_from_snapshot(&commit_messages)?;
 
-        self.try_commit(
+        self.commit_with_auto_compact(
             CommitEntriesPlan::Overwrite {
                 partition_filter,
                 new_entries,
@@ -4311,6 +4324,7 @@ mod tests {
         use crate::spec::{DataType, IntType, Schema, VarCharType};
         let schema = Schema::builder()
             .column("id", DataType::Int(IntType::new()))
+            .option("write-only", "true")
             .column("name", DataType::VarChar(VarCharType::string_type()))
             .build()
             .unwrap();
@@ -4410,6 +4424,7 @@ mod tests {
             .column("pt", DataType::VarChar(VarCharType::string_type()))
             .column("id", DataType::Int(IntType::new()))
             .partition_keys(["pt"])
+            .option("write-only", "true")
             .build()
             .unwrap();
         TableSchema::new(0, &schema)
@@ -4443,9 +4458,12 @@ mod tests {
     fn test_table_with_options(
         file_io: &FileIO,
         table_path: &str,
-        options: HashMap<String, String>,
+        mut options: HashMap<String, String>,
     ) -> Table {
         use crate::spec::{DataType, IntType, Schema, VarCharType};
+        options
+            .entry("write-only".into())
+            .or_insert_with(|| "true".into());
         let schema = Schema::builder()
             .column("id", DataType::Int(IntType::new()))
             .column("name", DataType::VarChar(VarCharType::string_type()))
@@ -6539,6 +6557,7 @@ mod tests {
     fn test_data_evolution_schema() -> TableSchema {
         use crate::spec::{DataType, IntType, Schema, VarCharType};
         let schema = Schema::builder()
+            .option("write-only", "true")
             .column("id", DataType::Int(IntType::new()))
             .column("name", DataType::VarChar(VarCharType::string_type()))
             .option("row-tracking.enabled", "true")
