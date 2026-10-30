@@ -1656,6 +1656,22 @@ impl<'a> CoreOptions<'a> {
         }
     }
 
+    /// Maximum concurrent buckets in one automatic compaction round. Default is 4.
+    pub fn write_compaction_parallelism(&self) -> crate::Result<usize> {
+        self.options
+            .get("write.compaction.parallelism")
+            .map_or(Ok(4), |raw| {
+                raw.parse::<usize>()
+                    .ok()
+                    .filter(|value| *value > 0)
+                    .ok_or_else(|| crate::Error::ConfigInvalid {
+                        message: format!(
+                            "write.compaction.parallelism must be a positive integer, got '{raw}'"
+                        ),
+                    })
+            })
+    }
+
     /// Include L0 files below normal compaction triggers. Java defaults to false.
     pub fn compaction_force_up_level0(&self) -> crate::Result<bool> {
         match self.options.get("compaction.force-up-level-0") {

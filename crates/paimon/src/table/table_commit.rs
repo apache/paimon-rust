@@ -410,7 +410,7 @@ impl TableCommit {
         }
         let count = pending.len();
         for (id, kind) in recovered {
-            self.compact_after_write(id, &kind).await?;
+            self.recover_compact_after_write(id, &kind).await?;
         }
         for (id, messages) in pending {
             self.filter_and_commit_with_identifier(messages, id).await?;
@@ -936,6 +936,7 @@ impl TableCommit {
             filter_committed,
         )
         .await
+        .map(|_| ())
     }
 
     /// Python-compatible alias for dropping partitions.
@@ -1011,6 +1012,7 @@ impl TableCommit {
             filter_committed,
         )
         .await
+        .map(|_| ())
     }
 
     /// A Format Table has no snapshots, so an overwrite commit would find nothing to delete and
@@ -1127,7 +1129,7 @@ impl TableCommit {
         expected_snapshot_id: Option<i64>,
         commit_identifier: i64,
         filter_committed: bool,
-    ) -> Result<()> {
+    ) -> Result<CommitOutcome> {
         let mut retry_count = 0u32;
         let mut duplicate_check_start_snapshot_id: Option<i64> = None;
         let mut retry_state: Option<Box<RetryState>> = None;
@@ -1143,7 +1145,7 @@ impl TableCommit {
         let mut publication_uncertain = false;
         let mut last_publication_error = None;
         let result = async {
-            loop {
+            let outcome = loop {
                 let latest_snapshot = self.snapshot_manager.get_latest_snapshot().await?;
                 if filter_committed {
                     let recovery_start = match &plan {
@@ -1161,7 +1163,7 @@ impl TableCommit {
                         )
                         .await?
                     {
-                        break;
+                        break CommitOutcome::Filtered;
                     }
                     self.check_recovered_files_exist(&plan).await?;
                     filter_committed = false;
@@ -1178,9 +1180,10 @@ impl TableCommit {
                     {
                         if !self.commit_callbacks.is_empty() {
                             let entries = self.read_delta_entries(None, &snapshot).await?;
-                            self.notify_commit_callbacks(snapshot, entries).await?;
+                            self.notify_commit_callbacks(snapshot.clone(), entries)
+                                .await?;
                         }
-                        break;
+                        break CommitOutcome::Published(Box::new(snapshot));
                     }
                 }
                 validate_expected_latest_snapshot(expected_snapshot_id, &latest_snapshot)?;
@@ -1199,7 +1202,7 @@ impl TableCommit {
                     && !commit_empty_overwrite
                     && !commit_empty_append
                 {
-                    break;
+                    break CommitOutcome::Empty;
                 }
 
                 let result = self
@@ -1207,7 +1210,9 @@ impl TableCommit {
                     .await?;
 
                 match result {
-                    CommitAttemptResult::Success => break,
+                    CommitAttemptResult::Success(snapshot) => {
+                        break CommitOutcome::Published(snapshot)
+                    }
                     CommitAttemptResult::Retry(mut state) => {
                         if let Some(error) = state.publication_error.take() {
                             publication_uncertain = true;
@@ -1235,9 +1240,9 @@ impl TableCommit {
 
                 self.commit_retry_wait(retry_count).await;
                 retry_count += 1;
-            }
+            };
 
-            Ok(())
+            Ok(outcome)
         }
         .await;
         match result {
@@ -1360,10 +1365,10 @@ impl TableCommit {
         {
             Ok(true) => {
                 if !self.commit_callbacks.is_empty() {
-                    self.notify_commit_callbacks(snapshot, resolved.entries)
+                    self.notify_commit_callbacks(snapshot.clone(), resolved.entries)
                         .await?;
                 }
-                return Ok(CommitAttemptResult::Success);
+                return Ok(CommitAttemptResult::Success(Box::new(snapshot)));
             }
             Ok(false) => {
                 if self.deletion_vectors_enabled && resolved.kind == CommitKind::COMPACT {
@@ -4039,8 +4044,14 @@ struct ResolvedCommit {
     base_data_files: Option<Vec<ManifestEntry>>,
 }
 
+enum CommitOutcome {
+    Published(Box<Snapshot>),
+    Filtered,
+    Empty,
+}
+
 enum CommitAttemptResult {
-    Success,
+    Success(Box<Snapshot>),
     Retry(Box<RetryState>),
 }
 

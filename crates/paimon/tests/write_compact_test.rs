@@ -323,6 +323,8 @@ async fn invalid_compaction_configuration_fails_before_data_publication() {
         (false, "write-only", "invalid"),
         (false, "compaction.min.file-num", "1"),
         (true, "compaction.force-up-level-0", "invalid"),
+        (false, "write.compaction.parallelism", "0"),
+        (false, "write.compaction.parallelism", "invalid"),
     ] {
         let table = table(primary_key, &[(key, value)]).await;
         let error = table

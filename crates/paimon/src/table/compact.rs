@@ -18,6 +18,8 @@
 //! Snapshot-bound append, data-evolution and primary-key compaction.
 
 mod append;
+mod automatic;
+pub(super) use automatic::execute_auto_plan;
 pub(super) mod data_evolution;
 pub(super) mod deletion_vectors;
 pub(super) mod primary_key;

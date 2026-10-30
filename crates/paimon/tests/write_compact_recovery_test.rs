@@ -148,9 +148,146 @@ async fn automatic_compact_identity_does_not_filter_a_legal_writer_name() {
     assert_eq!(rows(&table).await, vec![(1, 10), (2, 20), (99, 990)]);
 }
 
+struct AdvanceAndExpireDataSnapshot(Table);
+
+#[async_trait::async_trait]
+impl CommitCallback for AdvanceAndExpireDataSnapshot {
+    async fn call(&self, context: &CommitCallbackContext) -> paimon::Result<()> {
+        if context.snapshot.commit_kind() == &CommitKind::APPEND {
+            let other = self.0.copy_with_options(std::collections::HashMap::from([(
+                "write-only".into(),
+                "true".into(),
+            )]));
+            publish(&other, "concurrent-writer", 1, 99, false).await;
+            self.0
+                .file_io()
+                .delete_file(
+                    &self
+                        .0
+                        .snapshot_manager()
+                        .snapshot_path(context.snapshot.id()),
+                )
+                .await?;
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn normal_commit_passes_its_result_without_rediscovering_the_data_snapshot() {
+    let table = table(false).await;
+    publish(&table, "seed", 1, 0, false).await;
+    let builder = table.new_write_builder();
+    let mut writer = builder.new_write().unwrap();
+    writer
+        .write_arrow_batch(&batch(vec![1], None))
+        .await
+        .unwrap();
+    let mut commit = builder.new_commit();
+    commit
+        .add_commit_callback(Arc::new(AdvanceAndExpireDataSnapshot(table.clone())))
+        .unwrap();
+    commit
+        .commit(writer.prepare_commit().await.unwrap())
+        .await
+        .unwrap();
+    let snapshot = table
+        .snapshot_manager()
+        .get_latest_snapshot()
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(snapshot.id(), 4);
+    assert_eq!(snapshot.commit_kind(), &CommitKind::COMPACT);
+    assert!(!table
+        .file_io()
+        .exists(&table.snapshot_manager().snapshot_path(2))
+        .await
+        .unwrap());
+    assert_eq!(rows(&table).await, vec![(0, 0), (1, 10), (99, 990)]);
+}
+
 struct RemoveSecondTaskInput {
     table: Table,
     removed: Mutex<Option<(String, bytes::Bytes)>>,
+}
+
+#[derive(Default)]
+struct PauseAppend {
+    entered: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
+}
+
+#[async_trait::async_trait]
+impl CommitCallback for PauseAppend {
+    async fn call(&self, context: &CommitCallbackContext) -> paimon::Result<()> {
+        if context.snapshot.commit_kind() == &CommitKind::APPEND {
+            self.entered.notify_one();
+            self.resume.notified().await;
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn normal_commit_skips_compaction_already_finished_by_concurrent_recovery() {
+    let table = table(false)
+        .await
+        .copy_with_options(std::collections::HashMap::from([(
+            "target-file-row-num".into(),
+            "1".into(),
+        )]));
+    publish(&table, "seed", 1, 0, false).await;
+    let builder = table
+        .new_write_builder()
+        .with_commit_user("paused")
+        .unwrap();
+    let mut writer = builder.new_write().unwrap();
+    writer
+        .write_arrow_batch(&batch(vec![1], None))
+        .await
+        .unwrap();
+    let messages = writer.prepare_commit().await.unwrap();
+    let pause = Arc::new(PauseAppend::default());
+    let mut original = builder.new_commit();
+    original.add_commit_callback(pause.clone()).unwrap();
+    let concurrent = async {
+        pause.entered.notified().await;
+        builder
+            .new_commit()
+            .filter_and_commit_with_identifier(messages.clone(), 7)
+            .await
+            .unwrap();
+        let before = data_files(&table).await;
+        pause.resume.notify_one();
+        before
+    };
+    let (result, before) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        tokio::join!(
+            original.commit_with_identifier(messages.clone(), 7),
+            concurrent
+        )
+    })
+    .await
+    .expect("concurrent recovery must complete");
+    result.unwrap();
+    let snapshot = table
+        .snapshot_manager()
+        .get_latest_snapshot()
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        snapshot.id(),
+        3,
+        "one data snapshot must have only one automatic COMPACT"
+    );
+    assert_eq!(
+        data_files(&table).await,
+        before,
+        "the resumed request must not leave duplicate outputs"
+    );
+    assert_eq!(rows(&table).await, vec![(0, 0), (1, 10)]);
 }
 
 #[async_trait::async_trait]

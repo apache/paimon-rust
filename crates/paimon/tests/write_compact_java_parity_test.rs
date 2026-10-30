@@ -274,6 +274,52 @@ async fn overwrite_lookup_compaction_suppresses_changelog_without_affecting_late
 }
 
 #[tokio::test]
+async fn bounded_bucket_compaction_preserves_lookup_changes_and_deletion_vectors() {
+    for parallelism in ["1", "2"] {
+        for dv in ["false", "true"] {
+            let table = table(
+                false,
+                "4",
+                &[
+                    ("changelog-producer", "lookup"),
+                    ("deletion-vectors.enabled", dv),
+                    ("write.compaction.parallelism", parallelism),
+                ],
+            )
+            .await;
+            let ids = (0..32).collect::<Vec<_>>();
+            for version in [10, 20] {
+                write_batch(&table, &make_batch(ids.clone(), vec![version; ids.len()])).await;
+                let snapshot = latest(&table).await;
+                assert_eq!(snapshot.commit_kind(), &CommitKind::COMPACT);
+                assert_eq!(
+                    snapshot.changelog_record_count(),
+                    Some(if version == 10 { 32 } else { 64 })
+                );
+                assert_eq!(
+                    rows(&table).await,
+                    ids.iter().map(|id| (*id, version)).collect::<Vec<_>>()
+                );
+                let plan = table.new_read_builder().new_scan().plan().await.unwrap();
+                assert_eq!(
+                    plan.splits()
+                        .iter()
+                        .map(|split| split.bucket())
+                        .collect::<std::collections::HashSet<_>>()
+                        .len(),
+                    4
+                );
+                assert!(plan
+                    .splits()
+                    .iter()
+                    .flat_map(|split| split.data_files())
+                    .all(|file| file.level > 0));
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn automatic_gentle_lookup_rejects_before_publication_without_changing_manual_compaction() {
     for lookup_mode in [
         ("merge-engine", "first-row"),

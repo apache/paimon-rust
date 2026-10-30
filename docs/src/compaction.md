@@ -64,6 +64,13 @@ Automatic lookup compaction supports the default `lookup-compact=radical` policy
 here; use `write-only=true` and schedule dedicated compaction separately.
 An empty plan publishes no extra snapshot. Append, overwrite and state-dependent
 data commits use this behavior; empty commits and truncation do not trigger it.
+`write.compaction.parallelism` bounds concurrent buckets within one automatic
+round (default `4`, positive integer; `1` runs serially). Tasks in the same
+partition and bucket run in order. The commit waits for the complete round and
+publishes all successful results together. On execution failure, queued buckets
+are skipped, started buckets finish, and their unpublished outputs are cleaned up.
+Normal commits pass their actual data snapshot and touched bucket set directly
+to compaction; only recovery reconstructs them from stored snapshots and manifests.
 Table modes unsupported by the compaction API retain their write behavior without
 automatic compaction. Automatic lookup, first-row and deletion-vector compaction
 use the configured catalog cache when available, otherwise a temporary disk cache
