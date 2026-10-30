@@ -115,8 +115,9 @@ snapshot expiration and storage reclamation are separate maintenance work.
 The same API compacts primary-key tables with `deduplicate`,
 `first-row`, `partial-update` or `aggregation` merge engines. Changelog producers
 `none`, `input` and `lookup` are supported; `first-row` supports `none` or `lookup`.
-For `deduplicate` with `none`, `input` or `lookup`, the planner chooses incremental
-sorted runs using Java's universal-compaction size and count policy. Each L0 file is a
+For `deduplicate` with `none`, `input` or `lookup`, and non-DV `first-row` with
+`none` or `lookup`, the planner chooses incremental sorted runs using Java's
+universal-compaction size and count policy. Each L0 file is a
 run; all files at one positive level form a single run. Normal size and run-count
 triggers take precedence. If they select no work, explicit compaction forces
 progress on every L0 run and absorbs adjacent runs according to their sizes. A
@@ -130,8 +131,16 @@ The policy uses `num-sorted-run.compaction-trigger` (default `5`), `num-levels`
 `compaction.max-size-amplification-percent` (default `200`). When selected runs
 reach the oldest run, output goes to the highest configured or existing level;
 otherwise it goes immediately below the next unselected run. Explicit full
-compaction is not exposed. Without deletion vectors, outputs retain winning retracts, so older values
+compaction is not exposed. Without deletion vectors, `deduplicate` outputs retain winning retracts, so older values
 in untouched files do not reappear after a delete or out-of-order update.
+
+For `first-row`, both producers require actual catalog/FileIO local-cache.
+The executor looks up keys in retained higher-level files. Existing accepted keys
+stay in those files and produce neither a new data row nor a changelog event.
+Selected positive-level rows still participate in the output. The `lookup`
+producer emits only newly accepted keys, preserving their first add's row kind
+and sequence. If every input key already exists, compaction can retire its
+L0 inputs without creating a data or changelog file.
 
 With deletion vectors, `deduplicate` supports the same incremental selection for
 `none`, `input` and `lookup`. All three require actual catalog/FileIO local-cache.
@@ -149,16 +158,33 @@ retain their physical deletion metadata, including an empty list when appropriat
 Each output file is limited to 4,294,967,296 physical rows. Migrating files written
 without DV is unsupported, including enabling DV through temporary table options.
 
-`first-row`, `partial-update` and `aggregation` retain their current
-selection behavior: every active file in a selected bucket participates, and
-output uses the highest input level or level 1 for all-L0 inputs. Their state
-and changelog generation must see history before incremental selection can be
-enabled. Append size and count options do not control PK selection.
+Non-DV `partial-update` and `aggregation` with `lookup` use the same incremental
+policy and require actual catalog/FileIO local-cache. The executor inserts the
+nearest retained positive-level state into each changed key's merge, in sequence
+order. The output contains the materialized state; lookup scans use only the
+nearest positive-level state, so retained older levels are not aggregated again.
+
+With `none` or `input`, these engines use incremental selection only when every
+value field can be merged again independently of row order: `min`, `max`,
+`bool_and`, `bool_or`, or integer `sum` without checked overflow. Aggregation must
+have `aggregation.remove-record-on-delete=false` and no global sequence fields.
+Partial update must use `ignore-delete=true`, no global sequence fields, and
+protect every value field with a sequence group and one of these aggregate
+functions. Each group's ordering fields retain its winning sequence and must
+not also be protected fields. These modes merge only selected inputs, leaving
+retained history to ordinary query merging, and do not require local-cache.
+
+Other `none`/`input` configurations retain their previous selection: every active
+file in the selected bucket participates, and output uses the highest input level
+or level 1 for all-L0 inputs. This preserves sparse overwrite and order-sensitive
+state such as `first_value`, finite floating-point summation, checked-overflow
+behavior and reset-on-delete semantics. Existing retract/state restrictions still
+apply. Append size and count options do not control PK selection.
 
 Tasks capture their selected runs and output level. Executors validate the task
 against the captured snapshot. Committers independently recompute the selection
 from that snapshot and validate the files being removed and the output levels.
-Older serialized deduplicate tasks without an output level must be replanned
+Older serialized incremental tasks without an output level must be replanned
 before execution. Prepared results can still be published if their file changes
 match the captured selection; already committed results remain recoverable
 through the existing idempotent retry path.

@@ -182,9 +182,38 @@ impl MergeFunction for CompactReducer {
     }
 }
 
+struct CompactFirstRow {
+    inner: Box<dyn MergeFunction>,
+    output_level: i32,
+}
+
+impl MergeFunction for CompactFirstRow {
+    fn merge(
+        &self,
+        rows: &[MergeRow],
+        batches: &[BufferedBatch],
+        columns: &[usize],
+        schema: &SchemaRef,
+    ) -> Result<MergeResult> {
+        // Validate all selected records before checking retained history, as
+        // Java FirstRowMergeFunctionWrapper does when feeding its reducer.
+        let result = self.inner.merge(rows, batches, columns, schema)?;
+        for row in rows {
+            // Only a lookup hit can be above the output level. Its accepted
+            // record stays in retained history; selected positive rows must
+            // still be rewritten into this compaction's output.
+            if matches!(row.value_kind, 0 | 2) && row.level(batches)? > self.output_level {
+                return Ok(MergeResult::Omit);
+            }
+        }
+        Ok(result)
+    }
+}
+
 fn new_merge_function(
     config: &KeyValueReadConfig,
     fields: &[DataField],
+    output_level: i32,
 ) -> Result<Box<dyn MergeFunction>> {
     if config.merge_engine == MergeEngine::Deduplicate {
         return Ok(Box::new(CompactDeduplicate));
@@ -220,7 +249,10 @@ fn new_merge_function(
     };
     Ok(if config.merge_engine == MergeEngine::FirstRow {
         // First-row must still reject retracts unless ignore-delete is enabled.
-        inner
+        Box::new(CompactFirstRow {
+            inner,
+            output_level,
+        })
     } else {
         Box::new(CompactReducer {
             inner,
@@ -314,14 +346,15 @@ pub(super) async fn execute(
     let schema = table.schema();
     let options = schema.core_options();
     let lookup_changelog = options.try_changelog_producer()? == ChangelogProducer::Lookup;
-    let drop_delete = options.deletion_vectors_enabled() && task.output_level() > 0;
+    let output_level = task.output_level();
+    let drop_delete = options.deletion_vectors_enabled() && output_level > 0;
     let reader = new_reader(table, resources.clone())?.with_lookup(lookup);
     let mut batches =
         reader.read_with_merge_function(std::slice::from_ref(split), move |config, fields| {
             if lookup_changelog {
-                lookup::new_merge_function(config, fields)
+                lookup::new_merge_function(config, fields, output_level)
             } else {
-                new_merge_function(config, fields)
+                new_merge_function(config, fields, output_level)
             }
         })?;
     let keys = schema.trimmed_primary_keys();
