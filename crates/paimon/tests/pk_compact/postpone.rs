@@ -358,6 +358,7 @@ async fn postpone_compaction_merges_many_sort_runs_without_reducing_raw_updates(
     let table = table(&[
         ("bucket", "-2"),
         ("read.batch-size", "1"),
+        ("write-buffer-size", "1b"),
         ("merge-engine", "aggregation"),
         ("fields.value.aggregate-function", "sum"),
     ])
@@ -493,4 +494,312 @@ async fn postpone_dv_compaction_rejects_other_merge_engines() {
     assert!(error
         .to_string()
         .contains("Primary-key deletion-vector compaction requires deduplicate"));
+}
+
+#[tokio::test]
+async fn postpone_java_row_null_payload_cannot_be_decoded_as_legacy_layout() {
+    use std::sync::Arc;
+
+    let table = table(&[("bucket", "-2"), ("file.format", "row")]).await;
+    let fixed_table = table.copy_with_options(std::collections::HashMap::from([(
+        "bucket".into(),
+        "1".into(),
+    )]));
+    let builder = fixed_table.new_write_builder();
+    let mut writer = builder.new_write().unwrap();
+    let batch = RecordBatch::try_from_iter([
+        (
+            "id",
+            Arc::new(Int32Array::from(vec![1])) as arrow_array::ArrayRef,
+        ),
+        (
+            "value",
+            Arc::new(Int32Array::from(vec![None::<i32>])) as arrow_array::ArrayRef,
+        ),
+    ])
+    .unwrap();
+    writer.write_arrow_batch(&batch).await.unwrap();
+    let mut messages = writer.prepare_commit().await.unwrap();
+    for message in &mut messages {
+        for file in &mut message.new_files {
+            file.external_path = Some(format!("{}/bucket-0/{}", table.location(), file.file_name));
+            file.file_name = format!("data--u-java-s-0-w-{}", file.file_name);
+        }
+        message.bucket = -2;
+        message.total_buckets = None;
+    }
+    table
+        .new_write_builder()
+        .new_commit()
+        .commit(messages)
+        .await
+        .unwrap();
+    compact(&table).await;
+    let batches = read(&table, None).await;
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+    let batch = batches.iter().find(|batch| batch.num_rows() != 0).unwrap();
+    let ids = batch
+        .column_by_name("id")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    assert_eq!(ids.value(0), 1);
+    assert!(batch.column_by_name("value").unwrap().is_null(0));
+}
+
+#[tokio::test]
+async fn postpone_equal_time_java_files_keep_manifest_order() {
+    let table = table(&[("bucket", "-2")]).await;
+    let builder = table.new_write_builder();
+    let mut writer = builder.new_write().unwrap();
+    writer
+        .write_arrow_batch(&make_batch(vec![1], vec![10]))
+        .await
+        .unwrap();
+    let mut messages = writer.prepare_commit().await.unwrap();
+    writer
+        .write_arrow_batch(&make_batch_with_kinds(vec![1], vec![10], vec![3]))
+        .await
+        .unwrap();
+    let later = writer.prepare_commit().await.unwrap();
+    messages[0]
+        .new_files
+        .extend(later.into_iter().flat_map(|message| message.new_files));
+    for (file, suffix) in messages[0].new_files.iter_mut().zip(["z", "a"]) {
+        file.external_path = Some(format!(
+            "{}/bucket-postpone/{}",
+            table.location(),
+            file.file_name
+        ));
+        let (prefix, _) = file.file_name.rsplit_once("-w-").unwrap();
+        file.file_name = format!("{prefix}-w-{suffix}.parquet");
+        file.creation_time = chrono::DateTime::from_timestamp_millis(42);
+        // Java postpone writers use UNKNOWN_SEQUENCE across these files.
+        file.min_sequence_number = -1;
+        file.max_sequence_number = -1;
+    }
+    builder.new_commit().commit(messages).await.unwrap();
+    compact(&table).await;
+    assert!(
+        rows(&table).await.is_empty(),
+        "the later DELETE must win over the earlier INSERT"
+    );
+}
+
+async fn java_null_row_fixture(thin: bool, real_bucket: bool) -> Table {
+    use paimon::spec::BinaryTableStats;
+    use std::sync::Arc;
+
+    let table = table(&[
+        ("bucket", "-2"),
+        ("file.format", "row"),
+        ("postpone.default-bucket-num", "1"),
+        ("data-file.thin-mode", if thin { "true" } else { "false" }),
+    ])
+    .await;
+    let batch = RecordBatch::try_from_iter([
+        (
+            "id",
+            Arc::new(Int32Array::from(vec![1])) as arrow_array::ArrayRef,
+        ),
+        (
+            "value",
+            Arc::new(Int32Array::from(vec![None::<i32>])) as arrow_array::ArrayRef,
+        ),
+    ])
+    .unwrap();
+    let ordinary = table.new_write_builder();
+    let fixed = table.new_postpone_fixed_bucket_write_builder().unwrap();
+    let mut messages = if real_bucket {
+        let mut writer = fixed.new_write().unwrap();
+        writer.write_arrow_batch(&batch).await.unwrap();
+        writer.prepare_commit().await.unwrap()
+    } else {
+        let mut writer = ordinary.new_write().unwrap();
+        writer.write_arrow_batch(&batch).await.unwrap();
+        writer.prepare_commit().await.unwrap()
+    };
+    let bytes: &[u8] = if thin {
+        include_bytes!("../../testdata/postpone_row/java_postpone_thin_null.row")
+    } else {
+        include_bytes!("../../testdata/postpone_row/java_postpone_kv_null.row")
+    };
+    for message in &mut messages {
+        for file in &mut message.new_files {
+            let directory = if real_bucket {
+                "bucket-0"
+            } else {
+                "bucket-postpone"
+            };
+            table
+                .file_io()
+                .new_output(&format!(
+                    "{}/{directory}/{}",
+                    table.location(),
+                    file.file_name
+                ))
+                .unwrap()
+                .write(bytes::Bytes::copy_from_slice(bytes))
+                .await
+                .unwrap();
+            file.file_size = bytes.len() as i64;
+            file.min_sequence_number = -1;
+            file.max_sequence_number = -1;
+            file.key_stats =
+                BinaryTableStats::new(file.min_key.clone(), file.max_key.clone(), vec![Some(0)]);
+        }
+    }
+    if real_bucket {
+        fixed.new_commit().commit(messages).await.unwrap();
+    } else {
+        ordinary.new_commit().commit(messages).await.unwrap();
+    }
+    table
+}
+
+async fn disable_thin_mode(table: &Table) -> Table {
+    let schema = table
+        .schema()
+        .apply_changes(vec![paimon::spec::SchemaChange::set_option(
+            "data-file.thin-mode".into(),
+            "false".into(),
+        )])
+        .unwrap();
+    persist_table_schema(table.file_io(), table.location(), &schema).await;
+    table.copy_with_resolved_schema(schema, "main").unwrap()
+}
+
+#[tokio::test]
+async fn postpone_reads_java_generated_null_row_fixtures() {
+    for thin in [false, true] {
+        let original = java_null_row_fixture(thin, false).await;
+        let table = if thin {
+            disable_thin_mode(&original).await
+        } else {
+            original
+        };
+        compact(&table).await;
+        let batches = read(&table, None).await;
+        let batch = batches.iter().find(|batch| batch.num_rows() != 0).unwrap();
+        assert_eq!(
+            batch
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .value(0),
+            1
+        );
+        assert!(batch.column_by_name("value").unwrap().is_null(0));
+    }
+}
+
+#[tokio::test]
+async fn postpone_rejects_unsupported_thin_row_output_and_real_history() {
+    for real_bucket in [false, true] {
+        let original = java_null_row_fixture(true, real_bucket).await;
+        assert!(original.new_compact_builder().new_planner().is_err());
+        // A temporary option must not make Java read full KV output as thin ROW.
+        let temporary = original.copy_with_options(std::collections::HashMap::from([(
+            "data-file.thin-mode".into(),
+            "false".into(),
+        )]));
+        let builder = temporary.new_compact_builder();
+        let plan = builder.new_planner().unwrap().plan().await.unwrap();
+        let error = builder
+            .new_executor()
+            .unwrap()
+            .execute(&plan.tasks()[0])
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("cannot write thin-mode ROW"));
+        if real_bucket {
+            let changed = disable_thin_mode(&original).await;
+            let builder = changed.new_compact_builder();
+            let plan = builder.new_planner().unwrap().plan().await.unwrap();
+            let error = builder
+                .new_executor()
+                .unwrap()
+                .execute(&plan.tasks()[0])
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("real-bucket thin-mode ROW"));
+        }
+        assert_eq!(
+            original
+                .snapshot_manager()
+                .get_latest_snapshot_id()
+                .await
+                .unwrap(),
+            Some(1)
+        );
+    }
+}
+
+#[tokio::test]
+async fn postpone_mixed_row_changelog_obeys_persisted_thin_layout() {
+    let original = table(&[
+        ("bucket", "-2"),
+        ("file.format", "parquet"),
+        ("changelog-file.format", "row"),
+        ("changelog-producer", "lookup"),
+        ("data-file.thin-mode", "true"),
+    ])
+    .await;
+    write_batch(&original, &make_batch(vec![1], vec![10])).await;
+    assert!(
+        original.new_compact_builder().new_planner().is_err(),
+        "ROW changelog must use the same layout guard as ROW data"
+    );
+    let temporary = original.copy_with_options(std::collections::HashMap::from([(
+        "data-file.thin-mode".into(),
+        "false".into(),
+    )]));
+    let builder = temporary.new_compact_builder();
+    let plan = builder.new_planner().unwrap().plan().await.unwrap();
+    let error = builder
+        .new_executor()
+        .unwrap()
+        .execute(&plan.tasks()[0])
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("cannot write thin-mode ROW"));
+    assert_eq!(
+        original
+            .snapshot_manager()
+            .get_latest_snapshot_id()
+            .await
+            .unwrap(),
+        Some(1)
+    );
+    let changed = disable_thin_mode(&original).await;
+    let builder = changed.new_compact_builder();
+    let plan = builder.new_planner().unwrap().plan().await.unwrap();
+    let results = execute(&changed, &plan).await;
+    assert!(results[0]
+        .changelog_files()
+        .iter()
+        .all(|file| file.file_name.ends_with(".row")));
+    builder
+        .new_commit()
+        .unwrap()
+        .commit_compact(results)
+        .await
+        .unwrap();
+    assert_eq!(
+        lookup_changelog_tests::events(
+            &changed,
+            0,
+            changed
+                .snapshot_manager()
+                .get_latest_snapshot_id()
+                .await
+                .unwrap()
+                .unwrap()
+        )
+        .await,
+        vec![("+I".into(), 1, 10)]
+    );
 }

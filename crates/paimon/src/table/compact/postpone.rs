@@ -27,10 +27,10 @@ use arrow_ord::sort::{lexsort_to_indices, SortColumn};
 use futures::{StreamExt, TryStreamExt};
 
 use super::{invalid, primary_key, validate_file, CompactContext, CompactResult, CompactTask};
-use crate::resource::ResourceContext;
+use crate::resource::{MemoryReservation, ResourceContext};
 use crate::spec::{
-    bucket_path_under, BinaryRow, DataFileMeta, FileKind, ManifestEntry, PartitionComputer,
-    TableSchema, POSTPONE_BUCKET,
+    bucket_path_under, BinaryRow, ChangelogProducer, DataFileMeta, FileKind, ManifestEntry,
+    PartitionComputer, TableSchema, POSTPONE_BUCKET,
 };
 use crate::table::data_file_path_factory::DataFilePathFactory;
 use crate::table::data_file_reader::DataFileReader;
@@ -43,6 +43,80 @@ use crate::table::{BucketRouter, DataSplit, PostponeBucketPlan, Table};
 use crate::Result;
 
 const SORT_FAN_IN: usize = 128;
+
+pub(super) fn has_row_output(schema: &TableSchema) -> Result<bool> {
+    let options = schema.core_options();
+    Ok(options.file_format().eq_ignore_ascii_case("row")
+        || (options.try_changelog_producer()? == ChangelogProducer::Lookup
+            && options.changelog_file_format().eq_ignore_ascii_case("row")))
+}
+
+/// One shared retained-input budget across all buckets. Decoder batch boundaries
+/// must not turn into a remote object for every bucket and batch.
+struct PendingSortBuffer {
+    buckets: BTreeMap<i32, (Vec<RecordBatch>, usize)>,
+    bytes: usize,
+    limit: usize,
+    reservation: Option<MemoryReservation>,
+}
+
+impl PendingSortBuffer {
+    fn new(limit: usize, resources: Option<&ResourceContext>) -> Self {
+        Self {
+            buckets: BTreeMap::new(),
+            bytes: 0,
+            limit,
+            reservation: resources.map(ResourceContext::reservation),
+        }
+    }
+
+    fn must_flush_before(&self, batch: &RecordBatch) -> bool {
+        self.bytes != 0 && self.bytes.saturating_add(batch.get_array_memory_size()) > self.limit
+    }
+
+    fn push(&mut self, bucket: i32, batch: &RecordBatch) -> Result<()> {
+        let size = batch.get_array_memory_size();
+        let total = self
+            .bytes
+            .checked_add(size)
+            .ok_or_else(|| invalid("Postpone sort buffer size overflow"))?;
+        if let Some(reservation) = &mut self.reservation {
+            reservation.try_grow(size)?;
+        }
+        let (batches, bytes) = self.buckets.entry(bucket).or_default();
+        batches.push(batch.clone());
+        *bytes += size;
+        self.bytes = total;
+        Ok(())
+    }
+
+    async fn flush(
+        &mut self,
+        table: &Table,
+        partition_path: &str,
+        resources: Option<&ResourceContext>,
+        staged: &mut Vec<(i32, DataFileMeta)>,
+        runs: &mut BTreeMap<i32, Vec<DataFileMeta>>,
+    ) -> Result<()> {
+        while let Some((bucket, (mut batches, bytes))) = self.buckets.pop_first() {
+            let batch = if batches.len() == 1 {
+                batches.pop().unwrap()
+            } else {
+                arrow_select::concat::concat_batches(&batches[0].schema(), &batches)
+                    .map_err(|error| invalid(&error.to_string()))?
+            };
+            drop(batches);
+            self.bytes -= bytes;
+            if let Some(reservation) = &mut self.reservation {
+                reservation.try_resize(self.bytes)?;
+            }
+            let files = stage(table, partition_path, bucket, &batch, resources).await?;
+            staged.extend(files.iter().cloned().map(|file| (bucket, file)));
+            runs.entry(bucket).or_default().extend(files);
+        }
+        Ok(())
+    }
+}
 
 fn layout(entries: &[&ManifestEntry], schema: &TableSchema) -> Result<i32> {
     let mut known = None;
@@ -102,14 +176,11 @@ pub(super) fn plan_tasks(
             .push(entry);
     }
     let mut tasks = Vec::new();
-    for (partition, mut entries) in partitions {
+    for (partition, entries) in partitions {
         if !entries.iter().any(|entry| entry.file().level == 0) {
             continue;
         }
         let total_buckets = layout(&entries, &context.schema)?;
-        entries.sort_by(|a, b| {
-            (a.bucket(), &a.file().file_name).cmp(&(b.bucket(), &b.file().file_name))
-        });
         tasks.push(CompactTask {
             context: context.clone(),
             task_id: tasks.len(),
@@ -547,6 +618,10 @@ pub(super) async fn execute(
 ) -> Result<CompactResult> {
     let schema = table.schema();
     let options = schema.core_options();
+    let mut row_schemas = HashMap::new();
+    if has_row_output(schema)? && row_thin_mode(table, schema.id(), &mut row_schemas).await? {
+        return Err(crate::Error::Unsupported { message: "Postpone compaction cannot write thin-mode ROW files; change the persisted output schema".into() });
+    }
     let partition = BinaryRow::from_serialized_bytes(&task.partition)?;
     let deletions = if options.deletion_vectors_enabled() {
         Some(
@@ -580,6 +655,15 @@ pub(super) async fn execute(
                 .ok_or_else(|| invalid("Invalid postpone writer file name"))?;
             pending.push((writer, file));
         } else {
+            if file.file_name.ends_with(".row")
+                && row_thin_mode(table, file.schema_id, &mut row_schemas).await?
+            {
+                return Err(crate::Error::Unsupported {
+                    message:
+                        "Postpone compaction of real-bucket thin-mode ROW files is not supported"
+                            .into(),
+                });
+            }
             next_sequence = next_sequence.max(
                 file.max_sequence_number
                     .checked_add(1)
@@ -588,18 +672,9 @@ pub(super) async fn execute(
             buckets.entry(bucket).or_default().push(file.clone());
         }
     }
-    // Writer-local sequences and file counters break creation-time ties.
-    pending.sort_by_key(|(writer, file)| {
-        (
-            *writer,
-            file.creation_time,
-            file.min_sequence_number,
-            file.file_name
-                .rsplit('-')
-                .next()
-                .and_then(|tail| tail.split('.').next()?.parse::<u64>().ok()),
-        )
-    });
+    // Java sequences can be UNKNOWN_SEQUENCE in every pending file. Stable
+    // creation-time sorting preserves the captured scan order for ties.
+    pending.sort_by_key(|(writer, file)| (*writer, file.creation_time));
     let fields = primary_key::read_type(table);
     let budget = configured_parquet_read_budget(table)?;
     let budget = match &resources {
@@ -621,6 +696,7 @@ pub(super) async fn execute(
     .with_mosaic_prefetch(configured_mosaic_prefetch(table)?);
     let mut staged = Vec::new();
     let mut pending_runs = BTreeMap::<i32, Vec<DataFileMeta>>::new();
+    let mut sort_buffer = PendingSortBuffer::new(options.write_buffer_size()?, resources.as_ref());
     let mut output = Vec::new();
     let mut changelog_output = Vec::new();
     let result = async {
@@ -636,26 +712,30 @@ pub(super) async fn execute(
                 Some(deletions) => deletions.read_vector(table, &source, file).await?,
                 None => None,
             };
-            let mut batches = reader.clone().read(std::slice::from_ref(&source))?;
-            // ROW carries no field schema. Older Rust pending writers omitted
-            // duplicated key columns, while Java writes the ordinary KV layout.
-            // Probe before accepting any rows; strict ROW decoding rejects a
-            // layout that leaves bytes behind or crosses a physical row boundary.
-            let first = match batches.try_next().await {
-                Err(_) if file.file_name.ends_with(".row") => {
-                    batches = primary_key::new_reader(table, resources.clone())?
-                        .read_physical_file(source, file.clone())?;
-                    batches.try_next().await?
-                }
-                result => result?,
+            // ROW has no embedded schema, and NULLs can make both layouts have
+            // the same byte width. Java KV writers always retain one key-stat
+            // slot per trimmed key, even when statistics are disabled. Legacy
+            // Rust postpone writers have no key-stat slots. Use that metadata
+            // contract, plus the writing schema's thin-mode setting, rather than
+            // guessing the layout from a successful decode.
+            let kv_row =
+                if file.file_name.ends_with(".row") && !file.key_stats.null_counts().is_empty() {
+                    !row_thin_mode(table, file.schema_id, &mut row_schemas).await?
+                } else {
+                    false
+                };
+            let mut batches = if kv_row {
+                primary_key::new_reader(table, resources.clone())?
+                    .read_physical_file(source, file.clone())?
+            } else {
+                reader.clone().read(std::slice::from_ref(&source))?
             };
-            let mut batches = futures::stream::iter(first.map(Ok)).chain(batches).boxed();
             let mut rows = 0i64;
             while let Some(batch) = batches.try_next().await? {
                 let start = rows as u64;
                 rows += batch.num_rows() as i64;
                 // Decode and count physical rows before filtering. This also
-                // covers the Java ROW fallback, whose physical reader deliberately
+                // covers the Java ROW reader, whose physical reader deliberately
                 // ignores split masks to preserve lookup ordinals.
                 let batch = if let Some(deletion) = &deletion {
                     let live = BooleanArray::from_iter(
@@ -688,16 +768,60 @@ pub(super) async fn execute(
                 }
                 for (bucket, rows) in groups {
                     let batch = crate::table::table_write::take_rows(&batch, &rows)?;
-                    let files =
-                        stage(table, &partition_path, bucket, &batch, resources.as_ref()).await?;
-                    staged.extend(files.iter().cloned().map(|file| (bucket, file)));
-                    pending_runs.entry(bucket).or_default().extend(files);
+                    if sort_buffer.must_flush_before(&batch) {
+                        sort_buffer
+                            .flush(
+                                table,
+                                &partition_path,
+                                resources.as_ref(),
+                                &mut staged,
+                                &mut pending_runs,
+                            )
+                            .await?;
+                    }
+                    if let Err(error) = sort_buffer.push(bucket, &batch) {
+                        if sort_buffer.bytes == 0
+                            || !matches!(error, crate::Error::ResourceExhausted { .. })
+                        {
+                            return Err(error);
+                        }
+                        sort_buffer
+                            .flush(
+                                table,
+                                &partition_path,
+                                resources.as_ref(),
+                                &mut staged,
+                                &mut pending_runs,
+                            )
+                            .await?;
+                        sort_buffer.push(bucket, &batch)?;
+                    }
+                    if sort_buffer.bytes >= sort_buffer.limit {
+                        sort_buffer
+                            .flush(
+                                table,
+                                &partition_path,
+                                resources.as_ref(),
+                                &mut staged,
+                                &mut pending_runs,
+                            )
+                            .await?;
+                    }
                 }
             }
             if rows != file.row_count {
                 return Err(invalid("Postpone input row count changed"));
             }
         }
+        sort_buffer
+            .flush(
+                table,
+                &partition_path,
+                resources.as_ref(),
+                &mut staged,
+                &mut pending_runs,
+            )
+            .await?;
         for (bucket, mut files) in pending_runs {
             while files.len() > SORT_FAN_IN {
                 let mut merged = Vec::new();
@@ -752,4 +876,21 @@ pub(super) async fn execute(
         // captured masks and atomically retire their index ranges.
         deletion_vector_updates: options.deletion_vectors_enabled().then(Vec::new),
     })
+}
+
+async fn row_thin_mode(
+    table: &Table,
+    schema_id: i64,
+    cache: &mut HashMap<i64, bool>,
+) -> Result<bool> {
+    if let Some(&thin) = cache.get(&schema_id) {
+        return Ok(thin);
+    }
+    let schema = table.schema_manager().schema(schema_id).await?;
+    let thin = schema
+        .options()
+        .get("data-file.thin-mode")
+        .is_some_and(|value| value.eq_ignore_ascii_case("true"));
+    cache.insert(schema_id, thin);
+    Ok(thin)
 }

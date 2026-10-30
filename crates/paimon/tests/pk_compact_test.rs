@@ -41,6 +41,9 @@ mod postpone_tests;
 #[path = "pk_compact/postpone_deletion_vectors.rs"]
 mod postpone_dv_tests;
 
+#[path = "pk_compact/postpone_sort_buffer.rs"]
+mod postpone_sort_buffer_tests;
+
 #[path = "pk_compact/deletion_vectors.rs"]
 mod deletion_vector_tests;
 

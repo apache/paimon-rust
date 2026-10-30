@@ -17,11 +17,53 @@
 
 use super::partition_filter::PartitionFilter;
 use super::SnapshotManager;
-use crate::spec::{merge_active_entries, Manifest, ManifestEntry, ManifestList, Snapshot};
+use crate::spec::{
+    merge_active_entries, FileKind, Manifest, ManifestEntry, ManifestList, Snapshot,
+};
 
 /// Read active metadata without read-side bucket, level, column, or index pruning.
 /// Partition mutations must also see pending files and dedicated column files.
 pub(super) async fn read_snapshot_entries(
+    manager: &SnapshotManager,
+    snapshot: &Snapshot,
+    partition_filter: Option<&PartitionFilter>,
+) -> crate::Result<Vec<ManifestEntry>> {
+    Ok(merge_active_entries(
+        read_snapshot_log(manager, snapshot, partition_filter).await?,
+    ))
+}
+
+/// Java postpone replay preserves manifest encounter order for equal timestamps.
+/// Ordinary scans keep their existing unordered metadata representation.
+pub(super) async fn read_snapshot_entries_in_manifest_order(
+    manager: &SnapshotManager,
+    snapshot: &Snapshot,
+    partition_filter: Option<&PartitionFilter>,
+) -> crate::Result<Vec<ManifestEntry>> {
+    let mut positions = std::collections::HashMap::new();
+    let mut active = Vec::new();
+    for entry in read_snapshot_log(manager, snapshot, partition_filter).await? {
+        let id = entry.identifier();
+        match entry.kind() {
+            FileKind::Add => {
+                if let Some(&index) = positions.get(&id) {
+                    active[index] = Some(entry);
+                } else {
+                    positions.insert(id, active.len());
+                    active.push(Some(entry));
+                }
+            }
+            FileKind::Delete => {
+                if let Some(index) = positions.remove(&id) {
+                    active[index] = None;
+                }
+            }
+        }
+    }
+    Ok(active.into_iter().flatten().collect())
+}
+
+async fn read_snapshot_log(
     manager: &SnapshotManager,
     snapshot: &Snapshot,
     partition_filter: Option<&PartitionFilter>,
@@ -45,5 +87,5 @@ pub(super) async fn read_snapshot_entries(
             }
         }
     }
-    Ok(merge_active_entries(entries))
+    Ok(entries)
 }

@@ -349,12 +349,15 @@ or pending physical file bytes divided by `postpone.target-size-per-bucket`
 (default 1 GiB). The minimum count is one. Compaction does not rescale existing
 partitions or apply the batch writer's power-of-two rounding and parallelism cap.
 
-Pending files are replayed serially within each writer by creation time, using
-writer-local sequence bounds and file counters to break millisecond ties.
+Pending files are replayed serially within each writer by creation time. Equal
+creation times retain captured manifest encounter order, matching Java;
+original sequence numbers and file names do not break these ties.
 Different writers have no arrival ordering guarantee. Replay allocates sequences
 after the captured real-bucket history and retains row kinds and configured user
-sequence fields. Bounded input
-batches are routed and sorted into temporary Parquet KV runs. Additional passes
+sequence fields. Routed batches accumulate in a shared `write-buffer-size`
+budget across buckets, with retained memory charged to `ResourceContext` when
+configured. Reaching that budget sorts and spills temporary Parquet KV runs;
+decoder batch boundaries do not determine spill boundaries. Additional passes
 merge at most 128 temporary runs at a time while preserving every physical row,
 so small read batches do not exhaust the final merge's input limit. The ordinary
 PK compactor then applies the merge engine and generates lookup changelogs when
@@ -369,6 +372,12 @@ overwritten input or changed input metadata makes the commit fail; plan again
 from the latest snapshot. Serialized task/results retain their input and output
 bucket mappings for distributed execution, subset commits and idempotent retries.
 Postpone compaction requires partition keys to be included in the primary key.
+ROW pending layout is selected from the writing schema and key-stat metadata,
+including Java full and thin physical layouts; decoding success is not used to
+guess the schema. Thin pending ROW can be rewritten after changing the persisted
+output schema to non-thin mode. ROW outputs (data or lookup changelog) and real-bucket ROW inputs with
+`data-file.thin-mode=true` are explicitly rejected, because the shared Rust KV
+writer/reader do not support that physical layout for materialized files.
 
 With deletion vectors, postpone compaction supports `deduplicate` with `none`,
 `input` or `lookup` changelog producers and requires actual catalog/FileIO

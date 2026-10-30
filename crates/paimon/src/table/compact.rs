@@ -33,8 +33,8 @@ use sha2::{Digest, Sha256};
 
 use super::data_file_index_writer::FileIndexOptions;
 use super::data_file_writer::DataFileWriter;
-use super::partition_filter::validate_partition_filter;
-use super::snapshot_manifest::read_snapshot_entries;
+use super::partition_filter::{validate_partition_filter, PartitionFilter};
+use super::snapshot_manifest::{read_snapshot_entries, read_snapshot_entries_in_manifest_order};
 use super::write_builder::{ensure_table_write_authorized, validate_commit_user};
 use super::{DataSplit, Plan, Table, TableCommit};
 use crate::resource::ResourceContext;
@@ -292,10 +292,34 @@ impl CompactPlanner {
             CompactPlannerKind::DataEvolution(planner) => {
                 planner.plan_tasks(&self.table, &scan, &context).await?
             }
-            CompactPlannerKind::Postpone => postpone::plan_tasks(
-                &scan.plan_manifest_entries(&context.snapshot).await?,
-                &context,
-            )?,
+            CompactPlannerKind::Postpone => {
+                let filter = self
+                    .partition_filter
+                    .as_ref()
+                    .map(|predicate| {
+                        let mapping = crate::spec::field_idx_to_partition_idx(
+                            self.table.schema().fields(),
+                            self.table.schema().partition_keys(),
+                        );
+                        predicate
+                            .remap_field_index(&mapping)
+                            .map(|predicate| {
+                                PartitionFilter::from_predicate(
+                                    predicate,
+                                    &self.table.schema().partition_fields(),
+                                )
+                            })
+                            .ok_or_else(|| invalid("Invalid postpone partition filter"))
+                    })
+                    .transpose()?;
+                let entries = read_snapshot_entries_in_manifest_order(
+                    &self.table.snapshot_manager(),
+                    &context.snapshot,
+                    filter.as_ref(),
+                )
+                .await?;
+                postpone::plan_tasks(&entries, &context)?
+            }
         };
         Ok(CompactPlan {
             snapshot_id: Some(snapshot_id),
@@ -382,7 +406,11 @@ impl CompactExecutor {
             return Err(invalid("Compaction snapshot was replaced"));
         }
         validate_snapshot_indexes(&self.table, &snapshot).await?;
-        let active = read_snapshot_entries(&manager, &snapshot, None).await?;
+        let active = if task.is_postpone() {
+            read_snapshot_entries_in_manifest_order(&manager, &snapshot, None).await?
+        } else {
+            read_snapshot_entries(&manager, &snapshot, None).await?
+        };
         validate_dv_schemas(&self.table, active.iter().map(|entry| entry.file())).await?;
         task.validate_inputs(&active)?;
         let table = self
@@ -1004,6 +1032,15 @@ pub(super) fn ensure_supported(table: &Table) -> Result<()> {
     let properties = table.schema().options();
     if options.bucket() == crate::spec::POSTPONE_BUCKET {
         super::postpone_fixed_bucket_router::validate_postpone_fixed_bucket_schema(table.schema())?;
+        if postpone::has_row_output(table.schema())?
+            && properties
+                .get("data-file.thin-mode")
+                .is_some_and(|value| value.eq_ignore_ascii_case("true"))
+        {
+            return Err(Error::Unsupported {
+                message: "Postpone compaction cannot write thin-mode ROW files".into(),
+            });
+        }
     }
     if options.data_evolution_enabled() {
         data_evolution::ensure_supported(table)?;
