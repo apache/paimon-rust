@@ -463,6 +463,11 @@ impl RESTEnv {
         // Minted after the schema-replacing copy, which drops any session.
         let mut table = table.copy_with_resolved_schema(table.schema().clone(), &branch)?;
         table.branch_reference = branch_reference;
+        // Cache the catalog definition before any caller applies dynamic
+        // overrides. Historical DV checks must see the stored schema options.
+        table
+            .schema_manager()
+            .cache_resolved_schema(table.schema().clone());
         Ok(table.with_query_auth_session())
     }
 

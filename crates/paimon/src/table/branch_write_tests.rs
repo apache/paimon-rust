@@ -26,6 +26,7 @@ async fn table(primary_key: bool, options: &[(&str, &str)]) -> (tempfile::TempDi
     let dir = tempfile::tempdir().unwrap();
     let file_io = FileIOBuilder::new("file").build().unwrap();
     let mut builder = Schema::builder()
+        .option("write-only", "true")
         .column("id", DataType::Int(IntType::new()))
         .column("value", DataType::Int(IntType::new()));
     if primary_key {

@@ -4394,7 +4394,7 @@ async fn written(
         .unwrap();
     let identifier = Identifier::new("default", name);
     fs_catalog
-        .create_table(&identifier, schema(&[]), false)
+        .create_table(&identifier, schema(&[("write-only", "true")]), false)
         .await
         .unwrap();
     let plain = fs_catalog.get_table(&identifier).await.unwrap();
@@ -5971,3 +5971,7 @@ mod merge_sources;
 
 #[path = "rest_catalog/read_path_completion.rs"]
 mod read_path_completion;
+
+#[cfg(not(windows))]
+#[path = "rest_catalog/auto_compact_review.rs"]
+mod auto_compact_review;

@@ -422,6 +422,7 @@ async fn data_evolution_compact_retries_preserve_concurrent_deletes_and_publishe
             .option("data-evolution.enabled", "true")
             .option("deletion-vectors.enabled", "true")
             .option("compaction.min.file-num", "2")
+            .option("write-only", "true")
             .build().unwrap();
         let table = Table::new(io.clone(), Identifier::new("default", "de_compact_cas"), path.clone(), TableSchema::new(0, &schema), None);
         io.mkdirs(&format!("{path}/schema")).await.unwrap();
@@ -552,6 +553,7 @@ async fn stale_delete_after_compact_cas_loss_requires_repreparation() {
             .option("data-evolution.enabled", "true")
             .option("deletion-vectors.enabled", "true")
             .option("compaction.min.file-num", "2")
+            .option("write-only", "true")
             .build()
             .unwrap();
         let table = Table::new(

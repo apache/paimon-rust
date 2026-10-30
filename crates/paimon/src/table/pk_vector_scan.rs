@@ -1230,6 +1230,7 @@ mod tests {
         /// plain PK table where only PK-column conjuncts prune.
         fn prune_schema(with_deletion_vectors: bool) -> TableSchema {
             let mut builder = Schema::builder()
+                .option("write-only", "true")
                 .column("id", DataType::Int(IntType::new()))
                 .column("score", DataType::Int(IntType::new()))
                 .column(

@@ -163,11 +163,21 @@ impl DataEvolutionCompactPlanner {
         table: &Table,
         scan: &TableScan<'_>,
         context: &CompactContext,
+        buckets: Option<&super::CompactBuckets>,
     ) -> Result<Vec<CompactTask>> {
         let mut groups = BucketFiles::new();
         // Read captured manifests rather than query providers so shadowed
         // column versions are also included in each normal-file rewrite.
         for entry in scan.plan_manifest_entries(&context.snapshot).await? {
+            if buckets.is_some_and(|buckets| {
+                !buckets.contains(&(
+                    entry.partition().to_vec(),
+                    entry.bucket(),
+                    entry.total_buckets(),
+                ))
+            }) {
+                continue;
+            }
             if !is_data_evolution_normal_file(entry.file()) {
                 continue;
             }

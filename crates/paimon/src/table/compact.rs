@@ -18,6 +18,8 @@
 //! Snapshot-bound append, data-evolution and primary-key compaction.
 
 mod append;
+mod automatic;
+pub(super) use automatic::execute_auto_plan;
 pub(super) mod data_evolution;
 pub(super) mod deletion_vectors;
 pub(super) mod primary_key;
@@ -32,10 +34,10 @@ use sha2::{Digest, Sha256};
 
 use super::data_file_index_writer::FileIndexOptions;
 use super::data_file_writer::DataFileWriter;
-use super::partition_filter::validate_partition_filter;
+use super::partition_filter::{validate_partition_filter, PartitionFilter};
 use super::snapshot_manifest::read_snapshot_entries;
 use super::write_builder::{ensure_table_write_authorized, validate_commit_user};
-use super::{DataSplit, Plan, Table, TableCommit};
+use super::{DataSplit, Plan, Table, TableCommit, TableScan};
 use crate::resource::ResourceContext;
 use crate::spec::{
     bucket_path_under, BinaryRow, ChangelogProducer, DataFileMeta, FileKind, IndexManifest,
@@ -101,17 +103,28 @@ impl<'a> CompactBuilder<'a> {
         } else if self.table.schema().primary_keys().is_empty() {
             CompactPlannerKind::Append(append::AppendCompactPlanner::new(&options)?)
         } else {
-            CompactPlannerKind::PrimaryKey(primary_key::PrimaryKeyCompactPlanner)
+            CompactPlannerKind::PrimaryKey(primary_key::PrimaryKeyCompactPlanner {
+                automatic: false,
+            })
         };
         Ok(CompactPlanner {
             table: self.table.clone(),
             kind,
             partition_filter: self.partition_filter.clone(),
+            buckets: None,
         })
     }
 
     /// Executor resources are local; input files and output settings come from each task.
     pub fn new_executor(&self) -> Result<CompactExecutor> {
+        self.new_executor_impl(false)
+    }
+
+    pub(super) fn new_auto_executor(&self) -> Result<CompactExecutor> {
+        self.new_executor_impl(true)
+    }
+
+    fn new_executor_impl(&self, automatic: bool) -> Result<CompactExecutor> {
         ensure_supported(self.table)?;
         let options = self.table.schema().core_options();
         let lookup = options.try_changelog_producer()? == ChangelogProducer::Lookup
@@ -120,7 +133,7 @@ impl<'a> CompactBuilder<'a> {
             || (options.deletion_vectors_enabled()
                 && !self.table.schema().primary_keys().is_empty());
         let local_cache = self.table.file_io().local_cache();
-        if lookup && local_cache.is_none() {
+        if lookup && !automatic && local_cache.is_none() {
             return Err(Error::ConfigInvalid {
                 message:
                     "Lookup, first-row or deletion-vector compaction requires local-cache.enabled=true on the catalog/FileIO"
@@ -131,13 +144,21 @@ impl<'a> CompactBuilder<'a> {
             table: self.table.clone(),
             resources: self.resources.clone(),
             lookup_cache: if lookup {
-                Some(Arc::new(primary_key::lookup_file::LookupFileCache::new(
-                    local_cache.expect("lookup cache validated above"),
-                    self.table.schema().options(),
-                )?))
+                Some(Arc::new(if automatic {
+                    primary_key::lookup_file::LookupFileCache::automatic(
+                        local_cache,
+                        self.table.schema().options(),
+                    )?
+                } else {
+                    primary_key::lookup_file::LookupFileCache::new(
+                        local_cache.expect("lookup cache validated above"),
+                        self.table.schema().options(),
+                    )?
+                }))
             } else {
                 None
             },
+            emit_changelog: true,
         })
     }
 
@@ -155,7 +176,10 @@ pub struct CompactPlanner {
     table: Table,
     kind: CompactPlannerKind,
     partition_filter: Option<Predicate>,
+    buckets: Option<CompactBuckets>,
 }
+
+pub(super) type CompactBuckets = HashSet<(Vec<u8>, i32, i32)>;
 
 enum CompactPlannerKind {
     Append(append::AppendCompactPlanner),
@@ -239,12 +263,25 @@ impl CompactTask {
         self.bucket
     }
 
+    pub(super) fn total_buckets(&self) -> i32 {
+        self.total_buckets
+    }
+
     pub fn files(&self) -> &[DataFileMeta] {
         &self.files
     }
 }
 
 impl CompactPlanner {
+    /// Restrict automatic work to the buckets owned by one committed write.
+    pub(super) fn for_write(mut self, buckets: CompactBuckets) -> Self {
+        self.buckets = Some(buckets);
+        if let CompactPlannerKind::PrimaryKey(planner) = &mut self.kind {
+            planner.automatic = true;
+        }
+        self
+    }
+
     /// Capture a snapshot without writing data or publishing metadata.
     pub async fn plan(&self) -> Result<CompactPlan> {
         ensure_supported(&self.table)?;
@@ -252,8 +289,38 @@ impl CompactPlanner {
         if let Some(filter) = &self.partition_filter {
             reader.with_filter(filter.clone());
         }
-        let scan = reader.new_scan().with_scan_all_files();
-        let source = scan.plan_all().await?;
+        let scan = if let Some(buckets) = &self.buckets {
+            let fields = self.table.schema().partition_fields();
+            let filter = if fields.is_empty() {
+                None
+            } else {
+                Some(PartitionFilter::from_partition_set(
+                    buckets
+                        .iter()
+                        .map(|(partition, _, _)| partition.clone())
+                        .collect(),
+                    &fields,
+                )?)
+            };
+            TableScan::new(&self.table, filter, Vec::new(), None, None, None)
+        } else {
+            reader.new_scan()
+        }
+        .with_scan_all_files();
+        let source = scan.plan_all().await?.map_splits(|splits| {
+            Ok(splits
+                .into_iter()
+                .filter(|split| {
+                    self.buckets.as_ref().is_none_or(|buckets| {
+                        buckets.contains(&(
+                            split.partition().to_serialized_bytes(),
+                            split.bucket(),
+                            split.total_buckets(),
+                        ))
+                    })
+                })
+                .collect())
+        })?;
         let Some(snapshot_id) = source.snapshot_id() else {
             return Ok(CompactPlan {
                 snapshot_id: None,
@@ -283,7 +350,9 @@ impl CompactPlanner {
             CompactPlannerKind::Append(planner) => planner.plan_tasks(&source, &context)?,
             CompactPlannerKind::PrimaryKey(planner) => planner.plan_tasks(&source, &context)?,
             CompactPlannerKind::DataEvolution(planner) => {
-                planner.plan_tasks(&self.table, &scan, &context).await?
+                planner
+                    .plan_tasks(&self.table, &scan, &context, self.buckets.as_ref())
+                    .await?
             }
         };
         Ok(CompactPlan {
@@ -298,6 +367,7 @@ pub struct CompactExecutor {
     table: Table,
     resources: Option<ResourceContext>,
     lookup_cache: Option<Arc<primary_key::lookup_file::LookupFileCache>>,
+    emit_changelog: bool,
 }
 
 /// Prepared files owned by the caller until submitted to `TableCommit::commit_compact`.
@@ -358,6 +428,11 @@ pub struct CompactMetrics {
 }
 
 impl CompactExecutor {
+    pub(super) fn without_changelog(mut self) -> Self {
+        self.emit_changelog = false;
+        self
+    }
+
     pub async fn execute(&self, task: &CompactTask) -> Result<CompactResult> {
         ensure_supported(&self.table)?;
         task.validate_target(&self.table)?;
@@ -370,10 +445,10 @@ impl CompactExecutor {
         let active = read_snapshot_entries(&manager, &snapshot, None).await?;
         validate_dv_schemas(&self.table, active.iter().map(|entry| entry.file())).await?;
         task.validate_inputs(&active)?;
-        let table = self
-            .table
-            .copy_with_resolved_schema(task.context.schema.clone(), &task.context.branch)?
-            .copy_with_pinned_snapshot(Some(&snapshot));
+        // validate_target proved the complete schema and branch are identical.
+        // Preserve already resolved catalog schemas in the shared manager;
+        // rebuilding it here would require REST-only schemas to exist on disk.
+        let table = self.table.copy_with_pinned_snapshot(Some(&snapshot));
         let options = table.schema().core_options();
         let partition = BinaryRow::from_serialized_bytes(&task.partition)?;
         let computer = PartitionComputer::new(
@@ -448,8 +523,15 @@ impl CompactExecutor {
             } else {
                 None
             };
-            let (files, changelog_files) =
-                primary_key::execute(&table, task, &split, self.resources.clone(), lookup).await?;
+            let (files, changelog_files) = primary_key::execute(
+                &table,
+                task,
+                &split,
+                self.resources.clone(),
+                lookup,
+                self.emit_changelog,
+            )
+            .await?;
             let mut deletion_vector_updates = Vec::new();
             if let Some(deletions) = deletions {
                 for (name, bitmap) in deletions.lock().unwrap().iter() {

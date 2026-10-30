@@ -48,6 +48,7 @@ async fn create_table(kind: &str) -> (tempfile::TempDir, Table) {
         .await
         .unwrap();
     let mut schema = Schema::builder()
+        .option("write-only", "true")
         .column("id", DataType::Int(IntType::new()))
         .column("payload", DataType::Variant(VariantType::new()))
         .column(

@@ -271,7 +271,7 @@ async fn test_cross_partition_delete_file_in_old_partition() {
             "CREATE TABLE paimon.test_db.t_cross_dv (
                 dt STRING, id INT NOT NULL, value INT,
                 PRIMARY KEY (id)
-            ) PARTITIONED BY (dt)",
+            ) PARTITIONED BY (dt) WITH ('write-only' = 'true')",
         )
         .await
         .unwrap();
@@ -484,7 +484,18 @@ async fn test_cross_partition_first_row_skip() {
         .await
         .unwrap();
 
-    // Use scan_all_files to verify (FIRST_ROW skips level-0 in normal reads)
+    // Automatic compaction must make FIRST_ROW data visible to ordinary SQL,
+    // including cross-partition index restoration on the second write.
+    assert_eq!(
+        collect_id_value(
+            &sql_context,
+            "SELECT id, value FROM paimon.test_db.t_cross_fr ORDER BY id",
+        )
+        .await,
+        vec![(1, 10), (2, 20), (3, 30)]
+    );
+
+    // Include every file to detect unexpected DELETE files as well.
     let table = catalog
         .get_table(&Identifier::new("test_db", "t_cross_fr"))
         .await

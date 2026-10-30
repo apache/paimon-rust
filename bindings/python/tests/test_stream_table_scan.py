@@ -33,8 +33,9 @@ def table(tmp_path):
     ctx = SQLContext()
     ctx.register_catalog("paimon", options)
     ctx.sql("CREATE SCHEMA paimon.snapdb")
+    # These cursor tests require one APPEND snapshot per prepared batch.
     ctx.sql("CREATE TABLE paimon.snapdb.t (id INT, value INT, PRIMARY KEY (id)) "
-            "WITH ('bucket'='4', 'changelog-producer'='input', "
+            "WITH ('bucket'='4', 'changelog-producer'='input', 'write-only'='true', "
             "'source.split.target-size'='1 b', 'source.split.open-file-cost'='1 b')")
     table = PaimonCatalog(options).get_table("snapdb.t")
     for value in (100, 200):

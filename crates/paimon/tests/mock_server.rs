@@ -817,6 +817,67 @@ impl RESTServer {
         }
     }
 
+    /// Publish a snapshot against the catalog identity and filesystem head.
+    pub async fn commit_snapshot(
+        Path((db, table)): Path<(String, String)>,
+        Extension(state): Extension<Arc<RESTServer>>,
+        Json(request): Json<serde_json::Value>,
+    ) -> impl IntoResponse {
+        let identifier = Identifier::new(&db, &table);
+        let parsed = identifier.parsed_object_name().unwrap();
+        let response = state
+            .inner
+            .lock()
+            .unwrap()
+            .tables
+            .get(&format!("{db}.{table}"))
+            .cloned();
+        let Some(response) = response else {
+            return resource_error(StatusCode::NOT_FOUND, "TABLE", &table);
+        };
+        if response.id.as_deref() != request.get("tableId").and_then(|id| id.as_str()) {
+            return (StatusCode::OK, Json(json!({"success": false}))).into_response();
+        }
+        let snapshot: Snapshot = match serde_json::from_value(request["snapshot"].clone()) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"code": 400, "message": error.to_string()})),
+                )
+                    .into_response();
+            }
+        };
+        let location = response.path.unwrap();
+        let file_io = paimon::io::FileIO::from_path(&location)
+            .unwrap()
+            .build()
+            .unwrap();
+        let manager = paimon::table::SnapshotManager::new(file_io, location)
+            .with_branch(parsed.branch_or_default());
+        let published = async {
+            let latest = manager.get_latest_snapshot().await?;
+            if latest.as_ref().and_then(Snapshot::uuid)
+                != request
+                    .get("baseSnapshotUuid")
+                    .and_then(|uuid| uuid.as_str())
+                || snapshot.id() != latest.as_ref().map_or(1, |head| head.id() + 1)
+            {
+                return Ok(false);
+            }
+            manager.commit_snapshot(&snapshot).await
+        }
+        .await;
+        match published {
+            Ok(success) => (StatusCode::OK, Json(json!({"success": success}))).into_response(),
+            Err(error) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"code": 500, "message": error.to_string()})),
+            )
+                .into_response(),
+        }
+    }
+
     /// Handle GET /databases/:db/tables/:table - get a specific table.
     pub async fn get_table(
         headers: HeaderMap,
@@ -2362,6 +2423,10 @@ pub async fn start_mock_server(
         .route(
             &format!("{prefix}/databases/:db/tables/:table/snapshot"),
             get(RESTServer::load_snapshot),
+        )
+        .route(
+            &format!("{prefix}/databases/:db/tables/:table/commit"),
+            post(RESTServer::commit_snapshot),
         )
         // Database routes
         .route(
