@@ -443,6 +443,7 @@ impl TableCommit {
                 CommitEntriesPlan::Compact {
                     entries: prepared.entries,
                     changelog_entries: prepared.changelog_entries,
+                    deletion_vector_updates: prepared.deletion_vector_updates,
                     schema_id: prepared.schema_id,
                     read_snapshot: prepared.read_snapshot,
                     planned_snapshot_id: prepared.snapshot_id,
@@ -1351,7 +1352,40 @@ impl TableCommit {
                 }
                 return Ok(CommitAttemptResult::Success);
             }
-            Ok(false) => None,
+            Ok(false) => {
+                if self.deletion_vectors_enabled && resolved.kind == CommitKind::COMPACT {
+                    // Only this attempt's generated DV files are definitely
+                    // unpublished. Prepared data/changelogs and old shared
+                    // containers still belong to the caller or prior snapshots.
+                    let created = created_files
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<HashSet<_>>();
+                    for entry in resolved
+                        .new_index_manifest_entries
+                        .iter()
+                        .flatten()
+                        .filter(|entry| entry.index_file.index_type == DELETION_VECTORS_INDEX_TYPE)
+                    {
+                        let Ok(bucket) = self.bucket_path(&entry.partition, entry.bucket) else {
+                            continue;
+                        };
+                        let path = committed_index_file_path(
+                            self.table.location(),
+                            &bucket,
+                            self.table
+                                .schema()
+                                .core_options()
+                                .index_file_in_data_file_dir(),
+                            &entry.index_file,
+                        );
+                        if created.contains(path.as_str()) {
+                            let _ = self.table.file_io().delete_file(&path).await;
+                        }
+                    }
+                }
+                None
+            }
             Err(error) => Some(error),
         };
         Ok(CommitAttemptResult::Retry(Box::new(RetryState {
@@ -1370,15 +1404,13 @@ impl TableCommit {
     ) -> Result<(Snapshot, Vec<PartitionStatistics>)> {
         let new_snapshot_id = latest_snapshot.as_ref().map(|s| s.id() + 1).unwrap_or(1);
 
-        if self.data_evolution_enabled
-            && resolved.kind == CommitKind::COMPACT
-            && self.deletion_vectors_enabled
-        {
+        if self.deletion_vectors_enabled && resolved.kind == CommitKind::COMPACT {
             if let Some(snapshot) = latest_snapshot {
-                if let Some(indexes) = super::compact::data_evolution::rewrite_deletion_vectors(
+                if let Some(indexes) = super::compact::deletion_vectors::rewrite_indexes(
                     &self.table,
                     snapshot,
                     &resolved.entries,
+                    &resolved.deletion_vector_updates,
                     created_files,
                 )
                 .await?
@@ -1908,6 +1940,7 @@ impl TableCommit {
             CommitEntriesPlan::Compact {
                 entries,
                 changelog_entries,
+                deletion_vector_updates,
                 schema_id,
                 read_snapshot,
                 planned_snapshot_id,
@@ -1927,6 +1960,19 @@ impl TableCommit {
                         source: None,
                     });
                 }
+                // Duplicate recovery runs before resolve_commit. An already
+                // published legacy result can omit this field, but a first
+                // publication must retain every historical row deletion.
+                let deletion_vector_updates = match deletion_vector_updates.as_deref() {
+                    Some(updates) => updates,
+                    None if !self.data_evolution_enabled && self.deletion_vectors_enabled => {
+                        return Err(crate::Error::DataInvalid {
+                            message: "Deletion-vector compaction results are missing row deletions; execute the plan again".into(),
+                            source: None,
+                        });
+                    }
+                    None => &[],
+                };
                 // Concurrent writes may replace HASH indexes, deletion vectors
                 // or global indexes. Rebase on the latest manifest every retry.
                 let index_manifest_name = match latest_snapshot {
@@ -1965,6 +2011,7 @@ impl TableCommit {
                         super::compact::validate_primary_key_changes(
                             self.table.schema(),
                             entries,
+                            changelog_entries,
                             &captured_files,
                         )?;
                     }
@@ -2057,9 +2104,29 @@ impl TableCommit {
                     base_data_files.as_deref().unwrap_or_default(),
                     entries,
                 )?;
+                if !self.data_evolution_enabled && self.deletion_vectors_enabled {
+                    let captured =
+                        read_snapshot
+                            .as_deref()
+                            .ok_or_else(|| crate::Error::DataInvalid {
+                                message:
+                                    "PK deletion-vector compaction requires its captured snapshot"
+                                        .into(),
+                                source: None,
+                            })?;
+                    super::compact::primary_key::deletion_vectors::validate_dependencies(
+                        &self.table,
+                        captured,
+                        latest_snapshot.as_ref().expect("validated latest snapshot"),
+                        entries,
+                        deletion_vector_updates,
+                    )
+                    .await?;
+                }
                 Ok(ResolvedCommit {
                     entries: entries.clone(),
                     changelog_entries: changelog_entries.clone(),
+                    deletion_vector_updates: deletion_vector_updates.to_vec(),
                     kind: CommitKind::COMPACT,
                     index_manifest_name,
                     index_manifest_changed: false,
@@ -2133,6 +2200,7 @@ impl TableCommit {
                 Ok(ResolvedCommit {
                     entries: entries.clone(),
                     changelog_entries: changelog_entries.clone(),
+                    deletion_vector_updates: vec![],
                     kind,
                     index_manifest_name,
                     index_manifest_changed,
@@ -2205,6 +2273,7 @@ impl TableCommit {
                 Ok(ResolvedCommit {
                     entries,
                     changelog_entries: vec![],
+                    deletion_vector_updates: vec![],
                     kind: CommitKind::OVERWRITE,
                     index_manifest_name,
                     index_manifest_changed,
@@ -3887,6 +3956,8 @@ enum CommitEntriesPlan {
     Compact {
         entries: Vec<ManifestEntry>,
         changelog_entries: Vec<ManifestEntry>,
+        deletion_vector_updates:
+            Option<Vec<super::compact::deletion_vectors::DeletionVectorUpdate>>,
         schema_id: i64,
         read_snapshot: Option<Box<Snapshot>>,
         planned_snapshot_id: i64,
@@ -3947,6 +4018,7 @@ fn direct_commit_kind(
 struct ResolvedCommit {
     entries: Vec<ManifestEntry>,
     changelog_entries: Vec<ManifestEntry>,
+    deletion_vector_updates: Vec<super::compact::deletion_vectors::DeletionVectorUpdate>,
     kind: CommitKind,
     index_manifest_name: Option<String>,
     index_manifest_changed: bool,
@@ -4121,6 +4193,7 @@ mod tests {
     mod parity {
         use super::*;
         include!("table_commit/parity_tests.rs");
+        include!("table_commit/pk_dv_retry_tests.rs");
         include!("table_commit/recovery_tests.rs");
         include!("table_commit/row_tracking_tests.rs");
         include!("table_commit/abort_tests.rs");

@@ -65,6 +65,17 @@ impl DeletionVector {
         (*self.bitmap).clone()
     }
 
+    pub(crate) fn retained_bytes(&self) -> usize {
+        let stats = self.bitmap.statistics();
+        let bytes = stats
+            .n_bytes_array_containers
+            .saturating_add(stats.n_bytes_bitset_containers)
+            .saturating_add(stats.n_bytes_run_containers)
+            .saturating_add(u64::from(stats.n_containers).saturating_mul(64))
+            .saturating_add(64);
+        usize::try_from(bytes).unwrap_or(usize::MAX)
+    }
+
     /// Number of deleted positions in this vector.
     pub fn cardinality(&self) -> u64 {
         self.bitmap.len()
@@ -429,6 +440,19 @@ mod tests {
     use super::*;
     use roaring::RoaringBitmap;
     use std::env::current_dir;
+
+    #[test]
+    fn dense_vectors_charge_container_memory_instead_of_one_integer_per_deletion() {
+        let mut bitmap = RoaringBitmap::new();
+        bitmap.insert_range(0..8_500_000);
+        let vector = DeletionVector::from_bitmap(bitmap);
+        assert_eq!(vector.cardinality(), 8_500_000);
+        assert!(vector.retained_bytes() < 4 * 1024 * 1024);
+        assert!(
+            vector.retained_bytes()
+                >= vector.bitmap.statistics().n_bytes_bitset_containers as usize
+        );
+    }
     #[test]
     fn test_read_deletion_vector() {
         let workdir = current_dir().unwrap();

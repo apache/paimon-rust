@@ -32,6 +32,9 @@ mod incremental_lookup_tests;
 #[path = "pk_compact/dynamic_bucket.rs"]
 mod dynamic_tests;
 
+#[path = "pk_compact/deletion_vectors.rs"]
+mod deletion_vector_tests;
+
 use arrow_array::{Array, Int32Array, Int64Array, RecordBatch, StringArray};
 use common::incremental_helpers::{
     make_batch, make_batch_with_kinds, make_partitioned_batch, persist_table_schema, pk_schema,

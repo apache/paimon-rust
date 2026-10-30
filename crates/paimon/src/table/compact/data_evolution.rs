@@ -22,20 +22,19 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use futures::TryStreamExt;
+use indexmap::IndexMap;
 use roaring::RoaringBitmap;
 
 use super::{invalid, BucketFiles, CompactContext, CompactTask};
 use crate::resource::ResourceContext;
 use crate::spec::{
-    bucket_path, BinaryRow, CoreOptions, DataField, DataFileMeta, DataType, FileKind,
-    IndexManifest, IndexManifestEntry, ManifestEntry, PartitionComputer, Snapshot,
+    CoreOptions, DataField, DataFileMeta, DataType, FileKind, IndexManifestEntry, ManifestEntry,
 };
 use crate::table::data_file_index_writer::FileIndexOptions;
 use crate::table::data_file_writer::DataFileWriter;
-use crate::table::index_file_path::committed_index_file_path;
 use crate::table::source::{data_evolution_anchor_file, is_data_evolution_normal_file};
 use crate::table::stats_filter::group_by_overlapping_row_id;
-use crate::table::{DataEvolutionDeleteWriter, DataSplit, Table, TableScan};
+use crate::table::{DataSplit, Table, TableScan};
 use crate::{Error, Result};
 
 pub(super) fn ensure_supported(table: &Table) -> Result<()> {
@@ -527,114 +526,52 @@ pub(super) fn validate_indexes(entries: &[IndexManifestEntry]) -> Result<()> {
     Ok(())
 }
 
-/// Rebase DVs on the latest snapshot on every CAS attempt. A concurrent DELETE
-/// is carried forward, including deletions in untouched groups of this bucket.
-pub(in crate::table) async fn rewrite_deletion_vectors(
-    table: &Table,
-    snapshot: &Snapshot,
-    delta: &[ManifestEntry],
-    created_files: &mut Vec<String>,
-) -> Result<Option<Vec<IndexManifestEntry>>> {
-    let Some(name) = snapshot.index_manifest() else {
-        return Ok(None);
-    };
-    let mut indexes = IndexManifest::read(
-        table.file_io(),
-        &table.snapshot_manager().manifest_path(name),
-    )
-    .await?;
-    let mut buckets = BTreeMap::<_, (Vec<DataFileMeta>, Vec<DataFileMeta>)>::new();
-    for entry in delta {
-        let files = buckets
-            .entry((entry.partition().to_vec(), entry.bucket()))
-            .or_default();
-        match entry.kind() {
-            FileKind::Delete => files.0.push(entry.file().clone()),
-            FileKind::Add => files.1.push(entry.file().clone()),
-        }
-    }
-    let writer = DataEvolutionDeleteWriter::new(table)?;
-    let mut changed = false;
-    for ((partition, bucket), (before, after)) in buckets {
-        let groups = group_by_overlapping_row_id(before);
-        let anchors = groups
-            .iter()
-            .map(|group| Ok(data_evolution_anchor_file(group)?.file_name.clone()))
-            .collect::<Result<HashSet<_>>>()?;
-        // Like Java AppendDeleteFileMaintainer, replace only index files
-        // touched by selected anchors. Untouched files remain independent.
-        let (mut bitmaps, removed) = writer
-            .read_existing_bucket_deletion_vectors(&partition, bucket, snapshot, Some(&anchors))
-            .await?;
-        let mut moved = false;
-        for group in groups {
-            let anchor = data_evolution_anchor_file(&group)?;
-            let Some(bitmap) = bitmaps.shift_remove(&anchor.file_name) else {
-                continue;
-            };
-            moved = true;
-            let old_first = anchor.first_row_id.unwrap();
-            for position in bitmap {
-                if i64::from(position) >= anchor.row_count {
-                    return Err(invalid(
-                        "Deletion vector position is outside its compact input",
-                    ));
-                }
-                let absolute = old_first + i64::from(position);
-                let output = after
-                    .iter()
-                    .find(|file| {
-                        file.row_id_range()
-                            .is_some_and(|(start, end)| start <= absolute && absolute <= end)
-                    })
-                    .ok_or_else(|| invalid("Compacted files do not cover a deleted row ID"))?;
-                let relative = u32::try_from(absolute - output.first_row_id.unwrap())
-                    .map_err(|_| invalid("Compacted deletion vector position exceeds u32::MAX"))?;
-                bitmaps
-                    .entry(output.file_name.clone())
-                    .or_insert_with(RoaringBitmap::new)
-                    .insert(relative);
-            }
-        }
-        if !moved {
+/// Containers referencing these anchors participate in the row-ID remapping.
+pub(super) fn deletion_vector_anchors(before: &[DataFileMeta]) -> Result<HashSet<String>> {
+    group_by_overlapping_row_id(before.to_vec())
+        .iter()
+        .map(|group| Ok(data_evolution_anchor_file(group)?.file_name.clone()))
+        .collect()
+}
+
+/// Move anchor-relative positions into the compacted files, retaining masks
+/// belonging to other row-ID groups that share the selected containers.
+pub(super) fn remap_deletion_vectors(
+    before: &[DataFileMeta],
+    after: &[DataFileMeta],
+    vectors: &mut IndexMap<String, RoaringBitmap>,
+) -> Result<bool> {
+    let mut moved = false;
+    for group in group_by_overlapping_row_id(before.to_vec()) {
+        let anchor = data_evolution_anchor_file(&group)?;
+        let Some(bitmap) = vectors.shift_remove(&anchor.file_name) else {
             continue;
+        };
+        moved = true;
+        let old_first = anchor.first_row_id.unwrap();
+        for position in bitmap {
+            if i64::from(position) >= anchor.row_count {
+                return Err(invalid(
+                    "Deletion vector position is outside its compact input",
+                ));
+            }
+            let absolute = old_first + i64::from(position);
+            let output = after
+                .iter()
+                .find(|file| {
+                    file.row_id_range()
+                        .is_some_and(|(start, end)| start <= absolute && absolute <= end)
+                })
+                .ok_or_else(|| invalid("Compacted files do not cover a deleted row ID"))?;
+            let relative = u32::try_from(absolute - output.first_row_id.unwrap())
+                .map_err(|_| invalid("Compacted deletion vector position exceeds u32::MAX"))?;
+            vectors
+                .entry(output.file_name.clone())
+                .or_default()
+                .insert(relative);
         }
-        let file = writer
-            .write_deletion_vector_index_file(&partition, bucket, bitmaps)
-            .await?;
-        let computer = PartitionComputer::new(
-            table.schema().partition_keys(),
-            table.schema().fields(),
-            table.schema().core_options().partition_default_name(),
-            table.schema().core_options().legacy_partition_name(),
-        )?;
-        let bucket_dir = bucket_path(
-            &table.data_file_location(),
-            Some(&computer),
-            &BinaryRow::from_serialized_bytes(&partition)?,
-            bucket,
-        )?;
-        created_files.push(committed_index_file_path(
-            table.location(),
-            &bucket_dir,
-            table.schema().core_options().index_file_in_data_file_dir(),
-            &file,
-        ));
-        indexes.retain(|entry| {
-            !removed.iter().any(|old| {
-                entry.partition == partition && entry.bucket == bucket && entry.index_file == *old
-            })
-        });
-        indexes.push(IndexManifestEntry {
-            version: 1,
-            kind: FileKind::Add,
-            partition,
-            bucket,
-            index_file: file,
-        });
-        changed = true;
     }
-    Ok(changed.then_some(indexes))
+    Ok(moved)
 }
 
 #[cfg(test)]
