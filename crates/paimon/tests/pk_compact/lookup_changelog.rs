@@ -363,7 +363,12 @@ async fn lookup_compaction_first_row_only_emits_new_keys() {
 #[tokio::test]
 async fn lookup_first_row_preserves_the_earliest_record_across_positive_levels() {
     for with_l0 in [false, true] {
-        let table = lookup_table(&[("merge-engine", "first-row")]).await;
+        let table = lookup_table(&[
+            ("merge-engine", "first-row"),
+            ("num-sorted-run.compaction-trigger", "2"),
+            ("num-levels", "6"),
+        ])
+        .await;
         append_at_level(&table, 10, 3).await;
         append_at_level(&table, 20, 2).await;
         let history = table
@@ -376,6 +381,16 @@ async fn lookup_first_row_preserves_the_earliest_record_across_positive_levels()
             write_batch(&table, &make_batch(vec![1], vec![30])).await;
         }
         let end = compact(&table).await;
+        assert_eq!(
+            table
+                .snapshot_manager()
+                .get_latest_snapshot()
+                .await
+                .unwrap()
+                .unwrap()
+                .commit_kind(),
+            &CommitKind::COMPACT
+        );
         assert_eq!(rows(&table).await, vec![(1, 10)]);
         assert!(events(&table, history, end).await.is_empty());
     }
@@ -864,21 +879,28 @@ async fn lookup_compaction_validates_changelog_flags_before_execution() {
 
 #[tokio::test]
 async fn lookup_compaction_requires_the_catalog_cache() {
-    let table = table_with_cache(
-        pk_schema(&[
-            ("changelog-producer", "lookup"),
-            ("local-cache.enabled", "true"),
-        ]),
-        &[("local-cache.enabled", "false")],
-    )
-    .await;
-    assert!(table
-        .new_compact_builder()
-        .new_executor()
-        .err()
-        .unwrap()
-        .to_string()
-        .contains("local-cache.enabled=true"));
+    for (engine, producer) in [
+        ("deduplicate", "lookup"),
+        ("first-row", "lookup"),
+        ("first-row", "none"),
+    ] {
+        let table = table_with_cache(
+            pk_schema(&[
+                ("merge-engine", engine),
+                ("changelog-producer", producer),
+                ("local-cache.enabled", "true"),
+            ]),
+            &[("local-cache.enabled", "false")],
+        )
+        .await;
+        assert!(table
+            .new_compact_builder()
+            .new_executor()
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("local-cache.enabled=true"));
+    }
 }
 
 #[tokio::test]

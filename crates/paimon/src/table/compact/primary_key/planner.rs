@@ -25,11 +25,21 @@ use std::collections::BTreeMap;
 
 pub(in crate::table::compact) fn enabled(schema: &TableSchema) -> Result<bool> {
     let options = schema.core_options();
-    Ok(options.merge_engine()? == MergeEngine::Deduplicate
-        && matches!(
-            options.try_changelog_producer()?,
+    let producer = options.try_changelog_producer()?;
+    Ok(match options.merge_engine()? {
+        MergeEngine::Deduplicate => matches!(
+            producer,
             ChangelogProducer::None | ChangelogProducer::Input | ChangelogProducer::Lookup
-        ))
+        ),
+        MergeEngine::FirstRow => {
+            !options.deletion_vectors_enabled()
+                && matches!(
+                    producer,
+                    ChangelogProducer::None | ChangelogProducer::Lookup
+                )
+        }
+        _ => false,
+    })
 }
 
 fn number(

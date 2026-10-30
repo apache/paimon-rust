@@ -115,20 +115,26 @@ impl<'a> CompactBuilder<'a> {
         ensure_supported(self.table)?;
         let options = self.table.schema().core_options();
         let lookup = options.try_changelog_producer()? == ChangelogProducer::Lookup
+            || (!self.table.schema().primary_keys().is_empty()
+                && options.merge_engine()? == MergeEngine::FirstRow)
             || (options.deletion_vectors_enabled()
                 && !self.table.schema().primary_keys().is_empty());
         let local_cache = self.table.file_io().local_cache();
         if lookup && local_cache.is_none() {
             return Err(Error::ConfigInvalid {
                 message:
-                    "Lookup or deletion-vector compaction requires local-cache.enabled=true on the catalog/FileIO"
+                    "Lookup, first-row or deletion-vector compaction requires local-cache.enabled=true on the catalog/FileIO"
                         .into(),
             });
         }
         Ok(CompactExecutor {
             table: self.table.clone(),
             resources: self.resources.clone(),
-            lookup_cache: if lookup && options.merge_engine()? == MergeEngine::Deduplicate {
+            lookup_cache: if lookup
+                && matches!(
+                    options.merge_engine()?,
+                    MergeEngine::Deduplicate | MergeEngine::FirstRow
+                ) {
                 Some(Arc::new(primary_key::lookup_file::LookupFileCache::new(
                     local_cache.expect("lookup cache validated above"),
                     self.table.schema().options(),
@@ -820,13 +826,13 @@ pub(super) fn prepare_results(table: &Table, results: &[CompactResult]) -> Resul
         }
         let options = task.context.schema.core_options();
         let dv = task.is_primary_key() && options.deletion_vectors_enabled();
-        let ignores_retracts = dv
+        // First-row can leave every accepted key in retained history, even
+        // with ignore-delete=false, and therefore produce no data files.
+        let can_omit_keys = dv
             || (task.is_primary_key()
-                && options.ignore_delete()
-                && matches!(
-                    options.merge_engine()?,
-                    MergeEngine::FirstRow | MergeEngine::PartialUpdate
-                ));
+                && (options.merge_engine()? == MergeEngine::FirstRow
+                    || (options.ignore_delete()
+                        && options.merge_engine()? == MergeEngine::PartialUpdate)));
         if dv
             && result.files.iter().any(|file| {
                 file.delete_row_count != Some(0) || file.row_count > i64::from(u32::MAX) + 1
@@ -853,11 +859,10 @@ pub(super) fn prepare_results(table: &Table, results: &[CompactResult]) -> Resul
             collected.extend(updates.iter().cloned());
         }
         if task.is_primary_key()
-            && (output_rows > input_rows
-                || (input_rows > 0 && output_rows == 0 && !ignores_retracts))
+            && (output_rows > input_rows || (input_rows > 0 && output_rows == 0 && !can_omit_keys))
         {
             return Err(invalid(
-                "PK compaction must retain each key's merged state unless retracts are ignored",
+                "PK compaction must retain merged keys unless its merge mode can omit them",
             ));
         }
         let lookup = options.try_changelog_producer()? == ChangelogProducer::Lookup;

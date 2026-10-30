@@ -48,6 +48,10 @@ use crate::table::table_read::{
 use crate::table::{DataSplit, Plan, Table};
 use crate::Result;
 
+// A lookup hit remains in an unselected file; selected positive rows have only
+// FILE_LEVEL_METADATA_KEY and must still be included in the compact output.
+const LOOKUP_BASE_METADATA_KEY: &str = "paimon.compact.lookup-base";
+
 /// Select incremental sorted runs for supported merge modes.
 pub(super) struct PrimaryKeyCompactPlanner;
 
@@ -182,6 +186,31 @@ impl MergeFunction for CompactReducer {
     }
 }
 
+struct CompactFirstRow(Box<dyn MergeFunction>);
+
+impl MergeFunction for CompactFirstRow {
+    fn merge(
+        &self,
+        rows: &[MergeRow],
+        batches: &[BufferedBatch],
+        columns: &[usize],
+        schema: &SchemaRef,
+    ) -> Result<MergeResult> {
+        // Validate all selected records before checking retained history, as
+        // Java FirstRowMergeFunctionWrapper does when feeding its reducer.
+        let result = self.0.merge(rows, batches, columns, schema)?;
+        if rows.iter().any(|row| {
+            matches!(row.value_kind, 0 | 2)
+                && matches!(&batches[row.batch_idx], BufferedBatch::Source(batch)
+                    if batch.schema().metadata().contains_key(LOOKUP_BASE_METADATA_KEY))
+        }) {
+            Ok(MergeResult::Omit)
+        } else {
+            Ok(result)
+        }
+    }
+}
+
 fn new_merge_function(
     config: &KeyValueReadConfig,
     fields: &[DataField],
@@ -220,7 +249,7 @@ fn new_merge_function(
     };
     Ok(if config.merge_engine == MergeEngine::FirstRow {
         // First-row must still reject retracts unless ignore-delete is enabled.
-        inner
+        Box::new(CompactFirstRow(inner))
     } else {
         Box::new(CompactReducer {
             inner,
