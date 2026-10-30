@@ -3514,13 +3514,40 @@ async fn delta_filters_each_file_of_rows_read_file_by_file() {
     assert_eq!(filtered, expected);
 }
 
+/// `(merged row count, rows read)` of each split of the combined Delta range
+/// `(start, end]`, sorted.
+async fn combined_delta_row_counts(
+    table: &paimon::table::Table,
+    start: i64,
+    end: i64,
+) -> Vec<(Option<i64>, i64)> {
+    let builder = table.new_read_builder();
+    let read = builder.new_read().unwrap();
+    let scan = builder.new_incremental_scan(IncrementalScanMode::Delta, start, end);
+    let mut counts = Vec::new();
+    for split in scan.plan_combined_delta().await.unwrap().into_splits() {
+        let batches: Vec<RecordBatch> = read
+            .to_arrow(std::slice::from_ref(&split))
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let rows = batches.iter().map(RecordBatch::num_rows).sum::<usize>() as i64;
+        counts.push((split.merged_row_count(), rows));
+    }
+    counts.sort();
+    counts
+}
+
 /// A split that gives a merged row count reads that many rows. After the
 /// VECTOR column moved inline, the insert and the rewrite of bob's name and
 /// embedding are read file by file: eight rows, one per row of each of their
-/// four files, where merged rows would be two. Their split gives no count.
+/// four files, where merged rows would be two. Their split gives no count,
+/// while an insert of one file, planned as a split of its own, gives its own.
 #[tokio::test]
 async fn combined_delta_row_counts_match_the_rows_read() {
-    use paimon::spec::SchemaChange;
+    use arrow_array::ArrayRef;
+    use paimon::spec::{DataType, IntType, Schema, SchemaChange, TableSchema};
     let path = "memory:/incremental_batch/row_counts";
     let table = evolved_table(path, &[]).await;
     let change = SchemaChange::remove_option("vector.file.format".into());
@@ -3534,20 +3561,67 @@ async fn combined_delta_row_counts_match_the_rows_read() {
         None,
     );
     rewrite(&table, 1, vec![new_name("BOB"), new_embedding([9.0, 9.0])]).await;
+    assert_eq!(combined_delta_row_counts(&table, 0, 2).await, [(None, 8)]);
 
-    let builder = table.new_read_builder();
-    let read = builder.new_read().unwrap();
-    let scan = builder.new_incremental_scan(IncrementalScanMode::Delta, 0, 2);
-    let mut counts = Vec::new();
-    for split in scan.plan_combined_delta().await.unwrap().into_splits() {
-        let batches: Vec<RecordBatch> = read
-            .to_arrow(std::slice::from_ref(&split))
+    // An update of the first insert's values merges into its rows; the
+    // second insert is one file.
+    let path = "memory:/incremental_batch/row_counts_of_one_file";
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .column("value", DataType::Int(IntType::new()))
+        .option("row-tracking.enabled", "true")
+        .option("data-evolution.enabled", "true")
+        .build()
+        .unwrap();
+    let (file_io, table) = memory_table(path, TableSchema::new(0, &schema));
+    setup_dirs(&file_io, path).await;
+    persist_table_schema(&file_io, path, table.schema()).await;
+    write_batch(&table, &make_batch(vec![1, 2, 3], vec![10, 20, 30])).await;
+    write_batch(&table, &make_batch(vec![4, 5], vec![40, 50])).await;
+    let value = arrow_schema::Field::new("value", arrow_schema::DataType::Int32, true);
+    let values = std::sync::Arc::new(Int32Array::from(vec![11])) as ArrayRef;
+    rewrite(&table, 0, vec![(value, values)]).await;
+    let counts = combined_delta_row_counts(&table, 0, 3).await;
+    assert_eq!(counts, [(None, 3), (Some(2), 2)]);
+}
+
+/// A limit stops planning once the splits planned return enough rows, also
+/// for change events that may decode a row-id group file by file and so give
+/// no merged row count: such a group returns at least its merged rows. Each
+/// insert of the table writes a normal, a BLOB and a VECTOR file.
+#[tokio::test]
+async fn combined_delta_limit_stops_at_the_rows_splits_return_at_least() {
+    let path = "memory:/incremental_batch/limit_lower_bound";
+    let table = evolved_table(path, &[]).await;
+    for (ids, names) in [
+        (vec![3, 4], vec!["carol", "dave"]),
+        (vec![5, 6], vec!["erin", "fred"]),
+    ] {
+        let pictures = vec![b"c".as_slice(), b"d".as_slice()];
+        let batch = evolved_batch(ids, names, pictures, &[[1.0, 1.0], [2.0, 2.0]]);
+        write_batch(&table, &batch).await;
+    }
+    for (limit, expected) in [(None, (3, false, 6)), (Some(1), (1, true, 1))] {
+        let mut builder = table.new_read_builder();
+        if let Some(limit) = limit {
+            builder.with_limit(limit);
+        }
+        let scan = builder.new_incremental_scan(IncrementalScanMode::Delta, 0, 3);
+        let plan = scan.plan_combined_delta().await.unwrap();
+        let splits = plan.splits();
+        assert!(splits
+            .iter()
+            .all(|split| split.merged_row_count().is_none()));
+        let batches: Vec<RecordBatch> = builder
+            .new_read()
+            .unwrap()
+            .to_arrow(splits)
             .unwrap()
             .try_collect()
             .await
             .unwrap();
-        let rows = batches.iter().map(RecordBatch::num_rows).sum::<usize>() as i64;
-        counts.push((split.merged_row_count(), rows));
+        let rows = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
+        let early = plan.stats().limit_early_stopped;
+        assert_eq!((splits.len(), early, rows), expected, "{limit:?}");
     }
-    assert_eq!(counts, [(None, 8)]);
 }

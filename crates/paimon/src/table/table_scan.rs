@@ -731,8 +731,8 @@ fn merge_manifest_entries(mut entries: Vec<ManifestEntry>) -> Vec<ManifestEntry>
     entries
 }
 
-/// Whether scan-owned pruning still preserves `merged_row_count()` as a safe
-/// row-count hint.
+/// Whether scan-owned pruning still preserves `row_count_lower_bound()` as a
+/// safe row-count hint.
 ///
 /// Data predicates and row ranges can reduce rows within a split after planning,
 /// so split-level row counts stop being a conservative bound for final rows.
@@ -775,10 +775,10 @@ impl LimitPushdownAccumulator {
             return true;
         }
 
-        if let Some(merged_count) = split.merged_row_count() {
+        if let Some(count) = split.row_count_lower_bound() {
             self.fallback_splits.push(split.clone());
             self.limited_splits.push(split);
-            self.scanned_row_count += merged_count;
+            self.scanned_row_count += count;
             // Compare without a lossy signed cast: `limit` is `usize`, so
             // `limit as i64` turns any value above `i64::MAX` (e.g. a C caller
             // passing `SIZE_MAX`) negative, which would early-stop after the
@@ -2347,7 +2347,7 @@ impl<'a> PaimonTableScan<'a> {
     /// Apply a limit-pushdown hint to the generated splits.
     ///
     /// Mirrors Java `DataTableBatchScan#applyPushDownLimit`: splits whose
-    /// `merged_row_count()` is unknown (for example merge-needed PK splits or
+    /// `row_count_lower_bound()` is unknown (for example merge-needed PK splits or
     /// unknown deletion cardinality) are skipped — they contribute an unknown
     /// number of rows, so they cannot help satisfy the limit. Pruning is
     /// committed only once the accumulated known row count reaches the limit;

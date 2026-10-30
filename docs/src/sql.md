@@ -2404,10 +2404,12 @@ The optional fourth argument selects the mode:
   `data-evolution.write-cols-optimization.enabled` after the column moved to dedicated
   files; and every file of rows whose files are no longer column slices because a
   compaction in the range, such as the one a write runs after its commit unless
-  `write-only=true`, merged some of them. A column the table has since dropped, or
-  changed from VECTOR to a string type, keeps rows from merging only when the range
-  wrote it in VECTOR files of two layouts.
-- `changelog` returns the changelog rows of each commit.
+  `write-only=true`, merged some of them (Java's reader fails on such a range). A
+  column the table has since dropped, or changed from VECTOR to a string type, keeps
+  rows from merging only when the range wrote it in VECTOR files of two layouts.
+- `changelog` returns the changelog rows of each commit. A `lookup` or `full-compaction`
+  producer writes them when it compacts, in a later COMPACT snapshot, which the range
+  must include.
 - `diff` compares the table at the two snapshots and returns the added and changed
   rows (`$audit_log` adds `-U` and `-D` rows). It requires a primary-key table with
   `merge-engine=deduplicate` and no BLOB or VARIANT columns.
@@ -2417,7 +2419,10 @@ The optional fourth argument selects the mode:
 A `$audit_log` suffix puts `rowkind` first, followed by `_SEQUENCE_NUMBER` when
 `table-read.sequence-number.enabled=true`. Without it the columns are those of a
 query on the table, `_ROW_ID` included on a data-evolution table, so a column update
-returned without the row's other columns can be matched to its row.
+returned without the row's other columns can be matched to its row. A row read file
+by file comes once per file that wrote it, and nothing in the output tells which is
+newer; to read the rows' current values, join their `_ROW_ID`s with a query on the
+table.
 
 The table name resolves in the calling session: `my_table` and `my_db.my_table`
 use the current catalog (and database), as in a `FROM` clause, and

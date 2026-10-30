@@ -781,6 +781,17 @@ impl DataSplit {
     ///
     /// Reference: [DataSplit.mergedRowCount()](https://github.com/apache/paimon/blob/release-1.3/paimon-core/src/main/java/org/apache/paimon/table/source/DataSplit.java#L133)
     pub fn merged_row_count(&self) -> Option<i64> {
+        if self.is_streaming && !self.raw_convertible {
+            return None;
+        }
+        self.row_count_lower_bound()
+    }
+
+    /// A lower bound of the rows a read of this split returns, computed as
+    /// [`Self::merged_row_count`] is, but also for change events that may
+    /// decode a row-id group file by file: its files then return their own
+    /// rows, at least as many as the merged ones. A limit can be planned on it.
+    pub(crate) fn row_count_lower_bound(&self) -> Option<i64> {
         if self
             .query_auth_grant
             .as_ref()
@@ -794,9 +805,6 @@ impl DataSplit {
                 })
             })
         {
-            return None;
-        }
-        if self.is_streaming && !self.raw_convertible {
             return None;
         }
         if let Some(ranges) = &self.row_ranges {
