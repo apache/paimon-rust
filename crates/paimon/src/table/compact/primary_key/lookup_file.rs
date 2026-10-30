@@ -36,9 +36,9 @@ use std::collections::HashMap;
 use std::io::{Cursor, Write};
 use std::sync::{Arc, Mutex};
 
-const PREFIX: &str = "__paimon_generated__/lookup-sst-v1";
+const PREFIX: &str = "__paimon_generated__/lookup-sst-v2";
 const HEAD_LEN: usize = 24;
-const POINTER_LEN: usize = 37;
+const POINTER_LEN: usize = 45;
 
 struct Payload {
     path: String,
@@ -64,6 +64,13 @@ pub(in crate::table::compact) struct LookupFileCache {
     index: Mutex<Option<Arc<ParsedIndex>>>,
     // One decoded IPC batch across all files, never one cache per file/key.
     payload: Mutex<Option<Payload>>,
+    vector: Mutex<
+        Option<(
+            crate::DeletionFile,
+            crate::deletion_vector::DeletionVector,
+            Option<crate::resource::MemoryReservation>,
+        )>,
+    >,
 }
 
 impl LookupFileCache {
@@ -115,6 +122,7 @@ impl LookupFileCache {
             working: tokio::sync::Mutex::new(()),
             index: Mutex::new(None),
             payload: Mutex::new(None),
+            vector: Mutex::new(None),
         })
     }
 
@@ -125,6 +133,21 @@ impl LookupFileCache {
         keys: &[usize],
         input: F,
     ) -> Result<Option<RecordBatch>>
+    where
+        F: Fn() -> Result<ArrowRecordBatchStream> + Send,
+    {
+        self.lookup_with_position(identity, key, keys, input)
+            .await
+            .map(|row| row.map(|(batch, _)| batch))
+    }
+
+    pub(super) async fn lookup_with_position<F>(
+        &self,
+        identity: &str,
+        key: &[u8],
+        keys: &[usize],
+        input: F,
+    ) -> Result<Option<(RecordBatch, u64)>>
     where
         F: Fn() -> Result<ArrowRecordBatchStream> + Send,
     {
@@ -153,6 +176,46 @@ impl LookupFileCache {
             }
         }
         unreachable!()
+    }
+
+    /// One snapshot-dependent bitmap shares the executor's working budget.
+    pub(super) async fn is_deleted(
+        &self,
+        io: &crate::io::FileIO,
+        file: &crate::DeletionFile,
+        position: u64,
+        resources: Option<&crate::resource::ResourceContext>,
+    ) -> Result<bool> {
+        let _working = self.working.lock().await;
+        {
+            let cached = self.vector.lock().unwrap();
+            if let Some((_, vector, _)) = cached.as_ref().filter(|(key, _, _)| key == file) {
+                return Ok(vector.is_deleted(position));
+            }
+        }
+        *self.vector.lock().unwrap() = None;
+        if usize::try_from(file.length()).map_or(true, |size| size > self.limit) {
+            return Err(exhausted(
+                "Lookup deletion vector exceeds the memory budget",
+            ));
+        }
+        let vector = crate::deletion_vector::DeletionVectorFactory::read(io, file).await?;
+        let size = vector.retained_bytes();
+        if size > self.limit {
+            return Err(exhausted(
+                "Lookup deletion vector exceeds the memory budget",
+            ));
+        }
+        let reservation = resources
+            .map(|resources| {
+                let mut reservation = resources.reservation();
+                reservation.try_grow(size)?;
+                Ok::<_, Error>(reservation)
+            })
+            .transpose()?;
+        let deleted = vector.is_deleted(position);
+        *self.vector.lock().unwrap() = Some((file.clone(), vector, reservation));
+        Ok(deleted)
     }
 
     async fn build(
@@ -191,6 +254,7 @@ impl LookupFileCache {
         );
         let mut previous = None::<Vec<u8>>;
         let mut converter = None;
+        let mut position = 0u64;
         while let Some(batch) = input.try_next().await? {
             if batch.num_rows() == 0 {
                 continue;
@@ -256,6 +320,7 @@ impl LookupFileCache {
                 length: bytes.len() as u64,
                 raw_length: ipc.bytes.len() as u64,
                 row: 0,
+                position: 0,
                 crc: crc32fast::hash(&bytes),
                 compression,
             };
@@ -282,6 +347,7 @@ impl LookupFileCache {
                         key.as_ref(),
                         &Pointer {
                             row: row as u64,
+                            position: position + row as u64,
                             ..pointer
                         }
                         .encode(),
@@ -294,6 +360,9 @@ impl LookupFileCache {
                     ));
                 }
             }
+            position = position
+                .checked_add(batch.num_rows() as u64)
+                .ok_or_else(|| invalid("Lookup physical position overflow"))?;
         }
         writer.flush().await.map_err(exhausted)?;
         if writer.retained_bytes() > self.limit {
@@ -370,7 +439,7 @@ impl LookupFileCache {
         Ok(index)
     }
 
-    async fn read(&self, path: &str, size: u64, key: &[u8]) -> Result<Option<RecordBatch>> {
+    async fn read(&self, path: &str, size: u64, key: &[u8]) -> Result<Option<(RecordBatch, u64)>> {
         let index = self.parsed_index(path, size).await?;
         let footer_start = index.footer_start;
         let reader = GeneratedFileRead::new(self.local.clone(), path.into(), size);
@@ -443,7 +512,7 @@ impl LookupFileCache {
             return Err(invalid("Lookup row is outside its IPC batch"));
         }
         arrow_select::take::take_record_batch(&batch, &UInt64Array::from(vec![pointer.row]))
-            .map(Some)
+            .map(|batch| Some((batch, pointer.position)))
             .map_err(invalid)
     }
 }
@@ -454,13 +523,20 @@ struct Pointer {
     length: u64,
     raw_length: u64,
     row: u64,
+    position: u64,
     crc: u32,
     compression: BlockCompressionType,
 }
 impl Pointer {
     fn encode(self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(POINTER_LEN);
-        for value in [self.offset, self.length, self.raw_length, self.row] {
+        for value in [
+            self.offset,
+            self.length,
+            self.raw_length,
+            self.row,
+            self.position,
+        ] {
             bytes.extend_from_slice(&value.to_le_bytes());
         }
         bytes.extend_from_slice(&self.crc.to_le_bytes());
@@ -477,8 +553,9 @@ impl Pointer {
             length: number(8),
             raw_length: number(16),
             row: number(24),
-            crc: u32::from_le_bytes(bytes[32..36].try_into().unwrap()),
-            compression: BlockCompressionType::from_persistent_id(bytes[36]).map_err(invalid)?,
+            position: number(32),
+            crc: u32::from_le_bytes(bytes[40..44].try_into().unwrap()),
+            compression: BlockCompressionType::from_persistent_id(bytes[44]).map_err(invalid)?,
         })
     }
 }

@@ -2949,8 +2949,8 @@ plans, cross-partition dynamic bucket writes, or advanced aggregation options
 such as `ignore-retract`, `distinct`, `nested-key`, `count-limit`, and sequence
 groups.
 
-Primary-key compaction supports `changelog-producer=lookup` without deletion
-vectors, generating INSERT, UPDATE_BEFORE, UPDATE_AFTER and DELETE events when
+Primary-key compaction supports `changelog-producer=lookup`, including
+deletion-vector-enabled `deduplicate` tables, generating INSERT, UPDATE_BEFORE, UPDATE_AFTER and DELETE events when
 L0 files are compacted. The executor requires `local-cache.enabled=true` on the
 catalog/FileIO. See [Lookup changelog producer](compaction.md#lookup-changelog-producer).
 

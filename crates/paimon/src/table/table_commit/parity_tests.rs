@@ -362,11 +362,20 @@ async fn data_evolution_compact_retries_preserve_concurrent_deletes_and_publishe
     use arrow_array::{Int32Array, RecordBatch};
     use futures::TryStreamExt;
 
+    async fn dv_paths(table: &Table, snapshot: &Snapshot) -> Result<Vec<String>> {
+        let entries = IndexManifest::read(table.file_io(), &table.snapshot_manager().manifest_path(snapshot.index_manifest().unwrap())).await?;
+        let commit = table.new_write_builder().new_commit();
+        entries.into_iter().filter(|entry| entry.index_file.index_type == DELETION_VECTORS_INDEX_TYPE).map(|entry| {
+            Ok(committed_index_file_path(table.location(), &commit.bucket_path(&entry.partition, entry.bucket)?, table.schema().core_options().index_file_in_data_file_dir(), &entry.index_file))
+        }).collect()
+    }
+
     struct RacingCompactCommit {
         table: Table,
         calls: std::sync::atomic::AtomicUsize,
         publish_first: bool,
         delete_after_publish: bool,
+        paths: std::sync::Mutex<Vec<Vec<String>>>,
     }
 
     #[async_trait::async_trait]
@@ -378,6 +387,8 @@ async fn data_evolution_compact_retries_preserve_concurrent_deletes_and_publishe
             _: &str,
             _: &[PartitionStatistics],
         ) -> Result<bool> {
+            let paths = dv_paths(&self.table, snapshot).await?;
+            self.paths.lock().unwrap().push(paths);
             if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
                 if self.publish_first {
                     assert!(self.table.snapshot_manager().commit_snapshot(snapshot).await?);
@@ -424,11 +435,14 @@ async fn data_evolution_compact_retries_preserve_concurrent_deletes_and_publishe
         let mut delete = crate::table::DataEvolutionDeleteWriter::new(&table).unwrap();
         delete.add_row_ids([1]).unwrap();
         table.new_write_builder().new_commit().commit(delete.prepare_commit().await.unwrap()).await.unwrap();
+        let captured = table.snapshot_manager().get_latest_snapshot().await.unwrap().unwrap();
+        let original_paths = dv_paths(&table, &captured).await.unwrap();
         let builder = table.new_compact_builder();
         let plan = builder.new_planner().unwrap().plan().await.unwrap();
         let result = builder.new_executor().unwrap().execute(&plan.tasks()[0]).await.unwrap();
         let publisher = Arc::new(RacingCompactCommit {
             table: table.clone(), calls: std::sync::atomic::AtomicUsize::new(0), publish_first, delete_after_publish,
+            paths: std::sync::Mutex::new(Vec::new()),
         });
         let mut commit = builder.new_commit().unwrap();
         commit.snapshot_commit = publisher.clone();
@@ -439,6 +453,15 @@ async fn data_evolution_compact_retries_preserve_concurrent_deletes_and_publishe
         let after = table.snapshot_manager().get_latest_snapshot().await.unwrap().unwrap();
         assert_eq!(after.id(), if publish_first && !delete_after_publish { 4 } else { 5 });
         assert_eq!(after.commit_kind(), if delete_after_publish { &CommitKind::OVERWRITE } else { &CommitKind::COMPACT });
+        let attempts = publisher.paths.lock().unwrap().clone();
+        assert_eq!(attempts[0].len(), 1);
+        assert!(!original_paths.contains(&attempts[0][0]));
+        assert_eq!(io.exists(&attempts[0][0]).await.unwrap(), publish_first,
+            "CAS false must remove its unpublished DV; publish-then-error must retain it");
+        let current_paths = dv_paths(&table, &after).await.unwrap();
+        for path in original_paths.iter().chain(attempts.last().unwrap()).chain(&current_paths) {
+            assert!(io.exists(path).await.unwrap(), "deleted old-snapshot or published DV: {path}");
+        }
         assert_eq!(commit.commit_compact(vec![result.clone()]).await.unwrap(), metrics);
         // Recovery after coordinator restart must not need the captured source
         // snapshot once the COMPACT identity is already present in history.

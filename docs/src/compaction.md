@@ -130,8 +130,24 @@ The policy uses `num-sorted-run.compaction-trigger` (default `5`), `num-levels`
 `compaction.max-size-amplification-percent` (default `200`). When selected runs
 reach the oldest run, output goes to the highest configured or existing level;
 otherwise it goes immediately below the next unselected run. Explicit full
-compaction is not exposed. Outputs retain winning retracts, so older values
+compaction is not exposed. Without deletion vectors, outputs retain winning retracts, so older values
 in untouched files do not reappear after a delete or out-of-order update.
+
+With deletion vectors, `deduplicate` supports the same incremental selection for
+`none`, `input` and `lookup`. All three require actual catalog/FileIO local-cache.
+Lookup Files preserve unfiltered physical row positions; captured deletion vectors
+filter selected inputs and history before merging. A history hit moves its winning
+state into the output and marks the original position deleted, even when an
+out-of-order input loses. Winning retracts are omitted from data after changelog
+generation, so a DELETE may publish a changelog without a new data file.
+
+Commit atomically unions historical row deletions with the latest DV indexes and
+retires rewritten inputs' ranges, preserving unrelated ranges and HASH indexes.
+It rejects changed input masks, removed lookup targets and concurrently deleted
+hit positions; unrelated new DV bits can be merged. Uncommitted serialized DV results must
+retain their physical deletion metadata, including an empty list when appropriate.
+Each output file is limited to 4,294,967,296 physical rows. Migrating files written
+without DV is unsupported, including enabling DV through temporary table options.
 
 `first-row`, `partial-update` and `aggregation` retain their current
 selection behavior: every active file in a selected bucket participates, and
@@ -346,16 +362,16 @@ deletions into reassigned row IDs are not provided. Setting
 
 ## Current scope
 
-The `full-compaction` changelog producer is unsupported; `lookup` is supported
-for primary-key compaction without deletion vectors.
-Outside Data Evolution mode, row tracking, deletion vectors and dedicated
+The `full-compaction` changelog producer is unsupported. Primary-key deletion-vector
+compaction supports `deduplicate` with `none`, `input` or `lookup`.
+Outside Data Evolution mode, row tracking and dedicated
 blob/vector storage are unsupported. Query authorization, rowkind fields and
 postpone buckets are unsupported in all modes.
 Ordered bucketed append, append incremental clustering, primary-key clustering
 override (`pk-clustering-override`) and record-level expiration
 (`record-level.expire-time`) are also unsupported.
-Snapshot index manifests may contain dynamic-bucket HASH indexes, or deletion
-vectors and global indexes in Data Evolution mode.
+Snapshot index manifests may contain dynamic-bucket HASH indexes and primary-key
+deletion vectors, or deletion vectors and global indexes in Data Evolution mode.
 Embedded and sidecar file indexes are regenerated according to the captured
 table options. Language bindings and
 background compaction scheduling are not yet provided.

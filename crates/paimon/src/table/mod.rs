@@ -58,6 +58,7 @@ mod data_file_writer;
 mod de_vector_read;
 mod de_vector_scan;
 mod dedicated_format_file_writer;
+mod deletion_vector_index;
 mod dynamic_bucket_assigner;
 mod dynamic_bucket_assigner_router;
 mod dynamic_bucket_index;

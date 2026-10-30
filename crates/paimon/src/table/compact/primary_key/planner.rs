@@ -26,7 +26,6 @@ use std::collections::BTreeMap;
 pub(in crate::table::compact) fn enabled(schema: &TableSchema) -> Result<bool> {
     let options = schema.core_options();
     Ok(options.merge_engine()? == MergeEngine::Deduplicate
-        && !options.deletion_vectors_enabled()
         && matches!(
             options.try_changelog_producer()?,
             ChangelogProducer::None | ChangelogProducer::Input | ChangelogProducer::Lookup

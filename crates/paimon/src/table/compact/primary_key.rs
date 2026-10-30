@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+pub(in crate::table) mod deletion_vectors;
 pub(super) mod lookup;
 pub(super) mod lookup_file;
 pub(super) mod lookup_store;
@@ -22,6 +23,7 @@ pub(in crate::table) mod planner;
 
 use std::sync::Arc;
 
+use arrow_array::{BooleanArray, Int8Array};
 use arrow_schema::SchemaRef;
 use futures::TryStreamExt;
 
@@ -312,6 +314,7 @@ pub(super) async fn execute(
     let schema = table.schema();
     let options = schema.core_options();
     let lookup_changelog = options.try_changelog_producer()? == ChangelogProducer::Lookup;
+    let drop_delete = options.deletion_vectors_enabled() && task.output_level() > 0;
     let reader = new_reader(table, resources.clone())?.with_lookup(lookup);
     let mut batches =
         reader.read_with_merge_function(std::slice::from_ref(split), move |config, fields| {
@@ -375,11 +378,12 @@ pub(super) async fn execute(
         managed_blob_enabled: false,
         resources: resources.as_ref(),
     };
-    let mut writer = KeyValueRollingWriter::new(
-        file_options,
-        options.target_file_size(),
-        options.target_file_row_num()?,
-    );
+    let mut row_limit = options.target_file_row_num()?;
+    if options.deletion_vectors_enabled() {
+        row_limit = row_limit.min(i64::from(u32::MAX) + 1);
+    }
+    let mut writer =
+        KeyValueRollingWriter::new(file_options, options.target_file_size(), row_limit);
     let changelog_format = options.changelog_file_format();
     let mut changelog_writer = KeyValueRollingWriter::new(
         KeyValueFileOptions {
@@ -412,6 +416,27 @@ pub(super) async fn execute(
                 })?;
                 changelog_writer.write(&batch).await?;
             } else {
+                // Generate lookup changelog from the winning KV first. In DV
+                // mode the history is physically deleted, so its winning
+                // retract need not remain in the new positive-level data.
+                let batch = if drop_delete {
+                    let kinds = batch
+                        .column_by_name(VALUE_KIND_FIELD_NAME)
+                        .and_then(|column| column.as_any().downcast_ref::<Int8Array>())
+                        .ok_or_else(|| super::invalid("Invalid compaction value-kind column"))?;
+                    let live = kinds
+                        .iter()
+                        .map(|kind| {
+                            let kind =
+                                kind.ok_or_else(|| super::invalid("Null compaction value kind"))?;
+                            Ok(RowKind::from_value(kind)?.is_add())
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    arrow_select::filter::filter_record_batch(&batch, &BooleanArray::from(live))
+                        .map_err(|error| super::invalid(&error.to_string()))?
+                } else {
+                    batch
+                };
                 writer.write(&batch).await?;
             }
         }

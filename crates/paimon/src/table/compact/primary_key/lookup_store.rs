@@ -27,13 +27,14 @@ use arrow_array::RecordBatch;
 use arrow_row::{RowConverter, SortField};
 use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 struct HistoryFile {
     meta: DataFileMeta,
     range_compatible: bool,
     identity: tokio::sync::OnceCell<String>,
+    vector: Option<crate::DeletionFile>,
 }
 
 struct HistoryLevel {
@@ -52,7 +53,10 @@ struct LevelLookup {
     comparator: Option<KeyComparator>,
     resources: Option<ResourceContext>,
     schema_identity: Vec<u8>,
+    deletions: Option<LookupDeletions>,
 }
+
+pub(super) type LookupDeletions = Arc<Mutex<HashMap<String, roaring::RoaringBitmap>>>;
 
 pub(in crate::table::compact) async fn provider(
     table: &Table,
@@ -60,7 +64,7 @@ pub(in crate::table::compact) async fn provider(
     files: Vec<DataFileMeta>,
     cache: Arc<LookupFileCache>,
     resources: Option<ResourceContext>,
-) -> Result<Arc<dyn LookupProvider>> {
+) -> Result<(Arc<dyn LookupProvider>, Option<LookupDeletions>)> {
     let fields = super::read_type(table);
     let keys = table
         .schema()
@@ -87,9 +91,30 @@ pub(in crate::table::compact) async fn provider(
     )
     .map_err(invalid)?;
     let comparator = KeyComparator::from_table_schema(table.schema());
+    let dv = table.schema().core_options().deletion_vectors_enabled();
+    let history = DataSplit::builder()
+        .with_snapshot(split.snapshot_id())
+        .with_partition(split.partition().clone())
+        .with_bucket(split.bucket())
+        .with_total_buckets(split.total_buckets())
+        .with_bucket_path(split.bucket_path().to_string())
+        .with_data_files(files.clone())
+        .build()?;
+    let history = if dv {
+        super::deletion_vectors::with_deletion_files(
+            table,
+            &history,
+            table
+                .travel_snapshot()
+                .ok_or_else(|| invalid("Lookup needs a captured snapshot"))?,
+        )
+        .await?
+    } else {
+        history
+    };
     let mut schemas = BTreeMap::from([(table.schema().id(), true)]);
     let mut levels = BTreeMap::<_, HistoryLevel>::new();
-    for meta in files {
+    for (index, meta) in files.into_iter().enumerate() {
         let compatible = if let Some(&compatible) = schemas.get(&meta.schema_id) {
             compatible
         } else {
@@ -126,6 +151,11 @@ pub(in crate::table::compact) async fn provider(
                 meta,
                 range_compatible,
                 identity: tokio::sync::OnceCell::new(),
+                vector: history
+                    .data_deletion_files()
+                    .and_then(|files| files.get(index))
+                    .cloned()
+                    .flatten(),
             });
     }
     for level in levels.values_mut() {
@@ -148,18 +178,23 @@ pub(in crate::table::compact) async fn provider(
         options,
     ))
     .map_err(invalid)?;
-    Ok(Arc::new(LevelLookup {
-        table: table.clone(),
-        split: split.clone(),
-        levels,
-        cache,
-        keys,
-        key_fields,
-        converter: Mutex::new(converter),
-        comparator,
-        resources,
-        schema_identity,
-    }))
+    let deletions = dv.then(|| Arc::new(Mutex::new(HashMap::new())));
+    Ok((
+        Arc::new(LevelLookup {
+            table: table.clone(),
+            split: split.clone(),
+            levels,
+            cache,
+            keys,
+            key_fields,
+            converter: Mutex::new(converter),
+            comparator,
+            resources,
+            schema_identity,
+            deletions: deletions.clone(),
+        }),
+        deletions,
+    ))
 }
 
 #[async_trait::async_trait]
@@ -243,30 +278,58 @@ impl LookupProvider for LevelLookup {
                         Ok::<_, Error>(hex::encode(digest.finalize()))
                     })
                     .await?;
-                let row = self
-                    .cache
-                    .lookup(identity, key, &self.keys, || {
-                        let split = DataSplit::builder()
-                            .with_snapshot(self.split.snapshot_id())
-                            .with_partition(self.split.partition().clone())
-                            .with_bucket(self.split.bucket())
-                            .with_total_buckets(self.split.total_buckets())
-                            .with_bucket_path(self.split.bucket_path().to_string())
-                            .with_data_files(vec![file.meta.clone()])
-                            .build()?;
-                        // Reuse the normal KV decoder for schema evolution, file
-                        // formats, and preservation of system sequence/row kind.
-                        super::new_reader(&self.table, self.resources.clone())?
-                            .read_with_merge_function(&[split], |_, _| {
-                                Ok(Box::new(super::CompactDeduplicate))
-                            })
-                    })
-                    .await?;
-                if let Some(batch) = row {
+                let input = || {
+                    let split = DataSplit::builder()
+                        .with_snapshot(self.split.snapshot_id())
+                        .with_partition(self.split.partition().clone())
+                        .with_bucket(self.split.bucket())
+                        .with_total_buckets(self.split.total_buckets())
+                        .with_bucket_path(self.split.bucket_path().to_string())
+                        .with_data_files(vec![file.meta.clone()])
+                        .build()?;
+                    // Preserve physical ordinals before snapshot DV filtering.
+                    super::new_reader(&self.table, self.resources.clone())?
+                        .read_physical_file(split, file.meta.clone())
+                };
+                let row = if self.deletions.is_some() {
+                    self.cache
+                        .lookup_with_position(identity, key, &self.keys, &input)
+                        .await?
+                } else {
+                    self.cache
+                        .lookup(identity, key, &self.keys, &input)
+                        .await?
+                        .map(|batch| (batch, 0))
+                };
+                if let Some((batch, position)) = row {
+                    if let Some(vector) = &file.vector {
+                        if self
+                            .cache
+                            .is_deleted(
+                                self.table.file_io(),
+                                vector,
+                                position,
+                                self.resources.as_ref(),
+                            )
+                            .await?
+                        {
+                            continue;
+                        }
+                    }
                     if found.is_some() {
                         return Err(invalid(
                             "Lookup history has overlapping keys within a positive level",
                         ));
+                    }
+                    if let Some(deletions) = &self.deletions {
+                        let position = u32::try_from(position)
+                            .map_err(|_| invalid("PK deletion vector position exceeds u32::MAX"))?;
+                        deletions
+                            .lock()
+                            .unwrap()
+                            .entry(file.meta.file_name.clone())
+                            .or_default()
+                            .insert(position);
                     }
                     let mut metadata = batch.schema().metadata().clone();
                     metadata.insert(FILE_LEVEL_METADATA_KEY.into(), file.meta.level.to_string());
