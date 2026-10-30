@@ -209,7 +209,8 @@ def test_empty_stream_snapshot_properties(tmp_path):
 @pytest.mark.parametrize("overwrite", [False, True])
 @pytest.mark.parametrize("serialized", [False, True])
 def test_public_batch_commit_user_survives_serialization(tmp_path, overwrite, serialized):
-    table = _table(tmp_path, primary_key=True, options={"bucket": "1"})
+    # Inspect the data commit's identity rather than a subsequent COMPACT.
+    table = _table(tmp_path, primary_key=True, options={"bucket": "1", "write-only": "true"})
     _append(table, [1], [10])
     builder = table.new_batch_write_builder()
     assert builder.with_commit_user("python-batch-job") is builder

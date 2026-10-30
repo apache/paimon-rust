@@ -227,7 +227,7 @@ def test_custom_data_file_prefix_matches_table_option(tmp_path, primary_key):
     ctx.register_catalog("paimon", {"warehouse": str(tmp_path)})
     ctx.sql("CREATE SCHEMA paimon.wdb")
     key = ", PRIMARY KEY (id)" if primary_key else ""
-    bucket = ", 'bucket' = '1'" if primary_key else ""
+    bucket = ", 'bucket' = '1', 'compaction.force-up-level-0' = 'true'" if primary_key else ""
     ctx.sql(
         "CREATE TABLE paimon.wdb.t (id INT, name STRING{}) "
         "WITH ('data-file.prefix' = 'custom-'{})".format(key, bucket)
@@ -239,8 +239,10 @@ def test_custom_data_file_prefix_matches_table_option(tmp_path, primary_key):
     builder.new_commit().commit(writer.prepare_commit())
 
     files = list(tmp_path.rglob("*.parquet"))
-    assert len(files) == 1
-    assert files[0].name.startswith("custom-")
+    # Compaction retains source files for historical snapshots. Both source
+    # files and generated outputs must honor the configured prefix.
+    assert files
+    assert all(file.name.startswith("custom-") for file in files)
     assert pa.Table.from_batches(ctx.sql("SELECT id, name FROM paimon.wdb.t")).to_pydict() == {
         "id": [1], "name": ["a"]}
 
