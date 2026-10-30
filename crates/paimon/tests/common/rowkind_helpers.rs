@@ -72,6 +72,15 @@ pub fn rowkind_field_schema(kind_col: &str, options: &[(&str, &str)]) -> TableSc
 }
 
 pub fn memory_table(path: &str, schema: TableSchema) -> (paimon::io::FileIO, Table) {
+    // Raw merge fixtures retain every version until the read under test.
+    let schema = if schema.options().contains_key("write-only") {
+        schema
+    } else {
+        schema.copy_with_options(std::collections::HashMap::from([(
+            "write-only".into(),
+            "true".into(),
+        )]))
+    };
     let file_io = FileIOBuilder::new("memory").build().unwrap();
     let table = Table::new(
         file_io.clone(),

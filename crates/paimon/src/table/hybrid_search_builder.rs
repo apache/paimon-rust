@@ -1543,6 +1543,7 @@ mod pk_hybrid_tests {
 
     fn pk_schema(extra: &[(&str, &str)]) -> TableSchema {
         let mut builder = Schema::builder()
+            .option("write-only", "true")
             .column("id", DataType::Int(IntType::new()))
             .column(
                 VECTOR_COLUMN,

@@ -113,6 +113,7 @@ mod pk_dv_retry {
             .clone();
         setup_dirs(&io, &path).await;
         let schema = crate::spec::Schema::builder()
+            .option("write-only", "true")
             .column("id", DataType::Int(crate::spec::IntType::new()))
             .column("value", DataType::Int(crate::spec::IntType::new()))
             .primary_key(["id"])

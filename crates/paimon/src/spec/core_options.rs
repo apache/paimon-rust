@@ -1639,6 +1639,51 @@ impl<'a> CoreOptions<'a> {
             .unwrap_or(DEFAULT_TARGET_FILE_SIZE)
     }
 
+    /// Skip automatic compaction after a data commit. Defaults to false.
+    /// `write.compaction-skip` is the legacy alias; `write-only` takes precedence.
+    pub fn write_only(&self) -> crate::Result<bool> {
+        match self
+            .options
+            .get("write-only")
+            .or_else(|| self.options.get("write.compaction-skip"))
+        {
+            None => Ok(false),
+            Some(raw) if raw.eq_ignore_ascii_case("true") => Ok(true),
+            Some(raw) if raw.eq_ignore_ascii_case("false") => Ok(false),
+            Some(raw) => Err(crate::Error::ConfigInvalid {
+                message: format!("write-only must be true or false, got '{raw}'"),
+            }),
+        }
+    }
+
+    /// Maximum concurrent buckets in one automatic compaction round. Default is 4.
+    pub fn write_compaction_parallelism(&self) -> crate::Result<usize> {
+        self.options
+            .get("write.compaction.parallelism")
+            .map_or(Ok(4), |raw| {
+                raw.parse::<usize>()
+                    .ok()
+                    .filter(|value| *value > 0)
+                    .ok_or_else(|| crate::Error::ConfigInvalid {
+                        message: format!(
+                            "write.compaction.parallelism must be a positive integer, got '{raw}'"
+                        ),
+                    })
+            })
+    }
+
+    /// Include L0 files below normal compaction triggers. Java defaults to false.
+    pub fn compaction_force_up_level0(&self) -> crate::Result<bool> {
+        match self.options.get("compaction.force-up-level-0") {
+            None => Ok(false),
+            Some(raw) if raw.eq_ignore_ascii_case("true") => Ok(true),
+            Some(raw) if raw.eq_ignore_ascii_case("false") => Ok(false),
+            Some(raw) => Err(crate::Error::ConfigInvalid {
+                message: format!("compaction.force-up-level-0 must be true or false, got '{raw}'"),
+            }),
+        }
+    }
+
     /// Minimum input files for a compaction task. Default is 5. Data evolution
     /// permits one file for a forced rewrite; ordinary append requires two.
     pub fn compaction_min_file_num(&self) -> crate::Result<usize> {

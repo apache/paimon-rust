@@ -53,6 +53,9 @@ pub(crate) struct LocalCache {
     file_size_capacity: usize,
     // Bound queued and active background fills.
     fill_slots: Arc<tokio::sync::Semaphore>,
+    // Generated lookup reads can outlive the executor. Keep temporary disk
+    // storage alive until the last cache/read operation releases this object.
+    _temporary_directory: Option<tempfile::TempDir>,
 }
 
 #[derive(Debug)]
@@ -82,6 +85,7 @@ impl LocalCache {
             whitelist: FileType::parse_whitelist(whitelist),
             file_size_capacity: DEFAULT_FILE_SIZE_CAPACITY,
             fill_slots: Arc::new(tokio::sync::Semaphore::new(8)),
+            _temporary_directory: None,
         })
     }
 
@@ -131,7 +135,33 @@ impl LocalCache {
             whitelist: config.whitelist,
             file_size_capacity,
             fill_slots: Arc::new(tokio::sync::Semaphore::new(8)),
+            _temporary_directory: None,
         })
+    }
+
+    /// An automatic writer owns its lookup working files, just as Java's
+    /// writer-owned CacheManager does, without enabling a catalog-wide cache.
+    pub(crate) fn temporary_lookup(max_size: Option<u64>) -> crate::Result<Arc<Self>> {
+        let directory = tempfile::Builder::new()
+            .prefix("paimon-auto-lookup-")
+            .tempdir()
+            .map_err(|error| crate::Error::UnexpectedError {
+                message: "Cannot create automatic compaction lookup directory".into(),
+                source: Some(Box::new(error)),
+            })?;
+        let mut cache = Self::new_with_ratio(
+            LocalCacheConfig {
+                shared: false,
+                dir: Some(directory.path().to_path_buf()),
+                namespace: String::new(),
+                max_size,
+                block_size: 64 * 1024,
+                whitelist: HashSet::new(),
+            },
+            DEFAULT_HIGH_PRIORITY_POOL_RATIO,
+        )?;
+        cache._temporary_directory = Some(directory);
+        Ok(Arc::new(cache))
     }
 
     fn block_size(&self) -> u64 {

@@ -57,6 +57,34 @@ impl SchemaManager {
         }
     }
 
+    /// Retain a trusted schema already resolved by this table's catalog.
+    /// REST catalogs need not expose these definitions as filesystem files.
+    pub(super) fn cache_resolved_schema(&self, schema: TableSchema) {
+        self.cache
+            .lock()
+            .unwrap()
+            .entry(schema.id())
+            .or_insert_with(|| Arc::new(schema));
+    }
+
+    /// Carry immutable, already loaded metadata to a same-table read view.
+    /// Copy the source under its lock before locking the destination so clones
+    /// sharing one cache cannot deadlock each other.
+    pub(super) fn inherit_cached_schemas(&self, source: &Self) -> crate::Result<()> {
+        if self.table_path != source.table_path {
+            return Err(crate::Error::DataInvalid {
+                message: "Cannot share schema metadata across tables or branches".into(),
+                source: None,
+            });
+        }
+        let schemas = source.cache.lock().unwrap().clone();
+        let mut cache = self.cache.lock().unwrap();
+        for (id, schema) in schemas {
+            cache.entry(id).or_insert(schema);
+        }
+        Ok(())
+    }
+
     /// Path to the schema directory (e.g. `{table_path}/schema`).
     fn schema_directory(&self) -> String {
         format!("{}/{}", self.table_path.trim_end_matches('/'), SCHEMA_DIR)

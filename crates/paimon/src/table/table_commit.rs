@@ -49,6 +49,7 @@ const BATCH_COMMIT_IDENTIFIER: i64 = i64::MAX;
 /// Java RollingFileWriter.CHECK_ROLLING_RECORD_CNT.
 const CHECK_ROLLING_RECORD_COUNT: usize = 1000;
 
+mod auto_compact;
 mod global_index_source_check;
 mod row_tracking;
 
@@ -388,9 +389,18 @@ impl TableCommit {
         }
         let latest = self.snapshot_manager.get_latest_snapshot().await?;
         let mut pending = Vec::new();
+        let mut recovered = Vec::new();
         for (id, messages) in commits {
             if !self.is_committed_identifier(&latest, id).await? {
                 pending.push((id, messages));
+            } else if self
+                .auto_compaction_enabled(messages.iter().any(|m| !m.new_files.is_empty()))?
+            {
+                let kind = direct_commit_kind(
+                    &self.messages_to_entries(&messages),
+                    &self.messages_to_index_entries(&messages),
+                );
+                recovered.push((id, kind));
             }
         }
         // Java checks every pending checkpoint before publishing any snapshot.
@@ -399,6 +409,9 @@ impl TableCommit {
             self.check_recovery_files(messages).await?;
         }
         let count = pending.len();
+        for (id, kind) in recovered {
+            self.recover_compact_after_write(id, &kind).await?;
+        }
         for (id, messages) in pending {
             self.filter_and_commit_with_identifier(messages, id).await?;
         }
@@ -520,7 +533,7 @@ impl TableCommit {
         let check_from_snapshot = Self::check_from_snapshot(&commit_messages)?;
         // Never delete CommitMessage files on failure. A previous attempt may
         // have published them even when the caller received an exception.
-        self.try_commit(
+        self.commit_with_auto_compact(
             CommitEntriesPlan::Direct {
                 entries,
                 changelog_entries,
@@ -567,7 +580,7 @@ impl TableCommit {
         let changelog_entries = self.messages_to_changelog_entries(&commit_messages);
         let new_index_entries = self.messages_to_index_entries(&commit_messages);
         let check_from_snapshot = Self::check_from_snapshot(&commit_messages)?;
-        self.try_commit(
+        self.commit_with_auto_compact(
             CommitEntriesPlan::Direct {
                 entries,
                 changelog_entries,
@@ -676,7 +689,7 @@ impl TableCommit {
 
         let check_from_snapshot = Self::check_from_snapshot(&commit_messages)?;
 
-        self.try_commit(
+        self.commit_with_auto_compact(
             CommitEntriesPlan::Overwrite {
                 partition_filter,
                 new_entries,
@@ -923,6 +936,7 @@ impl TableCommit {
             filter_committed,
         )
         .await
+        .map(|_| ())
     }
 
     /// Python-compatible alias for dropping partitions.
@@ -998,6 +1012,7 @@ impl TableCommit {
             filter_committed,
         )
         .await
+        .map(|_| ())
     }
 
     /// A Format Table has no snapshots, so an overwrite commit would find nothing to delete and
@@ -1114,7 +1129,7 @@ impl TableCommit {
         expected_snapshot_id: Option<i64>,
         commit_identifier: i64,
         filter_committed: bool,
-    ) -> Result<()> {
+    ) -> Result<CommitOutcome> {
         let mut retry_count = 0u32;
         let mut duplicate_check_start_snapshot_id: Option<i64> = None;
         let mut retry_state: Option<Box<RetryState>> = None;
@@ -1130,7 +1145,7 @@ impl TableCommit {
         let mut publication_uncertain = false;
         let mut last_publication_error = None;
         let result = async {
-            loop {
+            let outcome = loop {
                 let latest_snapshot = self.snapshot_manager.get_latest_snapshot().await?;
                 if filter_committed {
                     let recovery_start = match &plan {
@@ -1148,7 +1163,7 @@ impl TableCommit {
                         )
                         .await?
                     {
-                        break;
+                        break CommitOutcome::Filtered;
                     }
                     self.check_recovered_files_exist(&plan).await?;
                     filter_committed = false;
@@ -1165,9 +1180,10 @@ impl TableCommit {
                     {
                         if !self.commit_callbacks.is_empty() {
                             let entries = self.read_delta_entries(None, &snapshot).await?;
-                            self.notify_commit_callbacks(snapshot, entries).await?;
+                            self.notify_commit_callbacks(snapshot.clone(), entries)
+                                .await?;
                         }
-                        break;
+                        break CommitOutcome::Published(Box::new(snapshot));
                     }
                 }
                 validate_expected_latest_snapshot(expected_snapshot_id, &latest_snapshot)?;
@@ -1186,7 +1202,7 @@ impl TableCommit {
                     && !commit_empty_overwrite
                     && !commit_empty_append
                 {
-                    break;
+                    break CommitOutcome::Empty;
                 }
 
                 let result = self
@@ -1194,7 +1210,9 @@ impl TableCommit {
                     .await?;
 
                 match result {
-                    CommitAttemptResult::Success => break,
+                    CommitAttemptResult::Success(snapshot) => {
+                        break CommitOutcome::Published(snapshot)
+                    }
                     CommitAttemptResult::Retry(mut state) => {
                         if let Some(error) = state.publication_error.take() {
                             publication_uncertain = true;
@@ -1222,9 +1240,9 @@ impl TableCommit {
 
                 self.commit_retry_wait(retry_count).await;
                 retry_count += 1;
-            }
+            };
 
-            Ok(())
+            Ok(outcome)
         }
         .await;
         match result {
@@ -1347,10 +1365,10 @@ impl TableCommit {
         {
             Ok(true) => {
                 if !self.commit_callbacks.is_empty() {
-                    self.notify_commit_callbacks(snapshot, resolved.entries)
+                    self.notify_commit_callbacks(snapshot.clone(), resolved.entries)
                         .await?;
                 }
-                return Ok(CommitAttemptResult::Success);
+                return Ok(CommitAttemptResult::Success(Box::new(snapshot)));
             }
             Ok(false) => {
                 if self.deletion_vectors_enabled && resolved.kind == CommitKind::COMPACT {
@@ -4026,8 +4044,14 @@ struct ResolvedCommit {
     base_data_files: Option<Vec<ManifestEntry>>,
 }
 
+enum CommitOutcome {
+    Published(Box<Snapshot>),
+    Filtered,
+    Empty,
+}
+
 enum CommitAttemptResult {
-    Success,
+    Success(Box<Snapshot>),
     Retry(Box<RetryState>),
 }
 
@@ -4311,6 +4335,7 @@ mod tests {
         use crate::spec::{DataType, IntType, Schema, VarCharType};
         let schema = Schema::builder()
             .column("id", DataType::Int(IntType::new()))
+            .option("write-only", "true")
             .column("name", DataType::VarChar(VarCharType::string_type()))
             .build()
             .unwrap();
@@ -4410,6 +4435,7 @@ mod tests {
             .column("pt", DataType::VarChar(VarCharType::string_type()))
             .column("id", DataType::Int(IntType::new()))
             .partition_keys(["pt"])
+            .option("write-only", "true")
             .build()
             .unwrap();
         TableSchema::new(0, &schema)
@@ -4443,9 +4469,12 @@ mod tests {
     fn test_table_with_options(
         file_io: &FileIO,
         table_path: &str,
-        options: HashMap<String, String>,
+        mut options: HashMap<String, String>,
     ) -> Table {
         use crate::spec::{DataType, IntType, Schema, VarCharType};
+        options
+            .entry("write-only".into())
+            .or_insert_with(|| "true".into());
         let schema = Schema::builder()
             .column("id", DataType::Int(IntType::new()))
             .column("name", DataType::VarChar(VarCharType::string_type()))
@@ -6539,6 +6568,7 @@ mod tests {
     fn test_data_evolution_schema() -> TableSchema {
         use crate::spec::{DataType, IntType, Schema, VarCharType};
         let schema = Schema::builder()
+            .option("write-only", "true")
             .column("id", DataType::Int(IntType::new()))
             .column("name", DataType::VarChar(VarCharType::string_type()))
             .option("row-tracking.enabled", "true")

@@ -74,6 +74,26 @@ pub(in crate::table::compact) struct LookupFileCache {
 }
 
 impl LookupFileCache {
+    pub(in crate::table::compact) fn automatic(
+        local: Option<Arc<LocalCache>>,
+        options: &HashMap<String, String>,
+    ) -> Result<Self> {
+        let mut options = options.clone();
+        let disk = options
+            .remove("lookup.cache-max-disk-size")
+            .map(|value| {
+                let size = parse_memory_size(&value)
+                    .map_err(|_| invalid("Invalid lookup.cache-max-disk-size"))?;
+                u64::try_from(size).map_err(invalid)
+            })
+            .transpose()?;
+        let local = match local {
+            Some(local) if disk.is_none() => local,
+            _ => LocalCache::temporary_lookup(disk)?,
+        };
+        Self::new(local, &options)
+    }
+
     pub(in crate::table::compact) fn new(
         local: Arc<LocalCache>,
         options: &HashMap<String, String>,

@@ -3979,6 +3979,7 @@ mod tests {
     fn scan_stats_test_table(table_path: &str) -> Table {
         let file_io = FileIOBuilder::new("memory").build().unwrap();
         let schema = PaimonSchema::builder()
+            .option("write-only", "true")
             .column("id", DataType::Int(IntType::new()))
             .build()
             .unwrap();
@@ -6149,6 +6150,7 @@ mod tests {
     pub(super) fn pk_stats_gate_table(table_path: &str) -> Table {
         let file_io = FileIOBuilder::new("memory").build().unwrap();
         let schema = PaimonSchema::builder()
+            .option("write-only", "true")
             .column("id", DataType::Int(IntType::new()))
             .column("value", DataType::Int(IntType::new()))
             .primary_key(["id"])
@@ -6354,6 +6356,7 @@ mod tests {
         let table_path = "memory:/test_first_row_stats_gate";
         let file_io = FileIOBuilder::new("memory").build().unwrap();
         let schema = PaimonSchema::builder()
+            .option("write-only", "true")
             .column("id", DataType::Int(IntType::new()))
             .column("value", DataType::Int(IntType::new()))
             .primary_key(["id"])

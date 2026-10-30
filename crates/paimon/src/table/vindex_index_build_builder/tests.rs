@@ -406,6 +406,7 @@ fn test_table_with_io(file_io: FileIO, table_path: &str, schema: Schema) -> Tabl
 
 fn vindex_schema_builder(options: HashMap<String, String>) -> crate::spec::SchemaBuilder {
     Schema::builder()
+        .option("write-only", "true")
         .column("id", DataType::Int(IntType::new()))
         .column(
             "embedding",

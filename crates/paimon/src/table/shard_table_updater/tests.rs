@@ -30,6 +30,7 @@ fn table(partitioned: bool) -> Table {
 
 fn table_with_io(partitioned: bool, file_io: crate::io::FileIO) -> Table {
     let mut schema = TableDefinition::builder()
+        .option("write-only", "true")
         .column("p", PaimonType::VarChar(VarCharType::string_type()))
         .column("id", PaimonType::Int(IntType::new()))
         .column("value", PaimonType::Int(IntType::new()))

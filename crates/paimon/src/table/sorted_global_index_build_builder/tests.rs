@@ -118,6 +118,7 @@ fn test_table(options: HashMap<String, String>) -> Table {
 
 fn test_table_with_path(table_path: &str, options: HashMap<String, String>) -> Table {
     let schema = Schema::builder()
+        .option("write-only", "true")
         .column("id", DataType::Int(IntType::new()))
         .column("name", DataType::VarChar(VarCharType::string_type()))
         .options(options)

@@ -643,6 +643,7 @@ async fn test_file_index_data_evolution_partial_file_projects_column_positions()
 
 fn primary_key_schema(options: &[(&str, &str)]) -> Schema {
     let mut builder = Schema::builder()
+        .option("write-only", "true")
         .column("id", crate::spec::DataType::Int(IntType::new()))
         .column("value", crate::spec::DataType::Int(IntType::new()))
         .primary_key(["id"])

@@ -49,7 +49,9 @@ use crate::table::{DataSplit, Plan, Table};
 use crate::Result;
 
 /// Select incremental sorted runs for supported merge modes.
-pub(super) struct PrimaryKeyCompactPlanner;
+pub(super) struct PrimaryKeyCompactPlanner {
+    pub(super) automatic: bool,
+}
 
 impl PrimaryKeyCompactPlanner {
     pub(super) fn plan_tasks(
@@ -58,14 +60,22 @@ impl PrimaryKeyCompactPlanner {
         context: &CompactContext,
     ) -> Result<Vec<CompactTask>> {
         let mut tasks = Vec::new();
+        let options = context.schema.core_options();
+        let force_level_zero = !self.automatic
+            || options.compaction_force_up_level0()?
+            || options.try_changelog_producer()? == ChangelogProducer::Lookup
+            || options.merge_engine()? == MergeEngine::FirstRow
+            || options.deletion_vectors_enabled();
         for ((partition, bucket, total_buckets), files) in split_files_by_bucket(source) {
             for file in &files {
                 validate_file(file, true)?;
             }
             if planner::enabled(&context.schema)? {
-                if let Some((files, output_level)) =
-                    planner::select(files, context.schema.options())?
-                {
+                if let Some((files, output_level)) = planner::select_with_force_level_zero(
+                    files,
+                    context.schema.options(),
+                    force_level_zero,
+                )? {
                     tasks.push(CompactTask {
                         context: context.clone(),
                         task_id: tasks.len(),
@@ -76,6 +86,19 @@ impl PrimaryKeyCompactPlanner {
                         output_level: Some(output_level),
                     });
                 }
+                continue;
+            }
+            // Some stateful reducers only support a complete-bucket rewrite.
+            // Automatic writes still wait for a normal Java trigger rather
+            // than turning every small batch into an explicit full rewrite.
+            if self.automatic
+                && planner::select_with_force_level_zero(
+                    files.clone(),
+                    context.schema.options(),
+                    force_level_zero,
+                )?
+                .is_none()
+            {
                 continue;
             }
             // One positive level is already a non-overlapping sorted run,
@@ -342,6 +365,7 @@ pub(super) async fn execute(
     split: &DataSplit,
     resources: Option<ResourceContext>,
     lookup: Option<Arc<dyn LookupProvider>>,
+    emit_changelog: bool,
 ) -> Result<(Vec<DataFileMeta>, Vec<DataFileMeta>)> {
     let schema = table.schema();
     let options = schema.core_options();
@@ -438,6 +462,9 @@ pub(super) async fn execute(
                 .metadata()
                 .contains_key(CHANGELOG_BATCH_METADATA_KEY)
             {
+                if !emit_changelog {
+                    continue;
+                }
                 let mut metadata = batch.schema().metadata().clone();
                 metadata.remove(CHANGELOG_BATCH_METADATA_KEY);
                 let batch = arrow_array::RecordBatch::try_new(
