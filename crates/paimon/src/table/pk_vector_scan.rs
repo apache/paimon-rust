@@ -46,6 +46,7 @@ struct UnresolvedAnnSegment {
     file_name: String,
     external_path: Option<String>,
     file_size: u64,
+    row_count: i64,
     index_meta: Vec<u8>,
 }
 
@@ -410,6 +411,7 @@ impl Scan for PkVectorScan {
                         file_name: entry.index_file.file_name.clone(),
                         external_path: entry.index_file.external_path.clone(),
                         file_size,
+                        row_count: entry.index_file.row_count,
                         index_meta: gim.index_meta.clone().unwrap_or_default(),
                     },
                 ));
@@ -551,6 +553,7 @@ fn plan_from_bucket_splits(
                     file_name: parts.file_name,
                     external_path: parts.external_path,
                     file_size,
+                    row_count: parts.row_count,
                     index_meta,
                 },
             ));
@@ -623,7 +626,7 @@ pub(super) fn plan_from_search_splits(
 ) -> crate::Result<PkVectorScanPlan> {
     let snapshot_id = snapshot.as_ref().map_or(0, Snapshot::id);
     let core = table.schema().core_options();
-    let index_type = core.primary_key_vector_index_type(column)?;
+    let index_type = super::pk_index_options::vector_index_type(table.schema().options(), column)?;
     let field_id = crate::table::find_field_id_by_name(table.schema().fields(), column)
         .ok_or_else(|| data_invalid("PK-vector column does not exist"))?;
     let partition = filter
@@ -732,6 +735,7 @@ pub(super) fn plan_from_search_splits(
                     external_path: file.external_path.clone(),
                     file_size: u64::try_from(file.file_size)
                         .map_err(|_| data_invalid("Index file size must not be negative"))?,
+                    row_count: file.row_count,
                     index_meta: meta.index_meta.clone().unwrap_or_default(),
                 },
             ));
@@ -855,6 +859,7 @@ fn plan_from_inputs(
                 source_meta: p.source_meta,
                 path: location.resolve(&p.file_name, p.external_path.as_deref()),
                 file_size: p.file_size,
+                row_count: p.row_count,
                 index_meta: p.index_meta,
             })
             .collect();
@@ -982,6 +987,7 @@ mod tests {
             .unwrap(),
             path: path.to_string(),
             file_size: 1,
+            row_count: 1,
             index_meta: Vec::new(),
         }
     }
@@ -997,6 +1003,7 @@ mod tests {
             file_name: file_name.to_string(),
             external_path: external_path.map(str::to_string),
             file_size: 10,
+            row_count: 1,
             index_meta: gim.index_meta.clone().unwrap_or_default(),
         }
     }
@@ -1602,6 +1609,60 @@ mod tests {
                 })
                 .collect(),
         )
+    }
+
+    #[tokio::test]
+    async fn java_empty_vector_payload_covers_sources_after_transport_without_io() {
+        // Use Java's zero-row payload, whose source still has six physical rows.
+        let decoded = BucketVectorSearchSplit::deserialize(include_bytes!(
+            "goldens/bucket_vector_search_split_v1_deletion_vectors.bin"
+        ))
+        .unwrap();
+        let empty = &decoded.payload_files()[1];
+        let mut meta = empty.global_index_meta().clone();
+        meta.row_range_end = 5;
+        let payload = BucketVectorPayload::new_for_test(
+            "ivf-flat",
+            empty.file_name(),
+            empty.file_size(),
+            empty.row_count(),
+            None,
+            None,
+            meta,
+        );
+        let split = engine_split(
+            11,
+            0,
+            BinaryRow::new(0),
+            vec![dfm("data-1.orc", 6, 1, Some(1))],
+            vec![payload],
+            &[],
+        );
+        let plan =
+            plan_from_bucket_splits("ivf-flat", 1, None, "/tbl", false, vec![split]).unwrap();
+        let split = &plan.splits[0];
+        assert_eq!(split.ann_segments[0].row_count, 0);
+        assert_eq!(split.active_files[0].row_count, 6);
+        let result = crate::vindex::pkvector::bucket::bucket_search(
+            None,
+            &split.ann_segments,
+            &split.active_files,
+            &Default::default(),
+            &|_, _, _, _, _| unreachable!("empty segment covers its sources without an exact read"),
+            &[0., 0.],
+            crate::vindex::pkvector::metric::VectorSearchMetric::L2,
+            1,
+            1,
+            &Default::default(),
+            false,
+            None,
+            1,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(result.indexed.is_empty());
+        assert!(result.exact.is_empty());
     }
 
     fn engine_payload(meta: GlobalIndexMeta) -> BucketVectorPayload {

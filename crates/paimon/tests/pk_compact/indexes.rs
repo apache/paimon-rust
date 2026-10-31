@@ -19,6 +19,427 @@ use super::*;
 use paimon::spec::{should_read_pk_index_source, IndexManifest, PrimaryKeyIndexSourceMeta};
 use std::collections::HashSet;
 
+async fn vector_table_for_indexes(options: &[(&str, &str)]) -> Table {
+    use paimon::spec::{ArrayType, FloatType};
+    let mut schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .column(
+            "embedding",
+            DataType::Array(ArrayType::new(DataType::Float(FloatType::new()))),
+        )
+        .primary_key(["id"])
+        .option("bucket", "1")
+        .option("pk-vector.index.columns", "embedding")
+        .option("deletion-vectors.enabled", "true")
+        .option("deletion-vectors.merge-on-read", "false")
+        .option("fields.embedding.pk-vector.index.type", "ivf-flat")
+        .option("fields.embedding.pk-vector.distance.metric", "l2")
+        .option(
+            "fields.embedding.pk-vector.index.options",
+            r#"{"dimension":2,"nlist":1}"#,
+        )
+        .option("global-index.search-mode", "fast");
+    for (key, value) in options {
+        schema = schema.option(*key, *value);
+    }
+    table_with_schema(TableSchema::new(0, &schema.build().unwrap())).await
+}
+
+fn vector_index_batch(ids: Vec<i32>, values: Vec<Option<[f32; 2]>>) -> RecordBatch {
+    use arrow_array::{
+        builder::{Float32Builder, ListBuilder},
+        ArrayRef,
+    };
+    use std::sync::Arc;
+    let mut vectors = ListBuilder::new(Float32Builder::new()).with_field(Arc::new(
+        arrow_schema::Field::new("element", arrow_schema::DataType::Float32, true),
+    ));
+    for value in values {
+        if let Some(value) = value {
+            vectors.values().append_slice(&value);
+            vectors.append(true);
+        } else {
+            vectors.append(false);
+        }
+    }
+    RecordBatch::try_from_iter([
+        ("id", Arc::new(Int32Array::from(ids)) as ArrayRef),
+        ("embedding", Arc::new(vectors.finish()) as ArrayRef),
+    ])
+    .unwrap()
+}
+
+#[tokio::test]
+async fn empty_vector_level_is_persisted_reused_and_searchable() {
+    let table = vector_table_for_indexes(&[]).await;
+    write_batch(
+        &table,
+        &vector_index_batch((0..1000).collect(), vec![None; 1000]),
+    )
+    .await;
+    let builder = table
+        .new_compact_builder()
+        .with_commit_user("empty-vector-level")
+        .unwrap();
+    let plan = builder.new_planner().unwrap().plan().await.unwrap();
+    let first = execute(&table, &plan).await;
+    let commit = builder.new_commit().unwrap();
+    commit.commit_compact(first.clone()).await.unwrap();
+    let empty = indexes(&table)
+        .await
+        .into_iter()
+        .find(|e| e.index_file.index_type == "ivf-flat")
+        .expect("Java records all-NULL sources as an explicit empty segment");
+    assert_eq!(empty.index_file.row_count, 0);
+    assert_eq!(empty.index_file.file_size, 0);
+    assert_eq!(
+        table
+            .file_io()
+            .new_input(&index_path(&table, &empty))
+            .unwrap()
+            .read()
+            .await
+            .unwrap()
+            .len(),
+        0
+    );
+    commit.commit_compact(first).await.unwrap();
+    let result = table
+        .new_vector_search_builder()
+        .with_vector_column("embedding")
+        .with_query_vector(vec![0., 0.])
+        .with_limit(1)
+        .execute()
+        .await
+        .unwrap();
+    let batches: Vec<RecordBatch> = result
+        .new_read_builder()
+        .read()
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 0);
+    let mut batch = table.new_batch_vector_search_builder();
+    for result in batch
+        .with_vector_column("embedding")
+        .with_query_vectors(vec![vec![0., 0.], vec![1., 0.]])
+        .with_limit(1)
+        .execute()
+        .await
+        .unwrap()
+    {
+        let batches: Vec<RecordBatch> = result
+            .new_read_builder()
+            .read()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 0);
+    }
+    // A smaller level must not rebuild the retained all-NULL level.
+    for id in [42, 43] {
+        write_batch(
+            &table,
+            &vector_index_batch(vec![id], vec![Some([id as f32, 0.])]),
+        )
+        .await;
+        let prepared = compact(&table).await;
+        assert!(indexes(&table).await.contains(&empty));
+        assert!(prepared
+            .iter()
+            .flat_map(|r| r.index_entries().unwrap())
+            .all(|entry| entry.index_file.file_name != empty.index_file.file_name));
+        let result = table
+            .new_vector_search_builder()
+            .with_vector_column("embedding")
+            .with_query_vector(vec![id as f32, 0.])
+            .with_limit(1)
+            .execute()
+            .await
+            .unwrap();
+        let batches: Vec<RecordBatch> = result
+            .new_read_builder()
+            .read()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+        assert_eq!(
+            batches[0]
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .value(0),
+            id
+        );
+        let mut batch = table.new_batch_vector_search_builder();
+        let results = batch
+            .with_vector_column("embedding")
+            .with_query_vectors(vec![vec![id as f32, 0.], vec![id as f32, 0.]])
+            .with_limit(1)
+            .execute()
+            .await
+            .unwrap();
+        for result in results {
+            let batches: Vec<RecordBatch> = result
+                .new_read_builder()
+                .read()
+                .await
+                .unwrap()
+                .try_collect()
+                .await
+                .unwrap();
+            assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+        }
+    }
+}
+
+#[tokio::test]
+async fn vector_output_cannot_be_omitted_and_counts_non_null_vectors() {
+    let table = vector_table_for_indexes(&[]).await;
+    write_batch(
+        &table,
+        &vector_index_batch(vec![1, 2], vec![None, Some([2., 0.])]),
+    )
+    .await;
+    let builder = table.new_compact_builder();
+    let plan = builder.new_planner().unwrap().plan().await.unwrap();
+    let results = execute(&table, &plan).await;
+    let entry = &results[0].index_entries().unwrap()[0];
+    assert_eq!(
+        entry.index_file.row_count, 1,
+        "Java records indexed vectors separately from the physical source range"
+    );
+    assert_eq!(
+        entry
+            .index_file
+            .global_index_meta
+            .as_ref()
+            .unwrap()
+            .row_range_end,
+        1
+    );
+    let path = index_path(&table, entry);
+    let mut wire = serde_json::to_value(&results).unwrap();
+    wire[0]["index_entries"] = serde_json::json!([]);
+    let error = builder
+        .new_commit()
+        .unwrap()
+        .commit_compact(serde_json::from_value(wire).unwrap())
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("Missing PK index output"),
+        "{error}"
+    );
+    assert_eq!(latest(&table).await.id(), 1);
+    assert!(table.file_io().exists(&path).await.unwrap());
+    builder
+        .new_commit()
+        .unwrap()
+        .commit_compact(results)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn vector_type_is_canonical_in_build_and_query() {
+    let table =
+        vector_table_for_indexes(&[("fields.embedding.pk-vector.index.type", " IVF-FLAT ")]).await;
+    write_batch(
+        &table,
+        &vector_index_batch(vec![1, 2], vec![Some([1., 0.]), Some([100., 0.])]),
+    )
+    .await;
+    compact(&table).await;
+    assert!(indexes(&table)
+        .await
+        .iter()
+        .any(|e| e.index_file.index_type == "ivf-flat"));
+    let result = table
+        .new_vector_search_builder()
+        .with_vector_column("embedding")
+        .with_query_vector(vec![1., 0.])
+        .with_limit(1)
+        .execute()
+        .await
+        .unwrap();
+    let batches: Vec<RecordBatch> = result
+        .new_read_builder()
+        .read()
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        batches[0]
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .value(0),
+        1
+    );
+}
+
+#[tokio::test]
+async fn conflicting_field_metric_is_rejected_before_build() {
+    for native in [
+        r#"{"dimension":2,"nlist":1,"fields.embedding.metric":"cosine"}"#,
+        r#"{"dimension":2,"nlist":1,"fields.embedding.distance.metric":"cosine"}"#,
+        r#"{"dimension":2,"nlist":1,"distance.metric":"cosine"}"#,
+    ] {
+        let table = vector_table_for_indexes(&[
+            ("fields.embedding.pk-vector.index.options", native),
+            ("fields.embedding.metric", "cosine"),
+        ])
+        .await;
+        assert!(table.new_compact_builder().new_planner().is_err());
+    }
+}
+
+#[tokio::test]
+async fn redeclared_scalar_index_after_type_evolution_falls_back() {
+    use paimon::spec::{FloatType, SchemaChange};
+    for family in ["btree", "bitmap"] {
+        let key = format!("pk-{family}.index.columns");
+        let table = table(&[(&key, "value"), ("target-file-row-num", "1")]).await;
+        write_batch(&table, &make_batch(vec![1, 2], vec![10, 20])).await;
+        compact(&table).await;
+        let removed = table
+            .schema()
+            .apply_changes(vec![SchemaChange::remove_option(key.clone())])
+            .unwrap();
+        persist_table_schema(table.file_io(), table.location(), &removed).await;
+        let changed = removed
+            .apply_changes(vec![SchemaChange::UpdateColumnType {
+                field_names: vec!["value".into()],
+                new_data_type: DataType::Float(FloatType::new()),
+                keep_nullability: true,
+            }])
+            .unwrap();
+        persist_table_schema(table.file_io(), table.location(), &changed).await;
+        let declared = changed
+            .apply_changes(vec![SchemaChange::set_option(key, "value".into())])
+            .unwrap();
+        persist_table_schema(table.file_io(), table.location(), &declared).await;
+        let current = table.copy_with_resolved_schema(declared, "main").unwrap();
+        for enabled in ["false", "true"] {
+            let read_table = current.copy_with_options(std::collections::HashMap::from([(
+                "global-index.enabled".into(),
+                enabled.into(),
+            )]));
+            let mut read = read_table.new_read_builder();
+            read.with_filter(
+                PredicateBuilder::new(read_table.schema().fields())
+                    .equal("value", Datum::Float(10.))
+                    .unwrap(),
+            );
+            let plan = read.new_scan().plan().await.unwrap();
+            let batches: Vec<RecordBatch> = read
+                .new_read()
+                .unwrap()
+                .to_arrow(plan.splits())
+                .unwrap()
+                .try_collect()
+                .await
+                .unwrap();
+            assert_eq!(
+                batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+                1,
+                "{family}, enabled={enabled}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn scalar_type_roundtrip_never_builds_cast_keys_on_retained_sources() {
+    use arrow_array::{ArrayRef, Float32Array};
+    use paimon::spec::{FloatType, SchemaChange};
+    use std::sync::Arc;
+    for family in ["btree", "bitmap"] {
+        let key = format!("pk-{family}.index.columns");
+        let table = table(&[
+            ("deletion-vectors.enabled", "true"),
+            ("deletion-vectors.merge-on-read", "false"),
+        ])
+        .await;
+        write_batch(&table, &make_batch((0..1000).collect(), vec![10; 1000])).await;
+        let old = compact(&table).await[0].files().to_vec();
+        let changed = table
+            .schema()
+            .apply_changes(vec![
+                SchemaChange::UpdateColumnType {
+                    field_names: vec!["value".into()],
+                    new_data_type: DataType::Float(FloatType::new()),
+                    keep_nullability: true,
+                },
+                SchemaChange::set_option(key.clone(), "value".into()),
+            ])
+            .unwrap();
+        persist_table_schema(table.file_io(), table.location(), &changed).await;
+        let changed = table.copy_with_resolved_schema(changed, "main").unwrap();
+        let batch = RecordBatch::try_from_iter([
+            ("id", Arc::new(Int32Array::from(vec![1001])) as ArrayRef),
+            ("value", Arc::new(Float32Array::from(vec![10.])) as ArrayRef),
+        ])
+        .unwrap();
+        write_batch(&changed, &batch).await;
+        compact(&changed).await;
+        for entry in indexes(&changed)
+            .await
+            .into_iter()
+            .filter(|e| e.index_file.index_type == family)
+        {
+            let source = PrimaryKeyIndexSourceMeta::from_global_index_meta(
+                entry.index_file.global_index_meta.as_ref().unwrap(),
+            )
+            .unwrap();
+            assert!(
+                source
+                    .source_files()
+                    .iter()
+                    .all(|source| !old.iter().any(|file| file.file_name == source.file_name())),
+                "retained INT sources must not receive FLOAT index keys"
+            );
+        }
+        let removed = changed
+            .schema()
+            .apply_changes(vec![SchemaChange::remove_option(key.clone())])
+            .unwrap();
+        persist_table_schema(table.file_io(), table.location(), &removed).await;
+        let reverted = removed
+            .apply_changes(vec![SchemaChange::UpdateColumnType {
+                field_names: vec!["value".into()],
+                new_data_type: DataType::Int(IntType::new()),
+                keep_nullability: true,
+            }])
+            .unwrap();
+        persist_table_schema(table.file_io(), table.location(), &reverted).await;
+        let restored = reverted
+            .apply_changes(vec![SchemaChange::set_option(key, "value".into())])
+            .unwrap();
+        persist_table_schema(table.file_io(), table.location(), &restored).await;
+        let restored = table.copy_with_resolved_schema(restored, "main").unwrap();
+        assert_eq!(filtered_rows(&restored, 10).await.len(), 1001, "{family}");
+        // Once sources are rewritten under the current codec they can be indexed.
+        write_batch(&restored, &make_batch(vec![1002], vec![10])).await;
+        compact(&restored).await;
+        assert_eq!(filtered_rows(&restored, 10).await.len(), 1002, "{family}");
+    }
+}
+
 #[tokio::test]
 async fn independently_committed_buckets_rebase_without_conflicting_local_ordinals() {
     let table = table(&[("bucket", "2"), ("pk-btree.index.columns", "value")]).await;
@@ -486,7 +907,14 @@ async fn all_native_families_build_with_physical_null_gaps_and_field_options() {
             entry.index_file.global_index_meta.as_ref().unwrap(),
         )
         .unwrap();
-        assert_eq!(entry.index_file.row_count, 3);
+        assert_eq!(
+            entry.index_file.row_count,
+            if entry.index_file.index_type == "ivf-flat" {
+                2
+            } else {
+                3
+            }
+        );
         assert_eq!(source.source_files().len(), 3);
         assert!(table
             .file_io()

@@ -427,7 +427,57 @@ pub(super) async fn refine(
     definitions: &[Definition],
     predicates: &[Predicate],
 ) -> Result<Vec<DataSplit>> {
-    let (groups, sources) = plan_groups(table, &splits, entries, definitions);
+    // Source frames contain file names and counts, but no key type. A declaration
+    // may have been removed before an allowed type change and then re-added.
+    // Equal-width encodings (for example INT/FLOAT) cannot be distinguished by
+    // the native reader. Writers prove one unchanged codec across the complete
+    // level. Check every visible active source here; retired/stats-pruned sources
+    // keep their ordinal offsets without preventing partial-coverage reads.
+    let files = splits
+        .iter()
+        .flat_map(|split| {
+            split.data_files().iter().map(move |file| {
+                (
+                    (
+                        split.partition().to_serialized_bytes(),
+                        split.bucket(),
+                        file.file_name.as_str(),
+                    ),
+                    file,
+                )
+            })
+        })
+        .collect::<HashMap<_, _>>();
+    let mut compatible = Vec::new();
+    for entry in entries {
+        let Some(meta) = &entry.index_file.global_index_meta else {
+            continue;
+        };
+        let Some(field) = table
+            .schema()
+            .fields()
+            .iter()
+            .find(|field| field.id() == meta.index_field_id)
+        else {
+            continue;
+        };
+        let Ok(source) = PrimaryKeyIndexSourceMeta::from_global_index_meta(meta) else {
+            continue;
+        };
+        let source_files = source
+            .source_files()
+            .iter()
+            .filter_map(|source| {
+                files
+                    .get(&(entry.partition.clone(), entry.bucket, source.file_name()))
+                    .copied()
+            })
+            .collect::<Vec<_>>();
+        if super::pk_index_schema::source_types_match(table, field, &source_files).await {
+            compatible.push(entry.clone());
+        }
+    }
+    let (groups, sources) = plan_groups(table, &splits, &compatible, definitions);
     if groups.is_empty() {
         return Ok(splits);
     }

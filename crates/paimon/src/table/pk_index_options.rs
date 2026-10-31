@@ -45,10 +45,39 @@ pub(super) fn field_options(
         parse_field_index_options(options, column, &key, &prefix, family == "vector")?;
     if family == "vector" {
         let metric = CoreOptions::new(options).primary_key_vector_distance_metric(column)?;
-        crate::vindex::pkvector::metric::VectorSearchMetric::parse(&metric)?;
+        let expected = crate::vindex::pkvector::metric::VectorSearchMetric::parse(&metric)?;
         resolved.insert(format!("{index_type}.metric"), metric);
+        // Native field aliases outrank the algorithm key within this map. Do
+        // not let them contradict the metric used for ANN/exact result merging.
+        for key in [
+            format!("fields.{column}.metric"),
+            format!("fields.{column}.distance.metric"),
+            format!("{index_type}.distance.metric"),
+        ] {
+            if let Some(value) = resolved.get(&key) {
+                if crate::vindex::pkvector::metric::VectorSearchMetric::parse(value)? != expected {
+                    return Err(Error::ConfigInvalid {
+                        message: format!(
+                            "{key} conflicts with fields.{column}.pk-vector.distance.metric"
+                        ),
+                    });
+                }
+            }
+        }
     }
     Ok(resolved)
+}
+
+pub(super) fn vector_index_type(
+    options: &HashMap<String, String>,
+    column: &str,
+) -> Result<&'static str> {
+    let configured = CoreOptions::new(options).primary_key_vector_index_type(column)?;
+    normalize_global_index_type(configured.trim())
+        .filter(|kind| crate::vindex::is_vindex_index_type(kind))
+        .ok_or_else(|| Error::ConfigInvalid {
+            message: format!("Unsupported primary-key vector index type: {configured}"),
+        })
 }
 
 pub(super) fn definitions(schema: &TableSchema) -> Result<Vec<Definition>> {
@@ -86,14 +115,7 @@ pub(super) fn definitions(schema: &TableSchema) -> Result<Vec<Definition>> {
             continue;
         };
         let kind = if family == "vector" {
-            let configured = schema
-                .core_options()
-                .primary_key_vector_index_type(field.name())?;
-            normalize_global_index_type(configured.trim())
-                .filter(|kind| crate::vindex::is_vindex_index_type(kind))
-                .ok_or_else(|| Error::ConfigInvalid {
-                    message: format!("Unsupported primary-key vector index type: {configured}"),
-                })?
+            vector_index_type(options, field.name())?
         } else {
             family
         };

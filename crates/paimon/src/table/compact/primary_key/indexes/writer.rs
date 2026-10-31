@@ -162,15 +162,28 @@ pub(super) async fn build(
                     kind,
                     &definition.field,
                 )?;
-                vector::write_payload(
+                let payload = vector::write_payload(
                     stream,
-                    output,
+                    output.clone(),
                     definition.field.name(),
                     &native,
                     range,
                     index_build::serialize_options(&native.native_options)?,
                 )
-                .await
+                .await?;
+                let payload = match payload {
+                    Some(payload) => payload,
+                    None => {
+                        // Java persists an empty segment to record completed
+                        // coverage; readers never open its native payload.
+                        output.write(bytes::Bytes::new()).await?;
+                        index_build::IndexPayload {
+                            row_count: 0,
+                            index_meta: Vec::new(),
+                        }
+                    }
+                };
+                Ok(Some(payload))
             }
             kind => scalar::write_payload(
                 stream,

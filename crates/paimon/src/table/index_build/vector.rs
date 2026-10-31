@@ -251,7 +251,6 @@ pub(in crate::table) async fn write_payload(
     range: RowRange,
     index_meta: Vec<u8>,
 ) -> Result<Option<IndexPayload>> {
-    let row_count = super::row_count(&range)?;
     let mut spill = VectorSpill::new(range, options.dimension())?;
     while let Some(batch) = batches.try_next().await? {
         spill.push_batch(&batch, column, false).await?;
@@ -259,6 +258,7 @@ pub(in crate::table) async fn write_payload(
     let Some(spill) = spill.finish().await? else {
         return Ok(None);
     };
+    let row_count = i64::try_from(spill.count).map_err(error)?;
     let trained = spill.train(options, false).await?;
     serialize_writer(trained.writer, output).await?;
     Ok(Some(IndexPayload {

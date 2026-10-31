@@ -96,7 +96,9 @@ impl PkVectorSearchParams {
         // Fan-out limit for bucket orchestration plus ANN and exact-file leaves (Java
         // `GLOBAL_INDEX_THREAD_NUM`); `1` reproduces strictly sequential execution.
         let concurrency = core.global_index_thread_num()?;
-        let index_type = core.primary_key_vector_index_type(pk_col)?;
+        let index_type =
+            super::pk_index_options::vector_index_type(table.schema().options(), pk_col)?
+                .to_string();
         let vector_field = table
             .schema()
             .fields()

@@ -276,7 +276,8 @@ impl VectorScan {
             VectorScanKind::PrimaryKey(Box::new(PkVectorScan::new(
                 table,
                 field_id,
-                core.primary_key_vector_index_type(&column)?,
+                super::pk_index_options::vector_index_type(table.schema().options(), &column)?
+                    .to_string(),
                 filter.cloned(),
             )))
         } else {

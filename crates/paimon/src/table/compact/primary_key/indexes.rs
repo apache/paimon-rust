@@ -147,6 +147,12 @@ fn compatible(table: &Table, entry: &IndexManifestEntry, definition: &Definition
     if entry.index_file.index_type != definition.index_type {
         return Ok(false);
     }
+    if crate::vindex::is_vindex_index_type(&definition.index_type)
+        && entry.index_file.row_count == 0
+        && entry.index_file.file_size == 0
+    {
+        return Ok(true);
+    }
     if definition.index_type == "full-text"
         || crate::vindex::is_vindex_index_type(&definition.index_type)
     {
@@ -167,11 +173,36 @@ struct Maintenance<'a> {
     builds: Vec<(i32, &'a Definition)>,
 }
 
+async fn unsupported_scalar_units(
+    table: &Table,
+    levels: &Levels,
+    defs: &[Definition],
+) -> HashSet<(i32, i32)> {
+    let mut unsupported = HashSet::new();
+    for (level, files) in levels {
+        let files = files.iter().collect::<Vec<_>>();
+        for definition in defs.iter().filter(|d| {
+            matches!(
+                d.index_type.as_str(),
+                "btree" | "bitmap" | "multivalue" | "fm"
+            )
+        }) {
+            if !crate::table::pk_index_schema::source_types_match(table, &definition.field, &files)
+                .await
+            {
+                unsupported.insert((*level, definition.field.id()));
+            }
+        }
+    }
+    unsupported
+}
+
 fn plan<'a>(
     table: &Table,
     indexes: &[IndexManifestEntry],
     levels: &Levels,
     defs: &'a [Definition],
+    unsupported: &HashSet<(i32, i32)>,
     partition: &[u8],
     bucket: i32,
 ) -> Result<Maintenance<'a>> {
@@ -205,7 +236,9 @@ fn plan<'a>(
         let valid = entries.len() == 1
             && expected.as_ref() == Some(&source(entries[0])?)
             && match definition {
-                Some(d) => compatible(table, entries[0], d)?,
+                Some(d) => {
+                    !unsupported.contains(&(*level, *field)) && compatible(table, entries[0], d)?
+                }
                 None => true,
             };
         if !valid {
@@ -221,6 +254,9 @@ fn plan<'a>(
             continue;
         }
         for definition in defs {
+            if unsupported.contains(&(*level, definition.field.id())) {
+                continue;
+            }
             let valid = existing
                 .get(&(*level, definition.field.id()))
                 .is_some_and(|entries| {
@@ -273,7 +309,16 @@ pub(in crate::table::compact) async fn prepare(
         }))
         .collect::<Vec<_>>();
     let after = levels(active, &changes, &task.partition, task.bucket);
-    let maintenance = plan(table, &indexes, &after, &defs, &task.partition, task.bucket)?;
+    let unsupported = unsupported_scalar_units(table, &after, &defs).await;
+    let maintenance = plan(
+        table,
+        &indexes,
+        &after,
+        &defs,
+        &unsupported,
+        &task.partition,
+        task.bucket,
+    )?;
     let mut entries = maintenance.deletes;
     for (level, definition) in maintenance.builds {
         match writer::build(table, split, &after[&level], definition, resources.clone()).await {
@@ -347,7 +392,16 @@ pub(in crate::table) async fn resolve(
     let mut after_levels = BTreeMap::new();
     for (partition, bucket) in &buckets {
         let after = levels(active, changes, partition, *bucket);
-        let maintenance = plan(table, &captured, &after, &defs, partition, *bucket)?;
+        let unsupported = unsupported_scalar_units(table, &after, &defs).await;
+        let maintenance = plan(
+            table,
+            &captured,
+            &after,
+            &defs,
+            &unsupported,
+            partition,
+            *bucket,
+        )?;
         required_deletes.extend(maintenance.deletes);
         for (level, definition) in maintenance.builds {
             required_builds.insert((partition.clone(), *bucket, level, definition.field.id()));
@@ -407,10 +461,18 @@ pub(in crate::table) async fn resolve(
         let files = &after_levels[&(key.0.clone(), key.1)][&key.2];
         let meta = entry.index_file.global_index_meta.as_ref().unwrap();
         let count = row_count(files)?;
+        let indexed_rows = entry.index_file.row_count;
+        let valid_count = if crate::vindex::is_vindex_index_type(&definition.index_type) {
+            indexed_rows >= 0
+                && indexed_rows <= count
+                && ((indexed_rows == 0) == (entry.index_file.file_size == 0))
+        } else {
+            indexed_rows == count
+        };
         if source(entry)? != source_meta(key.2, files)?
             || meta.row_range_start != 0
             || meta.row_range_end != count - 1
-            || entry.index_file.row_count != count
+            || !valid_count
             || entry.index_file.file_size < 0
             || !compatible(table, entry, definition)?
         {
@@ -419,12 +481,7 @@ pub(in crate::table) async fn resolve(
             ));
         }
     }
-    // All-NULL vector levels intentionally have no payload.
-    if required_builds.iter().any(|key| {
-        !defs
-            .iter()
-            .any(|d| d.field.id() == key.3 && crate::vindex::is_vindex_index_type(&d.index_type))
-    }) {
+    if !required_builds.is_empty() {
         return Err(invalid("Missing PK index output"));
     }
     if prepared.is_empty() {

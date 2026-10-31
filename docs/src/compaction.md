@@ -280,6 +280,9 @@ Unchanged coverage is retained. Changed coverage and incompatible vector
 definitions replace the previous references in the same COMPACT snapshot as
 data, changelogs and deletion vectors. Old payload files remain for historical
 snapshots. L0 files remain outside these indexes and use the existing read path.
+All-NULL vector levels retain an explicit empty segment, as in Java, so later
+maintenance reuses their coverage without rescanning or opening a native index.
+Vector payload row counts count indexed vectors; source ranges retain all physical positions.
 
 Commit validates the complete source set and captured index membership before
 publishing. Concurrent L0 appends and unrelated index changes can be rebased;
@@ -291,6 +294,9 @@ need maintenance; already published results remain recoverable without their
 original source snapshot.
 As in Java, declared indexed columns cannot be renamed, dropped or have their
 type changed while the declaration remains in effect.
+If a declaration is removed to change a scalar column's type, retained files with
+different source types use the normal read path until rewritten. Maintenance and
+reads share this codec check, including when a type is changed back later.
 
 The same API compacts primary-key tables with `deduplicate`,
 `first-row`, `partial-update` or `aggregation` merge engines. Changelog producers
