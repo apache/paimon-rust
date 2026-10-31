@@ -24,9 +24,65 @@ use arrow_array::{Int32Array, RecordBatch};
 use futures::TryStreamExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+mod lsm;
+mod schema;
 mod search;
+mod vector_dimension;
 
-async fn table(enabled: Option<bool>, compact: bool) -> Table {
+#[tokio::test]
+async fn index_columns_share_source_scan_and_covered_rounds_do_not_rescan_builders() {
+    use crate::table::maintenance_test_utils::{source_manifests, table as counted_table};
+    let mut totals = Vec::new();
+    for multiple in [false, true] {
+        let schema = TableSchemaBuilder::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("value", DataType::Int(IntType::new()))
+            .option("row-tracking.enabled", "true")
+            .option("data-evolution.enabled", "true")
+            .option("write-only", "true")
+            .option("global-index.btree.index-columns", "id");
+        let schema = if multiple {
+            schema.option("global-index.bitmap.index-columns", "value")
+        } else {
+            schema
+        };
+        let (raw, counter) = counted_table(TableSchema::new(0, &schema.build().unwrap())).await;
+        TableCommit::new(raw.clone(), "source".into())
+            .commit(messages(&raw, vec![1, 2]).await)
+            .await
+            .unwrap();
+        let written = latest(&raw).await;
+        let table = raw.copy_with_options(HashMap::from([("write-only".into(), "false".into())]));
+        let paths = source_manifests(&table, &written).await;
+        counter.watch(paths.clone());
+        TableCommit::new(table.clone(), "first-indexer".into())
+            .index_after_write(&written)
+            .await
+            .unwrap();
+        totals.push(counter.counts().values().sum::<usize>());
+        assert_eq!(indexes(&table).await.len(), if multiple { 2 } else { 1 });
+        let indexed = latest(&table).await;
+        let indexed_id = indexed.id();
+        counter.watch(source_manifests(&table, &indexed).await);
+        // Another round owns a different identity but sees fully indexed data.
+        TableCommit::new(table.clone(), "other-indexer".into())
+            .index_after_write(&written)
+            .await
+            .unwrap();
+        assert!(
+            counter.counts().values().all(|count| *count == 1),
+            "fully covered round should only inspect coverage: {:?}",
+            counter.counts()
+        );
+        assert_eq!(latest(&table).await.id(), indexed_id);
+    }
+    assert_eq!(
+        totals[0], totals[1],
+        "adding index columns must not reread source manifests"
+    );
+}
+
+pub(super) async fn table(enabled: Option<bool>, compact: bool) -> Table {
     let mut schema = TableSchemaBuilder::builder()
         .column("id", DataType::Int(IntType::new()))
         .column("value", DataType::Int(IntType::new()))
@@ -72,7 +128,7 @@ async fn table(enabled: Option<bool>, compact: bool) -> Table {
     table
 }
 
-async fn messages(table: &Table, ids: Vec<i32>) -> Vec<CommitMessage> {
+pub(super) async fn messages(table: &Table, ids: Vec<i32>) -> Vec<CommitMessage> {
     let values = ids.iter().map(|id| id * 10).collect::<Vec<_>>();
     let batch = RecordBatch::try_from_iter(vec![
         (
@@ -91,7 +147,7 @@ async fn messages(table: &Table, ids: Vec<i32>) -> Vec<CommitMessage> {
     write.prepare_commit().await.unwrap()
 }
 
-async fn latest(table: &Table) -> Snapshot {
+pub(super) async fn latest(table: &Table) -> Snapshot {
     table
         .snapshot_manager()
         .get_latest_snapshot()
@@ -113,7 +169,7 @@ async fn indexes(table: &Table) -> Vec<IndexManifestEntry> {
     }
 }
 
-async fn assert_complete(table: &Table) {
+pub(super) async fn assert_complete(table: &Table) {
     for (column, kind) in [("id", "btree"), ("value", "bitmap")] {
         assert!(table
             .new_global_index_build_builder()
@@ -279,13 +335,16 @@ async fn append_only_adds_missing_ranges_and_empty_commits_do_nothing() {
 }
 
 #[tokio::test]
-async fn changed_shards_replace_fragmented_indexes_and_preserve_historical_payloads() {
+async fn triggered_merges_replace_fragments_and_preserve_historical_payloads() {
     let table = table(Some(true), false)
         .await
-        .copy_with_options(HashMap::from([(
-            "sorted-index.records-per-range".into(),
-            "4".into(),
-        )]));
+        .copy_with_options(HashMap::from([
+            ("sorted-index.records-per-range".into(), "4".into()),
+            (
+                "global-index.num-sorted-run.compaction-trigger".into(),
+                "2".into(),
+            ),
+        ]));
     let commit = TableCommit::new(table.clone(), "writer".into());
     commit
         .commit_with_identifier(messages(&table, vec![1]).await, 6)
@@ -753,7 +812,12 @@ async fn definite_conflict_replans_coverage_and_preserves_competing_indexes() {
 
 #[tokio::test]
 async fn conflicting_replacement_replans_instead_of_deleting_a_competitors_payloads() {
-    let table = table(Some(true), false).await;
+    let table = table(Some(true), false)
+        .await
+        .copy_with_options(HashMap::from([(
+            "global-index.num-sorted-run.compaction-trigger".into(),
+            "2".into(),
+        )]));
     TableCommit::new(table.clone(), "seed".into())
         .commit(messages(&table, vec![1]).await)
         .await
@@ -1150,8 +1214,8 @@ async fn native_builders_share_automatic_incremental_and_captured_snapshot_contr
     let files = indexes(&table).await;
     assert_eq!(
         files.len(),
-        2,
-        "each native index should have one current shard after maintenance"
+        4,
+        "each native index retains two append runs below the merge trigger"
     );
     let full_text = files
         .iter()

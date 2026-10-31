@@ -23,6 +23,8 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use super::{prepare_results, CompactExecutor, CompactPlan, PreparedCompact};
 use crate::table::{CommitMessage, Table, TableCommit};
 use crate::{Error, Result};
+#[cfg(test)]
+mod metadata_tests;
 
 pub(in crate::table) async fn execute_auto_plan(
     table: &Table,
@@ -39,8 +41,12 @@ pub(in crate::table) async fn execute_auto_plan(
             .or_default()
             .push(task);
     }
+    let inputs = match plan.tasks().first() {
+        Some(task) => Some(executor.capture_inputs(task).await?),
+        None => None,
+    };
     let (results, error) = run_buckets(buckets.into_values(), parallelism, |task| {
-        executor.execute(task)
+        executor.execute_captured(task, inputs.as_ref().expect("nonempty task plan"))
     })
     .await;
     let prepared = match error {
@@ -59,6 +65,14 @@ pub(in crate::table) async fn execute_auto_plan(
                     result.files.clone(),
                 );
                 message.new_changelog_files = result.changelog_files.clone();
+                message.new_index_files = result
+                    .index_entries
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .filter(|e| e.kind == crate::spec::FileKind::Add)
+                    .map(|e| e.index_file.clone())
+                    .collect();
                 message
             })
             .collect::<Vec<_>>();

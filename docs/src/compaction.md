@@ -59,6 +59,13 @@ Overwrite compaction is pinned to its own committed data snapshot, so suppressin
 overwrite changelogs cannot consume a later append's pending lookup events.
 As in Java, overwriting partitions being consumed by streaming readers is unsupported;
 lookup changelogs do not describe the overwrite operation itself.
+Automatic tasks share one captured snapshot and bucket-grouped source/index
+metadata per round. Automatic index fields also share captured source metadata;
+native builds only plan files overlapping missing or selected merge ranges.
+Covered fields can still consolidate runs when their thresholds are met.
+Captured metadata is released after the round. Publication and retries still
+validate current sources and index
+membership, and manual task execution captures fresh inputs on every call.
 Automatic lookup compaction supports the default `lookup-compact=radical` policy.
 `gentle` requires writer-lifetime trigger intervals and is explicitly unsupported
 here; use `write-only=true` and schedule dedicated compaction separately.
@@ -141,9 +148,9 @@ Per-column parameters use
 `fields.<column>.global-index.<family>.index-options`, a JSON object containing
 string, boolean, or numeric values. Short keys are qualified with the native
 writer prefix, such as `block-size` to `btree-index.block-size`. Fully qualified
-writer keys and shared shard options are accepted. Conflicting values are
-rejected, matching primary-key option resolution. Vector columns additionally
-require `fields.<column>.global-index.vector.index-type`; the optional
+writer keys and shared shard options are accepted. Conflicting native writer
+values are rejected, matching primary-key option resolution. Vector columns
+additionally require `fields.<column>.global-index.vector.index-type`; the optional
 `distance-metric` defaults to `inner_product`.
 Explicit single-column builds also use these declarations as defaults; explicit
 builder options take precedence over them.
@@ -151,23 +158,70 @@ FULL/DETAIL raw fallback uses the same per-column parameters as automatic
 builds, including vector metric defaults and full-text tokenization. A declared
 full-text column can use raw fallback before its first index is published.
 
-Each round captures the current schema and one source snapshot. Like Java
-primary-key index maintenance, it compares the desired sources with current
-index units and replaces changed units atomically. Global units use partition,
-bucket, and row-ID shard boundaries instead of primary-key LSM levels. Valid
-units are retained, missing ranges are built, and partial or fragmented shards
-are rebuilt from current rows. A physical compaction that preserves row IDs and
-values can retain existing global payloads. Additions and retired references
-publish together; old files remain available to historical snapshots.
+Each round captures the current schema and one source snapshot. Missing row-ID
+coverage is built as independent index files, retaining compatible existing
+payloads. Adjacent index ranges form runs within one partition, bucket and row-ID
+shard; logical row-ID holes are separate groups. The UniversalCompaction run
+selector is shared with PK data compaction. Global index runs use logical row
+counts as their size measure, so new ranges can participate in selection before
+encoding; PK data runs continue to use bytes and their existing level rules.
+
+Index merging has independent options with the same defaults as PK compaction:
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `global-index.num-sorted-run.compaction-trigger` | `5` | Run count at which size-based selection becomes eligible; must be positive. |
+| `global-index.compaction.size-ratio` | `1` | Percentage tolerance when extending a merge to the next run; must be nonnegative. |
+| `global-index.compaction.max-size-amplification-percent` | `200` | Select all runs when newer runs exceed this percentage of the oldest run; must be nonnegative. |
+
+These options can also appear, fully qualified, in per-column `index-options`
+JSON and override the corresponding table-level index policy. They do not change
+the table's data-compaction options. Above the run-count limit, the selector
+also makes progress when adjacent run sizes differ too much
+for the normal size ratio. A single run is never rebuilt just to compact itself.
+
+For example, with a 1000-row-ID shard, an existing `[0, 599]` index and a new
+`[600, 799]` batch stay as two files below the trigger. Once enough adjacent runs
+accumulate, selected ranges are rebuilt together from current data and sidecar
+values. A large older run can remain untouched while smaller tail runs merge.
+The implementation rebuilds selected data ranges rather than concatenating old
+native index payloads. A physical compaction preserving row IDs and values can
+retain global payloads. Shard-boundary changes, removed rows and incompatible
+vector definitions retire affected payloads immediately. Additions and retired
+references publish together; historical snapshots retain their old files.
+
+Scalar and full-text payload reuse also checks the indexed field's type. New file
+names record the actual builder schema ID; this remains valid after its source
+snapshot expires and permits current-schema builds over older data. Java opens
+the manifest's file name unchanged, so native and manifest formats are unchanged.
+Legacy names require a complete schema history with an unchanged field ID and
+type. Missing history or incompatible types cause atomic retirement and rebuild;
+scalar layout-option changes alone retain compatible runs. Full-text type
+changes, such as a shorter VARCHAR width, rebuild tokens from current logical
+text. Full-text runs also require an equivalent parsed native configuration;
+analyzer changes rebuild coverage, while explicit defaults preserve compatible
+leaves. Missing or invalid analyzer metadata is rebuilt conservatively.
+
+Vector training still uses the actual non-NULL count. If a small or sparse run
+cannot satisfy its native training configuration, such as a size-per-vector
+budget, maintenance may retry once with complete pending connected groups. This
+keeps the declared algorithm, metric and budget. I/O and training execution
+errors do not trigger this expansion. All-NULL vector builds retain Java's
+existing empty-build behavior: they publish no zero-byte DE index marker.
 Manual `commit_compact` also maintains declared indexes when `write-only=false`.
 An empty maintenance plan publishes no snapshot. Empty data commits, index-only
 commits, and truncation do not trigger a separate round. Indexed-column updates
 retain `global-index.column-update-action`: use `DROP_PARTITION_INDEX` to allow
 the data update and automatically rebuild the affected coverage. Changing a
-vector algorithm or distance metric retires all incompatible payloads for that
-column and publishes their replacements together. Other writer parameters alone
-do not rebuild unchanged coverage; changing shard boundaries can regroup it.
-This synchronous mode has no minimum-row or time threshold.
+vector algorithm, distance metric or dimension retires all incompatible payloads
+for that column and publishes their replacements together. Other vector training
+parameters alone do not rebuild unchanged coverage; changing shard boundaries
+can regroup it.
+Source vectors must satisfy a changed dimension. If they do not, maintenance
+fails without publishing mixed-dimension payloads; fix the source values and
+retry maintenance with the same originating commit identity.
+Missing coverage is processed synchronously without a minimum-row or time
+delay; index consolidation follows the run thresholds above.
 
 A concurrent snapshot or schema change causes private outputs to be discarded
 and coverage to be replanned, bounded by `commit.max-retries` and
@@ -251,6 +305,61 @@ The removed-file metric counts manifest removals, not physical deletion;
 snapshot expiration and storage reclamation are separate maintenance work.
 
 ## Primary-key compaction
+
+Primary-key compaction also maintains declared source-backed indexes, using
+Java's primary-key options:
+
+| Option | Meaning |
+| --- | --- |
+| `pk-btree.index.columns` | Comma-separated BTree columns. |
+| `pk-bitmap.index.columns` | Comma-separated bitmap columns. |
+| `pk-multivalue.index.columns` | Comma-separated array columns. |
+| `pk-fm.index.columns` | Comma-separated FM string columns. |
+| `pk-full-text.index.columns` | Comma-separated full-text string columns. |
+| `pk-vector.index.columns` | Vector column, subject to the existing PK vector constraints. |
+| `fields.<column>.pk-<family>.index.options` | JSON object of native writer options. |
+| `fields.<column>.pk-vector.index.type` | Vector algorithm, such as `ivf-flat`. |
+| `fields.<column>.pk-vector.distance.metric` | Vector metric: `l2`, `cosine`, or `inner_product`. |
+
+Declarations are unset by default. With `write-only=false`, the normal automatic
+compaction round maintains them. Explicit compaction also maintains them with
+`write-only=true`, for dedicated compactors. This uses the same native writers
+as global indexes. PK vector and full-text search retain their existing
+deletion-vector and search-mode requirements.
+
+Each payload covers the complete compacted file set for one partition, bucket,
+positive level and column. Source files are sorted by name; payload ordinals
+concatenate their physical rows, preserving NULL and tombstone positions.
+Each native build projects its indexed column rather than decoding every value
+column. As in Java, vector builds exclude captured DV positions and lookup
+deletions discovered by the current compaction, while keeping their physical
+positions in the source frame. Selection precedes schema casts; bounded NULL
+batches fill ordinal gaps for the shared native writer. Scalar and full-text
+builds retain physical rows.
+Unchanged coverage is retained. Changed coverage and incompatible vector
+definitions replace the previous references in the same COMPACT snapshot as
+data, changelogs and deletion vectors. Old payload files remain for historical
+snapshots. L0 files remain outside these indexes and use the existing read path.
+All-NULL vector levels retain an explicit empty segment, as in Java, so later
+maintenance reuses their coverage without rescanning or opening a native index.
+Vector payload row counts count indexed vectors; source ranges retain all physical positions.
+
+Commit validates the complete source set and captured index membership before
+publishing. Concurrent L0 appends and unrelated index changes can be rebased;
+changes to a maintained unit require a new plan.
+For newly built vector payloads, captured deleted positions must remain deleted
+at commit. Concurrent DV additions and container repacking can be rebased;
+restoring positions, for example through rollback-as-latest, requires re-execution.
+A failed build cleans its private outputs. A failed or uncertain commit retains
+prepared outputs for retry with the same results and commit user. Older serialized results lacking
+index maintenance must be re-executed before first publication when indexes
+need maintenance; already published results remain recoverable without their
+original source snapshot.
+As in Java, declared indexed columns cannot be renamed, dropped or have their
+type changed while the declaration remains in effect.
+If a declaration is removed to change a scalar column's type, retained files with
+different source types use the normal read path until rewritten. Maintenance and
+reads share this codec check, including when a type is changed back later.
 
 The same API compacts primary-key tables with `deduplicate`,
 `first-row`, `partial-update` or `aggregation` merge engines. Changelog producers
@@ -537,7 +646,8 @@ Ordered bucketed append, append incremental clustering, primary-key clustering
 override (`pk-clustering-override`) and record-level expiration
 (`record-level.expire-time`) are also unsupported.
 Snapshot index manifests may contain dynamic-bucket HASH indexes and primary-key
-deletion vectors, or deletion vectors and global indexes in Data Evolution mode.
+deletion vectors and source-backed PK indexes, or deletion vectors and global
+indexes in Data Evolution mode.
 Embedded and sidecar file indexes are regenerated according to the captured
 table options. The automatic behavior also applies to language bindings using the
 table committer. The manual compaction API and background compaction scheduling

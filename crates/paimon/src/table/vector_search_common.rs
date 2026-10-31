@@ -37,7 +37,15 @@ use std::io::Cursor;
 
 pub(super) use super::partition_filter::validate_partition_filter;
 
-/// Read persisted scoring semantics for both raw queries and definition compatibility checks.
+/// Persisted vector properties which must agree across all runs of one column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct IndexVectorSemantics {
+    pub metric: MetricType,
+    pub dimension: usize,
+}
+
+/// Read the scoring metric without requiring dimension metadata or a payload read.
+/// Older callers and JSON-only metadata need only this scoring property.
 pub(super) async fn read_index_vector_metric(
     file_io: &FileIO,
     table_path: &str,
@@ -51,19 +59,63 @@ pub(super) async fn read_index_vector_metric(
     }
     if let Some(index_meta) = global_meta.index_meta.as_ref() {
         if let Ok(options) = serde_json::from_slice::<HashMap<String, String>>(index_meta) {
-            if let Some(metric) = options.get("metric") {
-                let metric = match normalize_metric(metric).as_str() {
-                    "l2" => Some(MetricType::L2),
-                    "cosine" => Some(MetricType::Cosine),
-                    "inner_product" => Some(MetricType::InnerProduct),
-                    _ => None,
-                };
-                if metric.is_some() {
-                    return Ok(metric);
-                }
+            if let Some(metric) = metric_from_index_options(&options) {
+                return Ok(Some(metric));
             }
         }
     }
+    Ok(Some(
+        read_index_vector_header(file_io, table_path, entry)
+            .await?
+            .metric,
+    ))
+}
+
+/// Read the structural definition of an existing run before reusing its coverage.
+/// Java and older metadata may omit these options, so fall back to the native header.
+pub(super) async fn read_index_vector_semantics(
+    file_io: &FileIO,
+    table_path: &str,
+    entry: &IndexManifestEntry,
+) -> crate::Result<Option<IndexVectorSemantics>> {
+    let Some(global_meta) = entry.index_file.global_index_meta.as_ref() else {
+        return Ok(None);
+    };
+    if !is_vindex_index_type(&entry.index_file.index_type) {
+        return Ok(None);
+    }
+    if let Some(index_meta) = global_meta.index_meta.as_ref() {
+        if let Ok(options) = serde_json::from_slice::<HashMap<String, String>>(index_meta) {
+            let dimension = options
+                .get("dimension")
+                .and_then(|value| value.parse::<usize>().ok())
+                .filter(|dimension| *dimension > 0);
+            if let (Some(metric), Some(dimension)) =
+                (metric_from_index_options(&options), dimension)
+            {
+                return Ok(Some(IndexVectorSemantics { metric, dimension }));
+            }
+        }
+    }
+    Ok(Some(
+        read_index_vector_header(file_io, table_path, entry).await?,
+    ))
+}
+
+fn metric_from_index_options(options: &HashMap<String, String>) -> Option<MetricType> {
+    match normalize_metric(options.get("metric")?).as_str() {
+        "l2" => Some(MetricType::L2),
+        "cosine" => Some(MetricType::Cosine),
+        "inner_product" => Some(MetricType::InnerProduct),
+        _ => None,
+    }
+}
+
+async fn read_index_vector_header(
+    file_io: &FileIO,
+    table_path: &str,
+    entry: &IndexManifestEntry,
+) -> crate::Result<IndexVectorSemantics> {
     let path = IndexFileLocation::Global { table_path }.resolve(
         &entry.index_file.file_name,
         entry.index_file.external_path.as_deref(),
@@ -95,7 +147,11 @@ pub(super) async fn read_index_vector_metric(
         ),
         source: Some(Box::new(e)),
     })?;
-    Ok(Some(reader.metadata().metric))
+    let metadata = reader.metadata();
+    Ok(IndexVectorSemantics {
+        metric: metadata.metric,
+        dimension: metadata.dimension,
+    })
 }
 
 pub(super) fn add_filter(current: &mut Option<Predicate>, filter: Predicate) {
@@ -512,4 +568,104 @@ pub(super) fn targets_primary_key_column(core: &CoreOptions<'_>, column: &str) -
             .primary_key_vector_index_columns()
             .ok()
             .is_some_and(|columns| columns.iter().any(|c| c == column))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::io::FileIOBuilder;
+    use crate::spec::{GlobalIndexMeta, IndexFileMeta};
+
+    fn entry(index_meta: Option<Vec<u8>>) -> IndexManifestEntry {
+        IndexManifestEntry {
+            version: 1,
+            kind: FileKind::Add,
+            partition: Vec::new(),
+            bucket: 0,
+            index_file: IndexFileMeta {
+                index_type: "ivf-flat".into(),
+                file_name: "vectors.index".into(),
+                file_size: 0,
+                row_count: 3,
+                deletion_vectors_ranges: None,
+                external_path: None,
+                global_index_meta: Some(GlobalIndexMeta {
+                    row_range_start: 0,
+                    row_range_end: 2,
+                    index_field_id: 1,
+                    extra_field_ids: None,
+                    index_meta,
+                    source_meta: None,
+                }),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn metric_only_json_does_not_require_dimension_or_payload() {
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let entry = entry(Some(br#"{"metric":"L2"}"#.to_vec()));
+        let table_path = "memory:/metric-only-vector-metadata";
+        assert!(!file_io
+            .exists(&format!("{table_path}/index/vectors.index"))
+            .await
+            .unwrap());
+        assert_eq!(
+            read_index_vector_metric(&file_io, table_path, &entry)
+                .await
+                .unwrap(),
+            Some(MetricType::L2)
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_vector_semantics_json_does_not_read_payload() {
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let entry = entry(Some(
+            br#"{"metric":"inner-product","dimension":"3"}"#.to_vec(),
+        ));
+        let table_path = "memory:/complete-vector-metadata";
+        assert!(!file_io
+            .exists(&format!("{table_path}/index/vectors.index"))
+            .await
+            .unwrap());
+        assert_eq!(
+            read_index_vector_semantics(&file_io, table_path, &entry)
+                .await
+                .unwrap(),
+            Some(IndexVectorSemantics {
+                metric: MetricType::InnerProduct,
+                dimension: 3,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_vector_semantics_read_dimension_from_native_header() {
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let table_path = "memory:/legacy-vector-metadata";
+        let payload = crate::table::vector_search_test_utils::build_vindex_segment_bytes("l2");
+        file_io
+            .new_output(&format!("{table_path}/index/vectors.index"))
+            .unwrap()
+            .write(payload.into())
+            .await
+            .unwrap();
+        for index_meta in [
+            None,
+            Some(br#"{}"#.to_vec()),
+            Some(br#"{"metric":"l2"}"#.to_vec()),
+            Some(br#"{"metric":"l2","dimension":"0"}"#.to_vec()),
+        ] {
+            assert_eq!(
+                read_index_vector_semantics(&file_io, table_path, &entry(index_meta))
+                    .await
+                    .unwrap(),
+                Some(IndexVectorSemantics {
+                    metric: MetricType::L2,
+                    dimension: 2,
+                })
+            );
+        }
+    }
 }

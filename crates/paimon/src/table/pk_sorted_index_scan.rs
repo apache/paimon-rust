@@ -86,50 +86,9 @@ fn definition_options(options: &Options, column: &str, family: &str) -> Result<O
     let mut resolved = options.clone();
     resolved.remove("sorted-index.records-per-file");
     resolved.remove("sorted-index.records-per-range");
-    let option_key = format!("fields.{column}.pk-{family}.index.options");
-    let Some(raw) = options
-        .get(&option_key)
-        .filter(|raw| !raw.trim().is_empty())
-    else {
-        return Ok(resolved);
-    };
-    let parsed: serde_json::Map<String, serde_json::Value> =
-        serde_json::from_str(raw).map_err(|_| {
-            config_invalid(format!(
-                "{option_key} must be a JSON object of option key-value pairs"
-            ))
-        })?;
-    let prefix = format!("{family}-index.");
-    for (key, value) in parsed {
-        if key.trim().is_empty() {
-            return Err(config_invalid(format!(
-                "{option_key} contains an empty option key"
-            )));
-        }
-        let value = match value {
-            serde_json::Value::String(value) => value,
-            serde_json::Value::Number(_) | serde_json::Value::Bool(_) => value.to_string(),
-            _ => {
-                return Err(config_invalid(format!(
-                    "{option_key} contains an invalid option value for {key}"
-                )))
-            }
-        };
-        let qualified = if key.starts_with(&prefix) || key.starts_with("fields.") {
-            key
-        } else {
-            format!("{prefix}{key}")
-        };
-        if resolved
-            .get(&qualified)
-            .is_some_and(|previous| previous != &value)
-        {
-            return Err(config_invalid(format!(
-                "{option_key} defines conflicting values for {qualified}"
-            )));
-        }
-        resolved.insert(qualified, value);
-    }
+    resolved.extend(super::pk_index_options::field_options(
+        options, column, family, family,
+    )?);
     Ok(resolved)
 }
 
@@ -468,7 +427,57 @@ pub(super) async fn refine(
     definitions: &[Definition],
     predicates: &[Predicate],
 ) -> Result<Vec<DataSplit>> {
-    let (groups, sources) = plan_groups(table, &splits, entries, definitions);
+    // Source frames contain file names and counts, but no key type. A declaration
+    // may have been removed before an allowed type change and then re-added.
+    // Equal-width encodings (for example INT/FLOAT) cannot be distinguished by
+    // the native reader. Writers prove one unchanged codec across the complete
+    // level. Check every visible active source here; retired/stats-pruned sources
+    // keep their ordinal offsets without preventing partial-coverage reads.
+    let files = splits
+        .iter()
+        .flat_map(|split| {
+            split.data_files().iter().map(move |file| {
+                (
+                    (
+                        split.partition().to_serialized_bytes(),
+                        split.bucket(),
+                        file.file_name.as_str(),
+                    ),
+                    file,
+                )
+            })
+        })
+        .collect::<HashMap<_, _>>();
+    let mut compatible = Vec::new();
+    for entry in entries {
+        let Some(meta) = &entry.index_file.global_index_meta else {
+            continue;
+        };
+        let Some(field) = table
+            .schema()
+            .fields()
+            .iter()
+            .find(|field| field.id() == meta.index_field_id)
+        else {
+            continue;
+        };
+        let Ok(source) = PrimaryKeyIndexSourceMeta::from_global_index_meta(meta) else {
+            continue;
+        };
+        let source_files = source
+            .source_files()
+            .iter()
+            .filter_map(|source| {
+                files
+                    .get(&(entry.partition.clone(), entry.bucket, source.file_name()))
+                    .copied()
+            })
+            .collect::<Vec<_>>();
+        if super::pk_index_schema::source_types_match(table, field, &source_files).await {
+            compatible.push(entry.clone());
+        }
+    }
+    let (groups, sources) = plan_groups(table, &splits, &compatible, definitions);
     if groups.is_empty() {
         return Ok(splits);
     }

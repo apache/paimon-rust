@@ -95,23 +95,60 @@ impl TableCommit {
             if definitions.is_empty() {
                 return Ok(());
             }
-            let data = crate::table::snapshot_manifest::read_snapshot_entries(
-                &self.snapshot_manager,
-                snapshot,
-                None,
-            )
-            .await?;
-            let view = GlobalIndexBuildView::capture(&table, Some(snapshot.clone())).await?;
+            let data: Arc<[ManifestEntry]> =
+                crate::table::snapshot_manifest::read_snapshot_entries(
+                    &self.snapshot_manager,
+                    snapshot,
+                    None,
+                )
+                .await?
+                .into();
+            let view = GlobalIndexBuildView::capture(&table, Some(snapshot.clone()))
+                .await?
+                .with_source_entries(data.clone());
             let mut messages = Vec::new();
             let prepared: Result<()> = async {
                 for definition in definitions {
-                    let plan =
+                    let mut plan =
                         planning::plan(&table, &definition, &data, view.index_entries()).await?;
-                    let built = definition
-                        .builder(&table)
-                        .build_with_view(plan.build_view(&view))
-                        .await?;
-                    messages.extend(built);
+                    if plan.needs_build {
+                        let built = match definition
+                            .builder(&table)
+                            .build_with_view(plan.build_view(&view))
+                            .await
+                        {
+                            Ok(built) => built,
+                            Err(error) => {
+                                let expandable =
+                                    crate::table::index_build::vector::training_range(&error)
+                                        .is_some_and(|range| {
+                                            plan.can_expand_training_range(&range)
+                                        });
+                                if !expandable {
+                                    return Err(error);
+                                }
+                                // A small/sparse leaf may not meet a persisted-size
+                                // objective. Retry once with larger pending groups;
+                                // keep the same codec, metric and source snapshot.
+                                plan = planning::plan_for_training(
+                                    &table,
+                                    &definition,
+                                    &data,
+                                    view.index_entries(),
+                                )
+                                .await?;
+                                definition
+                                    .builder(&table)
+                                    .build_with_view(plan.build_view(&view))
+                                    .await?
+                            }
+                        };
+                        messages.extend(built);
+                    } else {
+                        // Preserve validation for a refreshed schema without
+                        // planning already covered shards.
+                        definition.builder(&table).validate().await?;
+                    }
                     messages.extend(plan.deletions);
                 }
                 Ok(())
@@ -177,5 +214,67 @@ pub(super) fn auto_index_error(identifier: i64, error: crate::Error) -> crate::E
     crate::Error::UnexpectedError {
         message: format!("Data commit {identifier} succeeded, but automatic index build failed; retry through the corresponding recovery API with the same commit user and identifier"),
         source: Some(Box::new(error)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::table::table_commit::auto_index_tests::{assert_complete, latest, messages, table};
+    #[tokio::test]
+    async fn builders_only_plan_sources_overlapping_changed_units() {
+        use crate::table::global_index_options::definitions;
+        let table = table(Some(true), false).await;
+        TableCommit::new(table.clone(), "initial".into())
+            .commit(messages(&table, vec![1, 2]).await)
+            .await
+            .unwrap();
+        let raw = table.copy_with_options(HashMap::from([("write-only".into(), "true".into())]));
+        TableCommit::new(raw.clone(), "append".into())
+            .commit(messages(&raw, vec![3, 4]).await)
+            .await
+            .unwrap();
+        let snapshot = latest(&table).await;
+        let data: Arc<[ManifestEntry]> = crate::table::snapshot_manifest::read_snapshot_entries(
+            &table.snapshot_manager(),
+            &snapshot,
+            None,
+        )
+        .await
+        .unwrap()
+        .into();
+        assert_eq!(data.len(), 2);
+        let view = GlobalIndexBuildView::capture(&table, Some(snapshot))
+            .await
+            .unwrap()
+            .with_source_entries(data.clone());
+        let mut messages = Vec::new();
+        for definition in definitions(&table).unwrap() {
+            let plan = planning::plan(&table, &definition, &data, view.index_entries())
+                .await
+                .unwrap();
+            assert!(plan.needs_build);
+            let build_view = plan.build_view(&view);
+            let sources = build_view.manifest_entries(&table, None).await.unwrap();
+            assert_eq!(
+                sources.len(),
+                1,
+                "covered units must not enter per-column shard planning"
+            );
+            assert_eq!(sources[0].file().first_row_id, Some(2));
+            messages.extend(
+                definition
+                    .builder(&table)
+                    .build_with_view(build_view)
+                    .await
+                    .unwrap(),
+            );
+        }
+        assert_eq!(messages.len(), 2);
+        TableCommit::new(table.clone(), "build-new".into())
+            .commit(messages)
+            .await
+            .unwrap();
+        assert_complete(&table).await;
     }
 }

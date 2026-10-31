@@ -16,6 +16,85 @@
 // under the License.
 
 use super::*;
+
+#[tokio::test]
+async fn direct_scalar_builder_normalizes_native_type_and_manifest_together() {
+    use crate::spec::IndexManifestEntry;
+    use crate::table::global_index_scanner::GlobalIndexScanner;
+    for (configured, canonical) in [("BTREE", "btree"), ("Bitmap", "bitmap"), ("FM", "fm")] {
+        let table = test_table_with_path(
+            &format!("memory:/scalar_type_case/{}", uuid::Uuid::new_v4()),
+            table_options("10"),
+        );
+        setup_dirs(&table).await;
+        let mut write = TableWrite::new(&table, "case-source".into()).unwrap();
+        write
+            .write_arrow_batch(&data_batch(vec![1, 2, 3], vec!["alice", "bob", "alice"]))
+            .await
+            .unwrap();
+        TableCommit::new(table.clone(), "case-source".into())
+            .commit(write.prepare_commit().await.unwrap())
+            .await
+            .unwrap();
+        let mut build = SortedGlobalIndexBuildBuilder::new(&table);
+        build
+            .with_index_columns(&["name"])
+            .with_index_type(configured)
+            .with_options(HashMap::from([(
+                "fm-index.sa-sample-rate".into(),
+                "1".into(),
+            )]));
+        let (_, messages) = build.prepare().await.unwrap();
+        let entries = messages
+            .iter()
+            .flat_map(|message| {
+                message.new_index_files.iter().map(|file| {
+                    assert_eq!(file.index_type, canonical);
+                    assert!(file
+                        .file_name
+                        .starts_with(&format!("{canonical}-global-index-")));
+                    IndexManifestEntry {
+                        kind: FileKind::Add,
+                        partition: message.partition.clone(),
+                        bucket: message.bucket,
+                        index_file: file.clone(),
+                        version: 1,
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        let scanner = GlobalIndexScanner::create_with_fm_options(
+            table.file_io(),
+            table.location(),
+            1,
+            i64::MAX,
+            128 * 1024 * 1024,
+            i64::MAX,
+            &entries,
+            table.schema().fields(),
+            crate::fm_index::FMReadOptions {
+                locate_cost_ratio: 1.0,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .unwrap();
+        let predicates = PredicateBuilder::new(table.schema().fields());
+        let predicate = if canonical == "fm" {
+            predicates
+                .contains("name", Datum::String("bo".into()))
+                .unwrap()
+        } else {
+            predicates
+                .equal("name", Datum::String("bob".into()))
+                .unwrap()
+        };
+        assert_eq!(
+            scanner.matching_ranges(&predicate).await.unwrap(),
+            Some(vec![RowRange::new(1, 1)])
+        );
+    }
+}
 use crate::btree::{BTreeFileFooter, BTreeIndexMeta};
 use crate::catalog::Identifier;
 use crate::io::FileIOBuilder;
@@ -42,14 +121,23 @@ use std::sync::Arc;
 /// rejected, and an inverted or overflowing range is still an error.
 #[test]
 fn checked_row_count_spans_beyond_i32() {
+    let checked_row_count = |start, end| {
+        // Persisted ranges can bypass RowRange::new's ordering assertion.
+        let range = serde_json::from_value::<RowRange>(serde_json::json!({
+            "from": start,
+            "to": end,
+        }))
+        .unwrap();
+        crate::table::index_build::row_count(&range)
+    };
     let start = 0;
     let end = i64::from(i32::MAX) + 10;
     assert_eq!(
-        super::checked_row_count(start, end).unwrap(),
+        checked_row_count(start, end).unwrap(),
         i64::from(i32::MAX) + 11
     );
-    assert!(super::checked_row_count(5, 4).is_err());
-    assert!(super::checked_row_count(i64::MIN, i64::MAX).is_err());
+    assert!(checked_row_count(5, 4).is_err());
+    assert!(checked_row_count(i64::MIN, i64::MAX).is_err());
 }
 
 fn data_file(name: &str, first_row_id: Option<i64>, row_count: i64) -> DataFileMeta {

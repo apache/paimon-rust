@@ -15,32 +15,28 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::extraction::{data_split_for_shard, local_ids, validate_vector_batch};
+use super::extraction::data_split_for_shard;
 use super::pipeline::GranuleBuildOutcome;
 use super::planning::VindexIndexShard;
 use super::timing::{vector_index_build_timing_enabled, VectorIndexBuildTiming};
-use super::validation::{
-    checked_i64, checked_row_count, checked_std_vector_bytes, checked_training_sample_index,
-    checked_training_vector_count, checked_vector_bytes,
-};
+use super::validation::checked_row_count;
 use super::VindexIndexBuildBuilder;
 use crate::spec::{GlobalIndexMeta, IndexFileMeta, ROW_ID_FIELD_NAME};
 use crate::table::data_file_reader::DataFileReadTiming;
 use crate::table::table_read::configured_parquet_read_budget;
 use crate::vindex::{VindexVectorIndexOptions, DISKANN_IDENTIFIER};
 use crate::{Error, Result};
-use arrow_buffer::MutableBuffer;
 use futures::TryStreamExt;
-use paimon_vindex_core::autotune::default_training_vector_count;
-use paimon_vindex_core::index::{VectorIndexConfig, VectorIndexTrainer, VectorIndexWriter};
-use paimon_vindex_core::io::PosWriter;
-use std::io::{Read, Seek, SeekFrom};
+use paimon_vindex_core::index::VectorIndexWriter;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::io::AsyncWriteExt;
-use tokio_util::io::SyncIoBridge;
 
-const VECTOR_BUFFER_BYTES: usize = 8 * 1024 * 1024;
+use crate::table::index_build::{
+    vector::{serialize_writer, TrainedVectors, VectorSpill},
+    IndexFileWriter, IndexPayload,
+};
+use crate::table::index_file_path::IndexFileLocation;
+use crate::table::RowRange;
 
 pub(super) struct BuiltIndexFile {
     pub(super) meta: IndexFileMeta,
@@ -140,15 +136,10 @@ impl<'a> VindexIndexBuildBuilder<'a> {
             message: format!("Invalid vindex dimension: {dimension}"),
             source: Some(Box::new(e)),
         })?;
-        if dimension_usize == 0 {
-            return Err(Error::DataInvalid {
-                message: "vindex vector dimension must be positive".to_string(),
-                source: None,
-            });
-        }
-        checked_vector_bytes(row_count_usize, dimension_usize)?;
-        let mut raw_file = temporary_vector_file("vectors")?;
-        let mut id_file = temporary_vector_file("row IDs")?;
+        let mut spill = VectorSpill::new(
+            RowRange::new(shard.row_range_start, shard.row_range_end),
+            dimension_usize,
+        )?;
         let split = data_split_for_shard(shard)?;
         let mut read_builder = self.table.new_read_builder();
         read_builder.with_projection(&[index_column, ROW_ID_FIELD_NAME])?;
@@ -162,10 +153,6 @@ impl<'a> VindexIndexBuildBuilder<'a> {
             None => read,
         };
         let mut batches = read.to_arrow(&[split])?;
-        let mut expected_row_id = shard.row_range_start;
-        let mut rows_seen = 0usize;
-        let mut vector_count = 0usize;
-        let mut bytes_written = 0usize;
         loop {
             let source_start = timing_enabled.then(Instant::now);
             let batch = batches.try_next().await?;
@@ -174,105 +161,24 @@ impl<'a> VindexIndexBuildBuilder<'a> {
             }
             let Some(batch) = batch else { break };
             batch_count += 1;
-            let vectors =
-                validate_vector_batch(&batch, index_column, dimension_usize, &mut expected_row_id)?;
-            rows_seen =
-                rows_seen
-                    .checked_add(vectors.source_rows)
-                    .ok_or_else(|| Error::DataInvalid {
-                        message: "vindex streamed row count overflows usize".into(),
-                        source: None,
-                    })?;
-            vector_count = vector_count
-                .checked_add(vectors.vector_count)
-                .ok_or_else(|| Error::DataInvalid {
-                    message: "vindex streamed vector count overflows usize".into(),
-                    source: None,
-                })?;
-            let ids: arrow_buffer::ScalarBuffer<i64> =
-                local_ids(&vectors.row_ids, shard.row_range_start, row_count_usize)?.into();
-            let raw_write_start = timing_enabled.then(Instant::now);
-            raw_file
-                .write_all(vectors.bytes())
-                .await
-                .map_err(spill_error)?;
-            id_file
-                .write_all(ids.inner().as_slice())
-                .await
-                .map_err(spill_error)?;
-            if let Some(start) = raw_write_start {
-                raw_temp_write = raw_temp_write.saturating_add(start.elapsed());
-            }
-            bytes_written = bytes_written
-                .checked_add(vectors.bytes().len())
-                .ok_or_else(|| Error::DataInvalid {
-                    message: "vindex spilled byte count overflows usize".into(),
-                    source: None,
-                })?;
+            raw_temp_write = raw_temp_write.saturating_add(
+                spill
+                    .push_batch(&batch, index_column, timing_enabled)
+                    .await?,
+            );
         }
-        let expected_end =
-            shard
-                .row_range_end
-                .checked_add(1)
-                .ok_or_else(|| Error::DataInvalid {
-                    message: "vindex row range end overflows i64".into(),
-                    source: None,
-                })?;
-        if rows_seen != row_count_usize
-            || expected_row_id != expected_end
-            || bytes_written != checked_vector_bytes(vector_count, dimension_usize)?
-        {
-            return Err(Error::DataInvalid {
-                message: format!("vindex streamed data mismatch: rows={rows_seen}/{row_count_usize}, vectors={vector_count}, bytes={bytes_written}"), source: None,
-            });
-        }
-        // Like Java NativeVectorGlobalIndexWriter.finish: no vectors means no file.
-        if vector_count == 0 {
+        let bytes_written = spill.bytes_written();
+        let Some(spill) = spill.finish().await? else {
             return Ok(None);
-        }
-        raw_file.flush().await.map_err(spill_error)?;
-        id_file.flush().await.map_err(spill_error)?;
-        if raw_file.metadata().await.map_err(spill_error)?.len() != bytes_written as u64
-            || id_file.metadata().await.map_err(spill_error)?.len()
-                != checked_vector_bytes(vector_count, 2)? as u64
-        {
-            return Err(Error::DataInvalid {
-                message: "temporary vindex vector or row ID file size mismatch".into(),
-                source: None,
-            });
-        }
-        let raw_file = raw_file.into_std().await;
-        let id_file = id_file.into_std().await;
-        let training_vector_count =
-            checked_training_vector_count(vector_count, options.train_sample_ratio)?;
-        let config = options.training_config(vector_count)?;
-        let training_rows_retained = if timing_enabled {
-            default_training_vector_count(training_vector_count, config.nlist()).unwrap_or(0)
-        } else {
-            0
         };
-        let ratio = options.train_sample_ratio;
-        let (writer, train_finish, raw_temp_reread, index_add) =
-            tokio::task::spawn_blocking(move || {
-                train_and_add_spilled_vectors(
-                    raw_file,
-                    id_file,
-                    config,
-                    vector_count,
-                    dimension_usize,
-                    ratio,
-                    timing_enabled,
-                )
-            })
-            .await
-            .map_err(|e| Error::UnexpectedError {
-                message: format!("vindex training task failed: {e}"),
-                source: None,
-            })?
-            .map_err(|e| Error::UnexpectedError {
-                message: format!("Failed to train or add vectors to vindex index: {e}"),
-                source: Some(Box::new(e)),
-            })?;
+        let TrainedVectors {
+            writer,
+            train_finish,
+            raw_temp_reread,
+            index_add,
+            training_vector_count,
+            training_rows_retained,
+        } = spill.train(options, timing_enabled).await?;
 
         let serialize_upload_start = timing_enabled.then(Instant::now);
         let meta = self
@@ -339,162 +245,35 @@ impl<'a> VindexIndexBuildBuilder<'a> {
             self.index_type,
             uuid::Uuid::new_v4()
         );
-        let (index_path, external_path) =
-            crate::table::global_index_build_common::prepare_index_file_path(
-                self.table, &file_name,
-            )
-            .await?;
-        let write_result = async {
-            let async_writer = self
-                .table
-                .file_io()
-                .new_output(&index_path)?
-                .async_writer()
-                .await?;
-            let mut output = SyncIoBridge::new(async_writer);
-            tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-                let mut writer = writer;
-                writer.write(&mut PosWriter::new(&mut output))?;
-                output.shutdown()
-            })
-            .await
-            .map_err(|e| Error::UnexpectedError {
-                message: format!("vindex serialization task failed: {e}"),
-                source: None,
-            })?
-            .map_err(|e| Error::UnexpectedError {
-                message: format!("Failed to stream vindex index: {e}"),
-                source: Some(Box::new(e)),
-            })?;
-            self.table.file_io().get_status(&index_path).await
-        }
-        .await;
-        let status = match write_result {
-            Ok(status) => status,
-            Err(error) => {
-                let _ = self.table.file_io().delete_file(&index_path).await;
-                return Err(error);
-            }
+        let meta = GlobalIndexMeta {
+            row_range_start: shard.row_range_start,
+            row_range_end: shard.row_range_end,
+            index_field_id,
+            extra_field_ids: None,
+            source_meta: Some(
+                crate::spec::DataEvolutionIndexSourceMeta::new(shard.snapshot_id)?.serialize(),
+            ),
+            index_meta: None,
         };
-        Ok(IndexFileMeta {
-            index_type: self.index_type.clone(),
+        IndexFileWriter::new(
+            self.table,
+            &self.index_type,
             file_name,
-            file_size: checked_i64(
-                status.size,
-                "Index file is too large for Rust IndexFileMeta",
-            )?,
-            row_count,
-            deletion_vectors_ranges: None,
-            external_path,
-            global_index_meta: Some(GlobalIndexMeta {
-                row_range_start: shard.row_range_start,
-                row_range_end: shard.row_range_end,
-                index_field_id,
-                extra_field_ids: None,
-                source_meta: Some(
-                    crate::spec::DataEvolutionIndexSourceMeta::new(shard.snapshot_id)?.serialize(),
-                ),
-                index_meta: Some(index_meta),
-            }),
+            IndexFileLocation::Global {
+                table_path: self.table.location().trim_end_matches('/'),
+            },
+            "",
+            meta,
+        )
+        .await?
+        .write(self.table, |output| async move {
+            serialize_writer(writer, output).await?;
+            Ok(Some(IndexPayload {
+                row_count,
+                index_meta,
+            }))
         })
+        .await
+        .map(|file| file.expect("trained vector payload"))
     }
-}
-
-fn spill_error(error: std::io::Error) -> Error {
-    Error::UnexpectedError {
-        message: format!("Failed to spill vindex vectors: {error}"),
-        source: Some(Box::new(error)),
-    }
-}
-
-fn temporary_vector_file(kind: &str) -> Result<tokio::fs::File> {
-    tempfile::tempfile()
-        .map(tokio::fs::File::from_std)
-        .map_err(|error| Error::UnexpectedError {
-            message: format!("Failed to create temporary vindex {kind} file: {error}"),
-            source: Some(Box::new(error)),
-        })
-}
-
-/// Java samples the compacted non-null vector stream, then adds the original relative IDs.
-fn train_and_add_spilled_vectors(
-    mut raw_file: std::fs::File,
-    mut id_file: std::fs::File,
-    config: VectorIndexConfig,
-    vector_count: usize,
-    dimension: usize,
-    ratio: f64,
-    timing_enabled: bool,
-) -> std::io::Result<(VectorIndexWriter, Duration, Duration, Duration)> {
-    let train_start = timing_enabled.then(Instant::now);
-    let samples =
-        checked_training_vector_count(vector_count, ratio).map_err(std::io::Error::other)?;
-    let batch_rows = (VECTOR_BUFFER_BYTES / checked_std_vector_bytes(1, dimension)?)
-        .max(1)
-        .min(vector_count);
-    let mut buffer = MutableBuffer::new(checked_std_vector_bytes(batch_rows, dimension)?);
-    let mut sample_buffer = Vec::with_capacity(batch_rows * dimension);
-    let mut trainer = VectorIndexTrainer::new(config)?;
-    raw_file.seek(SeekFrom::Start(0))?;
-    let mut rows_seen = 0;
-    let mut selected = 0;
-    while rows_seen < vector_count {
-        let rows = batch_rows.min(vector_count - rows_seen);
-        buffer.resize(checked_std_vector_bytes(rows, dimension)?, 0);
-        raw_file.read_exact(buffer.as_slice_mut())?;
-        let values = buffer.typed_data::<f32>();
-        while selected < samples {
-            let sample = checked_training_sample_index(selected, vector_count, samples)
-                .map_err(std::io::Error::other)?;
-            if sample >= rows_seen + rows {
-                break;
-            }
-            let offset = (sample - rows_seen) * dimension;
-            sample_buffer.extend_from_slice(&values[offset..offset + dimension]);
-            selected += 1;
-        }
-        if !sample_buffer.is_empty() {
-            trainer.add_training_vectors_mut(&sample_buffer, sample_buffer.len() / dimension)?;
-            sample_buffer.clear();
-        }
-        rows_seen += rows;
-    }
-    if selected != samples {
-        return Err(std::io::Error::other(
-            "vindex training sample count mismatch",
-        ));
-    }
-    let training = trainer.finish()?;
-    let train_finish = train_start.map_or(Duration::ZERO, |start| start.elapsed());
-    let mut writer = VectorIndexWriter::new(training);
-    let mut raw_temp_reread = Duration::ZERO;
-    let mut index_add = Duration::ZERO;
-    raw_file.seek(SeekFrom::Start(0))?;
-    id_file.seek(SeekFrom::Start(0))?;
-    let mut ids = MutableBuffer::new(batch_rows * std::mem::size_of::<i64>());
-    let mut rows_added = 0;
-    while rows_added < vector_count {
-        let rows = batch_rows.min(vector_count - rows_added);
-        buffer.resize(checked_std_vector_bytes(rows, dimension)?, 0);
-        ids.resize(rows * std::mem::size_of::<i64>(), 0);
-        let read_start = timing_enabled.then(Instant::now);
-        raw_file.read_exact(buffer.as_slice_mut())?;
-        id_file.read_exact(ids.as_slice_mut())?;
-        if let Some(start) = read_start {
-            raw_temp_reread = raw_temp_reread.saturating_add(start.elapsed());
-        }
-        let add_start = timing_enabled.then(Instant::now);
-        writer.add_vectors(ids.typed_data::<i64>(), buffer.typed_data::<f32>(), rows)?;
-        if let Some(start) = add_start {
-            index_add = index_add.saturating_add(start.elapsed());
-        }
-        rows_added += rows;
-    }
-    let mut trailing = [0u8; 1];
-    if raw_file.read(&mut trailing)? != 0 || id_file.read(&mut trailing)? != 0 {
-        return Err(std::io::Error::other(
-            "temporary vindex vector or row ID file contains trailing bytes",
-        ));
-    }
-    Ok((writer, train_finish, raw_temp_reread, index_add))
 }

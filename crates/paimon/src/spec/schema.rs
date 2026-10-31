@@ -879,7 +879,14 @@ fn assert_not_updating_primary_key_index_column(
         .iter()
         .any(|column| column == field_name);
 
-    if is_vector_index_column || is_full_text_index_column {
+    let is_scalar_index_column = ["btree", "bitmap", "multivalue", "fm"]
+        .iter()
+        .any(|family| {
+            options
+                .get(&format!("pk-{family}.index.columns"))
+                .is_some_and(|columns| columns.split(',').any(|column| column.trim() == field_name))
+        });
+    if is_vector_index_column || is_full_text_index_column || is_scalar_index_column {
         return Err(crate::Error::Unsupported {
             message: format!("Cannot {operation} primary-key index column: [{field_name}]"),
         });
@@ -5760,6 +5767,45 @@ mod tests {
                 matches!(err, crate::Error::Unsupported { ref message }
                     if message == &expected_message),
                 "expected primary-key index guard, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_rejects_destructive_primary_key_scalar_index_column_changes() {
+        for family in ["btree", "bitmap", "multivalue", "fm"] {
+            let data_type = match family {
+                "fm" => DataType::VarChar(VarCharType::string_type()),
+                "multivalue" => DataType::Array(ArrayType::new(DataType::Int(IntType::new()))),
+                _ => DataType::Int(IntType::new()),
+            };
+            let table_schema = TableSchema::new(
+                0,
+                &Schema::builder()
+                    .column("id", DataType::Int(IntType::new()))
+                    .column("value", data_type)
+                    .primary_key(["id"])
+                    .option("bucket", "1")
+                    .option(format!("pk-{family}.index.columns"), "value")
+                    .build()
+                    .unwrap(),
+            );
+            assert_primary_key_index_column_changes_rejected(
+                &table_schema,
+                "value",
+                DataType::BigInt(crate::spec::BigIntType::new()),
+            );
+            let error = table_schema
+                .apply_changes(vec![
+                    crate::spec::SchemaChange::remove_option(format!("pk-{family}.index.columns")),
+                    crate::spec::SchemaChange::rename_column("value".into(), "renamed".into()),
+                ])
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("Cannot rename primary-key index column"),
+                "{error}"
             );
         }
     }

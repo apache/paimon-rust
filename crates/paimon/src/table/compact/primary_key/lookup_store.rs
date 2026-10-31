@@ -64,6 +64,7 @@ pub(in crate::table::compact) async fn provider(
     files: Vec<DataFileMeta>,
     cache: Arc<LookupFileCache>,
     resources: Option<ResourceContext>,
+    indexes: &[crate::spec::IndexManifestEntry],
 ) -> Result<(Arc<dyn LookupProvider>, Option<LookupDeletions>)> {
     let fields = super::read_type(table);
     let keys = table
@@ -101,14 +102,7 @@ pub(in crate::table::compact) async fn provider(
         .with_data_files(files.clone())
         .build()?;
     let history = if dv {
-        super::deletion_vectors::with_deletion_files(
-            table,
-            &history,
-            table
-                .travel_snapshot()
-                .ok_or_else(|| invalid("Lookup needs a captured snapshot"))?,
-        )
-        .await?
+        super::deletion_vectors::with_deletion_entries(table, &history, indexes)?
     } else {
         history
     };

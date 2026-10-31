@@ -17,7 +17,7 @@
 
 //! Deletion-vector index I/O shared by table writers and compaction.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use bytes::Bytes;
 use indexmap::IndexMap;
@@ -36,6 +36,9 @@ use crate::Result;
 const DELETION_VECTORS_INDEX_TYPE: &str = "DELETION_VECTORS";
 const DELETION_VECTORS_INDEX_VERSION_V1: u8 = 1;
 const MANIFEST_DIR: &str = "manifest";
+
+#[cfg(test)]
+mod tests;
 
 /// One bucket's deletion-vector location, owning the strings the shared resolver
 /// borrows. Built once per bucket so the read that merges existing vectors and the
@@ -179,6 +182,119 @@ pub(super) async fn read_containers(
     }
 
     Ok(bitmaps)
+}
+
+/// An index may omit positions deleted in its captured snapshot. Those
+/// positions must remain deleted when publishing that index: a concurrent
+/// rollback can restore masks without changing any source data-file metadata.
+/// New deletions and immutable-container repacking remain safe. Both manifests
+/// are supplied by the commit attempt, so this never rereads index manifests.
+pub(super) async fn validate_source_deletion_growth(
+    table: &Table,
+    captured: &[IndexManifestEntry],
+    current: &[IndexManifestEntry],
+    sources: HashSet<(Vec<u8>, i32, String)>,
+) -> Result<()> {
+    type Source = (Vec<u8>, i32, String);
+    type Reference<'a> = (&'a IndexFileMeta, &'a DeletionVectorMeta);
+
+    fn references<'a>(
+        table: &Table,
+        entries: &'a [IndexManifestEntry],
+        sources: &HashSet<Source>,
+    ) -> Result<HashMap<Source, Reference<'a>>> {
+        let mut result = HashMap::new();
+        for entry in entries.iter().filter(|entry| {
+            entry.kind == FileKind::Add
+                && entry.index_file.index_type == DELETION_VECTORS_INDEX_TYPE
+        }) {
+            let partition = if table.schema().partition_keys().is_empty() {
+                vec![]
+            } else {
+                entry.partition.clone()
+            };
+            for (name, meta) in entry.index_file.deletion_vectors_ranges.iter().flatten() {
+                let source = (partition.clone(), entry.bucket, name.clone());
+                if sources.contains(&source)
+                    && result.insert(source, (&entry.index_file, meta)).is_some()
+                {
+                    return Err(crate::Error::DataInvalid {
+                        message: "Multiple deletion vectors reference one index source".into(),
+                        source: None,
+                    });
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    async fn bitmap(
+        table: &Table,
+        source: &Source,
+        reference: Reference<'_>,
+    ) -> Result<RoaringBitmap> {
+        let (file, meta) = reference;
+        let path = file_path(table, &source.0, source.1, file)?;
+        let deletion_file = crate::DeletionFile::new(
+            path,
+            i64::from(meta.offset),
+            i64::from(meta.length),
+            meta.cardinality,
+        );
+        Ok(DeletionVectorFactory::read(table.file_io(), &deletion_file)
+            .await?
+            .to_bitmap())
+    }
+
+    if sources.is_empty() {
+        return Ok(());
+    }
+    let sources = sources
+        .into_iter()
+        .map(|(partition, bucket, name)| {
+            let partition = if table.schema().partition_keys().is_empty() {
+                vec![]
+            } else {
+                partition
+            };
+            (partition, bucket, name)
+        })
+        .collect();
+    let before = references(table, captured, &sources)?;
+    // No captured mask means the payload omitted no positions because of a
+    // deletion vector. Current masks need not be read in that case.
+    if before.is_empty() {
+        return Ok(());
+    }
+    let after = references(table, current, &sources)?;
+    for (source, previous) in before {
+        let next = after.get(&source).copied();
+        if next.is_some_and(|(file, meta)| {
+            file.file_name == previous.0.file_name
+                && file.external_path == previous.0.external_path
+                && meta == previous.1
+        }) {
+            continue;
+        }
+        let excluded = bitmap(table, &source, previous).await?;
+        if excluded.is_empty() {
+            continue;
+        }
+        let deleted = match next {
+            Some(reference) => bitmap(table, &source, reference).await?,
+            None => RoaringBitmap::new(),
+        };
+        if !excluded.is_subset(&deleted) {
+            return Err(crate::Error::DataInvalid {
+                message: format!(
+                    "Index source deletions were restored for '{}'; rebuild the index from a new snapshot",
+                    source.2
+                ),
+                source: None,
+            });
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn file_path(

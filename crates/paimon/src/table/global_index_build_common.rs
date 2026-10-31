@@ -25,19 +25,17 @@
 //! `index_type` string, so it lives here once rather than being copied into
 //! each builder.
 
-use crate::io::OutputFile;
-use crate::spec::{DataField, FileKind, IndexManifest, IndexManifestEntry, Snapshot};
+use crate::spec::{
+    DataField, FileKind, IndexManifest, IndexManifestEntry, ManifestEntry, Predicate, Snapshot,
+};
 use crate::table::{merge_row_ranges, RowRange, Table};
 use crate::{Error, Result};
-use bytes::Bytes;
-use std::path::Path;
 use std::sync::Arc;
-use tokio::io::AsyncReadExt;
 
 pub(crate) mod preparation;
+#[cfg(test)]
+mod source_tests;
 pub(crate) mod vector;
-
-const COPY_BUFFER_SIZE: usize = 1024 * 1024;
 
 /// One source snapshot and its effective index coverage. Builders use this same
 /// immutable view for both gap planning and overlap validation.
@@ -45,6 +43,9 @@ const COPY_BUFFER_SIZE: usize = 1024 * 1024;
 pub(crate) struct GlobalIndexBuildView {
     snapshot: Option<Snapshot>,
     index_entries: Arc<[IndexManifestEntry]>,
+    source_entries: Option<Arc<[ManifestEntry]>>,
+    /// Original positions in `source_entries`; `None` selects every entry.
+    source_selection: Option<Arc<[usize]>>,
 }
 
 impl GlobalIndexBuildView {
@@ -65,6 +66,8 @@ impl GlobalIndexBuildView {
         Ok(Self {
             snapshot: Some(snapshot),
             index_entries: entries.into(),
+            source_entries: None,
+            source_selection: None,
         })
     }
 
@@ -86,6 +89,43 @@ impl GlobalIndexBuildView {
         &self.index_entries
     }
 
+    /// Per-round immutable metadata, shared by all declared columns. Never
+    /// retained across retries or snapshots.
+    pub(crate) fn with_source_entries(mut self, entries: Arc<[ManifestEntry]>) -> Self {
+        self.source_entries = Some(entries);
+        self.source_selection = None;
+        self
+    }
+
+    pub(super) async fn manifest_entries(
+        &self,
+        table: &Table,
+        filter: Option<&Predicate>,
+    ) -> Result<Vec<ManifestEntry>> {
+        let Some(snapshot) = self.snapshot() else {
+            return Ok(vec![]);
+        };
+        if filter.is_none() {
+            if let Some(entries) = &self.source_entries {
+                return Ok(match &self.source_selection {
+                    Some(selected) => selected
+                        .iter()
+                        .map(|&index| entries[index].clone())
+                        .collect(),
+                    None => entries.to_vec(),
+                });
+            }
+        }
+        let mut read = table.new_read_builder();
+        if let Some(filter) = filter {
+            read.with_filter(filter.clone());
+        }
+        read.new_scan()
+            .with_scan_all_files()
+            .plan_manifest_entries(snapshot)
+            .await
+    }
+
     pub(crate) fn filter_indexes(&self, mut keep: impl FnMut(&IndexManifestEntry) -> bool) -> Self {
         Self {
             snapshot: self.snapshot.clone(),
@@ -95,6 +135,41 @@ impl GlobalIndexBuildView {
                 .filter(|entry| keep(entry))
                 .cloned()
                 .collect(),
+            source_entries: self.source_entries.clone(),
+            source_selection: self.source_selection.clone(),
+        }
+    }
+
+    /// Source filtering belongs to the caller's maintenance plan. Native
+    /// builders plan ranges with all overlapping column files.
+    pub(crate) fn filter_sources(&self, mut keep: impl FnMut(&ManifestEntry) -> bool) -> Self {
+        let Some(entries) = &self.source_entries else {
+            return self.clone();
+        };
+        let selected: Vec<usize> = match &self.source_selection {
+            Some(selected) => selected
+                .iter()
+                .copied()
+                .filter(|&index| keep(&entries[index]))
+                .collect(),
+            None => entries
+                .iter()
+                .enumerate()
+                .filter_map(|(index, entry)| keep(entry).then_some(index))
+                .collect(),
+        };
+        let current_len = self
+            .source_selection
+            .as_ref()
+            .map_or(entries.len(), |selected| selected.len());
+        if selected.len() == current_len {
+            return self.clone();
+        }
+        Self {
+            snapshot: self.snapshot.clone(),
+            index_entries: self.index_entries.clone(),
+            source_entries: Some(entries.clone()),
+            source_selection: Some(selected.into()),
         }
     }
 }
@@ -124,38 +199,6 @@ pub(crate) fn validate_build_table(table: &Table) -> Result<()> {
         });
     }
     Ok(())
-}
-
-/// Stream a locally built full-text index to its table location. The native
-/// writer serializes to a temporary file because it needs synchronous I/O.
-pub(crate) async fn copy_local_file_to_output(
-    source_path: &Path,
-    output: OutputFile,
-) -> Result<()> {
-    let mut source =
-        tokio::fs::File::open(source_path)
-            .await
-            .map_err(|e| Error::UnexpectedError {
-                message: format!("Failed to open temporary index file: {e}"),
-                source: None,
-            })?;
-    let mut writer = output.writer().await?;
-    let mut buffer = vec![0u8; COPY_BUFFER_SIZE];
-
-    loop {
-        let len = source
-            .read(&mut buffer)
-            .await
-            .map_err(|e| Error::UnexpectedError {
-                message: format!("Failed to read temporary index file: {e}"),
-                source: None,
-            })?;
-        if len == 0 {
-            break;
-        }
-        writer.write(Bytes::copy_from_slice(&buffer[..len])).await?;
-    }
-    writer.close().await
 }
 
 pub(crate) enum IndexColumns {
@@ -302,27 +345,4 @@ pub(crate) fn validate_existing_index_overlap(
         }
     }
     Ok(())
-}
-
-/// Resolve and create the table's global index directory, including external placement.
-pub(crate) async fn prepare_index_file_path(
-    table: &Table,
-    file_name: &str,
-) -> Result<(String, Option<String>)> {
-    let external_path = super::external_path::new_index_external_path(
-        table.schema().options(),
-        false,
-        "",
-        file_name,
-    )?;
-    let path = external_path.clone().unwrap_or_else(|| {
-        format!(
-            "{}/index/{file_name}",
-            table.location().trim_end_matches('/')
-        )
-    });
-    if let Some((directory, _)) = path.rsplit_once('/') {
-        table.file_io().mkdirs(&format!("{directory}/")).await?;
-    }
-    Ok((path, external_path))
 }
