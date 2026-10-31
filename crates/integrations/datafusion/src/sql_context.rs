@@ -1609,12 +1609,13 @@ impl SQLContext {
     }
 
     /// Reject latest-table statement executors while a session-level
-    /// time-travel selector is active.
+    /// time-travel selector or incremental timestamp window is active.
     ///
     /// These executors load the latest catalog table, while session reads
-    /// resolve the selected snapshot schema. Silently ignoring the selector
-    /// here would be inconsistent. Ordinary INSERT uses the resolved provider
-    /// and its selected schema, so it does not need this guard.
+    /// resolve the selected snapshot schema, or return a window's changes
+    /// instead of the table's rows. Silently ignoring the selector here would
+    /// be inconsistent. Ordinary INSERT uses the resolved provider and its
+    /// selected schema, so it does not need this guard.
     fn ensure_no_time_travel_for_write(&self, operation: &str) -> DFResult<()> {
         use paimon::spec::{
             SCAN_SNAPSHOT_ID_OPTION, SCAN_TAG_NAME_OPTION, SCAN_TIMESTAMP_MILLIS_OPTION,
@@ -1636,6 +1637,16 @@ impl SQLContext {
                      RESET 'paimon.{key}' first"
                 )));
             }
+        }
+        if !matches!(
+            CoreOptions::new(&options).incremental_timestamp_window(),
+            Ok(None)
+        ) {
+            let key = "incremental-between-timestamp";
+            return Err(DataFusionError::Plan(format!(
+                "Cannot execute {operation} while scan option '{key}' is set; \
+                 RESET 'paimon.{key}' first"
+            )));
         }
         Ok(())
     }

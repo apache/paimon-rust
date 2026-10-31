@@ -849,6 +849,85 @@ async fn test_a_read_of_the_range_as_its_window_counts_the_rows_it_returns() {
     assert_eq!(provider, (8, 8), "provider");
 }
 
+#[tokio::test]
+async fn test_writes_refuse_a_session_window() {
+    use datafusion::arrow::util::pretty::pretty_format_batches;
+    // UPDATE, DELETE and MERGE INTO find the rows they change by a query on the
+    // table. A session window makes that query return the window's changes: a
+    // column update without the row's other columns, or a row once per file
+    // that wrote it. The write would then compute values from, and match, rows
+    // the table no longer holds.
+    let tmp = TempDir::new().unwrap();
+    let ctx = context(&tmp).await;
+    run(
+        &ctx,
+        "CREATE TABLE paimon.default.de (id INT, v INT) WITH (
+            'row-tracking.enabled' = 'true',
+            'data-evolution.enabled' = 'true',
+            'deletion-vectors.enabled' = 'true',
+            'write-only' = 'true'
+        )",
+    )
+    .await;
+    run(
+        &ctx,
+        "INSERT INTO paimon.default.de (id, v) VALUES (1, 1), (2, 2)",
+    )
+    .await;
+    run(&ctx, "UPDATE paimon.default.de SET v = 20 WHERE id = 2").await;
+    let table = "SELECT id, v FROM paimon.default.de ORDER BY id";
+    let format = |batches: Vec<RecordBatch>| pretty_format_batches(&batches).unwrap().to_string();
+    let expected = format(run(&ctx, table).await);
+
+    let key = "incremental-between-timestamp";
+    run(&ctx, &format!("SET 'paimon.{key}' = '0,9999999999999'")).await;
+    for statement in [
+        "UPDATE paimon.default.de SET v = v + 1 WHERE id = 2",
+        "DELETE FROM paimon.default.de WHERE id = 1",
+        "MERGE INTO paimon.default.de t USING (SELECT 2 AS id) s ON t.id = s.id
+            WHEN MATCHED THEN UPDATE SET v = t.v + 1",
+    ] {
+        let err = expect_error(&ctx, statement).await;
+        assert!(
+            err.contains(&format!(
+                "scan option '{key}' is set; RESET 'paimon.{key}' first"
+            )),
+            "{statement}: {err}"
+        );
+    }
+    run(&ctx, &format!("RESET 'paimon.{key}'")).await;
+    assert_eq!(format(run(&ctx, table).await), expected);
+}
+
+#[tokio::test]
+async fn test_vector_search_refuses_a_session_window() {
+    // The index is searched at one snapshot, while the window's rows, read to
+    // return the hits, are its changes.
+    let tmp = TempDir::new().unwrap();
+    let ctx = context(&tmp).await;
+    run(
+        &ctx,
+        "CREATE TABLE paimon.default.v (id INT, embedding ARRAY<FLOAT>) WITH (
+            'row-tracking.enabled' = 'true',
+            'data-evolution.enabled' = 'true'
+        )",
+    )
+    .await;
+    let key = "incremental-between-timestamp";
+    run(&ctx, &format!("SET 'paimon.{key}' = '0,9999999999999'")).await;
+    let err = expect_error(
+        &ctx,
+        "SELECT * FROM vector_search('paimon.default.v', 'embedding', '[1.0, 0.0]', 1)",
+    )
+    .await;
+    assert!(
+        err.contains(&format!(
+            "vector_search searches one snapshot and cannot run while scan option '{key}' is set"
+        )),
+        "{err}"
+    );
+}
+
 /// Asserts that, for `name`, the function reads the rows a `FROM` clause in
 /// the same session reads.
 async fn assert_reads_as_from(ctx: &SQLContext, name: &str) {

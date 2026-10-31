@@ -154,6 +154,19 @@ impl TableFunctionImpl for VectorSearchFunction {
             },
             "vector_search: catalog access thread panicked",
         )?;
+        // The index is searched at one snapshot, while a read with a timestamp
+        // window returns that window's changes, which can hold a row once per
+        // file that wrote it, some of its columns NULL.
+        if !matches!(
+            CoreOptions::new(table.schema().options()).incremental_timestamp_window(),
+            Ok(None)
+        ) {
+            let key = "incremental-between-timestamp";
+            return Err(DataFusionError::Plan(format!(
+                "{FUNCTION_NAME} searches one snapshot and cannot run while scan option \
+                 '{key}' is set; RESET 'paimon.{key}' first"
+            )));
+        }
 
         let inner = PaimonTableProvider::try_new(table)?;
         let query_vector_json =
