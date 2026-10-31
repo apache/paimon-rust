@@ -178,8 +178,8 @@ Builder filters, projections, and limits still apply. A Data Evolution range
 merges its files into rows as described for
 [`paimon_incremental_query`](sql.md#incremental-query); files that do not merge
 are read as written, one row per row of each file. Project `_ROW_ID`, for
-example `rb.with_projection(["_ROW_ID", "embedding"])`, to match those rows to
-the table's rows.
+example `rb.with_projection(["_ROW_ID", "embedding"])`, to match those rows by
+their distinct `_ROW_ID`s to the table's rows.
 
 `split.is_streaming()` identifies this read contract. `split.serialize()` exports
 both batch and streaming splits to Java binary encoding, preserving the streaming
