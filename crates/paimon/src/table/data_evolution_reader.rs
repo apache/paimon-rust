@@ -1878,6 +1878,21 @@ impl BlobViewLookup {
         };
         for (identifier, refs) in by_table {
             let table = rest_env.get_table(&identifier).await?;
+            // A table that stores an incremental timestamp window reads that
+            // window's changes: a row once per file that wrote it, its BLOB
+            // NULL in the files that did not, so a view would resolve to
+            // whichever of them came last.
+            if !matches!(
+                CoreOptions::new(table.schema().options()).incremental_timestamp_window(),
+                Ok(None)
+            ) {
+                return Err(Error::Unsupported {
+                    message: format!(
+                        "Cannot resolve blob views of upstream table {}, which sets scan option 'incremental-between-timestamp'",
+                        identifier.full_name()
+                    ),
+                });
+            }
             lookup
                 .file_ios
                 .insert(identifier.clone(), table.file_io().clone());
