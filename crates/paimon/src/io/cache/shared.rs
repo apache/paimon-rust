@@ -747,6 +747,7 @@ mod tests {
                 let local = Arc::new(
                     LocalCache::new(LocalCacheConfig {
                         shared: true,
+                        excluded_extensions: Default::default(),
                         dir: Some(root.clone()),
                         namespace: "catalog".into(),
                         max_size: Some(4096),

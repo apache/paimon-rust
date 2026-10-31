@@ -51,6 +51,7 @@ pub(crate) struct LocalCache {
     block_size: u64,
     whitelist: HashSet<FileType>,
     file_size_capacity: usize,
+    excluded_extensions: HashSet<String>,
     // Bound queued and active background fills.
     fill_slots: Arc<tokio::sync::Semaphore>,
     // Generated lookup reads can outlive the executor. Keep temporary disk
@@ -84,6 +85,7 @@ impl LocalCache {
             block_size,
             whitelist: FileType::parse_whitelist(whitelist),
             file_size_capacity: DEFAULT_FILE_SIZE_CAPACITY,
+            excluded_extensions: HashSet::new(),
             fill_slots: Arc::new(tokio::sync::Semaphore::new(8)),
             _temporary_directory: None,
         })
@@ -134,6 +136,7 @@ impl LocalCache {
             block_size: config.block_size,
             whitelist: config.whitelist,
             file_size_capacity,
+            excluded_extensions: config.excluded_extensions,
             fill_slots: Arc::new(tokio::sync::Semaphore::new(8)),
             _temporary_directory: None,
         })
@@ -152,6 +155,7 @@ impl LocalCache {
         let mut cache = Self::new_with_ratio(
             LocalCacheConfig {
                 shared: false,
+                excluded_extensions: Default::default(),
                 dir: Some(directory.path().to_path_buf()),
                 namespace: String::new(),
                 max_size,
@@ -188,8 +192,26 @@ impl LocalCache {
         BlockKey::with_namespace(&self.namespace, path, self.block_size, block_index)
     }
 
-    pub(super) fn is_cacheable(&self, path: &str) -> bool {
+    /// Extension exclusions must not disable invalidation of existing shared blocks.
+    pub(super) fn is_whitelisted(&self, path: &str) -> bool {
         !FileType::is_mutable(path) && self.whitelist.contains(&FileType::classify(path))
+    }
+
+    pub(super) fn is_cacheable(&self, path: &str) -> bool {
+        if !self.is_whitelisted(path) {
+            return false;
+        }
+        if self.excluded_extensions.is_empty() {
+            return true;
+        }
+        let name = path.rsplit('/').next().unwrap_or(path);
+        !std::path::Path::new(name)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| {
+                self.excluded_extensions
+                    .contains(&extension.to_ascii_lowercase())
+            })
     }
 
     async fn get_block(
@@ -450,6 +472,7 @@ pub(crate) async fn create_local_cache_with_namespace_async(
 #[derive(Debug)]
 pub(crate) struct LocalCacheConfig {
     shared: bool,
+    excluded_extensions: HashSet<String>,
     dir: Option<PathBuf>,
     namespace: String,
     max_size: Option<u64>,
@@ -533,6 +556,15 @@ impl LocalCacheConfig {
             max_size,
             block_size,
             whitelist: FileType::parse_whitelist(whitelist),
+            excluded_extensions: options
+                .get(CatalogOptions::LOCAL_CACHE_EXCLUDE_EXTENSIONS)
+                .map(String::as_str)
+                .unwrap_or_default()
+                .split(',')
+                .map(|extension| extension.trim().trim_start_matches('.'))
+                .filter(|extension| !extension.is_empty())
+                .map(str::to_ascii_lowercase)
+                .collect(),
         }))
     }
 }
@@ -712,6 +744,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let cache = LocalCache::new(LocalCacheConfig {
             shared: false,
+            excluded_extensions: Default::default(),
             dir: Some(directory.path().to_path_buf()),
             namespace: "test".to_string(),
             max_size: None,
@@ -774,6 +807,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let config = || LocalCacheConfig {
             shared: false,
+            excluded_extensions: Default::default(),
             dir: Some(directory.path().to_path_buf()),
             namespace: "test".to_string(),
             max_size: None,
@@ -797,6 +831,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let config = || LocalCacheConfig {
             shared: false,
+            excluded_extensions: Default::default(),
             dir: Some(directory.path().to_path_buf()),
             namespace: "test".to_string(),
             max_size: None,
@@ -821,6 +856,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let cache = LocalCache::new(LocalCacheConfig {
             shared: false,
+            excluded_extensions: Default::default(),
             dir: Some(directory.path().to_path_buf()),
             namespace: "test".to_string(),
             max_size: None,
@@ -851,6 +887,7 @@ mod tests {
 
         LocalCache::new(LocalCacheConfig {
             shared: false,
+            excluded_extensions: Default::default(),
             dir: Some(directory.path().to_path_buf()),
             namespace: "test".to_string(),
             max_size: None,
@@ -872,6 +909,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let cache = LocalCache::new(LocalCacheConfig {
             shared: false,
+            excluded_extensions: Default::default(),
             dir: Some(directory.path().to_path_buf()),
             namespace: "test".to_string(),
             max_size: Some(8),
