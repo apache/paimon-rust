@@ -56,7 +56,9 @@ async fn assert_cache_selection(
                 std::fs::create_dir_all(path.parent().unwrap()).unwrap();
                 // Only block-cache routing is under test, not format decoding.
                 std::fs::write(&path, b"abcdefgh").unwrap();
-                let input = catalog.file_io().new_input(path.to_str().unwrap()).unwrap();
+                // Cache classification uses slash-separated FileIO paths on every platform.
+                let io_path = path.to_str().unwrap().replace('\\', "/");
+                let input = catalog.file_io().new_input(&io_path).unwrap();
                 let expected: &[u8] = if range_read { b"bcdefg" } else { b"abcdefgh" };
                 let cold = if range_read {
                     input.reader().await.unwrap().read(1..7).await.unwrap()
@@ -198,6 +200,7 @@ async fn test_exclusions_bypass_existing_blocks_and_preserve_invalidation() {
     for shared in [false, true] {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("data.blob");
+        let io_path = path.to_str().unwrap().replace('\\', "/");
         std::fs::write(&path, b"abcdefgh").unwrap();
         let mut options = Options::new();
         options.set(
@@ -214,17 +217,14 @@ async fn test_exclusions_bypass_existing_blocks_and_preserve_invalidation() {
             directory.path().join("cache").to_string_lossy(),
         );
         let catalog = FileSystemCatalog::new(options.clone()).unwrap();
-        let cached_input = catalog.file_io().new_input(path.to_str().unwrap()).unwrap();
+        let cached_input = catalog.file_io().new_input(&io_path).unwrap();
         assert_eq!(cached_input.read().await.unwrap().as_ref(), b"abcdefgh");
         std::fs::write(&path, b"12345678").unwrap();
         assert_eq!(cached_input.read().await.unwrap().as_ref(), b"abcdefgh");
 
         options.set(CatalogOptions::LOCAL_CACHE_EXCLUDE_EXTENSIONS, "blob");
         let excluded_catalog = FileSystemCatalog::new(options).unwrap();
-        let input = excluded_catalog
-            .file_io()
-            .new_input(path.to_str().unwrap())
-            .unwrap();
+        let input = excluded_catalog.file_io().new_input(&io_path).unwrap();
         assert_eq!(input.read().await.unwrap().as_ref(), b"12345678");
         assert_eq!(
             input
@@ -238,10 +238,7 @@ async fn test_exclusions_bypass_existing_blocks_and_preserve_invalidation() {
             b"234567"
         );
 
-        let output = excluded_catalog
-            .file_io()
-            .new_output(path.to_str().unwrap())
-            .unwrap();
+        let output = excluded_catalog.file_io().new_output(&io_path).unwrap();
         output
             .write(bytes::Bytes::from_static(b"updated!"))
             .await
@@ -255,7 +252,7 @@ async fn test_exclusions_bypass_existing_blocks_and_preserve_invalidation() {
 
         excluded_catalog
             .file_io()
-            .delete_file(path.to_str().unwrap())
+            .delete_file(&io_path)
             .await
             .unwrap();
         assert!(matches!(
