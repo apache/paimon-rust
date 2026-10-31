@@ -31,6 +31,65 @@ fn schema(evolved: bool) -> Schema {
     builder.build().unwrap()
 }
 
+#[tokio::test]
+async fn stale_rest_committer_auto_indexes_with_catalog_schema_and_recovers() {
+    let ctx = setup_catalog(vec!["default"]).await;
+    let temp = tempfile::tempdir().unwrap();
+    let name = "rest_auto_index";
+    let index_schema = |evolved: bool| {
+        let mut builder = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("value", DataType::Int(IntType::new()))
+            .option("row-tracking.enabled", "true")
+            .option("data-evolution.enabled", "true")
+            .option("write-only", "false")
+            .option("global-index.btree.index-columns", "id");
+        if evolved {
+            builder = builder.column("extra", DataType::Int(IntType::new()));
+        }
+        builder.build().unwrap()
+    };
+    ctx.server.add_table_with_schema(
+        "default",
+        name,
+        index_schema(false),
+        temp.path().to_str().unwrap(),
+    );
+    let identifier = Identifier::new("default", name);
+    let stale = ctx.catalog.get_table(&identifier).await.unwrap();
+    ctx.server
+        .set_table_schema_id("default", name, index_schema(true), 1);
+    let current = ctx.catalog.get_table(&identifier).await.unwrap();
+    let commit = stale.new_write_builder().new_commit();
+    let messages = stage(&current, 1, true).await;
+    commit
+        .commit_with_identifier(messages.clone(), 7)
+        .await
+        .unwrap();
+    commit
+        .filter_and_commit_with_identifier(messages, 7)
+        .await
+        .unwrap();
+    let snapshot = current
+        .snapshot_manager()
+        .get_latest_snapshot()
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(snapshot.id(), 2);
+    assert_eq!(snapshot.schema_id(), 1);
+    assert!(snapshot.index_manifest().is_some());
+    assert!(current.schema_manager().latest().await.unwrap().is_none());
+    assert!(current
+        .new_global_index_build_builder()
+        .with_index_column("id")
+        .build()
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(read_rows(&current).await, vec![(1, 10, Some(100))]);
+}
+
 async fn catalog_only_tables(name: &str) -> (TestContext, tempfile::TempDir, Table, Table) {
     let ctx = setup_catalog(vec!["default"]).await;
     let temp = tempfile::tempdir().unwrap();

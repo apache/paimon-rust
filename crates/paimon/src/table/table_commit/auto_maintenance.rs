@@ -65,7 +65,7 @@ impl TableCommit {
         Ok(())
     }
 
-    pub(super) async fn commit_with_auto_compact(
+    pub(super) async fn commit_with_maintenance(
         &self,
         plan: CommitEntriesPlan,
         expected_snapshot_id: Option<i64>,
@@ -77,8 +77,9 @@ impl TableCommit {
             CommitEntriesPlan::Overwrite { new_entries, .. } => new_entries,
             CommitEntriesPlan::Compact { .. } => unreachable!(),
         };
-        let enabled =
-            self.auto_compaction_enabled(entries.iter().any(|e| *e.kind() == FileKind::Add))?;
+        let has_new_files = entries.iter().any(|e| *e.kind() == FileKind::Add);
+        let enabled = self.auto_compaction_enabled(has_new_files)?;
+        let index_enabled = self.auto_index_enabled(has_new_files).await?;
         let buckets = enabled.then(|| self.written_buckets(entries));
         let kind = plan.commit_kind_hint();
         let outcome = self
@@ -89,12 +90,18 @@ impl TableCommit {
                 filter_committed,
             )
             .await?;
-        match (outcome, buckets) {
-            (CommitOutcome::Published(written), Some(buckets)) => {
-                self.compact_after_write(&written, buckets).await
+        match outcome {
+            CommitOutcome::Published(written) => {
+                if let Some(buckets) = buckets {
+                    self.compact_after_write(&written, buckets).await?;
+                }
+                if index_enabled {
+                    self.index_after_write(&written).await?;
+                }
+                Ok(())
             }
-            (CommitOutcome::Filtered, Some(_)) => {
-                self.recover_compact_after_write(commit_identifier, &kind)
+            CommitOutcome::Filtered if enabled || index_enabled => {
+                self.recover_maintenance_after_write(commit_identifier, &kind)
                     .await
             }
             _ => Ok(()),
@@ -132,14 +139,14 @@ impl TableCommit {
         )
     }
 
-    pub(super) async fn recover_compact_after_write(
+    pub(super) async fn recover_maintenance_after_write(
         &self,
         identifier: i64,
         kind: &CommitKind,
     ) -> Result<()> {
         // Only recovery reconstructs ownership from persisted metadata. Its
         // messages can reference source files already compacted or expired.
-        let recovered = async {
+        let recovered: Result<()> = async {
             let latest = self.snapshot_manager.get_latest_snapshot().await?;
             let earliest = self
                 .snapshot_manager
@@ -150,30 +157,38 @@ impl TableCommit {
                 .find_duplicate_commit(earliest, &latest, identifier, kind)
                 .await?
             else {
-                return Ok(None);
+                return Ok(());
             };
-            let mut compact = self.clone();
-            compact.commit_user = self.auto_compact_user(&written);
-            if compact
-                .is_committed_identifier_since(&latest, written.id(), Some(written.id() + 1))
-                .await?
-            {
-                return Ok(None);
+            // Completed compaction must not suppress an interrupted index round.
+            // Completion checks in each phase happen before reading its inputs.
+            if self.auto_compaction_enabled(true)? {
+                let mut compact = self.clone();
+                compact.commit_user = self.auto_compact_user(&written);
+                let latest = self.snapshot_manager.get_latest_snapshot().await?;
+                if !compact
+                    .is_committed_identifier_since(&latest, written.id(), Some(written.id() + 1))
+                    .await?
+                {
+                    let entries = self.read_delta_entries(None, &written).await?;
+                    self.compact_after_write(&written, self.written_buckets(&entries))
+                        .await?;
+                }
             }
-            let buckets = self.written_buckets(&self.read_delta_entries(None, &written).await?);
-            Ok(Some((written, buckets)))
+            if self.auto_index_enabled(true).await? {
+                self.index_after_write(&written).await?;
+            }
+            Ok(())
         }
-        .await
-        .map_err(|error| auto_compaction_error(identifier, error))?;
-        if let Some((written, buckets)) = recovered {
-            self.compact_after_write(&written, buckets).await?;
-        }
-        Ok(())
+        .await;
+        recovered.map_err(|error| crate::Error::UnexpectedError {
+            message: format!("Data commit {identifier} succeeded, but automatic maintenance recovery failed; retry with the same commit user and identifier"),
+            source: Some(Box::new(error)),
+        })
     }
 
-    async fn auto_compaction_table(&self, snapshot: Option<&Snapshot>) -> Result<Table> {
+    pub(super) async fn post_commit_table(&self, snapshot: Option<&Snapshot>) -> Result<Table> {
         // A historical writer can publish old-schema files against a newer
-        // schema. Compaction must read and write the current field layout.
+        // schema. Post-commit maintenance must use the current field layout.
         let current_schema = if let Some(env) = &self.table.rest_env {
             let response = env.current_table_identity_checked().await?;
             let schema_id = response
@@ -264,7 +279,7 @@ impl TableCommit {
             } else {
                 latest.as_ref()
             };
-            let table = self.auto_compaction_table(snapshot).await?;
+            let table = self.post_commit_table(snapshot).await?;
             let mut compact = Self::new(table, commit_user);
             compact.snapshot_commit = self.snapshot_commit.clone();
             compact.snapshot_properties = self.snapshot_properties.clone();

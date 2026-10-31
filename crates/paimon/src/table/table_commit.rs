@@ -49,7 +49,10 @@ const BATCH_COMMIT_IDENTIFIER: i64 = i64::MAX;
 /// Java RollingFileWriter.CHECK_ROLLING_RECORD_CNT.
 const CHECK_ROLLING_RECORD_COUNT: usize = 1000;
 
-mod auto_compact;
+mod auto_index;
+#[cfg(test)]
+mod auto_index_tests;
+mod auto_maintenance;
 mod global_index_source_check;
 mod row_tracking;
 
@@ -395,6 +398,9 @@ impl TableCommit {
                 pending.push((id, messages));
             } else if self
                 .auto_compaction_enabled(messages.iter().any(|m| !m.new_files.is_empty()))?
+                || self
+                    .auto_index_enabled(messages.iter().any(|m| !m.new_files.is_empty()))
+                    .await?
             {
                 let kind = direct_commit_kind(
                     &self.messages_to_entries(&messages),
@@ -410,7 +416,7 @@ impl TableCommit {
         }
         let count = pending.len();
         for (id, kind) in recovered {
-            self.recover_compact_after_write(id, &kind).await?;
+            self.recover_maintenance_after_write(id, &kind).await?;
         }
         for (id, messages) in pending {
             self.filter_and_commit_with_identifier(messages, id).await?;
@@ -447,11 +453,13 @@ impl TableCommit {
             return Ok(super::CompactMetrics::default());
         }
         let prepared = super::compact::prepare_results(&self.table, &results)?;
+        let maintain_indexes = self.auto_index_enabled(true).await?;
+        let planned_snapshot_id = prepared.snapshot_id;
         let mut commit = self.clone();
         // One stable identity per plan and task subset, allowing repeated plans
         // and idempotent retry without consuming the caller's checkpoint sequence.
         commit.commit_user = format!("{}-compact-{}", self.commit_user, prepared.commit_suffix);
-        commit
+        let outcome = commit
             .try_commit(
                 CommitEntriesPlan::Compact {
                     entries: prepared.entries,
@@ -466,6 +474,26 @@ impl TableCommit {
                 true,
             )
             .await?;
+        if maintain_indexes {
+            let written = match outcome {
+                CommitOutcome::Published(snapshot) => Some(*snapshot),
+                CommitOutcome::Filtered => {
+                    let latest = commit.snapshot_manager.get_latest_snapshot().await?;
+                    commit
+                        .find_duplicate_commit(
+                            planned_snapshot_id.saturating_add(1),
+                            &latest,
+                            BATCH_COMMIT_IDENTIFIER,
+                            &CommitKind::COMPACT,
+                        )
+                        .await?
+                }
+                CommitOutcome::Empty => None,
+            };
+            if let Some(snapshot) = written {
+                commit.index_after_write(&snapshot).await?;
+            }
+        }
         Ok(prepared.metrics)
     }
 
@@ -533,7 +561,7 @@ impl TableCommit {
         let check_from_snapshot = Self::check_from_snapshot(&commit_messages)?;
         // Never delete CommitMessage files on failure. A previous attempt may
         // have published them even when the caller received an exception.
-        self.commit_with_auto_compact(
+        self.commit_with_maintenance(
             CommitEntriesPlan::Direct {
                 entries,
                 changelog_entries,
@@ -580,7 +608,7 @@ impl TableCommit {
         let changelog_entries = self.messages_to_changelog_entries(&commit_messages);
         let new_index_entries = self.messages_to_index_entries(&commit_messages);
         let check_from_snapshot = Self::check_from_snapshot(&commit_messages)?;
-        self.commit_with_auto_compact(
+        self.commit_with_maintenance(
             CommitEntriesPlan::Direct {
                 entries,
                 changelog_entries,
@@ -689,7 +717,7 @@ impl TableCommit {
 
         let check_from_snapshot = Self::check_from_snapshot(&commit_messages)?;
 
-        self.commit_with_auto_compact(
+        self.commit_with_maintenance(
             CommitEntriesPlan::Overwrite {
                 partition_filter,
                 new_entries,

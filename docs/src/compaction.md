@@ -92,6 +92,99 @@ commit or a completed automatic `COMPACT` snapshot. A single round can leave
 additional work for a later write or a dedicated compaction job. This option does
 not schedule background work or expire snapshots.
 
+## Automatic global index maintenance
+
+With `write-only=false` (the default), writes synchronously maintain declared
+global indexes after automatic compaction. An empty compaction plan still allows
+index maintenance. `write-only=true` leaves both jobs to dedicated operators.
+Rust, Python, and DataFusion writes share this behavior. Tables without index
+declarations retain their existing write behavior; no separate index switch is
+required and no background job is scheduled.
+
+Index options follow the primary-key index convention: a comma-separated column
+list for each family and optional per-column parameters. Supported families are
+`btree`, `bitmap`, `multivalue`, `fm`, `full-text`, and `vector`:
+
+```rust
+let options = std::collections::HashMap::from([
+    ("row-tracking.enabled".into(), "true".into()),
+    ("bucket".into(), "-1".into()),
+    ("write-only".into(), "false".into()),
+    ("global-index.btree.index-columns".into(), "id,age".into()),
+    ("global-index.full-text.index-columns".into(), "text".into()),
+    (
+        "fields.text.global-index.full-text.index-options".into(),
+        r#"{"lower-case":true}"#.into(),
+    ),
+    ("global-index.vector.index-columns".into(), "embedding".into()),
+    ("fields.embedding.global-index.vector.index-type".into(), "diskann".into()),
+    ("fields.embedding.global-index.vector.distance-metric".into(), "cosine".into()),
+    (
+        "fields.embedding.global-index.vector.index-options".into(),
+        r#"{"dimension":768}"#.into(),
+    ),
+]);
+```
+
+Maintenance reuses the global-index builders and their table, column-type,
+and native writer restrictions. Tables must have row tracking enabled, no
+primary key, and `bucket=-1`. Data evolution and the query-side
+`global-index.enabled` option are not prerequisites for building indexes.
+Full-text builds additionally reject deletion-vector tables. Declared columns
+are trimmed; empty names, duplicates, unknown fields, and assigning multiple
+families to one column are rejected before data publication. Each listed column
+has its own index. Use the explicit build API for composite BTree indexes.
+Update the lists and per-column option keys together with schema renames or drops.
+`write-only=true` skips automatic index configuration validation.
+
+Per-column parameters use
+`fields.<column>.global-index.<family>.index-options`, a JSON object containing
+string, boolean, or numeric values. Short keys are qualified with the native
+writer prefix, such as `block-size` to `btree-index.block-size`. Fully qualified
+writer keys and shared shard options are accepted. Conflicting values are
+rejected, matching primary-key option resolution. Vector columns additionally
+require `fields.<column>.global-index.vector.index-type`; the optional
+`distance-metric` defaults to `inner_product`.
+Explicit single-column builds also use these declarations as defaults; explicit
+builder options take precedence over them.
+FULL/DETAIL raw fallback uses the same per-column parameters as automatic
+builds, including vector metric defaults and full-text tokenization. A declared
+full-text column can use raw fallback before its first index is published.
+
+Each round captures the current schema and one source snapshot. Like Java
+primary-key index maintenance, it compares the desired sources with current
+index units and replaces changed units atomically. Global units use partition,
+bucket, and row-ID shard boundaries instead of primary-key LSM levels. Valid
+units are retained, missing ranges are built, and partial or fragmented shards
+are rebuilt from current rows. A physical compaction that preserves row IDs and
+values can retain existing global payloads. Additions and retired references
+publish together; old files remain available to historical snapshots.
+Manual `commit_compact` also maintains declared indexes when `write-only=false`.
+An empty maintenance plan publishes no snapshot. Empty data commits, index-only
+commits, and truncation do not trigger a separate round. Indexed-column updates
+retain `global-index.column-update-action`: use `DROP_PARTITION_INDEX` to allow
+the data update and automatically rebuild the affected coverage. Changing a
+vector algorithm or distance metric retires all incompatible payloads for that
+column and publishes their replacements together. Other writer parameters alone
+do not rebuild unchanged coverage; changing shard boundaries can regroup it.
+This synchronous mode has no minimum-row or time threshold.
+
+A concurrent snapshot or schema change causes private outputs to be discarded
+and coverage to be replanned, bounded by `commit.max-retries` and
+`commit.timeout`. A stable identity derived from the originating data commit
+makes repeated recovery idempotent. Uncertain publication outcomes retain
+submitted files and check for an already published index snapshot before
+retrying. Data, compaction, and index publication are separate transactions:
+global row IDs must be assigned before indexing. An index failure leaves the
+data committed and returns an error preserving the
+cause. Retry append with `filter_and_commit_with_identifier` or
+`filter_and_commit`, or overwrite with `overwrite_with_identifier`, using the
+same commit user and identifier. Recovery resumes indexing even when automatic
+compaction already completed. For an interrupted manual compaction, retry the
+same prepared results and commit user through `commit_compact`.
+
+## Compaction planning
+
 Ordinary append and PK compaction use `target-file-size` as the output size target.
 For unaware append tables (`bucket=-1`), task selection follows the batch packing rules in Java's
 [`AppendCompactCoordinator`](https://github.com/apache/paimon/blob/master/paimon-core/src/main/java/org/apache/paimon/append/AppendCompactCoordinator.java):

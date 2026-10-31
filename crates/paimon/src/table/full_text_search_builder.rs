@@ -697,7 +697,7 @@ async fn read_raw_full_text_splits(
     let read = read_builder.new_read()?;
     let mut stream = read.to_arrow(splits)?;
 
-    let config = raw_full_text_config(table_options)?;
+    let config = raw_full_text_config(table_options, &search.field_name)?;
     let mut writer = tokio::task::spawn_blocking(move || {
         FullTextIndexWriter::new(config).map_err(full_text_error)
     })
@@ -908,8 +908,16 @@ fn raw_full_text_document(
 
 fn raw_full_text_config(
     table_options: &HashMap<String, String>,
+    column: &str,
 ) -> crate::Result<FullTextIndexConfig> {
-    let native_options: HashMap<String, String> = table_options
+    let mut options = table_options.clone();
+    options.extend(super::global_index_options::field_index_options(
+        table_options,
+        column,
+        "full-text",
+        "full-text",
+    )?);
+    let native_options: HashMap<String, String> = options
         .iter()
         .filter_map(|(key, value)| {
             key.strip_prefix("full-text.")
@@ -1321,7 +1329,7 @@ mod tests {
             "native_text,secondary".to_string(),
         )]);
 
-        let config = raw_full_text_config(&options).unwrap();
+        let config = raw_full_text_config(&options, "body").unwrap();
 
         assert_eq!(config.text_fields, vec!["native_text", "secondary"]);
         assert_eq!(config.default_text_field(), "native_text");
@@ -1333,7 +1341,7 @@ mod tests {
             "full-text.text-field".to_string(),
             "native_text".to_string(),
         )]);
-        let config = raw_full_text_config(&options).unwrap();
+        let config = raw_full_text_config(&options, "body").unwrap();
         let search = FullTextSearch::new(
             r#"{"match":{"column":"native_text","query":"rare common"}}"#.to_string(),
             10,

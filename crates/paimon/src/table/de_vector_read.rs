@@ -17,7 +17,7 @@
 
 //! Reads global vector indexes, scores raw vectors, and materializes global-row-ID results.
 
-use crate::io::{FileIO, FileRead};
+use crate::io::FileIO;
 use crate::spec::{
     row_id_data_field, CoreOptions, DataField, DataType, FileKind, GlobalIndexSearchMode,
     IndexFileMeta, IndexManifestEntry, Predicate, ROW_ID_FIELD_NAME,
@@ -38,8 +38,8 @@ use crate::table::search_task::{
 use crate::table::vector_read::Read;
 use crate::table::vector_search_common::{
     configured_refine_factor, configured_vector_index_type, indexed_search_limit,
-    log_vindex_range_io_stats, normalize_metric, resolve_materialize_read_type,
-    validate_global_vector_index_types, vindex_concurrency_limits,
+    log_vindex_range_io_stats, normalize_metric, read_index_vector_metric,
+    resolve_materialize_read_type, validate_global_vector_index_types, vindex_concurrency_limits,
 };
 use crate::table::{
     find_field_id_by_name, merge_row_ranges, ArrowRecordBatchStream, RowRange, Table,
@@ -56,9 +56,7 @@ use arrow_array::{Array, FixedSizeListArray, Float32Array, Int64Array, ListArray
 use arrow_select::interleave::interleave_record_batch;
 use futures::{stream, TryStreamExt};
 use paimon_vindex_core::blas::sgemm_a_bt;
-use paimon_vindex_core::diskann_io::DISKANN_HEADER_SIZE;
 use paimon_vindex_core::distance::MetricType;
-use paimon_vindex_core::index::VectorIndexReader as VIndexReader;
 use paimon_vindex_core::io::SeekRead;
 use roaring::RoaringTreemap;
 use serde::{Deserialize, Serialize};
@@ -900,7 +898,7 @@ async fn evaluate_batch_vector_search_with_executor(
             .collect::<Vec<_>>()
     };
     let configured_index_type =
-        configured_vector_index_type(evaluation.table_options, &search_options, field_name);
+        configured_vector_index_type(evaluation.table_options, &search_options, field_name)?;
     let index_type = vector_entries
         .first()
         .map(|entry| entry.index_file.index_type.as_str())
@@ -1125,7 +1123,7 @@ async fn evaluate_batch_vector_search_with_executor(
             })?;
             let metric_start = timing_enabled.then(Instant::now);
             let mut metric_options = vector_searches[0].options.clone();
-            if configured_vector_index_type(evaluation.table_options, &metric_options, field_name)
+            if configured_vector_index_type(evaluation.table_options, &metric_options, field_name)?
                 .is_none()
             {
                 if let Some(index_type) =
@@ -1673,7 +1671,7 @@ async fn resolve_raw_vector_metric(
     field_id: i32,
     field_name: &str,
 ) -> crate::Result<RawVectorMetric> {
-    let configured_type = configured_vector_index_type(table_options, search_options, field_name);
+    let configured_type = configured_vector_index_type(table_options, search_options, field_name)?;
     let index_type = index_entries
         .iter()
         .filter(|entry| entry.kind == FileKind::Add)
@@ -1703,6 +1701,7 @@ async fn resolve_raw_vector_metric(
             continue;
         }
         if let Some(metric) = read_index_vector_metric(file_io, table_path, entry).await? {
+            let metric = RawVectorMetric::from_vindex(metric);
             check.check(metric)?;
             persisted = Some(metric);
         }
@@ -1712,6 +1711,24 @@ async fn resolve_raw_vector_metric(
     }
     if let Some(metric) = check.requested {
         return Ok(metric);
+    }
+    if let Some(kind) = super::global_index_options::vector_index_type(table_options, field_name)? {
+        if index_type == Some(kind) {
+            let options = super::global_index_options::field_index_options(
+                table_options,
+                field_name,
+                "vector",
+                kind,
+            )?;
+            let native = crate::vindex::VindexVectorIndexOptions::resolve_native_options(
+                table_options,
+                &options,
+                &HashMap::new(),
+                kind,
+                field_name,
+            )?;
+            return RawVectorMetric::parse(&native["metric"]);
+        }
     }
     let table_metric = vector_metric_override(table_options, field_name, index_type)?;
     if let Some(metric) = table_metric {
@@ -1724,61 +1741,6 @@ async fn resolve_raw_vector_metric(
     } else {
         RawVectorMetric::L2
     })
-}
-
-/// Rerouted raw searches still validate each shard's persisted metric.
-async fn read_index_vector_metric(
-    file_io: &FileIO,
-    table_path: &str,
-    entry: &IndexManifestEntry,
-) -> crate::Result<Option<RawVectorMetric>> {
-    let Some(global_meta) = entry.index_file.global_index_meta.as_ref() else {
-        return Ok(None);
-    };
-    if !is_vindex_index_type(&entry.index_file.index_type) {
-        return Ok(None);
-    }
-    if let Some(index_meta) = global_meta.index_meta.as_ref() {
-        if let Ok(options) = serde_json::from_slice::<HashMap<String, String>>(index_meta) {
-            if let Some(metric) = options.get("metric") {
-                if let Some(metric) = RawVectorMetric::parse_normalized(&normalize_metric(metric)) {
-                    return Ok(Some(metric));
-                }
-            }
-        }
-    }
-    let path = IndexFileLocation::Global { table_path }.resolve(
-        &entry.index_file.file_name,
-        entry.index_file.external_path.as_deref(),
-    );
-    let input = file_io.new_input(&path)?;
-    let read_error = |e| crate::Error::DataInvalid {
-        message: format!(
-            "Failed to read vindex index file '{}' for raw search metric: {}",
-            entry.index_file.file_name, e
-        ),
-        source: Some(Box::new(e)),
-    };
-    let header_size = if entry.index_file.file_size > 0 {
-        (entry.index_file.file_size as u64).min(DISKANN_HEADER_SIZE as u64)
-    } else {
-        input
-            .metadata()
-            .await
-            .map_err(&read_error)?
-            .size
-            .min(DISKANN_HEADER_SIZE as u64)
-    };
-    let file_reader = input.reader().await.map_err(&read_error)?;
-    let bytes = file_reader.read(0..header_size).await.map_err(read_error)?;
-    let reader = VIndexReader::open(Cursor::new(bytes)).map_err(|e| crate::Error::DataInvalid {
-        message: format!(
-            "Failed to open paimon-vindex-core reader for raw search metric: {}",
-            e
-        ),
-        source: Some(Box::new(e)),
-    })?;
-    Ok(Some(RawVectorMetric::from_vindex(reader.metadata().metric)))
 }
 
 fn vector_metric_override(

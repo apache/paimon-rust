@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use super::full_text_index_build_builder::FullTextIndexBuildBuilder;
-use super::global_index_build_common::{resolve_index_fields, IndexColumns};
+use super::global_index_build_common::{resolve_index_fields, GlobalIndexBuildView, IndexColumns};
 use super::global_index_build_plan::{GlobalIndexBuildPlan, GlobalIndexBuildShard};
 use super::global_index_types::{
     normalize_global_index_type, normalize_queryable_global_index_type, BTREE_GLOBAL_INDEX_TYPE,
@@ -103,6 +103,20 @@ impl<'a> GlobalIndexBuildBuilder<'a> {
     pub fn with_options(&mut self, options: HashMap<String, String>) -> &mut Self {
         self.options = options;
         self
+    }
+
+    fn configured_table(&self, columns: &[&str], index_type: &str) -> Result<Table> {
+        if columns.len() != 1 || crate::vindex::is_vindex_index_type(index_type) {
+            return Ok(self.table.clone());
+        }
+        // Native vector builders keep declarations in their own option layer.
+        let defaults = super::global_index_options::declared_options(
+            self.table.schema().options(),
+            columns[0],
+            index_type,
+            index_type,
+        )?;
+        Ok(self.table.copy_with_options(defaults))
     }
 
     /// Restrict the build to partitions. Repeated calls combine filters with AND.
@@ -197,6 +211,24 @@ impl<'a> GlobalIndexBuildBuilder<'a> {
     }
 
     async fn prepare(&self) -> Result<PreparedBuild> {
+        self.prepare_with_view(None).await
+    }
+
+    /// Check the complete writer configuration without scanning or creating files.
+    pub(crate) async fn validate(&self) -> Result<()> {
+        self.prepare_with_view(Some(GlobalIndexBuildView::default()))
+            .await
+            .map(|_| ())
+    }
+
+    pub(crate) async fn build_with_view(
+        &self,
+        view: GlobalIndexBuildView,
+    ) -> Result<Vec<CommitMessage>> {
+        Ok(self.prepare_with_view(Some(view)).await?.messages)
+    }
+
+    async fn prepare_with_view(&self, view: Option<GlobalIndexBuildView>) -> Result<PreparedBuild> {
         CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
         self.table.ensure_not_branch_reference_for_write()?;
         let index_type = normalize_global_index_type(self.index_type.trim()).ok_or_else(|| {
@@ -210,8 +242,10 @@ impl<'a> GlobalIndexBuildBuilder<'a> {
         })?;
         let fields = resolve_index_fields(self.table, columns, index_type)?;
         let columns = fields.iter().map(|field| field.name()).collect::<Vec<_>>();
+        let table = self.configured_table(&columns, index_type)?;
         if normalize_queryable_global_index_type(index_type).is_some() {
-            let mut builder = SortedGlobalIndexBuildBuilder::new(self.table);
+            let mut builder = SortedGlobalIndexBuildBuilder::new(&table);
+            builder.view = view;
             builder
                 .with_index_columns(&columns)
                 .with_index_type(index_type)
@@ -222,14 +256,16 @@ impl<'a> GlobalIndexBuildBuilder<'a> {
             return Ok(builder.prepare().await?.into());
         }
         if index_type == FULL_TEXT_GLOBAL_INDEX_TYPE {
-            let mut builder = FullTextIndexBuildBuilder::new(self.table);
+            let mut builder = FullTextIndexBuildBuilder::new(&table);
+            builder.view = view;
             builder
                 .with_index_column(columns[0])
                 .with_options(self.options.clone());
             builder.partition_filter = self.partition_filter.clone();
             return Ok(builder.prepare().await?.into());
         }
-        let mut builder = VindexIndexBuildBuilder::new(self.table, index_type);
+        let mut builder = VindexIndexBuildBuilder::new(&table, index_type);
+        builder.view = view;
         builder
             .with_index_column(columns[0])
             .with_options(self.options.clone());
