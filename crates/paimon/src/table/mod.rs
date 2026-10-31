@@ -91,6 +91,7 @@ mod global_index_search_filter;
 mod global_index_types;
 mod hybrid_search_builder;
 mod incremental_scan;
+mod index_build;
 pub(crate) mod index_file_path;
 mod inline_blob;
 mod instant;

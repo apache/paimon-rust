@@ -18,7 +18,7 @@
 //! Bounded sort buffers and pairwise disk merges. Disk work runs on blocking workers.
 
 use super::extraction::sort_index_rows;
-use super::SortedIndexKeyRow;
+use super::scalar::SortedIndexKeyRow;
 use crate::btree::key_serde::{DynKeyComparator, KeyComparator};
 use crate::{Error, Result};
 use std::cmp::Ordering;

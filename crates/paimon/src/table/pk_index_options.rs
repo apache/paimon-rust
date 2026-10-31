@@ -126,29 +126,13 @@ pub(super) fn definitions(schema: &TableSchema) -> Result<Vec<Definition>> {
                         ),
                     });
                 }
-                let native = merged
-                    .iter()
-                    .filter_map(|(k, v)| {
-                        k.strip_prefix("full-text.")
-                            .map(|key| (key.to_string(), v.clone()))
-                    })
-                    .collect();
-                paimon_ftindex_core::FullTextIndexConfig::from_options(&native).map_err(invalid)?;
-            }
-            "fm" => {
-                crate::table::sorted_global_index_build_builder::validation::index_key_type(
-                    kind, field,
-                )?;
-                crate::fm_index::FMOptions::from_options(&merged)?;
+                let native =
+                    crate::table::index_build::full_text::native_full_text_options(&merged);
+                crate::table::index_build::full_text::full_text_config(&native)?;
             }
             _ => {
-                crate::table::sorted_global_index_build_builder::validation::index_key_type(
-                    kind, field,
-                )?;
-                crate::table::sorted_global_index_options::SortedIndexWriteOptions::from_options(
-                    kind, &merged,
-                )?;
-                schema.core_options().write_buffer_size()?;
+                crate::table::index_build::fields::index_key_type(kind, field)?;
+                crate::table::index_build::scalar::ScalarIndexOptions::from_options(kind, &merged)?;
             }
         }
         result.push(Definition {
@@ -158,10 +142,4 @@ pub(super) fn definitions(schema: &TableSchema) -> Result<Vec<Definition>> {
         });
     }
     Ok(result)
-}
-
-fn invalid(error: impl std::fmt::Display) -> Error {
-    Error::ConfigInvalid {
-        message: format!("Invalid primary-key index options: {error}"),
-    }
 }

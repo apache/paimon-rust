@@ -15,12 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub(super) mod extraction;
+mod extraction;
 mod pipeline;
 mod planning;
 pub(super) mod timing;
 mod validation;
-pub(super) mod writer;
+mod writer;
 
 use planning::plan_vindex_shards;
 use validation::{checked_i32, find_index_field, validate_vector_field};
