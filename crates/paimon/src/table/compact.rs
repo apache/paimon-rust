@@ -1300,9 +1300,10 @@ async fn read_snapshot_indexes(
         return Ok(entries);
     }
     for entry in &entries {
-        if !table.schema().primary_keys().is_empty() && primary_key::indexes::is_source_index(entry)
+        if !table.schema().primary_keys().is_empty()
+            && super::pk_index_maintenance::is_source_index(entry)
         {
-            primary_key::indexes::source(entry)?;
+            super::pk_index_maintenance::source(entry)?;
             continue;
         }
         if !(entry.index_file.index_type == "HASH"

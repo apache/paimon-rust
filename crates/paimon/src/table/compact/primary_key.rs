@@ -16,7 +16,7 @@
 // under the License.
 
 pub(in crate::table) mod deletion_vectors;
-pub(in crate::table) mod indexes;
+pub(super) mod indexes;
 pub(super) mod lookup;
 pub(super) mod lookup_file;
 pub(super) mod lookup_store;

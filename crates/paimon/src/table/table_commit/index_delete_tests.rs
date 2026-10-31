@@ -142,9 +142,13 @@ fn stale_hash_index_deletes_remain_tolerated() {
     file.global_index_meta = None;
     let mut deletion = add_index_entry(file);
     deletion.kind = FileKind::Delete;
-    assert!(TableCommit::merge_index_entries(&[], &[deletion], false)
-        .unwrap()
-        .is_empty());
+    assert!(TableCommit::merge_index_entries(
+        vec![],
+        &[deletion],
+        index_commit::IndexDomain::GlobalRowIds
+    )
+    .unwrap()
+    .is_empty());
 }
 
 #[tokio::test]

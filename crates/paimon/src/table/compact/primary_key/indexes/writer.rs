@@ -25,6 +25,7 @@ use crate::table::index_build::{
     vector, IndexFileWriter,
 };
 use crate::table::index_file_path::IndexFileLocation;
+use crate::table::pk_index_maintenance::{row_count, source_meta};
 use crate::table::pk_index_options::Definition;
 use crate::table::{ArrowRecordBatchStream, DataSplit, RowRange, Table};
 use crate::vindex::VindexVectorIndexOptions;
@@ -33,31 +34,7 @@ use arrow_array::{Int64Array, RecordBatch};
 use arrow_schema::{DataType as ArrowType, Field, Schema};
 use async_stream::try_stream;
 use futures::TryStreamExt;
-use std::collections::BTreeMap;
 use std::sync::Arc;
-
-pub(super) fn native_options(
-    table: &Table,
-    definition: &Definition,
-) -> Result<BTreeMap<String, String>> {
-    if crate::vindex::is_vindex_index_type(&definition.index_type) {
-        Ok(VindexVectorIndexOptions::new(
-            table.schema().options(),
-            &definition.options,
-            &definition.index_type,
-            &definition.field,
-        )?
-        .native_options
-        .into_iter()
-        .collect())
-    } else {
-        let mut options = table.schema().options().clone();
-        options.extend(definition.options.clone());
-        Ok(full_text::native_full_text_options(&options)
-            .into_iter()
-            .collect())
-    }
-}
 
 /// Physical rows include NULLs, tombstones and DV-hidden positions. The common
 /// writers receive dense, level-local ordinals, not a merged or filtered read.
@@ -92,7 +69,7 @@ fn batches(
                     .ok_or_else(|| invalid("PK index ordinal overflow"))?;
             }
         }
-        if offset != super::row_count(&files)? {
+        if offset != row_count(&files)? {
             Err(invalid("PK index source row count changed"))?;
         }
     })
@@ -105,14 +82,14 @@ pub(super) async fn build(
     definition: &Definition,
     resources: Option<ResourceContext>,
 ) -> Result<Option<IndexFileMeta>> {
-    let count = super::row_count(files)?;
+    let count = row_count(files)?;
     let range = RowRange::new(0, count - 1);
     let meta = GlobalIndexMeta {
         row_range_start: range.from(),
         row_range_end: range.to(),
         index_field_id: definition.field.id(),
         extra_field_ids: None,
-        source_meta: Some(super::source_meta(files[0].level, files)?.serialize()?),
+        source_meta: Some(source_meta(files[0].level, files)?.serialize()?),
         index_meta: None,
     };
     let in_data = table.schema().core_options().index_file_in_data_file_dir();

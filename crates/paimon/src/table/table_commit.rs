@@ -54,6 +54,9 @@ mod auto_index;
 mod auto_index_tests;
 mod auto_maintenance;
 mod global_index_source_check;
+mod index_commit;
+
+use index_commit::IndexChanges;
 mod row_tracking;
 
 const DELETION_VECTORS_INDEX_TYPE: &str = "DELETION_VECTORS";
@@ -1468,7 +1471,7 @@ impl TableCommit {
                 .await?
                 {
                     if let Some(prepared) = &resolved.new_index_manifest_entries {
-                        let is_pk = super::compact::primary_key::indexes::is_source_index;
+                        let is_pk = super::pk_index_maintenance::is_source_index;
                         indexes.retain(|e| !is_pk(e));
                         indexes.extend(prepared.iter().filter(|e| is_pk(e)).cloned());
                     }
@@ -1990,9 +1993,6 @@ impl TableCommit {
         retry_state: Option<&RetryState>,
         check_append_files: bool,
     ) -> Result<ResolvedCommit> {
-        let file_io = self.snapshot_manager.file_io();
-        let manifest_dir = self.snapshot_manager.manifest_dir();
-
         match plan {
             CommitEntriesPlan::Compact {
                 entries,
@@ -2033,12 +2033,9 @@ impl TableCommit {
                 };
                 // Concurrent writes may replace HASH indexes, deletion vectors
                 // or global indexes. Rebase on the latest manifest every retry.
-                let index_manifest_name = match latest_snapshot {
-                    Some(snapshot) => {
-                        super::compact::validate_snapshot_indexes(&self.table, snapshot).await?
-                    }
-                    None => None,
-                };
+                if let Some(snapshot) = latest_snapshot {
+                    super::compact::validate_snapshot_indexes(&self.table, snapshot).await?;
+                }
                 validate_file_entries(entries.iter())?;
                 validate_file_entries(changelog_entries.iter())?;
                 // This runs after duplicate-commit filtering: an uncertain commit
@@ -2181,23 +2178,25 @@ impl TableCommit {
                     )
                     .await?;
                 }
-                let new_indexes = super::compact::primary_key::indexes::resolve(
-                    &self.table,
-                    read_snapshot.as_deref(),
-                    latest_snapshot.as_ref().expect("validated latest snapshot"),
-                    base_data_files.as_deref().unwrap_or_default(),
-                    entries,
-                    index_entries.as_deref(),
-                )
-                .await?;
+                let indexes = self
+                    .resolve_indexes(
+                        latest_snapshot,
+                        entries,
+                        IndexChanges::Compact {
+                            captured: read_snapshot.as_deref(),
+                            active: base_data_files.as_deref().unwrap_or_default(),
+                            prepared: index_entries.as_deref(),
+                        },
+                    )
+                    .await?;
                 Ok(ResolvedCommit {
                     entries: entries.clone(),
                     changelog_entries: changelog_entries.clone(),
                     deletion_vector_updates: deletion_vector_updates.to_vec(),
                     kind: CommitKind::COMPACT,
-                    index_manifest_name,
-                    index_manifest_changed: new_indexes.is_some(),
-                    new_index_manifest_entries: new_indexes,
+                    index_manifest_name: indexes.manifest_name,
+                    index_manifest_changed: indexes.entries.is_some(),
+                    new_index_manifest_entries: indexes.entries,
                     base_data_files,
                 })
             }
@@ -2241,37 +2240,22 @@ impl TableCommit {
                     None
                 };
 
-                let previous =
-                    Self::read_prev_index_entries(file_io, &manifest_dir, latest_snapshot).await?;
-                self.check_global_index_sources(latest_snapshot, entries, new_index_entries)
+                let indexes = self
+                    .resolve_indexes(
+                        latest_snapshot,
+                        entries,
+                        IndexChanges::Direct(new_index_entries),
+                    )
                     .await?;
-                let mut index_entries = new_index_entries.clone();
-                index_entries.extend(
-                    self.global_index_update_entries(&previous, entries, new_index_entries)
-                        .await?,
-                );
-                let all = Self::merge_index_entries(&previous, &index_entries, false)?;
-                self.check_deletion_vector_references(
-                    latest_snapshot,
-                    entries,
-                    &index_entries,
-                    &all,
-                )
-                .await?;
-                let index_manifest_changed = all != previous;
-                let index_manifest_name = latest_snapshot
-                    .as_ref()
-                    .and_then(|s| s.index_manifest().map(str::to_string));
-                let new_index_manifest_entries = index_manifest_changed.then_some(all);
 
                 Ok(ResolvedCommit {
                     entries: entries.clone(),
                     changelog_entries: changelog_entries.clone(),
                     deletion_vector_updates: vec![],
                     kind,
-                    index_manifest_name,
-                    index_manifest_changed,
-                    new_index_manifest_entries,
+                    index_manifest_name: indexes.manifest_name,
+                    index_manifest_changed: indexes.entries.is_some(),
+                    new_index_manifest_entries: indexes.entries,
                     base_data_files,
                 })
             }
@@ -2306,170 +2290,29 @@ impl TableCommit {
                     )
                     .await?;
 
-                let previous =
-                    Self::read_prev_index_entries(file_io, &manifest_dir, latest_snapshot).await?;
-                self.check_global_index_sources(latest_snapshot, &entries, &new_index_entries)
+                let indexes = self
+                    .resolve_indexes(
+                        latest_snapshot,
+                        &entries,
+                        IndexChanges::Overwrite {
+                            entries: &new_index_entries,
+                            partition_filter: partition_filter.as_ref(),
+                        },
+                    )
                     .await?;
-                let mut all = previous.clone();
-                match partition_filter.as_ref() {
-                    None => all.clear(),
-                    Some(filter) => {
-                        let mut retained = Vec::new();
-                        for e in all {
-                            if !filter.matches_entry(&e.partition)? {
-                                retained.push(e);
-                            }
-                        }
-                        all = retained;
-                    }
-                }
-                let all = Self::merge_index_entries(&all, &new_index_entries, false)?;
-                self.check_deletion_vector_references(
-                    latest_snapshot,
-                    &entries,
-                    &new_index_entries,
-                    &all,
-                )
-                .await?;
-                let index_manifest_changed = all != previous;
-                let index_manifest_name = latest_snapshot
-                    .as_ref()
-                    .and_then(|s| s.index_manifest().map(str::to_string));
-                let new_index_manifest_entries = index_manifest_changed.then_some(all);
 
                 Ok(ResolvedCommit {
                     entries,
                     changelog_entries: vec![],
                     deletion_vector_updates: vec![],
                     kind: CommitKind::OVERWRITE,
-                    index_manifest_name,
-                    index_manifest_changed,
-                    new_index_manifest_entries,
+                    index_manifest_name: indexes.manifest_name,
+                    index_manifest_changed: indexes.entries.is_some(),
+                    new_index_manifest_entries: indexes.entries,
                     base_data_files,
                 })
             }
         }
-    }
-
-    fn merge_index_entries(
-        previous_entries: &[IndexManifestEntry],
-        new_index_entries: &[IndexManifestEntry],
-        drop_previous_global_indexes: bool,
-    ) -> Result<Vec<IndexManifestEntry>> {
-        let mut all = if drop_previous_global_indexes {
-            previous_entries
-                .iter()
-                .filter(|entry| entry.index_file.global_index_meta.is_none())
-                .cloned()
-                .collect::<Vec<_>>()
-        } else {
-            previous_entries.to_vec()
-        };
-        let deletions = new_index_entries
-            .iter()
-            .filter(|entry| entry.kind == FileKind::Delete)
-            .collect::<Vec<_>>();
-        for deletion in deletions {
-            let global_index = !matches!(
-                deletion.index_file.index_type.as_str(),
-                "HASH" | DELETION_VECTORS_INDEX_TYPE
-            );
-            // Java combines global indexes by type and file name, then checks
-            // the complete current metadata before removing an entry. A stale
-            // removal must not discard metadata-only row-id reassignment.
-            let position = all.iter().position(|entry| {
-                if global_index {
-                    entry.index_file.index_type == deletion.index_file.index_type
-                        && entry.index_file.file_name == deletion.index_file.file_name
-                } else {
-                    same_index_file_entry(entry, deletion)
-                }
-            });
-            if let Some(position) = position {
-                let previous = &all[position];
-                if global_index
-                    && (!same_index_partition(&previous.partition, &deletion.partition)
-                        || previous.bucket != deletion.bucket
-                        || previous.index_file != deletion.index_file)
-                {
-                    return Err(crate::Error::DataInvalid {
-                        message: format!(
-                            "Index file {} metadata does not match the current entry.",
-                            deletion.index_file.file_name
-                        ),
-                        source: None,
-                    });
-                }
-                all.remove(position);
-            } else if global_index {
-                return Err(crate::Error::DataInvalid {
-                    message: format!(
-                        "Trying to delete global index file {} which does not exist.",
-                        deletion.index_file.file_name
-                    ),
-                    source: None,
-                });
-            } else if deletion.index_file.index_type == DELETION_VECTORS_INDEX_TYPE {
-                return Err(crate::Error::DataInvalid {
-                    message: format!("Cannot replace missing deletion vector index '{}'; prepare the DELETE again from the latest snapshot", deletion.index_file.file_name),
-                    source: None,
-                });
-            }
-        }
-
-        let additions = new_index_entries
-            .iter()
-            .filter(|entry| entry.kind == FileKind::Add)
-            .cloned()
-            .collect::<Vec<_>>();
-        let new_hash_keys: HashSet<(Vec<u8>, i32)> = additions
-            .iter()
-            .filter(|e| e.index_file.index_type == "HASH")
-            .map(|e| (e.partition.clone(), e.bucket))
-            .collect();
-        all.retain(|e| {
-            if e.index_file.index_type == "HASH" {
-                !new_hash_keys.contains(&(e.partition.clone(), e.bucket))
-            } else {
-                true
-            }
-        });
-        Self::validate_global_index_overlap(&all, &additions)?;
-        Self::validate_added_global_index_overlap(&additions)?;
-        let mut dv_files = HashSet::new();
-        let mut dv_names = HashSet::new();
-        for entry in all
-            .iter()
-            .chain(&additions)
-            .filter(|entry| entry.index_file.index_type == DELETION_VECTORS_INDEX_TYPE)
-        {
-            let partition = if is_empty_partition(&entry.partition) {
-                &[][..]
-            } else {
-                entry.partition.as_slice()
-            };
-            if !dv_names.insert((partition, entry.bucket, entry.index_file.file_name.as_str())) {
-                return Err(crate::Error::DataInvalid {
-                    message: format!(
-                        "Duplicate deletion vector index '{}'",
-                        entry.index_file.file_name
-                    ),
-                    source: None,
-                });
-            }
-            if let Some(ranges) = &entry.index_file.deletion_vectors_ranges {
-                for file in ranges.keys() {
-                    if !dv_files.insert((partition, entry.bucket, file.as_str())) {
-                        return Err(crate::Error::DataInvalid {
-                            message: format!("Conflicting deletion vectors for data file '{file}'; prepare the DELETE again from the latest snapshot"),
-                            source: None,
-                        });
-                    }
-                }
-            }
-        }
-        all.extend(additions);
-        Ok(all)
     }
 
     async fn global_index_update_entries(
@@ -2616,103 +2459,6 @@ impl TableCommit {
                 })
             }
         }
-    }
-
-    fn validate_global_index_overlap(
-        retained_entries: &[IndexManifestEntry],
-        added_entries: &[IndexManifestEntry],
-    ) -> Result<()> {
-        for retained in retained_entries {
-            if retained.kind == FileKind::Delete {
-                continue;
-            }
-            let Some(retained_meta) = retained.index_file.global_index_meta.as_ref() else {
-                continue;
-            };
-            for added in added_entries {
-                if added.kind == FileKind::Delete {
-                    continue;
-                }
-                let Some(added_meta) = added.index_file.global_index_meta.as_ref() else {
-                    continue;
-                };
-                if retained_meta.index_field_id == added_meta.index_field_id
-                    && retained.index_file.index_type == added.index_file.index_type
-                    && same_extra_field_ids(
-                        retained_meta.extra_field_ids.as_deref(),
-                        added_meta.extra_field_ids.as_deref(),
-                    )
-                    && ranges_overlap(
-                        retained_meta.row_range_start,
-                        retained_meta.row_range_end,
-                        added_meta.row_range_start,
-                        added_meta.row_range_end,
-                    )
-                {
-                    return Err(global_index_overlap_error(
-                        retained,
-                        retained_meta,
-                        added,
-                        added_meta,
-                    ));
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn validate_added_global_index_overlap(added_entries: &[IndexManifestEntry]) -> Result<()> {
-        for (left_index, left) in added_entries.iter().enumerate() {
-            if left.kind == FileKind::Delete {
-                continue;
-            }
-            let Some(left_meta) = left.index_file.global_index_meta.as_ref() else {
-                continue;
-            };
-            for right in added_entries.iter().skip(left_index + 1) {
-                if right.kind == FileKind::Delete {
-                    continue;
-                }
-                let Some(right_meta) = right.index_file.global_index_meta.as_ref() else {
-                    continue;
-                };
-                if left_meta.index_field_id == right_meta.index_field_id
-                    && left.index_file.index_type == right.index_file.index_type
-                    && same_extra_field_ids(
-                        left_meta.extra_field_ids.as_deref(),
-                        right_meta.extra_field_ids.as_deref(),
-                    )
-                    && ranges_overlap(
-                        left_meta.row_range_start,
-                        left_meta.row_range_end,
-                        right_meta.row_range_start,
-                        right_meta.row_range_end,
-                    )
-                {
-                    return Err(global_index_overlap_error(
-                        left, left_meta, right, right_meta,
-                    ));
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Read index entries from the previous snapshot's index manifest.
-    async fn read_prev_index_entries(
-        file_io: &FileIO,
-        manifest_dir: &str,
-        latest_snapshot: &Option<Snapshot>,
-    ) -> Result<Vec<IndexManifestEntry>> {
-        if let Some(snap) = latest_snapshot {
-            if let Some(prev_index_manifest) = snap.index_manifest() {
-                let prev_path = format!("{manifest_dir}/{prev_index_manifest}");
-                return Ok(normalize_index_entries(
-                    IndexManifest::read(file_io, &prev_path).await?,
-                ));
-            }
-        }
-        Ok(vec![])
     }
 
     /// Stateful overwrite provider mirroring Python `OverwriteChangesProvider`.
