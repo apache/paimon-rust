@@ -1811,3 +1811,1644 @@ async fn delta_keeps_physical_retractions_and_changelog_row_kinds() {
     }
     assert!(read_current_pairs(&table).await.is_empty());
 }
+
+type BlobRow = (Option<i32>, Option<Vec<u8>>);
+
+/// `(id, picture)` of every row, sorted, located by column name so a leading
+/// `rowkind` column is skipped.
+fn blob_rows(batches: &[RecordBatch]) -> Vec<BlobRow> {
+    use arrow_array::LargeBinaryArray;
+    let mut rows = Vec::new();
+    for batch in batches {
+        let ids = batch.column_by_name("id").unwrap();
+        let ids = ids.as_any().downcast_ref::<Int32Array>().unwrap();
+        let pictures = batch.column_by_name("picture").unwrap();
+        let pictures = pictures
+            .as_any()
+            .downcast_ref::<LargeBinaryArray>()
+            .unwrap();
+        for row in 0..batch.num_rows() {
+            rows.push((
+                ids.is_valid(row).then(|| ids.value(row)),
+                pictures.is_valid(row).then(|| pictures.value(row).to_vec()),
+            ));
+        }
+    }
+    rows.sort();
+    rows
+}
+
+/// Reads `(start, end]` per commit, as rows and as audit rows.
+async fn read_delta_both_ways(
+    table: &paimon::table::Table,
+    start: i64,
+    end: i64,
+) -> (Vec<RecordBatch>, Vec<RecordBatch>) {
+    let builder = table.new_read_builder();
+    let plan = builder
+        .new_incremental_scan(IncrementalScanMode::Delta, start, end)
+        .plan()
+        .await
+        .unwrap();
+    let read = builder.new_read().unwrap();
+    let rows = read
+        .to_incremental_arrow(&plan)
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    let audit = read
+        .to_audit_log_arrow(&plan)
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    (rows, audit)
+}
+
+/// A data-evolution commit writes BLOB and dedicated VECTOR columns to files of
+/// their own beside the row's other columns. Each commit must still read back
+/// as whole rows, as in an ordinary read.
+#[tokio::test]
+async fn delta_merges_data_evolution_column_files_into_rows() {
+    use arrow_array::builder::{FixedSizeListBuilder, Float32Builder};
+    use arrow_array::{ArrayRef, FixedSizeListArray, Float32Array, LargeBinaryArray, StringArray};
+    use arrow_schema::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
+    use paimon::spec::{BlobType, DataType, FloatType, IntType, Schema, TableSchema, VectorType};
+    use std::sync::Arc;
+
+    let path = "memory:/incremental_batch/data_evolution_files";
+    let vector = VectorType::try_new(true, 2, DataType::Float(FloatType::new())).unwrap();
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .column("picture", DataType::Blob(BlobType::new()))
+        .column("embedding", DataType::Vector(vector))
+        .option("row-tracking.enabled", "true")
+        .option("data-evolution.enabled", "true")
+        .option("vector.file.format", "parquet")
+        .build()
+        .unwrap();
+    let (io, table) = memory_table(path, TableSchema::new(0, &schema));
+    setup_dirs(&io, path).await;
+    persist_table_schema(&io, path, table.schema()).await;
+    let element = Arc::new(Field::new("element", ArrowDataType::Float32, true));
+    let batch = |ids: Vec<i32>, pictures: Vec<&[u8]>, embeddings: Vec<[f32; 2]>| {
+        let mut builder =
+            FixedSizeListBuilder::new(Float32Builder::new(), 2).with_field(element.clone());
+        for embedding in embeddings {
+            builder.values().append_slice(&embedding);
+            builder.append(true);
+        }
+        RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                Field::new("id", ArrowDataType::Int32, true),
+                Field::new("picture", ArrowDataType::LargeBinary, true),
+                Field::new(
+                    "embedding",
+                    ArrowDataType::FixedSizeList(element.clone(), 2),
+                    true,
+                ),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(ids)) as ArrayRef,
+                Arc::new(LargeBinaryArray::from(pictures)),
+                Arc::new(builder.finish()),
+            ],
+        )
+        .unwrap()
+    };
+    write_batch(
+        &table,
+        &batch(
+            vec![1, 2],
+            vec![b"aaa", b"bb"],
+            vec![[1.0, 0.0], [0.0, 1.0]],
+        ),
+    )
+    .await;
+    write_batch(&table, &batch(vec![3], vec![b"c"], vec![[0.5, 0.5]])).await;
+
+    let embeddings = |batches: &[RecordBatch]| {
+        let mut rows = Vec::new();
+        for batch in batches {
+            let ids = batch.column_by_name("id").unwrap();
+            let ids = ids.as_any().downcast_ref::<Int32Array>().unwrap();
+            let lists = batch.column_by_name("embedding").unwrap();
+            let lists = lists.as_any().downcast_ref::<FixedSizeListArray>().unwrap();
+            for row in 0..batch.num_rows() {
+                let values = lists.is_valid(row).then(|| {
+                    let values = lists.value(row);
+                    let values = values.as_any().downcast_ref::<Float32Array>().unwrap();
+                    values.values().to_vec()
+                });
+                rows.push((ids.is_valid(row).then(|| ids.value(row)), values));
+            }
+        }
+        rows.sort_by_key(|row| row.0);
+        rows
+    };
+    let picture = |id: i32, bytes: &[u8]| (Some(id), Some(bytes.to_vec()));
+    for (start, ids) in [(0, vec![1, 2, 3]), (1, vec![3])] {
+        let (rows, audit) = read_delta_both_ways(&table, start, 2).await;
+        let all = [picture(1, b"aaa"), picture(2, b"bb"), picture(3, b"c")];
+        let expected: Vec<BlobRow> = all
+            .into_iter()
+            .filter(|row| ids.contains(&row.0.unwrap()))
+            .collect();
+        assert_eq!(blob_rows(&rows), expected, "rows from {start}");
+        assert_eq!(blob_rows(&audit), expected, "audit rows from {start}");
+        let vectors = [
+            (Some(1), Some(vec![1.0, 0.0])),
+            (Some(2), Some(vec![0.0, 1.0])),
+            (Some(3), Some(vec![0.5, 0.5])),
+        ];
+        let expected: Vec<_> = vectors
+            .into_iter()
+            .filter(|row| ids.contains(&row.0.unwrap()))
+            .collect();
+        assert_eq!(embeddings(&rows), expected, "embeddings from {start}");
+        let kinds: Vec<_> = audit
+            .iter()
+            .flat_map(|batch| {
+                let kinds = batch.column(0).as_any().downcast_ref::<StringArray>();
+                kinds.unwrap().iter().map(|kind| kind.unwrap().to_owned())
+            })
+            .collect();
+        assert_eq!(kinds, vec!["+I"; ids.len()], "row kinds from {start}");
+    }
+}
+
+/// A primary-key table keeps managed BLOB descriptors in its data files. Each
+/// commit must read back with the payloads, as in an ordinary read.
+#[tokio::test]
+async fn delta_resolves_primary_key_blob_payloads() {
+    use arrow_array::{ArrayRef, LargeBinaryArray};
+    use arrow_schema::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
+    use paimon::spec::{BlobType, DataType, IntType, Schema, TableSchema};
+    use std::sync::Arc;
+
+    let path = "memory:/incremental_batch/primary_key_blobs";
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::with_nullable(false)))
+        .column("picture", DataType::Blob(BlobType::new()))
+        .primary_key(["id"])
+        .option("bucket", "1")
+        .build()
+        .unwrap();
+    let (io, table) = memory_table(path, TableSchema::new(0, &schema));
+    setup_dirs(&io, path).await;
+    persist_table_schema(&io, path, table.schema()).await;
+    let batch = |ids: Vec<i32>, pictures: Vec<&[u8]>| {
+        RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                Field::new("id", ArrowDataType::Int32, false),
+                Field::new("picture", ArrowDataType::LargeBinary, true),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(ids)) as ArrayRef,
+                Arc::new(LargeBinaryArray::from(pictures)),
+            ],
+        )
+        .unwrap()
+    };
+    write_batch(&table, &batch(vec![1, 2], vec![b"aaa", b"bb"])).await;
+    write_batch(&table, &batch(vec![2], vec![b"c"])).await;
+
+    let (rows, audit) = read_delta_both_ways(&table, 0, 2).await;
+    let expected = vec![
+        (Some(1), Some(b"aaa".to_vec())),
+        (Some(2), Some(b"bb".to_vec())),
+        (Some(2), Some(b"c".to_vec())),
+    ];
+    assert_eq!(blob_rows(&rows), expected);
+    assert_eq!(blob_rows(&audit), expected);
+}
+
+/// Each commit reads back as a streaming read of that snapshot does, including
+/// a data-evolution update that rewrites a column of existing rows.
+#[tokio::test]
+async fn delta_reads_each_commit_as_its_stream_follow_up() {
+    use arrow_array::{ArrayRef, Int64Array, LargeBinaryArray};
+    use paimon::spec::{BlobType, DataType, IntType, Schema, TableSchema};
+    use std::sync::Arc;
+
+    let path = "memory:/incremental_batch/stream_follow_up";
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .column("picture", DataType::Blob(BlobType::new()))
+        .option("row-tracking.enabled", "true")
+        .option("data-evolution.enabled", "true")
+        .build()
+        .unwrap();
+    let (io, table) = memory_table(path, TableSchema::new(0, &schema));
+    setup_dirs(&io, path).await;
+    persist_table_schema(&io, path, table.schema()).await;
+    let batch = |ids: Vec<i32>, pictures: Vec<&[u8]>| {
+        RecordBatch::try_from_iter([
+            ("id", Arc::new(Int32Array::from(ids)) as ArrayRef),
+            ("picture", Arc::new(LargeBinaryArray::from(pictures))),
+        ])
+        .unwrap()
+    };
+    write_batch(&table, &batch(vec![1, 2], vec![b"aaa", b"bb"])).await;
+    write_batch(&table, &batch(vec![3], vec![b"c"])).await;
+    // Snapshot 3 rewrites `picture` of row 0.
+    let builder = table.new_write_builder();
+    let mut update = builder
+        .new_data_evolution_writer(vec!["picture".into()])
+        .unwrap();
+    update
+        .add_matched_batch(
+            RecordBatch::try_from_iter([
+                ("_ROW_ID", Arc::new(Int64Array::from(vec![0])) as ArrayRef),
+                (
+                    "picture",
+                    Arc::new(LargeBinaryArray::from(vec![b"new".as_slice()])),
+                ),
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+    builder
+        .new_commit()
+        .commit(update.prepare_commit().await.unwrap())
+        .await
+        .unwrap();
+
+    let read_builder = table.new_read_builder();
+    let mut stream = read_builder.new_stream_scan().unwrap();
+    for snapshot in 1..=3 {
+        stream.restore(Some(snapshot)).unwrap();
+        let plan = stream.plan().await.unwrap().unwrap();
+        let streamed: Vec<RecordBatch> = read_builder
+            .new_read()
+            .unwrap()
+            .to_arrow(plan.splits())
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let (rows, audit) = read_delta_both_ways(&table, snapshot - 1, snapshot).await;
+        assert!(!streamed.is_empty(), "snapshot {snapshot}");
+        assert_eq!(
+            blob_rows(&rows),
+            blob_rows(&streamed),
+            "snapshot {snapshot}"
+        );
+        assert_eq!(
+            blob_rows(&audit),
+            blob_rows(&streamed),
+            "snapshot {snapshot}"
+        );
+    }
+}
+
+/// A range of two column updates of the same rows, without the rows they
+/// update: every reader of the combined plan returns the updated columns and
+/// reads the column no file of the range wrote as NULL, NOT NULL `id`
+/// included.
+#[tokio::test]
+async fn combined_delta_reads_the_columns_a_range_did_not_write_as_null() {
+    use arrow_array::{ArrayRef, Int64Array, StringArray};
+    use paimon::spec::{DataType, IntType, Schema, TableSchema, VarCharType};
+    use paimon::table::{IncrementalPlan, IncrementalSplit};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    let path = "memory:/incremental_batch/column_updates_only";
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::with_nullable(false)))
+        .column("name", DataType::VarChar(VarCharType::string_type()))
+        .column("value", DataType::Int(IntType::new()))
+        .option("row-tracking.enabled", "true")
+        .option("data-evolution.enabled", "true")
+        .build()
+        .unwrap();
+    let (io, table) = memory_table(path, TableSchema::new(0, &schema));
+    setup_dirs(&io, path).await;
+    persist_table_schema(&io, path, table.schema()).await;
+    let rows = RecordBatch::try_from_iter_with_nullable([
+        (
+            "id",
+            Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
+            false,
+        ),
+        (
+            "name",
+            Arc::new(StringArray::from(vec!["alice", "bob"])),
+            true,
+        ),
+        ("value", Arc::new(Int32Array::from(vec![10, 20])), true),
+    ])
+    .unwrap();
+    write_batch(&table, &rows).await;
+    // Snapshot 2 rewrites `name` of row 0 and snapshot 3 `value` of row 1.
+    for (column, row_id, values) in [
+        (
+            "name",
+            0,
+            Arc::new(StringArray::from(vec!["ALICE"])) as ArrayRef,
+        ),
+        ("value", 1, Arc::new(Int32Array::from(vec![99]))),
+    ] {
+        // Distinct commit times, for the timestamp window below.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let builder = table.new_write_builder();
+        let mut update = builder
+            .new_data_evolution_writer(vec![column.into()])
+            .unwrap();
+        update
+            .add_matched_batch(
+                RecordBatch::try_from_iter([
+                    (
+                        "_ROW_ID",
+                        Arc::new(Int64Array::from(vec![row_id])) as ArrayRef,
+                    ),
+                    (column, values),
+                ])
+                .unwrap(),
+            )
+            .unwrap();
+        builder
+            .new_commit()
+            .commit(update.prepare_commit().await.unwrap())
+            .await
+            .unwrap();
+    }
+    type Row = (Option<i32>, Option<String>, Option<i32>);
+    let collect = |batches: &[RecordBatch]| {
+        let mut rows: Vec<Row> = Vec::new();
+        for batch in batches {
+            let column = |name: &str| batch.column_by_name(name).unwrap().clone();
+            let (id, name, value) = (column("id"), column("name"), column("value"));
+            let id = id.as_any().downcast_ref::<Int32Array>().unwrap();
+            let name = name.as_any().downcast_ref::<StringArray>().unwrap();
+            let value = value.as_any().downcast_ref::<Int32Array>().unwrap();
+            for row in 0..batch.num_rows() {
+                rows.push((
+                    id.is_valid(row).then(|| id.value(row)),
+                    name.is_valid(row).then(|| name.value(row).to_string()),
+                    value.is_valid(row).then(|| value.value(row)),
+                ));
+            }
+        }
+        rows.sort();
+        rows
+    };
+    let updates: Vec<Row> = vec![
+        (None, Some("ALICE".into()), Some(10)),
+        (None, Some("bob".into()), Some(99)),
+    ];
+
+    let builder = table.new_read_builder();
+    let splits = builder
+        .new_incremental_scan(IncrementalScanMode::Delta, 1, 3)
+        .plan_combined_delta()
+        .await
+        .unwrap()
+        .into_splits();
+    let read = builder.new_read().unwrap();
+    let batches: Vec<RecordBatch> = read.to_arrow(&splits).unwrap().try_collect().await.unwrap();
+    assert_eq!(collect(&batches), updates, "to_arrow");
+    let plan = IncrementalPlan::try_new(
+        IncrementalScanMode::Delta,
+        splits.into_iter().map(IncrementalSplit::Data).collect(),
+    )
+    .unwrap();
+    for (reader, stream) in [
+        ("to_incremental_arrow", read.to_incremental_arrow(&plan)),
+        ("to_audit_log_arrow", read.to_audit_log_arrow(&plan)),
+    ] {
+        let batches: Vec<RecordBatch> = stream.unwrap().try_collect().await.unwrap();
+        assert_eq!(collect(&batches), updates, "{reader}");
+    }
+
+    // An ordinary scan given the same range as a timestamp window plans it
+    // the same way.
+    let snapshots = table.snapshot_manager();
+    let start = snapshots.get_snapshot(1).await.unwrap().time_millis();
+    let end = snapshots.get_snapshot(3).await.unwrap().time_millis();
+    let windowed = table.copy_with_options(HashMap::from([(
+        "incremental-between-timestamp".to_string(),
+        format!("{start},{end}"),
+    )]));
+    let builder = windowed.new_read_builder();
+    let plan = builder.new_scan().plan().await.unwrap();
+    let batches: Vec<RecordBatch> = builder
+        .new_read()
+        .unwrap()
+        .to_arrow(plan.splits())
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(collect(&batches), updates, "incremental-between-timestamp");
+
+    // The table itself still reads whole rows.
+    let builder = table.new_read_builder();
+    let plan = builder.new_scan().plan().await.unwrap();
+    let batches: Vec<RecordBatch> = builder
+        .new_read()
+        .unwrap()
+        .to_arrow(plan.splits())
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    let current: Vec<Row> = vec![
+        (Some(1), Some("ALICE".into()), Some(10)),
+        (Some(2), Some("bob".into()), Some(99)),
+    ];
+    assert_eq!(collect(&batches), current, "snapshot read");
+}
+
+/// `(id, name, picture, embedding)` of a row of an `evolved_table`. Embedding
+/// values are whole numbers, kept as `i32` so that rows sort.
+type EvolvedRow = (
+    Option<i32>,
+    Option<String>,
+    Option<Vec<u8>>,
+    Option<Vec<i32>>,
+);
+
+/// An `EvolvedRow` whose picture holds the bytes of `picture`.
+fn evolved_row(
+    id: Option<i32>,
+    name: Option<&str>,
+    picture: Option<&str>,
+    embedding: Option<[i32; 2]>,
+) -> EvolvedRow {
+    (
+        id,
+        name.map(str::to_string),
+        picture.map(|picture| picture.as_bytes().to_vec()),
+        embedding.map(|values| values.to_vec()),
+    )
+}
+
+fn embedding_field(name: &str) -> arrow_schema::Field {
+    use arrow_schema::{DataType as ArrowDataType, Field};
+    let element = std::sync::Arc::new(Field::new("element", ArrowDataType::Float32, true));
+    Field::new(name, ArrowDataType::FixedSizeList(element, 2), true)
+}
+
+fn embedding_array(values: &[[f32; 2]]) -> arrow_array::ArrayRef {
+    use arrow_array::builder::{FixedSizeListBuilder, Float32Builder};
+    use arrow_schema::{DataType as ArrowDataType, Field};
+    let element = std::sync::Arc::new(Field::new("element", ArrowDataType::Float32, true));
+    let mut builder = FixedSizeListBuilder::new(Float32Builder::new(), 2).with_field(element);
+    for value in values {
+        builder.values().append_slice(value);
+        builder.append(true);
+    }
+    std::sync::Arc::new(builder.finish())
+}
+
+/// Rows `(id, name, picture, embedding)` to append to an `evolved_table`.
+fn evolved_batch(
+    ids: Vec<i32>,
+    names: Vec<&str>,
+    pictures: Vec<&[u8]>,
+    embeddings: &[[f32; 2]],
+) -> RecordBatch {
+    use arrow_array::{ArrayRef, LargeBinaryArray, StringArray};
+    use arrow_schema::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
+    RecordBatch::try_new(
+        std::sync::Arc::new(ArrowSchema::new(vec![
+            Field::new("id", ArrowDataType::Int32, false),
+            Field::new("name", ArrowDataType::Utf8, true),
+            Field::new("picture", ArrowDataType::LargeBinary, true),
+            embedding_field("embedding"),
+        ])),
+        vec![
+            std::sync::Arc::new(Int32Array::from(ids)) as ArrayRef,
+            std::sync::Arc::new(StringArray::from(names)),
+            std::sync::Arc::new(LargeBinaryArray::from(pictures)),
+            embedding_array(embeddings),
+        ],
+    )
+    .unwrap()
+}
+
+/// A data-evolution table `(id INT NOT NULL, name STRING, picture BLOB,
+/// embedding VECTOR<FLOAT, 2>)`, which keeps the VECTOR column in
+/// `.vector.parquet` files and whose snapshot 1 writes `alice` and `bob`, row
+/// ids 0 and 1.
+async fn evolved_table(path: &str, options: &[(&str, &str)]) -> paimon::table::Table {
+    evolved_table_with_picture(path, options, paimon::spec::BlobType::new()).await
+}
+
+/// An `evolved_table` whose `picture` column has type `picture`.
+async fn evolved_table_with_picture(
+    path: &str,
+    options: &[(&str, &str)],
+    picture: paimon::spec::BlobType,
+) -> paimon::table::Table {
+    use paimon::spec::{
+        DataType, FloatType, IntType, Schema, TableSchema, VarCharType, VectorType,
+    };
+    let vector = VectorType::try_new(true, 2, DataType::Float(FloatType::new())).unwrap();
+    let mut schema = Schema::builder()
+        .column("id", DataType::Int(IntType::with_nullable(false)))
+        .column("name", DataType::VarChar(VarCharType::string_type()))
+        .column("picture", DataType::Blob(picture))
+        .column("embedding", DataType::Vector(vector))
+        .option("row-tracking.enabled", "true")
+        .option("data-evolution.enabled", "true")
+        .option("vector.file.format", "parquet");
+    for (key, value) in options {
+        schema = schema.option(*key, *value);
+    }
+    let (io, table) = memory_table(path, TableSchema::new(0, &schema.build().unwrap()));
+    setup_dirs(&io, path).await;
+    persist_table_schema(&io, path, table.schema()).await;
+    let rows = vec![b"aaa".as_slice(), b"bb".as_slice()];
+    let batch = evolved_batch(
+        vec![1, 2],
+        vec!["alice", "bob"],
+        rows,
+        &[[1.0, 0.0], [0.0, 1.0]],
+    );
+    write_batch(&table, &batch).await;
+    table
+}
+
+/// Commits one data-evolution update of `columns` for the row with `row_id`.
+async fn rewrite(
+    table: &paimon::table::Table,
+    row_id: i64,
+    columns: Vec<(arrow_schema::Field, arrow_array::ArrayRef)>,
+) {
+    use arrow_array::{ArrayRef, Int64Array};
+    use arrow_schema::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
+    let names = columns
+        .iter()
+        .map(|(field, _)| field.name().clone())
+        .collect();
+    let mut fields = vec![Field::new("_ROW_ID", ArrowDataType::Int64, false)];
+    let mut arrays = vec![std::sync::Arc::new(Int64Array::from(vec![row_id])) as ArrayRef];
+    for (field, array) in columns {
+        fields.push(field);
+        arrays.push(array);
+    }
+    let batch =
+        RecordBatch::try_new(std::sync::Arc::new(ArrowSchema::new(fields)), arrays).unwrap();
+    let builder = table.new_write_builder();
+    let mut writer = builder.new_data_evolution_writer(names).unwrap();
+    writer.add_matched_batch(batch).unwrap();
+    let messages = writer.prepare_commit().await.unwrap();
+    builder.new_commit().commit(messages).await.unwrap();
+}
+
+fn new_embedding(value: [f32; 2]) -> (arrow_schema::Field, arrow_array::ArrayRef) {
+    (embedding_field("embedding"), embedding_array(&[value]))
+}
+
+fn new_picture(value: &[u8]) -> (arrow_schema::Field, arrow_array::ArrayRef) {
+    use arrow_array::LargeBinaryArray;
+    use arrow_schema::{DataType as ArrowDataType, Field};
+    let field = Field::new("picture", ArrowDataType::LargeBinary, true);
+    (
+        field,
+        std::sync::Arc::new(LargeBinaryArray::from(vec![value])),
+    )
+}
+
+fn new_name(value: &str) -> (arrow_schema::Field, arrow_array::ArrayRef) {
+    use arrow_array::StringArray;
+    use arrow_schema::{DataType as ArrowDataType, Field};
+    let field = Field::new("name", ArrowDataType::Utf8, true);
+    (field, std::sync::Arc::new(StringArray::from(vec![value])))
+}
+
+/// The rows of `batches`, sorted; a column the read leaves out reads as `None`.
+fn evolved_rows(batches: &[RecordBatch]) -> Vec<EvolvedRow> {
+    use arrow_array::{FixedSizeListArray, Float32Array, LargeBinaryArray, StringArray};
+    let mut rows = Vec::new();
+    for batch in batches {
+        let column = |name: &str| batch.column_by_name(name).map(|column| column.as_any());
+        let ids = column("id").map(|ids| ids.downcast_ref::<Int32Array>().unwrap());
+        let names = column("name").map(|names| names.downcast_ref::<StringArray>().unwrap());
+        let pictures = column("picture").map(|p| p.downcast_ref::<LargeBinaryArray>().unwrap());
+        let embeddings =
+            column("embedding").map(|e| e.downcast_ref::<FixedSizeListArray>().unwrap());
+        for row in 0..batch.num_rows() {
+            let embedding = embeddings.filter(|e| e.is_valid(row)).map(|e| {
+                let values = e.value(row);
+                let values = values.as_any().downcast_ref::<Float32Array>().unwrap();
+                values.values().iter().map(|value| *value as i32).collect()
+            });
+            rows.push((
+                ids.filter(|ids| ids.is_valid(row))
+                    .map(|ids| ids.value(row)),
+                names
+                    .filter(|n| n.is_valid(row))
+                    .map(|n| n.value(row).to_string()),
+                pictures
+                    .filter(|p| p.is_valid(row))
+                    .map(|p| p.value(row).to_vec()),
+                embedding,
+            ));
+        }
+    }
+    rows.sort();
+    rows
+}
+
+/// `rows` as a read type of `columns` (every column for `None`) returns them.
+fn project_evolved(rows: &[EvolvedRow], columns: Option<&[&str]>) -> Vec<EvolvedRow> {
+    let read = |name: &str| columns.is_none_or(|columns| columns.contains(&name));
+    let mut rows: Vec<EvolvedRow> = rows
+        .iter()
+        .map(|(id, name, picture, embedding)| {
+            (
+                id.filter(|_| read("id")),
+                name.clone().filter(|_| read("name")),
+                picture.clone().filter(|_| read("picture")),
+                embedding.clone().filter(|_| read("embedding")),
+            )
+        })
+        .collect();
+    rows.sort();
+    rows
+}
+
+/// Reads `(start, end]` through a read type of `columns` (every column for
+/// `None`), planned per commit and as one batch. Each plan reads alike through
+/// every reader taking it; returns the rows of both plans.
+async fn read_evolved_range(
+    table: &paimon::table::Table,
+    start: i64,
+    end: i64,
+    columns: Option<&[&str]>,
+) -> (Vec<EvolvedRow>, Vec<EvolvedRow>) {
+    use paimon::table::{IncrementalPlan, IncrementalSplit};
+    let label = format!("({start},{end}] {columns:?}");
+    let mut builder = table.new_read_builder();
+    if let Some(columns) = columns {
+        let fields = table.schema().fields().iter();
+        builder.with_read_type(
+            fields
+                .filter(|f| columns.contains(&f.name()))
+                .cloned()
+                .collect(),
+        );
+    }
+    let read = builder.new_read().unwrap();
+    let scan = builder.new_incremental_scan(IncrementalScanMode::Delta, start, end);
+    let plan = scan.plan().await.unwrap();
+    let rows: Vec<RecordBatch> = read
+        .to_incremental_arrow(&plan)
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    let audit: Vec<RecordBatch> = read
+        .to_audit_log_arrow(&plan)
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    let per_commit = evolved_rows(&rows);
+    assert_eq!(evolved_rows(&audit), per_commit, "{label} audit per commit");
+    // A stream scan reads the splits of each commit with `to_arrow`.
+    let rows: Vec<RecordBatch> = read
+        .to_arrow(&plan.data_splits())
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        evolved_rows(&rows),
+        per_commit,
+        "{label} to_arrow per commit"
+    );
+
+    let splits = scan.plan_combined_delta().await.unwrap().into_splits();
+    let rows: Vec<RecordBatch> = read.to_arrow(&splits).unwrap().try_collect().await.unwrap();
+    let combined = evolved_rows(&rows);
+    let plan = IncrementalPlan::try_new(
+        IncrementalScanMode::Delta,
+        splits.into_iter().map(IncrementalSplit::Data).collect(),
+    )
+    .unwrap();
+    let rows: Vec<RecordBatch> = read
+        .to_incremental_arrow(&plan)
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(evolved_rows(&rows), combined, "{label} as one batch");
+    (per_commit, combined)
+}
+
+/// The ordinary read of the table's latest snapshot.
+async fn read_evolved_snapshot(table: &paimon::table::Table) -> Vec<EvolvedRow> {
+    let builder = table.new_read_builder();
+    let plan = builder.new_scan().plan().await.unwrap();
+    let read = builder.new_read().unwrap();
+    let rows: Vec<RecordBatch> = read
+        .to_arrow(plan.splits())
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    evolved_rows(&rows)
+}
+
+/// Ranges of data-evolution updates to rows written before them. A BLOB or
+/// VECTOR file a range wrote for rows of no ordinary-column file in the range,
+/// such as a VECTOR rewrite alone, is read as written, as every data-evolution
+/// file was read before the files of a range were merged. Column slices of one
+/// row range still merge, a row a BLOB file did not write reading NULL. Every
+/// reader and read type returns the same rows, and the ordinary read is
+/// unchanged.
+#[tokio::test]
+async fn delta_reads_rewrites_of_blob_and_vector_columns() {
+    let row = evolved_row;
+    let vector = |values: [i32; 2]| row(None, None, None, Some(values));
+    let picture = |text: &str| row(None, None, Some(text), None);
+    let named = |name: &str| row(None, Some(name), None, None);
+    let alice = |embedding| row(Some(1), Some("alice"), Some("aaa"), Some(embedding));
+    let bob = |embedding| row(Some(2), Some("bob"), Some("bb"), Some(embedding));
+    // With the write-cols optimization, an insert's normal file omits its
+    // write columns although its BLOB and VECTOR columns are in other files.
+    for (suffix, options) in [
+        ("", &[][..]),
+        ("_dv", &[("deletion-vectors.enabled", "true")][..]),
+        (
+            "_omitted_cols",
+            &[("data-evolution.write-cols-optimization.enabled", "true")][..],
+        ),
+    ] {
+        let path = |name: &str| format!("memory:/incremental_batch/rewrites_{name}{suffix}");
+        // (case, table, range, rows per commit, rows as one batch, snapshot)
+        let mut cases = Vec::new();
+
+        // The reviewer's case: a VECTOR rewrite writes one `.vector.parquet`.
+        let table = evolved_table(&path("vector"), options).await;
+        rewrite(&table, 0, vec![new_embedding([9.0, 9.0])]).await;
+        let rewritten = vec![vector([0, 1]), vector([9, 9])];
+        let current = vec![alice([9, 9]), bob([0, 1])];
+        let range = (1, 2);
+        cases.push((
+            "vector",
+            table.clone(),
+            range,
+            rewritten.clone(),
+            rewritten,
+            current.clone(),
+        ));
+        // Together with the insert of its rows, the range merges into rows.
+        let inserted = vec![alice([1, 0]), bob([0, 1]), vector([0, 1]), vector([9, 9])];
+        cases.push((
+            "insert, vector",
+            table,
+            (0, 2),
+            inserted,
+            current.clone(),
+            current,
+        ));
+
+        let table = evolved_table(&path("two_vectors"), options).await;
+        rewrite(&table, 0, vec![new_embedding([9.0, 9.0])]).await;
+        rewrite(&table, 1, vec![new_embedding([7.0, 7.0])]).await;
+        let rewritten = vec![
+            vector([0, 1]),
+            vector([7, 7]),
+            vector([9, 9]),
+            vector([9, 9]),
+        ];
+        let current = vec![alice([9, 9]), bob([7, 7])];
+        cases.push((
+            "two vectors",
+            table.clone(),
+            (1, 3),
+            rewritten.clone(),
+            rewritten.clone(),
+            current.clone(),
+        ));
+        // With the insert, the latest of the two rewrites wins.
+        let mut inserted = vec![alice([1, 0]), bob([0, 1])];
+        inserted.extend(rewritten);
+        cases.push((
+            "insert, two vectors",
+            table,
+            (0, 3),
+            inserted,
+            current.clone(),
+            current,
+        ));
+
+        let table = evolved_table(&path("vector_blob"), options).await;
+        rewrite(&table, 0, vec![new_embedding([9.0, 9.0])]).await;
+        rewrite(&table, 1, vec![new_picture(b"zzzz")]).await;
+        // The BLOB file of row 1 holds no value for row 0.
+        let rewritten = vec![
+            row(None, None, None, None),
+            vector([0, 1]),
+            vector([9, 9]),
+            picture("zzzz"),
+        ];
+        let current = vec![
+            alice([9, 9]),
+            row(Some(2), Some("bob"), Some("zzzz"), Some([0, 1])),
+        ];
+        cases.push((
+            "vector, blob",
+            table,
+            (1, 3),
+            rewritten.clone(),
+            rewritten,
+            current,
+        ));
+
+        // One commit rewriting both: a BLOB file of row 0, a VECTOR file of both rows.
+        let table = evolved_table(&path("vector_and_blob"), options).await;
+        rewrite(
+            &table,
+            0,
+            vec![new_embedding([9.0, 9.0]), new_picture(b"zzzz")],
+        )
+        .await;
+        let rewritten = vec![vector([0, 1]), vector([9, 9]), picture("zzzz")];
+        let current = vec![
+            row(Some(1), Some("alice"), Some("zzzz"), Some([9, 9])),
+            bob([0, 1]),
+        ];
+        cases.push((
+            "vector and blob",
+            table,
+            (1, 2),
+            rewritten.clone(),
+            rewritten,
+            current,
+        ));
+        // The name file holds every row the VECTOR file holds, so they merge.
+        let table = evolved_table(&path("vector_name"), options).await;
+        rewrite(&table, 0, vec![new_embedding([9.0, 9.0])]).await;
+        rewrite(&table, 1, vec![new_name("BOB")]).await;
+        let rewritten = vec![named("BOB"), named("alice"), vector([0, 1]), vector([9, 9])];
+        let merged = vec![
+            row(None, Some("BOB"), None, Some([0, 1])),
+            row(None, Some("alice"), None, Some([9, 9])),
+        ];
+        let current = vec![
+            alice([9, 9]),
+            row(Some(2), Some("BOB"), Some("bb"), Some([0, 1])),
+        ];
+        cases.push(("vector, name", table, (1, 3), rewritten, merged, current));
+
+        let table = evolved_table(&path("two_blobs"), options).await;
+        rewrite(&table, 0, vec![new_picture(b"zzzz")]).await;
+        rewrite(&table, 1, vec![new_picture(b"yyyyy")]).await;
+        let rewritten = vec![
+            row(None, None, None, None),
+            picture("yyyyy"),
+            picture("zzzz"),
+        ];
+        let current = vec![
+            row(Some(1), Some("alice"), Some("zzzz"), Some([1, 0])),
+            row(Some(2), Some("bob"), Some("yyyyy"), Some([0, 1])),
+        ];
+        cases.push((
+            "two blobs",
+            table,
+            (1, 3),
+            rewritten.clone(),
+            rewritten,
+            current,
+        ));
+
+        // A BLOB file holding fewer rows than the name file: the rest read NULL.
+        let table = evolved_table(&path("name_blob"), options).await;
+        rewrite(&table, 1, vec![new_name("BOB")]).await;
+        rewrite(&table, 0, vec![new_picture(b"zzzz")]).await;
+        let rewritten = vec![named("BOB"), named("alice"), picture("zzzz")];
+        let merged = vec![named("BOB"), row(None, Some("alice"), Some("zzzz"), None)];
+        let current = vec![
+            row(Some(1), Some("alice"), Some("zzzz"), Some([1, 0])),
+            row(Some(2), Some("BOB"), Some("bb"), Some([0, 1])),
+        ];
+        cases.push(("name, blob", table, (1, 3), rewritten, merged, current));
+
+        // A rewrite of old rows next to an insert of new ones.
+        let table = evolved_table(&path("vector_insert"), options).await;
+        rewrite(&table, 0, vec![new_embedding([9.0, 9.0])]).await;
+        let pictures = vec![b"c".as_slice(), b"dd".as_slice()];
+        let batch = evolved_batch(
+            vec![3, 4],
+            vec!["carol", "dave"],
+            pictures,
+            &[[3.0, 3.0], [4.0, 4.0]],
+        );
+        write_batch(&table, &batch).await;
+        let carol = row(Some(3), Some("carol"), Some("c"), Some([3, 3]));
+        let dave = row(Some(4), Some("dave"), Some("dd"), Some([4, 4]));
+        let rows = vec![vector([0, 1]), vector([9, 9]), carol.clone(), dave.clone()];
+        let current = vec![alice([9, 9]), bob([0, 1]), carol, dave];
+        cases.push(("vector, insert", table, (1, 3), rows.clone(), rows, current));
+
+        for (case, table, (start, end), per_commit, combined, current) in &cases {
+            for columns in [
+                None,
+                Some(&["id", "name", "picture", "embedding"][..]),
+                Some(&[][..]),
+                Some(&["id"][..]),
+                Some(&["embedding"][..]),
+                Some(&["name", "picture"][..]),
+            ] {
+                let (rows, merged) = read_evolved_range(table, *start, *end, columns).await;
+                let label = format!("{case}{suffix} {columns:?}");
+                assert_eq!(
+                    rows,
+                    project_evolved(per_commit, columns),
+                    "{label} per commit"
+                );
+                assert_eq!(
+                    merged,
+                    project_evolved(combined, columns),
+                    "{label} as one batch"
+                );
+            }
+            let mut current = current.clone();
+            current.sort();
+            assert_eq!(
+                read_evolved_snapshot(table).await,
+                current,
+                "{case}{suffix} snapshot"
+            );
+        }
+    }
+}
+
+/// A VECTOR field a row-id group holds in files of two layouts, written before
+/// and after a schema change (a column added or an option set) or together
+/// with and apart from another VECTOR field, cannot be merged into rows. Each
+/// file of such a group in a range is read as written, whatever the read type.
+#[tokio::test]
+async fn delta_reads_vector_files_of_two_layouts_file_by_file() {
+    use arrow_schema::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
+    use paimon::spec::{
+        BlobType, DataType, FloatType, IntType, Schema, TableSchema, VarCharType, VectorType,
+    };
+    let vector_type = || {
+        DataType::Vector(VectorType::try_new(true, 2, DataType::Float(FloatType::new())).unwrap())
+    };
+    let row = evolved_row;
+    let vector = |values: [i32; 2]| row(None, None, None, Some(values));
+    let picture = |text: &str| row(None, None, Some(text), None);
+    let columns: [Option<&[&str]>; 4] = [None, Some(&[]), Some(&["id"]), Some(&["embedding"])];
+
+    // The rewrite follows `ADD COLUMN note` or `SET` of an option, after which
+    // its file has schema 1.
+    for add_column in [true, false] {
+        let path = format!("memory:/incremental_batch/two_layouts_add_column_{add_column}");
+        let table = evolved_table(&path, &[]).await;
+        let mut schema = Schema::builder()
+            .column("id", DataType::Int(IntType::with_nullable(false)))
+            .column("name", DataType::VarChar(VarCharType::string_type()))
+            .column("picture", DataType::Blob(BlobType::new()))
+            .column("embedding", vector_type());
+        let mut options = table.schema().options().clone();
+        if add_column {
+            schema = schema.column("note", DataType::VarChar(VarCharType::string_type()));
+        } else {
+            options.insert("snapshot.num-retained.max".into(), "10".into());
+        }
+        let table = paimon::table::Table::new(
+            table.file_io().clone(),
+            table.identifier().clone(),
+            path.clone(),
+            TableSchema::new(1, &schema.options(options).build().unwrap()),
+            None,
+        );
+        persist_table_schema(table.file_io(), &path, table.schema()).await;
+        rewrite(&table, 0, vec![new_embedding([9.0, 9.0])]).await;
+        let per_commit = vec![
+            row(Some(1), Some("alice"), Some("aaa"), Some([1, 0])),
+            row(Some(2), Some("bob"), Some("bb"), Some([0, 1])),
+            vector([0, 1]),
+            vector([9, 9]),
+        ];
+        let by_file = vec![
+            row(Some(1), Some("alice"), None, None),
+            row(Some(2), Some("bob"), None, None),
+            picture("aaa"),
+            picture("bb"),
+            vector([1, 0]),
+            vector([0, 1]),
+            vector([0, 1]),
+            vector([9, 9]),
+        ];
+        for columns in columns {
+            let (rows, merged) = read_evolved_range(&table, 0, 2, columns).await;
+            let label = format!("add column: {add_column} {columns:?}");
+            assert_eq!(rows, project_evolved(&per_commit, columns), "{label}");
+            assert_eq!(merged, project_evolved(&by_file, columns), "{label}");
+        }
+        // A filter applies to each row read, even when its row id also names rows
+        // of other files: under a LIMIT, the BLOB file's row 0 must not come back.
+        for (plan_combined, expected) in [
+            (
+                false,
+                vec![row(Some(1), Some("alice"), Some("aaa"), Some([1, 0]))],
+            ),
+            (true, vec![row(Some(1), Some("alice"), None, None)]),
+        ] {
+            use paimon::spec::{Datum, PredicateBuilder};
+            use paimon::table::{IncrementalPlan, IncrementalSplit};
+            let mut builder = table.new_read_builder();
+            let predicate = PredicateBuilder::new(table.schema().fields())
+                .equal("name", Datum::String("alice".into()))
+                .unwrap();
+            builder.with_filter(predicate).with_limit(2);
+            let scan = builder.new_incremental_scan(IncrementalScanMode::Delta, 0, 2);
+            let plan = if plan_combined {
+                let splits = scan.plan_combined_delta().await.unwrap().into_splits();
+                IncrementalPlan::try_new(
+                    IncrementalScanMode::Delta,
+                    splits.into_iter().map(IncrementalSplit::Data).collect(),
+                )
+                .unwrap()
+            } else {
+                scan.plan().await.unwrap()
+            };
+            let read = builder.new_read().unwrap();
+            let batches: Vec<RecordBatch> = read
+                .to_incremental_arrow(&plan)
+                .unwrap()
+                .try_collect()
+                .await
+                .unwrap();
+            let label =
+                format!("filter and limit, add column: {add_column}, combined: {plan_combined}");
+            assert_eq!(evolved_rows(&batches), expected, "{label}");
+        }
+    }
+    // A rewrite of one of two VECTOR fields that share a file.
+    let path = "memory:/incremental_batch/two_layouts_vector_columns";
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::with_nullable(false)))
+        .column("embedding", vector_type())
+        .column("embedding2", vector_type())
+        .option("row-tracking.enabled", "true")
+        .option("data-evolution.enabled", "true")
+        .option("vector.file.format", "parquet")
+        .build()
+        .unwrap();
+    let (io, table) = memory_table(path, TableSchema::new(0, &schema));
+    setup_dirs(&io, path).await;
+    persist_table_schema(&io, path, table.schema()).await;
+    let batch = RecordBatch::try_new(
+        std::sync::Arc::new(ArrowSchema::new(vec![
+            Field::new("id", ArrowDataType::Int32, false),
+            embedding_field("embedding"),
+            embedding_field("embedding2"),
+        ])),
+        vec![
+            std::sync::Arc::new(Int32Array::from(vec![1, 2])) as arrow_array::ArrayRef,
+            embedding_array(&[[1.0, 0.0], [0.0, 1.0]]),
+            embedding_array(&[[5.0, 5.0], [6.0, 6.0]]),
+        ],
+    )
+    .unwrap();
+    write_batch(&table, &batch).await;
+    rewrite(&table, 0, vec![new_embedding([9.0, 9.0])]).await;
+    let per_commit = vec![
+        row(Some(1), None, None, Some([1, 0])),
+        row(Some(2), None, None, Some([0, 1])),
+        vector([0, 1]),
+        vector([9, 9]),
+    ];
+    let by_file = vec![
+        row(Some(1), None, None, None),
+        row(Some(2), None, None, None),
+        vector([1, 0]),
+        vector([0, 1]),
+        vector([0, 1]),
+        vector([9, 9]),
+    ];
+    for columns in columns {
+        let (rows, merged) = read_evolved_range(&table, 0, 2, columns).await;
+        assert_eq!(
+            rows,
+            project_evolved(&per_commit, columns),
+            "two fields {columns:?}"
+        );
+        assert_eq!(
+            merged,
+            project_evolved(&by_file, columns),
+            "two fields {columns:?}"
+        );
+    }
+}
+
+/// With `blob-as-descriptor`, a range returns the descriptors of the BLOBs it
+/// wrote, whether a BLOB file is read on its own or merged into rows, as the
+/// ordinary read does.
+#[tokio::test]
+async fn delta_returns_blob_descriptors_of_rewrites() {
+    use paimon::spec::BlobDescriptor;
+    use std::collections::HashMap;
+    let path = "memory:/incremental_batch/rewrite_descriptors";
+    let table = evolved_table(path, &[]).await;
+    rewrite(&table, 0, vec![new_picture(b"zzzz")]).await;
+    let table = table.copy_with_options(HashMap::from([(
+        "blob-as-descriptor".to_string(),
+        "true".to_string(),
+    )]));
+    // The payload length each descriptor points at, by id; rows of the BLOB
+    // file alone have none.
+    let lengths = |rows: &[EvolvedRow]| {
+        let mut lengths: Vec<_> = rows
+            .iter()
+            .filter_map(|(id, _, picture, _)| {
+                let descriptor = BlobDescriptor::deserialize(picture.as_ref()?).unwrap();
+                Some((*id, descriptor.length()))
+            })
+            .collect();
+        lengths.sort();
+        lengths
+    };
+    let (rows, merged) = read_evolved_range(&table, 1, 2, None).await;
+    assert_eq!(lengths(&rows), [(None, 4)]);
+    assert_eq!(lengths(&merged), [(None, 4)]);
+    let (rows, merged) = read_evolved_range(&table, 0, 2, None).await;
+    assert_eq!(lengths(&rows), [(None, 4), (Some(1), 3), (Some(2), 2)]);
+    assert_eq!(lengths(&merged), [(Some(1), 4), (Some(2), 2)]);
+    let current = read_evolved_snapshot(&table).await;
+    assert_eq!(lengths(&current), [(Some(1), 4), (Some(2), 2)]);
+}
+
+/// A BLOB rewrite of bob's picture writes a placeholder for alice's, which a
+/// range without an older picture of hers reads as NULL, also in a `BLOB NOT
+/// NULL` column: alone, and merged into the rows of a name rewrite. The
+/// ordinary read is unchanged.
+#[tokio::test]
+async fn delta_reads_pictures_a_rewrite_left_unwritten_as_null() {
+    use paimon::spec::BlobType;
+    let row = evolved_row;
+    for nullable in [true, false] {
+        let picture = BlobType::with_nullable(nullable);
+        let path = |name: &str| format!("memory:/incremental_batch/unwritten_{name}_{nullable}");
+        let table = evolved_table_with_picture(&path("picture"), &[], picture.clone()).await;
+        rewrite(&table, 1, vec![new_picture(b"zz")]).await;
+        let rewritten = vec![
+            row(None, None, None, None),
+            row(None, None, Some("zz"), None),
+        ];
+        assert_eq!(
+            read_evolved_range(&table, 1, 2, None).await,
+            (rewritten.clone(), rewritten),
+            "picture, nullable: {nullable}"
+        );
+        let current = vec![
+            row(Some(1), Some("alice"), Some("aaa"), Some([1, 0])),
+            row(Some(2), Some("bob"), Some("zz"), Some([0, 1])),
+        ];
+        assert_eq!(read_evolved_snapshot(&table).await, current);
+
+        let table = evolved_table_with_picture(&path("name_picture"), &[], picture).await;
+        rewrite(&table, 1, vec![new_name("BOB")]).await;
+        rewrite(&table, 1, vec![new_picture(b"zz")]).await;
+        let (per_commit, merged) = read_evolved_range(&table, 1, 3, None).await;
+        let names = [
+            row(None, Some("BOB"), None, None),
+            row(None, Some("alice"), None, None),
+        ];
+        let pictures = [
+            row(None, None, None, None),
+            row(None, None, Some("zz"), None),
+        ];
+        let mut expected = [names, pictures].concat();
+        expected.sort();
+        assert_eq!(per_commit, expected, "name, picture, nullable: {nullable}");
+        assert_eq!(
+            merged,
+            [
+                row(None, Some("BOB"), Some("zz"), None),
+                row(None, Some("alice"), None, None),
+            ],
+            "name, picture as one batch, nullable: {nullable}"
+        );
+        let current = vec![
+            row(Some(1), Some("alice"), Some("aaa"), Some([1, 0])),
+            row(Some(2), Some("BOB"), Some("zz"), Some([0, 1])),
+        ];
+        assert_eq!(read_evolved_snapshot(&table).await, current);
+    }
+}
+
+/// A table that switches a VECTOR column between vector files and inline
+/// storage writes the rows' later embeddings in the other layout. A range
+/// holding both layouts of the same rows is read as written, so it returns
+/// the rewrite's embedding in either direction.
+#[tokio::test]
+async fn delta_reads_a_vector_column_stored_in_two_ways_file_by_file() {
+    use arrow_schema::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
+    use paimon::spec::{
+        DataType, FloatType, IntType, Schema, SchemaChange, TableSchema, VectorType,
+    };
+    let row = evolved_row;
+    let vector = |values: [i32; 2]| row(None, None, None, Some(values));
+    let vector_type =
+        DataType::Vector(VectorType::try_new(true, 2, DataType::Float(FloatType::new())).unwrap());
+    let batch = RecordBatch::try_new(
+        std::sync::Arc::new(ArrowSchema::new(vec![
+            Field::new("id", ArrowDataType::Int32, false),
+            embedding_field("embedding"),
+        ])),
+        vec![
+            std::sync::Arc::new(Int32Array::from(vec![1, 2])) as arrow_array::ArrayRef,
+            embedding_array(&[[1.0, 0.0], [0.0, 1.0]]),
+        ],
+    )
+    .unwrap();
+    let columns: [Option<&[&str]>; 3] = [None, Some(&["id", "embedding"]), Some(&["embedding"])];
+    for vector_files_first in [true, false] {
+        let path = format!("memory:/incremental_batch/two_storages_{vector_files_first}");
+        let mut schema = Schema::builder()
+            .column("id", DataType::Int(IntType::with_nullable(false)))
+            .column("embedding", vector_type.clone())
+            .option("row-tracking.enabled", "true")
+            .option("data-evolution.enabled", "true");
+        if vector_files_first {
+            schema = schema.option("vector.file.format", "parquet");
+        }
+        let (io, table) = memory_table(&path, TableSchema::new(0, &schema.build().unwrap()));
+        setup_dirs(&io, &path).await;
+        persist_table_schema(&io, &path, table.schema()).await;
+        write_batch(&table, &batch).await;
+        let change = if vector_files_first {
+            SchemaChange::remove_option("vector.file.format".into())
+        } else {
+            SchemaChange::set_option("vector.file.format".into(), "parquet".into())
+        };
+        let schema = table.schema().apply_changes(vec![change]).unwrap();
+        persist_table_schema(&io, &path, &schema).await;
+        let table = paimon::table::Table::new(io, table.identifier().clone(), path, schema, None);
+        rewrite(&table, 0, vec![new_embedding([9.0, 9.0])]).await;
+
+        let inserted = vec![
+            row(Some(1), None, None, Some([1, 0])),
+            row(Some(2), None, None, Some([0, 1])),
+        ];
+        let rewritten = vec![vector([9, 9]), vector([0, 1])];
+        let insert_files = if vector_files_first {
+            let ids = [
+                row(Some(1), None, None, None),
+                row(Some(2), None, None, None),
+            ];
+            [ids.to_vec(), vec![vector([1, 0]), vector([0, 1])]].concat()
+        } else {
+            inserted.clone()
+        };
+        let mut per_commit = [inserted, rewritten.clone()].concat();
+        per_commit.sort();
+        let mut by_file = [insert_files, rewritten].concat();
+        by_file.sort();
+        for columns in columns {
+            let label = format!("vector files first: {vector_files_first} {columns:?}");
+            let (rows, merged) = read_evolved_range(&table, 0, 2, columns).await;
+            assert_eq!(rows, project_evolved(&per_commit, columns), "{label}");
+            assert_eq!(merged, project_evolved(&by_file, columns), "{label}");
+        }
+    }
+}
+
+/// After the table starts storing a BLOB column inline as descriptors, the
+/// BLOB files written before still hold the pictures. A range of them is read
+/// as written, pictures included, rather than merged into rows that would
+/// look for the pictures inline.
+#[tokio::test]
+async fn delta_reads_blob_files_written_before_a_storage_change_as_written() {
+    use paimon::spec::SchemaChange;
+    let row = evolved_row;
+    let path = "memory:/incremental_batch/blob_storage_change";
+    let table = evolved_table(path, &[]).await;
+    let change = SchemaChange::set_option("blob-descriptor-field".into(), "picture".into());
+    let schema = table.schema().apply_changes(vec![change]).unwrap();
+    persist_table_schema(table.file_io(), path, &schema).await;
+    let table = paimon::table::Table::new(
+        table.file_io().clone(),
+        table.identifier().clone(),
+        path.to_string(),
+        schema,
+        None,
+    );
+    let mut by_file = vec![
+        row(Some(1), Some("alice"), None, None),
+        row(Some(2), Some("bob"), None, None),
+        row(None, None, Some("aaa"), None),
+        row(None, None, Some("bb"), None),
+        row(None, None, None, Some([1, 0])),
+        row(None, None, None, Some([0, 1])),
+    ];
+    by_file.sort();
+    let columns: [Option<&[&str]>; 3] = [None, Some(&["id", "picture"]), Some(&["picture"])];
+    for columns in columns {
+        let (rows, merged) = read_evolved_range(&table, 0, 1, columns).await;
+        let expected = project_evolved(&by_file, columns);
+        assert_eq!(rows, expected, "{columns:?}");
+        assert_eq!(merged, expected, "{columns:?}");
+    }
+}
+
+/// With the write-cols optimization, a file holding every column kept in
+/// normal files omits its write columns. Once the VECTOR column moves to
+/// vector files, such a file of an `id` rewrite holds no embeddings, while
+/// the older file of the same rows holds them inline. A range of both is read
+/// as written, embeddings included, also by a read that turns the
+/// optimization off.
+#[tokio::test]
+async fn delta_reads_embeddings_a_newer_file_does_not_hold_as_written() {
+    use arrow_schema::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
+    use paimon::spec::{
+        DataType, FloatType, IntType, Schema, SchemaChange, TableSchema, VectorType,
+    };
+    let row = evolved_row;
+    let path = "memory:/incremental_batch/omitted_write_cols";
+    let vector = VectorType::try_new(true, 2, DataType::Float(FloatType::new())).unwrap();
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::with_nullable(false)))
+        .column("embedding", DataType::Vector(vector))
+        .option("row-tracking.enabled", "true")
+        .option("data-evolution.enabled", "true")
+        .option("data-evolution.write-cols-optimization.enabled", "true")
+        .build()
+        .unwrap();
+    let (io, table) = memory_table(path, TableSchema::new(0, &schema));
+    setup_dirs(&io, path).await;
+    persist_table_schema(&io, path, table.schema()).await;
+    let id = Field::new("id", ArrowDataType::Int32, false);
+    let batch = RecordBatch::try_new(
+        std::sync::Arc::new(ArrowSchema::new(vec![
+            id.clone(),
+            embedding_field("embedding"),
+        ])),
+        vec![
+            std::sync::Arc::new(Int32Array::from(vec![1, 2])) as arrow_array::ArrayRef,
+            embedding_array(&[[1.0, 0.0], [0.0, 1.0]]),
+        ],
+    )
+    .unwrap();
+    write_batch(&table, &batch).await;
+    let change = SchemaChange::set_option("vector.file.format".into(), "parquet".into());
+    let schema = table.schema().apply_changes(vec![change]).unwrap();
+    persist_table_schema(&io, path, &schema).await;
+    let identifier = table.identifier().clone();
+    let table = paimon::table::Table::new(io, identifier, path.to_string(), schema, None);
+    let ids = std::sync::Arc::new(Int32Array::from(vec![11])) as arrow_array::ArrayRef;
+    rewrite(&table, 0, vec![(id, ids)]).await;
+
+    let mut by_file = vec![
+        row(Some(1), None, None, Some([1, 0])),
+        row(Some(2), None, None, Some([0, 1])),
+        row(Some(11), None, None, None),
+        row(Some(2), None, None, None),
+    ];
+    by_file.sort();
+    let off = std::collections::HashMap::from([(
+        "data-evolution.write-cols-optimization.enabled".to_string(),
+        "false".to_string(),
+    )]);
+    let columns: [Option<&[&str]>; 3] = [None, Some(&["id"]), Some(&["embedding"])];
+    for (optimization_off, table) in [(false, table.clone()), (true, table.copy_with_options(off))]
+    {
+        for columns in columns {
+            let label = format!("optimization off: {optimization_off} {columns:?}");
+            let (rows, merged) = read_evolved_range(&table, 0, 2, columns).await;
+            let expected = project_evolved(&by_file, columns);
+            assert_eq!(rows, expected, "{label}");
+            assert_eq!(merged, expected, "{label}");
+        }
+    }
+}
+
+/// A table handle built in memory can lack a schema file, which reads of
+/// the files of its own schema never need. Without the write-cols
+/// optimization or files of another schema, what a file without write columns
+/// holds does not decide the merge, so a range of an insert, an `id` rewrite
+/// and a rewrite of every column reads without one.
+#[tokio::test]
+async fn delta_reads_a_table_without_a_schema_file() {
+    use arrow_schema::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
+    use paimon::spec::{DataType, FloatType, IntType, Schema, TableSchema, VectorType};
+    let row = evolved_row;
+    let path = "memory:/incremental_batch/no_schema_file";
+    let vector = VectorType::try_new(true, 2, DataType::Float(FloatType::new())).unwrap();
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::with_nullable(false)))
+        .column("embedding", DataType::Vector(vector))
+        .option("row-tracking.enabled", "true")
+        .option("data-evolution.enabled", "true")
+        .build()
+        .unwrap();
+    let (io, table) = memory_table(path, TableSchema::new(0, &schema));
+    setup_dirs(&io, path).await;
+    let id = Field::new("id", ArrowDataType::Int32, false);
+    let ids =
+        |values: Vec<i32>| std::sync::Arc::new(Int32Array::from(values)) as arrow_array::ArrayRef;
+    let batch = RecordBatch::try_new(
+        std::sync::Arc::new(ArrowSchema::new(vec![
+            id.clone(),
+            embedding_field("embedding"),
+        ])),
+        vec![ids(vec![1, 2]), embedding_array(&[[1.0, 0.0], [0.0, 1.0]])],
+    )
+    .unwrap();
+    write_batch(&table, &batch).await;
+    rewrite(&table, 0, vec![(id.clone(), ids(vec![11]))]).await;
+    rewrite(
+        &table,
+        1,
+        vec![(id, ids(vec![22])), new_embedding([7.0, 7.0])],
+    )
+    .await;
+    let schema_file = format!("{path}/schema/schema-0");
+    assert!(!io.exists(&schema_file).await.unwrap());
+
+    let current = vec![
+        row(Some(11), None, None, Some([1, 0])),
+        row(Some(22), None, None, Some([7, 7])),
+    ];
+    let mut per_commit = vec![
+        row(Some(1), None, None, Some([1, 0])),
+        row(Some(2), None, None, Some([0, 1])),
+        row(Some(11), None, None, None),
+        row(Some(2), None, None, None),
+    ];
+    per_commit.extend(current.clone());
+    per_commit.sort();
+    assert_eq!(
+        read_evolved_range(&table, 0, 3, None).await,
+        (per_commit, current.clone())
+    );
+    assert_eq!(read_evolved_snapshot(&table).await, current);
+}
+
+/// With the write-cols optimization, an insert's normal file omits its write
+/// columns and leaves the BLOB or VECTOR column to dedicated files. After the
+/// column is dropped, a range of the insert still merges into its rows: the
+/// column is no longer read, so which file kept it decides nothing.
+#[tokio::test]
+async fn delta_merges_an_insert_whose_dedicated_column_was_dropped() {
+    use arrow_array::{ArrayRef, LargeBinaryArray};
+    use arrow_schema::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
+    use paimon::spec::{
+        BlobType, DataType, FloatType, IntType, Schema, SchemaChange, TableSchema, VectorType,
+    };
+    let row = evolved_row;
+    let vector = VectorType::try_new(true, 2, DataType::Float(FloatType::new())).unwrap();
+    let pictures: ArrayRef = std::sync::Arc::new(LargeBinaryArray::from(vec![
+        b"aaa".as_slice(),
+        b"bb".as_slice(),
+    ]));
+    let columns = [
+        (
+            Field::new("picture", ArrowDataType::LargeBinary, true),
+            DataType::Blob(BlobType::new()),
+            pictures,
+        ),
+        (
+            embedding_field("embedding"),
+            DataType::Vector(vector),
+            embedding_array(&[[1.0, 0.0], [0.0, 1.0]]),
+        ),
+    ];
+    for (field, data_type, values) in columns {
+        let column = field.name().clone();
+        let path = format!("memory:/incremental_batch/dropped_{column}");
+        let mut schema = Schema::builder()
+            .column("id", DataType::Int(IntType::with_nullable(false)))
+            .column(&column, data_type)
+            .option("row-tracking.enabled", "true")
+            .option("data-evolution.enabled", "true")
+            .option("data-evolution.write-cols-optimization.enabled", "true");
+        if column == "embedding" {
+            schema = schema.option("vector.file.format", "parquet");
+        }
+        let (io, table) = memory_table(&path, TableSchema::new(0, &schema.build().unwrap()));
+        setup_dirs(&io, &path).await;
+        persist_table_schema(&io, &path, table.schema()).await;
+        let batch = RecordBatch::try_new(
+            std::sync::Arc::new(ArrowSchema::new(vec![
+                Field::new("id", ArrowDataType::Int32, false),
+                field,
+            ])),
+            vec![
+                std::sync::Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
+                values,
+            ],
+        )
+        .unwrap();
+        write_batch(&table, &batch).await;
+        let change = SchemaChange::drop_column(column.clone());
+        let schema = table.schema().apply_changes(vec![change]).unwrap();
+        persist_table_schema(&io, &path, &schema).await;
+        let identifier = table.identifier().clone();
+        let table = paimon::table::Table::new(io, identifier, path, schema, None);
+
+        let inserted = vec![
+            row(Some(1), None, None, None),
+            row(Some(2), None, None, None),
+        ];
+        for read in [None, Some(&["id"][..])] {
+            assert_eq!(
+                read_evolved_range(&table, 0, 1, read).await,
+                (inserted.clone(), inserted.clone()),
+                "dropped {column}, read {read:?}"
+            );
+        }
+        assert_eq!(read_evolved_snapshot(&table).await, inserted);
+    }
+}
+
+/// A VECTOR column of one dimension can change type to STRING, called `name`
+/// here so that `evolved_rows` reads it as text. The vector files written
+/// before hold values no read decodes as text, and a merge never opens them:
+/// it reads a STRING column from normal files alone. So an insert of vector
+/// files merges into its rows, and so does a later update of the column,
+/// written inline, with or without the write-cols optimization.
+#[tokio::test]
+async fn delta_merges_rows_whose_vector_column_became_a_string() {
+    use arrow_array::builder::{FixedSizeListBuilder, Float32Builder};
+    use arrow_array::ArrayRef;
+    use arrow_schema::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
+    use paimon::spec::{
+        DataType, FloatType, IntType, Schema, SchemaChange, TableSchema, VarCharType, VectorType,
+    };
+    let row = evolved_row;
+    let vector = VectorType::try_new(true, 1, DataType::Float(FloatType::new())).unwrap();
+    for optimized in [false, true] {
+        let path = format!("memory:/incremental_batch/vector_to_string_{optimized}");
+        let mut schema = Schema::builder()
+            .column("id", DataType::Int(IntType::with_nullable(false)))
+            .column("name", DataType::Vector(vector.clone()))
+            .option("row-tracking.enabled", "true")
+            .option("data-evolution.enabled", "true")
+            .option("vector.file.format", "parquet");
+        if optimized {
+            schema = schema.option("data-evolution.write-cols-optimization.enabled", "true");
+        }
+        let (io, table) = memory_table(&path, TableSchema::new(0, &schema.build().unwrap()));
+        setup_dirs(&io, &path).await;
+        persist_table_schema(&io, &path, table.schema()).await;
+        let element = std::sync::Arc::new(Field::new("element", ArrowDataType::Float32, true));
+        let mut vectors =
+            FixedSizeListBuilder::new(Float32Builder::new(), 1).with_field(element.clone());
+        for value in [1.0, 2.0] {
+            vectors.values().append_value(value);
+            vectors.append(true);
+        }
+        let batch = RecordBatch::try_new(
+            std::sync::Arc::new(ArrowSchema::new(vec![
+                Field::new("id", ArrowDataType::Int32, false),
+                Field::new("name", ArrowDataType::FixedSizeList(element, 1), true),
+            ])),
+            vec![
+                std::sync::Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
+                std::sync::Arc::new(vectors.finish()),
+            ],
+        )
+        .unwrap();
+        write_batch(&table, &batch).await;
+        let text = DataType::VarChar(VarCharType::string_type());
+        let change = SchemaChange::update_column_type("name".into(), text);
+        let schema = table.schema().apply_changes(vec![change]).unwrap();
+        persist_table_schema(&io, &path, &schema).await;
+        let identifier = table.identifier().clone();
+        let table = paimon::table::Table::new(io, identifier, path, schema, None);
+
+        let label = |read: Option<&[&str]>| format!("optimized: {optimized}, read {read:?}");
+        let inserted = vec![
+            row(Some(1), None, None, None),
+            row(Some(2), None, None, None),
+        ];
+        for read in [None, Some(&["id"][..])] {
+            let expected = (inserted.clone(), inserted.clone());
+            let rows = read_evolved_range(&table, 0, 1, read).await;
+            assert_eq!(rows, expected, "{}", label(read));
+        }
+        rewrite(&table, 0, vec![new_name("x")]).await;
+        let mut per_commit = vec![
+            row(None, Some("x"), None, None),
+            row(None, None, None, None),
+        ];
+        per_commit.extend(inserted);
+        let current = vec![
+            row(Some(1), Some("x"), None, None),
+            row(Some(2), None, None, None),
+        ];
+        for read in [None, Some(&["id"][..]), Some(&["name"][..])] {
+            let expected = (
+                project_evolved(&per_commit, read),
+                project_evolved(&current, read),
+            );
+            let rows = read_evolved_range(&table, 0, 2, read).await;
+            assert_eq!(rows, expected, "{}", label(read));
+        }
+        assert_eq!(read_evolved_snapshot(&table).await, current);
+    }
+}

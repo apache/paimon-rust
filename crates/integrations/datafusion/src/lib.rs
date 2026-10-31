@@ -52,6 +52,7 @@ mod full_text_search;
 #[path = "../testdata/warehouse/mod.rs"]
 mod golden_warehouse;
 mod hybrid_search;
+mod incremental_query;
 mod lateral_vector_search;
 mod memory;
 mod merge_condition;

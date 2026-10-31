@@ -1412,6 +1412,34 @@ impl<'a> CoreOptions<'a> {
         selectors
     }
 
+    /// Options that choose which snapshots or files a scan reads: the
+    /// time-travel selectors, an incremental range or timestamp window, a file
+    /// creation-time filter, and a `scan.mode` other than `default`. A read
+    /// whose range its caller sets, such as an incremental query, cannot also
+    /// honor them.
+    pub fn configured_scan_range_options(&self) -> Vec<&'static str> {
+        let mut options = self.configured_time_travel_selectors();
+        options.extend(
+            [
+                INCREMENTAL_BETWEEN_OPTION,
+                INCREMENTAL_BETWEEN_TIMESTAMP_OPTION,
+                INCREMENTAL_BETWEEN_SCAN_MODE_OPTION,
+                "scan.file-creation-time-millis",
+                "scan.creation-time-millis",
+            ]
+            .into_iter()
+            .filter(|key| self.options.contains_key(*key)),
+        );
+        if self
+            .options
+            .get(SCAN_MODE_OPTION)
+            .is_some_and(|mode| !mode.eq_ignore_ascii_case("default"))
+        {
+            options.push(SCAN_MODE_OPTION);
+        }
+        options
+    }
+
     /// Validates and normalizes the internal time-travel selector.
     ///
     /// This is the semantic owner for selector mutual exclusion and strict
@@ -3883,6 +3911,38 @@ mod tests {
         assert!(CoreOptions::new(&options)
             .try_time_travel_selector()
             .is_err());
+    }
+
+    #[test]
+    fn test_scan_range_options_list_each_snapshot_or_file_selector() {
+        for (key, value) in [
+            (SCAN_SNAPSHOT_ID_OPTION, "1"),
+            (SCAN_TAG_NAME_OPTION, "t"),
+            (SCAN_VERSION_OPTION, "1"),
+            (SCAN_TIMESTAMP_MILLIS_OPTION, "1"),
+            (SCAN_TIMESTAMP_OPTION, "2024-01-01 00:00:00"),
+            (SCAN_WATERMARK_OPTION, "1"),
+            (INCREMENTAL_BETWEEN_OPTION, "1,2"),
+            (INCREMENTAL_BETWEEN_TIMESTAMP_OPTION, "1,2"),
+            (INCREMENTAL_BETWEEN_SCAN_MODE_OPTION, "delta"),
+            ("scan.file-creation-time-millis", "1"),
+            ("scan.creation-time-millis", "1"),
+            (SCAN_MODE_OPTION, "latest"),
+        ] {
+            let options = HashMap::from([(key.to_string(), value.to_string())]);
+            assert_eq!(
+                CoreOptions::new(&options).configured_scan_range_options(),
+                vec![key],
+                "{key}"
+            );
+        }
+        let options = HashMap::from([
+            (SCAN_MODE_OPTION.to_string(), "DEFAULT".to_string()),
+            ("read.batch-size".to_string(), "2".to_string()),
+        ]);
+        assert!(CoreOptions::new(&options)
+            .configured_scan_range_options()
+            .is_empty());
     }
 
     #[test]
