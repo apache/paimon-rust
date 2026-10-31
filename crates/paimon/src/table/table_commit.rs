@@ -49,10 +49,10 @@ const BATCH_COMMIT_IDENTIFIER: i64 = i64::MAX;
 /// Java RollingFileWriter.CHECK_ROLLING_RECORD_CNT.
 const CHECK_ROLLING_RECORD_COUNT: usize = 1000;
 
-mod auto_compact;
 mod auto_index;
 #[cfg(test)]
 mod auto_index_tests;
+mod auto_maintenance;
 mod global_index_source_check;
 mod row_tracking;
 
