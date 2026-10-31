@@ -2383,17 +2383,19 @@ SELECT * FROM paimon_incremental_query('my_db.my_table$audit_log', 1, 5, 'change
 
 The optional fourth argument selects the mode:
 
-- `delta` returns the rows each APPEND commit wrote, every version of a key included.
+- `delta` returns the rows each APPEND commit wrote, every version of a key included,
+  even rows a later `DELETE` removed.
   A data-evolution table's range is read as one batch, as Java's `incremental-between`
   scan reads it: the files it wrote for the same rows merge into rows when they are
   column slices of one row range, that is, its normal data files cover the same rows,
   its BLOB and VECTOR files lie within them, and each BLOB or VECTOR column has one
   layout, for BLOB the one the table now uses, and the merge would read each column
   where it is stored. For rows written before the range it returns every row of the
-  files the updates rewrote, unchanged rows included, with only the updated columns set
-  and the others NULL, NOT NULL columns included. (Java's reader instead fails when two
-  such updates of the same rows leave a NOT NULL column unwritten.) Other files are
-  returned as written, one row per row of each file. These include BLOB or VECTOR files
+  files the updates rewrote, unchanged rows included, with only the updated and the
+  partition columns set and the others NULL, NOT NULL columns included. (Java's reader
+  instead fails when two such updates of the same rows leave a NOT NULL column
+  unwritten.) Other files are returned as written, one row per row of each file.
+  These include BLOB or VECTOR files
   alone, such as recomputed embeddings, so two embedding updates of the same rows return
   both versions where Java returns the latest; every file of rows whose BLOB or VECTOR
   column the range wrote in two layouts (inline and in dedicated files, after a change
@@ -2421,9 +2423,9 @@ A `$audit_log` suffix puts `rowkind` first, followed by `_SEQUENCE_NUMBER` when
 query on the table, `_ROW_ID` included on a data-evolution table, so a column update
 returned without the row's other columns can be matched to its row. A row read file
 by file comes once per file that wrote it, and nothing in the output tells which is
-newer. To read the rows' values at the end of the range, join their `_ROW_ID`s with
-the table `VERSION AS OF` the end snapshot, and filter after the join: a column a file
-did not write is NULL in that file's rows.
+newer. To read the rows' values at the end of the range, join their distinct `_ROW_ID`s
+with the table `VERSION AS OF` the end snapshot, and filter after the join: a column a
+file did not write, other than a partition column, is NULL in that file's rows.
 
 The table name resolves in the calling session: `my_table` and `my_db.my_table`
 use the current catalog (and database), as in a `FROM` clause, and
@@ -2435,6 +2437,8 @@ choose another range to read (time-travel selectors, `incremental-between*`, fil
 creation-time filters and a `scan.mode` other than `default`), which are rejected
 whether the session or the table read sets them. With `SET 'paimon.branch'`, the
 table read is that branch.
+
+The range is read in one partition, and `WHERE` filters apply after the read.
 
 ## Dynamic Options (SET / RESET)
 
