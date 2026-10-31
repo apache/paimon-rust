@@ -393,6 +393,7 @@ mod tests {
         Arc::new(
             LocalCache::new(LocalCacheConfig {
                 shared: false,
+                excluded_extensions: Default::default(),
                 dir: None,
                 namespace: "test".into(),
                 max_size: None,
@@ -472,6 +473,7 @@ mod tests {
         let cache = Arc::new(
             LocalCache::new(LocalCacheConfig {
                 shared: true,
+                excluded_extensions: Default::default(),
                 dir: Some(directory.path().to_path_buf()),
                 namespace: "test".into(),
                 max_size: Some(16 * 1024 * 1024),
@@ -567,6 +569,7 @@ mod tests {
         let cache = Arc::new(
             LocalCache::new(LocalCacheConfig {
                 shared: false,
+                excluded_extensions: Default::default(),
                 dir: None,
                 namespace: "test".to_string(),
                 max_size: None,
@@ -603,6 +606,7 @@ mod tests {
         let cache = Arc::new(
             LocalCache::new(LocalCacheConfig {
                 shared: false,
+                excluded_extensions: Default::default(),
                 dir: None,
                 namespace: "test".to_string(),
                 max_size: Some(16),
@@ -657,6 +661,7 @@ mod tests {
         let cache = Arc::new(
             LocalCache::new(LocalCacheConfig {
                 shared: true,
+                excluded_extensions: Default::default(),
                 dir: Some(directory.path().to_path_buf()),
                 namespace: "test".into(),
                 max_size: Some(128 * 1024 * 1024),
@@ -729,6 +734,7 @@ mod tests {
         let cache = Arc::new(
             LocalCache::new(LocalCacheConfig {
                 shared: true,
+                excluded_extensions: Default::default(),
                 dir: Some(directory.path().to_path_buf()),
                 namespace: "test".into(),
                 max_size: Some(4096),
@@ -785,6 +791,7 @@ mod tests {
         let cache = Arc::new(
             LocalCache::new(LocalCacheConfig {
                 shared: true,
+                excluded_extensions: Default::default(),
                 dir: Some(directory.path().to_path_buf()),
                 namespace: "test".into(),
                 max_size: Some(4096),
@@ -841,6 +848,7 @@ mod tests {
         let cache = Arc::new(
             LocalCache::new(LocalCacheConfig {
                 shared: true,
+                excluded_extensions: Default::default(),
                 dir: Some(directory.path().to_path_buf()),
                 namespace: "test".into(),
                 max_size: Some(4096),
@@ -882,6 +890,7 @@ mod tests {
         let cache = Arc::new(
             LocalCache::new(LocalCacheConfig {
                 shared: false,
+                excluded_extensions: Default::default(),
                 dir: None,
                 namespace: "test".to_string(),
                 max_size: None,
@@ -913,6 +922,7 @@ mod tests {
         });
         let config = || LocalCacheConfig {
             shared: false,
+            excluded_extensions: Default::default(),
             dir: Some(directory.path().to_path_buf()),
             namespace: "test".to_string(),
             max_size: None,
@@ -961,6 +971,7 @@ mod tests {
         let cache = Arc::new(
             LocalCache::new(LocalCacheConfig {
                 shared: false,
+                excluded_extensions: Default::default(),
                 dir: None,
                 namespace: "test".to_string(),
                 max_size: None,
@@ -1011,6 +1022,7 @@ mod tests {
         let cache_a = Arc::new(
             LocalCache::new(LocalCacheConfig {
                 shared: false,
+                excluded_extensions: Default::default(),
                 dir: Some(directory.path().to_path_buf()),
                 namespace: "test".to_string(),
                 max_size: None,
@@ -1022,6 +1034,7 @@ mod tests {
         let cache_b = Arc::new(
             LocalCache::new(LocalCacheConfig {
                 shared: false,
+                excluded_extensions: Default::default(),
                 dir: Some(directory.path().to_path_buf()),
                 namespace: "test".to_string(),
                 max_size: None,
@@ -1074,6 +1087,7 @@ mod tests {
         let blocked_path = "s3://bucket/table/snapshot/snapshot-3";
         let config = || LocalCacheConfig {
             shared: false,
+            excluded_extensions: Default::default(),
             dir: Some(directory.path().to_path_buf()),
             namespace: "test".to_string(),
             max_size: None,
@@ -1221,6 +1235,7 @@ mod tests {
         let cache = Arc::new(
             LocalCache::new(LocalCacheConfig {
                 shared: false,
+                excluded_extensions: Default::default(),
                 dir: Some(directory.path().to_path_buf()),
                 namespace: "test".to_string(),
                 max_size: None,
@@ -1256,6 +1271,7 @@ mod tests {
         let cache = Arc::new(
             LocalCache::new(LocalCacheConfig {
                 shared: false,
+                excluded_extensions: Default::default(),
                 dir: Some(directory.path().to_path_buf()),
                 namespace: "test".to_string(),
                 max_size: None,
@@ -1278,6 +1294,7 @@ mod tests {
         let cache = Arc::new(
             LocalCache::new(LocalCacheConfig {
                 shared: false,
+                excluded_extensions: Default::default(),
                 dir: None,
                 namespace: "test".to_string(),
                 max_size: None,

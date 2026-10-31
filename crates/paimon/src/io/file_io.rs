@@ -661,7 +661,7 @@ impl FileIO {
             cache: self
                 .cache
                 .as_ref()
-                .filter(|cache| cache.is_cacheable(path))
+                .filter(|cache| cache.is_whitelisted(path))
                 .cloned(),
         })
     }
@@ -875,7 +875,9 @@ impl FileIO {
                 .invalidate_row_sidecar_size(cache_path);
         }
         if let (Some(cache), Some(cache_path)) = (
-            self.cache.as_ref().filter(|cache| cache.is_cacheable(path)),
+            self.cache
+                .as_ref()
+                .filter(|cache| cache.is_whitelisted(path)),
             cache_path,
         ) {
             cache.invalidate_path(&cache_path).await?;

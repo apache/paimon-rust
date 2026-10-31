@@ -445,10 +445,22 @@ let catalog = CatalogFactory::create(options).await?;
 | `local-cache.high-priority-pool-ratio` | `0.25` | Fraction of a finite cache budget protected for `meta` and `global-index` blocks. Use `0` for a single LRU. |
 | `local-cache.block-size` | `1 MiB` | Block size used for cached range reads. |
 | `local-cache.whitelist` | `meta,global-index` | Comma-separated eligible types: `meta`, `global-index`, `bucket-index`, `data`, `structured-data`, and `file-index`, or `*` for all of them. |
+| `local-cache.exclude-extensions` | empty | Comma-separated extensions to exclude from local block caching, overriding every whitelist selection, including `*`, metadata, and indexes. |
 
 Use `local-cache.whitelist=meta,global-index,structured-data` to cache data
 blocks without dedicated BLOB, video, or vector-store files. `data` and `*`
 retain their broader behavior.
+
+To exclude only BLOB files while keeping other data eligible, use
+`local-cache.whitelist=meta,global-index,data` with
+`local-cache.exclude-extensions=blob`. Extensions match the last extension of
+the file name, ignoring ASCII case and an optional leading dot in each entry.
+Surrounding whitespace and empty entries are ignored. For example, `blob, .VIDEO`
+excludes `.blob` and `.video` files; `gz` excludes `data.csv.gz`, while `csv`
+does not. Directory names do not participate in matching. An omitted or empty
+list preserves existing behavior. This option only filters source-file block
+caching; it does not change parsed metadata caches or generated lookup files.
+Extension exclusions do not suppress write or delete cache invalidation.
 
 The protected and regular LRUs share one total budget; either can use idle
 capacity. Catalogs or processes sharing a disk cache must use the same ratio.

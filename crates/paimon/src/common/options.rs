@@ -97,6 +97,9 @@ impl CatalogOptions {
     /// Comma-separated file types eligible for local caching.
     pub const LOCAL_CACHE_WHITELIST: &'static str = "local-cache.whitelist";
 
+    /// Comma-separated file extensions excluded from local caching (empty by default).
+    pub const LOCAL_CACHE_EXCLUDE_EXTENSIONS: &'static str = "local-cache.exclude-extensions";
+
     /// Maximum process-local cache size for parsed file-format metadata.
     pub const FILE_FORMAT_METADATA_CACHE_MAX_SIZE: &'static str =
         "file-format.metadata-cache.max-size";
