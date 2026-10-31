@@ -15,10 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod extraction;
+pub(super) mod extraction;
 mod planning;
-mod sort;
-mod validation;
+pub(super) mod sort;
+pub(super) mod validation;
 mod writer;
 
 #[cfg(test)]
@@ -53,7 +53,10 @@ enum GlobalIndexWriteOptions {
     FM(FMWriteOptions),
 }
 
-fn make_index_key_codec(index_type: &str, data_type: &DataType) -> (KeyComparator, SerializeKeyFn) {
+pub(super) fn make_index_key_codec(
+    index_type: &str,
+    data_type: &DataType,
+) -> (KeyComparator, SerializeKeyFn) {
     match index_type {
         BTREE_GLOBAL_INDEX_TYPE => (make_key_comparator(data_type), serialize_datum),
         BITMAP_GLOBAL_INDEX_TYPE => (

@@ -194,6 +194,12 @@ fn pk_vector_query_dimension(
                 }
             }
             let mut table_dimension_options = table_options.clone();
+            let declared_options = super::pk_index_options::field_options(
+                table_options,
+                vector_field.name(),
+                "vector",
+                index_type,
+            )?;
             if let Some(value) = table_options.get("dimension") {
                 if !table_options.contains_key(&format!("{index_type}.dimension"))
                     && !table_options.contains_key(&format!("{index_type}.index.dimension"))
@@ -203,8 +209,9 @@ fn pk_vector_query_dimension(
                 }
             }
             Ok(Some(
-                VindexVectorIndexOptions::new(
+                VindexVectorIndexOptions::new_with_defaults(
                     &table_dimension_options,
+                    &declared_options,
                     &dimension_options,
                     index_type,
                     vector_field,

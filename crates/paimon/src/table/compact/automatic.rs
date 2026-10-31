@@ -59,6 +59,14 @@ pub(in crate::table) async fn execute_auto_plan(
                     result.files.clone(),
                 );
                 message.new_changelog_files = result.changelog_files.clone();
+                message.new_index_files = result
+                    .index_entries
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .filter(|e| e.kind == crate::spec::FileKind::Add)
+                    .map(|e| e.index_file.clone())
+                    .collect();
                 message
             })
             .collect::<Vec<_>>();

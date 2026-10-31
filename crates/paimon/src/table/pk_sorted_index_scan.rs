@@ -86,50 +86,9 @@ fn definition_options(options: &Options, column: &str, family: &str) -> Result<O
     let mut resolved = options.clone();
     resolved.remove("sorted-index.records-per-file");
     resolved.remove("sorted-index.records-per-range");
-    let option_key = format!("fields.{column}.pk-{family}.index.options");
-    let Some(raw) = options
-        .get(&option_key)
-        .filter(|raw| !raw.trim().is_empty())
-    else {
-        return Ok(resolved);
-    };
-    let parsed: serde_json::Map<String, serde_json::Value> =
-        serde_json::from_str(raw).map_err(|_| {
-            config_invalid(format!(
-                "{option_key} must be a JSON object of option key-value pairs"
-            ))
-        })?;
-    let prefix = format!("{family}-index.");
-    for (key, value) in parsed {
-        if key.trim().is_empty() {
-            return Err(config_invalid(format!(
-                "{option_key} contains an empty option key"
-            )));
-        }
-        let value = match value {
-            serde_json::Value::String(value) => value,
-            serde_json::Value::Number(_) | serde_json::Value::Bool(_) => value.to_string(),
-            _ => {
-                return Err(config_invalid(format!(
-                    "{option_key} contains an invalid option value for {key}"
-                )))
-            }
-        };
-        let qualified = if key.starts_with(&prefix) || key.starts_with("fields.") {
-            key
-        } else {
-            format!("{prefix}{key}")
-        };
-        if resolved
-            .get(&qualified)
-            .is_some_and(|previous| previous != &value)
-        {
-            return Err(config_invalid(format!(
-                "{option_key} defines conflicting values for {qualified}"
-            )));
-        }
-        resolved.insert(qualified, value);
-    }
+    resolved.extend(super::pk_index_options::field_options(
+        options, column, family, family,
+    )?);
     Ok(resolved)
 }
 

@@ -370,7 +370,8 @@ pub struct CompactExecutor {
     emit_changelog: bool,
 }
 
-/// Prepared files owned by the caller until submitted to `TableCommit::commit_compact`.
+/// Prepared data, changelog and index files owned by the caller until submitted
+/// to `TableCommit::commit_compact`.
 /// A failed or uncertain commit must retain these files for retry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompactResult {
@@ -380,9 +381,16 @@ pub struct CompactResult {
     changelog_files: Vec<DataFileMeta>,
     #[serde(default)]
     deletion_vector_updates: Option<Vec<DeletionVectorUpdate>>,
+    #[serde(default)]
+    index_entries: Option<Vec<crate::spec::IndexManifestEntry>>,
 }
 
 impl CompactResult {
+    /// Atomic index additions and retirements prepared with these data files.
+    pub fn index_entries(&self) -> Option<&[crate::spec::IndexManifestEntry]> {
+        self.index_entries.as_deref()
+    }
+
     pub fn files(&self) -> &[DataFileMeta] {
         &self.files
     }
@@ -491,6 +499,7 @@ impl CompactExecutor {
                 files,
                 changelog_files: vec![],
                 deletion_vector_updates: None,
+                index_entries: None,
             });
         }
         if task.is_primary_key() {
@@ -547,10 +556,33 @@ impl CompactExecutor {
                     });
                 }
             }
+            let index_entries = match primary_key::indexes::prepare(
+                &table,
+                task,
+                &split,
+                &snapshot,
+                &active,
+                &files,
+                self.resources.clone(),
+            )
+            .await
+            {
+                Ok(entries) => entries,
+                Err(error) => {
+                    let mut message =
+                        super::CommitMessage::new(task.partition.clone(), task.bucket, files);
+                    message.new_changelog_files = changelog_files;
+                    let _ = super::TableCommit::new(table.clone(), "compact-cleanup".into())
+                        .abort(&[message])
+                        .await;
+                    return Err(error);
+                }
+            };
             return Ok(CompactResult {
                 task: task.clone(),
                 files,
                 changelog_files,
+                index_entries: Some(index_entries),
                 deletion_vector_updates: options
                     .deletion_vectors_enabled()
                     .then_some(deletion_vector_updates),
@@ -606,6 +638,7 @@ impl CompactExecutor {
                 files,
                 changelog_files: vec![],
                 deletion_vector_updates: None,
+                index_entries: None,
             }),
             Err(error) => {
                 writer.abort().await;
@@ -816,6 +849,7 @@ pub(super) struct PreparedCompact {
     pub entries: Vec<ManifestEntry>,
     pub changelog_entries: Vec<ManifestEntry>,
     pub deletion_vector_updates: Option<Vec<DeletionVectorUpdate>>,
+    pub index_entries: Option<Vec<crate::spec::IndexManifestEntry>>,
     pub schema_id: i64,
     pub snapshot_id: i64,
     pub read_snapshot: Option<Box<Snapshot>>,
@@ -834,6 +868,7 @@ pub(super) fn prepare_results(table: &Table, results: &[CompactResult]) -> Resul
     let mut entries = Vec::new();
     let mut changelog_entries = Vec::new();
     let mut deletion_vector_updates = Some(Vec::new());
+    let mut index_entries = Some(Vec::new());
     let mut metrics = CompactMetrics::default();
     for result in results {
         let task = &result.task;
@@ -847,6 +882,29 @@ pub(super) fn prepare_results(table: &Table, results: &[CompactResult]) -> Resul
             return Err(invalid("Compaction results must belong to one plan"));
         }
         ids.push(task.task_id);
+        if task.is_primary_key() {
+            match (&mut index_entries, &result.index_entries) {
+                (Some(all), Some(entries)) => {
+                    if entries
+                        .iter()
+                        .any(|e| e.partition != task.partition || e.bucket != task.bucket)
+                    {
+                        return Err(invalid("PK index output belongs to a different bucket"));
+                    }
+                    all.extend(entries.iter().cloned());
+                }
+                (_, None) => index_entries = None,
+                _ => {}
+            }
+        } else if result
+            .index_entries
+            .as_ref()
+            .is_some_and(|entries| !entries.is_empty())
+        {
+            return Err(invalid(
+                "Only PK compaction can prepare source-backed indexes",
+            ));
+        }
         for file in &task.files {
             if !inputs.insert((task.partition.clone(), task.bucket, file.file_name.clone())) {
                 return Err(invalid("Overlapping compaction results"));
@@ -1008,6 +1066,7 @@ pub(super) fn prepare_results(table: &Table, results: &[CompactResult]) -> Resul
         entries,
         changelog_entries,
         deletion_vector_updates,
+        index_entries,
         schema_id: first.task.context.schema.id(),
         snapshot_id: first.task.snapshot_id(),
         read_snapshot: first
@@ -1024,6 +1083,13 @@ pub(super) fn ensure_supported(table: &Table) -> Result<()> {
     table.ensure_not_branch_reference_for_write()?;
     let options = table.schema().core_options();
     let properties = table.schema().options();
+    if !table.schema().primary_keys().is_empty() {
+        super::pk_index_options::definitions(table.schema()).map_err(|error| {
+            Error::ConfigInvalid {
+                message: format!("Invalid primary-key index declaration: {error}"),
+            }
+        })?;
+    }
     if options.data_evolution_enabled() {
         data_evolution::ensure_supported(table)?;
         return options.validate_data_file_path_directory();
@@ -1138,8 +1204,7 @@ fn ensure_snapshot_supported(table: &Table, snapshot: &Snapshot) -> Result<()> {
     if snapshot.index_manifest().is_some()
         && !table.schema().core_options().data_evolution_enabled()
         && !table.schema().core_options().deletion_vectors_enabled()
-        && (table.schema().primary_keys().is_empty()
-            || table.schema().core_options().bucket() != -1)
+        && table.schema().primary_keys().is_empty()
     {
         return Err(Error::Unsupported {
             message: "Compaction only supports dynamic-bucket HASH index manifests".into(),
@@ -1149,8 +1214,8 @@ fn ensure_snapshot_supported(table: &Table, snapshot: &Snapshot) -> Result<()> {
 }
 
 /// HASH indexes contain key-to-bucket assignments, independent of data files.
-/// Preserve their manifest verbatim, including hashes of deleted keys. Other
-/// index types may address rewritten files or row positions and cannot be reused.
+/// Preserve their manifest verbatim, including hashes of deleted keys. PK source
+/// indexes and deletion vectors are validated here and maintained at commit.
 pub(super) async fn validate_snapshot_indexes(
     table: &Table,
     snapshot: &Snapshot,
@@ -1165,17 +1230,24 @@ pub(super) async fn validate_snapshot_indexes(
         data_evolution::validate_indexes(&entries)?;
         return Ok(Some(name.to_string()));
     }
-    if entries.iter().any(|entry| {
-        !(entry.index_file.index_type == "HASH"
+    for entry in &entries {
+        if !table.schema().primary_keys().is_empty() && primary_key::indexes::is_source_index(entry)
+        {
+            primary_key::indexes::source(entry)?;
+            continue;
+        }
+        if !(entry.index_file.index_type == "HASH"
             || (table.schema().core_options().deletion_vectors_enabled()
                 && entry.index_file.index_type == "DELETION_VECTORS"))
             || (entry.index_file.index_type == "HASH"
                 && entry.index_file.deletion_vectors_ranges.is_some())
             || entry.index_file.global_index_meta.is_some()
-    }) {
-        return Err(Error::Unsupported {
-            message: "Compaction only supports dynamic-bucket HASH index manifests".into(),
-        });
+        {
+            return Err(Error::Unsupported {
+                message: "Compaction requires HASH, deletion-vector or source-backed PK indexes"
+                    .into(),
+            });
+        }
     }
     Ok(Some(name.to_string()))
 }

@@ -48,12 +48,12 @@ pub(super) fn data_split_for_shard_ranges(
         .build()
 }
 
-pub(super) struct ValidatedVectorBatch {
-    pub(super) values: ScalarBuffer<f32>,
-    pub(super) row_ids: ScalarBuffer<i64>,
+pub(in crate::table) struct ValidatedVectorBatch {
+    pub(in crate::table) values: ScalarBuffer<f32>,
+    pub(in crate::table) row_ids: ScalarBuffer<i64>,
     /// Number of non-null vectors, not the number of source rows.
-    pub(super) vector_count: usize,
-    pub(super) source_rows: usize,
+    pub(in crate::table) vector_count: usize,
+    pub(in crate::table) source_rows: usize,
 }
 
 impl ValidatedVectorBatch {
@@ -76,7 +76,7 @@ pub(super) fn extract_vector_batch(
     validate_vector_batch_with(batch, index_column, dimension, |_| Ok(()))
 }
 
-pub(super) fn validate_vector_batch(
+pub(in crate::table) fn validate_vector_batch(
     batch: &RecordBatch,
     index_column: &str,
     dimension: usize,

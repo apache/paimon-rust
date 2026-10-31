@@ -417,7 +417,7 @@ fn temporary_vector_file(kind: &str) -> Result<tokio::fs::File> {
 }
 
 /// Java samples the compacted non-null vector stream, then adds the original relative IDs.
-fn train_and_add_spilled_vectors(
+pub(in crate::table) fn train_and_add_spilled_vectors(
     mut raw_file: std::fs::File,
     mut id_file: std::fs::File,
     config: VectorIndexConfig,

@@ -28,7 +28,7 @@ use tokio::io::AsyncReadExt;
 
 /// One run per binary level bounds open files during merging to two inputs.
 /// Temporary files are private scratch state and are removed on failure or cancellation.
-pub(super) struct IndexSorter {
+pub(in crate::table) struct IndexSorter {
     rows: Vec<SortedIndexKeyRow>,
     bytes: usize,
     budget: usize,
@@ -37,7 +37,7 @@ pub(super) struct IndexSorter {
 }
 
 impl IndexSorter {
-    pub(super) fn new(budget: usize, cmp: KeyComparator) -> Self {
+    pub(in crate::table) fn new(budget: usize, cmp: KeyComparator) -> Self {
         Self {
             rows: Vec::new(),
             bytes: 0,
@@ -47,7 +47,7 @@ impl IndexSorter {
         }
     }
 
-    pub(super) fn push(&mut self, row: SortedIndexKeyRow) -> Result<()> {
+    pub(in crate::table) fn push(&mut self, row: SortedIndexKeyRow) -> Result<()> {
         // Charge spare Vec slots as well as the actual serialized-key allocation.
         // The unstable sort uses no additional row-sized scratch allocation.
         let bytes = row
@@ -109,7 +109,7 @@ impl IndexSorter {
         }
     }
 
-    pub(super) fn finish(mut self) -> Result<SortedRows> {
+    pub(in crate::table) fn finish(mut self) -> Result<SortedRows> {
         if self.runs.is_empty() {
             sort_index_rows(&mut self.rows, &self.cmp)?;
             return Ok(SortedRows::Memory(self.rows.into_iter()));
@@ -131,7 +131,7 @@ impl IndexSorter {
     }
 }
 
-pub(super) enum SortedRows {
+pub(in crate::table) enum SortedRows {
     Memory(std::vec::IntoIter<SortedIndexKeyRow>),
     Disk {
         _run: NamedTempFile,
@@ -140,7 +140,7 @@ pub(super) enum SortedRows {
 }
 
 impl SortedRows {
-    pub(super) async fn next(&mut self) -> Result<Option<SortedIndexKeyRow>> {
+    pub(in crate::table) async fn next(&mut self) -> Result<Option<SortedIndexKeyRow>> {
         match self {
             Self::Memory(rows) => Ok(rows.next()),
             Self::Disk { reader, .. } => {
@@ -208,7 +208,7 @@ fn read_row(input: &mut impl Read) -> Result<Option<SortedIndexKeyRow>> {
     Ok(Some((key, i64::from_le_bytes(row_id))))
 }
 
-pub(super) fn compare_rows(
+pub(in crate::table) fn compare_rows(
     left: &SortedIndexKeyRow,
     right: &SortedIndexKeyRow,
     cmp: &DynKeyComparator<'_>,

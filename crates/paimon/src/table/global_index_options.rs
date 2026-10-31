@@ -96,18 +96,48 @@ pub(super) fn field_index_options(
         "vector" | "full-text" => format!("{index_type}."),
         _ => format!("{family}-index."),
     };
+    let options_key = format!("{field_prefix}index-options");
+    let mut options = parse_field_index_options(
+        table_options,
+        column,
+        &options_key,
+        &native_prefix,
+        family == "vector",
+    )?;
+    if family == "vector" {
+        let metric_key = format!("{field_prefix}distance-metric");
+        let metric = table_options
+            .get(&metric_key)
+            .map(String::as_str)
+            .unwrap_or("inner_product");
+        crate::vindex::pkvector::metric::VectorSearchMetric::parse(metric)?;
+        options.insert(
+            format!("{native_prefix}metric"),
+            metric.to_ascii_lowercase().replace('-', "_"),
+        );
+    }
+    Ok(options)
+}
+
+pub(super) fn parse_field_index_options(
+    table_options: &HashMap<String, String>,
+    column: &str,
+    options_key: &str,
+    native_prefix: &str,
+    vector: bool,
+) -> Result<HashMap<String, String>> {
     let mut options = HashMap::new();
     let mut insert = |key: &str, value: String| -> Result<()> {
         if key.trim().is_empty() {
             return Err(crate::Error::ConfigInvalid {
-                message: format!("{field_prefix}index-options contains an empty option key"),
+                message: format!("{options_key} contains an empty option key"),
             });
         }
-        let qualified = if key.starts_with(&native_prefix)
+        let qualified = if key.starts_with(native_prefix)
             || key.starts_with("fields.")
             || key.starts_with("global-index.")
             || key.starts_with("sorted-index.")
-            || (family == "vector" && matches!(key, "index.type" | "vindex.build.granule.enabled"))
+            || (vector && matches!(key, "index.type" | "vindex.build.granule.enabled"))
         {
             key.into()
         } else {
@@ -125,9 +155,8 @@ pub(super) fn field_index_options(
         options.insert(qualified, value);
         Ok(())
     };
-    let options_key = format!("{field_prefix}index-options");
     if let Some(raw) = table_options
-        .get(&options_key)
+        .get(options_key)
         .filter(|raw| !raw.trim().is_empty())
     {
         let parsed: serde_json::Map<String, serde_json::Value> = serde_json::from_str(raw)
@@ -148,18 +177,6 @@ pub(super) fn field_index_options(
             };
             insert(&key, value)?;
         }
-    }
-    if family == "vector" {
-        let metric_key = format!("{field_prefix}distance-metric");
-        let metric = table_options
-            .get(&metric_key)
-            .map(String::as_str)
-            .unwrap_or("inner_product");
-        crate::vindex::pkvector::metric::VectorSearchMetric::parse(metric)?;
-        options.insert(
-            format!("{native_prefix}metric"),
-            metric.to_ascii_lowercase().replace('-', "_"),
-        );
     }
     Ok(options)
 }

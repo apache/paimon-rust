@@ -49,7 +49,10 @@ pub(super) fn validate_btree_field(field: &DataField) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn index_key_type<'a>(index_type: &str, field: &'a DataField) -> Result<&'a DataType> {
+pub(in crate::table) fn index_key_type<'a>(
+    index_type: &str,
+    field: &'a DataField,
+) -> Result<&'a DataType> {
     if index_type == MULTIVALUE_GLOBAL_INDEX_TYPE {
         let DataType::Array(array_type) = field.data_type() else {
             return Err(Error::Unsupported {

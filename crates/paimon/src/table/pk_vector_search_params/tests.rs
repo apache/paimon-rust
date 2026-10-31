@@ -73,3 +73,42 @@ fn raw_query_dimensions_remain_supported_with_java_build_option_mapping() {
         );
     }
 }
+
+#[test]
+fn declared_array_dimension_matches_writes_and_preserves_query_override() {
+    let field = DataField::new(
+        1,
+        "embedding".into(),
+        DataType::Array(ArrayType::new(DataType::Float(FloatType::new()))),
+    );
+    for index_type in ["ivf-flat", "ivf-pq", "diskann"] {
+        let table = HashMap::from([
+            ("dimension".into(), "8".into()),
+            ("fields.embedding.index.dimension".into(), "32".into()),
+            (
+                "fields.embedding.pk-vector.index.options".into(),
+                r#"{"dimension":4}"#.into(),
+            ),
+        ]);
+        let declared = crate::table::pk_index_options::field_options(
+            &table,
+            "embedding",
+            "vector",
+            index_type,
+        )
+        .unwrap();
+        let write_dimension = VindexVectorIndexOptions::new(&table, &declared, index_type, &field)
+            .unwrap()
+            .dimension();
+        assert_eq!(write_dimension, 4);
+        assert_eq!(
+            pk_vector_query_dimension(&table, &HashMap::new(), index_type, &field).unwrap(),
+            Some(write_dimension)
+        );
+        let query = HashMap::from([("dimension".into(), "2".into())]);
+        assert_eq!(
+            pk_vector_query_dimension(&table, &query, index_type, &field).unwrap(),
+            Some(2)
+        );
+    }
+}

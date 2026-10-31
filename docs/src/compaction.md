@@ -252,6 +252,46 @@ snapshot expiration and storage reclamation are separate maintenance work.
 
 ## Primary-key compaction
 
+Primary-key compaction also maintains declared source-backed indexes, using
+Java's primary-key options:
+
+| Option | Meaning |
+| --- | --- |
+| `pk-btree.index.columns` | Comma-separated BTree columns. |
+| `pk-bitmap.index.columns` | Comma-separated bitmap columns. |
+| `pk-multivalue.index.columns` | Comma-separated array columns. |
+| `pk-fm.index.columns` | Comma-separated FM string columns. |
+| `pk-full-text.index.columns` | Comma-separated full-text string columns. |
+| `pk-vector.index.columns` | Vector column, subject to the existing PK vector constraints. |
+| `fields.<column>.pk-<family>.index.options` | JSON object of native writer options. |
+| `fields.<column>.pk-vector.index.type` | Vector algorithm, such as `ivf-flat`. |
+| `fields.<column>.pk-vector.distance.metric` | Vector metric: `l2`, `cosine`, or `inner_product`. |
+
+Declarations are unset by default. With `write-only=false`, the normal automatic
+compaction round maintains them. Explicit compaction also maintains them with
+`write-only=true`, for dedicated compactors. This uses the same native writers
+as global indexes. PK vector and full-text search retain their existing
+deletion-vector and search-mode requirements.
+
+Each payload covers the complete compacted file set for one partition, bucket,
+positive level and column. Source files are sorted by name; payload ordinals
+concatenate their physical rows, preserving NULL and tombstone positions.
+Unchanged coverage is retained. Changed coverage and incompatible vector
+definitions replace the previous references in the same COMPACT snapshot as
+data, changelogs and deletion vectors. Old payload files remain for historical
+snapshots. L0 files remain outside these indexes and use the existing read path.
+
+Commit validates the complete source set and captured index membership before
+publishing. Concurrent L0 appends and unrelated index changes can be rebased;
+changes to a maintained unit require a new plan. A failed build cleans its
+private outputs. A failed or uncertain commit retains prepared outputs for
+retry with the same results and commit user. Older serialized results lacking
+index maintenance must be re-executed before first publication when indexes
+need maintenance; already published results remain recoverable without their
+original source snapshot.
+As in Java, declared indexed columns cannot be renamed, dropped or have their
+type changed while the declaration remains in effect.
+
 The same API compacts primary-key tables with `deduplicate`,
 `first-row`, `partial-update` or `aggregation` merge engines. Changelog producers
 `none`, `input` and `lookup` are supported; `first-row` supports `none` or `lookup`.
@@ -537,7 +577,8 @@ Ordered bucketed append, append incremental clustering, primary-key clustering
 override (`pk-clustering-override`) and record-level expiration
 (`record-level.expire-time`) are also unsupported.
 Snapshot index manifests may contain dynamic-bucket HASH indexes and primary-key
-deletion vectors, or deletion vectors and global indexes in Data Evolution mode.
+deletion vectors and source-backed PK indexes, or deletion vectors and global
+indexes in Data Evolution mode.
 Embedded and sidecar file indexes are regenerated according to the captured
 table options. The automatic behavior also applies to language bindings using the
 table committer. The manual compaction API and background compaction scheduling

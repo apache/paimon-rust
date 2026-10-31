@@ -256,7 +256,7 @@ pub(super) fn build_read_splits_for_shard(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn emit_scalar_rows(
+pub(in crate::table) fn emit_scalar_rows(
     batches: &[RecordBatch],
     index_column: &str,
     data_type: &DataType,
@@ -331,7 +331,7 @@ fn emit_scalar_rows(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn emit_multivalue_rows(
+pub(in crate::table) fn emit_multivalue_rows(
     batches: &[RecordBatch],
     index_column: &str,
     element_type: &DataType,

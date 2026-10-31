@@ -116,6 +116,7 @@ mod pk_full_text_bucket_search;
 mod pk_full_text_bucket_state;
 mod pk_full_text_read;
 mod pk_full_text_scan;
+mod pk_index_options;
 mod pk_search_position;
 mod pk_search_ranker;
 mod pk_sorted_index_scan;

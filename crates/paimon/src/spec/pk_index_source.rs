@@ -117,6 +117,40 @@ impl PrimaryKeyIndexSourceMeta {
         &self.source_files
     }
 
+    /// Encode the Java DataOutput frame, including modified UTF-8 file names.
+    pub fn serialize(&self) -> crate::Result<Vec<u8>> {
+        let count = i32::try_from(self.source_files.len())
+            .map_err(|_| data_invalid("too many primary-key index source files"))?;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&SOURCE_META_VERSION.to_be_bytes());
+        bytes.extend_from_slice(&self.data_level.to_be_bytes());
+        bytes.extend_from_slice(&count.to_be_bytes());
+        for file in &self.source_files {
+            let mut name = Vec::new();
+            for ch in file.file_name.encode_utf16() {
+                match ch {
+                    1..=0x7f => name.push(ch as u8),
+                    0..=0x7ff => {
+                        name.push(0xc0 | (ch >> 6) as u8);
+                        name.push(0x80 | (ch & 0x3f) as u8);
+                    }
+                    _ => {
+                        name.push(0xe0 | (ch >> 12) as u8);
+                        name.push(0x80 | ((ch >> 6) & 0x3f) as u8);
+                        name.push(0x80 | (ch & 0x3f) as u8);
+                    }
+                }
+            }
+            let length = u16::try_from(name.len()).map_err(|_| {
+                data_invalid("primary-key index source name exceeds Java writeUTF limit")
+            })?;
+            bytes.extend_from_slice(&length.to_be_bytes());
+            bytes.extend_from_slice(&name);
+            bytes.extend_from_slice(&file.row_count.to_be_bytes());
+        }
+        Ok(bytes)
+    }
+
     /// Build from the `_SOURCE_META` bytes carried on a [`GlobalIndexMeta`].
     /// Errors if the metadata carries no source blob.
     pub fn from_global_index_meta(meta: &GlobalIndexMeta) -> crate::Result<Self> {
@@ -500,5 +534,41 @@ mod tests {
         let bytes = [0x00, 0x03, 0xED, 0xA0, 0x80];
         let mut cursor = DataInputCursor::new(&bytes);
         assert!(read_java_utf(&mut cursor).is_err());
+    }
+
+    #[test]
+    fn serialize_matches_java_frame_and_modified_utf8() {
+        let ascii = PrimaryKeyIndexSourceMeta::new(
+            2,
+            vec![
+                PrimaryKeyIndexSourceFile::new("a.parquet".into(), 3).unwrap(),
+                PrimaryKeyIndexSourceFile::new("b.parquet".into(), 0).unwrap(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            ascii.serialize().unwrap(),
+            frame(2, &[("a.parquet", 3), ("b.parquet", 0)])
+        );
+        let source = PrimaryKeyIndexSourceMeta::new(
+            1,
+            vec![PrimaryKeyIndexSourceFile::new("\0中😀".into(), 7).unwrap()],
+        )
+        .unwrap();
+        let bytes = source.serialize().unwrap();
+        assert_eq!(
+            &bytes[12..25],
+            &[0, 11, 0xc0, 0x80, 0xe4, 0xb8, 0xad, 0xed, 0xa0, 0xbd, 0xed, 0xb8, 0x80]
+        );
+        assert_eq!(
+            PrimaryKeyIndexSourceMeta::deserialize(&bytes).unwrap(),
+            source
+        );
+        let oversized = PrimaryKeyIndexSourceMeta::new(
+            1,
+            vec![PrimaryKeyIndexSourceFile::new("中".repeat(22000), 1).unwrap()],
+        )
+        .unwrap();
+        assert!(oversized.serialize().is_err());
     }
 }

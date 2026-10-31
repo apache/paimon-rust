@@ -465,6 +465,7 @@ impl TableCommit {
                     entries: prepared.entries,
                     changelog_entries: prepared.changelog_entries,
                     deletion_vector_updates: prepared.deletion_vector_updates,
+                    index_entries: prepared.index_entries,
                     schema_id: prepared.schema_id,
                     read_snapshot: prepared.read_snapshot,
                     planned_snapshot_id: prepared.snapshot_id,
@@ -1303,10 +1304,15 @@ impl TableCommit {
             CommitEntriesPlan::Compact {
                 entries,
                 changelog_entries,
+                index_entries,
                 ..
             } => {
                 return self
-                    .check_recovery_entries(entries, changelog_entries, &[])
+                    .check_recovery_entries(
+                        entries,
+                        changelog_entries,
+                        index_entries.as_deref().unwrap_or_default(),
+                    )
                     .await;
             }
         };
@@ -1452,7 +1458,7 @@ impl TableCommit {
 
         if self.deletion_vectors_enabled && resolved.kind == CommitKind::COMPACT {
             if let Some(snapshot) = latest_snapshot {
-                if let Some(indexes) = super::compact::deletion_vectors::rewrite_indexes(
+                if let Some(mut indexes) = super::compact::deletion_vectors::rewrite_indexes(
                     &self.table,
                     snapshot,
                     &resolved.entries,
@@ -1461,6 +1467,11 @@ impl TableCommit {
                 )
                 .await?
                 {
+                    if let Some(prepared) = &resolved.new_index_manifest_entries {
+                        let is_pk = super::compact::primary_key::indexes::is_source_index;
+                        indexes.retain(|e| !is_pk(e));
+                        indexes.extend(prepared.iter().filter(|e| is_pk(e)).cloned());
+                    }
                     resolved.index_manifest_changed = true;
                     resolved.new_index_manifest_entries = Some(indexes);
                 }
@@ -1987,6 +1998,7 @@ impl TableCommit {
                 entries,
                 changelog_entries,
                 deletion_vector_updates,
+                index_entries,
                 schema_id,
                 read_snapshot,
                 planned_snapshot_id,
@@ -2169,14 +2181,23 @@ impl TableCommit {
                     )
                     .await?;
                 }
+                let new_indexes = super::compact::primary_key::indexes::resolve(
+                    &self.table,
+                    read_snapshot.as_deref(),
+                    latest_snapshot.as_ref().expect("validated latest snapshot"),
+                    base_data_files.as_deref().unwrap_or_default(),
+                    entries,
+                    index_entries.as_deref(),
+                )
+                .await?;
                 Ok(ResolvedCommit {
                     entries: entries.clone(),
                     changelog_entries: changelog_entries.clone(),
                     deletion_vector_updates: deletion_vector_updates.to_vec(),
                     kind: CommitKind::COMPACT,
                     index_manifest_name,
-                    index_manifest_changed: false,
-                    new_index_manifest_entries: None,
+                    index_manifest_changed: new_indexes.is_some(),
+                    new_index_manifest_entries: new_indexes,
                     base_data_files,
                 })
             }
@@ -4004,6 +4025,7 @@ enum CommitEntriesPlan {
         changelog_entries: Vec<ManifestEntry>,
         deletion_vector_updates:
             Option<Vec<super::compact::deletion_vectors::DeletionVectorUpdate>>,
+        index_entries: Option<Vec<IndexManifestEntry>>,
         schema_id: i64,
         read_snapshot: Option<Box<Snapshot>>,
         planned_snapshot_id: i64,
