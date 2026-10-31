@@ -50,9 +50,9 @@ const BATCH_COMMIT_IDENTIFIER: i64 = i64::MAX;
 const CHECK_ROLLING_RECORD_COUNT: usize = 1000;
 
 mod auto_compact;
-mod auto_index_build;
+mod auto_index;
 #[cfg(test)]
-mod auto_index_build_tests;
+mod auto_index_tests;
 mod global_index_source_check;
 mod row_tracking;
 
@@ -399,7 +399,7 @@ impl TableCommit {
             } else if self
                 .auto_compaction_enabled(messages.iter().any(|m| !m.new_files.is_empty()))?
                 || self
-                    .auto_index_build_enabled(messages.iter().any(|m| !m.new_files.is_empty()))
+                    .auto_index_enabled(messages.iter().any(|m| !m.new_files.is_empty()))
                     .await?
             {
                 let kind = direct_commit_kind(
@@ -453,7 +453,7 @@ impl TableCommit {
             return Ok(super::CompactMetrics::default());
         }
         let prepared = super::compact::prepare_results(&self.table, &results)?;
-        let maintain_indexes = self.auto_index_build_enabled(true).await?;
+        let maintain_indexes = self.auto_index_enabled(true).await?;
         let planned_snapshot_id = prepared.snapshot_id;
         let mut commit = self.clone();
         // One stable identity per plan and task subset, allowing repeated plans

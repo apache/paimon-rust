@@ -530,7 +530,7 @@ async fn vector_definitions_require_a_supported_algorithm_and_metric() {
         None,
     );
     assert!(TableCommit::new(original.clone(), "writer".into())
-        .auto_index_build_enabled(true)
+        .auto_index_enabled(true)
         .await
         .unwrap_err()
         .to_string()
@@ -558,7 +558,7 @@ async fn vector_definitions_require_a_supported_algorithm_and_metric() {
             .copy_with_options(HashMap::from([(key.into(), value.into())]));
         assert!(
             TableCommit::new(table, "invalid".into())
-                .auto_index_build_enabled(true)
+                .auto_index_enabled(true)
                 .await
                 .is_err(),
             "{key}={value}"

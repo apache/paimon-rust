@@ -79,7 +79,7 @@ impl TableCommit {
         };
         let has_new_files = entries.iter().any(|e| *e.kind() == FileKind::Add);
         let enabled = self.auto_compaction_enabled(has_new_files)?;
-        let index_enabled = self.auto_index_build_enabled(has_new_files).await?;
+        let index_enabled = self.auto_index_enabled(has_new_files).await?;
         let buckets = enabled.then(|| self.written_buckets(entries));
         let kind = plan.commit_kind_hint();
         let outcome = self
@@ -174,7 +174,7 @@ impl TableCommit {
                         .await?;
                 }
             }
-            if self.auto_index_build_enabled(true).await? {
+            if self.auto_index_enabled(true).await? {
                 self.index_after_write(&written).await?;
             }
             Ok(())
