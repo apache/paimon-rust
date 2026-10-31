@@ -356,6 +356,7 @@ pub(super) async fn validate(
         }
     }
     let mut names = HashSet::new();
+    let mut vector_sources = HashSet::new();
     for entry in prepared.iter().filter(|e| e.kind == FileKind::Add) {
         if !names.insert(entry.index_file.file_name.as_str())
             || current
@@ -383,7 +384,8 @@ pub(super) async fn validate(
         } else {
             indexed_rows == count
         };
-        if source(entry)? != source_meta(key.2, files)?
+        let sources = source(entry)?;
+        if sources != source_meta(key.2, files)?
             || meta.row_range_start != 0
             || meta.row_range_end != count - 1
             || !valid_count
@@ -394,10 +396,26 @@ pub(super) async fn validate(
                 "PK index output does not match complete compacted level",
             ));
         }
+        if crate::vindex::is_vindex_index_type(&definition.index_type) {
+            vector_sources.extend(sources.source_files().iter().map(|file| {
+                (
+                    entry.partition.clone(),
+                    entry.bucket,
+                    file.file_name().into(),
+                )
+            }));
+        }
     }
     if !required_builds.is_empty() {
         return Err(invalid("Missing PK index output"));
     }
+    super::deletion_vector_index::validate_source_deletion_growth(
+        table,
+        &captured,
+        current,
+        vector_sources,
+    )
+    .await?;
     Ok(())
 }
 

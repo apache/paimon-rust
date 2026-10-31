@@ -54,7 +54,7 @@ impl SortedGlobalIndexBuildBuilder<'_> {
         IndexFileWriter::new(
             self.table,
             kind,
-            format!("{}-global-index-{}.index", kind, uuid::Uuid::new_v4()),
+            crate::table::global_index_schema::index_file_name(kind, self.table.schema().id()),
             IndexFileLocation::Global {
                 table_path: self.table.location().trim_end_matches('/'),
             },

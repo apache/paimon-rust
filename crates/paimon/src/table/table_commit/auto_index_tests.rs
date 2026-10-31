@@ -25,7 +25,9 @@ use futures::TryStreamExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 mod lsm;
+mod schema;
 mod search;
+mod vector_dimension;
 
 #[tokio::test]
 async fn index_columns_share_source_scan_and_covered_rounds_do_not_rescan_builders() {

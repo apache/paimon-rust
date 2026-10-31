@@ -87,6 +87,7 @@ mod global_index_freshness;
 mod global_index_options;
 mod global_index_result;
 pub(crate) mod global_index_scanner;
+mod global_index_schema;
 mod global_index_search_filter;
 mod global_index_types;
 mod hybrid_search_builder;

@@ -159,6 +159,48 @@ pub(in crate::table::compact) fn with_deletion_entries(
         .build()
 }
 
+/// Vector indexes exclude captured deletions and lookup hits discovered by this
+/// compaction. Decode each complete-level source mask once for all columns.
+pub(in crate::table::compact) async fn index_source_deletions(
+    table: &Table,
+    split: &DataSplit,
+    indexes: &[IndexManifestEntry],
+    updates: &[DeletionVectorUpdate],
+    files: &[&DataFileMeta],
+) -> Result<HashMap<String, RoaringBitmap>> {
+    let references = vector_references(indexes)?;
+    let partition = split.partition().to_serialized_bytes();
+    let mut pending = HashMap::<&str, Vec<_>>::new();
+    for update in updates
+        .iter()
+        .filter(|update| update.partition == partition && update.bucket == split.bucket())
+    {
+        pending.entry(&update.file_name).or_default().push(update);
+    }
+    let mut masks = HashMap::new();
+    for file in files {
+        let mut mask = read_bitmap(
+            table,
+            split.bucket_path(),
+            references.get(&(partition.clone(), split.bucket(), file.file_name.clone())),
+        )
+        .await?;
+        for update in pending.get(file.file_name.as_str()).into_iter().flatten() {
+            mask |= RoaringBitmap::deserialize_from(update.bitmap.as_slice())
+                .map_err(|error| super::super::invalid(&error.to_string()))?;
+        }
+        if !mask.is_empty() {
+            if i64::from(mask.max().unwrap()) >= file.row_count {
+                return Err(super::super::invalid(
+                    "PK index deletion exceeds source rows",
+                ));
+            }
+            masks.insert(file.file_name.clone(), mask);
+        }
+    }
+    Ok(masks)
+}
+
 /// Selected masks must be unchanged. Actual point-lookup hits must still be
 /// live; unrelated deletions in their files can safely be rebased by union.
 pub(in crate::table) async fn validate_dependencies(

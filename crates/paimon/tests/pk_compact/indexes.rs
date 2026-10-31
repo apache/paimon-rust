@@ -203,6 +203,403 @@ async fn empty_vector_level_is_persisted_reused_and_searchable() {
 }
 
 #[tokio::test]
+async fn vector_indexes_skip_invalid_values_hidden_by_captured_and_new_deletion_vectors() {
+    use arrow_array::{
+        builder::{Float32Builder, ListBuilder},
+        ArrayRef,
+    };
+    use paimon::spec::SchemaChange;
+    use std::sync::Arc;
+
+    for captured_mask in [true, false] {
+        let case = if captured_mask { "captured" } else { "new" };
+        let original = vector_table_for_indexes(&[]).await;
+        let schema = original
+            .schema()
+            .apply_changes(vec![SchemaChange::remove_option(
+                "pk-vector.index.columns".into(),
+            )])
+            .unwrap();
+        persist_table_schema(original.file_io(), original.location(), &schema).await;
+        let table = original.copy_with_resolved_schema(schema, "main").unwrap();
+
+        // A nullable ARRAY<FLOAT> can contain a NULL child before an index is
+        // declared. The only non-NULL vector in this base will later be hidden.
+        let mut vectors = ListBuilder::new(Float32Builder::new()).with_field(Arc::new(
+            arrow_schema::Field::new("element", arrow_schema::DataType::Float32, true),
+        ));
+        for id in 0..1000 {
+            if id == 42 {
+                vectors.values().append_value(1.);
+                vectors.values().append_null();
+                vectors.append(true);
+            } else {
+                vectors.append(false);
+            }
+        }
+        let batch = RecordBatch::try_from_iter([
+            (
+                "id",
+                Arc::new(Int32Array::from_iter_values(0..1000)) as ArrayRef,
+            ),
+            ("embedding", Arc::new(vectors.finish()) as ArrayRef),
+        ])
+        .unwrap();
+        write_batch(&table, &batch).await;
+        let first = compact(&table).await;
+        assert_eq!(first.len(), 1, "{case}");
+        assert_eq!(first[0].files().len(), 1, "{case}");
+        let base = first[0].files()[0].clone();
+        assert_eq!(base.row_count, 1000, "{case}");
+        assert!(base.level > 1, "{case}");
+        assert!(indexes(&table).await.is_empty(), "{case}");
+
+        if captured_mask {
+            write_batch(&table, &vector_index_batch(vec![42], vec![Some([42., 0.])])).await;
+            compact(&table).await;
+            assert!(indexes(&table).await.iter().any(|entry| {
+                entry.index_file.index_type == "DELETION_VECTORS"
+                    && entry
+                        .index_file
+                        .deletion_vectors_ranges
+                        .as_ref()
+                        .is_some_and(|ranges| ranges.contains_key(&base.file_name))
+            }));
+        }
+
+        let schema = table
+            .schema()
+            .apply_changes(vec![SchemaChange::set_option(
+                "pk-vector.index.columns".into(),
+                "embedding".into(),
+            )])
+            .unwrap();
+        persist_table_schema(table.file_io(), table.location(), &schema).await;
+        let current = table.copy_with_resolved_schema(schema, "main").unwrap();
+        let batch = if captured_mask {
+            vector_index_batch(vec![1001], vec![Some([1001., 0.])])
+        } else {
+            // This compaction discovers the old position through lookup and
+            // publishes its mask together with the newly built indexes.
+            vector_index_batch(vec![42, 1001], vec![Some([42., 0.]), Some([1001., 0.])])
+        };
+        write_batch(&current, &batch).await;
+        let builder = current.new_compact_builder();
+        let plan = builder.new_planner().unwrap().plan().await.unwrap();
+        assert!(!plan.tasks().is_empty(), "{case}");
+        assert!(
+            plan.tasks()
+                .iter()
+                .flat_map(CompactTask::files)
+                .all(|file| file.file_name != base.file_name),
+            "{case}: the hidden value must remain in unselected source history"
+        );
+        let results = execute(&current, &plan).await;
+        builder
+            .new_commit()
+            .unwrap()
+            .commit_compact(results)
+            .await
+            .unwrap();
+
+        let entries = indexes(&current).await;
+        let empty = entries
+            .iter()
+            .find(|entry| {
+                entry.index_file.index_type == "ivf-flat"
+                    && PrimaryKeyIndexSourceMeta::from_global_index_meta(
+                        entry.index_file.global_index_meta.as_ref().unwrap(),
+                    )
+                    .unwrap()
+                    .source_files()
+                    .iter()
+                    .any(|source| source.file_name() == base.file_name)
+            })
+            .unwrap();
+        let meta = empty.index_file.global_index_meta.as_ref().unwrap();
+        let source = PrimaryKeyIndexSourceMeta::from_global_index_meta(meta).unwrap();
+        assert_eq!(source.source_files().len(), 1, "{case}");
+        assert_eq!(source.source_files()[0].row_count(), 1000, "{case}");
+        assert_eq!(
+            (meta.row_range_start, meta.row_range_end),
+            (0, 999),
+            "{case}"
+        );
+        assert_eq!(empty.index_file.row_count, 0, "{case}");
+        assert_eq!(empty.index_file.file_size, 0, "{case}");
+        assert!(current
+            .file_io()
+            .exists(&index_path(&current, empty))
+            .await
+            .unwrap());
+        let deletion = entries
+            .iter()
+            .find_map(|entry| {
+                entry
+                    .index_file
+                    .deletion_vectors_ranges
+                    .as_ref()
+                    .and_then(|ranges| ranges.get(&base.file_name))
+            })
+            .unwrap();
+        assert_eq!(deletion.cardinality, Some(1), "{case}");
+
+        for id in [42, 1001] {
+            let result = current
+                .new_vector_search_builder()
+                .with_vector_column("embedding")
+                .with_query_vector(vec![id as f32, 0.])
+                .with_limit(1)
+                .execute()
+                .await
+                .unwrap();
+            let batches: Vec<RecordBatch> = result
+                .new_read_builder()
+                .read()
+                .await
+                .unwrap()
+                .try_collect()
+                .await
+                .unwrap();
+            assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+            assert_eq!(
+                batches[0]
+                    .column_by_name("id")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .value(0),
+                id,
+                "{case}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn retained_vector_sources_reject_restored_deletions_but_allow_repacking_and_growth() {
+    use bytes::Bytes;
+    use indexmap::IndexMap;
+    use paimon::spec::{DeletionVectorMeta, IndexFileMeta, SchemaChange};
+    use paimon::table::CommitMessage;
+    use roaring::RoaringBitmap;
+
+    // Publish a normal index-only DV transition. Removing this entry restores
+    // the same physical data, as rollback-to-as-latest does without a data delta.
+    async fn write_mask(table: &Table, source: &str, positions: &[u32]) -> IndexFileMeta {
+        let bitmap: RoaringBitmap = positions.iter().copied().collect();
+        let mut payload = 1581511376u32.to_be_bytes().to_vec();
+        bitmap.serialize_into(&mut payload).unwrap();
+        let mut bytes = vec![1];
+        bytes.extend_from_slice(&(payload.len() as i32).to_be_bytes());
+        bytes.extend_from_slice(&payload);
+        bytes.extend_from_slice(&crc32fast::hash(&payload).to_be_bytes());
+        let file = IndexFileMeta {
+            index_type: "DELETION_VECTORS".into(),
+            file_name: format!("index-{}-1", uuid::Uuid::new_v4()),
+            file_size: bytes.len() as i64,
+            row_count: 1,
+            deletion_vectors_ranges: Some(IndexMap::from([(
+                source.into(),
+                DeletionVectorMeta {
+                    offset: 1,
+                    length: payload.len() as i32,
+                    cardinality: Some(bitmap.len() as i64),
+                },
+            )])),
+            external_path: None,
+            global_index_meta: None,
+        };
+        let path = if table.schema().core_options().index_file_in_data_file_dir() {
+            format!("{}/bucket-0/{}", table.location(), file.file_name)
+        } else {
+            format!("{}/index/{}", table.location(), file.file_name)
+        };
+        table
+            .file_io()
+            .mkdirs(path.rsplit_once('/').unwrap().0)
+            .await
+            .unwrap();
+        table
+            .file_io()
+            .new_output(&path)
+            .unwrap()
+            .write(Bytes::from(bytes))
+            .await
+            .unwrap();
+        file
+    }
+
+    for change in ["removed", "shrunk", "repacked", "grown"] {
+        let original = vector_table_for_indexes(&[]).await;
+        let schema = original
+            .schema()
+            .apply_changes(vec![SchemaChange::remove_option(
+                "pk-vector.index.columns".into(),
+            )])
+            .unwrap();
+        persist_table_schema(original.file_io(), original.location(), &schema).await;
+        let table = original.copy_with_resolved_schema(schema, "main").unwrap();
+        write_batch(
+            &table,
+            &vector_index_batch(
+                (0..1000).collect(),
+                (0..1000).map(|id| Some([id as f32, 0.])).collect(),
+            ),
+        )
+        .await;
+        let first = compact(&table).await;
+        let base = first[0].files()[0].clone();
+        assert!(base.level > 1);
+        assert!(indexes(&table).await.is_empty());
+
+        let schema = table
+            .schema()
+            .apply_changes(vec![SchemaChange::set_option(
+                "pk-vector.index.columns".into(),
+                "embedding".into(),
+            )])
+            .unwrap();
+        persist_table_schema(table.file_io(), table.location(), &schema).await;
+        let current = table.copy_with_resolved_schema(schema, "main").unwrap();
+        write_batch(
+            &current,
+            &vector_index_batch(vec![1001], vec![Some([1001., 0.])]),
+        )
+        .await;
+        let captured_mask = write_mask(&current, &base.file_name, &[42]).await;
+        let partition = paimon::spec::BinaryRow::new(0).to_serialized_bytes();
+        let mut deletion = CommitMessage::new(partition.clone(), 0, vec![]);
+        deletion.new_index_files.push(captured_mask.clone());
+        current
+            .new_write_builder()
+            .new_commit()
+            .commit(vec![deletion])
+            .await
+            .unwrap();
+
+        let builder = current.new_compact_builder();
+        let plan = builder.new_planner().unwrap().plan().await.unwrap();
+        assert!(
+            plan.tasks()
+                .iter()
+                .flat_map(CompactTask::files)
+                .all(|file| file.file_name != base.file_name),
+            "{change}: source must be retained history"
+        );
+        let results = execute(&current, &plan).await;
+        let retained = results
+            .iter()
+            .flat_map(|result| result.index_entries().unwrap())
+            .find(|entry| {
+                entry.kind == paimon::spec::FileKind::Add
+                    && entry.index_file.index_type == "ivf-flat"
+                    && PrimaryKeyIndexSourceMeta::from_global_index_meta(
+                        entry.index_file.global_index_meta.as_ref().unwrap(),
+                    )
+                    .unwrap()
+                    .source_files()
+                    .iter()
+                    .any(|source| source.file_name() == base.file_name)
+            })
+            .unwrap();
+        assert_eq!(
+            retained.index_file.row_count, 999,
+            "{change}: captured deletion must be omitted"
+        );
+
+        let mut concurrent = CommitMessage::new(partition, 0, vec![]);
+        concurrent.deleted_index_files.push(captured_mask);
+        let replacement = match change {
+            "removed" => None,
+            "shrunk" => Some(vec![43]),
+            "repacked" => Some(vec![42]),
+            "grown" => Some(vec![42, 43]),
+            _ => unreachable!(),
+        };
+        if let Some(positions) = replacement {
+            concurrent
+                .new_index_files
+                .push(write_mask(&current, &base.file_name, &positions).await);
+        }
+        current
+            .new_write_builder()
+            .new_commit()
+            .commit(vec![concurrent])
+            .await
+            .unwrap();
+        let before = latest(&current).await;
+        let published = builder
+            .new_commit()
+            .unwrap()
+            .commit_compact(results.clone())
+            .await;
+        if matches!(change, "removed" | "shrunk") {
+            let error =
+                published.expect_err("a prepared vector payload cannot omit a restored live row");
+            assert!(
+                error.to_string().contains("source deletions were restored"),
+                "{change}: {error}"
+            );
+            assert_eq!(latest(&current).await, before, "{change}");
+            for result in &results {
+                for entry in result
+                    .index_entries()
+                    .unwrap()
+                    .iter()
+                    .filter(|entry| entry.kind == paimon::spec::FileKind::Add)
+                {
+                    assert!(
+                        current
+                            .file_io()
+                            .exists(&index_path(&current, entry))
+                            .await
+                            .unwrap(),
+                        "{change}: failed commit owns no prepared files"
+                    );
+                }
+                for file in result.files() {
+                    assert!(
+                        current
+                            .file_io()
+                            .exists(&format!(
+                                "{}/bucket-0/{}",
+                                current.location(),
+                                file.file_name
+                            ))
+                            .await
+                            .unwrap(),
+                        "{change}: prepared data must remain recoverable"
+                    );
+                }
+            }
+        } else {
+            published.unwrap();
+            assert_eq!(latest(&current).await.id(), before.id() + 1, "{change}");
+            let batches = read(&current, Some(&["id"])).await;
+            let ids = batches
+                .iter()
+                .flat_map(|batch| {
+                    batch
+                        .column_by_name("id")
+                        .unwrap()
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .unwrap()
+                        .values()
+                        .iter()
+                        .copied()
+                })
+                .collect::<Vec<_>>();
+            assert!(!ids.contains(&42), "{change}");
+            assert_eq!(ids.contains(&43), change == "repacked", "{change}");
+            assert!(ids.contains(&1001), "{change}");
+        }
+    }
+}
+
+#[tokio::test]
 async fn vector_output_cannot_be_omitted_and_counts_non_null_vectors() {
     let table = vector_table_for_indexes(&[]).await;
     write_batch(

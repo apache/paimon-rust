@@ -624,6 +624,7 @@ impl CompactExecutor {
                 indexes,
                 active,
                 &files,
+                &deletion_vector_updates,
                 self.resources.clone(),
             )
             .await

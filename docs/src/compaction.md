@@ -190,6 +190,18 @@ retain global payloads. Shard-boundary changes, removed rows and incompatible
 vector definitions retire affected payloads immediately. Additions and retired
 references publish together; historical snapshots retain their old files.
 
+Scalar and full-text payload reuse also checks the indexed field's type. New file
+names record the actual builder schema ID; this remains valid after its source
+snapshot expires and permits current-schema builds over older data. Java opens
+the manifest's file name unchanged, so native and manifest formats are unchanged.
+Legacy names require a complete schema history with an unchanged field ID and
+type. Missing history or incompatible types cause atomic retirement and rebuild;
+scalar layout-option changes alone retain compatible runs. Full-text type
+changes, such as a shorter VARCHAR width, rebuild tokens from current logical
+text. Full-text runs also require an equivalent parsed native configuration;
+analyzer changes rebuild coverage, while explicit defaults preserve compatible
+leaves. Missing or invalid analyzer metadata is rebuilt conservatively.
+
 Vector training still uses the actual non-NULL count. If a small or sparse run
 cannot satisfy its native training configuration, such as a size-per-vector
 budget, maintenance may retry once with complete pending connected groups. This
@@ -201,9 +213,13 @@ An empty maintenance plan publishes no snapshot. Empty data commits, index-only
 commits, and truncation do not trigger a separate round. Indexed-column updates
 retain `global-index.column-update-action`: use `DROP_PARTITION_INDEX` to allow
 the data update and automatically rebuild the affected coverage. Changing a
-vector algorithm or distance metric retires all incompatible payloads for that
-column and publishes their replacements together. Other writer parameters alone
-do not rebuild unchanged coverage; changing shard boundaries can regroup it.
+vector algorithm, distance metric or dimension retires all incompatible payloads
+for that column and publishes their replacements together. Other vector training
+parameters alone do not rebuild unchanged coverage; changing shard boundaries
+can regroup it.
+Source vectors must satisfy a changed dimension. If they do not, maintenance
+fails without publishing mixed-dimension payloads; fix the source values and
+retry maintenance with the same originating commit identity.
 Missing coverage is processed synchronously without a minimum-row or time
 delay; index consolidation follows the run thresholds above.
 
@@ -314,6 +330,12 @@ deletion-vector and search-mode requirements.
 Each payload covers the complete compacted file set for one partition, bucket,
 positive level and column. Source files are sorted by name; payload ordinals
 concatenate their physical rows, preserving NULL and tombstone positions.
+Each native build projects its indexed column rather than decoding every value
+column. As in Java, vector builds exclude captured DV positions and lookup
+deletions discovered by the current compaction, while keeping their physical
+positions in the source frame. Selection precedes schema casts; bounded NULL
+batches fill ordinal gaps for the shared native writer. Scalar and full-text
+builds retain physical rows.
 Unchanged coverage is retained. Changed coverage and incompatible vector
 definitions replace the previous references in the same COMPACT snapshot as
 data, changelogs and deletion vectors. Old payload files remain for historical
@@ -324,9 +346,12 @@ Vector payload row counts count indexed vectors; source ranges retain all physic
 
 Commit validates the complete source set and captured index membership before
 publishing. Concurrent L0 appends and unrelated index changes can be rebased;
-changes to a maintained unit require a new plan. A failed build cleans its
-private outputs. A failed or uncertain commit retains prepared outputs for
-retry with the same results and commit user. Older serialized results lacking
+changes to a maintained unit require a new plan.
+For newly built vector payloads, captured deleted positions must remain deleted
+at commit. Concurrent DV additions and container repacking can be rebased;
+restoring positions, for example through rollback-as-latest, requires re-execution.
+A failed build cleans its private outputs. A failed or uncertain commit retains
+prepared outputs for retry with the same results and commit user. Older serialized results lacking
 index maintenance must be re-executed before first publication when indexes
 need maintenance; already published results remain recoverable without their
 original source snapshot.

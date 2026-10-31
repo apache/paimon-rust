@@ -29,7 +29,10 @@ use crate::table::pk_index_maintenance::{levels, plan, unsupported_scalar_units}
 use crate::table::pk_index_options::definitions;
 use crate::table::{CommitMessage, DataSplit, Table, TableCommit};
 use crate::Result;
+use std::collections::HashSet;
+use std::sync::Arc;
 
+#[allow(clippy::too_many_arguments)]
 pub(in crate::table::compact) async fn prepare(
     table: &Table,
     task: &CompactTask,
@@ -37,6 +40,7 @@ pub(in crate::table::compact) async fn prepare(
     indexes: &[IndexManifestEntry],
     active: &[ManifestEntry],
     files: &[DataFileMeta],
+    deletion_updates: &[super::super::deletion_vectors::DeletionVectorUpdate],
     resources: Option<ResourceContext>,
 ) -> Result<Vec<IndexManifestEntry>> {
     let defs = definitions(table.schema())?;
@@ -75,9 +79,41 @@ pub(in crate::table::compact) async fn prepare(
         &task.partition,
         task.bucket,
     )?;
+    let vector_levels = maintenance
+        .builds
+        .iter()
+        .filter(|(_, definition)| crate::vindex::is_vindex_index_type(&definition.index_type))
+        .map(|(level, _)| *level)
+        .collect::<HashSet<_>>();
+    let vector_sources = after
+        .iter()
+        .filter(|(level, _)| vector_levels.contains(level))
+        .flat_map(|(_, files)| files)
+        .collect::<Vec<_>>();
+    let masks = Arc::new(if vector_sources.is_empty() {
+        Default::default()
+    } else {
+        super::deletion_vectors::index_source_deletions(
+            table,
+            split,
+            indexes,
+            deletion_updates,
+            &vector_sources,
+        )
+        .await?
+    });
     let mut entries = maintenance.deletes;
     for (level, definition) in maintenance.builds {
-        match writer::build(table, split, &after[&level], definition, resources.clone()).await {
+        match writer::build(
+            table,
+            split,
+            &after[&level],
+            definition,
+            masks.clone(),
+            resources.clone(),
+        )
+        .await
+        {
             Ok(Some(index_file)) => entries.push(IndexManifestEntry {
                 kind: FileKind::Add,
                 partition: task.partition.clone(),

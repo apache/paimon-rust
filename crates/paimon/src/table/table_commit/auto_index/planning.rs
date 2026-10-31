@@ -23,6 +23,7 @@ use super::*;
 use crate::table::global_index_build_common::{
     resolve_index_fields, GlobalIndexBuildView, IndexColumns,
 };
+use crate::table::index_build::full_text::{full_text_config, native_full_text_options};
 use crate::table::source::exclude_row_ranges;
 use crate::table::universal_compaction::{Run, UniversalCompaction};
 use crate::table::{merge_row_ranges, RowRange};
@@ -132,16 +133,24 @@ async fn plan_impl(
         &definition.index_type,
     )?;
     let field_id = fields[0].id();
-    let vector_metric = if crate::vindex::is_vindex_index_type(&definition.index_type) {
+    let vector_semantics = if crate::vindex::is_vindex_index_type(&definition.index_type) {
         let options = crate::vindex::VindexVectorIndexOptions::new(
             table.schema().options(),
             &definition.options,
             &definition.index_type,
             fields[0],
         )?;
-        Some(crate::vindex::pkvector::metric::VectorSearchMetric::parse(
-            &options.native_options["metric"],
-        )?)
+        Some((
+            crate::vindex::pkvector::metric::VectorSearchMetric::parse(
+                &options.native_options["metric"],
+            )?,
+            options.dimension(),
+        ))
+    } else {
+        None
+    };
+    let full_text_definition = if definition.index_type == "full-text" {
+        Some(full_text_config(&native_full_text_options(&options))?)
     } else {
         None
     };
@@ -180,7 +189,7 @@ async fn plan_impl(
         .filter(|entry| {
             entry.kind == FileKind::Add
                 && (entry.index_file.index_type == definition.index_type
-                    || vector_metric.is_some()
+                    || vector_semantics.is_some()
                         && crate::vindex::is_vindex_index_type(&entry.index_file.index_type))
                 && entry
                     .index_file
@@ -194,21 +203,50 @@ async fn plan_impl(
         .collect::<Vec<_>>();
     let mut current: HashMap<UnitKey, Vec<&IndexManifestEntry>> = HashMap::new();
     let mut replaced = HashSet::new();
+    let mut index_schema = matches!(
+        definition.index_type.as_str(),
+        "btree" | "bitmap" | "multivalue" | "fm" | "full-text"
+    )
+    .then(|| crate::table::global_index_schema::GlobalIndexSchema::new(table, fields[0]));
     for entry in selected.iter().copied() {
         let meta = entry.index_file.global_index_meta.as_ref().unwrap();
-        if let Some(metric) = vector_metric {
-            // A vector column owns one algorithm and scoring metric across all shards.
+        if let Some(proof) = &mut index_schema {
+            if !proof
+                .compatible(&entry.index_file.file_name, &definition.index_type)
+                .await
+            {
+                replaced.insert(index_file_key(entry));
+                continue;
+            }
+        }
+        if let Some(expected) = &full_text_definition {
+            // Analyzer options change matching semantics. Independent leaves
+            // must agree after applying native defaults and option aliases.
+            let recorded = meta
+                .index_meta
+                .as_deref()
+                .and_then(|bytes| serde_json::from_slice::<HashMap<String, String>>(bytes).ok())
+                .and_then(|options| full_text_config(&options).ok());
+            if recorded.as_ref() != Some(expected) {
+                replaced.insert(index_file_key(entry));
+                continue;
+            }
+        }
+        if let Some((metric, dimension)) = vector_semantics {
+            // A vector column owns one algorithm, metric and dimension across all shards.
             // Coverage equality cannot make a previous definition compatible.
             let compatible = entry.index_file.index_type == definition.index_type
-                && crate::table::vector_search_common::read_index_vector_metric(
+                && crate::table::vector_search_common::read_index_vector_semantics(
                     table.file_io(),
                     table.location(),
                     entry,
                 )
                 .await?
                 .is_some_and(|persisted| {
-                    crate::vindex::pkvector::metric::VectorSearchMetric::from_vindex(persisted)
-                        == metric
+                    crate::vindex::pkvector::metric::VectorSearchMetric::from_vindex(
+                        persisted.metric,
+                    ) == metric
+                        && persisted.dimension == dimension
                 });
             if !compatible {
                 replaced.insert(index_file_key(entry));
@@ -292,7 +330,7 @@ async fn plan_impl(
             if pending.is_empty() {
                 continue;
             }
-            if pending.as_slice() != std::slice::from_ref(&group) && vector_metric.is_some() {
+            if pending.as_slice() != std::slice::from_ref(&group) && vector_semantics.is_some() {
                 training_groups.push(group.clone());
                 if force_training_merge {
                     replaced.extend(existing.iter().map(|entry| index_file_key(entry)));

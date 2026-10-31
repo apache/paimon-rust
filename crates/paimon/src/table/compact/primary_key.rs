@@ -324,10 +324,17 @@ fn read_type(table: &Table) -> Vec<DataField> {
 }
 
 fn new_reader(table: &Table, resources: Option<ResourceContext>) -> Result<KeyValueFileReader> {
+    new_reader_with_projection(table, resources, read_type(table))
+}
+
+fn new_reader_with_projection(
+    table: &Table,
+    resources: Option<ResourceContext>,
+    read_type: Vec<DataField>,
+) -> Result<KeyValueFileReader> {
     let schema = table.schema();
     let options = schema.core_options();
     let merge_engine = options.merge_engine()?;
-    let read_type = read_type(table);
     let budget = configured_parquet_read_budget(table)?;
     let budget = match &resources {
         Some(resources) => Arc::new(budget.with_resources(resources.clone()).without_prefetch()),

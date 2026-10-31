@@ -223,9 +223,9 @@ impl<'a> FullTextIndexBuildBuilder<'a> {
         IndexFileWriter::new(
             self.table,
             FULL_TEXT_GLOBAL_INDEX_TYPE,
-            format!(
-                "{FULL_TEXT_GLOBAL_INDEX_TYPE}-global-index-{}.index",
-                uuid::Uuid::new_v4()
+            crate::table::global_index_schema::index_file_name(
+                FULL_TEXT_GLOBAL_INDEX_TYPE,
+                self.table.schema().id(),
             ),
             IndexFileLocation::Global {
                 table_path: self.table.location().trim_end_matches('/'),
