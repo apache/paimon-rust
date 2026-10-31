@@ -132,7 +132,10 @@ impl SchemaManager {
     /// Mirrors Java [SchemaManager.listAll()](https://github.com/apache/paimon/blob/release-1.3/paimon-core/src/main/java/org/apache/paimon/schema/SchemaManager.java).
     pub async fn list_all(&self) -> crate::Result<Vec<Arc<TableSchema>>> {
         let ids = self.list_all_ids().await?;
-        try_join_all(ids.into_iter().map(|id| self.schema(id))).await
+        // Catalog-resolved schemas can have synthetic timestamps. Enumerated
+        // schema files are authoritative for the persisted schema history.
+        let stored = Self::new(self.file_io.clone(), self.table_path.clone());
+        try_join_all(ids.into_iter().map(|id| stored.schema(id))).await
     }
 
     /// Return the schema with the highest id, or `None` when no schema files
@@ -270,6 +273,31 @@ mod tests {
         let schemas = sm.list_all().await.unwrap();
         let ids: Vec<i64> = schemas.iter().map(|s| s.id()).collect();
         assert_eq!(ids, vec![0, 1, 2]);
+    }
+
+    #[tokio::test]
+    async fn list_all_reads_persisted_schema_after_catalog_cache_seed() {
+        let file_io = memory_file_io();
+        let path = "memory:/persisted_schema";
+        let sm = SchemaManager::new(file_io.clone(), path.to_string());
+        let schema = Schema::builder().build().unwrap();
+        let mut stored = serde_json::to_value(TableSchema::new(0, &schema)).unwrap();
+        stored["timeMillis"] = serde_json::json!(1234);
+        file_io
+            .new_output(&sm.schema_path(0))
+            .unwrap()
+            .write(Bytes::from(serde_json::to_vec(&stored).unwrap()))
+            .await
+            .unwrap();
+        let mut resolved = stored.clone();
+        resolved["timeMillis"] = serde_json::json!(5678);
+        sm.cache_resolved_schema(serde_json::from_value(resolved).unwrap());
+
+        assert_eq!(sm.schema(0).await.unwrap().time_millis(), 5678);
+        let schemas = sm.list_all().await.unwrap();
+        assert_eq!(schemas.len(), 1);
+        assert_eq!(schemas[0].time_millis(), 1234);
+        assert_eq!(sm.schema(0).await.unwrap().time_millis(), 5678);
     }
 
     #[tokio::test]
