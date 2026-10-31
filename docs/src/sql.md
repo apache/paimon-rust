@@ -378,6 +378,10 @@ SELECT id, picture FROM paimon.my_db.asset_refs;
 RESET 'paimon.blob-view.resolve.enabled';
 ```
 
+Resolution fails if the upstream table stores `incremental-between-timestamp`,
+since a read of it returns that window's changes instead of the table's rows.
+Remove the option from the upstream table, or read the raw references as above.
+
 Like ordinary BLOB reads, `paimon.blob-as-descriptor = true` makes resolved Blob
 View columns return serialized BLOB descriptors instead of loading the BLOB
 bytes.
