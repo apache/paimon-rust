@@ -20,7 +20,7 @@ under the License.
 # Table Compaction
 
 Rust supports small-file compaction for ordinary append tables, normal-file
-compaction for Data Evolution tables, and full-bucket compaction for primary-key
+compaction for Data Evolution tables, and sorted-run compaction for primary-key
 tables with fixed or dynamic buckets. `CompactBuilder` creates
 a `CompactPlanner`, a `CompactExecutor`, and a `TableCommit`. Planning and
 execution do not publish snapshots; `commit_compact` atomically publishes the
@@ -44,6 +44,146 @@ for task in plan.tasks() {
 let metrics = committer.commit_compact(results).await?;
 println!("Compacted {} files into {}", metrics.files_removed, metrics.files_added);
 ```
+
+Writers also run one synchronous compaction round after a successful data commit.
+`write-only` defaults to `false`; set it to `true` to leave compaction to a
+dedicated job. The legacy `write.compaction-skip` alias is accepted, with
+`write-only` taking precedence. Automatic compaction uses the existing planner's
+thresholds and selects eligible files from the latest snapshot on the same branch,
+restricted to the partitions and buckets changed by this write. It uses the current
+schema even when the writer retains a historical schema, including schemas resolved
+through a REST catalog. Primary-key writes honor normal sorted-run count and size
+triggers. Lookup, first-row and deletion-vector compaction, or an explicit
+`compaction.force-up-level-0=true`, can advance L0 files below those triggers.
+Overwrite compaction is pinned to its own committed data snapshot, so suppressing
+overwrite changelogs cannot consume a later append's pending lookup events.
+As in Java, overwriting partitions being consumed by streaming readers is unsupported;
+lookup changelogs do not describe the overwrite operation itself.
+Automatic lookup compaction supports the default `lookup-compact=radical` policy.
+`gentle` requires writer-lifetime trigger intervals and is explicitly unsupported
+here; use `write-only=true` and schedule dedicated compaction separately.
+An empty plan publishes no extra snapshot. Append, overwrite and state-dependent
+data commits use this behavior; empty commits and truncation do not trigger it.
+`write.compaction.parallelism` bounds concurrent buckets within one automatic
+round (default `4`, positive integer; `1` runs serially). Tasks in the same
+partition and bucket run in order. The commit waits for the complete round and
+publishes all successful results together. On execution failure, queued buckets
+are skipped, started buckets finish, and their unpublished outputs are cleaned up.
+Normal commits pass their actual data snapshot and touched bucket set directly
+to compaction; only recovery reconstructs them from stored snapshots and manifests.
+Table modes unsupported by the compaction API retain their write behavior without
+automatic compaction. Automatic lookup, first-row and deletion-vector compaction
+use the configured catalog cache when available, otherwise a temporary disk cache
+owned by the writer's compaction work. `lookup.cache-max-disk-size` bounds that
+temporary cache when configured. Temporary files remain alive until the last cache
+reader is released. Explicit manual compaction still requires
+`local-cache.enabled=true` on the catalog/FileIO for these modes.
+For plain partial-update and aggregation tables, an unsupported lossless retract
+rewrite also leaves the raw source files in place. I/O, resource and data errors,
+and lookup changelog failures, are still returned to the caller.
+
+Data publication and compaction are separate transactions. A compaction failure
+leaves the data committed and returns an error retaining the underlying cause.
+For recoverable writes, use a stable commit user and caller-provided identifier,
+then retry with `filter_and_commit_with_identifier` (or `filter_and_commit`) for
+append, or `overwrite_with_identifier` for overwrite.
+Recovery finishes an interrupted compaction round without repeating the data
+commit or a completed automatic `COMPACT` snapshot. A single round can leave
+additional work for a later write or a dedicated compaction job. This option does
+not schedule background work or expire snapshots.
+
+## Automatic global index maintenance
+
+With `write-only=false` (the default), writes synchronously maintain declared
+global indexes after automatic compaction. An empty compaction plan still allows
+index maintenance. `write-only=true` leaves both jobs to dedicated operators.
+Rust, Python, and DataFusion writes share this behavior. Tables without index
+declarations retain their existing write behavior; no separate index switch is
+required and no background job is scheduled.
+
+Index options follow the primary-key index convention: a comma-separated column
+list for each family and optional per-column parameters. Supported families are
+`btree`, `bitmap`, `multivalue`, `fm`, `full-text`, and `vector`:
+
+```rust
+let options = std::collections::HashMap::from([
+    ("row-tracking.enabled".into(), "true".into()),
+    ("bucket".into(), "-1".into()),
+    ("write-only".into(), "false".into()),
+    ("global-index.btree.index-columns".into(), "id,age".into()),
+    ("global-index.full-text.index-columns".into(), "text".into()),
+    (
+        "fields.text.global-index.full-text.index-options".into(),
+        r#"{"lower-case":true}"#.into(),
+    ),
+    ("global-index.vector.index-columns".into(), "embedding".into()),
+    ("fields.embedding.global-index.vector.index-type".into(), "diskann".into()),
+    ("fields.embedding.global-index.vector.distance-metric".into(), "cosine".into()),
+    (
+        "fields.embedding.global-index.vector.index-options".into(),
+        r#"{"dimension":768}"#.into(),
+    ),
+]);
+```
+
+Maintenance reuses the global-index builders and their table, column-type,
+and native writer restrictions. Tables must have row tracking enabled, no
+primary key, and `bucket=-1`. Data evolution and the query-side
+`global-index.enabled` option are not prerequisites for building indexes.
+Full-text builds additionally reject deletion-vector tables. Declared columns
+are trimmed; empty names, duplicates, unknown fields, and assigning multiple
+families to one column are rejected before data publication. Each listed column
+has its own index. Use the explicit build API for composite BTree indexes.
+Update the lists and per-column option keys together with schema renames or drops.
+`write-only=true` skips automatic index configuration validation.
+
+Per-column parameters use
+`fields.<column>.global-index.<family>.index-options`, a JSON object containing
+string, boolean, or numeric values. Short keys are qualified with the native
+writer prefix, such as `block-size` to `btree-index.block-size`. Fully qualified
+writer keys and shared shard options are accepted. Conflicting values are
+rejected, matching primary-key option resolution. Vector columns additionally
+require `fields.<column>.global-index.vector.index-type`; the optional
+`distance-metric` defaults to `inner_product`.
+Explicit single-column builds also use these declarations as defaults; explicit
+builder options take precedence over them.
+FULL/DETAIL raw fallback uses the same per-column parameters as automatic
+builds, including vector metric defaults and full-text tokenization. A declared
+full-text column can use raw fallback before its first index is published.
+
+Each round captures the current schema and one source snapshot. Like Java
+primary-key index maintenance, it compares the desired sources with current
+index units and replaces changed units atomically. Global units use partition,
+bucket, and row-ID shard boundaries instead of primary-key LSM levels. Valid
+units are retained, missing ranges are built, and partial or fragmented shards
+are rebuilt from current rows. A physical compaction that preserves row IDs and
+values can retain existing global payloads. Additions and retired references
+publish together; old files remain available to historical snapshots.
+Manual `commit_compact` also maintains declared indexes when `write-only=false`.
+An empty maintenance plan publishes no snapshot. Empty data commits, index-only
+commits, and truncation do not trigger a separate round. Indexed-column updates
+retain `global-index.column-update-action`: use `DROP_PARTITION_INDEX` to allow
+the data update and automatically rebuild the affected coverage. Changing a
+vector algorithm or distance metric retires all incompatible payloads for that
+column and publishes their replacements together. Other writer parameters alone
+do not rebuild unchanged coverage; changing shard boundaries can regroup it.
+This synchronous mode has no minimum-row or time threshold.
+
+A concurrent snapshot or schema change causes private outputs to be discarded
+and coverage to be replanned, bounded by `commit.max-retries` and
+`commit.timeout`. A stable identity derived from the originating data commit
+makes repeated recovery idempotent. Uncertain publication outcomes retain
+submitted files and check for an already published index snapshot before
+retrying. Data, compaction, and index publication are separate transactions:
+global row IDs must be assigned before indexing. An index failure leaves the
+data committed and returns an error preserving the
+cause. Retry append with `filter_and_commit_with_identifier` or
+`filter_and_commit`, or overwrite with `overwrite_with_identifier`, using the
+same commit user and identifier. Recovery resumes indexing even when automatic
+compaction already completed. For an interrupted manual compaction, retry the
+same prepared results and commit user through `commit_compact`.
+
+## Compaction planning
 
 Ordinary append and PK compaction use `target-file-size` as the output size target.
 For unaware append tables (`bucket=-1`), task selection follows the batch packing rules in Java's
@@ -114,13 +254,80 @@ snapshot expiration and storage reclamation are separate maintenance work.
 
 The same API compacts primary-key tables with `deduplicate`,
 `first-row`, `partial-update` or `aggregation` merge engines. Changelog producers
-`none` and `input` are supported; `first-row` requires `none`.
-The planner includes every active file of each selected partition/bucket,
-including large files. Append size and count selection options do not split PK
-buckets. A single level-0 file is also eligible. A bucket whose files already form one sorted
-run at a single positive level needs no rewrite, including when the previous
-compaction rolled multiple output files. Output is key ordered at the highest input level, or level 1
-when all inputs are level 0.
+`none`, `input` and `lookup` are supported; `first-row` supports `none` or `lookup`.
+For `deduplicate` with `none`, `input` or `lookup`, and non-DV `first-row` with
+`none` or `lookup`, the planner chooses incremental sorted runs using Java's
+universal-compaction size and count policy. Each L0 file is a
+run; all files at one positive level form a single run. Normal size and run-count
+triggers take precedence. If they select no work, explicit compaction forces
+progress on every L0 run and absorbs adjacent runs according to their sizes. A
+large higher-level run can remain in place while smaller runs are rewritten.
+Without L0, positive-level maintenance requires the configured run-count and
+size triggers. A single positive run needs no rewrite, even when it spans
+several files.
+
+The policy uses `num-sorted-run.compaction-trigger` (default `5`), `num-levels`
+(default trigger plus one), `compaction.size-ratio` (default `1` percent), and
+`compaction.max-size-amplification-percent` (default `200`). When selected runs
+reach the oldest run, output goes to the highest configured or existing level;
+otherwise it goes immediately below the next unselected run. Explicit full
+compaction is not exposed. Without deletion vectors, `deduplicate` outputs retain winning retracts, so older values
+in untouched files do not reappear after a delete or out-of-order update.
+
+For `first-row`, both producers require actual catalog/FileIO local-cache.
+The executor looks up keys in retained higher-level files. Existing accepted keys
+stay in those files and produce neither a new data row nor a changelog event.
+Selected positive-level rows still participate in the output. The `lookup`
+producer emits only newly accepted keys, preserving their first add's row kind
+and sequence. If every input key already exists, compaction can retire its
+L0 inputs without creating a data or changelog file.
+
+With deletion vectors, `deduplicate` supports the same incremental selection for
+`none`, `input` and `lookup`. All three require actual catalog/FileIO local-cache.
+Lookup Files preserve unfiltered physical row positions; captured deletion vectors
+filter selected inputs and history before merging. A history hit moves its winning
+state into the output and marks the original position deleted, even when an
+out-of-order input loses. Winning retracts are omitted from data after changelog
+generation, so a DELETE may publish a changelog without a new data file.
+
+Commit atomically unions historical row deletions with the latest DV indexes and
+retires rewritten inputs' ranges, preserving unrelated ranges and HASH indexes.
+It rejects changed input masks, removed lookup targets and concurrently deleted
+hit positions; unrelated new DV bits can be merged. Uncommitted serialized DV results must
+retain their physical deletion metadata, including an empty list when appropriate.
+Each output file is limited to 4,294,967,296 physical rows. Migrating files written
+without DV is unsupported, including enabling DV through temporary table options.
+
+Non-DV `partial-update` and `aggregation` with `lookup` use the same incremental
+policy and require actual catalog/FileIO local-cache. The executor inserts the
+nearest retained positive-level state into each changed key's merge, in sequence
+order. The output contains the materialized state; lookup scans use only the
+nearest positive-level state, so retained older levels are not aggregated again.
+
+With `none` or `input`, these engines use incremental selection only when every
+value field can be merged again independently of row order: `min`, `max`,
+`bool_and`, `bool_or`, or integer `sum` without checked overflow. Aggregation must
+have `aggregation.remove-record-on-delete=false` and no global sequence fields.
+Partial update must use `ignore-delete=true`, no global sequence fields, and
+protect every value field with a sequence group and one of these aggregate
+functions. Each group's ordering fields retain its winning sequence and must
+not also be protected fields. These modes merge only selected inputs, leaving
+retained history to ordinary query merging, and do not require local-cache.
+
+Other `none`/`input` configurations retain their previous selection: every active
+file in the selected bucket participates, and output uses the highest input level
+or level 1 for all-L0 inputs. This preserves sparse overwrite and order-sensitive
+state such as `first_value`, finite floating-point summation, checked-overflow
+behavior and reset-on-delete semantics. Existing retract/state restrictions still
+apply. Append size and count options do not control PK selection.
+
+Tasks capture their selected runs and output level. Executors validate the task
+against the captured snapshot. Committers independently recompute the selection
+from that snapshot and validate the files being removed and the output levels.
+Older serialized incremental tasks without an output level must be replanned
+before execution. Prepared results can still be published if their file changes
+match the captured selection; already committed results remain recoverable
+through the existing idempotent retry path.
 
 Compaction uses each engine's existing merge function and persists its merge
 state, including original sequence metadata and synthesized DELETE records:
@@ -133,9 +340,9 @@ state, including original sequence metadata and synthesized DELETE records:
 - `partial-update` combines sparse columns using the configured sequence
   groups and field aggregators. Delete payloads and group sequence values are
   preserved so subsequent sparse updates can continue from that state.
-- `aggregation` writes the engine's field accumulators. Singleton records
-  remain unreduced, including retracts; compound DELETE states are preserved
-  rather than being discarded as they are by the query reader.
+- `aggregation` writes the engine's field accumulators. With `none` or `input`,
+  singleton records remain unreduced, including retracts; compound DELETE states
+  are preserved rather than being discarded as they are by the query reader.
 
 The existing engine rules for ignored deletes, unsupported retracts and
 whole-record deletion also apply during compaction. If all records are
@@ -174,6 +381,86 @@ There is no multipass merge yet; too many overlapping runs fail without
 publishing a snapshot. The captured snapshot must remain available until each
 task subset is successfully committed; retries of an already committed subset remain
 idempotent after its read snapshot expires.
+
+## Lookup changelog producer
+
+Set `changelog-producer=lookup` and run the same compaction API to publish data
+and changelog files atomically in a `COMPACT` snapshot. Ordinary writes produce
+L0 data files; changelogs become available when those files are compacted.
+Batch incremental `Changelog` / `Auto` scans and streaming follow-up scans read
+the resulting changelog manifest. `Delta` scans continue to skip compaction.
+
+For each key, the lowest positive level is its latest materialized history.
+Older positive levels already contributed to that state and are not reduced
+again. Compaction merges this history with the captured L0 records and emits
+changes only for keys with L0 input:
+
+- No live history and a live result: `INSERT`.
+- Live history and a deleted result: `DELETE` carrying the history's values.
+- Live history and a live result: `UPDATE_BEFORE` followed by `UPDATE_AFTER`.
+- No live history and no live result: no changelog.
+
+Before images retain the historical sequence metadata; after images carry the
+merged result's metadata. `first-row` emits the first accepted add for previously
+unseen keys, preserving its `INSERT` or `UPDATE_AFTER` kind. It considers all
+input levels when choosing the earliest record. `partial-update` and `aggregation`
+always run the reducer in lookup mode, including singleton retracts, as Java does.
+For example, lookup compaction turns a lone `DELETE(value=5)` with `sum` into
+live state `-5` when `aggregation.remove-record-on-delete=false`; an ordinary
+query still omits that singleton retract before compaction. Existing state
+preservation restrictions still apply. History selection precedes merging.
+
+Java-compatible options have these defaults:
+
+| Option | Default | Behavior |
+| --- | --- | --- |
+| `changelog-producer.row-deduplicate` | `false` | When true, skip update pairs whose user values are equal. |
+| `changelog-producer.row-deduplicate-ignore-fields` | unset | Comma-separated fields excluded from that comparison. |
+| `changelog-producer.ignore-update-before` | `false` | Omit `UPDATE_BEFORE` events. |
+| `changelog-producer.ignore-delete` | `false` | Omit `DELETE` events. |
+
+With default options, even an unchanged value produces an update pair when its
+key has L0 input. Ignoring changelog events does not change compacted table data.
+`changelog-file.format`, `changelog-file.compression`, `changelog-file.prefix`
+and changelog statistics options apply independently of data-file settings.
+Changelog files roll at the ordinary size and row limits. `CompactResult` exposes
+`changelog_files()`; `CompactMetrics` reports their file, row and byte counts in
+`changelog_files_added`, `changelog_rows_written` and `changelog_bytes_written`.
+The existing data metrics continue to count data files and rows only.
+
+For `deduplicate`, unselected higher-level history is read through point lookups
+in disposable local Lookup Files. Each file stores ordered keys and complete KV
+rows, including row kinds and sequence metadata. The first access builds it by
+streaming the source through the normal schema-evolution decoder. Later keys and
+executors reuse it; a missing or corrupt cache block causes a bounded rebuild
+instead of being treated as a missing key. Only selected runs are rewritten.
+Lookup selects candidate files by key range, retaining range pruning across
+schema changes that preserve the primary-key field IDs, order and types. The
+reader retains one bounded parsed SST index and one decoded IPC batch.
+Failed or cancelled builds clean up their unpublished cache blocks.
+
+The executor streams both outputs and aborts both writers on execution failure.
+Prepared results include both file lists for serialization, subset commits and
+idempotent retries. Commit validation checks that selected inputs remain valid
+and that files in each positive level have disjoint key ranges, matching Java's
+LSM conflict checks. Concurrent L0 appends and changes to unselected files are
+allowed when these checks pass. New L0 files remain eligible for a later
+compaction and produce no premature events.
+
+The executor requires an actual catalog/FileIO cache (`local-cache.enabled=true`);
+setting the flag in table properties alone does not attach a cache.
+Deduplicate Lookup Files use that cache's memory, disk or shared-disk backend,
+namespace, eviction policy and `local-cache.max-size` budget. Set `local-cache.dir` to keep
+them on disk. They do not require `data` in `local-cache.whitelist`.
+`lookup.cache-max-disk-size` is rejected; use `local-cache.max-size` instead.
+
+For deduplicate lookup caching, `lookup.cache-max-memory-size` defaults to
+`256 MiB` per executor and bounds working components such as input batches,
+IPC payloads and SST indexes. Oversized inputs or indexes,
+or a cache unable to retain the generated file, fail execution without publishing
+a snapshot. Reduce `read.batch-size` for oversized input batches or increase the
+appropriate budget. Cache storage is charged separately to `local-cache.max-size`.
+`lookup.cache-spill-compression` accepts `none`, `zstd` (default), `lz4` or `lzo`.
 
 ## Dynamic buckets
 
@@ -241,15 +528,17 @@ deletions into reassigned row IDs are not provided. Setting
 
 ## Current scope
 
-Compaction-generated changelogs (`full-compaction` / `lookup`) are unsupported.
-Outside Data Evolution mode, row tracking, deletion vectors and dedicated
+The `full-compaction` changelog producer is unsupported. Primary-key deletion-vector
+compaction supports `deduplicate` with `none`, `input` or `lookup`.
+Outside Data Evolution mode, row tracking and dedicated
 blob/vector storage are unsupported. Query authorization, rowkind fields and
 postpone buckets are unsupported in all modes.
 Ordered bucketed append, append incremental clustering, primary-key clustering
 override (`pk-clustering-override`) and record-level expiration
 (`record-level.expire-time`) are also unsupported.
-Snapshot index manifests may contain dynamic-bucket HASH indexes, or deletion
-vectors and global indexes in Data Evolution mode.
+Snapshot index manifests may contain dynamic-bucket HASH indexes and primary-key
+deletion vectors, or deletion vectors and global indexes in Data Evolution mode.
 Embedded and sidecar file indexes are regenerated according to the captured
-table options. Language bindings and
-background compaction scheduling are not yet provided.
+table options. The automatic behavior also applies to language bindings using the
+table committer. The manual compaction API and background compaction scheduling
+are not yet exposed through language bindings.

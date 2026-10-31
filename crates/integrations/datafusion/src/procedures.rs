@@ -18,6 +18,7 @@
 //! CALL procedure support for Paimon tables.
 //!
 //! Supported procedures:
+//! - `CALL sys.create_branch(table => '...', branch => '...'[, tag => '...', ignore_if_exists => true])`
 //! - `CALL sys.create_tag(table => '...', tag => '...', snapshot_id => ..., time_retained => '...')`
 //! - `CALL sys.replace_tag(table => '...', tag => '...', snapshot_id => ..., time_retained => '...')`
 //! - `CALL sys.delete_tag(table => '...', tag => '...')`
@@ -202,6 +203,7 @@ async fn earlier_or_equal_from_all(
 /// a misspelled `index_type` on `create_global_index` would build the default index.
 fn declared_parameters(proc_name: &str) -> Option<&'static [&'static str]> {
     Some(match proc_name {
+        "create_branch" => &["table", "branch", "tag", "ignore_if_exists"],
         "create_tag" => &["table", "tag", "snapshot_id", "time_retained"],
         "replace_tag" => &["table", "tag", "snapshot_id", "time_retained"],
         "delete_tag" => &["table", "tag"],
@@ -324,6 +326,7 @@ pub async fn execute_procedure(
     reject_unknown_args(proc_name, &args)?;
 
     match proc_name {
+        "create_branch" => proc_create_branch(ctx, catalog, catalog_name, &args).await,
         "create_tag" => proc_create_tag(ctx, catalog, catalog_name, &args).await,
         "replace_tag" => proc_replace_tag(ctx, catalog, catalog_name, &args).await,
         "delete_tag" => proc_delete_tag(ctx, catalog, catalog_name, &args).await,
@@ -660,6 +663,56 @@ async fn proc_replace_tag(
     tm.replace(tag_name, &snapshot, time_retained)
         .await
         .map_err(to_datafusion_error)?;
+    ok_result(ctx)
+}
+
+async fn proc_create_branch(
+    ctx: &SessionContext,
+    catalog: &Arc<dyn Catalog>,
+    catalog_name: &str,
+    args: &HashMap<String, String>,
+) -> DFResult<DataFrame> {
+    let branch = require_arg(args, "branch")?;
+    let ignore_if_exists = bool_arg(args, "ignore_if_exists")?;
+    // Validate before the existence check: an invalid name must not become a
+    // successful no-op just because it resolves to an existing directory.
+    BranchManager::validate_branch_name(branch).map_err(to_datafusion_error)?;
+    if branch.contains('$') {
+        return Err(DataFusionError::Plan(format!(
+            "Branch name '{branch}' cannot contain the SQL suffix delimiter '$'"
+        )));
+    }
+    let table = get_table(catalog, catalog_name, args).await?;
+    if table.rest_env().is_some() {
+        return Err(DataFusionError::NotImplemented(
+            "create_branch is not supported for tables managed by a REST catalog".to_string(),
+        ));
+    }
+    if table.schema().core_options().is_format_table() {
+        return Err(DataFusionError::NotImplemented(
+            "create_branch requires a FileStoreTable; format-table is not supported".to_string(),
+        ));
+    }
+    if !table.is_main_branch() {
+        return Err(DataFusionError::NotImplemented(
+            "create_branch requires a main-branch source table".to_string(),
+        ));
+    }
+
+    let manager = BranchManager::new(table.file_io().clone(), table.location().to_string());
+    if ignore_if_exists
+        && manager
+            .branch_exists(branch)
+            .await
+            .map_err(to_datafusion_error)?
+    {
+        return ok_result(ctx);
+    }
+    match args.get("tag") {
+        Some(tag) => manager.create_branch_from_tag(branch, tag).await,
+        None => manager.create_branch(branch).await,
+    }
+    .map_err(to_datafusion_error)?;
     ok_result(ctx)
 }
 

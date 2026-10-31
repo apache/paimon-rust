@@ -1154,6 +1154,59 @@ consumers before cleanup: running scans retain their loaded positions, and check
 completion can recreate deleted records. A fresh scan without an explicit checkpoint
 follows its existing initial scan behavior after its consumer record is deleted.
 
+### create_branch
+
+Create a branch from the main source table:
+
+```sql
+-- Copy the latest schema without inheriting data, snapshots, or tags.
+CALL sys.create_branch(table => 'paimon.my_db.my_table', branch => 'empty_branch');
+
+-- Start from a tag's historical schema and data.
+CALL sys.create_branch(
+    table => 'paimon.my_db.my_table',
+    branch => 'release_branch',
+    tag => 'release',
+    ignore_if_exists => true
+);
+```
+
+`table` and `branch` are required. `table` accepts `database.table` or
+`catalog.database.table`. Omitting `tag` creates a branch containing schema
+metadata only, even when the source table has data. A specified tag must exist;
+its retained snapshot can be used even after the live snapshot file has expired,
+provided the referenced schemas, manifests, and data files remain available.
+The source table is not modified. Query the new branch through `$branch_<name>`
+and list it through [`$branches`](#branches).
+
+`ignore_if_exists` defaults to `false`: an existing branch causes an error.
+With `true`, an existing branch is left unchanged and the tag is not resolved,
+even if the supplied tag does not exist. Both creation and an ignored request
+return one row with `result = 'OK'`. Boolean literals and case-insensitive
+`'true'` / `'false'` strings are accepted; other values are rejected. This
+parameter uses the Rust SQL name `ignore_if_exists`, rather than Java Spark's
+`ignoreIfExists`.
+
+Branch names must pass the Core name validator: `main`, empty or whitespace-only
+names, pure ASCII numeric names, `.`, `..`, path separators, and control
+characters are rejected. SQL also rejects `$` in target branch names because it
+separates branch and system-table suffixes in object names. Branch names preserve
+leading and trailing spaces.
+When creating a branch, tag names are passed unchanged to Core; trailing
+whitespace is invalid.
+Branch-name and source-table validation also apply when `ignore_if_exists` is
+`true`.
+
+Only non-REST FileStore tables resolved on `main` are supported. REST tables,
+format tables, external engine tables, and already resolved non-main source
+tables are rejected. The procedure does not resolve `$branch_<name>` or system
+table suffixes in its `table` argument and does not create from another branch.
+
+Creation reuses the Core metadata-copy path. Existence checks and file copies
+are not transactional; storage errors are returned and can leave partial branch
+metadata. `ignore_if_exists` checks name existence and does not repair a partial
+creation.
+
 ### create_tag
 
 Create a named tag from a snapshot:
@@ -1292,7 +1345,13 @@ CALL sys.rollback_to_timestamp(table => 'paimon.my_db.my_table', timestamp => 12
 
 ### create_global_index
 
-Build and commit a global index for a table column:
+Build and commit a global index for a table column.
+
+To maintain indexes synchronously after writes, declare columns through options
+such as `global-index.btree.index-columns='id'`. Maintenance runs by default
+when `write-only=false`; see
+[Automatic global index maintenance](compaction.md#automatic-global-index-maintenance)
+for the declaration format and recovery behavior.
 
 ```sql
 CALL sys.create_global_index(
@@ -1438,16 +1497,17 @@ threads. Prepared commit messages retain shard plan order. On a build failure,
 all started shards finish before private outputs are cleaned. Files in messages
 already returned to a caller are retained, including after a failed commit.
 
-The current global-index builders require a row-tracking data-evolution table
-with global indexes enabled. They do not support primary-key tables or tables
-with deletion vectors enabled:
+Global-index builders require a non-primary-key table with row tracking enabled
+and unaware buckets (`bucket=-1`). Data evolution and query-side global-index
+optimization may be disabled. Full-text builds additionally reject tables with
+deletion vectors enabled:
 
 ```sql
 CREATE TABLE paimon.my_db.items (
   id INT,
   embedding ARRAY<FLOAT>
 ) WITH (
-  'bucket' = '1',
+  'bucket' = '-1',
   'row-tracking.enabled' = 'true',
   'data-evolution.enabled' = 'true',
   'global-index.enabled' = 'true',
@@ -1507,7 +1567,7 @@ CREATE TABLE paimon.my_db.image_items (
   id INT,
   embedding ARRAY<FLOAT>
 ) WITH (
-  'bucket' = '1',
+  'bucket' = '-1',
   'row-tracking.enabled' = 'true',
   'data-evolution.enabled' = 'true',
   'global-index.enabled' = 'true',
@@ -1959,7 +2019,7 @@ CREATE TABLE paimon.my_db.items (
   id INT,
   embedding ARRAY<FLOAT>
 ) WITH (
-  'bucket' = '1',
+  'bucket' = '-1',
   'row-tracking.enabled' = 'true',
   'data-evolution.enabled' = 'true',
   'global-index.enabled' = 'true',
@@ -2966,18 +3026,27 @@ plans, cross-partition dynamic bucket writes, or advanced aggregation options
 such as `ignore-retract`, `distinct`, `nested-key`, `count-limit`, and sequence
 groups.
 
+Primary-key compaction supports `changelog-producer=lookup`, including
+deletion-vector-enabled `deduplicate` tables, generating INSERT, UPDATE_BEFORE, UPDATE_AFTER and DELETE events when
+L0 files are compacted. The executor requires `local-cache.enabled=true` on the
+catalog/FileIO. See [Lookup changelog producer](compaction.md#lookup-changelog-producer).
+
 ### Global Index Options
 
 Set these options when building global indexes with
-`CALL sys.create_global_index`. The current DataFusion builders require
-row-tracking and data evolution, and reject primary-key tables and tables with
-deletion vectors enabled.
+`CALL sys.create_global_index` or automatic builds. Builders require row tracking,
+`bucket=-1`, and no primary key. Data evolution and query-side global-index
+optimization may be disabled. Full-text builds reject deletion-vector tables.
 
 | Option | Default | Description |
 |---|---:|---|
 | `row-tracking.enabled` | `false` | Enables stable row ids required by global index files. |
 | `data-evolution.enabled` | `false` | Enables row-id-aware table evolution and partial-column writes. |
 | `global-index.enabled` | `true` | Enables global index metadata and global-index-aware reads. |
+| `global-index.<family>.index-columns` | unset | Comma-separated columns maintained automatically with `write-only=false`. Families: `btree`, `bitmap`, `multivalue`, `fm`, `full-text`, `vector`. Each column owns one index. |
+| `fields.<column>.global-index.<family>.index-options` | unset | Per-column JSON object of native writer options, following primary-key index option resolution. |
+| `fields.<column>.global-index.vector.index-type` | required for declared vector columns | Vector algorithm, such as `diskann` or `ivf-flat`. Changes replace incompatible payloads atomically during maintenance. |
+| `fields.<column>.global-index.vector.distance-metric` | `inner_product` | Vector distance metric for builds and FULL/DETAIL raw fallback: `inner_product`, `cosine`, or `l2`. Changes replace incompatible payloads atomically during maintenance. |
 | `global-index.row-count-per-shard` | `100000` | Maximum row count per vector global-index shard. |
 | `sorted-index.records-per-range` | `100000` | Maximum row count per BTree, bitmap, multivalue, or FM global-index file range; falls back to legacy `btree-index.records-per-range`. |
 | `btree-index.block-size` | `64kb` | Target BTree data-block size. |

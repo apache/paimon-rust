@@ -321,6 +321,7 @@ async fn build_committed_pk_vector_table(vectors: &[[f32; 2]]) -> Table {
     const DIM: usize = 2;
     let table_path = "memory:/pk_vector_route_test";
     let schema = Schema::builder()
+        .option("write-only", "true")
         .column("id", DataType::Int(IntType::new()))
         .column(
             "embedding",

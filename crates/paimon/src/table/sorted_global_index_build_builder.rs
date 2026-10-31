@@ -70,6 +70,7 @@ pub(super) struct SortedGlobalIndexBuildBuilder<'a> {
     index_type: String,
     options: HashMap<String, String>,
     partition_filter: Option<Predicate>,
+    pub(super) view: Option<super::global_index_build_common::GlobalIndexBuildView>,
 }
 
 impl<'a> SortedGlobalIndexBuildBuilder<'a> {
@@ -80,6 +81,7 @@ impl<'a> SortedGlobalIndexBuildBuilder<'a> {
             index_type: BTREE_GLOBAL_INDEX_TYPE.to_string(),
             options: HashMap::new(),
             partition_filter: None,
+            view: None,
         }
     }
 
@@ -178,7 +180,12 @@ impl<'a> SortedGlobalIndexBuildBuilder<'a> {
             .collect::<Vec<_>>();
         let extra_field_ids = (!extra_field_ids.is_empty()).then_some(extra_field_ids);
 
-        let Some(snapshot) = self.table.snapshot_manager().get_latest_snapshot().await? else {
+        let view = super::global_index_build_common::GlobalIndexBuildView::resolve(
+            self.table,
+            self.view.as_ref(),
+        )
+        .await?;
+        let Some(snapshot) = view.snapshot() else {
             return Ok((None, vec![]));
         };
 
@@ -189,16 +196,14 @@ impl<'a> SortedGlobalIndexBuildBuilder<'a> {
         let manifest_entries = read_builder
             .new_scan()
             .with_scan_all_files()
-            .plan_manifest_entries(&snapshot)
+            .plan_manifest_entries(snapshot)
             .await?;
         let indexed = crate::table::global_index_build_common::indexed_row_ranges(
-            self.table,
-            snapshot.index_manifest(),
+            view.index_entries(),
             index_type,
             index_field.id(),
             extra_field_ids.as_deref(),
-        )
-        .await?;
+        );
 
         let shards = plan_sorted_index_shards(
             self.table.location(),
@@ -215,8 +220,7 @@ impl<'a> SortedGlobalIndexBuildBuilder<'a> {
         }
 
         crate::table::global_index_build_common::validate_existing_index_overlap(
-            self.table,
-            snapshot.index_manifest(),
+            view.index_entries(),
             index_type,
             index_field.id(),
             extra_field_ids.as_deref(),
@@ -224,8 +228,7 @@ impl<'a> SortedGlobalIndexBuildBuilder<'a> {
                 .iter()
                 .map(|shard| RowRange::new(shard.row_range_start, shard.row_range_end))
                 .collect::<Vec<_>>(),
-        )
-        .await?;
+        )?;
 
         let commit = self.new_commit();
         let shard_count = shards.len();

@@ -470,6 +470,7 @@ mod tests {
 
     fn test_table(table_path: &str) -> Table {
         let schema = Schema::builder()
+            .option("write-only", "true")
             .column("id", DataType::Int(IntType::new()))
             .column("name", DataType::VarChar(VarCharType::string_type()))
             .build()
@@ -704,6 +705,7 @@ mod tests {
 
     async fn partitioned_index_table(path: &str) -> Table {
         let schema = Schema::builder()
+            .option("write-only", "true")
             .column("id", DataType::Int(IntType::new()))
             .column("dt", DataType::VarChar(VarCharType::string_type()))
             .column("name", DataType::VarChar(VarCharType::string_type()))

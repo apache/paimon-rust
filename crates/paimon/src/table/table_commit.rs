@@ -49,6 +49,10 @@ const BATCH_COMMIT_IDENTIFIER: i64 = i64::MAX;
 /// Java RollingFileWriter.CHECK_ROLLING_RECORD_CNT.
 const CHECK_ROLLING_RECORD_COUNT: usize = 1000;
 
+mod auto_index;
+#[cfg(test)]
+mod auto_index_tests;
+mod auto_maintenance;
 mod global_index_source_check;
 mod row_tracking;
 
@@ -388,9 +392,21 @@ impl TableCommit {
         }
         let latest = self.snapshot_manager.get_latest_snapshot().await?;
         let mut pending = Vec::new();
+        let mut recovered = Vec::new();
         for (id, messages) in commits {
             if !self.is_committed_identifier(&latest, id).await? {
                 pending.push((id, messages));
+            } else if self
+                .auto_compaction_enabled(messages.iter().any(|m| !m.new_files.is_empty()))?
+                || self
+                    .auto_index_enabled(messages.iter().any(|m| !m.new_files.is_empty()))
+                    .await?
+            {
+                let kind = direct_commit_kind(
+                    &self.messages_to_entries(&messages),
+                    &self.messages_to_index_entries(&messages),
+                );
+                recovered.push((id, kind));
             }
         }
         // Java checks every pending checkpoint before publishing any snapshot.
@@ -399,6 +415,9 @@ impl TableCommit {
             self.check_recovery_files(messages).await?;
         }
         let count = pending.len();
+        for (id, kind) in recovered {
+            self.recover_maintenance_after_write(id, &kind).await?;
+        }
         for (id, messages) in pending {
             self.filter_and_commit_with_identifier(messages, id).await?;
         }
@@ -434,14 +453,18 @@ impl TableCommit {
             return Ok(super::CompactMetrics::default());
         }
         let prepared = super::compact::prepare_results(&self.table, &results)?;
+        let maintain_indexes = self.auto_index_enabled(true).await?;
+        let planned_snapshot_id = prepared.snapshot_id;
         let mut commit = self.clone();
         // One stable identity per plan and task subset, allowing repeated plans
         // and idempotent retry without consuming the caller's checkpoint sequence.
         commit.commit_user = format!("{}-compact-{}", self.commit_user, prepared.commit_suffix);
-        commit
+        let outcome = commit
             .try_commit(
                 CommitEntriesPlan::Compact {
                     entries: prepared.entries,
+                    changelog_entries: prepared.changelog_entries,
+                    deletion_vector_updates: prepared.deletion_vector_updates,
                     schema_id: prepared.schema_id,
                     read_snapshot: prepared.read_snapshot,
                     planned_snapshot_id: prepared.snapshot_id,
@@ -451,6 +474,26 @@ impl TableCommit {
                 true,
             )
             .await?;
+        if maintain_indexes {
+            let written = match outcome {
+                CommitOutcome::Published(snapshot) => Some(*snapshot),
+                CommitOutcome::Filtered => {
+                    let latest = commit.snapshot_manager.get_latest_snapshot().await?;
+                    commit
+                        .find_duplicate_commit(
+                            planned_snapshot_id.saturating_add(1),
+                            &latest,
+                            BATCH_COMMIT_IDENTIFIER,
+                            &CommitKind::COMPACT,
+                        )
+                        .await?
+                }
+                CommitOutcome::Empty => None,
+            };
+            if let Some(snapshot) = written {
+                commit.index_after_write(&snapshot).await?;
+            }
+        }
         Ok(prepared.metrics)
     }
 
@@ -518,7 +561,7 @@ impl TableCommit {
         let check_from_snapshot = Self::check_from_snapshot(&commit_messages)?;
         // Never delete CommitMessage files on failure. A previous attempt may
         // have published them even when the caller received an exception.
-        self.try_commit(
+        self.commit_with_maintenance(
             CommitEntriesPlan::Direct {
                 entries,
                 changelog_entries,
@@ -565,7 +608,7 @@ impl TableCommit {
         let changelog_entries = self.messages_to_changelog_entries(&commit_messages);
         let new_index_entries = self.messages_to_index_entries(&commit_messages);
         let check_from_snapshot = Self::check_from_snapshot(&commit_messages)?;
-        self.try_commit(
+        self.commit_with_maintenance(
             CommitEntriesPlan::Direct {
                 entries,
                 changelog_entries,
@@ -674,7 +717,7 @@ impl TableCommit {
 
         let check_from_snapshot = Self::check_from_snapshot(&commit_messages)?;
 
-        self.try_commit(
+        self.commit_with_maintenance(
             CommitEntriesPlan::Overwrite {
                 partition_filter,
                 new_entries,
@@ -921,6 +964,7 @@ impl TableCommit {
             filter_committed,
         )
         .await
+        .map(|_| ())
     }
 
     /// Python-compatible alias for dropping partitions.
@@ -996,6 +1040,7 @@ impl TableCommit {
             filter_committed,
         )
         .await
+        .map(|_| ())
     }
 
     /// A Format Table has no snapshots, so an overwrite commit would find nothing to delete and
@@ -1112,7 +1157,7 @@ impl TableCommit {
         expected_snapshot_id: Option<i64>,
         commit_identifier: i64,
         filter_committed: bool,
-    ) -> Result<()> {
+    ) -> Result<CommitOutcome> {
         let mut retry_count = 0u32;
         let mut duplicate_check_start_snapshot_id: Option<i64> = None;
         let mut retry_state: Option<Box<RetryState>> = None;
@@ -1128,7 +1173,7 @@ impl TableCommit {
         let mut publication_uncertain = false;
         let mut last_publication_error = None;
         let result = async {
-            loop {
+            let outcome = loop {
                 let latest_snapshot = self.snapshot_manager.get_latest_snapshot().await?;
                 if filter_committed {
                     let recovery_start = match &plan {
@@ -1146,7 +1191,7 @@ impl TableCommit {
                         )
                         .await?
                     {
-                        break;
+                        break CommitOutcome::Filtered;
                     }
                     self.check_recovered_files_exist(&plan).await?;
                     filter_committed = false;
@@ -1163,9 +1208,10 @@ impl TableCommit {
                     {
                         if !self.commit_callbacks.is_empty() {
                             let entries = self.read_delta_entries(None, &snapshot).await?;
-                            self.notify_commit_callbacks(snapshot, entries).await?;
+                            self.notify_commit_callbacks(snapshot.clone(), entries)
+                                .await?;
                         }
-                        break;
+                        break CommitOutcome::Published(Box::new(snapshot));
                     }
                 }
                 validate_expected_latest_snapshot(expected_snapshot_id, &latest_snapshot)?;
@@ -1184,7 +1230,7 @@ impl TableCommit {
                     && !commit_empty_overwrite
                     && !commit_empty_append
                 {
-                    break;
+                    break CommitOutcome::Empty;
                 }
 
                 let result = self
@@ -1192,7 +1238,9 @@ impl TableCommit {
                     .await?;
 
                 match result {
-                    CommitAttemptResult::Success => break,
+                    CommitAttemptResult::Success(snapshot) => {
+                        break CommitOutcome::Published(snapshot)
+                    }
                     CommitAttemptResult::Retry(mut state) => {
                         if let Some(error) = state.publication_error.take() {
                             publication_uncertain = true;
@@ -1220,9 +1268,9 @@ impl TableCommit {
 
                 self.commit_retry_wait(retry_count).await;
                 retry_count += 1;
-            }
+            };
 
-            Ok(())
+            Ok(outcome)
         }
         .await;
         match result {
@@ -1252,8 +1300,14 @@ impl TableCommit {
                 new_index_entries,
                 ..
             } => (new_entries.as_slice(), &[][..], new_index_entries),
-            CommitEntriesPlan::Compact { entries, .. } => {
-                return self.check_recovery_entries(entries, &[], &[]).await;
+            CommitEntriesPlan::Compact {
+                entries,
+                changelog_entries,
+                ..
+            } => {
+                return self
+                    .check_recovery_entries(entries, changelog_entries, &[])
+                    .await;
             }
         };
         self.check_recovery_entries(entries, changelog_entries, index_entries)
@@ -1339,12 +1393,45 @@ impl TableCommit {
         {
             Ok(true) => {
                 if !self.commit_callbacks.is_empty() {
-                    self.notify_commit_callbacks(snapshot, resolved.entries)
+                    self.notify_commit_callbacks(snapshot.clone(), resolved.entries)
                         .await?;
                 }
-                return Ok(CommitAttemptResult::Success);
+                return Ok(CommitAttemptResult::Success(Box::new(snapshot)));
             }
-            Ok(false) => None,
+            Ok(false) => {
+                if self.deletion_vectors_enabled && resolved.kind == CommitKind::COMPACT {
+                    // Only this attempt's generated DV files are definitely
+                    // unpublished. Prepared data/changelogs and old shared
+                    // containers still belong to the caller or prior snapshots.
+                    let created = created_files
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<HashSet<_>>();
+                    for entry in resolved
+                        .new_index_manifest_entries
+                        .iter()
+                        .flatten()
+                        .filter(|entry| entry.index_file.index_type == DELETION_VECTORS_INDEX_TYPE)
+                    {
+                        let Ok(bucket) = self.bucket_path(&entry.partition, entry.bucket) else {
+                            continue;
+                        };
+                        let path = committed_index_file_path(
+                            self.table.location(),
+                            &bucket,
+                            self.table
+                                .schema()
+                                .core_options()
+                                .index_file_in_data_file_dir(),
+                            &entry.index_file,
+                        );
+                        if created.contains(path.as_str()) {
+                            let _ = self.table.file_io().delete_file(&path).await;
+                        }
+                    }
+                }
+                None
+            }
             Err(error) => Some(error),
         };
         Ok(CommitAttemptResult::Retry(Box::new(RetryState {
@@ -1363,15 +1450,13 @@ impl TableCommit {
     ) -> Result<(Snapshot, Vec<PartitionStatistics>)> {
         let new_snapshot_id = latest_snapshot.as_ref().map(|s| s.id() + 1).unwrap_or(1);
 
-        if self.data_evolution_enabled
-            && resolved.kind == CommitKind::COMPACT
-            && self.deletion_vectors_enabled
-        {
+        if self.deletion_vectors_enabled && resolved.kind == CommitKind::COMPACT {
             if let Some(snapshot) = latest_snapshot {
-                if let Some(indexes) = super::compact::data_evolution::rewrite_deletion_vectors(
+                if let Some(indexes) = super::compact::deletion_vectors::rewrite_indexes(
                     &self.table,
                     snapshot,
                     &resolved.entries,
+                    &resolved.deletion_vector_updates,
                     created_files,
                 )
                 .await?
@@ -1900,6 +1985,8 @@ impl TableCommit {
         match plan {
             CommitEntriesPlan::Compact {
                 entries,
+                changelog_entries,
+                deletion_vector_updates,
                 schema_id,
                 read_snapshot,
                 planned_snapshot_id,
@@ -1919,6 +2006,19 @@ impl TableCommit {
                         source: None,
                     });
                 }
+                // Duplicate recovery runs before resolve_commit. An already
+                // published legacy result can omit this field, but a first
+                // publication must retain every historical row deletion.
+                let deletion_vector_updates = match deletion_vector_updates.as_deref() {
+                    Some(updates) => updates,
+                    None if !self.data_evolution_enabled && self.deletion_vectors_enabled => {
+                        return Err(crate::Error::DataInvalid {
+                            message: "Deletion-vector compaction results are missing row deletions; execute the plan again".into(),
+                            source: None,
+                        });
+                    }
+                    None => &[],
+                };
                 // Concurrent writes may replace HASH indexes, deletion vectors
                 // or global indexes. Rebase on the latest manifest every retry.
                 let index_manifest_name = match latest_snapshot {
@@ -1928,6 +2028,7 @@ impl TableCommit {
                     None => None,
                 };
                 validate_file_entries(entries.iter())?;
+                validate_file_entries(changelog_entries.iter())?;
                 // This runs after duplicate-commit filtering: an uncertain commit
                 // can be retried even after the captured read snapshot expires.
                 if let Some(captured) = read_snapshot {
@@ -1952,6 +2053,14 @@ impl TableCommit {
                         .iter()
                         .map(|e| (e.partition(), e.bucket()))
                         .collect::<HashSet<_>>();
+                    if !self.table.schema().primary_keys().is_empty() {
+                        super::compact::validate_primary_key_changes(
+                            self.table.schema(),
+                            entries,
+                            changelog_entries,
+                            &captured_files,
+                        )?;
+                    }
                     let deleted_ids = deletes
                         .iter()
                         .map(|entry| commit_file_identifier(entry))
@@ -1974,8 +2083,7 @@ impl TableCommit {
                         .iter()
                         .filter(|e| {
                             buckets.contains(&(e.partition(), e.bucket()))
-                                && (!self.data_evolution_enabled
-                                    || deleted_ids.contains(&commit_file_identifier(e)))
+                                && deleted_ids.contains(&commit_file_identifier(e))
                         })
                         .map(|entry| (commit_file_identifier(entry), entry))
                         .collect::<HashMap<_, _>>();
@@ -1993,7 +2101,7 @@ impl TableCommit {
                             message: if self.data_evolution_enabled {
                                 "Data-evolution compaction inputs must match the captured row-ID groups"
                             } else {
-                                "PK compaction must include the complete captured bucket"
+                                "PK compaction must match its captured incremental inputs"
                             }.into(),
                             source: None,
                         });
@@ -2042,9 +2150,29 @@ impl TableCommit {
                     base_data_files.as_deref().unwrap_or_default(),
                     entries,
                 )?;
+                if !self.data_evolution_enabled && self.deletion_vectors_enabled {
+                    let captured =
+                        read_snapshot
+                            .as_deref()
+                            .ok_or_else(|| crate::Error::DataInvalid {
+                                message:
+                                    "PK deletion-vector compaction requires its captured snapshot"
+                                        .into(),
+                                source: None,
+                            })?;
+                    super::compact::primary_key::deletion_vectors::validate_dependencies(
+                        &self.table,
+                        captured,
+                        latest_snapshot.as_ref().expect("validated latest snapshot"),
+                        entries,
+                        deletion_vector_updates,
+                    )
+                    .await?;
+                }
                 Ok(ResolvedCommit {
                     entries: entries.clone(),
-                    changelog_entries: vec![],
+                    changelog_entries: changelog_entries.clone(),
+                    deletion_vector_updates: deletion_vector_updates.to_vec(),
                     kind: CommitKind::COMPACT,
                     index_manifest_name,
                     index_manifest_changed: false,
@@ -2118,6 +2246,7 @@ impl TableCommit {
                 Ok(ResolvedCommit {
                     entries: entries.clone(),
                     changelog_entries: changelog_entries.clone(),
+                    deletion_vector_updates: vec![],
                     kind,
                     index_manifest_name,
                     index_manifest_changed,
@@ -2190,6 +2319,7 @@ impl TableCommit {
                 Ok(ResolvedCommit {
                     entries,
                     changelog_entries: vec![],
+                    deletion_vector_updates: vec![],
                     kind: CommitKind::OVERWRITE,
                     index_manifest_name,
                     index_manifest_changed,
@@ -3868,9 +3998,12 @@ fn build_partition_stats_row(datums: &[Option<Datum>], data_types: &[DataType]) 
 
 /// Plan for resolving commit entries.
 enum CommitEntriesPlan {
-    /// Replace unchanged data files without publishing logical row changes.
+    /// Replace unchanged data files and atomically publish generated changelogs.
     Compact {
         entries: Vec<ManifestEntry>,
+        changelog_entries: Vec<ManifestEntry>,
+        deletion_vector_updates:
+            Option<Vec<super::compact::deletion_vectors::DeletionVectorUpdate>>,
         schema_id: i64,
         read_snapshot: Option<Box<Snapshot>>,
         planned_snapshot_id: i64,
@@ -3931,6 +4064,7 @@ fn direct_commit_kind(
 struct ResolvedCommit {
     entries: Vec<ManifestEntry>,
     changelog_entries: Vec<ManifestEntry>,
+    deletion_vector_updates: Vec<super::compact::deletion_vectors::DeletionVectorUpdate>,
     kind: CommitKind,
     index_manifest_name: Option<String>,
     index_manifest_changed: bool,
@@ -3938,8 +4072,14 @@ struct ResolvedCommit {
     base_data_files: Option<Vec<ManifestEntry>>,
 }
 
+enum CommitOutcome {
+    Published(Box<Snapshot>),
+    Filtered,
+    Empty,
+}
+
 enum CommitAttemptResult {
-    Success,
+    Success(Box<Snapshot>),
     Retry(Box<RetryState>),
 }
 
@@ -4105,6 +4245,7 @@ mod tests {
     mod parity {
         use super::*;
         include!("table_commit/parity_tests.rs");
+        include!("table_commit/pk_dv_retry_tests.rs");
         include!("table_commit/recovery_tests.rs");
         include!("table_commit/row_tracking_tests.rs");
         include!("table_commit/abort_tests.rs");
@@ -4222,6 +4363,7 @@ mod tests {
         use crate::spec::{DataType, IntType, Schema, VarCharType};
         let schema = Schema::builder()
             .column("id", DataType::Int(IntType::new()))
+            .option("write-only", "true")
             .column("name", DataType::VarChar(VarCharType::string_type()))
             .build()
             .unwrap();
@@ -4321,6 +4463,7 @@ mod tests {
             .column("pt", DataType::VarChar(VarCharType::string_type()))
             .column("id", DataType::Int(IntType::new()))
             .partition_keys(["pt"])
+            .option("write-only", "true")
             .build()
             .unwrap();
         TableSchema::new(0, &schema)
@@ -4354,9 +4497,12 @@ mod tests {
     fn test_table_with_options(
         file_io: &FileIO,
         table_path: &str,
-        options: HashMap<String, String>,
+        mut options: HashMap<String, String>,
     ) -> Table {
         use crate::spec::{DataType, IntType, Schema, VarCharType};
+        options
+            .entry("write-only".into())
+            .or_insert_with(|| "true".into());
         let schema = Schema::builder()
             .column("id", DataType::Int(IntType::new()))
             .column("name", DataType::VarChar(VarCharType::string_type()))
@@ -6450,6 +6596,7 @@ mod tests {
     fn test_data_evolution_schema() -> TableSchema {
         use crate::spec::{DataType, IntType, Schema, VarCharType};
         let schema = Schema::builder()
+            .option("write-only", "true")
             .column("id", DataType::Int(IntType::new()))
             .column("name", DataType::VarChar(VarCharType::string_type()))
             .option("row-tracking.enabled", "true")

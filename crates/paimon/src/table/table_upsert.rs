@@ -570,6 +570,7 @@ mod tests {
 
     async fn numeric_table(path: &str) -> Table {
         let schema = PaimonSchema::builder()
+            .option("write-only", "true")
             .column("key", PaimonType::Int(IntType::new()))
             .column("value", PaimonType::Int(IntType::new()))
             .column("keep", PaimonType::Int(IntType::new()))
