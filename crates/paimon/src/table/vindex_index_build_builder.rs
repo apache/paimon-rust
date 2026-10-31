@@ -39,9 +39,7 @@ pub(super) struct VindexIndexBuildBuilder<'a> {
     index_type: String,
     options: HashMap<String, String>,
     pub(super) partition_filter: Option<Predicate>,
-    pub(super) snapshot: Option<Option<crate::spec::Snapshot>>,
-    pub(super) replaced_index_files:
-        std::collections::HashSet<super::global_index_build_common::IndexFileKey>,
+    pub(super) view: Option<super::global_index_build_common::GlobalIndexBuildView>,
 }
 
 impl<'a> VindexIndexBuildBuilder<'a> {
@@ -52,8 +50,7 @@ impl<'a> VindexIndexBuildBuilder<'a> {
             index_type: index_type.to_string(),
             options: HashMap::new(),
             partition_filter: None,
-            snapshot: None,
-            replaced_index_files: Default::default(),
+            view: None,
         }
     }
 
@@ -115,10 +112,12 @@ impl<'a> VindexIndexBuildBuilder<'a> {
             options.dimension() as u64,
             "vindex dimension is too large for Rust builder",
         )?;
-        let Some(snapshot) =
-            super::global_index_build_common::build_snapshot(self.table, self.snapshot.as_ref())
-                .await?
-        else {
+        let view = super::global_index_build_common::GlobalIndexBuildView::resolve(
+            self.table,
+            self.view.as_ref(),
+        )
+        .await?;
+        let Some(snapshot) = view.snapshot() else {
             return Ok(GlobalIndexBuildPlan::new(
                 self.table,
                 None,
@@ -136,17 +135,14 @@ impl<'a> VindexIndexBuildBuilder<'a> {
         let manifest_entries = read_builder
             .new_scan()
             .with_scan_all_files()
-            .plan_manifest_entries(&snapshot)
+            .plan_manifest_entries(snapshot)
             .await?;
         let indexed = crate::table::global_index_build_common::indexed_row_ranges(
-            self.table,
-            snapshot.index_manifest(),
+            view.index_entries(),
             &self.index_type,
             index_field.id(),
             None, // single-column build; no extra fields today
-            &self.replaced_index_files,
-        )
-        .await?;
+        );
         let shards = plan_vindex_shards(
             self.table.location(),
             self.table.schema().partition_keys(),
@@ -160,8 +156,7 @@ impl<'a> VindexIndexBuildBuilder<'a> {
 
         if !shards.is_empty() {
             crate::table::global_index_build_common::validate_existing_index_overlap(
-                self.table,
-                snapshot.index_manifest(),
+                view.index_entries(),
                 &self.index_type,
                 index_field.id(),
                 None,
@@ -169,14 +164,12 @@ impl<'a> VindexIndexBuildBuilder<'a> {
                     .iter()
                     .map(|shard| RowRange::new(shard.row_range_start, shard.row_range_end))
                     .collect::<Vec<_>>(),
-                &self.replaced_index_files,
-            )
-            .await?;
+            )?;
         }
 
         Ok(GlobalIndexBuildPlan::new(
             self.table,
-            Some(snapshot),
+            Some(snapshot.clone()),
             index_column.into(),
             self.index_type.clone(),
             self.options.clone(),

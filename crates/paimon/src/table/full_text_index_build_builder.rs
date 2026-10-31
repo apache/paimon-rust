@@ -53,9 +53,7 @@ pub(super) struct FullTextIndexBuildBuilder<'a> {
     index_column: Option<String>,
     options: HashMap<String, String>,
     pub(super) partition_filter: Option<Predicate>,
-    pub(super) snapshot: Option<Option<crate::spec::Snapshot>>,
-    pub(super) replaced_index_files:
-        std::collections::HashSet<super::global_index_build_common::IndexFileKey>,
+    pub(super) view: Option<super::global_index_build_common::GlobalIndexBuildView>,
 }
 
 impl<'a> FullTextIndexBuildBuilder<'a> {
@@ -65,8 +63,7 @@ impl<'a> FullTextIndexBuildBuilder<'a> {
             index_column: None,
             options: HashMap::new(),
             partition_filter: None,
-            snapshot: None,
-            replaced_index_files: Default::default(),
+            view: None,
         }
     }
 
@@ -115,10 +112,12 @@ impl<'a> FullTextIndexBuildBuilder<'a> {
         full_text_config(&native_options)?;
         let index_meta = serialize_index_meta(&native_options)?;
 
-        let Some(snapshot) =
-            super::global_index_build_common::build_snapshot(self.table, self.snapshot.as_ref())
-                .await?
-        else {
+        let view = super::global_index_build_common::GlobalIndexBuildView::resolve(
+            self.table,
+            self.view.as_ref(),
+        )
+        .await?;
+        let Some(snapshot) = view.snapshot() else {
             return Ok((None, vec![]));
         };
 
@@ -129,17 +128,14 @@ impl<'a> FullTextIndexBuildBuilder<'a> {
         let manifest_entries = read_builder
             .new_scan()
             .with_scan_all_files()
-            .plan_manifest_entries(&snapshot)
+            .plan_manifest_entries(snapshot)
             .await?;
         let indexed = indexed_row_ranges(
-            self.table,
-            snapshot.index_manifest(),
+            view.index_entries(),
             FULL_TEXT_GLOBAL_INDEX_TYPE,
             index_field.id(),
             None,
-            &self.replaced_index_files,
-        )
-        .await?;
+        );
         let shards = plan_vector_index_shards(
             self.table.location(),
             self.table.schema().partition_keys(),
@@ -156,8 +152,7 @@ impl<'a> FullTextIndexBuildBuilder<'a> {
         }
 
         validate_existing_index_overlap(
-            self.table,
-            snapshot.index_manifest(),
+            view.index_entries(),
             FULL_TEXT_GLOBAL_INDEX_TYPE,
             index_field.id(),
             None,
@@ -165,9 +160,7 @@ impl<'a> FullTextIndexBuildBuilder<'a> {
                 .iter()
                 .map(|shard| RowRange::new(shard.row_range_start, shard.row_range_end))
                 .collect::<Vec<_>>(),
-            &self.replaced_index_files,
-        )
-        .await?;
+        )?;
 
         let prepared = super::global_index_build_common::preparation::prepare_shards(
             self.table,

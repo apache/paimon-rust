@@ -16,6 +16,7 @@
 // under the License.
 
 use super::*;
+use crate::table::global_index_build_common::GlobalIndexBuildView;
 use crate::table::global_index_options::{definitions, Definition};
 use sha2::{Digest, Sha256};
 
@@ -100,20 +101,15 @@ impl TableCommit {
                 None,
             )
             .await?;
-            let indexes = match snapshot.index_manifest() {
-                Some(name) => {
-                    IndexManifest::read(table.file_io(), &self.snapshot_manager.manifest_path(name))
-                        .await?
-                }
-                None => vec![],
-            };
+            let view = GlobalIndexBuildView::capture(&table, Some(snapshot.clone())).await?;
             let mut messages = Vec::new();
             let prepared: Result<()> = async {
                 for definition in definitions {
-                    let plan = planning::plan(&table, &definition, &data, &indexes).await?;
+                    let plan =
+                        planning::plan(&table, &definition, &data, view.index_entries()).await?;
                     let built = definition
                         .builder(&table)
-                        .build_for_maintenance(snapshot, plan.replaced)
+                        .build_with_view(plan.build_view(&view))
                         .await?;
                     messages.extend(built);
                     messages.extend(plan.deletions);

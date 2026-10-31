@@ -30,8 +30,8 @@ use crate::spec::{DataField, FileKind, IndexManifest, IndexManifestEntry, Snapsh
 use crate::table::{merge_row_ranges, RowRange, Table};
 use crate::{Error, Result};
 use bytes::Bytes;
-use std::collections::HashSet;
 use std::path::Path;
+use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 
 pub(crate) mod preparation;
@@ -39,25 +39,63 @@ pub(crate) mod vector;
 
 const COPY_BUFFER_SIZE: usize = 1024 * 1024;
 
-pub(crate) type IndexFileKey = (Vec<u8>, i32, String);
-
-pub(crate) fn index_file_key(entry: &IndexManifestEntry) -> IndexFileKey {
-    (
-        entry.partition.clone(),
-        entry.bucket,
-        entry.index_file.file_name.clone(),
-    )
+/// One source snapshot and its effective index coverage. Builders use this same
+/// immutable view for both gap planning and overlap validation.
+#[derive(Clone, Default)]
+pub(crate) struct GlobalIndexBuildView {
+    snapshot: Option<Snapshot>,
+    index_entries: Arc<[IndexManifestEntry]>,
 }
 
-/// An automatic round fixes one source snapshot for every index definition.
-/// Capturing an empty view also validates builder configuration without I/O.
-pub(super) async fn build_snapshot(
-    table: &Table,
-    captured: Option<&Option<Snapshot>>,
-) -> Result<Option<Snapshot>> {
-    match captured {
-        Some(snapshot) => Ok(snapshot.clone()),
-        None => table.snapshot_manager().get_latest_snapshot().await,
+impl GlobalIndexBuildView {
+    pub(crate) async fn capture(table: &Table, snapshot: Option<Snapshot>) -> Result<Self> {
+        let Some(snapshot) = snapshot else {
+            return Ok(Self::default());
+        };
+        let entries = match snapshot.index_manifest() {
+            Some(name) => {
+                IndexManifest::read(
+                    table.file_io(),
+                    &table.snapshot_manager().manifest_path(name),
+                )
+                .await?
+            }
+            None => vec![],
+        };
+        Ok(Self {
+            snapshot: Some(snapshot),
+            index_entries: entries.into(),
+        })
+    }
+
+    /// An empty captured view validates configuration without reading metadata.
+    pub(super) async fn resolve(table: &Table, captured: Option<&Self>) -> Result<Self> {
+        match captured {
+            Some(view) => Ok(view.clone()),
+            None => {
+                Self::capture(table, table.snapshot_manager().get_latest_snapshot().await?).await
+            }
+        }
+    }
+
+    pub(crate) fn snapshot(&self) -> Option<&Snapshot> {
+        self.snapshot.as_ref()
+    }
+
+    pub(crate) fn index_entries(&self) -> &[IndexManifestEntry] {
+        &self.index_entries
+    }
+
+    pub(crate) fn filter_indexes(&self, mut keep: impl FnMut(&IndexManifestEntry) -> bool) -> Self {
+        Self {
+            snapshot: self.snapshot.clone(),
+            index_entries: self
+                .index_entries
+                .iter()
+                .filter(|entry| keep(entry))
+                .cloned()
+                .collect(),
+        }
     }
 }
 
@@ -201,32 +239,18 @@ fn ranges_overlap(a_start: i64, a_end: i64, b_start: i64, b_end: i64) -> bool {
 /// Row ranges already covered by `index_type` global-index files for
 /// `index_field_id` (and matching `extra_field_ids`). Mirrors Java
 /// `GlobalIndexBuilderUtils.indexedRowRanges`.
-pub(crate) async fn indexed_row_ranges(
-    table: &Table,
-    index_manifest_name: Option<&str>,
+pub(crate) fn indexed_row_ranges(
+    entries: &[IndexManifestEntry],
     index_type: &str,
     index_field_id: i32,
     extra_field_ids: Option<&[i32]>,
-    replaced: &HashSet<IndexFileKey>,
-) -> Result<Vec<RowRange>> {
-    let Some(index_manifest_name) = index_manifest_name else {
-        return Ok(Vec::new());
-    };
-    let path = format!(
-        "{}/manifest/{}",
-        table.location().trim_end_matches('/'),
-        index_manifest_name
-    );
-    let entries = IndexManifest::read(table.file_io(), &path).await?;
+) -> Vec<RowRange> {
     let mut ranges = Vec::new();
     for entry in entries {
-        if entry.kind != FileKind::Add
-            || entry.index_file.index_type != index_type
-            || replaced.contains(&index_file_key(&entry))
-        {
+        if entry.kind != FileKind::Add || entry.index_file.index_type != index_type {
             continue;
         }
-        let Some(meta) = entry.index_file.global_index_meta else {
+        let Some(meta) = &entry.index_file.global_index_meta else {
             continue;
         };
         if meta.index_field_id != index_field_id
@@ -236,7 +260,7 @@ pub(crate) async fn indexed_row_ranges(
         }
         ranges.push(RowRange::new(meta.row_range_start, meta.row_range_end));
     }
-    Ok(merge_row_ranges(ranges))
+    merge_row_ranges(ranges)
 }
 
 /// Guard against building a global index over a row range that an existing index
@@ -245,32 +269,18 @@ pub(crate) async fn indexed_row_ranges(
 /// `indexed_row_ranges` and Java `GlobalIndexIdentifier` -- so a different index
 /// type (or different `extra_field_ids`) on the same field coexists. Two files
 /// of the same identity with overlapping ranges are still rejected.
-pub(crate) async fn validate_existing_index_overlap(
-    table: &Table,
-    index_manifest_name: Option<&str>,
+pub(crate) fn validate_existing_index_overlap(
+    entries: &[IndexManifestEntry],
     index_type: &str,
     index_field_id: i32,
     extra_field_ids: Option<&[i32]>,
     planned: &[RowRange],
-    replaced: &HashSet<IndexFileKey>,
 ) -> Result<()> {
-    let Some(index_manifest_name) = index_manifest_name else {
-        return Ok(());
-    };
-    let path = format!(
-        "{}/manifest/{}",
-        table.location().trim_end_matches('/'),
-        index_manifest_name
-    );
-    let entries = IndexManifest::read(table.file_io(), &path).await?;
     for entry in entries {
-        if entry.kind != FileKind::Add
-            || entry.index_file.index_type != index_type
-            || replaced.contains(&index_file_key(&entry))
-        {
+        if entry.kind != FileKind::Add || entry.index_file.index_type != index_type {
             continue;
         }
-        let Some(meta) = entry.index_file.global_index_meta else {
+        let Some(meta) = &entry.index_file.global_index_meta else {
             continue;
         };
         if meta.index_field_id != index_field_id

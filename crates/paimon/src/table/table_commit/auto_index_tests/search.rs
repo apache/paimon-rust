@@ -23,6 +23,181 @@ use arrow_array::builder::{Float32Builder, ListBuilder};
 use arrow_array::{ArrayRef, StringArray};
 
 #[tokio::test]
+async fn filtered_build_views_preserve_snapshot_and_unrelated_index_coverage() {
+    use crate::table::global_index_build_common::{
+        indexed_row_ranges, validate_existing_index_overlap, GlobalIndexBuildView,
+    };
+
+    let (_catalog, table) = search_table(&[
+        ("global-index.btree.index-columns", "id"),
+        ("sorted-index.records-per-range", "2"),
+        ("global-index.full-text.index-columns", "text"),
+        ("global-index.vector.index-columns", "embedding"),
+        (
+            "fields.embedding.global-index.vector.index-type",
+            "ivf-flat",
+        ),
+        (
+            "fields.embedding.global-index.vector.index-options",
+            r#"{"dimension":2,"nlist":1}"#,
+        ),
+    ])
+    .await;
+    let commit = TableCommit::new(table.clone(), "writer".into());
+    commit
+        .commit(search_messages(&table, &[[1., 0.], [2., 0.], [3., 0.], [4., 0.]]).await)
+        .await
+        .unwrap();
+    let captured = latest(&table).await;
+    let source = GlobalIndexBuildView::capture(&table, Some(captured.clone()))
+        .await
+        .unwrap();
+    assert_eq!(source.index_entries().len(), 6);
+
+    commit
+        .commit(search_messages(&table, &[[5., 0.], [6., 0.]]).await)
+        .await
+        .unwrap();
+    let current = indexes(&table).await;
+    let current_snapshot = latest(&table).await.id();
+    assert_eq!(current.len(), 9);
+
+    for (column, kind) in [
+        ("id", "btree"),
+        ("text", "full-text"),
+        ("embedding", "ivf-flat"),
+    ] {
+        let field_id = table
+            .schema()
+            .fields()
+            .iter()
+            .find(|field| field.name() == column)
+            .unwrap()
+            .id();
+        let retired = source
+            .index_entries()
+            .iter()
+            .find(|entry| {
+                entry.index_file.index_type == kind
+                    && entry
+                        .index_file
+                        .global_index_meta
+                        .as_ref()
+                        .is_some_and(|meta| {
+                            meta.index_field_id == field_id && meta.row_range_start == 0
+                        })
+            })
+            .unwrap();
+        let filtered = source
+            .filter_indexes(|entry| entry.index_file.file_name != retired.index_file.file_name);
+        assert_eq!(
+            source.index_entries().len(),
+            6,
+            "filtering must not alter the source view"
+        );
+        assert_eq!(filtered.index_entries().len(), 5);
+        assert_eq!(filtered.snapshot().unwrap().id(), captured.id());
+        assert_eq!(
+            indexed_row_ranges(filtered.index_entries(), kind, field_id, None),
+            vec![crate::table::RowRange::new(2, 3)],
+        );
+
+        let replacement = [crate::table::RowRange::new(0, 1)];
+        assert!(validate_existing_index_overlap(
+            source.index_entries(),
+            kind,
+            field_id,
+            None,
+            &replacement
+        )
+        .is_err());
+        validate_existing_index_overlap(
+            filtered.index_entries(),
+            kind,
+            field_id,
+            None,
+            &replacement,
+        )
+        .unwrap();
+        assert!(
+            validate_existing_index_overlap(
+                filtered.index_entries(),
+                kind,
+                field_id,
+                None,
+                &[crate::table::RowRange::new(2, 3)],
+            )
+            .is_err(),
+            "retained coverage must still reject overlap"
+        );
+
+        let mut builder = table.new_global_index_build_builder();
+        builder.with_index_column(column).with_index_type(kind);
+        assert!(builder
+            .build_with_view(source.clone())
+            .await
+            .unwrap()
+            .is_empty());
+        let built = builder.build_with_view(filtered.clone()).await.unwrap();
+        assert_eq!(
+            built.len(),
+            1,
+            "{kind}: rebuild only the gap in the captured view"
+        );
+        assert!(
+            built[0].deleted_index_files.is_empty(),
+            "builders do not decide which old references to retire"
+        );
+        let meta = built[0].new_index_files[0]
+            .global_index_meta
+            .as_ref()
+            .unwrap();
+        assert_eq!((meta.row_range_start, meta.row_range_end), (0, 1), "{kind}");
+        assert_eq!(
+            crate::spec::DataEvolutionIndexSourceMeta::deserialize(
+                meta.source_meta.as_deref().unwrap()
+            )
+            .unwrap()
+            .scan_snapshot_id(),
+            captured.id(),
+        );
+
+        let (other_column, other_type) = if kind == "btree" {
+            ("text", "full-text")
+        } else {
+            ("id", "btree")
+        };
+        assert!(
+            table
+                .new_global_index_build_builder()
+                .with_index_column(other_column)
+                .with_index_type(other_type)
+                .build_with_view(filtered)
+                .await
+                .unwrap()
+                .is_empty(),
+            "unrelated index definitions must keep their coverage"
+        );
+        assert_eq!(latest(&table).await.id(), current_snapshot);
+        assert_eq!(
+            indexes(&table).await,
+            current,
+            "a build view must not change published references"
+        );
+        assert!(table
+            .file_io()
+            .exists(&format!(
+                "{}/index/{}",
+                table.location(),
+                retired.index_file.file_name
+            ))
+            .await
+            .unwrap());
+        commit.abort(&built).await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn manual_builds_and_planned_shards_share_declarations_and_preserve_explicit_overrides() {
     for override_metric in [None, Some("l2")] {
         let (_catalog, table) = search_table(&[

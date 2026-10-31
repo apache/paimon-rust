@@ -19,6 +19,7 @@ use super::*;
 use crate::catalog::Identifier;
 use crate::io::FileIOBuilder;
 use crate::spec::{IntType, Schema as TableSchemaBuilder, TableSchema};
+use crate::table::global_index_build_common::GlobalIndexBuildView;
 use arrow_array::{Int32Array, RecordBatch};
 use futures::TryStreamExt;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -958,7 +959,11 @@ async fn captured_builds_ignore_later_appends_and_validation_creates_no_files() 
     assert_eq!(latest(&table).await.id(), 2);
     assert!(indexes(&table).await.is_empty());
     let built = builder
-        .build_for_maintenance(&source, Default::default())
+        .build_with_view(
+            GlobalIndexBuildView::capture(&table, Some(source))
+                .await
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(built.len(), 1);
@@ -1126,7 +1131,11 @@ async fn native_builders_share_automatic_incremental_and_captured_snapshot_contr
         // Snapshot 1 precedes both rounds; the later append must not enter this build.
         let source = table.snapshot_manager().get_snapshot(1).await.unwrap();
         let built = builder
-            .build_for_maintenance(&source, Default::default())
+            .build_with_view(
+                GlobalIndexBuildView::capture(&table, Some(source))
+                    .await
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(built.len(), 1, "{kind}");

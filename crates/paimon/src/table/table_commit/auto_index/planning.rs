@@ -22,16 +22,31 @@
 
 use super::*;
 use crate::table::global_index_build_common::{
-    index_file_key, resolve_index_fields, IndexColumns, IndexFileKey,
+    resolve_index_fields, GlobalIndexBuildView, IndexColumns,
 };
 use crate::table::{merge_row_ranges, RowRange};
 use std::collections::BTreeMap;
 
 type UnitKey = (Vec<u8>, i32, i64);
+type IndexFileKey = (Vec<u8>, i32, String);
+
+fn index_file_key(entry: &IndexManifestEntry) -> IndexFileKey {
+    (
+        entry.partition.clone(),
+        entry.bucket,
+        entry.index_file.file_name.clone(),
+    )
+}
 
 pub(super) struct MaintenancePlan {
-    pub replaced: HashSet<IndexFileKey>,
+    replaced: HashSet<IndexFileKey>,
     pub deletions: Vec<CommitMessage>,
+}
+
+impl MaintenancePlan {
+    pub(super) fn build_view(&self, source: &GlobalIndexBuildView) -> GlobalIndexBuildView {
+        source.filter_indexes(|entry| !self.replaced.contains(&index_file_key(entry)))
+    }
 }
 
 fn partition_key(bytes: &[u8]) -> Vec<u8> {
