@@ -17,9 +17,11 @@
 
 //! Shared vector-search option validation, index I/O helpers, and result ordering.
 
+use crate::io::{FileIO, FileRead};
 use crate::spec::{
     CoreOptions, DataField, FileKind, IndexManifestEntry, Predicate, ROW_ID_FIELD_NAME,
 };
+use crate::table::index_file_path::IndexFileLocation;
 use crate::table::pk_vector_position_read::{PKEY_VECTOR_POSITION_COLUMN, SEARCH_SCORE_COLUMN};
 use crate::table::read_builder::resolve_projected_fields;
 use crate::table::Table;
@@ -27,9 +29,74 @@ use crate::vindex::is_vindex_index_type;
 use crate::vindex::range_reader::RangeIoStats;
 use arrow_array::{Int64Array, RecordBatch};
 use arrow_select::interleave::interleave_record_batch;
+use paimon_vindex_core::diskann_io::DISKANN_HEADER_SIZE;
+use paimon_vindex_core::distance::MetricType;
+use paimon_vindex_core::index::VectorIndexReader as VIndexReader;
 use std::collections::HashMap;
+use std::io::Cursor;
 
 pub(super) use super::partition_filter::validate_partition_filter;
+
+/// Read persisted scoring semantics for both raw queries and definition compatibility checks.
+pub(super) async fn read_index_vector_metric(
+    file_io: &FileIO,
+    table_path: &str,
+    entry: &IndexManifestEntry,
+) -> crate::Result<Option<MetricType>> {
+    let Some(global_meta) = entry.index_file.global_index_meta.as_ref() else {
+        return Ok(None);
+    };
+    if !is_vindex_index_type(&entry.index_file.index_type) {
+        return Ok(None);
+    }
+    if let Some(index_meta) = global_meta.index_meta.as_ref() {
+        if let Ok(options) = serde_json::from_slice::<HashMap<String, String>>(index_meta) {
+            if let Some(metric) = options.get("metric") {
+                let metric = match normalize_metric(metric).as_str() {
+                    "l2" => Some(MetricType::L2),
+                    "cosine" => Some(MetricType::Cosine),
+                    "inner_product" => Some(MetricType::InnerProduct),
+                    _ => None,
+                };
+                if metric.is_some() {
+                    return Ok(metric);
+                }
+            }
+        }
+    }
+    let path = IndexFileLocation::Global { table_path }.resolve(
+        &entry.index_file.file_name,
+        entry.index_file.external_path.as_deref(),
+    );
+    let input = file_io.new_input(&path)?;
+    let read_error = |e| crate::Error::DataInvalid {
+        message: format!(
+            "Failed to read vindex index file '{}' for vector metric: {}",
+            entry.index_file.file_name, e
+        ),
+        source: Some(Box::new(e)),
+    };
+    let header_size = if entry.index_file.file_size > 0 {
+        (entry.index_file.file_size as u64).min(DISKANN_HEADER_SIZE as u64)
+    } else {
+        input
+            .metadata()
+            .await
+            .map_err(&read_error)?
+            .size
+            .min(DISKANN_HEADER_SIZE as u64)
+    };
+    let file_reader = input.reader().await.map_err(&read_error)?;
+    let bytes = file_reader.read(0..header_size).await.map_err(read_error)?;
+    let reader = VIndexReader::open(Cursor::new(bytes)).map_err(|e| crate::Error::DataInvalid {
+        message: format!(
+            "Failed to open paimon-vindex-core reader for vector metric: {}",
+            e
+        ),
+        source: Some(Box::new(e)),
+    })?;
+    Ok(Some(reader.metadata().metric))
+}
 
 pub(super) fn add_filter(current: &mut Option<Predicate>, filter: Predicate) {
     *current = Some(match current.take() {
@@ -78,16 +145,26 @@ pub(super) fn configured_vector_index_type(
     table_options: &HashMap<String, String>,
     query_options: &HashMap<String, String>,
     column: &str,
-) -> Option<String> {
-    [
+) -> crate::Result<Option<String>> {
+    let keys = [
         "index_type".to_string(),
         "index-type".into(),
         "vector.index-type".into(),
         format!("fields.{column}.index-type"),
-    ]
-    .iter()
-    .find_map(|key| query_options.get(key).or_else(|| table_options.get(key)))
-    .map(|value| value.trim().to_ascii_lowercase())
+    ];
+    if let Some(value) = keys.iter().find_map(|key| query_options.get(key)) {
+        return Ok(Some(value.trim().to_ascii_lowercase()));
+    }
+    if let Some(kind) = super::global_index_options::vector_index_type(query_options, column)? {
+        return Ok(Some(kind.into()));
+    }
+    if let Some(kind) = super::global_index_options::vector_index_type(table_options, column)? {
+        return Ok(Some(kind.into()));
+    }
+    Ok(keys
+        .iter()
+        .find_map(|key| table_options.get(key))
+        .map(|value| value.trim().to_ascii_lowercase()))
 }
 
 pub(super) fn current_tokio_runtime_handle() -> crate::Result<tokio::runtime::Handle> {

@@ -1639,7 +1639,8 @@ impl<'a> CoreOptions<'a> {
             .unwrap_or(DEFAULT_TARGET_FILE_SIZE)
     }
 
-    /// Skip automatic compaction after a data commit. Defaults to false.
+    /// Skip automatic compaction and declared global-index maintenance after
+    /// a data commit. Defaults to false.
     /// `write.compaction-skip` is the legacy alias; `write-only` takes precedence.
     pub fn write_only(&self) -> crate::Result<bool> {
         match self

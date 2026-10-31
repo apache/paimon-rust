@@ -88,8 +88,15 @@ pub(super) async fn global_search_splits(
         .iter()
         .filter(|entry| entry.kind == FileKind::Add && belongs(&entry.index_file))
         .collect::<Vec<_>>();
-    // Full-text admits raw fallback only after finding its index definition.
-    if full_text && selected.is_empty() {
+    // A declaration supplies the definition even before its first payload is published.
+    if full_text
+        && selected.is_empty()
+        && !super::global_index_options::declares_column(
+            table.schema().options(),
+            column,
+            "full-text",
+        )
+    {
         return Ok(vec![]);
     }
     let row_filter = filter.and_then(|filter| {
@@ -200,8 +207,12 @@ pub(super) async fn global_search_splits(
             .values()
             .flat_map(|files| files.iter())
             .next()
-            .map(|file| file.index_type.clone())
-            .or_else(|| configured_vector_index_type(table.schema().options(), options, column));
+            .map(|file| file.index_type.clone());
+        let index_type = match index_type {
+            Some(kind) => Some(kind),
+            None if full_text => None,
+            None => configured_vector_index_type(table.schema().options(), options, column)?,
+        };
         result.push(SearchScanSplit::Raw {
             scalar_index_files: intersecting_scalar(&raw_ranges),
             row_ranges: raw_ranges,

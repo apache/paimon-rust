@@ -1344,7 +1344,13 @@ CALL sys.rollback_to_timestamp(table => 'paimon.my_db.my_table', timestamp => 12
 
 ### create_global_index
 
-Build and commit a global index for a table column:
+Build and commit a global index for a table column.
+
+To maintain indexes synchronously after writes, declare columns through options
+such as `global-index.btree.index-columns='id'`. Maintenance runs by default
+when `write-only=false`; see
+[Automatic global index maintenance](compaction.md#automatic-global-index-maintenance)
+for the declaration format and recovery behavior.
 
 ```sql
 CALL sys.create_global_index(
@@ -1490,16 +1496,17 @@ threads. Prepared commit messages retain shard plan order. On a build failure,
 all started shards finish before private outputs are cleaned. Files in messages
 already returned to a caller are retained, including after a failed commit.
 
-The current global-index builders require a row-tracking data-evolution table
-with global indexes enabled. They do not support primary-key tables or tables
-with deletion vectors enabled:
+Global-index builders require a non-primary-key table with row tracking enabled
+and unaware buckets (`bucket=-1`). Data evolution and query-side global-index
+optimization may be disabled. Full-text builds additionally reject tables with
+deletion vectors enabled:
 
 ```sql
 CREATE TABLE paimon.my_db.items (
   id INT,
   embedding ARRAY<FLOAT>
 ) WITH (
-  'bucket' = '1',
+  'bucket' = '-1',
   'row-tracking.enabled' = 'true',
   'data-evolution.enabled' = 'true',
   'global-index.enabled' = 'true',
@@ -1559,7 +1566,7 @@ CREATE TABLE paimon.my_db.image_items (
   id INT,
   embedding ARRAY<FLOAT>
 ) WITH (
-  'bucket' = '1',
+  'bucket' = '-1',
   'row-tracking.enabled' = 'true',
   'data-evolution.enabled' = 'true',
   'global-index.enabled' = 'true',
@@ -2011,7 +2018,7 @@ CREATE TABLE paimon.my_db.items (
   id INT,
   embedding ARRAY<FLOAT>
 ) WITH (
-  'bucket' = '1',
+  'bucket' = '-1',
   'row-tracking.enabled' = 'true',
   'data-evolution.enabled' = 'true',
   'global-index.enabled' = 'true',
@@ -2957,15 +2964,19 @@ catalog/FileIO. See [Lookup changelog producer](compaction.md#lookup-changelog-p
 ### Global Index Options
 
 Set these options when building global indexes with
-`CALL sys.create_global_index`. The current DataFusion builders require
-row-tracking and data evolution, and reject primary-key tables and tables with
-deletion vectors enabled.
+`CALL sys.create_global_index` or automatic builds. Builders require row tracking,
+`bucket=-1`, and no primary key. Data evolution and query-side global-index
+optimization may be disabled. Full-text builds reject deletion-vector tables.
 
 | Option | Default | Description |
 |---|---:|---|
 | `row-tracking.enabled` | `false` | Enables stable row ids required by global index files. |
 | `data-evolution.enabled` | `false` | Enables row-id-aware table evolution and partial-column writes. |
 | `global-index.enabled` | `true` | Enables global index metadata and global-index-aware reads. |
+| `global-index.<family>.index-columns` | unset | Comma-separated columns maintained automatically with `write-only=false`. Families: `btree`, `bitmap`, `multivalue`, `fm`, `full-text`, `vector`. Each column owns one index. |
+| `fields.<column>.global-index.<family>.index-options` | unset | Per-column JSON object of native writer options, following primary-key index option resolution. |
+| `fields.<column>.global-index.vector.index-type` | required for declared vector columns | Vector algorithm, such as `diskann` or `ivf-flat`. Changes replace incompatible payloads atomically during maintenance. |
+| `fields.<column>.global-index.vector.distance-metric` | `inner_product` | Vector distance metric for builds and FULL/DETAIL raw fallback: `inner_product`, `cosine`, or `l2`. Changes replace incompatible payloads atomically during maintenance. |
 | `global-index.row-count-per-shard` | `100000` | Maximum row count per vector global-index shard. |
 | `sorted-index.records-per-range` | `100000` | Maximum row count per BTree, bitmap, multivalue, or FM global-index file range; falls back to legacy `btree-index.records-per-range`. |
 | `btree-index.block-size` | `64kb` | Target BTree data-block size. |
