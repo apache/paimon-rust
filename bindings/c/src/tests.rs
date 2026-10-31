@@ -26,6 +26,8 @@
 //! must NOT wrap C FFI calls inside another `block_on`. Use the global
 //! runtime only for Rust-API setup (write_data_rust, setup_table_dirs).
 
+mod commit_messages;
+
 use std::collections::HashMap;
 use std::ffi::{c_void, CString};
 use std::mem::ManuallyDrop;
