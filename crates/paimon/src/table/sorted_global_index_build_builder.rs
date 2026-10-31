@@ -160,14 +160,8 @@ impl<'a> SortedGlobalIndexBuildBuilder<'a> {
             return Ok((None, vec![]));
         };
 
-        let mut read_builder = self.table.new_read_builder();
-        if let Some(filter) = &self.partition_filter {
-            read_builder.with_filter(filter.clone());
-        }
-        let manifest_entries = read_builder
-            .new_scan()
-            .with_scan_all_files()
-            .plan_manifest_entries(snapshot)
+        let manifest_entries = view
+            .manifest_entries(self.table, self.partition_filter.as_ref())
             .await?;
         let indexed = crate::table::global_index_build_common::indexed_row_ranges(
             view.index_entries(),

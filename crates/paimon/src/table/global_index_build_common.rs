@@ -25,7 +25,9 @@
 //! `index_type` string, so it lives here once rather than being copied into
 //! each builder.
 
-use crate::spec::{DataField, FileKind, IndexManifest, IndexManifestEntry, Snapshot};
+use crate::spec::{
+    DataField, FileKind, IndexManifest, IndexManifestEntry, ManifestEntry, Predicate, Snapshot,
+};
 use crate::table::{merge_row_ranges, RowRange, Table};
 use crate::{Error, Result};
 use std::sync::Arc;
@@ -39,6 +41,7 @@ pub(crate) mod vector;
 pub(crate) struct GlobalIndexBuildView {
     snapshot: Option<Snapshot>,
     index_entries: Arc<[IndexManifestEntry]>,
+    source_entries: Option<Arc<[ManifestEntry]>>,
 }
 
 impl GlobalIndexBuildView {
@@ -59,6 +62,7 @@ impl GlobalIndexBuildView {
         Ok(Self {
             snapshot: Some(snapshot),
             index_entries: entries.into(),
+            source_entries: None,
         })
     }
 
@@ -80,6 +84,36 @@ impl GlobalIndexBuildView {
         &self.index_entries
     }
 
+    /// Per-round immutable metadata, shared by all declared columns. Never
+    /// retained across retries or snapshots.
+    pub(crate) fn with_source_entries(mut self, entries: Arc<[ManifestEntry]>) -> Self {
+        self.source_entries = Some(entries);
+        self
+    }
+
+    pub(super) async fn manifest_entries(
+        &self,
+        table: &Table,
+        filter: Option<&Predicate>,
+    ) -> Result<Vec<ManifestEntry>> {
+        let Some(snapshot) = self.snapshot() else {
+            return Ok(vec![]);
+        };
+        if filter.is_none() {
+            if let Some(entries) = &self.source_entries {
+                return Ok(entries.to_vec());
+            }
+        }
+        let mut read = table.new_read_builder();
+        if let Some(filter) = filter {
+            read.with_filter(filter.clone());
+        }
+        read.new_scan()
+            .with_scan_all_files()
+            .plan_manifest_entries(snapshot)
+            .await
+    }
+
     pub(crate) fn filter_indexes(&self, mut keep: impl FnMut(&IndexManifestEntry) -> bool) -> Self {
         Self {
             snapshot: self.snapshot.clone(),
@@ -89,6 +123,27 @@ impl GlobalIndexBuildView {
                 .filter(|entry| keep(entry))
                 .cloned()
                 .collect(),
+            source_entries: self.source_entries.clone(),
+        }
+    }
+
+    /// Source filtering belongs to the caller's maintenance plan. Native
+    /// builders still plan complete shards, with all overlapping column files.
+    pub(crate) fn filter_sources(&self, mut keep: impl FnMut(&ManifestEntry) -> bool) -> Self {
+        let Some(entries) = &self.source_entries else {
+            return self.clone();
+        };
+        let selected = entries
+            .iter()
+            .filter(|entry| keep(entry))
+            .collect::<Vec<_>>();
+        if selected.len() == entries.len() {
+            return self.clone();
+        }
+        Self {
+            snapshot: self.snapshot.clone(),
+            index_entries: self.index_entries.clone(),
+            source_entries: Some(selected.into_iter().cloned().collect()),
         }
     }
 }

@@ -41,11 +41,30 @@ fn index_file_key(entry: &IndexManifestEntry) -> IndexFileKey {
 pub(super) struct MaintenancePlan {
     replaced: HashSet<IndexFileKey>,
     pub deletions: Vec<CommitMessage>,
+    pub needs_build: bool,
+    build_ranges: HashMap<(Vec<u8>, i32), Vec<RowRange>>,
 }
 
 impl MaintenancePlan {
     pub(super) fn build_view(&self, source: &GlobalIndexBuildView) -> GlobalIndexBuildView {
-        source.filter_indexes(|entry| !self.replaced.contains(&index_file_key(entry)))
+        let view = if self.replaced.is_empty() {
+            source.clone()
+        } else {
+            source.filter_indexes(|entry| !self.replaced.contains(&index_file_key(entry)))
+        };
+        view.filter_sources(|entry| {
+            let Some((start, end)) = entry.file().row_id_range() else {
+                return false;
+            };
+            let Some(ranges) = self
+                .build_ranges
+                .get(&(partition_key(entry.partition()), entry.bucket()))
+            else {
+                return false;
+            };
+            let first = ranges.partition_point(|range| range.to() < start);
+            ranges.get(first).is_some_and(|range| range.from() <= end)
+        })
     }
 }
 
@@ -119,7 +138,7 @@ pub(super) async fn plan(
                 .push(RowRange::new(start.max(from), end.min(to)));
         }
     }
-    let desired = desired
+    let mut desired = desired
         .into_iter()
         .map(|(key, ranges)| (key, merge_row_ranges(ranges)))
         .collect::<HashMap<_, _>>();
@@ -193,6 +212,8 @@ pub(super) async fn plan(
         let wanted = desired.get(&key).map(Vec::as_slice).unwrap_or(&[]);
         if coverage.as_slice() != wanted || files.len() != wanted.len() {
             replaced.extend(files.iter().map(|entry| index_file_key(entry)));
+        } else {
+            desired.remove(&key);
         }
     }
     let mut deletions: BTreeMap<(Vec<u8>, i32), CommitMessage> = BTreeMap::new();
@@ -207,8 +228,21 @@ pub(super) async fn plan(
                 .push(entry.index_file.clone());
         }
     }
+    let mut build_ranges: HashMap<(Vec<u8>, i32), Vec<RowRange>> = HashMap::new();
+    for ((partition, bucket, _), ranges) in desired {
+        build_ranges
+            .entry((partition, bucket))
+            .or_default()
+            .extend(ranges);
+    }
+    let build_ranges = build_ranges
+        .into_iter()
+        .map(|(key, ranges)| (key, merge_row_ranges(ranges)))
+        .collect::<HashMap<_, _>>();
     Ok(MaintenancePlan {
         replaced,
         deletions: deletions.into_values().collect(),
+        needs_build: !build_ranges.is_empty(),
+        build_ranges,
     })
 }

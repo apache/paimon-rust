@@ -59,6 +59,12 @@ Overwrite compaction is pinned to its own committed data snapshot, so suppressin
 overwrite changelogs cannot consume a later append's pending lookup events.
 As in Java, overwriting partitions being consumed by streaming readers is unsupported;
 lookup changelogs do not describe the overwrite operation itself.
+Automatic tasks share one captured snapshot and bucket-grouped source/index
+metadata per round. Automatic index fields also share captured source metadata;
+fully covered fields skip shard planning, and changed fields only plan files
+overlapping their missing or replaced units. Captured metadata is released after
+the round. Publication and retries still validate current sources and index
+membership, and manual task execution captures fresh inputs on every call.
 Automatic lookup compaction supports the default `lookup-compact=radical` policy.
 `gentle` requires writer-lifetime trigger intervals and is explicitly unsupported
 here; use `write-only=true` and schedule dedicated compaction separately.

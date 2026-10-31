@@ -98,6 +98,8 @@ mod instant;
 mod kv_data_file_writer;
 mod kv_file_reader;
 mod kv_file_writer;
+#[cfg(test)]
+mod maintenance_test_utils;
 mod managed_blob_reader;
 mod managed_blob_reference;
 #[cfg(test)]

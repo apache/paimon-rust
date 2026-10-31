@@ -26,7 +26,60 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 mod search;
 
-async fn table(enabled: Option<bool>, compact: bool) -> Table {
+#[tokio::test]
+async fn index_columns_share_source_scan_and_covered_rounds_do_not_rescan_builders() {
+    use crate::table::maintenance_test_utils::{source_manifests, table as counted_table};
+    let mut totals = Vec::new();
+    for multiple in [false, true] {
+        let schema = TableSchemaBuilder::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("value", DataType::Int(IntType::new()))
+            .option("row-tracking.enabled", "true")
+            .option("data-evolution.enabled", "true")
+            .option("write-only", "true")
+            .option("global-index.btree.index-columns", "id");
+        let schema = if multiple {
+            schema.option("global-index.bitmap.index-columns", "value")
+        } else {
+            schema
+        };
+        let (raw, counter) = counted_table(TableSchema::new(0, &schema.build().unwrap())).await;
+        TableCommit::new(raw.clone(), "source".into())
+            .commit(messages(&raw, vec![1, 2]).await)
+            .await
+            .unwrap();
+        let written = latest(&raw).await;
+        let table = raw.copy_with_options(HashMap::from([("write-only".into(), "false".into())]));
+        let paths = source_manifests(&table, &written).await;
+        counter.watch(paths.clone());
+        TableCommit::new(table.clone(), "first-indexer".into())
+            .index_after_write(&written)
+            .await
+            .unwrap();
+        totals.push(counter.counts().values().sum::<usize>());
+        assert_eq!(indexes(&table).await.len(), if multiple { 2 } else { 1 });
+        let indexed = latest(&table).await;
+        let indexed_id = indexed.id();
+        counter.watch(source_manifests(&table, &indexed).await);
+        // Another round owns a different identity but sees fully indexed data.
+        TableCommit::new(table.clone(), "other-indexer".into())
+            .index_after_write(&written)
+            .await
+            .unwrap();
+        assert!(
+            counter.counts().values().all(|count| *count == 1),
+            "fully covered round should only inspect coverage: {:?}",
+            counter.counts()
+        );
+        assert_eq!(latest(&table).await.id(), indexed_id);
+    }
+    assert_eq!(
+        totals[0], totals[1],
+        "adding index columns must not reread source manifests"
+    );
+}
+
+pub(super) async fn table(enabled: Option<bool>, compact: bool) -> Table {
     let mut schema = TableSchemaBuilder::builder()
         .column("id", DataType::Int(IntType::new()))
         .column("value", DataType::Int(IntType::new()))
@@ -72,7 +125,7 @@ async fn table(enabled: Option<bool>, compact: bool) -> Table {
     table
 }
 
-async fn messages(table: &Table, ids: Vec<i32>) -> Vec<CommitMessage> {
+pub(super) async fn messages(table: &Table, ids: Vec<i32>) -> Vec<CommitMessage> {
     let values = ids.iter().map(|id| id * 10).collect::<Vec<_>>();
     let batch = RecordBatch::try_from_iter(vec![
         (
@@ -91,7 +144,7 @@ async fn messages(table: &Table, ids: Vec<i32>) -> Vec<CommitMessage> {
     write.prepare_commit().await.unwrap()
 }
 
-async fn latest(table: &Table) -> Snapshot {
+pub(super) async fn latest(table: &Table) -> Snapshot {
     table
         .snapshot_manager()
         .get_latest_snapshot()
@@ -113,7 +166,7 @@ async fn indexes(table: &Table) -> Vec<IndexManifestEntry> {
     }
 }
 
-async fn assert_complete(table: &Table) {
+pub(super) async fn assert_complete(table: &Table) {
     for (column, kind) in [("id", "btree"), ("value", "bitmap")] {
         assert!(table
             .new_global_index_build_builder()

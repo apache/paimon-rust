@@ -41,7 +41,8 @@ use super::{DataSplit, Plan, Table, TableCommit, TableScan};
 use crate::resource::ResourceContext;
 use crate::spec::{
     bucket_path_under, BinaryRow, ChangelogProducer, DataFileMeta, FileKind, IndexManifest,
-    ManifestEntry, MergeEngine, PartitionComputer, Predicate, Snapshot, TableSchema,
+    IndexManifestEntry, ManifestEntry, MergeEngine, PartitionComputer, Predicate, Snapshot,
+    TableSchema,
 };
 use crate::{Error, Result};
 
@@ -370,6 +371,14 @@ pub struct CompactExecutor {
     emit_changelog: bool,
 }
 
+// Valid only for one immutable automatic round. Publication still reads and
+// validates current metadata; manual execution captures fresh inputs each call.
+struct CompactInputs {
+    snapshot: Snapshot,
+    data: HashMap<(Vec<u8>, i32), Vec<ManifestEntry>>,
+    indexes: HashMap<(Vec<u8>, i32), Vec<IndexManifestEntry>>,
+}
+
 /// Prepared data, changelog and index files owned by the caller until submitted
 /// to `TableCommit::commit_compact`.
 /// A failed or uncertain commit must retain these files for retry.
@@ -442,6 +451,11 @@ impl CompactExecutor {
     }
 
     pub async fn execute(&self, task: &CompactTask) -> Result<CompactResult> {
+        let inputs = self.capture_inputs(task).await?;
+        self.execute_captured(task, &inputs).await
+    }
+
+    async fn capture_inputs(&self, task: &CompactTask) -> Result<CompactInputs> {
         ensure_supported(&self.table)?;
         task.validate_target(&self.table)?;
         let manager = self.table.snapshot_manager();
@@ -449,14 +463,60 @@ impl CompactExecutor {
         if !task.context.snapshot.has_same_read_metadata(&snapshot) {
             return Err(invalid("Compaction snapshot was replaced"));
         }
-        validate_snapshot_indexes(&self.table, &snapshot).await?;
+        let indexes = read_snapshot_indexes(&self.table, &snapshot).await?;
+        if !self.table.schema().primary_keys().is_empty()
+            && self
+                .table
+                .schema()
+                .core_options()
+                .deletion_vectors_enabled()
+        {
+            primary_key::deletion_vectors::validate_index_references(&indexes)?;
+        }
         let active = read_snapshot_entries(&manager, &snapshot, None).await?;
         validate_dv_schemas(&self.table, active.iter().map(|entry| entry.file())).await?;
-        task.validate_inputs(&active)?;
+        let mut data = HashMap::<_, Vec<_>>::new();
+        for entry in active {
+            data.entry((entry.partition().to_vec(), entry.bucket()))
+                .or_default()
+                .push(entry);
+        }
+        let mut by_bucket = HashMap::<_, Vec<_>>::new();
+        for entry in indexes {
+            by_bucket
+                .entry((entry.partition.clone(), entry.bucket))
+                .or_default()
+                .push(entry);
+        }
+        Ok(CompactInputs {
+            snapshot,
+            data,
+            indexes: by_bucket,
+        })
+    }
+
+    async fn execute_captured(
+        &self,
+        task: &CompactTask,
+        inputs: &CompactInputs,
+    ) -> Result<CompactResult> {
+        task.validate_target(&self.table)?;
+        let snapshot = &inputs.snapshot;
+        if !task.context.snapshot.has_same_read_metadata(snapshot) {
+            return Err(invalid("Compaction snapshot was replaced"));
+        }
+        let key = (task.partition.clone(), task.bucket);
+        let active = inputs.data.get(&key).map(Vec::as_slice).unwrap_or_default();
+        let indexes = inputs
+            .indexes
+            .get(&key)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        task.validate_inputs(active)?;
         // validate_target proved the complete schema and branch are identical.
         // Preserve already resolved catalog schemas in the shared manager;
         // rebuilding it here would require REST-only schemas to exist on disk.
-        let table = self.table.copy_with_pinned_snapshot(Some(&snapshot));
+        let table = self.table.copy_with_pinned_snapshot(Some(snapshot));
         let options = table.schema().core_options();
         let partition = BinaryRow::from_serialized_bytes(&task.partition)?;
         let computer = PartitionComputer::new(
@@ -481,7 +541,7 @@ impl CompactExecutor {
             .with_data_files(task.files.clone())
             .build()?;
         let split = if options.deletion_vectors_enabled() && task.is_primary_key() {
-            primary_key::deletion_vectors::with_deletion_files(&table, &split, &snapshot).await?
+            primary_key::deletion_vectors::with_deletion_entries(&table, &split, indexes)?
         } else {
             split
         };
@@ -524,6 +584,7 @@ impl CompactExecutor {
                         history,
                         cache.clone(),
                         self.resources.clone(),
+                        indexes,
                     )
                     .await?;
                     deletions = collected;
@@ -560,8 +621,8 @@ impl CompactExecutor {
                 &table,
                 task,
                 &split,
-                &snapshot,
-                &active,
+                indexes,
+                active,
                 &files,
                 self.resources.clone(),
             )
@@ -1220,15 +1281,23 @@ pub(super) async fn validate_snapshot_indexes(
     table: &Table,
     snapshot: &Snapshot,
 ) -> Result<Option<String>> {
+    read_snapshot_indexes(table, snapshot).await?;
+    Ok(snapshot.index_manifest().map(str::to_owned))
+}
+
+async fn read_snapshot_indexes(
+    table: &Table,
+    snapshot: &Snapshot,
+) -> Result<Vec<IndexManifestEntry>> {
     ensure_snapshot_supported(table, snapshot)?;
     let Some(name) = snapshot.index_manifest() else {
-        return Ok(None);
+        return Ok(vec![]);
     };
     let path = table.snapshot_manager().manifest_path(name);
     let entries = IndexManifest::read(table.file_io(), &path).await?;
     if table.schema().core_options().data_evolution_enabled() {
         data_evolution::validate_indexes(&entries)?;
-        return Ok(Some(name.to_string()));
+        return Ok(entries);
     }
     for entry in &entries {
         if !table.schema().primary_keys().is_empty() && primary_key::indexes::is_source_index(entry)
@@ -1249,7 +1318,7 @@ pub(super) async fn validate_snapshot_indexes(
             });
         }
     }
-    Ok(Some(name.to_string()))
+    Ok(entries)
 }
 
 fn validate_file(file: &DataFileMeta, primary_key: bool) -> Result<()> {

@@ -78,6 +78,12 @@ fn vector_references(indexes: &[IndexManifestEntry]) -> Result<HashMap<FileId, V
     Ok(references)
 }
 
+pub(in crate::table::compact) fn validate_index_references(
+    indexes: &[IndexManifestEntry],
+) -> Result<()> {
+    vector_references(indexes).map(|_| ())
+}
+
 fn resolve_vector(table: &Table, bucket_path: &str, reference: &VectorReference) -> DeletionFile {
     let location = IndexFileLocation::BucketLocal {
         table_path: table.location().trim_end_matches('/'),
@@ -126,12 +132,12 @@ fn bucket_path(table: &Table, partition: &[u8], bucket: i32) -> Result<String> {
 }
 
 /// Apply captured physical masks before merging, including masks on L0 files.
-pub(in crate::table::compact) async fn with_deletion_files(
+pub(in crate::table::compact) fn with_deletion_entries(
     table: &Table,
     split: &DataSplit,
-    snapshot: &Snapshot,
+    indexes: &[IndexManifestEntry],
 ) -> Result<DataSplit> {
-    let references = vector_references(&read_indexes(table, snapshot).await?)?;
+    let references = vector_references(indexes)?;
     let partition = split.partition().to_serialized_bytes();
     let files = split
         .data_files()

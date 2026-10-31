@@ -277,13 +277,12 @@ pub(in crate::table::compact) async fn prepare(
     table: &Table,
     task: &CompactTask,
     split: &DataSplit,
-    snapshot: &Snapshot,
+    indexes: &[IndexManifestEntry],
     active: &[ManifestEntry],
     files: &[DataFileMeta],
     resources: Option<ResourceContext>,
 ) -> Result<Vec<IndexManifestEntry>> {
     let defs = definitions(table.schema())?;
-    let indexes = read_indexes(table, snapshot).await?;
     let changes = task
         .files
         .iter()
@@ -312,7 +311,7 @@ pub(in crate::table::compact) async fn prepare(
     let unsupported = unsupported_scalar_units(table, &after, &defs).await;
     let maintenance = plan(
         table,
-        &indexes,
+        indexes,
         &after,
         &defs,
         &unsupported,
