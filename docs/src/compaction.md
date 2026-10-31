@@ -61,9 +61,10 @@ As in Java, overwriting partitions being consumed by streaming readers is unsupp
 lookup changelogs do not describe the overwrite operation itself.
 Automatic tasks share one captured snapshot and bucket-grouped source/index
 metadata per round. Automatic index fields also share captured source metadata;
-fully covered fields skip shard planning, and changed fields only plan files
-overlapping their missing or replaced units. Captured metadata is released after
-the round. Publication and retries still validate current sources and index
+native builds only plan files overlapping missing or selected merge ranges.
+Covered fields can still consolidate runs when their thresholds are met.
+Captured metadata is released after the round. Publication and retries still
+validate current sources and index
 membership, and manual task execution captures fresh inputs on every call.
 Automatic lookup compaction supports the default `lookup-compact=radical` policy.
 `gentle` requires writer-lifetime trigger intervals and is explicitly unsupported
@@ -147,9 +148,9 @@ Per-column parameters use
 `fields.<column>.global-index.<family>.index-options`, a JSON object containing
 string, boolean, or numeric values. Short keys are qualified with the native
 writer prefix, such as `block-size` to `btree-index.block-size`. Fully qualified
-writer keys and shared shard options are accepted. Conflicting values are
-rejected, matching primary-key option resolution. Vector columns additionally
-require `fields.<column>.global-index.vector.index-type`; the optional
+writer keys and shared shard options are accepted. Conflicting native writer
+values are rejected, matching primary-key option resolution. Vector columns
+additionally require `fields.<column>.global-index.vector.index-type`; the optional
 `distance-metric` defaults to `inner_product`.
 Explicit single-column builds also use these declarations as defaults; explicit
 builder options take precedence over them.
@@ -157,14 +158,44 @@ FULL/DETAIL raw fallback uses the same per-column parameters as automatic
 builds, including vector metric defaults and full-text tokenization. A declared
 full-text column can use raw fallback before its first index is published.
 
-Each round captures the current schema and one source snapshot. Like Java
-primary-key index maintenance, it compares the desired sources with current
-index units and replaces changed units atomically. Global units use partition,
-bucket, and row-ID shard boundaries instead of primary-key LSM levels. Valid
-units are retained, missing ranges are built, and partial or fragmented shards
-are rebuilt from current rows. A physical compaction that preserves row IDs and
-values can retain existing global payloads. Additions and retired references
-publish together; old files remain available to historical snapshots.
+Each round captures the current schema and one source snapshot. Missing row-ID
+coverage is built as independent index files, retaining compatible existing
+payloads. Adjacent index ranges form runs within one partition, bucket and row-ID
+shard; logical row-ID holes are separate groups. The UniversalCompaction run
+selector is shared with PK data compaction. Global index runs use logical row
+counts as their size measure, so new ranges can participate in selection before
+encoding; PK data runs continue to use bytes and their existing level rules.
+
+Index merging has independent options with the same defaults as PK compaction:
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `global-index.num-sorted-run.compaction-trigger` | `5` | Run count at which size-based selection becomes eligible; must be positive. |
+| `global-index.compaction.size-ratio` | `1` | Percentage tolerance when extending a merge to the next run; must be nonnegative. |
+| `global-index.compaction.max-size-amplification-percent` | `200` | Select all runs when newer runs exceed this percentage of the oldest run; must be nonnegative. |
+
+These options can also appear, fully qualified, in per-column `index-options`
+JSON and override the corresponding table-level index policy. They do not change
+the table's data-compaction options. Above the run-count limit, the selector
+also makes progress when adjacent run sizes differ too much
+for the normal size ratio. A single run is never rebuilt just to compact itself.
+
+For example, with a 1000-row-ID shard, an existing `[0, 599]` index and a new
+`[600, 799]` batch stay as two files below the trigger. Once enough adjacent runs
+accumulate, selected ranges are rebuilt together from current data and sidecar
+values. A large older run can remain untouched while smaller tail runs merge.
+The implementation rebuilds selected data ranges rather than concatenating old
+native index payloads. A physical compaction preserving row IDs and values can
+retain global payloads. Shard-boundary changes, removed rows and incompatible
+vector definitions retire affected payloads immediately. Additions and retired
+references publish together; historical snapshots retain their old files.
+
+Vector training still uses the actual non-NULL count. If a small or sparse run
+cannot satisfy its native training configuration, such as a size-per-vector
+budget, maintenance may retry once with complete pending connected groups. This
+keeps the declared algorithm, metric and budget. I/O and training execution
+errors do not trigger this expansion. All-NULL vector builds retain Java's
+existing empty-build behavior: they publish no zero-byte DE index marker.
 Manual `commit_compact` also maintains declared indexes when `write-only=false`.
 An empty maintenance plan publishes no snapshot. Empty data commits, index-only
 commits, and truncation do not trigger a separate round. Indexed-column updates
@@ -173,7 +204,8 @@ the data update and automatically rebuild the affected coverage. Changing a
 vector algorithm or distance metric retires all incompatible payloads for that
 column and publishes their replacements together. Other writer parameters alone
 do not rebuild unchanged coverage; changing shard boundaries can regroup it.
-This synchronous mode has no minimum-row or time threshold.
+Missing coverage is processed synchronously without a minimum-row or time
+delay; index consolidation follows the run thresholds above.
 
 A concurrent snapshot or schema change causes private outputs to be discarded
 and coverage to be replanned, bounded by `commit.max-retries` and

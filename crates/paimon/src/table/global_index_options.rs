@@ -76,11 +76,18 @@ pub(super) fn definitions(table: &Table) -> Result<Vec<Definition>> {
         } else {
             family
         };
-        result.push(Definition {
+        let definition = Definition {
             column: column.into(),
             index_type: index_type.into(),
             options: field_index_options(options, column, family, index_type)?,
-        });
+        };
+        let mut merged = options.clone();
+        merged.extend(definition.options.clone());
+        crate::table::universal_compaction::UniversalCompaction::from_options(
+            &merged,
+            "global-index.",
+        )?;
+        result.push(definition);
     }
     Ok(result)
 }
@@ -145,7 +152,14 @@ pub(super) fn parse_field_index_options(
         };
         if options
             .get(&qualified)
-            .or_else(|| table_options.get(&qualified))
+            .or_else(|| match qualified.as_str() {
+                // Maintenance policies are column overrides; native writer
+                // options still reject conflicting table and field definitions.
+                "global-index.num-sorted-run.compaction-trigger"
+                | "global-index.compaction.size-ratio"
+                | "global-index.compaction.max-size-amplification-percent" => None,
+                _ => table_options.get(&qualified),
+            })
             .is_some_and(|previous| previous != &value)
         {
             return Err(crate::Error::ConfigInvalid {

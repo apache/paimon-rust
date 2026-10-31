@@ -21,17 +21,19 @@ use crate::io::{FileIOBuilder, FileIOProvider};
 use crate::spec::{ManifestList, Snapshot, TableSchema};
 use crate::table::Table;
 use crate::Result;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 #[derive(Debug)]
 pub(super) struct MetadataIo {
     operator: opendal::Operator,
     watched: Mutex<BTreeMap<String, usize>>,
+    observed: Mutex<BTreeSet<String>>,
 }
 #[async_trait::async_trait]
 impl FileIOProvider for MetadataIo {
     async fn create(&self, path: &str) -> Result<(opendal::Operator, String)> {
+        self.observed.lock().unwrap().insert(path.into());
         if let Some(reads) = self.watched.lock().unwrap().get_mut(path) {
             *reads += 1;
         }
@@ -51,12 +53,16 @@ impl MetadataIo {
     pub fn counts(&self) -> BTreeMap<String, usize> {
         self.watched.lock().unwrap().clone()
     }
+    pub fn observed_paths(&self) -> BTreeSet<String> {
+        self.observed.lock().unwrap().clone()
+    }
 }
 pub(super) async fn table(schema: TableSchema) -> (Table, Arc<MetadataIo>) {
     let counter = Arc::new(MetadataIo {
         operator: opendal::Operator::from_config(opendal::services::MemoryConfig::default())
             .unwrap(),
         watched: Mutex::new(BTreeMap::new()),
+        observed: Mutex::new(BTreeSet::new()),
     });
     let io = FileIOBuilder::new("memory")
         .with_provider(counter.clone())

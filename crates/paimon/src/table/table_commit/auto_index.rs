@@ -109,13 +109,40 @@ impl TableCommit {
             let mut messages = Vec::new();
             let prepared: Result<()> = async {
                 for definition in definitions {
-                    let plan =
+                    let mut plan =
                         planning::plan(&table, &definition, &data, view.index_entries()).await?;
                     if plan.needs_build {
-                        let built = definition
+                        let built = match definition
                             .builder(&table)
                             .build_with_view(plan.build_view(&view))
-                            .await?;
+                            .await
+                        {
+                            Ok(built) => built,
+                            Err(error) => {
+                                let expandable =
+                                    crate::table::index_build::vector::training_range(&error)
+                                        .is_some_and(|range| {
+                                            plan.can_expand_training_range(&range)
+                                        });
+                                if !expandable {
+                                    return Err(error);
+                                }
+                                // A small/sparse leaf may not meet a persisted-size
+                                // objective. Retry once with larger pending groups;
+                                // keep the same codec, metric and source snapshot.
+                                plan = planning::plan_for_training(
+                                    &table,
+                                    &definition,
+                                    &data,
+                                    view.index_entries(),
+                                )
+                                .await?;
+                                definition
+                                    .builder(&table)
+                                    .build_with_view(plan.build_view(&view))
+                                    .await?
+                            }
+                        };
                         messages.extend(built);
                     } else {
                         // Preserve validation for a refreshed schema without

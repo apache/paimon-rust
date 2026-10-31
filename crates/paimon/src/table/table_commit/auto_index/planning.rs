@@ -15,17 +15,21 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Compare desired global row-ID units with their current index payloads.
-//! Like Java PrimaryKeyIndexLevels, rebuild changed units and retire their old
-//! payloads atomically. Global indexes use row-ID shards rather than PK levels:
-//! a physical compaction preserving logical row IDs does not invalidate them.
+//! Append missing row-ID coverage as independent index runs. Select adjacent
+//! runs with the shared UniversalCompaction policy and rebuild selected ranges
+//! from current data, atomically retiring their old payloads.
 
 use super::*;
 use crate::table::global_index_build_common::{
     resolve_index_fields, GlobalIndexBuildView, IndexColumns,
 };
+use crate::table::source::exclude_row_ranges;
+use crate::table::universal_compaction::{Run, UniversalCompaction};
 use crate::table::{merge_row_ranges, RowRange};
 use std::collections::BTreeMap;
+
+#[cfg(test)]
+mod tests;
 
 type UnitKey = (Vec<u8>, i32, i64);
 type IndexFileKey = (Vec<u8>, i32, String);
@@ -43,9 +47,16 @@ pub(super) struct MaintenancePlan {
     pub deletions: Vec<CommitMessage>,
     pub needs_build: bool,
     build_ranges: HashMap<(Vec<u8>, i32), Vec<RowRange>>,
+    training_groups: Vec<RowRange>,
 }
 
 impl MaintenancePlan {
+    pub(super) fn can_expand_training_range(&self, range: &RowRange) -> bool {
+        self.training_groups
+            .iter()
+            .any(|group| group.from() <= range.from() && range.to() <= group.to() && group != range)
+    }
+
     pub(super) fn build_view(&self, source: &GlobalIndexBuildView) -> GlobalIndexBuildView {
         let view = if self.replaced.is_empty() {
             source.clone()
@@ -82,9 +93,31 @@ pub(super) async fn plan(
     data: &[ManifestEntry],
     indexes: &[IndexManifestEntry],
 ) -> Result<MaintenancePlan> {
+    plan_impl(table, definition, data, indexes, false).await
+}
+
+/// A native training constraint may require a larger unit than an independent
+/// leaf. Retry once with complete pending groups, preserving the declared codec.
+pub(super) async fn plan_for_training(
+    table: &Table,
+    definition: &Definition,
+    data: &[ManifestEntry],
+    indexes: &[IndexManifestEntry],
+) -> Result<MaintenancePlan> {
+    plan_impl(table, definition, data, indexes, true).await
+}
+
+async fn plan_impl(
+    table: &Table,
+    definition: &Definition,
+    data: &[ManifestEntry],
+    indexes: &[IndexManifestEntry],
+    force_training_merge: bool,
+) -> Result<MaintenancePlan> {
     let mut options = table.schema().options().clone();
     options.extend(definition.options.clone());
     let core = CoreOptions::new(&options);
+    let strategy = UniversalCompaction::from_options(&options, "global-index.")?;
     let width = if matches!(
         definition.index_type.as_str(),
         "btree" | "bitmap" | "multivalue" | "fm"
@@ -138,7 +171,7 @@ pub(super) async fn plan(
                 .push(RowRange::new(start.max(from), end.min(to)));
         }
     }
-    let mut desired = desired
+    let desired = desired
         .into_iter()
         .map(|(key, ranges)| (key, merge_row_ranges(ranges)))
         .collect::<HashMap<_, _>>();
@@ -161,7 +194,7 @@ pub(super) async fn plan(
         .collect::<Vec<_>>();
     let mut current: HashMap<UnitKey, Vec<&IndexManifestEntry>> = HashMap::new();
     let mut replaced = HashSet::new();
-    for entry in &selected {
+    for entry in selected.iter().copied() {
         let meta = entry.index_file.global_index_meta.as_ref().unwrap();
         if let Some(metric) = vector_metric {
             // A vector column owns one algorithm and scoring metric across all shards.
@@ -189,31 +222,87 @@ pub(super) async fn plan(
             });
         }
         let shard = meta.row_range_start / width;
-        if shard != meta.row_range_end / width {
-            // A shard-size change can invalidate a former unit's boundaries.
+        let key = (partition_key(&entry.partition), entry.bucket, shard);
+        let contained = desired.get(&key).is_some_and(|groups| {
+            groups.iter().any(|group| {
+                group.from() <= meta.row_range_start && meta.row_range_end <= group.to()
+            })
+        });
+        if shard != meta.row_range_end / width || !contained {
+            // Row removal or shard-boundary changes cannot leave stale coverage.
             replaced.insert(index_file_key(entry));
         } else {
-            current
-                .entry((partition_key(&entry.partition), entry.bucket, shard))
-                .or_default()
-                .push(entry);
+            current.entry(key).or_default().push(entry);
         }
     }
-    for (key, files) in current {
-        let coverage = merge_row_ranges(
-            files
+    for files in current.values_mut() {
+        retire_overlaps(files, &mut replaced);
+    }
+    let mut build_ranges: HashMap<(Vec<u8>, i32), Vec<RowRange>> = HashMap::new();
+    let mut training_groups = Vec::new();
+    for ((partition, bucket, shard), groups) in desired {
+        let files = current
+            .remove(&(partition.clone(), bucket, shard))
+            .unwrap_or_default();
+        for group in groups {
+            let existing = files
                 .iter()
-                .map(|entry| {
+                .copied()
+                .filter(|entry| {
                     let meta = entry.index_file.global_index_meta.as_ref().unwrap();
-                    RowRange::new(meta.row_range_start, meta.row_range_end)
+                    group.from() <= meta.row_range_start && meta.row_range_end <= group.to()
                 })
-                .collect(),
-        );
-        let wanted = desired.get(&key).map(Vec::as_slice).unwrap_or(&[]);
-        if coverage.as_slice() != wanted || files.len() != wanted.len() {
-            replaced.extend(files.iter().map(|entry| index_file_key(entry)));
-        } else {
-            desired.remove(&key);
+                .collect::<Vec<_>>();
+            let covered =
+                merge_row_ranges(existing.iter().map(|entry| index_range(entry)).collect());
+            let missing = exclude_row_ranges(std::slice::from_ref(&group), &covered);
+            let mut runs = existing
+                .iter()
+                .map(|&entry| IndexRun {
+                    range: index_range(entry),
+                    index: Some(entry),
+                })
+                .chain(
+                    missing
+                        .iter()
+                        .cloned()
+                        .map(|range| IndexRun { range, index: None }),
+                )
+                .collect::<Vec<_>>();
+            // Increasing row IDs act as append sequence: newest runs first, as
+            // in PK L0 selection. Only adjacent ranges of one group may merge.
+            runs.sort_by_key(|run| std::cmp::Reverse(run.range.from()));
+            let candidates = runs
+                .iter()
+                .map(|run| Run {
+                    size: run.range.to() as u128 - run.range.from() as u128 + 1,
+                    stop_before_large: true,
+                })
+                .collect::<Vec<_>>();
+            let mut pending = missing;
+            if let Some(count) = strategy.pick(&candidates, 0).filter(|&count| count >= 2) {
+                for run in &runs[..count] {
+                    if let Some(entry) = run.index {
+                        replaced.insert(index_file_key(entry));
+                    }
+                    pending.push(run.range.clone());
+                }
+            }
+            let mut pending = merge_row_ranges(pending);
+            if pending.is_empty() {
+                continue;
+            }
+            if pending.as_slice() != std::slice::from_ref(&group) && vector_metric.is_some() {
+                training_groups.push(group.clone());
+                if force_training_merge {
+                    replaced.extend(existing.iter().map(|entry| index_file_key(entry)));
+                    pending = vec![group];
+                }
+            }
+            build_ranges
+                .entry((partition.clone(), bucket))
+                .or_default()
+                .extend(pending);
         }
     }
     let mut deletions: BTreeMap<(Vec<u8>, i32), CommitMessage> = BTreeMap::new();
@@ -228,13 +317,6 @@ pub(super) async fn plan(
                 .push(entry.index_file.clone());
         }
     }
-    let mut build_ranges: HashMap<(Vec<u8>, i32), Vec<RowRange>> = HashMap::new();
-    for ((partition, bucket, _), ranges) in desired {
-        build_ranges
-            .entry((partition, bucket))
-            .or_default()
-            .extend(ranges);
-    }
     let build_ranges = build_ranges
         .into_iter()
         .map(|(key, ranges)| (key, merge_row_ranges(ranges)))
@@ -244,5 +326,43 @@ pub(super) async fn plan(
         deletions: deletions.into_values().collect(),
         needs_build: !build_ranges.is_empty(),
         build_ranges,
+        training_groups,
     })
+}
+
+struct IndexRun<'a> {
+    range: RowRange,
+    index: Option<&'a IndexManifestEntry>,
+}
+
+fn index_range(entry: &IndexManifestEntry) -> RowRange {
+    let meta = entry.index_file.global_index_meta.as_ref().unwrap();
+    RowRange::new(meta.row_range_start, meta.row_range_end)
+}
+
+/// Adjacent fragments are legitimate runs; overlapping coverage must be
+/// replaced before incremental builds can safely reuse the remaining files.
+fn retire_overlaps(files: &mut Vec<&IndexManifestEntry>, replaced: &mut HashSet<IndexFileKey>) {
+    files.sort_by_key(|entry| {
+        entry
+            .index_file
+            .global_index_meta
+            .as_ref()
+            .unwrap()
+            .row_range_start
+    });
+    let mut first = 0;
+    while first < files.len() {
+        let mut end = index_range(files[first]).to();
+        let mut next = first + 1;
+        while next < files.len() && index_range(files[next]).from() <= end {
+            end = end.max(index_range(files[next]).to());
+            next += 1;
+        }
+        if next > first + 1 {
+            replaced.extend(files[first..next].iter().map(|entry| index_file_key(entry)));
+        }
+        first = next;
+    }
+    files.retain(|entry| !replaced.contains(&index_file_key(entry)));
 }

@@ -24,6 +24,7 @@ use arrow_array::{Int32Array, RecordBatch};
 use futures::TryStreamExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+mod lsm;
 mod search;
 
 #[tokio::test]
@@ -332,13 +333,16 @@ async fn append_only_adds_missing_ranges_and_empty_commits_do_nothing() {
 }
 
 #[tokio::test]
-async fn changed_shards_replace_fragmented_indexes_and_preserve_historical_payloads() {
+async fn triggered_merges_replace_fragments_and_preserve_historical_payloads() {
     let table = table(Some(true), false)
         .await
-        .copy_with_options(HashMap::from([(
-            "sorted-index.records-per-range".into(),
-            "4".into(),
-        )]));
+        .copy_with_options(HashMap::from([
+            ("sorted-index.records-per-range".into(), "4".into()),
+            (
+                "global-index.num-sorted-run.compaction-trigger".into(),
+                "2".into(),
+            ),
+        ]));
     let commit = TableCommit::new(table.clone(), "writer".into());
     commit
         .commit_with_identifier(messages(&table, vec![1]).await, 6)
@@ -806,7 +810,12 @@ async fn definite_conflict_replans_coverage_and_preserves_competing_indexes() {
 
 #[tokio::test]
 async fn conflicting_replacement_replans_instead_of_deleting_a_competitors_payloads() {
-    let table = table(Some(true), false).await;
+    let table = table(Some(true), false)
+        .await
+        .copy_with_options(HashMap::from([(
+            "global-index.num-sorted-run.compaction-trigger".into(),
+            "2".into(),
+        )]));
     TableCommit::new(table.clone(), "seed".into())
         .commit(messages(&table, vec![1]).await)
         .await
@@ -1203,8 +1212,8 @@ async fn native_builders_share_automatic_incremental_and_captured_snapshot_contr
     let files = indexes(&table).await;
     assert_eq!(
         files.len(),
-        2,
-        "each native index should have one current shard after maintenance"
+        4,
+        "each native index retains two append runs below the merge trigger"
     );
     let full_text = files
         .iter()

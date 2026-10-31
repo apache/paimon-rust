@@ -141,7 +141,7 @@ impl GlobalIndexBuildView {
     }
 
     /// Source filtering belongs to the caller's maintenance plan. Native
-    /// builders still plan complete shards, with all overlapping column files.
+    /// builders plan ranges with all overlapping column files.
     pub(crate) fn filter_sources(&self, mut keep: impl FnMut(&ManifestEntry) -> bool) -> Self {
         let Some(entries) = &self.source_entries else {
             return self.clone();

@@ -279,6 +279,9 @@ fn validate_user_option_keys(
                 "index.type"
                     | "global-index.row-count-per-shard"
                     | "global-index.build.parallelism"
+                    | "global-index.num-sorted-run.compaction-trigger"
+                    | "global-index.compaction.size-ratio"
+                    | "global-index.compaction.max-size-amplification-percent"
             ) {
                 return false;
             }

@@ -158,6 +158,7 @@ impl VectorSpill {
             ids: self.ids.into_std().await,
             count: self.vectors,
             dimension: self.dimension,
+            range: self.range,
         }))
     }
 }
@@ -167,6 +168,45 @@ pub(in crate::table) struct SpilledVectors {
     ids: std::fs::File,
     count: usize,
     dimension: usize,
+    range: RowRange,
+}
+
+/// A data-dependent training configuration failure, distinct from native I/O
+/// or training execution errors. Maintenance may retry a larger source unit.
+#[derive(Debug)]
+struct TrainingRequirement {
+    range: RowRange,
+    vectors: usize,
+    cause: Error,
+}
+
+impl std::fmt::Display for TrainingRequirement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} vectors in row range [{}, {}]: {}",
+            self.vectors,
+            self.range.from(),
+            self.range.to(),
+            self.cause
+        )
+    }
+}
+
+impl std::error::Error for TrainingRequirement {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.cause)
+    }
+}
+
+pub(in crate::table) fn training_range(error: &Error) -> Option<RowRange> {
+    let mut cause: &(dyn std::error::Error + 'static) = error;
+    loop {
+        if let Some(requirement) = cause.downcast_ref::<TrainingRequirement>() {
+            return Some(requirement.range.clone());
+        }
+        cause = cause.source()?;
+    }
 }
 pub(in crate::table) struct TrainedVectors {
     pub writer: VectorIndexWriter,
@@ -184,7 +224,16 @@ impl SpilledVectors {
     ) -> Result<TrainedVectors> {
         let training_vector_count =
             checked_training_vector_count(self.count, options.train_sample_ratio)?;
-        let config = options.training_config(self.count)?;
+        let config = options
+            .training_config(self.count)
+            .map_err(|cause| Error::DataInvalid {
+                message: cause.to_string(),
+                source: Some(Box::new(TrainingRequirement {
+                    range: self.range.clone(),
+                    vectors: self.count,
+                    cause,
+                })),
+            })?;
         let training_rows_retained = if timing_enabled {
             default_training_vector_count(training_vector_count, config.nlist()).unwrap_or(0)
         } else {

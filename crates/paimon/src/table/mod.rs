@@ -191,6 +191,7 @@ mod table_upsert;
 pub(crate) mod table_write;
 mod tag_manager;
 pub(crate) mod time_travel;
+mod universal_compaction;
 mod update_assignment;
 mod update_input;
 mod upsert_key_matcher;
