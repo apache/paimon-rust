@@ -464,7 +464,8 @@ async fn execute_cow_merge_inner(
                 conditions.push(format!("({prev}) IS NOT TRUE"));
             }
             if let Some(ref pred) = mc.predicate {
-                conditions.push(pred.clone());
+                // Preserve OR grouping when combined with previous-clause exclusions.
+                conditions.push(format!("({pred})"));
                 consumed_predicates.push(pred.clone());
             } else {
                 consumed_predicates.push("TRUE".to_string());
@@ -897,7 +898,8 @@ async fn build_insert_batches_inner(
             conditions.push(format!("({prev}) IS NOT TRUE"));
         }
         if let Some(ref pred) = ins.predicate {
-            conditions.push(pred.clone());
+            // Preserve OR grouping when combined with previous-clause exclusions.
+            conditions.push(format!("({pred})"));
             consumed_predicates.push(pred.clone());
         } else {
             consumed_predicates.push("TRUE".to_string());
@@ -2489,6 +2491,122 @@ mod tests {
                     (4, "fallback".to_string(), 100),
                     (5, "first".to_string(), 100),
                     (6, "second".to_string(), 100),
+                ],
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cow_merge_matched_or_predicates_preserve_clause_order() {
+        for delete_second in [false, true] {
+            let (_tmp, sql_context, table) = setup_append_only_table("t_or_matched").await;
+            for sql in [
+                "CREATE TABLE paimon.test_db.source (id INT, flag INT)",
+                "INSERT INTO paimon.test_db.source VALUES (1, 1), (2, 0), (3, NULL)",
+            ] {
+                sql_context.sql(sql).await.unwrap().collect().await.unwrap();
+            }
+
+            let second_action = if delete_second {
+                "DELETE"
+            } else {
+                "UPDATE SET name = 'second'"
+            };
+            let merge = parse_merge(&format!(
+                "MERGE INTO paimon.test_db.t_or_matched t USING paimon.test_db.source s \
+                 ON t.id = s.id \
+                 WHEN MATCHED AND s.flag = 1 THEN UPDATE SET name = 'first' \
+                 WHEN MATCHED AND s.flag = 0 OR s.flag = 1 THEN {second_action} \
+                 WHEN MATCHED THEN UPDATE SET name = 'fallback'"
+            ));
+            let result = execute_merge_into(&sql_context, &merge, table, true)
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+            assert_eq!(
+                result[0]
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .unwrap()
+                    .value(0),
+                3,
+            );
+
+            let batches = sql_context
+                .sql("SELECT id, name, value FROM paimon.test_db.t_or_matched ORDER BY id")
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+            let mut expected = vec![
+                (1, "first".to_string(), 10),
+                (3, "fallback".to_string(), 30),
+            ];
+            if !delete_second {
+                expected.insert(1, (2, "second".to_string(), 20));
+            }
+            assert_eq!(collect_rows(&batches), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_merge_insert_or_predicates_preserve_clause_order() {
+        for data_evolution in [false, true] {
+            let (_tmp, sql_context, table) = if data_evolution {
+                setup_data_evolution_table("t_or_insert").await
+            } else {
+                setup_append_only_table("t_or_insert").await
+            };
+            for sql in [
+                "CREATE TABLE paimon.test_db.source (id INT, flag INT)",
+                "INSERT INTO paimon.test_db.source VALUES (4, 1), (5, 0), (6, NULL)",
+            ] {
+                sql_context.sql(sql).await.unwrap().collect().await.unwrap();
+            }
+
+            let merge = parse_merge(
+                "MERGE INTO paimon.test_db.t_or_insert t USING paimon.test_db.source s \
+                 ON t.id = s.id \
+                 WHEN NOT MATCHED AND s.flag = 1 THEN INSERT (id, name, value) VALUES (s.id, 'first', 100) \
+                 WHEN NOT MATCHED AND s.flag = 0 OR s.flag = 1 THEN INSERT (id, name, value) VALUES (s.id, 'second', 100) \
+                 WHEN NOT MATCHED THEN INSERT (id, name, value) VALUES (s.id, 'fallback', 100)",
+            );
+            let result = execute_merge_into(&sql_context, &merge, table, true)
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+            assert_eq!(
+                result[0]
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .unwrap()
+                    .value(0),
+                3,
+            );
+
+            let batches = sql_context
+                .sql("SELECT id, name, value FROM paimon.test_db.t_or_insert ORDER BY id")
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+            assert_eq!(
+                collect_rows(&batches),
+                vec![
+                    (1, "alice".to_string(), 10),
+                    (2, "bob".to_string(), 20),
+                    (3, "charlie".to_string(), 30),
+                    (4, "first".to_string(), 100),
+                    (5, "second".to_string(), 100),
+                    (6, "fallback".to_string(), 100),
                 ],
             );
         }
