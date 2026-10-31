@@ -266,7 +266,8 @@ class TableScan:
     def with_row_position_slice(self, start: int, end: int) -> "TableScan": ...
     def with_row_position_shard(self, index: int, count: int) -> "TableScan": ...
     def with_chunk_shuffle(self, seed: str, chunk_size: int) -> "TableScan":
-        """Deterministically shuffle fixed-live-row chunks. ``seed`` is a decimal
+        """Deterministically shuffle fixed-live-row chunks; on Data Evolution
+        tables chunks count row ids. ``seed`` is a decimal
         integer string so arbitrarily large seeds keep Python ``random.Random``
         semantics."""
         ...

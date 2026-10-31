@@ -2421,8 +2421,9 @@ A `$audit_log` suffix puts `rowkind` first, followed by `_SEQUENCE_NUMBER` when
 query on the table, `_ROW_ID` included on a data-evolution table, so a column update
 returned without the row's other columns can be matched to its row. A row read file
 by file comes once per file that wrote it, and nothing in the output tells which is
-newer; to read the rows' current values, join their `_ROW_ID`s with a query on the
-table.
+newer. To read the rows' values at the end of the range, join their `_ROW_ID`s with
+the table `VERSION AS OF` the end snapshot, and filter after the join: a column a file
+did not write is NULL in that file's rows.
 
 The table name resolves in the calling session: `my_table` and `my_db.my_table`
 use the current catalog (and database), as in a `FROM` clause, and
