@@ -33,6 +33,8 @@ use crate::{Error, Result};
 use std::sync::Arc;
 
 pub(crate) mod preparation;
+#[cfg(test)]
+mod source_tests;
 pub(crate) mod vector;
 
 /// One source snapshot and its effective index coverage. Builders use this same
@@ -42,6 +44,8 @@ pub(crate) struct GlobalIndexBuildView {
     snapshot: Option<Snapshot>,
     index_entries: Arc<[IndexManifestEntry]>,
     source_entries: Option<Arc<[ManifestEntry]>>,
+    /// Original positions in `source_entries`; `None` selects every entry.
+    source_selection: Option<Arc<[usize]>>,
 }
 
 impl GlobalIndexBuildView {
@@ -63,6 +67,7 @@ impl GlobalIndexBuildView {
             snapshot: Some(snapshot),
             index_entries: entries.into(),
             source_entries: None,
+            source_selection: None,
         })
     }
 
@@ -88,6 +93,7 @@ impl GlobalIndexBuildView {
     /// retained across retries or snapshots.
     pub(crate) fn with_source_entries(mut self, entries: Arc<[ManifestEntry]>) -> Self {
         self.source_entries = Some(entries);
+        self.source_selection = None;
         self
     }
 
@@ -101,7 +107,13 @@ impl GlobalIndexBuildView {
         };
         if filter.is_none() {
             if let Some(entries) = &self.source_entries {
-                return Ok(entries.to_vec());
+                return Ok(match &self.source_selection {
+                    Some(selected) => selected
+                        .iter()
+                        .map(|&index| entries[index].clone())
+                        .collect(),
+                    None => entries.to_vec(),
+                });
             }
         }
         let mut read = table.new_read_builder();
@@ -124,6 +136,7 @@ impl GlobalIndexBuildView {
                 .cloned()
                 .collect(),
             source_entries: self.source_entries.clone(),
+            source_selection: self.source_selection.clone(),
         }
     }
 
@@ -133,17 +146,30 @@ impl GlobalIndexBuildView {
         let Some(entries) = &self.source_entries else {
             return self.clone();
         };
-        let selected = entries
-            .iter()
-            .filter(|entry| keep(entry))
-            .collect::<Vec<_>>();
-        if selected.len() == entries.len() {
+        let selected: Vec<usize> = match &self.source_selection {
+            Some(selected) => selected
+                .iter()
+                .copied()
+                .filter(|&index| keep(&entries[index]))
+                .collect(),
+            None => entries
+                .iter()
+                .enumerate()
+                .filter_map(|(index, entry)| keep(entry).then_some(index))
+                .collect(),
+        };
+        let current_len = self
+            .source_selection
+            .as_ref()
+            .map_or(entries.len(), |selected| selected.len());
+        if selected.len() == current_len {
             return self.clone();
         }
         Self {
             snapshot: self.snapshot.clone(),
             index_entries: self.index_entries.clone(),
-            source_entries: Some(selected.into_iter().cloned().collect()),
+            source_entries: Some(entries.clone()),
+            source_selection: Some(selected.into()),
         }
     }
 }
