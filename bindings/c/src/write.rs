@@ -23,11 +23,12 @@ use arrow_array::ffi::{from_ffi, FFI_ArrowArray, FFI_ArrowSchema};
 use arrow_array::{Array, RecordBatch, RecordBatchOptions, StructArray};
 use arrow_schema::{DataType as ArrowDataType, Schema as ArrowSchema};
 use paimon::resource::ResourceContext;
-use paimon::table::{PostponeBucketPlan, Table};
+use paimon::spec::CoreOptions;
+use paimon::table::{CommitMessage, PostponeBucketPlan, Table, COMMIT_MESSAGE_SERIALIZER_VERSION};
 
 use crate::error::{check_non_null, paimon_error, validate_cstr, PaimonErrorCode};
 use crate::result::{
-    paimon_result_postpone_fixed_bucket_prepare_commit,
+    paimon_result_bytes_array, paimon_result_postpone_fixed_bucket_prepare_commit,
     paimon_result_postpone_fixed_bucket_table_commit,
     paimon_result_postpone_fixed_bucket_table_write,
     paimon_result_postpone_fixed_bucket_write_builder, paimon_result_prepare_commit,
@@ -762,6 +763,7 @@ pub unsafe extern "C" fn paimon_write_builder_new_commit(
     let inner = Box::into_raw(Box::new(TableCommitState {
         commit,
         overwrite: state.overwrite,
+        is_format_table: CoreOptions::new(state.table.schema().options()).is_format_table(),
         table_location: state.table.location().to_string(),
         commit_user: state.commit_user.clone(),
     })) as *mut c_void;
@@ -851,6 +853,133 @@ pub unsafe extern "C" fn paimon_postpone_fixed_bucket_table_commit_free(
 }
 
 // ======================= CommitMessages ===============================
+
+/// Version of the Java CommitMessageSerializer bodies exported by this library.
+/// The version is not embedded in each body; transport it alongside the bytes.
+#[no_mangle]
+pub extern "C" fn paimon_commit_messages_serializer_version() -> i32 {
+    COMMIT_MESSAGE_SERIALIZER_VERSION
+}
+
+/// Export one unframed Java v14 body per message, preserving message order.
+/// Table identity, commit_user and overwrite mode are not part of the bodies.
+/// Format Table messages are unsupported. No postpone-specific handle is accepted.
+///
+/// The input handle is borrowed. The returned buffers own their bytes and must
+/// be freed with paimon_bytes_array_free, independently of the input handle.
+/// On failure, the returned array is empty and the input remains usable.
+///
+/// # Safety
+/// msgs must be a live standard message handle, or null (returns an error).
+#[no_mangle]
+pub unsafe extern "C" fn paimon_commit_messages_serialize(
+    msgs: *const paimon_commit_messages,
+) -> paimon_result_bytes_array {
+    let encode = || -> Result<Vec<Vec<u8>>, *mut paimon_error> {
+        check_non_null(msgs, "msgs")?;
+        check_non_null((*msgs).inner, "msgs.inner")?;
+        let state = &*((*msgs).inner as *const CommitMessagesState);
+        state
+            .messages
+            .iter()
+            .map(|message| message.serialize().map_err(paimon_error::from_paimon))
+            .collect()
+    };
+    match encode() {
+        Ok(bytes) => paimon_result_bytes_array {
+            bytes: paimon_bytes_array::new(bytes),
+            error: ptr::null_mut(),
+        },
+        Err(error) => paimon_result_bytes_array {
+            bytes: paimon_bytes_array::empty(),
+            error,
+        },
+    }
+}
+
+/// Import Java v14 bodies and bind them to the target standard committer.
+/// The target supplies table location, commit_user and overwrite mode; the wire
+/// bodies contain none of these. The caller must route messages to the correct
+/// table and operation. This function cannot authenticate their original context.
+/// Format Table committers are unsupported.
+///
+/// Input buffers and tc are borrowed only for this call. The returned handle
+/// owns its metadata and a copy of the context; free it with
+/// paimon_commit_messages_free. An empty list is valid. Any error returns a null
+/// handle, without changing the committer or transferring input ownership.
+///
+/// # Safety
+/// tc must be a live standard committer, or null (returns an error). For nonzero
+/// bodies_len, bodies must point to that many initialized paimon_byte_slice
+/// values, each referring to readable bytes for this call. Null, empty and
+/// oversized individual buffers return an error.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_commit_messages_deserialize(
+    tc: *const paimon_table_commit,
+    version: i32,
+    bodies: *const paimon_byte_slice,
+    bodies_len: usize,
+) -> paimon_result_prepare_commit {
+    let decode = || -> Result<CommitMessagesState, *mut paimon_error> {
+        check_non_null(tc, "tc")?;
+        check_non_null((*tc).inner, "tc.inner")?;
+        let target = &*((*tc).inner as *const TableCommitState);
+        if target.is_format_table {
+            return Err(paimon_error::new(
+                PaimonErrorCode::Unsupported,
+                "Java CommitMessage bodies cannot be imported for a Format Table".into(),
+            ));
+        }
+        if version != COMMIT_MESSAGE_SERIALIZER_VERSION {
+            return Err(paimon_error::new(
+                PaimonErrorCode::Unsupported,
+                format!("CommitMessage serializer version {version} is not supported"),
+            ));
+        }
+        if bodies_len > isize::MAX as usize / std::mem::size_of::<paimon_byte_slice>() {
+            return Err(invalid_input("oversized CommitMessage body array"));
+        }
+        let bodies = if bodies_len == 0 {
+            &[]
+        } else {
+            check_non_null(bodies, "bodies")?;
+            std::slice::from_raw_parts(bodies, bodies_len)
+        };
+        let mut messages = Vec::new();
+        for body in bodies {
+            if body.data.is_null() || body.len == 0 || body.len > isize::MAX as usize {
+                return Err(invalid_input("null, empty or oversized CommitMessage body"));
+            }
+            let mut message = CommitMessage::deserialize(
+                version,
+                std::slice::from_raw_parts(body.data, body.len),
+            )
+            .map_err(|error| invalid_input(error.to_string()))?;
+            if target.overwrite {
+                message.mark_fixed_bucket_overwrite();
+            }
+            messages.push(message);
+        }
+        Ok(CommitMessagesState {
+            messages,
+            overwrite: target.overwrite,
+            table_location: target.table_location.clone(),
+            commit_user: target.commit_user.clone(),
+        })
+    };
+    match decode() {
+        Ok(state) => paimon_result_prepare_commit {
+            messages: Box::into_raw(Box::new(paimon_commit_messages {
+                inner: Box::into_raw(Box::new(state)) as *mut c_void,
+            })),
+            error: ptr::null_mut(),
+        },
+        Err(error) => paimon_result_prepare_commit {
+            messages: ptr::null_mut(),
+            error,
+        },
+    }
+}
 
 /// Free standard commit messages.
 #[no_mangle]
@@ -1383,6 +1512,15 @@ const _: unsafe extern "C" fn(
 ) -> *mut paimon_error = paimon_postpone_fixed_bucket_write_builder_with_bucket_plan;
 const _: unsafe extern "C" fn(*mut paimon_table_write) -> paimon_result_prepare_commit =
     paimon_table_write_prepare_commit;
+const _: extern "C" fn() -> i32 = paimon_commit_messages_serializer_version;
+const _: unsafe extern "C" fn(*const paimon_commit_messages) -> paimon_result_bytes_array =
+    paimon_commit_messages_serialize;
+const _: unsafe extern "C" fn(
+    *const paimon_table_commit,
+    i32,
+    *const paimon_byte_slice,
+    usize,
+) -> paimon_result_prepare_commit = paimon_commit_messages_deserialize;
 const _: unsafe extern "C" fn(
     *mut paimon_postpone_fixed_bucket_table_write,
 ) -> paimon_result_postpone_fixed_bucket_prepare_commit =

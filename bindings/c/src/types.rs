@@ -157,7 +157,8 @@ impl paimon_bytes_array {
 }
 
 /// # Safety
-/// `array` was returned by `paimon_blob_reader_read_blobs`.
+/// `array` was returned by a Paimon C function and has not been freed.
+/// This frees every buffer and the array itself; do not free elements separately.
 #[no_mangle]
 pub unsafe extern "C" fn paimon_bytes_array_free(array: paimon_bytes_array) {
     if array.data.is_null() {
@@ -454,6 +455,7 @@ pub(crate) struct PostponeFixedBucketTableWriteState {
 pub(crate) struct TableCommitState {
     pub commit: TableCommit,
     pub overwrite: bool,
+    pub is_format_table: bool,
     pub table_location: String,
     pub commit_user: String,
 }
@@ -494,7 +496,7 @@ pub struct paimon_table_commit {
     pub inner: *mut c_void,
 }
 
-/// Opaque container for commit messages and their originating write context.
+/// Opaque container for commit messages and their write or import context.
 #[repr(C)]
 pub struct paimon_commit_messages {
     pub inner: *mut c_void,
