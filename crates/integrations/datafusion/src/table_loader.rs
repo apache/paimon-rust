@@ -147,7 +147,16 @@ pub(crate) async fn load_data_table_for_read(
 pub(crate) fn table_read_name(identifier: &Identifier, read: &Table) -> String {
     match read.branch() {
         DEFAULT_MAIN_BRANCH => format!("table '{}'", identifier.full_name()),
-        branch => format!("branch '{branch}' of table '{}'", identifier.full_name()),
+        branch => {
+            // `t$branch_b` already names the branch it reads.
+            let table = identifier
+                .table_name()
+                .unwrap_or_else(|_| identifier.object().to_string());
+            format!(
+                "branch '{branch}' of table '{}.{table}'",
+                identifier.database()
+            )
+        }
     }
 }
 

@@ -924,6 +924,77 @@ async fn test_writes_refuse_an_incremental_window() {
             "stored, {statement}: {err}"
         );
     }
+    // TRUNCATE TABLE reads no rows, so a window does not keep it from running.
+    run(&ctx, &format!("SET 'paimon.{key}' = '{window}'")).await;
+    run(&ctx, "TRUNCATE TABLE paimon.default.de").await;
+}
+
+#[tokio::test]
+async fn test_writes_and_vector_search_check_the_branch_they_read() {
+    use paimon::spec::SchemaChange;
+    use paimon::table::{BranchManager, SnapshotManager, TagManager};
+    // With a session `branch`, the target lookup of UPDATE and the reads of
+    // `vector_search` read that branch, so its options decide: here only b1
+    // stores the window, and the main branch does not.
+    let tmp = TempDir::new().unwrap();
+    let ctx = context(&tmp).await;
+    let key = "incremental-between-timestamp";
+    run(
+        &ctx,
+        &format!(
+            "CREATE TABLE paimon.default.t (id INT, embedding ARRAY<FLOAT>) WITH (
+                'row-tracking.enabled' = 'true',
+                'data-evolution.enabled' = 'true',
+                'write-only' = 'true',
+                '{key}' = '0,9999999999999'
+            )"
+        ),
+    )
+    .await;
+    run(&ctx, "INSERT INTO paimon.default.t (id) VALUES (1)").await;
+    let warehouse = catalog(&tmp);
+    let identifier = Identifier::new("default", "t");
+    let loaded = warehouse.get_table(&identifier).await.unwrap();
+    let (io, location) = (loaded.file_io().clone(), loaded.location().to_string());
+    let snapshot = SnapshotManager::new(io.clone(), location.clone())
+        .get_latest_snapshot()
+        .await
+        .unwrap()
+        .unwrap();
+    TagManager::new(io.clone(), location.clone())
+        .create("base", &snapshot)
+        .await
+        .unwrap();
+    BranchManager::new(io, location)
+        .create_branch_from_tag("b1", "base")
+        .await
+        .unwrap();
+    let unset = SchemaChange::remove_option(key.to_string());
+    warehouse
+        .alter_table(&identifier, vec![unset], false)
+        .await
+        .unwrap();
+
+    let vector_search =
+        "SELECT * FROM vector_search('paimon.default.t', 'embedding', '[1.0, 0.0]', 1)";
+    run(&ctx, vector_search).await;
+    // A name that selects the branch reads it as well.
+    let message = format!("branch 'b1' of table 'default.t', which sets scan option '{key}'");
+    for query in [
+        "SELECT * FROM vector_search('paimon.default.t$branch_b1', 'embedding', '[1.0, 0.0]', 1)",
+        "SELECT * FROM paimon_incremental_query('default.t$branch_b1', 0, 1)",
+    ] {
+        let err = expect_error(&ctx, query).await;
+        assert!(err.contains(&message), "{query}: {err}");
+    }
+    run(&ctx, "SET 'paimon.branch' = 'b1'").await;
+    for statement in [
+        "UPDATE paimon.default.t SET id = 2 WHERE id = 1",
+        vector_search,
+    ] {
+        let err = expect_error(&ctx, statement).await;
+        assert!(err.contains(&message), "{statement}: {err}");
+    }
 }
 
 #[tokio::test]
