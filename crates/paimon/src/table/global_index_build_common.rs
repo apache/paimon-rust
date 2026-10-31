@@ -26,10 +26,11 @@
 //! each builder.
 
 use crate::io::OutputFile;
-use crate::spec::{DataField, FileKind, IndexManifest};
+use crate::spec::{DataField, FileKind, IndexManifest, IndexManifestEntry, Snapshot};
 use crate::table::{merge_row_ranges, RowRange, Table};
 use crate::{Error, Result};
 use bytes::Bytes;
+use std::collections::HashSet;
 use std::path::Path;
 use tokio::io::AsyncReadExt;
 
@@ -37,6 +38,28 @@ pub(crate) mod preparation;
 pub(crate) mod vector;
 
 const COPY_BUFFER_SIZE: usize = 1024 * 1024;
+
+pub(crate) type IndexFileKey = (Vec<u8>, i32, String);
+
+pub(crate) fn index_file_key(entry: &IndexManifestEntry) -> IndexFileKey {
+    (
+        entry.partition.clone(),
+        entry.bucket,
+        entry.index_file.file_name.clone(),
+    )
+}
+
+/// An automatic round fixes one source snapshot for every index definition.
+/// Capturing an empty view also validates builder configuration without I/O.
+pub(super) async fn build_snapshot(
+    table: &Table,
+    captured: Option<&Option<Snapshot>>,
+) -> Result<Option<Snapshot>> {
+    match captured {
+        Some(snapshot) => Ok(snapshot.clone()),
+        None => table.snapshot_manager().get_latest_snapshot().await,
+    }
+}
 
 /// Validate the table that owns global row IDs. Procedure options only tune
 /// index generation; they cannot enable row tracking or change bucket layout.
@@ -184,6 +207,7 @@ pub(crate) async fn indexed_row_ranges(
     index_type: &str,
     index_field_id: i32,
     extra_field_ids: Option<&[i32]>,
+    replaced: &HashSet<IndexFileKey>,
 ) -> Result<Vec<RowRange>> {
     let Some(index_manifest_name) = index_manifest_name else {
         return Ok(Vec::new());
@@ -196,7 +220,10 @@ pub(crate) async fn indexed_row_ranges(
     let entries = IndexManifest::read(table.file_io(), &path).await?;
     let mut ranges = Vec::new();
     for entry in entries {
-        if entry.kind != FileKind::Add || entry.index_file.index_type != index_type {
+        if entry.kind != FileKind::Add
+            || entry.index_file.index_type != index_type
+            || replaced.contains(&index_file_key(&entry))
+        {
             continue;
         }
         let Some(meta) = entry.index_file.global_index_meta else {
@@ -225,6 +252,7 @@ pub(crate) async fn validate_existing_index_overlap(
     index_field_id: i32,
     extra_field_ids: Option<&[i32]>,
     planned: &[RowRange],
+    replaced: &HashSet<IndexFileKey>,
 ) -> Result<()> {
     let Some(index_manifest_name) = index_manifest_name else {
         return Ok(());
@@ -236,7 +264,10 @@ pub(crate) async fn validate_existing_index_overlap(
     );
     let entries = IndexManifest::read(table.file_io(), &path).await?;
     for entry in entries {
-        if entry.kind != FileKind::Add || entry.index_file.index_type != index_type {
+        if entry.kind != FileKind::Add
+            || entry.index_file.index_type != index_type
+            || replaced.contains(&index_file_key(&entry))
+        {
             continue;
         }
         let Some(meta) = entry.index_file.global_index_meta else {

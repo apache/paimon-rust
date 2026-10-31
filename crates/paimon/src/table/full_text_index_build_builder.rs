@@ -53,6 +53,9 @@ pub(super) struct FullTextIndexBuildBuilder<'a> {
     index_column: Option<String>,
     options: HashMap<String, String>,
     pub(super) partition_filter: Option<Predicate>,
+    pub(super) snapshot: Option<Option<crate::spec::Snapshot>>,
+    pub(super) replaced_index_files:
+        std::collections::HashSet<super::global_index_build_common::IndexFileKey>,
 }
 
 impl<'a> FullTextIndexBuildBuilder<'a> {
@@ -62,6 +65,8 @@ impl<'a> FullTextIndexBuildBuilder<'a> {
             index_column: None,
             options: HashMap::new(),
             partition_filter: None,
+            snapshot: None,
+            replaced_index_files: Default::default(),
         }
     }
 
@@ -110,10 +115,10 @@ impl<'a> FullTextIndexBuildBuilder<'a> {
         full_text_config(&native_options)?;
         let index_meta = serialize_index_meta(&native_options)?;
 
-        // The table's manager resolves a REST-managed table's latest snapshot
-        // through the catalog, like reads and commit validation do.
-        let snapshot_manager = self.table.snapshot_manager();
-        let Some(snapshot) = snapshot_manager.get_latest_snapshot().await? else {
+        let Some(snapshot) =
+            super::global_index_build_common::build_snapshot(self.table, self.snapshot.as_ref())
+                .await?
+        else {
             return Ok((None, vec![]));
         };
 
@@ -132,6 +137,7 @@ impl<'a> FullTextIndexBuildBuilder<'a> {
             FULL_TEXT_GLOBAL_INDEX_TYPE,
             index_field.id(),
             None,
+            &self.replaced_index_files,
         )
         .await?;
         let shards = plan_vector_index_shards(
@@ -159,6 +165,7 @@ impl<'a> FullTextIndexBuildBuilder<'a> {
                 .iter()
                 .map(|shard| RowRange::new(shard.row_range_start, shard.row_range_end))
                 .collect::<Vec<_>>(),
+            &self.replaced_index_files,
         )
         .await?;
 

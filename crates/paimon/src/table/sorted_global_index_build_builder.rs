@@ -70,6 +70,9 @@ pub(super) struct SortedGlobalIndexBuildBuilder<'a> {
     index_type: String,
     options: HashMap<String, String>,
     partition_filter: Option<Predicate>,
+    pub(super) snapshot: Option<Option<crate::spec::Snapshot>>,
+    pub(super) replaced_index_files:
+        std::collections::HashSet<super::global_index_build_common::IndexFileKey>,
 }
 
 impl<'a> SortedGlobalIndexBuildBuilder<'a> {
@@ -80,6 +83,8 @@ impl<'a> SortedGlobalIndexBuildBuilder<'a> {
             index_type: BTREE_GLOBAL_INDEX_TYPE.to_string(),
             options: HashMap::new(),
             partition_filter: None,
+            snapshot: None,
+            replaced_index_files: Default::default(),
         }
     }
 
@@ -178,7 +183,10 @@ impl<'a> SortedGlobalIndexBuildBuilder<'a> {
             .collect::<Vec<_>>();
         let extra_field_ids = (!extra_field_ids.is_empty()).then_some(extra_field_ids);
 
-        let Some(snapshot) = self.table.snapshot_manager().get_latest_snapshot().await? else {
+        let Some(snapshot) =
+            super::global_index_build_common::build_snapshot(self.table, self.snapshot.as_ref())
+                .await?
+        else {
             return Ok((None, vec![]));
         };
 
@@ -197,6 +205,7 @@ impl<'a> SortedGlobalIndexBuildBuilder<'a> {
             index_type,
             index_field.id(),
             extra_field_ids.as_deref(),
+            &self.replaced_index_files,
         )
         .await?;
 
@@ -224,6 +233,7 @@ impl<'a> SortedGlobalIndexBuildBuilder<'a> {
                 .iter()
                 .map(|shard| RowRange::new(shard.row_range_start, shard.row_range_end))
                 .collect::<Vec<_>>(),
+            &self.replaced_index_files,
         )
         .await?;
 
