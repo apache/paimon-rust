@@ -55,7 +55,7 @@ use crate::table::{datafusion_read_fields, PaimonTableProvider};
 use crate::table_function_args::{
     extract_int_literal, extract_string_literal, parse_table_identifier,
 };
-use crate::table_loader::load_data_table_for_read;
+use crate::table_loader::{ensure_no_incremental_window, load_data_table_for_read};
 use crate::DynamicOptions;
 
 const FUNCTION_NAME: &str = "vector_search";
@@ -146,27 +146,24 @@ impl TableFunctionImpl for VectorSearchFunction {
                     table
                 } else {
                     table
-                        .copy_with_time_travel(dynamic_options)
+                        .copy_with_time_travel(dynamic_options.clone())
                         .await
                         .map_err(to_datafusion_error)?
                 };
+                // The index is searched at one snapshot, while a read with a
+                // timestamp window returns that window's changes, which can
+                // hold a row once per file that wrote it, some of its columns
+                // NULL.
+                ensure_no_incremental_window(
+                    &format!("{FUNCTION_NAME} searches one snapshot and cannot run"),
+                    &dynamic_options,
+                    &identifier,
+                    &table,
+                )?;
                 Ok::<_, DataFusionError>(table)
             },
             "vector_search: catalog access thread panicked",
         )?;
-        // The index is searched at one snapshot, while a read with a timestamp
-        // window returns that window's changes, which can hold a row once per
-        // file that wrote it, some of its columns NULL.
-        if !matches!(
-            CoreOptions::new(table.schema().options()).incremental_timestamp_window(),
-            Ok(None)
-        ) {
-            let key = "incremental-between-timestamp";
-            return Err(DataFusionError::Plan(format!(
-                "{FUNCTION_NAME} searches one snapshot and cannot run while scan option \
-                 '{key}' is set; RESET 'paimon.{key}' first"
-            )));
-        }
 
         let inner = PaimonTableProvider::try_new(table)?;
         let query_vector_json =

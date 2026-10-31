@@ -1609,13 +1609,12 @@ impl SQLContext {
     }
 
     /// Reject latest-table statement executors while a session-level
-    /// time-travel selector or incremental timestamp window is active.
+    /// time-travel selector is active.
     ///
     /// These executors load the latest catalog table, while session reads
-    /// resolve the selected snapshot schema, or return a window's changes
-    /// instead of the table's rows. Silently ignoring the selector here would
-    /// be inconsistent. Ordinary INSERT uses the resolved provider and its
-    /// selected schema, so it does not need this guard.
+    /// resolve the selected snapshot schema. Silently ignoring the selector
+    /// here would be inconsistent. Ordinary INSERT uses the resolved provider
+    /// and its selected schema, so it does not need this guard.
     fn ensure_no_time_travel_for_write(&self, operation: &str) -> DFResult<()> {
         use paimon::spec::{
             SCAN_SNAPSHOT_ID_OPTION, SCAN_TAG_NAME_OPTION, SCAN_TIMESTAMP_MILLIS_OPTION,
@@ -1638,17 +1637,33 @@ impl SQLContext {
                 )));
             }
         }
-        if !matches!(
-            CoreOptions::new(&options).incremental_timestamp_window(),
-            Ok(None)
-        ) {
-            let key = "incremental-between-timestamp";
-            return Err(DataFusionError::Plan(format!(
-                "Cannot execute {operation} while scan option '{key}' is set; \
-                 RESET 'paimon.{key}' first"
-            )));
-        }
         Ok(())
+    }
+
+    /// Reject UPDATE, DELETE and MERGE INTO while the query that finds their
+    /// target rows, a read of `table` in this session, would return the
+    /// changes of an incremental timestamp window: the write would change
+    /// rows by versions the table no longer holds.
+    async fn ensure_target_lookup_reads_rows(
+        &self,
+        identifier: &Identifier,
+        table: &paimon::table::Table,
+        operation: &str,
+    ) -> DFResult<()> {
+        let statement = format!("Cannot execute {operation}");
+        let options = self.dynamic_options.read().unwrap().clone();
+        if options.is_empty() {
+            return crate::table_loader::ensure_no_incremental_window(
+                &statement, &options, identifier, table,
+            );
+        }
+        // The lookup's provider applies the session's options to the table, a
+        // session `branch` among them, so check the table it reads.
+        let read = table
+            .copy_with_time_travel(options.clone())
+            .await
+            .map_err(to_datafusion_error)?;
+        crate::table_loader::ensure_no_incremental_window(&statement, &options, identifier, &read)
     }
 
     async fn handle_merge_into(
@@ -1672,6 +1687,8 @@ impl SQLContext {
             .get_table(&identifier)
             .await
             .map_err(to_datafusion_error)?;
+        self.ensure_target_lookup_reads_rows(&identifier, &table, "MERGE INTO")
+            .await?;
 
         crate::merge_into::execute_merge_into(self, merge, table, enable_ident_normalization).await
     }
@@ -1697,6 +1714,8 @@ impl SQLContext {
             .get_table(&identifier)
             .await
             .map_err(to_datafusion_error)?;
+        self.ensure_target_lookup_reads_rows(&identifier, &table, "UPDATE")
+            .await?;
 
         crate::update::execute_update(self, update, table, enable_ident_normalization).await
     }
@@ -1725,6 +1744,8 @@ impl SQLContext {
             .get_table(&identifier)
             .await
             .map_err(to_datafusion_error)?;
+        self.ensure_target_lookup_reads_rows(&identifier, &table, "DELETE")
+            .await?;
 
         let table_ref = table_name.to_string();
         crate::delete::execute_delete(self, delete, table, &table_ref).await

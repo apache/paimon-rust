@@ -59,7 +59,7 @@ use crate::table::{
 use crate::table_function_args::{
     extract_int_literal, extract_string_literal, parse_table_identifier,
 };
-use crate::table_loader::load_data_table_for_read;
+use crate::table_loader::{ensure_no_incremental_window, load_data_table_for_read};
 
 const FUNCTION_NAME: &str = "hybrid_search";
 const SEARCH_SCORE_COLUMN: &str = "__paimon_search_score";
@@ -133,7 +133,19 @@ impl TableFunctionImpl for HybridSearchFunction {
             parse_table_identifier(FUNCTION_NAME, &table_name, &self.default_database)?;
         let catalog = Arc::clone(&self.catalog);
         let table = block_on_with_runtime(
-            async move { load_data_table_for_read(&catalog, &identifier, FUNCTION_NAME).await },
+            async move {
+                let table = load_data_table_for_read(&catalog, &identifier, FUNCTION_NAME).await?;
+                // The indexes are searched at one snapshot, while a window
+                // stored on the table would make the read of their hits return
+                // that window's changes. Session options do not apply here.
+                ensure_no_incremental_window(
+                    &format!("{FUNCTION_NAME} searches one snapshot and cannot run"),
+                    &HashMap::new(),
+                    &identifier,
+                    &table,
+                )?;
+                Ok::<_, DataFusionError>(table)
+            },
             "hybrid_search: catalog access thread panicked",
         )?;
 

@@ -58,7 +58,6 @@ use datafusion::physical_plan::{
 };
 use datafusion::prelude::SessionContext;
 use futures::{stream, StreamExt, TryStreamExt};
-use paimon::catalog::DEFAULT_MAIN_BRANCH;
 use paimon::resource::ResourceContext;
 use paimon::spec::{CoreOptions, DataField};
 use paimon::table::{
@@ -76,7 +75,7 @@ use crate::table::{datafusion_arrow_schema, datafusion_read_fields};
 use crate::table_function_args::{
     extract_int_literal, extract_string_literal, resolve_table_argument,
 };
-use crate::table_loader::load_data_table_for_read;
+use crate::table_loader::{load_data_table_for_read, table_read_name};
 
 const FUNCTION_NAME: &str = "paimon_incremental_query";
 const AUDIT_LOG_SUFFIX: &str = "$audit_log";
@@ -194,12 +193,7 @@ impl TableFunctionImpl for IncrementalQueryFunction {
                 // Checked on the table read: a session `branch` reads that
                 // branch, with that branch's options.
                 ensure_no_range_options(table.schema().options(), |key| {
-                    let read = match table.branch() {
-                        DEFAULT_MAIN_BRANCH => format!("table '{}'", identifier.full_name()),
-                        branch => {
-                            format!("branch '{branch}' of table '{}'", identifier.full_name())
-                        }
-                    };
+                    let read = table_read_name(&identifier, &table);
                     format!(
                         "{FUNCTION_NAME} reads the range its arguments give and cannot run on \
                          {read}, which sets scan option '{key}'"
