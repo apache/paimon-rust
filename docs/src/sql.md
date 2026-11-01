@@ -1851,6 +1851,8 @@ functions, rather than the full Java regex dialect. No match or an unmatched
 optional group produces an empty string; no matches for `regexp_extract_all`
 produce an empty list. Null arguments produce null. Invalid patterns, negative
 or out-of-range group indices, and date arithmetic overflow produce errors.
+SHA-2 and Base64 preserve raw bytes across Arrow binary representations,
+including dictionary encodings and null dictionary values.
 
 The timestamp aliases retain DataFusion semantics: optional formats are Chrono
 strftime strings, not Spark/Java patterns; numeric `to_timestamp_ltz` inputs

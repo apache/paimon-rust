@@ -59,10 +59,68 @@ async fn mod_preserves_numeric_remainder_and_null_semantics() {
             "mod(5.5, 2.0) = 5.5 % 2.0",
             "mod(CAST(7 AS BIGINT), 3) = 1",
             "mod(CAST(NULL AS BIGINT), 2) IS NULL",
+            "mod(NULL, 2) IS NULL",
+            "mod(2, NULL) IS NULL",
         ],
     )
     .await;
     assert_error(&ctx, "mod(1, 0)", "zero").await;
+}
+
+#[tokio::test]
+async fn mod_matches_native_remainder_decimal_coercion() {
+    let ctx = SQLContext::new();
+    for (left, right) in [
+        ("CAST(5.55 AS DECIMAL(10,2))", "CAST(2.1 AS DECIMAL(4,1))"),
+        (
+            "CAST('12345678901234567890123456789012345678' AS DECIMAL(38,0))",
+            "CAST('0.1' AS DECIMAL(38,1))",
+        ),
+        ("CAST(5.55 AS DECIMAL(10,2))", "CAST(2.1 AS DOUBLE)"),
+        ("CAST(5.55 AS DECIMAL(10,2))", "CAST(2 AS BIGINT)"),
+    ] {
+        let sql = format!("SELECT mod({left}, {right}) AS actual, {left} % {right} AS expected");
+        let batches = ctx.sql(&sql).await.unwrap().collect().await.unwrap();
+        let batch = &batches[0];
+        assert_eq!(
+            batch.column(0).data_type(),
+            batch.column(1).data_type(),
+            "{sql}"
+        );
+        assert_eq!(
+            ScalarValue::try_from_array(batch.column(0), 0).unwrap(),
+            ScalarValue::try_from_array(batch.column(1), 0).unwrap(),
+            "{sql}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn date_sub_null_days_do_not_parse_rejected_strings() {
+    let ctx = SQLContext::new();
+    assert_true(
+        &ctx,
+        &["date_sub('not-a-date', CAST(NULL AS BIGINT)) IS NULL"],
+    )
+    .await;
+    let batches = ctx
+        .sql(
+            "SELECT date_sub(d, days) FROM (VALUES \
+        ('not-a-date', CAST(NULL AS BIGINT)), ('2024-03-01', CAST(1 AS BIGINT))) AS t(d, days)",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        ScalarValue::try_from_array(batches[0].column(0), 0).unwrap(),
+        ScalarValue::Date32(None)
+    );
+    assert_eq!(
+        ScalarValue::try_from_array(batches[0].column(0), 1).unwrap(),
+        ScalarValue::Date32(Some(19782))
+    );
 }
 
 #[tokio::test]
@@ -153,6 +211,7 @@ async fn sha2_and_base64_preserve_padding_binary_and_null_contracts() {
             "length(sha2('abc', 512)) = 128",
             "sha2('abc', 123) IS NULL",
             "sha2(NULL, 256) IS NULL",
+            "sha2('abc', NULL) IS NULL",
             "sha2(decode('616263', 'hex'), 256) = sha2('abc', 256)",
             "to_base64('f') = 'Zg=='",
             "to_base64('fo') = 'Zm8='",
@@ -163,6 +222,61 @@ async fn sha2_and_base64_preserve_padding_binary_and_null_contracts() {
         ],
     )
     .await;
+}
+
+#[tokio::test]
+async fn binary_encoding_preserves_non_utf8_bytes_across_arrow_types() {
+    let ctx = SQLContext::new();
+    assert_true(&ctx, &[
+        "sha2(decode('00ff', 'hex'), CAST(256 AS INT)) = sha2(decode('00ff', 'hex'), 256)",
+        "to_base64(arrow_cast(decode('00ff', 'hex'), 'LargeBinary')) = 'AP8='",
+        "to_base64(arrow_cast(decode('00ff', 'hex'), 'BinaryView')) = 'AP8='",
+        "to_base64(arrow_cast(decode('00ff', 'hex'), 'FixedSizeBinary(2)')) = 'AP8='",
+        "sha2(arrow_cast(decode('00ff', 'hex'), 'LargeBinary'), 256) = sha2(decode('00ff', 'hex'), 256)",
+        "sha2(arrow_cast(decode('00ff', 'hex'), 'BinaryView'), 256) = sha2(decode('00ff', 'hex'), 256)",
+    ]).await;
+}
+
+#[tokio::test]
+async fn binary_encoding_preserves_dictionary_bytes_and_value_nulls() {
+    use datafusion::arrow::array::{Array, BinaryArray, DictionaryArray, Int8Array, RecordBatch};
+    use datafusion::arrow::datatypes::{Field, Int8Type, Schema};
+    use std::sync::Arc;
+    let ctx = SQLContext::new();
+    let values = Arc::new(BinaryArray::from(vec![Some(&[0_u8, 255][..]), None]));
+    let encoded =
+        DictionaryArray::<Int8Type>::try_new(Int8Array::from(vec![Some(0), Some(1), None]), values)
+            .unwrap();
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "bytes",
+        encoded.data_type().clone(),
+        true,
+    )]));
+    ctx.ctx()
+        .register_batch(
+            "encoded_bytes",
+            RecordBatch::try_new(schema, vec![Arc::new(encoded)]).unwrap(),
+        )
+        .unwrap();
+    let batches = ctx.sql("SELECT to_base64(bytes), sha2(bytes, 256), sha2(decode('00ff', 'hex'), 256) FROM encoded_bytes")
+        .await.unwrap().collect().await.unwrap();
+    let batch = &batches[0];
+    assert_eq!(
+        ScalarValue::try_from_array(batch.column(0), 0).unwrap(),
+        ScalarValue::Utf8(Some("AP8=".into()))
+    );
+    assert_eq!(
+        ScalarValue::try_from_array(batch.column(1), 0).unwrap(),
+        ScalarValue::try_from_array(batch.column(2), 0).unwrap()
+    );
+    for row in [1, 2] {
+        for column in [0, 1] {
+            assert_eq!(
+                ScalarValue::try_from_array(batch.column(column), row).unwrap(),
+                ScalarValue::Utf8(None)
+            );
+        }
+    }
 }
 
 #[tokio::test]

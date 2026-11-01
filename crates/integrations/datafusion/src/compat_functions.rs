@@ -25,11 +25,13 @@ use datafusion::arrow::array::{
 use datafusion::arrow::compute::{cast, kernels::numeric};
 use datafusion::arrow::datatypes::{DataType, Field, FieldRef};
 use datafusion::common::config::ConfigOptions;
+use datafusion::common::types::{logical_int64, logical_string, NativeType};
 use datafusion::common::{DataFusionError, Result, ScalarValue};
 use datafusion::logical_expr::simplify::{ExprSimplifyResult, SimplifyContext};
+use datafusion::logical_expr::type_coercion::binary::BinaryTypeCoercer;
 use datafusion::logical_expr::{
-    ColumnarValue, Expr, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature,
-    TypeSignature, Volatility,
+    Coercion, ColumnarValue, Expr, Operator, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDF,
+    ScalarUDFImpl, Signature, TypeSignature, TypeSignatureClass, Volatility,
 };
 use datafusion::prelude::SessionContext;
 use regex::Regex;
@@ -55,7 +57,7 @@ pub(crate) fn register_compat_functions(ctx: &SessionContext) {
         Kind::ToBase64,
     ] {
         let signature = match kind {
-            Kind::Mod => Signature::numeric(2, Volatility::Immutable),
+            Kind::Mod => Signature::user_defined(Volatility::Immutable),
             Kind::DateSub => Signature::one_of(
                 vec![
                     TypeSignature::Exact(vec![DataType::Date32, DataType::Int64]),
@@ -71,17 +73,32 @@ pub(crate) fn register_compat_functions(ctx: &SessionContext) {
                 Volatility::Immutable,
             ),
             Kind::Sha2 => Signature::one_of(
-                vec![
-                    TypeSignature::Exact(vec![DataType::Utf8, DataType::Int64]),
-                    TypeSignature::Exact(vec![DataType::Binary, DataType::Int64]),
-                ],
+                [
+                    TypeSignatureClass::Native(logical_string()),
+                    TypeSignatureClass::Binary,
+                ]
+                .into_iter()
+                .map(|input| {
+                    TypeSignature::Coercible(vec![
+                        Coercion::new_exact(input),
+                        Coercion::new_implicit(
+                            TypeSignatureClass::Native(logical_int64()),
+                            vec![TypeSignatureClass::Integer],
+                            NativeType::Int64,
+                        ),
+                    ])
+                })
+                .collect(),
                 Volatility::Immutable,
             ),
             Kind::ToBase64 => Signature::one_of(
-                vec![
-                    TypeSignature::Exact(vec![DataType::Utf8]),
-                    TypeSignature::Exact(vec![DataType::Binary]),
-                ],
+                [
+                    TypeSignatureClass::Native(logical_string()),
+                    TypeSignatureClass::Binary,
+                ]
+                .into_iter()
+                .map(|input| TypeSignature::Coercible(vec![Coercion::new_exact(input)]))
+                .collect(),
                 Volatility::Immutable,
             ),
         };
@@ -157,9 +174,21 @@ impl ScalarUDFImpl for CompatFunction {
     fn signature(&self) -> &Signature {
         &self.signature
     }
+    fn coerce_types(&self, types: &[DataType]) -> Result<Vec<DataType>> {
+        let [left, right] = types else {
+            return Err(DataFusionError::Plan("mod expects two arguments".into()));
+        };
+        let (left, right) =
+            BinaryTypeCoercer::new(left, &Operator::Modulo, right).get_input_types()?;
+        Ok(vec![left, right])
+    }
     fn return_type(&self, types: &[DataType]) -> Result<DataType> {
+        if self.kind == Kind::Mod {
+            return BinaryTypeCoercer::new(&types[0], &Operator::Modulo, &types[1])
+                .get_result_type();
+        }
         Ok(match self.kind {
-            Kind::Mod => types[0].clone(),
+            Kind::Mod => unreachable!("handled above"),
             Kind::DateSub => DataType::Date32,
             Kind::RegexpExtractAll => {
                 DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)))
@@ -199,23 +228,35 @@ impl ScalarUDFImpl for CompatFunction {
                 extract_regex(&arrays, self.kind == Kind::RegexpExtractAll)?
             }
             Kind::Sha2 | Kind::ToBase64 => {
+                // Preserve the byte family during planning, then normalize its
+                // Arrow representation without decoding binary data as UTF-8.
+                let input_type = if NativeType::from(arrays[0].data_type()).is_binary() {
+                    DataType::Binary
+                } else {
+                    DataType::Utf8
+                };
+                let input = cast(&arrays[0], &input_type)?;
                 let mut result = StringBuilder::new();
                 for row in 0..arrays[0].len() {
-                    if arrays.iter().any(|array| array.is_null(row)) {
+                    if input.is_null(row)
+                        || arrays
+                            .iter()
+                            .skip(1)
+                            .any(|array| array.data_type() == &DataType::Null || array.is_null(row))
+                    {
                         result.append_null();
                         continue;
                     }
-                    let bytes =
-                        if let Some(array) = arrays[0].as_any().downcast_ref::<BinaryArray>() {
-                            array.value(row)
-                        } else {
-                            arrays[0]
-                                .as_any()
-                                .downcast_ref::<StringArray>()
-                                .ok_or_else(|| error("expected string or binary"))?
-                                .value(row)
-                                .as_bytes()
-                        };
+                    let bytes = if let Some(array) = input.as_any().downcast_ref::<BinaryArray>() {
+                        array.value(row)
+                    } else {
+                        input
+                            .as_any()
+                            .downcast_ref::<StringArray>()
+                            .ok_or_else(|| error("expected string or binary"))?
+                            .value(row)
+                            .as_bytes()
+                    };
                     if self.kind == Kind::ToBase64 {
                         result
                             .append_value(base64::engine::general_purpose::STANDARD.encode(bytes));
