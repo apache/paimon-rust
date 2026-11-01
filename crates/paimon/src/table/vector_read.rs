@@ -90,15 +90,11 @@ impl BatchVectorRead {
         let reader = if targets_primary_key_column(table, column) {
             let pk_col = core.single_vector_index_column()?;
             PkVectorSearchParams::validate_inputs(table, filter, &pk_col, queries, limit)?;
-            VectorReadKind::PrimaryKey(Box::new(
-                PkVectorRead::new(table, options, filter, &pk_col, queries, limit)
-                    .with_vector_index_type(context.vector_index_type.clone()),
-            ))
+            VectorReadKind::PrimaryKey(Box::new(PkVectorRead::new(
+                table, options, filter, &pk_col, queries, limit,
+            )))
         } else {
-            VectorReadKind::DataEvolution(
-                DeVectorRead::new(column, queries, limit, options)?
-                    .with_vector_index_type(context.vector_index_type.clone()),
-            )
+            VectorReadKind::DataEvolution(DeVectorRead::new(column, queries, limit, options)?)
         };
         Ok(Self {
             context,

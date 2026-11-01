@@ -242,7 +242,6 @@ async fn empty_vector_level_is_persisted_reused_and_searchable() {
     commit.commit_compact(first).await.unwrap();
     let result = table
         .new_vector_search_builder()
-        .with_vector_index_type("embedding", "invalid-unused-type")
         .with_vector_column("embedding")
         .with_query_vector(vec![0., 0.])
         .with_limit(1)

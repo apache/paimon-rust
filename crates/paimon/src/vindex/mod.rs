@@ -266,6 +266,30 @@ fn compile_training_config(
     })
 }
 
+/// The generic build API accepts a complete table option map. Native parameters
+/// remain scoped to this implementation/column; qualified typos still reach the
+/// strict validator, while unrelated table properties stay in the captured plan.
+pub(crate) fn build_parameters(
+    options: &HashMap<String, String>,
+    kind: &str,
+    column: &str,
+) -> HashMap<String, String> {
+    let prefix = format!("{kind}.");
+    let field = format!("fields.{column}.");
+    options
+        .iter()
+        .filter(|(key, _)| {
+            key.starts_with(&prefix)
+                || native_option_key(key).is_some()
+                || matches!(key.as_str(), "index.type" | "vindex.build.granule.enabled")
+                || key.strip_prefix(&field).is_some_and(|suffix| {
+                    native_option_key(suffix).is_some() || suffix == "train.sample-ratio"
+                })
+        })
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
 fn validate_user_option_keys(
     options: &HashMap<String, String>,
     index_type: &str,

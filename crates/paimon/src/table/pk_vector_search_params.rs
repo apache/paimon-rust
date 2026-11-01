@@ -96,7 +96,6 @@ impl PkVectorSearchParams {
         Ok(field)
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn resolve(
         table: &Table,
         query_options: &HashMap<String, String>,
@@ -105,7 +104,6 @@ impl PkVectorSearchParams {
         queries: &[&[f32]],
         limit: usize,
         metadata_type: Option<&str>,
-        raw_type: Option<&str>,
     ) -> crate::Result<Self> {
         let vector_field = Self::validate_inputs(table, filter, column, queries, limit)?;
         let core = CoreOptions::new(table.schema().options());
@@ -113,15 +111,12 @@ impl PkVectorSearchParams {
             table.schema().options(),
             query_options,
             column,
-            metadata_type.or(raw_type),
+            metadata_type,
             true,
         )?;
         let mut vector_options = configuration.resolved;
         // Like Java, persisted PK payloads are checked against the table metric.
-        // The Native hint affects only fallback when no valid payload exists.
-        if metadata_type.is_some() || raw_type.is_none() {
-            vector_options.metric = configuration.table_metric;
-        }
+        vector_options.metric = configuration.table_metric;
         let metric = VectorSearchMetric::parse(&vector_options.metric)?;
         let refine_factor = if let Some(kind) = vector_options.index_type.as_deref() {
             resolved_refine_factor(

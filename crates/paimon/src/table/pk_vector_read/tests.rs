@@ -947,17 +947,9 @@ async fn reader_uses_planned_splits_after_index_manifest_is_removed() {
     let table = build_committed_pk_vector_table(&[[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]]).await;
     let options = HashMap::new();
     let query = [0.0, 1.0];
-    let params = PkVectorSearchParams::resolve(
-        &table,
-        &options,
-        None,
-        "embedding",
-        &[&query],
-        2,
-        None,
-        None,
-    )
-    .unwrap();
+    let params =
+        PkVectorSearchParams::resolve(&table, &options, None, "embedding", &[&query], 2, None)
+            .unwrap();
     let scan =
         crate::table::pk_vector_scan::PkVectorScan::new(&table, params.vector_field.id(), None);
     let read = PkVectorRead::new(&table, &options, None, "embedding", &[&query], 2);

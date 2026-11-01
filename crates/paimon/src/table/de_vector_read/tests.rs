@@ -246,7 +246,13 @@ fn scheduled_vector_transport_restores_one_shared_raw_filter_per_bitmap() {
         .collect::<Vec<_>>();
     for search in &mut searches {
         search.set_shared_include_row_ids(Arc::clone(&shared));
-        search.index_type = Some("diskann".into());
+        search.options = HashMap::from([
+            (
+                "global-index.diskann.index-columns".into(),
+                "embedding".into(),
+            ),
+            ("opaque.parameter".into(), "unchanged".into()),
+        ]);
     }
     let wire = TaskVectorQueries::capture(&searches).unwrap();
     assert_eq!(
@@ -255,10 +261,10 @@ fn scheduled_vector_transport_restores_one_shared_raw_filter_per_bitmap() {
         "encode a shared bitmap once per query batch"
     );
     let restored = wire.restore().unwrap();
-    assert!(restored
-        .iter()
-        .all(|search| search.index_type.as_deref() == Some("diskann")
-            && !search.options.contains_key("index_type")));
+    assert!(restored.iter().all(
+        |search| search.options["global-index.diskann.index-columns"] == "embedding"
+            && search.options["opaque.parameter"] == "unchanged"
+    ));
     let restored_shared = shared_batch_include_row_ids(&restored).unwrap();
     assert_eq!(restored_shared.as_ref(), shared.as_ref());
     let scoring = RawScoringPlan::new(&restored, RawVectorMetric::L2);

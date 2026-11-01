@@ -176,6 +176,47 @@ pub(super) fn field_index_options(
         .collect())
 }
 
+/// A procedure JSON object replaces that field's schema object before parsing.
+/// Flat procedure parameters keep their own precedence layer and cannot create
+/// false conflicts with legacy JSON in the table source.
+pub(super) fn build_table_options(
+    table: &HashMap<String, String>,
+    user: &HashMap<String, String>,
+    column: &str,
+) -> HashMap<String, String> {
+    let mut effective = table.clone();
+    let prefix = format!("fields.{column}.");
+    effective.extend(
+        user.iter()
+            .filter(|(key, _)| {
+                key.starts_with(&prefix)
+                    && (key.ends_with(".index-options") || key.ends_with(".index.options"))
+            })
+            .map(|(key, value)| (key.clone(), value.clone())),
+    );
+    effective
+}
+
+/// Parse a procedure's original option map without treating table properties as
+/// native vector parameters. Keep the original map in captured build plans.
+pub(super) fn build_options(
+    options: &HashMap<String, String>,
+    column: &str,
+    kind: &str,
+) -> Result<HashMap<String, String>> {
+    let core = CoreOptions::new(options);
+    if crate::vindex::is_vindex_index_type(kind) {
+        let resolved = core.vector_index_options(
+            Some(kind),
+            column,
+            declares_column(options, column, "vector"),
+        )?;
+        Ok(resolved.options)
+    } else {
+        core.global_index_options(kind, column)
+    }
+}
+
 pub(super) fn declares_column(
     options: &HashMap<String, String>,
     column: &str,

@@ -75,9 +75,7 @@ impl GlobalIndexBuildView {
     pub(super) async fn resolve(table: &Table, captured: Option<&Self>) -> Result<Self> {
         match captured {
             Some(view) => Ok(view.clone()),
-            None => {
-                Self::capture(table, table.snapshot_manager().get_latest_snapshot().await?).await
-            }
+            None => Self::capture(table, table.resolve_read_snapshot().await?).await,
         }
     }
 

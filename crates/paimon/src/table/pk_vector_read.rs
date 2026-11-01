@@ -61,7 +61,6 @@ pub(super) struct PkVectorRead {
     vector_column: String,
     queries: Vec<Vec<f32>>,
     limit: usize,
-    raw_index_type: Option<String>,
 }
 
 impl PkVectorRead {
@@ -81,13 +80,7 @@ impl PkVectorRead {
             vector_column: vector_column.to_string(),
             queries: queries.iter().map(|query| query.to_vec()).collect(),
             limit,
-            raw_index_type: None,
         }
-    }
-
-    pub(super) fn with_vector_index_type(mut self, index_type: Option<String>) -> Self {
-        self.raw_index_type = index_type;
-        self
     }
 }
 
@@ -120,7 +113,6 @@ impl Read for PkVectorRead {
             &queries,
             self.limit,
             metadata_type,
-            self.raw_index_type.as_deref(),
         )?;
         let candidates = search_pk_candidates_batch_with_plan(
             &self.table,

@@ -59,8 +59,10 @@ async fn two_vector_table(pk: bool, declaration: &str) -> Table {
             .primary_key(["id"])
             .option("bucket", "1")
             .option("deletion-vectors.enabled", "true")
-            .option(declaration, "embedding")
-            .option("fields.embedding.pk-vector.index.type", "ivf-flat");
+            .option(declaration, "embedding");
+        if declaration == "pk-vector.index.columns" {
+            schema = schema.option("fields.embedding.pk-vector.index.type", "ivf-flat");
+        }
     } else {
         schema = schema
             .option("row-tracking.enabled", "true")
@@ -69,8 +71,8 @@ async fn two_vector_table(pk: bool, declaration: &str) -> Table {
     }
     let table = Table::new(
         FileIOBuilder::new("memory").build().unwrap(),
-        Identifier::new("default", "native_type"),
-        format!("memory:/native-type-{}", uuid::Uuid::new_v4()),
+        Identifier::new("default", "index_options"),
+        format!("memory:/index-options-{}", uuid::Uuid::new_v4()),
         TableSchema::new(0, &schema.build().unwrap()),
         None,
     );
@@ -98,7 +100,7 @@ async fn two_vector_table(pk: bool, declaration: &str) -> Table {
         Field::new("embedding", columns[1].data_type().clone(), true),
         Field::new("other", columns[2].data_type().clone(), true),
     ]));
-    let mut writer = TableWrite::new(&table, "native-type".into()).unwrap();
+    let mut writer = TableWrite::new(&table, "index-options".into()).unwrap();
     writer
         .write_arrow_batch(&RecordBatch::try_new(arrow, columns).unwrap())
         .await
@@ -114,7 +116,7 @@ async fn two_vector_table(pk: bool, declaration: &str) -> Table {
             file.file_source = Some(1);
         }
     }
-    TableCommit::new(table.clone(), "native-type".into())
+    TableCommit::new(table.clone(), "index-options".into())
         .commit(messages)
         .await
         .unwrap();
@@ -130,7 +132,7 @@ fn raw_type(plan: &VectorScanPlan) -> Option<&str> {
 
 struct Worker {
     table: Table,
-    expected_type: String,
+    options: HashMap<String, String>,
 }
 
 #[async_trait::async_trait]
@@ -142,9 +144,11 @@ impl SearchTaskExecutor for Worker {
             let task = SearchTask::deserialize_with_context(&frame, &context)?;
             let wire: serde_json::Value = serde_json::from_slice(&task.serialize()?).unwrap();
             for query in wire["payload"]["queries"]["queries"].as_array().unwrap() {
-                assert_eq!(query["index_type"], self.expected_type);
-                assert!(query["options"].get("index_type").is_none());
-                assert!(query["options"].get("metric").is_none());
+                assert!(query.get("index_type").is_none());
+                assert_eq!(
+                    query["options"],
+                    serde_json::to_value(&self.options).unwrap()
+                );
             }
             results.push(SearchTaskResult::deserialize(
                 &task.execute(&self.table).await?.serialize()?,
@@ -155,51 +159,53 @@ impl SearchTaskExecutor for Worker {
     }
 }
 
+fn declaration(kind: &str, column: &str) -> HashMap<String, String> {
+    HashMap::from([(format!("global-index.{kind}.index-columns"), column.into())])
+}
+
 #[tokio::test]
-async fn native_type_is_captured_by_single_batch_plan_reader_and_worker() {
+async fn configuration_is_captured_by_single_batch_plan_reader_and_worker() {
     let table = raw_table().await;
+    let mut options = declaration("ivf-flat", "embedding");
+    options.insert(
+        "fields.embedding.index-options".into(),
+        r#"{"dimension":2,"nlist":1}"#.into(),
+    );
+    options.insert(
+        "opaque.future.parameter".into(),
+        r#"{"value":[1,2]}"#.into(),
+    );
     let mut builder = table.new_vector_search_builder();
-    // Store before configuring a query; unrelated columns and superseded hints
-    // cannot influence the selected vector column.
     builder
-        .with_vector_index_type("other", "invalid")
-        .with_vector_index_type("embedding", "invalid")
-        .with_vector_index_type("embedding", "ivf-flat")
+        .with_options(options.clone())
         .with_vector_column("embedding")
         .with_query_vector(vec![1.0, 0.0])
         .with_limit(3);
     let scan = builder.new_scan().unwrap();
     let reader = builder.new_read().unwrap();
-    builder.with_vector_index_type("embedding", "diskann");
+    let changed = HashMap::from([
+        ("global-index.ivf-flat.index-columns".into(), "other".into()),
+        (
+            "global-index.diskann.index-columns".into(),
+            "embedding".into(),
+        ),
+        ("ivf-flat.metric".into(), "l2".into()),
+        ("diskann.metric".into(), "cosine".into()),
+    ]);
+    builder.with_options(changed.clone());
     let plan = scan.plan().await.unwrap();
     assert_eq!(raw_type(&plan), Some("ivf-flat"));
     let restored: VectorScanPlan =
         serde_json::from_slice(&serde_json::to_vec(&plan).unwrap()).unwrap();
     let local = reader.read(restored.clone()).await.unwrap();
     assert_eq!(local.row_ids().unwrap().scores, vec![1.0, 1.0, 0.0]);
+    // Captured raw split metadata wins over a fresh reader's new declarations.
     let mut fresh = table.new_vector_search_builder();
     fresh
+        .with_options(changed)
         .with_vector_column("embedding")
         .with_query_vector(vec![1.0, 0.0])
         .with_limit(3);
-    let result = fresh
-        .new_read()
-        .unwrap()
-        .read(restored.clone())
-        .await
-        .unwrap();
-    assert_eq!(
-        result.row_ids().unwrap().scores,
-        local.row_ids().unwrap().scores
-    );
-    // A transported raw source remains authoritative even if a fresh reader's
-    // fallback hint names a different parameter namespace.
-    fresh
-        .with_vector_index_type("embedding", "diskann")
-        .with_options(HashMap::from([
-            ("ivf-flat.metric".into(), "l2".into()),
-            ("diskann.metric".into(), "cosine".into()),
-        ]));
     let result = fresh
         .new_read()
         .unwrap()
@@ -209,33 +215,27 @@ async fn native_type_is_captured_by_single_batch_plan_reader_and_worker() {
     assert_eq!(result.row_ids().unwrap().scores, vec![1.0, 0.5, 1.0 / 3.0]);
     let worker = Worker {
         table: table.clone(),
-        expected_type: "ivf-flat".into(),
+        options: options.clone(),
     };
     let remote = reader.read_with_executor(restored, &worker).await.unwrap();
-    assert_eq!(
-        remote.row_ids().unwrap().row_ids,
-        local.row_ids().unwrap().row_ids
-    );
     assert_eq!(
         remote.row_ids().unwrap().scores,
         local.row_ids().unwrap().scores
     );
-
     let mut batch = table.new_batch_vector_search_builder();
     batch
-        .with_vector_index_type("embedding", "ivf-flat")
+        .with_options(options)
         .with_vector_column("embedding")
         .with_query_vectors(vec![vec![1.0, 0.0]; 2])
         .with_limit(3);
     let scan = batch.new_scan().unwrap();
     let reader = batch.new_read().unwrap();
-    batch.with_vector_index_type("embedding", "diskann");
-    let results = reader
+    batch.with_options(declaration("diskann", "embedding"));
+    for result in reader
         .read_with_executor(scan.plan().await.unwrap(), &worker)
         .await
-        .unwrap();
-    assert_eq!(results.len(), 2);
-    for result in results {
+        .unwrap()
+    {
         assert_eq!(
             result.row_ids().unwrap().scores,
             local.row_ids().unwrap().scores
@@ -244,7 +244,7 @@ async fn native_type_is_captured_by_single_batch_plan_reader_and_worker() {
 }
 
 #[tokio::test]
-async fn native_type_raw_fallback_preserves_declarations_and_metric_options() {
+async fn raw_fallback_preserves_unmodified_declarations_and_metric_options() {
     let raw = raw_table().await;
     for declaration in [
         "global-index.ivf-flat.index-columns",
@@ -279,12 +279,10 @@ async fn native_type_raw_fallback_preserves_declarations_and_metric_options() {
             builder.execute().await.unwrap().row_ids().unwrap().scores,
             vec![1.0, 1.0, 0.0]
         );
-        builder
-            .with_vector_index_type("embedding", "diskann")
-            .with_options(HashMap::from([
-                ("ivf-flat.metric".into(), "l2".into()),
-                ("diskann.metric".into(), "cosine".into()),
-            ]));
+        builder.with_options(HashMap::from([
+            ("ivf-flat.metric".into(), "cosine".into()),
+            ("diskann.metric".into(), "l2".into()),
+        ]));
         let result = builder.execute().await.unwrap();
         assert_eq!(result.row_ids().unwrap().row_ids, vec![0, 2, 1]);
         assert!((result.row_ids().unwrap().scores[1] - 1.0_f32 / 2.0_f32.sqrt()).abs() < 1e-6);
@@ -319,39 +317,23 @@ async fn removed_type_options_do_not_change_raw_defaults() {
 }
 
 #[tokio::test]
-async fn metadata_precedes_native_type_even_with_partial_raw_coverage() {
-    let table = de_vector_table_with_metric(Some("l2"))
-        .await
-        .copy_with_options(HashMap::from([
+async fn metadata_precedes_configuration_even_with_partial_raw_coverage() {
+    let original = de_vector_table_with_metric(Some("l2")).await;
+    for kind in ["diskann", "invalid-unused-type"] {
+        let table = original.copy_with_options(HashMap::from([
             ("vector-index.search-mode".into(), "full".into()),
-            ("diskann.metric".into(), "cosine".into()),
+            (
+                format!("global-index.{kind}.index-columns"),
+                "embedding".into(),
+            ),
+            (format!("{kind}.metric"), "invalid-unused-metric".into()),
         ]));
-    let mut builder = table.new_vector_search_builder();
-    builder
-        .with_vector_column("embedding")
-        .with_query_vector(vec![1.0, 0.0])
-        .with_limit(3)
-        .with_options(HashMap::from([("ivf.nprobe".into(), "2".into())]));
-    let expected = builder.execute().await.unwrap();
-    assert_eq!(
-        expected.row_ids().unwrap().scores,
-        vec![1.0, 0.5, 1.0 / 3.0]
-    );
-    for hint in ["diskann", "invalid-unused-type"] {
-        builder.with_vector_index_type("embedding", hint);
+        let mut builder = table.new_vector_search_builder();
+        builder
+            .with_vector_column("embedding")
+            .with_query_vector(vec![1.0, 0.0])
+            .with_limit(3);
         let plan = builder.new_scan().unwrap().plan().await.unwrap();
-        let result = builder
-            .new_read()
-            .unwrap()
-            .read(plan.clone())
-            .await
-            .unwrap();
-        assert_eq!(
-            result.row_ids().unwrap().scores,
-            expected.row_ids().unwrap().scores
-        );
-        // Keep one authoritative indexed source and add raw coverage: the raw
-        // range must use persisted semantics too, without interpreting the hint.
         let mut splits = plan.splits().to_vec();
         splits.push(SearchScanSplit::Raw {
             row_ranges: vec![crate::table::RowRange::new(0, 2)],
@@ -364,106 +346,89 @@ async fn metadata_precedes_native_type_even_with_partial_raw_coverage() {
             .read(VectorScanPlan::new(plan.snapshot().cloned(), splits).unwrap())
             .await
             .unwrap();
-        assert_eq!(
-            result.row_ids().unwrap().row_ids,
-            expected.row_ids().unwrap().row_ids
-        );
-        assert_eq!(
-            result.row_ids().unwrap().scores,
-            expected.row_ids().unwrap().scores
-        );
+        assert_eq!(result.row_ids().unwrap().row_ids, vec![0, 2, 1]);
+        assert_eq!(result.row_ids().unwrap().scores, vec![1.0, 0.5, 1.0 / 3.0]);
     }
 }
 
 #[tokio::test]
-async fn native_type_pk_raw_fallback_uses_its_dimension_metric_and_hybrid_route() {
+async fn pk_raw_fallback_keeps_table_metric_in_single_batch_and_hybrid() {
     use futures::TryStreamExt;
     for declaration in [
         "global-index.ivf-flat.index-columns",
         "global-index.ivf-flat.index-column",
         "pk-vector.index.columns",
     ] {
-        let table = two_vector_table(true, declaration).await;
-        for query in [
-            vec![],
-            vec![1.0],
-            vec![f32::NAN, 0.0],
-            vec![0.0, f32::INFINITY],
+        let original = two_vector_table(true, declaration).await;
+        for table_options in [
+            HashMap::new(),
+            HashMap::from([(
+                "fields.embedding.index-options".into(),
+                r#"{"dimension":2,"metric":"cosine"}"#.into(),
+            )]),
         ] {
-            let mut invalid = table.new_vector_search_builder();
-            invalid
-                .with_vector_index_type("embedding", "diskann")
-                .with_vector_column("embedding")
-                .with_query_vector(query)
-                .with_limit(1);
-            assert!(
-                invalid.new_read().is_err(),
-                "fixed vector errors must precede planning"
-            );
+            let cosine = !table_options.is_empty();
+            let table = original.copy_with_options(table_options);
+            let expected = if cosine { 1.0 } else { 3.0 };
+            // Java PK metrics come from the table result, including raw-only plans.
+            for query_options in [
+                HashMap::from([("ivf-flat.metric".into(), "l2".into())]),
+                HashMap::from([(
+                    "fields.embedding.index-options".into(),
+                    r#"{"metric":"l2"}"#.into(),
+                )]),
+            ] {
+                let mut builder = table.new_vector_search_builder();
+                builder
+                    .with_options(query_options.clone())
+                    .with_vector_column("embedding")
+                    .with_query_vector(vec![1.0, 0.0])
+                    .with_limit(1);
+                assert_eq!(
+                    builder.execute().await.unwrap().positions().unwrap()[0].score,
+                    expected
+                );
+                let mut batch = table.new_batch_vector_search_builder();
+                batch
+                    .with_options(query_options.clone())
+                    .with_vector_column("embedding")
+                    .with_query_vectors(vec![vec![1.0, 0.0]; 2])
+                    .with_limit(1);
+                for result in batch.execute().await.unwrap() {
+                    assert_eq!(result.positions().unwrap()[0].score, expected);
+                }
+                let mut hybrid = table.new_hybrid_search_builder();
+                hybrid
+                    .add_vector_route("embedding", vec![1.0, 0.0], 1, 1.0, query_options)
+                    .unwrap()
+                    .with_limit(1);
+                let batches = hybrid
+                    .execute_read()
+                    .await
+                    .unwrap()
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+                    1
+                );
+                assert_eq!(
+                    batches[0]
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<arrow_array::Int32Array>()
+                        .unwrap()
+                        .value(0),
+                    1
+                );
+            }
         }
-        let options = HashMap::from([("diskann.metric".into(), "cosine".into())]);
-        let mut builder = table.new_vector_search_builder();
-        builder
-            .with_vector_index_type("embedding", "diskann")
-            .with_vector_column("embedding")
-            .with_query_vector(vec![1.0, 0.0])
-            .with_limit(1);
-        let plan = builder.new_scan().unwrap().plan().await.unwrap();
-        assert!(!plan.splits().is_empty());
-        assert!(plan.splits().iter().all(|source| matches!(source, SearchScanSplit::PrimaryKey { payloads, .. } if payloads.is_empty())));
-        let result = builder
-            .new_read()
-            .unwrap()
-            .read(plan.clone())
-            .await
-            .unwrap();
-        assert_eq!(result.positions().unwrap().len(), 1);
-        assert_eq!(result.positions().unwrap()[0].score, 3.0);
-        builder.with_options(options.clone());
-        let result = builder.new_read().unwrap().read(plan).await.unwrap();
-        assert_eq!(result.positions().unwrap().len(), 1);
-        assert_eq!(result.positions().unwrap()[0].score, 1.0);
-        let mut batch = table.new_batch_vector_search_builder();
-        batch
-            .with_vector_index_type("embedding", "diskann")
-            .with_vector_column("embedding")
-            .with_query_vectors(vec![vec![1.0, 0.0]; 2])
-            .with_limit(1)
-            .with_options(options.clone());
-        for result in batch.execute().await.unwrap() {
-            assert_eq!(result.positions().unwrap()[0].score, 1.0);
-        }
-        let mut hybrid = table.new_hybrid_search_builder();
-        hybrid.with_vector_index_type("embedding", "diskann");
-        hybrid
-            .add_vector_route("embedding", vec![1.0, 0.0], 1, 1.0, options)
-            .unwrap()
-            .with_limit(1);
-        let batches = hybrid
-            .execute_read()
-            .await
-            .unwrap()
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
-        assert_eq!(
-            batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
-            1
-        );
-        assert_eq!(
-            batches[0]
-                .column(0)
-                .as_any()
-                .downcast_ref::<arrow_array::Int32Array>()
-                .unwrap()
-                .value(0),
-            1
-        );
     }
 }
 
 #[test]
-fn native_type_does_not_defer_array_query_emptiness_or_finiteness() {
+fn raw_configuration_keeps_eager_query_validation() {
     let table = crate::table::vector_search_test_utils::pk_vector_table(&[
         ("pk-vector.index.columns", "embedding"),
         ("fields.embedding.pk-vector.index.type", "ivf-flat"),
@@ -471,7 +436,7 @@ fn native_type_does_not_defer_array_query_emptiness_or_finiteness() {
     for query in [vec![], vec![f32::NAN, 0.0], vec![0.0, f32::INFINITY]] {
         let mut builder = table.new_vector_search_builder();
         builder
-            .with_vector_index_type("embedding", "diskann")
+            .with_options(declaration("diskann", "embedding"))
             .with_vector_column("embedding")
             .with_query_vector(query)
             .with_limit(1);
@@ -480,30 +445,38 @@ fn native_type_does_not_defer_array_query_emptiness_or_finiteness() {
 }
 
 #[tokio::test]
-async fn native_type_hybrid_is_per_column_and_captured_before_builder_changes() {
-    let table = two_vector_table(false, "unused").await;
-    let options = HashMap::from([
-        ("ivf-flat.metric".into(), "l2".into()),
-        ("diskann.metric".into(), "cosine".into()),
-    ]);
+async fn hybrid_configuration_is_per_column_and_captured_with_each_route() {
+    let table = two_vector_table(false, "unused")
+        .await
+        .copy_with_options(HashMap::from([
+            (
+                "global-index.ivf-flat.index-columns".into(),
+                "embedding".into(),
+            ),
+            ("global-index.diskann.index-column".into(), "other".into()),
+            (
+                "fields.embedding.index-options".into(),
+                r#"{"dimension":2,"metric":"l2"}"#.into(),
+            ),
+            (
+                "fields.other.index-options".into(),
+                r#"{"dimension":2,"metric":"cosine"}"#.into(),
+            ),
+        ]));
     let mut hybrid = table.new_hybrid_search_builder();
-    hybrid
-        .with_vector_index_type("embedding", "ivf-flat")
-        .with_vector_index_type("other", "diskann")
-        .with_vector_index_type("embedding", "diskann");
-    hybrid
-        .add_vector_route("other", vec![1.0, 0.0], 1, 1.0, options.clone())
-        .unwrap();
-    hybrid
-        .add_vector_route("embedding", vec![1.0, 0.0], 1, 1.0, options)
-        .unwrap()
-        .with_limit(2);
-    // Give embedding a different implementation, independent of route order.
-    hybrid.with_vector_index_type("embedding", "ivf-flat");
+    for field in ["other", "embedding"] {
+        hybrid
+            .add_vector_route(
+                field,
+                vec![1.0, 0.0],
+                1,
+                1.0,
+                HashMap::from([("opaque.route.parameter".into(), format!("value-{field}"))]),
+            )
+            .unwrap();
+    }
+    hybrid.with_limit(2);
     let routes = hybrid.route_builders().await.unwrap();
-    hybrid
-        .with_vector_index_type("embedding", "diskann")
-        .with_vector_index_type("other", "ivf-flat");
     for route in routes {
         let builder = route.vector_search_builder().unwrap();
         let plan = builder.new_scan().unwrap().plan().await.unwrap();
@@ -513,11 +486,13 @@ async fn native_type_hybrid_is_per_column_and_captured_before_builder_changes() 
             ("ivf-flat", 1)
         };
         assert_eq!(raw_type(&plan), Some(kind));
-        let result = route.execute().await.unwrap();
-        assert_eq!(result.row_ids().unwrap().row_ids, vec![row_id]);
+        assert_eq!(
+            route.execute().await.unwrap().row_ids().unwrap().row_ids,
+            vec![row_id]
+        );
         let worker = Worker {
             table: table.clone(),
-            expected_type: kind.into(),
+            options: route.route().options().clone(),
         };
         let remote = builder
             .new_read()
@@ -527,4 +502,73 @@ async fn native_type_hybrid_is_per_column_and_captured_before_builder_changes() 
             .unwrap();
         assert_eq!(remote.row_ids().unwrap().row_ids, vec![row_id]);
     }
+}
+
+#[tokio::test]
+async fn raw_build_map_preserves_json_precedence_and_serialized_shards() {
+    let table = raw_table().await;
+    let mut options = table.schema().options().clone();
+    options.extend(declaration("ivf-flat", "embedding"));
+    options.extend(HashMap::from([
+        ("ivf-flat.metric".into(), "l2".into()),
+        (
+            "fields.embedding.index-options".into(),
+            r#"{"dimension":2,"nlist":1,"metric":"cosine"}"#.into(),
+        ),
+        ("opaque.future.option".into(), "value".into()),
+    ]));
+    let mut builder = table.new_global_index_build_builder();
+    builder
+        .with_index_column("embedding")
+        .with_index_type("ivf-flat")
+        .with_options(options);
+    let plan = builder.plan().await.unwrap();
+    assert_eq!(plan.snapshot_id(), Some(1));
+    assert!(!plan.shards().is_empty());
+    let worker = table.copy_with_options(HashMap::from([(
+        "fields.embedding.index-options".into(),
+        "invalid worker JSON".into(),
+    )]));
+    for shard in plan.shards() {
+        let shard: crate::table::GlobalIndexBuildShard =
+            serde_json::from_slice(&serde_json::to_vec(&shard).unwrap()).unwrap();
+        let messages = worker
+            .new_global_index_build_builder()
+            .build_shard(&shard)
+            .await
+            .unwrap();
+        assert!(!messages.is_empty());
+        for file in messages.iter().flat_map(|message| &message.new_index_files) {
+            let meta: HashMap<String, String> = serde_json::from_slice(
+                file.global_index_meta
+                    .as_ref()
+                    .unwrap()
+                    .index_meta
+                    .as_ref()
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(meta["dimension"], "2");
+            assert_eq!(meta["nlist"], "1");
+            assert_eq!(meta["metric"], "cosine");
+        }
+    }
+    // Qualified typos still fail at the Rust parameter boundary.
+    builder.with_options(HashMap::from([("ivf-flat.nlsit".into(), "1".into())]));
+    assert!(builder
+        .plan()
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("ivf-flat.nlsit"));
+    let empty = table.copy_with_pinned_snapshot(None);
+    let plan = empty
+        .new_global_index_build_builder()
+        .with_index_column("embedding")
+        .with_index_type("ivf-flat")
+        .plan()
+        .await
+        .unwrap();
+    assert_eq!(plan.snapshot_id(), None);
+    assert!(plan.shards().is_empty());
 }

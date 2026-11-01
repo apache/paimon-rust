@@ -278,7 +278,6 @@ pub struct PyHybridSearchBuilder {
     limit: Option<usize>,
     ranker: HybridSearchRanker,
     pinned_snapshot: Option<Option<Snapshot>>,
-    vector_index_types: HashMap<String, String>,
 }
 
 impl PyHybridSearchBuilder {
@@ -290,15 +289,11 @@ impl PyHybridSearchBuilder {
             limit: None,
             ranker: HybridSearchRanker::Rrf,
             pinned_snapshot: None,
-            vector_index_types: HashMap::new(),
         }
     }
 
     fn builder(&self) -> paimon::table::HybridSearchBuilder<'_> {
         let mut builder = self.table.new_hybrid_search_builder();
-        for (column, index_type) in &self.vector_index_types {
-            builder.with_vector_index_type(column, index_type);
-        }
         for route in &self.routes {
             builder.add_route(route.clone());
         }
@@ -321,14 +316,6 @@ impl PyHybridSearchBuilder {
 
 #[pymethods]
 impl PyHybridSearchBuilder {
-    fn with_vector_index_type(
-        mut slf: PyRefMut<'_, Self>,
-        column: String,
-        index_type: String,
-    ) -> PyRefMut<'_, Self> {
-        slf.vector_index_types.insert(column, index_type);
-        slf
-    }
     #[pyo3(signature = (field_name, vector, limit, weight=1.0, options=None))]
     fn add_vector_route(
         mut slf: PyRefMut<'_, Self>,

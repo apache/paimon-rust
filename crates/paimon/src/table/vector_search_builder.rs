@@ -43,7 +43,6 @@ struct VectorSearchConfig {
     query_vector: Option<Vec<f32>>,
     limit: Option<usize>,
     options: HashMap<String, String>,
-    vector_index_types: HashMap<String, String>,
     filter: Option<Predicate>,
 }
 
@@ -72,17 +71,6 @@ impl<'a> VectorSearchBuilder<'a> {
 
     pub fn with_vector_column(&mut self, name: &str) -> &mut Self {
         self.config.write().unwrap().vector_column = Some(name.to_string());
-        self
-    }
-
-    /// Store the implementation used when no vector index metadata is available.
-    /// Does not plan or execute a query. Repeated calls replace the column's hint.
-    pub fn with_vector_index_type(&mut self, column: &str, index_type: &str) -> &mut Self {
-        self.config
-            .write()
-            .unwrap()
-            .vector_index_types
-            .insert(column.into(), index_type.into());
         self
     }
 
@@ -138,10 +126,8 @@ impl<'a> VectorSearchBuilder<'a> {
                 .ok_or_else(|| crate::Error::ConfigInvalid {
                     message: "Vector column must be set via with_vector_column()".to_string(),
                 })?;
-        VectorScan::new(&self.table, column, config.filter.as_ref(), None, None).map(|scan| {
-            scan.with_options(&config.options)
-                .with_vector_index_type(config.vector_index_types.get(column).cloned())
-        })
+        VectorScan::new(&self.table, column, config.filter.as_ref(), None, None)
+            .map(|scan| scan.with_options(&config.options))
     }
 
     /// Create an owned reader; query errors are reported before planning.
@@ -152,9 +138,7 @@ impl<'a> VectorSearchBuilder<'a> {
 
     fn read_with_config(&self, config: &VectorSearchConfig) -> crate::Result<VectorRead> {
         let (column, query, limit) = self.query(config)?;
-        let mut context =
-            PlanContext::new(&self.table, column, config.filter.as_ref(), None, None)?;
-        context.vector_index_type = config.vector_index_types.get(column).cloned();
+        let context = PlanContext::new(&self.table, column, config.filter.as_ref(), None, None)?;
         Ok(VectorRead {
             batch: BatchVectorRead::new(
                 &self.table,
@@ -210,4 +194,4 @@ impl<'a> VectorSearchBuilder<'a> {
 mod tests;
 
 #[cfg(test)]
-mod native_type_tests;
+mod index_options_tests;

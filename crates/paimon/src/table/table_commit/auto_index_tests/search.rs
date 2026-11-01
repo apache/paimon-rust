@@ -781,3 +781,120 @@ async fn vector_algorithm_and_metric_changes_atomically_replace_incompatible_pay
         );
     }
 }
+
+#[tokio::test]
+async fn raw_native_build_maps_share_field_json_and_full_text_collections() {
+    let (_catalog, table) = search_table(&[
+        ("write-only", "true"),
+        ("global-index.btree.index-columns", "id"),
+        ("btree-index.block-size", "invalid overridden default"),
+        ("fields.id.index-options", r#"{"block-size":128}"#),
+        ("global-index.full-text.index-columns", "text,folded_text"),
+        ("full-text.tokenizer", "invalid overridden tokenizer"),
+        ("full-text.stop-words", r#"["foo"]"#),
+        (
+            "fields.text.index-options",
+            r#"{"tokenizer":"raw","lower-case":false}"#,
+        ),
+        (
+            "fields.folded_text.index-options",
+            r#"{"tokenizer":"simple","lower-case":true}"#,
+        ),
+        ("full-text-index.search-mode", "full"),
+        ("opaque.future.parameter", "preserved"),
+    ])
+    .await;
+    TableCommit::new(table.clone(), "raw-native-map".into())
+        .commit(search_messages(&table, &[[1., 0.], [0., 1.]]).await)
+        .await
+        .unwrap();
+    let snapshot = latest(&table).await;
+    let raw = table.copy_with_pinned_snapshot(Some(&snapshot));
+    let ids = |table: Table, field: &'static str| async move {
+        table
+            .new_full_text_search_builder()
+            .with_query(field, r#"{"match":{"query":"FOO"}}"#)
+            .with_limit(10)
+            .execute()
+            .await
+            .unwrap()
+            .row_ids()
+            .unwrap()
+            .row_ids
+            .clone()
+    };
+    assert_eq!(ids(raw.clone(), "text").await, vec![0]);
+    assert_eq!(ids(raw.clone(), "folded_text").await, Vec::<u64>::new());
+    for (kind, field) in [("btree", "id"), ("full-text", "text")] {
+        let empty = table.copy_with_pinned_snapshot(None);
+        assert!(empty
+            .new_global_index_build_builder()
+            .with_index_column(field)
+            .with_index_type(kind)
+            .with_options(table.schema().options().clone())
+            .build()
+            .await
+            .unwrap()
+            .is_empty());
+    }
+    for (kind, field) in [
+        ("btree", "id"),
+        ("full-text", "text"),
+        ("full-text", "folded_text"),
+    ] {
+        assert_eq!(
+            table
+                .new_global_index_build_builder()
+                .with_index_column(field)
+                .with_index_type(kind)
+                .with_options(table.schema().options().clone())
+                .execute()
+                .await
+                .unwrap(),
+            1
+        );
+    }
+    assert_eq!(ids(table.clone(), "text").await, vec![0]);
+    assert_eq!(ids(table.clone(), "folded_text").await, Vec::<u64>::new());
+}
+
+#[tokio::test]
+async fn procedure_flat_parameters_override_legacy_json_without_source_conflicts() {
+    let (_catalog, table) = search_table(&[
+        ("write-only", "true"),
+        ("fields.id.pk-btree.index.options", r#"{"block-size":128}"#),
+        (
+            "fields.embedding.pk-vector.index.options",
+            r#"{"dimension":2,"nlist":1}"#,
+        ),
+    ])
+    .await;
+    TableCommit::new(table.clone(), "procedure-overrides".into())
+        .commit(search_messages(&table, &[[1., 0.], [0., 1.]]).await)
+        .await
+        .unwrap();
+    let plan = table
+        .new_global_index_build_builder()
+        .with_index_column("embedding")
+        .with_index_type("ivf-flat")
+        .with_options(HashMap::from([("ivf-flat.nlist".into(), "2".into())]))
+        .plan()
+        .await
+        .unwrap();
+    assert_eq!(plan.snapshot_id(), Some(1));
+    assert_eq!(plan.shards().len(), 1);
+    assert_eq!(
+        table
+            .new_global_index_build_builder()
+            .with_index_column("id")
+            .with_index_type("btree")
+            .with_options(HashMap::from([(
+                "btree-index.block-size".into(),
+                "256".into()
+            )]))
+            .execute()
+            .await
+            .unwrap(),
+        1
+    );
+}

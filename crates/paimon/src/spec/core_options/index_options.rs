@@ -200,6 +200,25 @@ impl CoreOptions<'_> {
             &legacy_key
         };
         let mut resolved = self.options.clone();
+        if kind == "full-text" {
+            for (_, value) in resolved
+                .iter_mut()
+                .filter(|(key, _)| key.starts_with("full-text."))
+            {
+                if let Ok(values) = serde_json::from_str::<Vec<serde_json::Value>>(value) {
+                    *value = values
+                        .into_iter()
+                        .map(|value| {
+                            value
+                                .as_str()
+                                .map(str::to_string)
+                                .unwrap_or_else(|| value.to_string())
+                        })
+                        .collect::<Vec<_>>()
+                        .join(";");
+                }
+            }
+        }
         if let Some(value) = self
             .options
             .get(&format!("{field}global-index.row-count-per-shard"))

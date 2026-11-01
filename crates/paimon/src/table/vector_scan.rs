@@ -189,7 +189,6 @@ async fn primary_key_sources(
 #[derive(Clone)]
 pub(super) struct PlanContext {
     pub(super) column: String,
-    pub(super) vector_index_type: Option<String>,
     pub(super) filter: Option<Predicate>,
     pub(super) include_row_ids: Option<Arc<RoaringTreemap>>,
     pub(super) prepared_snapshot: Option<Option<Snapshot>>,
@@ -232,7 +231,6 @@ impl PlanContext {
         }
         Ok(Self {
             column: column.to_string(),
-            vector_index_type: None,
             filter: filter.cloned(),
             include_row_ids: prepared
                 .map(PreparedVectorSearchFilter::include_row_ids)
@@ -301,11 +299,6 @@ impl VectorScan {
         self
     }
 
-    pub(super) fn with_vector_index_type(mut self, index_type: Option<String>) -> Self {
-        self.context.vector_index_type = index_type;
-        self
-    }
-
     pub async fn plan(&self) -> crate::Result<VectorScanPlan> {
         match &self.scan {
             VectorScanKind::DataEvolution(scan) => {
@@ -330,7 +323,6 @@ impl VectorScan {
                         self.context.filter.as_ref(),
                         &self.options,
                         false,
-                        self.context.vector_index_type.as_deref(),
                     )
                     .await?
                 };

@@ -73,13 +73,6 @@ pub(super) struct DeVectorRead {
 }
 
 impl DeVectorRead {
-    pub(super) fn with_vector_index_type(mut self, index_type: Option<String>) -> Self {
-        for search in &mut self.vector_searches {
-            search.index_type = index_type.clone();
-        }
-        self
-    }
-
     /// Validate query parameters before planning, including for empty tables and
     /// filters. Snapshot-dependent row-ID filters are supplied by the plan.
     pub(super) fn new(
@@ -759,8 +752,7 @@ async fn evaluate_batch_vector_search_with_executor(
         .find_map(|source| match source {
             crate::table::SearchScanSplit::Raw { index_type, .. } => index_type.as_deref(),
             _ => None,
-        })
-        .or(vector_searches[0].index_type.as_deref());
+        });
     let configuration = resolve_vector_search_options(
         evaluation.table_options,
         &search_options,
@@ -1701,7 +1693,7 @@ async fn resolve_raw_vector_metric(
     index_entries: &[IndexManifestEntry],
     field_id: i32,
     field_name: &str,
-    explicit_index_type: Option<&str>,
+    source_index_type: Option<&str>,
 ) -> crate::Result<RawVectorMetric> {
     let persisted_type = index_entries
         .iter()
@@ -1719,7 +1711,7 @@ async fn resolve_raw_vector_metric(
         table_options,
         search_options,
         field_name,
-        persisted_type.or(explicit_index_type),
+        persisted_type.or(source_index_type),
         false,
     )?;
     resolve_raw_vector_metric_resolved(
@@ -2664,8 +2656,6 @@ struct TaskVectorSearch {
     limit: usize,
     field: String,
     options: HashMap<String, String>,
-    #[serde(default)]
-    index_type: Option<String>,
     include: Option<usize>,
 }
 #[derive(Clone, Serialize, Deserialize)]
@@ -2702,7 +2692,6 @@ impl TaskVectorQueries {
                     limit: search.limit,
                     field: search.field_name.clone(),
                     options: search.options.clone(),
-                    index_type: search.index_type.clone(),
                     include,
                 })
             })
@@ -2733,7 +2722,6 @@ impl TaskVectorQueries {
                     query.field.clone(),
                 )?
                 .with_options(query.options.clone());
-                search.index_type = query.index_type.clone();
                 if let Some(index) = query.include {
                     let shared = filters.get(index).ok_or_else(|| {
                         crate::table::search_task::invalid(

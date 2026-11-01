@@ -60,7 +60,6 @@ pub(super) async fn global_search_splits(
     filter: Option<&Predicate>,
     options: &HashMap<String, String>,
     full_text: bool,
-    vector_index_type: Option<&str>,
 ) -> crate::Result<Vec<SearchScanSplit>> {
     let field_id = find_field_id_by_name(table.schema().fields(), column).ok_or_else(|| {
         crate::Error::ConfigInvalid {
@@ -217,7 +216,7 @@ pub(super) async fn global_search_splits(
                     table.schema().options(),
                     options,
                     column,
-                    vector_index_type,
+                    None,
                     false,
                 )?
                 .resolved

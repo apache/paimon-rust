@@ -596,7 +596,6 @@ async fn pk_vector_reads_captured_payload_after_algorithm_configuration_changes(
         let mut builder = changed.new_vector_search_builder();
         builder
             .with_vector_column(VECTOR_COLUMN)
-            .with_vector_index_type(VECTOR_COLUMN, "invalid-unused-hint")
             .with_query_vector(query.to_vec())
             .with_limit(3);
         let plan = builder.new_scan().unwrap().plan().await.unwrap();
@@ -641,7 +640,6 @@ async fn pk_vector_end_to_end_returns_expected_row_ids_and_scores() {
     // Search-only PK results preserve local positions and metric scores.
     let scored = table
         .new_vector_search_builder()
-        .with_vector_index_type(VECTOR_COLUMN, "invalid-unused-type")
         .with_vector_column(VECTOR_COLUMN)
         .with_query_vector(query.to_vec())
         .with_limit(3)

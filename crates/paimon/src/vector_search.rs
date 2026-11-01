@@ -27,8 +27,6 @@ pub struct VectorSearch {
     pub limit: usize,
     pub field_name: String,
     pub options: HashMap<String, String>,
-    /// Implementation hint for raw fallback; persisted index metadata takes precedence.
-    pub(crate) index_type: Option<String>,
     pub include_row_ids: Option<roaring::RoaringTreemap>,
     pub(crate) shared_include_row_ids: Option<Arc<roaring::RoaringTreemap>>,
 }
@@ -58,7 +56,6 @@ impl VectorSearch {
             limit,
             field_name,
             options: HashMap::new(),
-            index_type: None,
             include_row_ids: None,
             shared_include_row_ids: None,
         })

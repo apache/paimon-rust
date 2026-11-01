@@ -52,6 +52,67 @@ def _single(table):
     return table.new_vector_search_builder().with_vector_column('embedding').with_query_vector([1, 0]).with_limit(10)
 
 
+def test_vector_build_accepts_raw_schema_options_and_field_json(table):
+    options = {
+        'bucket': '-1', 'data-evolution.enabled': 'true', 'row-tracking.enabled': 'true',
+        'global-index.enabled': 'true', 'vector-index.search-mode': 'full',
+        'global-index.ivf-flat.index-columns': 'embedding',
+        'fields.embedding.pk-vector.index.options': 'invalid replaced JSON',
+        'fields.embedding.index-options': '{"dimension":2,"nlist":1,"metric":"cosine"}',
+        'ivf-flat.metric': 'l2', 'opaque.future.option': 'preserved',
+    }
+    configured = table.copy(options)
+    builder = (configured.new_global_index_build_builder().with_index_column('embedding')
+               .with_index_type('ivf-flat').with_options(options))
+    assert builder.plan().shards()
+    assert builder.execute() > 0
+    actual = _single(configured).execute().row_ids()
+    assert sorted(actual.values()) == pytest.approx([0, 1, 1])
+
+
+@pytest.mark.parametrize('shared_json', [False, True, 'aliases'])
+def test_full_text_json_encoded_lists_keep_raw_and_indexed_semantics(tmp_path, shared_json):
+    import json
+    ctx = SQLContext()
+    ctx.register_catalog('paimon', {'warehouse': str(tmp_path)})
+    ctx.sql('CREATE SCHEMA paimon.db')
+    ctx.sql("CREATE TABLE paimon.db.texts (id INT, body STRING) WITH ("
+            "'bucket'='-1','row-tracking.enabled'='true','data-evolution.enabled'='true',"
+            "'global-index.enabled'='true','write-only'='true','full-text-index.search-mode'='full')")
+    table = PaimonCatalog({'warehouse': str(tmp_path)}).get_table('db.texts')
+    write = table.new_batch_write_builder()
+    writer, commit = write.new_write(), write.new_commit()
+    try:
+        writer.write_arrow(pa.record_batch([[1, 2], ['paimon data', 'needle']], schema=pa.schema([
+            ('id', pa.int32()), ('body', pa.string())])))
+        commit.commit(writer.prepare_commit())
+    finally:
+        writer.close()
+        commit.close()
+    options = {'global-index.full-text.index-columns': 'body'}
+    if shared_json == 'aliases':
+        options.update({'full-text.stop-words': json.dumps(['paimon']), 'full-text.columns': json.dumps(['body'])})
+    elif shared_json:
+        options['fields.body.index-options'] = json.dumps({'stop-words': ['paimon'], 'text-fields': ['body']})
+    else:
+        options.update({'full-text.stop-words': json.dumps(['paimon']),
+                        'full-text.text-fields': json.dumps(['body'])})
+    table = table.copy(options)
+
+    def hits(query):
+        return (table.new_full_text_search_builder().with_query('body', json.dumps({'match': {'query': query}}))
+                .with_limit(3).execute().row_ids())
+
+    assert len(hits('paimon')) == 0
+    before = hits('data')
+    assert len(before) == 1
+    builder = (table.new_global_index_build_builder().with_index_column('body')
+               .with_index_type('full-text').with_options(options))
+    assert builder.execute() == 1
+    assert len(hits('paimon')) == 0
+    assert hits('data') == before
+
+
 def test_filters_accumulate_and_partition_uses_table_schema(table):
     result = (_single(table).with_filter({'method': 'greaterThan', 'field': 'id', 'literals': [1]})
               .with_filter({'method': 'lessThan', 'field': 'id', 'literals': [4]})
@@ -159,16 +220,19 @@ def test_single_vector_keyword_matches_stub(table):
 
 
 @pytest.mark.parametrize('batch', [False, True])
-def test_explicit_native_type_survives_scan_read_and_uses_raw_metric_options(table, batch):
+def test_raw_options_survive_scan_read_and_use_raw_metric_options(table, batch):
     import pickle
     builder = (table.new_batch_vector_search_builder().with_query_vectors([[1, 0], [1, 0]])
                if batch else table.new_vector_search_builder().with_query_vector([1, 0]))
-    assert builder.with_vector_index_type(column='embedding', index_type='ivf-flat') is builder
+    builder.with_options({'global-index.ivf-flat.index-columns': 'embedding',
+                          'fields.embedding.index-options': '{"dimension":2,"nlist":1}',
+                          'opaque.future.option': '{"value":[1,2]}'})
     builder.with_vector_column('embedding').with_limit(3)
     plan = pickle.loads(pickle.dumps(builder.new_vector_search_scan().scan()))
     reader = builder.new_batch_vector_search_read() if batch else builder.new_vector_search_read()
     # Mutating the builder must not change captured reader configuration.
-    builder.with_vector_index_type('embedding', 'diskann').with_option('metric', 'l2')
+    builder.with_options({'global-index.ivf-flat.index-columns': 'other',
+                          'global-index.diskann.index-columns': 'embedding', 'metric': 'l2'})
     results = reader.read_batch_plan(plan) if batch else [reader.read_plan(plan)]
     for result in results:
         assert sorted(result.row_ids().values()) == pytest.approx([0, 1, 1])
@@ -177,14 +241,14 @@ def test_explicit_native_type_survives_scan_read_and_uses_raw_metric_options(tab
         assert sorted(result.row_ids().values()) == pytest.approx([1 / 3, 1, 1])
 
 
-def test_native_type_keeps_index_metadata_and_ignores_removed_option_hints(table):
+def test_options_keep_index_metadata_and_ignore_removed_option_hints(table):
     expected = _single(table).execute().row_ids()
     for key in ('index_type', 'index-type', 'vector.index-type', 'fields.embedding.index-type'):
         assert _single(table.copy({key: 'diskann'})).with_option(key, 'ivf-flat').execute().row_ids() == expected
     (table.new_global_index_build_builder().with_index_column('embedding')
      .with_index_type('ivf-flat').with_options({'dimension': '2', 'nlist': '1', 'metric': 'l2'}).execute())
     expected = _single(table).execute().row_ids()
-    assert (_single(table).with_vector_index_type('embedding', 'invalid-unused-type')
+    assert (_single(table).with_options({'global-index.invalid-unused-type.index-columns': 'embedding'})
             .execute().row_ids()) == expected
     # Table defaults are not explicit query metrics. Both JSON namespaces obey
     # that boundary when the persisted index uses a different metric.
@@ -193,22 +257,28 @@ def test_native_type_keeps_index_metadata_and_ignores_removed_option_hints(table
         ('fields.embedding.index-options', '{"metric":"cosine"}'),
         ('fields.embedding.pk-vector.index.options', '{"metric":"cosine"}'),
     ):
-        assert (_single(table.copy({key: value})).with_vector_index_type('embedding', 'diskann')
+        assert (_single(table.copy({key: value, 'global-index.diskann.index-columns': 'embedding'}))
                 .execute().row_ids()) == expected
         with pytest.raises(Exception, match='does not match index metric'):
             _single(table).with_option(key, value).execute()
 
 
-def test_hybrid_native_type_is_captured_with_the_route_builder(table):
+def test_hybrid_options_are_captured_with_the_route_builder(table):
     hybrid = table.new_hybrid_search_builder()
-    assert hybrid.with_vector_index_type('embedding', 'ivf-flat') is hybrid
     hybrid.add_vector_route('embedding', [1, 0], 3, options={
-        'ivf-flat.metric': 'l2', 'diskann.metric': 'inner_product'}).with_limit(3)
+        'global-index.ivf-flat.index-columns': 'embedding', 'ivf-flat.metric': 'l2'}).with_limit(3)
     captured = hybrid.route_builders()[0].search_builder()
-    hybrid.with_vector_index_type('embedding', 'diskann')
+    hybrid.add_vector_route('embedding', [1, 0], 3, options={
+        'global-index.diskann.index-columns': 'embedding', 'diskann.metric': 'inner_product'})
     assert sorted(captured.execute().row_ids().values()) == pytest.approx([1 / 3, 1, 1])
-    updated = hybrid.route_builders()[0].search_builder()
+    updated = hybrid.route_builders()[1].search_builder()
     assert sorted(updated.execute().row_ids().values()) == pytest.approx([0, 1, 1])
+
+
+def test_builders_have_no_separate_type_setter(table):
+    for builder in (table.new_vector_search_builder(), table.new_batch_vector_search_builder(),
+                    table.new_hybrid_search_builder()):
+        assert not hasattr(builder, 'with_vector_index_type')
 
 
 def test_external_result_uses_same_scan_type_without_search_context(table):

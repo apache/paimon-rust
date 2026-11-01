@@ -1332,6 +1332,58 @@ mod tests {
     }
 
     #[test]
+    fn json_encoded_flat_analyzer_collections_match_field_json() {
+        for options in [
+            HashMap::from([
+                (
+                    "full-text.stop-words".into(),
+                    r#"["paimon","index"]"#.into(),
+                ),
+                ("full-text.columns".into(), r#"["body","title"]"#.into()),
+            ]),
+            HashMap::from([
+                (
+                    "full-text.stop-words".into(),
+                    r#"["paimon","index"]"#.into(),
+                ),
+                ("full-text.text_fields".into(), r#"["body","title"]"#.into()),
+            ]),
+            HashMap::from([
+                (
+                    "full-text.stop-words".into(),
+                    r#"["paimon","index"]"#.into(),
+                ),
+                ("full-text.text-fields".into(), r#"["body","title"]"#.into()),
+            ]),
+            HashMap::from([(
+                "fields.body.index-options".into(),
+                r#"{"stop-words":["paimon","index"],"text-fields":["body","title"]}"#.into(),
+            )]),
+        ] {
+            let config = raw_full_text_config(&options, "body").unwrap();
+            assert_eq!(config.text_fields, vec!["body", "title"]);
+            assert_eq!(config.tokenizer.stop_words, vec!["paimon", "index"]);
+            let defaults = super::super::global_index_options::field_index_options(
+                &options,
+                "body",
+                "full-text",
+                "full-text",
+            )
+            .unwrap();
+            let mut merged = options.clone();
+            merged.extend(defaults);
+            let native = super::super::index_build::full_text::native_full_text_options(&merged);
+            for (key, value) in &native {
+                match key.replace('_', "-").as_str() {
+                    "stop-words" => assert_eq!(value, "paimon;index"),
+                    "text-fields" | "columns" => assert_eq!(value, "body;title"),
+                    _ => (),
+                }
+            }
+        }
+    }
+
+    #[test]
     fn test_raw_full_text_config_preserves_native_text_fields() {
         let options = HashMap::from([(
             "full-text.text-fields".to_string(),
