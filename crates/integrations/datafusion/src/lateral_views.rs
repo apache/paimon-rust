@@ -438,6 +438,34 @@ pub(crate) fn parseable_sql(sql: &str) -> Result<std::borrow::Cow<'_, str>> {
         keywords::Keyword as K,
         tokenizer::{Token, Tokenizer},
     };
+    let starts_expression = |token: &Token| match token {
+        Token::Word(word) => {
+            word.quote_style.is_some()
+                || (!datafusion::sql::sqlparser::keywords::RESERVED_FOR_COLUMN_ALIAS
+                    .contains(&word.keyword)
+                    && !matches!(
+                        word.keyword,
+                        K::AS
+                            | K::BY
+                            | K::WINDOW
+                            | K::QUALIFY
+                            | K::LIMIT
+                            | K::OFFSET
+                            | K::FETCH
+                            | K::SORT
+                            | K::DISTRIBUTE
+                            | K::CLUSTER
+                            | K::LATERAL
+                    ))
+        }
+        Token::EOF
+        | Token::RParen
+        | Token::RBracket
+        | Token::Comma
+        | Token::SemiColon
+        | Token::Period => false,
+        _ => true,
+    };
     let tokens = Tokenizer::new(&GenericDialect {}, sql)
         .tokenize_with_location()
         .map_err(|e| plan_error(&format!("SQL parse error: {e}")))?;
@@ -446,27 +474,46 @@ pub(crate) fn parseable_sql(sql: &str) -> Result<std::borrow::Cow<'_, str>> {
         .filter(|t| !matches!(t.token, Token::Whitespace(_)))
         .collect::<Vec<_>>();
     let mut depth = 0i32;
-    let mut active = std::collections::HashSet::new();
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Phase {
+        Function,
+        Arguments,
+        TableAlias,
+        Columns,
+    }
+    let mut active = std::collections::HashMap::new();
     let mut positions = Vec::new();
     for (index, token) in significant.iter().enumerate() {
         if token.token == Token::RParen {
             active.remove(&depth);
             depth -= 1;
+            if active.get(&depth) == Some(&Phase::Arguments) {
+                active.insert(depth, Phase::TableAlias);
+            }
         }
         if matches!(&token.token,Token::Word(w) if w.keyword==K::VIEW)
             && index > 0
             && matches!(&significant[index-1].token,Token::Word(w) if w.keyword==K::LATERAL)
         {
-            active.insert(depth);
+            active.insert(depth, Phase::Function);
         }
-        if active.contains(&depth) {
+        if active.get(&depth) == Some(&Phase::TableAlias)
+            && matches!(
+                token.token,
+                Token::Word(_) | Token::SingleQuotedString(_) | Token::DoubleQuotedString(_)
+            )
+        {
+            active.insert(depth, Phase::Columns);
+            continue;
+        }
+        if active.get(&depth) == Some(&Phase::Columns) {
             if let Token::Word(word) = &token.token {
                 let next = significant.get(index + 1).map(|t| &t.token);
                 let ending = match word.keyword {
                     K::ORDER | K::SORT | K::DISTRIBUTE => {
                         matches!(next,Some(Token::Word(w)) if w.keyword==K::BY)
                     }
-                    K::LIMIT | K::OFFSET | K::QUALIFY => true,
+                    K::LIMIT | K::OFFSET | K::QUALIFY => next.is_some_and(starts_expression),
                     K::FETCH => {
                         matches!(next,Some(Token::Word(w)) if matches!(w.keyword,K::FIRST|K::NEXT))
                     }
@@ -503,6 +550,9 @@ pub(crate) fn parseable_sql(sql: &str) -> Result<std::borrow::Cow<'_, str>> {
             }
         }
         if token.token == Token::LParen {
+            if active.get(&depth) == Some(&Phase::Function) {
+                active.insert(depth, Phase::Arguments);
+            }
             depth += 1;
         }
     }

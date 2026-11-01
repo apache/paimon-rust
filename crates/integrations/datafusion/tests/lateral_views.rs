@@ -139,6 +139,19 @@ async fn lateral_explode_decodes_dictionary_collections_and_value_nulls() {
 #[tokio::test]
 async fn lateral_expansion_preserves_empty_parents_joins_and_dependent_generators() {
     let ctx = SQLContext::new();
+    assert_eq!(rows(&ctx,"SELECT lv.col FROM (VALUES (ARRAY[1,2])) t(xs) LATERAL VIEW explode(xs) 'lv' LIMIT (1)").await,vec![vec!["1"]]);
+    assert_eq!(rows(&ctx,"SELECT lv.col, row_number() OVER () AS rn FROM (VALUES (ARRAY[1])) t(xs) LATERAL VIEW explode(xs) lv QUALIFY E'a' = 'a' AND rn=1").await,vec![vec!["1","1"]]);
+    let mut union_rows = rows(&ctx,"SELECT a.\"limit\" AS x FROM (VALUES (ARRAY[1])) t(xs) LATERAL VIEW explode(xs) a limit UNION ALL SELECT b.col FROM (VALUES (ARRAY[2])) t(xs) LATERAL VIEW explode(xs) b LIMIT (2)").await;
+    union_rows.sort();
+    assert_eq!(union_rows, vec![vec!["1"], vec!["2"]]);
+    for (table_alias, column_alias) in [("limit", "col"), ("order", "by"), ("fetch", "first")] {
+        let sql = format!(
+            r#"SELECT "{table_alias}"."{column_alias}" AS x FROM (VALUES (ARRAY[1])) t(xs) LATERAL VIEW explode(xs) {table_alias} {column_alias} UNION ALL SELECT b.col FROM (VALUES (ARRAY[2])) t(xs) LATERAL VIEW explode(xs) b LIMIT (2)"#
+        );
+        let mut actual = rows(&ctx, &sql).await;
+        actual.sort();
+        assert_eq!(actual, vec![vec!["1"], vec!["2"]], "{sql}");
+    }
     assert_eq!(rows(&ctx,"SELECT COUNT(*) FROM (SELECT ARRAY[1] xs WHERE FALSE) t LATERAL VIEW explode_outer(xs) lv").await,vec![vec!["0"]]);
     assert_eq!(rows(&ctx,"SELECT a.id,b.id,lv.col FROM (VALUES (1,ARRAY[7,7])) a(id,xs) JOIN (VALUES (1)) b(id) ON a.id=b.id LATERAL VIEW explode(a.xs) lv").await,vec![vec!["1","1","7"],vec!["1","1","7"]]);
     assert_eq!(rows(&ctx,"SELECT b.p,b.v FROM (SELECT ARRAY[ARRAY[1,2],ARRAY[3]] items) t LATERAL VIEW explode(items) a AS xs LATERAL VIEW posexplode(xs) b AS p,v").await,vec![vec!["0","1"],vec!["1","2"],vec!["0","3"]]);
