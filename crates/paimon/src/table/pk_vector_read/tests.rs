@@ -1005,8 +1005,7 @@ async fn persisted_metric_skips_empty_segments_and_rejects_mixed_payloads() {
     let error = read
         .read(mixed)
         .await
-        .err()
-        .expect("mixed persisted metrics must fail");
+        .expect_err("mixed persisted metrics must fail");
     assert!(
         error
             .to_string()
