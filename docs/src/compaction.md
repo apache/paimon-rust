@@ -181,7 +181,9 @@ Compatibility and precedence follow Java's shared configuration resolver:
   Vector metric aliases are resolved together after JSON merging, so field JSON
   overrides legacy metric properties and case-only aliases stay compatible.
 - Legacy `pk-vector` declarations still select the algorithm through
-  `fields.<column>.pk-vector.index.type`. The former Rust
+  `fields.<column>.pk-vector.index.type`, only for columns named by
+  `pk-vector.index.columns`. The field type alone does not select an
+  implementation. The former Rust
   `global-index.vector` declaration and field algorithm/metric keys remain aliases.
   That older Rust declaration retains its metric/default priority over flat
   aliases until replaced by a concrete declaration or shared field JSON.
@@ -356,19 +358,15 @@ snapshot expiration and storage reclamation are separate maintenance work.
 
 Primary-key compaction maintains declared source-backed indexes using the same
 `global-index.<type>.index-columns` and `fields.<column>.index-options` options
-shown above. Existing Java primary-key configurations remain compatible:
+shown above. New code uses the shared `CoreOptions` index resolvers; PK-specific
+option accessors are internal implementation details.
 
-| Option | Meaning |
-| --- | --- |
-| `pk-btree.index.columns` | Comma-separated BTree columns. |
-| `pk-bitmap.index.columns` | Comma-separated bitmap columns. |
-| `pk-multivalue.index.columns` | Comma-separated array columns. |
-| `pk-fm.index.columns` | Comma-separated FM string columns. |
-| `pk-full-text.index.columns` | Comma-separated full-text string columns. |
-| `pk-vector.index.columns` | Vector column, subject to the existing PK vector constraints. |
-| `fields.<column>.pk-<family>.index.options` | JSON object of native writer options. |
-| `fields.<column>.pk-vector.index.type` | Vector algorithm, such as `ivf-flat`. |
-| `fields.<column>.pk-vector.distance.metric` | Vector metric: `l2`, `cosine`, or `inner_product`. |
+Existing Java `pk-<family>.index.columns` declarations, field JSON and metric
+properties remain compatibility aliases. The legacy vector configuration pairs
+`pk-vector.index.columns` with `fields.<column>.pk-vector.index.type`; new
+configuration selects the implementation directly in
+`global-index.<type>.index-columns`. No new PK-specific configuration API is
+provided.
 
 Declarations are unset by default. With `write-only=false`, the normal automatic
 compaction round maintains them. Explicit compaction also maintains them with

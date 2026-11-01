@@ -486,10 +486,16 @@ async fn raw_search_without_files_uses_the_configured_indexer_default() {
         (" IVF-FLAT ", RawVectorMetric::InnerProduct),
         ("diskann", RawVectorMetric::InnerProduct),
     ] {
-        let options = HashMap::from([(
-            "fields.embedding.pk-vector.index.type".to_string(),
-            index_type.to_string(),
-        )]);
+        let options = HashMap::from([
+            (
+                "pk-vector.index.columns".to_string(),
+                "embedding".to_string(),
+            ),
+            (
+                "fields.embedding.pk-vector.index.type".to_string(),
+                index_type.to_string(),
+            ),
+        ]);
         assert_eq!(
             resolve_raw_vector_metric(
                 &file_io,
@@ -523,6 +529,10 @@ async fn raw_search_without_files_uses_the_configured_indexer_default() {
         );
     }
     let mut table_options = HashMap::from([
+        (
+            "pk-vector.index.columns".to_string(),
+            "embedding".to_string(),
+        ),
         (
             "fields.embedding.pk-vector.index.type".to_string(),
             "ivf-flat".to_string(),

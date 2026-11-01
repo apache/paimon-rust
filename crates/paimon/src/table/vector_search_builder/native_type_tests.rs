@@ -299,6 +299,7 @@ async fn removed_type_options_do_not_change_raw_defaults() {
         "index-type",
         "vector.index-type",
         "fields.embedding.index-type",
+        "fields.embedding.pk-vector.index.type",
     ] {
         let table = table.copy_with_options(HashMap::from([(key.into(), "diskann".into())]));
         let mut builder = table.new_vector_search_builder();

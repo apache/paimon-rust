@@ -842,8 +842,8 @@ async fn legacy_field_metric_aliases_override_pk_metric_consistently() {
             table
                 .schema()
                 .core_options()
-                .primary_key_vector_distance_metric("embedding")
-                .unwrap(),
+                .vector_index_options("ivf-flat", "embedding", true)
+                .unwrap()["ivf-flat.metric"],
             "cosine"
         );
         write_batch(

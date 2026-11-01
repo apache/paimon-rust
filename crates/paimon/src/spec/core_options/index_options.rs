@@ -102,8 +102,9 @@ impl CoreOptions<'_> {
         }
     }
 
-    /// Concrete declarations select the implementation; retain old PK and Rust
-    /// field declarations. Query implementation hints belong to the builder API.
+    /// Concrete declarations select the implementation. Legacy PK field types
+    /// apply only to columns listed by the legacy PK declaration; they are not
+    /// standalone implementation hints. Query hints belong to the builder API.
     pub fn vector_index_type(&self, column: &str) -> Result<Option<String>> {
         let declared = self
             .global_index_types()
@@ -122,14 +123,22 @@ impl CoreOptions<'_> {
         if let Some(kind) = declared.into_iter().next() {
             return Ok(Some(kind));
         }
-        Ok([
-            format!("fields.{column}.global-index.vector.index-type"),
-            format!("fields.{column}.pk-vector.index.type"),
-        ]
-        .iter()
-        .find_map(|key| self.options.get(key))
-        .map(|s| s.trim().to_ascii_lowercase())
-        .filter(|s| !s.is_empty()))
+        let legacy_pk = columns(self.options.get("pk-vector.index.columns"))
+            .iter()
+            .any(|declared| declared == column);
+        Ok(self
+            .options
+            .get(&format!("fields.{column}.global-index.vector.index-type"))
+            .or_else(|| {
+                legacy_pk
+                    .then(|| {
+                        self.options
+                            .get(&format!("fields.{column}.pk-vector.index.type"))
+                    })
+                    .flatten()
+            })
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty()))
     }
 
     /// Resolve implementation defaults and one field's JSON without mutating
@@ -695,6 +704,57 @@ mod tests {
                     .as_deref(),
                 Some("ivf-flat")
             );
+        }
+    }
+
+    #[test]
+    fn legacy_pk_vector_type_requires_the_complete_column_declaration() {
+        let mut values = map(&[("fields.embedding.pk-vector.index.type", " IVF-FLAT ")]);
+        for columns in [None, Some(""), Some("other")] {
+            if let Some(columns) = columns {
+                values.insert("pk-vector.index.columns".into(), columns.into());
+            } else {
+                values.remove("pk-vector.index.columns");
+            }
+            assert_eq!(
+                CoreOptions::new(&values)
+                    .vector_index_type("embedding")
+                    .unwrap(),
+                None
+            );
+        }
+        values.insert(
+            "pk-vector.index.columns".into(),
+            " other, embedding ".into(),
+        );
+        assert_eq!(
+            CoreOptions::new(&values)
+                .vector_index_type("embedding")
+                .unwrap()
+                .as_deref(),
+            Some("ivf-flat")
+        );
+        values.remove("fields.embedding.pk-vector.index.type");
+        assert_eq!(
+            CoreOptions::new(&values)
+                .vector_index_type("embedding")
+                .unwrap(),
+            None
+        );
+        values.insert(
+            "fields.embedding.pk-vector.index.type".into(),
+            "diskann".into(),
+        );
+        for suffix in ["index-columns", "index-column"] {
+            values.insert(format!("global-index.ivf-pq.{suffix}"), "embedding".into());
+            assert_eq!(
+                CoreOptions::new(&values)
+                    .vector_index_type("embedding")
+                    .unwrap()
+                    .as_deref(),
+                Some("ivf-pq")
+            );
+            values.remove(&format!("global-index.ivf-pq.{suffix}"));
         }
     }
 

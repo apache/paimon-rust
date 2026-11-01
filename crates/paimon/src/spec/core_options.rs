@@ -2169,14 +2169,16 @@ impl<'a> CoreOptions<'a> {
             .unwrap_or_default()
     }
 
+    // PK layout adapters remain internal. Public configuration uses the shared
+    // global_index_* and vector_index_* resolvers, including legacy fallback.
     /// Whether a shared or legacy vector declaration is present.
-    pub fn primary_key_vector_index_enabled(&self) -> bool {
+    pub(crate) fn primary_key_vector_index_enabled(&self) -> bool {
         !self.vector_index_columns().is_empty()
     }
 
     /// The configured PK-vector index columns, split on ',' and trimmed. Blank tokens
     /// are preserved so schema validation can reject malformed column lists.
-    pub fn primary_key_vector_index_columns(&self) -> crate::Result<Vec<String>> {
+    pub(crate) fn primary_key_vector_index_columns(&self) -> crate::Result<Vec<String>> {
         let columns = self.vector_index_columns();
         if columns.is_empty() {
             return Err(crate::Error::ConfigInvalid {
@@ -2187,7 +2189,7 @@ impl<'a> CoreOptions<'a> {
     }
 
     /// The single PK-vector index column. The first release supports exactly one.
-    pub fn primary_key_vector_index_column(&self) -> crate::Result<String> {
+    pub(crate) fn primary_key_vector_index_column(&self) -> crate::Result<String> {
         let mut columns = self.primary_key_vector_index_columns()?;
         if columns.len() != 1 {
             return Err(crate::Error::ConfigInvalid {
@@ -2202,7 +2204,7 @@ impl<'a> CoreOptions<'a> {
 
     /// The index type for a PK-vector column. Required — planning and the index reader
     /// both need it, so an absent value is a hard error rather than a guessed default.
-    pub fn primary_key_vector_index_type(&self, col: &str) -> crate::Result<String> {
+    pub(crate) fn primary_key_vector_index_type(&self, col: &str) -> crate::Result<String> {
         self.vector_index_type(col)?
             .ok_or_else(|| crate::Error::ConfigInvalid {
                 message: format!("fields.{col}.pk-vector.index.type is required but not set"),
@@ -2211,7 +2213,7 @@ impl<'a> CoreOptions<'a> {
 
     /// The distance metric name for a PK-vector column, defaulting to inner_product.
     /// Validated against the supported metrics; an unknown value is a hard error.
-    pub fn primary_key_vector_distance_metric(&self, col: &str) -> crate::Result<String> {
+    pub(crate) fn primary_key_vector_distance_metric(&self, col: &str) -> crate::Result<String> {
         if let Some(kind) = self.vector_index_type(col)? {
             return self
                 .vector_index_options(&kind, col, true)?
@@ -2239,7 +2241,7 @@ impl<'a> CoreOptions<'a> {
     }
 
     /// True when the PK full-text index column option key is present (any value).
-    pub fn primary_key_full_text_index_enabled(&self) -> bool {
+    pub(crate) fn primary_key_full_text_index_enabled(&self) -> bool {
         !self.primary_key_full_text_index_columns().is_empty()
     }
 
@@ -2248,7 +2250,7 @@ impl<'a> CoreOptions<'a> {
     /// filter them) so parsing matches Java exactly; `[]` only when the key is
     /// absent. Never returns a `Result`, never errors (do not copy the fail-loud
     /// shape of `primary_key_vector_index_columns`).
-    pub fn primary_key_full_text_index_columns(&self) -> Vec<String> {
+    pub(crate) fn primary_key_full_text_index_columns(&self) -> Vec<String> {
         self.global_index_columns("full-text")
     }
 }
