@@ -168,6 +168,7 @@ impl SQLContextBuilder {
         }
         let state = state_builder.build();
         let ctx = SessionContext::new_with_state(state);
+        crate::compat_functions::register_compat_functions(&ctx);
         crate::blob_descriptor_functions::register_blob_descriptor_functions(&ctx);
         crate::variant_functions::register_variant_functions(&ctx);
         crate::json_functions::register_json_functions(&ctx);
