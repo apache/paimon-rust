@@ -57,18 +57,37 @@ pub(super) async fn read_index_vector_metric(
     if !is_vindex_index_type(&entry.index_file.index_type) {
         return Ok(None);
     }
-    if let Some(index_meta) = global_meta.index_meta.as_ref() {
+    let path = IndexFileLocation::Global { table_path }.resolve(
+        &entry.index_file.file_name,
+        entry.index_file.external_path.as_deref(),
+    );
+    read_vector_index_metric(
+        file_io,
+        &path,
+        entry.index_file.file_size.max(0) as u64,
+        global_meta.index_meta.as_deref(),
+    )
+    .await
+    .map(Some)
+}
+
+/// Resolve the metric of an already selected payload, including bucket-local PK files.
+pub(super) async fn read_vector_index_metric(
+    file_io: &FileIO,
+    path: &str,
+    file_size: u64,
+    index_meta: Option<&[u8]>,
+) -> crate::Result<MetricType> {
+    if let Some(index_meta) = index_meta {
         if let Ok(options) = serde_json::from_slice::<HashMap<String, String>>(index_meta) {
             if let Some(metric) = metric_from_index_options(&options) {
-                return Ok(Some(metric));
+                return Ok(metric);
             }
         }
     }
-    Ok(Some(
-        read_index_vector_header(file_io, table_path, entry)
-            .await?
-            .metric,
-    ))
+    Ok(read_vector_index_header(file_io, path, file_size)
+        .await?
+        .metric)
 }
 
 /// Read the structural definition of an existing run before reusing its coverage.
@@ -120,16 +139,24 @@ async fn read_index_vector_header(
         &entry.index_file.file_name,
         entry.index_file.external_path.as_deref(),
     );
-    let input = file_io.new_input(&path)?;
+    read_vector_index_header(file_io, &path, entry.index_file.file_size.max(0) as u64).await
+}
+
+async fn read_vector_index_header(
+    file_io: &FileIO,
+    path: &str,
+    file_size: u64,
+) -> crate::Result<IndexVectorSemantics> {
+    let input = file_io.new_input(path)?;
     let read_error = |e| crate::Error::DataInvalid {
         message: format!(
             "Failed to read vindex index file '{}' for vector metric: {}",
-            entry.index_file.file_name, e
+            path, e
         ),
         source: Some(Box::new(e)),
     };
-    let header_size = if entry.index_file.file_size > 0 {
-        (entry.index_file.file_size as u64).min(DISKANN_HEADER_SIZE as u64)
+    let header_size = if file_size > 0 {
+        file_size.min(DISKANN_HEADER_SIZE as u64)
     } else {
         input
             .metadata()

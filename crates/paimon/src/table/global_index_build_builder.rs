@@ -375,6 +375,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn vector_build_ignores_opaque_parameters_and_validates_known_parameters() {
+        let table = empty_table();
+        for kind in ["ivf-flat", "ivf-pq"] {
+            let mut options = HashMap::from([
+                (format!("{kind}.index.dimension"), "2".into()),
+                (format!("{kind}.ignored-option"), "ignored".into()),
+                ("fields.vector.metric".into(), "l2".into()),
+                ("metric".into(), "invalid".into()),
+                ("dimension".into(), "999".into()),
+            ]);
+            let mut builder = table.new_global_index_build_builder();
+            builder
+                .with_index_column("vector")
+                .with_index_type(kind)
+                .with_options(options.clone());
+            assert!(builder.build().await.unwrap().is_empty());
+            options.insert("fields.vector.metric".into(), "invalid".into());
+            let error = builder
+                .with_options(options.clone())
+                .build()
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("metric"), "{error}");
+            if kind == "ivf-flat" {
+                options.insert("fields.vector.metric".into(), "l2".into());
+                options.insert("ivf-flat.ivf.pq-encoding".into(), "canonical".into());
+                let error = builder.with_options(options).build().await.unwrap_err();
+                assert!(
+                    error.to_string().contains("ivf-flat.ivf.pq-encoding"),
+                    "{error}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn build_eligibility_uses_table_row_tracking_not_read_optimizations() {
         for (evolution, enabled) in [(false, true), (true, false), (false, false)] {
             let original = empty_table();

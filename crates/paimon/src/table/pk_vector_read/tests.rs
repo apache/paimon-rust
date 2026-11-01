@@ -943,6 +943,78 @@ fn verify_segment_metric_rejects_mismatched_vindex_metric() {
 
 // ---- Search results retain scored positions and the planned source context. ----
 #[tokio::test]
+async fn persisted_metric_skips_empty_segments_and_rejects_mixed_payloads() {
+    let table = build_committed_pk_vector_table(&[[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]]).await;
+    let scan = crate::table::pk_vector_scan::PkVectorScan::new(&table, 1, None);
+    let plan = scan.plan().await.unwrap();
+    let read_table = table.copy_with_options(HashMap::from([(
+        "fields.embedding.distance.metric".into(),
+        "inner_product".into(),
+    )]));
+    let read = PkVectorRead::new(
+        &read_table,
+        &HashMap::new(),
+        None,
+        "embedding",
+        &[&[0.0, 1.0]],
+        2,
+    );
+
+    // The second bucket is an independent source unit; source file names may
+    // coincide across buckets without overlapping segment ownership.
+    let mut other = plan.splits[0].clone();
+    other.data_split = DataSplitBuilder::new()
+        .with_snapshot(plan.snapshot_id)
+        .with_partition(other.data_split.partition().clone())
+        .with_bucket(1)
+        .with_bucket_path("memory:/pk_vector_route_test/bucket-1".into())
+        .with_total_buckets(2)
+        .with_data_files(other.data_split.data_files().to_vec())
+        .build()
+        .unwrap();
+    let mut with_empty = plan.clone();
+    let mut empty = other.clone();
+    let segment = &mut empty.ann_segments[0];
+    segment.row_count = 0;
+    segment.path = "memory:/missing-empty-payload".into();
+    with_empty.splits.insert(0, empty);
+    let results = read.read(with_empty).await.unwrap();
+    assert_eq!(
+        results[0]
+            .positions()
+            .unwrap()
+            .iter()
+            .map(|p| p.score)
+            .collect::<Vec<_>>(),
+        vec![1.0, 0.5]
+    );
+
+    let mut mixed = plan;
+    let bytes = build_vindex_segment_bytes("cosine");
+    let segment = &mut other.ann_segments[0];
+    segment.path = "memory:/mixed-cosine-payload".into();
+    segment.file_size = bytes.len() as u64;
+    table
+        .file_io()
+        .new_output(&segment.path)
+        .unwrap()
+        .write(bytes::Bytes::from(bytes))
+        .await
+        .unwrap();
+    mixed.splits.push(other);
+    let error = read
+        .read(mixed)
+        .await
+        .expect_err("mixed persisted metrics must fail");
+    assert!(
+        error
+            .to_string()
+            .contains("does not match configured metric"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
 async fn reader_uses_planned_splits_after_index_manifest_is_removed() {
     let table = build_committed_pk_vector_table(&[[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]]).await;
     let options = HashMap::new();

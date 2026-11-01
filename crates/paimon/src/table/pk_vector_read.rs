@@ -38,7 +38,7 @@ use crate::table::source::DataSplit;
 use crate::table::vector_read::Read;
 use crate::table::vector_search_common::{
     collect_ranked_rows, current_tokio_runtime_handle, log_vindex_range_io_stats,
-    reorder_and_strip_position, vindex_concurrency_limits, RankedRow,
+    read_vector_index_metric, reorder_and_strip_position, vindex_concurrency_limits, RankedRow,
 };
 use crate::table::{ArrowRecordBatchStream, RowRange, Table};
 use crate::vector_search::{GlobalIndexIOMeta, GlobalIndexResult, VectorSearch};
@@ -105,7 +105,7 @@ impl Read for PkVectorRead {
             }
             metadata_type = Some(segment.index_type.as_str());
         }
-        let params = PkVectorSearchParams::resolve(
+        let mut params = PkVectorSearchParams::resolve(
             &self.table,
             &self.options,
             self.filter.as_ref(),
@@ -114,6 +114,28 @@ impl Read for PkVectorRead {
             self.limit,
             metadata_type,
         )?;
+        // The payload's training metric governs ANN scores, raw fallback and
+        // refinement. Schema/query options cannot reinterpret an existing index.
+        // One payload establishes the metric; the search scorer validates every
+        // other payload against it without serializing extra remote header reads.
+        if let Some(segment) = plan
+            .splits
+            .iter()
+            .flat_map(|split| &split.ann_segments)
+            .find(|segment| segment.row_count > 0)
+        {
+            let metric = VectorSearchMetric::from_vindex(
+                read_vector_index_metric(
+                    self.table.file_io(),
+                    &segment.path,
+                    segment.file_size,
+                    Some(&segment.index_meta),
+                )
+                .await?,
+            );
+            params.metric = metric;
+            params.vector_options.metric = metric.as_str().into();
+        }
         let candidates = search_pk_candidates_batch_with_plan(
             &self.table,
             self.filter.as_ref(),

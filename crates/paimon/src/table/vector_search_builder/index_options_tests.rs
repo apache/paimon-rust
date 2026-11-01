@@ -645,14 +645,22 @@ async fn raw_build_map_preserves_json_precedence_and_serialized_shards() {
             assert_eq!(meta["metric"], "cosine");
         }
     }
-    // Qualified typos still fail at the Rust parameter boundary.
-    builder.with_options(HashMap::from([("ivf-flat.nlsit".into(), "1".into())]));
+    // Opaque procedure parameters are ignored, while known invalid values fail.
+    builder.with_options(HashMap::from([(
+        "ivf-flat.future-option".into(),
+        "1".into(),
+    )]));
+    assert!(!builder.plan().await.unwrap().shards().is_empty());
+    builder.with_options(HashMap::from([(
+        "ivf-flat.dimension".into(),
+        "invalid".into(),
+    )]));
     assert!(builder
         .plan()
         .await
         .unwrap_err()
         .to_string()
-        .contains("ivf-flat.nlsit"));
+        .contains("dimension"));
     let empty = table.copy_with_pinned_snapshot(None);
     let plan = empty
         .new_global_index_build_builder()
