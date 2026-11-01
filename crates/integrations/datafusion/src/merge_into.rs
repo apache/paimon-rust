@@ -23,6 +23,7 @@
 //!   via [`paimon::table::CopyOnWriteMergeWriter`].
 
 use std::collections::{HashMap, HashSet};
+use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -34,8 +35,8 @@ use datafusion::arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::prelude::{DataFrame, SessionContext};
 use datafusion::sql::sqlparser::ast::{
-    AssignmentTarget, BinaryOperator, Expr as SqlExpr, Ident, Merge, MergeAction, MergeClauseKind,
-    MergeInsertExpr, MergeInsertKind, TableFactor,
+    visit_expressions_mut, AssignmentTarget, BinaryOperator, Expr as SqlExpr, Ident, Merge,
+    MergeAction, MergeClauseKind, MergeInsertExpr, MergeInsertKind, TableFactor, VisitMut,
 };
 use futures::TryStreamExt;
 
@@ -314,7 +315,28 @@ async fn execute_cow_merge_once(
     table: &Table,
     enable_ident_normalization: bool,
 ) -> DFResult<DataFrame> {
-    let mut clauses = extract_cow_merge_clauses(merge, enable_ident_normalization)?;
+    let (source_ref, source_alias) = extract_source_ref(&merge.source)?;
+    let (target_ref, target_alias) = extract_table_ref(&merge.table)?;
+    let s_alias = source_alias.as_deref().unwrap_or(&source_ref);
+    let t_alias = target_alias.as_deref().unwrap_or("__cow_t");
+
+    // Rewrite column qualifiers before rendering SQL, preserving literal contents.
+    let mut aliased_merge = merge.clone();
+    rewrite_table_references(
+        &mut aliased_merge.on,
+        &target_ref,
+        t_alias,
+        &source_ref,
+        s_alias,
+    );
+    rewrite_table_references(
+        &mut aliased_merge.clauses,
+        &target_ref,
+        t_alias,
+        &source_ref,
+        s_alias,
+    );
+    let clauses = extract_cow_merge_clauses(&aliased_merge, enable_ident_normalization)?;
     validate_merge_insert_columns(&clauses.inserts, table.schema().fields())?;
     for matched in &clauses.matched {
         if let CowMatchedAction::Update(update) = &matched.action {
@@ -334,12 +356,8 @@ async fn execute_cow_merge_once(
         }
     }
 
-    let (source_ref, source_alias) = extract_source_ref(&merge.source)?;
-    let (target_ref, target_alias) = extract_table_ref(&merge.table)?;
     let on_expr = &merge.on;
-    let on_condition = on_expr.to_string();
-    let s_alias = source_alias.as_deref().unwrap_or(&source_ref);
-    let t_alias = target_alias.as_deref().unwrap_or("__cow_t");
+    let on_condition = aliased_merge.on.to_string();
 
     // Build partition filter from source data to avoid scanning all partitions
     let partition_set =
@@ -348,27 +366,6 @@ async fn execute_cow_merge_once(
     let mut writer = CopyOnWriteMergeWriter::new(table, update_columns.clone(), partition_set)
         .await
         .map_err(to_datafusion_error)?;
-
-    // Rewrite ON condition and all clause expressions: replace original table references with aliases
-    let on_condition = rewrite_condition(&on_condition, &target_ref, t_alias, &source_ref, s_alias);
-    for mc in &mut clauses.matched {
-        if let Some(ref mut pred) = mc.predicate {
-            *pred = rewrite_condition(pred, &target_ref, t_alias, &source_ref, s_alias);
-        }
-        if let CowMatchedAction::Update(ref mut upd) = mc.action {
-            for expr in &mut upd.exprs {
-                *expr = rewrite_condition(expr, &target_ref, t_alias, &source_ref, s_alias);
-            }
-        }
-    }
-    for ins in &mut clauses.inserts {
-        for expr in &mut ins.value_exprs {
-            *expr = rewrite_condition(expr, &target_ref, t_alias, &source_ref, s_alias);
-        }
-        if let Some(ref mut pred) = ins.predicate {
-            *pred = rewrite_condition(pred, &target_ref, t_alias, &source_ref, s_alias);
-        }
-    }
 
     // Read each target file individually, attach __paimon_file_idx and __paimon_row_offset
     let mut temp_tracker = TempTableTracker::new(ctx);
@@ -1633,60 +1630,43 @@ fn is_qualified_column(parts: &[Ident], alias: &str, column: &str) -> bool {
         && parts[1].value.eq_ignore_ascii_case(column)
 }
 
-/// Rewrite SQL expressions by replacing original table references with aliases.
+/// Replace table qualifiers in column references, leaving literals and column names intact.
 ///
 /// For example, `paimon.test_db.target.a = source.a` becomes `t.a = s.a`
 /// when target_ref="paimon.test_db.target", t_alias="t", source_ref="source", s_alias="s".
 ///
-/// Uses word-boundary-aware replacement to avoid mangling identifiers that
-/// contain the table name as a substring (e.g. `"my_source.x"` won't match `"source."`).
-///
-/// Limitation: this is best-effort text replacement, not AST-level rewriting.
-/// It may produce incorrect results for quoted identifiers containing dots
-/// (e.g. `"my.table".col`) or other unusual naming patterns.
-///
-/// TODO: migrate to AST-level rewriting for correctness with edge-case identifiers.
-fn rewrite_condition(
-    condition: &str,
+/// Match the longest qualifier first, and rewrite it only once so an alias that
+/// equals another table name cannot be rewritten again.
+fn rewrite_table_references<T: VisitMut>(
+    node: &mut T,
     target_ref: &str,
     t_alias: &str,
     source_ref: &str,
     s_alias: &str,
-) -> String {
-    let mut result = condition.to_string();
-    // Replace longer (more qualified) names first to avoid partial matches
-    if target_ref.len() >= source_ref.len() {
-        result = replace_table_ref(&result, target_ref, t_alias);
-        result = replace_table_ref(&result, source_ref, s_alias);
-    } else {
-        result = replace_table_ref(&result, source_ref, s_alias);
-        result = replace_table_ref(&result, target_ref, t_alias);
-    }
-    result
-}
-
-/// Replace `"ref."` with `"alias."` only when `ref` is not preceded by a word character.
-fn replace_table_ref(input: &str, table_ref: &str, alias: &str) -> String {
-    let needle = format!("{table_ref}.");
-    let replacement = format!("{alias}.");
-    let mut result = String::with_capacity(input.len());
-    let mut remaining = input;
-
-    while let Some(pos) = remaining.find(&needle) {
-        let preceding_is_word = pos > 0 && {
-            let prev = remaining.as_bytes()[pos - 1];
-            prev.is_ascii_alphanumeric() || prev == b'_'
-        };
-        if preceding_is_word {
-            result.push_str(&remaining[..pos + needle.len()]);
-        } else {
-            result.push_str(&remaining[..pos]);
-            result.push_str(&replacement);
+) {
+    let _: ControlFlow<()> = visit_expressions_mut(node, |expr| {
+        if let SqlExpr::CompoundIdentifier(parts) = expr {
+            for prefix_len in (1..parts.len()).rev() {
+                let qualifier = parts[..prefix_len]
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(".");
+                let alias = if qualifier == target_ref {
+                    Some(t_alias)
+                } else if qualifier == source_ref {
+                    Some(s_alias)
+                } else {
+                    None
+                };
+                if let Some(alias) = alias {
+                    parts.splice(..prefix_len, [Ident::new(alias)]);
+                    break;
+                }
+            }
         }
-        remaining = &remaining[pos + needle.len()..];
-    }
-    result.push_str(remaining);
-    result
+        ControlFlow::Continue(())
+    });
 }
 
 /// Return a DataFrame with a single "count" column.
@@ -1774,6 +1754,37 @@ mod tests {
         match stmts.into_iter().next().unwrap() {
             datafusion::sql::sqlparser::ast::Statement::Merge(m) => m,
             _ => panic!("Expected MERGE statement"),
+        }
+    }
+
+    #[test]
+    fn test_merge_reference_rewrite_preserves_literal_contents() {
+        for (input, expected) in [
+            ("target.id = source.id", "t.id = s.id"),
+            ("'source.payload'", "'source.payload'"),
+            ("'it''s target.payload'", "'it''s target.payload'"),
+            (
+                "'{\"path\":\"source.payload\"}'",
+                "'{\"path\":\"source.payload\"}'",
+            ),
+            ("source.name LIKE 'target.%'", "s.name LIKE 'target.%'"),
+            ("source.\"source.payload\"", "s.\"source.payload\""),
+            ("my_source.id = source.id", "my_source.id = s.id"),
+            (
+                "target.nested.value = source.value",
+                "t.nested.value = s.value",
+            ),
+        ] {
+            let parse_expr = |sql| {
+                Parser::new(&GenericDialect {})
+                    .try_with_sql(sql)
+                    .unwrap()
+                    .parse_expr()
+                    .unwrap()
+            };
+            let mut actual = parse_expr(input);
+            rewrite_table_references(&mut actual, "target", "t", "source", "s");
+            assert_eq!(actual, parse_expr(expected), "{input}");
         }
     }
 
@@ -2608,6 +2619,64 @@ mod tests {
                     (5, "second".to_string(), 100),
                     (6, "fallback".to_string(), 100),
                 ],
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cow_merge_preserves_string_literals() {
+        for (on_predicate, matched_predicate, insert_predicate) in [
+            ("", "", ""),
+            (" AND s.name = 'paimon.test_db.source.payload'", "", ""),
+            ("", " AND s.name = 'paimon.test_db.source.payload'", ""),
+            ("", "", " AND s.name = 'paimon.test_db.source.payload'"),
+        ] {
+            let (_tmp, sql_context, table) = setup_append_only_table("target").await;
+            for sql in [
+                "CREATE TABLE paimon.test_db.source (id INT, name VARCHAR)",
+                "INSERT INTO paimon.test_db.source VALUES (1, 'paimon.test_db.source.payload'), (4, 'paimon.test_db.source.payload')",
+            ] {
+                sql_context.sql(sql).await.unwrap().collect().await.unwrap();
+            }
+
+            let merge = parse_merge(&format!(
+                "MERGE INTO paimon.test_db.target t USING paimon.test_db.source s \
+                 ON paimon.test_db.target.id = paimon.test_db.source.id{on_predicate} \
+                 WHEN MATCHED{matched_predicate} THEN UPDATE SET name = 'paimon.test_db.target.payload' \
+                 WHEN NOT MATCHED{insert_predicate} THEN INSERT (id, name, value) VALUES (s.id, 'paimon.test_db.source.payload', 40)"
+            ));
+            let result = execute_merge_into(&sql_context, &merge, table, true)
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+            assert_eq!(
+                result[0]
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .unwrap()
+                    .value(0),
+                2,
+            );
+
+            let batches = sql_context
+                .sql("SELECT id, name, value FROM paimon.test_db.target ORDER BY id")
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+            assert_eq!(
+                collect_rows(&batches),
+                vec![
+                    (1, "paimon.test_db.target.payload".to_string(), 10),
+                    (2, "bob".to_string(), 20),
+                    (3, "charlie".to_string(), 30),
+                    (4, "paimon.test_db.source.payload".to_string(), 40),
+                ],
+                "ON: {on_predicate}, MATCHED: {matched_predicate}, INSERT: {insert_predicate}",
             );
         }
     }
