@@ -1916,6 +1916,25 @@ The timestamp aliases retain DataFusion semantics: optional formats are Chrono
 strftime strings, not Spark/Java patterns; numeric `to_timestamp_ltz` inputs
 are epoch seconds. The Flink `(number, precision)` overload is not implemented.
 
+### Additional scalar compatibility functions
+
+| Function | Contract |
+|----------|----------|
+| `split(text, regex[, limit])` | Returns a string array using Rust regex syntax. A positive limit caps the number of parts and retains the remaining suffix in the last part; a nonpositive limit is unlimited. An empty pattern splits Unicode characters. |
+| `locate(needle, text[, start])` | Returns a one-based Unicode-character position, or zero if no match exists or start is nonpositive/out of range. Start defaults to one. |
+| `date(value)` | Alias of native `to_date`, retaining its accepted inputs and conversion errors. |
+| `typeof(value)` | Returns SQL-style names for common scalar, array, map, struct and Variant types, including typed NULLs. Other Arrow types retain their Arrow type labels. |
+| `hex(value)` | Uppercase hexadecimal UTF-8/string or raw binary bytes; integer inputs use hexadecimal digits, with negative signed values represented as 64-bit two's complement. |
+| `unhex(text)` | Decodes case-insensitive hex. An odd number of digits is left-padded with zero; invalid hex returns NULL. |
+| `size(collection)` | Counts array elements or map entries, including NULL values, and returns INT. |
+| `hour(value)` | Extracts an INT hour from timestamps, times or timestamp strings. Dates produce zero; timestamp timezone metadata is honored. |
+
+Except for `typeof`, NULL inputs produce NULL. Empty collections have size zero.
+These functions are registered locally and do not require REST function metadata.
+Split patterns follow the same Rust regex restrictions as the other regex
+compatibility functions. SQLContext's `date` alias follows native DataFusion
+behavior when session configuration changes.
+
 ### Column Projection
 
 Only the required columns are read, reducing I/O:
