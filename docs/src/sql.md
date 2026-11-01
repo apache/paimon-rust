@@ -794,6 +794,27 @@ ALTER TABLE paimon.my_db.users SET TBLPROPERTIES('data-evolution.enabled' = 'tru
 ALTER TABLE IF EXISTS paimon.my_db.users ADD COLUMN age INT;
 ```
 
+### Table and column comments
+
+```sql
+CREATE TABLE db.t (id INT COMMENT 'identifier') COMMENT 'description';
+ALTER TABLE db.t ALTER COLUMN id COMMENT 'new description';
+COMMENT ON TABLE db.t IS 'new table description';
+COMMENT ON COLUMN db.t.id IS 'new column description';
+COMMENT ON TABLE db.t IS NULL;
+COMMENT ON COLUMN db.t.id IS NULL;
+```
+
+These statements update catalog metadata without changing field IDs, types or
+stored rows. Quoted identifiers retain their case; unquoted names follow the
+session's identifier-normalization setting. Column comments address top-level
+columns. Clearing a column comment uses Paimon's empty-description encoding.
+
+`ALTER TABLE IF EXISTS ... ALTER COLUMN ... COMMENT` ignores a missing table,
+but still reports a missing column. The nonstandard `COMMENT IF EXISTS` form
+is rejected. Comments on temporary objects, including temporary objects that
+shadow persistent tables, and writes to branch references are rejected.
+
 ## DML
 
 The table type determines which row-level DML operations are supported:
