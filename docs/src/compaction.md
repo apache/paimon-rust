@@ -154,6 +154,21 @@ overrides table implementation defaults. Vector metrics default to
 `inner_product`, and accepted metric aliases resolve consistently for builds,
 indexed reads, raw scoring and refinement.
 
+Query builders expose `with_vector_index_type(column, index_type)` in Rust and
+Python for single, batch and hybrid vector searches. This stores a per-column
+implementation hint without planning a query. Existing index metadata takes
+precedence; the hint selects the implementation for raw fallback when no vector
+index metadata is available. Captured scans, readers, hybrid routes and worker
+transport retain it. Ordinary parameters still use `with_options`, and readers
+leave an unspecified metric unset so global index metadata can supply it. PK
+readers retain Java's table metric validation.
+
+The option aliases `index_type`, `index-type`, `vector.index-type` and
+`fields.<column>.index-type` no longer select vector implementations. Use the
+shared declaration, the retained PK declaration, or the explicit builder API.
+The native training parameter `index.type` and typed index metadata fields are
+unchanged.
+
 Compatibility and precedence follow Java's shared configuration resolver:
 
 - Declarations prefer `global-index.<type>.index-columns`, then the DLF singular

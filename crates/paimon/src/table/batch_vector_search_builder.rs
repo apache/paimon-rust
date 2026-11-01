@@ -34,6 +34,7 @@ pub struct BatchVectorSearchBuilder<'a> {
     query_vectors: Option<Vec<Vec<f32>>>,
     limit: Option<usize>,
     options: HashMap<String, String>,
+    vector_index_types: HashMap<String, String>,
     filter: Option<Predicate>,
     include_row_ids: Option<Arc<RoaringTreemap>>,
     prepared_filter: Option<PreparedVectorSearchFilter>,
@@ -47,6 +48,7 @@ impl<'a> BatchVectorSearchBuilder<'a> {
             query_vectors: None,
             limit: None,
             options: HashMap::new(),
+            vector_index_types: HashMap::new(),
             filter: None,
             include_row_ids: None,
             prepared_filter: None,
@@ -55,6 +57,13 @@ impl<'a> BatchVectorSearchBuilder<'a> {
 
     pub fn with_vector_column(&mut self, name: &str) -> &mut Self {
         self.vector_column = Some(name.to_string());
+        self
+    }
+
+    /// Store a raw-fallback implementation without planning or executing a query.
+    pub fn with_vector_index_type(&mut self, column: &str, index_type: &str) -> &mut Self {
+        self.vector_index_types
+            .insert(column.into(), index_type.into());
         self
     }
 
@@ -122,19 +131,23 @@ impl<'a> BatchVectorSearchBuilder<'a> {
             self.include_row_ids.as_ref(),
             self.prepared_filter.as_ref(),
         )
-        .map(|scan| scan.with_options(&self.options))
+        .map(|scan| {
+            scan.with_options(&self.options)
+                .with_vector_index_type(self.vector_index_types.get(column).cloned())
+        })
     }
 
     /// Create an owned batch reader; result i belongs to input query i.
     pub fn new_read(&self) -> crate::Result<BatchVectorRead> {
         let column = self.column()?;
-        let context = PlanContext::new(
+        let mut context = PlanContext::new(
             self.table,
             column,
             self.filter.as_ref(),
             self.include_row_ids.as_ref(),
             self.prepared_filter.as_ref(),
         )?;
+        context.vector_index_type = self.vector_index_types.get(column).cloned();
         let queries = self
             .query_vectors
             .as_deref()

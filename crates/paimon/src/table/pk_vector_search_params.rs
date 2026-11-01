@@ -30,6 +30,7 @@ use std::collections::HashMap;
 /// from the table schema, the options and the queries alone, independent of which
 /// splits planning yields. Resolved before planning so a malformed query or option
 /// fails loud even when the plan turns out empty.
+#[derive(Clone)]
 pub(super) struct PkVectorSearchParams {
     pub(super) metric: VectorSearchMetric,
     /// Fan-out limit for bucket orchestration plus ANN and exact-file leaves (Java
@@ -52,6 +53,29 @@ impl PkVectorSearchParams {
         pk_col: &str,
         queries: &[&[f32]],
         limit: usize,
+    ) -> crate::Result<Self> {
+        Self::resolve_for_type(
+            table,
+            query_options,
+            filter,
+            pk_col,
+            queries,
+            limit,
+            None,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn resolve_for_type(
+        table: &Table,
+        query_options: &HashMap<String, String>,
+        filter: Option<&Predicate>,
+        pk_col: &str,
+        queries: &[&[f32]],
+        limit: usize,
+        index_type: Option<&str>,
+        validate_dimension: bool,
     ) -> crate::Result<Self> {
         let core = CoreOptions::new(table.schema().options());
         core.ensure_read_authorized()?;
@@ -90,15 +114,46 @@ impl PkVectorSearchParams {
                 source: None,
             });
         }
-        // `primary_key_vector_distance_metric` returns a validated name; re-parse into
-        // the enum for the numeric semantics.
-        let metric = VectorSearchMetric::parse(&core.primary_key_vector_distance_metric(pk_col)?)?;
         // Fan-out limit for bucket orchestration plus ANN and exact-file leaves (Java
         // `GLOBAL_INDEX_THREAD_NUM`); `1` reproduces strictly sequential execution.
         let concurrency = core.global_index_thread_num()?;
-        let index_type =
+        let raw_type_override = index_type.is_some();
+        let index_type = if let Some(kind) = index_type {
+            super::vector_search_common::raw_vector_index_type(
+                table.schema().options(),
+                query_options,
+                pk_col,
+                Some(kind),
+            )?
+            .unwrap()
+        } else {
             super::pk_index_options::vector_index_type(table.schema().options(), pk_col)?
-                .to_string();
+                .to_string()
+        };
+        let metric = if raw_type_override {
+            let mut configured_metric = None;
+            for options in [query_options, table.schema().options()] {
+                let resolved =
+                    CoreOptions::new(options).vector_index_options(&index_type, pk_col, false)?;
+                configured_metric = [
+                    format!("fields.{pk_col}.distance.metric"),
+                    format!("fields.{pk_col}.metric"),
+                    format!("{index_type}.metric"),
+                    "metric".into(),
+                    "distance.metric".into(),
+                ]
+                .iter()
+                .find_map(|key| resolved.get(key).cloned());
+                if configured_metric.is_some() {
+                    break;
+                }
+            }
+            VectorSearchMetric::parse(configured_metric.as_deref().unwrap_or("inner_product"))?
+        } else {
+            // PK readers retain Java's table metric validation. The explicit
+            // implementation affects only plans with no ANN metadata at all.
+            VectorSearchMetric::parse(&core.primary_key_vector_distance_metric(pk_col)?)?
+        };
         let vector_field = table
             .schema()
             .fields()
@@ -141,14 +196,21 @@ impl PkVectorSearchParams {
         // ARRAY<FLOAT> gets the index dimension from the same vindex option resolver
         // used by index reads. Both valid PK-vector column shapes must reject NaN/Inf
         // up front, not only after a non-empty plan opens readers.
-        if let Some(dimension) = pk_vector_query_dimension(
-            table.schema().options(),
-            query_options,
-            &index_type,
-            &vector_field,
-        )? {
-            for query in queries {
-                validate_query(query, dimension)?;
+        // Only ARRAY's implementation-dependent width waits for the source
+        // plan. Fixed schema widths, emptiness and finiteness remain eager.
+        for query in queries {
+            validate_query(query, query.len().max(1))?;
+        }
+        if validate_dimension || matches!(vector_field.data_type(), DataType::Vector(_)) {
+            if let Some(dimension) = pk_vector_query_dimension(
+                table.schema().options(),
+                query_options,
+                &index_type,
+                &vector_field,
+            )? {
+                for query in queries {
+                    validate_query(query, dimension)?;
+                }
             }
         }
 
@@ -178,6 +240,11 @@ fn pk_vector_query_dimension(
         }
         DataType::Array(array_type) if matches!(array_type.element_type(), DataType::Float(_)) => {
             // ARRAY<FLOAT> carries its dimension in the vindex options.
+            let query_options = CoreOptions::new(query_options).vector_index_options(
+                index_type,
+                vector_field.name(),
+                false,
+            )?;
             let mut dimension_options = HashMap::new();
             for key in [
                 "dimension".to_string(),

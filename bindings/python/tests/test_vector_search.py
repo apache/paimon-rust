@@ -158,6 +158,59 @@ def test_single_vector_keyword_matches_stub(table):
     assert builder.execute().row_ids() == _single(table).with_limit(1).execute().row_ids()
 
 
+@pytest.mark.parametrize('batch', [False, True])
+def test_explicit_native_type_survives_scan_read_and_uses_raw_metric_options(table, batch):
+    import pickle
+    builder = (table.new_batch_vector_search_builder().with_query_vectors([[1, 0], [1, 0]])
+               if batch else table.new_vector_search_builder().with_query_vector([1, 0]))
+    assert builder.with_vector_index_type(column='embedding', index_type='ivf-flat') is builder
+    builder.with_vector_column('embedding').with_limit(3)
+    plan = pickle.loads(pickle.dumps(builder.new_vector_search_scan().scan()))
+    reader = builder.new_batch_vector_search_read() if batch else builder.new_vector_search_read()
+    # Mutating the builder must not change captured reader configuration.
+    builder.with_vector_index_type('embedding', 'diskann').with_option('metric', 'l2')
+    results = reader.read_batch_plan(plan) if batch else [reader.read_plan(plan)]
+    for result in results:
+        assert sorted(result.row_ids().values()) == pytest.approx([0, 1, 1])
+    results = builder.execute() if batch else [builder.execute()]
+    for result in results:
+        assert sorted(result.row_ids().values()) == pytest.approx([1 / 3, 1, 1])
+
+
+def test_native_type_keeps_index_metadata_and_ignores_removed_option_hints(table):
+    expected = _single(table).execute().row_ids()
+    for key in ('index_type', 'index-type', 'vector.index-type', 'fields.embedding.index-type'):
+        assert _single(table.copy({key: 'diskann'})).with_option(key, 'ivf-flat').execute().row_ids() == expected
+    (table.new_global_index_build_builder().with_index_column('embedding')
+     .with_index_type('ivf-flat').with_options({'dimension': '2', 'nlist': '1', 'metric': 'l2'}).execute())
+    expected = _single(table).execute().row_ids()
+    assert (_single(table).with_vector_index_type('embedding', 'invalid-unused-type')
+            .execute().row_ids()) == expected
+    # Table defaults are not explicit query metrics. Both JSON namespaces obey
+    # that boundary when the persisted index uses a different metric.
+    for key, value in (
+        ('ivf-flat.metric', 'cosine'),
+        ('fields.embedding.index-options', '{"metric":"cosine"}'),
+        ('fields.embedding.pk-vector.index.options', '{"metric":"cosine"}'),
+    ):
+        assert (_single(table.copy({key: value})).with_vector_index_type('embedding', 'diskann')
+                .execute().row_ids()) == expected
+        with pytest.raises(Exception, match='does not match index metric'):
+            _single(table).with_option(key, value).execute()
+
+
+def test_hybrid_native_type_is_captured_with_the_route_builder(table):
+    hybrid = table.new_hybrid_search_builder()
+    assert hybrid.with_vector_index_type('embedding', 'ivf-flat') is hybrid
+    hybrid.add_vector_route('embedding', [1, 0], 3, options={
+        'ivf-flat.metric': 'l2', 'diskann.metric': 'inner_product'}).with_limit(3)
+    captured = hybrid.route_builders()[0].search_builder()
+    hybrid.with_vector_index_type('embedding', 'diskann')
+    assert sorted(captured.execute().row_ids().values()) == pytest.approx([1 / 3, 1, 1])
+    updated = hybrid.route_builders()[0].search_builder()
+    assert sorted(updated.execute().row_ids().values()) == pytest.approx([0, 1, 1])
+
+
 def test_external_result_uses_same_scan_type_without_search_context(table):
     found = _single(table).with_limit(1).execute()
     external = GlobalIndexResult.from_scored_row_ids(found.row_ids())

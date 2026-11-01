@@ -246,6 +246,7 @@ impl FullTextScan {
                 self.context.filter.as_ref(),
                 &Default::default(),
                 true,
+                None,
             )
             .await?
         };

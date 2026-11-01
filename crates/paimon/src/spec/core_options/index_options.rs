@@ -103,7 +103,7 @@ impl CoreOptions<'_> {
     }
 
     /// Concrete declarations select the implementation; retain old PK and Rust
-    /// field declarations and the flat implementation aliases used by DLF.
+    /// field declarations. Query implementation hints belong to the builder API.
     pub fn vector_index_type(&self, column: &str) -> Result<Option<String>> {
         let declared = self
             .global_index_types()
@@ -125,10 +125,6 @@ impl CoreOptions<'_> {
         Ok([
             format!("fields.{column}.global-index.vector.index-type"),
             format!("fields.{column}.pk-vector.index.type"),
-            "index_type".into(),
-            "index-type".into(),
-            "vector.index-type".into(),
-            format!("fields.{column}.index-type"),
         ]
         .iter()
         .find_map(|key| self.options.get(key))
@@ -671,5 +667,65 @@ mod tests {
             .unwrap();
         assert_eq!(resolved["ivf-flat.dimension"], "2");
         assert_eq!(resolved["ivf-flat.metric"], "l2");
+    }
+
+    #[test]
+    fn removed_vector_type_hints_do_not_select_an_implementation() {
+        for key in [
+            "index_type",
+            "index-type",
+            "vector.index-type",
+            "fields.embedding.index-type",
+        ] {
+            let mut values = map(&[(key, "diskann")]);
+            assert_eq!(
+                CoreOptions::new(&values)
+                    .vector_index_type("embedding")
+                    .unwrap(),
+                None
+            );
+            values.insert(
+                "global-index.ivf-flat.index-columns".into(),
+                "embedding".into(),
+            );
+            assert_eq!(
+                CoreOptions::new(&values)
+                    .vector_index_type("embedding")
+                    .unwrap()
+                    .as_deref(),
+                Some("ivf-flat")
+            );
+        }
+    }
+
+    #[test]
+    fn short_field_options_replace_old_json_and_override_prefixed_defaults_without_query_metric() {
+        let values = map(&[
+            ("global-index.ivf-pq.index-column", "embedding"),
+            ("ivf-pq.dimension", "8"),
+            ("ivf-pq.nlist", "16"),
+            ("fields.embedding.dimension", "4"),
+            (
+                "fields.embedding.pk-vector.index.options",
+                r#"{"pq.m":3,"nlist":32}"#,
+            ),
+            (
+                "fields.embedding.index-options",
+                r#"{"dimension":2,"nlist":1}"#,
+            ),
+        ]);
+        let resolved = CoreOptions::new(&values)
+            .vector_index_options("ivf-pq", "embedding", false)
+            .unwrap();
+        assert_eq!(resolved["ivf-pq.nlist"], "1");
+        assert_eq!(resolved["fields.embedding.dimension"], "2");
+        assert!(!resolved.contains_key("ivf-pq.pq.m"));
+        assert!(!resolved.contains_key("ivf-pq.metric"));
+        assert!(!resolved.contains_key("fields.embedding.metric"));
+        let defaults = CoreOptions::new(&values)
+            .vector_index_options("ivf-pq", "embedding", true)
+            .unwrap();
+        assert_eq!(defaults["ivf-pq.metric"], "inner_product");
+        assert_eq!(values["ivf-pq.dimension"], "8");
     }
 }

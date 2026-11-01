@@ -58,6 +58,21 @@ fn raw_query_dimensions_remain_supported_with_java_build_option_mapping() {
             pk_vector_query_dimension(&table, &query, index_type, &field).unwrap(),
             Some(2)
         );
+        let query = HashMap::from([
+            ("dimension".into(), "7".into()),
+            (
+                "fields.embedding.pk-vector.index.options".into(),
+                "invalid old JSON".into(),
+            ),
+            (
+                "fields.embedding.index-options".into(),
+                r#"{"dimension":2}"#.into(),
+            ),
+        ]);
+        assert_eq!(
+            pk_vector_query_dimension(&table, &query, index_type, &field).unwrap(),
+            Some(2)
+        );
         let table = HashMap::from([
             ("dimension".into(), "8".into()),
             (format!("{index_type}.index.dimension"), "16".into()),

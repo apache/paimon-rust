@@ -392,6 +392,7 @@ pub struct HybridSearchBuilder<'a> {
     ranker: HybridSearchRanker,
     filter: Option<Predicate>,
     pinned_snapshot: Option<Option<Snapshot>>,
+    vector_index_types: HashMap<String, String>,
 }
 
 impl<'a> HybridSearchBuilder<'a> {
@@ -403,11 +404,19 @@ impl<'a> HybridSearchBuilder<'a> {
             ranker: HybridSearchRanker::Rrf,
             filter: None,
             pinned_snapshot: None,
+            vector_index_types: HashMap::new(),
         }
     }
 
     pub fn add_route(&mut self, route: HybridSearchRoute) -> &mut Self {
         self.routes.push(route);
+        self
+    }
+
+    /// Store each vector route's raw-fallback implementation, even before routes exist.
+    pub fn with_vector_index_type(&mut self, column: &str, index_type: &str) -> &mut Self {
+        self.vector_index_types
+            .insert(column.into(), index_type.into());
         self
     }
 
@@ -621,6 +630,9 @@ impl<'a> HybridSearchBuilder<'a> {
                             super::VectorSearchBuilder::from_owned(table.clone()),
                             route,
                             self.filter.as_ref(),
+                            self.vector_index_types
+                                .get(&route.field_name)
+                                .map(String::as_str),
                         ))
                     }
                     HybridSearchRouteKind::FullText => {
@@ -645,7 +657,14 @@ impl<'a> HybridSearchBuilder<'a> {
         table: &'t Table,
         route: &HybridSearchRoute,
     ) -> super::VectorSearchBuilder<'t> {
-        vector_route_builder(table, route, self.filter.as_ref())
+        configure_vector_route_builder(
+            table.new_vector_search_builder(),
+            route,
+            self.filter.as_ref(),
+            self.vector_index_types
+                .get(&route.field_name)
+                .map(String::as_str),
+        )
     }
 
     fn validate_global_routes(&self) -> crate::Result<()> {
@@ -1226,24 +1245,20 @@ fn build_hybrid_indexed_splits(
     Ok(out)
 }
 
-fn vector_route_builder<'t>(
-    table: &'t Table,
-    route: &HybridSearchRoute,
-    filter: Option<&Predicate>,
-) -> super::VectorSearchBuilder<'t> {
-    configure_vector_route_builder(table.new_vector_search_builder(), route, filter)
-}
-
 fn configure_vector_route_builder<'t>(
     mut builder: super::VectorSearchBuilder<'t>,
     route: &HybridSearchRoute,
     filter: Option<&Predicate>,
+    index_type: Option<&str>,
 ) -> super::VectorSearchBuilder<'t> {
     builder
         .with_vector_column(&route.field_name)
         .with_query_vector(route.vector.clone().expect("validated vector route"))
         .with_limit(route.limit)
         .with_options(route.options.clone());
+    if let Some(index_type) = index_type {
+        builder.with_vector_index_type(&route.field_name, index_type);
+    }
     if let Some(filter) = filter {
         builder.with_filter(filter.clone());
     }

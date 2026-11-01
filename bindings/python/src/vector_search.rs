@@ -38,6 +38,7 @@ struct SearchConfig {
     column: Option<String>,
     limit: Option<usize>,
     options: Vec<HashMap<String, String>>,
+    vector_index_types: HashMap<String, String>,
     filters: Vec<Predicate>,
     partition_filters: Vec<Predicate>,
 }
@@ -48,6 +49,9 @@ impl SearchConfig {
         table: &'a Table,
     ) -> paimon::Result<paimon::table::BatchVectorSearchBuilder<'a>> {
         let mut builder = table.new_batch_vector_search_builder();
+        for (column, index_type) in &self.vector_index_types {
+            builder.with_vector_index_type(column, index_type);
+        }
         if let Some(column) = &self.column {
             builder.with_vector_column(column);
         }
@@ -91,6 +95,14 @@ impl PyVectorSearchBuilder {
 impl PyVectorSearchBuilder {
     fn with_vector_column(mut slf: PyRefMut<'_, Self>, name: String) -> PyRefMut<'_, Self> {
         slf.inner.with_vector_column(&name);
+        slf
+    }
+    fn with_vector_index_type(
+        mut slf: PyRefMut<'_, Self>,
+        column: String,
+        index_type: String,
+    ) -> PyRefMut<'_, Self> {
+        slf.inner.with_vector_index_type(&column, &index_type);
         slf
     }
     fn with_limit(mut slf: PyRefMut<'_, Self>, limit: usize) -> PyRefMut<'_, Self> {
@@ -167,6 +179,14 @@ impl PyBatchVectorSearchBuilder {
 impl PyBatchVectorSearchBuilder {
     fn with_vector_column(mut slf: PyRefMut<'_, Self>, name: String) -> PyRefMut<'_, Self> {
         slf.config.column = Some(name);
+        slf
+    }
+    fn with_vector_index_type(
+        mut slf: PyRefMut<'_, Self>,
+        column: String,
+        index_type: String,
+    ) -> PyRefMut<'_, Self> {
+        slf.config.vector_index_types.insert(column, index_type);
         slf
     }
     fn with_limit(mut slf: PyRefMut<'_, Self>, limit: usize) -> PyRefMut<'_, Self> {
@@ -662,14 +682,23 @@ for factory, expected in (
         raise AssertionError('Unconfigured query was accepted')
 
 single = table.new_vector_search_builder().with_vector_column('embedding').with_query_vector([1., 0.]).with_limit(1)
+for factory in (table.new_vector_search_builder, table.new_batch_vector_search_builder, table.new_hybrid_search_builder):
+    configured = factory()
+    # This API must only store configuration: neither a query nor a snapshot
+    # is available, and a superseded invalid implementation is accepted here.
+    assert configured.with_vector_index_type(column='embedding', index_type='invalid') is configured
+    assert configured.with_vector_index_type('embedding', 'ivf-flat') is configured
+assert single.with_vector_index_type('embedding', 'ivf-flat') is single
 assert isinstance(single.execute(), sdk.GlobalIndexResult)
 assert len(single.execute()) == 0
 batch = table.new_batch_vector_search_builder().with_vector_column('embedding').with_query_vectors([[1., 0.], [0., 1.]]).with_limit(1)
+assert batch.with_vector_index_type('embedding', 'diskann') is batch
 results = batch.execute()
 assert len(results) == 2 and all(isinstance(result, sdk.GlobalIndexResult) and len(result) == 0 for result in results)
 text = table.new_full_text_search_builder().with_query('body', 'needle').with_limit(1)
 assert isinstance(text.execute(), sdk.GlobalIndexResult) and len(text.execute()) == 0
 hybrid = table.new_hybrid_search_builder().add_vector_route('embedding', [1., 0.], 1).add_full_text_route('body', 'needle', 1).with_limit(1)
+assert hybrid.with_vector_index_type('embedding', 'ivf-flat') is hybrid
 assert isinstance(hybrid.execute(), sdk.GlobalIndexResult) and len(hybrid.execute()) == 0
 try:
     batch.with_query_vectors([]).execute()

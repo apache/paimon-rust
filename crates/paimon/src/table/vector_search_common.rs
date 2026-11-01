@@ -202,25 +202,32 @@ pub(super) fn configured_vector_index_type(
     query_options: &HashMap<String, String>,
     column: &str,
 ) -> crate::Result<Option<String>> {
-    let keys = [
-        "index_type".to_string(),
-        "index-type".into(),
-        "vector.index-type".into(),
-        format!("fields.{column}.index-type"),
-    ];
-    if let Some(value) = keys.iter().find_map(|key| query_options.get(key)) {
-        return Ok(Some(value.trim().to_ascii_lowercase()));
-    }
     if let Some(kind) = super::global_index_options::vector_index_type(query_options, column)? {
         return Ok(Some(kind.into()));
     }
     if let Some(kind) = super::global_index_options::vector_index_type(table_options, column)? {
         return Ok(Some(kind.into()));
     }
-    Ok(keys
-        .iter()
-        .find_map(|key| table_options.get(key))
-        .map(|value| value.trim().to_ascii_lowercase()))
+    Ok(None)
+}
+
+/// Resolve only after discovering that no persisted vector implementation exists.
+pub(super) fn raw_vector_index_type(
+    table_options: &HashMap<String, String>,
+    query_options: &HashMap<String, String>,
+    column: &str,
+    explicit: Option<&str>,
+) -> crate::Result<Option<String>> {
+    let Some(kind) = explicit else {
+        return configured_vector_index_type(table_options, query_options, column);
+    };
+    let kind = kind.trim().to_ascii_lowercase();
+    if !is_vindex_index_type(&kind) {
+        return Err(crate::Error::ConfigInvalid {
+            message: format!("Unsupported vector index type for {column}: {kind}"),
+        });
+    }
+    Ok(Some(kind))
 }
 
 pub(super) fn current_tokio_runtime_handle() -> crate::Result<tokio::runtime::Handle> {

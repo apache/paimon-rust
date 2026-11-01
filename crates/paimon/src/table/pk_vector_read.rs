@@ -62,6 +62,7 @@ pub(super) struct PkVectorRead {
     queries: Vec<Vec<f32>>,
     limit: usize,
     params: PkVectorSearchParams,
+    raw_index_type: Option<String>,
 }
 
 impl PkVectorRead {
@@ -83,7 +84,13 @@ impl PkVectorRead {
             queries: queries.iter().map(|query| query.to_vec()).collect(),
             limit,
             params,
+            raw_index_type: None,
         }
+    }
+
+    pub(super) fn with_vector_index_type(mut self, index_type: Option<String>) -> Self {
+        self.raw_index_type = index_type;
+        self
     }
 }
 
@@ -93,6 +100,24 @@ impl Read for PkVectorRead {
     async fn read(&self, plan: PkVectorScanPlan) -> crate::Result<Vec<GlobalIndexResult>> {
         let core = CoreOptions::new(self.table.schema().options());
         let queries: Vec<&[f32]> = self.queries.iter().map(Vec::as_slice).collect();
+        let mut params = self.params.clone();
+        if let Some(kind) = &self.raw_index_type {
+            let raw_type = plan
+                .splits
+                .iter()
+                .all(|split| split.ann_segments.is_empty())
+                .then_some(kind.as_str());
+            params = PkVectorSearchParams::resolve_for_type(
+                &self.table,
+                &self.options,
+                self.filter.as_ref(),
+                &self.vector_column,
+                &queries,
+                self.limit,
+                raw_type,
+                true,
+            )?;
+        }
         let candidates = search_pk_candidates_batch_with_plan(
             &self.table,
             &self.options,
@@ -102,7 +127,7 @@ impl Read for PkVectorRead {
             &queries,
             self.limit,
             &plan,
-            &self.params,
+            &params,
         )
         .await?;
         let table = Arc::new(self.table.clone());
@@ -114,7 +139,7 @@ impl Read for PkVectorRead {
                     plan.snapshot_id,
                     candidates,
                     &plan.splits,
-                    self.params.metric,
+                    params.metric,
                 )
             })
             .collect()
